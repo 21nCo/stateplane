@@ -1,0 +1,19 @@
+contracts/decisions.md
+  s_4a1f51a32f40b2::t_3002a27a1d3e05 9,11-12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d7f960d4baf1cc0c3d26d80924252eb60c65c5a8",
+  "prompts": {},
+  "sessions": {
+    "s_4a1f51a32f40b2": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c88a-c379-7711-89ae-f383fcca0dab",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
