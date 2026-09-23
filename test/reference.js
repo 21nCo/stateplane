@@ -63,6 +63,31 @@ const tupleOf = (data, paths, schema) => {
 const allowedKeywords = new Set(['$schema', 'type', 'properties', 'required', 'additionalProperties', 'items', 'minItems', 'maxItems', 'minLength', 'maxLength', 'minimum', 'maximum', 'enum', 'format', 'description']);
 const plainObject = value => value !== null && typeof value === 'object' &&
   (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+// A receipt may only fingerprint JSON-compatible payloads. In particular, JSON
+// serialization must not silently omit an object field or turn an array slot into null.
+const validateJsonPayload = (value, ancestors = new Set()) => {
+  if (value === null || typeof value === 'boolean') return;
+  if (typeof value === 'number' && Number.isFinite(value)) return;
+  if (typeof value === 'string' && wellFormed(value)) return;
+  if (!Array.isArray(value) && !plainObject(value)) fail('SCHEMA_INVALID');
+  if (ancestors.has(value)) fail('SCHEMA_INVALID');
+  ancestors.add(value);
+  if (Array.isArray(value)) {
+    if (Reflect.ownKeys(value).length !== value.length + 1) fail('SCHEMA_INVALID');
+    for (let index = 0; index < value.length; index++) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, index);
+      if (!descriptor || !Object.hasOwn(descriptor, 'value')) fail('SCHEMA_INVALID');
+      validateJsonPayload(descriptor.value, ancestors);
+    }
+  } else {
+    for (const key of Reflect.ownKeys(value)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (typeof key !== 'string' || !wellFormed(key) || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) fail('SCHEMA_INVALID');
+      validateJsonPayload(descriptor.value, ancestors);
+    }
+  }
+  ancestors.delete(value);
+};
 const definitionType = (s, root) => {
   if (!plainObject(s) || Object.keys(s).some(name => !allowedKeywords.has(name))) fail('SCHEMA_UNSUPPORTED');
   if (root ? s.$schema !== 'https://json-schema.org/draft/2020-12/schema' : Object.hasOwn(s, '$schema')) fail('SCHEMA_UNSUPPORTED');
@@ -74,14 +99,20 @@ const definitionType = (s, root) => {
     (types.length === 1 && types[0] === 'null')) fail('SCHEMA_UNSUPPORTED');
   return types.find(t => t !== 'null');
 };
-const validateBounds = (s, type) => {
-  if (s.description !== undefined && (typeof s.description !== 'string' || !wellFormed(s.description))) fail('SCHEMA_UNSUPPORTED');
+const validateSizeBounds = s => {
   for (const [min, max] of [['minLength', 'maxLength'], ['minItems', 'maxItems']]) {
     for (const key of [min, max]) if (s[key] !== undefined && (!Number.isSafeInteger(s[key]) || s[key] < 0)) fail('SCHEMA_UNSUPPORTED');
     if (s[min] !== undefined && s[max] !== undefined && s[min] > s[max]) fail('SCHEMA_UNSUPPORTED');
   }
+};
+const validateNumericBounds = s => {
   for (const key of ['minimum', 'maximum']) if (s[key] !== undefined && (typeof s[key] !== 'number' || !Number.isFinite(s[key]))) fail('SCHEMA_UNSUPPORTED');
   if (s.minimum !== undefined && s.maximum !== undefined && s.minimum > s.maximum) fail('SCHEMA_UNSUPPORTED');
+};
+const validateBounds = (s, type) => {
+  if (s.description !== undefined && (typeof s.description !== 'string' || !wellFormed(s.description))) fail('SCHEMA_UNSUPPORTED');
+  validateSizeBounds(s);
+  validateNumericBounds(s);
   if (s.format !== undefined && (type !== 'string' || s.format !== 'date-time')) fail('SCHEMA_UNSUPPORTED');
   if (type !== 'string' && (s.minLength !== undefined || s.maxLength !== undefined)) fail('SCHEMA_UNSUPPORTED');
   if (!['number', 'integer'].includes(type) && (s.minimum !== undefined || s.maximum !== undefined)) fail('SCHEMA_UNSUPPORTED');
@@ -130,15 +161,17 @@ const validateScalar = (data, schema, type) => {
   if (type === 'string' && ((schema.minLength !== undefined && [...data].length < schema.minLength) || (schema.maxLength !== undefined && [...data].length > schema.maxLength))) fail('SCHEMA_INVALID');
   if (schema.format === 'date-time') utcInstant(data);
 };
+const validateArray = (data, schema) => {
+  if (!Array.isArray(data) || (schema.minItems !== undefined && data.length < schema.minItems) || (schema.maxItems !== undefined && data.length > schema.maxItems)) fail('SCHEMA_INVALID');
+  for (const value of data) validateData(value, schema.items);
+};
 const validateData = (data, schema) => {
   if (data === null && !(Array.isArray(schema.type) ? schema.type.includes('null') : schema.type === 'null')) fail('SCHEMA_INVALID');
   const type = Array.isArray(schema.type) ? schema.type.find(t => t !== 'null') : schema.type;
   if (data === null) { /* A nullable value must still satisfy enum below. */ }
   else if (type === 'object') validateObject(data, schema);
-  else if (type === 'array') {
-    if (!Array.isArray(data) || (schema.minItems !== undefined && data.length < schema.minItems) || (schema.maxItems !== undefined && data.length > schema.maxItems)) fail('SCHEMA_INVALID');
-    for (const value of data) validateData(value, schema.items);
-  } else validateScalar(data, schema, type);
+  else if (type === 'array') validateArray(data, schema);
+  else validateScalar(data, schema, type);
   if (schema.enum && !schema.enum.some(value => stable(value) === stable(data))) fail('SCHEMA_INVALID');
 };
 const validateMutationInput = ({ operation, id, externalKey, data, set, unset, expectedRevision, expectedSchemaVersion, idempotencyKey, extra }) => {
@@ -153,15 +186,31 @@ const validateMutationInput = ({ operation, id, externalKey, data, set, unset, e
   if (expectedSchemaVersion !== undefined && (!Number.isSafeInteger(expectedSchemaVersion) || expectedSchemaVersion < 1)) fail('INVALID_ARGUMENT');
   return externalKey === undefined ? undefined : keyOf(externalKey);
 };
+const validatePatchShape = (set, unset) => {
+  if (!plainObject(set) || !Array.isArray(unset) || Reflect.ownKeys(unset).length !== unset.length + 1) fail('INVALID_ARGUMENT');
+  const paths = new Set();
+  for (let index = 0; index < unset.length; index++) {
+    const descriptor = Object.getOwnPropertyDescriptor(unset, index);
+    const path = descriptor?.value;
+    if (!descriptor || !Object.hasOwn(descriptor, 'value') || typeof path !== 'string' || !wellFormed(path) ||
+      paths.has(path) || Object.hasOwn(set, path)) fail('INVALID_ARGUMENT');
+    paths.add(path);
+  }
+};
+const validateFingerprintPayload = (operation, data, set, unset) => {
+  if (operation === 'create' || operation === 'replace') validateJsonPayload(data);
+  if (operation === 'patch') {
+    validatePatchShape(set, unset);
+    validateJsonPayload(set);
+  }
+};
 const mutationData = (operation, data, set, unset, current, schema) => {
   if (operation === 'delete') return undefined;
   if (operation === 'create' || operation === 'replace') {
     if (data === undefined) fail('SCHEMA_INVALID');
     return clone(data);
   }
-  if (!plainObject(set) || !Array.isArray(unset) || new Set(unset).size !== unset.length ||
-    unset.some(k => typeof k !== 'string' || !Object.hasOwn(schema.properties ?? {}, k) ||
-      schema.required?.includes(k) || Object.hasOwn(set, k))) fail('INVALID_ARGUMENT');
+  if (unset.some(k => !Object.hasOwn(schema.properties ?? {}, k) || schema.required?.includes(k))) fail('INVALID_ARGUMENT');
   const next = { ...clone(current.data), ...clone(set) };
   for (const k of unset) delete next[k];
   return next;
@@ -294,14 +343,15 @@ export class ReferenceState {
   mutate({ spaceId, credential, collection, operation, id, externalKey, data, set, unset, expectedRevision, expectedSchemaVersion, idempotencyKey, ...extra }) {
     const { c } = this.#access(spaceId, credential, collection, 'records:write', true);
     const normalized = validateMutationInput({ operation, id, externalKey, data, set, unset, expectedRevision, expectedSchemaVersion, idempotencyKey, extra });
+    const identity = stable([spaceId, credential, operation, idempotencyKey]);
+    const previous = this.receipts.get(identity);
+    // Before parsing a receipt's payload, check that its original collection is still visible.
+    if (previous) this.#access(spaceId, credential, previous.collection, 'records:write', true);
+    validateFingerprintPayload(operation, data, set, unset);
     // Caller-supplied schema precondition is stable across compatible schema additions.
     // Do not fingerprint the server's current schema version: a lost response must replay.
     const fingerprint = digest({ actor: credential, operation, collection, id, externalKey: normalized, data, set, unset, expectedRevision, expectedSchemaVersion });
-    const identity = stable([spaceId, credential, operation, idempotencyKey]);
-    const previous = this.receipts.get(identity);
     if (previous) {
-      // A changed request cannot probe whether a revoked collection has a receipt.
-      this.#access(spaceId, credential, previous.collection, 'records:write', true);
       if (previous.fingerprint !== fingerprint) fail('IDEMPOTENCY_MISMATCH');
       return { ...clone(previous.receipt), replayed: true };
     }
@@ -333,6 +383,18 @@ export class ReferenceState {
     this.receipts.set(identity, { collection, fingerprint, receipt });
     return clone(receipt);
   }
+  #cursorAfter(cursor, { spaceId, credential, collection, order, policyVersion, schemaVersion }) {
+    if (cursor === undefined) return null;
+    if (typeof cursor !== 'string' || !cursor || !/^[A-Za-z0-9_-]+$/.test(cursor)) fail('CURSOR_INVALID');
+    let decoded;
+    try { decoded = JSON.parse(Buffer.from(cursor, 'base64url').toString()); } catch { fail('CURSOR_INVALID'); }
+    if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) fail('CURSOR_INVALID');
+    const { signature, ...binding } = decoded;
+    if (binding.spaceId !== spaceId || binding.credential !== credential || binding.collection !== collection || binding.policyVersion !== policyVersion || binding.schemaVersion !== schemaVersion || stable(binding.sort) !== stable(order) || signature !== this.#sign(binding)) fail('CURSOR_INVALID');
+    if (!binding.after || typeof binding.after.id !== 'string' || (!order && typeof binding.after.value !== 'string') ||
+      (order && ![0, 1, 2].includes(binding.after.rank))) fail('CURSOR_INVALID');
+    return binding.after;
+  }
   query({ spaceId, credential, collection, limit, cursor, sort, filter }) {
     const { s, c } = this.#access(spaceId, credential, collection, 'records:read');
     if (!Number.isSafeInteger(limit) || limit < 1) fail('INVALID_ARGUMENT');
@@ -344,18 +406,7 @@ export class ReferenceState {
     const order = sort === undefined ? null : { field: sort.field, direction: sort.direction };
     const tuple = record => sortTuple(record, order, c.schema);
     const compare = (a, b) => compareTuples(a, b, order, c.schema);
-    let after = null;
-    if (cursor !== undefined) {
-      if (typeof cursor !== 'string' || !cursor || !/^[A-Za-z0-9_-]+$/.test(cursor)) fail('CURSOR_INVALID');
-      let decoded;
-      try { decoded = JSON.parse(Buffer.from(cursor, 'base64url').toString()); } catch { fail('CURSOR_INVALID'); }
-      if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) fail('CURSOR_INVALID');
-      const { signature, ...binding } = decoded;
-      if (binding.spaceId !== spaceId || binding.credential !== credential || binding.collection !== collection || binding.policyVersion !== s.policyVersion || binding.schemaVersion !== c.version || stable(binding.sort) !== stable(order) || signature !== this.#sign(binding)) fail('CURSOR_INVALID');
-      if (!binding.after || typeof binding.after.id !== 'string' || (!order && typeof binding.after.value !== 'string') ||
-        (order && ![0, 1, 2].includes(binding.after.rank))) fail('CURSOR_INVALID');
-      after = binding.after;
-    }
+    const after = this.#cursorAfter(cursor, { spaceId, credential, collection, order, policyVersion: s.policyVersion, schemaVersion: c.version });
     const sorted = [...c.records.values()].filter(r => !r.deleted && (!after || compare(tuple(r), after) > 0)).sort((a, b) => compare(tuple(a), tuple(b)));
     const items = sorted.slice(0, limit).map(clone);
     const last = items.at(-1);

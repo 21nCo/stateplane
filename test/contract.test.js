@@ -198,6 +198,50 @@ test('lost committed response: matching old expectedRevision replays before stal
   code(() => write(db, 'replace', id, 1, 'lost-response', req), 'FORBIDDEN');
 });
 
+test('invalid JSON data and patch shapes cannot alias receipts or produce effects', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  db.define('sp_a', 'entries', { $schema: schema.$schema, type: 'object', additionalProperties: false,
+    properties: { label: { type: 'string' }, tags: { type: 'array', items: { type: ['string', 'null'] } }, optional: { type: 'string' } } });
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
+  const created = { ...scope, operation: 'create', data: { label: 'item', tags: [null] }, idempotencyKey: 'create' };
+  const id = db.mutate(created).ref.id;
+  const replaced = { ...scope, operation: 'replace', id, expectedRevision: 1, data: { label: 'next' }, idempotencyKey: 'replace' };
+  db.mutate(replaced);
+  const patched = { ...scope, operation: 'patch', id, expectedRevision: 2, set: { optional: 'ok' }, unset: [], idempotencyKey: 'patch' };
+  db.mutate(patched);
+  const collection = db.spaces.get('sp_a').collections.get('entries');
+  const snapshot = () => ({ records: structuredClone([...collection.records]), reserved: [...collection.reserved].map(([k, r]) => [k, r.id, r.revision]),
+    events: structuredClone(db.events), outbox: structuredClone(db.outbox), receipts: structuredClone([...db.receipts]) });
+  const before = snapshot();
+  const sparse = [,];
+  const circular = { label: 'cycle' };
+  circular.self = circular;
+  for (const request of [
+    { ...created, data: { label: 'item', tags: [undefined] } },
+    { ...created, idempotencyKey: 'fresh-array', data: { label: 'item', tags: [undefined] } },
+    { ...replaced, data: { label: 'next', optional: undefined } },
+    { ...replaced, idempotencyKey: 'fresh-object', data: { label: 'next', optional: undefined } },
+    { ...patched, set: { optional: 'ok', extra: undefined } },
+    { ...patched, idempotencyKey: 'fresh-set', set: { optional: 'ok', extra: undefined } },
+    { ...patched, unset: [undefined] },
+    { ...patched, unset: 'optional' },
+    { ...patched, unset: ['optional', 'optional'] },
+    { ...patched, unset: ['optional'], set: { optional: 'ok' } },
+    { ...created, idempotencyKey: 'sparse', data: { label: 'item', tags: sparse } },
+    { ...created, idempotencyKey: 'circular', data: circular },
+    { ...created, idempotencyKey: 'nonfinite', data: { label: 'item', optional: Infinity } }
+  ]) {
+    code(() => db.mutate(request), request.operation === 'patch' && request.unset !== patched.unset ? 'INVALID_ARGUMENT' : 'SCHEMA_INVALID');
+    assert.deepEqual(snapshot(), before);
+  }
+  assert.equal(db.mutate(replaced).replayed, true);
+  assert.deepEqual(snapshot(), before);
+  db.revoke('sp_a', 'agent');
+  code(() => db.mutate(created), 'FORBIDDEN');
+  code(() => db.mutate({ ...created, data: { label: 'item', tags: [undefined] } }), 'FORBIDDEN');
+});
+
 test('delete tombstones prevent key reuse and projection resurrection', () => {
   const db = setup();
   const id = create(db, 'item', { label: 'entry', state: 'open' }, 'one').ref.id;
@@ -473,6 +517,7 @@ test('receipt identity cannot disclose a revoked original collection through ano
   db.revoke('sp_a', 'agent', 'entries');
   const before = [db.events.length, db.outbox.length, db.receipts.size];
   code(() => db.mutate({ ...original, collection: 'other', externalKey: 'second' }), 'FORBIDDEN');
+  code(() => db.mutate({ ...original, collection: 'other', data: { label: undefined } }), 'FORBIDDEN');
   code(() => db.mutate(original), 'FORBIDDEN');
   assert.deepEqual([db.events.length, db.outbox.length, db.receipts.size], before);
   assert.equal(db.mutate({ ...original, collection: 'other', externalKey: 'second', idempotencyKey: 'fresh' }).revision, 1);
