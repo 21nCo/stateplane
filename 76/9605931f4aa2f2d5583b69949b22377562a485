@@ -1,0 +1,23 @@
+ARCHITECTURE.md
+  s_621f2416635dac::t_518c8558503ba1 3,5,7,9,11,13-23,26,28,30,32,34,36,38,40,42,44,46,48,50-52,54
+test/foundation.test.mjs
+  s_621f2416635dac::t_5aee1c803521d1 1-40
+contracts/v1.md
+  s_621f2416635dac::t_798c2a102eff7d 1-41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "769605931f4aa2f2d5583b69949b22377562a485",
+  "prompts": {},
+  "sessions": {
+    "s_621f2416635dac": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0cf88-d299-7c41-8dce-27bbb0f005de",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
