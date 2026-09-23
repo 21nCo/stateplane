@@ -179,6 +179,43 @@ test('live keyset cursor is bound to credential/policy/schema and pages are not 
   code(() => db.query({ ...scope, limit: 1, cursor: second.cursor }), 'FORBIDDEN');
 });
 
+test('default keyset ordering uses creation time then ID across ID width boundaries', () => {
+  const db = setup();
+  const ids = [];
+  for (let n = 1; n <= 12; n++) ids.push(create(db, `key-${n}`, { label: `entry-${n}` }, `create-${n}`).ref.id);
+  const received = [];
+  let cursor;
+  do {
+    const page = db.query({ ...scope, limit: 3, cursor });
+    received.push(...page.items.map(item => item.id));
+    cursor = page.cursor;
+  } while (cursor);
+  assert.deepEqual(received, ids);
+  assert.equal(db.get({ ...scope, id: ids[0] }).createdAt < db.get({ ...scope, id: ids[1] }).createdAt, true);
+  const first = db.query({ ...scope, limit: 2 });
+  create(db, 'later', { label: 'later' }, 'later');
+  const rest = db.query({ ...scope, limit: 20, cursor: first.cursor });
+  assert.deepEqual(rest.items.map(item => item.id), [...ids.slice(2), 'rec_13']);
+});
+
+test('grants remain independent by credential and collection, with no implicit wildcard', () => {
+  const db = setup();
+  db.define('sp_a', 'notes', schema);
+  db.grant('sp_a', 'agent', 'notes', ['read', 'write']);
+  const a = create(db, 'a', { label: 'entry' }, 'one');
+  const b = db.mutate({ ...scope, collection: 'notes', operation: 'create', data: { label: 'memo' }, idempotencyKey: 'two' });
+  assert.equal(db.get({ ...scope, id: a.ref.id }).data.label, 'entry');
+  assert.equal(db.get({ ...scope, collection: 'notes', id: b.ref.id }).data.label, 'memo');
+  code(() => db.grant('sp_a', 'wild', '*', ['read', 'write']), 'INVALID_ARGUMENT');
+  code(() => db.get({ ...scope, credential: 'wild', id: a.ref.id }), 'FORBIDDEN');
+  db.revoke('sp_a', 'agent', 'notes');
+  code(() => db.get({ ...scope, collection: 'notes', id: b.ref.id }), 'FORBIDDEN');
+  code(() => db.mutate({ ...scope, collection: 'notes', operation: 'create', data: { label: 'memo' }, idempotencyKey: 'two' }), 'FORBIDDEN');
+  assert.equal(db.get({ ...scope, id: a.ref.id }).data.label, 'entry');
+  db.grant('sp_a', 'agent', 'entries', ['read']);
+  code(() => create(db, 'another', { label: 'entry' }, 'three'), 'FORBIDDEN');
+});
+
 test('rebuild projects current revisions only and never changes authoritative record fields', () => {
   const db = setup();
   const id = create(db, 'item', { label: 'entry', state: 'open' }, 'one').ref.id;
@@ -206,6 +243,44 @@ test('definition fails closed on unsupported schema, and suspended/readOnly life
   db.lifecycle('sp_a', 'suspended');
   code(() => db.get({ ...scope, id }), 'SPACE_UNAVAILABLE');
   code(() => db.mutate({ ...scope, operation: 'create', externalKey: 'item', data: { label: 'entry' }, idempotencyKey: 'one' }), 'SPACE_UNAVAILABLE');
+});
+
+test('definition rejects scalar roots, open nested objects and nullable non-scalars before writes', () => {
+  const db = setup();
+  const closed = { type: 'object', properties: { label: { type: 'string' } }, additionalProperties: false };
+  for (const [name, invalid] of [
+    ['scalar', { ...schema, type: 'string' }],
+    ['nullable-root', { ...schema, type: ['object', 'null'] }],
+    ['open-child', { ...schema, required: [], properties: { item: { type: 'object', properties: closed.properties } } }],
+    ['nullable-child', { ...schema, required: [], properties: { item: { ...closed, type: ['object', 'null'] } } }],
+    ['open-array-item', { ...schema, required: [], properties: { items: { type: 'array', items: { type: 'object', properties: closed.properties } } } }],
+    ['nullable-array-item', { ...schema, required: [], properties: { items: { type: 'array', items: { ...closed, type: ['object', 'null'] } } } }],
+    ['untyped', { ...schema, required: [], properties: { item: { description: 'missing type' } } }]
+  ]) code(() => db.define('sp_a', name, invalid), 'SCHEMA_UNSUPPORTED');
+  db.define('sp_a', 'nested', { ...schema, required: ['item'], properties: { item: { type: 'array', items: closed } } });
+  db.grant('sp_a', 'agent', 'nested', ['read', 'write']);
+  const valid = db.mutate({ ...scope, collection: 'nested', operation: 'create', data: { item: [{ label: 'fine' }] }, idempotencyKey: 'valid' });
+  assert.equal(valid.revision, 1);
+  code(() => db.mutate({ ...scope, collection: 'nested', operation: 'create', data: { item: [{ label: 'fine', surprise: true }] }, idempotencyKey: 'bad' }), 'SCHEMA_INVALID');
+});
+
+test('accepted schema and uniqueness definitions are snapshots of caller input', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  const input = structuredClone(schema);
+  const constraints = [{ name: 'label', paths: ['label'] }];
+  db.define('sp_a', 'entries', input, constraints);
+  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  const first = create(db, 'first', { label: 'shared' }, 'one');
+  input.properties.label.type = 'number';
+  input.properties.state.enum.push('invented');
+  constraints[0].paths[0] = 'state';
+  constraints[0].name = 'changed';
+  code(() => create(db, 'second', { label: 'shared' }, 'two'), 'UNIQUE_CONFLICT');
+  code(() => create(db, 'third', { label: 'different', state: 'invented' }, 'three'), 'SCHEMA_INVALID');
+  const replacement = write(db, 'replace', first.ref.id, 1, 'four', { data: { label: 'updated' } });
+  assert.equal(replacement.schemaVersion, 1);
+  create(db, 'fourth', { label: 'shared' }, 'five');
 });
 
 test('schema versions admit only compatible optional additions and stale schema change fails', () => {

@@ -38,12 +38,24 @@ const validateDefinition = (s, root = true) => {
   if (!s || typeof s !== 'object' || Array.isArray(s)) fail('SCHEMA_INVALID');
   for (const name of Object.keys(s)) if (!allowedKeywords.has(name)) fail('SCHEMA_UNSUPPORTED');
   if (root && s.$schema !== 'https://json-schema.org/draft/2020-12/schema') fail('SCHEMA_UNSUPPORTED');
-  if (s.format && s.format !== 'date-time') fail('SCHEMA_UNSUPPORTED');
-  if (s.type === 'object' && s.additionalProperties !== false) fail('SCHEMA_UNSUPPORTED');
-  if (s.type === 'object') for (const child of Object.values(s.properties ?? {})) validateDefinition(child, false);
-  if (s.type === 'array') validateDefinition(s.items, false);
+  if (!root && Object.hasOwn(s, '$schema')) fail('SCHEMA_UNSUPPORTED');
   const types = Array.isArray(s.type) ? s.type : [s.type];
-  if (types.length > 2 || (types.length === 2 && !types.includes('null')) || types.some(t => !['string', 'number', 'integer', 'boolean', 'object', 'array', 'null'].includes(t))) fail('SCHEMA_UNSUPPORTED');
+  if (root && s.type !== 'object') fail('SCHEMA_UNSUPPORTED');
+  if (types.length === 0 || types.length > 2 || (types.length === 2 &&
+    (!types.includes('null') || !['string', 'number', 'integer', 'boolean'].includes(types.find(t => t !== 'null')))) ||
+    types.some(t => !['string', 'number', 'integer', 'boolean', 'object', 'array', 'null'].includes(t)) ||
+    (types.length === 1 && types[0] === 'null')) fail('SCHEMA_UNSUPPORTED');
+  const type = types.find(t => t !== 'null');
+  if (s.format !== undefined && (type !== 'string' || s.format !== 'date-time')) fail('SCHEMA_UNSUPPORTED');
+  if (type === 'object') {
+    if (s.additionalProperties !== false || (s.properties !== undefined && (!s.properties || typeof s.properties !== 'object' || Array.isArray(s.properties)))) fail('SCHEMA_UNSUPPORTED');
+    for (const child of Object.values(s.properties ?? {})) validateDefinition(child, false);
+    if (s.required !== undefined && (!Array.isArray(s.required) || s.required.some(k => typeof k !== 'string' || !Object.hasOwn(s.properties ?? {}, k)) || new Set(s.required).size !== s.required.length)) fail('SCHEMA_UNSUPPORTED');
+  } else if (s.properties !== undefined || s.required !== undefined || s.additionalProperties !== undefined) fail('SCHEMA_UNSUPPORTED');
+  if (type === 'array') validateDefinition(s.items, false);
+  else if (s.items !== undefined || s.minItems !== undefined || s.maxItems !== undefined) fail('SCHEMA_UNSUPPORTED');
+  if (type !== 'string' && (s.minLength !== undefined || s.maxLength !== undefined)) fail('SCHEMA_UNSUPPORTED');
+  if (!['number', 'integer'].includes(type) && (s.minimum !== undefined || s.maximum !== undefined)) fail('SCHEMA_UNSUPPORTED');
 };
 const validateData = (data, schema) => {
   if (data === null && !(Array.isArray(schema.type) ? schema.type.includes('null') : schema.type === 'null')) fail('SCHEMA_INVALID');
@@ -71,8 +83,8 @@ export class ReferenceState {
   constructor() { this.spaces = new Map(); this.events = []; this.outbox = []; this.receipts = new Map(); this.seq = 0; this.generation = 1; this.projection = new Map(); this.cursorSecret = randomBytes(32); }
   #sign(value) { return createHmac('sha256', this.cursorSecret).update(stable(value)).digest('hex'); }
   addSpace(id, owner) { this.spaces.set(id, { owner, lifecycle: 'active', policyVersion: 1, collections: new Map(), grants: new Map() }); }
-  grant(spaceId, credential, collection, permissions) { const s = this.spaces.get(spaceId); s.grants.set(credential, { collection, permissions: new Set(permissions) }); s.policyVersion++; }
-  revoke(spaceId, credential) { const s = this.spaces.get(spaceId); s.grants.delete(credential); s.policyVersion++; }
+  grant(spaceId, credential, collection, permissions) { if (collection === '*') fail('INVALID_ARGUMENT'); const s = this.spaces.get(spaceId); if (!s.grants.has(credential)) s.grants.set(credential, new Map()); s.grants.get(credential).set(collection, new Set(permissions)); s.policyVersion++; }
+  revoke(spaceId, credential, collection) { const s = this.spaces.get(spaceId); if (collection === undefined) s.grants.delete(credential); else { s.grants.get(credential)?.delete(collection); if (!s.grants.get(credential)?.size) s.grants.delete(credential); } s.policyVersion++; }
   lifecycle(spaceId, state) { const s = this.spaces.get(spaceId); s.lifecycle = state; s.policyVersion++; }
   define(spaceId, slug, schema, uniques = []) {
     validateDefinition(schema);
@@ -83,7 +95,7 @@ export class ReferenceState {
     })) fail('SCHEMA_UNSUPPORTED');
     const s = this.spaces.get(spaceId);
     if (s.collections.has(slug)) fail('SCHEMA_CONFLICT');
-    s.collections.set(slug, { schema, uniques, records: new Map(), reserved: new Map(), version: 1 });
+    s.collections.set(slug, { schema: clone(schema), uniques: clone(uniques), records: new Map(), reserved: new Map(), version: 1 });
   }
   revise(spaceId, slug, expectedVersion, schema) {
     validateDefinition(schema);
@@ -93,7 +105,7 @@ export class ReferenceState {
     const withoutDescription = value => JSON.parse(JSON.stringify(value, (key, v) => key === 'description' ? undefined : v));
     const old = c.schema;
     if (stable(withoutDescription({ ...old, properties: {} })) !== stable(withoutDescription({ ...schema, properties: {} })) ||
-      Object.entries(old.properties).some(([name, shape]) => !schema.properties?.[name] || stable(withoutDescription(shape)) !== stable(withoutDescription(schema.properties[name])))) fail('SCHEMA_BREAKING');
+      Object.entries(old.properties ?? {}).some(([name, shape]) => !schema.properties?.[name] || stable(withoutDescription(shape)) !== stable(withoutDescription(schema.properties[name])))) fail('SCHEMA_BREAKING');
     c.schema = clone(schema);
     c.version++;
     return c.version;
@@ -103,8 +115,8 @@ export class ReferenceState {
     if (!s) fail('NOT_FOUND');
     if (s.lifecycle === 'deleted') fail('NOT_FOUND');
     if (['suspended', 'deleting'].includes(s.lifecycle) || (s.lifecycle === 'readOnly' && capability === 'write' && !replay)) fail('SPACE_UNAVAILABLE');
-    const grant = s.grants.get(credential);
-    if (!grant || (grant.collection !== '*' && grant.collection !== collection) || !grant.permissions.has(capability)) fail('FORBIDDEN');
+    const permissions = s.grants.get(credential)?.get(collection);
+    if (!permissions?.has(capability)) fail('FORBIDDEN');
     const c = s.collections.get(collection);
     if (!c) fail('NOT_FOUND');
     return { s, c };
@@ -163,7 +175,7 @@ export class ReferenceState {
       if (holder && holder.id !== recordId) fail(holder.deleted ? 'KEY_RESERVED' : 'UNIQUE_CONFLICT');
     }
     // Stage all validation before any state/event/outbox mutation. The oracle is synchronous.
-    const record = { id: recordId, key: recordKey, keyMode: current?.keyMode ?? (normalized === undefined ? 'generated' : 'external'), revision: (current?.revision ?? 0) + 1, data: operation === 'delete' ? clone(current.data) : nextData, deleted: operation === 'delete', schemaVersion: c.version };
+    const record = { id: recordId, key: recordKey, keyMode: current?.keyMode ?? (normalized === undefined ? 'generated' : 'external'), createdAt: current?.createdAt ?? new Date(Date.UTC(2020, 0, 1, 0, 0, 0, this.seq + 1)).toISOString(), revision: (current?.revision ?? 0) + 1, data: operation === 'delete' ? clone(current.data) : nextData, deleted: operation === 'delete', schemaVersion: c.version };
     if (current) for (const [reservation, holder] of c.reserved) if (holder === current) {
       if (operation === 'delete' || JSON.parse(reservation)[0] === 'external') c.reserved.set(reservation, record);
       else c.reserved.delete(reservation);
@@ -180,18 +192,20 @@ export class ReferenceState {
   query({ spaceId, credential, collection, limit, cursor }) {
     const { s, c } = this.#access(spaceId, credential, collection, 'read');
     if (!Number.isSafeInteger(limit) || limit < 1) fail('INVALID_ARGUMENT');
-    let after = '';
+    let after = null;
     if (cursor) {
       let decoded;
       try { decoded = JSON.parse(Buffer.from(cursor, 'base64url').toString()); } catch { fail('CURSOR_INVALID'); }
       const { signature, ...binding } = decoded;
       if (binding.spaceId !== spaceId || binding.credential !== credential || binding.collection !== collection || binding.policyVersion !== s.policyVersion || binding.schemaVersion !== c.version || signature !== this.#sign(binding)) fail('CURSOR_INVALID');
-      after = decoded.after;
+      if (!binding.after || typeof binding.after.createdAt !== 'string' || typeof binding.after.id !== 'string') fail('CURSOR_INVALID');
+      after = binding.after;
     }
-    const sorted = [...c.records.values()].filter(r => !r.deleted && r.id > after).sort((a, b) => a.id.localeCompare(b.id));
+    const compare = (a, b) => a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    const sorted = [...c.records.values()].filter(r => !r.deleted && (!after || compare(r, after) > 0)).sort(compare);
     const items = sorted.slice(0, limit).map(clone);
-    const last = items.at(-1)?.id;
-    const payload = { spaceId, credential, collection, policyVersion: s.policyVersion, schemaVersion: c.version, after: last };
+    const last = items.at(-1);
+    const payload = { spaceId, credential, collection, policyVersion: s.policyVersion, schemaVersion: c.version, after: last && { createdAt: last.createdAt, id: last.id } };
     return { items, cursor: sorted.length > limit ? Buffer.from(JSON.stringify({ ...payload, signature: this.#sign(payload) })).toString('base64url') : null };
   }
   count(args) { return this.query({ ...args, limit: Number.MAX_SAFE_INTEGER }).items.length; }
