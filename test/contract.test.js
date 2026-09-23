@@ -525,3 +525,30 @@ test('unpaired surrogate external keys and composite string data fail before eff
   assert.equal(db.get({ ...scope, id: good.ref.id }).key, '\uD83D\uDCAB');
   code(() => create(db, 'second', { label: '\uD83D\uDCAB' }, 'collision'), 'UNIQUE_CONFLICT');
 });
+
+test('unique and sortable paths must be declared scalar property names, not coerced values', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  const numericProperty = { ...schema, properties: { ...schema.properties, '1': { type: 'string' } } };
+  for (const path of [1, '', 'missing', 'label.part', '\uD800']) {
+    code(() => db.define('sp_a', 'entries', numericProperty, [{ name: 'key', paths: [path] }]), 'SCHEMA_UNSUPPORTED');
+    code(() => db.define('sp_a', 'entries', numericProperty, [], [path]), 'SCHEMA_UNSUPPORTED');
+  }
+  db.define('sp_a', 'entries', numericProperty, [{ name: 'key', paths: ['1'] }], ['1']);
+  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  create(db, 'one', { label: 'first', '1': 'same' }, 'one');
+  code(() => create(db, 'two', { label: 'second', '1': 'same' }, 'two'), 'UNIQUE_CONFLICT');
+});
+
+test('only an absent cursor starts a first page; malformed supplied tokens fail with a stable code', () => {
+  const db = setup();
+  for (const key of ['one', 'two']) create(db, key, { label: key }, key);
+  const first = db.query({ ...scope, limit: 1 });
+  assert.ok(first.cursor);
+  for (const cursor of ['', null, 0, false, {}, 'not-base64!',
+    ...['null', '[]', '"text"', '0', '{}'].map(value => Buffer.from(value).toString('base64url'))]) {
+    code(() => db.query({ ...scope, limit: 1, cursor }), 'CURSOR_INVALID');
+  }
+  assert.equal(db.query({ ...scope, limit: 1, cursor: first.cursor }).items[0].key, 'two');
+  assert.equal(db.query({ ...scope, limit: 1 }).items[0].key, 'one');
+});

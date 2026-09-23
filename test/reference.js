@@ -116,18 +116,18 @@ export class ReferenceState {
   lifecycle(spaceId, state) { const s = this.spaces.get(spaceId); s.lifecycle = state; s.policyVersion++; }
   define(spaceId, slug, schema, uniques = [], sortable = []) {
     validateDefinition(schema);
+    const scalarPath = path => {
+      if (typeof path !== 'string' || !path || !wellFormed(path) || !Object.hasOwn(schema.properties ?? {}, path)) return false;
+      const shape = schema.properties[path];
+      const type = Array.isArray(shape.type) ? shape.type.find(t => t !== 'null') : shape.type;
+      return ['string', 'number', 'integer', 'boolean'].includes(type);
+    };
     if (!Array.isArray(uniques) || new Set(uniques.map(u => u?.name)).size !== uniques.length) fail('SCHEMA_UNSUPPORTED');
     for (const u of uniques) if (!u || typeof u.name !== 'string' || !u.name || !wellFormed(u.name) ||
-      !Array.isArray(u.paths) || !u.paths.length || new Set(u.paths).size !== u.paths.length || u.paths.some(path => {
-      const shape = schema.properties?.[path];
-      const type = Array.isArray(shape?.type) ? shape.type.find(t => t !== 'null') : shape?.type;
-      return !['string', 'number', 'integer', 'boolean'].includes(type);
-    })) fail('SCHEMA_UNSUPPORTED');
-    if (!Array.isArray(sortable) || new Set(sortable).size !== sortable.length || sortable.some(path => {
-      const shape = schema.properties?.[path];
-      const type = Array.isArray(shape?.type) ? shape.type.find(t => t !== 'null') : shape?.type;
-      return !['string', 'number', 'integer', 'boolean'].includes(type);
-    })) fail('SCHEMA_UNSUPPORTED');
+      !Array.isArray(u.paths) || !u.paths.length || new Set(u.paths).size !== u.paths.length ||
+      u.paths.some(path => !scalarPath(path))) fail('SCHEMA_UNSUPPORTED');
+    if (!Array.isArray(sortable) || new Set(sortable).size !== sortable.length ||
+      sortable.some(path => !scalarPath(path))) fail('SCHEMA_UNSUPPORTED');
     const s = this.spaces.get(spaceId);
     if (s.collections.has(slug)) fail('SCHEMA_CONFLICT');
     s.collections.set(slug, { schema: clone(schema), uniques: clone(uniques), sortable: clone(sortable), records: new Map(), reserved: new Map(), version: 1 });
@@ -270,9 +270,11 @@ export class ReferenceState {
       return scalarCompare(a.id, b.id);
     };
     let after = null;
-    if (cursor) {
+    if (cursor !== undefined) {
+      if (typeof cursor !== 'string' || !cursor || !/^[A-Za-z0-9_-]+$/.test(cursor)) fail('CURSOR_INVALID');
       let decoded;
       try { decoded = JSON.parse(Buffer.from(cursor, 'base64url').toString()); } catch { fail('CURSOR_INVALID'); }
+      if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) fail('CURSOR_INVALID');
       const { signature, ...binding } = decoded;
       if (binding.spaceId !== spaceId || binding.credential !== credential || binding.collection !== collection || binding.policyVersion !== s.policyVersion || binding.schemaVersion !== c.version || stable(binding.sort) !== stable(order) || signature !== this.#sign(binding)) fail('CURSOR_INVALID');
       if (!binding.after || typeof binding.after.id !== 'string' || (!order && typeof binding.after.value !== 'string') ||
