@@ -1,0 +1,31 @@
+test/reference.js
+  s_9e907c0957907b::t_e00ac42695f642 41,43-58,86-87,98,108,118-119,178,195,201-202,204-205,207-208
+test/README.md
+  s_bd5cffaa435038::t_798854170324aa 5
+test/contract.test.js
+  s_bd5cffaa435038::t_40784d963a07b1 182-218,248-285
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a66afbfa7175f9b82bc9a5f30e97ff8e4bc466e5",
+  "prompts": {},
+  "sessions": {
+    "s_9e907c0957907b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e250598d-2d23-4e69-a61f-6f49607fbd48",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_bd5cffaa435038": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ce25-95ac-7992-8543-95b302fb71be",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
