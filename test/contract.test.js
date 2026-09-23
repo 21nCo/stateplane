@@ -9,12 +9,13 @@ const schema = {
   required: ['label'], additionalProperties: false
 };
 const uniques = [{ name: 'label_state', paths: ['label', 'state'] }];
+const recordAccess = ['records:read', 'records:write'];
 const setup = () => {
   const store = new ReferenceState();
   for (const space of ['sp_a', 'sp_b']) {
     store.addSpace(space, 'owner');
     store.define(space, 'entries', schema, uniques);
-    store.grant(space, 'agent', 'entries', ['read', 'write']);
+    store.grant(space, 'agent', 'entries', recordAccess);
   }
   return store;
 };
@@ -75,7 +76,7 @@ test('key lookup requires a mode, isolates colliding ID text, and hides tombston
   db.revoke('sp_a', 'agent');
   code(() => lookup('external', 'rec_2'), 'FORBIDDEN');
   code(() => lookup('external', '\u0085'), 'FORBIDDEN');
-  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
   write(db, 'delete', external.ref.id, 1, 'delete-external');
   assert.equal(lookup('external', 'rec_2'), null);
   assert.equal(lookup('generated', 'rec_2').id, generated.ref.id);
@@ -87,7 +88,7 @@ test('external keys cannot collide with constraint namespaces, and replacement r
   const db = new ReferenceState();
   db.addSpace('sp_a', 'owner');
   db.define('sp_a', 'entries', schema, [{ name: 'key', paths: ['label'] }]);
-  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
   const first = create(db, 'seed', { label: 'x' }, 'one');
   create(db, 'string:1:x', { label: 'y' }, 'two');
   write(db, 'replace', first.ref.id, 1, 'three', { data: { label: 'z' } });
@@ -104,7 +105,7 @@ test('nullable enum still validates null, UTC dates reject rollover and compare 
     $schema: schema.$schema, type: 'object', additionalProperties: false,
     properties: { state: { type: ['integer', 'null'], enum: [1] }, observedAt: { type: 'string', format: 'date-time' } }
   }, [{ name: 'instant', paths: ['observedAt'] }]);
-  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
   const before = [db.events.length, db.outbox.length, db.receipts.size];
   code(() => create(db, 'bad-null', { state: null }, 'one'), 'SCHEMA_INVALID');
   for (const bad of ['2026-02-30T25:99:99Z', '2026-02-30T12:00:00Z', '2026-09-23T12:00:60Z']) {
@@ -120,7 +121,7 @@ test('nullable enum still validates null, UTC dates reject rollover and compare 
 test('integer records and enum definitions use v1 safe-integer boundaries', () => {
   const db = setup();
   db.define('sp_a', 'bounded', { ...schema, properties: { ordinal: { type: 'integer', enum: [Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER] } }, required: ['ordinal'] });
-  db.grant('sp_a', 'agent', 'bounded', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'bounded', recordAccess);
   for (const value of [Number.MAX_SAFE_INTEGER + 1, Number.MIN_SAFE_INTEGER - 1]) {
     code(() => db.define('sp_a', `enum-${value}`, { ...schema, properties: { ordinal: { type: 'integer', enum: [value] } } }), 'SCHEMA_UNSUPPORTED');
     const before = [db.events.length, db.outbox.length, db.receipts.size];
@@ -132,7 +133,7 @@ test('integer records and enum definitions use v1 safe-integer boundaries', () =
     assert.equal(db.get({ ...scope, collection: 'bounded', id: receipt.ref.id }).data.ordinal, value);
   }
   db.define('sp_a', 'finite-number', { ...schema, properties: { ordinal: { type: 'number' } }, required: ['ordinal'] });
-  db.grant('sp_a', 'agent', 'finite-number', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'finite-number', recordAccess);
   assert.equal(db.mutate({ ...scope, collection: 'finite-number', operation: 'create', data: { ordinal: Number.MAX_SAFE_INTEGER + 1 }, idempotencyKey: 'number' }).revision, 1);
 });
 
@@ -150,13 +151,19 @@ test('existing-record key input is rejected before side effects, even when norma
 
 test('atomic validation failure leaves record, event, receipt, reservations and outbox untouched', () => {
   const db = setup();
-  const a = create(db, 'a', { label: 'a' }, 'one');
+  const a = create(db, 'a', { label: 'a', state: 'open' }, 'one');
   create(db, 'b', { label: 'b', state: 'open' }, 'two');
-  const before = [db.events.length, db.outbox.length, db.receipts.size];
+  const collection = db.spaces.get('sp_a').collections.get('entries');
+  const snapshot = () => ({ records: structuredClone([...collection.records]),
+    reservations: [...collection.reserved].map(([key, record]) => [key, record.id, record.revision, record.deleted]),
+    events: structuredClone(db.events), outbox: structuredClone(db.outbox), receipts: structuredClone([...db.receipts]) });
+  const before = snapshot();
   code(() => write(db, 'replace', a.ref.id, 1, 'bad', { data: { label: 'b', state: 'open' } }), 'UNIQUE_CONFLICT');
+  assert.deepEqual(snapshot(), before);
   code(() => write(db, 'replace', a.ref.id, 1, 'invalid', { data: { label: 'a', secret: true } }), 'SCHEMA_INVALID');
-  assert.deepEqual([db.events.length, db.outbox.length, db.receipts.size], before);
-  assert.equal(db.get({ ...scope, id: a.ref.id }).revision, 1);
+  assert.deepEqual(snapshot(), before);
+  code(() => create(db, 'third', { label: 'a', state: 'open' }, 'third'), 'UNIQUE_CONFLICT');
+  assert.deepEqual(snapshot(), before);
   const good = write(db, 'replace', a.ref.id, 1, 'good', { data: { label: 'a', state: 'open' } });
   assert.equal(good.revision, 2);
 });
@@ -218,7 +225,7 @@ test('live keyset cursor is bound to credential/policy/schema and pages are not 
   const forged = JSON.parse(Buffer.from(first.cursor, 'base64url').toString());
   forged.after = 'rec_999';
   code(() => db.query({ ...scope, limit: 1, cursor: Buffer.from(JSON.stringify(forged)).toString('base64url') }), 'CURSOR_INVALID');
-  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
   code(() => db.query({ ...scope, limit: 1, cursor: first.cursor }), 'CURSOR_INVALID');
   db.revoke('sp_a', 'agent');
   code(() => db.query({ ...scope, limit: 1, cursor: second.cursor }), 'FORBIDDEN');
@@ -228,6 +235,9 @@ test('default keyset ordering uses creation time then ID across ID width boundar
   const db = setup();
   const ids = [];
   for (let n = 1; n <= 12; n++) ids.push(create(db, `key-${n}`, { label: `entry-${n}` }, `create-${n}`).ref.id);
+  // Force a timestamp tie across the ID-width boundary; the oracle's synthetic clock normally never ties.
+  for (const record of db.spaces.get('sp_a').collections.get('entries').records.values()) record.createdAt = '2020-01-01T00:00:00.001Z';
+  const byId = [...ids].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
   const received = [];
   let cursor;
   do {
@@ -235,29 +245,30 @@ test('default keyset ordering uses creation time then ID across ID width boundar
     received.push(...page.items.map(item => item.id));
     cursor = page.cursor;
   } while (cursor);
-  assert.deepEqual(received, ids);
-  assert.equal(db.get({ ...scope, id: ids[0] }).createdAt < db.get({ ...scope, id: ids[1] }).createdAt, true);
+  assert.deepEqual(received, byId);
+  assert.deepEqual(received.slice(0, 4), ['rec_1', 'rec_10', 'rec_11', 'rec_12']);
+  assert.equal(db.get({ ...scope, id: ids[0] }).createdAt, db.get({ ...scope, id: ids[9] }).createdAt);
   const first = db.query({ ...scope, limit: 2 });
   create(db, 'later', { label: 'later' }, 'later');
   const rest = db.query({ ...scope, limit: 20, cursor: first.cursor });
-  assert.deepEqual(rest.items.map(item => item.id), [...ids.slice(2), 'rec_13']);
+  assert.deepEqual(rest.items.map(item => item.id), [...byId.slice(2), 'rec_13']);
 });
 
 test('grants remain independent by credential and collection, with no implicit wildcard', () => {
   const db = setup();
   db.define('sp_a', 'notes', schema);
-  db.grant('sp_a', 'agent', 'notes', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'notes', recordAccess);
   const a = create(db, 'a', { label: 'entry' }, 'one');
   const b = db.mutate({ ...scope, collection: 'notes', operation: 'create', data: { label: 'memo' }, idempotencyKey: 'two' });
   assert.equal(db.get({ ...scope, id: a.ref.id }).data.label, 'entry');
   assert.equal(db.get({ ...scope, collection: 'notes', id: b.ref.id }).data.label, 'memo');
-  code(() => db.grant('sp_a', 'wild', '*', ['read', 'write']), 'INVALID_ARGUMENT');
+  code(() => db.grant('sp_a', 'wild', '*', recordAccess), 'INVALID_ARGUMENT');
   code(() => db.get({ ...scope, credential: 'wild', id: a.ref.id }), 'FORBIDDEN');
   db.revoke('sp_a', 'agent', 'notes');
   code(() => db.get({ ...scope, collection: 'notes', id: b.ref.id }), 'FORBIDDEN');
   code(() => db.mutate({ ...scope, collection: 'notes', operation: 'create', data: { label: 'memo' }, idempotencyKey: 'two' }), 'FORBIDDEN');
   assert.equal(db.get({ ...scope, id: a.ref.id }).data.label, 'entry');
-  db.grant('sp_a', 'agent', 'entries', ['read']);
+  db.grant('sp_a', 'agent', 'entries', ['records:read']);
   code(() => create(db, 'another', { label: 'entry' }, 'three'), 'FORBIDDEN');
 });
 
@@ -303,7 +314,7 @@ test('definition rejects scalar roots, open nested objects and nullable non-scal
     ['untyped', { ...schema, required: [], properties: { item: { description: 'missing type' } } }]
   ]) code(() => db.define('sp_a', name, invalid), 'SCHEMA_UNSUPPORTED');
   db.define('sp_a', 'nested', { ...schema, required: ['item'], properties: { item: { type: 'array', items: closed } } });
-  db.grant('sp_a', 'agent', 'nested', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'nested', recordAccess);
   const valid = db.mutate({ ...scope, collection: 'nested', operation: 'create', data: { item: [{ label: 'fine' }] }, idempotencyKey: 'valid' });
   assert.equal(valid.revision, 1);
   code(() => db.mutate({ ...scope, collection: 'nested', operation: 'create', data: { item: [{ label: 'fine', surprise: true }] }, idempotencyKey: 'bad' }), 'SCHEMA_INVALID');
@@ -315,7 +326,7 @@ test('accepted schema and uniqueness definitions are snapshots of caller input',
   const input = structuredClone(schema);
   const constraints = [{ name: 'label', paths: ['label'] }];
   db.define('sp_a', 'entries', input, constraints);
-  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
   const first = create(db, 'first', { label: 'shared' }, 'one');
   input.properties.label.type = 'number';
   input.properties.state.enum.push('invented');
@@ -374,7 +385,7 @@ test('definition rejects invalid keyword values and measures string lengths in U
     ['bad-item-bounds', { type: 'array', items: { type: 'string' }, minItems: -1 }]
   ]) code(() => db.define('sp_a', name, withLabel(shape)), 'SCHEMA_UNSUPPORTED');
   db.define('sp_a', 'unicode', withLabel({ type: 'string', minLength: 2, maxLength: 2 }));
-  db.grant('sp_a', 'agent', 'unicode', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'unicode', recordAccess);
   const unicodeScope = { ...scope, collection: 'unicode', operation: 'create' };
   code(() => db.mutate({ ...unicodeScope, data: { label: '💫' }, idempotencyKey: 'one' }), 'SCHEMA_INVALID');
   const receipt = db.mutate({ ...unicodeScope, data: { label: '💫a' }, idempotencyKey: 'two' });
@@ -406,7 +417,7 @@ test('optional sort keyset distinguishes missing/null/value in either direction 
   const db = new ReferenceState();
   db.addSpace('sp_a', 'owner');
   db.define('sp_a', 'entries', schema, [], ['ordinal']);
-  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
   const entries = [
     ['value-2', { label: 'v2', ordinal: 2 }],
     ['missing-1', { label: 'm1' }],
@@ -440,7 +451,7 @@ test('date-time sort compares UTC instants including fractional seconds, not enc
     $schema: schema.$schema, type: 'object', additionalProperties: false,
     properties: { observedAt: { type: 'string', format: 'date-time' } }
   }, [], ['observedAt']);
-  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
   for (const [key, observedAt] of [
     ['later', '2026-09-23T12:00:00.12Z'],
     ['whole', '2026-09-23T12:00:00Z'],
@@ -456,7 +467,7 @@ test('date-time sort compares UTC instants including fractional seconds, not enc
 test('receipt identity cannot disclose a revoked original collection through another collection', () => {
   const db = setup();
   db.define('sp_a', 'other', schema);
-  db.grant('sp_a', 'agent', 'other', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'other', recordAccess);
   const original = { ...scope, operation: 'create', externalKey: 'first', data: { label: 'first' }, idempotencyKey: 'shared' };
   db.mutate(original);
   db.revoke('sp_a', 'agent', 'entries');
@@ -465,7 +476,7 @@ test('receipt identity cannot disclose a revoked original collection through ano
   code(() => db.mutate(original), 'FORBIDDEN');
   assert.deepEqual([db.events.length, db.outbox.length, db.receipts.size], before);
   assert.equal(db.mutate({ ...original, collection: 'other', externalKey: 'second', idempotencyKey: 'fresh' }).revision, 1);
-  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
   assert.equal(db.mutate(original).replayed, true);
   code(() => db.mutate({ ...original, collection: 'other', externalKey: 'second' }), 'IDEMPOTENCY_MISMATCH');
 });
@@ -506,7 +517,7 @@ test('fingerprint uses locale-independent UTF-8 key ordering and replays reorder
   const db = setup();
   db.define('sp_a', 'unicode', { $schema: schema.$schema, type: 'object', additionalProperties: false,
     properties: { 'é': { type: 'string' }, z: { type: 'string' } } });
-  db.grant('sp_a', 'agent', 'unicode', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'unicode', recordAccess);
   const request = { ...scope, collection: 'unicode', operation: 'create', externalKey: 'key', data: { 'é': 'accent', z: 'plain' }, idempotencyKey: 'unicode-key' };
   const committed = db.mutate(request);
   const expected = createHash('sha256').update('{"actor":"agent","collection":"unicode","data":{"z":"plain","é":"accent"},"externalKey":"key","operation":"create"}').digest('hex');
@@ -518,7 +529,7 @@ test('fingerprint uses locale-independent UTF-8 key ordering and replays reorder
   assert.deepEqual([db.events.length, db.outbox.length, db.receipts.size], before);
   db.define('sp_a', 'indexed', { $schema: schema.$schema, type: 'object', additionalProperties: false,
     properties: { '2': { type: 'string' }, '10': { type: 'string' } } });
-  db.grant('sp_a', 'agent', 'indexed', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'indexed', recordAccess);
   db.mutate({ ...request, collection: 'indexed', data: { '2': 'second', '10': 'tenth' }, idempotencyKey: 'numeric-keys' });
   const numeric = createHash('sha256').update('{"actor":"agent","collection":"indexed","data":{"10":"tenth","2":"second"},"externalKey":"key","operation":"create"}').digest('hex');
   assert.equal([...db.receipts.values()].at(-1).fingerprint, numeric);
@@ -530,7 +541,7 @@ test('unique constraint names are distinct within a collection and independent a
   const constraints = [{ name: 'dup', paths: ['label'] }, { name: 'dup', paths: ['state'] }];
   code(() => db.define('sp_a', 'entries', schema, constraints), 'SCHEMA_UNSUPPORTED');
   db.define('sp_a', 'entries', schema, [{ name: 'by_label', paths: ['label'] }, { name: 'by_state', paths: ['state'] }]);
-  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
   create(db, 'one', { label: 'x', state: 'open' }, 'one');
   create(db, 'two', { label: 'open', state: 'closed' }, 'two');
   code(() => create(db, 'three', { label: 'x', state: 'closed' }, 'three'), 'UNIQUE_CONFLICT');
@@ -558,7 +569,7 @@ test('unpaired surrogate external keys and composite string data fail before eff
   code(() => db.define('sp_a', 'bad-description', { ...schema, description: '\uDC00' }), 'SCHEMA_UNSUPPORTED');
   code(() => db.define('sp_a', 'bad-constraint', schema, [{ name: '\uD800', paths: ['label'] }]), 'SCHEMA_UNSUPPORTED');
   db.define('sp_a', 'entries', schema, [{ name: 'label', paths: ['label'] }]);
-  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
   const before = [db.events.length, db.outbox.length, db.receipts.size];
   for (const invalid of ['\uD800x', 'x\uDC00', '\uD800']) {
     code(() => create(db, invalid, { label: 'valid' }, `key-${invalid}`), 'INVALID_ARGUMENT');
@@ -579,7 +590,7 @@ test('unique and sortable paths must be declared scalar property names, not coer
     code(() => db.define('sp_a', 'entries', numericProperty, [], [path]), 'SCHEMA_UNSUPPORTED');
   }
   db.define('sp_a', 'entries', numericProperty, [{ name: 'key', paths: ['1'] }], ['1']);
-  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
   create(db, 'one', { label: 'first', '1': 'same' }, 'one');
   code(() => create(db, 'two', { label: 'second', '1': 'same' }, 'two'), 'UNIQUE_CONFLICT');
 });
@@ -629,20 +640,107 @@ test('mutation-specific payloads reject ignored fields before receipt lookup or 
 test('replay needs a current write grant on both requested and original collections', () => {
   const db = setup();
   db.define('sp_a', 'other', schema);
-  db.grant('sp_a', 'agent', 'other', ['read', 'write']);
+  db.grant('sp_a', 'agent', 'other', recordAccess);
   const request = { ...scope, operation: 'create', externalKey: 'first', data: { label: 'first' }, idempotencyKey: 'shared' };
   const committed = db.mutate(request);
   const before = [db.events.length, db.outbox.length, db.receipts.size];
-  db.grant('sp_a', 'agent', 'entries', ['read']);
+  db.grant('sp_a', 'agent', 'entries', ['records:read']);
   assert.equal(db.count(scope), 1);
   code(() => db.mutate(request), 'FORBIDDEN');
   code(() => db.mutate({ ...request, collection: 'other', externalKey: 'different' }), 'FORBIDDEN');
-  db.grant('sp_a', 'agent', 'entries', ['write']);
+  db.grant('sp_a', 'agent', 'entries', ['records:write']);
   assert.equal(db.mutate(request).receiptId, committed.receiptId);
-  db.grant('sp_a', 'agent', 'other', ['read']);
+  db.grant('sp_a', 'agent', 'other', ['records:read']);
   code(() => db.mutate({ ...request, collection: 'other', externalKey: 'different' }), 'FORBIDDEN');
   db.lifecycle('sp_a', 'readOnly');
   assert.equal(db.mutate(request).replayed, true);
   code(() => db.mutate({ ...request, idempotencyKey: 'new' }), 'SPACE_UNAVAILABLE');
   assert.deepEqual([db.events.length, db.outbox.length, db.receipts.size], before);
+});
+
+test('count and exists reject page cursors rather than narrowing the exact query', () => {
+  const db = setup();
+  for (const key of ['a', 'b', 'c']) create(db, key, { label: key }, key);
+  const first = db.query({ ...scope, limit: 1 });
+  assert.ok(first.cursor);
+  for (const cursor of [first.cursor, null, '']) {
+    code(() => db.count({ ...scope, cursor }), 'INVALID_ARGUMENT');
+    code(() => db.exists({ ...scope, cursor }), 'INVALID_ARGUMENT');
+  }
+  assert.equal(db.count(scope), 3);
+  assert.equal(db.exists(scope), true);
+  assert.equal(db.count({ ...scope, cursor: undefined }), 3);
+  for (const id of db.query({ ...scope, limit: 3 }).items.slice(1).map(record => record.id)) {
+    write(db, 'delete', id, 1, `delete-${id}`);
+  }
+  assert.equal(db.count(scope), 1);
+  assert.equal(db.exists(scope), true);
+  code(() => db.exists({ ...scope, cursor: first.cursor }), 'INVALID_ARGUMENT');
+});
+
+test('composite string reservations use NFC but never change stored data spelling', () => {
+  const db = setup();
+  const original = 'e\u0301';
+  const first = create(db, 'first', { label: original, state: 'open' }, 'one');
+  assert.equal(db.get({ ...scope, id: first.ref.id }).data.label, original);
+  code(() => create(db, 'second', { label: '\u00e9', state: 'open' }, 'two'), 'UNIQUE_CONFLICT');
+  assert.equal(db.get({ ...scope, id: first.ref.id }).data.label, original);
+  create(db, 'third', { label: '\u00e9', state: 'closed' }, 'three');
+});
+
+test('optional prototype-named unique fields are absent unless own, even on null-prototype data', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  const named = { $schema: schema.$schema, type: 'object', additionalProperties: false,
+    properties: { toString: { type: 'string' }, constructor: { type: 'string' } } };
+  db.define('sp_a', 'entries', named, [{ name: 'named', paths: ['toString', 'constructor'] }]);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
+  const one = create(db, 'one', {}, 'one');
+  create(db, 'two', { toString: 'a' }, 'two');
+  const data = Object.assign(Object.create(null), { toString: 'a', constructor: 'b' });
+  const third = create(db, 'three', data, 'three');
+  assert.equal(Object.hasOwn(db.get({ ...scope, id: one.ref.id }).data, 'toString'), false);
+  assert.deepEqual(db.get({ ...scope, id: third.ref.id }).data, { toString: 'a', constructor: 'b' });
+  code(() => create(db, 'four', { toString: 'a', constructor: 'b' }, 'four'), 'UNIQUE_CONFLICT');
+});
+
+test('non-JSON object instances fail at root and nested schema paths without effects', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  const nested = { type: 'object', properties: {}, additionalProperties: false };
+  db.define('sp_a', 'entries', { $schema: schema.$schema, type: 'object', properties: { child: nested }, additionalProperties: false });
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
+  for (const [index, data] of [new Date(), new Map(), { child: new Date() }, { child: new Map() }].entries()) {
+    code(() => create(db, `bad-${index}`, data, `bad-${index}`), 'SCHEMA_INVALID');
+  }
+  assert.equal(db.count(scope), 0);
+  assert.deepEqual([db.events.length, db.outbox.length, db.receipts.size], [0, 0, 0]);
+  assert.equal(create(db, 'plain', { child: {} }, 'plain').revision, 1);
+});
+
+test('grant rejects non-contract capability tokens before policy changes', () => {
+  const db = setup();
+  const policy = db.spaces.get('sp_a').policyVersion;
+  for (const invalid of [['read'], ['WRITE'], ['records:reed'], ['records:read', 'other'], 'records:read']) {
+    code(() => db.grant('sp_a', 'new-agent', 'entries', invalid), 'INVALID_ARGUMENT');
+  }
+  assert.equal(db.spaces.get('sp_a').policyVersion, policy);
+  code(() => db.get({ ...scope, credential: 'new-agent', id: 'rec_1' }), 'FORBIDDEN');
+  db.grant('sp_a', 'new-agent', 'entries', ['records:read']);
+  assert.equal(db.spaces.get('sp_a').grants.get('new-agent').get('entries').has('records:read'), true);
+});
+
+test('long key edges and fractional seconds use bounded linear trimming with unchanged normalization', () => {
+  const db = setup();
+  const key = ' \u0085'.repeat(20000) + 'x' + '\u3000'.repeat(20000);
+  const first = create(db, key, { label: 'x' }, 'long');
+  assert.equal(db.get({ ...scope, id: first.ref.id }).key, 'x');
+  const dated = new ReferenceState();
+  dated.addSpace('sp_a', 'owner');
+  dated.define('sp_a', 'entries', { $schema: schema.$schema, type: 'object', additionalProperties: false,
+    properties: { observedAt: { type: 'string', format: 'date-time' } } }, [{ name: 'time', paths: ['observedAt'] }]);
+  dated.grant('sp_a', 'agent', 'entries', recordAccess);
+  const manyZeros = '2026-09-23T12:00:00.' + '0'.repeat(20000) + '1Z';
+  create(dated, 'one', { observedAt: manyZeros }, 'one');
+  code(() => create(dated, 'two', { observedAt: manyZeros }, 'two'), 'UNIQUE_CONFLICT');
 });
