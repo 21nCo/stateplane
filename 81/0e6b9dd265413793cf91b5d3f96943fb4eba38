@@ -1,0 +1,14 @@
+ARCHITECTURE.md
+  h_a39f9495f9ec1d 1-300
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "810e6b9dd265413793cf91b5d3f96943fb4eba38",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
