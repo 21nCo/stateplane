@@ -1,0 +1,21 @@
+test/contract.test.js
+  s_443991029aaf4a::t_7cc0f9db4f038d 555-604
+test/reference.js
+  s_443991029aaf4a::t_bf47ccdf9fd6bb 169,171,175-178
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a185848945479e43662b1eb0666ec149fe65f64a",
+  "prompts": {},
+  "sessions": {
+    "s_443991029aaf4a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ceba-254c-7783-b307-8c3de886ea52",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
