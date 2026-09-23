@@ -19,8 +19,10 @@ const stable = value => {
 const digest = value => createHash('sha256').update(stable(value)).digest('hex');
 // Fixed Unicode White_Space set (not JS trim, which includes FEFF but excludes 0085).
 const edgeWhitespace = /^[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/gu;
+// A lone UTF-16 surrogate has no Unicode scalar value and cannot encode as UTF-8.
+const wellFormed = value => [...value].every(scalar => scalar.length !== 1 || scalar < '\uD800' || scalar > '\uDFFF');
 const keyOf = key => {
-  if (typeof key !== 'string') fail('INVALID_ARGUMENT');
+  if (typeof key !== 'string' || !wellFormed(key)) fail('INVALID_ARGUMENT');
   const normalized = key.normalize('NFC').replace(edgeWhitespace, '');
   if (!normalized) fail('INVALID_ARGUMENT');
   return normalized;
@@ -56,7 +58,7 @@ const validateDefinition = (s, root = true) => {
     types.some(t => !['string', 'number', 'integer', 'boolean', 'object', 'array', 'null'].includes(t)) ||
     (types.length === 1 && types[0] === 'null')) fail('SCHEMA_UNSUPPORTED');
   const type = types.find(t => t !== 'null');
-  if (s.description !== undefined && typeof s.description !== 'string') fail('SCHEMA_UNSUPPORTED');
+  if (s.description !== undefined && (typeof s.description !== 'string' || !wellFormed(s.description))) fail('SCHEMA_UNSUPPORTED');
   for (const [min, max] of [['minLength', 'maxLength'], ['minItems', 'maxItems']]) {
     for (const key of [min, max]) if (s[key] !== undefined && (!Number.isSafeInteger(s[key]) || s[key] < 0)) fail('SCHEMA_UNSUPPORTED');
     if (s[min] !== undefined && s[max] !== undefined && s[min] > s[max]) fail('SCHEMA_UNSUPPORTED');
@@ -66,6 +68,7 @@ const validateDefinition = (s, root = true) => {
   if (s.format !== undefined && (type !== 'string' || s.format !== 'date-time')) fail('SCHEMA_UNSUPPORTED');
   if (type === 'object') {
     if (s.additionalProperties !== false || (s.properties !== undefined && (!s.properties || typeof s.properties !== 'object' || Array.isArray(s.properties)))) fail('SCHEMA_UNSUPPORTED');
+    if (Object.keys(s.properties ?? {}).some(name => !wellFormed(name))) fail('SCHEMA_UNSUPPORTED');
     for (const child of Object.values(s.properties ?? {})) validateDefinition(child, false);
     if (s.required !== undefined && (!Array.isArray(s.required) || s.required.some(k => typeof k !== 'string' || !Object.hasOwn(s.properties ?? {}, k)) || new Set(s.required).size !== s.required.length)) fail('SCHEMA_UNSUPPORTED');
   } else if (s.properties !== undefined || s.required !== undefined || s.additionalProperties !== undefined) fail('SCHEMA_UNSUPPORTED');
@@ -88,13 +91,14 @@ const validateData = (data, schema) => {
     // A nullable type still has to satisfy enum; no other scalar constraint applies.
   } else if (type === 'object') {
     if (!data || typeof data !== 'object' || Array.isArray(data)) fail('SCHEMA_INVALID');
-    for (const k of Object.keys(data)) { if (!schema.properties?.[k]) fail('SCHEMA_INVALID'); validateData(data[k], schema.properties[k]); }
+    for (const k of Object.keys(data)) { if (!wellFormed(k) || !Object.hasOwn(schema.properties ?? {}, k)) fail('SCHEMA_INVALID'); validateData(data[k], schema.properties[k]); }
     for (const k of schema.required ?? []) if (!Object.hasOwn(data, k)) fail('SCHEMA_INVALID');
   } else if (type === 'array') {
     if (!Array.isArray(data) || (schema.minItems !== undefined && data.length < schema.minItems) || (schema.maxItems !== undefined && data.length > schema.maxItems)) fail('SCHEMA_INVALID');
     for (const value of data) validateData(value, schema.items);
   } else {
     if (typeof data !== (type === 'integer' || type === 'number' ? 'number' : type)) fail('SCHEMA_INVALID');
+    if (type === 'string' && !wellFormed(data)) fail('SCHEMA_INVALID');
     if (type === 'integer' && !Number.isSafeInteger(data)) fail('SCHEMA_INVALID');
     if (typeof data === 'number' && (!Number.isFinite(data) || (schema.minimum !== undefined && data < schema.minimum) || (schema.maximum !== undefined && data > schema.maximum))) fail('SCHEMA_INVALID');
     if (type === 'string' && ((schema.minLength !== undefined && [...data].length < schema.minLength) || (schema.maxLength !== undefined && [...data].length > schema.maxLength))) fail('SCHEMA_INVALID');
@@ -112,7 +116,9 @@ export class ReferenceState {
   lifecycle(spaceId, state) { const s = this.spaces.get(spaceId); s.lifecycle = state; s.policyVersion++; }
   define(spaceId, slug, schema, uniques = [], sortable = []) {
     validateDefinition(schema);
-    for (const u of uniques) if (!u.name || !u.paths?.length || u.paths.some(path => {
+    if (!Array.isArray(uniques) || new Set(uniques.map(u => u?.name)).size !== uniques.length) fail('SCHEMA_UNSUPPORTED');
+    for (const u of uniques) if (!u || typeof u.name !== 'string' || !u.name || !wellFormed(u.name) ||
+      !Array.isArray(u.paths) || !u.paths.length || new Set(u.paths).size !== u.paths.length || u.paths.some(path => {
       const shape = schema.properties?.[path];
       const type = Array.isArray(shape?.type) ? shape.type.find(t => t !== 'null') : shape?.type;
       return !['string', 'number', 'integer', 'boolean'].includes(type);
@@ -191,7 +197,9 @@ export class ReferenceState {
       nextData = clone(data);
     }
     if (operation === 'patch') {
-      if (!set || typeof set !== 'object' || !Array.isArray(unset) || unset.some(k => Object.hasOwn(set, k))) fail('INVALID_ARGUMENT');
+      if (!set || typeof set !== 'object' || Array.isArray(set) || !Array.isArray(unset) ||
+        new Set(unset).size !== unset.length || unset.some(k => typeof k !== 'string' ||
+          !Object.hasOwn(c.schema.properties ?? {}, k) || c.schema.required?.includes(k) || Object.hasOwn(set, k))) fail('INVALID_ARGUMENT');
       nextData = { ...clone(current.data), ...clone(set) };
       for (const k of unset) delete nextData[k];
     }

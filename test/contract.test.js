@@ -479,3 +479,49 @@ test('fingerprint uses locale-independent UTF-8 key ordering and replays reorder
   const numeric = createHash('sha256').update('{"actor":"agent","collection":"indexed","data":{"10":"tenth","2":"second"},"externalKey":"key","operation":"create"}').digest('hex');
   assert.equal([...db.receipts.values()].at(-1).fingerprint, numeric);
 });
+
+test('unique constraint names are distinct within a collection and independent across constraints', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  const constraints = [{ name: 'dup', paths: ['label'] }, { name: 'dup', paths: ['state'] }];
+  code(() => db.define('sp_a', 'entries', schema, constraints), 'SCHEMA_UNSUPPORTED');
+  db.define('sp_a', 'entries', schema, [{ name: 'by_label', paths: ['label'] }, { name: 'by_state', paths: ['state'] }]);
+  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  create(db, 'one', { label: 'x', state: 'open' }, 'one');
+  create(db, 'two', { label: 'open', state: 'closed' }, 'two');
+  code(() => create(db, 'three', { label: 'x', state: 'closed' }, 'three'), 'UNIQUE_CONFLICT');
+  assert.equal(db.count(scope), 2);
+});
+
+test('patch rejects unknown or required unset without effects, but permits absent optional unset', () => {
+  const db = setup();
+  const id = create(db, 'one', { label: 'entry' }, 'one').ref.id;
+  const before = [db.events.length, db.outbox.length, db.receipts.size];
+  for (const unset of [['misspelled'], ['label'], ['state', 'state']]) {
+    code(() => write(db, 'patch', id, 1, `bad-${unset.join('-')}`, { set: {}, unset }), 'INVALID_ARGUMENT');
+    assert.deepEqual([db.events.length, db.outbox.length, db.receipts.size], before);
+    assert.equal(db.get({ ...scope, id }).revision, 1);
+  }
+  assert.equal(write(db, 'patch', id, 1, 'noop', { set: {}, unset: ['state'] }).revision, 2);
+  assert.deepEqual(db.get({ ...scope, id }).data, { label: 'entry' });
+  assert.deepEqual([db.events.length, db.outbox.length, db.receipts.size], before.map(n => n + 1));
+});
+
+test('unpaired surrogate external keys and composite string data fail before effects', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  code(() => db.define('sp_a', 'bad-property', { ...schema, properties: { '\uD800': { type: 'string' } } }), 'SCHEMA_UNSUPPORTED');
+  code(() => db.define('sp_a', 'bad-description', { ...schema, description: '\uDC00' }), 'SCHEMA_UNSUPPORTED');
+  code(() => db.define('sp_a', 'bad-constraint', schema, [{ name: '\uD800', paths: ['label'] }]), 'SCHEMA_UNSUPPORTED');
+  db.define('sp_a', 'entries', schema, [{ name: 'label', paths: ['label'] }]);
+  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  const before = [db.events.length, db.outbox.length, db.receipts.size];
+  for (const invalid of ['\uD800x', 'x\uDC00', '\uD800']) {
+    code(() => create(db, invalid, { label: 'valid' }, `key-${invalid}`), 'INVALID_ARGUMENT');
+    code(() => create(db, 'valid', { label: invalid }, `data-${invalid}`), 'SCHEMA_INVALID');
+    assert.deepEqual([db.events.length, db.outbox.length, db.receipts.size], before);
+  }
+  const good = create(db, '\uD83D\uDCAB', { label: '\uD83D\uDCAB' }, 'pair');
+  assert.equal(db.get({ ...scope, id: good.ref.id }).key, '\uD83D\uDCAB');
+  code(() => create(db, 'second', { label: '\uD83D\uDCAB' }, 'collision'), 'UNIQUE_CONFLICT');
+});
