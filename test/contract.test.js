@@ -552,3 +552,53 @@ test('only an absent cursor starts a first page; malformed supplied tokens fail 
   assert.equal(db.query({ ...scope, limit: 1, cursor: first.cursor }).items[0].key, 'two');
   assert.equal(db.query({ ...scope, limit: 1 }).items[0].key, 'one');
 });
+
+test('mutation-specific payloads reject ignored fields before receipt lookup or effects', () => {
+  const db = setup();
+  const request = { ...scope, operation: 'create', externalKey: 'first', data: { label: 'first' }, idempotencyKey: 'first' };
+  const first = db.mutate(request);
+  const snapshot = () => ({ record: db.get({ ...scope, id: first.ref.id }),
+    events: structuredClone(db.events), outbox: structuredClone(db.outbox),
+    receipts: db.receipts.size, reserved: db.spaces.get('sp_a').collections.get('entries').reserved.size });
+  const before = snapshot();
+  const failures = [
+    { ...request, id: first.ref.id },
+    { ...request, set: { label: 'ignored' } },
+    { ...request, unset: ['state'] },
+    { ...request, unused: 'ignored' },
+    { ...scope, operation: 'replace', id: first.ref.id, expectedRevision: 1, data: { label: 'changed' }, set: {}, idempotencyKey: 'bad-replace' },
+    { ...scope, operation: 'replace', id: first.ref.id, expectedRevision: 1, data: { label: 'changed' }, unset: [], idempotencyKey: 'bad-replace-unset' },
+    { ...scope, operation: 'patch', id: first.ref.id, expectedRevision: 1, set: {}, unset: [], data: { label: 'ignored' }, idempotencyKey: 'bad-patch' },
+    { ...scope, operation: 'delete', id: first.ref.id, expectedRevision: 1, data: { label: 'ignored' }, idempotencyKey: 'bad-delete' },
+    { ...scope, operation: 'delete', id: first.ref.id, expectedRevision: 1, set: {}, idempotencyKey: 'bad-delete-set' },
+    { ...scope, operation: 'delete', id: first.ref.id, expectedRevision: 1, unset: [], idempotencyKey: 'bad-delete-unset' }
+  ];
+  for (const invalid of failures) {
+    code(() => db.mutate(invalid), 'INVALID_ARGUMENT');
+    assert.deepEqual(snapshot(), before);
+  }
+  assert.equal(db.mutate(request).replayed, true);
+  assert.deepEqual(snapshot(), before);
+  assert.equal(write(db, 'delete', first.ref.id, 1, 'valid-delete').revision, 2);
+});
+
+test('replay needs a current write grant on both requested and original collections', () => {
+  const db = setup();
+  db.define('sp_a', 'other', schema);
+  db.grant('sp_a', 'agent', 'other', ['read', 'write']);
+  const request = { ...scope, operation: 'create', externalKey: 'first', data: { label: 'first' }, idempotencyKey: 'shared' };
+  const committed = db.mutate(request);
+  const before = [db.events.length, db.outbox.length, db.receipts.size];
+  db.grant('sp_a', 'agent', 'entries', ['read']);
+  assert.equal(db.count(scope), 1);
+  code(() => db.mutate(request), 'FORBIDDEN');
+  code(() => db.mutate({ ...request, collection: 'other', externalKey: 'different' }), 'FORBIDDEN');
+  db.grant('sp_a', 'agent', 'entries', ['write']);
+  assert.equal(db.mutate(request).receiptId, committed.receiptId);
+  db.grant('sp_a', 'agent', 'other', ['read']);
+  code(() => db.mutate({ ...request, collection: 'other', externalKey: 'different' }), 'FORBIDDEN');
+  db.lifecycle('sp_a', 'readOnly');
+  assert.equal(db.mutate(request).replayed, true);
+  code(() => db.mutate({ ...request, idempotencyKey: 'new' }), 'SPACE_UNAVAILABLE');
+  assert.deepEqual([db.events.length, db.outbox.length, db.receipts.size], before);
+});

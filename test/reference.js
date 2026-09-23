@@ -166,12 +166,16 @@ export class ReferenceState {
     const r = c.records.get(id);
     return r && !r.deleted ? clone(r) : null;
   }
-  mutate({ spaceId, credential, collection, operation, id, externalKey, data, set, unset, expectedRevision, expectedSchemaVersion, idempotencyKey }) {
+  mutate({ spaceId, credential, collection, operation, id, externalKey, data, set, unset, expectedRevision, expectedSchemaVersion, idempotencyKey, ...extra }) {
     const { c } = this.#access(spaceId, credential, collection, 'write', true);
-    if (!idempotencyKey || !['create', 'replace', 'patch', 'delete'].includes(operation)) fail('INVALID_ARGUMENT');
+    if (!idempotencyKey || !['create', 'replace', 'patch', 'delete'].includes(operation) || Object.keys(extra).length) fail('INVALID_ARGUMENT');
     if (operation !== 'create' && (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1)) fail('INVALID_ARGUMENT');
     if (operation === 'create' && expectedRevision !== undefined) fail('INVALID_ARGUMENT');
     if (operation !== 'create' && externalKey !== undefined) fail('INVALID_ARGUMENT');
+    if ((operation === 'create' && (id !== undefined || set !== undefined || unset !== undefined)) ||
+      (operation === 'replace' && (set !== undefined || unset !== undefined)) ||
+      (operation === 'patch' && data !== undefined) ||
+      (operation === 'delete' && (data !== undefined || set !== undefined || unset !== undefined))) fail('INVALID_ARGUMENT');
     if (expectedSchemaVersion !== undefined && (!Number.isSafeInteger(expectedSchemaVersion) || expectedSchemaVersion < 1)) fail('INVALID_ARGUMENT');
     const normalized = externalKey === undefined ? undefined : keyOf(externalKey);
     // Caller-supplied schema precondition is stable across compatible schema additions.
@@ -190,7 +194,6 @@ export class ReferenceState {
     const current = id ? c.records.get(id) : null;
     if (operation !== 'create' && (!current || current.deleted)) fail('NOT_FOUND');
     if (operation !== 'create' && current.revision !== expectedRevision) fail('REVISION_CONFLICT');
-    if (operation === 'create' && id !== undefined) fail('INVALID_ARGUMENT');
     let nextData;
     if (operation === 'create' || operation === 'replace') {
       if (data === undefined) fail('SCHEMA_INVALID');
