@@ -166,6 +166,18 @@ export class ReferenceState {
     const r = c.records.get(id);
     return r && !r.deleted ? clone(r) : null;
   }
+  getByKey({ spaceId, credential, collection, mode, key }) {
+    const { c } = this.#access(spaceId, credential, collection, 'read');
+    if (!['generated', 'external'].includes(mode)) fail('INVALID_ARGUMENT');
+    let r;
+    if (mode === 'external') {
+      r = c.reserved.get(stable(['external', keyOf(key)]));
+    } else {
+      if (typeof key !== 'string' || !key || !wellFormed(key)) fail('INVALID_ARGUMENT');
+      r = c.records.get(key);
+    }
+    return r && !r.deleted && r.keyMode === mode ? clone(r) : null;
+  }
   mutate({ spaceId, credential, collection, operation, id, externalKey, data, set, unset, expectedRevision, expectedSchemaVersion, idempotencyKey, ...extra }) {
     const { c } = this.#access(spaceId, credential, collection, 'write', true);
     if (!idempotencyKey || !['create', 'replace', 'patch', 'delete'].includes(operation) || Object.keys(extra).length) fail('INVALID_ARGUMENT');

@@ -58,6 +58,31 @@ test('generated IDs and external keys have separate namespaces, including tombst
   code(() => create(db, 'rec_2', { label: 'new' }, 'three'), 'KEY_RESERVED');
 });
 
+test('key lookup requires a mode, isolates colliding ID text, and hides tombstones', () => {
+  const db = setup();
+  const external = create(db, ' rec_2 ', { label: 'external' }, 'one');
+  const generated = db.mutate({ ...scope, operation: 'create', data: { label: 'generated' }, idempotencyKey: 'two' });
+  const lookup = (mode, key, other = {}) => db.getByKey({ ...scope, mode, key, ...other });
+  assert.equal(lookup('external', 'rec_2').id, external.ref.id);
+  assert.equal(lookup('external', ' rec_2 ').id, external.ref.id);
+  assert.equal(lookup('generated', 'rec_2').id, generated.ref.id);
+  assert.equal(lookup('generated', ` ${generated.ref.id} `), null);
+  assert.equal(lookup('generated', external.ref.id), null);
+  assert.equal(lookup('external', external.ref.id), null);
+  assert.equal(lookup('generated', 'rec_2', { spaceId: 'sp_b' }), null);
+  for (const mode of [undefined, 'any', null]) code(() => lookup(mode, 'rec_2'), 'INVALID_ARGUMENT');
+  code(() => lookup('external', '\u0085'), 'INVALID_ARGUMENT');
+  db.revoke('sp_a', 'agent');
+  code(() => lookup('external', 'rec_2'), 'FORBIDDEN');
+  code(() => lookup('external', '\u0085'), 'FORBIDDEN');
+  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  write(db, 'delete', external.ref.id, 1, 'delete-external');
+  assert.equal(lookup('external', 'rec_2'), null);
+  assert.equal(lookup('generated', 'rec_2').id, generated.ref.id);
+  write(db, 'delete', generated.ref.id, 1, 'delete-generated');
+  assert.equal(lookup('generated', 'rec_2'), null);
+});
+
 test('external keys cannot collide with constraint namespaces, and replacement releases live tuples only', () => {
   const db = new ReferenceState();
   db.addSpace('sp_a', 'owner');
@@ -90,6 +115,25 @@ test('nullable enum still validates null, UTC dates reject rollover and compare 
   code(() => create(db, 'same', { observedAt: '2026-09-23T12:00:00.0Z' }, 'same'), 'UNIQUE_CONFLICT');
   create(db, 'fraction', { observedAt: '2026-09-23T12:00:00.1230Z' }, 'fraction');
   code(() => create(db, 'same-fraction', { observedAt: '2026-09-23T12:00:00.123Z' }, 'same-fraction'), 'UNIQUE_CONFLICT');
+});
+
+test('integer records and enum definitions use v1 safe-integer boundaries', () => {
+  const db = setup();
+  db.define('sp_a', 'bounded', { ...schema, properties: { ordinal: { type: 'integer', enum: [Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER] } }, required: ['ordinal'] });
+  db.grant('sp_a', 'agent', 'bounded', ['read', 'write']);
+  for (const value of [Number.MAX_SAFE_INTEGER + 1, Number.MIN_SAFE_INTEGER - 1]) {
+    code(() => db.define('sp_a', `enum-${value}`, { ...schema, properties: { ordinal: { type: 'integer', enum: [value] } } }), 'SCHEMA_UNSUPPORTED');
+    const before = [db.events.length, db.outbox.length, db.receipts.size];
+    code(() => create(db, `outside-${value}`, { label: 'outside', ordinal: value }, `outside-${value}`), 'SCHEMA_INVALID');
+    assert.deepEqual([db.events.length, db.outbox.length, db.receipts.size], before);
+  }
+  for (const value of [Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER]) {
+    const receipt = db.mutate({ ...scope, collection: 'bounded', operation: 'create', data: { ordinal: value }, idempotencyKey: `edge-${value}` });
+    assert.equal(db.get({ ...scope, collection: 'bounded', id: receipt.ref.id }).data.ordinal, value);
+  }
+  db.define('sp_a', 'finite-number', { ...schema, properties: { ordinal: { type: 'number' } }, required: ['ordinal'] });
+  db.grant('sp_a', 'agent', 'finite-number', ['read', 'write']);
+  assert.equal(db.mutate({ ...scope, collection: 'finite-number', operation: 'create', data: { ordinal: Number.MAX_SAFE_INTEGER + 1 }, idempotencyKey: 'number' }).revision, 1);
 });
 
 test('existing-record key input is rejected before side effects, even when normalized key matches', () => {
