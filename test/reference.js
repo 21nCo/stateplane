@@ -6,8 +6,16 @@ export class ContractError extends Error {
 }
 const fail = code => { throw new ContractError(code); };
 const clone = value => structuredClone(value);
-const stable = value => JSON.stringify(value, (_key, v) => v && !Array.isArray(v) && typeof v === 'object'
-  ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b))) : v);
+// Canonical object-key ordering is UTF-8 byte order, independent of host locale/ICU.
+const stable = value => {
+  if (Array.isArray(value)) return `[${value.map(item => stable(item) ?? 'null').join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    const fields = Object.keys(value).sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))
+      .filter(key => value[key] !== undefined).map(key => `${JSON.stringify(key)}:${stable(value[key])}`);
+    return `{${fields.join(',')}}`;
+  }
+  return JSON.stringify(value);
+};
 const digest = value => createHash('sha256').update(stable(value)).digest('hex');
 // Fixed Unicode White_Space set (not JS trim, which includes FEFF but excludes 0085).
 const edgeWhitespace = /^[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/gu;
@@ -37,7 +45,7 @@ const tupleOf = (data, paths, schema) => {
 };
 const allowedKeywords = new Set(['$schema', 'type', 'properties', 'required', 'additionalProperties', 'items', 'minItems', 'maxItems', 'minLength', 'maxLength', 'minimum', 'maximum', 'enum', 'format', 'description']);
 const validateDefinition = (s, root = true) => {
-  if (!s || typeof s !== 'object' || Array.isArray(s)) fail('SCHEMA_INVALID');
+  if (!s || typeof s !== 'object' || Array.isArray(s)) fail('SCHEMA_UNSUPPORTED');
   for (const name of Object.keys(s)) if (!allowedKeywords.has(name)) fail('SCHEMA_UNSUPPORTED');
   if (root && s.$schema !== 'https://json-schema.org/draft/2020-12/schema') fail('SCHEMA_UNSUPPORTED');
   if (!root && Object.hasOwn(s, '$schema')) fail('SCHEMA_UNSUPPORTED');
@@ -166,6 +174,8 @@ export class ReferenceState {
     const identity = stable([spaceId, credential, operation, idempotencyKey]);
     const previous = this.receipts.get(identity);
     if (previous) {
+      // A changed request cannot probe whether a revoked collection has a receipt.
+      this.#access(spaceId, credential, previous.collection, 'write', true);
       if (previous.fingerprint !== fingerprint) fail('IDEMPOTENCY_MISMATCH');
       return { ...clone(previous.receipt), replayed: true };
     }
@@ -212,12 +222,14 @@ export class ReferenceState {
     const receipt = { contractVersion: '1', receiptId: `receipt_${this.events.length + 1}`, spaceId, ref: { kind: 'record', id: recordId }, operation, beforeRevision: current?.revision ?? null, revision: record.revision, schemaVersion: c.version, committedAt: 'synthetic', expiresAt: 'configured-by-adapter', projection: { generation: this.generation, state: 'pending' }, replayed: false };
     this.events.push({ spaceId, collection, id: recordId, revision: record.revision });
     this.outbox.push({ spaceId, collection, id: recordId, revision: record.revision, generation: this.generation });
-    this.receipts.set(identity, { fingerprint, receipt });
+    this.receipts.set(identity, { collection, fingerprint, receipt });
     return clone(receipt);
   }
-  query({ spaceId, credential, collection, limit, cursor, sort }) {
+  query({ spaceId, credential, collection, limit, cursor, sort, filter }) {
     const { s, c } = this.#access(spaceId, credential, collection, 'read');
     if (!Number.isSafeInteger(limit) || limit < 1) fail('INVALID_ARGUMENT');
+    // This oracle has no typed-filter compiler. Never return unfiltered exact results.
+    if (filter !== undefined) fail('INVALID_ARGUMENT');
     if (sort !== undefined && (!sort || Array.isArray(sort) || typeof sort !== 'object' ||
       Object.keys(sort).some(key => !['field', 'direction'].includes(key)) ||
       !c.sortable.includes(sort.field) || !['asc', 'desc'].includes(sort.direction))) fail('INVALID_ARGUMENT');

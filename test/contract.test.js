@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { ReferenceState } from './reference.js';
 
 const schema = {
@@ -406,4 +407,75 @@ test('date-time sort compares UTC instants including fractional seconds, not enc
   const first = db.query({ ...scope, limit: 2, sort });
   assert.deepEqual(first.items.map(item => item.key), ['whole', 'equal']);
   assert.deepEqual(db.query({ ...scope, limit: 2, sort, cursor: first.cursor }).items.map(item => item.key), ['early', 'later']);
+});
+
+test('receipt identity cannot disclose a revoked original collection through another collection', () => {
+  const db = setup();
+  db.define('sp_a', 'other', schema);
+  db.grant('sp_a', 'agent', 'other', ['read', 'write']);
+  const original = { ...scope, operation: 'create', externalKey: 'first', data: { label: 'first' }, idempotencyKey: 'shared' };
+  db.mutate(original);
+  db.revoke('sp_a', 'agent', 'entries');
+  const before = [db.events.length, db.outbox.length, db.receipts.size];
+  code(() => db.mutate({ ...original, collection: 'other', externalKey: 'second' }), 'FORBIDDEN');
+  code(() => db.mutate(original), 'FORBIDDEN');
+  assert.deepEqual([db.events.length, db.outbox.length, db.receipts.size], before);
+  assert.equal(db.mutate({ ...original, collection: 'other', externalKey: 'second', idempotencyKey: 'fresh' }).revision, 1);
+  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  assert.equal(db.mutate(original).replayed, true);
+  code(() => db.mutate({ ...original, collection: 'other', externalKey: 'second' }), 'IDEMPOTENCY_MISMATCH');
+});
+
+test('unsupported filters fail closed for pages, exact count and exists', () => {
+  const db = setup();
+  create(db, 'one', { label: 'present' }, 'one');
+  const filter = { field: 'label', op: 'eq', value: 'absent' };
+  for (const run of [() => db.query({ ...scope, limit: 1, filter }),
+    () => db.count({ ...scope, filter }), () => db.exists({ ...scope, filter }),
+    () => db.query({ ...scope, limit: 1, filter: null })]) code(run, 'INVALID_ARGUMENT');
+  assert.equal(db.count(scope), 1);
+  assert.equal(db.exists(scope), true);
+});
+
+test('malformed child schema nodes fail as unsupported definitions and revisions', () => {
+  const db = setup();
+  const invalid = [null, 'string', [], { type: 'array' }, { type: 'object', properties: { inner: null }, additionalProperties: false }];
+  for (const [index, child] of invalid.entries()) {
+    const malformed = { ...schema, properties: { ...schema.properties, bad: child } };
+    code(() => db.define('sp_a', `bad-${index}`, malformed), 'SCHEMA_UNSUPPORTED');
+    code(() => db.revise('sp_a', 'entries', 1, malformed), 'SCHEMA_UNSUPPORTED');
+  }
+  assert.equal(db.revise('sp_a', 'entries', 1, { ...schema, properties: { ...schema.properties, valid: { type: 'string' } } }), 2);
+});
+
+test('v1 compatible schema additions are top-level only', () => {
+  const db = setup();
+  const nested = { type: 'object', properties: { label: { type: 'string' } }, additionalProperties: false };
+  const first = { ...schema, properties: { ...schema.properties, detail: nested } };
+  assert.equal(db.revise('sp_a', 'entries', 1, first), 2);
+  const nestedAddition = { ...first, properties: { ...first.properties, detail: { ...nested, properties: { ...nested.properties, note: { type: 'string' } } } } };
+  code(() => db.revise('sp_a', 'entries', 2, nestedAddition), 'SCHEMA_BREAKING');
+  assert.equal(db.revise('sp_a', 'entries', 2, { ...first, properties: { ...first.properties, topLevelNote: { type: 'string' } } }), 3);
+});
+
+test('fingerprint uses locale-independent UTF-8 key ordering and replays reordered objects', () => {
+  const db = setup();
+  db.define('sp_a', 'unicode', { $schema: schema.$schema, type: 'object', additionalProperties: false,
+    properties: { 'é': { type: 'string' }, z: { type: 'string' } } });
+  db.grant('sp_a', 'agent', 'unicode', ['read', 'write']);
+  const request = { ...scope, collection: 'unicode', operation: 'create', externalKey: 'key', data: { 'é': 'accent', z: 'plain' }, idempotencyKey: 'unicode-key' };
+  const committed = db.mutate(request);
+  const expected = createHash('sha256').update('{"actor":"agent","collection":"unicode","data":{"z":"plain","é":"accent"},"externalKey":"key","operation":"create"}').digest('hex');
+  assert.equal([...db.receipts.values()].at(-1).fingerprint, expected);
+  const before = [db.events.length, db.outbox.length, db.receipts.size];
+  const replay = db.mutate({ ...request, data: { z: 'plain', 'é': 'accent' } });
+  assert.equal(replay.receiptId, committed.receiptId);
+  assert.equal(replay.replayed, true);
+  assert.deepEqual([db.events.length, db.outbox.length, db.receipts.size], before);
+  db.define('sp_a', 'indexed', { $schema: schema.$schema, type: 'object', additionalProperties: false,
+    properties: { '2': { type: 'string' }, '10': { type: 'string' } } });
+  db.grant('sp_a', 'agent', 'indexed', ['read', 'write']);
+  db.mutate({ ...request, collection: 'indexed', data: { '2': 'second', '10': 'tenth' }, idempotencyKey: 'numeric-keys' });
+  const numeric = createHash('sha256').update('{"actor":"agent","collection":"indexed","data":{"10":"tenth","2":"second"},"externalKey":"key","operation":"create"}').digest('hex');
+  assert.equal([...db.receipts.values()].at(-1).fingerprint, numeric);
 });
