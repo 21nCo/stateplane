@@ -1,0 +1,19 @@
+test/contract.test.js
+  s_621f2416635dac::t_765d1b123f3b01 12,18,79,91,108,124,136,154,156-160,162,164-166,228,238-240,248-250,254,260,265,271,317,329,388,420,454,470,479,520,532,544,572,593,643,647,651,653,660-746
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "88efc029c720d43ff9df349fc7d13749c3d538b3",
+  "prompts": {},
+  "sessions": {
+    "s_621f2416635dac": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0cf88-d299-7c41-8dce-27bbb0f005de",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
