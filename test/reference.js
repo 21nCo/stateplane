@@ -15,12 +15,21 @@ const keyOf = key => {
   if (!normalized) fail('INVALID_ARGUMENT');
   return normalized;
 };
-const tupleOf = (data, paths) => {
+const utcInstant = value => {
+  const match = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z$/.exec(value);
+  if (!match || match[1].startsWith('0000-')) fail('SCHEMA_INVALID');
+  const parsed = new Date(`${match[1]}Z`);
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 19) !== match[1]) fail('SCHEMA_INVALID');
+  const fraction = match[2]?.replace(/0+$/, '');
+  return `${match[1]}${fraction ? `.${fraction}` : ''}Z`;
+};
+const tupleOf = (data, paths, schema) => {
   const parts = paths.map(path => data[path]);
   if (parts.some(v => v === undefined || v === null)) return null;
-  return parts.map(v => {
+  return parts.map((v, index) => {
     if (!['string', 'number', 'boolean'].includes(typeof v) || (typeof v === 'number' && !Number.isFinite(v))) fail('SCHEMA_INVALID');
-    const value = typeof v === 'string' ? v.normalize('NFC') : JSON.stringify(v);
+    const value = schema.properties[paths[index]].format === 'date-time'
+      ? utcInstant(v) : typeof v === 'string' ? v.normalize('NFC') : JSON.stringify(v);
     return `${typeof v}:${Buffer.byteLength(value)}:${value}`;
   }).join('');
 };
@@ -37,9 +46,11 @@ const validateDefinition = (s, root = true) => {
   if (types.length > 2 || (types.length === 2 && !types.includes('null')) || types.some(t => !['string', 'number', 'integer', 'boolean', 'object', 'array', 'null'].includes(t))) fail('SCHEMA_UNSUPPORTED');
 };
 const validateData = (data, schema) => {
-  if (data === null && (Array.isArray(schema.type) ? schema.type.includes('null') : schema.type === 'null')) return;
+  if (data === null && !(Array.isArray(schema.type) ? schema.type.includes('null') : schema.type === 'null')) fail('SCHEMA_INVALID');
   const type = Array.isArray(schema.type) ? schema.type.find(t => t !== 'null') : schema.type;
-  if (type === 'object') {
+  if (data === null) {
+    // A nullable type still has to satisfy enum; no other scalar constraint applies.
+  } else if (type === 'object') {
     if (!data || typeof data !== 'object' || Array.isArray(data)) fail('SCHEMA_INVALID');
     for (const k of Object.keys(data)) { if (!schema.properties?.[k]) fail('SCHEMA_INVALID'); validateData(data[k], schema.properties[k]); }
     for (const k of schema.required ?? []) if (!Object.hasOwn(data, k)) fail('SCHEMA_INVALID');
@@ -51,7 +62,7 @@ const validateData = (data, schema) => {
     if (type === 'integer' && !Number.isSafeInteger(data)) fail('SCHEMA_INVALID');
     if (typeof data === 'number' && (!Number.isFinite(data) || (schema.minimum !== undefined && data < schema.minimum) || (schema.maximum !== undefined && data > schema.maximum))) fail('SCHEMA_INVALID');
     if (type === 'string' && ((schema.minLength !== undefined && data.length < schema.minLength) || (schema.maxLength !== undefined && data.length > schema.maxLength))) fail('SCHEMA_INVALID');
-    if (schema.format === 'date-time' && !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/.test(data)) fail('SCHEMA_INVALID');
+    if (schema.format === 'date-time') utcInstant(data);
   }
   if (schema.enum && !schema.enum.some(value => stable(value) === stable(data))) fail('SCHEMA_INVALID');
 };
@@ -65,7 +76,11 @@ export class ReferenceState {
   lifecycle(spaceId, state) { const s = this.spaces.get(spaceId); s.lifecycle = state; s.policyVersion++; }
   define(spaceId, slug, schema, uniques = []) {
     validateDefinition(schema);
-    for (const u of uniques) if (!u.name || !u.paths?.length || u.paths.some(path => !schema.properties?.[path] || !['string', 'number', 'integer', 'boolean'].includes(schema.properties[path].type))) fail('SCHEMA_UNSUPPORTED');
+    for (const u of uniques) if (!u.name || !u.paths?.length || u.paths.some(path => {
+      const shape = schema.properties?.[path];
+      const type = Array.isArray(shape?.type) ? shape.type.find(t => t !== 'null') : shape?.type;
+      return !['string', 'number', 'integer', 'boolean'].includes(type);
+    })) fail('SCHEMA_UNSUPPORTED');
     const s = this.spaces.get(spaceId);
     if (s.collections.has(slug)) fail('SCHEMA_CONFLICT');
     s.collections.set(slug, { schema, uniques, records: new Map(), reserved: new Map(), version: 1 });
@@ -99,13 +114,17 @@ export class ReferenceState {
     const r = c.records.get(id);
     return r && !r.deleted ? clone(r) : null;
   }
-  mutate({ spaceId, credential, collection, operation, id, externalKey, data, set, unset, expectedRevision, idempotencyKey }) {
+  mutate({ spaceId, credential, collection, operation, id, externalKey, data, set, unset, expectedRevision, expectedSchemaVersion, idempotencyKey }) {
     const { c } = this.#access(spaceId, credential, collection, 'write', true);
     if (!idempotencyKey || !['create', 'replace', 'patch', 'delete'].includes(operation)) fail('INVALID_ARGUMENT');
     if (operation !== 'create' && (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1)) fail('INVALID_ARGUMENT');
     if (operation === 'create' && expectedRevision !== undefined) fail('INVALID_ARGUMENT');
+    if (operation !== 'create' && externalKey !== undefined) fail('INVALID_ARGUMENT');
+    if (expectedSchemaVersion !== undefined && (!Number.isSafeInteger(expectedSchemaVersion) || expectedSchemaVersion < 1)) fail('INVALID_ARGUMENT');
     const normalized = externalKey === undefined ? undefined : keyOf(externalKey);
-    const fingerprint = digest({ operation, collection, id, externalKey: normalized, data, set, unset, expectedRevision });
+    // Caller-supplied schema precondition is stable across compatible schema additions.
+    // Do not fingerprint the server's current schema version: a lost response must replay.
+    const fingerprint = digest({ actor: credential, operation, collection, id, externalKey: normalized, data, set, unset, expectedRevision, expectedSchemaVersion });
     const identity = stable([spaceId, credential, operation, idempotencyKey]);
     const previous = this.receipts.get(identity);
     if (previous) {
@@ -113,6 +132,7 @@ export class ReferenceState {
       return { ...clone(previous.receipt), replayed: true };
     }
     this.#access(spaceId, credential, collection, 'write');
+    if (expectedSchemaVersion !== undefined && expectedSchemaVersion !== c.version) fail('SCHEMA_CONFLICT');
     const current = id ? c.records.get(id) : null;
     if (operation !== 'create' && (!current || current.deleted)) fail('NOT_FOUND');
     if (operation !== 'create' && current.revision !== expectedRevision) fail('REVISION_CONFLICT');
@@ -130,19 +150,22 @@ export class ReferenceState {
     if (operation !== 'delete') validateData(nextData, c.schema);
     const recordId = current?.id ?? `rec_${this.seq + 1}`;
     const recordKey = current?.key ?? normalized ?? recordId;
-    const wanted = [`key:${recordKey}`];
+    // Record IDs are a separate namespace from caller-provided external keys.
+    // Array encoding keeps constraint names/tuples distinct from either key namespace.
+    const wanted = current?.keyMode === 'external' || (!current && normalized !== undefined)
+      ? [stable(['external', recordKey])] : [];
     if (operation !== 'delete') for (const u of c.uniques) {
-      const tuple = tupleOf(nextData, u.paths);
-      if (tuple !== null) wanted.push(`${u.name}:${tuple}`);
+      const tuple = tupleOf(nextData, u.paths, c.schema);
+      if (tuple !== null) wanted.push(stable(['unique', u.name, tuple]));
     }
     for (const reservation of wanted) {
       const holder = c.reserved.get(reservation);
       if (holder && holder.id !== recordId) fail(holder.deleted ? 'KEY_RESERVED' : 'UNIQUE_CONFLICT');
     }
     // Stage all validation before any state/event/outbox mutation. The oracle is synchronous.
-    const record = { id: recordId, key: recordKey, revision: (current?.revision ?? 0) + 1, data: operation === 'delete' ? clone(current.data) : nextData, deleted: operation === 'delete', schemaVersion: c.version };
+    const record = { id: recordId, key: recordKey, keyMode: current?.keyMode ?? (normalized === undefined ? 'generated' : 'external'), revision: (current?.revision ?? 0) + 1, data: operation === 'delete' ? clone(current.data) : nextData, deleted: operation === 'delete', schemaVersion: c.version };
     if (current) for (const [reservation, holder] of c.reserved) if (holder === current) {
-      if (operation === 'delete' || reservation.startsWith('key:')) c.reserved.set(reservation, record);
+      if (operation === 'delete' || JSON.parse(reservation)[0] === 'external') c.reserved.set(reservation, record);
       else c.reserved.delete(reservation);
     }
     if (!current) this.seq++;

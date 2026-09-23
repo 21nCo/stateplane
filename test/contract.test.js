@@ -46,6 +46,63 @@ test('create only, NFC key, typed composite uniqueness and null/missing', () => 
   assert.equal(db.exists(scope), true);
 });
 
+test('generated IDs and external keys have separate namespaces, including tombstones', () => {
+  const db = setup();
+  const external = create(db, 'rec_2', { label: 'external' }, 'one');
+  const generated = db.mutate({ ...scope, operation: 'create', data: { label: 'generated' }, idempotencyKey: 'two' });
+  assert.equal(generated.ref.id, 'rec_2');
+  assert.equal(db.get({ ...scope, id: generated.ref.id }).keyMode, 'generated');
+  assert.equal(db.get({ ...scope, id: external.ref.id }).keyMode, 'external');
+  write(db, 'delete', external.ref.id, 1, 'delete');
+  code(() => create(db, 'rec_2', { label: 'new' }, 'three'), 'KEY_RESERVED');
+});
+
+test('external keys cannot collide with constraint namespaces, and replacement releases live tuples only', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  db.define('sp_a', 'entries', schema, [{ name: 'key', paths: ['label'] }]);
+  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  const first = create(db, 'seed', { label: 'x' }, 'one');
+  create(db, 'string:1:x', { label: 'y' }, 'two');
+  write(db, 'replace', first.ref.id, 1, 'three', { data: { label: 'z' } });
+  create(db, 'third', { label: 'x' }, 'four');
+  code(() => create(db, 'seed', { label: 'fresh' }, 'five'), 'UNIQUE_CONFLICT');
+  write(db, 'delete', first.ref.id, 2, 'delete');
+  code(() => create(db, 'fourth', { label: 'z' }, 'six'), 'KEY_RESERVED');
+});
+
+test('nullable enum still validates null, UTC dates reject rollover and compare equivalent instants', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  db.define('sp_a', 'entries', {
+    $schema: schema.$schema, type: 'object', additionalProperties: false,
+    properties: { state: { type: ['integer', 'null'], enum: [1] }, observedAt: { type: 'string', format: 'date-time' } }
+  }, [{ name: 'instant', paths: ['observedAt'] }]);
+  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  const before = [db.events.length, db.outbox.length, db.receipts.size];
+  code(() => create(db, 'bad-null', { state: null }, 'one'), 'SCHEMA_INVALID');
+  for (const bad of ['2026-02-30T25:99:99Z', '2026-02-30T12:00:00Z', '2026-09-23T12:00:60Z']) {
+    code(() => create(db, bad, { observedAt: bad }, bad), 'SCHEMA_INVALID');
+  }
+  assert.deepEqual([db.events.length, db.outbox.length, db.receipts.size], before);
+  create(db, 'valid', { state: 1, observedAt: '2026-09-23T12:00:00Z' }, 'valid');
+  code(() => create(db, 'same', { observedAt: '2026-09-23T12:00:00.0Z' }, 'same'), 'UNIQUE_CONFLICT');
+  create(db, 'fraction', { observedAt: '2026-09-23T12:00:00.1230Z' }, 'fraction');
+  code(() => create(db, 'same-fraction', { observedAt: '2026-09-23T12:00:00.123Z' }, 'same-fraction'), 'UNIQUE_CONFLICT');
+});
+
+test('existing-record key input is rejected before side effects, even when normalized key matches', () => {
+  const db = setup();
+  const id = create(db, 'original', { label: 'entry' }, 'one').ref.id;
+  const before = [db.events.length, db.outbox.length, db.receipts.size];
+  for (const externalKey of ['other', ' original ']) {
+    code(() => write(db, 'replace', id, 1, externalKey, { externalKey, data: { label: 'changed' } }), 'INVALID_ARGUMENT');
+  }
+  assert.deepEqual([db.events.length, db.outbox.length, db.receipts.size], before);
+  assert.equal(db.get({ ...scope, id }).revision, 1);
+  code(() => create(db, 'original', { label: 'other' }, 'two'), 'UNIQUE_CONFLICT');
+});
+
 test('atomic validation failure leaves record, event, receipt, reservations and outbox untouched', () => {
   const db = setup();
   const a = create(db, 'a', { label: 'a' }, 'one');
@@ -161,4 +218,20 @@ test('schema versions admit only compatible optional additions and stale schema 
   assert.equal(db.get({ ...scope, id }).schemaVersion, 1);
   write(db, 'patch', id, 1, 'two', { set: { note: 'synthetic' }, unset: [] });
   assert.equal(db.get({ ...scope, id }).schemaVersion, 2);
+});
+
+test('caller schema precondition participates in fingerprint but compatible revision does not break replay', () => {
+  const db = setup();
+  const id = create(db, 'item', { label: 'entry' }, 'one').ref.id;
+  const request = { data: { label: 'entry', state: 'open' }, expectedSchemaVersion: 1 };
+  const receipt = write(db, 'replace', id, 1, 'lost', request);
+  const added = { ...schema, properties: { ...schema.properties, note: { type: 'string' } } };
+  db.revise('sp_a', 'entries', 1, added);
+  const before = [db.events.length, db.outbox.length, db.receipts.size];
+  assert.equal(write(db, 'replace', id, 1, 'lost', request).receiptId, receipt.receiptId);
+  assert.deepEqual([db.events.length, db.outbox.length, db.receipts.size], before);
+  code(() => write(db, 'replace', id, 1, 'lost', { data: request.data, expectedSchemaVersion: 2 }), 'IDEMPOTENCY_MISMATCH');
+  code(() => write(db, 'replace', id, 1, 'new', request), 'SCHEMA_CONFLICT');
+  write(db, 'replace', id, 2, 'next', { data: request.data, expectedSchemaVersion: 2 });
+  assert.equal(db.get({ ...scope, id }).revision, 3);
 });
