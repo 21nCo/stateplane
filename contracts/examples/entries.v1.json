@@ -1,0 +1,18 @@
+{
+  "slug": "entries",
+  "version": 1,
+  "schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "label": { "type": "string", "minLength": 1 },
+      "state": { "type": ["string", "null"], "enum": ["open", "closed", null] },
+      "observedAt": { "type": "string", "format": "date-time" }
+    },
+    "required": ["label"],
+    "additionalProperties": false
+  },
+  "unique": [{ "name": "by_label", "paths": ["label"] }],
+  "filterable": ["state"],
+  "sortable": ["observedAt"]
+}
