@@ -9,9 +9,11 @@ const clone = value => structuredClone(value);
 const stable = value => JSON.stringify(value, (_key, v) => v && !Array.isArray(v) && typeof v === 'object'
   ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b))) : v);
 const digest = value => createHash('sha256').update(stable(value)).digest('hex');
+// Fixed Unicode White_Space set (not JS trim, which includes FEFF but excludes 0085).
+const edgeWhitespace = /^[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/gu;
 const keyOf = key => {
   if (typeof key !== 'string') fail('INVALID_ARGUMENT');
-  const normalized = key.normalize('NFC').trim();
+  const normalized = key.normalize('NFC').replace(edgeWhitespace, '');
   if (!normalized) fail('INVALID_ARGUMENT');
   return normalized;
 };
@@ -41,11 +43,18 @@ const validateDefinition = (s, root = true) => {
   if (!root && Object.hasOwn(s, '$schema')) fail('SCHEMA_UNSUPPORTED');
   const types = Array.isArray(s.type) ? s.type : [s.type];
   if (root && s.type !== 'object') fail('SCHEMA_UNSUPPORTED');
-  if (types.length === 0 || types.length > 2 || (types.length === 2 &&
+  if (types.length === 0 || types.length > 2 || new Set(types).size !== types.length || (types.length === 2 &&
     (!types.includes('null') || !['string', 'number', 'integer', 'boolean'].includes(types.find(t => t !== 'null')))) ||
     types.some(t => !['string', 'number', 'integer', 'boolean', 'object', 'array', 'null'].includes(t)) ||
     (types.length === 1 && types[0] === 'null')) fail('SCHEMA_UNSUPPORTED');
   const type = types.find(t => t !== 'null');
+  if (s.description !== undefined && typeof s.description !== 'string') fail('SCHEMA_UNSUPPORTED');
+  for (const [min, max] of [['minLength', 'maxLength'], ['minItems', 'maxItems']]) {
+    for (const key of [min, max]) if (s[key] !== undefined && (!Number.isSafeInteger(s[key]) || s[key] < 0)) fail('SCHEMA_UNSUPPORTED');
+    if (s[min] !== undefined && s[max] !== undefined && s[min] > s[max]) fail('SCHEMA_UNSUPPORTED');
+  }
+  for (const key of ['minimum', 'maximum']) if (s[key] !== undefined && (typeof s[key] !== 'number' || !Number.isFinite(s[key]))) fail('SCHEMA_UNSUPPORTED');
+  if (s.minimum !== undefined && s.maximum !== undefined && s.minimum > s.maximum) fail('SCHEMA_UNSUPPORTED');
   if (s.format !== undefined && (type !== 'string' || s.format !== 'date-time')) fail('SCHEMA_UNSUPPORTED');
   if (type === 'object') {
     if (s.additionalProperties !== false || (s.properties !== undefined && (!s.properties || typeof s.properties !== 'object' || Array.isArray(s.properties)))) fail('SCHEMA_UNSUPPORTED');
@@ -56,6 +65,13 @@ const validateDefinition = (s, root = true) => {
   else if (s.items !== undefined || s.minItems !== undefined || s.maxItems !== undefined) fail('SCHEMA_UNSUPPORTED');
   if (type !== 'string' && (s.minLength !== undefined || s.maxLength !== undefined)) fail('SCHEMA_UNSUPPORTED');
   if (!['number', 'integer'].includes(type) && (s.minimum !== undefined || s.maximum !== undefined)) fail('SCHEMA_UNSUPPORTED');
+  if (s.enum !== undefined) {
+    if (!Array.isArray(s.enum) || s.enum.length === 0) fail('SCHEMA_UNSUPPORTED');
+    for (const value of s.enum) {
+      try { validateData(value, { ...s, enum: undefined }); }
+      catch (error) { if (error instanceof ContractError && error.code === 'SCHEMA_INVALID') fail('SCHEMA_UNSUPPORTED'); throw error; }
+    }
+  }
 };
 const validateData = (data, schema) => {
   if (data === null && !(Array.isArray(schema.type) ? schema.type.includes('null') : schema.type === 'null')) fail('SCHEMA_INVALID');
@@ -73,7 +89,7 @@ const validateData = (data, schema) => {
     if (typeof data !== (type === 'integer' || type === 'number' ? 'number' : type)) fail('SCHEMA_INVALID');
     if (type === 'integer' && !Number.isSafeInteger(data)) fail('SCHEMA_INVALID');
     if (typeof data === 'number' && (!Number.isFinite(data) || (schema.minimum !== undefined && data < schema.minimum) || (schema.maximum !== undefined && data > schema.maximum))) fail('SCHEMA_INVALID');
-    if (type === 'string' && ((schema.minLength !== undefined && data.length < schema.minLength) || (schema.maxLength !== undefined && data.length > schema.maxLength))) fail('SCHEMA_INVALID');
+    if (type === 'string' && ((schema.minLength !== undefined && [...data].length < schema.minLength) || (schema.maxLength !== undefined && [...data].length > schema.maxLength))) fail('SCHEMA_INVALID');
     if (schema.format === 'date-time') utcInstant(data);
   }
   if (schema.enum && !schema.enum.some(value => stable(value) === stable(data))) fail('SCHEMA_INVALID');
@@ -86,23 +102,33 @@ export class ReferenceState {
   grant(spaceId, credential, collection, permissions) { if (collection === '*') fail('INVALID_ARGUMENT'); const s = this.spaces.get(spaceId); if (!s.grants.has(credential)) s.grants.set(credential, new Map()); s.grants.get(credential).set(collection, new Set(permissions)); s.policyVersion++; }
   revoke(spaceId, credential, collection) { const s = this.spaces.get(spaceId); if (collection === undefined) s.grants.delete(credential); else { s.grants.get(credential)?.delete(collection); if (!s.grants.get(credential)?.size) s.grants.delete(credential); } s.policyVersion++; }
   lifecycle(spaceId, state) { const s = this.spaces.get(spaceId); s.lifecycle = state; s.policyVersion++; }
-  define(spaceId, slug, schema, uniques = []) {
+  define(spaceId, slug, schema, uniques = [], sortable = []) {
     validateDefinition(schema);
     for (const u of uniques) if (!u.name || !u.paths?.length || u.paths.some(path => {
       const shape = schema.properties?.[path];
       const type = Array.isArray(shape?.type) ? shape.type.find(t => t !== 'null') : shape?.type;
       return !['string', 'number', 'integer', 'boolean'].includes(type);
     })) fail('SCHEMA_UNSUPPORTED');
+    if (!Array.isArray(sortable) || new Set(sortable).size !== sortable.length || sortable.some(path => {
+      const shape = schema.properties?.[path];
+      const type = Array.isArray(shape?.type) ? shape.type.find(t => t !== 'null') : shape?.type;
+      return !['string', 'number', 'integer', 'boolean'].includes(type);
+    })) fail('SCHEMA_UNSUPPORTED');
     const s = this.spaces.get(spaceId);
     if (s.collections.has(slug)) fail('SCHEMA_CONFLICT');
-    s.collections.set(slug, { schema: clone(schema), uniques: clone(uniques), records: new Map(), reserved: new Map(), version: 1 });
+    s.collections.set(slug, { schema: clone(schema), uniques: clone(uniques), sortable: clone(sortable), records: new Map(), reserved: new Map(), version: 1 });
   }
   revise(spaceId, slug, expectedVersion, schema) {
     validateDefinition(schema);
     const c = this.spaces.get(spaceId)?.collections.get(slug);
     if (!c) fail('NOT_FOUND');
     if (c.version !== expectedVersion) fail('SCHEMA_CONFLICT');
-    const withoutDescription = value => JSON.parse(JSON.stringify(value, (key, v) => key === 'description' ? undefined : v));
+    // Traverse schema nodes, not arbitrary object keys: "description" may itself be a property name.
+    const withoutDescription = value => {
+      const { description, properties, items, ...keywords } = value;
+      return { ...keywords, ...(properties === undefined ? {} : { properties: Object.fromEntries(Object.entries(properties).map(([name, shape]) => [name, withoutDescription(shape)])) }),
+        ...(items === undefined ? {} : { items: withoutDescription(items) }) };
+    };
     const old = c.schema;
     if (stable(withoutDescription({ ...old, properties: {} })) !== stable(withoutDescription({ ...schema, properties: {} })) ||
       Object.entries(old.properties ?? {}).some(([name, shape]) => !schema.properties?.[name] || stable(withoutDescription(shape)) !== stable(withoutDescription(schema.properties[name])))) fail('SCHEMA_BREAKING');
@@ -189,23 +215,54 @@ export class ReferenceState {
     this.receipts.set(identity, { fingerprint, receipt });
     return clone(receipt);
   }
-  query({ spaceId, credential, collection, limit, cursor }) {
+  query({ spaceId, credential, collection, limit, cursor, sort }) {
     const { s, c } = this.#access(spaceId, credential, collection, 'read');
     if (!Number.isSafeInteger(limit) || limit < 1) fail('INVALID_ARGUMENT');
+    if (sort !== undefined && (!sort || Array.isArray(sort) || typeof sort !== 'object' ||
+      Object.keys(sort).some(key => !['field', 'direction'].includes(key)) ||
+      !c.sortable.includes(sort.field) || !['asc', 'desc'].includes(sort.direction))) fail('INVALID_ARGUMENT');
+    const order = sort === undefined ? null : { field: sort.field, direction: sort.direction };
+    const tuple = record => {
+      if (!order) return { value: record.createdAt, id: record.id };
+      const has = Object.hasOwn(record.data, order.field);
+      const value = record.data[order.field];
+      const rank = !has ? 0 : value === null ? 1 : 2;
+      const sortableValue = rank === 2 && c.schema.properties[order.field].format === 'date-time' ? utcInstant(value) : value;
+      return { rank, value: rank === 2 ? sortableValue : null, id: record.id };
+    };
+    const scalarCompare = (a, b) => typeof a === 'string'
+      ? Buffer.compare(Buffer.from(a), Buffer.from(b)) : a < b ? -1 : a > b ? 1 : 0;
+    const valueCompare = (a, b) => {
+      if (order && c.schema.properties[order.field].format === 'date-time') {
+        const whole = scalarCompare(a.slice(0, 19), b.slice(0, 19));
+        if (whole) return whole;
+        const fraction = value => value.slice(19, -1).replace(/^\./, '');
+        const left = fraction(a), right = fraction(b);
+        return scalarCompare(left.padEnd(Math.max(left.length, right.length), '0'), right.padEnd(Math.max(left.length, right.length), '0'));
+      }
+      return scalarCompare(a, b);
+    };
+    const compare = (a, b) => {
+      const primary = order
+        ? a.rank === b.rank ? a.rank === 2 ? valueCompare(a.value, b.value) : 0 : a.rank < b.rank ? -1 : 1
+        : scalarCompare(a.value, b.value);
+      if (primary) return order?.direction === 'desc' ? -primary : primary;
+      return scalarCompare(a.id, b.id);
+    };
     let after = null;
     if (cursor) {
       let decoded;
       try { decoded = JSON.parse(Buffer.from(cursor, 'base64url').toString()); } catch { fail('CURSOR_INVALID'); }
       const { signature, ...binding } = decoded;
-      if (binding.spaceId !== spaceId || binding.credential !== credential || binding.collection !== collection || binding.policyVersion !== s.policyVersion || binding.schemaVersion !== c.version || signature !== this.#sign(binding)) fail('CURSOR_INVALID');
-      if (!binding.after || typeof binding.after.createdAt !== 'string' || typeof binding.after.id !== 'string') fail('CURSOR_INVALID');
+      if (binding.spaceId !== spaceId || binding.credential !== credential || binding.collection !== collection || binding.policyVersion !== s.policyVersion || binding.schemaVersion !== c.version || stable(binding.sort) !== stable(order) || signature !== this.#sign(binding)) fail('CURSOR_INVALID');
+      if (!binding.after || typeof binding.after.id !== 'string' || (!order && typeof binding.after.value !== 'string') ||
+        (order && ![0, 1, 2].includes(binding.after.rank))) fail('CURSOR_INVALID');
       after = binding.after;
     }
-    const compare = (a, b) => a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-    const sorted = [...c.records.values()].filter(r => !r.deleted && (!after || compare(r, after) > 0)).sort(compare);
+    const sorted = [...c.records.values()].filter(r => !r.deleted && (!after || compare(tuple(r), after) > 0)).sort((a, b) => compare(tuple(a), tuple(b)));
     const items = sorted.slice(0, limit).map(clone);
     const last = items.at(-1);
-    const payload = { spaceId, credential, collection, policyVersion: s.policyVersion, schemaVersion: c.version, after: last && { createdAt: last.createdAt, id: last.id } };
+    const payload = { spaceId, credential, collection, policyVersion: s.policyVersion, schemaVersion: c.version, sort: order, after: last && tuple(last) };
     return { items, cursor: sorted.length > limit ? Buffer.from(JSON.stringify({ ...payload, signature: this.#sign(payload) })).toString('base64url') : null };
   }
   count(args) { return this.query({ ...args, limit: Number.MAX_SAFE_INTEGER }).items.length; }

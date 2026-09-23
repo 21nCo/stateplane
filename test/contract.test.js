@@ -310,3 +310,100 @@ test('caller schema precondition participates in fingerprint but compatible revi
   write(db, 'replace', id, 2, 'next', { data: request.data, expectedSchemaVersion: 2 });
   assert.equal(db.get({ ...scope, id }).revision, 3);
 });
+
+test('definition rejects invalid keyword values and measures string lengths in Unicode codepoints', () => {
+  const db = setup();
+  const withLabel = shape => ({ ...schema, properties: { ...schema.properties, label: shape } });
+  for (const [name, shape] of [
+    ['negative-length', { type: 'string', minLength: -1 }],
+    ['fractional-length', { type: 'string', maxLength: 1.5 }],
+    ['inverted-length', { type: 'string', minLength: 2, maxLength: 1 }],
+    ['bad-minimum', { type: 'number', minimum: 'a' }],
+    ['infinite-maximum', { type: 'number', maximum: Infinity }],
+    ['inverted-bounds', { type: 'number', minimum: 2, maximum: 1 }],
+    ['scalar-enum', { type: 'string', enum: 'x' }],
+    ['empty-enum', { type: 'string', enum: [] }],
+    ['wrong-type-enum', { type: 'string', enum: [1] }],
+    ['wrong-description', { type: 'string', description: false }],
+    ['duplicate-type', { type: ['string', 'string'] }],
+    ['bad-item-bounds', { type: 'array', items: { type: 'string' }, minItems: -1 }]
+  ]) code(() => db.define('sp_a', name, withLabel(shape)), 'SCHEMA_UNSUPPORTED');
+  db.define('sp_a', 'unicode', withLabel({ type: 'string', minLength: 2, maxLength: 2 }));
+  db.grant('sp_a', 'agent', 'unicode', ['read', 'write']);
+  const unicodeScope = { ...scope, collection: 'unicode', operation: 'create' };
+  code(() => db.mutate({ ...unicodeScope, data: { label: '💫' }, idempotencyKey: 'one' }), 'SCHEMA_INVALID');
+  const receipt = db.mutate({ ...unicodeScope, data: { label: '💫a' }, idempotencyKey: 'two' });
+  assert.equal(receipt.revision, 1);
+  code(() => db.mutate({ ...unicodeScope, data: { label: '💫ab' }, idempotencyKey: 'three' }), 'SCHEMA_INVALID');
+});
+
+test('compatibility compares the schema of a field literally named description', () => {
+  const db = setup();
+  const original = { ...schema, properties: { ...schema.properties, description: { type: 'string', description: 'annotation one' } } };
+  assert.equal(db.revise('sp_a', 'entries', 1, original), 2);
+  const id = create(db, 'item', { label: 'entry', description: 'value' }, 'one').ref.id;
+  const changed = { ...original, properties: { ...original.properties, description: { type: 'number' } } };
+  code(() => db.revise('sp_a', 'entries', 2, changed), 'SCHEMA_BREAKING');
+  assert.equal(db.get({ ...scope, id }).data.description, 'value');
+  assert.equal(db.revise('sp_a', 'entries', 2, { ...original, properties: { ...original.properties, description: { ...original.properties.description, description: 'annotation two' } } }), 3);
+  assert.equal(write(db, 'replace', id, 1, 'two', { data: { label: 'entry', description: 'still valid' } }).schemaVersion, 3);
+});
+
+test('key normalization uses the fixed Unicode White_Space set, not JS trim', () => {
+  const db = setup();
+  create(db, '\u0085e\u0301\u2000', { label: 'a' }, 'one');
+  code(() => create(db, '\u00e9', { label: 'b' }, 'two'), 'UNIQUE_CONFLICT');
+  code(() => create(db, '\u0085', { label: 'b' }, 'three'), 'INVALID_ARGUMENT');
+  create(db, '\ufeff\u00e9', { label: 'b' }, 'four'); // FEFF is not in the published set
+});
+
+test('optional sort keyset distinguishes missing/null/value in either direction with ID ties', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  db.define('sp_a', 'entries', schema, [], ['ordinal']);
+  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  const entries = [
+    ['value-2', { label: 'v2', ordinal: 2 }],
+    ['missing-1', { label: 'm1' }],
+    ['null-1', { label: 'n1', ordinal: null }],
+    ['value-1', { label: 'v1', ordinal: 1 }],
+    ['missing-2', { label: 'm2' }],
+    ['null-2', { label: 'n2', ordinal: null }],
+    ['value-1b', { label: 'v1b', ordinal: 1 }]
+  ];
+  for (const [key, data] of entries) create(db, key, data, key);
+  const pageAll = direction => {
+    const seen = [];
+    let cursor;
+    do {
+      const page = db.query({ ...scope, limit: 2, sort: { field: 'ordinal', direction }, cursor });
+      seen.push(...page.items.map(item => item.key));
+      if (cursor === undefined && page.cursor) code(() => db.query({ ...scope, limit: 2, cursor: page.cursor }), 'CURSOR_INVALID');
+      cursor = page.cursor;
+    } while (cursor);
+    return seen;
+  };
+  assert.deepEqual(pageAll('asc'), ['missing-1', 'missing-2', 'null-1', 'null-2', 'value-1', 'value-1b', 'value-2']);
+  assert.deepEqual(pageAll('desc'), ['value-2', 'value-1', 'value-1b', 'null-1', 'null-2', 'missing-1', 'missing-2']);
+  code(() => db.query({ ...scope, limit: 2, sort: { field: 'label', direction: 'asc' } }), 'INVALID_ARGUMENT');
+});
+
+test('date-time sort compares UTC instants including fractional seconds, not encoded text', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  db.define('sp_a', 'entries', {
+    $schema: schema.$schema, type: 'object', additionalProperties: false,
+    properties: { observedAt: { type: 'string', format: 'date-time' } }
+  }, [], ['observedAt']);
+  db.grant('sp_a', 'agent', 'entries', ['read', 'write']);
+  for (const [key, observedAt] of [
+    ['later', '2026-09-23T12:00:00.12Z'],
+    ['whole', '2026-09-23T12:00:00Z'],
+    ['early', '2026-09-23T12:00:00.003Z'],
+    ['equal', '2026-09-23T12:00:00.0Z']
+  ]) create(db, key, { observedAt }, key);
+  const sort = { field: 'observedAt', direction: 'asc' };
+  const first = db.query({ ...scope, limit: 2, sort });
+  assert.deepEqual(first.items.map(item => item.key), ['whole', 'equal']);
+  assert.deepEqual(db.query({ ...scope, limit: 2, sort, cursor: first.cursor }).items.map(item => item.key), ['early', 'later']);
+});
