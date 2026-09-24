@@ -48,6 +48,44 @@ test('create only, NFC key, typed composite uniqueness and null/missing', () => 
   assert.equal(db.exists(scope), true);
 });
 
+test('mutation envelopes cannot inherit IDs or dispatch fields and overwrite a create', () => {
+  const db = setup();
+  const created = create(db, 'original', { label: 'original' }, 'first');
+  const id = created.ref.id;
+  const c = db.spaces.get('sp_a').collections.get('entries');
+  const snapshot = () => ({ records: structuredClone([...c.records]),
+    reservations: [...c.reserved].map(([key, row]) => [key, row.id, row.revision, row.deleted]),
+    events: structuredClone(db.events), outbox: structuredClone(db.outbox), receipts: structuredClone([...db.receipts]), seq: db.seq });
+  const before = snapshot();
+  const base = { ...scope, operation: 'create', data: { label: 'changed' }, idempotencyKey: 'second' };
+  let getterCalls = 0;
+  const accessor = { ...base };
+  Object.defineProperty(accessor, 'id', { enumerable: true, get() { getterCalls++; return id; } });
+  const hidden = { ...base };
+  Object.defineProperty(hidden, 'id', { enumerable: false, value: id });
+  const targetAccessor = { ...base };
+  Object.defineProperty(targetAccessor, 'collection', { enumerable: true, get() { getterCalls++; return 'entries'; } });
+  const decorated = { ...base, [Symbol('extra')]: true };
+  const attempts = [Object.assign(Object.create({ id }), base),
+    Object.assign(Object.create({ id }), { ...base, idempotencyKey: 'first', data: { label: 'original' } }),
+    Object.assign(Object.create({ operation: 'create' }), { ...scope, data: base.data, idempotencyKey: 'second' }),
+    Object.assign(Object.create({ collection: 'entries' }), { spaceId: scope.spaceId, credential: scope.credential, operation: 'create', data: base.data, idempotencyKey: 'second' }),
+    accessor, hidden, targetAccessor, decorated, { ...base, unknown: true }];
+  for (const request of attempts) {
+    code(() => db.mutate(request), 'INVALID_ARGUMENT');
+    assert.deepEqual(snapshot(), before);
+  }
+  assert.equal(getterCalls, 0);
+  db.revoke('sp_a', 'agent', 'entries');
+  code(() => db.mutate(attempts[0]), 'FORBIDDEN');
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
+  assert.equal(db.mutate(Object.assign(Object.create(null), { ...base, idempotencyKey: 'null-prototype', data: { label: 'fresh' } })).beforeRevision, null);
+  const replace = write(db, 'replace', id, 1, 'replace', { data: { label: 'updated' } });
+  assert.equal(replace.beforeRevision, 1);
+  assert.equal(db.mutate({ ...scope, operation: 'replace', id, expectedRevision: 1, idempotencyKey: 'replace', data: { label: 'updated' } }).replayed, true);
+  assert.equal(db.get({ ...scope, id }).data.label, 'updated');
+});
+
 test('generated IDs and external keys have separate namespaces, including tombstones', () => {
   const db = setup();
   const external = create(db, 'rec_2', { label: 'external' }, 'one');
@@ -362,6 +400,31 @@ test('definition rejects scalar roots, open nested objects and nullable non-scal
   const valid = db.mutate({ ...scope, collection: 'nested', operation: 'create', data: { item: [{ label: 'fine' }] }, idempotencyKey: 'valid' });
   assert.equal(valid.revision, 1);
   code(() => db.mutate({ ...scope, collection: 'nested', operation: 'create', data: { item: [{ label: 'fine', surprise: true }] }, idempotencyKey: 'bad' }), 'SCHEMA_INVALID');
+});
+
+test('schema type arrays require a two-member nullable scalar union at define and revise', () => {
+  const db = setup();
+  const c = db.spaces.get('sp_a').collections.get('entries');
+  const first = create(db, 'first', { label: 'first' }, 'first');
+  const before = [db.events.length, db.outbox.length, db.receipts.size, c.records.size, c.reserved.size];
+  const child = shape => ({ ...schema, properties: { ...schema.properties, optional: shape } });
+  const invalid = [
+    { type: ['string'] },
+    { type: ['object'], additionalProperties: false, properties: {} },
+    { type: ['array'], items: { type: 'string' } },
+    { type: 'array', items: { type: ['string'] } }
+  ];
+  for (const [index, shape] of invalid.entries()) {
+    const candidate = child(shape);
+    code(() => db.define('sp_a', `invalid-${index}`, candidate), 'SCHEMA_UNSUPPORTED');
+    code(() => db.revise('sp_a', 'entries', 1, candidate), 'SCHEMA_UNSUPPORTED');
+    assert.equal(c.version, 1);
+    assert.equal(db.spaces.get('sp_a').collections.has(`invalid-${index}`), false);
+    assert.deepEqual([db.events.length, db.outbox.length, db.receipts.size, c.records.size, c.reserved.size], before);
+  }
+  assert.equal(db.get({ ...scope, id: first.ref.id }).revision, 1);
+  db.define('sp_a', 'scalar', child({ type: 'string' }));
+  assert.equal(db.revise('sp_a', 'entries', 1, child({ type: ['string', 'null'] })), 2);
 });
 
 test('accepted schema and uniqueness definitions are snapshots of caller input', () => {

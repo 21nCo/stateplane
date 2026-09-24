@@ -146,7 +146,8 @@ const definitionType = (s, root) => {
   if (root ? s.$schema !== 'https://json-schema.org/draft/2020-12/schema' : Object.hasOwn(s, '$schema')) fail('SCHEMA_UNSUPPORTED');
   const types = Array.isArray(s.type) ? schemaArrayMembers(s.type) : [s.type];
   if (root && s.type !== 'object') fail('SCHEMA_UNSUPPORTED');
-  if (types.length === 0 || types.length > 2 || new Set(types).size !== types.length || (types.length === 2 &&
+  if ((Array.isArray(s.type) && types.length !== 2) || types.length === 0 || types.length > 2 ||
+    new Set(types).size !== types.length || (types.length === 2 &&
     (!types.includes('null') || !['string', 'number', 'integer', 'boolean'].includes(types.find(t => t !== 'null')))) ||
     types.some(t => !['string', 'number', 'integer', 'boolean', 'object', 'array', 'null'].includes(t)) ||
     (types.length === 1 && types[0] === 'null')) fail('SCHEMA_UNSUPPORTED');
@@ -250,6 +251,30 @@ const validateData = (data, schema) => {
 };
 const mutationFields = new Set(['spaceId', 'credential', 'collection', 'operation', 'id', 'externalKey', 'data', 'set', 'unset',
   'expectedRevision', 'expectedSchemaVersion', 'idempotencyKey']);
+// Authorization uses only own target fields; never invoke an inherited getter
+// while locating the requested collection. The remaining envelope is checked
+// after target authorization, before looking up or disclosing any receipt.
+const mutationTarget = request => {
+  if (request === null || typeof request !== 'object') fail('INVALID_ARGUMENT');
+  const target = {};
+  for (const key of ['spaceId', 'credential', 'collection']) {
+    const descriptor = Object.getOwnPropertyDescriptor(request, key);
+    if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) fail('INVALID_ARGUMENT');
+    target[key] = descriptor.value;
+  }
+  return target;
+};
+const mutationEnvelope = request => {
+  if (!plainObject(request)) fail('INVALID_ARGUMENT');
+  const fields = {};
+  for (const key of Reflect.ownKeys(request)) {
+    const descriptor = Object.getOwnPropertyDescriptor(request, key);
+    if (typeof key !== 'string' || !mutationFields.has(key) || !descriptor?.enumerable ||
+      !Object.hasOwn(descriptor, 'value')) fail('INVALID_ARGUMENT');
+    fields[key] = descriptor.value;
+  }
+  return fields;
+};
 const validateMutationInput = ({ operation, id, externalKey, expectedRevision, expectedSchemaVersion, idempotencyKey, supplied }) => {
   if (typeof idempotencyKey !== 'string' || !idempotencyKey ||
     !['create', 'replace', 'patch', 'delete'].includes(operation) || [...supplied].some(field => !mutationFields.has(field))) fail('INVALID_ARGUMENT');
@@ -425,10 +450,14 @@ export class ReferenceState {
     return r && !r.deleted && r.keyMode === mode ? clone(r) : null;
   }
   mutate(request) {
-    const { spaceId, credential, collection, operation, id, externalKey, data, set, unset, expectedRevision, expectedSchemaVersion, idempotencyKey } = request;
+    const target = mutationTarget(request);
+    const { spaceId, credential, collection } = target;
     const { c } = this.#access(spaceId, credential, collection, 'records:write', true);
+    const fields = mutationEnvelope(request);
+    if (fields.spaceId !== spaceId || fields.credential !== credential || fields.collection !== collection) fail('INVALID_ARGUMENT');
+    const { operation, id, externalKey, data, set, unset, expectedRevision, expectedSchemaVersion, idempotencyKey } = fields;
     const normalized = validateMutationInput({ operation, id, externalKey, expectedRevision, expectedSchemaVersion,
-      idempotencyKey, supplied: new Set(Reflect.ownKeys(request)) });
+      idempotencyKey, supplied: new Set(Object.keys(fields)) });
     const identity = stable([spaceId, credential, operation, idempotencyKey]);
     const previous = this.receipts.get(identity);
     // Before parsing a receipt's payload, check that its original collection is still visible.
@@ -445,7 +474,7 @@ export class ReferenceState {
       return { ...clone(previous.receipt), replayed: true };
     }
     if (expectedSchemaVersion !== undefined && expectedSchemaVersion !== c.version) fail('SCHEMA_CONFLICT');
-    const current = id ? c.records.get(id) : null;
+    const current = operation === 'create' ? null : c.records.get(id);
     if (operation !== 'create' && (!current || current.deleted)) fail('NOT_FOUND');
     if (operation !== 'create' && current.revision !== expectedRevision) fail('REVISION_CONFLICT');
     const nextData = mutationData(operation, data, set, unset, current, c.schema);

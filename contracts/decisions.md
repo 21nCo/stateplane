@@ -17,6 +17,7 @@ Status: accepted logical decisions; **not** evidence of deployed infrastructure.
 ## D3 — Conditional mutations, keys and links
 
 - Create is create-only. Existing-record writes require a revision; replace removes omitted optional fields, while patch uses explicit top-level set/unset. Reject non-applicable inputs before receipt lookup. Null is present; missing is absent.
+- Authorize an own requested target first, then validate/snapshot the undecorated own-data mutation envelope before receipt lookup. Reject inherited dispatch/ID fields, accessors, hidden or symbol fields and extra fields as `INVALID_ARGUMENT`; never let create consult an inherited ID or overwrite a row.
 - Generated IDs, external keys and named composite reservations occupy separate typed namespaces. Lookup selects generated or external mode, never falls back, and returns only live records even when key text collides. Existing-record mutations reject key input; tombstones reserve external and composite keys.
 - Normalize external keys with NFC and the fixed Unicode White_Space edge set (including U+0085, excluding U+FEFF). Compare composite unique string components using NFC **only for reservation**, leaving stored data byte-exact; equivalent UTC date-time instants reserve one tuple.
 - Collection unique descriptor/paths and sortable declarations are dense undecorated JSON arrays; descriptor objects have exactly own enumerable data fields `name` and `paths`. Validate and snapshot descriptors before checking names or cloning; malformed definitions fail `SCHEMA_UNSUPPORTED` before creation. Grant capability lists are likewise dense undecorated ordinary arrays; malformed tokens fail `INVALID_ARGUMENT` before policy changes. RFC3339 UTC includes actual IERS-announced positive leap seconds; preserve chronological order and fractional equivalence across record validation, reservations and typed sorts (STA-7/8 update the leap table).
@@ -36,6 +37,7 @@ Status: accepted logical decisions; **not** evidence of deployed infrastructure.
 ## D5 — Schema syntax and evolution
 
 - Use the bounded Draft 2020-12 JSON Schema subset, not a custom DSL. Reject unknown/malformed keyword values and breaking revisions. Count string lengths as Unicode codepoints; compatibility ignores only schema-node `description` annotations, not a property named `description`.
+- A schema `type` is a single type-name string or exactly the two-member nullable scalar union; reject singleton arrays (including child object/array nodes) as `SCHEMA_UNSUPPORTED` at define/revise without effects.
 - Present optional keywords with `undefined` are malformed, not absent. Validate all definition nodes as JSON-compatible before define/revise comparison; reject without effects as `SCHEMA_UNSUPPORTED`.
 - Integers use the inclusive binary64 safe range (±9007199254740991), because JavaScript-based JSON clients/fingerprints cannot reliably preserve larger integer identity. Finite `number` is separate from this interoperability bound.
 - Only top-level optional additions are compatible in v1 after index readiness where needed; nested additions require a later migration workflow.
