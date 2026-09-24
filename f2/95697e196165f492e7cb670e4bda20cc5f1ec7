@@ -1,0 +1,23 @@
+contracts/decisions.md
+  s_5c176ddac99943::t_354ee977b14946 59
+contracts/v1.md
+  s_5c176ddac99943::t_c97a5fb9fdd51c 57-58
+test/reference.js
+  s_5c176ddac99943::t_d6fef148bfe33a 356-369,563
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f295697e196165f492e7cb670e4bda20cc5f1ec7",
+  "prompts": {},
+  "sessions": {
+    "s_5c176ddac99943": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bf2c5397-8adb-4c0d-a657-a5d0c5a161aa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
