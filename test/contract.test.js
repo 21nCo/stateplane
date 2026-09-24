@@ -1017,3 +1017,28 @@ test('noncanonical base64url aliases cannot reuse signed page cursors', () => {
   }
   assert.deepEqual([...seen].sort(), [1, 2]);
 });
+
+test('JSON envelope aliases cannot reuse a signed page cursor', () => {
+  const db = setup();
+  for (let index = 0; index < 3; index++) create(db, `page-${index}`, { label: `page-${index}` }, `page-${index}`);
+  const args = { ...scope, limit: 1 };
+  const cursor = db.query(args).cursor;
+  const text = Buffer.from(cursor, 'base64url').toString('utf8');
+  const envelope = JSON.parse(text);
+  const aliases = [
+    ` ${text} `,
+    text.replace('"spaceId":', '"spaceId":"sp_a","spaceId":'),
+    JSON.stringify(Object.fromEntries(Object.entries(envelope).reverse()))
+  ];
+  for (const aliasText of aliases) {
+    assert.notEqual(aliasText, text);
+    assert.deepEqual(JSON.parse(aliasText), envelope); // same signed binding, different wire bytes
+    const alias = Buffer.from(aliasText, 'utf8').toString('base64url');
+    assert.equal(Buffer.from(alias, 'base64url').toString('base64url'), alias);
+    code(() => db.query({ ...args, cursor: alias }), 'CURSOR_INVALID');
+  }
+  code(() => db.query({ ...args, cursor: Buffer.from([0xff]).toString('base64url') }), 'CURSOR_INVALID');
+  assert.equal(db.query({ ...args, cursor }).items[0].key, 'page-1');
+  db.revoke('sp_a', 'agent', 'entries');
+  code(() => db.query({ ...args, cursor: Buffer.from(aliases[1]).toString('base64url') }), 'FORBIDDEN');
+});

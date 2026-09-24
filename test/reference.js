@@ -462,7 +462,12 @@ export class ReferenceState {
     try {
       const bytes = Buffer.from(cursor, 'base64url');
       if (bytes.toString('base64url') !== cursor) fail('CURSOR_INVALID');
-      decoded = JSON.parse(bytes.toString());
+      const text = bytes.toString('utf8');
+      if (!Buffer.from(text, 'utf8').equals(bytes)) fail('CURSOR_INVALID');
+      decoded = JSON.parse(text);
+      // Authenticate the single emitted wire form, not a binding reconstructed
+      // from alternate JSON spellings (duplicate keys, order or whitespace).
+      if (stable(decoded) !== text) fail('CURSOR_INVALID');
     } catch { fail('CURSOR_INVALID'); }
     if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) fail('CURSOR_INVALID');
     const { signature, ...binding } = decoded;
@@ -487,7 +492,7 @@ export class ReferenceState {
     const items = sorted.slice(0, limit).map(clone);
     const last = items.at(-1);
     const payload = { spaceId, credential, collection, policyVersion: s.policyVersion, schemaVersion: c.version, sort: order, after: last && tuple(last) };
-    return { items, cursor: sorted.length > limit ? Buffer.from(JSON.stringify({ ...payload, signature: this.#sign(payload) })).toString('base64url') : null };
+    return { items, cursor: sorted.length > limit ? Buffer.from(stable({ ...payload, signature: this.#sign(payload) })).toString('base64url') : null };
   }
   count({ cursor, ...args }) {
     if (cursor !== undefined) fail('INVALID_ARGUMENT');

@@ -44,6 +44,7 @@ Status: accepted logical decisions; **not** evidence of deployed infrastructure.
 ## D6 — Exact reads and consistent analysis
 
 - Exact filtered count/exists and record status come from authority; unsupported filters fail closed. Live keyset pages bind scope/query/schema, are not snapshots, and cannot be supplied to count/exists.
+- A signed cursor is accepted in one emitted wire representation, not reconstructed from alternate JSON spellings of the same binding. The in-memory oracle checks exact UTF-8 JSON envelope bytes and canonical unpadded base64url before validating the signature; real adapters may choose another opaque authenticated encoding but reject aliases and authorize before decoding.
 - Optional sorts order missing, null, value ascending (reverse the primary order descending), with ID always ascending on ties. Export/long analysis needs a pinned consistent boundary and fetch-time authorization.
 - Proof: STA-8 exact queries; STA-15 analytics; STA-17 export.
 
