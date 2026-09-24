@@ -65,12 +65,14 @@ test('mutation envelopes cannot inherit IDs or dispatch fields and overwrite a c
   Object.defineProperty(hidden, 'id', { enumerable: false, value: id });
   const targetAccessor = { ...base };
   Object.defineProperty(targetAccessor, 'collection', { enumerable: true, get() { getterCalls++; return 'entries'; } });
+  const hiddenTarget = { ...base };
+  Object.defineProperty(hiddenTarget, 'collection', { enumerable: false, value: 'entries' });
   const decorated = { ...base, [Symbol('extra')]: true };
   const attempts = [Object.assign(Object.create({ id }), base),
     Object.assign(Object.create({ id }), { ...base, idempotencyKey: 'first', data: { label: 'original' } }),
     Object.assign(Object.create({ operation: 'create' }), { ...scope, data: base.data, idempotencyKey: 'second' }),
     Object.assign(Object.create({ collection: 'entries' }), { spaceId: scope.spaceId, credential: scope.credential, operation: 'create', data: base.data, idempotencyKey: 'second' }),
-    accessor, hidden, targetAccessor, decorated, { ...base, unknown: true }];
+    accessor, hidden, hiddenTarget, targetAccessor, decorated, { ...base, unknown: true }];
   for (const request of attempts) {
     code(() => db.mutate(request), 'INVALID_ARGUMENT');
     assert.deepEqual(snapshot(), before);
@@ -78,12 +80,62 @@ test('mutation envelopes cannot inherit IDs or dispatch fields and overwrite a c
   assert.equal(getterCalls, 0);
   db.revoke('sp_a', 'agent', 'entries');
   code(() => db.mutate(attempts[0]), 'FORBIDDEN');
+  code(() => db.mutate(hiddenTarget), 'FORBIDDEN');
+  assert.deepEqual(snapshot(), before);
   db.grant('sp_a', 'agent', 'entries', recordAccess);
   assert.equal(db.mutate(Object.assign(Object.create(null), { ...base, idempotencyKey: 'null-prototype', data: { label: 'fresh' } })).beforeRevision, null);
   const replace = write(db, 'replace', id, 1, 'replace', { data: { label: 'updated' } });
   assert.equal(replace.beforeRevision, 1);
   assert.equal(db.mutate({ ...scope, operation: 'replace', id, expectedRevision: 1, idempotencyKey: 'replace', data: { label: 'updated' } }).replayed, true);
   assert.equal(db.get({ ...scope, id }).data.label, 'updated');
+});
+
+test('definition and revision require own keywords despite polluted prototypes', () => {
+  const db = setup();
+  const collection = db.spaces.get('sp_a').collections.get('entries');
+  const snapshot = () => ({ collections: [...db.spaces.get('sp_a').collections.keys()],
+    version: collection.version, schema: structuredClone(collection.schema), rows: structuredClone([...collection.records]),
+    reservations: structuredClone([...collection.reserved]), events: structuredClone(db.events),
+    outbox: structuredClone(db.outbox), receipts: structuredClone([...db.receipts]) });
+  const before = snapshot();
+  const uri = schema.$schema;
+  const inheritedRoot = { type: 'object', additionalProperties: false, properties: { label: { type: 'string' } }, required: ['label'] };
+  const inheritedChild = { ...schema, properties: { label: {} } };
+  const inheritedClosed = { $schema: uri, type: 'object', properties: {} };
+  const inheritedNestedClosed = { ...schema, properties: { label: { type: 'object', properties: {} } } };
+  const previous = Object.fromEntries(['$schema', 'type', 'additionalProperties', 'enum', 'minLength', 'properties']
+    .map(key => [key, Object.getOwnPropertyDescriptor(Object.prototype, key)]));
+  try {
+    Object.defineProperties(Object.prototype, {
+      $schema: { configurable: true, value: uri },
+      type: { configurable: true, value: 'string' },
+      additionalProperties: { configurable: true, value: false },
+      enum: { configurable: true, value: ['blocked'] },
+      minLength: { configurable: true, value: 100 },
+      properties: { configurable: true, value: { label: { type: 'string' } } }
+    });
+    for (const [name, malformed] of [
+      ['missing-root-uri', inheritedRoot], ['missing-child-type', inheritedChild],
+      ['missing-closed-flag', inheritedClosed], ['missing-nested-closed-flag', inheritedNestedClosed]
+    ]) {
+      code(() => db.define('sp_a', name, malformed), 'SCHEMA_UNSUPPORTED');
+      code(() => db.revise('sp_a', 'entries', 1, malformed), 'SCHEMA_UNSUPPORTED');
+      assert.deepEqual(snapshot(), before);
+    }
+    code(() => db.revise('sp_a', 'entries', 1, { $schema: uri, type: 'object', additionalProperties: false }), 'SCHEMA_BREAKING');
+    assert.deepEqual(snapshot(), before);
+    const valid = { ...schema, properties: { ...schema.properties, note: { type: 'string' } } };
+    db.define('sp_a', 'valid', valid);
+    assert.equal(db.revise('sp_a', 'entries', 1, valid), 2);
+    assert.equal(create(db, 'valid', { label: 'ok' }, 'valid').beforeRevision, null);
+  } finally {
+    for (const [key, descriptor] of Object.entries(previous)) {
+      if (descriptor) Object.defineProperty(Object.prototype, key, descriptor);
+      else delete Object.prototype[key];
+    }
+  }
+  assert.equal(collection.version, 2);
+  assert.equal(db.spaces.get('sp_a').collections.has('valid'), true);
 });
 
 test('generated IDs and external keys have separate namespaces, including tombstones', () => {

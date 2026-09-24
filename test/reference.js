@@ -143,7 +143,8 @@ const uniqueDescriptors = (uniques, scalarPath) => {
 };
 const definitionType = (s, root) => {
   if (!plainObject(s) || Object.keys(s).some(name => !allowedKeywords.has(name))) fail('SCHEMA_UNSUPPORTED');
-  if (root ? s.$schema !== 'https://json-schema.org/draft/2020-12/schema' : Object.hasOwn(s, '$schema')) fail('SCHEMA_UNSUPPORTED');
+  if (root ? (!Object.hasOwn(s, '$schema') || s.$schema !== 'https://json-schema.org/draft/2020-12/schema') : Object.hasOwn(s, '$schema')) fail('SCHEMA_UNSUPPORTED');
+  if (!Object.hasOwn(s, 'type')) fail('SCHEMA_UNSUPPORTED');
   const types = Array.isArray(s.type) ? schemaArrayMembers(s.type) : [s.type];
   if (root && s.type !== 'object') fail('SCHEMA_UNSUPPORTED');
   if ((Array.isArray(s.type) && types.length !== 2) || types.length === 0 || types.length > 2 ||
@@ -215,10 +216,12 @@ const validateDefinition = (s, root = true) => {
     if (error instanceof ContractError && error.code === 'SCHEMA_INVALID') fail('SCHEMA_UNSUPPORTED');
     throw error;
   }
-  const type = definitionType(s, root);
-  validateBounds(s, type);
-  validateDefinitionStructure(s, type);
-  validateDefinitionEnum(s);
+  // Validation reads only the supplied keywords, never Object.prototype defaults.
+  const node = Object.assign(Object.create(null), s);
+  const type = definitionType(node, root);
+  validateBounds(node, type);
+  validateDefinitionStructure(node, type);
+  validateDefinitionEnum(node);
 };
 const validateObject = (data, schema) => {
   if (!plainObject(data)) fail('SCHEMA_INVALID');
@@ -241,6 +244,8 @@ const validateArray = (data, schema) => {
   for (const value of data) validateData(value, schema.items);
 };
 const validateData = (data, schema) => {
+  // Schema validation and enum checking never borrow optional keywords from a prototype.
+  schema = Object.assign(Object.create(null), schema);
   if (data === null && !(Array.isArray(schema.type) ? schema.type.includes('null') : schema.type === 'null')) fail('SCHEMA_INVALID');
   const type = Array.isArray(schema.type) ? schema.type.find(t => t !== 'null') : schema.type;
   if (data === null) { /* A nullable value must still satisfy enum below. */ }
@@ -259,7 +264,7 @@ const mutationTarget = request => {
   const target = {};
   for (const key of ['spaceId', 'credential', 'collection']) {
     const descriptor = Object.getOwnPropertyDescriptor(request, key);
-    if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) fail('INVALID_ARGUMENT');
+    if (!descriptor || !Object.hasOwn(descriptor, 'value')) fail('INVALID_ARGUMENT');
     target[key] = descriptor.value;
   }
   return target;
@@ -403,7 +408,9 @@ export class ReferenceState {
     if (c.version !== expectedVersion) fail('SCHEMA_CONFLICT');
     // Traverse schema nodes, not arbitrary object keys: "description" may itself be a property name.
     const withoutDescription = value => {
-      const { description, properties, items, ...keywords } = value;
+      value = Object.assign(Object.create(null), value);
+      const { description, properties, items, ...rest } = value;
+      const keywords = Object.assign(Object.create(null), rest);
       for (const keyword of ['required', 'type', 'enum']) {
         if (Array.isArray(keywords[keyword])) {
           const members = new Map(keywords[keyword].map(member => [stable(member), member]));
@@ -415,8 +422,11 @@ export class ReferenceState {
         ...(items === undefined ? {} : { items: withoutDescription(items) }) };
     };
     const old = c.schema;
+    const oldProperties = Object.hasOwn(old, 'properties') ? old.properties : {};
+    const nextProperties = Object.hasOwn(schema, 'properties') ? schema.properties : {};
     if (stable(withoutDescription({ ...old, properties: {} })) !== stable(withoutDescription({ ...schema, properties: {} })) ||
-      Object.entries(old.properties ?? {}).some(([name, shape]) => !schema.properties?.[name] || stable(withoutDescription(shape)) !== stable(withoutDescription(schema.properties[name])))) fail('SCHEMA_BREAKING');
+      Object.entries(oldProperties).some(([name, shape]) => !Object.hasOwn(nextProperties, name) ||
+        stable(withoutDescription(shape)) !== stable(withoutDescription(nextProperties[name])))) fail('SCHEMA_BREAKING');
     c.schema = clone(schema);
     c.version++;
     return c.version;
