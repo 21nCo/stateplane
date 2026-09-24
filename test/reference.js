@@ -1,5 +1,6 @@
 // Contract oracle only: synchronous single-process model, NOT a production repository.
 import { createHash, createHmac, randomBytes } from 'node:crypto';
+import { types } from 'node:util';
 
 export class ContractError extends Error {
   constructor(code) { super(code); this.code = code; }
@@ -101,6 +102,9 @@ const validateJsonObject = (value, ancestors) => {
   }
 };
 const validateJsonPayload = (value, ancestors = new Set()) => {
+  // A transparent Proxy can impersonate plain JSON yet fail structuredClone
+  // (or alias a committed receipt). Reject it before any reflective reads.
+  if (types.isProxy(value)) fail('SCHEMA_INVALID');
   if (value === null || typeof value === 'boolean') return;
   if (typeof value === 'number' && Number.isFinite(value)) return;
   if (typeof value === 'string' && wellFormed(value)) return;
@@ -114,7 +118,7 @@ const validateJsonPayload = (value, ancestors = new Set()) => {
 // Keyword arrays are JSON arrays, not sparse or decorated in-process arrays.
 // Validate them before set comparisons, where holes or duplicates could disappear.
 const schemaArrayMembers = (value, errorCode = 'SCHEMA_UNSUPPORTED') => {
-  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype ||
+  if (types.isProxy(value) || !Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype ||
     Reflect.ownKeys(value).length !== value.length + 1) fail(errorCode);
   const members = [];
   for (let index = 0; index < value.length; index++) {
@@ -126,7 +130,7 @@ const schemaArrayMembers = (value, errorCode = 'SCHEMA_UNSUPPORTED') => {
 };
 const uniqueDescriptors = (uniques, scalarPath) => {
   const entries = schemaArrayMembers(uniques).map(value => {
-    if (!plainObject(value)) fail('SCHEMA_UNSUPPORTED');
+    if (types.isProxy(value) || !plainObject(value)) fail('SCHEMA_UNSUPPORTED');
     // Inspect own descriptors, never caller getters; retain only validated data.
     const fields = Object.getOwnPropertyDescriptors(value);
     const keys = Reflect.ownKeys(fields);
@@ -156,7 +160,7 @@ const definitionType = (s, root) => {
 };
 const validateSizeBounds = s => {
   for (const [min, max] of [['minLength', 'maxLength'], ['minItems', 'maxItems']]) {
-    for (const key of [min, max]) if (s[key] !== undefined && (!Number.isSafeInteger(s[key]) || s[key] < 0)) fail('SCHEMA_UNSUPPORTED');
+    for (const key of [min, max]) if (s[key] !== undefined && (!Number.isInteger(s[key]) || s[key] < 0)) fail('SCHEMA_UNSUPPORTED');
     if (s[min] !== undefined && s[max] !== undefined && s[min] > s[max]) fail('SCHEMA_UNSUPPORTED');
   }
 };
@@ -294,7 +298,7 @@ const validateMutationInput = ({ operation, id, externalKey, expectedRevision, e
   return externalKey === undefined ? undefined : keyOf(externalKey);
 };
 const validatePatchShape = (set, unset) => {
-  if (!plainObject(set) || !Array.isArray(unset) || Object.getPrototypeOf(unset) !== Array.prototype ||
+  if (types.isProxy(set) || !plainObject(set) || types.isProxy(unset) || !Array.isArray(unset) || Object.getPrototypeOf(unset) !== Array.prototype ||
     Reflect.ownKeys(unset).length !== unset.length + 1) fail('INVALID_ARGUMENT');
   const paths = new Set();
   for (let index = 0; index < unset.length; index++) {

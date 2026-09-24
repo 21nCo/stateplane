@@ -878,6 +878,86 @@ test('non-JSON object instances fail at root and nested schema paths without eff
   assert.equal(create(db, 'plain', { child: {} }, 'plain').revision, 1);
 });
 
+test('proxied JSON-shaped inputs cannot escape definition, fingerprint or receipt validation', () => {
+  const db = setup();
+  const space = db.spaces.get('sp_a');
+  const collection = space.collections.get('entries');
+  const proxy = value => new Proxy(value, {});
+  const revoked = Proxy.revocable({ type: 'string' }, {});
+  revoked.revoke();
+  const committed = create(db, 'original', { label: 'original' }, 'original');
+  const snapshot = () => ({ collections: [...space.collections.keys()], version: collection.version,
+    schema: structuredClone(collection.schema), rows: structuredClone([...collection.records]),
+    reservations: [...collection.reserved].map(([key, row]) => [key, row.id, row.revision]),
+    events: structuredClone(db.events), outbox: structuredClone(db.outbox),
+    receipts: structuredClone([...db.receipts]), seq: db.seq });
+  const before = snapshot();
+  const invalidSchemas = [proxy(schema), { ...schema, properties: { ...schema.properties, label: proxy({ type: 'string' }) } },
+    { ...schema, required: proxy(['label']) }, { ...schema, properties: proxy({ ...schema.properties }) },
+    { ...schema, properties: { ...schema.properties, label: revoked.proxy } }];
+  for (const [index, invalid] of invalidSchemas.entries()) {
+    code(() => db.define('sp_a', `proxied-${index}`, invalid), 'SCHEMA_UNSUPPORTED');
+    code(() => db.revise('sp_a', 'entries', 1, invalid), 'SCHEMA_UNSUPPORTED');
+    assert.deepEqual(snapshot(), before);
+  }
+  for (const [index, descriptors, sortable] of [
+    [0, proxy(uniques), []], [1, [proxy({ name: 'other', paths: ['label'] })], []],
+    [2, [{ name: 'other', paths: proxy(['label']) }], []], [3, [], proxy(['label'])]
+  ]) {
+    code(() => db.define('sp_a', `descriptor-${index}`, schema, descriptors, sortable), 'SCHEMA_UNSUPPORTED');
+    assert.deepEqual(snapshot(), before);
+  }
+  const createRequest = { ...scope, operation: 'create', externalKey: 'original', data: { label: 'original' }, idempotencyKey: 'original' };
+  const invalidMutations = [
+    { ...createRequest, data: proxy({ label: 'original' }) },
+    { ...createRequest, data: { label: 'original', nested: proxy({}) } },
+    { ...createRequest, idempotencyKey: 'fresh-proxy', data: proxy({ label: 'fresh' }) },
+    { ...scope, operation: 'replace', id: committed.ref.id, expectedRevision: 1,
+      idempotencyKey: 'replace-proxy', data: proxy({ label: 'next' }) },
+    { ...scope, operation: 'patch', id: committed.ref.id, expectedRevision: 1,
+      idempotencyKey: 'patch-proxy', set: proxy({ label: 'next' }), unset: [] }
+  ];
+  for (const invalid of invalidMutations) {
+    code(() => db.mutate(invalid), invalid.operation === 'patch' ? 'INVALID_ARGUMENT' : 'SCHEMA_INVALID');
+    assert.deepEqual(snapshot(), before);
+  }
+  assert.equal(db.mutate(createRequest).replayed, true);
+  const patch = { ...scope, operation: 'patch', id: committed.ref.id, expectedRevision: 1,
+    idempotencyKey: 'valid-patch', set: { label: 'next' }, unset: [] };
+  assert.equal(db.mutate(patch).revision, 2);
+  const afterPatch = snapshot();
+  code(() => db.mutate({ ...patch, set: proxy({ label: 'next' }) }), 'INVALID_ARGUMENT');
+  assert.deepEqual(snapshot(), afterPatch);
+  assert.equal(db.mutate(patch).replayed, true);
+});
+
+test('schema size keywords accept nonnegative integer bounds beyond safe record-integer range', () => {
+  const db = setup();
+  const space = db.spaces.get('sp_a');
+  const bound = 9007199254740992;
+  const shape = property => ({ ...schema, properties: { ...schema.properties, extra: property } });
+  for (const [index, property] of [
+    { type: 'string', maxLength: bound }, { type: 'string', minLength: bound },
+    { type: 'array', items: { type: 'string' }, maxItems: bound },
+    { type: 'array', items: { type: 'string' }, minItems: bound }
+  ].entries()) {
+    db.define('sp_a', `large-${index}`, shape(property));
+    const keyword = Object.keys(property).find(key => key.startsWith('min') || key.startsWith('max'));
+    assert.equal(space.collections.get(`large-${index}`).schema.properties.extra[keyword], bound);
+  }
+  assert.equal(db.revise('sp_a', 'entries', 1, shape({ type: 'string', maxLength: bound })), 2);
+  const before = { collections: space.collections.size, version: space.collections.get('entries').version,
+    events: db.events.length, outbox: db.outbox.length, receipts: db.receipts.size };
+  for (const [index, invalid] of [-1, 0.5, Infinity, NaN, '10'].entries()) {
+    const malformed = shape({ type: 'string', maxLength: invalid });
+    code(() => db.define('sp_a', `bad-${index}`, malformed), 'SCHEMA_UNSUPPORTED');
+    code(() => db.revise('sp_a', 'entries', 2, malformed), 'SCHEMA_UNSUPPORTED');
+    assert.deepEqual({ collections: space.collections.size, version: space.collections.get('entries').version,
+      events: db.events.length, outbox: db.outbox.length, receipts: db.receipts.size }, before);
+  }
+  assert.equal(create(db, 'normal', { label: 'normal' }, 'normal').revision, 1);
+});
+
 test('grant rejects non-contract capability tokens before policy changes', () => {
   const db = setup();
   const policy = db.spaces.get('sp_a').policyVersion;
