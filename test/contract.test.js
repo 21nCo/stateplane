@@ -661,6 +661,75 @@ test('optional sort keyset distinguishes missing/null/value in either direction 
   code(() => db.query({ ...scope, limit: 2, sort: { field: 'label', direction: 'asc' } }), 'INVALID_ARGUMENT');
 });
 
+test('query, count and exists validate one own-data sort snapshot before cursor binding', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  db.define('sp_a', 'entries', schema, [], ['label']);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
+  create(db, 'one', { label: 'a', ordinal: 2 }, 'one');
+  create(db, 'two', { label: 'b', ordinal: 1 }, 'two');
+  const collection = db.spaces.get('sp_a').collections.get('entries');
+  const effects = () => structuredClone({ records: [...collection.records], reserved: [...collection.reserved],
+    events: db.events, outbox: db.outbox, receipts: [...db.receipts], seq: db.seq });
+  const before = effects();
+  let getterCalls = 0;
+  const fieldGetter = { direction: 'asc' };
+  Object.defineProperty(fieldGetter, 'field', { enumerable: true, get() {
+    getterCalls++;
+    return getterCalls === 1 ? 'label' : 'ordinal';
+  } });
+  const directionGetter = { field: 'label' };
+  Object.defineProperty(directionGetter, 'direction', { enumerable: true, get() {
+    getterCalls++;
+    return getterCalls === 1 ? 'asc' : 'desc';
+  } });
+  const throwing = { direction: 'asc' };
+  Object.defineProperty(throwing, 'field', { enumerable: true, get() { throw Error('getter invoked'); } });
+  const hidden = { field: 'label', direction: 'asc' };
+  Object.defineProperty(hidden, 'field', { value: 'label', enumerable: false });
+  const hiddenDirection = { field: 'label', direction: 'asc' };
+  Object.defineProperty(hiddenDirection, 'direction', { value: 'asc', enumerable: false });
+  const inherited = Object.assign(Object.create({ field: 'label' }), { direction: 'asc' });
+  const inheritedDirection = Object.assign(Object.create({ direction: 'asc' }), { field: 'label' });
+  const symbol = { field: 'label', direction: 'asc', [Symbol('extra')]: true };
+  const decorated = { field: 'label', direction: 'asc', extra: true };
+  let proxyTraps = 0;
+  const proxy = new Proxy({ field: 'label', direction: 'asc' }, { ownKeys() {
+    proxyTraps++;
+    throw Error('proxy trap invoked');
+  } });
+  const revoked = Proxy.revocable({ field: 'label', direction: 'asc' }, {});
+  revoked.revoke();
+  for (const sort of [fieldGetter, directionGetter, throwing, hidden, hiddenDirection, inherited,
+    inheritedDirection, symbol, decorated, new Proxy({ field: 'label', direction: 'asc' }, {}),
+    proxy, revoked.proxy, { field: 'ordinal', direction: 'asc' }, { field: 'label', direction: 'up' }, null]) {
+    for (const run of [() => db.query({ ...scope, limit: 1, sort }),
+      () => db.count({ ...scope, sort }), () => db.exists({ ...scope, sort })]) {
+      code(run, 'INVALID_ARGUMENT');
+      assert.deepEqual(effects(), before);
+    }
+  }
+  assert.equal(getterCalls, 0);
+  assert.equal(proxyTraps, 0);
+  const sort = { field: 'label', direction: 'asc' };
+  assert.deepEqual(db.query({ ...scope, limit: 2,
+    sort: Object.assign(Object.create(null), sort) }).items.map(row => row.key), ['one', 'two']);
+  const page = db.query({ ...scope, limit: 1, sort });
+  assert.deepEqual(page.items.map(row => row.key), ['one']);
+  assert.deepEqual(db.query({ ...scope, limit: 1, sort, cursor: page.cursor }).items.map(row => row.key), ['two']);
+  code(() => db.query({ ...scope, limit: 1, cursor: page.cursor, sort: { field: 'label', direction: 'desc' } }), 'CURSOR_INVALID');
+  assert.deepEqual(db.query({ ...scope, limit: 2, sort: { field: 'label', direction: 'desc' } }).items.map(row => row.key), ['two', 'one']);
+  assert.equal(db.count({ ...scope, sort }), 2);
+  assert.equal(db.exists({ ...scope, sort }), true);
+  code(() => db.count({ ...scope, sort, cursor: page.cursor }), 'INVALID_ARGUMENT');
+  code(() => db.exists({ ...scope, sort, cursor: page.cursor }), 'INVALID_ARGUMENT');
+  db.revoke('sp_a', 'agent', 'entries');
+  code(() => db.query({ ...scope, limit: 1, sort: fieldGetter }), 'FORBIDDEN');
+  code(() => db.count({ ...scope, sort: fieldGetter }), 'FORBIDDEN');
+  code(() => db.exists({ ...scope, sort: fieldGetter }), 'FORBIDDEN');
+  assert.equal(getterCalls, 0);
+});
+
 test('date-time sort compares UTC instants including fractional seconds, not encoded text', () => {
   const db = new ReferenceState();
   db.addSpace('sp_a', 'owner');

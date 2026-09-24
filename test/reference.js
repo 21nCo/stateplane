@@ -353,6 +353,20 @@ const scalarCompare = (a, b) => {
   if (a > b) return 1;
   return 0;
 };
+const queryOrder = (sort, sortable) => {
+  if (sort === undefined) return null;
+  // A proxy can run caller traps during reflection, even when later rejected.
+  if (!sort || typeof sort !== 'object' || types.isProxy(sort) || Array.isArray(sort) || !plainObject(sort)) fail('INVALID_ARGUMENT');
+  const keys = Reflect.ownKeys(sort);
+  if (keys.length !== 2 || !keys.includes('field') || !keys.includes('direction')) fail('INVALID_ARGUMENT');
+  const field = Object.getOwnPropertyDescriptor(sort, 'field');
+  const direction = Object.getOwnPropertyDescriptor(sort, 'direction');
+  if (!field?.enumerable || !Object.hasOwn(field, 'value') ||
+    !direction?.enumerable || !Object.hasOwn(direction, 'value')) fail('INVALID_ARGUMENT');
+  const order = { field: field.value, direction: direction.value };
+  if (!sortable.includes(order.field) || !['asc', 'desc'].includes(order.direction)) fail('INVALID_ARGUMENT');
+  return order;
+};
 const sortTuple = (record, order, schema) => {
   if (!order) return { value: record.createdAt, id: record.id };
   const has = Object.hasOwn(record.data, order.field);
@@ -546,10 +560,7 @@ export class ReferenceState {
     if (!Number.isSafeInteger(limit) || limit < 1) fail('INVALID_ARGUMENT');
     // This oracle has no typed-filter compiler. Never return unfiltered exact results.
     if (filter !== undefined) fail('INVALID_ARGUMENT');
-    if (sort !== undefined && (!sort || Array.isArray(sort) || typeof sort !== 'object' ||
-      Object.keys(sort).some(key => !['field', 'direction'].includes(key)) ||
-      !c.sortable.includes(sort.field) || !['asc', 'desc'].includes(sort.direction))) fail('INVALID_ARGUMENT');
-    const order = sort === undefined ? null : { field: sort.field, direction: sort.direction };
+    const order = queryOrder(sort, c.sortable);
     const tuple = record => sortTuple(record, order, c.schema);
     const compare = (a, b) => compareTuples(a, b, order, c.schema);
     const after = this.#cursorAfter(cursor, { spaceId, credential, collection, order, policyVersion: s.policyVersion, schemaVersion: c.version });
