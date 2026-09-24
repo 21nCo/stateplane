@@ -328,7 +328,8 @@ const mutationData = (operation, data, set, unset, current, schema) => {
     if (data === undefined) fail('SCHEMA_INVALID');
     return clone(data);
   }
-  if (unset.some(k => !Object.hasOwn(schema.properties ?? {}, k) || schema.required?.includes(k))) fail('INVALID_ARGUMENT');
+  const required = Object.hasOwn(schema, 'required') ? schema.required : [];
+  if (unset.some(k => !Object.hasOwn(schema.properties ?? {}, k) || required.includes(k))) fail('INVALID_ARGUMENT');
   const next = { ...clone(current.data), ...clone(set) };
   for (const k of unset) delete next[k];
   return next;

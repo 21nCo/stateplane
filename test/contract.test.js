@@ -196,6 +196,59 @@ test('stored optional format remains own-only across reservations, sorts and cur
   }
 });
 
+test('stored required keyword remains own-only for optional patch unset and replay', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  const optional = { $schema: schema.$schema, type: 'object', additionalProperties: false,
+    properties: { foo: { type: 'string' } } };
+  db.define('sp_a', 'entries', optional);
+  db.define('sp_a', 'required', { ...optional, required: ['foo'] });
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
+  db.grant('sp_a', 'agent', 'required', recordAccess);
+  const first = create(db, 'first', { foo: 'one' }, 'first');
+  const second = create(db, 'second', { foo: 'two' }, 'second');
+  const required = db.mutate({ ...scope, collection: 'required', operation: 'create',
+    data: { foo: 'must stay' }, idempotencyKey: 'required' });
+  const patch = (collection, id, key) => ({ ...scope, collection, operation: 'patch',
+    id, expectedRevision: 1, set: {}, unset: ['foo'], idempotencyKey: key });
+  const committed = patch('entries', first.ref.id, 'committed');
+  const receipt = db.mutate(committed);
+  const snapshot = () => structuredClone({ seq: db.seq, events: db.events, outbox: db.outbox,
+    receipts: [...db.receipts], collections: [...db.spaces.get('sp_a').collections].map(([name, c]) =>
+      [name, [...c.records], [...c.reserved]]) });
+  const previous = Object.getOwnPropertyDescriptor(Object.prototype, 'required');
+  let getterCalls = 0;
+  try {
+    Object.defineProperty(Object.prototype, 'required', { configurable: true, value: ['foo'] });
+    const beforeReplay = snapshot();
+    assert.deepEqual(db.mutate(committed), { ...receipt, replayed: true });
+    assert.deepEqual(snapshot(), beforeReplay);
+    const fresh = patch('entries', second.ref.id, 'fresh');
+    assert.equal(db.mutate(fresh).revision, 2);
+    assert.deepEqual(db.get({ ...scope, id: second.ref.id }).data, {});
+    const beforeFailure = snapshot();
+    code(() => db.mutate(patch('required', required.ref.id, 'bad-required')), 'INVALID_ARGUMENT');
+    assert.deepEqual(snapshot(), beforeFailure);
+    Object.defineProperty(Object.prototype, 'required', { configurable: true, get() {
+      getterCalls++;
+      throw Error('inherited required getter invoked');
+    } });
+    const beforeGetterReplay = snapshot();
+    assert.deepEqual(db.mutate(committed), { ...receipt, replayed: true });
+    assert.equal(db.mutate(fresh).replayed, true);
+    assert.deepEqual(snapshot(), beforeGetterReplay);
+    const third = create(db, 'third', { foo: 'three' }, 'third');
+    assert.equal(db.mutate(patch('entries', third.ref.id, 'getter-fresh')).revision, 2);
+    const beforeRejected = snapshot();
+    code(() => db.mutate(patch('required', required.ref.id, 'bad-getter')), 'INVALID_ARGUMENT');
+    assert.deepEqual(snapshot(), beforeRejected);
+    assert.equal(getterCalls, 0);
+  } finally {
+    if (previous) Object.defineProperty(Object.prototype, 'required', previous);
+    else delete Object.prototype.required;
+  }
+});
+
 test('generated IDs and external keys have separate namespaces, including tombstones', () => {
   const db = setup();
   const external = create(db, 'rec_2', { label: 'external' }, 'one');
