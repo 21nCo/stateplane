@@ -1169,13 +1169,28 @@ test('existing-record mutations require well-formed nonempty IDs before receipt 
       idempotencyKey: `missing-${fields.operation}` }), 'NOT_FOUND');
     assert.deepEqual(snapshot(), before);
   }
-  const replacement = { ...scope, operation: 'replace', id: created.ref.id,
-    expectedRevision: 1, data: { label: 'changed' }, idempotencyKey: 'valid-replace' };
-  const committed = db.mutate(replacement);
-  for (const id of [undefined, null, 0, '', '\uD800']) {
-    code(() => db.mutate({ ...replacement, id }), 'INVALID_ARGUMENT');
+  const committedRequests = [
+    { ...scope, operation: 'replace', id: created.ref.id, expectedRevision: 1,
+      data: { label: 'changed' }, idempotencyKey: 'valid-replace' },
+    { ...scope, operation: 'patch', id: created.ref.id, expectedRevision: 2,
+      set: {}, unset: [], idempotencyKey: 'valid-patch' },
+    { ...scope, operation: 'delete', id: created.ref.id, expectedRevision: 3,
+      idempotencyKey: 'valid-delete' }
+  ];
+  const committed = committedRequests.map(request => db.mutate(request));
+  const after = snapshot();
+  for (const [index, request] of committedRequests.entries()) {
+    for (const id of [undefined, null, 0, '', '\uD800']) {
+      code(() => db.mutate({ ...request, id }), 'INVALID_ARGUMENT');
+      assert.deepEqual(snapshot(), after);
+    }
+    code(() => db.mutate({ ...request, id: 'rec_missing' }), 'IDEMPOTENCY_MISMATCH');
+    assert.deepEqual(snapshot(), after);
+    const replay = db.mutate(request);
+    assert.equal(replay.receiptId, committed[index].receiptId);
+    assert.equal(replay.replayed, true);
+    assert.deepEqual(snapshot(), after);
   }
-  assert.equal(db.mutate(replacement).receiptId, committed.receiptId);
-  assert.equal(db.mutate(replacement).replayed, true);
-  assert.equal(db.get({ ...scope, id: created.ref.id }).revision, 2);
+  assert.equal(collection.records.get(created.ref.id).revision, 4);
+  assert.equal(db.get({ ...scope, id: created.ref.id }), null);
 });
