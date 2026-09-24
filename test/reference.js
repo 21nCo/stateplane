@@ -370,7 +370,8 @@ const queryOrder = (sort, sortable) => {
 const sortTuple = (record, order, schema) => {
   if (!order) return { value: record.createdAt, id: record.id };
   const has = Object.hasOwn(record.data, order.field);
-  const value = record.data[order.field];
+  // A missing optional field must not traverse Object.prototype (or run a getter).
+  const value = has ? record.data[order.field] : undefined;
   let rank = 2;
   if (!has) rank = 0;
   else if (value === null) rank = 1;

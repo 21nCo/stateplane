@@ -661,6 +661,49 @@ test('optional sort keyset distinguishes missing/null/value in either direction 
   code(() => db.query({ ...scope, limit: 2, sort: { field: 'label', direction: 'asc' } }), 'INVALID_ARGUMENT');
 });
 
+test('missing sort values never read inherited getters during query or cursor continuation', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  db.define('sp_a', 'entries', schema, [], ['ordinal']);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
+  for (const [key, data] of [
+    ['missing-1', { label: 'first' }], ['null', { label: 'second', ordinal: null }],
+    ['value', { label: 'third', ordinal: 1 }], ['missing-2', { label: 'fourth' }]
+  ]) create(db, key, data, key);
+  const collection = db.spaces.get('sp_a').collections.get('entries');
+  const effects = () => structuredClone({ records: [...collection.records], reserved: [...collection.reserved],
+    events: db.events, outbox: db.outbox, receipts: [...db.receipts], seq: db.seq });
+  const before = effects();
+  const previous = Object.getOwnPropertyDescriptor(Object.prototype, 'ordinal');
+  let getterCalls = 0;
+  try {
+    Object.defineProperty(Object.prototype, 'ordinal', { configurable: true, get() {
+      getterCalls++;
+      throw Error('inherited sort getter invoked');
+    } });
+    for (const [direction, expected] of [
+      ['asc', ['missing-1', 'missing-2', 'null', 'value']],
+      ['desc', ['value', 'null', 'missing-1', 'missing-2']]
+    ]) {
+      const seen = [];
+      let cursor;
+      do {
+        const page = db.query({ ...scope, limit: 1, sort: { field: 'ordinal', direction }, cursor });
+        seen.push(...page.items.map(item => item.key));
+        cursor = page.cursor;
+      } while (cursor);
+      assert.deepEqual(seen, expected);
+      assert.equal(db.count({ ...scope, sort: { field: 'ordinal', direction } }), 4);
+      assert.equal(db.exists({ ...scope, sort: { field: 'ordinal', direction } }), true);
+    }
+    assert.equal(getterCalls, 0);
+    assert.deepEqual(effects(), before);
+  } finally {
+    if (previous) Object.defineProperty(Object.prototype, 'ordinal', previous);
+    else delete Object.prototype.ordinal;
+  }
+});
+
 test('query, count and exists validate one own-data sort snapshot before cursor binding', () => {
   const db = new ReferenceState();
   db.addSpace('sp_a', 'owner');
