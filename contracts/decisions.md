@@ -27,6 +27,7 @@ Status: accepted logical decisions; **not** evidence of deployed infrastructure.
 - Receipt identity includes space, credential and operation. Fingerprint server-derived actor, canonical payload with UTF-8-byte-ordered object keys and optional caller-supplied `expectedSchemaVersion`, not the current server schema version.
 - An omitted precondition means current schema; a provided version is checked only for a new write after receipt lookup. Authorize requested and original receipt collections with current operation-specific write grants before comparing fingerprints or replaying. A read grant alone never replays a write receipt.
 - Only JSON-compatible operation payloads participate in a fingerprint or receipt replay. Reject recursively invalid data/set as `SCHEMA_INVALID` and malformed patch shape as `INVALID_ARGUMENT` before fingerprinting, including same-key retries; authorize both requested and original receipt collections first. Current-schema and stale-revision checks remain after committed replay, so compatible additions do not invalidate a valid retry.
+- Reject present but inapplicable fields even if their in-process value is `undefined`; reject undefined optional key/schema preconditions rather than alias omission. Reject custom-prototype arrays recursively and fingerprint verified own array elements without invoking caller-controlled methods. Neither a fresh invalid write nor an invalid retry may create or disclose a receipt.
 - In space `readOnly`, reads/export remain permitted under their grants; **new writes are denied**, but a matching committed write may replay under retained write grants. Matching replay precedes stale schema/revision checks. A lost response is retryable within documented retention even after compatible additions; changed requests fail without disclosing revoked results.
 - Proof: STA-5 atomic store; STA-6 policy; STA-7 mutations; STA-9/10 transports.
 
@@ -35,6 +36,7 @@ Status: accepted logical decisions; **not** evidence of deployed infrastructure.
 - Use the bounded Draft 2020-12 JSON Schema subset, not a custom DSL. Reject unknown/malformed keyword values and breaking revisions. Count string lengths as Unicode codepoints; compatibility ignores only schema-node `description` annotations, not a property named `description`.
 - Integers use the inclusive binary64 safe range (±9007199254740991), because JavaScript-based JSON clients/fingerprints cannot reliably preserve larger integer identity. Finite `number` is separate from this interoperability bound.
 - Only top-level optional additions are compatible in v1 after index readiness where needed; nested additions require a later migration workflow.
+- Treat schema-node `required`, `enum`, and nullable `type` members as unordered sets for compatibility; keep array data and array enum *values* ordered. Membership or constraint changes still fail as breaking.
 - Proof: STA-7 schema/compiler.
 
 ## D6 — Exact reads and consistent analysis

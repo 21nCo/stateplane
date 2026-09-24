@@ -789,3 +789,91 @@ test('long key edges and fractional seconds use bounded linear trimming with unc
   create(dated, 'one', { observedAt: manyZeros }, 'one');
   code(() => create(dated, 'two', { observedAt: manyZeros }, 'two'), 'UNIQUE_CONFLICT');
 });
+
+test('present undefined operation fields and custom-prototype arrays never alias receipts', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  db.define('sp_a', 'entries', { $schema: schema.$schema, type: 'object', additionalProperties: false,
+    properties: { label: { type: 'string' }, tags: { type: 'array', items: { type: ['string', 'null'] } } } });
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
+  const created = { ...scope, operation: 'create', data: { label: 'item', tags: [null] }, idempotencyKey: 'create' };
+  const id = db.mutate(created).ref.id;
+  const replaced = { ...scope, operation: 'replace', id, expectedRevision: 1, data: { label: 'next' }, idempotencyKey: 'replace' };
+  db.mutate(replaced);
+  const patched = { ...scope, operation: 'patch', id, expectedRevision: 2, set: {}, unset: [], idempotencyKey: 'patch' };
+  db.mutate(patched);
+  const deleted = { ...scope, operation: 'delete', id, expectedRevision: 3, idempotencyKey: 'delete' };
+  db.mutate(deleted);
+  const collection = db.spaces.get('sp_a').collections.get('entries');
+  const snapshot = () => ({ rows: structuredClone([...collection.records]),
+    reservations: [...collection.reserved].map(([key, record]) => [key, record.id, record.revision]),
+    events: structuredClone(db.events), outbox: structuredClone(db.outbox), receipts: structuredClone([...db.receipts]) });
+  const before = snapshot();
+  const changed = ['different'];
+  Object.setPrototypeOf(changed, Object.assign(Object.create(Array.prototype), { map: () => ['null'] }));
+  const wrongFields = [
+    [created, ['id', 'set', 'unset', 'expectedRevision']],
+    [replaced, ['set', 'unset', 'externalKey']],
+    [patched, ['data', 'externalKey']],
+    [deleted, ['data', 'set', 'unset', 'externalKey']]
+  ];
+  for (const [original, fields] of wrongFields) for (const field of fields) {
+    for (const key of [original.idempotencyKey, `${original.idempotencyKey}-${field}`]) {
+      code(() => db.mutate({ ...original, idempotencyKey: key, [field]: undefined }), 'INVALID_ARGUMENT');
+      assert.deepEqual(snapshot(), before);
+    }
+  }
+  const hidden = Object.defineProperty({ ...created }, 'set', { value: undefined });
+  code(() => db.mutate(hidden), 'INVALID_ARGUMENT');
+  code(() => db.mutate({ ...created, [Symbol('unrecognized')]: undefined }), 'INVALID_ARGUMENT');
+  assert.deepEqual(snapshot(), before);
+  for (const original of [created, replaced, patched, deleted]) {
+    code(() => db.mutate({ ...original, expectedSchemaVersion: undefined }), 'INVALID_ARGUMENT');
+    assert.deepEqual(snapshot(), before);
+  }
+  for (const key of ['create', 'fresh-array']) {
+    code(() => db.mutate({ ...created, idempotencyKey: key, data: { label: 'item', tags: changed } }), 'SCHEMA_INVALID');
+    assert.deepEqual(snapshot(), before);
+    code(() => db.mutate({ ...patched, idempotencyKey: key, set: { tags: changed } }), 'SCHEMA_INVALID');
+    assert.deepEqual(snapshot(), before);
+  }
+  db.define('sp_a', 'nested', { $schema: schema.$schema, type: 'object', additionalProperties: false,
+    properties: { tags: { type: 'array', items: { type: 'array', items: { type: ['string', 'null'] } } } } });
+  db.grant('sp_a', 'agent', 'nested', recordAccess);
+  const nested = { ...created, collection: 'nested', idempotencyKey: 'nested', data: { tags: [[null]] } };
+  db.mutate(nested);
+  const nestedBefore = snapshot();
+  code(() => db.mutate({ ...nested, data: { tags: [changed] } }), 'SCHEMA_INVALID');
+  code(() => db.mutate({ ...nested, idempotencyKey: 'nested-fresh', data: { tags: [changed] } }), 'SCHEMA_INVALID');
+  assert.deepEqual(snapshot(), nestedBefore);
+  assert.equal(db.mutate(created).replayed, true);
+  assert.equal(db.mutate(deleted).replayed, true);
+  db.revoke('sp_a', 'agent');
+  code(() => db.mutate({ ...created, set: undefined }), 'FORBIDDEN');
+  assert.deepEqual(snapshot(), nestedBefore);
+});
+
+test('schema compatibility treats required, enum and nullable type members as sets', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  const original = { ...schema, required: ['label', 'state'] };
+  db.define('sp_a', 'entries', original);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
+  const id = create(db, 'entry', { label: 'entry', state: 'open', ordinal: null }, 'create').ref.id;
+  const reordered = { ...original, required: ['state', 'label'], properties: { ...original.properties,
+    state: { ...original.properties.state, enum: ['closed', 'open'] },
+    ordinal: { type: ['null', 'integer'] } } };
+  assert.equal(db.revise('sp_a', 'entries', 1, reordered), 2);
+  assert.equal(write(db, 'replace', id, 1, 'replace', { data: { label: 'entry', state: 'closed', ordinal: null } }).schemaVersion, 2);
+  const changedEnum = { ...reordered, properties: { ...reordered.properties, state: { type: 'string', enum: ['open', 'other'] } } };
+  code(() => db.revise('sp_a', 'entries', 2, changedEnum), 'SCHEMA_BREAKING');
+  code(() => db.revise('sp_a', 'entries', 2, { ...reordered, required: ['label'] }), 'SCHEMA_BREAKING');
+  code(() => db.revise('sp_a', 'entries', 2, { ...reordered, properties: { ...reordered.properties, ordinal: { type: 'integer' } } }), 'SCHEMA_BREAKING');
+  code(() => write(db, 'replace', id, 2, 'invalid', { data: { label: 'entry', state: 'other' } }), 'SCHEMA_INVALID');
+  assert.equal(db.get({ ...scope, id }).revision, 2);
+  const arrayEnum = { ...schema, required: [], properties: { tags: { type: 'array', items: { type: 'integer' }, enum: [[1, 2], [2, 1]] } } };
+  db.define('sp_a', 'array-enum', arrayEnum);
+  assert.equal(db.revise('sp_a', 'array-enum', 1, { ...arrayEnum, properties: { tags: { ...arrayEnum.properties.tags, enum: [[2, 1], [1, 2]] } } }), 2);
+  code(() => db.revise('sp_a', 'array-enum', 2, { ...arrayEnum, properties: { tags: { ...arrayEnum.properties.tags, enum: [[1, 2], [1, 2]] } } }), 'SCHEMA_BREAKING');
+  assert.equal(db.revise('sp_a', 'array-enum', 2, { ...arrayEnum, properties: { tags: { ...arrayEnum.properties.tags, enum: [[1, 2], [2, 1], [1, 2]] } } }), 3);
+});
