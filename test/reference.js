@@ -69,13 +69,17 @@ const utcInstant = value => {
   fraction = fraction.slice(0, end);
   return match[1] + (fraction ? '.' + fraction : '') + 'Z';
 };
+// Stored schema nodes are cloned into ordinary objects; a later prototype
+// change must never supply an optional keyword they did not declare.
+const dateTimeField = (schema, field) => Object.hasOwn(schema.properties[field], 'format') &&
+  schema.properties[field].format === 'date-time';
 const tupleOf = (data, paths, schema) => {
   const parts = paths.map(path => Object.hasOwn(data, path) ? data[path] : undefined);
   if (parts.some(v => v === undefined || v === null)) return null;
   return parts.map((v, index) => {
     if (!['string', 'number', 'boolean'].includes(typeof v) || (typeof v === 'number' && !Number.isFinite(v))) fail('SCHEMA_INVALID');
     let value;
-    if (schema.properties[paths[index]].format === 'date-time') value = utcInstant(v);
+    if (dateTimeField(schema, paths[index])) value = utcInstant(v);
     else if (typeof v === 'string') value = v.normalize('NFC'); // reservation only; stored data is unchanged
     else value = JSON.stringify(v);
     return `${typeof v}:${Buffer.byteLength(value)}:${value}`;
@@ -356,11 +360,11 @@ const sortTuple = (record, order, schema) => {
   let rank = 2;
   if (!has) rank = 0;
   else if (value === null) rank = 1;
-  const sortableValue = rank === 2 && schema.properties[order.field].format === 'date-time' ? utcInstant(value) : value;
+  const sortableValue = rank === 2 && dateTimeField(schema, order.field) ? utcInstant(value) : value;
   return { rank, value: rank === 2 ? sortableValue : null, id: record.id };
 };
 const compareSortValues = (a, b, order, schema) => {
-  if (!order || schema.properties[order.field].format !== 'date-time') return scalarCompare(a, b);
+  if (!order || !dateTimeField(schema, order.field)) return scalarCompare(a, b);
   const whole = scalarCompare(a.slice(0, 19), b.slice(0, 19));
   if (whole) return whole;
   const fraction = value => value.slice(19, -1).replace(/^\./, '');

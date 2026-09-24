@@ -138,6 +138,64 @@ test('definition and revision require own keywords despite polluted prototypes',
   assert.equal(db.spaces.get('sp_a').collections.has('valid'), true);
 });
 
+test('stored optional format remains own-only across reservations, sorts and cursors', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  db.define('sp_a', 'entries', {
+    $schema: schema.$schema, type: 'object', additionalProperties: false,
+    properties: { label: { type: 'string' } }, required: ['label']
+  }, [{ name: 'label', paths: ['label'] }], ['label']);
+  db.define('sp_a', 'dated', {
+    $schema: schema.$schema, type: 'object', additionalProperties: false,
+    properties: { observedAt: { type: 'string', format: 'date-time' } }, required: ['observedAt']
+  }, [{ name: 'instant', paths: ['observedAt'] }], ['observedAt']);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
+  db.grant('sp_a', 'agent', 'dated', recordAccess);
+  const put = (collection, field, value, key) => db.mutate({ ...scope, collection, operation: 'create',
+    data: { [field]: value }, idempotencyKey: key });
+  const first = put('entries', 'label', '2020-01-01T00:00:00.1Z', 'first');
+  const second = put('entries', 'label', '2020-01-01T00:00:00Z', 'second');
+  const snapshot = () => ({ seq: db.seq, events: structuredClone(db.events), outbox: structuredClone(db.outbox),
+    receipts: structuredClone([...db.receipts]), collections: [...db.spaces.get('sp_a').collections].map(([name, c]) =>
+      [name, structuredClone([...c.records]), structuredClone([...c.reserved])]) });
+  const previous = Object.getOwnPropertyDescriptor(Object.prototype, 'format');
+  try {
+    Object.defineProperty(Object.prototype, 'format', { configurable: true, value: 'date-time' });
+    const third = put('entries', 'label', 'ordinary', 'third');
+    assert.equal(db.get({ ...scope, id: third.ref.id }).data.label, 'ordinary');
+    const beforeFailure = snapshot();
+    code(() => put('entries', 'label', 'ordinary', 'duplicate'), 'UNIQUE_CONFLICT');
+    assert.deepEqual(snapshot(), beforeFailure);
+    for (const [direction, expected] of [
+      ['asc', [first.ref.id, second.ref.id, third.ref.id]],
+      ['desc', [third.ref.id, second.ref.id, first.ref.id]]
+    ]) {
+      const sort = { field: 'label', direction };
+      assert.deepEqual(db.query({ ...scope, limit: 3, sort }).items.map(row => row.id), expected);
+      let cursor;
+      const paged = [];
+      do {
+        const page = db.query({ ...scope, limit: 1, sort, ...(cursor ? { cursor } : {}) });
+        paged.push(...page.items.map(row => row.id));
+        cursor = page.cursor;
+      } while (cursor);
+      assert.deepEqual(paged, expected);
+    }
+    const later = put('dated', 'observedAt', '2020-01-01T00:00:00.1Z', 'later');
+    const earlier = put('dated', 'observedAt', '2020-01-01T00:00:00Z', 'earlier');
+    const dated = { ...scope, collection: 'dated', limit: 1, sort: { field: 'observedAt', direction: 'asc' } };
+    const firstPage = db.query(dated);
+    assert.deepEqual(firstPage.items.map(row => row.id), [earlier.ref.id]);
+    assert.deepEqual(db.query({ ...dated, cursor: firstPage.cursor }).items.map(row => row.id), [later.ref.id]);
+    const beforeInvalid = snapshot();
+    code(() => put('dated', 'observedAt', 'ordinary', 'invalid-date'), 'SCHEMA_INVALID');
+    assert.deepEqual(snapshot(), beforeInvalid);
+  } finally {
+    if (previous) Object.defineProperty(Object.prototype, 'format', previous);
+    else delete Object.prototype.format;
+  }
+});
+
 test('generated IDs and external keys have separate namespaces, including tombstones', () => {
   const db = setup();
   const external = create(db, 'rec_2', { label: 'external' }, 'one');
