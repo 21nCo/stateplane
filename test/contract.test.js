@@ -907,3 +907,113 @@ test('schema keyword arrays reject sparse and duplicate members at definition an
   assert.equal(db.revise('sp_a', 'entries', 1, { ...schema, required: ['label'], properties: { ...schema.properties,
     tags: { type: 'array', items: { type: 'integer' }, enum: [[1, 2], [2, 1]] } } }), 2);
 });
+
+test('collection unique and sort path lists reject non-JSON arrays without reservations', () => {
+  const db = setup();
+  const s = db.spaces.get('sp_a');
+  const before = { collections: s.collections.size, events: db.events.length, outbox: db.outbox.length, receipts: db.receipts.size };
+  const decorated = ['label'];
+  decorated.extra = true;
+  const wrong = [1];
+  const cases = [
+    [new Array(1), []],
+    [[{ name: 'key', paths: new Array(1) }], []],
+    [[{ name: 'key', paths: decorated }], []],
+    [[{ name: 'key', paths: wrong }], []],
+    [[], new Array(1)],
+    [[], decorated]
+  ];
+  for (const [index, [unique, sortable]] of cases.entries()) {
+    code(() => db.define('sp_a', `bad-path-${index}`, schema, unique, sortable), 'SCHEMA_UNSUPPORTED');
+    assert.equal(s.collections.has(`bad-path-${index}`), false);
+    assert.deepEqual({ collections: s.collections.size, events: db.events.length, outbox: db.outbox.length, receipts: db.receipts.size }, before);
+  }
+  db.define('sp_a', 'good-paths', schema, [{ name: 'pair', paths: ['label', 'state'] }], ['label']);
+  db.grant('sp_a', 'agent', 'good-paths', recordAccess);
+  const make = (key, data) => db.mutate({ ...scope, collection: 'good-paths', operation: 'create', externalKey: key, data, idempotencyKey: key });
+  make('first', { label: 'x', state: 'open' });
+  make('second', { label: 'y', state: 'open' });
+  assert.equal(db.count({ ...scope, collection: 'good-paths' }), 2);
+});
+
+test('present undefined schema keywords fail closed at definition and revision', () => {
+  const db = setup();
+  const c = db.spaces.get('sp_a').collections.get('entries');
+  create(db, 'existing', { label: 'existing' }, 'existing');
+  const snapshot = () => ({ schema: structuredClone(c.schema), version: c.version, rows: structuredClone([...c.records]),
+    reservations: structuredClone([...c.reserved]), events: structuredClone(db.events), outbox: structuredClone(db.outbox), receipts: structuredClone([...db.receipts]) });
+  const before = snapshot();
+  const field = (type, name) => ({ ...schema, properties: { ...schema.properties, label: { type, [name]: undefined } } });
+  const variants = ['minLength', 'maxLength', 'format', 'description', 'enum'].map(name => field('string', name));
+  variants.push(...['minimum', 'maximum'].map(name => field('number', name)));
+  variants.push(...['minItems', 'maxItems', 'items'].map(name => field('array', name)));
+  variants.push({ ...schema, properties: undefined }, { ...schema, required: undefined }, { ...schema, additionalProperties: undefined });
+  variants.push({ ...schema, properties: { ...schema.properties, nested: { type: 'object', properties: undefined, additionalProperties: false } } });
+  for (const [index, invalid] of variants.entries()) {
+    code(() => db.define('sp_a', `undefined-${index}`, invalid), 'SCHEMA_UNSUPPORTED');
+    assert.equal(db.spaces.get('sp_a').collections.has(`undefined-${index}`), false);
+    code(() => db.revise('sp_a', 'entries', 1, invalid), 'SCHEMA_UNSUPPORTED');
+    assert.deepEqual(snapshot(), before);
+  }
+  assert.equal(db.revise('sp_a', 'entries', 1, { ...schema, properties: { ...schema.properties, extra: { type: 'string', minLength: 0 } } }), 2);
+});
+
+test('announced UTC leap second validates and sorts between adjacent seconds', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  const dated = { ...schema, properties: { observedAt: { type: 'string', format: 'date-time' } }, required: ['observedAt'] };
+  db.define('sp_a', 'entries', dated, [], ['observedAt']);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
+  const instants = ['2017-01-01T00:00:00Z', '2016-12-31T23:59:60.5000Z',
+    '2016-12-31T23:59:59.999Z', '2016-12-31T23:59:60Z'];
+  for (const [index, observedAt] of instants.entries()) create(db, `instant-${index}`, { observedAt }, `instant-${index}`);
+  const pageOrder = direction => {
+    const result = [];
+    let cursor;
+    do {
+      const page = db.query({ ...scope, limit: 1, sort: { field: 'observedAt', direction }, cursor });
+      result.push(...page.items.map(row => row.data.observedAt));
+      cursor = page.cursor;
+    } while (cursor);
+    return result;
+  };
+  const chronological = [instants[2], instants[3], instants[1], instants[0]];
+  assert.deepEqual(pageOrder('asc'), chronological);
+  assert.deepEqual(pageOrder('desc'), [...chronological].reverse());
+  const before = [db.events.length, db.receipts.size, db.outbox.length];
+  for (const invalid of ['2016-06-30T23:59:60Z', '2016-12-31T22:59:60Z', '2016-02-30T23:59:60Z']) {
+    code(() => create(db, invalid, { observedAt: invalid }, invalid), 'SCHEMA_INVALID');
+  }
+  assert.deepEqual([db.events.length, db.receipts.size, db.outbox.length], before);
+  db.define('sp_a', 'unique-instants', dated, [{ name: 'instant', paths: ['observedAt'] }]);
+  db.grant('sp_a', 'agent', 'unique-instants', recordAccess);
+  const unique = observedAt => db.mutate({ ...scope, collection: 'unique-instants', operation: 'create', data: { observedAt }, idempotencyKey: observedAt });
+  unique('2016-12-31T23:59:60.5000Z');
+  code(() => unique('2016-12-31T23:59:60.5Z'), 'UNIQUE_CONFLICT');
+  unique('2017-01-01T00:00:00Z');
+  assert.equal(db.count({ ...scope, collection: 'unique-instants' }), 2);
+});
+
+test('noncanonical base64url aliases cannot reuse signed page cursors', () => {
+  const db = setup();
+  for (let index = 0; index < 3; index++) create(db, `page-${index}`, { label: `page-${index}` }, `page-${index}`);
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  const seen = new Set();
+  for (let length = 1; length <= 12 && seen.size < 2; length++) {
+    const credential = 'c'.repeat(length);
+    db.grant('sp_a', credential, 'entries', recordAccess);
+    const args = { ...scope, credential, limit: 1 };
+    const cursor = db.query(args).cursor;
+    const remainder = Buffer.from(cursor, 'base64url').length % 3;
+    if (remainder === 0 || seen.has(remainder)) continue;
+    seen.add(remainder);
+    const last = cursor.at(-1);
+    const alias = cursor.slice(0, -1) + alphabet[alphabet.indexOf(last) + 1];
+    assert.deepEqual(Buffer.from(alias, 'base64url'), Buffer.from(cursor, 'base64url'));
+    assert.equal(db.query({ ...args, cursor }).items.length, 1);
+    code(() => db.query({ ...args, cursor: alias }), 'CURSOR_INVALID');
+    db.revoke('sp_a', credential, 'entries');
+    code(() => db.query({ ...args, cursor: alias }), 'FORBIDDEN');
+  }
+  assert.deepEqual([...seen].sort(), [1, 2]);
+});

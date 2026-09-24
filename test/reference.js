@@ -44,11 +44,24 @@ const keyOf = key => {
   if (!normalized) fail('INVALID_ARGUMENT');
   return normalized;
 };
+// Positive UTC leap seconds from IERS Leap_Second.dat (Bulletin 72, July 2026).
+// The oracle pins this table; deployed validators must update it from IERS.
+const leapDays = new Set([
+  '1972-06-30', '1972-12-31', '1973-12-31', '1974-12-31', '1975-12-31',
+  '1976-12-31', '1977-12-31', '1978-12-31', '1979-12-31', '1981-06-30',
+  '1982-06-30', '1983-06-30', '1985-06-30', '1987-12-31', '1989-12-31',
+  '1990-12-31', '1992-06-30', '1993-06-30', '1994-06-30', '1995-12-31',
+  '1997-06-30', '1998-12-31', '2005-12-31', '2008-12-31', '2012-06-30',
+  '2015-06-30', '2016-12-31'
+]);
 const utcInstant = value => {
   const match = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z$/.exec(value);
   if (!match || match[1].startsWith('0000-')) fail('SCHEMA_INVALID');
-  const parsed = new Date(`${match[1]}Z`);
-  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 19) !== match[1]) fail('SCHEMA_INVALID');
+  const leap = match[1].endsWith('T23:59:60');
+  if (match[1].endsWith(':60') && (!leap || !leapDays.has(match[1].slice(0, 10)))) fail('SCHEMA_INVALID');
+  const check = leap ? `${match[1].slice(0, -2)}59` : match[1];
+  const parsed = new Date(`${check}Z`);
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 19) !== check) fail('SCHEMA_INVALID');
   let fraction = match[2] ?? '';
   let end = fraction.length;
   while (end > 0 && fraction[end - 1] === '0') end--;
@@ -141,18 +154,28 @@ const validateBounds = (s, type) => {
   if (!['number', 'integer'].includes(type) && (s.minimum !== undefined || s.maximum !== undefined)) fail('SCHEMA_UNSUPPORTED');
 };
 const validateDefinitionStructure = (s, type) => {
-  if (type === 'object') {
-    if (s.additionalProperties !== false || (s.properties !== undefined && !plainObject(s.properties))) fail('SCHEMA_UNSUPPORTED');
-    if (Object.keys(s.properties ?? {}).some(name => !wellFormed(name))) fail('SCHEMA_UNSUPPORTED');
-    for (const child of Object.values(s.properties ?? {})) validateDefinition(child, false);
-    if (s.required !== undefined) {
-      const required = schemaArrayMembers(s.required);
-      if (required.some(k => typeof k !== 'string' || !Object.hasOwn(s.properties ?? {}, k)) ||
-        new Set(required).size !== required.length) fail('SCHEMA_UNSUPPORTED');
-    }
-  } else if (s.properties !== undefined || s.required !== undefined || s.additionalProperties !== undefined) fail('SCHEMA_UNSUPPORTED');
+  if (type === 'object') validateObjectDefinition(s);
+  else if (s.properties !== undefined || s.required !== undefined || s.additionalProperties !== undefined) fail('SCHEMA_UNSUPPORTED');
   if (type === 'array') validateDefinition(s.items, false);
   else if (s.items !== undefined || s.minItems !== undefined || s.maxItems !== undefined) fail('SCHEMA_UNSUPPORTED');
+};
+const validateObjectDefinition = s => {
+  if (s.additionalProperties !== false || (s.properties !== undefined && !plainObject(s.properties))) fail('SCHEMA_UNSUPPORTED');
+  if (Object.keys(s.properties ?? {}).some(name => !wellFormed(name))) fail('SCHEMA_UNSUPPORTED');
+  for (const child of Object.values(s.properties ?? {})) validateDefinition(child, false);
+  if (s.required === undefined) return;
+  const required = schemaArrayMembers(s.required);
+  if (required.some(k => typeof k !== 'string' || !Object.hasOwn(s.properties ?? {}, k)) ||
+    new Set(required).size !== required.length) fail('SCHEMA_UNSUPPORTED');
+};
+const validateEnumMember = (value, schema) => {
+  try {
+    validateJsonPayload(value);
+    validateData(value, { ...schema, enum: undefined });
+  } catch (error) {
+    if (error instanceof ContractError && error.code === 'SCHEMA_INVALID') fail('SCHEMA_UNSUPPORTED');
+    throw error;
+  }
 };
 const validateDefinitionEnum = s => {
   if (s.enum !== undefined) {
@@ -160,14 +183,7 @@ const validateDefinitionEnum = s => {
     if (members.length === 0) fail('SCHEMA_UNSUPPORTED');
     const seen = new Set();
     for (const value of members) {
-      try {
-        validateJsonPayload(value);
-        validateData(value, { ...s, enum: undefined });
-      }
-      catch (error) {
-        if (error instanceof ContractError && error.code === 'SCHEMA_INVALID') fail('SCHEMA_UNSUPPORTED');
-        throw error;
-      }
+      validateEnumMember(value, s);
       const canonical = stable(value);
       if (seen.has(canonical)) fail('SCHEMA_UNSUPPORTED');
       seen.add(canonical);
@@ -175,6 +191,12 @@ const validateDefinitionEnum = s => {
   }
 };
 const validateDefinition = (s, root = true) => {
+  // Presence, not undefined-value comparison, determines whether a keyword was supplied.
+  // Reject all non-JSON definition nodes before checking the supported keyword subset.
+  try { validateJsonPayload(s); } catch (error) {
+    if (error instanceof ContractError && error.code === 'SCHEMA_INVALID') fail('SCHEMA_UNSUPPORTED');
+    throw error;
+  }
   const type = definitionType(s, root);
   validateBounds(s, type);
   validateDefinitionStructure(s, type);
@@ -322,12 +344,15 @@ export class ReferenceState {
       const type = Array.isArray(shape.type) ? shape.type.find(t => t !== 'null') : shape.type;
       return ['string', 'number', 'integer', 'boolean'].includes(type);
     };
-    if (!Array.isArray(uniques) || new Set(uniques.map(u => u?.name)).size !== uniques.length) fail('SCHEMA_UNSUPPORTED');
-    for (const u of uniques) if (!u || typeof u.name !== 'string' || !u.name || !wellFormed(u.name) ||
-      !Array.isArray(u.paths) || !u.paths.length || new Set(u.paths).size !== u.paths.length ||
-      u.paths.some(path => !scalarPath(path))) fail('SCHEMA_UNSUPPORTED');
-    if (!Array.isArray(sortable) || new Set(sortable).size !== sortable.length ||
-      sortable.some(path => !scalarPath(path))) fail('SCHEMA_UNSUPPORTED');
+    const uniqueEntries = schemaArrayMembers(uniques);
+    const sortPaths = schemaArrayMembers(sortable);
+    if (new Set(uniqueEntries.map(u => u?.name)).size !== uniqueEntries.length) fail('SCHEMA_UNSUPPORTED');
+    for (const u of uniqueEntries) {
+      if (!plainObject(u) || typeof u.name !== 'string' || !u.name || !wellFormed(u.name)) fail('SCHEMA_UNSUPPORTED');
+      const paths = schemaArrayMembers(u.paths);
+      if (!paths.length || new Set(paths).size !== paths.length || paths.some(path => !scalarPath(path))) fail('SCHEMA_UNSUPPORTED');
+    }
+    if (new Set(sortPaths).size !== sortPaths.length || sortPaths.some(path => !scalarPath(path))) fail('SCHEMA_UNSUPPORTED');
     const s = this.spaces.get(spaceId);
     if (s.collections.has(slug)) fail('SCHEMA_CONFLICT');
     s.collections.set(slug, { schema: clone(schema), uniques: clone(uniques), sortable: clone(sortable), records: new Map(), reserved: new Map(), version: 1 });
@@ -434,7 +459,11 @@ export class ReferenceState {
     if (cursor === undefined) return null;
     if (typeof cursor !== 'string' || !cursor || !/^[A-Za-z0-9_-]+$/.test(cursor)) fail('CURSOR_INVALID');
     let decoded;
-    try { decoded = JSON.parse(Buffer.from(cursor, 'base64url').toString()); } catch { fail('CURSOR_INVALID'); }
+    try {
+      const bytes = Buffer.from(cursor, 'base64url');
+      if (bytes.toString('base64url') !== cursor) fail('CURSOR_INVALID');
+      decoded = JSON.parse(bytes.toString());
+    } catch { fail('CURSOR_INVALID'); }
     if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) fail('CURSOR_INVALID');
     const { signature, ...binding } = decoded;
     if (binding.spaceId !== spaceId || binding.credential !== credential || binding.collection !== collection || binding.policyVersion !== policyVersion || binding.schemaVersion !== schemaVersion || stable(binding.sort) !== stable(order) || signature !== this.#sign(binding)) fail('CURSOR_INVALID');

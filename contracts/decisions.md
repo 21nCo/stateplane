@@ -19,6 +19,7 @@ Status: accepted logical decisions; **not** evidence of deployed infrastructure.
 - Create is create-only. Existing-record writes require a revision; replace removes omitted optional fields, while patch uses explicit top-level set/unset. Reject non-applicable inputs before receipt lookup. Null is present; missing is absent.
 - Generated IDs, external keys and named composite reservations occupy separate typed namespaces. Lookup selects generated or external mode, never falls back, and returns only live records even when key text collides. Existing-record mutations reject key input; tombstones reserve external and composite keys.
 - Normalize external keys with NFC and the fixed Unicode White_Space edge set (including U+0085, excluding U+FEFF). Compare composite unique string components using NFC **only for reservation**, leaving stored data byte-exact; equivalent UTC date-time instants reserve one tuple.
+- Collection unique descriptor/paths and sortable declarations are dense undecorated JSON arrays; invalid declarations fail closed before creation. RFC3339 UTC includes actual IERS-announced positive leap seconds; preserve chronological order and fractional equivalence across record validation, reservations and typed sorts (STA-7/8 update the leap table).
 - Link restrict/detach governs deletion of record, source or claim endpoints. A mixed policy restricts the entire delete; detach atomically tombstones incident links, never leaves live dangling links and never cascades into other endpoints. These rules prevent lost updates, namespace collisions and ambiguous resurrection.
 - Proof: STA-7 record mutations; STA-13 link/source/claim adapter fixtures and create/delete races.
 
@@ -34,6 +35,7 @@ Status: accepted logical decisions; **not** evidence of deployed infrastructure.
 ## D5 — Schema syntax and evolution
 
 - Use the bounded Draft 2020-12 JSON Schema subset, not a custom DSL. Reject unknown/malformed keyword values and breaking revisions. Count string lengths as Unicode codepoints; compatibility ignores only schema-node `description` annotations, not a property named `description`.
+- Present optional keywords with `undefined` are malformed, not absent. Validate all definition nodes as JSON-compatible before define/revise comparison; reject without effects as `SCHEMA_UNSUPPORTED`.
 - Integers use the inclusive binary64 safe range (±9007199254740991), because JavaScript-based JSON clients/fingerprints cannot reliably preserve larger integer identity. Finite `number` is separate from this interoperability bound.
 - Only top-level optional additions are compatible in v1 after index readiness where needed; nested additions require a later migration workflow.
 - Treat schema-node `required`, `enum`, and nullable `type` members as unordered sets for compatibility; keep array data and array enum *values* ordered. Membership or constraint changes still fail as breaking.
