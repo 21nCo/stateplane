@@ -1,0 +1,21 @@
+contracts/decisions.md
+  s_92b99c4bbc53d8::t_87facb7841b67d 58
+contracts/v1.md
+  s_92b99c4bbc53d8::t_d2487948c99eff 57
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4487ebe2b522f352b7ca1742bb67f249f2d3ad4b",
+  "prompts": {},
+  "sessions": {
+    "s_92b99c4bbc53d8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0d34a-5b26-78c0-951d-38a3c8b072bc",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
