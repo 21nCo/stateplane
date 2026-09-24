@@ -1,0 +1,29 @@
+contracts/v1.md
+  s_6215e9efa4aae3::t_f208bf7a0a8441 29
+test/contract.test.js
+  s_dbeaf6beea25e6::t_a4fccea17204b2 1172-1192,1194-1195
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a3de18fc3b189bcdf641b1a5c9b6e14bae3c9adf",
+  "prompts": {},
+  "sessions": {
+    "s_6215e9efa4aae3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6ff63f6b-2434-4437-b322-8d4ae7c95bc8",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_dbeaf6beea25e6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c886-73ef-72c2-b7ee-54bc7cc84533",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
