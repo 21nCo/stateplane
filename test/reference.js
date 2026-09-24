@@ -113,16 +113,33 @@ const validateJsonPayload = (value, ancestors = new Set()) => {
 };
 // Keyword arrays are JSON arrays, not sparse or decorated in-process arrays.
 // Validate them before set comparisons, where holes or duplicates could disappear.
-const schemaArrayMembers = value => {
+const schemaArrayMembers = (value, errorCode = 'SCHEMA_UNSUPPORTED') => {
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype ||
-    Reflect.ownKeys(value).length !== value.length + 1) fail('SCHEMA_UNSUPPORTED');
+    Reflect.ownKeys(value).length !== value.length + 1) fail(errorCode);
   const members = [];
   for (let index = 0; index < value.length; index++) {
     const descriptor = Object.getOwnPropertyDescriptor(value, index);
-    if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) fail('SCHEMA_UNSUPPORTED');
+    if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) fail(errorCode);
     members.push(descriptor.value);
   }
   return members;
+};
+const uniqueDescriptors = (uniques, scalarPath) => {
+  const entries = schemaArrayMembers(uniques).map(value => {
+    if (!plainObject(value)) fail('SCHEMA_UNSUPPORTED');
+    // Inspect own descriptors, never caller getters; retain only validated data.
+    const fields = Object.getOwnPropertyDescriptors(value);
+    const keys = Reflect.ownKeys(fields);
+    if (keys.length !== 2 || !keys.includes('name') || !keys.includes('paths') ||
+      keys.some(key => !fields[key].enumerable || !Object.hasOwn(fields[key], 'value'))) fail('SCHEMA_UNSUPPORTED');
+    const name = fields.name.value;
+    const paths = schemaArrayMembers(fields.paths.value);
+    if (typeof name !== 'string' || !name || !wellFormed(name) || !paths.length ||
+      new Set(paths).size !== paths.length || paths.some(path => !scalarPath(path))) fail('SCHEMA_UNSUPPORTED');
+    return { name, paths };
+  });
+  if (new Set(entries.map(entry => entry.name)).size !== entries.length) fail('SCHEMA_UNSUPPORTED');
+  return entries;
 };
 const definitionType = (s, root) => {
   if (!plainObject(s) || Object.keys(s).some(name => !allowedKeywords.has(name))) fail('SCHEMA_UNSUPPORTED');
@@ -328,10 +345,12 @@ export class ReferenceState {
   #sign(value) { return createHmac('sha256', this.cursorSecret).update(stable(value)).digest('hex'); }
   addSpace(id, owner) { this.spaces.set(id, { owner, lifecycle: 'active', policyVersion: 1, collections: new Map(), grants: new Map() }); }
   grant(spaceId, credential, collection, permissions) {
-    if (collection === '*' || !Array.isArray(permissions) || permissions.some(p => !['records:read', 'records:write'].includes(p))) fail('INVALID_ARGUMENT');
+    if (collection === '*') fail('INVALID_ARGUMENT');
+    const capabilities = schemaArrayMembers(permissions, 'INVALID_ARGUMENT');
+    if (capabilities.some(p => !['records:read', 'records:write'].includes(p))) fail('INVALID_ARGUMENT');
     const s = this.spaces.get(spaceId);
     if (!s.grants.has(credential)) s.grants.set(credential, new Map());
-    s.grants.get(credential).set(collection, new Set(permissions));
+    s.grants.get(credential).set(collection, new Set(capabilities));
     s.policyVersion++;
   }
   revoke(spaceId, credential, collection) { const s = this.spaces.get(spaceId); if (collection === undefined) s.grants.delete(credential); else { s.grants.get(credential)?.delete(collection); if (!s.grants.get(credential)?.size) s.grants.delete(credential); } s.policyVersion++; }
@@ -344,18 +363,12 @@ export class ReferenceState {
       const type = Array.isArray(shape.type) ? shape.type.find(t => t !== 'null') : shape.type;
       return ['string', 'number', 'integer', 'boolean'].includes(type);
     };
-    const uniqueEntries = schemaArrayMembers(uniques);
+    const uniqueEntries = uniqueDescriptors(uniques, scalarPath);
     const sortPaths = schemaArrayMembers(sortable);
-    if (new Set(uniqueEntries.map(u => u?.name)).size !== uniqueEntries.length) fail('SCHEMA_UNSUPPORTED');
-    for (const u of uniqueEntries) {
-      if (!plainObject(u) || typeof u.name !== 'string' || !u.name || !wellFormed(u.name)) fail('SCHEMA_UNSUPPORTED');
-      const paths = schemaArrayMembers(u.paths);
-      if (!paths.length || new Set(paths).size !== paths.length || paths.some(path => !scalarPath(path))) fail('SCHEMA_UNSUPPORTED');
-    }
     if (new Set(sortPaths).size !== sortPaths.length || sortPaths.some(path => !scalarPath(path))) fail('SCHEMA_UNSUPPORTED');
     const s = this.spaces.get(spaceId);
     if (s.collections.has(slug)) fail('SCHEMA_CONFLICT');
-    s.collections.set(slug, { schema: clone(schema), uniques: clone(uniques), sortable: clone(sortable), records: new Map(), reserved: new Map(), version: 1 });
+    s.collections.set(slug, { schema: clone(schema), uniques: uniqueEntries, sortable: sortPaths, records: new Map(), reserved: new Map(), version: 1 });
   }
   revise(spaceId, slug, expectedVersion, schema) {
     validateDefinition(schema);

@@ -775,6 +775,60 @@ test('grant rejects non-contract capability tokens before policy changes', () =>
   assert.equal(db.spaces.get('sp_a').grants.get('new-agent').get('entries').has('records:read'), true);
 });
 
+test('grant rejects sparse and decorated capability lists without changing existing grants', () => {
+  const db = setup();
+  const space = db.spaces.get('sp_a');
+  const before = space.policyVersion;
+  const permissions = () => [...space.grants.get('agent').get('entries')];
+  const original = permissions();
+  const decorated = ['records:write'];
+  decorated.extra = true;
+  const hidden = ['records:write'];
+  Object.defineProperty(hidden, 'hidden', { value: true });
+  const accessor = ['records:write'];
+  Object.defineProperty(accessor, 0, { get() { throw Error('getter invoked'); }, enumerable: true });
+  const custom = ['records:write'];
+  Object.setPrototypeOf(custom, Object.create(Array.prototype));
+  for (const invalid of [[, 'records:write'], decorated, hidden, accessor, custom, ['records:reed']]) {
+    code(() => db.grant('sp_a', 'agent', 'entries', invalid), 'INVALID_ARGUMENT');
+    assert.equal(space.policyVersion, before);
+    assert.deepEqual(permissions(), original);
+  }
+  db.grant('sp_a', 'agent', 'entries', ['records:write']);
+  assert.equal(space.policyVersion, before + 1);
+  assert.deepEqual(permissions(), ['records:write']);
+});
+
+test('unique descriptors must be snapshot-safe JSON data before name, path or clone checks', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  const space = db.spaces.get('sp_a');
+  const before = { collections: [...space.collections], events: [...db.events], outbox: [...db.outbox], receipts: [...db.receipts] };
+  let reads = 0;
+  const changing = { get name() { return ++reads === 1 ? 'first' : 'second'; }, paths: ['label'] };
+  const throwing = { get name() { throw Error('getter invoked'); }, paths: ['label'] };
+  const extraFunction = { name: 'first', paths: ['label'], extra: () => null };
+  const hidden = { name: 'first', paths: ['label'] };
+  Object.defineProperty(hidden, 'extra', { value: 1 });
+  const inherited = Object.assign(Object.create({ name: 'first' }), { paths: ['label'] });
+  const invalid = [
+    [changing, { name: 'second', paths: ['label'] }], [throwing], [extraFunction], [hidden], [inherited],
+    [{ name: 'first', paths: ['label'] }, { name: 'first', paths: ['label'] }],
+    [{ name: 'first', paths: [, 'label'] }], [{ name: 'first', paths: ['label'], extra: 'unsupported' }]
+  ];
+  for (const [index, descriptors] of invalid.entries()) {
+    code(() => db.define('sp_a', `invalid-${index}`, schema, descriptors), 'SCHEMA_UNSUPPORTED');
+    assert.deepEqual({ collections: [...space.collections], events: [...db.events], outbox: [...db.outbox], receipts: [...db.receipts] }, before);
+  }
+  assert.equal(reads, 0);
+  db.define('sp_a', 'valid', schema, [{ name: 'first', paths: ['label'] }, { name: 'second', paths: ['label'] }]);
+  db.grant('sp_a', 'agent', 'valid', recordAccess);
+  assert.deepEqual(space.collections.get('valid').uniques.map(({ name }) => name), ['first', 'second']);
+  db.mutate({ ...scope, collection: 'valid', operation: 'create', data: { label: 'taken' }, idempotencyKey: 'first' });
+  code(() => db.mutate({ ...scope, collection: 'valid', operation: 'create', data: { label: 'taken' }, idempotencyKey: 'second' }), 'UNIQUE_CONFLICT');
+  assert.equal(space.collections.get('valid').reserved.size, 2);
+});
+
 test('long key edges and fractional seconds use bounded linear trimming with unchanged normalization', () => {
   const db = setup();
   const key = ' \u0085'.repeat(20000) + 'x' + '\u3000'.repeat(20000);
