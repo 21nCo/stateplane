@@ -49,6 +49,7 @@ Status: accepted logical decisions; **not** evidence of deployed infrastructure.
 - Nonnegative integer length/item schema bounds do not inherit the record `integer` safe-range restriction; independently configured resource budgets may constrain definitions after evidence is gathered. Proxied schema nodes, arrays and declaration descriptors fail `SCHEMA_UNSUPPORTED` before persistence or revision.
 - Only top-level optional additions are compatible in v1 after index readiness where needed; nested additions require a later migration workflow.
 - Treat schema-node `required`, `enum`, and nullable `type` members as unordered sets for compatibility; keep array data and array enum *values* ordered. Membership or constraint changes still fail as breaking.
+- Traverse verified own indexed array values for item validation and enum definition/revision, not a later inherited iterator. Prototype-wide iterator pollution cannot skip an invalid member; invalid definitions and fresh/conditional writes fail without effects. Receipt fingerprint comparison still precedes current-schema validation on a committed retry.
 - Proof: STA-7 schema/compiler.
 
 ## D6 — Exact reads and consistent analysis

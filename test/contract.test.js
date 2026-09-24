@@ -1651,3 +1651,71 @@ test('existing-record mutations require well-formed nonempty IDs before receipt 
   assert.equal(collection.records.get(created.ref.id).revision, 4);
   assert.equal(db.get({ ...scope, id: created.ref.id }), null);
 });
+
+test('array item and enum validation never trusts an inherited iterator', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  const arrays = { $schema: schema.$schema, type: 'object', additionalProperties: false,
+    properties: { tags: { type: 'array', items: { type: 'string' } } }, required: ['tags'] };
+  db.define('sp_a', 'entries', arrays);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
+  const original = create(db, 'original', { tags: ['ok'] }, 'original');
+  const c = db.spaces.get('sp_a').collections.get('entries');
+  const snapshot = () => structuredClone({ seq: db.seq, version: c.version,
+    collections: [...db.spaces.get('sp_a').collections.keys()], records: [...c.records],
+    reservations: [...c.reserved], events: db.events, outbox: db.outbox, receipts: [...db.receipts] });
+  const oldIterator = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
+  let bypasses = 0;
+  try {
+    Object.defineProperty(Array.prototype, Symbol.iterator, { configurable: true, writable: true,
+      value: function* () {
+        if (this.length === 1 && Object.hasOwn(this, 0) && this[0] === 123) { bypasses++; return; }
+        if (this.length === 2 && this[0] === 'string' && this[1] === 'null') { bypasses++; return; }
+        if (this.length === 1 && this[0]?.additionalProperties === false && this[0]?.type === undefined) { bypasses++; return; }
+        if (this.length && this[this.length - 1] === 'rogue') {
+          bypasses++;
+          for (let index = 0; index < this.length - 1; index++) yield this[index];
+          return;
+        }
+        yield* oldIterator.value.call(this);
+      } });
+    db.define('sp_a', 'nullable', { ...arrays,
+      properties: { tag: { type: ['string', 'null'] } }, required: [] });
+    const before = snapshot();
+    const invalidSchema = { ...arrays, properties: { tags: { type: 'array',
+      items: { type: 'string' }, enum: [[123]] } } };
+    code(() => db.define('sp_a', 'invalid', invalidSchema), 'SCHEMA_UNSUPPORTED');
+    assert.deepEqual(snapshot(), before);
+    code(() => db.revise('sp_a', 'entries', 1, invalidSchema), 'SCHEMA_UNSUPPORTED');
+    assert.deepEqual(snapshot(), before);
+    const invalidChild = { ...arrays, properties: { rogue: { additionalProperties: false, properties: {} } } };
+    code(() => db.define('sp_a', 'invalid-child', invalidChild), 'SCHEMA_UNSUPPORTED');
+    assert.deepEqual(snapshot(), before);
+    code(() => create(db, 'invalid', { tags: [123] }, 'invalid'), 'SCHEMA_INVALID');
+    assert.deepEqual(snapshot(), before);
+    code(() => create(db, 'unknown', { tags: ['ok'], rogue: true }, 'unknown'), 'SCHEMA_INVALID');
+    assert.deepEqual(snapshot(), before);
+    code(() => db.mutate({ ...scope, operation: 'create', data: { tags: ['ok'] },
+      idempotencyKey: 'decorated', rogue: true }), 'INVALID_ARGUMENT');
+    assert.deepEqual(snapshot(), before);
+    for (const request of [
+      { ...scope, operation: 'replace', id: original.ref.id, expectedRevision: 1,
+        data: { tags: [123] }, idempotencyKey: 'replace-invalid' },
+      { ...scope, operation: 'patch', id: original.ref.id, expectedRevision: 1,
+        set: { tags: [123] }, unset: [], idempotencyKey: 'patch-invalid' }
+    ]) {
+      code(() => db.mutate(request), 'SCHEMA_INVALID');
+      assert.deepEqual(snapshot(), before);
+    }
+    const valid = create(db, 'valid', { tags: ['safe'] }, 'valid');
+    assert.deepEqual(db.get({ ...scope, id: valid.ref.id }).data.tags, ['safe']);
+    const after = snapshot();
+    code(() => create(db, 'valid', { tags: [123] }, 'valid'), 'IDEMPOTENCY_MISMATCH');
+    assert.deepEqual(snapshot(), after);
+    assert.equal(create(db, 'valid', { tags: ['safe'] }, 'valid').replayed, true);
+    assert.deepEqual(snapshot(), after);
+    assert.equal(bypasses, 0);
+  } finally {
+    Object.defineProperty(Array.prototype, Symbol.iterator, oldIterator);
+  }
+});

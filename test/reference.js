@@ -99,7 +99,9 @@ const validateJsonArray = (value, ancestors) => {
   }
 };
 const validateJsonObject = (value, ancestors) => {
-  for (const key of Reflect.ownKeys(value)) {
+  const keys = Reflect.ownKeys(value);
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index];
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (typeof key !== 'string' || !wellFormed(key) || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) fail('SCHEMA_INVALID');
     validateJsonPayload(descriptor.value, ancestors);
@@ -128,7 +130,7 @@ const schemaArrayMembers = (value, errorCode = 'SCHEMA_UNSUPPORTED') => {
   for (let index = 0; index < value.length; index++) {
     const descriptor = Object.getOwnPropertyDescriptor(value, index);
     if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) fail(errorCode);
-    members.push(descriptor.value);
+    members[index] = descriptor.value;
   }
   return members;
 };
@@ -156,20 +158,29 @@ const definitionType = (s, root) => {
   const types = Array.isArray(s.type) ? schemaArrayMembers(s.type) : [s.type];
   if (root && s.type !== 'object') fail('SCHEMA_UNSUPPORTED');
   if ((Array.isArray(s.type) && types.length !== 2) || types.length === 0 || types.length > 2 ||
-    new Set(types).size !== types.length || (types.length === 2 &&
-    (!types.includes('null') || !['string', 'number', 'integer', 'boolean'].includes(types.find(t => t !== 'null')))) ||
+    (types.length === 2 && (types[0] === types[1] ||
+    (types[0] !== 'null' && types[1] !== 'null') ||
+    !['string', 'number', 'integer', 'boolean'].includes(types[0] === 'null' ? types[1] : types[0]))) ||
     types.some(t => !['string', 'number', 'integer', 'boolean', 'object', 'array', 'null'].includes(t)) ||
     (types.length === 1 && types[0] === 'null')) fail('SCHEMA_UNSUPPORTED');
-  return types.find(t => t !== 'null');
+  return types[0] === 'null' ? types[1] : types[0];
 };
 const validateSizeBounds = s => {
-  for (const [min, max] of [['minLength', 'maxLength'], ['minItems', 'maxItems']]) {
-    for (const key of [min, max]) if (s[key] !== undefined && (!Number.isInteger(s[key]) || s[key] < 0)) fail('SCHEMA_UNSUPPORTED');
+  const bounds = [['minLength', 'maxLength'], ['minItems', 'maxItems']];
+  for (let index = 0; index < bounds.length; index++) {
+    const min = bounds[index][0], max = bounds[index][1];
+    for (let side = 0; side < 2; side++) {
+      const key = bounds[index][side];
+      if (s[key] !== undefined && (!Number.isInteger(s[key]) || s[key] < 0)) fail('SCHEMA_UNSUPPORTED');
+    }
     if (s[min] !== undefined && s[max] !== undefined && s[min] > s[max]) fail('SCHEMA_UNSUPPORTED');
   }
 };
 const validateNumericBounds = s => {
-  for (const key of ['minimum', 'maximum']) if (s[key] !== undefined && (typeof s[key] !== 'number' || !Number.isFinite(s[key]))) fail('SCHEMA_UNSUPPORTED');
+  for (let index = 0; index < 2; index++) {
+    const key = index === 0 ? 'minimum' : 'maximum';
+    if (s[key] !== undefined && (typeof s[key] !== 'number' || !Number.isFinite(s[key]))) fail('SCHEMA_UNSUPPORTED');
+  }
   if (s.minimum !== undefined && s.maximum !== undefined && s.minimum > s.maximum) fail('SCHEMA_UNSUPPORTED');
 };
 const validateBounds = (s, type) => {
@@ -189,7 +200,8 @@ const validateDefinitionStructure = (s, type) => {
 const validateObjectDefinition = s => {
   if (s.additionalProperties !== false || (s.properties !== undefined && !plainObject(s.properties))) fail('SCHEMA_UNSUPPORTED');
   if (Object.keys(s.properties ?? {}).some(name => !wellFormed(name))) fail('SCHEMA_UNSUPPORTED');
-  for (const child of Object.values(s.properties ?? {})) validateDefinition(child, false);
+  const children = Object.values(s.properties ?? {});
+  for (let index = 0; index < children.length; index++) validateDefinition(children[index], false);
   if (s.required === undefined) return;
   const required = schemaArrayMembers(s.required);
   if (required.some(k => typeof k !== 'string' || !Object.hasOwn(s.properties ?? {}, k)) ||
@@ -209,7 +221,8 @@ const validateDefinitionEnum = s => {
     const members = schemaArrayMembers(s.enum);
     if (members.length === 0) fail('SCHEMA_UNSUPPORTED');
     const seen = new Set();
-    for (const value of members) {
+    for (let index = 0; index < members.length; index++) {
+      const value = members[index];
       validateEnumMember(value, s);
       const canonical = stable(value);
       if (seen.has(canonical)) fail('SCHEMA_UNSUPPORTED');
@@ -233,11 +246,14 @@ const validateDefinition = (s, root = true) => {
 };
 const validateObject = (data, schema) => {
   if (!plainObject(data)) fail('SCHEMA_INVALID');
-  for (const k of Object.keys(data)) {
+  const keys = Object.keys(data);
+  for (let index = 0; index < keys.length; index++) {
+    const k = keys[index];
     if (!wellFormed(k) || !Object.hasOwn(schema.properties ?? {}, k)) fail('SCHEMA_INVALID');
     validateData(data[k], schema.properties[k]);
   }
-  for (const k of schema.required ?? []) if (!Object.hasOwn(data, k)) fail('SCHEMA_INVALID');
+  const required = schema.required ?? [];
+  for (let index = 0; index < required.length; index++) if (!Object.hasOwn(data, required[index])) fail('SCHEMA_INVALID');
 };
 const validateScalar = (data, schema, type) => {
   if (typeof data !== (type === 'integer' || type === 'number' ? 'number' : type)) fail('SCHEMA_INVALID');
@@ -249,18 +265,29 @@ const validateScalar = (data, schema, type) => {
 };
 const validateArray = (data, schema) => {
   if (!Array.isArray(data) || (schema.minItems !== undefined && data.length < schema.minItems) || (schema.maxItems !== undefined && data.length > schema.maxItems)) fail('SCHEMA_INVALID');
-  for (const value of data) validateData(value, schema.items);
+  // JSON validation already checked dense own data slots. Never use a later
+  // inherited iterator to decide which values satisfy the item schema.
+  for (let index = 0; index < data.length; index++) {
+    validateData(Object.getOwnPropertyDescriptor(data, index).value, schema.items);
+  }
 };
 const validateData = (data, schema) => {
   // Schema validation and enum checking never borrow optional keywords from a prototype.
   schema = Object.assign(Object.create(null), schema);
-  if (data === null && !(Array.isArray(schema.type) ? schema.type.includes('null') : schema.type === 'null')) fail('SCHEMA_INVALID');
-  const type = Array.isArray(schema.type) ? schema.type.find(t => t !== 'null') : schema.type;
+  if (data === null && !(Array.isArray(schema.type) ? schema.type[0] === 'null' || schema.type[1] === 'null' : schema.type === 'null')) fail('SCHEMA_INVALID');
+  const type = Array.isArray(schema.type) ? (schema.type[0] === 'null' ? schema.type[1] : schema.type[0]) : schema.type;
   if (data === null) { /* A nullable value must still satisfy enum below. */ }
   else if (type === 'object') validateObject(data, schema);
   else if (type === 'array') validateArray(data, schema);
   else validateScalar(data, schema, type);
-  if (schema.enum && !schema.enum.some(value => stable(value) === stable(data))) fail('SCHEMA_INVALID');
+  if (schema.enum) {
+    const value = stable(data);
+    let matched = false;
+    for (let index = 0; index < schema.enum.length; index++) {
+      if (stable(Object.getOwnPropertyDescriptor(schema.enum, index).value) === value) matched = true;
+    }
+    if (!matched) fail('SCHEMA_INVALID');
+  }
 };
 const mutationFields = new Set(['spaceId', 'credential', 'collection', 'operation', 'id', 'externalKey', 'data', 'set', 'unset',
   'expectedRevision', 'expectedSchemaVersion', 'idempotencyKey']);
@@ -272,7 +299,9 @@ const mutationTarget = request => {
   // caller traps or throw before authorization and envelope validation.
   if (types.isProxy(request) || request === null || typeof request !== 'object') fail('INVALID_ARGUMENT');
   const target = {};
-  for (const key of ['spaceId', 'credential', 'collection']) {
+  const keys = ['spaceId', 'credential', 'collection'];
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index];
     const descriptor = Object.getOwnPropertyDescriptor(request, key);
     if (!descriptor || !Object.hasOwn(descriptor, 'value')) fail('INVALID_ARGUMENT');
     target[key] = descriptor.value;
@@ -282,7 +311,9 @@ const mutationTarget = request => {
 const mutationEnvelope = request => {
   if (!plainObject(request)) fail('INVALID_ARGUMENT');
   const fields = {};
-  for (const key of Reflect.ownKeys(request)) {
+  const keys = Reflect.ownKeys(request);
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index];
     const descriptor = Object.getOwnPropertyDescriptor(request, key);
     if (typeof key !== 'string' || !mutationFields.has(key) || !descriptor?.enumerable ||
       !Object.hasOwn(descriptor, 'value')) fail('INVALID_ARGUMENT');
@@ -331,18 +362,20 @@ const mutationData = (operation, data, set, unset, current, schema) => {
   const required = Object.hasOwn(schema, 'required') ? schema.required : [];
   if (unset.some(k => !Object.hasOwn(schema.properties ?? {}, k) || required.includes(k))) fail('INVALID_ARGUMENT');
   const next = { ...clone(current.data), ...clone(set) };
-  for (const k of unset) delete next[k];
+  for (let index = 0; index < unset.length; index++) delete next[unset[index]];
   return next;
 };
 const reservationsFor = (current, normalized, nextData, operation, c, recordId) => {
   const recordKey = current?.key ?? normalized ?? recordId;
   const wanted = current?.keyMode === 'external' || (!current && normalized !== undefined)
     ? [stable(['external', recordKey])] : [];
-  if (operation !== 'delete') for (const u of c.uniques) {
+  if (operation !== 'delete') for (let index = 0; index < c.uniques.length; index++) {
+    const u = c.uniques[index];
     const tuple = tupleOf(nextData, u.paths, c.schema);
     if (tuple !== null) wanted.push(stable(['unique', u.name, tuple]));
   }
-  for (const reservation of wanted) {
+  for (let index = 0; index < wanted.length; index++) {
+    const reservation = wanted[index];
     const holder = c.reserved.get(reservation);
     if (holder && holder.id !== recordId) fail(holder.deleted ? 'KEY_RESERVED' : 'UNIQUE_CONFLICT');
   }
@@ -417,7 +450,7 @@ export class ReferenceState {
     const scalarPath = path => {
       if (typeof path !== 'string' || !path || !wellFormed(path) || !Object.hasOwn(schema.properties ?? {}, path)) return false;
       const shape = schema.properties[path];
-      const type = Array.isArray(shape.type) ? shape.type.find(t => t !== 'null') : shape.type;
+      const type = Array.isArray(shape.type) ? (shape.type[0] === 'null' ? shape.type[1] : shape.type[0]) : shape.type;
       return ['string', 'number', 'integer', 'boolean'].includes(type);
     };
     const uniqueEntries = uniqueDescriptors(uniques, scalarPath);
@@ -437,11 +470,19 @@ export class ReferenceState {
       value = Object.assign(Object.create(null), value);
       const { description, properties, items, ...rest } = value;
       const keywords = Object.assign(Object.create(null), rest);
-      for (const keyword of ['required', 'type', 'enum']) {
+      const setKeywords = ['required', 'type', 'enum'];
+      for (let index = 0; index < setKeywords.length; index++) {
+        const keyword = setKeywords[index];
         if (Array.isArray(keywords[keyword])) {
-          const members = new Map(keywords[keyword].map(member => [stable(member), member]));
-          keywords[keyword] = [...members].sort(([a], [b]) => Buffer.compare(Buffer.from(a), Buffer.from(b)))
-            .map(([, member]) => member);
+          const members = new Map();
+          for (let index = 0; index < keywords[keyword].length; index++) {
+            const member = Object.getOwnPropertyDescriptor(keywords[keyword], index).value;
+            members.set(stable(member), member);
+          }
+          const entries = [];
+          for (const entry of members) entries[entries.length] = entry;
+          entries.sort((a, b) => Buffer.compare(Buffer.from(a[0]), Buffer.from(b[0])));
+          keywords[keyword] = entries.map(entry => entry[1]);
         }
       }
       return { ...keywords, ...(properties === undefined ? {} : { properties: Object.fromEntries(Object.entries(properties).map(([name, shape]) => [name, withoutDescription(shape)])) }),
@@ -529,7 +570,7 @@ export class ReferenceState {
     }
     if (!current) this.seq++;
     c.records.set(recordId, record);
-    for (const reservation of wanted) c.reserved.set(reservation, record);
+    for (let index = 0; index < wanted.length; index++) c.reserved.set(wanted[index], record);
     const receipt = { contractVersion: '1', receiptId: `receipt_${this.events.length + 1}`, spaceId, ref: { kind: 'record', id: recordId }, operation, beforeRevision: current?.revision ?? null, revision: record.revision, schemaVersion: c.version, committedAt: 'synthetic', expiresAt: 'configured-by-adapter', projection: { generation: this.generation, state: 'pending' }, replayed: false };
     this.events.push({ spaceId, collection, id: recordId, revision: record.revision });
     this.outbox.push({ spaceId, collection, id: recordId, revision: record.revision, generation: this.generation });
