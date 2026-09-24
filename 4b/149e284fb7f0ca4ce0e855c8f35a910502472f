@@ -1,0 +1,20 @@
+contracts/decisions.md
+  h_a39f9495f9ec1d 20,40
+contracts/v1.md
+  h_a39f9495f9ec1d 15,31
+test/contract.test.js
+  h_a39f9495f9ec1d 51-88,405-429
+test/reference.js
+  h_a39f9495f9ec1d 149-150,254-277,453-454,456-458,460,477
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4b149e284fb7f0ca4ce0e855c8f35a910502472f",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
