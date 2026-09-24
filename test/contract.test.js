@@ -1096,3 +1096,86 @@ test('JSON envelope aliases cannot reuse a signed page cursor', () => {
   db.revoke('sp_a', 'agent', 'entries');
   code(() => db.query({ ...args, cursor: Buffer.from(aliases[1]).toString('base64url') }), 'FORBIDDEN');
 });
+
+test('readOnly denies fresh malformed writes before payload validation but permits authorized committed replay', () => {
+  const db = setup();
+  const created = { ...scope, operation: 'create', externalKey: 'item', data: { label: 'entry' }, idempotencyKey: 'create' };
+  const saved = db.mutate(created);
+  const patched = { ...scope, operation: 'patch', id: saved.ref.id, expectedRevision: 1,
+    set: { state: 'open' }, unset: [], idempotencyKey: 'patch' };
+  const patchReceipt = db.mutate(patched);
+  const collection = db.spaces.get('sp_a').collections.get('entries');
+  const snapshot = () => ({ rows: structuredClone([...collection.records]),
+    reservations: [...collection.reserved].map(([key, record]) => [key, record.id, record.revision]),
+    events: structuredClone(db.events), outbox: structuredClone(db.outbox), receipts: structuredClone([...db.receipts]) });
+  const before = snapshot();
+  db.lifecycle('sp_a', 'readOnly');
+  for (const invalid of [
+    { ...created, idempotencyKey: 'fresh-bad-create', data: { label: undefined } },
+    { ...patched, idempotencyKey: 'fresh-bad-patch', set: { state: undefined } },
+    { ...patched, idempotencyKey: 'fresh-bad-shape', unset: 'state' }
+  ]) {
+    code(() => db.mutate(invalid), 'SPACE_UNAVAILABLE');
+    assert.deepEqual(snapshot(), before);
+  }
+  assert.equal(db.mutate(created).receiptId, saved.receiptId);
+  assert.equal(db.mutate(patched).receiptId, patchReceipt.receiptId);
+  for (const [invalid, expected] of [
+    [{ ...created, data: { label: undefined } }, 'SCHEMA_INVALID'],
+    [{ ...patched, set: { state: undefined } }, 'SCHEMA_INVALID'],
+    [{ ...patched, unset: 'state' }, 'INVALID_ARGUMENT']
+  ]) {
+    code(() => db.mutate(invalid), expected);
+    assert.deepEqual(snapshot(), before);
+  }
+  code(() => db.mutate({ ...created, data: { label: 'changed' } }), 'IDEMPOTENCY_MISMATCH');
+  assert.deepEqual(snapshot(), before);
+  db.grant('sp_a', 'agent', 'entries', ['records:read']);
+  code(() => db.mutate(created), 'FORBIDDEN');
+  code(() => db.mutate({ ...created, idempotencyKey: 'fresh-bad-create', data: { label: undefined } }), 'FORBIDDEN');
+  assert.deepEqual(snapshot(), before);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
+  db.lifecycle('sp_a', 'active');
+  code(() => db.mutate({ ...created, idempotencyKey: 'active-bad-create', data: { label: undefined } }), 'SCHEMA_INVALID');
+  code(() => db.mutate({ ...patched, idempotencyKey: 'active-bad-patch', set: { state: undefined } }), 'SCHEMA_INVALID');
+  assert.deepEqual(snapshot(), before);
+  assert.equal(db.mutate(patched).replayed, true); // expectedRevision 1 is stale; the receipt wins
+});
+
+test('existing-record mutations require well-formed nonempty IDs before receipt lookup and record inspection', () => {
+  const db = setup();
+  const created = create(db, 'item', { label: 'entry' }, 'create');
+  const operations = [
+    { operation: 'replace', data: { label: 'changed' } },
+    { operation: 'patch', set: {}, unset: [] },
+    { operation: 'delete' }
+  ];
+  const collection = db.spaces.get('sp_a').collections.get('entries');
+  const snapshot = () => ({ rows: structuredClone([...collection.records]),
+    reservations: [...collection.reserved].map(([key, record]) => [key, record.id, record.revision]),
+    events: structuredClone(db.events), outbox: structuredClone(db.outbox), receipts: structuredClone([...db.receipts]) });
+  const before = snapshot();
+  for (const fields of operations) for (const id of [undefined, null, 0, '', '\uD800']) {
+    for (const request of [
+      { ...scope, ...fields, id, expectedRevision: 1, idempotencyKey: `bad-${fields.operation}` },
+      { ...scope, ...fields, id, expectedRevision: 1, idempotencyKey: 'create' }
+    ]) {
+      code(() => db.mutate(request), 'INVALID_ARGUMENT');
+      assert.deepEqual(snapshot(), before);
+    }
+  }
+  for (const fields of operations) {
+    code(() => db.mutate({ ...scope, ...fields, id: 'rec_missing', expectedRevision: 1,
+      idempotencyKey: `missing-${fields.operation}` }), 'NOT_FOUND');
+    assert.deepEqual(snapshot(), before);
+  }
+  const replacement = { ...scope, operation: 'replace', id: created.ref.id,
+    expectedRevision: 1, data: { label: 'changed' }, idempotencyKey: 'valid-replace' };
+  const committed = db.mutate(replacement);
+  for (const id of [undefined, null, 0, '', '\uD800']) {
+    code(() => db.mutate({ ...replacement, id }), 'INVALID_ARGUMENT');
+  }
+  assert.equal(db.mutate(replacement).receiptId, committed.receiptId);
+  assert.equal(db.mutate(replacement).replayed, true);
+  assert.equal(db.get({ ...scope, id: created.ref.id }).revision, 2);
+});

@@ -250,10 +250,11 @@ const validateData = (data, schema) => {
 };
 const mutationFields = new Set(['spaceId', 'credential', 'collection', 'operation', 'id', 'externalKey', 'data', 'set', 'unset',
   'expectedRevision', 'expectedSchemaVersion', 'idempotencyKey']);
-const validateMutationInput = ({ operation, externalKey, expectedRevision, expectedSchemaVersion, idempotencyKey, supplied }) => {
+const validateMutationInput = ({ operation, id, externalKey, expectedRevision, expectedSchemaVersion, idempotencyKey, supplied }) => {
   if (typeof idempotencyKey !== 'string' || !idempotencyKey ||
     !['create', 'replace', 'patch', 'delete'].includes(operation) || [...supplied].some(field => !mutationFields.has(field))) fail('INVALID_ARGUMENT');
   if (operation !== 'create' && (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1)) fail('INVALID_ARGUMENT');
+  if (operation !== 'create' && (typeof id !== 'string' || !id || !wellFormed(id))) fail('INVALID_ARGUMENT');
   if ((operation === 'create' && ['id', 'set', 'unset', 'expectedRevision'].some(field => supplied.has(field))) ||
     (operation === 'replace' && ['externalKey', 'set', 'unset'].some(field => supplied.has(field))) ||
     (operation === 'patch' && ['externalKey', 'data'].some(field => supplied.has(field))) ||
@@ -426,12 +427,15 @@ export class ReferenceState {
   mutate(request) {
     const { spaceId, credential, collection, operation, id, externalKey, data, set, unset, expectedRevision, expectedSchemaVersion, idempotencyKey } = request;
     const { c } = this.#access(spaceId, credential, collection, 'records:write', true);
-    const normalized = validateMutationInput({ operation, externalKey, expectedRevision, expectedSchemaVersion,
+    const normalized = validateMutationInput({ operation, id, externalKey, expectedRevision, expectedSchemaVersion,
       idempotencyKey, supplied: new Set(Reflect.ownKeys(request)) });
     const identity = stable([spaceId, credential, operation, idempotencyKey]);
     const previous = this.receipts.get(identity);
     // Before parsing a receipt's payload, check that its original collection is still visible.
     if (previous) this.#access(spaceId, credential, previous.collection, 'records:write', true);
+    // A readOnly space accepts only committed retries; fresh writes are denied
+    // before inspecting their payload, without hiding malformed committed retries.
+    else this.#access(spaceId, credential, collection, 'records:write');
     validateFingerprintPayload(operation, data, set, unset);
     // Caller-supplied schema precondition is stable across compatible schema additions.
     // Do not fingerprint the server's current schema version: a lost response must replay.
@@ -440,7 +444,6 @@ export class ReferenceState {
       if (previous.fingerprint !== fingerprint) fail('IDEMPOTENCY_MISMATCH');
       return { ...clone(previous.receipt), replayed: true };
     }
-    this.#access(spaceId, credential, collection, 'records:write');
     if (expectedSchemaVersion !== undefined && expectedSchemaVersion !== c.version) fail('SCHEMA_CONFLICT');
     const current = id ? c.records.get(id) : null;
     if (operation !== 'create' && (!current || current.deleted)) fail('NOT_FOUND');
