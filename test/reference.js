@@ -98,10 +98,23 @@ const validateJsonPayload = (value, ancestors = new Set()) => {
   else validateJsonObject(value, ancestors);
   ancestors.delete(value);
 };
+// Keyword arrays are JSON arrays, not sparse or decorated in-process arrays.
+// Validate them before set comparisons, where holes or duplicates could disappear.
+const schemaArrayMembers = value => {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype ||
+    Reflect.ownKeys(value).length !== value.length + 1) fail('SCHEMA_UNSUPPORTED');
+  const members = [];
+  for (let index = 0; index < value.length; index++) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, index);
+    if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) fail('SCHEMA_UNSUPPORTED');
+    members.push(descriptor.value);
+  }
+  return members;
+};
 const definitionType = (s, root) => {
   if (!plainObject(s) || Object.keys(s).some(name => !allowedKeywords.has(name))) fail('SCHEMA_UNSUPPORTED');
   if (root ? s.$schema !== 'https://json-schema.org/draft/2020-12/schema' : Object.hasOwn(s, '$schema')) fail('SCHEMA_UNSUPPORTED');
-  const types = Array.isArray(s.type) ? s.type : [s.type];
+  const types = Array.isArray(s.type) ? schemaArrayMembers(s.type) : [s.type];
   if (root && s.type !== 'object') fail('SCHEMA_UNSUPPORTED');
   if (types.length === 0 || types.length > 2 || new Set(types).size !== types.length || (types.length === 2 &&
     (!types.includes('null') || !['string', 'number', 'integer', 'boolean'].includes(types.find(t => t !== 'null')))) ||
@@ -132,20 +145,32 @@ const validateDefinitionStructure = (s, type) => {
     if (s.additionalProperties !== false || (s.properties !== undefined && !plainObject(s.properties))) fail('SCHEMA_UNSUPPORTED');
     if (Object.keys(s.properties ?? {}).some(name => !wellFormed(name))) fail('SCHEMA_UNSUPPORTED');
     for (const child of Object.values(s.properties ?? {})) validateDefinition(child, false);
-    if (s.required !== undefined && (!Array.isArray(s.required) || s.required.some(k => typeof k !== 'string' || !Object.hasOwn(s.properties ?? {}, k)) || new Set(s.required).size !== s.required.length)) fail('SCHEMA_UNSUPPORTED');
+    if (s.required !== undefined) {
+      const required = schemaArrayMembers(s.required);
+      if (required.some(k => typeof k !== 'string' || !Object.hasOwn(s.properties ?? {}, k)) ||
+        new Set(required).size !== required.length) fail('SCHEMA_UNSUPPORTED');
+    }
   } else if (s.properties !== undefined || s.required !== undefined || s.additionalProperties !== undefined) fail('SCHEMA_UNSUPPORTED');
   if (type === 'array') validateDefinition(s.items, false);
   else if (s.items !== undefined || s.minItems !== undefined || s.maxItems !== undefined) fail('SCHEMA_UNSUPPORTED');
 };
 const validateDefinitionEnum = s => {
   if (s.enum !== undefined) {
-    if (!Array.isArray(s.enum) || s.enum.length === 0) fail('SCHEMA_UNSUPPORTED');
-    for (const value of s.enum) {
-      try { validateData(value, { ...s, enum: undefined }); }
+    const members = schemaArrayMembers(s.enum);
+    if (members.length === 0) fail('SCHEMA_UNSUPPORTED');
+    const seen = new Set();
+    for (const value of members) {
+      try {
+        validateJsonPayload(value);
+        validateData(value, { ...s, enum: undefined });
+      }
       catch (error) {
         if (error instanceof ContractError && error.code === 'SCHEMA_INVALID') fail('SCHEMA_UNSUPPORTED');
         throw error;
       }
+      const canonical = stable(value);
+      if (seen.has(canonical)) fail('SCHEMA_UNSUPPORTED');
+      seen.add(canonical);
     }
   }
 };

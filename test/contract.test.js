@@ -804,9 +804,9 @@ test('present undefined operation fields and custom-prototype arrays never alias
   db.mutate(patched);
   const deleted = { ...scope, operation: 'delete', id, expectedRevision: 3, idempotencyKey: 'delete' };
   db.mutate(deleted);
-  const collection = db.spaces.get('sp_a').collections.get('entries');
-  const snapshot = () => ({ rows: structuredClone([...collection.records]),
-    reservations: [...collection.reserved].map(([key, record]) => [key, record.id, record.revision]),
+  const snapshot = () => ({ collections: [...db.spaces.get('sp_a').collections].map(([name, state]) => ({ name,
+    rows: structuredClone([...state.records]),
+    reservations: [...state.reserved].map(([key, record]) => [key, record.id, record.revision]) })),
     events: structuredClone(db.events), outbox: structuredClone(db.outbox), receipts: structuredClone([...db.receipts]) });
   const before = snapshot();
   const changed = ['different'];
@@ -844,6 +844,7 @@ test('present undefined operation fields and custom-prototype arrays never alias
   db.mutate(nested);
   const nestedBefore = snapshot();
   code(() => db.mutate({ ...nested, data: { tags: [changed] } }), 'SCHEMA_INVALID');
+  assert.deepEqual(snapshot(), nestedBefore);
   code(() => db.mutate({ ...nested, idempotencyKey: 'nested-fresh', data: { tags: [changed] } }), 'SCHEMA_INVALID');
   assert.deepEqual(snapshot(), nestedBefore);
   assert.equal(db.mutate(created).replayed, true);
@@ -874,6 +875,35 @@ test('schema compatibility treats required, enum and nullable type members as se
   const arrayEnum = { ...schema, required: [], properties: { tags: { type: 'array', items: { type: 'integer' }, enum: [[1, 2], [2, 1]] } } };
   db.define('sp_a', 'array-enum', arrayEnum);
   assert.equal(db.revise('sp_a', 'array-enum', 1, { ...arrayEnum, properties: { tags: { ...arrayEnum.properties.tags, enum: [[2, 1], [1, 2]] } } }), 2);
-  code(() => db.revise('sp_a', 'array-enum', 2, { ...arrayEnum, properties: { tags: { ...arrayEnum.properties.tags, enum: [[1, 2], [1, 2]] } } }), 'SCHEMA_BREAKING');
-  assert.equal(db.revise('sp_a', 'array-enum', 2, { ...arrayEnum, properties: { tags: { ...arrayEnum.properties.tags, enum: [[1, 2], [2, 1], [1, 2]] } } }), 3);
+  code(() => db.revise('sp_a', 'array-enum', 2, { ...arrayEnum, properties: { tags: { ...arrayEnum.properties.tags, enum: [[1, 2]] } } }), 'SCHEMA_BREAKING');
+  code(() => db.revise('sp_a', 'array-enum', 2, { ...arrayEnum, properties: { tags: { ...arrayEnum.properties.tags, enum: [[1, 2], [1, 2]] } } }), 'SCHEMA_UNSUPPORTED');
+  code(() => db.revise('sp_a', 'array-enum', 2, { ...arrayEnum, properties: { tags: { ...arrayEnum.properties.tags, enum: [[1, 2], [2, 1], [1, 2]] } } }), 'SCHEMA_UNSUPPORTED');
+  assert.equal(db.spaces.get('sp_a').collections.get('array-enum').version, 2);
+});
+
+test('schema keyword arrays reject sparse and duplicate members at definition and revision without effects', () => {
+  const db = setup();
+  const collection = db.spaces.get('sp_a').collections.get('entries');
+  create(db, 'existing', { label: 'existing', state: 'open' }, 'existing');
+  const snapshot = () => ({ version: collection.version, schema: structuredClone(collection.schema),
+    records: structuredClone([...collection.records]), reservations: structuredClone([...collection.reserved]),
+    events: structuredClone(db.events), outbox: structuredClone(db.outbox), receipts: structuredClone([...db.receipts]) });
+  const before = snapshot();
+  const scalarEnum = { ...schema, properties: { ...schema.properties, state: { type: 'string', enum: ['open', 'open'] } } };
+  const structuralEnum = { ...schema, properties: { ...schema.properties,
+    tags: { type: 'array', items: { type: 'integer' }, enum: [[1, 2], [1, 2]] } } };
+  const objectEnum = { ...schema, properties: { ...schema.properties,
+    detail: { type: 'object', properties: { a: { type: 'integer' }, b: { type: 'integer' } }, additionalProperties: false,
+      enum: [{ a: 1, b: 2 }, { b: 2, a: 1 }] } } };
+  const sparseRequired = { ...schema, required: new Array(1) };
+  const sparseTypes = { ...schema, properties: { ...schema.properties, ordinal: { type: ['integer', ,] } } };
+  const sparseEnum = { ...schema, properties: { ...schema.properties, state: { type: 'string', enum: new Array(1) } } };
+  for (const [index, invalid] of [scalarEnum, structuralEnum, objectEnum, sparseRequired, sparseTypes, sparseEnum].entries()) {
+    code(() => db.define('sp_a', `invalid-${index}`, invalid), 'SCHEMA_UNSUPPORTED');
+    assert.equal(db.spaces.get('sp_a').collections.has(`invalid-${index}`), false);
+    code(() => db.revise('sp_a', 'entries', 1, invalid), 'SCHEMA_UNSUPPORTED');
+    assert.deepEqual(snapshot(), before);
+  }
+  assert.equal(db.revise('sp_a', 'entries', 1, { ...schema, required: ['label'], properties: { ...schema.properties,
+    tags: { type: 'array', items: { type: 'integer' }, enum: [[1, 2], [2, 1]] } } }), 2);
 });
