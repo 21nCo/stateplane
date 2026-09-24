@@ -7,20 +7,49 @@ export class ContractError extends Error {
 }
 const fail = code => { throw new ContractError(code); };
 const clone = value => structuredClone(value);
+// Never assign into an empty array through an inherited numeric setter.
+const appendOwn = (array, value) => Object.defineProperty(array, array.length,
+  { value, enumerable: true, writable: true, configurable: true });
+// Indexed scans below are intentional: S4138's for-of rewrite would invoke
+// a mutable inherited iterator after input validation and change decisions.
+const someOwn = (array, predicate) => {
+  for (let index = 0; index < array.length; index++) { // NOSONAR
+    if (predicate(Object.getOwnPropertyDescriptor(array, index).value, index)) return true;
+  }
+  return false;
+};
+const includesOwn = (array, value) => someOwn(array, item => item === value);
+const hasDuplicateOwn = array => {
+  const seen = new Set();
+  for (let index = 0; index < array.length; index++) { // NOSONAR
+    const item = Object.getOwnPropertyDescriptor(array, index).value;
+    if (seen.has(item)) return true;
+    seen.add(item);
+  }
+  return false;
+};
+const sortIntrinsic = Array.prototype.sort;
 // Canonical object-key ordering is UTF-8 byte order, independent of host locale/ICU.
 const stable = value => {
   if (Array.isArray(value)) {
-    const items = [];
-    for (let index = 0; index < value.length; index++) {
-      items.push(stable(Object.getOwnPropertyDescriptor(value, index)?.value) ?? 'null');
+    let items = '';
+    for (let index = 0; index < value.length; index++) { // NOSONAR
+      if (index) items += ',';
+      items += stable(Object.getOwnPropertyDescriptor(value, index)?.value) ?? 'null';
     }
-    return `[${items.join(',')}]`;
+    return `[${items}]`;
   }
   if (value !== null && typeof value === 'object') {
-    const fields = Object.keys(value).sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))
-      .filter(key => Object.getOwnPropertyDescriptor(value, key).value !== undefined)
-      .map(key => `${JSON.stringify(key)}:${stable(Object.getOwnPropertyDescriptor(value, key).value)}`);
-    return `{${fields.join(',')}}`;
+    const keys = Object.keys(value);
+    Reflect.apply(sortIntrinsic, keys, [(a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b))]);
+    let fields = '';
+    for (let index = 0; index < keys.length; index++) { // NOSONAR
+      const key = keys[index], item = Object.getOwnPropertyDescriptor(value, key).value;
+      if (item === undefined) continue;
+      if (fields) fields += ',';
+      fields += `${JSON.stringify(key)}:${stable(item)}`;
+    }
+    return `{${fields}}`;
   }
   return JSON.stringify(value);
 };
@@ -35,7 +64,9 @@ const trimKey = value => {
   let end = scalars.length;
   while (start < end && whitespace.has(scalars[start].codePointAt(0))) start++;
   while (end > start && whitespace.has(scalars[end - 1].codePointAt(0))) end--;
-  return scalars.slice(start, end).join('');
+  let trimmed = '';
+  for (let index = start; index < end; index++) trimmed += scalars[index];
+  return trimmed;
 };
 // A lone UTF-16 surrogate has no Unicode scalar value and cannot encode as UTF-8.
 const wellFormed = value => [...value].every(scalar => scalar.length !== 1 || scalar < '\uD800' || scalar > '\uDFFF');
@@ -74,16 +105,19 @@ const utcInstant = value => {
 const dateTimeField = (schema, field) => Object.hasOwn(schema.properties[field], 'format') &&
   schema.properties[field].format === 'date-time';
 const tupleOf = (data, paths, schema) => {
-  const parts = paths.map(path => Object.hasOwn(data, path) ? data[path] : undefined);
-  if (parts.some(v => v === undefined || v === null)) return null;
-  return parts.map((v, index) => {
-    if (!['string', 'number', 'boolean'].includes(typeof v) || (typeof v === 'number' && !Number.isFinite(v))) fail('SCHEMA_INVALID');
+  let tuple = '';
+  for (let index = 0; index < paths.length; index++) { // NOSONAR
+    const path = Object.getOwnPropertyDescriptor(paths, index).value;
+    const v = Object.hasOwn(data, path) ? data[path] : undefined;
+    if (v === undefined || v === null) return null;
+    if (!includesOwn(['string', 'number', 'boolean'], typeof v) || (typeof v === 'number' && !Number.isFinite(v))) fail('SCHEMA_INVALID');
     let value;
-    if (dateTimeField(schema, paths[index])) value = utcInstant(v);
+    if (dateTimeField(schema, path)) value = utcInstant(v);
     else if (typeof v === 'string') value = v.normalize('NFC'); // reservation only; stored data is unchanged
     else value = JSON.stringify(v);
-    return `${typeof v}:${Buffer.byteLength(value)}:${value}`;
-  }).join('');
+    tuple += `${typeof v}:${Buffer.byteLength(value)}:${value}`;
+  }
+  return tuple;
 };
 const allowedKeywords = new Set(['$schema', 'type', 'properties', 'required', 'additionalProperties', 'items', 'minItems', 'maxItems', 'minLength', 'maxLength', 'minimum', 'maximum', 'enum', 'format', 'description']);
 const plainObject = value => value !== null && typeof value === 'object' &&
@@ -92,7 +126,7 @@ const plainObject = value => value !== null && typeof value === 'object' &&
 // serialization must not silently omit an object field or turn an array slot into null.
 const validateJsonArray = (value, ancestors) => {
   if (Object.getPrototypeOf(value) !== Array.prototype || Reflect.ownKeys(value).length !== value.length + 1) fail('SCHEMA_INVALID');
-  for (let index = 0; index < value.length; index++) {
+  for (let index = 0; index < value.length; index++) { // NOSONAR
     const descriptor = Object.getOwnPropertyDescriptor(value, index);
     if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) fail('SCHEMA_INVALID');
     validateJsonPayload(descriptor.value, ancestors);
@@ -100,7 +134,7 @@ const validateJsonArray = (value, ancestors) => {
 };
 const validateJsonObject = (value, ancestors) => {
   const keys = Reflect.ownKeys(value);
-  for (let index = 0; index < keys.length; index++) {
+  for (let index = 0; index < keys.length; index++) { // NOSONAR
     const key = keys[index];
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (typeof key !== 'string' || !wellFormed(key) || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) fail('SCHEMA_INVALID');
@@ -127,32 +161,39 @@ const schemaArrayMembers = (value, errorCode = 'SCHEMA_UNSUPPORTED') => {
   if (types.isProxy(value) || !Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype ||
     Reflect.ownKeys(value).length !== value.length + 1) fail(errorCode);
   const members = [];
-  for (let index = 0; index < value.length; index++) {
+  for (let index = 0; index < value.length; index++) { // NOSONAR
     const descriptor = Object.getOwnPropertyDescriptor(value, index);
     if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) fail(errorCode);
-    members[index] = descriptor.value;
+    appendOwn(members, descriptor.value);
   }
   return members;
 };
 const uniqueDescriptors = (uniques, scalarPath) => {
-  const entries = schemaArrayMembers(uniques).map(value => {
+  const entries = [];
+  const descriptors = schemaArrayMembers(uniques);
+  for (let index = 0; index < descriptors.length; index++) { // NOSONAR
+    const value = descriptors[index];
     if (types.isProxy(value) || !plainObject(value)) fail('SCHEMA_UNSUPPORTED');
     // Inspect own descriptors, never caller getters; retain only validated data.
     const fields = Object.getOwnPropertyDescriptors(value);
     const keys = Reflect.ownKeys(fields);
-    if (keys.length !== 2 || !keys.includes('name') || !keys.includes('paths') ||
-      keys.some(key => !fields[key].enumerable || !Object.hasOwn(fields[key], 'value'))) fail('SCHEMA_UNSUPPORTED');
+    if (keys.length !== 2 || !includesOwn(keys, 'name') || !includesOwn(keys, 'paths') ||
+      someOwn(keys, key => !fields[key].enumerable || !Object.hasOwn(fields[key], 'value'))) fail('SCHEMA_UNSUPPORTED');
     const name = fields.name.value;
     const paths = schemaArrayMembers(fields.paths.value);
     if (typeof name !== 'string' || !name || !wellFormed(name) || !paths.length ||
-      new Set(paths).size !== paths.length || paths.some(path => !scalarPath(path))) fail('SCHEMA_UNSUPPORTED');
-    return { name, paths };
-  });
-  if (new Set(entries.map(entry => entry.name)).size !== entries.length) fail('SCHEMA_UNSUPPORTED');
+      hasDuplicateOwn(paths) || someOwn(paths, path => !scalarPath(path))) fail('SCHEMA_UNSUPPORTED');
+    appendOwn(entries, { name, paths });
+  }
+  const names = new Set();
+  for (let index = 0; index < entries.length; index++) { // NOSONAR
+    if (names.has(entries[index].name)) fail('SCHEMA_UNSUPPORTED');
+    names.add(entries[index].name);
+  }
   return entries;
 };
 const definitionType = (s, root) => {
-  if (!plainObject(s) || Object.keys(s).some(name => !allowedKeywords.has(name))) fail('SCHEMA_UNSUPPORTED');
+  if (!plainObject(s) || someOwn(Object.keys(s), name => !allowedKeywords.has(name))) fail('SCHEMA_UNSUPPORTED');
   if (root ? (!Object.hasOwn(s, '$schema') || s.$schema !== 'https://json-schema.org/draft/2020-12/schema') : Object.hasOwn(s, '$schema')) fail('SCHEMA_UNSUPPORTED');
   if (!Object.hasOwn(s, 'type')) fail('SCHEMA_UNSUPPORTED');
   const types = Array.isArray(s.type) ? schemaArrayMembers(s.type) : [s.type];
@@ -160,14 +201,14 @@ const definitionType = (s, root) => {
   if ((Array.isArray(s.type) && types.length !== 2) || types.length === 0 || types.length > 2 ||
     (types.length === 2 && (types[0] === types[1] ||
     (types[0] !== 'null' && types[1] !== 'null') ||
-    !['string', 'number', 'integer', 'boolean'].includes(types[0] === 'null' ? types[1] : types[0]))) ||
-    types.some(t => !['string', 'number', 'integer', 'boolean', 'object', 'array', 'null'].includes(t)) ||
+    !includesOwn(['string', 'number', 'integer', 'boolean'], types[0] === 'null' ? types[1] : types[0]))) ||
+    someOwn(types, t => !includesOwn(['string', 'number', 'integer', 'boolean', 'object', 'array', 'null'], t)) ||
     (types.length === 1 && types[0] === 'null')) fail('SCHEMA_UNSUPPORTED');
   return types[0] === 'null' ? types[1] : types[0];
 };
 const validateSizeBounds = s => {
   const bounds = [['minLength', 'maxLength'], ['minItems', 'maxItems']];
-  for (let index = 0; index < bounds.length; index++) {
+  for (let index = 0; index < bounds.length; index++) { // NOSONAR
     const min = bounds[index][0], max = bounds[index][1];
     for (let side = 0; side < 2; side++) {
       const key = bounds[index][side];
@@ -189,7 +230,7 @@ const validateBounds = (s, type) => {
   validateNumericBounds(s);
   if (s.format !== undefined && (type !== 'string' || s.format !== 'date-time')) fail('SCHEMA_UNSUPPORTED');
   if (type !== 'string' && (s.minLength !== undefined || s.maxLength !== undefined)) fail('SCHEMA_UNSUPPORTED');
-  if (!['number', 'integer'].includes(type) && (s.minimum !== undefined || s.maximum !== undefined)) fail('SCHEMA_UNSUPPORTED');
+  if (!includesOwn(['number', 'integer'], type) && (s.minimum !== undefined || s.maximum !== undefined)) fail('SCHEMA_UNSUPPORTED');
 };
 const validateDefinitionStructure = (s, type) => {
   if (type === 'object') validateObjectDefinition(s);
@@ -199,13 +240,13 @@ const validateDefinitionStructure = (s, type) => {
 };
 const validateObjectDefinition = s => {
   if (s.additionalProperties !== false || (s.properties !== undefined && !plainObject(s.properties))) fail('SCHEMA_UNSUPPORTED');
-  if (Object.keys(s.properties ?? {}).some(name => !wellFormed(name))) fail('SCHEMA_UNSUPPORTED');
+  if (someOwn(Object.keys(s.properties ?? {}), name => !wellFormed(name))) fail('SCHEMA_UNSUPPORTED');
   const children = Object.values(s.properties ?? {});
-  for (let index = 0; index < children.length; index++) validateDefinition(children[index], false);
+  for (let index = 0; index < children.length; index++) validateDefinition(children[index], false); // NOSONAR
   if (s.required === undefined) return;
   const required = schemaArrayMembers(s.required);
-  if (required.some(k => typeof k !== 'string' || !Object.hasOwn(s.properties ?? {}, k)) ||
-    new Set(required).size !== required.length) fail('SCHEMA_UNSUPPORTED');
+  if (someOwn(required, k => typeof k !== 'string' || !Object.hasOwn(s.properties ?? {}, k)) ||
+    hasDuplicateOwn(required)) fail('SCHEMA_UNSUPPORTED');
 };
 const validateEnumMember = (value, schema) => {
   try {
@@ -221,7 +262,7 @@ const validateDefinitionEnum = s => {
     const members = schemaArrayMembers(s.enum);
     if (members.length === 0) fail('SCHEMA_UNSUPPORTED');
     const seen = new Set();
-    for (let index = 0; index < members.length; index++) {
+    for (let index = 0; index < members.length; index++) { // NOSONAR
       const value = members[index];
       validateEnumMember(value, s);
       const canonical = stable(value);
@@ -247,13 +288,13 @@ const validateDefinition = (s, root = true) => {
 const validateObject = (data, schema) => {
   if (!plainObject(data)) fail('SCHEMA_INVALID');
   const keys = Object.keys(data);
-  for (let index = 0; index < keys.length; index++) {
+  for (let index = 0; index < keys.length; index++) { // NOSONAR
     const k = keys[index];
     if (!wellFormed(k) || !Object.hasOwn(schema.properties ?? {}, k)) fail('SCHEMA_INVALID');
     validateData(data[k], schema.properties[k]);
   }
   const required = schema.required ?? [];
-  for (let index = 0; index < required.length; index++) if (!Object.hasOwn(data, required[index])) fail('SCHEMA_INVALID');
+  for (let index = 0; index < required.length; index++) if (!Object.hasOwn(data, required[index])) fail('SCHEMA_INVALID'); // NOSONAR
 };
 const validateScalar = (data, schema, type) => {
   if (typeof data !== (type === 'integer' || type === 'number' ? 'number' : type)) fail('SCHEMA_INVALID');
@@ -267,27 +308,29 @@ const validateArray = (data, schema) => {
   if (!Array.isArray(data) || (schema.minItems !== undefined && data.length < schema.minItems) || (schema.maxItems !== undefined && data.length > schema.maxItems)) fail('SCHEMA_INVALID');
   // JSON validation already checked dense own data slots. Never use a later
   // inherited iterator to decide which values satisfy the item schema.
-  for (let index = 0; index < data.length; index++) {
+  for (let index = 0; index < data.length; index++) { // NOSONAR
     validateData(Object.getOwnPropertyDescriptor(data, index).value, schema.items);
   }
+};
+const schemaType = schema => {
+  if (!Array.isArray(schema.type)) return schema.type;
+  return schema.type[0] === 'null' ? schema.type[1] : schema.type[0];
+};
+const validateEnumValue = (data, schema) => {
+  if (!schema.enum) return;
+  const value = stable(data);
+  if (!someOwn(schema.enum, member => stable(member) === value)) fail('SCHEMA_INVALID');
 };
 const validateData = (data, schema) => {
   // Schema validation and enum checking never borrow optional keywords from a prototype.
   schema = Object.assign(Object.create(null), schema);
-  if (data === null && !(Array.isArray(schema.type) ? schema.type[0] === 'null' || schema.type[1] === 'null' : schema.type === 'null')) fail('SCHEMA_INVALID');
-  const type = Array.isArray(schema.type) ? (schema.type[0] === 'null' ? schema.type[1] : schema.type[0]) : schema.type;
+  if (data === null && !(Array.isArray(schema.type) ? includesOwn(schema.type, 'null') : schema.type === 'null')) fail('SCHEMA_INVALID');
+  const type = schemaType(schema);
   if (data === null) { /* A nullable value must still satisfy enum below. */ }
   else if (type === 'object') validateObject(data, schema);
   else if (type === 'array') validateArray(data, schema);
   else validateScalar(data, schema, type);
-  if (schema.enum) {
-    const value = stable(data);
-    let matched = false;
-    for (let index = 0; index < schema.enum.length; index++) {
-      if (stable(Object.getOwnPropertyDescriptor(schema.enum, index).value) === value) matched = true;
-    }
-    if (!matched) fail('SCHEMA_INVALID');
-  }
+  validateEnumValue(data, schema);
 };
 const mutationFields = new Set(['spaceId', 'credential', 'collection', 'operation', 'id', 'externalKey', 'data', 'set', 'unset',
   'expectedRevision', 'expectedSchemaVersion', 'idempotencyKey']);
@@ -300,7 +343,7 @@ const mutationTarget = request => {
   if (types.isProxy(request) || request === null || typeof request !== 'object') fail('INVALID_ARGUMENT');
   const target = {};
   const keys = ['spaceId', 'credential', 'collection'];
-  for (let index = 0; index < keys.length; index++) {
+  for (let index = 0; index < keys.length; index++) { // NOSONAR
     const key = keys[index];
     const descriptor = Object.getOwnPropertyDescriptor(request, key);
     if (!descriptor || !Object.hasOwn(descriptor, 'value')) fail('INVALID_ARGUMENT');
@@ -312,7 +355,7 @@ const mutationEnvelope = request => {
   if (!plainObject(request)) fail('INVALID_ARGUMENT');
   const fields = {};
   const keys = Reflect.ownKeys(request);
-  for (let index = 0; index < keys.length; index++) {
+  for (let index = 0; index < keys.length; index++) { // NOSONAR
     const key = keys[index];
     const descriptor = Object.getOwnPropertyDescriptor(request, key);
     if (typeof key !== 'string' || !mutationFields.has(key) || !descriptor?.enumerable ||
@@ -323,13 +366,13 @@ const mutationEnvelope = request => {
 };
 const validateMutationInput = ({ operation, id, externalKey, expectedRevision, expectedSchemaVersion, idempotencyKey, supplied }) => {
   if (typeof idempotencyKey !== 'string' || !idempotencyKey ||
-    !['create', 'replace', 'patch', 'delete'].includes(operation) || [...supplied].some(field => !mutationFields.has(field))) fail('INVALID_ARGUMENT');
+    !includesOwn(['create', 'replace', 'patch', 'delete'], operation) || someOwn([...supplied], field => !mutationFields.has(field))) fail('INVALID_ARGUMENT');
   if (operation !== 'create' && (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1)) fail('INVALID_ARGUMENT');
   if (operation !== 'create' && (typeof id !== 'string' || !id || !wellFormed(id))) fail('INVALID_ARGUMENT');
-  if ((operation === 'create' && ['id', 'set', 'unset', 'expectedRevision'].some(field => supplied.has(field))) ||
-    (operation === 'replace' && ['externalKey', 'set', 'unset'].some(field => supplied.has(field))) ||
-    (operation === 'patch' && ['externalKey', 'data'].some(field => supplied.has(field))) ||
-    (operation === 'delete' && ['externalKey', 'data', 'set', 'unset'].some(field => supplied.has(field)))) fail('INVALID_ARGUMENT');
+  if ((operation === 'create' && someOwn(['id', 'set', 'unset', 'expectedRevision'], field => supplied.has(field))) ||
+    (operation === 'replace' && someOwn(['externalKey', 'set', 'unset'], field => supplied.has(field))) ||
+    (operation === 'patch' && someOwn(['externalKey', 'data'], field => supplied.has(field))) ||
+    (operation === 'delete' && someOwn(['externalKey', 'data', 'set', 'unset'], field => supplied.has(field)))) fail('INVALID_ARGUMENT');
   if (supplied.has('externalKey') && externalKey === undefined) fail('INVALID_ARGUMENT');
   if (supplied.has('expectedSchemaVersion') && (!Number.isSafeInteger(expectedSchemaVersion) || expectedSchemaVersion < 1)) fail('INVALID_ARGUMENT');
   return externalKey === undefined ? undefined : keyOf(externalKey);
@@ -338,7 +381,7 @@ const validatePatchShape = (set, unset) => {
   if (types.isProxy(set) || !plainObject(set) || types.isProxy(unset) || !Array.isArray(unset) || Object.getPrototypeOf(unset) !== Array.prototype ||
     Reflect.ownKeys(unset).length !== unset.length + 1) fail('INVALID_ARGUMENT');
   const paths = new Set();
-  for (let index = 0; index < unset.length; index++) {
+  for (let index = 0; index < unset.length; index++) { // NOSONAR
     const descriptor = Object.getOwnPropertyDescriptor(unset, index);
     const path = descriptor?.value;
     if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable || typeof path !== 'string' || !wellFormed(path) ||
@@ -360,21 +403,21 @@ const mutationData = (operation, data, set, unset, current, schema) => {
     return clone(data);
   }
   const required = Object.hasOwn(schema, 'required') ? schema.required : [];
-  if (unset.some(k => !Object.hasOwn(schema.properties ?? {}, k) || required.includes(k))) fail('INVALID_ARGUMENT');
+  if (someOwn(unset, k => !Object.hasOwn(schema.properties ?? {}, k) || includesOwn(required, k))) fail('INVALID_ARGUMENT');
   const next = { ...clone(current.data), ...clone(set) };
-  for (let index = 0; index < unset.length; index++) delete next[unset[index]];
+  for (let index = 0; index < unset.length; index++) delete next[unset[index]]; // NOSONAR
   return next;
 };
 const reservationsFor = (current, normalized, nextData, operation, c, recordId) => {
   const recordKey = current?.key ?? normalized ?? recordId;
   const wanted = current?.keyMode === 'external' || (!current && normalized !== undefined)
     ? [stable(['external', recordKey])] : [];
-  if (operation !== 'delete') for (let index = 0; index < c.uniques.length; index++) {
+  if (operation !== 'delete') for (let index = 0; index < c.uniques.length; index++) { // NOSONAR
     const u = c.uniques[index];
     const tuple = tupleOf(nextData, u.paths, c.schema);
-    if (tuple !== null) wanted.push(stable(['unique', u.name, tuple]));
+    if (tuple !== null) appendOwn(wanted, stable(['unique', u.name, tuple]));
   }
-  for (let index = 0; index < wanted.length; index++) {
+  for (let index = 0; index < wanted.length; index++) { // NOSONAR
     const reservation = wanted[index];
     const holder = c.reserved.get(reservation);
     if (holder && holder.id !== recordId) fail(holder.deleted ? 'KEY_RESERVED' : 'UNIQUE_CONFLICT');
@@ -392,13 +435,13 @@ const queryOrder = (sort, sortable) => {
   // A proxy can run caller traps during reflection, even when later rejected.
   if (!sort || typeof sort !== 'object' || types.isProxy(sort) || Array.isArray(sort) || !plainObject(sort)) fail('INVALID_ARGUMENT');
   const keys = Reflect.ownKeys(sort);
-  if (keys.length !== 2 || !keys.includes('field') || !keys.includes('direction')) fail('INVALID_ARGUMENT');
+  if (keys.length !== 2 || !includesOwn(keys, 'field') || !includesOwn(keys, 'direction')) fail('INVALID_ARGUMENT');
   const field = Object.getOwnPropertyDescriptor(sort, 'field');
   const direction = Object.getOwnPropertyDescriptor(sort, 'direction');
   if (!field?.enumerable || !Object.hasOwn(field, 'value') ||
     !direction?.enumerable || !Object.hasOwn(direction, 'value')) fail('INVALID_ARGUMENT');
   const order = { field: field.value, direction: direction.value };
-  if (!sortable.includes(order.field) || !['asc', 'desc'].includes(order.direction)) fail('INVALID_ARGUMENT');
+  if (!includesOwn(sortable, order.field) || !includesOwn(['asc', 'desc'], order.direction)) fail('INVALID_ARGUMENT');
   return order;
 };
 const sortTuple = (record, order, schema) => {
@@ -437,10 +480,12 @@ export class ReferenceState {
   grant(spaceId, credential, collection, permissions) {
     if (collection === '*') fail('INVALID_ARGUMENT');
     const capabilities = schemaArrayMembers(permissions, 'INVALID_ARGUMENT');
-    if (capabilities.some(p => !['records:read', 'records:write'].includes(p))) fail('INVALID_ARGUMENT');
+    if (someOwn(capabilities, p => !includesOwn(['records:read', 'records:write'], p))) fail('INVALID_ARGUMENT');
     const s = this.spaces.get(spaceId);
     if (!s.grants.has(credential)) s.grants.set(credential, new Map());
-    s.grants.get(credential).set(collection, new Set(capabilities));
+    const granted = new Set();
+    for (let index = 0; index < capabilities.length; index++) granted.add(capabilities[index]); // NOSONAR
+    s.grants.get(credential).set(collection, granted);
     s.policyVersion++;
   }
   revoke(spaceId, credential, collection) { const s = this.spaces.get(spaceId); if (collection === undefined) s.grants.delete(credential); else { s.grants.get(credential)?.delete(collection); if (!s.grants.get(credential)?.size) s.grants.delete(credential); } s.policyVersion++; }
@@ -450,12 +495,12 @@ export class ReferenceState {
     const scalarPath = path => {
       if (typeof path !== 'string' || !path || !wellFormed(path) || !Object.hasOwn(schema.properties ?? {}, path)) return false;
       const shape = schema.properties[path];
-      const type = Array.isArray(shape.type) ? (shape.type[0] === 'null' ? shape.type[1] : shape.type[0]) : shape.type;
-      return ['string', 'number', 'integer', 'boolean'].includes(type);
+      const type = schemaType(shape);
+      return includesOwn(['string', 'number', 'integer', 'boolean'], type);
     };
     const uniqueEntries = uniqueDescriptors(uniques, scalarPath);
     const sortPaths = schemaArrayMembers(sortable);
-    if (new Set(sortPaths).size !== sortPaths.length || sortPaths.some(path => !scalarPath(path))) fail('SCHEMA_UNSUPPORTED');
+    if (hasDuplicateOwn(sortPaths) || someOwn(sortPaths, path => !scalarPath(path))) fail('SCHEMA_UNSUPPORTED');
     const s = this.spaces.get(spaceId);
     if (s.collections.has(slug)) fail('SCHEMA_CONFLICT');
     s.collections.set(slug, { schema: clone(schema), uniques: uniqueEntries, sortable: sortPaths, records: new Map(), reserved: new Map(), version: 1 });
@@ -471,29 +516,41 @@ export class ReferenceState {
       const { description, properties, items, ...rest } = value;
       const keywords = Object.assign(Object.create(null), rest);
       const setKeywords = ['required', 'type', 'enum'];
-      for (let index = 0; index < setKeywords.length; index++) {
+      for (let index = 0; index < setKeywords.length; index++) { // NOSONAR
         const keyword = setKeywords[index];
         if (Array.isArray(keywords[keyword])) {
           const members = new Map();
-          for (let index = 0; index < keywords[keyword].length; index++) {
+          for (let index = 0; index < keywords[keyword].length; index++) { // NOSONAR
             const member = Object.getOwnPropertyDescriptor(keywords[keyword], index).value;
             members.set(stable(member), member);
           }
           const entries = [];
-          for (const entry of members) entries[entries.length] = entry;
-          entries.sort((a, b) => Buffer.compare(Buffer.from(a[0]), Buffer.from(b[0])));
-          keywords[keyword] = entries.map(entry => entry[1]);
+          for (const entry of members) appendOwn(entries, entry);
+          Reflect.apply(sortIntrinsic, entries, [(a, b) => Buffer.compare(Buffer.from(a[0]), Buffer.from(b[0]))]);
+          const values = [];
+          for (let index = 0; index < entries.length; index++) appendOwn(values, entries[index][1]); // NOSONAR
+          keywords[keyword] = values;
         }
       }
-      return { ...keywords, ...(properties === undefined ? {} : { properties: Object.fromEntries(Object.entries(properties).map(([name, shape]) => [name, withoutDescription(shape)])) }),
+      const childProperties = Object.create(null);
+      if (properties !== undefined) {
+        const names = Object.keys(properties);
+        for (let index = 0; index < names.length; index++) { // NOSONAR
+          const name = names[index];
+          Object.defineProperty(childProperties, name, { value: withoutDescription(properties[name]),
+            enumerable: true, writable: true, configurable: true });
+        }
+      }
+      return { ...keywords, ...(properties === undefined ? {} : { properties: childProperties }),
         ...(items === undefined ? {} : { items: withoutDescription(items) }) };
     };
     const old = c.schema;
     const oldProperties = Object.hasOwn(old, 'properties') ? old.properties : {};
     const nextProperties = Object.hasOwn(schema, 'properties') ? schema.properties : {};
+    const oldNames = Object.keys(oldProperties);
     if (stable(withoutDescription({ ...old, properties: {} })) !== stable(withoutDescription({ ...schema, properties: {} })) ||
-      Object.entries(oldProperties).some(([name, shape]) => !Object.hasOwn(nextProperties, name) ||
-        stable(withoutDescription(shape)) !== stable(withoutDescription(nextProperties[name])))) fail('SCHEMA_BREAKING');
+      someOwn(oldNames, name => !Object.hasOwn(nextProperties, name) ||
+        stable(withoutDescription(oldProperties[name])) !== stable(withoutDescription(nextProperties[name])))) fail('SCHEMA_BREAKING');
     c.schema = clone(schema);
     c.version++;
     return c.version;
@@ -502,7 +559,7 @@ export class ReferenceState {
     const s = this.spaces.get(spaceId);
     if (!s) fail('NOT_FOUND');
     if (s.lifecycle === 'deleted') fail('NOT_FOUND');
-    if (['suspended', 'deleting'].includes(s.lifecycle) || (s.lifecycle === 'readOnly' && capability === 'records:write' && !replay)) fail('SPACE_UNAVAILABLE');
+    if (includesOwn(['suspended', 'deleting'], s.lifecycle) || (s.lifecycle === 'readOnly' && capability === 'records:write' && !replay)) fail('SPACE_UNAVAILABLE');
     const permissions = s.grants.get(credential)?.get(collection);
     if (!permissions?.has(capability)) fail('FORBIDDEN');
     const c = s.collections.get(collection);
@@ -516,7 +573,7 @@ export class ReferenceState {
   }
   getByKey({ spaceId, credential, collection, mode, key }) {
     const { c } = this.#access(spaceId, credential, collection, 'records:read');
-    if (!['generated', 'external'].includes(mode)) fail('INVALID_ARGUMENT');
+    if (!includesOwn(['generated', 'external'], mode)) fail('INVALID_ARGUMENT');
     let r;
     if (mode === 'external') {
       r = c.reserved.get(stable(['external', keyOf(key)]));
@@ -570,10 +627,10 @@ export class ReferenceState {
     }
     if (!current) this.seq++;
     c.records.set(recordId, record);
-    for (let index = 0; index < wanted.length; index++) c.reserved.set(wanted[index], record);
+    for (let index = 0; index < wanted.length; index++) c.reserved.set(wanted[index], record); // NOSONAR
     const receipt = { contractVersion: '1', receiptId: `receipt_${this.events.length + 1}`, spaceId, ref: { kind: 'record', id: recordId }, operation, beforeRevision: current?.revision ?? null, revision: record.revision, schemaVersion: c.version, committedAt: 'synthetic', expiresAt: 'configured-by-adapter', projection: { generation: this.generation, state: 'pending' }, replayed: false };
-    this.events.push({ spaceId, collection, id: recordId, revision: record.revision });
-    this.outbox.push({ spaceId, collection, id: recordId, revision: record.revision, generation: this.generation });
+    appendOwn(this.events, { spaceId, collection, id: recordId, revision: record.revision });
+    appendOwn(this.outbox, { spaceId, collection, id: recordId, revision: record.revision, generation: this.generation });
     this.receipts.set(identity, { collection, fingerprint, receipt });
     return clone(receipt);
   }
@@ -595,7 +652,7 @@ export class ReferenceState {
     const { signature, ...binding } = decoded;
     if (binding.spaceId !== spaceId || binding.credential !== credential || binding.collection !== collection || binding.policyVersion !== policyVersion || binding.schemaVersion !== schemaVersion || stable(binding.sort) !== stable(order) || signature !== this.#sign(binding)) fail('CURSOR_INVALID');
     if (!binding.after || typeof binding.after.id !== 'string' || (!order && typeof binding.after.value !== 'string') ||
-      (order && ![0, 1, 2].includes(binding.after.rank))) fail('CURSOR_INVALID');
+      (order && !includesOwn([0, 1, 2], binding.after.rank))) fail('CURSOR_INVALID');
     return binding.after;
   }
   query({ spaceId, credential, collection, limit, cursor, sort, filter }) {
@@ -607,9 +664,14 @@ export class ReferenceState {
     const tuple = record => sortTuple(record, order, c.schema);
     const compare = (a, b) => compareTuples(a, b, order, c.schema);
     const after = this.#cursorAfter(cursor, { spaceId, credential, collection, order, policyVersion: s.policyVersion, schemaVersion: c.version });
-    const sorted = [...c.records.values()].filter(r => !r.deleted && (!after || compare(tuple(r), after) > 0)).sort((a, b) => compare(tuple(a), tuple(b)));
-    const items = sorted.slice(0, limit).map(clone);
-    const last = items.at(-1);
+    const sorted = [];
+    for (const record of c.records.values()) {
+      if (!record.deleted && (!after || compare(tuple(record), after) > 0)) appendOwn(sorted, record);
+    }
+    Reflect.apply(sortIntrinsic, sorted, [(a, b) => compare(tuple(a), tuple(b))]);
+    const items = [];
+    for (let index = 0; index < Math.min(sorted.length, limit); index++) appendOwn(items, clone(sorted[index])); // NOSONAR
+    const last = items[items.length - 1];
     const payload = { spaceId, credential, collection, policyVersion: s.policyVersion, schemaVersion: c.version, sort: order, after: last && tuple(last) };
     return { items, cursor: sorted.length > limit ? Buffer.from(stable({ ...payload, signature: this.#sign(payload) })).toString('base64url') : null };
   }

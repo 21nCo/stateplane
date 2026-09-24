@@ -1719,3 +1719,115 @@ test('array item and enum validation never trusts an inherited iterator', () => 
     Object.defineProperty(Array.prototype, Symbol.iterator, oldIterator);
   }
 });
+
+test('unique reservations use own path elements after inherited map pollution', () => {
+  const db = setup();
+  const collection = db.spaces.get('sp_a').collections.get('entries');
+  const first = create(db, 'one', { label: 'duplicate', state: 'open' }, 'one');
+  const second = create(db, 'two', { label: 'other', state: 'open' }, 'two');
+  const snapshot = () => structuredClone({ seq: db.seq, version: collection.version,
+    rows: [...collection.records], reserved: [...collection.reserved],
+    events: db.events, outbox: db.outbox, receipts: [...db.receipts] });
+  const before = snapshot();
+  const paths = collection.uniques[0].paths;
+  const oldMap = Array.prototype.map;
+  let calls = 0;
+  try {
+    Array.prototype.map = function (...args) {
+      if (this === paths) { calls++; return [undefined]; }
+      return Reflect.apply(oldMap, this, args);
+    };
+    code(() => create(db, 'three', { label: 'duplicate', state: 'open' }, 'duplicate-create'), 'UNIQUE_CONFLICT');
+    code(() => write(db, 'replace', second.ref.id, 1, 'duplicate-replace',
+      { data: { label: 'duplicate', state: 'open' } }), 'UNIQUE_CONFLICT');
+    code(() => write(db, 'patch', second.ref.id, 1, 'duplicate-patch',
+      { set: { label: 'duplicate' }, unset: [] }), 'UNIQUE_CONFLICT');
+    assert.equal(db.mutate({ ...scope, operation: 'create', externalKey: 'one',
+      data: { label: 'duplicate', state: 'open' }, idempotencyKey: 'one' }).receiptId, first.receiptId);
+  } finally {
+    Array.prototype.map = oldMap;
+  }
+  assert.equal(calls, 0);
+  assert.deepEqual(snapshot(), before);
+  assert.equal(create(db, 'three', { label: 'unique', state: 'open' }, 'unique').revision, 1);
+});
+
+test('inherited numeric setter cannot erase compatibility set members', () => {
+  const db = setup();
+  const collection = db.spaces.get('sp_a').collections.get('entries');
+  const before = structuredClone({ version: collection.version, schema: collection.schema,
+    rows: [...collection.records], reserved: [...collection.reserved],
+    events: db.events, outbox: db.outbox, receipts: [...db.receipts], seq: db.seq });
+  const previous = Object.getOwnPropertyDescriptor(Array.prototype, '0');
+  let setterCalls = 0, failure;
+  try {
+    Object.defineProperty(Array.prototype, '0', { configurable: true,
+      get() { return undefined; }, set() { setterCalls++; } });
+    try { db.revise('sp_a', 'entries', 1, { ...schema, required: [] }); }
+    catch (error) { failure = error.code ?? error.message; }
+  } finally {
+    if (previous) Object.defineProperty(Array.prototype, '0', previous);
+    else delete Array.prototype[0];
+  }
+  assert.equal(failure, 'SCHEMA_BREAKING');
+  assert.equal(setterCalls, 0);
+  assert.deepEqual(structuredClone({ version: collection.version, schema: collection.schema,
+    rows: [...collection.records], reserved: [...collection.reserved],
+    events: db.events, outbox: db.outbox, receipts: [...db.receipts], seq: db.seq }), before);
+  assert.equal(db.revise('sp_a', 'entries', 1, { ...schema, description: 'compatible' }), 2);
+});
+
+test('schema path uniqueness and grants ignore inherited array iteration', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  const iterator = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
+  let altered = 0;
+  try {
+    Object.defineProperty(Array.prototype, Symbol.iterator, { configurable: true, writable: true,
+      value: function* () {
+        if (this.length === 2 && this[0] === 'label' && this[1] === 'label') {
+          altered++; yield 'label'; yield 'state'; return;
+        }
+        if (this.length === 1 && this[0] === 'records:read') {
+          altered++; yield 'records:write'; return;
+        }
+        yield* iterator.value.call(this);
+      } });
+    code(() => db.define('sp_a', 'duplicate-unique', schema,
+      [{ name: 'duplicate', paths: ['label', 'label'] }]), 'SCHEMA_UNSUPPORTED');
+    code(() => db.define('sp_a', 'duplicate-sort', schema, [], ['label', 'label']), 'SCHEMA_UNSUPPORTED');
+    db.define('sp_a', 'entries', schema);
+    db.grant('sp_a', 'reader', 'entries', ['records:read']);
+    code(() => db.mutate({ ...scope, credential: 'reader', operation: 'create',
+      data: { label: 'entry' }, idempotencyKey: 'denied' }), 'FORBIDDEN');
+  } finally {
+    Object.defineProperty(Array.prototype, Symbol.iterator, iterator);
+  }
+  assert.equal(altered, 0);
+  assert.equal(db.spaces.get('sp_a').collections.size, 1);
+  assert.equal(db.spaces.get('sp_a').collections.get('entries').records.size, 0);
+  assert.deepEqual([...db.spaces.get('sp_a').grants.get('reader').get('entries')], ['records:read']);
+});
+
+test('valid first write retains reservations, audit and receipt under inherited numeric setter', () => {
+  const db = setup();
+  const previous = Object.getOwnPropertyDescriptor(Array.prototype, '0');
+  let written, failure;
+  try {
+    Object.defineProperty(Array.prototype, '0', { configurable: true,
+      get() { return undefined; }, set() { throw Error('inherited numeric setter invoked'); } });
+    try { written = create(db, 'one', { label: 'first', state: 'open' }, 'one'); }
+    catch (error) { failure = error; }
+  } finally {
+    if (previous) Object.defineProperty(Array.prototype, '0', previous);
+    else delete Array.prototype[0];
+  }
+  if (failure) throw failure;
+  const c = db.spaces.get('sp_a').collections.get('entries');
+  assert.equal(written.revision, 1);
+  assert.equal(c.records.size, 1);
+  assert.equal(c.reserved.size, 2);
+  assert.deepEqual([db.events.length, db.outbox.length, db.receipts.size, db.seq], [1, 1, 1, 1]);
+  code(() => create(db, 'two', { label: 'first', state: 'open' }, 'two'), 'UNIQUE_CONFLICT');
+  assert.equal(create(db, 'one', { label: 'first', state: 'open' }, 'one').replayed, true);
+});
