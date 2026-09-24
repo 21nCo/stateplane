@@ -264,7 +264,9 @@ const mutationFields = new Set(['spaceId', 'credential', 'collection', 'operatio
 // while locating the requested collection. The remaining envelope is checked
 // after target authorization, before looking up or disclosing any receipt.
 const mutationTarget = request => {
-  if (request === null || typeof request !== 'object') fail('INVALID_ARGUMENT');
+  // No target can be trusted from a Proxy: even descriptor reads can invoke
+  // caller traps or throw before authorization and envelope validation.
+  if (types.isProxy(request) || request === null || typeof request !== 'object') fail('INVALID_ARGUMENT');
   const target = {};
   for (const key of ['spaceId', 'credential', 'collection']) {
     const descriptor = Object.getOwnPropertyDescriptor(request, key);

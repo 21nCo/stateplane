@@ -931,6 +931,45 @@ test('proxied JSON-shaped inputs cannot escape definition, fingerprint or receip
   assert.equal(db.mutate(patch).replayed, true);
 });
 
+test('proxied mutation envelopes fail before traps, receipts or writes across operations', () => {
+  const db = setup();
+  const created = { ...scope, operation: 'create', data: { label: 'one' }, idempotencyKey: 'create' };
+  const id = db.mutate(created).ref.id;
+  const replaced = { ...scope, operation: 'replace', id, expectedRevision: 1,
+    data: { label: 'two' }, idempotencyKey: 'replace' };
+  db.mutate(replaced);
+  const patched = { ...scope, operation: 'patch', id, expectedRevision: 2,
+    set: { label: 'three' }, unset: [], idempotencyKey: 'patch' };
+  db.mutate(patched);
+  const deleted = { ...scope, operation: 'delete', id, expectedRevision: 3, idempotencyKey: 'delete' };
+  db.mutate(deleted);
+  const c = db.spaces.get('sp_a').collections.get('entries');
+  const snapshot = () => ({ rows: structuredClone([...c.records]),
+    reservations: [...c.reserved].map(([key, row]) => [key, row.id, row.revision, row.deleted]),
+    events: structuredClone(db.events), outbox: structuredClone(db.outbox),
+    receipts: structuredClone([...db.receipts]), seq: db.seq });
+  const committed = [created, replaced, patched, deleted];
+  const fresh = committed.map(request => ({ ...request, idempotencyKey: `fresh-${request.operation}` }));
+  for (const request of [...committed, ...fresh]) {
+    let trapCalls = 0;
+    const throwing = new Proxy(request, { getOwnPropertyDescriptor() {
+      trapCalls++;
+      throw new Error('descriptor trap invoked');
+    } });
+    const revoked = Proxy.revocable(request, {});
+    revoked.revoke();
+    for (const envelope of [new Proxy(request, {}), throwing, revoked.proxy]) {
+      const before = snapshot();
+      code(() => db.mutate(envelope), 'INVALID_ARGUMENT');
+      assert.equal(trapCalls, 0);
+      assert.deepEqual(snapshot(), before);
+    }
+  }
+  for (const request of committed) assert.equal(db.mutate(request).replayed, true);
+  assert.equal(db.mutate({ ...scope, operation: 'create', data: { label: 'fresh' },
+    idempotencyKey: 'ordinary-fresh' }).revision, 1);
+});
+
 test('schema size keywords accept nonnegative integer bounds beyond safe record-integer range', () => {
   const db = setup();
   const space = db.spaces.get('sp_a');
