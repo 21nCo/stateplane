@@ -1,0 +1,31 @@
+contracts/decisions.md
+  s_2944c5ead9b0d2::t_036bef86e672ef 21,43
+contracts/v1.md
+  s_2944c5ead9b0d2::t_b449e4a6f0e667 21-22,33
+test/reference.js
+  s_67633f17848900::t_8c46bc49e12fa3 146-147,219-224,247-248,267,411-413,425-426,428-429
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e270ff624e02667e81a9f84b83759ddb83f1b5b6",
+  "prompts": {},
+  "sessions": {
+    "s_2944c5ead9b0d2": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "c8a5b118-e911-4e86-86eb-cab72774d02a",
+        "model": "composer-2.5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_67633f17848900": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0d192-353f-7dc0-a086-0a098ec5ebe5",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
