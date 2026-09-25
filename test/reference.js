@@ -30,27 +30,29 @@ const hasDuplicateOwn = array => {
 };
 const sortIntrinsic = Array.prototype.sort;
 // Canonical object-key ordering is UTF-8 byte order, independent of host locale/ICU.
+const stableArray = value => {
+  let items = '';
+  for (let index = 0; index < value.length; index++) { // NOSONAR
+    if (index) items += ',';
+    items += stable(Object.getOwnPropertyDescriptor(value, index)?.value) ?? 'null';
+  }
+  return `[${items}]`;
+};
+const stableObject = value => {
+  const keys = Object.keys(value);
+  Reflect.apply(sortIntrinsic, keys, [(a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b))]);
+  let fields = '';
+  for (let index = 0; index < keys.length; index++) { // NOSONAR
+    const key = keys[index], item = Object.getOwnPropertyDescriptor(value, key).value;
+    if (item === undefined) continue;
+    if (fields) fields += ',';
+    fields += `${JSON.stringify(key)}:${stable(item)}`;
+  }
+  return `{${fields}}`;
+};
 const stable = value => {
-  if (Array.isArray(value)) {
-    let items = '';
-    for (let index = 0; index < value.length; index++) { // NOSONAR
-      if (index) items += ',';
-      items += stable(Object.getOwnPropertyDescriptor(value, index)?.value) ?? 'null';
-    }
-    return `[${items}]`;
-  }
-  if (value !== null && typeof value === 'object') {
-    const keys = Object.keys(value);
-    Reflect.apply(sortIntrinsic, keys, [(a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b))]);
-    let fields = '';
-    for (let index = 0; index < keys.length; index++) { // NOSONAR
-      const key = keys[index], item = Object.getOwnPropertyDescriptor(value, key).value;
-      if (item === undefined) continue;
-      if (fields) fields += ',';
-      fields += `${JSON.stringify(key)}:${stable(item)}`;
-    }
-    return `{${fields}}`;
-  }
+  if (Array.isArray(value)) return stableArray(value);
+  if (value !== null && typeof value === 'object') return stableObject(value);
   return JSON.stringify(value);
 };
 const digest = value => createHash('sha256').update(stable(value)).digest('hex');
@@ -69,7 +71,17 @@ const trimKey = value => {
   return trimmed;
 };
 // A lone UTF-16 surrogate has no Unicode scalar value and cannot encode as UTF-8.
-const wellFormed = value => [...value].every(scalar => scalar.length !== 1 || scalar < '\uD800' || scalar > '\uDFFF');
+const wellFormed = value => {
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xDC00 && unit <= 0xDFFF) return false;
+    if (unit >= 0xD800 && unit <= 0xDBFF) {
+      const next = value.charCodeAt(++index);
+      if (!(next >= 0xDC00 && next <= 0xDFFF)) return false;
+    }
+  }
+  return true;
+};
 const keyOf = key => {
   if (typeof key !== 'string' || !wellFormed(key)) fail('INVALID_ARGUMENT');
   const normalized = trimKey(key.normalize('NFC'));
@@ -102,8 +114,9 @@ const utcInstant = value => {
 };
 // Stored schema nodes are cloned into ordinary objects; a later prototype
 // change must never supply an optional keyword they did not declare.
-const dateTimeField = (schema, field) => Object.hasOwn(schema.properties[field], 'format') &&
-  schema.properties[field].format === 'date-time';
+const schemaProperties = schema => Object.hasOwn(schema, 'properties') ? schema.properties : {};
+const dateTimeField = (schema, field) => Object.hasOwn(schemaProperties(schema)[field], 'format') &&
+  schemaProperties(schema)[field].format === 'date-time';
 const tupleOf = (data, paths, schema) => {
   let tuple = '';
   for (let index = 0; index < paths.length; index++) { // NOSONAR
@@ -403,7 +416,8 @@ const mutationData = (operation, data, set, unset, current, schema) => {
     return clone(data);
   }
   const required = Object.hasOwn(schema, 'required') ? schema.required : [];
-  if (someOwn(unset, k => !Object.hasOwn(schema.properties ?? {}, k) || includesOwn(required, k))) fail('INVALID_ARGUMENT');
+  const properties = schemaProperties(schema);
+  if (someOwn(unset, k => !Object.hasOwn(properties, k) || includesOwn(required, k))) fail('INVALID_ARGUMENT');
   const next = { ...clone(current.data), ...clone(set) };
   for (let index = 0; index < unset.length; index++) delete next[unset[index]]; // NOSONAR
   return next;
@@ -473,6 +487,57 @@ const compareTuples = (a, b, order, schema) => {
   return scalarCompare(a.id, b.id);
 };
 
+// Canonicalize only set-valued schema keywords; arrays inside enum members
+// remain ordered data. All construction uses own slots, even under pollution.
+const canonicalSchemaSet = members => {
+  const byValue = new Map();
+  for (let index = 0; index < members.length; index++) { // NOSONAR
+    const member = Object.getOwnPropertyDescriptor(members, index).value;
+    byValue.set(stable(member), member);
+  }
+  const entries = [];
+  for (const entry of byValue) appendOwn(entries, entry);
+  Reflect.apply(sortIntrinsic, entries, [(a, b) => Buffer.compare(Buffer.from(a[0]), Buffer.from(b[0]))]);
+  const values = [];
+  for (let index = 0; index < entries.length; index++) appendOwn(values, entries[index][1]); // NOSONAR
+  return values;
+};
+const canonicalSchemaKeywords = value => {
+  const keywords = Object.assign(Object.create(null), value);
+  const setKeywords = ['required', 'type', 'enum'];
+  for (let index = 0; index < setKeywords.length; index++) { // NOSONAR
+    const keyword = setKeywords[index];
+    if (Array.isArray(keywords[keyword])) keywords[keyword] = canonicalSchemaSet(keywords[keyword]);
+  }
+  return keywords;
+};
+const withoutDescription = value => {
+  // Traverse schema nodes, not arbitrary object keys: "description" may itself be a property name.
+  const { description, properties, items, ...rest } = Object.assign(Object.create(null), value);
+  const keywords = canonicalSchemaKeywords(rest);
+  if (properties !== undefined) {
+    const children = Object.create(null);
+    const names = Object.keys(properties);
+    for (let index = 0; index < names.length; index++) { // NOSONAR
+      const name = names[index];
+      Object.defineProperty(children, name, { value: withoutDescription(properties[name]),
+        enumerable: true, writable: true, configurable: true });
+    }
+    keywords.properties = children;
+  }
+  if (items !== undefined) keywords.items = withoutDescription(items);
+  return keywords;
+};
+const compatibleSchemaAddition = (old, next) => {
+  const oldProperties = schemaProperties(old);
+  const nextProperties = schemaProperties(next);
+  const oldNames = Object.keys(oldProperties);
+  return stable(withoutDescription({ ...old, properties: {} })) ===
+    stable(withoutDescription({ ...next, properties: {} })) &&
+    !someOwn(oldNames, name => !Object.hasOwn(nextProperties, name) ||
+      stable(withoutDescription(oldProperties[name])) !== stable(withoutDescription(nextProperties[name])));
+};
+
 export class ReferenceState {
   constructor() { this.spaces = new Map(); this.events = []; this.outbox = []; this.receipts = new Map(); this.seq = 0; this.generation = 1; this.projection = new Map(); this.cursorSecret = randomBytes(32); }
   #sign(value) { return createHmac('sha256', this.cursorSecret).update(stable(value)).digest('hex'); }
@@ -493,8 +558,9 @@ export class ReferenceState {
   define(spaceId, slug, schema, uniques = [], sortable = []) {
     validateDefinition(schema);
     const scalarPath = path => {
-      if (typeof path !== 'string' || !path || !wellFormed(path) || !Object.hasOwn(schema.properties ?? {}, path)) return false;
-      const shape = schema.properties[path];
+      const properties = schemaProperties(schema);
+      if (typeof path !== 'string' || !path || !wellFormed(path) || !Object.hasOwn(properties, path)) return false;
+      const shape = properties[path];
       const type = schemaType(shape);
       return includesOwn(['string', 'number', 'integer', 'boolean'], type);
     };
@@ -510,47 +576,7 @@ export class ReferenceState {
     const c = this.spaces.get(spaceId)?.collections.get(slug);
     if (!c) fail('NOT_FOUND');
     if (c.version !== expectedVersion) fail('SCHEMA_CONFLICT');
-    // Traverse schema nodes, not arbitrary object keys: "description" may itself be a property name.
-    const withoutDescription = value => {
-      value = Object.assign(Object.create(null), value);
-      const { description, properties, items, ...rest } = value;
-      const keywords = Object.assign(Object.create(null), rest);
-      const setKeywords = ['required', 'type', 'enum'];
-      for (let index = 0; index < setKeywords.length; index++) { // NOSONAR
-        const keyword = setKeywords[index];
-        if (Array.isArray(keywords[keyword])) {
-          const members = new Map();
-          for (let index = 0; index < keywords[keyword].length; index++) { // NOSONAR
-            const member = Object.getOwnPropertyDescriptor(keywords[keyword], index).value;
-            members.set(stable(member), member);
-          }
-          const entries = [];
-          for (const entry of members) appendOwn(entries, entry);
-          Reflect.apply(sortIntrinsic, entries, [(a, b) => Buffer.compare(Buffer.from(a[0]), Buffer.from(b[0]))]);
-          const values = [];
-          for (let index = 0; index < entries.length; index++) appendOwn(values, entries[index][1]); // NOSONAR
-          keywords[keyword] = values;
-        }
-      }
-      const childProperties = Object.create(null);
-      if (properties !== undefined) {
-        const names = Object.keys(properties);
-        for (let index = 0; index < names.length; index++) { // NOSONAR
-          const name = names[index];
-          Object.defineProperty(childProperties, name, { value: withoutDescription(properties[name]),
-            enumerable: true, writable: true, configurable: true });
-        }
-      }
-      return { ...keywords, ...(properties === undefined ? {} : { properties: childProperties }),
-        ...(items === undefined ? {} : { items: withoutDescription(items) }) };
-    };
-    const old = c.schema;
-    const oldProperties = Object.hasOwn(old, 'properties') ? old.properties : {};
-    const nextProperties = Object.hasOwn(schema, 'properties') ? schema.properties : {};
-    const oldNames = Object.keys(oldProperties);
-    if (stable(withoutDescription({ ...old, properties: {} })) !== stable(withoutDescription({ ...schema, properties: {} })) ||
-      someOwn(oldNames, name => !Object.hasOwn(nextProperties, name) ||
-        stable(withoutDescription(oldProperties[name])) !== stable(withoutDescription(nextProperties[name])))) fail('SCHEMA_BREAKING');
+    if (!compatibleSchemaAddition(c.schema, schema)) fail('SCHEMA_BREAKING');
     c.schema = clone(schema);
     c.version++;
     return c.version;

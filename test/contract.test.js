@@ -1831,3 +1831,94 @@ test('valid first write retains reservations, audit and receipt under inherited 
   code(() => create(db, 'two', { label: 'first', state: 'open' }, 'two'), 'UNIQUE_CONFLICT');
   assert.equal(create(db, 'one', { label: 'first', state: 'open' }, 'one').replayed, true);
 });
+
+test('Unicode scalar checks ignore inherited every across fresh writes, replay and definitions', () => {
+  const db = setup();
+  const id = create(db, 'first', { label: 'valid' }, 'first').ref.id;
+  const c = db.spaces.get('sp_a').collections.get('entries');
+  const snapshot = () => structuredClone({ seq: db.seq, version: c.version, rows: [...c.records],
+    reserved: [...c.reserved], events: db.events, outbox: db.outbox, receipts: [...db.receipts] });
+  const before = snapshot();
+  const previous = Object.getOwnPropertyDescriptor(Array.prototype, 'every');
+  let calls = 0;
+  try {
+    Object.defineProperty(Array.prototype, 'every', { configurable: true, writable: true,
+      value: function () { calls++; return true; } });
+    const bad = '\uD800';
+    for (const request of [
+      { ...scope, operation: 'create', data: { label: bad }, idempotencyKey: 'bad-create' },
+      { ...scope, operation: 'replace', id, expectedRevision: 1, data: { label: bad }, idempotencyKey: 'bad-replace' },
+      { ...scope, operation: 'patch', id, expectedRevision: 1, set: { label: bad }, unset: [], idempotencyKey: 'bad-patch' },
+      { ...scope, operation: 'create', data: { label: bad }, idempotencyKey: 'first' }
+    ]) {
+      code(() => db.mutate(request), 'SCHEMA_INVALID');
+      assert.deepEqual(snapshot(), before);
+    }
+    code(() => create(db, bad, { label: 'valid' }, 'bad-key'), 'INVALID_ARGUMENT');
+    code(() => write(db, 'delete', bad, 1, 'bad-id'), 'INVALID_ARGUMENT');
+    assert.deepEqual(snapshot(), before);
+    code(() => db.define('sp_a', 'bad-definition', { ...schema,
+      properties: { [bad]: { type: 'string' } } }), 'SCHEMA_UNSUPPORTED');
+    code(() => db.revise('sp_a', 'entries', 1, { ...schema,
+      properties: { ...schema.properties, [bad]: { type: 'string' } } }), 'SCHEMA_UNSUPPORTED');
+    assert.deepEqual(snapshot(), before);
+    assert.equal(db.mutate({ ...scope, operation: 'create', externalKey: 'first',
+      data: { label: 'valid' }, idempotencyKey: 'first' }).replayed, true);
+    assert.equal(calls, 0);
+    Object.defineProperty(Array.prototype, 'every', { configurable: true, writable: true,
+      value() { throw Error('inherited every invoked'); } });
+    code(() => create(db, 'bad-key', { label: bad }, 'throwing'), 'SCHEMA_INVALID');
+    assert.deepEqual(snapshot(), before);
+  } finally {
+    if (previous) Object.defineProperty(Array.prototype, 'every', previous);
+    else delete Array.prototype.every;
+  }
+});
+
+test('stored schema with no own properties rejects undeclared unset despite later prototype pollution', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  const closed = { $schema: schema.$schema, type: 'object', additionalProperties: false };
+  db.define('sp_a', 'entries', closed);
+  db.define('sp_a', 'optional', { ...closed, properties: { note: { type: 'string' } } });
+  db.define('sp_a', 'required', { ...closed, properties: { note: { type: 'string' } }, required: ['note'] });
+  for (const collection of ['entries', 'optional', 'required']) db.grant('sp_a', 'agent', collection, recordAccess);
+  const empty = create(db, 'empty', {}, 'empty');
+  const optional = db.mutate({ ...scope, collection: 'optional', operation: 'create',
+    data: { note: 'present' }, idempotencyKey: 'optional' });
+  const required = db.mutate({ ...scope, collection: 'required', operation: 'create',
+    data: { note: 'present' }, idempotencyKey: 'required' });
+  const snapshot = () => structuredClone({ seq: db.seq, collections: [...db.spaces.get('sp_a').collections]
+    .map(([name, c]) => [name, c.version, c.schema, [...c.records], [...c.reserved]]),
+  events: db.events, outbox: db.outbox, receipts: [...db.receipts] });
+  const patch = (collection, id, path, idempotencyKey) => ({ ...scope, collection, operation: 'patch',
+    id, expectedRevision: 1, set: {}, unset: [path], idempotencyKey });
+  const previous = Object.getOwnPropertyDescriptor(Object.prototype, 'properties');
+  let getterCalls = 0;
+  try {
+    Object.defineProperty(Object.prototype, 'properties', { configurable: true,
+      value: { ghost: { type: 'string' } } });
+    const before = snapshot();
+    code(() => db.define('sp_a', 'invalid-sort', closed, [], ['ghost']), 'SCHEMA_UNSUPPORTED');
+    assert.deepEqual(snapshot(), before);
+    code(() => db.mutate(patch('entries', empty.ref.id, 'ghost', 'invalid')), 'INVALID_ARGUMENT');
+    assert.deepEqual(snapshot(), before);
+    code(() => db.mutate(patch('required', required.ref.id, 'note', 'required-unset')), 'INVALID_ARGUMENT');
+    assert.deepEqual(snapshot(), before);
+    const request = patch('optional', optional.ref.id, 'note', 'valid-unset');
+    const committed = db.mutate(request);
+    assert.equal(committed.revision, 2);
+    Object.defineProperty(Object.prototype, 'properties', { configurable: true, get() {
+      getterCalls++;
+      throw Error('inherited properties getter invoked');
+    } });
+    const after = snapshot();
+    assert.equal(db.mutate(request).replayed, true);
+    code(() => db.mutate(patch('entries', empty.ref.id, 'ghost', 'getter')), 'INVALID_ARGUMENT');
+    assert.deepEqual(snapshot(), after);
+    assert.equal(getterCalls, 0);
+  } finally {
+    if (previous) Object.defineProperty(Object.prototype, 'properties', previous);
+    else delete Object.prototype.properties;
+  }
+});
