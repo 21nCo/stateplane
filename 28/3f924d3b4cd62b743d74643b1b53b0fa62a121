@@ -1,0 +1,23 @@
+contracts/decisions.md
+  s_6126673cc0a89e::t_4a519bf1a7b5eb 32-33,59-60
+contracts/v1.md
+  s_6126673cc0a89e::t_4ab82dbab7d603 27-28,59-60
+test/contract.test.js
+  s_6126673cc0a89e::t_1c3a11285c12b2 1925-2038
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "283f924d3b4cd62b743d74643b1b53b0fa62a121",
+  "prompts": {},
+  "sessions": {
+    "s_6126673cc0a89e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c2bc-9ed5-72b0-a4bd-e7dcb1d6a6eb",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
