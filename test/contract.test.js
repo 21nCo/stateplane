@@ -2145,3 +2145,73 @@ test('key and composite reservations keep NFC semantics after inherited normaliz
     Object.defineProperty(String.prototype, 'normalize', previous);
   }
 });
+
+test('key, receipt and UTC sort paths ignore later inherited string method changes', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  db.define('sp_a', 'entries', { $schema: schema.$schema, type: 'object',
+    properties: { label: { type: 'string' }, observedAt: { type: 'string', format: 'date-time' } },
+    required: ['label', 'observedAt'], additionalProperties: false },
+  [{ name: 'label_time', paths: ['label', 'observedAt'] }], ['observedAt']);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
+  const c = db.spaces.get('sp_a').collections.get('entries');
+  const snapshot = () => structuredClone({ seq: db.seq, rows: [...c.records], reserved: [...c.reserved],
+    events: db.events, outbox: db.outbox, receipts: [...db.receipts] });
+  const methods = ['slice', 'startsWith', 'endsWith', 'replace', 'padEnd'];
+  const previous = new Map(methods.map(name => [name, Object.getOwnPropertyDescriptor(String.prototype, name)]));
+  const calls = new Map(methods.map(name => [name, 0]));
+  try {
+    for (const name of methods) {
+      const original = previous.get(name).value;
+      Object.defineProperty(String.prototype, name, { configurable: true, writable: true,
+        value: function (...args) {
+          const value = String(this);
+          if (value === 'alpha' || value === 'beta' || value[0] === '2' || value[0] === '.') {
+            calls.set(name, calls.get(name) + 1);
+            throw new Error(`inherited ${name} called`);
+          }
+          return Reflect.apply(original, this, args);
+        } });
+    }
+    const first = create(db, 'alpha', { label: 'one', observedAt: '2020-01-01T00:00:00.1Z' }, 'first');
+    const second = create(db, 'beta', { label: 'two', observedAt: '2020-01-01T00:00:00.2Z' }, 'second');
+    assert.equal(db.get({ ...scope, id: first.ref.id }).key, 'alpha');
+    assert.equal(db.getByKey({ ...scope, mode: 'external', key: 'beta' }).id, second.ref.id);
+    const beforeConflict = snapshot();
+    code(() => create(db, 'gamma', { label: 'one', observedAt: '2020-01-01T00:00:00.10Z' }, 'duplicate'), 'UNIQUE_CONFLICT');
+    code(() => write(db, 'replace', second.ref.id, 1, 'replace-conflict',
+      { data: { label: 'one', observedAt: '2020-01-01T00:00:00.10Z' } }), 'UNIQUE_CONFLICT');
+    code(() => write(db, 'patch', second.ref.id, 1, 'patch-conflict',
+      { set: { label: 'one', observedAt: '2020-01-01T00:00:00.10Z' }, unset: [] }), 'UNIQUE_CONFLICT');
+    code(() => create(db, 'invalid', { label: 'invalid', observedAt: '2020-01-01T00:00:60Z' }, 'invalid'), 'SCHEMA_INVALID');
+    assert.deepEqual(snapshot(), beforeConflict);
+    const page = db.query({ ...scope, sort: { field: 'observedAt', direction: 'asc' }, limit: 1 });
+    assert.equal(page.items[0].id, first.ref.id);
+    assert.equal(db.query({ ...scope, sort: { field: 'observedAt', direction: 'asc' }, limit: 1,
+      cursor: page.cursor }).items[0].id, second.ref.id);
+    const patch = { ...scope, operation: 'patch', id: second.ref.id, expectedRevision: 1,
+      set: { observedAt: '2020-01-01T00:00:00.25Z' }, unset: [], idempotencyKey: 'patch' };
+    assert.equal(db.mutate(patch).revision, 2);
+    const committed = snapshot();
+    assert.equal(db.mutate(patch).replayed, true); // committed response lost; revision 1 is stale
+    code(() => db.mutate({ ...patch, set: { observedAt: '2020-01-01T00:00:00.26Z' } }), 'IDEMPOTENCY_MISMATCH');
+    assert.deepEqual(snapshot(), committed);
+    db.revoke('sp_a', 'agent', 'entries');
+    code(() => db.mutate(patch), 'FORBIDDEN');
+    assert.deepEqual(snapshot(), committed);
+    db.grant('sp_a', 'agent', 'entries', recordAccess);
+    db.lifecycle('sp_a', 'readOnly');
+    assert.equal(db.mutate(patch).replayed, true);
+    code(() => create(db, 'fresh', { label: 'fresh', observedAt: '2020-01-01T00:00:00.3Z' }, 'fresh'), 'SPACE_UNAVAILABLE');
+    assert.deepEqual(snapshot(), committed);
+    db.lifecycle('sp_a', 'active');
+    write(db, 'delete', first.ref.id, 1, 'delete');
+    const tombstoned = snapshot();
+    code(() => create(db, 'alpha', { label: 'fresh', observedAt: '2020-01-01T00:00:00.3Z' }, 'reserved'), 'KEY_RESERVED');
+    assert.deepEqual(snapshot(), tombstoned);
+    assert.equal(db.getByKey({ ...scope, mode: 'external', key: 'alpha' }), null);
+    for (const name of methods) assert.equal(calls.get(name), 0, name);
+  } finally {
+    for (const name of methods) Object.defineProperty(String.prototype, name, previous.get(name));
+  }
+});

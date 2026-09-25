@@ -62,6 +62,14 @@ const stringCodeUnitAt = String.prototype.charCodeAt;
 const codeUnitAt = (value, index) => Reflect.apply(stringCodeUnitAt, value, [index]);
 const stringNormalize = String.prototype.normalize;
 const normalizeNfc = value => Reflect.apply(stringNormalize, value, ['NFC']);
+const stringSlice = String.prototype.slice;
+const sliceString = (value, start, end) => Reflect.apply(stringSlice, value, [start, end]);
+const stringStartsWith = String.prototype.startsWith;
+const startsWithString = (value, prefix) => Reflect.apply(stringStartsWith, value, [prefix]);
+const stringEndsWith = String.prototype.endsWith;
+const endsWithString = (value, suffix) => Reflect.apply(stringEndsWith, value, [suffix]);
+const stringPadEnd = String.prototype.padEnd;
+const padEndString = (value, length, fill) => Reflect.apply(stringPadEnd, value, [length, fill]);
 // Fixed Unicode White_Space set (not JS trim, which includes FEFF but excludes 0085).
 const whitespace = new Set([0x20, 0x85, 0xa0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000]);
 for (let code = 0x09; code <= 0x0d; code++) whitespace.add(code);
@@ -73,7 +81,7 @@ const trimKey = value => {
   // actual UTF-16 units; String.prototype[Symbol.iterator] is mutable.
   while (start < end && whitespace.has(codeUnitAt(value, start))) start++;
   while (end > start && whitespace.has(codeUnitAt(value, end - 1))) end--;
-  return value.slice(start, end);
+  return sliceString(value, start, end);
 };
 // A lone UTF-16 surrogate has no Unicode scalar value and cannot encode as UTF-8.
 const wellFormed = value => {
@@ -115,16 +123,16 @@ const leapDays = new Set([
 ]);
 const utcInstant = value => {
   const match = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z$/.exec(value);
-  if (!match || match[1].startsWith('0000-')) fail('SCHEMA_INVALID');
-  const leap = match[1].endsWith('T23:59:60');
-  if (match[1].endsWith(':60') && (!leap || !leapDays.has(match[1].slice(0, 10)))) fail('SCHEMA_INVALID');
-  const check = leap ? `${match[1].slice(0, -2)}59` : match[1];
+  if (!match || startsWithString(match[1], '0000-')) fail('SCHEMA_INVALID');
+  const leap = endsWithString(match[1], 'T23:59:60');
+  if (endsWithString(match[1], ':60') && (!leap || !leapDays.has(sliceString(match[1], 0, 10)))) fail('SCHEMA_INVALID');
+  const check = leap ? `${sliceString(match[1], 0, -2)}59` : match[1];
   const parsed = new Date(`${check}Z`);
-  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 19) !== check) fail('SCHEMA_INVALID');
+  if (!Number.isFinite(parsed.getTime()) || sliceString(parsed.toISOString(), 0, 19) !== check) fail('SCHEMA_INVALID');
   let fraction = match[2] ?? '';
   let end = fraction.length;
   while (end > 0 && fraction[end - 1] === '0') end--;
-  fraction = fraction.slice(0, end);
+  fraction = sliceString(fraction, 0, end);
   return match[1] + (fraction ? '.' + fraction : '') + 'Z';
 };
 // Stored schema nodes are cloned into ordinary objects; a later prototype
@@ -493,11 +501,15 @@ const sortTuple = (record, order, schema) => {
 };
 const compareSortValues = (a, b, order, schema) => {
   if (!order || !dateTimeField(schema, order.field)) return scalarCompare(a, b);
-  const whole = scalarCompare(a.slice(0, 19), b.slice(0, 19));
+  const whole = scalarCompare(sliceString(a, 0, 19), sliceString(b, 0, 19));
   if (whole) return whole;
-  const fraction = value => value.slice(19, -1).replace(/^\./, '');
+  const fraction = value => {
+    const digits = sliceString(value, 19, -1);
+    return startsWithString(digits, '.') ? sliceString(digits, 1) : digits;
+  };
   const left = fraction(a), right = fraction(b);
-  return scalarCompare(left.padEnd(Math.max(left.length, right.length), '0'), right.padEnd(Math.max(left.length, right.length), '0'));
+  return scalarCompare(padEndString(left, Math.max(left.length, right.length), '0'),
+    padEndString(right, Math.max(left.length, right.length), '0'));
 };
 const compareTuples = (a, b, order, schema) => {
   let primary;
