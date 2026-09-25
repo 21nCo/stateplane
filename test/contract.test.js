@@ -2215,3 +2215,89 @@ test('key, receipt and UTC sort paths ignore later inherited string method chang
     for (const name of methods) Object.defineProperty(String.prototype, name, previous.get(name));
   }
 });
+
+test('UTC writes, reservations and cursors ignore later RegExp method changes', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  db.define('sp_a', 'entries', { $schema: schema.$schema, type: 'object',
+    properties: { label: { type: 'string' }, observedAt: { type: 'string', format: 'date-time' } },
+    required: ['label', 'observedAt'], additionalProperties: false },
+  [{ name: 'label_time', paths: ['label', 'observedAt'] }], ['observedAt']);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
+  const c = db.spaces.get('sp_a').collections.get('entries');
+  const snapshot = () => structuredClone({ seq: db.seq, rows: [...c.records], reserved: [...c.reserved],
+    events: db.events, outbox: db.outbox, receipts: [...db.receipts] });
+  const first = create(db, 'alpha', { label: 'one', observedAt: '2020-01-01T00:00:00.1Z' }, 'first');
+  const second = create(db, 'beta', { label: 'two', observedAt: '2020-01-01T00:00:00.2Z' }, 'second');
+  const originalExec = Object.getOwnPropertyDescriptor(RegExp.prototype, 'exec');
+  const originalTest = Object.getOwnPropertyDescriptor(RegExp.prototype, 'test');
+  let mode = 'altered';
+  let calls = 0;
+  const contractPattern = pattern => pattern.source.startsWith('^(\\d{4}-') ||
+    pattern.source.startsWith('^[A-Za-z0-9_-]') || pattern.source.startsWith('^[a-f0-9]');
+  try {
+    Object.defineProperty(RegExp.prototype, 'exec', { ...originalExec, value: function (value) {
+      if (contractPattern(this)) {
+        calls++;
+        if (mode === 'throw') throw new Error('inherited exec called');
+        if (value === 'not-a-date') return ['2020-01-01T00:00:00Z', '2020-01-01T00:00:00', undefined];
+      }
+      return Reflect.apply(originalExec.value, this, [value]);
+    } });
+    Object.defineProperty(RegExp.prototype, 'test', { ...originalTest, value: function (value) {
+      if (contractPattern(this)) {
+        calls++;
+        if (mode === 'throw') throw new Error('inherited test called');
+        return false;
+      }
+      return Reflect.apply(originalTest.value, this, [value]);
+    } });
+    const beforeInvalid = snapshot();
+    code(() => create(db, 'invalid', { label: 'bad', observedAt: 'not-a-date' }, 'invalid'), 'SCHEMA_INVALID');
+    code(() => write(db, 'replace', second.ref.id, 1, 'replace-invalid',
+      { data: { label: 'two', observedAt: 'not-a-date' } }), 'SCHEMA_INVALID');
+    code(() => write(db, 'patch', second.ref.id, 1, 'patch-invalid',
+      { set: { observedAt: 'not-a-date' }, unset: [] }), 'SCHEMA_INVALID');
+    assert.deepEqual(snapshot(), beforeInvalid);
+    mode = 'throw';
+    const third = create(db, 'gamma', { label: 'three', observedAt: '2016-12-31T23:59:60Z' }, 'third');
+    assert.equal(db.getByKey({ ...scope, mode: 'external', key: 'gamma' }).id, third.ref.id);
+    const beforeConflict = snapshot();
+    code(() => create(db, 'delta', { label: 'one', observedAt: '2020-01-01T00:00:00.10Z' }, 'collision'), 'UNIQUE_CONFLICT');
+    assert.deepEqual(snapshot(), beforeConflict);
+    for (const [direction, expected] of [
+      ['asc', [third.ref.id, first.ref.id, second.ref.id]],
+      ['desc', [second.ref.id, first.ref.id, third.ref.id]]
+    ]) {
+      const sort = { field: 'observedAt', direction };
+      const ids = [];
+      let cursor;
+      do {
+        const page = db.query({ ...scope, limit: 1, sort, ...(cursor ? { cursor } : {}) });
+        ids.push(page.items[0].id);
+        cursor = page.cursor;
+      } while (cursor);
+      assert.deepEqual(ids, expected);
+    }
+    code(() => db.query({ ...scope, limit: 1, cursor: 'not-base64!' }), 'CURSOR_INVALID');
+    const patch = { ...scope, operation: 'patch', id: second.ref.id, expectedRevision: 1,
+      set: { observedAt: '2020-01-01T00:00:00.25Z' }, unset: [], idempotencyKey: 'patch' };
+    assert.equal(db.mutate(patch).revision, 2);
+    const committed = snapshot();
+    assert.equal(db.mutate(patch).replayed, true);
+    code(() => db.mutate({ ...patch, set: { observedAt: '2020-01-01T00:00:00.26Z' } }), 'IDEMPOTENCY_MISMATCH');
+    assert.deepEqual(snapshot(), committed);
+    db.revoke('sp_a', 'agent', 'entries');
+    code(() => db.mutate(patch), 'FORBIDDEN');
+    assert.deepEqual(snapshot(), committed);
+    db.grant('sp_a', 'agent', 'entries', recordAccess);
+    db.lifecycle('sp_a', 'readOnly');
+    assert.equal(db.mutate(patch).replayed, true);
+    code(() => create(db, 'fresh', { label: 'fresh', observedAt: 'not-a-date' }, 'fresh'), 'SPACE_UNAVAILABLE');
+    assert.deepEqual(snapshot(), committed);
+    assert.equal(calls, 0);
+  } finally {
+    Object.defineProperty(RegExp.prototype, 'exec', originalExec);
+    Object.defineProperty(RegExp.prototype, 'test', originalTest);
+  }
+});

@@ -70,6 +70,10 @@ const stringEndsWith = String.prototype.endsWith;
 const endsWithString = (value, suffix) => Reflect.apply(stringEndsWith, value, [suffix]);
 const stringPadEnd = String.prototype.padEnd;
 const padEndString = (value, length, fill) => Reflect.apply(stringPadEnd, value, [length, fill]);
+// RegExp.prototype.test delegates to the current exec method. Use the captured
+// matcher for every contract decision, including cursor syntax checks.
+const regexpExec = RegExp.prototype.exec;
+const matchRegex = (pattern, value) => Reflect.apply(regexpExec, pattern, [value]);
 // Fixed Unicode White_Space set (not JS trim, which includes FEFF but excludes 0085).
 const whitespace = new Set([0x20, 0x85, 0xa0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000]);
 for (let code = 0x09; code <= 0x0d; code++) whitespace.add(code);
@@ -122,7 +126,7 @@ const leapDays = new Set([
   '2015-06-30', '2016-12-31'
 ]);
 const utcInstant = value => {
-  const match = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z$/.exec(value);
+  const match = matchRegex(/^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z$/, value);
   if (!match || startsWithString(match[1], '0000-')) fail('SCHEMA_INVALID');
   const leap = endsWithString(match[1], 'T23:59:60');
   if (endsWithString(match[1], ':60') && (!leap || !leapDays.has(sliceString(match[1], 0, 10)))) fail('SCHEMA_INVALID');
@@ -696,7 +700,7 @@ export class ReferenceState {
   }
   #cursorAfter(cursor, { spaceId, credential, collection, order, policyVersion, schemaVersion }) {
     if (cursor === undefined) return null;
-    if (typeof cursor !== 'string' || !cursor || !/^[A-Za-z0-9_-]+$/.test(cursor)) fail('CURSOR_INVALID');
+    if (typeof cursor !== 'string' || !cursor || !matchRegex(/^[A-Za-z0-9_-]+$/, cursor)) fail('CURSOR_INVALID');
     let decoded;
     try {
       const bytes = Buffer.from(cursor, 'base64url');
@@ -713,7 +717,7 @@ export class ReferenceState {
     if (binding.spaceId !== spaceId || binding.credential !== credential || binding.collection !== collection ||
       binding.policyVersion !== policyVersion || binding.schemaVersion !== schemaVersion ||
       stable(binding.sort) !== stable(order) || typeof signature !== 'string' ||
-      !/^[a-f0-9]{64}$/.test(signature) ||
+      !matchRegex(/^[a-f0-9]{64}$/, signature) ||
       !timingSafeEqual(Buffer.from(signature, 'hex'), Buffer.from(this.#sign(binding), 'hex'))) fail('CURSOR_INVALID');
     if (!binding.after || typeof binding.after.id !== 'string' || (!order && typeof binding.after.value !== 'string') ||
       (order && !includesOwn([0, 1, 2], binding.after.rank))) fail('CURSOR_INVALID');
