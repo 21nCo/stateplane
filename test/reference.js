@@ -60,6 +60,8 @@ const digest = value => createHash('sha256').update(stable(value)).digest('hex')
 // Capture its UTF-16-unit semantics for trimming, validation and length checks.
 const stringCodeUnitAt = String.prototype.charCodeAt;
 const codeUnitAt = (value, index) => Reflect.apply(stringCodeUnitAt, value, [index]);
+const stringNormalize = String.prototype.normalize;
+const normalizeNfc = value => Reflect.apply(stringNormalize, value, ['NFC']);
 // Fixed Unicode White_Space set (not JS trim, which includes FEFF but excludes 0085).
 const whitespace = new Set([0x20, 0x85, 0xa0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000]);
 for (let code = 0x09; code <= 0x0d; code++) whitespace.add(code);
@@ -97,7 +99,7 @@ const scalarLength = value => {
 };
 const keyOf = key => {
   if (typeof key !== 'string' || !wellFormed(key)) fail('INVALID_ARGUMENT');
-  const normalized = trimKey(key.normalize('NFC'));
+  const normalized = trimKey(normalizeNfc(key));
   if (!normalized) fail('INVALID_ARGUMENT');
   return normalized;
 };
@@ -139,7 +141,7 @@ const tupleOf = (data, paths, schema) => {
     if (!includesOwn(['string', 'number', 'boolean'], typeof v) || (typeof v === 'number' && !Number.isFinite(v))) fail('SCHEMA_INVALID');
     let value;
     if (dateTimeField(schema, path)) value = utcInstant(v);
-    else if (typeof v === 'string') value = v.normalize('NFC'); // reservation only; stored data is unchanged
+    else if (typeof v === 'string') value = normalizeNfc(v); // reservation only; stored data is unchanged
     else value = JSON.stringify(v);
     tuple += `${typeof v}:${Buffer.byteLength(value)}:${value}`;
   }
@@ -721,7 +723,7 @@ export class ReferenceState {
     Reflect.apply(sortIntrinsic, sorted, [(a, b) => compare(tuple(a), tuple(b))]);
     const items = [];
     for (let index = 0; index < Math.min(sorted.length, limit); index++) appendOwn(items, clone(sorted[index])); // NOSONAR
-    const last = items[items.length - 1];
+    const last = items[items.length - 1]; // NOSONAR -- .at would call a mutable inherited array method.
     const payload = { spaceId, credential, collection, policyVersion: s.policyVersion, schemaVersion: c.version, sort: order, after: last && tuple(last) };
     return { items, cursor: sorted.length > limit ? Buffer.from(stable({ ...payload, signature: this.#sign(payload) })).toString('base64url') : null };
   }

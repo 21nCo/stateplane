@@ -2090,3 +2090,58 @@ test('Unicode validation and key normalization ignore later inherited charCodeAt
     Object.defineProperty(String.prototype, 'charCodeAt', previous);
   }
 });
+
+test('key and composite reservations keep NFC semantics after inherited normalize changes', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  db.define('sp_a', 'entries', { $schema: schema.$schema, type: 'object',
+    properties: { label: { type: 'string' } }, required: ['label'], additionalProperties: false },
+  [{ name: 'label', paths: ['label'] }]);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
+  const first = create(db, '\u00e9-key', { label: '\u00e9' }, 'first');
+  const other = create(db, 'other', { label: 'other' }, 'other');
+  const c = db.spaces.get('sp_a').collections.get('entries');
+  const snapshot = () => structuredClone({ seq: db.seq, version: c.version, rows: [...c.records],
+    reserved: [...c.reserved], events: db.events, outbox: db.outbox, receipts: [...db.receipts] });
+  const previous = Object.getOwnPropertyDescriptor(String.prototype, 'normalize');
+  let calls = 0;
+  try {
+    Object.defineProperty(String.prototype, 'normalize', { configurable: true, value: function () {
+      calls++;
+      return String(this);
+    } });
+    const before = snapshot();
+    assert.equal(db.mutate({ ...scope, operation: 'create', externalKey: 'e\u0301-key',
+      data: { label: '\u00e9' }, idempotencyKey: 'first' }).replayed, true);
+    code(() => db.mutate({ ...scope, operation: 'create', externalKey: 'e\u0301-key',
+      data: { label: 'changed' }, idempotencyKey: 'first' }), 'IDEMPOTENCY_MISMATCH');
+    code(() => create(db, 'e\u0301-key', { label: 'different' }, 'duplicate-key'), 'UNIQUE_CONFLICT');
+    code(() => create(db, 'new', { label: 'e\u0301' }, 'duplicate-tuple'), 'UNIQUE_CONFLICT');
+    code(() => write(db, 'replace', other.ref.id, 1, 'duplicate-replace',
+      { data: { label: 'e\u0301' } }), 'UNIQUE_CONFLICT');
+    code(() => write(db, 'patch', other.ref.id, 1, 'duplicate-patch',
+      { set: { label: 'e\u0301' }, unset: [] }), 'UNIQUE_CONFLICT');
+    assert.deepEqual(snapshot(), before);
+
+    const created = create(db, ' e\u0301-new ', { label: 'fresh' }, 'fresh');
+    assert.equal(db.get({ ...scope, id: created.ref.id }).key, '\u00e9-new');
+    assert.equal(db.getByKey({ ...scope, mode: 'external', key: '\u00e9-new' }).id, created.ref.id);
+    const patched = { ...scope, operation: 'patch', id: other.ref.id, expectedRevision: 1,
+      set: { label: 're\u0301play' }, unset: [], idempotencyKey: 'patched' };
+    assert.equal(db.mutate(patched).revision, 2);
+    assert.equal(db.get({ ...scope, id: other.ref.id }).data.label, 're\u0301play');
+    const committed = snapshot();
+    assert.equal(db.mutate(patched).replayed, true); // expectedRevision 1 is now stale
+    assert.deepEqual(snapshot(), committed);
+
+    write(db, 'delete', first.ref.id, 1, 'delete-first');
+    const tombstoned = snapshot();
+    code(() => create(db, 'e\u0301-key', { label: 'different' }, 'tombstone-key'), 'KEY_RESERVED');
+    code(() => create(db, 'another', { label: 'e\u0301' }, 'tombstone-tuple'), 'KEY_RESERVED');
+    assert.deepEqual(snapshot(), tombstoned);
+    assert.equal(db.getByKey({ ...scope, mode: 'external', key: '\u00e9-key' }), null);
+    assert.equal(calls, 0);
+  } finally {
+    Object.defineProperty(String.prototype, 'normalize', previous);
+  }
+});
