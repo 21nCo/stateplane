@@ -56,6 +56,10 @@ const stable = value => {
   return JSON.stringify(value);
 };
 const digest = value => createHash('sha256').update(stable(value)).digest('hex');
+// A caller may change the inherited string method after the module loads.
+// Capture its UTF-16-unit semantics for trimming, validation and length checks.
+const stringCodeUnitAt = String.prototype.charCodeAt;
+const codeUnitAt = (value, index) => Reflect.apply(stringCodeUnitAt, value, [index]);
 // Fixed Unicode White_Space set (not JS trim, which includes FEFF but excludes 0085).
 const whitespace = new Set([0x20, 0x85, 0xa0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000]);
 for (let code = 0x09; code <= 0x0d; code++) whitespace.add(code);
@@ -65,17 +69,17 @@ const trimKey = value => {
   let end = value.length;
   // The fixed White_Space set consists entirely of BMP code points. Scan
   // actual UTF-16 units; String.prototype[Symbol.iterator] is mutable.
-  while (start < end && whitespace.has(value.charCodeAt(start))) start++;
-  while (end > start && whitespace.has(value.charCodeAt(end - 1))) end--;
+  while (start < end && whitespace.has(codeUnitAt(value, start))) start++;
+  while (end > start && whitespace.has(codeUnitAt(value, end - 1))) end--;
   return value.slice(start, end);
 };
 // A lone UTF-16 surrogate has no Unicode scalar value and cannot encode as UTF-8.
 const wellFormed = value => {
   for (let index = 0; index < value.length; index++) {
-    const unit = value.charCodeAt(index);
+    const unit = codeUnitAt(value, index);
     if (unit >= 0xDC00 && unit <= 0xDFFF) return false;
     if (unit >= 0xD800 && unit <= 0xDBFF) {
-      const next = value.charCodeAt(++index);
+      const next = codeUnitAt(value, ++index);
       if (!(next >= 0xDC00 && next <= 0xDFFF)) return false;
     }
   }
@@ -85,7 +89,7 @@ const wellFormed = value => {
 const scalarLength = value => {
   let count = 0;
   for (let index = 0; index < value.length; index++) {
-    const unit = value.charCodeAt(index);
+    const unit = codeUnitAt(value, index);
     if (unit >= 0xD800 && unit <= 0xDBFF) index++;
     count++;
   }
@@ -318,17 +322,20 @@ const validateObject = (data, schema) => {
   const required = schema.required ?? [];
   for (let index = 0; index < required.length; index++) if (!Object.hasOwn(data, required[index])) fail('SCHEMA_INVALID'); // NOSONAR
 };
-const validateScalar = (data, schema, type) => {
-  if (typeof data !== (type === 'integer' || type === 'number' ? 'number' : type)) fail('SCHEMA_INVALID');
-  if (type === 'string' && !wellFormed(data)) fail('SCHEMA_INVALID');
-  if (type === 'integer' && !Number.isSafeInteger(data)) fail('SCHEMA_INVALID');
-  if (typeof data === 'number' && (!Number.isFinite(data) || (schema.minimum !== undefined && data < schema.minimum) || (schema.maximum !== undefined && data > schema.maximum))) fail('SCHEMA_INVALID');
-  if (type === 'string' && (schema.minLength !== undefined || schema.maxLength !== undefined)) {
+const validateStringScalar = (data, schema) => {
+  if (!wellFormed(data)) fail('SCHEMA_INVALID');
+  if (schema.minLength !== undefined || schema.maxLength !== undefined) {
     const length = scalarLength(data);
     if ((schema.minLength !== undefined && length < schema.minLength) ||
       (schema.maxLength !== undefined && length > schema.maxLength)) fail('SCHEMA_INVALID');
   }
   if (schema.format === 'date-time') utcInstant(data);
+};
+const validateScalar = (data, schema, type) => {
+  if (typeof data !== (type === 'integer' || type === 'number' ? 'number' : type)) fail('SCHEMA_INVALID');
+  if (type === 'string') validateStringScalar(data, schema);
+  if (type === 'integer' && !Number.isSafeInteger(data)) fail('SCHEMA_INVALID');
+  if (typeof data === 'number' && (!Number.isFinite(data) || (schema.minimum !== undefined && data < schema.minimum) || (schema.maximum !== undefined && data > schema.maximum))) fail('SCHEMA_INVALID');
 };
 const validateArray = (data, schema) => {
   if (!Array.isArray(data) || (schema.minItems !== undefined && data.length < schema.minItems) || (schema.maxItems !== undefined && data.length > schema.maxItems)) fail('SCHEMA_INVALID');

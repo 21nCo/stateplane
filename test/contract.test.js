@@ -2036,3 +2036,57 @@ test('cursor signature accepts issued tokens and rejects malformed or changed he
     assert.deepEqual(snapshot(), before);
   }
 });
+
+test('Unicode validation and key normalization ignore later inherited charCodeAt overrides', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  const definition = { $schema: schema.$schema, type: 'object', additionalProperties: false,
+    properties: { label: { type: 'string', minLength: 2 }, short: { type: 'string', maxLength: 1 } } };
+  db.define('sp_a', 'entries', definition, [{ name: 'label', paths: ['label'] }]);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
+  const baseline = create(db, 'baseline', { label: 'valid' }, 'baseline');
+  const c = db.spaces.get('sp_a').collections.get('entries');
+  const snapshot = () => structuredClone({ seq: db.seq, version: c.version, rows: [...c.records],
+    reserved: [...c.reserved], events: db.events, outbox: db.outbox, receipts: [...db.receipts] });
+  const previous = Object.getOwnPropertyDescriptor(String.prototype, 'charCodeAt');
+  let calls = 0;
+  try {
+    Object.defineProperty(String.prototype, 'charCodeAt', { configurable: true, value: function (index) {
+      calls++;
+      const text = String(this);
+      if (text === 'AB') return index === 0 ? 0xD800 : 0xDC00;
+      if (text === '\ud800') return 0x41;
+      if (text === '\u0085 actual \u00a0') return 0x41;
+      if (text === 'throw') throw Error('inherited charCodeAt invoked');
+      return Reflect.apply(previous.value, text, [index]);
+    } });
+    const before = snapshot();
+    code(() => create(db, 'bad-string', { label: '\ud800' }, 'bad-string'), 'SCHEMA_INVALID');
+    code(() => create(db, 'bad-length', { label: 'AB', short: 'AB' }, 'bad-length'), 'SCHEMA_INVALID');
+    code(() => create(db, 'bad-key', { label: 'valid', short: '\ud800' }, 'bad-key'), 'SCHEMA_INVALID');
+    code(() => create(db, '\ud800', { label: 'valid' }, 'lone-key'), 'INVALID_ARGUMENT');
+    code(() => db.mutate({ ...scope, operation: 'replace', id: baseline.ref.id,
+      expectedRevision: 1, data: { label: '\ud800' }, idempotencyKey: 'bad-replace' }), 'SCHEMA_INVALID');
+    code(() => db.mutate({ ...scope, operation: 'patch', id: baseline.ref.id,
+      expectedRevision: 1, set: { label: '\ud800' }, unset: [], idempotencyKey: 'bad-patch' }), 'SCHEMA_INVALID');
+    code(() => db.define('sp_a', 'bad-schema', { ...definition,
+      properties: { label: { type: 'string', enum: ['\ud800'] } } }), 'SCHEMA_UNSUPPORTED');
+    code(() => db.revise('sp_a', 'entries', 1, { ...definition,
+      properties: { ...definition.properties, extra: { type: 'string', enum: ['\ud800'] } } }), 'SCHEMA_UNSUPPORTED');
+    assert.deepEqual(snapshot(), before);
+    assert.equal(db.mutate({ ...scope, operation: 'create', externalKey: 'baseline',
+      data: { label: 'valid' }, idempotencyKey: 'baseline' }).replayed, true);
+    assert.deepEqual(snapshot(), before);
+    const actual = create(db, '\u0085 actual \u00a0', { label: '💡x', short: '💡' }, 'actual');
+    assert.equal(db.get({ ...scope, id: actual.ref.id }).key, 'actual');
+    assert.equal(db.getByKey({ ...scope, mode: 'external', key: '\u0085 actual \u00a0' }).id, actual.ref.id);
+    const beforeDuplicate = snapshot();
+    code(() => create(db, 'actual', { label: 'other' }, 'duplicate'), 'UNIQUE_CONFLICT');
+    assert.deepEqual(snapshot(), beforeDuplicate);
+    const throwing = create(db, 'throw', { label: 'throw' }, 'throw');
+    assert.equal(db.get({ ...scope, id: throwing.ref.id }).key, 'throw');
+    assert.equal(calls, 0);
+  } finally {
+    Object.defineProperty(String.prototype, 'charCodeAt', previous);
+  }
+});
