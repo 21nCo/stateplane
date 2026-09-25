@@ -29,6 +29,8 @@ Status: accepted logical decisions; **not** evidence of deployed infrastructure.
 
 ## D4 — Idempotency and authorization
 
+The D3 target/envelope snapshot uses own data slots rather than ordinary-object assignment that an inherited setter could swallow. Key normalization and string bounds scan actual well-formed UTF-16 scalars rather than an inherited string iterator; authorization and exact committed replay retain their established precedence. STA-7 proves the corresponding adapter boundary, not this in-memory oracle alone.
+
 - Receipt identity includes space, credential and operation. Fingerprint server-derived actor, canonical payload with UTF-8-byte-ordered object keys and optional caller-supplied `expectedSchemaVersion`, not the current server schema version.
 - An omitted precondition means current schema; a provided version is checked only for a new write after receipt lookup. Authorize requested and original receipt collections with current operation-specific write grants before comparing fingerprints or replaying. A read grant alone never replays a write receipt.
 - Only JSON-compatible operation payloads participate in a fingerprint or receipt replay. Reject recursively invalid data/set as `SCHEMA_INVALID` and malformed patch shape as `INVALID_ARGUMENT` before fingerprinting, including same-key retries; authorize both requested and original receipt collections first. Current-schema and stale-revision checks remain after committed replay, so compatible additions do not invalidate a valid retry.
@@ -53,6 +55,8 @@ Status: accepted logical decisions; **not** evidence of deployed infrastructure.
 - Proof: STA-7 schema/compiler.
 
 ## D6 — Exact reads and consistent analysis
+
+The reference cursor checks canonical wire bytes and binding, then validates a fixed-length lowercase hex HMAC and compares its bytes with a constant-time primitive; malformed or altered signatures fail `CURSOR_INVALID`. STA-8 owns production adapter verification; no timing measurement or deployed implementation is claimed here.
 
 - Exact filtered count/exists and record status come from authority; unsupported filters fail closed. Live keyset pages bind scope/query/schema, are not snapshots, and cannot be supplied to count/exists.
 - A signed cursor is accepted in one emitted wire representation, not reconstructed from alternate JSON spellings of the same binding. The in-memory oracle checks exact UTF-8 JSON envelope bytes and canonical unpadded base64url before validating the signature; real adapters may choose another opaque authenticated encoding but reject aliases and authorize before decoding.

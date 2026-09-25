@@ -1,5 +1,5 @@
 // Contract oracle only: synchronous single-process model, NOT a production repository.
-import { createHash, createHmac, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { types } from 'node:util';
 
 export class ContractError extends Error {
@@ -61,14 +61,13 @@ const whitespace = new Set([0x20, 0x85, 0xa0, 0x1680, 0x2028, 0x2029, 0x202f, 0x
 for (let code = 0x09; code <= 0x0d; code++) whitespace.add(code);
 for (let code = 0x2000; code <= 0x200a; code++) whitespace.add(code);
 const trimKey = value => {
-  const scalars = [...value];
   let start = 0;
-  let end = scalars.length;
-  while (start < end && whitespace.has(scalars[start].codePointAt(0))) start++;
-  while (end > start && whitespace.has(scalars[end - 1].codePointAt(0))) end--;
-  let trimmed = '';
-  for (let index = start; index < end; index++) trimmed += scalars[index];
-  return trimmed;
+  let end = value.length;
+  // The fixed White_Space set consists entirely of BMP code points. Scan
+  // actual UTF-16 units; String.prototype[Symbol.iterator] is mutable.
+  while (start < end && whitespace.has(value.charCodeAt(start))) start++;
+  while (end > start && whitespace.has(value.charCodeAt(end - 1))) end--;
+  return value.slice(start, end);
 };
 // A lone UTF-16 surrogate has no Unicode scalar value and cannot encode as UTF-8.
 const wellFormed = value => {
@@ -81,6 +80,16 @@ const wellFormed = value => {
     }
   }
   return true;
+};
+// Called only after wellFormed: a surrogate pair is one Unicode scalar.
+const scalarLength = value => {
+  let count = 0;
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xD800 && unit <= 0xDBFF) index++;
+    count++;
+  }
+  return count;
 };
 const keyOf = key => {
   if (typeof key !== 'string' || !wellFormed(key)) fail('INVALID_ARGUMENT');
@@ -314,7 +323,11 @@ const validateScalar = (data, schema, type) => {
   if (type === 'string' && !wellFormed(data)) fail('SCHEMA_INVALID');
   if (type === 'integer' && !Number.isSafeInteger(data)) fail('SCHEMA_INVALID');
   if (typeof data === 'number' && (!Number.isFinite(data) || (schema.minimum !== undefined && data < schema.minimum) || (schema.maximum !== undefined && data > schema.maximum))) fail('SCHEMA_INVALID');
-  if (type === 'string' && ((schema.minLength !== undefined && [...data].length < schema.minLength) || (schema.maxLength !== undefined && [...data].length > schema.maxLength))) fail('SCHEMA_INVALID');
+  if (type === 'string' && (schema.minLength !== undefined || schema.maxLength !== undefined)) {
+    const length = scalarLength(data);
+    if ((schema.minLength !== undefined && length < schema.minLength) ||
+      (schema.maxLength !== undefined && length > schema.maxLength)) fail('SCHEMA_INVALID');
+  }
   if (schema.format === 'date-time') utcInstant(data);
 };
 const validateArray = (data, schema) => {
@@ -354,7 +367,7 @@ const mutationTarget = request => {
   // No target can be trusted from a Proxy: even descriptor reads can invoke
   // caller traps or throw before authorization and envelope validation.
   if (types.isProxy(request) || request === null || typeof request !== 'object') fail('INVALID_ARGUMENT');
-  const target = {};
+  const target = Object.create(null);
   const keys = ['spaceId', 'credential', 'collection'];
   for (let index = 0; index < keys.length; index++) { // NOSONAR
     const key = keys[index];
@@ -366,7 +379,7 @@ const mutationTarget = request => {
 };
 const mutationEnvelope = request => {
   if (!plainObject(request)) fail('INVALID_ARGUMENT');
-  const fields = {};
+  const fields = Object.create(null);
   const keys = Reflect.ownKeys(request);
   for (let index = 0; index < keys.length; index++) { // NOSONAR
     const key = keys[index];
@@ -676,7 +689,11 @@ export class ReferenceState {
     } catch { fail('CURSOR_INVALID'); }
     if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) fail('CURSOR_INVALID');
     const { signature, ...binding } = decoded;
-    if (binding.spaceId !== spaceId || binding.credential !== credential || binding.collection !== collection || binding.policyVersion !== policyVersion || binding.schemaVersion !== schemaVersion || stable(binding.sort) !== stable(order) || signature !== this.#sign(binding)) fail('CURSOR_INVALID');
+    if (binding.spaceId !== spaceId || binding.credential !== credential || binding.collection !== collection ||
+      binding.policyVersion !== policyVersion || binding.schemaVersion !== schemaVersion ||
+      stable(binding.sort) !== stable(order) || typeof signature !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(signature) ||
+      !timingSafeEqual(Buffer.from(signature, 'hex'), Buffer.from(this.#sign(binding), 'hex'))) fail('CURSOR_INVALID');
     if (!binding.after || typeof binding.after.id !== 'string' || (!order && typeof binding.after.value !== 'string') ||
       (order && !includesOwn([0, 1, 2], binding.after.rank))) fail('CURSOR_INVALID');
     return binding.after;

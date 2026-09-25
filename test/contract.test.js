@@ -1922,3 +1922,117 @@ test('stored schema with no own properties rejects undeclared unset despite late
     else delete Object.prototype.properties;
   }
 });
+
+test('mutation snapshots preserve own credentials and operations under inherited setters', () => {
+  const db = setup();
+  db.grant('sp_a', 'privileged', 'entries', recordAccess);
+  db.revoke('sp_a', 'agent', 'entries');
+  const unauthorized = { ...scope, operation: 'create', data: { label: 'blocked' }, idempotencyKey: 'blocked' };
+  const authorized = { ...unauthorized, credential: 'privileged', data: { label: 'allowed' }, idempotencyKey: 'allowed' };
+  const c = db.spaces.get('sp_a').collections.get('entries');
+  const snapshot = () => structuredClone({ seq: db.seq, rows: [...c.records], reserved: [...c.reserved],
+    events: db.events, outbox: db.outbox, receipts: [...db.receipts] });
+  const priorCredential = Object.getOwnPropertyDescriptor(Object.prototype, 'credential');
+  const priorOperation = Object.getOwnPropertyDescriptor(Object.prototype, 'operation');
+  try {
+    Object.defineProperty(Object.prototype, 'credential',
+      { configurable: true, get() { return 'privileged'; }, set(_) {} });
+    const before = snapshot();
+    code(() => db.mutate(unauthorized), 'FORBIDDEN');
+    assert.deepEqual(snapshot(), before);
+    Object.defineProperty(Object.prototype, 'operation',
+      { configurable: true, get() { return 'delete'; }, set(_) {} });
+    const receipt = db.mutate(authorized);
+    assert.equal(receipt.operation, 'create');
+    assert.equal(db.get({ ...scope, credential: 'privileged', id: receipt.ref.id }).data.label, 'allowed');
+    const committed = snapshot();
+    assert.equal(db.mutate(authorized).replayed, true);
+    assert.deepEqual(snapshot(), committed);
+    for (const [operation, expectedRevision, other] of [
+      ['replace', 1, { data: { label: 'replaced' } }],
+      ['patch', 2, { set: { label: 'patched' }, unset: [] }],
+      ['delete', 3, {}]
+    ]) {
+      const request = { ...scope, credential: 'privileged', operation, id: receipt.ref.id,
+        expectedRevision, idempotencyKey: operation, ...other };
+      const beforeDenied = snapshot();
+      code(() => db.mutate({ ...request, credential: 'agent' }), 'FORBIDDEN');
+      assert.deepEqual(snapshot(), beforeDenied);
+      const result = db.mutate(request);
+      assert.equal(result.revision, expectedRevision + 1);
+      const afterCommit = snapshot();
+      assert.equal(db.mutate(request).replayed, true);
+      assert.deepEqual(snapshot(), afterCommit);
+    }
+    assert.equal(db.get({ ...scope, credential: 'privileged', id: receipt.ref.id }), null);
+    db.revoke('sp_a', 'privileged', 'entries');
+    const afterRevocation = snapshot();
+    code(() => db.mutate(authorized), 'FORBIDDEN');
+    assert.deepEqual(snapshot(), afterRevocation);
+  } finally {
+    if (priorCredential) Object.defineProperty(Object.prototype, 'credential', priorCredential);
+    else delete Object.prototype.credential;
+    if (priorOperation) Object.defineProperty(Object.prototype, 'operation', priorOperation);
+    else delete Object.prototype.operation;
+  }
+});
+
+test('external keys and string lengths count actual Unicode scalars, not inherited iterator output', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  db.define('sp_a', 'entries', { ...schema, properties: {
+    label: { type: 'string', minLength: 2 }, short: { type: 'string', maxLength: 1 }
+  } });
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
+  const committedRequest = { ...scope, operation: 'create', externalKey: 'baseline',
+    data: { label: 'valid' }, idempotencyKey: 'baseline' };
+  db.mutate(committedRequest);
+  const c = db.spaces.get('sp_a').collections.get('entries');
+  const snapshot = () => structuredClone({ seq: db.seq, rows: [...c.records], reserved: [...c.reserved],
+    events: db.events, outbox: db.outbox, receipts: [...db.receipts] });
+  const previous = Object.getOwnPropertyDescriptor(String.prototype, Symbol.iterator);
+  const iterator = previous.value;
+  let calls = 0;
+  try {
+    Object.defineProperty(String.prototype, Symbol.iterator, { configurable: true, value: function () {
+      calls++;
+      const text = String(this);
+      if (text === 'throw') throw Error('inherited string iterator invoked');
+      return Reflect.apply(iterator, text === 'actual' ? 'xy' : text === 'A' ? 'AB' : text === 'AB' ? 'A' : text, []);
+    } });
+    const actual = create(db, 'actual', { label: 'valid' }, 'actual');
+    assert.equal(db.get({ ...scope, id: actual.ref.id }).key, 'actual');
+    assert.equal(db.getByKey({ ...scope, mode: 'external', key: 'actual' }).id, actual.ref.id);
+    const before = snapshot();
+    code(() => create(db, 'invalid', { label: 'A' }, 'invalid'), 'SCHEMA_INVALID');
+    code(() => create(db, 'one-scalar', { label: '💡' }, 'one-scalar'), 'SCHEMA_INVALID');
+    code(() => create(db, 'too-long', { label: 'valid', short: 'AB' }, 'too-long'), 'SCHEMA_INVALID');
+    assert.deepEqual(snapshot(), before);
+    assert.equal(db.mutate(committedRequest).replayed, true);
+    assert.deepEqual(snapshot(), before);
+    const later = create(db, 'throw', { label: '💡x' }, 'throw');
+    assert.equal(db.get({ ...scope, id: later.ref.id }).key, 'throw');
+    assert.equal(calls, 0);
+  } finally {
+    Object.defineProperty(String.prototype, Symbol.iterator, previous);
+  }
+});
+
+test('cursor signature accepts issued tokens and rejects malformed or changed hex', () => {
+  const db = setup();
+  create(db, 'one', { label: 'one' }, 'one');
+  create(db, 'two', { label: 'two' }, 'two');
+  const first = db.query({ ...scope, limit: 1 });
+  assert.equal(db.query({ ...scope, limit: 1, cursor: first.cursor }).items.length, 1);
+  const c = db.spaces.get('sp_a').collections.get('entries');
+  const snapshot = () => structuredClone({ seq: db.seq, rows: [...c.records], reserved: [...c.reserved],
+    events: db.events, outbox: db.outbox, receipts: [...db.receipts] });
+  const before = snapshot();
+  const parsed = JSON.parse(Buffer.from(first.cursor, 'base64url').toString('utf8'));
+  for (const signature of [parsed.signature.slice(1), 'g'.repeat(64),
+    (parsed.signature[0] === 'a' ? 'b' : 'a') + parsed.signature.slice(1)]) {
+    code(() => db.query({ ...scope, limit: 1,
+      cursor: Buffer.from(JSON.stringify({ ...parsed, signature })).toString('base64url') }), 'CURSOR_INVALID');
+    assert.deepEqual(snapshot(), before);
+  }
+});
