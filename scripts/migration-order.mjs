@@ -16,7 +16,7 @@ export async function migrationInventory(directory) {
   const files = [];
   for (const entry of entries) {
     if (!/\.sql$/i.test(entry.name)) continue;
-    const match = /^([0-9]+)_[a-z0-9_]+\.sql$/.exec(entry.name);
+    const match = /^(\d+)_[a-z0-9_]+\.sql$/.exec(entry.name);
     if (!entry.isFile() || !match) throw new Error(`Invalid migration file: ${entry.name}`);
     const version = BigInt(match[1]);
     if (versions.has(version)) {
