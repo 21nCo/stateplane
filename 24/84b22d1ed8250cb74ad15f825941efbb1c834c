@@ -1,0 +1,70 @@
+.env.example
+  h_a39f9495f9ec1d 1-2
+.github/workflows/ci.yml
+  h_a39f9495f9ec1d 6-7,12-15,18,24
+.gitignore
+  h_a39f9495f9ec1d 11
+README.md
+  h_a39f9495f9ec1d 15,19,23
+app/src/app.html
+  h_a39f9495f9ec1d 2
+app/src/routes/+page.svelte
+  h_a39f9495f9ec1d 1
+app/wrangler.jsonc
+  h_a39f9495f9ec1d 2
+docker-compose.yml
+  h_a39f9495f9ec1d 6
+docs/package-qualification.md
+  h_a39f9495f9ec1d 3,14-15,19,28
+eslint.config.js
+  h_a39f9495f9ec1d 9-10
+package.json
+  h_a39f9495f9ec1d 15,18-20,22-24,37,52
+packages/contracts/src/index.ts
+  h_a39f9495f9ec1d 3-9
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 3-14
+packages/read-model/src/index.ts
+  h_a39f9495f9ec1d 11,15
+packages/workers/package.json
+  h_a39f9495f9ec1d 22-23
+packages/workers/src/index.ts
+  h_a39f9495f9ec1d 2-3
+pnpm-lock.yaml
+  h_a39f9495f9ec1d 41-43,87-88,200-202,1343-1344,1346-1347,1357-1358,1360-1361,1363-1364,1366-1367,1369-1370,2548-2549,2556-2561,3826,3830-3831,3835,3837,3843,3847,3849,3852,3854-3855,3859,3861,3863,4922,4924-4930
+scripts/check-boundaries.mjs
+  h_a39f9495f9ec1d 2-5,8-9,13,17,27-68,70-80,82-85,87,89-92,95-122
+scripts/db-connection.mjs
+  h_a39f9495f9ec1d 1-19
+scripts/local-db.mjs
+  h_a39f9495f9ec1d 1-48
+scripts/migrate.mjs
+  h_a39f9495f9ec1d 5-6,8,17
+scripts/migration-order.mjs
+  h_a39f9495f9ec1d 1-5
+scripts/qualify-exports.mjs
+  h_a39f9495f9ec1d 2,4,7,9-41,43,46-47
+scripts/test-consumer.mjs
+  h_a39f9495f9ec1d 9-10,14,26,31,34
+test/db-connection.test.js
+  h_a39f9495f9ec1d 1-21
+test/e2e/foundation.spec.ts
+  h_a39f9495f9ec1d 5-6
+test/foundation-boundaries.test.js
+  h_a39f9495f9ec1d 1-42
+test/package-exports.test.js
+  h_a39f9495f9ec1d 1-26
+test/qualification.test.ts
+  h_a39f9495f9ec1d 12,74-82
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2484b22d1ed8250cb74ad15f825941efbb1c834c",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
