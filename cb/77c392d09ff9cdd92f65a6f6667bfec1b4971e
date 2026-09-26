@@ -1,0 +1,33 @@
+contracts/decisions.md
+  s_ee6f287c08acb3::t_f3a5f5d3f57ed3 57
+contracts/v1.md
+  s_ee6f287c08acb3::t_d13447ef49ebfe 23-24
+test/contract.test.js
+  s_ee6f287c08acb3::t_af160ed841ac76 2480-2540
+test/reference.js
+  s_16208d9e94c152::t_200a3640915c9a 34,44-47,65-69,716,746-747,816-820
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cb77c392d09ff9cdd92f65a6f6667bfec1b4971e",
+  "prompts": {},
+  "sessions": {
+    "s_16208d9e94c152": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0dbe7-1ef9-7b80-8341-fe952b6e9b65",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_ee6f287c08acb3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0dbe8-d479-71a1-9012-f08e8b29a7ff",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
