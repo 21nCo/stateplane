@@ -1,0 +1,35 @@
+docker-compose.yml
+  s_a2bd3276976ac7::t_380d94b033386d 6,17
+packages/contracts/src/index.ts
+  s_a2bd3276976ac7::t_cf630556e5a425 4-5,7
+packages/postgres/src/index.ts
+  s_a2bd3276976ac7::t_cd8f973375b63e 1,5-9,11-15,17
+scripts/check-boundaries.mjs
+  s_a2bd3276976ac7::t_531873233b605e 28-40,43,47-62,70,76,84,105
+scripts/db-connection.mjs
+  s_a2bd3276976ac7::t_69faf21523a0d8 3,9-15,17-23
+scripts/local-db-password.mjs
+  s_a2bd3276976ac7::t_4b824d32fd2bc7 1-38
+scripts/migrate.mjs
+  s_a2bd3276976ac7::t_1b89db6a76583a 18-22,26-27
+scripts/migration-order.mjs
+  s_a2bd3276976ac7::t_8712748da6e3d3 1,5-7
+scripts/test-consumer.mjs
+  s_a2bd3276976ac7::t_3202f3d906d50a 34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f3479de8d54bec57e02b8f1c42c6cdee0af187e0",
+  "prompts": {},
+  "sessions": {
+    "s_a2bd3276976ac7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0d8b0-85e2-7702-9013-989547be5d4f",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
