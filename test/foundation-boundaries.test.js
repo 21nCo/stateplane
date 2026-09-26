@@ -35,6 +35,57 @@ test('package and CLI checks reject forbidden imports with extra call arguments'
   }
 });
 
+test('no-substitution template module loads obey package and browser boundaries', () => {
+  const packagePath = join(base, 'packages/api/src/index.ts');
+  const packageLoads = [
+    'require(`@stateplane/postgres`)',
+    'require(`@stateplane/postgres`, ignored)',
+    'import(`@stateplane/postgres`)',
+    'import(`@stateplane/postgres`, { with: { type: "json" } })',
+    'type Secret = typeof import(`@stateplane/postgres`)'
+  ];
+  for (const source of packageLoads) {
+    assert.ok(sourceProblems(packagePath, source, base).some(problem => problem.includes('forbidden dependency')), source);
+  }
+
+  const browserLoads = [
+    '<script>require(`$lib/server/secret`)</script>',
+    '<script>import(`@stateplane/postgres`)</script>',
+    '<button onclick={() => import(`$lib/server/secret`)}>Load</button>',
+    '<button onclick={() => require(`@stateplane/postgres`, ignored)}>Load</button>'
+  ];
+  for (const source of browserLoads) {
+    assert.ok(sourceProblems(browser, source, base).some(problem => problem.includes('browser imports')), source);
+  }
+
+  const windowsBase = 'C:\\fixture';
+  const windowsPackage = 'C:\\fixture\\packages\\api\\src\\index.ts';
+  const windowsBrowser = 'C:\\fixture\\app\\src\\routes\\+page.svelte';
+  assert.ok(sourceProblems(windowsPackage, 'import(`../../postgres/src/index`)', windowsBase).some(problem => problem.includes('forbidden dependency')));
+  assert.ok(sourceProblems(windowsBrowser, '<button onclick={() => import(`../lib/server/secret`)}>Load</button>', windowsBase).some(problem => problem.includes('browser imports server package')));
+
+  assert.deepEqual(sourceProblems(server, 'import(`@stateplane/postgres`)', base), []);
+  assert.deepEqual(sourceProblems(browser, '<script>import(`@stateplane/contracts`)</script>', base), []);
+  assert.deepEqual(sourceProblems(packagePath, 'import(`@stateplane/${name}`)', base), []);
+});
+
+test('workspace boundary scan rejects template loads in package and Svelte sources', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'stateplane-boundary-template-'));
+  try {
+    await mkdir(join(directory, 'packages/api/src'), { recursive: true });
+    await mkdir(join(directory, 'app/src/routes'), { recursive: true });
+    await writeFile(join(directory, 'packages/api/package.json'), JSON.stringify({ dependencies: { '@stateplane/auth': 'workspace:*', '@stateplane/application': 'workspace:*' } }));
+    await writeFile(join(directory, 'packages/api/src/index.ts'), 'void import(`@stateplane/postgres`);');
+    await writeFile(join(directory, 'app/src/routes/+page.svelte'), '<script>require(`$lib/server/secret`)</script><button onclick={() => import(`@stateplane/postgres`)}>Load</button>');
+    const problems = await checkBoundaries(directory);
+    assert.ok(problems.some(problem => problem.includes('forbidden dependency @stateplane/postgres')));
+    assert.ok(problems.some(problem => problem.includes('browser imports server package $lib/server/secret')));
+    assert.ok(problems.some(problem => problem.includes('browser imports @stateplane/postgres')));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('real server modules may import server packages even inside a route named server', () => {
   assert.deepEqual(sourceProblems(server, `import type { RecordRef } from '@stateplane/postgres';`, base), []);
   assert.ok(sourceProblems(browser, `<script>import x from '@stateplane/postgres';</script>`, base).length > 0);

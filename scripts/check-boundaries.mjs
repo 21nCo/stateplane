@@ -26,12 +26,27 @@ async function walk(dir) {
   return result;
 }
 
+/** Read a statically known module specifier from a Svelte expression. */
+function markupSpecifier(value) {
+  if (typeof value?.value === 'string') return value.value;
+  if (value?.type === 'TemplateLiteral' && value.expressions.length === 0 && value.quasis.length === 1) {
+    return value.quasis[0].value.cooked;
+  }
+  return null;
+}
+
 /** Traverse Svelte markup expressions once and collect literal module loads. */
 function visitMarkup(value, result, seen) {
   if (!value || typeof value !== 'object' || seen.has(value)) return;
   seen.add(value);
-  if (value.type === 'ImportExpression' && typeof value.source?.value === 'string') result.push(value.source.value);
-  if (value.type === 'CallExpression' && value.callee?.name === 'require' && typeof value.arguments?.[0]?.value === 'string') result.push(value.arguments[0].value);
+  if (value.type === 'ImportExpression') {
+    const specifier = markupSpecifier(value.source);
+    if (specifier !== null) result.push(specifier);
+  }
+  if (value.type === 'CallExpression' && value.callee?.name === 'require') {
+    const specifier = markupSpecifier(value.arguments?.[0]);
+    if (specifier !== null) result.push(specifier);
+  }
   for (const child of Object.values(value)) {
     if (Array.isArray(child)) child.forEach(item => visitMarkup(item, result, seen));
     else visitMarkup(child, result, seen);
@@ -45,18 +60,25 @@ function markupSpecifiers(fragment) {
   return result;
 }
 
+/** Read a string or no-substitution template module specifier from TypeScript. */
+function typeScriptSpecifier(value) {
+  return value && (ts.isStringLiteral(value) || ts.isNoSubstitutionTemplateLiteral(value)) ? value.text : null;
+}
+
 /** Traverse one TypeScript AST for static and literal runtime dependencies. */
 function visitTypeScript(node, result) {
-  if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
-    result.push(node.moduleSpecifier.text);
-  } else if (ts.isExternalModuleReference(node) && node.expression && ts.isStringLiteral(node.expression)) {
-    result.push(node.expression.text);
-  } else if (ts.isCallExpression(node) && node.arguments.length > 0 && ts.isStringLiteral(node.arguments[0]) &&
+  let specifier = null;
+  if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+    specifier = typeScriptSpecifier(node.moduleSpecifier);
+  } else if (ts.isExternalModuleReference(node)) {
+    specifier = typeScriptSpecifier(node.expression);
+  } else if (ts.isCallExpression(node) && node.arguments.length > 0 &&
     (node.expression.kind === ts.SyntaxKind.ImportKeyword || ts.isIdentifier(node.expression) && node.expression.text === 'require')) {
-    result.push(node.arguments[0].text);
-  } else if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument) && ts.isStringLiteral(node.argument.literal)) {
-    result.push(node.argument.literal.text);
+    specifier = typeScriptSpecifier(node.arguments[0]);
+  } else if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) {
+    specifier = typeScriptSpecifier(node.argument.literal);
   }
+  if (specifier !== null) result.push(specifier);
   ts.forEachChild(node, child => visitTypeScript(child, result));
 }
 
