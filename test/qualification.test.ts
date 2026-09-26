@@ -9,6 +9,7 @@ import { parseBearerChallenge } from '@mcpfn/testing/auth';
 import { validateSchema } from '@datafn/core';
 import { memoryAdapter } from '@superfunctions/db/testing';
 import { readModelSchema } from '@stateplane/read-model';
+import { parseRevision } from '@stateplane/contracts';
 
 describe('published package boundary', () => {
   it('AuthFn composes API key and region plugins and revocation denies replay', async () => {
@@ -70,6 +71,15 @@ describe('published package boundary', () => {
     expect(result).toBeTruthy();
     expect(readModelSchema.resources.map(resource => resource.name)).toEqual(['spacePlacements']);
     expect(readModelSchema.resources[0].permissions?.write?.fields).toEqual([]);
+    expect(readModelSchema.resources[0].permissions?.read?.fields).toContain('storageTargetId');
+    expect(readModelSchema.resources[0].fields.map(field => field.name)).toContain('storageTargetId');
+  });
+
+  it('constructs only positive safe revisions', () => {
+    expect(parseRevision(1)).toBe(1);
+    for (const value of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '1', null]) {
+      expect(() => parseRevision(value)).toThrow(RangeError);
+    }
   });
 
   it('shared DB memory transactions roll back multi-write failure', async () => {

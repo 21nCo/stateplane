@@ -6,12 +6,12 @@ import { spawnSync } from 'node:child_process';
 const root = resolve(import.meta.dirname, '..');
 const temp = await mkdtemp(join(tmpdir(), 'stateplane-consumer-'));
 function run(command, args, cwd) {
-  const result = spawnSync(command, args, { cwd, encoding: 'utf8', stdio: 'pipe', env: process.env });
-  if (result.status !== 0) throw Error(`${command} ${args.join(' ')} failed\n${result.stdout}\n${result.stderr}`);
+  const result = spawnSync(command, args, { cwd, encoding: 'utf8', stdio: 'pipe', env: process.env, shell: process.platform === 'win32' && ['pnpm', 'npm'].includes(command) });
+  if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed\n${result.stdout}\n${result.stderr}`);
   return result.stdout.trim();
 }
 try {
-  const names = ['contracts', 'application', 'auth', 'api', 'read-model'];
+  const names = ['contracts', 'application', 'auth', 'api', 'read-model', 'postgres', 'workers'];
   const tarballs = [];
   for (const name of names) {
     const tarball = join(temp, `${name}.tgz`);
@@ -23,13 +23,15 @@ try {
   await writeFile(join(temp, 'consumer.mjs'), `
 import { healthResponse } from '@stateplane/api';
 import { readModelSchema } from '@stateplane/read-model';
+import { parseRevision } from '@stateplane/contracts';
 import { validateSchema } from '@datafn/core';
 if ((await healthResponse().json()).status !== 'scaffold') throw Error('API export failed');
 if (readModelSchema.resources[0].name !== 'spacePlacements') throw Error('fixed schema export failed');
 if (!validateSchema(readModelSchema)) throw Error('DataFn schema rejected');
+if (parseRevision(1) !== 1) throw Error('revision export failed');
 `);
   run('node', ['consumer.mjs'], temp);
-  await writeFile(join(temp, 'consumer.ts'), `import type { RecordRef } from '@stateplane/contracts';\nimport type { HttpDependencies } from '@stateplane/api';\nconst ref: RecordRef | undefined = undefined;\nconst deps: HttpDependencies | undefined = undefined;\nvoid ref; void deps;\n`);
+  await writeFile(join(temp, 'consumer.ts'), `import { parseRevision, type RecordRef, type Revision, type CollectionId } from '@stateplane/contracts';\nimport type { HttpDependencies } from '@stateplane/api';\nimport type { AuthorityTransaction } from '@stateplane/postgres';\nimport type { ProjectionJob } from '@stateplane/workers';\nconst ref: RecordRef | undefined = undefined;\nconst deps: HttpDependencies | undefined = undefined;\nconst revision: Revision = parseRevision(1);\n// @ts-expect-error A raw number is not a validated revision.\nconst invalid: Revision = 0;\ndeclare const job: ProjectionJob;\nconst collection: CollectionId = job.ref.collectionId;\ndeclare const tx: AuthorityTransaction;\nvoid tx.reserveUnique; void tx.writeRecord; void tx.writeReceipt; void tx.appendAudit; void tx.enqueueProjection;\nvoid ref; void deps; void revision; void invalid; void collection;\n`);
   await writeFile(join(temp, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'NodeNext', moduleResolution: 'NodeNext', target: 'ES2022', strict: true, skipLibCheck: true, noEmit: true }, files: ['consumer.ts'] }));
   run(join(root, 'node_modules/.bin/tsc'), ['-p', 'tsconfig.json'], temp);
   console.log('Packed Stateplane packages import and typecheck in an isolated npm consumer');

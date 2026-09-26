@@ -12,14 +12,15 @@ pnpm install --frozen-lockfile
 pnpm check
 pnpm db:up
 pnpm db:migrate
+pnpm exec playwright install chromium
 pnpm test:e2e
 ```
 
-`pnpm check` runs lint and boundary checks, typecheck, the STA-2 contract fixture suite, focused published package tests, builds, isolated packed-package consumer, and Worker dry-run. `pnpm worker:package-dry-run` separately probes production package bundling into a Worker; the Node-only McpFn testing package is excluded. Playwright needs Chromium (`pnpm exec playwright install chromium`) before `pnpm test:e2e` on a new machine. CI installs it with system dependencies. Use `pnpm db:down` after local testing. Run `docker compose down -v` only when intentionally deleting this checkout's disposable data.
+`pnpm check` runs lint and boundary checks, typecheck, the STA-2 contract fixture suite, focused published package tests, builds, isolated packed-package consumer, and both Worker dry-runs. The package probe bundles production packages into a Worker; the Node-only McpFn testing package is excluded. CI installs Chromium with system dependencies. Use `pnpm db:down` after local testing; it retains the disposable database volume and local credential for the next run.
 
 Local Worker/R2 development: `pnpm dev:worker`. Wrangler persists its local emulated R2 state in `.data/wrangler/app`. The local binding is `ORIGINALS` and its bucket name is `stateplane-originals-local`; no Cloudflare account or shared R2 resource is used by `wrangler dev`. `pnpm --filter @stateplane/app dev` runs Vite without Worker bindings for UI work. A remote Cloudflare Preview, Hyperdrive, and a real regional R2 bucket are later acceptance boundaries, not results of local development.
 
-The isolated Postgres service binds only `127.0.0.1:55432`, uses the `stateplane` database and a disposable local password. `DATABASE_URL` may override it for a disposable external database; keep that value in your private process environment or an ignored `.env.*.local` file. Migrations run under a transaction and advisory lock and reject changed files by SHA-256. Migration 001 installs pgvector; authority tables belong to STA-5. The port and connection timeout are local bootstrap choices, not service limits or recovery promises.
+The isolated Postgres service binds only `127.0.0.1:55432` and uses the `stateplane` database. `pnpm db:up` generates a random local password in ignored `.data/local-db-password` (mode 0600); `pnpm db:migrate` reads that file. Keep it while the Compose volume exists, or remove the volume and password together before a fresh bootstrap. For a disposable external database, export `DATABASE_URL` in your private process environment before `pnpm db:migrate`. If storing it in `.env.local`, load it explicitly with `set -a; . ./.env.local; set +a`; the migration command does not read env files itself. External URLs require `sslmode=verify-full` and a trusted server certificate; set `PGSSLROOTCERT` to a private CA file when needed. `.env.local` and `.env.*.local` are ignored. Migrations run under a transaction and advisory lock and reject changed files by SHA-256. Migration 001 installs pgvector; hosted acceptance must use a pgvector-capable image. Authority tables belong to STA-5. The port and connection timeout are local bootstrap choices, not service limits or recovery promises.
 
 ## Package ownership
 

@@ -3,7 +3,7 @@ services:
     image: pgvector/pgvector:pg17
     environment:
       POSTGRES_USER: stateplane
-      POSTGRES_PASSWORD: local-only-stateplane
+      POSTGRES_PASSWORD: ${STATEPLANE_POSTGRES_PASSWORD:?Run pnpm db:up}
       POSTGRES_DB: stateplane
     ports:
       - "127.0.0.1:55432:5432"

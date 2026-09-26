@@ -1,5 +1,5 @@
 {
-  "$schema": "../node_modules/wrangler/config-schema.json",
+  "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "stateplane-local",
   "main": ".svelte-kit/cloudflare/_worker.js",
   "compatibility_date": "2026-09-01",

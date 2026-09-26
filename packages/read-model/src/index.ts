@@ -8,9 +8,10 @@ export const readModelSchema = defineSchema({
     fields: [
       { name: 'id', type: 'string', required: true, readonly: true },
       { name: 'cellId', type: 'string', required: true, readonly: true },
+      { name: 'storageTargetId', type: 'string', required: true, readonly: true },
       { name: 'generation', type: 'number', required: true, readonly: true },
       { name: 'state', type: 'string', required: true, readonly: true }
     ],
-    permissions: { read: { fields: ['id', 'cellId', 'generation', 'state'] }, write: { fields: [] } }
+    permissions: { read: { fields: ['id', 'cellId', 'storageTargetId', 'generation', 'state'] }, write: { fields: [] } }
   }]
 });

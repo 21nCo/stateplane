@@ -8,5 +8,5 @@ coverage/
 playwright-report/
 test-results/
 .env
-.env.*.local
+.env*.local
 !.env.example

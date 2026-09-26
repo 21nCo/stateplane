@@ -12,16 +12,16 @@
     "lint": "eslint packages scripts test/qualification.test.ts && node scripts/check-boundaries.mjs",
     "test": "pnpm test:contracts && pnpm test:qualification",
     "test:contracts": "node --test test/*.test.js",
-    "test:qualification": "pnpm --filter @stateplane/read-model build && vitest run test/qualification.test.ts && node scripts/qualify-exports.mjs",
+    "test:qualification": "pnpm --filter @stateplane/contracts build && pnpm --filter @stateplane/read-model build && vitest run test/qualification.test.ts && node scripts/qualify-exports.mjs",
     "test:consumer": "node scripts/test-consumer.mjs",
     "test:e2e": "playwright test",
-    "db:up": "docker compose up -d --wait postgres",
-    "db:down": "docker compose down",
-    "db:migrate": "node scripts/migrate.mjs",
+    "db:up": "node scripts/local-db.mjs up",
+    "db:down": "node scripts/local-db.mjs down",
+    "db:migrate": "node scripts/local-db.mjs migrate",
     "dev:worker": "pnpm --filter @stateplane/app dev:worker",
-    "worker:dry-run": "pnpm --filter @stateplane/app exec wrangler deploy --dry-run --outdir ../../.data/worker-dry-run",
-    "worker:package-dry-run": "pnpm --filter @stateplane/app exec wrangler deploy ../scripts/qualification-worker.ts --config wrangler.jsonc --dry-run --outdir ../../.data/package-worker-dry-run",
-    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm test:consumer && pnpm worker:dry-run"
+    "worker:dry-run": "pnpm --filter @stateplane/app exec wrangler deploy --dry-run --outdir ../.data/worker-dry-run",
+    "worker:package-dry-run": "pnpm --filter @stateplane/app exec wrangler deploy ../scripts/qualification-worker.ts --config wrangler.jsonc --dry-run --outdir ../.data/package-worker-dry-run",
+    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm test:consumer && pnpm worker:dry-run && pnpm worker:package-dry-run"
   },
   "devDependencies": {
     "@authfn/api-keys": "0.1.2",
@@ -34,6 +34,7 @@
     "@mcpfn/core": "0.0.5",
     "@mcpfn/testing": "0.0.5",
     "@playwright/test": "1.62.0",
+    "@stateplane/contracts": "workspace:*",
     "@stateplane/read-model": "workspace:*",
     "@superfunctions/db": "0.2.1",
     "@superfunctions/observability": "0.0.1",
@@ -48,6 +49,6 @@
     "turbo": "2.10.7",
     "typescript": "6.0.3",
     "typescript-eslint": "8.65.0",
-    "vitest": "4.1.10"
+    "vitest": "4.1.11"
   }
 }
