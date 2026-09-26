@@ -1,0 +1,12 @@
+node_modules/
+**/dist/
+**/.turbo/
+**/.svelte-kit/
+.data/
+.wrangler/
+coverage/
+playwright-report/
+test-results/
+.env
+.env.*.local
+!.env.example

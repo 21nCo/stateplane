@@ -1,8 +1,53 @@
 {
-  "name": "stateplane-contract-fixtures",
+  "name": "stateplane",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@11.9.0",
+  "engines": {
+    "node": ">=22.13.0 <25"
+  },
   "scripts": {
-    "test": "node --test test/*.test.js"
+    "build": "turbo run build",
+    "typecheck": "turbo run typecheck",
+    "lint": "eslint packages scripts test/qualification.test.ts && node scripts/check-boundaries.mjs",
+    "test": "pnpm test:contracts && pnpm test:qualification",
+    "test:contracts": "node --test test/*.test.js",
+    "test:qualification": "pnpm --filter @stateplane/read-model build && vitest run test/qualification.test.ts && node scripts/qualify-exports.mjs",
+    "test:consumer": "node scripts/test-consumer.mjs",
+    "test:e2e": "playwright test",
+    "db:up": "docker compose up -d --wait postgres",
+    "db:down": "docker compose down",
+    "db:migrate": "node scripts/migrate.mjs",
+    "dev:worker": "pnpm --filter @stateplane/app dev:worker",
+    "worker:dry-run": "pnpm --filter @stateplane/app exec wrangler deploy --dry-run --outdir ../../.data/worker-dry-run",
+    "worker:package-dry-run": "pnpm --filter @stateplane/app exec wrangler deploy ../scripts/qualification-worker.ts --config wrangler.jsonc --dry-run --outdir ../../.data/package-worker-dry-run",
+    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm test:consumer && pnpm worker:dry-run"
+  },
+  "devDependencies": {
+    "@authfn/api-keys": "0.1.2",
+    "@authfn/core": "0.1.1",
+    "@authfn/multi-region": "0.1.2",
+    "@datafn/core": "0.1.1",
+    "@datafn/server": "0.2.0",
+    "@eslint/js": "10.0.1",
+    "@mcpfn/auth": "0.0.5",
+    "@mcpfn/core": "0.0.5",
+    "@mcpfn/testing": "0.0.5",
+    "@playwright/test": "1.62.0",
+    "@stateplane/read-model": "workspace:*",
+    "@superfunctions/db": "0.2.1",
+    "@superfunctions/observability": "0.0.1",
+    "@superfunctions/storage-r2": "0.2.0",
+    "@types/node": "22.20.1",
+    "@types/pg": "8.20.0",
+    "eslint": "10.8.0",
+    "globals": "17.7.0",
+    "pg": "8.22.0",
+    "prettier": "3.9.6",
+    "svelte-check": "4.7.3",
+    "turbo": "2.10.7",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.65.0",
+    "vitest": "4.1.10"
   }
 }

@@ -1,0 +1,13 @@
+packages:
+  - app
+  - packages/*
+
+allowBuilds:
+  esbuild: true
+  workerd: true
+
+minimumReleaseAgeExclude:
+  - '@mcpfn/auth@0.0.5'
+  - '@mcpfn/client@0.0.4'
+  - '@mcpfn/core@0.0.5'
+  - '@mcpfn/testing@0.0.5'

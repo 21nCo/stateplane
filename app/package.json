@@ -1,0 +1,26 @@
+{
+  "name": "@stateplane/app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev --host 127.0.0.1",
+    "dev:worker": "vite build && wrangler dev --config wrangler.jsonc --persist-to ../.data/wrangler/app",
+    "build": "vite build",
+    "typecheck": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
+  },
+  "dependencies": {
+    "@stateplane/contracts": "workspace:*",
+    "@stateplane/api": "workspace:*"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-cloudflare": "7.2.9",
+    "@sveltejs/kit": "2.70.1",
+    "@sveltejs/vite-plugin-svelte": "7.2.0",
+    "@tailwindcss/vite": "4.3.3",
+    "@cloudflare/workers-types": "5.20260722.1",
+    "svelte": "5.56.8",
+    "tailwindcss": "4.3.3",
+    "vite": "8.1.5",
+    "wrangler": "4.115.0"
+  }
+}
