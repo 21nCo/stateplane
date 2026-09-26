@@ -19,7 +19,7 @@ export function connectionOptions(value, rootCertPath = process.env.PGSSLROOTCER
       throw new Error('Loopback DATABASE_URL only permits sslmode=disable');
     }
     url.searchParams.delete('sslmode');
-    return { connectionString: url.toString(), connectionTimeoutMillis: 5000 };
+    return { connectionString: url.toString(), connectionTimeoutMillis: 5000, ssl: false };
   }
   if (url.searchParams.get('sslmode') !== 'verify-full') {
     throw new Error('External DATABASE_URL requires sslmode=verify-full');

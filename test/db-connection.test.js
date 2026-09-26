@@ -29,12 +29,35 @@ test('external database connections require certificate-verified TLS', () => {
 });
 
 test('local database keeps the plaintext loopback bootstrap', () => {
-  for (const host of ['localhost', '127.0.0.1', '[::1]']) {
-    const effective = new pg.Client(connectionOptions(`postgres://user@${host}:55432/stateplane`, '')).connectionParameters;
-    assert.equal(effective.ssl, false);
+  const previous = process.env.PGSSLMODE;
+  process.env.PGSSLMODE = 'require';
+  try {
+    for (const host of ['localhost', '127.0.0.1', '[::1]']) {
+      for (const suffix of ['', '?sslmode=disable']) {
+        const effective = new pg.Client(connectionOptions(`postgres://user@${host}:55432/stateplane${suffix}`, '')).connectionParameters;
+        assert.equal(effective.host, host);
+        assert.equal(effective.ssl, false);
+      }
+    }
+  } finally {
+    if (previous === undefined) delete process.env.PGSSLMODE;
+    else process.env.PGSSLMODE = previous;
   }
   assert.throws(() => connectionOptions('postgres://user@localhost/stateplane?ssl=0', ''), /not allowed/);
   assert.throws(() => connectionOptions('', ''), /DATABASE_URL is required/);
+});
+
+test('external TLS policy overrides inherited plaintext mode', () => {
+  const previous = process.env.PGSSLMODE;
+  process.env.PGSSLMODE = 'disable';
+  try {
+    const effective = new pg.Client(connectionOptions('postgres://user@db.example.test/stateplane?sslmode=verify-full', '')).connectionParameters;
+    assert.equal(effective.host, 'db.example.test');
+    assert.deepEqual(effective.ssl, { rejectUnauthorized: true, servername: 'db.example.test' });
+  } finally {
+    if (previous === undefined) delete process.env.PGSSLMODE;
+    else process.env.PGSSLMODE = previous;
+  }
 });
 
 test('private CA is passed to the effective external pg client', async () => {
