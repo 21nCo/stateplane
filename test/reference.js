@@ -7,6 +7,44 @@ export class ContractError extends Error {
 }
 const fail = code => { throw new ContractError(code); };
 const clone = value => structuredClone(value);
+// Keep numeric and keyed-collection decisions stable when a caller changes
+// globals or inherited methods after loading the reference oracle.
+const isFiniteNumber = Number.isFinite;
+const isIntegerNumber = Number.isInteger;
+const isSafeIntegerNumber = Number.isSafeInteger;
+const maxSafeInteger = Number.MAX_SAFE_INTEGER;
+const nativeMapGet = Map.prototype.get;
+const nativeMapSet = Map.prototype.set;
+const nativeMapHas = Map.prototype.has;
+const nativeMapDelete = Map.prototype.delete;
+const nativeMapIterator = Map.prototype[Symbol.iterator];
+const nativeMapValues = Map.prototype.values;
+const nativeMapIteratorNext = Object.getPrototypeOf(Reflect.apply(nativeMapIterator, new Map(), [])).next;
+const nativeMapSize = Object.getOwnPropertyDescriptor(Map.prototype, 'size').get;
+const nativeSetHas = Set.prototype.has;
+const nativeSetAdd = Set.prototype.add;
+const nativeSetDelete = Set.prototype.delete;
+const nativeSetIterator = Set.prototype[Symbol.iterator];
+const nativeSetIteratorNext = Object.getPrototypeOf(Reflect.apply(nativeSetIterator, new Set(), [])).next;
+const trustedIterator = (iterator, next) => ({
+  next() { return Reflect.apply(next, iterator, []); },
+  [Symbol.iterator]() { return this; }
+});
+class TrustedMap extends Map {
+  get(key) { return Reflect.apply(nativeMapGet, this, [key]); }
+  set(key, value) { return Reflect.apply(nativeMapSet, this, [key, value]); }
+  has(key) { return Reflect.apply(nativeMapHas, this, [key]); }
+  delete(key) { return Reflect.apply(nativeMapDelete, this, [key]); }
+  values() { return trustedIterator(Reflect.apply(nativeMapValues, this, []), nativeMapIteratorNext); }
+  [Symbol.iterator]() { return trustedIterator(Reflect.apply(nativeMapIterator, this, []), nativeMapIteratorNext); }
+  get size() { return Reflect.apply(nativeMapSize, this, []); }
+}
+class TrustedSet extends Set {
+  has(value) { return Reflect.apply(nativeSetHas, this, [value]); }
+  add(value) { return Reflect.apply(nativeSetAdd, this, [value]); }
+  delete(value) { return Reflect.apply(nativeSetDelete, this, [value]); }
+  [Symbol.iterator]() { return trustedIterator(Reflect.apply(nativeSetIterator, this, []), nativeSetIteratorNext); }
+}
 // Never assign into an empty array through an inherited numeric setter.
 const appendOwn = (array, value) => Object.defineProperty(array, array.length,
   { value, enumerable: true, writable: true, configurable: true });
@@ -20,7 +58,7 @@ const someOwn = (array, predicate) => {
 };
 const includesOwn = (array, value) => someOwn(array, item => item === value);
 const hasDuplicateOwn = array => {
-  const seen = new Set();
+  const seen = new TrustedSet();
   for (let index = 0; index < array.length; index++) { // NOSONAR
     const item = Object.getOwnPropertyDescriptor(array, index).value;
     if (seen.has(item)) return true;
@@ -85,7 +123,7 @@ const toISOString = value => Reflect.apply(dateToISOString, value, []);
 const syntheticTimestamp = sequence => toISOString(new NativeDate(Reflect.apply(dateUtc, NativeDate,
   [2020, 0, 1, 0, 0, 0, sequence])));
 // Fixed Unicode White_Space set (not JS trim, which includes FEFF but excludes 0085).
-const whitespace = new Set([0x20, 0x85, 0xa0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000]);
+const whitespace = new TrustedSet([0x20, 0x85, 0xa0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000]);
 for (let code = 0x09; code <= 0x0d; code++) whitespace.add(code);
 for (let code = 0x2000; code <= 0x200a; code++) whitespace.add(code);
 const trimKey = value => {
@@ -127,7 +165,7 @@ const keyOf = key => {
 };
 // Positive UTC leap seconds from IERS Leap_Second.dat (Bulletin 72, July 2026).
 // The oracle pins this table; deployed validators must update it from IERS.
-const leapDays = new Set([
+const leapDays = new TrustedSet([
   '1972-06-30', '1972-12-31', '1973-12-31', '1974-12-31', '1975-12-31',
   '1976-12-31', '1977-12-31', '1978-12-31', '1979-12-31', '1981-06-30',
   '1982-06-30', '1983-06-30', '1985-06-30', '1987-12-31', '1989-12-31',
@@ -142,7 +180,7 @@ const utcInstant = value => {
   if (endsWithString(match[1], ':60') && (!leap || !leapDays.has(sliceString(match[1], 0, 10)))) fail('SCHEMA_INVALID');
   const check = leap ? `${sliceString(match[1], 0, -2)}59` : match[1];
   const parsed = new NativeDate(`${check}Z`);
-  if (!Number.isFinite(getTime(parsed)) || sliceString(toISOString(parsed), 0, 19) !== check) fail('SCHEMA_INVALID');
+  if (!isFiniteNumber(getTime(parsed)) || sliceString(toISOString(parsed), 0, 19) !== check) fail('SCHEMA_INVALID');
   let fraction = match[2] ?? '';
   let end = fraction.length;
   while (end > 0 && fraction[end - 1] === '0') end--;
@@ -160,7 +198,7 @@ const tupleOf = (data, paths, schema) => {
     const path = Object.getOwnPropertyDescriptor(paths, index).value;
     const v = Object.hasOwn(data, path) ? data[path] : undefined;
     if (v === undefined || v === null) return null;
-    if (!includesOwn(['string', 'number', 'boolean'], typeof v) || (typeof v === 'number' && !Number.isFinite(v))) fail('SCHEMA_INVALID');
+    if (!includesOwn(['string', 'number', 'boolean'], typeof v) || (typeof v === 'number' && !isFiniteNumber(v))) fail('SCHEMA_INVALID');
     let value;
     if (dateTimeField(schema, path)) value = utcInstant(v);
     else if (typeof v === 'string') value = normalizeNfc(v); // reservation only; stored data is unchanged
@@ -169,7 +207,7 @@ const tupleOf = (data, paths, schema) => {
   }
   return tuple;
 };
-const allowedKeywords = new Set(['$schema', 'type', 'properties', 'required', 'additionalProperties', 'items', 'minItems', 'maxItems', 'minLength', 'maxLength', 'minimum', 'maximum', 'enum', 'format', 'description']);
+const allowedKeywords = new TrustedSet(['$schema', 'type', 'properties', 'required', 'additionalProperties', 'items', 'minItems', 'maxItems', 'minLength', 'maxLength', 'minimum', 'maximum', 'enum', 'format', 'description']);
 const plainObject = value => value !== null && typeof value === 'object' &&
   (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 // A receipt may only fingerprint JSON-compatible payloads. In particular, JSON
@@ -191,12 +229,12 @@ const validateJsonObject = (value, ancestors) => {
     validateJsonPayload(descriptor.value, ancestors);
   }
 };
-const validateJsonPayload = (value, ancestors = new Set()) => {
+const validateJsonPayload = (value, ancestors = new TrustedSet()) => {
   // A transparent Proxy can impersonate plain JSON yet fail structuredClone
   // (or alias a committed receipt). Reject it before any reflective reads.
   if (types.isProxy(value)) fail('SCHEMA_INVALID');
   if (value === null || typeof value === 'boolean') return;
-  if (typeof value === 'number' && Number.isFinite(value)) return;
+  if (typeof value === 'number' && isFiniteNumber(value)) return;
   if (typeof value === 'string' && wellFormed(value)) return;
   if (!Array.isArray(value) && !plainObject(value)) fail('SCHEMA_INVALID');
   if (ancestors.has(value)) fail('SCHEMA_INVALID');
@@ -235,7 +273,7 @@ const uniqueDescriptors = (uniques, scalarPath) => {
       hasDuplicateOwn(paths) || someOwn(paths, path => !scalarPath(path))) fail('SCHEMA_UNSUPPORTED');
     appendOwn(entries, { name, paths });
   }
-  const names = new Set();
+  const names = new TrustedSet();
   for (let index = 0; index < entries.length; index++) { // NOSONAR
     if (names.has(entries[index].name)) fail('SCHEMA_UNSUPPORTED');
     names.add(entries[index].name);
@@ -262,7 +300,7 @@ const validateSizeBounds = s => {
     const min = bounds[index][0], max = bounds[index][1];
     for (let side = 0; side < 2; side++) {
       const key = bounds[index][side];
-      if (s[key] !== undefined && (!Number.isInteger(s[key]) || s[key] < 0)) fail('SCHEMA_UNSUPPORTED');
+      if (s[key] !== undefined && (!isIntegerNumber(s[key]) || s[key] < 0)) fail('SCHEMA_UNSUPPORTED');
     }
     if (s[min] !== undefined && s[max] !== undefined && s[min] > s[max]) fail('SCHEMA_UNSUPPORTED');
   }
@@ -270,7 +308,7 @@ const validateSizeBounds = s => {
 const validateNumericBounds = s => {
   for (let index = 0; index < 2; index++) {
     const key = index === 0 ? 'minimum' : 'maximum';
-    if (s[key] !== undefined && (typeof s[key] !== 'number' || !Number.isFinite(s[key]))) fail('SCHEMA_UNSUPPORTED');
+    if (s[key] !== undefined && (typeof s[key] !== 'number' || !isFiniteNumber(s[key]))) fail('SCHEMA_UNSUPPORTED');
   }
   if (s.minimum !== undefined && s.maximum !== undefined && s.minimum > s.maximum) fail('SCHEMA_UNSUPPORTED');
 };
@@ -311,7 +349,7 @@ const validateDefinitionEnum = s => {
   if (s.enum !== undefined) {
     const members = schemaArrayMembers(s.enum);
     if (members.length === 0) fail('SCHEMA_UNSUPPORTED');
-    const seen = new Set();
+    const seen = new TrustedSet();
     for (let index = 0; index < members.length; index++) { // NOSONAR
       const value = members[index];
       validateEnumMember(value, s);
@@ -358,8 +396,8 @@ const validateStringScalar = (data, schema) => {
 const validateScalar = (data, schema, type) => {
   if (typeof data !== (type === 'integer' || type === 'number' ? 'number' : type)) fail('SCHEMA_INVALID');
   if (type === 'string') validateStringScalar(data, schema);
-  if (type === 'integer' && !Number.isSafeInteger(data)) fail('SCHEMA_INVALID');
-  if (typeof data === 'number' && (!Number.isFinite(data) || (schema.minimum !== undefined && data < schema.minimum) || (schema.maximum !== undefined && data > schema.maximum))) fail('SCHEMA_INVALID');
+  if (type === 'integer' && !isSafeIntegerNumber(data)) fail('SCHEMA_INVALID');
+  if (typeof data === 'number' && (!isFiniteNumber(data) || (schema.minimum !== undefined && data < schema.minimum) || (schema.maximum !== undefined && data > schema.maximum))) fail('SCHEMA_INVALID');
 };
 const validateArray = (data, schema) => {
   if (!Array.isArray(data) || (schema.minItems !== undefined && data.length < schema.minItems) || (schema.maxItems !== undefined && data.length > schema.maxItems)) fail('SCHEMA_INVALID');
@@ -389,7 +427,7 @@ const validateData = (data, schema) => {
   else validateScalar(data, schema, type);
   validateEnumValue(data, schema);
 };
-const mutationFields = new Set(['spaceId', 'credential', 'collection', 'operation', 'id', 'externalKey', 'data', 'set', 'unset',
+const mutationFields = new TrustedSet(['spaceId', 'credential', 'collection', 'operation', 'id', 'externalKey', 'data', 'set', 'unset',
   'expectedRevision', 'expectedSchemaVersion', 'idempotencyKey']);
 // Authorization uses only own target fields; never invoke an inherited getter
 // while locating the requested collection. The remaining envelope is checked
@@ -424,20 +462,20 @@ const mutationEnvelope = request => {
 const validateMutationInput = ({ operation, id, externalKey, expectedRevision, expectedSchemaVersion, idempotencyKey, supplied }) => {
   if (typeof idempotencyKey !== 'string' || !idempotencyKey ||
     !includesOwn(['create', 'replace', 'patch', 'delete'], operation) || someOwn([...supplied], field => !mutationFields.has(field))) fail('INVALID_ARGUMENT');
-  if (operation !== 'create' && (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1)) fail('INVALID_ARGUMENT');
+  if (operation !== 'create' && (!isSafeIntegerNumber(expectedRevision) || expectedRevision < 1)) fail('INVALID_ARGUMENT');
   if (operation !== 'create' && (typeof id !== 'string' || !id || !wellFormed(id))) fail('INVALID_ARGUMENT');
   if ((operation === 'create' && someOwn(['id', 'set', 'unset', 'expectedRevision'], field => supplied.has(field))) ||
     (operation === 'replace' && someOwn(['externalKey', 'set', 'unset'], field => supplied.has(field))) ||
     (operation === 'patch' && someOwn(['externalKey', 'data'], field => supplied.has(field))) ||
     (operation === 'delete' && someOwn(['externalKey', 'data', 'set', 'unset'], field => supplied.has(field)))) fail('INVALID_ARGUMENT');
   if (supplied.has('externalKey') && externalKey === undefined) fail('INVALID_ARGUMENT');
-  if (supplied.has('expectedSchemaVersion') && (!Number.isSafeInteger(expectedSchemaVersion) || expectedSchemaVersion < 1)) fail('INVALID_ARGUMENT');
+  if (supplied.has('expectedSchemaVersion') && (!isSafeIntegerNumber(expectedSchemaVersion) || expectedSchemaVersion < 1)) fail('INVALID_ARGUMENT');
   return externalKey === undefined ? undefined : keyOf(externalKey);
 };
 const validatePatchShape = (set, unset) => {
   if (types.isProxy(set) || !plainObject(set) || types.isProxy(unset) || !Array.isArray(unset) || Object.getPrototypeOf(unset) !== Array.prototype ||
     Reflect.ownKeys(unset).length !== unset.length + 1) fail('INVALID_ARGUMENT');
-  const paths = new Set();
+  const paths = new TrustedSet();
   for (let index = 0; index < unset.length; index++) { // NOSONAR
     const descriptor = Object.getOwnPropertyDescriptor(unset, index);
     const path = descriptor?.value;
@@ -538,7 +576,7 @@ const compareTuples = (a, b, order, schema) => {
 // Canonicalize only set-valued schema keywords; arrays inside enum members
 // remain ordered data. All construction uses own slots, even under pollution.
 const canonicalSchemaSet = members => {
-  const byValue = new Map();
+  const byValue = new TrustedMap();
   for (let index = 0; index < members.length; index++) { // NOSONAR
     const member = Object.getOwnPropertyDescriptor(members, index).value;
     byValue.set(stable(member), member);
@@ -587,16 +625,16 @@ const compatibleSchemaAddition = (old, next) => {
 };
 
 export class ReferenceState {
-  constructor() { this.spaces = new Map(); this.events = []; this.outbox = []; this.receipts = new Map(); this.seq = 0; this.generation = 1; this.projection = new Map(); this.cursorSecret = randomBytes(32); }
+  constructor() { this.spaces = new TrustedMap(); this.events = []; this.outbox = []; this.receipts = new TrustedMap(); this.seq = 0; this.generation = 1; this.projection = new TrustedMap(); this.cursorSecret = randomBytes(32); }
   #sign(value) { return createHmac('sha256', this.cursorSecret).update(stable(value)).digest('hex'); }
-  addSpace(id, owner) { this.spaces.set(id, { owner, lifecycle: 'active', policyVersion: 1, collections: new Map(), grants: new Map() }); }
+  addSpace(id, owner) { this.spaces.set(id, { owner, lifecycle: 'active', policyVersion: 1, collections: new TrustedMap(), grants: new TrustedMap() }); }
   grant(spaceId, credential, collection, permissions) {
     if (collection === '*') fail('INVALID_ARGUMENT');
     const capabilities = schemaArrayMembers(permissions, 'INVALID_ARGUMENT');
     if (someOwn(capabilities, p => !includesOwn(['records:read', 'records:write'], p))) fail('INVALID_ARGUMENT');
     const s = this.spaces.get(spaceId);
-    if (!s.grants.has(credential)) s.grants.set(credential, new Map());
-    const granted = new Set();
+    if (!s.grants.has(credential)) s.grants.set(credential, new TrustedMap());
+    const granted = new TrustedSet();
     for (let index = 0; index < capabilities.length; index++) granted.add(capabilities[index]); // NOSONAR
     s.grants.get(credential).set(collection, granted);
     s.policyVersion++;
@@ -617,7 +655,7 @@ export class ReferenceState {
     if (hasDuplicateOwn(sortPaths) || someOwn(sortPaths, path => !scalarPath(path))) fail('SCHEMA_UNSUPPORTED');
     const s = this.spaces.get(spaceId);
     if (s.collections.has(slug)) fail('SCHEMA_CONFLICT');
-    s.collections.set(slug, { schema: clone(schema), uniques: uniqueEntries, sortable: sortPaths, records: new Map(), reserved: new Map(), version: 1 });
+    s.collections.set(slug, { schema: clone(schema), uniques: uniqueEntries, sortable: sortPaths, records: new TrustedMap(), reserved: new TrustedMap(), version: 1 });
   }
   revise(spaceId, slug, expectedVersion, schema) {
     validateDefinition(schema);
@@ -665,7 +703,7 @@ export class ReferenceState {
     if (fields.spaceId !== spaceId || fields.credential !== credential || fields.collection !== collection) fail('INVALID_ARGUMENT');
     const { operation, id, externalKey, data, set, unset, expectedRevision, expectedSchemaVersion, idempotencyKey } = fields;
     const normalized = validateMutationInput({ operation, id, externalKey, expectedRevision, expectedSchemaVersion,
-      idempotencyKey, supplied: new Set(Object.keys(fields)) });
+      idempotencyKey, supplied: new TrustedSet(Object.keys(fields)) });
     const identity = stable([spaceId, credential, operation, idempotencyKey]);
     const previous = this.receipts.get(identity);
     // Before parsing a receipt's payload, check that its original collection is still visible.
@@ -735,7 +773,7 @@ export class ReferenceState {
   }
   query({ spaceId, credential, collection, limit, cursor, sort, filter }) {
     const { s, c } = this.#access(spaceId, credential, collection, 'records:read');
-    if (!Number.isSafeInteger(limit) || limit < 1) fail('INVALID_ARGUMENT');
+    if (!isSafeIntegerNumber(limit) || limit < 1) fail('INVALID_ARGUMENT');
     // This oracle has no typed-filter compiler. Never return unfiltered exact results.
     if (filter !== undefined) fail('INVALID_ARGUMENT');
     const order = queryOrder(sort, c.sortable);
@@ -755,7 +793,7 @@ export class ReferenceState {
   }
   count({ cursor, ...args }) {
     if (cursor !== undefined) fail('INVALID_ARGUMENT');
-    return this.query({ ...args, limit: Number.MAX_SAFE_INTEGER }).items.length;
+    return this.query({ ...args, limit: maxSafeInteger }).items.length;
   }
   exists({ cursor, ...args }) {
     if (cursor !== undefined) fail('INVALID_ARGUMENT');
@@ -763,7 +801,7 @@ export class ReferenceState {
   }
   rebuild() {
     this.generation++;
-    const projected = new Map();
+    const projected = new TrustedMap();
     for (const [spaceId, s] of this.spaces) for (const [collection, c] of s.collections) for (const r of c.records.values()) if (!r.deleted) projected.set(`${spaceId}/${collection}/${r.id}`, { revision: r.revision, generation: this.generation });
     this.projection = projected;
   }
