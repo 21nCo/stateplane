@@ -1,0 +1,22 @@
+contracts/decisions.md
+  h_a39f9495f9ec1d 28,57
+contracts/v1.md
+  h_a39f9495f9ec1d 77-78
+test/README.md
+  h_a39f9495f9ec1d 43-44
+test/contract.test.js
+  h_a39f9495f9ec1d 26-68,2193,2226,2240,2279-2280,2282,2291,2321-2322,2337-2382,2384-2388,2391,2394-2395,2397-2407,2410-2477
+test/reference.js
+  h_a39f9495f9ec1d 10-47,61,126,168,183,201,210,232,237,276,303,311,352,399-400,430,465,472,478,579,628,630,636-637,658,706,776,796,804
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7013df9e275994735725a159150ba28e09e920e9",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
