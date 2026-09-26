@@ -14,9 +14,25 @@ test('syntax parsing catches commented static imports, exports and dynamic impor
     `<script lang="ts">import type { RecordRef } from /* comment */ '@stateplane/postgres';</script>`,
     `<script>export { secret } from /* comment */ '$lib/server/secret';</script>`,
     `<script>const module = import('@stateplane/auth');</script>`,
+    `<script>const module = import('@stateplane/auth', { with: { type: 'json' } });</script>`,
+    `<script>require('@stateplane/postgres', ignored);</script>`,
+    `<script>require('@stateplane/postgres', ignored, another);</script>`,
     `<button onclick={() => import('@stateplane/postgres')}>Load</button>`
   ];
   for (const source of sources) assert.ok(sourceProblems(browser, source, base).length > 0);
+});
+
+test('package and CLI checks reject forbidden imports with extra call arguments', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'stateplane-boundary-cli-'));
+  try {
+    await mkdir(join(directory, 'packages/api/src'), { recursive: true });
+    await mkdir(join(directory, 'app/src'), { recursive: true });
+    await writeFile(join(directory, 'packages/api/package.json'), JSON.stringify({ dependencies: { '@stateplane/auth': 'workspace:*', '@stateplane/application': 'workspace:*' } }));
+    await writeFile(join(directory, 'packages/api/src/index.ts'), `require('@stateplane/postgres', ignored);`);
+    assert.ok((await checkBoundaries(directory)).some(problem => problem.includes('forbidden dependency')));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('real server modules may import server packages even inside a route named server', () => {

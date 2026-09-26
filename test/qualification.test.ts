@@ -77,8 +77,18 @@ describe('published package boundary', () => {
 
   it('constructs only positive safe revisions', () => {
     expect(parseRevision(1)).toBe(1);
-    for (const value of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '1', null]) {
+    for (const value of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, '1', null]) {
       expect(() => parseRevision(value)).toThrow(RangeError);
+    }
+    const original = Number.isSafeInteger;
+    try {
+      Number.isSafeInteger = () => true;
+      expect(parseRevision(2)).toBe(2);
+      for (const value of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+        expect(() => parseRevision(value)).toThrow(RangeError);
+      }
+    } finally {
+      Number.isSafeInteger = original;
     }
   });
 

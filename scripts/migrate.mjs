@@ -15,12 +15,16 @@ try {
   await client.query('SELECT pg_advisory_xact_lock(73003)');
   await client.query('CREATE TABLE IF NOT EXISTS stateplane_migrations (name text PRIMARY KEY, sha256 text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())');
   const files = (await readdir(directory)).filter(name => /^\d+_[a-z0-9_]+\.sql$/.test(name)).sort(migrationOrder);
+  const applied = await client.query('SELECT name, sha256 FROM stateplane_migrations');
+  const recorded = new Map(applied.rows.map(row => [row.name, row.sha256]));
+  for (const name of recorded.keys()) {
+    if (!files.includes(name)) throw new Error(`Migration drift: applied file missing: ${name}`);
+  }
   for (const name of files) {
     const sql = await readFile(resolve(directory, name), 'utf8');
     const sha256 = createHash('sha256').update(sql).digest('hex');
-    const found = await client.query('SELECT sha256 FROM stateplane_migrations WHERE name = $1', [name]);
-    if (found.rows.length) {
-      if (found.rows[0].sha256 !== sha256) throw new Error(`Migration drift: ${name}`);
+    if (recorded.has(name)) {
+      if (recorded.get(name) !== sha256) throw new Error(`Migration drift: ${name}`);
       continue;
     }
     await client.query(sql);

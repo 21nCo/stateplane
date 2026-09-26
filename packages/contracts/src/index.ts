@@ -1,8 +1,10 @@
 export type SpaceId = string & { readonly __spaceId: unique symbol };
 export type CollectionId = string & { readonly __collectionId: unique symbol };
 export type Revision = number & { readonly __revision: unique symbol };
+const isSafeInteger = Number.isSafeInteger;
+/** Validate a revision before it crosses an authority or worker boundary. */
 export function parseRevision(value: unknown): Revision {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+  if (typeof value !== 'number' || !isSafeInteger(value) || value < 1) {
     throw new RangeError('Revision must be a positive safe integer');
   }
   return value as Revision;

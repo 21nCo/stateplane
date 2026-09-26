@@ -3,7 +3,7 @@ services:
     image: pgvector/pgvector:pg17
     environment:
       POSTGRES_USER: stateplane
-      POSTGRES_PASSWORD: ${STATEPLANE_POSTGRES_PASSWORD:?Run pnpm db:up}
+      POSTGRES_PASSWORD_FILE: /run/secrets/stateplane_postgres_password
       POSTGRES_DB: stateplane
     ports:
       - "127.0.0.1:55432:5432"
@@ -14,5 +14,6 @@ services:
       retries: 20
     volumes:
       - stateplane_pg:/var/lib/postgresql/data
+      - ./.data/local-db-password:/run/secrets/stateplane_postgres_password:ro
 volumes:
   stateplane_pg:

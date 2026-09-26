@@ -25,23 +25,41 @@ async function walk(dir) {
   return result;
 }
 
+/** Traverse Svelte markup expressions once and collect literal module loads. */
+function visitMarkup(value, result, seen) {
+  if (!value || typeof value !== 'object' || seen.has(value)) return;
+  seen.add(value);
+  if (value.type === 'ImportExpression' && typeof value.source?.value === 'string') result.push(value.source.value);
+  if (value.type === 'CallExpression' && value.callee?.name === 'require' && typeof value.arguments?.[0]?.value === 'string') result.push(value.arguments[0].value);
+  for (const child of Object.values(value)) {
+    if (Array.isArray(child)) child.forEach(item => visitMarkup(item, result, seen));
+    else visitMarkup(child, result, seen);
+  }
+}
+
+/** Collect module loads in Svelte markup, including event expressions. */
 function markupSpecifiers(fragment) {
   const result = [];
-  const seen = new Set();
-  function visit(value) {
-    if (!value || typeof value !== 'object' || seen.has(value)) return;
-    seen.add(value);
-    if (value.type === 'ImportExpression' && typeof value.source?.value === 'string') result.push(value.source.value);
-    if (value.type === 'CallExpression' && value.callee?.name === 'require' && typeof value.arguments?.[0]?.value === 'string') result.push(value.arguments[0].value);
-    for (const child of Object.values(value)) {
-      if (Array.isArray(child)) child.forEach(visit);
-      else visit(child);
-    }
-  }
-  visit(fragment);
+  visitMarkup(fragment, result, new Set());
   return result;
 }
 
+/** Traverse one TypeScript AST for static and literal runtime dependencies. */
+function visitTypeScript(node, result) {
+  if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+    result.push(node.moduleSpecifier.text);
+  } else if (ts.isExternalModuleReference(node) && node.expression && ts.isStringLiteral(node.expression)) {
+    result.push(node.expression.text);
+  } else if (ts.isCallExpression(node) && node.arguments.length > 0 && ts.isStringLiteral(node.arguments[0]) &&
+    (node.expression.kind === ts.SyntaxKind.ImportKeyword || ts.isIdentifier(node.expression) && node.expression.text === 'require')) {
+    result.push(node.arguments[0].text);
+  } else if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument) && ts.isStringLiteral(node.argument.literal)) {
+    result.push(node.argument.literal.text);
+  }
+  ts.forEachChild(node, child => visitTypeScript(child, result));
+}
+
+/** Extract literal dependency specifiers from TypeScript and Svelte scripts and markup. */
 export function moduleSpecifiers(path, source) {
   const result = [];
   const svelte = path.endsWith('.svelte') ? parseSvelte(source, { modern: true, filename: path }) : null;
@@ -49,25 +67,13 @@ export function moduleSpecifiers(path, source) {
   for (const script of segments) {
     const ast = ts.createSourceFile(path.endsWith('.svelte') ? `${path}.ts` : path, script, ts.ScriptTarget.Latest, true);
     if (ast.parseDiagnostics.length) throw new Error(`${path}: invalid script syntax`);
-    function visit(node) {
-      if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
-        result.push(node.moduleSpecifier.text);
-      } else if (ts.isExternalModuleReference(node) && node.expression && ts.isStringLiteral(node.expression)) {
-        result.push(node.expression.text);
-      } else if (ts.isCallExpression(node) && node.arguments.length === 1 && ts.isStringLiteral(node.arguments[0]) &&
-        (node.expression.kind === ts.SyntaxKind.ImportKeyword || ts.isIdentifier(node.expression) && node.expression.text === 'require')) {
-        result.push(node.arguments[0].text);
-      } else if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument) && ts.isStringLiteral(node.argument.literal)) {
-        result.push(node.argument.literal.text);
-      }
-      ts.forEachChild(node, visit);
-    }
-    visit(ast);
+    visitTypeScript(ast, result);
   }
   if (svelte) result.push(...markupSpecifiers(svelte.fragment));
   return result;
 }
 
+/** SvelteKit server entrypoints and private server modules stay outside browser policy. */
 export function isBrowserSource(rel) {
   if (!rel.startsWith('app/src/')) return false;
   const name = rel.split('/').at(-1);
@@ -75,6 +81,7 @@ export function isBrowserSource(rel) {
   return !rel.startsWith('app/src/lib/server/');
 }
 
+/** Apply package and browser dependency rules to one source file. */
 export function sourceProblems(path, source, base = root) {
   const problems = [];
   const rel = relative(base, path);
@@ -95,6 +102,7 @@ export function sourceProblems(path, source, base = root) {
   return problems;
 }
 
+/** Check package declarations and every package and app source in a workspace. */
 export async function checkBoundaries(base = root) {
   const problems = [];
   const packageNames = await readdir(join(base, 'packages'), { withFileTypes: true });
