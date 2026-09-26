@@ -2538,3 +2538,100 @@ test('mutation presence and map entry consumers ignore later Array iterator chan
     Object.defineProperty(Array.prototype, Symbol.iterator, original);
   }
 });
+
+test('stored schemas, records, reads and receipts ignore later clone reassignment', () => {
+  const trustedClone = globalThis.structuredClone;
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  const definition = trustedClone(schema);
+  const request = { ...scope, operation: 'create', externalKey: 'first',
+    data: { label: 'first', state: 'open' }, idempotencyKey: 'first' };
+  try {
+    globalThis.structuredClone = value => value;
+    db.define('sp_a', 'entries', definition, uniques, ['label']);
+    db.grant('sp_a', 'agent', 'entries', recordAccess);
+    const collection = db.spaces.get('sp_a').collections.get('entries');
+    definition.required.length = 0;
+    definition.properties.label.type = 'number';
+    assert.deepEqual(collection.schema.required, ['label']);
+    assert.equal(collection.schema.properties.label.type, 'string');
+
+    const revision = { ...schema, description: 'compatible', required: ['label'] };
+    assert.equal(db.revise('sp_a', 'entries', 1, revision), 2);
+    revision.required.length = 0;
+    assert.deepEqual(collection.schema.required, ['label']);
+    const receipt = db.mutate(request);
+    const id = receipt.ref.id;
+    request.data.label = 'changed by caller';
+    receipt.ref.id = 'changed receipt';
+    receipt.projection.state = 'current';
+    assert.equal(db.get({ ...scope, id }).data.label, 'first');
+    const replay = db.mutate({ ...request, data: { label: 'first', state: 'open' } });
+    assert.equal(replay.ref.id, id);
+    assert.equal(replay.projection.state, 'pending');
+    assert.equal(replay.replayed, true);
+    const read = db.get({ ...scope, id });
+    const keyed = db.getByKey({ ...scope, mode: 'external', key: 'first' });
+    const page = db.query({ ...scope, limit: 1 });
+    read.data.label = 'changed read';
+    keyed.data.label = 'changed key read';
+    page.items[0].data.label = 'changed page';
+    replay.ref.id = 'changed replay';
+    assert.equal(db.get({ ...scope, id }).data.label, 'first');
+    assert.equal(db.mutate({ ...request, data: { label: 'first', state: 'open' } }).ref.id, id);
+
+    const replace = { ...scope, operation: 'replace', id, expectedRevision: 1,
+      data: { label: 'second', state: 'open' }, idempotencyKey: 'replace' };
+    assert.equal(db.mutate(replace).revision, 2);
+    replace.data.label = 'changed replacement';
+    assert.equal(db.get({ ...scope, id }).data.label, 'second');
+    const patch = { ...scope, operation: 'patch', id, expectedRevision: 2,
+      set: { label: 'third' }, unset: [], idempotencyKey: 'patch' };
+    assert.equal(db.mutate(patch).revision, 3);
+    patch.set.label = 'changed patch';
+    assert.equal(db.get({ ...scope, id }).data.label, 'third');
+    db.rebuild();
+    assert.equal(db.projectionStatus({ ...scope, id }), 'current');
+    const beforeDelete = db.get({ ...scope, id });
+    const removal = { ...scope, operation: 'delete', id, expectedRevision: 3, idempotencyKey: 'delete' };
+    assert.equal(db.mutate(removal).revision, 4);
+    beforeDelete.data.label = 'changed after delete';
+    assert.equal(collection.records.get(id).data.label, 'third');
+    assert.equal(db.get({ ...scope, id }), null);
+    assert.equal(db.mutate(removal).replayed, true);
+    assert.equal(db.count(scope), 0);
+    assert.equal(db.exists(scope), false);
+    db.rebuild();
+    assert.equal(db.projectionStatus({ ...scope, id }), null);
+    const snapshot = () => trustedClone({ seq: db.seq, schema: collection.schema, rows: [...collection.records],
+      reservations: [...collection.reserved], events: db.events, outbox: db.outbox, receipts: [...db.receipts] });
+    const settled = snapshot();
+    code(() => db.mutate({ ...replace, data: { label: 'other', state: 'open' } }), 'IDEMPOTENCY_MISMATCH');
+    assert.deepEqual(snapshot(), settled);
+    db.revoke('sp_a', 'agent', 'entries');
+    code(() => db.mutate(removal), 'FORBIDDEN');
+    db.grant('sp_a', 'agent', 'entries', recordAccess);
+    db.lifecycle('sp_a', 'readOnly');
+    assert.equal(db.mutate(removal).replayed, true);
+    code(() => db.mutate({ ...scope, operation: 'create', data: { label: 'fresh' }, idempotencyKey: 'fresh' }), 'SPACE_UNAVAILABLE');
+  } finally {
+    globalThis.structuredClone = trustedClone;
+  }
+});
+
+test('clone reassignment to a throwing function does not interrupt valid operations', () => {
+  const trustedClone = globalThis.structuredClone;
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  try {
+    globalThis.structuredClone = () => { throw Error('late clone called'); };
+    db.define('sp_a', 'entries', schema, uniques);
+    db.grant('sp_a', 'agent', 'entries', recordAccess);
+    const receipt = create(db, 'first', { label: 'first', state: 'open' }, 'first');
+    assert.equal(db.get({ ...scope, id: receipt.ref.id }).data.label, 'first');
+    assert.equal(create(db, 'first', { label: 'first', state: 'open' }, 'first').replayed, true);
+    assert.equal(db.query({ ...scope, limit: 1 }).items.length, 1);
+  } finally {
+    globalThis.structuredClone = trustedClone;
+  }
+});

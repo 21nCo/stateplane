@@ -6,7 +6,9 @@ export class ContractError extends Error {
   constructor(code) { super(code); this.code = code; }
 }
 const fail = code => { throw new ContractError(code); };
-const clone = value => structuredClone(value);
+// Keep authoritative copies independent of later global reassignment.
+const trustedStructuredClone = globalThis.structuredClone;
+const clone = value => trustedStructuredClone(value);
 // Keep numeric and keyed-collection decisions stable when a caller changes
 // globals or inherited methods after loading the reference oracle.
 const isFiniteNumber = Number.isFinite;
@@ -31,7 +33,7 @@ const trustedIterator = (iterator, next) => ({
   [Symbol.iterator]() { return this; }
 });
 class TrustedMap extends Map {
-  constructor() { super(); }
+  constructor() { super(); } // NOSONAR -- never forward an iterable to Map's constructor.
   get(key) { return Reflect.apply(nativeMapGet, this, [key]); }
   set(key, value) { return Reflect.apply(nativeMapSet, this, [key, value]); }
   has(key) { return Reflect.apply(nativeMapHas, this, [key]); }
