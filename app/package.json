@@ -13,7 +13,7 @@
     "@stateplane/contracts": "workspace:*"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "5.20260722.1",
+    "@cloudflare/workers-types": "5.20260918.1",
     "@sveltejs/adapter-cloudflare": "7.2.9",
     "@sveltejs/kit": "2.70.1",
     "@sveltejs/vite-plugin-svelte": "7.2.0",
