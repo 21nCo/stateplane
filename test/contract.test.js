@@ -2301,3 +2301,94 @@ test('UTC writes, reservations and cursors ignore later RegExp method changes', 
     Object.defineProperty(RegExp.prototype, 'test', originalTest);
   }
 });
+
+test('UTC decisions and generated timestamps ignore later Date method changes', () => {
+  const db = new ReferenceState();
+  db.addSpace('sp_a', 'owner');
+  db.define('sp_a', 'entries', { $schema: schema.$schema, type: 'object',
+    properties: { label: { type: 'string' }, observedAt: { type: 'string', format: 'date-time' } },
+    required: ['label', 'observedAt'], additionalProperties: false },
+  [{ name: 'label_time', paths: ['label', 'observedAt'] }], ['observedAt']);
+  db.grant('sp_a', 'agent', 'entries', recordAccess);
+  const c = db.spaces.get('sp_a').collections.get('entries');
+  const snapshot = () => structuredClone({ seq: db.seq, rows: [...c.records], reserved: [...c.reserved],
+    events: db.events, outbox: db.outbox, receipts: [...db.receipts] });
+  const first = create(db, 'alpha', { label: 'one', observedAt: '2020-01-01T00:00:00.1Z' }, 'first');
+  const second = create(db, 'beta', { label: 'two', observedAt: '2020-01-01T00:00:00.2Z' }, 'second');
+  const NativeDate = Date;
+  const originals = new Map(['getTime', 'toISOString'].map(name =>
+    [name, Object.getOwnPropertyDescriptor(NativeDate.prototype, name)]));
+  const originalUtc = Object.getOwnPropertyDescriptor(NativeDate, 'UTC');
+  let calls = 0;
+  try {
+    Object.defineProperty(NativeDate.prototype, 'getTime', { ...originals.get('getTime'), value() { calls++; return 0; } });
+    Object.defineProperty(NativeDate.prototype, 'toISOString', { ...originals.get('toISOString'),
+      value() { calls++; return '2023-02-29T00:00:00.000Z'; } });
+    Object.defineProperty(NativeDate, 'UTC', { ...originalUtc, value() { calls++; return 0; } });
+    globalThis.Date = function () { calls++; throw new Error('changed Date constructor called'); };
+    const unchanged = snapshot();
+    for (const invalid of [
+      () => create(db, 'invalid', { label: 'bad', observedAt: '2023-02-29T00:00:00Z' }, 'invalid'),
+      () => write(db, 'replace', second.ref.id, 1, 'replace-invalid',
+        { data: { label: 'two', observedAt: '2023-02-29T00:00:00Z' } }),
+      () => write(db, 'patch', second.ref.id, 1, 'patch-invalid',
+        { set: { observedAt: '2023-02-29T00:00:00Z' }, unset: [] })
+    ]) {
+      code(invalid, 'SCHEMA_INVALID');
+      assert.deepEqual(snapshot(), unchanged);
+    }
+    const third = create(db, 'gamma', { label: 'three', observedAt: '2016-12-31T23:59:60Z' }, 'third');
+    assert.equal(db.get({ ...scope, id: third.ref.id }).createdAt, '2020-01-01T00:00:00.003Z');
+    const beforeConflict = snapshot();
+    code(() => create(db, 'delta', { label: 'one', observedAt: '2020-01-01T00:00:00.10Z' }, 'collision'), 'UNIQUE_CONFLICT');
+    assert.deepEqual(snapshot(), beforeConflict);
+    for (const [direction, expected] of [
+      ['asc', [third.ref.id, first.ref.id, second.ref.id]],
+      ['desc', [second.ref.id, first.ref.id, third.ref.id]]
+    ]) {
+      const sort = { field: 'observedAt', direction };
+      const ids = [];
+      let cursor;
+      do {
+        const page = db.query({ ...scope, limit: 1, sort, ...(cursor ? { cursor } : {}) });
+        ids.push(page.items[0].id);
+        cursor = page.cursor;
+      } while (cursor);
+      assert.deepEqual(ids, expected);
+    }
+    for (const name of ['getTime', 'toISOString']) Object.defineProperty(NativeDate.prototype, name,
+      { ...originals.get(name), value() { calls++; throw new Error('changed Date method called'); } });
+    Object.defineProperty(NativeDate, 'UTC', { ...originalUtc, value() { calls++; throw new Error('changed UTC called'); } });
+    const beforeThrowingRejections = snapshot();
+    code(() => create(db, 'invalid-throw', { label: 'bad', observedAt: '2023-02-29T00:00:00Z' }, 'invalid-throw'), 'SCHEMA_INVALID');
+    code(() => write(db, 'replace', third.ref.id, 1, 'replace-invalid-throw',
+      { data: { label: 'three', observedAt: '2023-02-29T00:00:00Z' } }), 'SCHEMA_INVALID');
+    code(() => write(db, 'patch', third.ref.id, 1, 'patch-invalid-throw',
+      { set: { observedAt: '2023-02-29T00:00:00Z' }, unset: [] }), 'SCHEMA_INVALID');
+    assert.deepEqual(snapshot(), beforeThrowingRejections);
+    const fourth = create(db, 'epsilon', { label: 'four', observedAt: '2020-01-01T00:00:00.4Z' }, 'fourth');
+    assert.equal(db.get({ ...scope, id: fourth.ref.id }).createdAt, '2020-01-01T00:00:00.004Z');
+    assert.equal(write(db, 'replace', third.ref.id, 1, 'replace-valid',
+      { data: { label: 'three', observedAt: '2016-12-31T23:59:60.5Z' } }).revision, 2);
+    const changed = { ...scope, operation: 'patch', id: second.ref.id, expectedRevision: 1,
+      set: { observedAt: '2020-01-01T00:00:00.25Z' }, unset: [], idempotencyKey: 'patch' };
+    assert.equal(db.mutate(changed).revision, 2);
+    const committed = snapshot();
+    assert.equal(db.mutate(changed).replayed, true);
+    code(() => db.mutate({ ...changed, set: { observedAt: '2020-01-01T00:00:00.26Z' } }), 'IDEMPOTENCY_MISMATCH');
+    assert.deepEqual(snapshot(), committed);
+    db.revoke('sp_a', 'agent', 'entries');
+    code(() => db.mutate(changed), 'FORBIDDEN');
+    assert.deepEqual(snapshot(), committed);
+    db.grant('sp_a', 'agent', 'entries', recordAccess);
+    db.lifecycle('sp_a', 'readOnly');
+    assert.equal(db.mutate(changed).replayed, true);
+    code(() => create(db, 'fresh', { label: 'fresh', observedAt: '2023-02-29T00:00:00Z' }, 'fresh'), 'SPACE_UNAVAILABLE');
+    assert.deepEqual(snapshot(), committed);
+    assert.equal(calls, 0);
+  } finally {
+    globalThis.Date = NativeDate;
+    for (const [name, descriptor] of originals) Object.defineProperty(NativeDate.prototype, name, descriptor);
+    Object.defineProperty(NativeDate, 'UTC', originalUtc);
+  }
+});

@@ -74,6 +74,16 @@ const padEndString = (value, length, fill) => Reflect.apply(stringPadEnd, value,
 // matcher for every contract decision, including cursor syntax checks.
 const regexpExec = RegExp.prototype.exec;
 const matchRegex = (pattern, value) => Reflect.apply(regexpExec, pattern, [value]);
+// Date validation and synthetic timestamps must use the same trusted clock
+// operations after callers have had a chance to change inherited methods.
+const NativeDate = Date;
+const dateUtc = Date.UTC;
+const dateGetTime = Date.prototype.getTime;
+const dateToISOString = Date.prototype.toISOString;
+const getTime = value => Reflect.apply(dateGetTime, value, []);
+const toISOString = value => Reflect.apply(dateToISOString, value, []);
+const syntheticTimestamp = sequence => toISOString(new NativeDate(Reflect.apply(dateUtc, NativeDate,
+  [2020, 0, 1, 0, 0, 0, sequence])));
 // Fixed Unicode White_Space set (not JS trim, which includes FEFF but excludes 0085).
 const whitespace = new Set([0x20, 0x85, 0xa0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000]);
 for (let code = 0x09; code <= 0x0d; code++) whitespace.add(code);
@@ -131,8 +141,8 @@ const utcInstant = value => {
   const leap = endsWithString(match[1], 'T23:59:60');
   if (endsWithString(match[1], ':60') && (!leap || !leapDays.has(sliceString(match[1], 0, 10)))) fail('SCHEMA_INVALID');
   const check = leap ? `${sliceString(match[1], 0, -2)}59` : match[1];
-  const parsed = new Date(`${check}Z`);
-  if (!Number.isFinite(parsed.getTime()) || sliceString(parsed.toISOString(), 0, 19) !== check) fail('SCHEMA_INVALID');
+  const parsed = new NativeDate(`${check}Z`);
+  if (!Number.isFinite(getTime(parsed)) || sliceString(toISOString(parsed), 0, 19) !== check) fail('SCHEMA_INVALID');
   let fraction = match[2] ?? '';
   let end = fraction.length;
   while (end > 0 && fraction[end - 1] === '0') end--;
@@ -684,7 +694,7 @@ export class ReferenceState {
   }
   #commitMutation({ spaceId, collection, operation, normalized, current, nextData, c, recordId, recordKey, wanted, identity, fingerprint }) {
     // Stage all validation before any state/event/outbox mutation. The oracle is synchronous.
-    const record = { id: recordId, key: recordKey, keyMode: current?.keyMode ?? (normalized === undefined ? 'generated' : 'external'), createdAt: current?.createdAt ?? new Date(Date.UTC(2020, 0, 1, 0, 0, 0, this.seq + 1)).toISOString(), revision: (current?.revision ?? 0) + 1, data: operation === 'delete' ? clone(current.data) : nextData, deleted: operation === 'delete', schemaVersion: c.version };
+    const record = { id: recordId, key: recordKey, keyMode: current?.keyMode ?? (normalized === undefined ? 'generated' : 'external'), createdAt: current?.createdAt ?? syntheticTimestamp(this.seq + 1), revision: (current?.revision ?? 0) + 1, data: operation === 'delete' ? clone(current.data) : nextData, deleted: operation === 'delete', schemaVersion: c.version };
     if (current) for (const [reservation, holder] of c.reserved) if (holder === current) {
       if (operation === 'delete' || JSON.parse(reservation)[0] === 'external') c.reserved.set(reservation, record);
       else c.reserved.delete(reservation);
