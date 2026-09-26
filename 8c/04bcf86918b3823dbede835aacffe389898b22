@@ -1,0 +1,18 @@
+scripts/migrate.mjs
+  h_a39f9495f9ec1d 2,6,17
+scripts/migration-order.mjs
+  h_a39f9495f9ec1d 1-2,11-29
+test/db-connection.test.js
+  h_a39f9495f9ec1d 3,9,106-139
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8c04bcf86918b3823dbede835aacffe389898b22",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
