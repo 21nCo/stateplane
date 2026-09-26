@@ -6,5 +6,9 @@
   "compatibility_flags": ["nodejs_compat"],
   "assets": { "binding": "ASSETS", "directory": ".svelte-kit/cloudflare" },
   "r2_buckets": [{ "binding": "ORIGINALS", "bucket_name": "stateplane-originals-local", "preview_bucket_name": "stateplane-originals-preview" }],
-  "vars": { "STATEPLANE_ENV": "local" }
+  "vars": { "STATEPLANE_ENV": "local" },
+  "previews": {
+    "r2_buckets": [{ "binding": "ORIGINALS", "bucket_name": "stateplane-originals-preview" }],
+    "vars": { "STATEPLANE_ENV": "preview" }
+  }
 }

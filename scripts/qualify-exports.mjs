@@ -7,10 +7,12 @@ const root = resolve(import.meta.dirname, '..');
 const requirePackage = createRequire(import.meta.url);
 const names = ['@authfn/core', '@authfn/api-keys', '@authfn/multi-region', '@mcpfn/core', '@mcpfn/auth', '@mcpfn/testing', '@datafn/core', '@datafn/server', '@superfunctions/db', '@superfunctions/storage-r2', '@superfunctions/observability'];
 
+/** Detect a CommonJS root condition anywhere in a package export map. */
 function hasRequireCondition(value) {
   return value && typeof value === 'object' && ('require' in value || Object.values(value).some(hasRequireCondition));
 }
 
+/** Load both advertised root entrypoints as an external consumer would. */
 export async function verifyRoot(name, conditions, importModule = specifier => import(specifier), requireModule = requirePackage) {
   const imported = await importModule(name);
   if (!Object.keys(imported).length) throw new Error(`Empty package entry: ${name}`);
@@ -20,11 +22,13 @@ export async function verifyRoot(name, conditions, importModule = specifier => i
   }
 }
 
+/** Check the packed paths and root imports of every qualified dependency. */
 export async function qualifyExports() {
   for (const name of names) {
     const path = resolve(root, 'node_modules', name, 'package.json');
     const pkg = JSON.parse(await readFile(path, 'utf8'));
     for (const [entry, conditions] of Object.entries(pkg.exports)) {
+      /** Verify each conditional export target exists in the packed package. */
       async function visit(value) {
         if (typeof value === 'string') {
           await stat(resolve(path, '..', value));

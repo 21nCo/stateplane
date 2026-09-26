@@ -62,6 +62,21 @@ test('concurrent local bootstrap publishes one complete password', async () => {
   }
 });
 
+test('local password reader rejects bytes Compose would interpret differently', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'stateplane-password-bytes-'));
+  try {
+    const generated = await localPassword(directory, true);
+    const path = join(directory, '.data/local-db-password');
+    assert.equal(await localPassword(directory, false), generated);
+    for (const value of [` ${generated}\n`, `${generated} \n`, `${generated}\n\n`, `${generated}\r\n`]) {
+      await writeFile(path, value);
+      await assert.rejects(localPassword(directory, false), /incomplete or invalid/);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('mixed-width migration prefixes apply in numeric order', () => {
   assert.deepEqual(['10_later.sql', '2_first.sql', '001_base.sql'].sort(migrationOrder), ['001_base.sql', '2_first.sql', '10_later.sql']);
 });

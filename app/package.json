@@ -9,18 +9,18 @@
     "typecheck": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
   },
   "dependencies": {
-    "@stateplane/contracts": "workspace:*",
-    "@stateplane/api": "workspace:*"
+    "@stateplane/api": "workspace:*",
+    "@stateplane/contracts": "workspace:*"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "5.20260722.1",
     "@sveltejs/adapter-cloudflare": "7.2.9",
     "@sveltejs/kit": "2.70.1",
     "@sveltejs/vite-plugin-svelte": "7.2.0",
     "@tailwindcss/vite": "4.3.3",
-    "@cloudflare/workers-types": "5.20260722.1",
     "svelte": "5.56.8",
     "tailwindcss": "4.3.3",
     "vite": "8.1.5",
-    "wrangler": "4.115.0"
+    "wrangler": "4.135.0"
   }
 }

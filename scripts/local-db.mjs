@@ -5,6 +5,7 @@ import { localPassword } from './local-db-password.mjs';
 const root = resolve(import.meta.dirname, '..');
 const operation = process.argv[2];
 
+/** Run one local bootstrap command and preserve its exit status. */
 function run(command, args, env) {
   const result = spawnSync(command, args, { cwd: root, env, stdio: 'inherit' });
   if (result.error) throw result.error;

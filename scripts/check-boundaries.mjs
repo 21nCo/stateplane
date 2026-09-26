@@ -1,6 +1,6 @@
 import { readFile, readdir } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { dirname, join, relative, resolve } from 'node:path';
+import pathModule, { join, relative, resolve, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 
@@ -15,6 +15,7 @@ const roles = new Map([
   ['read-model', []]
 ]);
 
+/** List source files recursively for the workspace boundary scan. */
 async function walk(dir) {
   const result = [];
   for (const entry of await readdir(dir, { withFileTypes: true })) {
@@ -75,29 +76,42 @@ export function moduleSpecifiers(path, source) {
 
 /** SvelteKit server entrypoints and private server modules stay outside browser policy. */
 export function isBrowserSource(rel) {
+  rel = rel.replaceAll('\\', '/');
   if (!rel.startsWith('app/src/')) return false;
   const name = rel.split('/').at(-1);
   if (/\.server\.[cm]?[jt]s$/.test(name) || /^\+server\.[cm]?[jt]s$/.test(name)) return false;
   return !rel.startsWith('app/src/lib/server/');
 }
 
+/** Classify a source using the path rules of its host, then normalize separators. */
+function sourceLocation(path, base) {
+  const paths = /^(?:[a-z]:[\\/]|\\\\)/i.test(path) ? win32 : pathModule;
+  const rel = paths.relative(base, path).replaceAll('\\', '/');
+  return { paths, rel, role: rel.startsWith('packages/') ? rel.split('/')[1] : null, browser: isBrowserSource(rel) };
+}
+
+/** Apply the dependency graph and server import policy to one specifier. */
+function specifierProblems(rel, role, browser, specifier, local) {
+  const problems = [];
+  const target = specifier.match(/^@stateplane\/([^/]+)/)?.[1] ?? local.match(/^packages\/([^/]+)/)?.[1];
+  if (role && target && target !== role && !roles.get(role)?.includes(target)) problems.push(`${rel}: forbidden dependency ${specifier}`);
+  if (browser && target && target !== 'contracts') problems.push(`${rel}: browser imports ${specifier}`);
+  const serverLocal = /^app\/src\/lib\/server(?:\/|$)/.test(local) || /\.server(?:\.|$)/.test(local) || /\/\+server(?:\.|$)/.test(local);
+  if (browser && (/^(?:node:|pg$|@authfn\/|@mcpfn\/|@superfunctions\/|@datafn\/|\$env\/(?:static|dynamic)\/private|\$lib\/server(?:\/|$))/.test(specifier) || serverLocal)) {
+    problems.push(`${rel}: browser imports server package ${specifier}`);
+  }
+  if (role === 'contracts' && /^(?:node:|pg$|@authfn\/|@mcpfn\/|@superfunctions\/|@datafn\/)/.test(specifier)) problems.push(`${rel}: contracts import runtime ${specifier}`);
+  return problems;
+}
+
 /** Apply package and browser dependency rules to one source file. */
 export function sourceProblems(path, source, base = root) {
   const problems = [];
-  const rel = relative(base, path);
-  const role = rel.startsWith('packages/') ? rel.split('/')[1] : null;
-  const browser = isBrowserSource(rel);
+  const { paths, rel, role, browser } = sourceLocation(path, base);
   if (role && !roles.has(role)) problems.push(`${rel}: unknown package role ${role}`);
   for (const specifier of moduleSpecifiers(path, source)) {
-    const local = specifier.startsWith('.') ? relative(base, resolve(dirname(path), specifier)) : '';
-    const target = specifier.match(/^@stateplane\/([^/]+)/)?.[1] ?? local.match(/^packages\/([^/]+)/)?.[1];
-    if (role && target && target !== role && !roles.get(role)?.includes(target)) problems.push(`${rel}: forbidden dependency ${specifier}`);
-    if (browser && target && target !== 'contracts') problems.push(`${rel}: browser imports ${specifier}`);
-    const serverLocal = /^app\/src\/lib\/server(?:\/|$)/.test(local) || /\.server(?:\.|$)/.test(local) || /\/\+server(?:\.|$)/.test(local);
-    if (browser && (/^(?:node:|pg$|@authfn\/|@mcpfn\/|@superfunctions\/|@datafn\/|\$env\/(?:static|dynamic)\/private|\$lib\/server(?:\/|$))/.test(specifier) || serverLocal)) {
-      problems.push(`${rel}: browser imports server package ${specifier}`);
-    }
-    if (role === 'contracts' && /^(?:node:|pg$|@authfn\/|@mcpfn\/|@superfunctions\/|@datafn\/)/.test(specifier)) problems.push(`${rel}: contracts import runtime ${specifier}`);
+    const local = specifier.startsWith('.') ? paths.relative(base, paths.resolve(paths.dirname(path), specifier)).replaceAll('\\', '/') : '';
+    problems.push(...specifierProblems(rel, role, browser, specifier, local));
   }
   return problems;
 }

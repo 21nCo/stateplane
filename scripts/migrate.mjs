@@ -17,8 +17,9 @@ try {
   const files = (await readdir(directory)).filter(name => /^\d+_[a-z0-9_]+\.sql$/.test(name)).sort(migrationOrder);
   const applied = await client.query('SELECT name, sha256 FROM stateplane_migrations');
   const recorded = new Map(applied.rows.map(row => [row.name, row.sha256]));
-  for (const name of recorded.keys()) {
-    if (!files.includes(name)) throw new Error(`Migration drift: applied file missing: ${name}`);
+  const recordedNames = [...recorded.keys()].sort(migrationOrder);
+  for (const [index, name] of recordedNames.entries()) {
+    if (files[index] !== name) throw new Error(`Migration drift: applied history is not a prefix of current files at ${name}`);
   }
   for (const name of files) {
     const sql = await readFile(resolve(directory, name), 'utf8');

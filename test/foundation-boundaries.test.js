@@ -40,6 +40,18 @@ test('real server modules may import server packages even inside a route named s
   assert.ok(sourceProblems(browser, `<script>import x from '@stateplane/postgres';</script>`, base).length > 0);
 });
 
+test('Windows source and local paths enforce the same package and browser rules', () => {
+  const windowsBase = 'C:\\fixture';
+  const windowsPackage = 'C:\\fixture\\packages\\api\\src\\index.ts';
+  const windowsBrowser = 'C:\\fixture\\app\\src\\routes\\+page.svelte';
+  const windowsServer = 'C:\\fixture\\app\\src\\routes\\+page.server.ts';
+  assert.ok(sourceProblems(windowsPackage, `import x from '@stateplane/postgres';`, windowsBase).some(problem => problem.includes('forbidden dependency')));
+  assert.ok(sourceProblems(windowsPackage, `import x from '../../postgres/src/index';`, windowsBase).some(problem => problem.includes('forbidden dependency')));
+  assert.ok(sourceProblems(windowsBrowser, `<script>import x from '@stateplane/postgres';</script>`, windowsBase).some(problem => problem.includes('browser imports')));
+  assert.ok(sourceProblems(windowsBrowser, `<script>import x from '../lib/server/secret';</script>`, windowsBase).some(problem => problem.includes('browser imports server package')));
+  assert.deepEqual(sourceProblems(windowsServer, `import type { RecordRef } from '@stateplane/postgres';`, windowsBase), []);
+});
+
 test('unknown package roles fail clearly and dependency key order is irrelevant', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'stateplane-boundary-'));
   try {

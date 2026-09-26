@@ -4,7 +4,8 @@ import { join } from 'node:path';
 
 /** Reject an interrupted or manually damaged local credential file. */
 async function readPublished(path) {
-  const value = (await readFile(path, 'utf8')).trim();
+  // Docker's POSTGRES_PASSWORD_FILE strips the single generated line ending.
+  const value = (await readFile(path, 'utf8')).replace(/\n$/, '');
   if (!/^[0-9a-f]{64}$/.test(value)) throw new Error('Local database password file is incomplete or invalid');
   return value;
 }
