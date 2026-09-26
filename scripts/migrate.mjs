@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
-import { readFile, readdir } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import pg from 'pg';
 import { connectionOptions } from './db-connection.mjs';
-import { migrationOrder } from './migration-order.mjs';
+import { migrationInventory, migrationOrder } from './migration-order.mjs';
 
 const client = new pg.Client(connectionOptions(process.env.DATABASE_URL));
 const directory = resolve(import.meta.dirname, '../migrations');
@@ -14,7 +14,7 @@ try {
   transactionOpen = true;
   await client.query('SELECT pg_advisory_xact_lock(73003)');
   await client.query('CREATE TABLE IF NOT EXISTS stateplane_migrations (name text PRIMARY KEY, sha256 text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())');
-  const files = (await readdir(directory)).filter(name => /^\d+_[a-z0-9_]+\.sql$/.test(name)).sort(migrationOrder);
+  const files = await migrationInventory(directory);
   const applied = await client.query('SELECT name, sha256 FROM stateplane_migrations');
   const recorded = new Map(applied.rows.map(row => [row.name, row.sha256]));
   const recordedNames = [...recorded.keys()].sort(migrationOrder);

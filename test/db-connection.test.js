@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import { strict as assert } from 'node:assert';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import pg from 'pg';
 import { connectionOptions } from '../scripts/db-connection.mjs';
 import { localPassword } from '../scripts/local-db-password.mjs';
-import { migrationOrder } from '../scripts/migration-order.mjs';
+import { migrationInventory, migrationOrder } from '../scripts/migration-order.mjs';
 
 test('external database connections require certificate-verified TLS', () => {
   assert.throws(() => connectionOptions('postgres://user@db.example.test/stateplane', ''), /verify-full/);
@@ -102,4 +102,38 @@ test('local password reader rejects bytes Compose would interpret differently', 
 
 test('mixed-width migration prefixes apply in numeric order', () => {
   assert.deepEqual(['10_later.sql', '2_first.sql', '001_base.sql'].sort(migrationOrder), ['001_base.sql', '2_first.sql', '10_later.sql']);
+});
+
+test('migration inventory orders every valid SQL file and ignores unrelated files', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'stateplane-migrations-'));
+  try {
+    for (const name of ['10_later.sql', '2_middle.sql', '001_base.sql', 'README.md']) {
+      await writeFile(join(directory, name), 'SELECT 1;');
+    }
+    assert.deepEqual(await migrationInventory(directory), ['001_base.sql', '2_middle.sql', '10_later.sql']);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('migration inventory rejects malformed SQL names, duplicate versions, and non-files', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'stateplane-migrations-invalid-'));
+  try {
+    for (const name of ['002-add_index.sql', '002_AddIndex.sql', '002_index.SQL']) {
+      await writeFile(join(directory, name), 'SELECT 1;');
+      await assert.rejects(migrationInventory(directory), /Invalid migration file/);
+      await rm(join(directory, name));
+    }
+    await writeFile(join(directory, '002_index.sql'), 'SELECT 1;');
+    await writeFile(join(directory, '2_other.sql'), 'SELECT 1;');
+    await assert.rejects(migrationInventory(directory), /Duplicate migration version 2/);
+    await rm(join(directory, '2_other.sql'));
+    await mkdir(join(directory, '003_directory.sql'));
+    await assert.rejects(migrationInventory(directory), /Invalid migration file/);
+    await rm(join(directory, '003_directory.sql'), { recursive: true });
+    await symlink(join(directory, '002_index.sql'), join(directory, '003_alias.sql'));
+    await assert.rejects(migrationInventory(directory), /Invalid migration file/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
