@@ -31,6 +31,7 @@ const trustedIterator = (iterator, next) => ({
   [Symbol.iterator]() { return this; }
 });
 class TrustedMap extends Map {
+  constructor() { super(); }
   get(key) { return Reflect.apply(nativeMapGet, this, [key]); }
   set(key, value) { return Reflect.apply(nativeMapSet, this, [key, value]); }
   has(key) { return Reflect.apply(nativeMapHas, this, [key]); }
@@ -40,6 +41,10 @@ class TrustedMap extends Map {
   get size() { return Reflect.apply(nativeMapSize, this, []); }
 }
 class TrustedSet extends Set {
+  constructor(values) {
+    super();
+    if (values !== undefined) for (let index = 0; index < values.length; index++) this.add(values[index]); // NOSONAR
+  }
   has(value) { return Reflect.apply(nativeSetHas, this, [value]); }
   add(value) { return Reflect.apply(nativeSetAdd, this, [value]); }
   delete(value) { return Reflect.apply(nativeSetDelete, this, [value]); }
@@ -57,6 +62,11 @@ const someOwn = (array, predicate) => {
   return false;
 };
 const includesOwn = (array, value) => someOwn(array, item => item === value);
+const setFromOwn = array => {
+  const values = new TrustedSet();
+  for (let index = 0; index < array.length; index++) values.add(Object.getOwnPropertyDescriptor(array, index).value); // NOSONAR
+  return values;
+};
 const hasDuplicateOwn = array => {
   const seen = new TrustedSet();
   for (let index = 0; index < array.length; index++) { // NOSONAR
@@ -703,7 +713,7 @@ export class ReferenceState {
     if (fields.spaceId !== spaceId || fields.credential !== credential || fields.collection !== collection) fail('INVALID_ARGUMENT');
     const { operation, id, externalKey, data, set, unset, expectedRevision, expectedSchemaVersion, idempotencyKey } = fields;
     const normalized = validateMutationInput({ operation, id, externalKey, expectedRevision, expectedSchemaVersion,
-      idempotencyKey, supplied: new TrustedSet(Object.keys(fields)) });
+      idempotencyKey, supplied: setFromOwn(Object.keys(fields)) });
     const identity = stable([spaceId, credential, operation, idempotencyKey]);
     const previous = this.receipts.get(identity);
     // Before parsing a receipt's payload, check that its original collection is still visible.
@@ -733,7 +743,8 @@ export class ReferenceState {
   #commitMutation({ spaceId, collection, operation, normalized, current, nextData, c, recordId, recordKey, wanted, identity, fingerprint }) {
     // Stage all validation before any state/event/outbox mutation. The oracle is synchronous.
     const record = { id: recordId, key: recordKey, keyMode: current?.keyMode ?? (normalized === undefined ? 'generated' : 'external'), createdAt: current?.createdAt ?? syntheticTimestamp(this.seq + 1), revision: (current?.revision ?? 0) + 1, data: operation === 'delete' ? clone(current.data) : nextData, deleted: operation === 'delete', schemaVersion: c.version };
-    if (current) for (const [reservation, holder] of c.reserved) if (holder === current) {
+    if (current) for (const entry of c.reserved) if (entry[1] === current) {
+      const reservation = entry[0];
       if (operation === 'delete' || JSON.parse(reservation)[0] === 'external') c.reserved.set(reservation, record);
       else c.reserved.delete(reservation);
     }
@@ -802,7 +813,11 @@ export class ReferenceState {
   rebuild() {
     this.generation++;
     const projected = new TrustedMap();
-    for (const [spaceId, s] of this.spaces) for (const [collection, c] of s.collections) for (const r of c.records.values()) if (!r.deleted) projected.set(`${spaceId}/${collection}/${r.id}`, { revision: r.revision, generation: this.generation });
+    for (const spaceEntry of this.spaces) for (const collectionEntry of spaceEntry[1].collections) {
+      for (const r of collectionEntry[1].records.values()) if (!r.deleted) {
+        projected.set(`${spaceEntry[0]}/${collectionEntry[0]}/${r.id}`, { revision: r.revision, generation: this.generation });
+      }
+    }
     this.projection = projected;
   }
   projectionStatus({ spaceId, credential, collection, id }) {

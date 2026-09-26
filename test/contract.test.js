@@ -2477,3 +2477,64 @@ test('canonical schema sets and reservations ignore later Map and Set iterator c
     Object.defineProperty(Set.prototype, Symbol.iterator, setIterator);
   }
 });
+
+test('mutation presence and map entry consumers ignore later Array iterator changes', () => {
+  const db = setup();
+  const collection = db.spaces.get('sp_a').collections.get('entries');
+  const first = create(db, 'first', { label: 'one', state: 'open' }, 'first');
+  const snapshot = () => structuredClone({ seq: db.seq, version: collection.version,
+    rows: [...collection.records], reserved: [...collection.reserved],
+    events: db.events, outbox: db.outbox, receipts: [...db.receipts] });
+  const bad = [
+    { ...scope, operation: 'create', id: first.ref.id, data: { label: 'two' }, idempotencyKey: 'bad-id' },
+    { ...scope, operation: 'create', externalKey: undefined, data: { label: 'two' }, idempotencyKey: 'bad-key' },
+    { ...scope, operation: 'create', expectedSchemaVersion: undefined, data: { label: 'two' }, idempotencyKey: 'bad-version' },
+    { ...scope, operation: 'replace', id: first.ref.id, expectedRevision: 1, externalKey: 'other',
+      data: { label: 'two' }, idempotencyKey: 'bad-replace' },
+    { ...scope, operation: 'patch', id: first.ref.id, expectedRevision: 1, data: { label: 'two' },
+      set: { label: 'two' }, unset: [], idempotencyKey: 'bad-patch' },
+    { ...scope, operation: 'delete', id: first.ref.id, expectedRevision: 1, data: { label: 'two' },
+      idempotencyKey: 'bad-delete' },
+    { ...scope, operation: 'create', externalKey: 'first', data: { label: 'one', state: 'open' },
+      idempotencyKey: 'first', id: first.ref.id }
+  ];
+  const original = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
+  try {
+    Object.defineProperty(Array.prototype, Symbol.iterator, { ...original, value: function* () {} });
+    const before = snapshot();
+    for (let index = 0; index < bad.length; index++) { // NOSONAR
+      code(() => db.mutate(bad[index]), 'INVALID_ARGUMENT');
+      assert.deepEqual(snapshot(), before);
+    }
+    const replace = { ...scope, operation: 'replace', id: first.ref.id, expectedRevision: 1,
+      data: { label: 'two', state: 'open' }, idempotencyKey: 'replace' };
+    assert.equal(db.mutate(replace).revision, 2);
+    assert.equal(db.mutate(replace).replayed, true);
+    const committed = snapshot();
+    code(() => db.mutate({ ...replace, data: { label: 'other', state: 'open' } }), 'IDEMPOTENCY_MISMATCH');
+    assert.deepEqual(snapshot(), committed);
+    assert.equal(create(db, 'reused', { label: 'one', state: 'open' }, 'reused').revision, 1);
+    assert.equal(db.count(scope), 2);
+    assert.equal(db.exists(scope), true);
+    const page = db.query({ ...scope, limit: 1 });
+    assert.equal(page.items.length, 1);
+    assert.equal(db.query({ ...scope, limit: 1, cursor: page.cursor }).items.length, 1);
+    db.rebuild();
+    assert.equal(db.projectionStatus({ ...scope, id: first.ref.id }), 'current');
+    Object.defineProperty(Array.prototype, Symbol.iterator, { ...original,
+      value() { throw Error('late Array iterator called'); } });
+    assert.equal(db.mutate(replace).replayed, true);
+    let rejected;
+    try { db.mutate(bad[0]); } catch (error) { rejected = error; }
+    assert.equal(rejected?.code, 'INVALID_ARGUMENT');
+    Object.defineProperty(Array.prototype, Symbol.iterator, { ...original, value: function* () {} });
+    db.revoke('sp_a', 'agent', 'entries');
+    code(() => db.mutate(replace), 'FORBIDDEN');
+    db.grant('sp_a', 'agent', 'entries', recordAccess);
+    db.lifecycle('sp_a', 'readOnly');
+    assert.equal(db.mutate(replace).replayed, true);
+    code(() => db.mutate(bad[0]), 'SPACE_UNAVAILABLE');
+  } finally {
+    Object.defineProperty(Array.prototype, Symbol.iterator, original);
+  }
+});
