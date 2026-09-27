@@ -177,6 +177,35 @@ test('requires complete isolated Hyperdrive inventory and rejects secret-shaped 
   assert.throws(() => validateInventory(topology, 'development', publicVpc), /cannot include a VPC service/);
 });
 
+test('public app and MCP routes render only valid distinct HTTPS DNS authorities', () => {
+  for (const environment of ['development', 'production']) {
+    const valid = inventory(environment);
+    valid.routes = { app: `https://${'a'.repeat(63)}.example.test`, mcp: 'https://mcp.example.test' };
+    const configs = renderTopology(topology, environment, valid, '/tmp/stateplane-topology');
+    assert.deepEqual(configs['app.json'].routes, [{ pattern: `${'a'.repeat(63)}.example.test`, custom_domain: true }]);
+    assert.deepEqual(configs['mcp.json'].routes, [{ pattern: 'mcp.example.test', custom_domain: true }]);
+    assert.equal(configs['directory.json'].routes, undefined);
+    assert.equal(configs['in-south-api.json'].routes, undefined);
+
+    for (const key of ['app', 'mcp']) {
+      for (const route of [
+        'https://-bad.example', 'https://bad-.example', 'https://foo..example',
+        'https://foo.example.', 'https://foo_example.test',
+        `https://${'a'.repeat(64)}.example.test`,
+        `https://${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(63)}.test`,
+        'https://foo.example.test:443', 'https://foo.example.test/path'
+      ]) {
+        const bad = copy(valid);
+        bad.routes[key] = route;
+        assert.throws(() => renderTopology(topology, environment, bad, '/tmp/stateplane-topology'), new RegExp(`Invalid ${key} route`), `${environment}/${key}: ${route}`);
+      }
+    }
+    const duplicate = copy(valid);
+    duplicate.routes.mcp = duplicate.routes.app;
+    assert.throws(() => validateInventory(topology, environment, duplicate), /Public routes must differ/);
+  }
+});
+
 test('live gate rejects stale Hyperdrive caching, wrong origin and inadequate backup retention', () => {
   const definition = topology.environments.production.cells[0];
   const resource = inventory('production').cells['in-south'];

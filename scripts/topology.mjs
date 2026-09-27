@@ -10,6 +10,7 @@ const safeName = /^[a-z][a-z0-9-]*$/;
 const rdsDatabaseName = /^[a-z][a-z0-9_]{0,62}$/;
 const cloudflareName = /^[a-z][a-z0-9-]{0,62}$/;
 const rdsInstanceName = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
+const dnsLabel = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const restoreSuffix = '-restore-';
 const minimumRestoreToken = 'a'.repeat(8);
 const cellPlacement = {
@@ -92,6 +93,7 @@ function validateCell(environment, env, cell, all) {
   all.workers.push(resource.api, resource.mcp, resource.jobs);
 }
 
+/** Validate the complete cell pattern and every derived provider resource name. */
 export function validateTopology(topology) {
   allowedKeys(topology, ['version', 'provider', 'environments'], 'topology');
   if (topology.version !== 1 || topology.provider !== 'aws-rds-postgresql') throw new Error('Unsupported topology version or provider');
@@ -112,6 +114,18 @@ function checkRdsInstanceId(value, expected, label) {
   if (!restored.test(value)) throw new Error(`${label} RDS instance mismatch`);
 }
 
+/**
+ * Accept only a bare HTTPS authority whose DNS labels can be used as a
+ * Cloudflare custom domain. Ownership and DNS resolution require a live check.
+ */
+function validPublicRoute(route) {
+  if (typeof route !== 'string' || !route.startsWith('https://')) return false;
+  const host = route.slice('https://'.length);
+  const labels = host.split('.');
+  return host.length <= 253 && labels.length >= 2 && labels.every(label => dnsLabel.test(label));
+}
+
+/** Validate private resource IDs and optional public routes before rendering. */
 export function validateInventory(topology, environment, inventory) {
   const env = topology.environments[environment];
   if (!env) throw new Error('Unknown environment');
@@ -139,7 +153,7 @@ export function validateInventory(topology, environment, inventory) {
   if (inventory.routes !== undefined) {
     allowedKeys(inventory.routes, ['app', 'mcp'], 'routes');
     for (const key of ['app', 'mcp']) {
-      if (typeof inventory.routes[key] !== 'string' || !/^https:\/\/[a-z0-9.-]+$/.test(inventory.routes[key])) throw new Error(`Invalid ${key} route`);
+      if (!validPublicRoute(inventory.routes[key])) throw new Error(`Invalid ${key} route`);
     }
     if (inventory.routes.app === inventory.routes.mcp) throw new Error('Public routes must differ');
   }
@@ -159,6 +173,7 @@ const common = (out, name, main, role, environment, projectRoot) => ({
 });
 const binding = (id) => [{ binding: 'AUTHORITY', id }];
 
+/** Render validated per-environment Worker configs without embedding secrets. */
 export function renderTopology(topology, environment, inventory, out, projectRoot = root) {
   validateTopology(topology);
   validateInventory(topology, environment, inventory);
