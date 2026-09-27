@@ -9,6 +9,7 @@ const awsRegion = /^[a-z]{2}-[a-z]+-\d$/;
 const safeName = /^[a-z][a-z0-9-]*$/;
 const rdsDatabaseName = /^[a-z][a-z0-9_]{0,62}$/;
 const cloudflareName = /^[a-z][a-z0-9-]{0,62}$/;
+const rdsInstanceName = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 const cellPlacement = {
   'in-south': { awsRegion: 'ap-south-1', r2LocationHint: 'apac' },
   'us-east': { awsRegion: 'us-east-1', r2LocationHint: 'enam' },
@@ -25,6 +26,8 @@ const unique = (values, label) => {
   if (new Set(values).size !== values.length) throw new Error(`${label} must be unique across environments`);
 };
 export const cellDatabaseName = (env, cell) => `${env.prefix.replaceAll('-', '_')}_${cell.id.replaceAll('-', '_')}`;
+const rdsInstanceId = (env, cell) => `${env.prefix}-${cell?.id ?? 'control'}-db`;
+const validRdsInstanceId = value => typeof value === 'string' && value.length <= 63 && rdsInstanceName.test(value);
 const names = (env, cell) => {
   const prefix = env.prefix;
   return {
@@ -60,6 +63,7 @@ function validateEnvironment(environment, env, all) {
   actual.sort((a, b) => String(a).localeCompare(String(b)));
   if (actual.join(',') !== expected.join(',')) throw new Error(`${environment} has incomplete cell pattern`);
   assertDerivedNames(environment, names(env));
+  if (!validRdsInstanceId(rdsInstanceId(env))) throw new Error(`${environment} control RDS instance name is invalid`);
   const directory = `${env.prefix}-directory`;
   check(directory, cloudflareName, `${environment} directory name`);
   all.databases.push(`${env.control.awsRegion}/${env.control.database}`);
@@ -77,6 +81,7 @@ function validateCell(environment, env, cell, all) {
   if (cellPlacement[cell.id]?.awsRegion !== cell.awsRegion) throw new Error(`${environment} ${cell.id} is mapped to the wrong provider region`);
   const resource = names(env, cell);
   assertDerivedNames(`${environment} ${cell.id}`, resource);
+  if (!validRdsInstanceId(rdsInstanceId(env, cell))) throw new Error(`${environment} ${cell.id} RDS instance name is invalid`);
   all.databases.push(`${cell.awsRegion}/${resource.database}`);
   all.hyperdrives.push(resource.hyperdrive);
   all.buckets.push(resource.bucket);
@@ -96,11 +101,12 @@ export function validateTopology(topology) {
 }
 
 function checkRdsInstanceId(value, expected, label) {
+  if (!validRdsInstanceId(value)) throw new Error(`${label} RDS instance mismatch`);
   if (value === expected) return;
   // Restores use a new RDS instance in the same cell; the live gate still proves
   // database, region, endpoint and Hyperdrive identity before cutover.
   const restored = new RegExp(`^${expected}-restore-[a-z0-9]{8,24}$`);
-  if (typeof value !== 'string' || value.length > 63 || !restored.test(value)) throw new Error(`${label} RDS instance mismatch`);
+  if (!restored.test(value)) throw new Error(`${label} RDS instance mismatch`);
 }
 
 export function validateInventory(topology, environment, inventory) {
@@ -114,7 +120,7 @@ export function validateInventory(topology, environment, inventory) {
   };
   allowedKeys(inventory.control, ['hyperdriveId', 'rdsInstanceId', 'network', 'vpcServiceId'], 'control inventory');
   check(inventory.control.hyperdriveId, hexId, 'control Hyperdrive ID');
-  checkRdsInstanceId(inventory.control.rdsInstanceId, `${env.prefix}-control-db`, 'Control');
+  checkRdsInstanceId(inventory.control.rdsInstanceId, rdsInstanceId(env), 'Control');
   network(inventory.control, 'control');
   allowedKeys(inventory.cells, env.cells.map(cell => cell.id), 'cell inventory');
   if (Object.keys(inventory.cells).length !== env.cells.length) throw new Error('Missing cell inventory');
@@ -122,7 +128,7 @@ export function validateInventory(topology, environment, inventory) {
   for (const cell of env.cells) {
     allowedKeys(inventory.cells[cell.id], ['hyperdriveId', 'rdsInstanceId', 'network', 'vpcServiceId'], `${cell.id} inventory`);
     check(inventory.cells[cell.id].hyperdriveId, hexId, `${cell.id} Hyperdrive ID`);
-    checkRdsInstanceId(inventory.cells[cell.id].rdsInstanceId, `${env.prefix}-${cell.id}-db`, cell.id);
+    checkRdsInstanceId(inventory.cells[cell.id].rdsInstanceId, rdsInstanceId(env, cell), cell.id);
     network(inventory.cells[cell.id], cell.id);
     ids.push(inventory.cells[cell.id].hyperdriveId);
   }

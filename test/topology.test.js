@@ -110,6 +110,19 @@ test('all RDS PostgreSQL database names are provisionable and match the regional
   assert.throws(() => validateTopology(badControl), /control database is invalid/);
 });
 
+test('generated RDS instance IDs reject prefixes that AWS cannot provision', () => {
+  for (const environment of ['development', 'production']) {
+    for (const prefix of ['foo-', 'foo--bar']) {
+      const malformed = copy(topology);
+      malformed.environments[environment].prefix = prefix;
+      assert.throws(() => validateTopology(malformed), /control RDS instance name is invalid/);
+    }
+    const valid = copy(topology);
+    valid.environments[environment].prefix = `foo-${environment}`;
+    assert.doesNotThrow(() => validateTopology(valid));
+  }
+});
+
 test('rejects cross-environment reuse and strict processing claims', () => {
   const reused = copy(topology);
   reused.environments.production.prefix = reused.environments.development.prefix;
@@ -251,6 +264,14 @@ test('restore inventory accepts only a same-cell replacement name', () => {
     wrong.cells['in-south'].rdsInstanceId += suffix;
     assert.throws(() => validateInventory(topology, 'production', wrong), /RDS instance mismatch/);
   }
+  const malformedTopology = copy(topology);
+  malformedTopology.environments.production.prefix = 'foo--bar';
+  const malformedRestore = inventory('production');
+  malformedRestore.control.rdsInstanceId = 'foo--bar-control-db-restore-abcdefgh';
+  for (const cell of malformedTopology.environments.production.cells) {
+    malformedRestore.cells[cell.id].rdsInstanceId = `foo--bar-${cell.id}-db`;
+  }
+  assert.throws(() => validateInventory(malformedTopology, 'production', malformedRestore), /RDS instance mismatch/);
 });
 
 test('derived Cloudflare names are bounded even when an RDS database name fits', () => {
