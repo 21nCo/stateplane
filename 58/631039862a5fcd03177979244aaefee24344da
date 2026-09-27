@@ -1,0 +1,21 @@
+scripts/topology.mjs
+  s_3058aa458d6557::t_139b912108157d 12,29-30,66,84,104,109,123,131
+test/topology.test.js
+  s_3058aa458d6557::t_8efe81d680e3af 113-125,267-274
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "58631039862a5fcd03177979244aaefee24344da",
+  "prompts": {},
+  "sessions": {
+    "s_3058aa458d6557": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0e214-820d-7fa0-a0ea-0fdea628637e",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
