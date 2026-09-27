@@ -11,6 +11,7 @@ const database = vi.hoisted(() => ({
   closed: 0,
   transactionRow: false,
   rollbackLeavesRow: false,
+  rollbackFailure: false,
   insertFailure: false,
   failQuery: '' as string,
   endFailure: false,
@@ -28,7 +29,7 @@ vi.mock('pg', () => ({
     async query(sql: string) {
       if (database.failQuery && sql.includes(database.failQuery)) throw new Error('query timeout');
       if (sql === 'BEGIN') { database.transactionRow = false; return { rows: [] }; }
-      if (sql === 'ROLLBACK') { if (!database.rollbackLeavesRow) database.transactionRow = false; return { rows: [] }; }
+      if (sql === 'ROLLBACK') { if (database.rollbackFailure) throw new Error('rollback failed'); if (!database.rollbackLeavesRow) database.transactionRow = false; return { rows: [] }; }
       if (sql.includes('current_database() AS database')) return { rows: [{ database: database.targetDatabase, role: database.targetRole }] };
       if (sql.includes('FROM pg_extension')) return { rows: [{ extversion: '0.8.6' }] };
       if (sql.includes('::vector')) return { rows: database.vectorMissingRow ? [] : [{ distance: database.vectorDistance }] };
@@ -53,13 +54,14 @@ vi.mock('pg', () => ({
 
 import worker from '../deployment/workers/qualification';
 
-async function qualify(authorization: string | null = 'Bearer disposable-token', disposable = '1') {
+async function qualify(authorization: string | null = 'Bearer disposable-token', disposable = '1', bindings: Record<string, unknown> = {}) {
   return worker.fetch(new Request('https://preview.example/qualify', {
     method: 'POST', headers: authorization === null ? {} : { authorization }
   }), {
     AUTHORITY: { connectionString: 'postgres://disposable.example/probe' },
     PROBE_TOKEN: 'disposable-token', STATEPLANE_DISPOSABLE: disposable,
-    STATEPLANE_PROBE_DATABASE: 'sta4_aaaaaaaaaaaaaaaa_dev_in_south', STATEPLANE_PROBE_ROLE: 'sta4_probe_aaaaaaaaaaaaaaaa'
+    STATEPLANE_PROBE_DATABASE: 'sta4_aaaaaaaaaaaaaaaa_dev_in_south', STATEPLANE_PROBE_ROLE: 'sta4_probe_aaaaaaaaaaaaaaaa',
+    ...bindings
   } as never);
 }
 
@@ -76,6 +78,7 @@ describe('disposable qualification row cleanup', () => {
     database.closed = 0;
     database.transactionRow = false;
     database.rollbackLeavesRow = false;
+    database.rollbackFailure = false;
     database.insertFailure = false;
     database.failQuery = '';
     database.endFailure = false;
@@ -159,6 +162,17 @@ describe('disposable qualification row cleanup', () => {
     } finally { log.mockRestore(); }
   });
 
+  it('reports a failed rollback and cleans up a possible row', async () => {
+    database.rollbackFailure = true;
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect((await qualify()).status).toBe(500);
+      expect(log).toHaveBeenCalledWith('Qualification failed', 'probe:transaction-rollback');
+      expect(database.row).toBeNull();
+      expect(database.closed).toBe(2);
+    } finally { log.mockRestore(); }
+  });
+
   it('fails when either client cannot close', async () => {
     database.endFailure = true;
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -209,5 +223,38 @@ describe('disposable qualification row cleanup', () => {
       expect(database.connections).toBe(0);
       expect(database.row).toBeNull();
     }
+  });
+
+  it('denies undeclared, malformed and missing target bindings before connecting', async () => {
+    for (const bindings of [
+      { STATEPLANE_PROBE_DATABASE: 'sta4_aaaaaaaaaaaaaaaa_prod_eu_west' },
+      { STATEPLANE_PROBE_DATABASE: 'sta4_aaaaaaaaaaaaaaaa_dev_unknown' },
+      { STATEPLANE_PROBE_DATABASE: 'stateplane_prod_in_south' },
+      { STATEPLANE_PROBE_DATABASE: undefined },
+      { STATEPLANE_PROBE_ROLE: 'sta4_probe_bbbbbbbbbbbbbbbb' },
+      { STATEPLANE_PROBE_ROLE: undefined },
+      { AUTHORITY: undefined }
+    ]) {
+      expect((await qualify('Bearer disposable-token', '1', bindings)).status).toBe(403);
+      expect(database.connections).toBe(0);
+    }
+  });
+
+  it('admits every declared development and production cell', async () => {
+    for (const suffix of ['dev_in_south', 'dev_us_east', 'dev_eu_west', 'prod_in_south', 'prod_us_east']) {
+      const target = `sta4_aaaaaaaaaaaaaaaa_${suffix}`;
+      database.targetDatabase = target;
+      expect((await qualify('Bearer disposable-token', '1', { STATEPLANE_PROBE_DATABASE: target })).status).toBe(200);
+      expect(database.row).toBeNull();
+    }
+  });
+
+  it('hashes unequal-length Bearer candidates before denial', async () => {
+    const digest = vi.spyOn(crypto.subtle, 'digest');
+    try {
+      expect((await qualify('Bearer x')).status).toBe(403);
+      expect(digest).toHaveBeenCalledTimes(2);
+      expect(database.connections).toBe(0);
+    } finally { digest.mockRestore(); }
   });
 });

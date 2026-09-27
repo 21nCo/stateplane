@@ -1,4 +1,5 @@
 import { Client } from 'pg';
+import topology from '../topology.json' with { type: 'json' };
 
 interface Env {
   AUTHORITY: Hyperdrive;
@@ -16,7 +17,7 @@ class QualificationFailure extends Error {
 
 async function authorized(request: Request, expected: string): Promise<boolean> {
   const supplied = request.headers.get('authorization') ?? '';
-  if (!supplied.startsWith('Bearer ') || !expected || supplied.length !== expected.length + 7) return false;
+  if (!supplied.startsWith('Bearer ') || !expected) return false;
   const encode = (value: string) => crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
   const [a, b] = await Promise.all([encode(supplied.slice(7)), encode(expected)]);
   const left = new Uint8Array(a);
@@ -26,89 +27,112 @@ async function authorized(request: Request, expected: string): Promise<boolean> 
   return difference === 0;
 }
 
+function declaredTarget(database: string | undefined, role: string | undefined): boolean {
+  const match = /^sta4_([a-f0-9]{16})_(dev|prod)_([a-z]+(?:_[a-z]+)*)$/.exec(database ?? '');
+  if (!match || role !== `sta4_probe_${match[1]}`) return false;
+  const environment = match[2] === 'dev' ? topology.environments.development : topology.environments.production;
+  return environment.cells.some(cell => cell.id.replaceAll('-', '_') === match[3]);
+}
+
+type ProbeClient = Client;
+
+async function atStage<T>(stage: string, action: () => Promise<T>): Promise<T> {
+  try { return await action(); }
+  catch { throw new QualificationFailure([`probe:${stage}`]); }
+}
+
+async function verifyTarget(writer: ProbeClient, database: string, role: string): Promise<string> {
+  await atStage('target-identity', async () => {
+    const identity = await writer.query('SELECT current_database() AS database, current_user AS role');
+    if (identity.rows[0]?.database !== database || identity.rows[0]?.role !== role) throw new Error('Target identity mismatch');
+  });
+  const extension = await atStage('pgvector-extension', async () => {
+    const response = await writer.query("SELECT extversion FROM pg_extension WHERE extname = 'vector'");
+    if (typeof response.rows[0]?.extversion !== 'string' || !response.rows[0].extversion) throw new Error('pgvector missing');
+    return response.rows[0].extversion as string;
+  });
+  await atStage('pgvector-distance', async () => {
+    const vector = await writer.query("SELECT '[1,0,0]'::vector <-> '[0,1,0]'::vector AS distance");
+    const distance: unknown = vector.rows[0]?.distance;
+    if (typeof distance !== 'number' || !Number.isFinite(distance) || Math.abs(distance - Math.sqrt(2)) > 0.00001) throw new Error('pgvector distance mismatch');
+  });
+  return extension;
+}
+
+async function verifyRollback(writer: ProbeClient, id: string, markRow: () => void): Promise<void> {
+  await atStage('transaction-begin', () => writer.query('BEGIN'));
+  const failures: string[] = [];
+  try {
+    await atStage('transaction-insert', async () => {
+      await writer.query('SET LOCAL statement_timeout = 5000');
+      markRow();
+      await writer.query('INSERT INTO stateplane_qualification (probe_id, value) VALUES ($1, 99)', [id]);
+    });
+  } catch (error) { failures.push(...(error as QualificationFailure).stages); }
+  try { await atStage('transaction-rollback', () => writer.query('ROLLBACK')); }
+  catch (error) { failures.push(...(error as QualificationFailure).stages); }
+  if (failures.length) throw new QualificationFailure(failures);
+  await atStage('rollback-read', async () => {
+    const rolledBack = await writer.query('SELECT count(*)::integer AS count FROM stateplane_qualification WHERE probe_id = $1', [id]);
+    if (rolledBack.rows[0]?.count !== 0) throw new Error('Rollback was not atomic');
+  });
+}
+
+async function verifyFreshReads(writer: ProbeClient, reader: ProbeClient, id: string): Promise<number> {
+  await atStage('reader-connect', () => reader.connect());
+  await atStage('initial-read', async () => {
+    const first = await reader.query('SELECT value FROM stateplane_qualification WHERE probe_id = $1', [id]);
+    if (first.rows[0]?.value !== 1) throw new Error('Initial read was stale');
+  });
+  await atStage('committed-update', () => writer.query('UPDATE stateplane_qualification SET value = 2 WHERE probe_id = $1', [id]));
+  await atStage('fresh-read', async () => {
+    const fresh = await reader.query('SELECT value FROM stateplane_qualification WHERE probe_id = $1', [id]);
+    if (fresh.rows[0]?.value !== 2) throw new Error('Fresh read was stale');
+  });
+  return atStage('connection-count', async () => {
+    const activity = await reader.query('SELECT count(*)::integer AS count FROM pg_stat_activity WHERE datname = current_database() AND usename = current_user');
+    const count: unknown = activity.rows[0]?.count;
+    if (!Number.isSafeInteger(count) || (count as number) < 1) throw new Error('Connection count unavailable');
+    return count as number;
+  });
+}
+
+async function cleanupRow(writer: ProbeClient, id: string): Promise<void> {
+  try { await writer.query('DELETE FROM stateplane_qualification WHERE probe_id = $1', [id]); }
+  catch { throw new QualificationFailure(['cleanup-delete']); }
+  try {
+    const remaining = await writer.query('SELECT count(*)::integer AS count FROM stateplane_qualification WHERE probe_id = $1', [id]);
+    if (remaining.rows[0]?.count !== 0) throw new Error('Qualification row cleanup failed');
+  } catch { throw new QualificationFailure(['cleanup-verify']); }
+}
+
 async function probe(connectionString: string, expectedDatabase: string, expectedRole: string) {
   const id = crypto.randomUUID();
   const writer = new Client({ connectionString, connectionTimeoutMillis: 5000, query_timeout: 5000 });
   const reader = new Client({ connectionString, connectionTimeoutMillis: 5000, query_timeout: 5000 });
   const start = Date.now();
-  let writerConnected = false;
   let rowMayExist = false;
   let result: { pgvectorVersion: string; rollback: boolean; freshRead: boolean; observedConnections: number; elapsedMs: number } | undefined;
-  const failureStages: string[] = [];
-  let stage = 'writer-connect';
+  const failures: string[] = [];
   try {
-    await writer.connect();
-    writerConnected = true;
-    stage = 'target-identity';
-    const identity = await writer.query('SELECT current_database() AS database, current_user AS role');
-    if (identity.rows[0]?.database !== expectedDatabase || identity.rows[0]?.role !== expectedRole) throw new Error('Disposable target identity mismatch');
-    stage = 'pgvector-extension';
-    const extension = await writer.query("SELECT extversion FROM pg_extension WHERE extname = 'vector'");
-    if (typeof extension.rows[0]?.extversion !== 'string' || !extension.rows[0].extversion) throw new Error('pgvector is not installed');
-    stage = 'pgvector-distance';
-    const vector = await writer.query("SELECT '[1,0,0]'::vector <-> '[0,1,0]'::vector AS distance");
-    const distance: unknown = vector.rows[0]?.distance;
-    if (typeof distance !== 'number' || !Number.isFinite(distance) || Math.abs(distance - Math.sqrt(2)) > 0.00001) throw new Error('pgvector distance mismatch');
-    stage = 'probe-table';
-    await writer.query('CREATE TABLE IF NOT EXISTS stateplane_qualification (probe_id uuid PRIMARY KEY, value integer NOT NULL)');
-    stage = 'transaction-begin';
-    await writer.query('BEGIN');
-    let insertFailed = false;
-    try {
-      stage = 'transaction-insert';
-      await writer.query('SET LOCAL statement_timeout = 5000');
-      rowMayExist = true;
-      await writer.query('INSERT INTO stateplane_qualification (probe_id, value) VALUES ($1, 99)', [id]);
-    } catch {
-      failureStages.push(`probe:${stage}`);
-      insertFailed = true;
-    }
-    try {
-      stage = 'transaction-rollback';
-      await writer.query('ROLLBACK');
-    } catch {
-      failureStages.push('probe:transaction-rollback');
-    }
-    if (insertFailed || failureStages.length) throw new QualificationFailure(failureStages);
-
-    stage = 'rollback-read';
-    const rolledBack = await writer.query('SELECT count(*)::integer AS count FROM stateplane_qualification WHERE probe_id = $1', [id]);
-    if (rolledBack.rows[0].count !== 0) throw new Error('Rollback was not atomic');
-    stage = 'committed-insert';
-    await writer.query('INSERT INTO stateplane_qualification (probe_id, value) VALUES ($1, 1)', [id]);
-    stage = 'reader-connect';
-    await reader.connect();
-    stage = 'initial-read';
-    const first = await reader.query('SELECT value FROM stateplane_qualification WHERE probe_id = $1', [id]);
-    if (first.rows[0]?.value !== 1) throw new Error('Initial read was stale');
-    stage = 'committed-update';
-    await writer.query('UPDATE stateplane_qualification SET value = 2 WHERE probe_id = $1', [id]);
-    stage = 'fresh-read';
-    const fresh = await reader.query('SELECT value FROM stateplane_qualification WHERE probe_id = $1', [id]);
-    if (fresh.rows[0]?.value !== 2) throw new Error('Fresh read was stale');
-    stage = 'connection-count';
-    const activity = await reader.query('SELECT count(*)::integer AS count FROM pg_stat_activity WHERE datname = current_database() AND usename = current_user');
-    if (!Number.isSafeInteger(activity.rows[0]?.count) || activity.rows[0].count < 1) throw new Error('Connection count unavailable');
-    stage = 'result';
-    result = { pgvectorVersion: extension.rows[0].extversion, rollback: true, freshRead: true, observedConnections: activity.rows[0].count, elapsedMs: Date.now() - start };
+    await atStage('writer-connect', () => writer.connect());
+    const pgvectorVersion = await verifyTarget(writer, expectedDatabase, expectedRole);
+    await atStage('probe-table', () => writer.query('CREATE TABLE IF NOT EXISTS stateplane_qualification (probe_id uuid PRIMARY KEY, value integer NOT NULL)'));
+    await verifyRollback(writer, id, () => { rowMayExist = true; });
+    await atStage('committed-insert', () => writer.query('INSERT INTO stateplane_qualification (probe_id, value) VALUES ($1, 1)', [id]));
+    const observedConnections = await verifyFreshReads(writer, reader, id);
+    result = { pgvectorVersion, rollback: true, freshRead: true, observedConnections, elapsedMs: Date.now() - start };
   } catch (error) {
-    if (!(error instanceof QualificationFailure)) failureStages.push(`probe:${stage}`);
+    failures.push(...(error instanceof QualificationFailure ? error.stages : ['probe:unexpected']));
   }
-  try {
-    if (writerConnected && rowMayExist) {
-      stage = 'cleanup-delete';
-      await writer.query('DELETE FROM stateplane_qualification WHERE probe_id = $1', [id]);
-      stage = 'cleanup-verify';
-      const remaining = await writer.query('SELECT count(*)::integer AS count FROM stateplane_qualification WHERE probe_id = $1', [id]);
-      if (remaining.rows[0]?.count !== 0) throw new Error('Qualification row cleanup failed');
-    }
-  } catch {
-    failureStages.push(stage);
+  if (rowMayExist) {
+    try { await cleanupRow(writer, id); }
+    catch (error) { failures.push(...(error as QualificationFailure).stages); }
   }
   const closed = await Promise.allSettled([writer.end(), reader.end()]);
-  if (closed[0].status === 'rejected') failureStages.push('close:writer');
-  if (closed[1].status === 'rejected') failureStages.push('close:reader');
-  if (failureStages.length) throw new QualificationFailure(failureStages);
+  if (closed[0].status === 'rejected') failures.push('close:writer');
+  if (closed[1].status === 'rejected') failures.push('close:reader');
+  if (failures.length) throw new QualificationFailure(failures);
   if (!result) throw new Error('Qualification result missing');
   return result;
 }
@@ -116,8 +140,8 @@ async function probe(connectionString: string, expectedDatabase: string, expecte
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     if (new URL(request.url).pathname !== '/qualify' || request.method !== 'POST') return new Response('Not found', { status: 404 });
-    if (env.STATEPLANE_DISPOSABLE !== '1' || !/^sta4_[a-f0-9]{16}_(dev|prod)_(in_south|us_east|eu_west)$/.test(env.STATEPLANE_PROBE_DATABASE ?? '') ||
-        !/^sta4_probe_[a-f0-9]{16}$/.test(env.STATEPLANE_PROBE_ROLE ?? '') || !(await authorized(request, env.PROBE_TOKEN))) return new Response('Forbidden', { status: 403 });
+    if (env.STATEPLANE_DISPOSABLE !== '1' || !declaredTarget(env.STATEPLANE_PROBE_DATABASE, env.STATEPLANE_PROBE_ROLE) ||
+        !env.AUTHORITY?.connectionString || !(await authorized(request, env.PROBE_TOKEN))) return new Response('Forbidden', { status: 403 });
     try {
       return Response.json({ ok: true, ...(await probe(env.AUTHORITY.connectionString, env.STATEPLANE_PROBE_DATABASE, env.STATEPLANE_PROBE_ROLE)) }, { headers: { 'Cache-Control': 'no-store' } });
     } catch (error) {
