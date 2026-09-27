@@ -10,6 +10,8 @@ const safeName = /^[a-z][a-z0-9-]*$/;
 const rdsDatabaseName = /^[a-z][a-z0-9_]{0,62}$/;
 const cloudflareName = /^[a-z][a-z0-9-]{0,62}$/;
 const rdsInstanceName = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
+const restoreSuffix = '-restore-';
+const minimumRestoreToken = 'a'.repeat(8);
 const cellPlacement = {
   'in-south': { awsRegion: 'ap-south-1', r2LocationHint: 'apac' },
   'us-east': { awsRegion: 'us-east-1', r2LocationHint: 'enam' },
@@ -28,6 +30,7 @@ const unique = (values, label) => {
 export const cellDatabaseName = (env, cell) => `${env.prefix.replaceAll('-', '_')}_${cell.id.replaceAll('-', '_')}`;
 const rdsInstanceId = (env, cell) => `${env.prefix}-${cell?.id ?? 'control'}-db`;
 const validRdsInstanceId = value => typeof value === 'string' && value.length <= 63 && rdsInstanceName.test(value);
+const validRestorableRdsInstanceId = value => validRdsInstanceId(value) && validRdsInstanceId(`${value}${restoreSuffix}${minimumRestoreToken}`);
 const names = (env, cell) => {
   const prefix = env.prefix;
   return {
@@ -63,7 +66,7 @@ function validateEnvironment(environment, env, all) {
   actual.sort((a, b) => String(a).localeCompare(String(b)));
   if (actual.join(',') !== expected.join(',')) throw new Error(`${environment} has incomplete cell pattern`);
   assertDerivedNames(environment, names(env));
-  if (!validRdsInstanceId(rdsInstanceId(env))) throw new Error(`${environment} control RDS instance name is invalid`);
+  if (!validRestorableRdsInstanceId(rdsInstanceId(env))) throw new Error(`${environment} control RDS instance name is invalid`);
   const directory = `${env.prefix}-directory`;
   check(directory, cloudflareName, `${environment} directory name`);
   all.databases.push(`${env.control.awsRegion}/${env.control.database}`);
@@ -81,7 +84,7 @@ function validateCell(environment, env, cell, all) {
   if (cellPlacement[cell.id]?.awsRegion !== cell.awsRegion) throw new Error(`${environment} ${cell.id} is mapped to the wrong provider region`);
   const resource = names(env, cell);
   assertDerivedNames(`${environment} ${cell.id}`, resource);
-  if (!validRdsInstanceId(rdsInstanceId(env, cell))) throw new Error(`${environment} ${cell.id} RDS instance name is invalid`);
+  if (!validRestorableRdsInstanceId(rdsInstanceId(env, cell))) throw new Error(`${environment} ${cell.id} RDS instance name is invalid`);
   all.databases.push(`${cell.awsRegion}/${resource.database}`);
   all.hyperdrives.push(resource.hyperdrive);
   all.buckets.push(resource.bucket);
@@ -101,11 +104,11 @@ export function validateTopology(topology) {
 }
 
 function checkRdsInstanceId(value, expected, label) {
-  if (!validRdsInstanceId(value)) throw new Error(`${label} RDS instance mismatch`);
+  if (!validRestorableRdsInstanceId(expected) || !validRdsInstanceId(value)) throw new Error(`${label} RDS instance mismatch`);
   if (value === expected) return;
   // Restores use a new RDS instance in the same cell; the live gate still proves
   // database, region, endpoint and Hyperdrive identity before cutover.
-  const restored = new RegExp(`^${expected}-restore-[a-z0-9]{8,24}$`);
+  const restored = new RegExp(`^${expected}${restoreSuffix}[a-z0-9]{8,24}$`);
   if (!restored.test(value)) throw new Error(`${label} RDS instance mismatch`);
 }
 

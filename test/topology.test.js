@@ -123,6 +123,32 @@ test('generated RDS instance IDs reject prefixes that AWS cannot provision', () 
   }
 });
 
+test('accepted control and cell RDS IDs leave room for a minimum-length restore', () => {
+  for (const environment of ['development', 'production']) {
+    const boundary = copy(topology);
+    boundary.environments[environment].prefix = 'a'.repeat(34);
+    assert.doesNotThrow(() => validateTopology(boundary));
+    const resources = inventory(environment);
+    const prefix = boundary.environments[environment].prefix;
+    resources.control.rdsInstanceId = `${prefix}-control-db-restore-abcdefgh`;
+    for (const cell of boundary.environments[environment].cells) {
+      resources.cells[cell.id].rdsInstanceId = `${prefix}-${cell.id}-db-restore-abcdefgh`;
+      assert.ok(resources.cells[cell.id].rdsInstanceId.length <= 63, `${environment}/${cell.id}`);
+    }
+    assert.doesNotThrow(() => validateInventory(boundary, environment, resources));
+    assert.equal(resources.cells['in-south'].rdsInstanceId.length, 63);
+    resources.cells['in-south'].rdsInstanceId += 'i';
+    assert.throws(() => validateInventory(boundary, environment, resources), /in-south RDS instance mismatch/);
+
+    const cellOverflow = copy(boundary);
+    cellOverflow.environments[environment].prefix = 'a'.repeat(35);
+    assert.throws(() => validateTopology(cellOverflow), new RegExp(`${environment} in-south RDS instance name is invalid`));
+    const controlOverflow = copy(boundary);
+    controlOverflow.environments[environment].prefix = 'a'.repeat(36);
+    assert.throws(() => validateTopology(controlOverflow), new RegExp(`${environment} control RDS instance name is invalid`));
+  }
+});
+
 test('rejects cross-environment reuse and strict processing claims', () => {
   const reused = copy(topology);
   reused.environments.production.prefix = reused.environments.development.prefix;
@@ -256,22 +282,20 @@ test('live gate verifies PostgreSQL origin identity and public CA for control an
 });
 
 test('restore inventory accepts only a same-cell replacement name', () => {
-  const restored = inventory('production');
-  restored.cells['in-south'].rdsInstanceId += '-restore-abcdefgh';
-  assert.doesNotThrow(() => validateInventory(topology, 'production', restored));
-  for (const suffix of ['-restore-short', '-restore-ABCDEFGH', '-other-abcdefgh']) {
-    const wrong = inventory('production');
-    wrong.cells['in-south'].rdsInstanceId += suffix;
-    assert.throws(() => validateInventory(topology, 'production', wrong), /RDS instance mismatch/);
+  for (const environment of ['development', 'production']) {
+    const targets = ['control', ...topology.environments[environment].cells.map(cell => cell.id)];
+    for (const target of targets) {
+      const resource = resources => target === 'control' ? resources.control : resources.cells[target];
+      const restored = inventory(environment);
+      resource(restored).rdsInstanceId += '-restore-abcdefgh';
+      assert.doesNotThrow(() => validateInventory(topology, environment, restored), `${environment}/${target}`);
+      for (const suffix of ['-restore-short', '-restore-ABCDEFGH', '-other-abcdefgh', '-restore-abcdefghijklmnopqrstuvwxy']) {
+        const wrong = inventory(environment);
+        resource(wrong).rdsInstanceId += suffix;
+        assert.throws(() => validateInventory(topology, environment, wrong), /RDS instance mismatch/, `${environment}/${target}/${suffix}`);
+      }
+    }
   }
-  const malformedTopology = copy(topology);
-  malformedTopology.environments.production.prefix = 'foo--bar';
-  const malformedRestore = inventory('production');
-  malformedRestore.control.rdsInstanceId = 'foo--bar-control-db-restore-abcdefgh';
-  for (const cell of malformedTopology.environments.production.cells) {
-    malformedRestore.cells[cell.id].rdsInstanceId = `foo--bar-${cell.id}-db`;
-  }
-  assert.throws(() => validateInventory(malformedTopology, 'production', malformedRestore), /RDS instance mismatch/);
 });
 
 test('derived Cloudflare names are bounded even when an RDS database name fits', () => {
