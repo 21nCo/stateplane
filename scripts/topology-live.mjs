@@ -7,6 +7,14 @@ const validCidr = (value, family) => {
   return parts.length === 2 && isIP(parts[0]) === family && /^\d+$/.test(parts[1]) && bits >= 0 && bits <= (family === 4 ? 32 : 128);
 };
 
+const validRestorableTime = (value, retention) => {
+  if (typeof value !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/.test(value)) return false;
+  const calendarDate = value.slice(0, 10);
+  const midnight = Date.parse(`${calendarDate}T00:00:00Z`);
+  const point = Date.parse(value);
+  return Number.isFinite(midnight) && new Date(midnight).toISOString().slice(0, 10) === calendarDate && Number.isFinite(point) && point <= Date.now() && point >= Date.now() - retention * 86_400_000;
+};
+
 export function assertApprovedIngress(label, instance, securityGroups, approvedCidrs) {
   const ids = instance?.VpcSecurityGroups?.map(group => group.VpcSecurityGroupId);
   if (!ids?.length || ids.some(id => typeof id !== 'string' || !id)) throw new Error(`${label}: RDS security groups missing`);
@@ -20,8 +28,12 @@ export function assertApprovedIngress(label, instance, securityGroups, approvedC
   for (const group of securityGroups) {
     if (!Array.isArray(group.IpPermissions)) throw new Error(`${label}: RDS security group rules unavailable`);
     for (const rule of group.IpPermissions) {
-      if (rule.IpProtocol !== '-1' && rule.IpProtocol !== 'tcp') continue;
-      if (rule.IpProtocol === '-1') throw new Error(`${label}: unapproved all-protocol RDS ingress`);
+      const protocol = String(rule.IpProtocol);
+      if (protocol === '-1') throw new Error(`${label}: unapproved all-protocol RDS ingress`);
+      if (protocol !== 'tcp' && protocol !== '6') {
+        if (['udp', '17', 'icmp', '1', 'icmpv6', '58'].includes(protocol)) continue;
+        throw new Error(`${label}: unknown RDS ingress protocol`);
+      }
       if (!Number.isInteger(rule.FromPort) || !Number.isInteger(rule.ToPort)) throw new Error(`${label}: invalid RDS ingress port range`);
       if (rule.FromPort > 5432 || rule.ToPort < 5432) continue;
       if (rule.FromPort !== 5432 || rule.ToPort !== 5432) throw new Error(`${label}: unapproved broad RDS ingress port range`);
@@ -45,6 +57,8 @@ export function assertLiveResources(label, environment, definition, resource, da
   if (!['rds-ca-rsa2048-g1', 'rds-ca-rsa4096-g1', 'rds-ca-ecc384-g1'].includes(instance.CACertificateIdentifier)) throw new Error(`${label}: RDS CA identifier unavailable or unsupported`);
   const retention = instance.BackupRetentionPeriod;
   if (!Number.isInteger(retention) || retention < (environment === 'production' ? 7 : 1)) throw new Error(`${label}: RDS backups/PITR disabled, invalid or below policy`);
+  const restorable = instance.LatestRestorableTime;
+  if (!validRestorableTime(restorable, retention)) throw new Error(`${label}: RDS PITR latest restorable time unavailable or invalid`);
   if (environment === 'production' && instance.DeletionProtection !== true) throw new Error(`${label}: production RDS deletion protection is disabled or unavailable`);
   if (hyperdrive?.id !== resource.hyperdriveId || hyperdrive.caching?.disabled !== true) throw new Error(`${label}: Hyperdrive cache is enabled or ID differs`);
   if (hyperdrive.origin_connection_limit !== definition.originConnectionLimit) throw new Error(`${label}: Hyperdrive origin connection limit differs`);

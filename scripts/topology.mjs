@@ -8,6 +8,11 @@ const regionId = /^[a-z]{2}-[a-z]+$/;
 const awsRegion = /^[a-z]{2}-[a-z]+-\d$/;
 const safeName = /^[a-z][a-z0-9-]*$/;
 const rdsDatabaseName = /^[a-z][a-z0-9_]{0,62}$/;
+const cellPlacement = {
+  'in-south': { awsRegion: 'ap-south-1', r2LocationHint: 'apac' },
+  'us-east': { awsRegion: 'us-east-1', r2LocationHint: 'enam' },
+  'eu-west': { awsRegion: 'eu-west-1', r2LocationHint: 'weur' }
+};
 const allowedKeys = (value, keys, label) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} must be an object`);
   for (const key of Object.keys(value)) if (!keys.includes(key)) throw new Error(`${label} has unsupported field ${key}`);
@@ -44,6 +49,7 @@ export function validateTopology(topology) {
     check(env.prefix, safeName, `${environment} prefix`);
     allowedKeys(env.control, ['awsRegion', 'database', 'originConnectionLimit'], `${environment} control`);
     check(env.control.awsRegion, awsRegion, `${environment} control region`);
+    if (env.control.awsRegion !== 'us-east-1') throw new Error(`${environment} control is mapped to the wrong provider region`);
     check(env.control.database, rdsDatabaseName, `${environment} control database`);
     if (!Number.isSafeInteger(env.control.originConnectionLimit) || env.control.originConnectionLimit < 1) throw new Error(`${environment} control connection limit is invalid`);
     if (!Array.isArray(env.cells) || env.cells.length === 0) throw new Error(`${environment} needs cells`);
@@ -56,9 +62,9 @@ export function validateTopology(topology) {
       allowedKeys(cell, ['id', 'awsRegion', 'r2LocationHint', 'originConnectionLimit'], `${environment} cell`);
       check(cell.id, regionId, `${environment} cell ID`);
       check(cell.awsRegion, awsRegion, `${environment} cell AWS region`);
-      if (!['apac', 'enam', 'weur'].includes(cell.r2LocationHint)) throw new Error(`${environment} cell R2 hint is invalid`);
+      if (cell.r2LocationHint !== cellPlacement[cell.id]?.r2LocationHint) throw new Error(`${environment} ${cell.id} R2 hint differs from placement policy`);
       if (!Number.isSafeInteger(cell.originConnectionLimit) || cell.originConnectionLimit < 1) throw new Error(`${environment} cell connection limit is invalid`);
-      if ({ 'in-south': 'ap-south-1', 'us-east': 'us-east-1', 'eu-west': 'eu-west-1' }[cell.id] !== cell.awsRegion) throw new Error(`${environment} ${cell.id} is mapped to the wrong provider region`);
+      if (cellPlacement[cell.id]?.awsRegion !== cell.awsRegion) throw new Error(`${environment} ${cell.id} is mapped to the wrong provider region`);
       const resource = names(env, cell);
       check(resource.database, rdsDatabaseName, `${environment} ${cell.id} RDS database`);
       all.databases.push(`${cell.awsRegion}/${resource.database}`);
