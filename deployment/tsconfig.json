@@ -2,9 +2,10 @@
   "extends": "../tsconfig.base.json",
   "compilerOptions": {
     "module": "ESNext",
+    "lib": ["ES2022"],
     "moduleResolution": "Bundler",
     "noEmit": true,
-    "types": ["../app/node_modules/@cloudflare/workers-types", "node"]
+    "types": ["@cloudflare/workers-types", "node"]
   },
   "include": ["workers/**/*.ts"]
 }

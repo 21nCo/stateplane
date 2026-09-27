@@ -1,4 +1,4 @@
-import { readFile, mkdir, writeFile } from 'node:fs/promises';
+import { readFile, mkdir, writeFile, access } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
@@ -9,6 +9,10 @@ const run = promisify(execFile);
 const root = resolve(import.meta.dirname, '..');
 export async function dryRunTopology(topology, { projectRoot = root, runWrangler = run } = {}) {
   const wrangler = resolve(projectRoot, 'app/node_modules/.bin/wrangler');
+  if (runWrangler === run) {
+    try { await access(resolve(projectRoot, 'app/.svelte-kit/cloudflare/_worker.js')); }
+    catch { throw new Error('Build @stateplane/app before topology dry-run'); }
+  }
   let count = 0;
   for (const [environment, env] of Object.entries(topology.environments)) {
     const out = resolve(projectRoot, '.data/topology-dry-run', environment);
@@ -19,7 +23,7 @@ export async function dryRunTopology(topology, { projectRoot = root, runWrangler
       control: { hyperdriveId: ids[0].repeat(32), rdsInstanceId: `${env.prefix}-control-db`, network: 'public-tls' },
       cells: Object.fromEntries(env.cells.map((cell, index) => [cell.id, { hyperdriveId: ids[index + 1].repeat(32), rdsInstanceId: `${env.prefix}-${cell.id}-db`, network: 'public-tls' }]))
     };
-    const configs = renderTopology(topology, environment, inventory, out);
+    const configs = renderTopology(topology, environment, inventory, out, projectRoot);
     for (const [file, config] of Object.entries(configs)) {
       const path = join(out, file);
       await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });

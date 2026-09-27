@@ -8,6 +8,7 @@ const regionId = /^[a-z]{2}-[a-z]+$/;
 const awsRegion = /^[a-z]{2}-[a-z]+-\d$/;
 const safeName = /^[a-z][a-z0-9-]*$/;
 const rdsDatabaseName = /^[a-z][a-z0-9_]{0,62}$/;
+const cloudflareName = /^[a-z][a-z0-9-]{0,62}$/;
 const cellPlacement = {
   'in-south': { awsRegion: 'ap-south-1', r2LocationHint: 'apac' },
   'us-east': { awsRegion: 'us-east-1', r2LocationHint: 'enam' },
@@ -38,44 +39,68 @@ const names = (env, cell) => {
   };
 };
 
+function assertDerivedNames(environment, resource) {
+  check(resource.database, rdsDatabaseName, `${environment} RDS database`);
+  for (const [kind, name] of Object.entries(resource)) {
+    if (kind !== 'database' && name !== undefined) check(name, cloudflareName, `${environment} ${kind} name`);
+  }
+}
+
+function validateEnvironment(environment, env, all) {
+  allowedKeys(env, ['prefix', 'control', 'cells'], environment);
+  check(env.prefix, safeName, `${environment} prefix`);
+  allowedKeys(env.control, ['awsRegion', 'database', 'originConnectionLimit'], `${environment} control`);
+  check(env.control.awsRegion, awsRegion, `${environment} control region`);
+  if (env.control.awsRegion !== 'us-east-1') throw new Error(`${environment} control is mapped to the wrong provider region`);
+  check(env.control.database, rdsDatabaseName, `${environment} control database`);
+  if (!Number.isSafeInteger(env.control.originConnectionLimit) || env.control.originConnectionLimit < 1) throw new Error(`${environment} control connection limit is invalid`);
+  if (!Array.isArray(env.cells) || env.cells.length === 0) throw new Error(`${environment} needs cells`);
+  const expected = environment === 'production' ? ['in-south', 'us-east'] : ['eu-west', 'in-south', 'us-east'];
+  const actual = env.cells.map(cell => cell?.id);
+  actual.sort((a, b) => String(a).localeCompare(String(b)));
+  if (actual.join(',') !== expected.join(',')) throw new Error(`${environment} has incomplete cell pattern`);
+  assertDerivedNames(environment, names(env));
+  const directory = `${env.prefix}-directory`;
+  check(directory, cloudflareName, `${environment} directory name`);
+  all.databases.push(`${env.control.awsRegion}/${env.control.database}`);
+  all.hyperdrives.push(names(env).hyperdrive);
+  all.workers.push(names(env).api, names(env).mcp, directory);
+  for (const cell of env.cells) validateCell(environment, env, cell, all);
+}
+
+function validateCell(environment, env, cell, all) {
+  allowedKeys(cell, ['id', 'awsRegion', 'r2LocationHint', 'originConnectionLimit'], `${environment} cell`);
+  check(cell.id, regionId, `${environment} cell ID`);
+  check(cell.awsRegion, awsRegion, `${environment} cell AWS region`);
+  if (cell.r2LocationHint !== cellPlacement[cell.id]?.r2LocationHint) throw new Error(`${environment} ${cell.id} R2 hint differs from placement policy`);
+  if (!Number.isSafeInteger(cell.originConnectionLimit) || cell.originConnectionLimit < 1) throw new Error(`${environment} cell connection limit is invalid`);
+  if (cellPlacement[cell.id]?.awsRegion !== cell.awsRegion) throw new Error(`${environment} ${cell.id} is mapped to the wrong provider region`);
+  const resource = names(env, cell);
+  assertDerivedNames(`${environment} ${cell.id}`, resource);
+  all.databases.push(`${cell.awsRegion}/${resource.database}`);
+  all.hyperdrives.push(resource.hyperdrive);
+  all.buckets.push(resource.bucket);
+  all.queues.push(resource.queue, resource.deadLetterQueue);
+  all.workers.push(resource.api, resource.mcp, resource.jobs);
+}
+
 export function validateTopology(topology) {
   allowedKeys(topology, ['version', 'provider', 'environments'], 'topology');
   if (topology.version !== 1 || topology.provider !== 'aws-rds-postgresql') throw new Error('Unsupported topology version or provider');
   allowedKeys(topology.environments, ['development', 'production'], 'environments');
   if (Object.keys(topology.environments).length !== 2) throw new Error('Development and production are required');
   const all = { databases: [], hyperdrives: [], buckets: [], queues: [], workers: [] };
-  for (const [environment, env] of Object.entries(topology.environments)) {
-    allowedKeys(env, ['prefix', 'control', 'cells'], environment);
-    check(env.prefix, safeName, `${environment} prefix`);
-    allowedKeys(env.control, ['awsRegion', 'database', 'originConnectionLimit'], `${environment} control`);
-    check(env.control.awsRegion, awsRegion, `${environment} control region`);
-    if (env.control.awsRegion !== 'us-east-1') throw new Error(`${environment} control is mapped to the wrong provider region`);
-    check(env.control.database, rdsDatabaseName, `${environment} control database`);
-    if (!Number.isSafeInteger(env.control.originConnectionLimit) || env.control.originConnectionLimit < 1) throw new Error(`${environment} control connection limit is invalid`);
-    if (!Array.isArray(env.cells) || env.cells.length === 0) throw new Error(`${environment} needs cells`);
-    const expected = environment === 'production' ? ['in-south', 'us-east'] : ['in-south', 'us-east', 'eu-west'];
-    if (env.cells.map(cell => cell.id).sort().join(',') !== expected.sort().join(',')) throw new Error(`${environment} has incomplete cell pattern`);
-    all.databases.push(`${env.control.awsRegion}/${env.control.database}`);
-    all.hyperdrives.push(names(env).hyperdrive);
-    all.workers.push(names(env).api, names(env).mcp, `${env.prefix}-directory`);
-    for (const cell of env.cells) {
-      allowedKeys(cell, ['id', 'awsRegion', 'r2LocationHint', 'originConnectionLimit'], `${environment} cell`);
-      check(cell.id, regionId, `${environment} cell ID`);
-      check(cell.awsRegion, awsRegion, `${environment} cell AWS region`);
-      if (cell.r2LocationHint !== cellPlacement[cell.id]?.r2LocationHint) throw new Error(`${environment} ${cell.id} R2 hint differs from placement policy`);
-      if (!Number.isSafeInteger(cell.originConnectionLimit) || cell.originConnectionLimit < 1) throw new Error(`${environment} cell connection limit is invalid`);
-      if (cellPlacement[cell.id]?.awsRegion !== cell.awsRegion) throw new Error(`${environment} ${cell.id} is mapped to the wrong provider region`);
-      const resource = names(env, cell);
-      check(resource.database, rdsDatabaseName, `${environment} ${cell.id} RDS database`);
-      all.databases.push(`${cell.awsRegion}/${resource.database}`);
-      all.hyperdrives.push(resource.hyperdrive);
-      all.buckets.push(resource.bucket);
-      all.queues.push(resource.queue, resource.deadLetterQueue);
-      all.workers.push(resource.api, resource.mcp, resource.jobs);
-    }
-  }
+  for (const [environment, env] of Object.entries(topology.environments)) validateEnvironment(environment, env, all);
   for (const [label, values] of Object.entries(all)) unique(values, label);
   return topology;
+}
+
+function checkRdsInstanceId(value, expected, label) {
+  if (value === expected) return;
+  // Restores use a new RDS instance in the same cell; the live gate still proves
+  // database, region, endpoint and Hyperdrive identity before cutover.
+  const restored = new RegExp(`^${expected}-restore-[a-z0-9]{8,24}$`);
+  if (typeof value !== 'string' || value.length > 63 || !restored.test(value)) throw new Error(`${label} RDS instance mismatch`);
 }
 
 export function validateInventory(topology, environment, inventory) {
@@ -89,7 +114,7 @@ export function validateInventory(topology, environment, inventory) {
   };
   allowedKeys(inventory.control, ['hyperdriveId', 'rdsInstanceId', 'network', 'vpcServiceId'], 'control inventory');
   check(inventory.control.hyperdriveId, hexId, 'control Hyperdrive ID');
-  if (inventory.control.rdsInstanceId !== `${env.prefix}-control-db`) throw new Error('Control RDS instance mismatch');
+  checkRdsInstanceId(inventory.control.rdsInstanceId, `${env.prefix}-control-db`, 'Control');
   network(inventory.control, 'control');
   allowedKeys(inventory.cells, env.cells.map(cell => cell.id), 'cell inventory');
   if (Object.keys(inventory.cells).length !== env.cells.length) throw new Error('Missing cell inventory');
@@ -97,7 +122,7 @@ export function validateInventory(topology, environment, inventory) {
   for (const cell of env.cells) {
     allowedKeys(inventory.cells[cell.id], ['hyperdriveId', 'rdsInstanceId', 'network', 'vpcServiceId'], `${cell.id} inventory`);
     check(inventory.cells[cell.id].hyperdriveId, hexId, `${cell.id} Hyperdrive ID`);
-    if (inventory.cells[cell.id].rdsInstanceId !== `${env.prefix}-${cell.id}-db`) throw new Error(`${cell.id} RDS instance mismatch`);
+    checkRdsInstanceId(inventory.cells[cell.id].rdsInstanceId, `${env.prefix}-${cell.id}-db`, cell.id);
     network(inventory.cells[cell.id], cell.id);
     ids.push(inventory.cells[cell.id].hyperdriveId);
   }
@@ -112,12 +137,12 @@ export function validateInventory(topology, environment, inventory) {
   return inventory;
 }
 
-const workerPath = (out, path) => relative(out, resolve(root, path));
+const workerPath = (out, path, projectRoot) => relative(out, resolve(projectRoot, path));
 const service = (binding, name) => ({ binding, service: name });
-const common = (out, name, main, role, environment) => ({
-  $schema: workerPath(out, 'app/node_modules/wrangler/config-schema.json'),
+const common = (out, name, main, role, environment, projectRoot) => ({
+  $schema: workerPath(out, 'app/node_modules/wrangler/config-schema.json', projectRoot),
   name,
-  main: workerPath(out, main),
+  main: workerPath(out, main, projectRoot),
   compatibility_date: '2026-09-25',
   compatibility_flags: ['nodejs_compat'],
   workers_dev: false,
@@ -125,7 +150,7 @@ const common = (out, name, main, role, environment) => ({
 });
 const binding = (id) => [{ binding: 'AUTHORITY', id }];
 
-export function renderTopology(topology, environment, inventory, out) {
+export function renderTopology(topology, environment, inventory, out, projectRoot = root) {
   validateTopology(topology);
   validateInventory(topology, environment, inventory);
   const env = topology.environments[environment];
@@ -134,19 +159,19 @@ export function renderTopology(topology, environment, inventory, out) {
   const apiBindings = env.cells.map(cell => service(`CELL_${cell.id.replaceAll('-', '_').toUpperCase()}_API`, names(env, cell).api));
   const mcpBindings = env.cells.map(cell => service(`CELL_${cell.id.replaceAll('-', '_').toUpperCase()}_MCP`, names(env, cell).mcp));
   output['app.json'] = {
-    ...common(out, local.api, 'app/.svelte-kit/cloudflare/_worker.js', 'gateway-app', environment),
-    assets: { binding: 'ASSETS', directory: workerPath(out, 'app/.svelte-kit/cloudflare') },
+    ...common(out, local.api, 'app/.svelte-kit/cloudflare/_worker.js', 'gateway-app', environment, projectRoot),
+    assets: { binding: 'ASSETS', directory: workerPath(out, 'app/.svelte-kit/cloudflare', projectRoot) },
     services: [service('DIRECTORY', `${env.prefix}-directory`), ...apiBindings]
   };
   output['mcp.json'] = {
-    ...common(out, local.mcp, 'deployment/workers/gateway.ts', 'gateway-mcp', environment),
+    ...common(out, local.mcp, 'deployment/workers/gateway.ts', 'gateway-mcp', environment, projectRoot),
     services: [service('DIRECTORY', `${env.prefix}-directory`), ...mcpBindings]
   };
   if (inventory.routes) {
     for (const [key, route] of Object.entries(inventory.routes)) output[`${key}.json`].routes = [{ pattern: new URL(route).host, custom_domain: true }];
   }
   output['directory.json'] = {
-    ...common(out, `${env.prefix}-directory`, 'deployment/workers/directory.ts', 'directory', environment),
+    ...common(out, `${env.prefix}-directory`, 'deployment/workers/directory.ts', 'directory', environment, projectRoot),
     hyperdrive: binding(inventory.control.hyperdriveId)
   };
   for (const cell of env.cells) {
@@ -154,7 +179,7 @@ export function renderTopology(topology, environment, inventory, out) {
     const id = inventory.cells[cell.id].hyperdriveId;
     const suffix = cell.id;
     const regional = (name, role) => ({
-      ...common(out, name, 'deployment/workers/cell.ts', role, environment),
+      ...common(out, name, 'deployment/workers/cell.ts', role, environment, projectRoot),
       placement: { mode: 'smart' },
       vars: { STATEPLANE_ENV: environment, STATEPLANE_ROLE: role, STATEPLANE_CELL: cell.id },
       hyperdrive: binding(id),
@@ -164,7 +189,7 @@ export function renderTopology(topology, environment, inventory, out) {
     output[`${suffix}-api.json`] = regional(n.api, 'cell-api');
     output[`${suffix}-mcp.json`] = regional(n.mcp, 'cell-mcp');
     output[`${suffix}-jobs.json`] = {
-      ...common(out, n.jobs, 'deployment/workers/jobs.ts', 'cell-jobs', environment),
+      ...common(out, n.jobs, 'deployment/workers/jobs.ts', 'cell-jobs', environment, projectRoot),
       placement: { mode: 'smart' },
       vars: { STATEPLANE_ENV: environment, STATEPLANE_ROLE: 'cell-jobs', STATEPLANE_CELL: cell.id },
       hyperdrive: binding(id),
@@ -192,5 +217,10 @@ async function main() {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main().catch(error => { console.error(error.message); process.exitCode = 1; });
+  try {
+    await main();
+  } catch (error) {
+    console.error(error.message);
+    process.exitCode = 1;
+  }
 }

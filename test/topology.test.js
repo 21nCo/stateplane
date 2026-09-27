@@ -15,8 +15,8 @@ const approvedCidrs = { ipv4_cidrs: ['203.0.113.0/24', '198.51.100.0/24'], ipv6_
 const approvedGroups = [{ GroupId: groupId, IpPermissions: [{ IpProtocol: 'tcp', FromPort: 5432, ToPort: 5432, IpRanges: approvedCidrs.ipv4_cidrs.map(CidrIp => ({ CidrIp })) }] }];
 const recentRestorableTime = new Date(Date.now() - 60_000).toISOString();
 const assertLiveResources = (label, environment, definition, resource, database, hyperdrive, instance) =>
-  assertRawLiveResources(label, environment, definition, resource, database, hyperdrive,
-    { CACertificateIdentifier: 'rds-ca-rsa2048-g1', DeletionProtection: true, LatestRestorableTime: recentRestorableTime, ...instance, NetworkType: 'IPV4', VpcSecurityGroups: [{ VpcSecurityGroupId: groupId }] }, approvedGroups, approvedCidrs);
+  assertRawLiveResources({ label, environment, definition, resource, database, hyperdrive,
+    instance: { CACertificateIdentifier: 'rds-ca-rsa2048-g1', DeletionProtection: true, LatestRestorableTime: recentRestorableTime, ...instance, NetworkType: 'IPV4', VpcSecurityGroups: [{ VpcSecurityGroupId: groupId }] }, securityGroups: approvedGroups, approvedCidrs });
 const copy = value => structuredClone(value);
 const inventory = environment => ({
   environment,
@@ -60,6 +60,9 @@ test('synthetic dry-run preserves a previously rendered operator config', async 
     const synthetic = JSON.parse(await readFile(join(projectRoot, '.data/topology-dry-run/production/app.json'), 'utf8'));
     assert.equal(synthetic.routes, undefined);
     assert.notEqual(synthetic.services[0].service, undefined);
+    assert.equal(synthetic.main, '../../../app/.svelte-kit/cloudflare/_worker.js');
+    assert.equal(synthetic.$schema, '../../../app/node_modules/wrangler/config-schema.json');
+    assert.equal(synthetic.assets.directory, '../../../app/.svelte-kit/cloudflare');
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -101,7 +104,7 @@ test('all RDS PostgreSQL database names are provisionable and match the regional
   assert.equal(new Set(names).size, 7);
   const tooLong = copy(topology);
   tooLong.environments.development.prefix = `stateplane-${'a'.repeat(55)}`;
-  assert.throws(() => validateTopology(tooLong), /RDS database is invalid/);
+  assert.throws(() => validateTopology(tooLong), /name is invalid|RDS database is invalid/);
   const badControl = copy(topology);
   badControl.environments.production.control.database = 'bad-name';
   assert.throws(() => validateTopology(badControl), /control database is invalid/);
@@ -130,6 +133,9 @@ test('requires complete isolated Hyperdrive inventory and rejects secret-shaped 
   untrustedPrivate.cells['in-south'].network = 'workers-vpc';
   untrustedPrivate.cells['in-south'].vpcServiceId = '550e8400-e29b-41d4-a716-446655440000';
   assert.throws(() => validateInventory(topology, 'development', untrustedPrivate), /unsupported until private CA trust is proven/);
+  const publicVpc = inventory('development');
+  publicVpc.cells['in-south'].vpcServiceId = '550e8400-e29b-41d4-a716-446655440000';
+  assert.throws(() => validateInventory(topology, 'development', publicVpc), /cannot include a VPC service/);
 });
 
 test('live gate rejects stale Hyperdrive caching, wrong origin and inadequate backup retention', () => {
@@ -220,9 +226,47 @@ test('live gate verifies PostgreSQL origin identity and public CA for control an
       assert.throws(() => checkLive({ ...hyperdrive, origin: { ...hyperdrive.origin, port: 3306 } }), /origin port mismatch/, `${environment}/${label}: MySQL port`);
       assert.throws(() => checkLive(hyperdrive, { ...instance, Endpoint: { Address: host, Port: 3306 } }), /endpoint port mismatch/, `${environment}/${label}: RDS port`);
 
+      assert.throws(() => checkLive(hyperdrive, { ...instance, DBInstanceIdentifier: 'wrong-db' }), /RDS identity mismatch/);
+      assert.throws(() => checkLive(hyperdrive, { ...instance, Engine: 'mysql' }), /RDS identity mismatch/);
+      assert.throws(() => checkLive(hyperdrive, { ...instance, DBName: 'other' }), /RDS identity mismatch/);
+      assert.throws(() => checkLive(hyperdrive, { ...instance, DBInstanceStatus: 'creating' }), /not available/);
+      assert.throws(() => checkLive(hyperdrive, { ...instance, CACertificateIdentifier: 'unsupported' }), /CA identifier/);
+      assert.throws(() => checkLive({ ...hyperdrive, id: 'f'.repeat(32) }), /ID differs/);
+      assert.throws(() => checkLive({ ...hyperdrive, origin_connection_limit: 500 }), /connection limit differs/);
+      assert.throws(() => checkLive(hyperdrive, { ...instance, Endpoint: { Address: 'other.us-west-1.rds.amazonaws.com', Port: 5432 } }), /endpoint region mismatch/);
+      assert.throws(() => checkLive(hyperdrive, { ...instance, PubliclyAccessible: false }), /public Hyperdrive origin mismatch/);
+      assert.throws(() => checkLive({ ...hyperdrive, origin: { ...hyperdrive.origin, host: 'other.example' } }), /public Hyperdrive origin mismatch/);
+      assert.throws(() => checkLive({ ...hyperdrive, mtls: { sslmode: 'require', ca_certificate_id: caCertificateId } }), /verify origin TLS/);
       assert.throws(() => checkLive(hyperdrive, instance, { ...resource, network: 'workers-vpc' }), /unsupported network mode/);
     }
   }
+});
+
+test('restore inventory accepts only a same-cell replacement name', () => {
+  const restored = inventory('production');
+  restored.cells['in-south'].rdsInstanceId += '-restore-abcdefgh';
+  assert.doesNotThrow(() => validateInventory(topology, 'production', restored));
+  for (const suffix of ['-restore-short', '-restore-ABCDEFGH', '-other-abcdefgh']) {
+    const wrong = inventory('production');
+    wrong.cells['in-south'].rdsInstanceId += suffix;
+    assert.throws(() => validateInventory(topology, 'production', wrong), /RDS instance mismatch/);
+  }
+});
+
+test('derived Cloudflare names are bounded even when an RDS database name fits', () => {
+  const long = copy(topology);
+  long.environments.development.prefix = `a${'b'.repeat(42)}`;
+  assert.match(cellDatabaseName(long.environments.development, long.environments.development.cells[0]), /^[a-z][a-z0-9_]{0,62}$/);
+  assert.throws(() => validateTopology(long), /name is invalid/);
+});
+
+test('PITR rejects a stalled latest-restorable point independent of retention', () => {
+  const env = topology.environments.production;
+  const resource = inventory('production').control;
+  const host = 'sta4.abcdefgh.us-east-1.rds.amazonaws.com';
+  const instance = { DBInstanceIdentifier: resource.rdsInstanceId, Engine: 'postgres', DBName: env.control.database, DBInstanceStatus: 'available', BackupRetentionPeriod: 7, PubliclyAccessible: true, Endpoint: { Address: host, Port: 5432 }, LatestRestorableTime: new Date(Date.now() - 2 * 60 * 60_000).toISOString() };
+  const hyperdrive = { id: resource.hyperdriveId, caching: { disabled: true }, origin_connection_limit: 5, mtls: { sslmode: 'verify-full', ca_certificate_id: caCertificateId }, origin: { host, port: 5432, scheme: 'postgres', database: env.control.database } };
+  assert.throws(() => assertLiveResources('control', 'production', env.control, resource, env.control.database, hyperdrive, instance), /PITR latest restorable time/);
 });
 
 test('public RDS ingress is limited to current approved Cloudflare ranges for every control and cell', () => {
@@ -237,15 +281,19 @@ test('public RDS ingress is limited to current approved Cloudflare ranges for ev
       const dualGroup = [{ ...approvedGroups[0], IpPermissions: [{ ...approvedGroups[0].IpPermissions[0], Ipv6Ranges: approvedCidrs.ipv6_cidrs.map(CidrIpv6 => ({ CidrIpv6 })) }] }];
       assert.doesNotThrow(() => check(dualGroup, approvedCidrs, { ...instance, NetworkType: 'DUAL' }), `${environment}/${label}: complete dual-stack ingress`);
       assert.throws(() => check(approvedGroups, approvedCidrs, { ...instance, NetworkType: 'DUAL' }), /coverage incomplete/, `${environment}/${label}: missing IPv6 ingress`);
+      assert.throws(() => check(dualGroup, { ...approvedCidrs, ipv6_cidrs: [] }, { ...instance, NetworkType: 'DUAL' }), /ranges unavailable/, `${environment}/${label}: DUAL requires nonempty IPv6 inventory`);
+      assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [approvedGroups[0].IpPermissions[0], { IpProtocol: 'udp', FromPort: 0, ToPort: 65535, IpRanges: [{ CidrIp: '0.0.0.0/0' }] }] }]), /unapproved/, `${environment}/${label}: world-open UDP`);
+      assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [approvedGroups[0].IpPermissions[0], { IpProtocol: 'tcp', FromPort: 22, ToPort: 22, IpRanges: [{ CidrIp: '0.0.0.0/0' }] }] }]), /unapproved/, `${environment}/${label}: off-port TCP`);
+      assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [approvedGroups[0].IpPermissions[0], { IpProtocol: 'icmp', FromPort: -1, ToPort: -1, IpRanges: [{ CidrIp: '0.0.0.0/0' }] }] }]), /unapproved/, `${environment}/${label}: world-open ICMP`);
       assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ ...approvedGroups[0].IpPermissions[0], IpRanges: [{ CidrIp: '0.0.0.0/0' }] }] }]), /unapproved/);
       assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ ...approvedGroups[0].IpPermissions[0], IpRanges: [], Ipv6Ranges: [{ CidrIpv6: '::/0' }] }] }]), /unapproved/);
       assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ ...approvedGroups[0].IpPermissions[0], IpRanges: [{ CidrIp: '192.0.2.0/24' }] }] }]), /unapproved/);
       assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ IpProtocol: '-1', IpRanges: [{ CidrIp: '0.0.0.0/0' }] }] }]), /unapproved/);
       assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ IpProtocol: '-1', IpRanges: approvedCidrs.ipv4_cidrs.map(CidrIp => ({ CidrIp })) }] }]), /unapproved/, `${environment}/${label}: approved CIDRs cannot use all protocols`);
-      assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ IpProtocol: 'tcp', FromPort: 0, ToPort: 65535, IpRanges: approvedCidrs.ipv4_cidrs.map(CidrIp => ({ CidrIp })) }] }]), /broad RDS ingress port range/, `${environment}/${label}: broad TCP range`);
+      assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ IpProtocol: 'tcp', FromPort: 0, ToPort: 65535, IpRanges: approvedCidrs.ipv4_cidrs.map(CidrIp => ({ CidrIp })) }] }]), /unapproved RDS ingress protocol or port range/, `${environment}/${label}: broad TCP range`);
       assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [approvedGroups[0].IpPermissions[0], { IpProtocol: '6', FromPort: 5432, ToPort: 5432, IpRanges: [{ CidrIp: '0.0.0.0/0' }] }] }]), /unapproved RDS port 5432 ingress/, `${environment}/${label}: numeric TCP cannot bypass range checks`);
       assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [approvedGroups[0].IpPermissions[0], { IpProtocol: 6, FromPort: 5432, ToPort: 5432, IpRanges: [{ CidrIp: '0.0.0.0/0' }] }] }]), /unapproved RDS port 5432 ingress/, `${environment}/${label}: numeric protocol value cannot bypass range checks`);
-      assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [approvedGroups[0].IpPermissions[0], { IpProtocol: 'unknown', FromPort: 5432, ToPort: 5432, IpRanges: [{ CidrIp: '0.0.0.0/0' }] }] }]), /unknown RDS ingress protocol/, `${environment}/${label}: unknown protocol cannot bypass range checks`);
+      assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [approvedGroups[0].IpPermissions[0], { IpProtocol: 'unknown', FromPort: 5432, ToPort: 5432, IpRanges: [{ CidrIp: '0.0.0.0/0' }] }] }]), /unapproved RDS ingress protocol or port range/, `${environment}/${label}: unknown protocol cannot bypass range checks`);
       assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ IpProtocol: 'tcp', FromPort: 5432, ToPort: 5432, UserIdGroupPairs: [{ GroupId: 'sg-other' }] }] }]), /unapproved/);
       assert.throws(() => check([], approvedCidrs), /inventory incomplete/);
       assert.throws(() => check(approvedGroups, null), /ranges unavailable/);

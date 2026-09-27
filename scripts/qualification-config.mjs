@@ -10,6 +10,8 @@ if (!environment || !topology.environments[environment].cells.some(cell => cell.
   console.error('Usage: node scripts/qualification-config.mjs sta-4-<head>-<dev|prod>-<cell> <disposable-hyperdrive-id>');
   process.exit(2);
 }
+const probeDatabase = `sta4_${match[0].slice(6, 22)}_${match[1]}_${match[2].replaceAll('-', '_')}`;
+const probeRole = `sta4_probe_${match[0].slice(6, 22)}`;
 const out = resolve(root, '.data/qualification');
 await mkdir(out, { recursive: true });
 const config = {
@@ -20,10 +22,10 @@ const config = {
   compatibility_flags: ['nodejs_compat'],
   workers_dev: false,
   hyperdrive: [{ binding: 'AUTHORITY', id: hyperdriveId }],
-  vars: { STATEPLANE_DISPOSABLE: '1' },
+  vars: { STATEPLANE_DISPOSABLE: '1', STATEPLANE_PROBE_DATABASE: probeDatabase, STATEPLANE_PROBE_ROLE: probeRole },
   previews: {
     hyperdrive: [{ binding: 'AUTHORITY', id: hyperdriveId }],
-    vars: { STATEPLANE_DISPOSABLE: '1' }
+    vars: { STATEPLANE_DISPOSABLE: '1', STATEPLANE_PROBE_DATABASE: probeDatabase, STATEPLANE_PROBE_ROLE: probeRole }
   }
 };
 await writeFile(resolve(out, `${name}.json`), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });

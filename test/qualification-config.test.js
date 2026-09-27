@@ -9,7 +9,7 @@ import { promisify } from 'node:util';
 const run = promisify(execFile);
 const root = resolve(import.meta.dirname, '..');
 const script = resolve(root, 'scripts/qualification-config.mjs');
-const wrangler = resolve(root, 'app/node_modules/.bin/wrangler');
+const pnpm = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
 const head = randomBytes(20).toString('hex');
 const hyperdriveId = 'a'.repeat(32);
 
@@ -24,16 +24,16 @@ test('full-head qualification configs dry-run for every declared target cell', {
       const bundlePath = resolve(root, '.data/qualification/bundles', environment, cell.id);
       try {
         const { stdout } = await run(process.execPath, [script, name, id]);
-        assert.equal(stdout.trim(), `.data/qualification/${name}.json`);
+        assert.equal(stdout.trim().replaceAll('\\', '/'), `.data/qualification/${name}.json`);
         const config = JSON.parse(await readFile(configPath));
         assert.equal(config.name, name);
         assert.ok(name.length <= 63);
         assert.deepEqual(config.hyperdrive, [{ binding: 'AUTHORITY', id }]);
         assert.deepEqual(config.previews.hyperdrive, config.hyperdrive);
-        assert.deepEqual(config.previews.vars, { STATEPLANE_DISPOSABLE: '1' });
+        assert.deepEqual(config.previews.vars, { STATEPLANE_DISPOSABLE: '1', STATEPLANE_PROBE_DATABASE: `sta4_${head.slice(0, 16)}_${environment === 'development' ? 'dev' : 'prod'}_${cell.id.replaceAll('-', '_')}`, STATEPLANE_PROBE_ROLE: `sta4_probe_${head.slice(0, 16)}` });
         assert.equal(JSON.stringify(config).includes('password'), false);
         retained.push({ environment, cell: cell.id, name: config.name, id: config.previews.hyperdrive[0].id });
-        await run(wrangler, ['deploy', '--config', configPath, '--dry-run', '--outdir', bundlePath], { maxBuffer: 1024 * 1024 });
+        await run(pnpm, ['--filter', '@stateplane/app', 'exec', 'wrangler', 'deploy', '--config', configPath, '--dry-run', '--outdir', bundlePath], { maxBuffer: 1024 * 1024 });
       } finally {
         await rm(configPath, { force: true });
         await rm(bundlePath, { recursive: true, force: true });

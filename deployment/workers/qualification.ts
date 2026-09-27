@@ -4,6 +4,8 @@ interface Env {
   AUTHORITY: Hyperdrive;
   PROBE_TOKEN: string;
   STATEPLANE_DISPOSABLE: string;
+  STATEPLANE_PROBE_DATABASE: string;
+  STATEPLANE_PROBE_ROLE: string;
 }
 
 class QualificationFailure extends Error {
@@ -24,10 +26,10 @@ async function authorized(request: Request, expected: string): Promise<boolean> 
   return difference === 0;
 }
 
-async function probe(connectionString: string) {
+async function probe(connectionString: string, expectedDatabase: string, expectedRole: string) {
   const id = crypto.randomUUID();
-  const writer = new Client({ connectionString, connectionTimeoutMillis: 5000 });
-  const reader = new Client({ connectionString, connectionTimeoutMillis: 5000 });
+  const writer = new Client({ connectionString, connectionTimeoutMillis: 5000, query_timeout: 5000 });
+  const reader = new Client({ connectionString, connectionTimeoutMillis: 5000, query_timeout: 5000 });
   const start = Date.now();
   let writerConnected = false;
   let rowMayExist = false;
@@ -37,9 +39,12 @@ async function probe(connectionString: string) {
   try {
     await writer.connect();
     writerConnected = true;
+    stage = 'target-identity';
+    const identity = await writer.query('SELECT current_database() AS database, current_user AS role');
+    if (identity.rows[0]?.database !== expectedDatabase || identity.rows[0]?.role !== expectedRole) throw new Error('Disposable target identity mismatch');
     stage = 'pgvector-extension';
     const extension = await writer.query("SELECT extversion FROM pg_extension WHERE extname = 'vector'");
-    if (!extension.rows[0]) throw new Error('pgvector is not installed');
+    if (typeof extension.rows[0]?.extversion !== 'string' || !extension.rows[0].extversion) throw new Error('pgvector is not installed');
     stage = 'pgvector-distance';
     const vector = await writer.query("SELECT '[1,0,0]'::vector <-> '[0,1,0]'::vector AS distance");
     const distance: unknown = vector.rows[0]?.distance;
@@ -48,18 +53,27 @@ async function probe(connectionString: string) {
     await writer.query('CREATE TABLE IF NOT EXISTS stateplane_qualification (probe_id uuid PRIMARY KEY, value integer NOT NULL)');
     stage = 'transaction-begin';
     await writer.query('BEGIN');
+    let insertFailed = false;
     try {
       stage = 'transaction-insert';
       await writer.query('SET LOCAL statement_timeout = 5000');
+      rowMayExist = true;
       await writer.query('INSERT INTO stateplane_qualification (probe_id, value) VALUES ($1, 99)', [id]);
-    } finally {
+    } catch {
+      failureStages.push(`probe:${stage}`);
+      insertFailed = true;
+    }
+    try {
       stage = 'transaction-rollback';
       await writer.query('ROLLBACK');
+    } catch {
+      failureStages.push('probe:transaction-rollback');
     }
+    if (insertFailed || failureStages.length) throw new QualificationFailure(failureStages);
+
     stage = 'rollback-read';
     const rolledBack = await writer.query('SELECT count(*)::integer AS count FROM stateplane_qualification WHERE probe_id = $1', [id]);
     if (rolledBack.rows[0].count !== 0) throw new Error('Rollback was not atomic');
-    rowMayExist = true;
     stage = 'committed-insert';
     await writer.query('INSERT INTO stateplane_qualification (probe_id, value) VALUES ($1, 1)', [id]);
     stage = 'reader-connect';
@@ -74,10 +88,11 @@ async function probe(connectionString: string) {
     if (fresh.rows[0]?.value !== 2) throw new Error('Fresh read was stale');
     stage = 'connection-count';
     const activity = await reader.query('SELECT count(*)::integer AS count FROM pg_stat_activity WHERE datname = current_database() AND usename = current_user');
+    if (!Number.isSafeInteger(activity.rows[0]?.count) || activity.rows[0].count < 1) throw new Error('Connection count unavailable');
     stage = 'result';
     result = { pgvectorVersion: extension.rows[0].extversion, rollback: true, freshRead: true, observedConnections: activity.rows[0].count, elapsedMs: Date.now() - start };
-  } catch {
-    failureStages.push(`probe:${stage}`);
+  } catch (error) {
+    if (!(error instanceof QualificationFailure)) failureStages.push(`probe:${stage}`);
   }
   try {
     if (writerConnected && rowMayExist) {
@@ -90,7 +105,9 @@ async function probe(connectionString: string) {
   } catch {
     failureStages.push(stage);
   }
-  await Promise.allSettled([writer.end(), reader.end()]);
+  const closed = await Promise.allSettled([writer.end(), reader.end()]);
+  if (closed[0].status === 'rejected') failureStages.push('close:writer');
+  if (closed[1].status === 'rejected') failureStages.push('close:reader');
   if (failureStages.length) throw new QualificationFailure(failureStages);
   if (!result) throw new Error('Qualification result missing');
   return result;
@@ -99,9 +116,10 @@ async function probe(connectionString: string) {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     if (new URL(request.url).pathname !== '/qualify' || request.method !== 'POST') return new Response('Not found', { status: 404 });
-    if (env.STATEPLANE_DISPOSABLE !== '1' || !(await authorized(request, env.PROBE_TOKEN))) return new Response('Forbidden', { status: 403 });
+    if (env.STATEPLANE_DISPOSABLE !== '1' || !/^sta4_[a-f0-9]{16}_(dev|prod)_(in_south|us_east|eu_west)$/.test(env.STATEPLANE_PROBE_DATABASE ?? '') ||
+        !/^sta4_probe_[a-f0-9]{16}$/.test(env.STATEPLANE_PROBE_ROLE ?? '') || !(await authorized(request, env.PROBE_TOKEN))) return new Response('Forbidden', { status: 403 });
     try {
-      return Response.json({ ok: true, ...(await probe(env.AUTHORITY.connectionString)) }, { headers: { 'Cache-Control': 'no-store' } });
+      return Response.json({ ok: true, ...(await probe(env.AUTHORITY.connectionString, env.STATEPLANE_PROBE_DATABASE, env.STATEPLANE_PROBE_ROLE)) }, { headers: { 'Cache-Control': 'no-store' } });
     } catch (error) {
       console.error('Qualification failed', error instanceof QualificationFailure ? error.stages.join(',') : 'unexpected');
       return Response.json({ ok: false }, { status: 500, headers: { 'Cache-Control': 'no-store' } });

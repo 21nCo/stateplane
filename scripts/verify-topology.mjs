@@ -43,7 +43,7 @@ async function verify(label, definition, resource, database) {
   const instance = rds.DBInstances?.[0];
   const ids = instance?.VpcSecurityGroups?.map(group => group.VpcSecurityGroupId) ?? [];
   const groups = ids.length ? await json('aws', ['ec2', 'describe-security-groups', '--region', definition.awsRegion, '--group-ids', ...ids, '--output', 'json']) : undefined;
-  assertLiveResources(label, environment, definition, resource, database, hyperdrive, instance, groups?.SecurityGroups, approvedCidrs);
+  assertLiveResources({ label, environment, definition, resource, database, hyperdrive, instance, securityGroups: groups?.SecurityGroups, approvedCidrs });
   const bundleResponse = await fetch(`https://truststore.pki.rds.amazonaws.com/${definition.awsRegion}/${definition.awsRegion}-bundle.pem`);
   if (!bundleResponse.ok) throw new Error(`${label}: regional RDS CA bundle unavailable`);
   const expectedRoot = selectRdsRoot(await bundleResponse.text(), definition.awsRegion, instance.CACertificateIdentifier);

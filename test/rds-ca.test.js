@@ -15,4 +15,6 @@ test('selects one root for the instance CA and rejects a different or bundled up
   assert.throws(() => assertUploadedRdsRoot({ ca: false, certificates: rsa2048.pem }, rsa2048), /unavailable/);
   assert.throws(() => selectRdsRoot(bundle, 'eu-west-1', 'rds-ca-rsa2048-g1'), /unavailable/);
   assert.throws(() => selectRdsRoot(bundle, 'us-east-1', 'rds-ca-ecc384-g1'), /unavailable/);
+  assert.throws(() => selectRdsRoot(bundle, 'us-west-1', 'rds-ca-rsa2048-g1'), /unsupported/);
+  assert.throws(() => selectRdsRoot(bundle, 'us-east-1', 'unknown-ca'), /unsupported/);
 });
