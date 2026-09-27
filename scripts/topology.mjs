@@ -115,14 +115,21 @@ function checkRdsInstanceId(value, expected, label) {
 }
 
 /**
- * Accept only a bare HTTPS authority whose DNS labels can be used as a
- * Cloudflare custom domain. Ownership and DNS resolution require a live check.
+ * Return the unchanged hostname of a bare HTTPS DNS authority suitable for a
+ * Cloudflare custom domain. A numeric final label can be parsed as an IP
+ * address by URL consumers. Ownership and resolution require a live check.
  */
-function validPublicRoute(route) {
-  if (typeof route !== 'string' || !route.startsWith('https://')) return false;
+function publicRouteHost(route) {
+  if (typeof route !== 'string' || !route.startsWith('https://')) return null;
   const host = route.slice('https://'.length);
   const labels = host.split('.');
-  return host.length <= 253 && labels.length >= 2 && labels.every(label => dnsLabel.test(label));
+  if (host.length > 253 || labels.length < 2 || !labels.every(label => dnsLabel.test(label)) || !/[a-z]/.test(labels.at(-1))) return null;
+  try {
+    if (new URL(route).host !== host) return null;
+  } catch {
+    return null;
+  }
+  return host;
 }
 
 /** Validate private resource IDs and optional public routes before rendering. */
@@ -153,7 +160,7 @@ export function validateInventory(topology, environment, inventory) {
   if (inventory.routes !== undefined) {
     allowedKeys(inventory.routes, ['app', 'mcp'], 'routes');
     for (const key of ['app', 'mcp']) {
-      if (!validPublicRoute(inventory.routes[key])) throw new Error(`Invalid ${key} route`);
+      if (publicRouteHost(inventory.routes[key]) === null) throw new Error(`Invalid ${key} route`);
     }
     if (inventory.routes.app === inventory.routes.mcp) throw new Error('Public routes must differ');
   }
@@ -192,7 +199,7 @@ export function renderTopology(topology, environment, inventory, out, projectRoo
     services: [service('DIRECTORY', `${env.prefix}-directory`), ...mcpBindings]
   };
   if (inventory.routes) {
-    for (const [key, route] of Object.entries(inventory.routes)) output[`${key}.json`].routes = [{ pattern: new URL(route).host, custom_domain: true }];
+    for (const [key, route] of Object.entries(inventory.routes)) output[`${key}.json`].routes = [{ pattern: publicRouteHost(route), custom_domain: true }];
   }
   output['directory.json'] = {
     ...common(out, `${env.prefix}-directory`, 'deployment/workers/directory.ts', 'directory', environment, projectRoot),

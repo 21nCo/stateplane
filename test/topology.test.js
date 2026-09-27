@@ -180,9 +180,11 @@ test('requires complete isolated Hyperdrive inventory and rejects secret-shaped 
 test('public app and MCP routes render only valid distinct HTTPS DNS authorities', () => {
   for (const environment of ['development', 'production']) {
     const valid = inventory(environment);
-    valid.routes = { app: `https://${'a'.repeat(63)}.example.test`, mcp: 'https://mcp.example.test' };
+    const longestHost = `${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(61)}`;
+    valid.routes = { app: `https://${longestHost}`, mcp: 'https://mcp.example.test' };
     const configs = renderTopology(topology, environment, valid, '/tmp/stateplane-topology');
-    assert.deepEqual(configs['app.json'].routes, [{ pattern: `${'a'.repeat(63)}.example.test`, custom_domain: true }]);
+    assert.equal(longestHost.length, 253);
+    assert.deepEqual(configs['app.json'].routes, [{ pattern: longestHost, custom_domain: true }]);
     assert.deepEqual(configs['mcp.json'].routes, [{ pattern: 'mcp.example.test', custom_domain: true }]);
     assert.equal(configs['directory.json'].routes, undefined);
     assert.equal(configs['in-south-api.json'].routes, undefined);
@@ -191,12 +193,14 @@ test('public app and MCP routes render only valid distinct HTTPS DNS authorities
       for (const route of [
         'https://-bad.example', 'https://bad-.example', 'https://foo..example',
         'https://foo.example.', 'https://foo_example.test',
+        'https://1.2', 'https://127.0.0.1', 'https://foo.123', 'https://foo.0x7f',
         `https://${'a'.repeat(64)}.example.test`,
         `https://${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(63)}.test`,
         'https://foo.example.test:443', 'https://foo.example.test/path'
       ]) {
         const bad = copy(valid);
         bad.routes[key] = route;
+        assert.throws(() => validateInventory(topology, environment, bad), new RegExp(`Invalid ${key} route`), `${environment}/${key}: ${route}`);
         assert.throws(() => renderTopology(topology, environment, bad, '/tmp/stateplane-topology'), new RegExp(`Invalid ${key} route`), `${environment}/${key}: ${route}`);
       }
     }
