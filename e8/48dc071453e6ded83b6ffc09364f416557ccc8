@@ -1,0 +1,18 @@
+docs/regional-topology.md
+  h_a39f9495f9ec1d 13,42
+scripts/topology.mjs
+  h_a39f9495f9ec1d 14-16,66,87
+test/topology.test.js
+  h_a39f9495f9ec1d 93-113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e848dc071453e6ded83b6ffc09364f416557ccc8",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
