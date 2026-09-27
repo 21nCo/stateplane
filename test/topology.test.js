@@ -1,12 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { validateTopology, validateInventory, renderTopology, cellDatabaseName } from '../scripts/topology.mjs';
-import { assertLiveResources } from '../scripts/topology-live.mjs';
-import { createVpcServiceReader, parseVpcServiceResponse } from '../scripts/cloudflare-vpc.mjs';
+import { dryRunTopology } from '../scripts/topology-dry-run.mjs';
+import { assertLiveResources as assertRawLiveResources, assertApprovedIngress } from '../scripts/topology-live.mjs';
 
 const topology = JSON.parse(readFileSync(new URL('../deployment/topology.json', import.meta.url)));
 const caCertificateId = '550e8400-e29b-41d4-a716-446655440001';
+const groupId = 'sg-approved';
+const approvedCidrs = { ipv4_cidrs: ['203.0.113.0/24'], ipv6_cidrs: ['2001:db8::/32'] };
+const approvedGroups = [{ GroupId: groupId, IpPermissions: [{ IpProtocol: 'tcp', FromPort: 5432, ToPort: 5432, IpRanges: [{ CidrIp: approvedCidrs.ipv4_cidrs[0] }] }] }];
+const assertLiveResources = (label, environment, definition, resource, database, hyperdrive, instance) =>
+  assertRawLiveResources(label, environment, definition, resource, database, hyperdrive,
+    { ...instance, VpcSecurityGroups: [{ VpcSecurityGroupId: groupId }] }, approvedGroups, approvedCidrs);
 const copy = value => structuredClone(value);
 const inventory = environment => ({
   environment,
@@ -30,6 +39,28 @@ test('both environments have distinct provider databases, private cells and cach
       assert.equal(JSON.stringify(worker).includes('password'), false, file);
       if (/^(in-south|us-east|eu-west)-(api|mcp)\.json$/.test(file)) assert.equal(worker.hyperdrive[0].binding, 'AUTHORITY');
     }
+  }
+});
+
+test('synthetic dry-run preserves a previously rendered operator config', async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), 'sta4-dry-run-'));
+  try {
+    const live = join(projectRoot, '.data/topology/production');
+    await mkdir(live, { recursive: true });
+    const config = renderTopology(topology, 'production', {
+      ...inventory('production'),
+      routes: { app: 'https://sta4-app.example.test', mcp: 'https://sta4-mcp.example.test' }
+    }, live)['app.json'];
+    const original = `${JSON.stringify(config, null, 2)}\n`;
+    await writeFile(join(live, 'app.json'), original);
+    const count = await dryRunTopology(topology, { projectRoot, runWrangler: async () => ({ stdout: '' }) });
+    assert.equal(count, 21);
+    assert.equal(await readFile(join(live, 'app.json'), 'utf8'), original);
+    const synthetic = JSON.parse(await readFile(join(projectRoot, '.data/topology-dry-run/production/app.json'), 'utf8'));
+    assert.equal(synthetic.routes, undefined);
+    assert.notEqual(synthetic.services[0].service, undefined);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
@@ -81,10 +112,10 @@ test('requires complete isolated Hyperdrive inventory and rejects secret-shaped 
   const secret = inventory('development');
   secret.cells['us-east'].databaseUrl = 'private value';
   assert.throws(() => validateInventory(topology, 'development', secret), /unsupported field/);
-  const sharedTunnel = inventory('development');
-  sharedTunnel.cells['in-south'].network = sharedTunnel.cells['us-east'].network = 'workers-vpc';
-  sharedTunnel.cells['in-south'].vpcServiceId = sharedTunnel.cells['us-east'].vpcServiceId = '550e8400-e29b-41d4-a716-446655440000';
-  assert.throws(() => validateInventory(topology, 'development', sharedTunnel), /VPC service IDs must be unique/);
+  const untrustedPrivate = inventory('development');
+  untrustedPrivate.cells['in-south'].network = 'workers-vpc';
+  untrustedPrivate.cells['in-south'].vpcServiceId = '550e8400-e29b-41d4-a716-446655440000';
+  assert.throws(() => validateInventory(topology, 'development', untrustedPrivate), /unsupported until private CA trust is proven/);
 });
 
 test('live gate rejects stale Hyperdrive caching, wrong origin and inadequate backup retention', () => {
@@ -98,14 +129,7 @@ test('live gate rejects stale Hyperdrive caching, wrong origin and inadequate ba
   assert.throws(() => assertLiveResources('in-south', 'production', definition, resource, database, { ...hyperdrive, caching: { disabled: false } }, instance), /cache is enabled/);
   assert.throws(() => assertLiveResources('in-south', 'production', definition, resource, database, { ...hyperdrive, origin: { ...hyperdrive.origin, database: 'other' } }, instance), /another database/);
   assert.throws(() => assertLiveResources('in-south', 'production', definition, resource, database, hyperdrive, { ...instance, BackupRetentionPeriod: 0 }), /backups\/PITR/);
-  const privateResource = { ...resource, network: 'workers-vpc', vpcServiceId: '550e8400-e29b-41d4-a716-446655440000' };
-  const privateOrigin = { ...hyperdrive, origin: { service_id: privateResource.vpcServiceId, scheme: 'postgresql', database }, mtls: {} };
-  const vpc = { service_id: privateResource.vpcServiceId, type: 'tcp', tcp_port: 5432, app_protocol: 'postgresql', host: { hostname: host }, tls_settings: { cert_verification_mode: 'verify_full' } };
-  assert.doesNotThrow(() => assertLiveResources('in-south', 'production', definition, privateResource, database, privateOrigin, { ...instance, PubliclyAccessible: false }, vpc));
-  const { tls_settings: _omitted, ...defaultTlsVpc } = vpc;
-  assert.doesNotThrow(() => assertLiveResources('in-south', 'production', definition, privateResource, database, privateOrigin, { ...instance, PubliclyAccessible: false }, defaultTlsVpc));
-  assert.throws(() => assertLiveResources('in-south', 'production', definition, privateResource, database, privateOrigin, { ...instance, PubliclyAccessible: false }, { ...vpc, tls_settings: { cert_verification_mode: 'verify_ca' } }), /TLS verification/);
-  assert.throws(() => assertLiveResources('in-south', 'production', definition, privateResource, database, privateOrigin, { ...instance, PubliclyAccessible: false }, { ...vpc, tls_settings: { cert_verification_mode: 'disabled' } }), /TLS verification/);
+  assert.throws(() => assertLiveResources('in-south', 'production', definition, { ...resource, network: 'workers-vpc' }, database, hyperdrive, instance), /unsupported network mode/);
 });
 
 test('live gate requires a valid backup retention period for every control and cell database', () => {
@@ -151,63 +175,27 @@ test('live gate verifies PostgreSQL origin identity and public CA for control an
       assert.throws(() => checkLive({ ...hyperdrive, origin: { ...hyperdrive.origin, port: 3306 } }), /origin port mismatch/, `${environment}/${label}: MySQL port`);
       assert.throws(() => checkLive(hyperdrive, { ...instance, Endpoint: { Address: host, Port: 3306 } }), /endpoint port mismatch/, `${environment}/${label}: RDS port`);
 
-      const privateResource = { ...resource, network: 'workers-vpc', vpcServiceId: '550e8400-e29b-41d4-a716-446655440000' };
-      const privateInstance = { ...instance, PubliclyAccessible: false };
-      const privateOrigin = { ...hyperdrive, mtls: undefined, origin: { service_id: privateResource.vpcServiceId, scheme: 'postgresql', database } };
-      const vpc = { service_id: privateResource.vpcServiceId, type: 'tcp', tcp_port: 5432, app_protocol: 'postgresql', host: { hostname: host } };
-      assert.doesNotThrow(() => checkLive(privateOrigin, privateInstance, privateResource, vpc), `${environment}/${label}: valid private PostgreSQL origin`);
-      assert.throws(() => checkLive({ ...privateOrigin, origin: { ...privateOrigin.origin, scheme: 'mysql' } }, privateInstance, privateResource, vpc), /not PostgreSQL/, `${environment}/${label}: private MySQL scheme`);
-      assert.throws(() => checkLive(privateOrigin, { ...privateInstance, Endpoint: { Address: host, Port: 3306 } }, privateResource, vpc), /endpoint port mismatch/, `${environment}/${label}: private RDS port`);
-      assert.throws(() => checkLive(privateOrigin, privateInstance, privateResource, { ...vpc, tcp_port: 3306 }), /VPC service target mismatch/, `${environment}/${label}: private service port`);
+      assert.throws(() => checkLive(hyperdrive, instance, { ...resource, network: 'workers-vpc' }), /unsupported network mode/);
     }
   }
 });
 
-test('Cloudflare structured VPC API reads verify account and service identity before checking control and cell targets', async () => {
-  const accountId = 'a'.repeat(32);
-  const serviceId = '550e8400-e29b-41d4-a716-446655440000';
-  const calls = [];
-  const service = { service_id: serviceId, type: 'tcp', tcp_port: 5432, app_protocol: 'postgresql', host: { hostname: 'sta-4.abcdefgh.us-east-1.rds.amazonaws.com' }, tls_settings: { cert_verification_mode: 'verify_full' } };
-  const read = await createVpcServiceReader('/wrangler', {
-    accountId,
-    run: async (_, args) => ({ stdout: JSON.stringify(args[0] === 'whoami'
-      ? { loggedIn: true, accounts: [{ id: accountId }] }
-      : { type: 'oauth', token: 'test-token' }) }),
-    request: async (url, options) => {
-      calls.push({ url, authorization: options.headers.Authorization });
-      return { ok: true, json: async () => ({ success: true, errors: [], messages: [], result: service }) };
+test('public RDS ingress is limited to current approved Cloudflare ranges for every control and cell', () => {
+  for (const [environment, env] of Object.entries(topology.environments)) {
+    for (const label of ['control', ...env.cells.map(cell => cell.id)]) {
+      const instance = { VpcSecurityGroups: [{ VpcSecurityGroupId: groupId }] };
+      const check = (groups = approvedGroups, ranges = approvedCidrs, rds = instance) => assertApprovedIngress(label, rds, groups, ranges);
+      assert.doesNotThrow(() => check(), `${environment}/${label}: approved ingress`);
+      assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ ...approvedGroups[0].IpPermissions[0], IpRanges: [{ CidrIp: '0.0.0.0/0' }] }] }]), /unapproved/);
+      assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ ...approvedGroups[0].IpPermissions[0], IpRanges: [], Ipv6Ranges: [{ CidrIpv6: '::/0' }] }] }]), /unapproved/);
+      assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ ...approvedGroups[0].IpPermissions[0], IpRanges: [{ CidrIp: '198.51.100.0/24' }] }] }]), /unapproved/);
+      assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ IpProtocol: '-1', IpRanges: [{ CidrIp: '0.0.0.0/0' }] }] }]), /unapproved/);
+      assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ IpProtocol: 'tcp', FromPort: 5432, ToPort: 5432, UserIdGroupPairs: [{ GroupId: 'sg-other' }] }] }]), /unapproved/);
+      assert.throws(() => check([], approvedCidrs), /inventory incomplete/);
+      assert.throws(() => check(approvedGroups, null), /ranges unavailable/);
+      assert.throws(() => check(approvedGroups, { ipv4_cidrs: [undefined], ipv6_cidrs: [] }), /ranges unavailable/);
+      assert.throws(() => check([{ GroupId: groupId }]), /rules unavailable/);
+      assert.throws(() => check(approvedGroups, approvedCidrs, {}), /security groups missing/);
     }
-  });
-  const fetched = await read(serviceId);
-  assert.equal(calls[0].url, `https://api.cloudflare.com/client/v4/accounts/${accountId}/connectivity/directory/services/${serviceId}`);
-  assert.equal(calls[0].authorization, 'Bearer test-token');
-  for (const label of ['control', 'us-east']) {
-    const env = topology.environments.production;
-    const definition = label === 'control' ? env.control : env.cells.find(cell => cell.id === label);
-    const resource = { ...(label === 'control' ? inventory('production').control : inventory('production').cells[label]), network: 'workers-vpc', vpcServiceId: serviceId };
-    const database = label === 'control' ? env.control.database : cellDatabaseName(env, definition);
-    const instance = { DBInstanceIdentifier: resource.rdsInstanceId, Engine: 'postgres', DBName: database, DBInstanceStatus: 'available', BackupRetentionPeriod: 7, PubliclyAccessible: false, Endpoint: { Address: service.host.hostname, Port: 5432 } };
-    const hyperdrive = { id: resource.hyperdriveId, caching: { disabled: true }, origin_connection_limit: 5, origin: { service_id: serviceId, scheme: 'postgres', database } };
-    assert.doesNotThrow(() => assertLiveResources(label, 'production', definition, resource, database, hyperdrive, instance, fetched));
-    const { tls_settings: _omitted, ...defaultTlsService } = fetched;
-    assert.doesNotThrow(() => assertLiveResources(label, 'production', definition, resource, database, hyperdrive, instance, defaultTlsService));
-    assert.throws(() => assertLiveResources(label, 'production', definition, resource, database, hyperdrive, instance, { ...fetched, tls_settings: { cert_verification_mode: 'verify_ca' } }), /TLS verification/);
-    assert.throws(() => assertLiveResources(label, 'production', definition, resource, database, hyperdrive, instance, { ...fetched, tls_settings: { cert_verification_mode: 'disabled' } }), /TLS verification/);
-    assert.throws(() => assertLiveResources(label, 'production', definition, resource, database, hyperdrive, instance, { ...fetched, tcp_port: 5442 }), /VPC service target mismatch/);
   }
-  assert.throws(() => parseVpcServiceResponse({ success: false, result: service }, serviceId), /unsuccessful/);
-  assert.throws(() => parseVpcServiceResponse({ success: true, result: null }, serviceId), /empty result/);
-  assert.throws(() => parseVpcServiceResponse({ success: true, result: { ...service, service_id: 'another' } }, serviceId), /ID mismatch/);
-  await assert.rejects(() => createVpcServiceReader('/wrangler', {
-    accountId: 'f'.repeat(32),
-    run: async () => ({ stdout: JSON.stringify({ loggedIn: true, accounts: [{ id: accountId }] }) })
-  }), /authenticated Wrangler account/);
-  const denied = await createVpcServiceReader('/wrangler', {
-    accountId,
-    run: async (_, args) => ({ stdout: JSON.stringify(args[0] === 'whoami'
-      ? { loggedIn: true, accounts: [{ id: accountId }] }
-      : { type: 'oauth', token: 'test-token' }) }),
-    request: async () => ({ ok: false, status: 403 })
-  });
-  await assert.rejects(() => denied(serviceId), /HTTP 403/);
 });

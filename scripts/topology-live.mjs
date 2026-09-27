@@ -1,4 +1,43 @@
-export function assertLiveResources(label, environment, definition, resource, database, hyperdrive, instance, vpcService) {
+import { isIP } from 'node:net';
+
+const validCidr = (value, family) => {
+  if (typeof value !== 'string') return false;
+  const parts = value.split('/');
+  const bits = Number(parts[1]);
+  return parts.length === 2 && isIP(parts[0]) === family && /^\d+$/.test(parts[1]) && bits >= 0 && bits <= (family === 4 ? 32 : 128);
+};
+
+export function assertApprovedIngress(label, instance, securityGroups, approvedCidrs) {
+  const ids = instance?.VpcSecurityGroups?.map(group => group.VpcSecurityGroupId);
+  if (!ids?.length || ids.some(id => typeof id !== 'string' || !id)) throw new Error(`${label}: RDS security groups missing`);
+  if (!Array.isArray(securityGroups) || securityGroups.length !== ids.length || new Set(securityGroups.map(group => group.GroupId)).size !== ids.length || securityGroups.some(group => !ids.includes(group.GroupId))) throw new Error(`${label}: RDS security group inventory incomplete`);
+  if (!Array.isArray(approvedCidrs?.ipv4_cidrs) || !Array.isArray(approvedCidrs?.ipv6_cidrs) || !approvedCidrs.ipv4_cidrs.length || !approvedCidrs.ipv4_cidrs.every(cidr => validCidr(cidr, 4)) || !approvedCidrs.ipv6_cidrs.every(cidr => validCidr(cidr, 6))) throw new Error(`${label}: Cloudflare ingress ranges unavailable`);
+  const ipv4 = new Set(approvedCidrs.ipv4_cidrs);
+  const ipv6 = new Set(approvedCidrs.ipv6_cidrs);
+  let approved = false;
+  for (const group of securityGroups) {
+    if (!Array.isArray(group.IpPermissions)) throw new Error(`${label}: RDS security group rules unavailable`);
+    for (const rule of group.IpPermissions) {
+      if (rule.IpProtocol !== '-1' && rule.IpProtocol !== 'tcp') continue;
+      if (rule.IpProtocol !== '-1') {
+        if (!Number.isInteger(rule.FromPort) || !Number.isInteger(rule.ToPort)) throw new Error(`${label}: invalid RDS ingress port range`);
+        if (rule.FromPort > 5432 || rule.ToPort < 5432) continue;
+      }
+      if ((rule.UserIdGroupPairs?.length ?? 0) || (rule.PrefixListIds?.length ?? 0)) throw new Error(`${label}: unapproved RDS port 5432 ingress`);
+      for (const range of rule.IpRanges ?? []) {
+        if (!ipv4.has(range.CidrIp)) throw new Error(`${label}: unapproved RDS port 5432 ingress`);
+        approved = true;
+      }
+      for (const range of rule.Ipv6Ranges ?? []) {
+        if (!ipv6.has(range.CidrIpv6)) throw new Error(`${label}: unapproved RDS port 5432 ingress`);
+        approved = true;
+      }
+    }
+  }
+  if (!approved) throw new Error(`${label}: no approved RDS port 5432 ingress`);
+}
+
+export function assertLiveResources(label, environment, definition, resource, database, hyperdrive, instance, securityGroups, approvedCidrs) {
   if (!instance || instance.DBInstanceIdentifier !== resource.rdsInstanceId || instance.Engine !== 'postgres' || instance.DBName !== database) throw new Error(`${label}: RDS identity mismatch`);
   if (instance.DBInstanceStatus !== 'available') throw new Error(`${label}: RDS is not available`);
   const retention = instance.BackupRetentionPeriod;
@@ -14,9 +53,6 @@ export function assertLiveResources(label, environment, definition, resource, da
     if (hyperdrive.origin.port !== instance.Endpoint.Port) throw new Error(`${label}: public Hyperdrive origin port mismatch`);
     if (hyperdrive.mtls?.sslmode !== 'verify-full') throw new Error(`${label}: Hyperdrive must verify origin TLS hostname`);
     if (!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(hyperdrive.mtls.ca_certificate_id ?? '')) throw new Error(`${label}: public Hyperdrive origin requires an uploaded CA certificate ID`);
-  } else if (resource.network === 'workers-vpc') {
-    if (instance.PubliclyAccessible || hyperdrive.origin.service_id !== resource.vpcServiceId) throw new Error(`${label}: private VPC origin mismatch`);
-    if (vpcService?.service_id !== resource.vpcServiceId || vpcService.type !== 'tcp' || vpcService.tcp_port !== 5432 || vpcService.app_protocol !== 'postgresql' || vpcService.host?.hostname !== instance.Endpoint.Address) throw new Error(`${label}: VPC service target mismatch`);
-    if (vpcService.tls_settings !== undefined && vpcService.tls_settings?.cert_verification_mode !== 'verify_full') throw new Error(`${label}: VPC service TLS verification is not full`);
+    assertApprovedIngress(label, instance, securityGroups, approvedCidrs);
   } else throw new Error(`${label}: unsupported network mode`);
 }

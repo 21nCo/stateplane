@@ -8,7 +8,6 @@ const regionId = /^[a-z]{2}-[a-z]+$/;
 const awsRegion = /^[a-z]{2}-[a-z]+-\d$/;
 const safeName = /^[a-z][a-z0-9-]*$/;
 const rdsDatabaseName = /^[a-z][a-z0-9_]{0,62}$/;
-const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
 const allowedKeys = (value, keys, label) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} must be an object`);
   for (const key of Object.keys(value)) if (!keys.includes(key)) throw new Error(`${label} has unsupported field ${key}`);
@@ -79,8 +78,7 @@ export function validateInventory(topology, environment, inventory) {
   allowedKeys(inventory, ['environment', 'control', 'cells', 'routes'], 'inventory');
   if (inventory.environment !== environment) throw new Error('Inventory environment mismatch');
   const network = (resource, label) => {
-    if (!['public-tls', 'workers-vpc'].includes(resource.network)) throw new Error(`${label} network mode is invalid`);
-    if (resource.network === 'workers-vpc') check(resource.vpcServiceId, uuid, `${label} VPC service ID`);
+    if (resource.network !== 'public-tls') throw new Error(`${label} network mode is unsupported until private CA trust is proven`);
     if (resource.network === 'public-tls' && resource.vpcServiceId !== undefined) throw new Error(`${label} public network cannot include a VPC service`);
   };
   allowedKeys(inventory.control, ['hyperdriveId', 'rdsInstanceId', 'network', 'vpcServiceId'], 'control inventory');
@@ -90,17 +88,14 @@ export function validateInventory(topology, environment, inventory) {
   allowedKeys(inventory.cells, env.cells.map(cell => cell.id), 'cell inventory');
   if (Object.keys(inventory.cells).length !== env.cells.length) throw new Error('Missing cell inventory');
   const ids = [inventory.control.hyperdriveId];
-  const vpcIds = inventory.control.vpcServiceId ? [inventory.control.vpcServiceId] : [];
   for (const cell of env.cells) {
     allowedKeys(inventory.cells[cell.id], ['hyperdriveId', 'rdsInstanceId', 'network', 'vpcServiceId'], `${cell.id} inventory`);
     check(inventory.cells[cell.id].hyperdriveId, hexId, `${cell.id} Hyperdrive ID`);
     if (inventory.cells[cell.id].rdsInstanceId !== `${env.prefix}-${cell.id}-db`) throw new Error(`${cell.id} RDS instance mismatch`);
     network(inventory.cells[cell.id], cell.id);
     ids.push(inventory.cells[cell.id].hyperdriveId);
-    if (inventory.cells[cell.id].vpcServiceId) vpcIds.push(inventory.cells[cell.id].vpcServiceId);
   }
   unique(ids, 'Hyperdrive IDs');
-  unique(vpcIds, 'VPC service IDs');
   if (inventory.routes !== undefined) {
     allowedKeys(inventory.routes, ['app', 'mcp'], 'routes');
     for (const key of ['app', 'mcp']) {
