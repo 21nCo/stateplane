@@ -90,6 +90,27 @@ test('control region and each cell R2 hint must match the declared placement pol
   }
 });
 
+test('every control and cell origin limit stays within the plan-independent Hyperdrive range', () => {
+  for (const environment of ['development', 'production']) {
+    const consumers = ['control', ...topology.environments[environment].cells.map(cell => cell.id)];
+    for (const consumer of consumers) {
+      for (const limit of [5, 20]) {
+        const allowed = copy(topology);
+        const definition = consumer === 'control' ? allowed.environments[environment].control : allowed.environments[environment].cells.find(cell => cell.id === consumer);
+        definition.originConnectionLimit = limit;
+        assert.doesNotThrow(() => renderTopology(allowed, environment, inventory(environment), '/tmp/stateplane-topology'), `${environment}/${consumer}: ${limit}`);
+      }
+      for (const limit of [4, 21]) {
+        const invalid = copy(topology);
+        const definition = consumer === 'control' ? invalid.environments[environment].control : invalid.environments[environment].cells.find(cell => cell.id === consumer);
+        definition.originConnectionLimit = limit;
+        assert.throws(() => validateTopology(invalid), /connection limit is invalid/, `${environment}/${consumer}: ${limit}`);
+        assert.throws(() => renderTopology(invalid, environment, inventory(environment), '/tmp/stateplane-topology'), /connection limit is invalid/, `${environment}/${consumer}: ${limit} render`);
+      }
+    }
+  }
+});
+
 test('all RDS PostgreSQL database names are provisionable and match the regional inventory', () => {
   const names = [];
   for (const [environment, env] of Object.entries(topology.environments)) {

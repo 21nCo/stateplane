@@ -11,6 +11,9 @@ const rdsDatabaseName = /^[a-z][a-z0-9_]{0,62}$/;
 const cloudflareName = /^[a-z][a-z0-9-]{0,62}$/;
 const rdsInstanceName = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 const dnsLabel = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+// Hyperdrive permits 5-20 origin connections on Free and 5-100 on Paid.
+// The manifest does not attest a Workers plan, so admit only the shared range.
+const validOriginConnectionLimit = value => Number.isSafeInteger(value) && value >= 5 && value <= 20;
 const restoreSuffix = '-restore-';
 const minimumRestoreToken = 'a'.repeat(8);
 const cellPlacement = {
@@ -60,7 +63,7 @@ function validateEnvironment(environment, env, all) {
   check(env.control.awsRegion, awsRegion, `${environment} control region`);
   if (env.control.awsRegion !== 'us-east-1') throw new Error(`${environment} control is mapped to the wrong provider region`);
   check(env.control.database, rdsDatabaseName, `${environment} control database`);
-  if (!Number.isSafeInteger(env.control.originConnectionLimit) || env.control.originConnectionLimit < 1) throw new Error(`${environment} control connection limit is invalid`);
+  if (!validOriginConnectionLimit(env.control.originConnectionLimit)) throw new Error(`${environment} control connection limit is invalid`);
   if (!Array.isArray(env.cells) || env.cells.length === 0) throw new Error(`${environment} needs cells`);
   const expected = environment === 'production' ? ['in-south', 'us-east'] : ['eu-west', 'in-south', 'us-east'];
   const actual = env.cells.map(cell => cell?.id);
@@ -81,7 +84,7 @@ function validateCell(environment, env, cell, all) {
   check(cell.id, regionId, `${environment} cell ID`);
   check(cell.awsRegion, awsRegion, `${environment} cell AWS region`);
   if (cell.r2LocationHint !== cellPlacement[cell.id]?.r2LocationHint) throw new Error(`${environment} ${cell.id} R2 hint differs from placement policy`);
-  if (!Number.isSafeInteger(cell.originConnectionLimit) || cell.originConnectionLimit < 1) throw new Error(`${environment} cell connection limit is invalid`);
+  if (!validOriginConnectionLimit(cell.originConnectionLimit)) throw new Error(`${environment} cell connection limit is invalid`);
   if (cellPlacement[cell.id]?.awsRegion !== cell.awsRegion) throw new Error(`${environment} ${cell.id} is mapped to the wrong provider region`);
   const resource = names(env, cell);
   assertDerivedNames(`${environment} ${cell.id}`, resource);
