@@ -4,6 +4,8 @@ const database = vi.hoisted(() => ({
   row: null as number | null,
   deleteMode: 'ok' as 'ok' | 'throw' | 'no-op',
   staleInitialRead: false,
+  vectorDistance: Math.SQRT2 as number | string | undefined,
+  vectorMissingRow: false,
   connections: 0,
   closed: 0
 }));
@@ -14,7 +16,7 @@ vi.mock('pg', () => ({
     async end() { database.closed++; }
     async query(sql: string) {
       if (sql.includes('FROM pg_extension')) return { rows: [{ extversion: '0.8.6' }] };
-      if (sql.includes('::vector')) return { rows: [{ distance: Math.SQRT2 }] };
+      if (sql.includes('::vector')) return { rows: database.vectorMissingRow ? [] : [{ distance: database.vectorDistance }] };
       if (sql.startsWith('INSERT') && sql.includes('99')) return { rows: [] };
       if (sql.startsWith('INSERT')) { database.row = 1; return { rows: [] }; }
       if (sql.startsWith('UPDATE')) { database.row = 2; return { rows: [] }; }
@@ -47,6 +49,8 @@ describe('disposable qualification row cleanup', () => {
     database.row = null;
     database.deleteMode = 'ok';
     database.staleInitialRead = false;
+    database.vectorDistance = Math.SQRT2;
+    database.vectorMissingRow = false;
     database.connections = 0;
     database.closed = 0;
   });
@@ -57,6 +61,20 @@ describe('disposable qualification row cleanup', () => {
     expect((await response.json()).ok).toBe(true);
     expect(database.row).toBeNull();
     expect(database.closed).toBe(2);
+  });
+
+  it('rejects missing and nonnumeric pgvector results before writing a probe row', async () => {
+    for (const distance of [undefined, 'not-a-number', NaN]) {
+      database.vectorDistance = distance;
+      const response = await qualify();
+      expect(response.status).toBe(500);
+      expect(database.row).toBeNull();
+    }
+    database.vectorMissingRow = true;
+    const response = await qualify();
+    expect(response.status).toBe(500);
+    expect(database.row).toBeNull();
+    expect(database.closed).toBe(8);
   });
 
   it('fails the probe and closes both clients when DELETE fails', async () => {

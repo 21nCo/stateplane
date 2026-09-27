@@ -15,7 +15,7 @@ const approvedCidrs = { ipv4_cidrs: ['203.0.113.0/24', '198.51.100.0/24'], ipv6_
 const approvedGroups = [{ GroupId: groupId, IpPermissions: [{ IpProtocol: 'tcp', FromPort: 5432, ToPort: 5432, IpRanges: approvedCidrs.ipv4_cidrs.map(CidrIp => ({ CidrIp })) }] }];
 const assertLiveResources = (label, environment, definition, resource, database, hyperdrive, instance) =>
   assertRawLiveResources(label, environment, definition, resource, database, hyperdrive,
-    { CACertificateIdentifier: 'rds-ca-rsa2048-g1', ...instance, NetworkType: 'IPV4', VpcSecurityGroups: [{ VpcSecurityGroupId: groupId }] }, approvedGroups, approvedCidrs);
+    { CACertificateIdentifier: 'rds-ca-rsa2048-g1', DeletionProtection: true, ...instance, NetworkType: 'IPV4', VpcSecurityGroups: [{ VpcSecurityGroupId: groupId }] }, approvedGroups, approvedCidrs);
 const copy = value => structuredClone(value);
 const inventory = environment => ({
   environment,
@@ -156,6 +156,29 @@ test('live gate requires a valid backup retention period for every control and c
   }
 });
 
+test('production control and every cell require explicit RDS deletion protection', () => {
+  for (const [environment, env] of Object.entries(topology.environments)) {
+    const resources = inventory(environment);
+    const targets = [
+      ['control', env.control, resources.control, env.control.database],
+      ...env.cells.map(cell => [cell.id, cell, resources.cells[cell.id], cellDatabaseName(env, cell)])
+    ];
+    for (const [label, definition, resource, database] of targets) {
+      const host = `sta-4.abcdefgh.${definition.awsRegion}.rds.amazonaws.com`;
+      const instance = { DBInstanceIdentifier: resource.rdsInstanceId, Engine: 'postgres', DBName: database, DBInstanceStatus: 'available', BackupRetentionPeriod: environment === 'production' ? 7 : 1, PubliclyAccessible: true, Endpoint: { Address: host, Port: 5432 } };
+      const hyperdrive = { id: resource.hyperdriveId, caching: { disabled: true }, origin_connection_limit: definition.originConnectionLimit, mtls: { sslmode: 'verify-full', ca_certificate_id: caCertificateId }, origin: { host, port: 5432, scheme: 'postgres', database } };
+      for (const protection of [false, undefined]) {
+        if (environment === 'production') {
+          assert.throws(() => assertLiveResources(label, environment, definition, resource, database, hyperdrive, { ...instance, DeletionProtection: protection }), /deletion protection/, `${environment}/${label}: ${String(protection)}`);
+        } else {
+          assert.doesNotThrow(() => assertLiveResources(label, environment, definition, resource, database, hyperdrive, { ...instance, DeletionProtection: protection }), `${environment}/${label}: disposable`);
+        }
+      }
+      assert.doesNotThrow(() => assertLiveResources(label, environment, definition, resource, database, hyperdrive, { ...instance, DeletionProtection: true }));
+    }
+  }
+});
+
 test('live gate verifies PostgreSQL origin identity and public CA for control and every cell', () => {
   for (const [environment, env] of Object.entries(topology.environments)) {
     const resources = inventory(environment);
@@ -196,6 +219,8 @@ test('public RDS ingress is limited to current approved Cloudflare ranges for ev
       assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ ...approvedGroups[0].IpPermissions[0], IpRanges: [], Ipv6Ranges: [{ CidrIpv6: '::/0' }] }] }]), /unapproved/);
       assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ ...approvedGroups[0].IpPermissions[0], IpRanges: [{ CidrIp: '192.0.2.0/24' }] }] }]), /unapproved/);
       assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ IpProtocol: '-1', IpRanges: [{ CidrIp: '0.0.0.0/0' }] }] }]), /unapproved/);
+      assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ IpProtocol: '-1', IpRanges: approvedCidrs.ipv4_cidrs.map(CidrIp => ({ CidrIp })) }] }]), /unapproved/, `${environment}/${label}: approved CIDRs cannot use all protocols`);
+      assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ IpProtocol: 'tcp', FromPort: 0, ToPort: 65535, IpRanges: approvedCidrs.ipv4_cidrs.map(CidrIp => ({ CidrIp })) }] }]), /broad RDS ingress port range/, `${environment}/${label}: broad TCP range`);
       assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ IpProtocol: 'tcp', FromPort: 5432, ToPort: 5432, UserIdGroupPairs: [{ GroupId: 'sg-other' }] }] }]), /unapproved/);
       assert.throws(() => check([], approvedCidrs), /inventory incomplete/);
       assert.throws(() => check(approvedGroups, null), /ranges unavailable/);

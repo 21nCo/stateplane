@@ -42,7 +42,8 @@ async function probe(connectionString: string) {
     if (!extension.rows[0]) throw new Error('pgvector is not installed');
     stage = 'pgvector-distance';
     const vector = await writer.query("SELECT '[1,0,0]'::vector <-> '[0,1,0]'::vector AS distance");
-    if (Math.abs(Number(vector.rows[0].distance) - Math.sqrt(2)) > 0.00001) throw new Error('pgvector distance mismatch');
+    const distance: unknown = vector.rows[0]?.distance;
+    if (typeof distance !== 'number' || !Number.isFinite(distance) || Math.abs(distance - Math.sqrt(2)) > 0.00001) throw new Error('pgvector distance mismatch');
     stage = 'probe-table';
     await writer.query('CREATE TABLE IF NOT EXISTS stateplane_qualification (probe_id uuid PRIMARY KEY, value integer NOT NULL)');
     stage = 'transaction-begin';

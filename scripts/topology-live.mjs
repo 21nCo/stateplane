@@ -21,10 +21,10 @@ export function assertApprovedIngress(label, instance, securityGroups, approvedC
     if (!Array.isArray(group.IpPermissions)) throw new Error(`${label}: RDS security group rules unavailable`);
     for (const rule of group.IpPermissions) {
       if (rule.IpProtocol !== '-1' && rule.IpProtocol !== 'tcp') continue;
-      if (rule.IpProtocol !== '-1') {
-        if (!Number.isInteger(rule.FromPort) || !Number.isInteger(rule.ToPort)) throw new Error(`${label}: invalid RDS ingress port range`);
-        if (rule.FromPort > 5432 || rule.ToPort < 5432) continue;
-      }
+      if (rule.IpProtocol === '-1') throw new Error(`${label}: unapproved all-protocol RDS ingress`);
+      if (!Number.isInteger(rule.FromPort) || !Number.isInteger(rule.ToPort)) throw new Error(`${label}: invalid RDS ingress port range`);
+      if (rule.FromPort > 5432 || rule.ToPort < 5432) continue;
+      if (rule.FromPort !== 5432 || rule.ToPort !== 5432) throw new Error(`${label}: unapproved broad RDS ingress port range`);
       if ((rule.UserIdGroupPairs?.length ?? 0) || (rule.PrefixListIds?.length ?? 0)) throw new Error(`${label}: unapproved RDS port 5432 ingress`);
       for (const range of rule.IpRanges ?? []) {
         if (!requiredIpv4.has(range.CidrIp)) throw new Error(`${label}: unapproved RDS port 5432 ingress`);
@@ -45,6 +45,7 @@ export function assertLiveResources(label, environment, definition, resource, da
   if (!['rds-ca-rsa2048-g1', 'rds-ca-rsa4096-g1', 'rds-ca-ecc384-g1'].includes(instance.CACertificateIdentifier)) throw new Error(`${label}: RDS CA identifier unavailable or unsupported`);
   const retention = instance.BackupRetentionPeriod;
   if (!Number.isInteger(retention) || retention < (environment === 'production' ? 7 : 1)) throw new Error(`${label}: RDS backups/PITR disabled, invalid or below policy`);
+  if (environment === 'production' && instance.DeletionProtection !== true) throw new Error(`${label}: production RDS deletion protection is disabled or unavailable`);
   if (hyperdrive?.id !== resource.hyperdriveId || hyperdrive.caching?.disabled !== true) throw new Error(`${label}: Hyperdrive cache is enabled or ID differs`);
   if (hyperdrive.origin_connection_limit !== definition.originConnectionLimit) throw new Error(`${label}: Hyperdrive origin connection limit differs`);
   if (hyperdrive.origin?.database !== database) throw new Error(`${label}: Hyperdrive points at another database`);
