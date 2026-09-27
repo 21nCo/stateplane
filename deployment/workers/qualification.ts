@@ -24,6 +24,7 @@ async function probe(connectionString: string) {
   const reader = new Client({ connectionString, connectionTimeoutMillis: 5000 });
   const start = Date.now();
   let writerConnected = false;
+  let rowMayExist = false;
   try {
     await writer.connect();
     writerConnected = true;
@@ -41,6 +42,7 @@ async function probe(connectionString: string) {
     }
     const rolledBack = await writer.query('SELECT count(*)::integer AS count FROM stateplane_qualification WHERE probe_id = $1', [id]);
     if (rolledBack.rows[0].count !== 0) throw new Error('Rollback was not atomic');
+    rowMayExist = true;
     await writer.query('INSERT INTO stateplane_qualification (probe_id, value) VALUES ($1, 1)', [id]);
     await reader.connect();
     const first = await reader.query('SELECT value FROM stateplane_qualification WHERE probe_id = $1', [id]);
@@ -51,8 +53,15 @@ async function probe(connectionString: string) {
     const activity = await reader.query('SELECT count(*)::integer AS count FROM pg_stat_activity WHERE datname = current_database() AND usename = current_user');
     return { pgvectorVersion: extension.rows[0].extversion, rollback: true, freshRead: true, observedConnections: activity.rows[0].count, elapsedMs: Date.now() - start };
   } finally {
-    if (writerConnected) await writer.query('DELETE FROM stateplane_qualification WHERE probe_id = $1', [id]).catch(() => {});
-    await Promise.allSettled([writer.end(), reader.end()]);
+    try {
+      if (writerConnected && rowMayExist) {
+        await writer.query('DELETE FROM stateplane_qualification WHERE probe_id = $1', [id]);
+        const remaining = await writer.query('SELECT count(*)::integer AS count FROM stateplane_qualification WHERE probe_id = $1', [id]);
+        if (remaining.rows[0]?.count !== 0) throw new Error('Qualification row cleanup failed');
+      }
+    } finally {
+      await Promise.allSettled([writer.end(), reader.end()]);
+    }
   }
 }
 
