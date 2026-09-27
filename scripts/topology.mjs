@@ -7,6 +7,8 @@ const hexId = /^[a-f0-9]{32}$/i;
 const regionId = /^[a-z]{2}-[a-z]+$/;
 const awsRegion = /^[a-z]{2}-[a-z]+-\d$/;
 const safeName = /^[a-z][a-z0-9-]*$/;
+const rdsDatabaseName = /^[a-z][a-z0-9_]{0,62}$/;
+const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
 const allowedKeys = (value, keys, label) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} must be an object`);
   for (const key of Object.keys(value)) if (!keys.includes(key)) throw new Error(`${label} has unsupported field ${key}`);
@@ -17,10 +19,11 @@ const check = (value, pattern, label) => {
 const unique = (values, label) => {
   if (new Set(values).size !== values.length) throw new Error(`${label} must be unique across environments`);
 };
+export const cellDatabaseName = (env, cell) => `${env.prefix.replaceAll('-', '_')}_${cell.id.replaceAll('-', '_')}`;
 const names = (env, cell) => {
   const prefix = env.prefix;
   return {
-    database: cell ? `${prefix}_${cell.id.replaceAll('-', '_')}` : env.control.database,
+    database: cell ? cellDatabaseName(env, cell) : env.control.database,
     hyperdrive: `${prefix}-${cell?.id ?? 'control'}-authority`,
     bucket: cell ? `${prefix}-${cell.id}-originals` : undefined,
     queue: cell ? `${prefix}-${cell.id}-projection` : undefined,
@@ -42,7 +45,7 @@ export function validateTopology(topology) {
     check(env.prefix, safeName, `${environment} prefix`);
     allowedKeys(env.control, ['awsRegion', 'database', 'originConnectionLimit'], `${environment} control`);
     check(env.control.awsRegion, awsRegion, `${environment} control region`);
-    check(env.control.database, /^[a-z][a-z0-9_]*$/, `${environment} control database`);
+    check(env.control.database, rdsDatabaseName, `${environment} control database`);
     if (!Number.isSafeInteger(env.control.originConnectionLimit) || env.control.originConnectionLimit < 1) throw new Error(`${environment} control connection limit is invalid`);
     if (!Array.isArray(env.cells) || env.cells.length === 0) throw new Error(`${environment} needs cells`);
     const expected = environment === 'production' ? ['in-south', 'us-east'] : ['in-south', 'us-east', 'eu-west'];
@@ -58,6 +61,7 @@ export function validateTopology(topology) {
       if (!Number.isSafeInteger(cell.originConnectionLimit) || cell.originConnectionLimit < 1) throw new Error(`${environment} cell connection limit is invalid`);
       if ({ 'in-south': 'ap-south-1', 'us-east': 'us-east-1', 'eu-west': 'eu-west-1' }[cell.id] !== cell.awsRegion) throw new Error(`${environment} ${cell.id} is mapped to the wrong provider region`);
       const resource = names(env, cell);
+      check(resource.database, rdsDatabaseName, `${environment} ${cell.id} RDS database`);
       all.databases.push(`${cell.awsRegion}/${resource.database}`);
       all.hyperdrives.push(resource.hyperdrive);
       all.buckets.push(resource.bucket);
@@ -76,7 +80,7 @@ export function validateInventory(topology, environment, inventory) {
   if (inventory.environment !== environment) throw new Error('Inventory environment mismatch');
   const network = (resource, label) => {
     if (!['public-tls', 'workers-vpc'].includes(resource.network)) throw new Error(`${label} network mode is invalid`);
-    if (resource.network === 'workers-vpc') check(resource.vpcServiceId, /^[a-zA-Z0-9:_-]{8,128}$/, `${label} VPC service ID`);
+    if (resource.network === 'workers-vpc') check(resource.vpcServiceId, uuid, `${label} VPC service ID`);
     if (resource.network === 'public-tls' && resource.vpcServiceId !== undefined) throw new Error(`${label} public network cannot include a VPC service`);
   };
   allowedKeys(inventory.control, ['hyperdriveId', 'rdsInstanceId', 'network', 'vpcServiceId'], 'control inventory');
