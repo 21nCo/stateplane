@@ -1,0 +1,14 @@
+test/qualification-worker.test.ts
+  h_a39f9495f9ec1d 20,31,34-44,87,166-169,189-191
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "be88b06c335bc4cb36c04b8896dd669b14cd6f7b",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
