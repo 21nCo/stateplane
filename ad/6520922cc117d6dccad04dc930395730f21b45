@@ -1,0 +1,22 @@
+deployment/workers/qualification.ts
+  h_a39f9495f9ec1d 27,45,56-64
+docs/regional-topology.md
+  h_a39f9495f9ec1d 51
+package.json
+  h_a39f9495f9ec1d 12,17
+test/qualification-worker.test.ts
+  h_a39f9495f9ec1d 1-74
+vitest.config.ts
+  h_a39f9495f9ec1d 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ad6520922cc117d6dccad04dc930395730f21b45",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
