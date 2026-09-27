@@ -1,12 +1,15 @@
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve, relative } from 'node:path';
 
 const [name, hyperdriveId] = process.argv.slice(2);
-if (!/^sta-4-[a-z0-9-]{1,45}$/.test(name ?? '') || !/^[a-f0-9]{32}$/i.test(hyperdriveId ?? '')) {
+const root = resolve(import.meta.dirname, '..');
+const topology = JSON.parse(await readFile(resolve(root, 'deployment/topology.json')));
+const cellIds = new Set(Object.values(topology.environments).flatMap(environment => environment.cells.map(cell => cell.id)));
+const match = /^sta-4-[a-f0-9]{40}-([a-z]+(?:-[a-z]+)*)$/.exec(name ?? '');
+if (!match || !cellIds.has(match[1]) || !/^[a-f0-9]{32}$/i.test(hyperdriveId ?? '')) {
   console.error('Usage: node scripts/qualification-config.mjs sta-4-<head>-<cell> <disposable-hyperdrive-id>');
   process.exit(2);
 }
-const root = resolve(import.meta.dirname, '..');
 const out = resolve(root, '.data/qualification');
 await mkdir(out, { recursive: true });
 const config = {
