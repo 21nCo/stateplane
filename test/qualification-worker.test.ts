@@ -17,6 +17,7 @@ const database = vi.hoisted(() => ({
   endFailure: false,
   queryTimeout: 0,
   valueReads: 0,
+  queries: [] as string[],
   targetDatabase: 'sta4_aaaaaaaaaaaaaaaa_dev_in_south',
   targetRole: 'sta4_probe_aaaaaaaaaaaaaaaa'
 }));
@@ -27,9 +28,20 @@ vi.mock('pg', () => ({
     async connect() { database.connections++; }
     async end() { database.closed++; if (database.endFailure) throw new Error('close failed'); }
     async query(sql: string) {
+      database.queries.push(sql);
       if (database.failQuery && sql.includes(database.failQuery)) throw new Error('query timeout');
       if (sql === 'BEGIN') { database.transactionRow = false; return { rows: [] }; }
-      if (sql === 'ROLLBACK') { if (database.rollbackFailure) throw new Error('rollback failed'); if (!database.rollbackLeavesRow) database.transactionRow = false; return { rows: [] }; }
+      if (sql === 'ROLLBACK') {
+        if (database.rollbackFailure) throw new Error('rollback failed');
+        if (database.rollbackLeavesRow && database.transactionRow) database.row = 99;
+        database.transactionRow = false;
+        return { rows: [] };
+      }
+      if (sql === 'COMMIT') {
+        if (database.transactionRow) database.row = 99;
+        database.transactionRow = false;
+        return { rows: [] };
+      }
       if (sql.includes('current_database() AS database')) return { rows: [{ database: database.targetDatabase, role: database.targetRole }] };
       if (sql.includes('FROM pg_extension')) return { rows: [{ extversion: '0.8.6' }] };
       if (sql.includes('::vector')) return { rows: database.vectorMissingRow ? [] : [{ distance: database.vectorDistance }] };
@@ -72,6 +84,7 @@ describe('disposable qualification row cleanup', () => {
     database.staleInitialRead = false;
     database.staleFreshRead = false;
     database.valueReads = 0;
+    database.queries = [];
     database.vectorDistance = Math.SQRT2;
     database.vectorMissingRow = false;
     database.connections = 0;
@@ -150,6 +163,10 @@ describe('disposable qualification row cleanup', () => {
     expect(response.status).toBe(500);
     expect(database.row).toBeNull();
     expect(database.transactionRow).toBe(false);
+    expect(database.queries).toContain('ROLLBACK');
+    expect(database.queries.some(sql => sql.startsWith('DELETE FROM stateplane_qualification'))).toBe(true);
+    expect(database.queries.filter(sql => sql.includes('SELECT count(*)') && sql.includes('stateplane_qualification'))).toHaveLength(2);
+    expect(database.closed).toBe(2);
   });
 
   it('preserves the failed insert stage and still removes a possible row', async () => {
@@ -169,6 +186,9 @@ describe('disposable qualification row cleanup', () => {
       expect((await qualify()).status).toBe(500);
       expect(log).toHaveBeenCalledWith('Qualification failed', 'probe:transaction-rollback');
       expect(database.row).toBeNull();
+      expect(database.transactionRow).toBe(false);
+      expect(database.queries.some(sql => sql.startsWith('DELETE FROM stateplane_qualification'))).toBe(true);
+      expect(database.queries.filter(sql => sql.includes('SELECT count(*)') && sql.includes('stateplane_qualification'))).toHaveLength(1);
       expect(database.closed).toBe(2);
     } finally { log.mockRestore(); }
   });
