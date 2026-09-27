@@ -42,6 +42,7 @@ export function assertApprovedIngress(label, instance, securityGroups, approvedC
 export function assertLiveResources(label, environment, definition, resource, database, hyperdrive, instance, securityGroups, approvedCidrs) {
   if (!instance || instance.DBInstanceIdentifier !== resource.rdsInstanceId || instance.Engine !== 'postgres' || instance.DBName !== database) throw new Error(`${label}: RDS identity mismatch`);
   if (instance.DBInstanceStatus !== 'available') throw new Error(`${label}: RDS is not available`);
+  if (!['rds-ca-rsa2048-g1', 'rds-ca-rsa4096-g1', 'rds-ca-ecc384-g1'].includes(instance.CACertificateIdentifier)) throw new Error(`${label}: RDS CA identifier unavailable or unsupported`);
   const retention = instance.BackupRetentionPeriod;
   if (!Number.isInteger(retention) || retention < (environment === 'production' ? 7 : 1)) throw new Error(`${label}: RDS backups/PITR disabled, invalid or below policy`);
   if (hyperdrive?.id !== resource.hyperdriveId || hyperdrive.caching?.disabled !== true) throw new Error(`${label}: Hyperdrive cache is enabled or ID differs`);

@@ -15,7 +15,7 @@ const approvedCidrs = { ipv4_cidrs: ['203.0.113.0/24', '198.51.100.0/24'], ipv6_
 const approvedGroups = [{ GroupId: groupId, IpPermissions: [{ IpProtocol: 'tcp', FromPort: 5432, ToPort: 5432, IpRanges: approvedCidrs.ipv4_cidrs.map(CidrIp => ({ CidrIp })) }] }];
 const assertLiveResources = (label, environment, definition, resource, database, hyperdrive, instance) =>
   assertRawLiveResources(label, environment, definition, resource, database, hyperdrive,
-    { ...instance, NetworkType: 'IPV4', VpcSecurityGroups: [{ VpcSecurityGroupId: groupId }] }, approvedGroups, approvedCidrs);
+    { CACertificateIdentifier: 'rds-ca-rsa2048-g1', ...instance, NetworkType: 'IPV4', VpcSecurityGroups: [{ VpcSecurityGroupId: groupId }] }, approvedGroups, approvedCidrs);
 const copy = value => structuredClone(value);
 const inventory = environment => ({
   environment,
@@ -171,6 +171,7 @@ test('live gate verifies PostgreSQL origin identity and public CA for control an
       assert.doesNotThrow(() => checkLive(), `${environment}/${label}: valid public PostgreSQL origin`);
       assert.throws(() => checkLive({ ...hyperdrive, mtls: { sslmode: 'verify-full' } }), /CA certificate ID/, `${environment}/${label}: absent CA`);
       assert.throws(() => checkLive({ ...hyperdrive, mtls: { sslmode: 'verify-full', ca_certificate_id: 'invalid' } }), /CA certificate ID/, `${environment}/${label}: malformed CA`);
+      assert.throws(() => checkLive(hyperdrive, { ...instance, CACertificateIdentifier: undefined }), /RDS CA identifier/, `${environment}/${label}: missing RDS CA`);
       assert.throws(() => checkLive({ ...hyperdrive, origin: { ...hyperdrive.origin, scheme: 'mysql' } }), /not PostgreSQL/, `${environment}/${label}: MySQL scheme`);
       assert.throws(() => checkLive({ ...hyperdrive, origin: { ...hyperdrive.origin, port: 3306 } }), /origin port mismatch/, `${environment}/${label}: MySQL port`);
       assert.throws(() => checkLive(hyperdrive, { ...instance, Endpoint: { Address: host, Port: 3306 } }), /endpoint port mismatch/, `${environment}/${label}: RDS port`);

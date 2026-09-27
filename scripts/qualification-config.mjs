@@ -4,10 +4,10 @@ import { resolve, relative } from 'node:path';
 const [name, hyperdriveId] = process.argv.slice(2);
 const root = resolve(import.meta.dirname, '..');
 const topology = JSON.parse(await readFile(resolve(root, 'deployment/topology.json')));
-const cellIds = new Set(Object.values(topology.environments).flatMap(environment => environment.cells.map(cell => cell.id)));
-const match = /^sta-4-[a-f0-9]{40}-([a-z]+(?:-[a-z]+)*)$/.exec(name ?? '');
-if (!match || !cellIds.has(match[1]) || !/^[a-f0-9]{32}$/i.test(hyperdriveId ?? '')) {
-  console.error('Usage: node scripts/qualification-config.mjs sta-4-<head>-<cell> <disposable-hyperdrive-id>');
+const match = /^sta-4-[a-f0-9]{40}-(dev|prod)-([a-z]+(?:-[a-z]+)*)$/.exec(name ?? '');
+const environment = { dev: 'development', prod: 'production' }[match?.[1]];
+if (!environment || !topology.environments[environment].cells.some(cell => cell.id === match[2]) || !/^[a-f0-9]{32}$/i.test(hyperdriveId ?? '')) {
+  console.error('Usage: node scripts/qualification-config.mjs sta-4-<head>-<dev|prod>-<cell> <disposable-hyperdrive-id>');
   process.exit(2);
 }
 const out = resolve(root, '.data/qualification');
