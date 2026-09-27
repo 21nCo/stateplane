@@ -12,6 +12,6 @@ export function assertLiveResources(label, environment, definition, resource, da
   } else if (resource.network === 'workers-vpc') {
     if (instance.PubliclyAccessible || hyperdrive.origin.service_id !== resource.vpcServiceId) throw new Error(`${label}: private VPC origin mismatch`);
     if (vpcService?.service_id !== resource.vpcServiceId || vpcService.type !== 'tcp' || vpcService.tcp_port !== 5432 || vpcService.app_protocol !== 'postgresql' || vpcService.host?.hostname !== instance.Endpoint.Address) throw new Error(`${label}: VPC service target mismatch`);
-    if (vpcService.tls_settings?.cert_verification_mode !== 'verify_full') throw new Error(`${label}: VPC service TLS verification is not full`);
+    if (vpcService.tls_settings !== undefined && vpcService.tls_settings?.cert_verification_mode !== 'verify_full') throw new Error(`${label}: VPC service TLS verification is not full`);
   } else throw new Error(`${label}: unsupported network mode`);
 }

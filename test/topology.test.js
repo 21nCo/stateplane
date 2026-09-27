@@ -101,6 +101,9 @@ test('live gate rejects stale Hyperdrive caching, wrong origin and inadequate ba
   const privateOrigin = { ...hyperdrive, origin: { service_id: privateResource.vpcServiceId, database }, mtls: {} };
   const vpc = { service_id: privateResource.vpcServiceId, type: 'tcp', tcp_port: 5432, app_protocol: 'postgresql', host: { hostname: host }, tls_settings: { cert_verification_mode: 'verify_full' } };
   assert.doesNotThrow(() => assertLiveResources('in-south', 'production', definition, privateResource, database, privateOrigin, { ...instance, PubliclyAccessible: false }, vpc));
+  const { tls_settings: _omitted, ...defaultTlsVpc } = vpc;
+  assert.doesNotThrow(() => assertLiveResources('in-south', 'production', definition, privateResource, database, privateOrigin, { ...instance, PubliclyAccessible: false }, defaultTlsVpc));
+  assert.throws(() => assertLiveResources('in-south', 'production', definition, privateResource, database, privateOrigin, { ...instance, PubliclyAccessible: false }, { ...vpc, tls_settings: { cert_verification_mode: 'verify_ca' } }), /TLS verification/);
   assert.throws(() => assertLiveResources('in-south', 'production', definition, privateResource, database, privateOrigin, { ...instance, PubliclyAccessible: false }, { ...vpc, tls_settings: { cert_verification_mode: 'disabled' } }), /TLS verification/);
 });
 
@@ -130,6 +133,10 @@ test('Cloudflare structured VPC API reads verify account and service identity be
     const instance = { DBInstanceIdentifier: resource.rdsInstanceId, Engine: 'postgres', DBName: database, DBInstanceStatus: 'available', BackupRetentionPeriod: 7, PubliclyAccessible: false, Endpoint: { Address: service.host.hostname } };
     const hyperdrive = { id: resource.hyperdriveId, caching: { disabled: true }, origin_connection_limit: 5, origin: { service_id: serviceId, database } };
     assert.doesNotThrow(() => assertLiveResources(label, 'production', definition, resource, database, hyperdrive, instance, fetched));
+    const { tls_settings: _omitted, ...defaultTlsService } = fetched;
+    assert.doesNotThrow(() => assertLiveResources(label, 'production', definition, resource, database, hyperdrive, instance, defaultTlsService));
+    assert.throws(() => assertLiveResources(label, 'production', definition, resource, database, hyperdrive, instance, { ...fetched, tls_settings: { cert_verification_mode: 'verify_ca' } }), /TLS verification/);
+    assert.throws(() => assertLiveResources(label, 'production', definition, resource, database, hyperdrive, instance, { ...fetched, tls_settings: { cert_verification_mode: 'disabled' } }), /TLS verification/);
     assert.throws(() => assertLiveResources(label, 'production', definition, resource, database, hyperdrive, instance, { ...fetched, tcp_port: 5442 }), /VPC service target mismatch/);
   }
   assert.throws(() => parseVpcServiceResponse({ success: false, result: service }, serviceId), /unsuccessful/);

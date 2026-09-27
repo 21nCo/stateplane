@@ -3,12 +3,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const database = vi.hoisted(() => ({
   row: null as number | null,
   deleteMode: 'ok' as 'ok' | 'throw' | 'no-op',
+  connections: 0,
   closed: 0
 }));
 
 vi.mock('pg', () => ({
   Client: class {
-    async connect() {}
+    async connect() { database.connections++; }
     async end() { database.closed++; }
     async query(sql: string) {
       if (sql.includes('FROM pg_extension')) return { rows: [{ extversion: '0.8.6' }] };
@@ -31,12 +32,12 @@ vi.mock('pg', () => ({
 
 import worker from '../deployment/workers/qualification';
 
-async function qualify() {
+async function qualify(authorization: string | null = 'Bearer disposable-token', disposable = '1') {
   return worker.fetch(new Request('https://preview.example/qualify', {
-    method: 'POST', headers: { authorization: 'Bearer disposable-token' }
+    method: 'POST', headers: authorization === null ? {} : { authorization }
   }), {
     AUTHORITY: { connectionString: 'postgres://disposable.example/probe' },
-    PROBE_TOKEN: 'disposable-token', STATEPLANE_DISPOSABLE: '1'
+    PROBE_TOKEN: 'disposable-token', STATEPLANE_DISPOSABLE: disposable
   } as never);
 }
 
@@ -44,6 +45,7 @@ describe('disposable qualification row cleanup', () => {
   beforeEach(() => {
     database.row = null;
     database.deleteMode = 'ok';
+    database.connections = 0;
     database.closed = 0;
   });
 
@@ -70,5 +72,19 @@ describe('disposable qualification row cleanup', () => {
     expect(response.status).toBe(500);
     expect(database.row).toBe(2);
     expect(database.closed).toBe(2);
+  });
+
+  it('denies missing, wrong and non-Bearer credentials and non-disposable deployments before connecting', async () => {
+    for (const [authorization, disposable] of [
+      [null, '1'],
+      ['Bearer disposable-tokex', '1'],
+      ['Basic disposable-token', '1'],
+      ['Bearer disposable-token', '0']
+    ] as const) {
+      const response = await qualify(authorization, disposable);
+      expect(response.status).toBe(403);
+      expect(database.connections).toBe(0);
+      expect(database.row).toBeNull();
+    }
   });
 });
