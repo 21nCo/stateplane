@@ -1,0 +1,22 @@
+deployment/workers/qualification.ts
+  h_a39f9495f9ec1d 28-29,56-64,66-67,69-72
+docs/regional-topology.md
+  h_a39f9495f9ec1d 44
+package.json
+  h_a39f9495f9ec1d 12
+scripts/topology-live.mjs
+  h_a39f9495f9ec1d 10-11,14,16
+test/topology.test.js
+  h_a39f9495f9ec1d 9,95-96,102,121-122,135-165,189-190
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b42261689c9a9fb565b177ed6b1310ad20c232a6",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
