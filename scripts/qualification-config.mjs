@@ -4,14 +4,14 @@ import { resolve, relative } from 'node:path';
 const [name, hyperdriveId] = process.argv.slice(2);
 const root = resolve(import.meta.dirname, '..');
 const topology = JSON.parse(await readFile(resolve(root, 'deployment/topology.json')));
-const match = /^sta-4-[a-f0-9]{40}-(dev|prod)-([a-z]+(?:-[a-z]+)*)$/.exec(name ?? '');
-const environment = { dev: 'development', prod: 'production' }[match?.[1]];
-if (!environment || !topology.environments[environment].cells.some(cell => cell.id === match[2]) || !/^[a-f0-9]{32}$/i.test(hyperdriveId ?? '')) {
-  console.error('Usage: node scripts/qualification-config.mjs sta-4-<head>-<dev|prod>-<cell> <disposable-hyperdrive-id>');
+const match = /^s4-([a-f0-9]{40})-(d|p)-([a-z]+(?:-[a-z]+)*)$/.exec(name ?? '');
+const environment = { d: 'development', p: 'production' }[match?.[2]];
+if (!environment || name.length > 54 || !topology.environments[environment].cells.some(cell => cell.id === match[3]) || !/^[a-f0-9]{32}$/i.test(hyperdriveId ?? '')) {
+  console.error('Usage: node scripts/qualification-config.mjs s4-<full-head>-<d|p>-<cell> <disposable-hyperdrive-id> (name <= 54 characters)');
   process.exit(2);
 }
-const probeDatabase = `sta4_${match[0].slice(6, 22)}_${match[1]}_${match[2].replaceAll('-', '_')}`;
-const probeRole = `sta4_probe_${match[0].slice(6, 22)}`;
+const probeDatabase = `sta4_${match[1].slice(0, 16)}_${match[2] === 'd' ? 'dev' : 'prod'}_${match[3].replaceAll('-', '_')}`;
+const probeRole = `sta4_probe_${match[1].slice(0, 16)}`;
 const out = resolve(root, '.data/qualification');
 await mkdir(out, { recursive: true });
 const config = {
