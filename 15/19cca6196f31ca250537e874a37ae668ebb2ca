@@ -1,0 +1,44 @@
+README.md
+  h_a39f9495f9ec1d 3-4
+deployment/topology.json
+  h_a39f9495f9ec1d 1-23
+deployment/tsconfig.json
+  h_a39f9495f9ec1d 1-10
+deployment/workers/cell.ts
+  h_a39f9495f9ec1d 1-8
+deployment/workers/directory.ts
+  h_a39f9495f9ec1d 1-7
+deployment/workers/gateway.ts
+  h_a39f9495f9ec1d 1-8
+deployment/workers/jobs.ts
+  h_a39f9495f9ec1d 1-7
+deployment/workers/qualification.ts
+  h_a39f9495f9ec1d 1-70
+docs/regional-topology.md
+  h_a39f9495f9ec1d 1-67
+package.json
+  h_a39f9495f9ec1d 11,14-15,26
+scripts/qualification-config.mjs
+  h_a39f9495f9ec1d 1-23
+scripts/topology-dry-run.mjs
+  h_a39f9495f9ec1d 1-33
+scripts/topology-live.mjs
+  h_a39f9495f9ec1d 1-17
+scripts/topology.mjs
+  h_a39f9495f9ec1d 1-191
+scripts/verify-topology.mjs
+  h_a39f9495f9ec1d 1-45
+test/topology.test.js
+  h_a39f9495f9ec1d 1-84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1519cca6196f31ca250537e874a37ae668ebb2ca",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
