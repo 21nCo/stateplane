@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const database = vi.hoisted(() => ({
   row: null as number | null,
   deleteMode: 'ok' as 'ok' | 'throw' | 'no-op',
+  staleInitialRead: false,
   connections: 0,
   closed: 0
 }));
@@ -23,7 +24,7 @@ vi.mock('pg', () => ({
         return { rows: [] };
       }
       if (sql.includes('count(*)') && sql.includes('stateplane_qualification')) return { rows: [{ count: database.row === null ? 0 : 1 }] };
-      if (sql.includes('SELECT value')) return { rows: database.row === null ? [] : [{ value: database.row }] };
+      if (sql.includes('SELECT value')) return { rows: database.row === null ? [] : [{ value: database.staleInitialRead ? 0 : database.row }] };
       if (sql.includes('pg_stat_activity')) return { rows: [{ count: 2 }] };
       return { rows: [] };
     }
@@ -45,6 +46,7 @@ describe('disposable qualification row cleanup', () => {
   beforeEach(() => {
     database.row = null;
     database.deleteMode = 'ok';
+    database.staleInitialRead = false;
     database.connections = 0;
     database.closed = 0;
   });
@@ -72,6 +74,22 @@ describe('disposable qualification row cleanup', () => {
     expect(response.status).toBe(500);
     expect(database.row).toBe(2);
     expect(database.closed).toBe(2);
+  });
+
+  it('reports both the stale-read and cleanup stages without logging database errors', async () => {
+    database.staleInitialRead = true;
+    database.deleteMode = 'throw';
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const response = await qualify();
+      expect(response.status).toBe(500);
+      expect(await response.json()).toEqual({ ok: false });
+      expect(log).toHaveBeenCalledWith('Qualification failed', 'probe:initial-read,cleanup-delete');
+      expect(JSON.stringify(log.mock.calls)).not.toContain('DELETE failed');
+      expect(database.closed).toBe(2);
+    } finally {
+      log.mockRestore();
+    }
   });
 
   it('denies missing, wrong and non-Bearer credentials and non-disposable deployments before connecting', async () => {

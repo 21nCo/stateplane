@@ -20,7 +20,11 @@ const config = {
   compatibility_flags: ['nodejs_compat'],
   workers_dev: false,
   hyperdrive: [{ binding: 'AUTHORITY', id: hyperdriveId }],
-  vars: { STATEPLANE_DISPOSABLE: '1' }
+  vars: { STATEPLANE_DISPOSABLE: '1' },
+  previews: {
+    hyperdrive: [{ binding: 'AUTHORITY', id: hyperdriveId }],
+    vars: { STATEPLANE_DISPOSABLE: '1' }
+  }
 };
 await writeFile(resolve(out, `${name}.json`), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
 console.log(relative(root, resolve(out, `${name}.json`)));

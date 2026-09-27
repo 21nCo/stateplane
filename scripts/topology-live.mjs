@@ -12,9 +12,11 @@ export function assertApprovedIngress(label, instance, securityGroups, approvedC
   if (!ids?.length || ids.some(id => typeof id !== 'string' || !id)) throw new Error(`${label}: RDS security groups missing`);
   if (!Array.isArray(securityGroups) || securityGroups.length !== ids.length || new Set(securityGroups.map(group => group.GroupId)).size !== ids.length || securityGroups.some(group => !ids.includes(group.GroupId))) throw new Error(`${label}: RDS security group inventory incomplete`);
   if (!Array.isArray(approvedCidrs?.ipv4_cidrs) || !Array.isArray(approvedCidrs?.ipv6_cidrs) || !approvedCidrs.ipv4_cidrs.length || !approvedCidrs.ipv4_cidrs.every(cidr => validCidr(cidr, 4)) || !approvedCidrs.ipv6_cidrs.every(cidr => validCidr(cidr, 6))) throw new Error(`${label}: Cloudflare ingress ranges unavailable`);
-  const ipv4 = new Set(approvedCidrs.ipv4_cidrs);
-  const ipv6 = new Set(approvedCidrs.ipv6_cidrs);
-  let approved = false;
+  const requiredIpv4 = new Set(approvedCidrs.ipv4_cidrs);
+  const requiredIpv6 = instance.NetworkType === 'DUAL' ? new Set(approvedCidrs.ipv6_cidrs) : new Set();
+  if (instance.NetworkType !== 'IPV4' && instance.NetworkType !== 'DUAL') throw new Error(`${label}: RDS address family unavailable`);
+  const coveredIpv4 = new Set();
+  const coveredIpv6 = new Set();
   for (const group of securityGroups) {
     if (!Array.isArray(group.IpPermissions)) throw new Error(`${label}: RDS security group rules unavailable`);
     for (const rule of group.IpPermissions) {
@@ -25,16 +27,16 @@ export function assertApprovedIngress(label, instance, securityGroups, approvedC
       }
       if ((rule.UserIdGroupPairs?.length ?? 0) || (rule.PrefixListIds?.length ?? 0)) throw new Error(`${label}: unapproved RDS port 5432 ingress`);
       for (const range of rule.IpRanges ?? []) {
-        if (!ipv4.has(range.CidrIp)) throw new Error(`${label}: unapproved RDS port 5432 ingress`);
-        approved = true;
+        if (!requiredIpv4.has(range.CidrIp)) throw new Error(`${label}: unapproved RDS port 5432 ingress`);
+        coveredIpv4.add(range.CidrIp);
       }
       for (const range of rule.Ipv6Ranges ?? []) {
-        if (!ipv6.has(range.CidrIpv6)) throw new Error(`${label}: unapproved RDS port 5432 ingress`);
-        approved = true;
+        if (!requiredIpv6.has(range.CidrIpv6)) throw new Error(`${label}: unapproved RDS port 5432 ingress`);
+        coveredIpv6.add(range.CidrIpv6);
       }
     }
   }
-  if (!approved) throw new Error(`${label}: no approved RDS port 5432 ingress`);
+  if (coveredIpv4.size !== requiredIpv4.size || coveredIpv6.size !== requiredIpv6.size) throw new Error(`${label}: Cloudflare RDS port 5432 ingress coverage incomplete`);
 }
 
 export function assertLiveResources(label, environment, definition, resource, database, hyperdrive, instance, securityGroups, approvedCidrs) {

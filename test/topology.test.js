@@ -11,11 +11,11 @@ import { assertLiveResources as assertRawLiveResources, assertApprovedIngress } 
 const topology = JSON.parse(readFileSync(new URL('../deployment/topology.json', import.meta.url)));
 const caCertificateId = '550e8400-e29b-41d4-a716-446655440001';
 const groupId = 'sg-approved';
-const approvedCidrs = { ipv4_cidrs: ['203.0.113.0/24'], ipv6_cidrs: ['2001:db8::/32'] };
-const approvedGroups = [{ GroupId: groupId, IpPermissions: [{ IpProtocol: 'tcp', FromPort: 5432, ToPort: 5432, IpRanges: [{ CidrIp: approvedCidrs.ipv4_cidrs[0] }] }] }];
+const approvedCidrs = { ipv4_cidrs: ['203.0.113.0/24', '198.51.100.0/24'], ipv6_cidrs: ['2001:db8::/32'] };
+const approvedGroups = [{ GroupId: groupId, IpPermissions: [{ IpProtocol: 'tcp', FromPort: 5432, ToPort: 5432, IpRanges: approvedCidrs.ipv4_cidrs.map(CidrIp => ({ CidrIp })) }] }];
 const assertLiveResources = (label, environment, definition, resource, database, hyperdrive, instance) =>
   assertRawLiveResources(label, environment, definition, resource, database, hyperdrive,
-    { ...instance, VpcSecurityGroups: [{ VpcSecurityGroupId: groupId }] }, approvedGroups, approvedCidrs);
+    { ...instance, NetworkType: 'IPV4', VpcSecurityGroups: [{ VpcSecurityGroupId: groupId }] }, approvedGroups, approvedCidrs);
 const copy = value => structuredClone(value);
 const inventory = environment => ({
   environment,
@@ -183,12 +183,17 @@ test('live gate verifies PostgreSQL origin identity and public CA for control an
 test('public RDS ingress is limited to current approved Cloudflare ranges for every control and cell', () => {
   for (const [environment, env] of Object.entries(topology.environments)) {
     for (const label of ['control', ...env.cells.map(cell => cell.id)]) {
-      const instance = { VpcSecurityGroups: [{ VpcSecurityGroupId: groupId }] };
+      const instance = { NetworkType: 'IPV4', VpcSecurityGroups: [{ VpcSecurityGroupId: groupId }] };
       const check = (groups = approvedGroups, ranges = approvedCidrs, rds = instance) => assertApprovedIngress(label, rds, groups, ranges);
       assert.doesNotThrow(() => check(), `${environment}/${label}: approved ingress`);
+      assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ ...approvedGroups[0].IpPermissions[0], IpRanges: [{ CidrIp: approvedCidrs.ipv4_cidrs[0] }] }] }]), /coverage incomplete/, `${environment}/${label}: one of two current IPv4 ranges`);
+      assert.throws(() => check(approvedGroups, approvedCidrs, { ...instance, NetworkType: undefined }), /address family unavailable/);
+      const dualGroup = [{ ...approvedGroups[0], IpPermissions: [{ ...approvedGroups[0].IpPermissions[0], Ipv6Ranges: approvedCidrs.ipv6_cidrs.map(CidrIpv6 => ({ CidrIpv6 })) }] }];
+      assert.doesNotThrow(() => check(dualGroup, approvedCidrs, { ...instance, NetworkType: 'DUAL' }), `${environment}/${label}: complete dual-stack ingress`);
+      assert.throws(() => check(approvedGroups, approvedCidrs, { ...instance, NetworkType: 'DUAL' }), /coverage incomplete/, `${environment}/${label}: missing IPv6 ingress`);
       assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ ...approvedGroups[0].IpPermissions[0], IpRanges: [{ CidrIp: '0.0.0.0/0' }] }] }]), /unapproved/);
       assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ ...approvedGroups[0].IpPermissions[0], IpRanges: [], Ipv6Ranges: [{ CidrIpv6: '::/0' }] }] }]), /unapproved/);
-      assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ ...approvedGroups[0].IpPermissions[0], IpRanges: [{ CidrIp: '198.51.100.0/24' }] }] }]), /unapproved/);
+      assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ ...approvedGroups[0].IpPermissions[0], IpRanges: [{ CidrIp: '192.0.2.0/24' }] }] }]), /unapproved/);
       assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ IpProtocol: '-1', IpRanges: [{ CidrIp: '0.0.0.0/0' }] }] }]), /unapproved/);
       assert.throws(() => check([{ ...approvedGroups[0], IpPermissions: [{ IpProtocol: 'tcp', FromPort: 5432, ToPort: 5432, UserIdGroupPairs: [{ GroupId: 'sg-other' }] }] }]), /unapproved/);
       assert.throws(() => check([], approvedCidrs), /inventory incomplete/);

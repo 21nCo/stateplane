@@ -26,6 +26,8 @@ test('full-head qualification configs dry-run for every declared target cell', {
         const config = JSON.parse(await readFile(configPath));
         assert.equal(config.name, name);
         assert.deepEqual(config.hyperdrive, [{ binding: 'AUTHORITY', id: hyperdriveId }]);
+        assert.deepEqual(config.previews.hyperdrive, config.hyperdrive);
+        assert.deepEqual(config.previews.vars, { STATEPLANE_DISPOSABLE: '1' });
         assert.equal(JSON.stringify(config).includes('password'), false);
         await run(wrangler, ['deploy', '--config', configPath, '--dry-run', '--outdir', bundlePath], { maxBuffer: 1024 * 1024 });
       } finally {
