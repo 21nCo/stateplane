@@ -9,7 +9,7 @@
   "scripts": {
     "build": "turbo run build",
     "typecheck": "turbo run typecheck && pnpm exec tsc -p deployment/tsconfig.json",
-    "lint": "eslint packages scripts test/qualification.test.ts test/qualification-worker.test.ts && node scripts/check-boundaries.mjs",
+    "lint": "eslint packages scripts deployment/workers test/qualification.test.ts test/qualification-worker.test.ts && node scripts/check-boundaries.mjs",
     "test": "pnpm test:contracts && pnpm test:qualification",
     "topology:validate": "node scripts/topology.mjs validate",
     "topology:dry-run": "pnpm --filter @stateplane/app build && node scripts/topology-dry-run.mjs",

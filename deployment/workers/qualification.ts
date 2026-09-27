@@ -25,6 +25,8 @@ async function probe(connectionString: string) {
   const start = Date.now();
   let writerConnected = false;
   let rowMayExist = false;
+  let result: { pgvectorVersion: string; rollback: boolean; freshRead: boolean; observedConnections: number; elapsedMs: number } | undefined;
+  let failure: unknown;
   try {
     await writer.connect();
     writerConnected = true;
@@ -51,18 +53,23 @@ async function probe(connectionString: string) {
     const fresh = await reader.query('SELECT value FROM stateplane_qualification WHERE probe_id = $1', [id]);
     if (fresh.rows[0]?.value !== 2) throw new Error('Fresh read was stale');
     const activity = await reader.query('SELECT count(*)::integer AS count FROM pg_stat_activity WHERE datname = current_database() AND usename = current_user');
-    return { pgvectorVersion: extension.rows[0].extversion, rollback: true, freshRead: true, observedConnections: activity.rows[0].count, elapsedMs: Date.now() - start };
-  } finally {
-    try {
-      if (writerConnected && rowMayExist) {
-        await writer.query('DELETE FROM stateplane_qualification WHERE probe_id = $1', [id]);
-        const remaining = await writer.query('SELECT count(*)::integer AS count FROM stateplane_qualification WHERE probe_id = $1', [id]);
-        if (remaining.rows[0]?.count !== 0) throw new Error('Qualification row cleanup failed');
-      }
-    } finally {
-      await Promise.allSettled([writer.end(), reader.end()]);
-    }
+    result = { pgvectorVersion: extension.rows[0].extversion, rollback: true, freshRead: true, observedConnections: activity.rows[0].count, elapsedMs: Date.now() - start };
+  } catch (error) {
+    failure = error;
   }
+  try {
+    if (writerConnected && rowMayExist) {
+      await writer.query('DELETE FROM stateplane_qualification WHERE probe_id = $1', [id]);
+      const remaining = await writer.query('SELECT count(*)::integer AS count FROM stateplane_qualification WHERE probe_id = $1', [id]);
+      if (remaining.rows[0]?.count !== 0) throw new Error('Qualification row cleanup failed');
+    }
+  } catch (error) {
+    failure = error;
+  }
+  await Promise.allSettled([writer.end(), reader.end()]);
+  if (failure) throw failure;
+  if (!result) throw new Error('Qualification result missing');
+  return result;
 }
 
 export default {

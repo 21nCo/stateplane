@@ -6,6 +6,7 @@ import { assertLiveResources } from '../scripts/topology-live.mjs';
 import { createVpcServiceReader, parseVpcServiceResponse } from '../scripts/cloudflare-vpc.mjs';
 
 const topology = JSON.parse(readFileSync(new URL('../deployment/topology.json', import.meta.url)));
+const caCertificateId = '550e8400-e29b-41d4-a716-446655440001';
 const copy = value => structuredClone(value);
 const inventory = environment => ({
   environment,
@@ -91,14 +92,14 @@ test('live gate rejects stale Hyperdrive caching, wrong origin and inadequate ba
   const resource = inventory('production').cells['in-south'];
   const database = cellDatabaseName(topology.environments.production, definition);
   const host = 'sta-4.abcdefgh.ap-south-1.rds.amazonaws.com';
-  const instance = { DBInstanceIdentifier: resource.rdsInstanceId, Engine: 'postgres', DBName: database, DBInstanceStatus: 'available', BackupRetentionPeriod: 7, PubliclyAccessible: true, Endpoint: { Address: host } };
-  const hyperdrive = { id: resource.hyperdriveId, caching: { disabled: true }, origin_connection_limit: 5, mtls: { sslmode: 'verify-full' }, origin: { host, database } };
+  const instance = { DBInstanceIdentifier: resource.rdsInstanceId, Engine: 'postgres', DBName: database, DBInstanceStatus: 'available', BackupRetentionPeriod: 7, PubliclyAccessible: true, Endpoint: { Address: host, Port: 5432 } };
+  const hyperdrive = { id: resource.hyperdriveId, caching: { disabled: true }, origin_connection_limit: 5, mtls: { sslmode: 'verify-full', ca_certificate_id: caCertificateId }, origin: { host, port: 5432, scheme: 'postgres', database } };
   assert.doesNotThrow(() => assertLiveResources('in-south', 'production', definition, resource, database, hyperdrive, instance));
   assert.throws(() => assertLiveResources('in-south', 'production', definition, resource, database, { ...hyperdrive, caching: { disabled: false } }, instance), /cache is enabled/);
   assert.throws(() => assertLiveResources('in-south', 'production', definition, resource, database, { ...hyperdrive, origin: { ...hyperdrive.origin, database: 'other' } }, instance), /another database/);
   assert.throws(() => assertLiveResources('in-south', 'production', definition, resource, database, hyperdrive, { ...instance, BackupRetentionPeriod: 0 }), /backups\/PITR/);
   const privateResource = { ...resource, network: 'workers-vpc', vpcServiceId: '550e8400-e29b-41d4-a716-446655440000' };
-  const privateOrigin = { ...hyperdrive, origin: { service_id: privateResource.vpcServiceId, database }, mtls: {} };
+  const privateOrigin = { ...hyperdrive, origin: { service_id: privateResource.vpcServiceId, scheme: 'postgresql', database }, mtls: {} };
   const vpc = { service_id: privateResource.vpcServiceId, type: 'tcp', tcp_port: 5432, app_protocol: 'postgresql', host: { hostname: host }, tls_settings: { cert_verification_mode: 'verify_full' } };
   assert.doesNotThrow(() => assertLiveResources('in-south', 'production', definition, privateResource, database, privateOrigin, { ...instance, PubliclyAccessible: false }, vpc));
   const { tls_settings: _omitted, ...defaultTlsVpc } = vpc;
@@ -117,8 +118,8 @@ test('live gate requires a valid backup retention period for every control and c
     const minimum = environment === 'production' ? 7 : 1;
     for (const [label, definition, resource, database] of targets) {
       const host = `sta-4.abcdefgh.${definition.awsRegion}.rds.amazonaws.com`;
-      const instance = { DBInstanceIdentifier: resource.rdsInstanceId, Engine: 'postgres', DBName: database, DBInstanceStatus: 'available', BackupRetentionPeriod: minimum, PubliclyAccessible: true, Endpoint: { Address: host } };
-      const hyperdrive = { id: resource.hyperdriveId, caching: { disabled: true }, origin_connection_limit: definition.originConnectionLimit, mtls: { sslmode: 'verify-full' }, origin: { host, database } };
+      const instance = { DBInstanceIdentifier: resource.rdsInstanceId, Engine: 'postgres', DBName: database, DBInstanceStatus: 'available', BackupRetentionPeriod: minimum, PubliclyAccessible: true, Endpoint: { Address: host, Port: 5432 } };
+      const hyperdrive = { id: resource.hyperdriveId, caching: { disabled: true }, origin_connection_limit: definition.originConnectionLimit, mtls: { sslmode: 'verify-full', ca_certificate_id: caCertificateId }, origin: { host, port: 5432, scheme: 'postgres', database } };
       assert.doesNotThrow(() => assertLiveResources(label, environment, definition, resource, database, hyperdrive, instance), `${environment}/${label}: valid retention`);
       for (const retention of [undefined, NaN, 'unavailable', minimum - 1, minimum + 0.5]) {
         assert.throws(
@@ -127,6 +128,37 @@ test('live gate requires a valid backup retention period for every control and c
           `${environment}/${label}: ${String(retention)} must fail closed`
         );
       }
+    }
+  }
+});
+
+test('live gate verifies PostgreSQL origin identity and public CA for control and every cell', () => {
+  for (const [environment, env] of Object.entries(topology.environments)) {
+    const resources = inventory(environment);
+    const targets = [
+      ['control', env.control, resources.control, env.control.database],
+      ...env.cells.map(cell => [cell.id, cell, resources.cells[cell.id], cellDatabaseName(env, cell)])
+    ];
+    for (const [label, definition, resource, database] of targets) {
+      const host = `sta-4.abcdefgh.${definition.awsRegion}.rds.amazonaws.com`;
+      const instance = { DBInstanceIdentifier: resource.rdsInstanceId, Engine: 'postgres', DBName: database, DBInstanceStatus: 'available', BackupRetentionPeriod: environment === 'production' ? 7 : 1, PubliclyAccessible: true, Endpoint: { Address: host, Port: 5432 } };
+      const hyperdrive = { id: resource.hyperdriveId, caching: { disabled: true }, origin_connection_limit: definition.originConnectionLimit, mtls: { sslmode: 'verify-full', ca_certificate_id: caCertificateId }, origin: { host, port: 5432, scheme: 'postgres', database } };
+      const checkLive = (origin = hyperdrive, rds = instance, currentResource = resource, vpc) => assertLiveResources(label, environment, definition, currentResource, database, origin, rds, vpc);
+      assert.doesNotThrow(() => checkLive(), `${environment}/${label}: valid public PostgreSQL origin`);
+      assert.throws(() => checkLive({ ...hyperdrive, mtls: { sslmode: 'verify-full' } }), /CA certificate ID/, `${environment}/${label}: absent CA`);
+      assert.throws(() => checkLive({ ...hyperdrive, mtls: { sslmode: 'verify-full', ca_certificate_id: 'invalid' } }), /CA certificate ID/, `${environment}/${label}: malformed CA`);
+      assert.throws(() => checkLive({ ...hyperdrive, origin: { ...hyperdrive.origin, scheme: 'mysql' } }), /not PostgreSQL/, `${environment}/${label}: MySQL scheme`);
+      assert.throws(() => checkLive({ ...hyperdrive, origin: { ...hyperdrive.origin, port: 3306 } }), /origin port mismatch/, `${environment}/${label}: MySQL port`);
+      assert.throws(() => checkLive(hyperdrive, { ...instance, Endpoint: { Address: host, Port: 3306 } }), /endpoint port mismatch/, `${environment}/${label}: RDS port`);
+
+      const privateResource = { ...resource, network: 'workers-vpc', vpcServiceId: '550e8400-e29b-41d4-a716-446655440000' };
+      const privateInstance = { ...instance, PubliclyAccessible: false };
+      const privateOrigin = { ...hyperdrive, mtls: undefined, origin: { service_id: privateResource.vpcServiceId, scheme: 'postgresql', database } };
+      const vpc = { service_id: privateResource.vpcServiceId, type: 'tcp', tcp_port: 5432, app_protocol: 'postgresql', host: { hostname: host } };
+      assert.doesNotThrow(() => checkLive(privateOrigin, privateInstance, privateResource, vpc), `${environment}/${label}: valid private PostgreSQL origin`);
+      assert.throws(() => checkLive({ ...privateOrigin, origin: { ...privateOrigin.origin, scheme: 'mysql' } }, privateInstance, privateResource, vpc), /not PostgreSQL/, `${environment}/${label}: private MySQL scheme`);
+      assert.throws(() => checkLive(privateOrigin, { ...privateInstance, Endpoint: { Address: host, Port: 3306 } }, privateResource, vpc), /endpoint port mismatch/, `${environment}/${label}: private RDS port`);
+      assert.throws(() => checkLive(privateOrigin, privateInstance, privateResource, { ...vpc, tcp_port: 3306 }), /VPC service target mismatch/, `${environment}/${label}: private service port`);
     }
   }
 });
@@ -154,8 +186,8 @@ test('Cloudflare structured VPC API reads verify account and service identity be
     const definition = label === 'control' ? env.control : env.cells.find(cell => cell.id === label);
     const resource = { ...(label === 'control' ? inventory('production').control : inventory('production').cells[label]), network: 'workers-vpc', vpcServiceId: serviceId };
     const database = label === 'control' ? env.control.database : cellDatabaseName(env, definition);
-    const instance = { DBInstanceIdentifier: resource.rdsInstanceId, Engine: 'postgres', DBName: database, DBInstanceStatus: 'available', BackupRetentionPeriod: 7, PubliclyAccessible: false, Endpoint: { Address: service.host.hostname } };
-    const hyperdrive = { id: resource.hyperdriveId, caching: { disabled: true }, origin_connection_limit: 5, origin: { service_id: serviceId, database } };
+    const instance = { DBInstanceIdentifier: resource.rdsInstanceId, Engine: 'postgres', DBName: database, DBInstanceStatus: 'available', BackupRetentionPeriod: 7, PubliclyAccessible: false, Endpoint: { Address: service.host.hostname, Port: 5432 } };
+    const hyperdrive = { id: resource.hyperdriveId, caching: { disabled: true }, origin_connection_limit: 5, origin: { service_id: serviceId, scheme: 'postgres', database } };
     assert.doesNotThrow(() => assertLiveResources(label, 'production', definition, resource, database, hyperdrive, instance, fetched));
     const { tls_settings: _omitted, ...defaultTlsService } = fetched;
     assert.doesNotThrow(() => assertLiveResources(label, 'production', definition, resource, database, hyperdrive, instance, defaultTlsService));
