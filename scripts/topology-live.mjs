@@ -1,7 +1,8 @@
 export function assertLiveResources(label, environment, definition, resource, database, hyperdrive, instance, vpcService) {
   if (!instance || instance.DBInstanceIdentifier !== resource.rdsInstanceId || instance.Engine !== 'postgres' || instance.DBName !== database) throw new Error(`${label}: RDS identity mismatch`);
   if (instance.DBInstanceStatus !== 'available') throw new Error(`${label}: RDS is not available`);
-  if (instance.BackupRetentionPeriod < (environment === 'production' ? 7 : 1)) throw new Error(`${label}: RDS backups/PITR disabled or below policy`);
+  const retention = instance.BackupRetentionPeriod;
+  if (!Number.isInteger(retention) || retention < (environment === 'production' ? 7 : 1)) throw new Error(`${label}: RDS backups/PITR disabled, invalid or below policy`);
   if (hyperdrive?.id !== resource.hyperdriveId || hyperdrive.caching?.disabled !== true) throw new Error(`${label}: Hyperdrive cache is enabled or ID differs`);
   if (hyperdrive.origin_connection_limit !== definition.originConnectionLimit) throw new Error(`${label}: Hyperdrive origin connection limit differs`);
   if (hyperdrive.origin?.database !== database) throw new Error(`${label}: Hyperdrive points at another database`);

@@ -107,6 +107,30 @@ test('live gate rejects stale Hyperdrive caching, wrong origin and inadequate ba
   assert.throws(() => assertLiveResources('in-south', 'production', definition, privateResource, database, privateOrigin, { ...instance, PubliclyAccessible: false }, { ...vpc, tls_settings: { cert_verification_mode: 'disabled' } }), /TLS verification/);
 });
 
+test('live gate requires a valid backup retention period for every control and cell database', () => {
+  for (const [environment, env] of Object.entries(topology.environments)) {
+    const resources = inventory(environment);
+    const targets = [
+      ['control', env.control, resources.control, env.control.database],
+      ...env.cells.map(cell => [cell.id, cell, resources.cells[cell.id], cellDatabaseName(env, cell)])
+    ];
+    const minimum = environment === 'production' ? 7 : 1;
+    for (const [label, definition, resource, database] of targets) {
+      const host = `sta-4.abcdefgh.${definition.awsRegion}.rds.amazonaws.com`;
+      const instance = { DBInstanceIdentifier: resource.rdsInstanceId, Engine: 'postgres', DBName: database, DBInstanceStatus: 'available', BackupRetentionPeriod: minimum, PubliclyAccessible: true, Endpoint: { Address: host } };
+      const hyperdrive = { id: resource.hyperdriveId, caching: { disabled: true }, origin_connection_limit: definition.originConnectionLimit, mtls: { sslmode: 'verify-full' }, origin: { host, database } };
+      assert.doesNotThrow(() => assertLiveResources(label, environment, definition, resource, database, hyperdrive, instance), `${environment}/${label}: valid retention`);
+      for (const retention of [undefined, NaN, 'unavailable', minimum - 1, minimum + 0.5]) {
+        assert.throws(
+          () => assertLiveResources(label, environment, definition, resource, database, hyperdrive, { ...instance, BackupRetentionPeriod: retention }),
+          /backups\/PITR/,
+          `${environment}/${label}: ${String(retention)} must fail closed`
+        );
+      }
+    }
+  }
+});
+
 test('Cloudflare structured VPC API reads verify account and service identity before checking control and cell targets', async () => {
   const accountId = 'a'.repeat(32);
   const serviceId = '550e8400-e29b-41d4-a716-446655440000';
