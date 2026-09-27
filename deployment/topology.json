@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "provider": "aws-rds-postgresql",
+  "environments": {
+    "development": {
+      "prefix": "stateplane-dev",
+      "control": { "awsRegion": "us-east-1", "database": "stateplane_control_dev", "originConnectionLimit": 5 },
+      "cells": [
+        { "id": "in-south", "awsRegion": "ap-south-1", "r2LocationHint": "apac", "originConnectionLimit": 5 },
+        { "id": "us-east", "awsRegion": "us-east-1", "r2LocationHint": "enam", "originConnectionLimit": 5 },
+        { "id": "eu-west", "awsRegion": "eu-west-1", "r2LocationHint": "weur", "originConnectionLimit": 5 }
+      ]
+    },
+    "production": {
+      "prefix": "stateplane-prod",
+      "control": { "awsRegion": "us-east-1", "database": "stateplane_control_prod", "originConnectionLimit": 5 },
+      "cells": [
+        { "id": "in-south", "awsRegion": "ap-south-1", "r2LocationHint": "apac", "originConnectionLimit": 5 },
+        { "id": "us-east", "awsRegion": "us-east-1", "r2LocationHint": "enam", "originConnectionLimit": 5 }
+      ]
+    }
+  }
+}
