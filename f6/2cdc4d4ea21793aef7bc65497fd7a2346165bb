@@ -1,0 +1,26 @@
+deployment/workers/role-grants.js
+  h_a39f9495f9ec1d 48,56
+docs/regional-topology.md
+  h_a39f9495f9ec1d 38
+scripts/topology-sql.mjs
+  h_a39f9495f9ec1d 7-12
+scripts/wrangler-json.mjs
+  h_a39f9495f9ec1d 34-38
+test/qualification-config.test.js
+  h_a39f9495f9ec1d 120-124,273
+test/role-grants-postgres.test.js
+  h_a39f9495f9ec1d 50-55
+test/topology.test.js
+  h_a39f9495f9ec1d 288,306-308,365-378
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f62cdc4d4ea21793aef7bc65497fd7a2346165bb",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
