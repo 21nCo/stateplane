@@ -173,6 +173,9 @@ export function validateDeploymentInventories(topology, development, production)
     ...[inventory.control, ...Object.values(inventory.cells)].flatMap(resource =>
       [resource.serviceId, resource.volumeInstanceId, resource.hyperdriveId])];
   unique([...values(development), ...values(production)], 'Development and production resource IDs');
+  const routes = [development, production].flatMap(inventory =>
+    inventory.routes ? Object.values(inventory.routes).map(publicRouteHost) : []);
+  unique(routes, 'Public route hosts');
 }
 
 const workerPath = (out, path, projectRoot) => relative(out, resolve(projectRoot, path));

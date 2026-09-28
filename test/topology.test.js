@@ -125,6 +125,14 @@ test('development and production cannot reuse provider scope or bindings', () =>
     reused.control[key] = development.control[key].toUpperCase();
     assert.throws(() => validateDeploymentInventories(topology, development, reused), /must be unique/);
   }
+  development.routes = { app: 'https://dev.example.com', mcp: 'https://dev-mcp.example.com' };
+  production.routes = { app: 'https://prod.example.com', mcp: 'https://prod-mcp.example.com' };
+  assert.doesNotThrow(() => validateDeploymentInventories(topology, development, production));
+  for (const [key, shared] of [['app', development.routes.app], ['mcp', development.routes.app], ['app', development.routes.mcp], ['mcp', development.routes.mcp]]) {
+    const collided = copy(production);
+    collided.routes[key] = shared;
+    assert.throws(() => validateDeploymentInventories(topology, development, collided), /Public route hosts must be unique across environments/);
+  }
 });
 
 test('rendered control, gateways and every cell use isolated names and secret-free bindings', () => {
@@ -280,6 +288,20 @@ test('synthetic collision fails before any generated file or Wrangler invocation
     assert.equal(calls, 0);
     await assert.rejects(readFile(join(projectRoot, '.data/topology-dry-run/development/app.json')), { code: 'ENOENT' });
     await assert.rejects(readFile(join(projectRoot, '.data/topology-dry-run/production/app.json')), { code: 'ENOENT' });
+  } finally { await rm(projectRoot, { recursive: true, force: true }); }
+});
+
+test('shared public route fails before rendering either environment', async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), 'sta4-route-preflight-'));
+  const inventories = syntheticInventories(topology);
+  inventories.development.routes = { app: 'https://shared.example.com', mcp: 'https://dev-mcp.example.com' };
+  inventories.production.routes = { app: 'https://prod.example.com', mcp: 'https://shared.example.com' };
+  let calls = 0;
+  try {
+    await assert.rejects(dryRunTopology(topology, { projectRoot, inventories, runWrangler: async () => { calls++; } }), /Public route hosts must be unique across environments/);
+    assert.equal(calls, 0);
+    await assert.rejects(readFile(join(projectRoot, '.data/topology-dry-run/development/app.json')), { code: 'ENOENT' });
+    await assert.rejects(readFile(join(projectRoot, '.data/topology-dry-run/production/mcp.json')), { code: 'ENOENT' });
   } finally { await rm(projectRoot, { recursive: true, force: true }); }
 });
 
