@@ -4,7 +4,7 @@ import { resolve, relative } from 'node:path';
 const [name, hyperdriveId] = process.argv.slice(2);
 const root = resolve(import.meta.dirname, '..');
 const topology = JSON.parse(await readFile(resolve(root, 'deployment/topology.json')));
-const match = /^s4-([a-f0-9]{40})-(d|p)-([a-z]+(?:-[a-z]+)*)$/.exec(name ?? '');
+const match = /^s4-([a-f0-9]{40})-([dp])-([a-z]+(?:-[a-z]+)*)$/.exec(name ?? '');
 const environment = { d: 'development', p: 'production' }[match?.[2]];
 if (!environment || name.length > 54 || !topology.environments[environment].cells.some(cell => cell.id === match[3]) || !/^[a-f0-9]{32}$/i.test(hyperdriveId ?? '')) {
   console.error('Usage: node scripts/qualification-config.mjs s4-<full-head>-<d|p>-<cell> <disposable-hyperdrive-id> (name <= 54 characters)');
