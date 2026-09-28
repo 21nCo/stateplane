@@ -1,0 +1,28 @@
+deployment/workers/qualification.ts
+  h_a39f9495f9ec1d 81,93-95,98-102,121,129-130
+docs/regional-topology.md
+  h_a39f9495f9ec1d 42,54
+scripts/qualification-config.mjs
+  h_a39f9495f9ec1d 25,29
+scripts/qualification-load.mjs
+  h_a39f9495f9ec1d 15-16,25-26,28
+scripts/qualification-preview-secret.mjs
+  h_a39f9495f9ec1d 1-48
+test/qualification-config.test.js
+  h_a39f9495f9ec1d 5-7,13,35-36,78-113
+test/qualification-load.test.js
+  h_a39f9495f9ec1d 1-26
+test/qualification-worker.test.ts
+  h_a39f9495f9ec1d 20-21,64-68,107-108,116,129-139
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e483d40b697827c3758ed48e6ecdee4bb53692a7",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
