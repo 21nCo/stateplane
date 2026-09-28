@@ -148,13 +148,36 @@ async function probe(connectionString: string, expectedDatabase: string, expecte
   return result;
 }
 
+async function verifyNoResiduals(connectionString: string, expectedDatabase: string, expectedRole: string) {
+  const reader = new Client({ connectionString, connectionTimeoutMillis: 5000, query_timeout: 5000 });
+  const failures: string[] = [];
+  try {
+    await atStage('reader-connect', () => reader.connect());
+    await verifyTarget(reader, expectedDatabase, expectedRole);
+    await atStage('residual-read', async () => {
+      const rows = await reader.query('SELECT count(*)::integer AS count FROM stateplane_qualification');
+      if (rows.rows[0]?.count !== 0) throw new Error('Qualification rows remain');
+    });
+  } catch (error) {
+    failures.push(...(error instanceof QualificationFailure ? error.stages : ['probe:unexpected']));
+  }
+  try { await reader.end(); }
+  catch { failures.push('close:reader'); }
+  if (failures.length) throw new QualificationFailure(failures);
+  return { residualRows: 0 };
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    if (new URL(request.url).pathname !== '/qualify' || request.method !== 'POST') return new Response('Not found', { status: 404 });
+    const path = new URL(request.url).pathname;
+    if (!['/qualify', '/qualify/residual'].includes(path) || request.method !== 'POST') return new Response('Not found', { status: 404 });
     if (env.STATEPLANE_DISPOSABLE !== '1' || !declaredTarget(env.STATEPLANE_PROBE_DATABASE, env.STATEPLANE_PROBE_ROLE) ||
         !env.AUTHORITY?.connectionString || !(await authorized(request, env.PROBE_TOKEN))) return new Response('Forbidden', { status: 403 });
     try {
-      return Response.json({ ok: true, ...(await probe(env.AUTHORITY.connectionString, env.STATEPLANE_PROBE_DATABASE, env.STATEPLANE_PROBE_ROLE)) }, { headers: { 'Cache-Control': 'no-store' } });
+      const result = path === '/qualify'
+        ? await probe(env.AUTHORITY.connectionString, env.STATEPLANE_PROBE_DATABASE, env.STATEPLANE_PROBE_ROLE)
+        : await verifyNoResiduals(env.AUTHORITY.connectionString, env.STATEPLANE_PROBE_DATABASE, env.STATEPLANE_PROBE_ROLE);
+      return Response.json({ ok: true, ...result }, { headers: { 'Cache-Control': 'no-store' } });
     } catch (error) {
       console.error('Qualification failed', error instanceof QualificationFailure ? error.stages.join(',') : 'unexpected');
       return Response.json({ ok: false }, { status: 500, headers: { 'Cache-Control': 'no-store' } });

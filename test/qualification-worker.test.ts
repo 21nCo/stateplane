@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const database = vi.hoisted(() => ({
   row: null as number | null,
+  orphanRows: 0,
   deleteMode: 'ok' as 'ok' | 'throw' | 'no-op',
   staleInitialRead: false,
   staleFreshRead: false,
@@ -62,6 +63,7 @@ vi.mock('pg', () => ({
         if (database.deleteMode === 'ok') { database.row = null; database.transactionRow = false; }
         return { rows: [] };
       }
+      if (sql === 'SELECT count(*)::integer AS count FROM stateplane_qualification') return { rows: [{ count: database.orphanRows + (database.row === null ? 0 : 1) }] };
       if (sql.includes('count(*)') && sql.includes('stateplane_qualification')) return { rows: [{ count: database.row === null && !database.transactionRow ? 0 : 1 }] };
       if (sql.includes('SELECT value')) {
         database.valueReads++;
@@ -79,8 +81,8 @@ vi.mock('pg', () => ({
 
 import worker from '../deployment/workers/qualification';
 
-async function qualify(authorization: string | null = 'Bearer disposable-token', disposable = '1', bindings: Record<string, unknown> = {}) {
-  return worker.fetch(new Request('https://preview.example/qualify', {
+async function qualify(authorization: string | null = 'Bearer disposable-token', disposable = '1', bindings: Record<string, unknown> = {}, path = '/qualify') {
+  return worker.fetch(new Request(`https://preview.example${path}`, {
     method: 'POST', headers: authorization === null ? {} : { authorization }
   }), {
     AUTHORITY: { connectionString: 'postgres://disposable.example/probe' },
@@ -93,6 +95,7 @@ async function qualify(authorization: string | null = 'Bearer disposable-token',
 describe('disposable qualification row cleanup', () => {
   beforeEach(() => {
     database.row = null;
+    database.orphanRows = 0;
     database.deleteMode = 'ok';
     database.staleInitialRead = false;
     database.staleFreshRead = false;
@@ -129,6 +132,38 @@ describe('disposable qualification row cleanup', () => {
     expect(database.queryTimeout).toBe(5000);
     expect(database.row).toBeNull();
     expect(database.closed).toBe(2);
+  });
+
+  it('rejects an orphan from a prior interrupted probe in the final table-wide read', async () => {
+    expect((await qualify()).status).toBe(200);
+    const clean = await qualify('Bearer disposable-token', '1', {}, '/qualify/residual');
+    expect(clean.status).toBe(200);
+    expect(await clean.json()).toEqual({ ok: true, residualRows: 0 });
+    database.queries = [];
+    database.closed = 0;
+    database.orphanRows = 1;
+    expect((await qualify()).status).toBe(200);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const response = await qualify('Bearer disposable-token', '1', {}, '/qualify/residual');
+      expect(response.status).toBe(500);
+      expect(await response.json()).toEqual({ ok: false });
+      expect(log).toHaveBeenCalledWith('Qualification failed', 'probe:residual-read');
+      expect(database.queries).toContain('SELECT count(*)::integer AS count FROM stateplane_qualification');
+      expect(database.closed).toBe(3);
+    } finally { log.mockRestore(); }
+  });
+
+  it('requires authorization and fails closed when the final residual read fails', async () => {
+    expect((await qualify(null, '1', {}, '/qualify/residual')).status).toBe(403);
+    expect(database.connections).toBe(0);
+    database.failQuery = 'SELECT count(*)::integer AS count FROM stateplane_qualification';
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/residual')).status).toBe(500);
+      expect(log).toHaveBeenCalledWith('Qualification failed', 'probe:residual-read');
+      expect(database.closed).toBe(1);
+    } finally { log.mockRestore(); }
   });
 
   it('fails if the database cannot report sufficient connection capacity', async () => {

@@ -25,13 +25,17 @@ export async function runLoad(name, expectedUrl, concurrency = 10, minimumHeadro
   const url = expectedUrl ? targets.find(target => target === expectedUrl) : targets[0];
   if (!url) throw new Error('Probe URL does not match the named Preview deployment');
 
-  async function requestProbe() {
-    if (signal?.aborted) throw new Error('Qualification load interrupted');
+  async function requestJson(target, allowCancel) {
+    if (allowCancel && signal?.aborted) throw new Error('Qualification load interrupted');
     const timeout = AbortSignal.timeout(30000);
-    const response = await request(url, { method: 'POST', redirect: 'error',
-      headers: { authorization: `Bearer ${token}` }, signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+    const response = await request(target, { method: 'POST', redirect: 'error',
+      headers: { authorization: `Bearer ${token}` }, signal: allowCancel && signal ? AbortSignal.any([signal, timeout]) : timeout });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const body = await response.json();
+    return response.json();
+  }
+
+  async function requestProbe() {
+    const body = await requestJson(url, true);
     if (body.ok !== true || body.rollback !== true || body.freshRead !== true ||
         !Number.isSafeInteger(body.observedConnections) || !Number.isSafeInteger(body.maxConnections) ||
         body.observedConnections < 2 || body.maxConnections < 2 ||
@@ -45,13 +49,24 @@ export async function runLoad(name, expectedUrl, concurrency = 10, minimumHeadro
   await requestProbe();
   const results = await Promise.allSettled(Array.from({ length: concurrency }, requestProbe));
   const failed = results.filter(result => result.status === 'rejected');
-  if (failed.length) throw new Error(`${failed.length}/${concurrency} concurrent qualification requests failed`);
+  const issues = [];
+  if (failed.length) issues.push(`${failed.length}/${concurrency} concurrent qualification requests failed`);
+  // This read is deliberately after every concurrent request settles. It uses a
+  // fresh timeout even when the caller was interrupted, so cleanup is checked
+  // before reporting the interrupted run as failed.
+  try {
+    const residual = await requestJson(`${url}/residual`, false);
+    if (residual.ok !== true || residual.residualRows !== 0) throw new Error('Residual rows remain');
+  } catch { issues.push('Final residual readback failed'); }
+  if (signal?.aborted) issues.push('Qualification load interrupted');
+  if (issues.length) throw new Error(issues.join('; '));
   const values = results.map(result => result.value);
   const high = Math.max(...values.map(value => value.observedConnections));
   const maximum = Math.min(...values.map(value => value.maxConnections));
   const reserved = Math.max(...values.map(value => value.reservedConnections));
   if (maximum - high - reserved < minimumHeadroom) throw new Error(`Origin connection headroom below ${minimumHeadroom}: observed ${high}/${maximum}, reserved ${reserved}`);
   return { previewName: name, previewUrl: url, requests: concurrency, success: values.length,
+    residualRows: 0,
     peakObservedConnections: high, minMaxConnections: maximum, maxReservedConnections: reserved,
     minimumHeadroom: maximum - high - reserved, maxElapsedMs: Math.max(...values.map(value => value.elapsedMs)) };
 }

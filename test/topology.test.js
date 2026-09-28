@@ -363,7 +363,7 @@ test('protected SQL URL file requires exact mode 0600', { skip: process.platform
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test('malformed protected SQL URL file does not expose credentials through parser errors', async () => {
+test('malformed protected SQL URL file does not expose credentials through parser errors', { skip: process.platform === 'win32' }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'sta4-sql-redaction-'));
   const path = join(directory, 'urls.json');
   const secret = 'private-password-fragment-12345';
