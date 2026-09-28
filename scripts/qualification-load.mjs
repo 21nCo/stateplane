@@ -46,14 +46,17 @@ export async function runLoad(name, expectedUrl, concurrency = 10, minimumHeadro
   }
   // The first probe creates the disposable table. Complete it before any parallel
   // request so PostgreSQL catalog creation cannot race on a fresh database.
-  await requestProbe();
-  const results = await Promise.allSettled(Array.from({ length: concurrency }, requestProbe));
+  let serialFailure;
+  try { await requestProbe(); }
+  catch (error) { serialFailure = error; }
+  const results = serialFailure ? [] : await Promise.allSettled(Array.from({ length: concurrency }, requestProbe));
   const failed = results.filter(result => result.status === 'rejected');
   const issues = [];
+  if (serialFailure) issues.push('First qualification request failed');
   if (failed.length) issues.push(`${failed.length}/${concurrency} concurrent qualification requests failed`);
-  // This read is deliberately after every concurrent request settles. It uses a
-  // fresh timeout even when the caller was interrupted, so cleanup is checked
-  // before reporting the interrupted run as failed.
+  // This read follows a failed bootstrap or every settled concurrent request.
+  // It uses a fresh timeout even when the caller was interrupted, so cleanup is
+  // checked before reporting the interrupted run as failed.
   try {
     const residual = await requestJson(`${url}/residual`, false);
     if (residual.ok !== true || residual.residualRows !== 0) throw new Error('Residual rows remain');

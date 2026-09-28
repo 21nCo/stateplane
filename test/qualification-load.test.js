@@ -56,6 +56,24 @@ test('first probe completes table bootstrap before concurrent load', async () =>
   assert.equal((await runLoad(name, url, 3, 5, options(request))).success, 3);
 });
 
+test('failed first probe checks table-wide residuals before reporting its failure', async () => {
+  let probes = 0;
+  let residualReads = 0;
+  const request = async target => {
+    if (target.endsWith('/residual')) {
+      residualReads++;
+      return { ok: true, json: async () => ({ ok: true, residualRows: 1 }) };
+    }
+    probes++;
+    // The Worker can commit an insert and then fail before returning its result.
+    throw new Error('response lost after insert');
+  };
+  await assert.rejects(runLoad(name, url, 2, 5, { token: 'test-only-token', deployPreview, request }),
+    /First qualification request failed; Final residual readback failed/);
+  assert.equal(probes, 1, 'concurrent load must not run before bootstrap succeeds');
+  assert.equal(residualReads, 1, 'post-commit failure still requires table-wide cleanup evidence');
+});
+
 test('final read detects an orphan from an earlier interrupted probe after clean concurrent probes', async () => {
   let probes = 0;
   let completed = 0;

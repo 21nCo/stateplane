@@ -7,6 +7,7 @@ import { validateTopology, validateInventory, cellDatabaseName, railwayServiceNa
 import { assertLiveResources } from './topology-live.mjs';
 import { parseUploadedCa } from './topology-ca.mjs';
 import { readWranglerJson } from './wrangler-json.mjs';
+import { verifyOperationalBinding } from './operational-binding.mjs';
 
 const run = promisify(execFile);
 const [environment, inventoryPath] = process.argv.slice(2);
@@ -19,6 +20,7 @@ if (!account) throw new Error('STATEPLANE_RAILWAY_ACCOUNT must select a connecte
 const topology = validateTopology(JSON.parse(await readFile(new URL('../deployment/topology.json', import.meta.url))));
 const inventory = validateInventory(topology, environment, JSON.parse(await readFile(resolve(inventoryPath))));
 if (!process.env.STATEPLANE_SQL_URLS_FILE) throw new Error('STATEPLANE_SQL_URLS_FILE must select protected per-resource SQL URLs');
+if (!process.env.PROBE_TOKEN || /[\r\n]/.test(process.env.PROBE_TOKEN)) throw new Error('Protected single-line PROBE_TOKEN required for operational Worker proof');
 const sqlUrlsPath = resolve(process.env.STATEPLANE_SQL_URLS_FILE);
 const sqlUrls = await readProtectedSqlUrls(sqlUrlsPath);
 const env = topology.environments[environment];
@@ -73,13 +75,21 @@ async function verify(label, definition, resource, database, serviceName) {
     projectId: inventory.projectId, environmentId: inventory.environmentId, railway: railwayReadback, hyperdrive: hyperdriveReadback });
   const ca = await verifyUploadedCa(hyperdriveReadback.mtls.ca_certificate_id);
   await verifySqlIdentity(label, resource, database, railwayReadback.tcpProxies[0], ca, sqlUrls[label]);
-  console.log(`${label}: Railway ${definition.railwayRegion} service/volume, backup and PITR estimate, pinned PostgreSQL image, verified-TLS SQL identity/pgvector and cache-disabled Hyperdrive limit ${definition.originConnectionLimit}; Worker transaction and restore drill still required`);
+  const worker = await verifyOperationalBinding(environment, label, resource, database, { signal: controller.signal });
+  console.log(`${label}: Railway ${definition.railwayRegion} service/volume, backup and PITR estimate, pinned PostgreSQL image, verified-TLS SQL identity/pgvector, cache-disabled Hyperdrive limit ${definition.originConnectionLimit}, operational Worker binding ${worker.hyperdriveId} at ${worker.name}; transaction and restore drill still required`);
 }
 
+const controller = new AbortController();
+const interrupt = () => controller.abort();
+process.once('SIGINT', interrupt);
+process.once('SIGTERM', interrupt);
 try {
   await verify('control', env.control, inventory.control, env.control.database, railwayServiceName(env));
   for (const cell of env.cells) await verify(cell.id, cell, inventory.cells[cell.id], cellDatabaseName(env, cell), railwayServiceName(env, cell));
 } catch (error) {
   console.error(error instanceof Error ? error.message : 'Unknown verification failure');
   process.exitCode = 1;
+} finally {
+  process.removeListener('SIGINT', interrupt);
+  process.removeListener('SIGTERM', interrupt);
 }
