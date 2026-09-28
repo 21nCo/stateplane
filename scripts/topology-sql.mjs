@@ -1,4 +1,10 @@
 import { Client } from 'pg';
+import { readFile, stat } from 'node:fs/promises';
+
+export async function readProtectedSqlUrls(path) {
+  if (((await stat(path)).mode & 0o777) !== 0o600) throw new Error('Protected SQL URL file must be mode 0600');
+  return JSON.parse(await readFile(path, 'utf8'));
+}
 
 /** Prove the declared proxy accepts a verified TLS connection to the intended PostgreSQL database and role. */
 export async function verifySqlIdentity(label, resource, database, proxy, ca, value, ClientType = Client) {

@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -68,8 +69,9 @@ export async function setupPreview(name, token, { runWrangler = wrangler, signal
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
-  if (!Array.isArray(deployed?.urls) || deployed.urls.length === 0 ||
-      !deployed.urls.every(url => typeof url === 'string' && url.startsWith('https://'))) {
+  const urls = deployed?.preview?.urls;
+  if (!Array.isArray(urls) || urls.length === 0 ||
+      !urls.every(url => typeof url === 'string' && url.startsWith('https://'))) {
     throw new Error('Preview deployment returned no usable HTTPS URL');
   }
   const listed = readWranglerJson(await runWrangler(['preview', 'secret', 'list', ...target, '--json'], signal));
@@ -77,10 +79,10 @@ export async function setupPreview(name, token, { runWrangler = wrangler, signal
     throw new Error('PROBE_TOKEN is absent from the latest Preview deployment');
   }
   if (signal?.aborted) throw new Error('Preview setup interrupted');
-  return deployed.urls;
+  return urls;
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (process.argv[1] && realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url))) {
   const controller = new AbortController();
   let interrupted = false;
   const cancel = () => { interrupted = true; controller.abort(); };
@@ -90,7 +92,10 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     const urls = await setupPreview(process.argv[2], process.env.PROBE_TOKEN, { signal: controller.signal });
     console.log(JSON.stringify({ name: process.argv[2], urls, probeTokenBound: true }));
   } catch (error) {
-    console.error(interrupted ? 'Preview setup interrupted; temporary token removed' : error instanceof Error ? error.message : 'Preview secret setup failed');
+    let message = 'Preview secret setup failed';
+    if (interrupted) message = 'Preview setup interrupted; temporary token removed';
+    else if (error instanceof Error) message = error.message;
+    console.error(message);
     process.exitCode = interrupted ? 130 : 1;
   } finally {
     process.removeListener('SIGINT', cancel);

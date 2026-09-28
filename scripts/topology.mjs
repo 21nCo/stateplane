@@ -11,6 +11,7 @@ const safeName = /^[a-z][a-z0-9-]*$/;
 const postgresDatabaseName = /^[a-z][a-z0-9_]{0,62}$/;
 const postgresRoleName = /^[a-z][a-z0-9_]{0,62}$/;
 const postgresImage = /^[a-z0-9][a-z0-9./_-]*:(?:[a-z0-9._-]+)$/;
+const imageDigest = /^sha256:[a-f0-9]{64}$/i;
 const cloudflareName = /^[a-z][a-z0-9-]{0,62}$/;
 const dnsLabel = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 // Hyperdrive permits 5-20 origin connections on Free and 5-100 on Paid.
@@ -134,11 +135,12 @@ export function validateInventory(topology, environment, inventory) {
   check(inventory.environmentId, uuid, 'Railway environment ID');
   const resourceIds = [];
   const validateResource = (resource, label) => {
-    allowedKeys(resource, ['hyperdriveId', 'serviceId', 'volumeInstanceId', 'network', 'postgresImage', 'databaseRole'], `${label} inventory`);
+    allowedKeys(resource, ['hyperdriveId', 'serviceId', 'volumeInstanceId', 'network', 'postgresImage', 'postgresImageDigest', 'databaseRole'], `${label} inventory`);
     check(resource.hyperdriveId, hexId, `${label} Hyperdrive ID`);
     check(resource.serviceId, uuid, `${label} Railway service ID`);
     check(resource.volumeInstanceId, uuid, `${label} Railway volume instance ID`);
     check(resource.postgresImage, postgresImage, `${label} pinned PostgreSQL image`);
+    check(resource.postgresImageDigest, imageDigest, `${label} approved PostgreSQL image digest`);
     check(resource.databaseRole, postgresRoleName, `${label} PostgreSQL role`);
     if (resource.network !== 'public-tls') throw new Error(`${label} network mode is unsupported until verified private connectivity is available`);
     resourceIds.push(resource.serviceId, resource.volumeInstanceId);

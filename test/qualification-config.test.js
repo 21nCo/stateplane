@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { readWranglerJson, setupPreview, wrangler, wranglerInvocation } from '../scripts/qualification-preview-secret.mjs';
@@ -87,7 +87,7 @@ test('Preview setup protects its token, requires a URL and verifies the latest b
       secretFile = args[args.indexOf('--secrets-file') + 1];
       assert.equal((await stat(secretFile)).mode & 0o077, 0);
       assert.equal(JSON.parse(await readFile(secretFile)).PROBE_TOKEN, 'private-test-token');
-      return 'Wrangler 4.135\n' + JSON.stringify({ urls: ['https://probe.example.workers.dev'] });
+      return 'Wrangler 4.135\n' + JSON.stringify({ preview: { urls: ['https://probe.example.workers.dev'] }, deployment: { urls: [] } });
     }
     return 'Reading secrets...\n' + JSON.stringify([{ name: 'PROBE_TOKEN', type: 'secret_text' }]);
   };
@@ -98,9 +98,9 @@ test('Preview setup protects its token, requires a URL and verifies the latest b
     await assert.rejects(readFile(secretFile), { code: 'ENOENT' });
     assert.equal((await readFile(configPath, 'utf8')).includes('private-test-token'), false);
     await assert.rejects(setupPreview(name, 'private-test-token', { runWrangler: async args =>
-      args.includes('--secrets-file') ? JSON.stringify({ urls: [] }) : '[]' }), /no usable HTTPS URL/);
+      args.includes('--secrets-file') ? JSON.stringify({ preview: { urls: [] } }) : '[]' }), /no usable HTTPS URL/);
     await assert.rejects(setupPreview(name, 'private-test-token', { runWrangler: async args =>
-      args.includes('--secrets-file') ? JSON.stringify({ urls: ['https://probe.example.workers.dev'] }) : '[]' }), /PROBE_TOKEN is absent/);
+      args.includes('--secrets-file') ? JSON.stringify({ preview: { urls: ['https://probe.example.workers.dev'] } }) : '[]' }), /PROBE_TOKEN is absent/);
     assert.throws(() => readWranglerJson('Wrangler banner without JSON'), /no valid JSON/);
   } finally {
     await rm(configPath, { force: true });
@@ -170,4 +170,47 @@ test('Preview helper resolves project Wrangler through the trusted Node executab
   assert.equal(invocation.command, process.execPath);
   assert.equal(invocation.args[0], resolve(root, 'app/node_modules/wrangler/bin/wrangler.js'));
   assert.deepEqual(invocation.args.slice(1), ['preview', '--json']);
+});
+
+test('documented Preview CLI reads protected token, prints Preview URL and handles interruption', { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sta4-preview-cli-'));
+  const name = `s4-${head}-d-apse`;
+  const helper = join(directory, 'scripts/qualification-preview-secret.mjs');
+  const fakeWrangler = join(directory, 'app/node_modules/wrangler/bin/wrangler.js');
+  const marker = join(directory, 'marker.json');
+  try {
+    await mkdir(join(directory, 'scripts'), { recursive: true });
+    await mkdir(join(directory, 'app/node_modules/wrangler/bin'), { recursive: true });
+    await mkdir(join(directory, '.data/qualification'), { recursive: true });
+    await writeFile(join(directory, 'package.json'), '{"type":"module"}');
+    await copyFile(resolve(root, 'scripts/qualification-preview-secret.mjs'), helper);
+    await writeFile(join(directory, '.data/qualification', `${name}.json`), JSON.stringify({ name, previews: { secrets: { required: ['PROBE_TOKEN'] } } }));
+    await writeFile(fakeWrangler, `import { readFileSync, writeFileSync } from 'node:fs';
+const args = process.argv.slice(2);
+if (args.includes('--secrets-file')) {
+  const file = args[args.indexOf('--secrets-file') + 1];
+  if (readFileSync(file, 'utf8').includes('private-test-token') === false) process.exit(2);
+  if (process.env.FAKE_WAIT) {
+    writeFileSync(process.env.FAKE_MARKER, JSON.stringify({ file }));
+    setInterval(() => {}, 1000);
+  } else console.log(JSON.stringify({ preview: { urls: ['https://probe.example.workers.dev'] }, deployment: { urls: [] } }));
+} else console.log(JSON.stringify([{ name: 'PROBE_TOKEN', type: 'secret_text' }]));`);
+    const env = { ...process.env, PROBE_TOKEN: 'private-test-token' };
+    const { stdout } = await run(process.execPath, [helper, name], { env });
+    assert.deepEqual(JSON.parse(stdout), { name, urls: ['https://probe.example.workers.dev'], probeTokenBound: true });
+    await assert.rejects(run(process.execPath, [helper, name], { env: { ...env, PROBE_TOKEN: '' } }), /protected single-line PROBE_TOKEN/);
+    if (process.platform !== 'win32') {
+      const child = spawn(process.execPath, [helper, name], { env: { ...env, FAKE_WAIT: '1', FAKE_MARKER: marker }, stdio: ['ignore', 'pipe', 'pipe'] });
+      const closed = new Promise(resolveClose => child.on('close', resolveClose));
+      let observed;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        try { observed = JSON.parse(await readFile(marker, 'utf8')); break; }
+        catch { await new Promise(resolveDelay => setTimeout(resolveDelay, 25)); }
+      }
+      assert.ok(observed, 'Wrangler child started');
+      child.kill('SIGINT');
+      assert.equal(await closed, 130);
+      await assert.rejects(readFile(observed.file), { code: 'ENOENT' });
+    }
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });

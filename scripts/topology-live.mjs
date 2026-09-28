@@ -12,7 +12,7 @@ export function assertLiveResources({ label, environment, definition, resource, 
       serviceInstance.latestDeployment?.status !== 'SUCCESS' ||
       serviceInstance.source?.image !== resource.postgresImage || serviceInstance.source?.repo ||
       serviceInstance.latestDeployment?.meta?.image !== resource.postgresImage ||
-      !/^sha256:[a-f0-9]{64}$/i.test(serviceInstance.latestDeployment?.meta?.imageDigest ?? '')) {
+      serviceInstance.latestDeployment?.meta?.imageDigest?.toLowerCase() !== resource.postgresImageDigest.toLowerCase()) {
     throw new Error(`${label}: Railway deployment region, image or status mismatch`);
   }
   if (volumeInstance?.id !== resource.volumeInstanceId || volumeInstance.serviceId !== resource.serviceId ||

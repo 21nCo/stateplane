@@ -1,10 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { mkdtemp, readFile, rm, writeFile, chmod } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { validateTopology, validateInventory, validateDeploymentInventories, renderTopology, cellDatabaseName, railwayServiceName } from '../scripts/topology.mjs';
 import { assertLiveResources } from '../scripts/topology-live.mjs';
-import { verifySqlIdentity } from '../scripts/topology-sql.mjs';
-import { dryRunTopology } from '../scripts/topology-dry-run.mjs';
+import { readProtectedSqlUrls, verifySqlIdentity } from '../scripts/topology-sql.mjs';
+import { dryRunTopology, syntheticInventories } from '../scripts/topology-dry-run.mjs';
 import { execFileSync } from 'node:child_process';
 
 const topology = JSON.parse(readFileSync(new URL('../deployment/topology.json', import.meta.url)));
@@ -14,11 +17,11 @@ const inventory = environment => {
   const env = topology.environments[environment];
   const resources = [env.control, ...env.cells];
   const ids = resources.map((_, index) => ({
-    hyperdriveId: (index + 1).toString(16).repeat(32), serviceId: uuid((index + 1).toString()),
-    volumeInstanceId: uuid((index + 5).toString()), network: 'public-tls',
-    postgresImage: 'pgvector/pgvector:pg16', databaseRole: `probe_${index}`
+    hyperdriveId: `deadbee${index}`.repeat(4), serviceId: uuid('abcd'[index]),
+    volumeInstanceId: uuid('ef12'[index]), network: 'public-tls',
+    postgresImage: 'pgvector/pgvector:pg16', postgresImageDigest: `sha256:${'a'.repeat(64)}`, databaseRole: `probe_${index}`
   }));
-  return { environment, projectId: uuid('a'), environmentId: uuid('b'), control: ids[0],
+  return { environment, projectId: uuid('a').replace('-1111-', '-5555-'), environmentId: uuid('b').replace('-1111-', '-6666-'), control: ids[0],
     cells: Object.fromEntries(env.cells.map((cell, index) => [cell.id, ids[index + 1]])) };
 };
 
@@ -30,21 +33,21 @@ const live = (environment, label) => {
   const database = cell ? cellDatabaseName(env, cell) : env.control.database;
   const serviceName = railwayServiceName(env, cell);
   const railway = {
-    service: { id: resource.serviceId, name: serviceName, projectId: uuid('a'), deletedAt: null },
-    serviceInstance: { serviceId: resource.serviceId, environmentId: uuid('b'), region: definition.railwayRegion,
+    service: { id: resource.serviceId, name: serviceName, projectId: inventory(environment).projectId, deletedAt: null },
+    serviceInstance: { serviceId: resource.serviceId, environmentId: inventory(environment).environmentId, region: definition.railwayRegion,
       source: { image: resource.postgresImage, repo: null }, latestDeployment: { status: 'SUCCESS', meta: { image: resource.postgresImage, imageDigest: `sha256:${'a'.repeat(64)}` } }, deletedAt: null },
-    volumeInstance: { id: resource.volumeInstanceId, serviceId: resource.serviceId, environmentId: uuid('b'),
+    volumeInstance: { id: resource.volumeInstanceId, serviceId: resource.serviceId, environmentId: inventory(environment).environmentId,
       region: definition.railwayRegion, deletedAt: null, isPendingDeletion: false },
     backupSchedules: [{ retentionSeconds: environment === 'production' ? 30 * 86400 : 6 * 86400 }],
     backups: [{ id: 'snapshot', createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 86400_000).toISOString() }],
     pitrEstimate: { baseBackupLabel: 'full', likelyToFit: true },
-    tcpProxies: [{ serviceId: resource.serviceId, environmentId: uuid('b'), applicationPort: 5432,
+    tcpProxies: [{ serviceId: resource.serviceId, environmentId: inventory(environment).environmentId, applicationPort: 5432,
       domain: 'tcp.railway.app', proxyPort: 12345, deletedAt: null }]
   };
   const hyperdrive = { id: resource.hyperdriveId, caching: { disabled: true }, origin_connection_limit: 5,
     origin: { scheme: 'postgres', database, host: 'tcp.railway.app', port: 12345 },
     mtls: { sslmode: 'verify-full', ca_certificate_id: uuid('c') } };
-  return { label, environment, definition, resource, database, serviceName, projectId: uuid('a'), environmentId: uuid('b'), railway, hyperdrive };
+  return { label, environment, definition, resource, database, serviceName, projectId: inventory(environment).projectId, environmentId: inventory(environment).environmentId, railway, hyperdrive };
 };
 
 test('Railway cell pattern, physical regions and legacy provider are enforced', () => {
@@ -90,6 +93,12 @@ test('inventory isolates every Railway service, volume and Hyperdrive binding', 
     const wrongNetwork = copy(good);
     wrongNetwork.control.network = 'workers-vpc';
     assert.throws(() => validateInventory(topology, environment, wrongNetwork), /unsupported/);
+    for (const label of ['control', ...Object.keys(good.cells)]) {
+      const unapproved = copy(good);
+      const target = label === 'control' ? unapproved.control : unapproved.cells[label];
+      delete target.postgresImageDigest;
+      assert.throws(() => validateInventory(topology, environment, unapproved), /approved PostgreSQL image digest/);
+    }
   }
 });
 
@@ -97,12 +106,12 @@ test('development and production cannot reuse provider scope or bindings', () =>
   const development = inventory('development');
   const production = inventory('production');
   assert.throws(() => validateDeploymentInventories(topology, development, production), /must be unique/);
-  production.projectId = uuid('c');
-  production.environmentId = uuid('d');
+  production.projectId = uuid('c').replace('-1111-', '-7777-');
+  production.environmentId = uuid('d').replace('-1111-', '-8888-');
   for (const resource of [production.control, ...Object.values(production.cells)]) {
-    resource.serviceId = resource.serviceId.replace(/^./, 'e');
-    resource.volumeInstanceId = resource.volumeInstanceId.replace(/^./, 'f');
-    resource.hyperdriveId = resource.hyperdriveId.replace(/^./, 'f');
+    resource.serviceId = resource.serviceId.replace('-1111-4111-', '-3333-4333-');
+    resource.volumeInstanceId = resource.volumeInstanceId.replace('-1111-4111-', '-4444-4444-');
+    resource.hyperdriveId = `9${resource.hyperdriveId.slice(1)}`;
   }
   assert.doesNotThrow(() => validateDeploymentInventories(topology, development, production));
   for (const key of ['projectId', 'environmentId']) {
@@ -158,6 +167,7 @@ test('provider readback rejects wrong region, volume, origin, backup, PITR, TLS 
       check(bad => { bad.railway.serviceInstance.source.image = 'redis:7'; });
       check(bad => { bad.railway.serviceInstance.latestDeployment.meta.image = 'redis:7'; });
       check(bad => { bad.railway.serviceInstance.latestDeployment.meta.imageDigest = null; });
+      check(bad => { bad.railway.serviceInstance.latestDeployment.meta.imageDigest = `sha256:${'b'.repeat(64)}`; });
       check(bad => { bad.railway.serviceInstance.source.repo = 'unrelated/repo'; });
       check(bad => { bad.railway.backupSchedules = []; });
       check(bad => { bad.railway.backups = []; });
@@ -201,4 +211,28 @@ test('synthetic dry run inventories pass cross-environment isolation and compare
   assert.equal(await dryRunTopology(topology, { runWrangler: async () => ({ stdout: '' }) }), 21);
   assert.throws(() => execFileSync(process.execPath, ['scripts/topology.mjs', 'compare'], { cwd: new URL('..', import.meta.url), stdio: 'pipe' }), error =>
     error.stderr.toString().includes('compare <development-inventory.json> <production-inventory.json>'));
+});
+
+test('synthetic collision fails before any generated file or Wrangler invocation', async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), 'sta4-topology-preflight-'));
+  const inventories = syntheticInventories(topology);
+  inventories.production.control.serviceId = inventories.development.control.serviceId.toUpperCase();
+  let calls = 0;
+  try {
+    await assert.rejects(dryRunTopology(topology, { projectRoot, inventories, runWrangler: async () => { calls++; } }), /must be unique/);
+    assert.equal(calls, 0);
+    await assert.rejects(readFile(join(projectRoot, '.data/topology-dry-run/development/app.json')), { code: 'ENOENT' });
+    await assert.rejects(readFile(join(projectRoot, '.data/topology-dry-run/production/app.json')), { code: 'ENOENT' });
+  } finally { await rm(projectRoot, { recursive: true, force: true }); }
+});
+
+test('protected SQL URL file requires exact mode 0600', { skip: process.platform === 'win32' }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sta4-sql-urls-'));
+  const path = join(directory, 'urls.json');
+  try {
+    await writeFile(path, '{"control":"postgres://test"}', { mode: 0o600 });
+    assert.deepEqual(await readProtectedSqlUrls(path), { control: 'postgres://test' });
+    await chmod(path, 0o700);
+    await assert.rejects(readProtectedSqlUrls(path), /mode 0600/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });

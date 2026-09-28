@@ -1,9 +1,9 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { readFile, stat } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { X509Certificate } from 'node:crypto';
-import { verifySqlIdentity } from './topology-sql.mjs';
+import { readProtectedSqlUrls, verifySqlIdentity } from './topology-sql.mjs';
 import { validateTopology, validateInventory, cellDatabaseName, railwayServiceName } from './topology.mjs';
 import { assertLiveResources } from './topology-live.mjs';
 
@@ -19,8 +19,7 @@ const topology = validateTopology(JSON.parse(await readFile(new URL('../deployme
 const inventory = validateInventory(topology, environment, JSON.parse(await readFile(resolve(inventoryPath))));
 if (!process.env.STATEPLANE_SQL_URLS_FILE) throw new Error('STATEPLANE_SQL_URLS_FILE must select protected per-resource SQL URLs');
 const sqlUrlsPath = resolve(process.env.STATEPLANE_SQL_URLS_FILE);
-if ((await stat(sqlUrlsPath)).mode & 0o077) throw new Error('Protected SQL URL file must be mode 0600');
-const sqlUrls = JSON.parse(await readFile(sqlUrlsPath, 'utf8'));
+const sqlUrls = await readProtectedSqlUrls(sqlUrlsPath);
 const env = topology.environments[environment];
 const wrangler = resolve(import.meta.dirname, '../app/node_modules/.bin/wrangler');
 const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;

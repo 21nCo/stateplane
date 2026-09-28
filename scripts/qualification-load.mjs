@@ -6,7 +6,7 @@ if (!(url ?? '').startsWith('https://') || !Number.isSafeInteger(concurrency) ||
   console.error('Usage: PROBE_TOKEN=<secret> node scripts/qualification-load.mjs <https-preview-qualify-url> [concurrency 2..50] [minimum-headroom]');
   process.exit(2);
 }
-const results = await Promise.allSettled(Array.from({ length: concurrency }, async () => {
+async function requestProbe() {
   const response = await fetch(url, { method: 'POST', headers: { authorization: `Bearer ${process.env.PROBE_TOKEN}` }, signal: AbortSignal.timeout(30000) });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   const body = await response.json();
@@ -17,7 +17,11 @@ const results = await Promise.allSettled(Array.from({ length: concurrency }, asy
       body.maxConnections - body.reservedConnections < body.observedConnections ||
       !Number.isFinite(body.elapsedMs)) throw new Error('Incomplete qualification result');
   return body;
-}));
+}
+// The first probe creates the disposable table. Complete it before any parallel
+// request so PostgreSQL catalog creation cannot race on a fresh database.
+await requestProbe();
+const results = await Promise.allSettled(Array.from({ length: concurrency }, requestProbe));
 const failed = results.filter(result => result.status === 'rejected');
 if (failed.length) throw new Error(`${failed.length}/${concurrency} concurrent qualification requests failed`);
 const values = results.map(result => result.value);
