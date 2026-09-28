@@ -1,6 +1,18 @@
 const DAY_SECONDS = 86400;
 const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
 const hexId = /^[a-f0-9]{32}$/i;
+const absoluteDirectory = /^\/(?:[a-zA-Z0-9._-]+\/)*[a-zA-Z0-9._-]+$/;
+export const validVolumePath = value => typeof value === 'string' && absoluteDirectory.test(value) &&
+  !value.split('/').some(segment => segment === '.' || segment === '..');
+
+export function assertVolumePlacement(label, volumeInstance, mountPath, dataDirectory) {
+  if (!validVolumePath(mountPath) ||
+      volumeInstance?.mountPath !== mountPath ||
+      !validVolumePath(dataDirectory) ||
+      !(dataDirectory === mountPath || dataDirectory.startsWith(`${mountPath}/`))) {
+    throw new Error(`${label}: PostgreSQL data directory is outside the inventoried Railway volume mount`);
+  }
+}
 
 /** Provider APIs may canonicalize the case of hexadecimal resource IDs. */
 export const sameProviderId = (actual, expected, pattern = uuid) =>
@@ -27,6 +39,7 @@ export function assertLiveResources({ label, environment, definition, resource, 
       !sameProviderId(volumeInstance.serviceId, resource.serviceId) ||
       !sameProviderId(volumeInstance.environmentId, environmentId) || volumeInstance.region !== definition.railwayRegion ||
       volumeInstance.deletedAt || volumeInstance.isPendingDeletion) throw new Error(`${label}: Railway volume identity or region mismatch`);
+  if (volumeInstance.mountPath !== resource.volumeMountPath) throw new Error(`${label}: Railway volume mount mismatch`);
   const requiredRetention = (environment === 'production' ? 7 : 1) * DAY_SECONDS;
   if (!Array.isArray(backupSchedules) || !backupSchedules.some(schedule =>
     Number.isInteger(schedule.retentionSeconds) && schedule.retentionSeconds >= requiredRetention) ||

@@ -1,6 +1,7 @@
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { resolve, relative, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { validVolumePath } from './topology-live.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const hexId = /^[a-f0-9]{32}$/i;
@@ -67,7 +68,7 @@ function validateEnvironment(environment, env, all) {
   const expected = environment === 'production' ? ['ap-southeast', 'us-east'] : ['ap-southeast', 'eu-west', 'us-east'];
   const actual = env.cells.map(cell => cell?.id);
   actual.sort((a, b) => String(a).localeCompare(String(b)));
-  if (actual.join(',') !== expected.join(',')) throw new Error(`${environment} has incomplete cell pattern`);
+  if (actual.join(',') !== expected.sort((a, b) => a.localeCompare(b)).join(',')) throw new Error(`${environment} has incomplete cell pattern`);
   assertDerivedNames(environment, names(env));
   check(railwayServiceName(env), cloudflareName, `${environment} control Railway service name`);
   const directory = `${env.prefix}-directory`;
@@ -135,10 +136,11 @@ export function validateInventory(topology, environment, inventory) {
   check(inventory.environmentId, uuid, 'Railway environment ID');
   const resourceIds = [];
   const validateResource = (resource, label) => {
-    allowedKeys(resource, ['hyperdriveId', 'serviceId', 'volumeInstanceId', 'network', 'postgresImage', 'postgresImageDigest', 'databaseRole'], `${label} inventory`);
+    allowedKeys(resource, ['hyperdriveId', 'serviceId', 'volumeInstanceId', 'volumeMountPath', 'network', 'postgresImage', 'postgresImageDigest', 'databaseRole'], `${label} inventory`);
     check(resource.hyperdriveId, hexId, `${label} Hyperdrive ID`);
     check(resource.serviceId, uuid, `${label} Railway service ID`);
     check(resource.volumeInstanceId, uuid, `${label} Railway volume instance ID`);
+    if (!validVolumePath(resource.volumeMountPath)) throw new Error(`${label} Railway volume mount path is invalid`);
     check(resource.postgresImage, postgresImage, `${label} pinned PostgreSQL image`);
     check(resource.postgresImageDigest, imageDigest, `${label} approved PostgreSQL image digest`);
     check(resource.databaseRole, postgresRoleName, `${label} PostgreSQL role`);

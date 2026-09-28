@@ -4,8 +4,10 @@ import { resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { qualificationTarget } from './qualification-artifact.mjs';
 import { readHyperdrive } from './wrangler-command.mjs';
-import { sameProviderId } from './topology-live.mjs';
+import { sameProviderId, validVolumePath } from './topology-live.mjs';
 import { validateDeploymentInventories } from './topology.mjs';
+import { readProtectedSqlUrls, verifyPgdataPlacement } from './topology-sql.mjs';
+import { readUploadedCa } from './topology-ca.mjs';
 
 const run = promisify(execFile);
 const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
@@ -13,7 +15,7 @@ const hex = /^[a-f0-9]{32}$/i;
 export const qualificationProviderQuery = `query ReadDisposable($serviceId: String!, $environmentId: String!, $volumeInstanceId: String!) {
   service(id: $serviceId) { id name projectId deletedAt }
   serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { serviceId environmentId region deletedAt latestDeployment { status } }
-  volumeInstance(id: $volumeInstanceId) { id serviceId environmentId region deletedAt isPendingDeletion }
+  volumeInstance(id: $volumeInstanceId) { id serviceId environmentId region mountPath deletedAt isPendingDeletion }
   tcpProxies(serviceId: $serviceId, environmentId: $environmentId) { id serviceId environmentId applicationPort domain proxyPort deletedAt }
 }`;
 
@@ -24,20 +26,37 @@ export async function readQualificationInventory(path) {
   catch { throw new Error('Protected qualification inventory is invalid JSON'); }
 }
 
-export async function connectedQualificationReadback(inventory, signal) {
+export async function readRailwayQualification(inventory, signal, runCommand = run) {
   const account = process.env.STATEPLANE_RAILWAY_ACCOUNT;
   if (!account) throw new Error('Connected Railway account required');
   const payload = JSON.stringify({ query: qualificationProviderQuery, variables: {
     serviceId: inventory.serviceId,
     environmentId: inventory.environmentId, volumeInstanceId: inventory.volumeInstanceId
   } });
-  const { stdout } = await run('composio', ['proxy', 'https://backboard.railway.com/graphql/v2',
+  const { stdout } = await runCommand('composio', ['proxy', 'https://backboard.railway.com/graphql/v2',
     '--toolkit', 'railway', '--account', account, '-X', 'POST', '-H', 'content-type: application/json', '-d', payload],
-  { maxBuffer: 1024 * 1024, signal });
-  const railway = JSON.parse(stdout);
-  if (railway.errors?.length || !railway.data) throw new Error('Connected Railway readback failed');
+  { maxBuffer: 1024 * 1024, timeout: 15_000, killSignal: 'SIGKILL', signal });
+  let railway;
+  try { railway = JSON.parse(stdout); }
+  catch { throw new Error('Connected Railway readback is invalid JSON'); }
+  if (!railway || !Array.isArray(railway.errors ?? []) || railway.errors?.length ||
+      !railway.data || typeof railway.data !== 'object') throw new Error('Connected Railway readback failed');
+  return railway.data;
+}
+
+export async function connectedQualificationReadback(inventory, signal) {
+  const railway = await readRailwayQualification(inventory, signal);
   const hyperdrive = await readHyperdrive(inventory.hyperdriveId, { signal });
-  return { railway: railway.data, hyperdrive };
+  return { railway, hyperdrive };
+}
+
+export async function connectedPgdataProof(inventory, railway, hyperdrive, signal) {
+  if (!process.env.STATEPLANE_QUALIFICATION_PGDATA_URL_FILE) throw new Error('Protected disposable PGDATA SQL URL file required');
+  const urls = await readProtectedSqlUrls(process.env.STATEPLANE_QUALIFICATION_PGDATA_URL_FILE);
+  const ca = await readUploadedCa(hyperdrive.mtls.ca_certificate_id, signal);
+  await verifyPgdataPlacement({ label: inventory.name, volumeInstance: railway.volumeInstance,
+    mountPath: inventory.volumeMountPath, database: inventory.database, proxy: railway.tcpProxies[0],
+    ca, value: urls.url, signal });
 }
 
 /** A separate protected target record and live provider reads must agree before disposable DDL. */
@@ -47,7 +66,7 @@ export async function verifyQualificationTarget(root, name, head, artifactId,
       development: process.env.STATEPLANE_DEVELOPMENT_INVENTORY_FILE,
       production: process.env.STATEPLANE_PRODUCTION_INVENTORY_FILE
     },
-    readback = connectedQualificationReadback, signal } = {}) {
+    readback = connectedQualificationReadback, pgdataProof = connectedPgdataProof, signal } = {}) {
   if (signal?.aborted) throw new Error('Qualification target verification interrupted');
   const topology = JSON.parse(await readFile(resolve(root, 'deployment/topology.json'), 'utf8'));
   const { environment, cell } = qualificationTarget(name, head, topology);
@@ -56,11 +75,12 @@ export async function verifyQualificationTarget(root, name, head, artifactId,
   const expectedRole = `sta4_probe_${head.slice(0, 16)}`;
   const inventory = await readQualificationInventory(inventoryPath);
   if (!inventory || Array.isArray(inventory) || typeof inventory !== 'object' ||
-      Object.keys(inventory).sort().join(',') !== ['database', 'environmentId', 'hyperdriveId', 'name', 'projectId',
-        'role', 'serviceId', 'volumeInstanceId'].sort().join(',') ||
+      Object.keys(inventory).sort((a, b) => a.localeCompare(b)).join(',') !== ['database', 'environmentId', 'hyperdriveId', 'name', 'projectId',
+        'role', 'serviceId', 'volumeInstanceId', 'volumeMountPath'].sort((a, b) => a.localeCompare(b)).join(',') ||
       inventory.name !== name || inventory.database !== expectedDatabase || inventory.role !== expectedRole ||
       ![inventory.projectId, inventory.environmentId, inventory.serviceId, inventory.volumeInstanceId].every(id => uuid.test(id ?? '')) ||
-      !hex.test(inventory.hyperdriveId ?? '') || !sameProviderId(inventory.hyperdriveId, artifactId, hex)) {
+      !hex.test(inventory.hyperdriveId ?? '') || !validVolumePath(inventory.volumeMountPath) ||
+      !sameProviderId(inventory.hyperdriveId, artifactId, hex)) {
     throw new Error('Disposable qualification target differs from protected inventory');
   }
   if (!operationalInventoryPaths?.development || !operationalInventoryPaths?.production) {
@@ -93,7 +113,8 @@ export async function verifyQualificationTarget(root, name, head, artifactId,
       !sameProviderId(volumeInstance?.id, inventory.volumeInstanceId) ||
       !sameProviderId(volumeInstance?.serviceId, inventory.serviceId) ||
       !sameProviderId(volumeInstance?.environmentId, inventory.environmentId) ||
-      volumeInstance.region !== definition.railwayRegion || volumeInstance.deletedAt || volumeInstance.isPendingDeletion ||
+      volumeInstance.region !== definition.railwayRegion || volumeInstance.mountPath !== inventory.volumeMountPath ||
+      volumeInstance.deletedAt || volumeInstance.isPendingDeletion ||
       !sameProviderId(proxy?.serviceId, inventory.serviceId) ||
       !sameProviderId(proxy?.environmentId, inventory.environmentId) || proxy.deletedAt ||
       proxy.applicationPort !== 5432 || !proxy.domain || !Number.isInteger(proxy.proxyPort)) {
@@ -107,5 +128,7 @@ export async function verifyQualificationTarget(root, name, head, artifactId,
       hyperdrive.mtls?.sslmode !== 'verify-full' || !uuid.test(hyperdrive.mtls?.ca_certificate_id ?? '')) {
     throw new Error('Disposable Hyperdrive origin, role, cache or TLS readback mismatch');
   }
+  await pgdataProof(inventory, railway, hyperdrive, signal);
+  if (signal?.aborted) throw new Error('Qualification target verification interrupted');
   return { environment, cell, railwayRegion: definition.railwayRegion, database: inventory.database, role: inventory.role };
 }

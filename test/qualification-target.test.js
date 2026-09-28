@@ -8,7 +8,7 @@ import { syntheticInventories } from '../scripts/topology-dry-run.mjs';
 
 const root = resolve(import.meta.dirname, '..');
 const head = 'a'.repeat(40);
-const uuid = index => `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
+const uuid = index => `00000000-0000-4000-8000-a${String(index).padStart(11, '0')}`;
 const targets = [
   ['d', 'apse', 'asia-southeast1-eqsg3a'], ['d', 'use', 'us-east4-eqdc4a'],
   ['d', 'euw', 'europe-west4-drams3a'], ['p', 'apse', 'asia-southeast1-eqsg3a'],
@@ -19,7 +19,8 @@ function fixture(short, cell, region, index) {
   const name = `s4-${head}-${short}-${cell}`;
   const inventory = {
     name, projectId: uuid(1), environmentId: uuid(2), serviceId: uuid(index * 2 + 10),
-    volumeInstanceId: uuid(index * 2 + 11), hyperdriveId: index.toString(16).padStart(32, '0'),
+    volumeInstanceId: uuid(index * 2 + 11), volumeMountPath: '/var/lib/postgresql/data',
+    hyperdriveId: index.toString(16).padStart(32, 'a'),
     database: `sta4_${head.slice(0, 16)}_${short === 'd' ? 'dev' : 'prod'}_${{ apse: 'ap_southeast', use: 'us_east', euw: 'eu_west' }[cell]}`,
     role: `sta4_probe_${head.slice(0, 16)}`
   };
@@ -31,7 +32,8 @@ function fixture(short, cell, region, index) {
       serviceInstance: { serviceId: inventory.serviceId, environmentId: inventory.environmentId,
         region, deletedAt: null, latestDeployment: { status: 'SUCCESS' } },
       volumeInstance: { id: inventory.volumeInstanceId, serviceId: inventory.serviceId,
-        environmentId: inventory.environmentId, region, deletedAt: null, isPendingDeletion: false },
+        environmentId: inventory.environmentId, region, mountPath: inventory.volumeMountPath,
+        deletedAt: null, isPendingDeletion: false },
       tcpProxies: [proxy]
     },
     hyperdrive: { id: inventory.hyperdriveId, caching: { disabled: true }, origin_connection_limit: 5,
@@ -58,7 +60,8 @@ test('each disposable cell requires an independent protected ID and physical pro
       const inventoryPath = join(directory, `${index}.json`);
       await writeFile(inventoryPath, JSON.stringify(inventory), { mode: 0o600 });
       const verify = (value = readback, artifactId = inventory.hyperdriveId) =>
-        verifyQualificationTarget(root, name, head, artifactId, { inventoryPath, operationalInventoryPaths, readback: async () => value });
+        verifyQualificationTarget(root, name, head, artifactId, { inventoryPath, operationalInventoryPaths,
+          readback: async () => value, pgdataProof: async () => {} });
       assert.equal((await verify()).railwayRegion, region);
       await assert.rejects(verify({ ...readback, railway: { ...readback.railway,
         service: { ...readback.railway.service, name: 'stateplane-dev-ap-southeast' } } }), /service, volume/);
@@ -72,6 +75,12 @@ test('each disposable cell requires an independent protected ID and physical pro
       // A restored volume or retry with a changed provider ID must receive a new protected record.
       await assert.rejects(verify({ ...readback, railway: { ...readback.railway,
         volumeInstance: { ...readback.railway.volumeInstance, id: uuid(500) } } }), /region or proxy/);
+      await assert.rejects(verify({ ...readback, railway: { ...readback.railway,
+        volumeInstance: { ...readback.railway.volumeInstance, mountPath: '/wrong-volume' } } }), /region or proxy/);
+      await assert.rejects(verifyQualificationTarget(root, name, head, inventory.hyperdriveId, {
+        inventoryPath, operationalInventoryPaths, readback: async () => readback,
+        pgdataProof: async () => { throw new Error('PGDATA outside mount'); }
+      }), /PGDATA outside mount/);
       for (const key of ['serviceId', 'volumeInstanceId', 'hyperdriveId']) {
         const changed = structuredClone(operational);
         changed.development.control[key] = inventory[key].toUpperCase();
@@ -79,13 +88,13 @@ test('each disposable cell requires an independent protected ID and physical pro
         let readbackCalled = false;
         await assert.rejects(verifyQualificationTarget(root, name, head, inventory.hyperdriveId, {
           inventoryPath, operationalInventoryPaths,
-          readback: async () => { readbackCalled = true; return readback; }
+          readback: async () => { readbackCalled = true; return readback; }, pgdataProof: async () => {}
         }), /reuses an operational resource/);
         assert.equal(readbackCalled, false);
         await writeFile(operationalInventoryPaths.development, JSON.stringify(operational.development), { mode: 0o600 });
       }
       await assert.rejects(verifyQualificationTarget(root, name, head, inventory.hyperdriveId, {
-        inventoryPath, operationalInventoryPaths: {}, readback: async () => readback
+        inventoryPath, operationalInventoryPaths: {}, readback: async () => readback, pgdataProof: async () => {}
       }), /operational inventory paths required/);
     }
   } finally { await rm(directory, { recursive: true, force: true }); }

@@ -1,6 +1,7 @@
 import { Client } from 'pg';
 import { readFile, stat } from 'node:fs/promises';
 import { operationalGrantsAllowed, operationalGrantsSql } from '../deployment/workers/role-grants.js';
+import { assertVolumePlacement } from './topology-live.mjs';
 
 export async function readProtectedSqlUrls(path) {
   if (((await stat(path)).mode & 0o777) !== 0o600) throw new Error('Protected SQL URL file must be mode 0600');
@@ -46,6 +47,35 @@ export async function verifySqlIdentity({ label, resource, database, proxy, ca, 
     }
   } catch {
     throw new Error(signal?.aborted ? `${label}: topology verification interrupted` : `${label}: verified-TLS SQL identity or pgvector query failed`);
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
+
+/** A separate read-only settings credential proves the running server's PGDATA, not just its configured image path. */
+export async function verifyPgdataPlacement({ label, volumeInstance, mountPath, database, proxy, ca, value, ClientType = Client, signal }) {
+  if (signal?.aborted) throw new Error(`${label}: topology verification interrupted`);
+  if (typeof value !== 'string') throw new Error(`${label}: protected PGDATA SQL URL missing`);
+  let url;
+  try { url = new URL(value); }
+  catch { throw new Error(`${label}: protected PGDATA SQL URL is invalid`); }
+  if (!['postgres:', 'postgresql:'].includes(url.protocol) || url.hostname !== proxy.domain ||
+      Number(url.port) !== proxy.proxyPort || decodeURIComponent(url.pathname.slice(1)) !== database ||
+      !url.username || !url.password || url.search || url.hash) {
+    throw new Error(`${label}: protected PGDATA SQL URL differs from declared proxy or database`);
+  }
+  const client = new ClientType({ connectionString: value, connectionTimeoutMillis: 5000, query_timeout: 5000,
+    ssl: { ca, rejectUnauthorized: true, servername: proxy.domain } });
+  try {
+    await client.connect();
+    if (signal?.aborted) throw new Error('interrupted');
+    const result = await client.query('SELECT current_database() AS database, current_user AS role, current_setting(\'data_directory\') AS data_directory');
+    if (signal?.aborted) throw new Error('interrupted');
+    if (result.rows.length !== 1 || result.rows[0].database !== database ||
+        result.rows[0].role !== decodeURIComponent(url.username)) throw new Error('SQL identity mismatch');
+    assertVolumePlacement(label, volumeInstance, mountPath, result.rows[0].data_directory);
+  } catch {
+    throw new Error(signal?.aborted ? `${label}: topology verification interrupted` : `${label}: verified-TLS PGDATA placement proof failed`);
   } finally {
     await client.end().catch(() => {});
   }

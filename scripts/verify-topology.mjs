@@ -2,10 +2,10 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { readProtectedSqlUrls, verifySqlIdentity } from './topology-sql.mjs';
+import { readProtectedSqlUrls, verifySqlIdentity, verifyPgdataPlacement } from './topology-sql.mjs';
 import { validateTopology, validateInventory, cellDatabaseName, railwayServiceName } from './topology.mjs';
 import { assertLiveResources } from './topology-live.mjs';
-import { parseUploadedCa } from './topology-ca.mjs';
+import { readUploadedCa } from './topology-ca.mjs';
 import { readHyperdrive } from './wrangler-command.mjs';
 import { verifyOperationalBinding } from './operational-binding.mjs';
 import { verifyBindingPreflight } from './topology-verification-flow.mjs';
@@ -21,19 +21,18 @@ if (!account) throw new Error('STATEPLANE_RAILWAY_ACCOUNT must select a connecte
 const topology = validateTopology(JSON.parse(await readFile(new URL('../deployment/topology.json', import.meta.url))));
 const inventory = validateInventory(topology, environment, JSON.parse(await readFile(resolve(inventoryPath))));
 if (!process.env.STATEPLANE_SQL_URLS_FILE) throw new Error('STATEPLANE_SQL_URLS_FILE must select protected per-resource SQL URLs');
+if (!process.env.STATEPLANE_PGDATA_URLS_FILE) throw new Error('STATEPLANE_PGDATA_URLS_FILE must select protected per-resource settings SQL URLs');
 if (!process.env.PROBE_TOKEN || /[\r\n]/.test(process.env.PROBE_TOKEN)) throw new Error('Protected single-line PROBE_TOKEN required for operational Worker proof');
 const sqlUrlsPath = resolve(process.env.STATEPLANE_SQL_URLS_FILE);
 const sqlUrls = await readProtectedSqlUrls(sqlUrlsPath);
+const pgdataUrls = await readProtectedSqlUrls(resolve(process.env.STATEPLANE_PGDATA_URLS_FILE));
 const env = topology.environments[environment];
-const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
-const apiToken = process.env.CLOUDFLARE_API_TOKEN;
-if (!/^[a-f0-9]{32}$/i.test(accountId ?? '') || !apiToken) throw new Error('Protected Cloudflare account ID and API token required for CA readback');
 
 const providerQuery = `query ReadCell($projectId: String!, $serviceId: String!, $environmentId: String!, $volumeInstanceId: String!, $targetTimestamp: DateTime!) {
   regions(projectId: $projectId) { name }
   service(id: $serviceId) { id name projectId deletedAt }
   serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { serviceId environmentId region deletedAt source { image repo } latestDeployment { status meta } }
-  volumeInstance(id: $volumeInstanceId) { id serviceId environmentId region deletedAt isPendingDeletion }
+  volumeInstance(id: $volumeInstanceId) { id serviceId environmentId region mountPath deletedAt isPendingDeletion }
   volumeInstanceBackupScheduleList(volumeInstanceId: $volumeInstanceId) { id retentionSeconds }
   volumeInstanceBackupList(volumeInstanceId: $volumeInstanceId) { id externalId createdAt expiresAt usedMB referencedMB volumeInstanceSizeMB }
   volumeInstancePitrRestoreEstimate(volumeInstanceId: $volumeInstanceId, targetTimestamp: $targetTimestamp) { baseBackupLabel likelyToFit }
@@ -46,7 +45,8 @@ async function railway(resource, signal) {
     targetTimestamp: new Date(Date.now() - 15 * 60_000).toISOString()
   } });
   const { stdout } = await run('composio', ['proxy', 'https://backboard.railway.com/graphql/v2', '--toolkit', 'railway', '--account', account,
-    '-X', 'POST', '-H', 'content-type: application/json', '-d', payload], { maxBuffer: 1024 * 1024, signal });
+    '-X', 'POST', '-H', 'content-type: application/json', '-d', payload],
+  { maxBuffer: 1024 * 1024, timeout: 30_000, killSignal: 'SIGKILL', signal });
   const response = JSON.parse(stdout);
   if (response.errors?.length || !response.data) throw new Error('Connected Railway provider readback failed');
   return { ...response.data, backupSchedules: response.data.volumeInstanceBackupScheduleList,
@@ -59,14 +59,6 @@ async function hyperdrive(id, signal) {
   return value;
 }
 
-async function verifyUploadedCa(id, signal) {
-  const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/mtls_certificates/${id}`, {
-    headers: { Authorization: `Bearer ${apiToken}` }, signal
-  });
-  if (!response.ok) throw new Error('Uploaded Hyperdrive CA certificate is unavailable');
-  return parseUploadedCa(await response.json(), id);
-}
-
 async function verify(label, definition, resource, database, serviceName) {
   const worker = await verifyBindingPreflight(controller.signal, {
     railway: () => railway(resource, controller.signal),
@@ -76,9 +68,13 @@ async function verify(label, definition, resource, database, serviceName) {
       assertLiveResources({ label, environment, definition, resource, database, serviceName,
         projectId: inventory.projectId, environmentId: inventory.environmentId, railway: railwayReadback, hyperdrive: hyperdriveReadback });
     },
-    ca: hyperdriveReadback => verifyUploadedCa(hyperdriveReadback.mtls.ca_certificate_id, controller.signal),
-    sql: (railwayReadback, _hyperdriveReadback, ca) => verifySqlIdentity({ label, resource, database,
-      proxy: railwayReadback.tcpProxies[0], ca, value: sqlUrls[label], signal: controller.signal }),
+    ca: hyperdriveReadback => readUploadedCa(hyperdriveReadback.mtls.ca_certificate_id, controller.signal),
+    sql: async (railwayReadback, _hyperdriveReadback, ca) => {
+      const proxy = railwayReadback.tcpProxies[0];
+      await verifyPgdataPlacement({ label, volumeInstance: railwayReadback.volumeInstance,
+        mountPath: resource.volumeMountPath, database, proxy, ca, value: pgdataUrls[label], signal: controller.signal });
+      await verifySqlIdentity({ label, resource, database, proxy, ca, value: sqlUrls[label], signal: controller.signal });
+    },
     worker: () => verifyOperationalBinding(environment, label, resource, database, { signal: controller.signal })
   });
   console.log(`${label}: Railway ${definition.railwayRegion} service/volume, backup and PITR estimate, pinned PostgreSQL image, verified-TLS SQL identity/pgvector, cache-disabled Hyperdrive limit ${definition.originConnectionLimit}, operational Worker binding ${worker.hyperdriveId} at ${worker.name}; transaction and restore drill still required`);

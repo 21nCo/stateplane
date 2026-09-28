@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { verifyBindingPreflight } from '../scripts/topology-verification-flow.mjs';
 
 test('an interrupted provider read settles both reads and never deploys the Worker', async () => {
@@ -43,4 +44,38 @@ test('an interruption during verified SQL closes that stage before Worker deploy
   } finally { release(); }
   await rejection;
   assert.deepEqual(stages, ['validate', 'sql-start', 'sql-settled']);
+});
+
+test('in-flight provider child exits before an interrupted preflight settles', { timeout: 10_000 }, async () => {
+  const controller = new AbortController();
+  let child;
+  let exited = false;
+  let ready;
+  const started = new Promise(resolve => { ready = resolve; });
+  const stages = [];
+  const proof = verifyBindingPreflight(controller.signal, {
+    railway: async () => {
+      child = spawn(process.execPath, ['-e', 'process.stdout.write("ready\\n"); setInterval(() => {}, 1000)'],
+        { signal: controller.signal, stdio: ['ignore', 'pipe', 'ignore'] });
+      child.on('error', () => {});
+      child.stdout.once('data', () => ready());
+      await new Promise((resolve, reject) => child.once('close', code => {
+        exited = true;
+        code === 0 ? resolve() : reject(new Error('provider child interrupted'));
+      }));
+    },
+    hyperdrive: async () => { stages.push('hyperdrive'); },
+    validate: () => stages.push('validate'), ca: () => stages.push('ca'),
+    sql: () => stages.push('sql'), worker: () => stages.push('worker')
+  });
+  const rejection = assert.rejects(proof, /Topology verification interrupted/);
+  try {
+    await started;
+    controller.abort();
+    await rejection;
+    assert.equal(exited, true);
+    assert.deepEqual(stages, ['hyperdrive']);
+  } finally {
+    if (child && !exited) child.kill('SIGKILL');
+  }
 });

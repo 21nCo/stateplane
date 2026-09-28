@@ -19,6 +19,7 @@ const inventory = environment => {
   const ids = resources.map((_, index) => ({
     hyperdriveId: `deadbee${index}`.repeat(4), serviceId: uuid('abcd'[index]),
     volumeInstanceId: uuid('ef12'[index]), network: 'public-tls',
+    volumeMountPath: '/var/lib/postgresql/data',
     postgresImage: 'pgvector/pgvector:pg16', postgresImageDigest: `sha256:${'a'.repeat(64)}`, databaseRole: `probe_${index}`
   }));
   return { environment, projectId: uuid('a').replace('-1111-', '-5555-'), environmentId: uuid('b').replace('-1111-', '-6666-'), control: ids[0],
@@ -37,7 +38,7 @@ const live = (environment, label) => {
     serviceInstance: { serviceId: resource.serviceId, environmentId: inventory(environment).environmentId, region: definition.railwayRegion,
       source: { image: resource.postgresImage, repo: null }, latestDeployment: { status: 'SUCCESS', meta: { image: resource.postgresImage, imageDigest: `sha256:${'a'.repeat(64)}` } }, deletedAt: null },
     volumeInstance: { id: resource.volumeInstanceId, serviceId: resource.serviceId, environmentId: inventory(environment).environmentId,
-      region: definition.railwayRegion, deletedAt: null, isPendingDeletion: false },
+      region: definition.railwayRegion, mountPath: resource.volumeMountPath, deletedAt: null, isPendingDeletion: false },
     backupSchedules: [{ retentionSeconds: environment === 'production' ? 30 * 86400 : 6 * 86400 }],
     backups: [{ id: 'snapshot', externalId: 'railway-snapshot', usedMB: 0, referencedMB: 0, volumeInstanceSizeMB: 1024,
       createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 86400_000).toISOString() }],
@@ -88,6 +89,9 @@ test('inventory isolates every Railway service, volume and Hyperdrive binding', 
     const missingVolume = copy(good);
     delete missingVolume.cells['us-east'].volumeInstanceId;
     assert.throws(() => validateInventory(topology, environment, missingVolume), /volume instance ID/);
+    const missingMount = copy(good);
+    delete missingMount.cells['us-east'].volumeMountPath;
+    assert.throws(() => validateInventory(topology, environment, missingMount), /volume mount path/);
     const old = copy(good);
     old.cells['ap-southeast'].rdsInstanceId = 'old';
     assert.throws(() => validateInventory(topology, environment, old), /unsupported field/);
@@ -198,6 +202,7 @@ test('render CLI fails before writing config when counterpart is missing or shar
     await mkdir(join(projectRoot, 'deployment'));
     await writeFile(join(projectRoot, 'package.json'), '{"type":"module"}');
     await copyFile(new URL('../scripts/topology.mjs', import.meta.url), join(projectRoot, 'scripts/topology.mjs'));
+    await copyFile(new URL('../scripts/topology-live.mjs', import.meta.url), join(projectRoot, 'scripts/topology-live.mjs'));
     await writeFile(join(projectRoot, 'deployment/topology.json'), JSON.stringify(topology));
     const devPath = join(projectRoot, 'development.json');
     const prodPath = join(projectRoot, 'production.json');
@@ -220,6 +225,7 @@ test('provider readback rejects wrong region, volume, origin, backup, PITR, TLS 
       const check = edit => { const bad = copy(good); edit(bad); assert.throws(() => assertLiveResources(bad), undefined, `${environment}/${label}`); };
       check(bad => { bad.railway.serviceInstance.region = 'us-west2'; });
       check(bad => { bad.railway.volumeInstance.region = 'us-west2'; });
+      check(bad => { bad.railway.volumeInstance.mountPath = '/wrong-volume'; });
       check(bad => { bad.railway.service.name = 'another-cell'; });
       check(bad => { bad.railway.serviceInstance.source.image = 'redis:7'; });
       check(bad => { bad.railway.serviceInstance.latestDeployment.meta.image = 'redis:7'; });
@@ -344,7 +350,9 @@ test('interrupted protected SQL read closes the client and stops before grant or
 });
 
 test('synthetic dry run inventories pass cross-environment isolation and compare shows its own syntax', async () => {
-  assert.equal(await dryRunTopology(topology, { runWrangler: async () => ({ stdout: '' }) }), 21);
+  // Each environment renders app, MCP gateway and directory plus API, MCP and jobs per cell.
+  const expected = Object.values(topology.environments).reduce((count, env) => count + 3 + 3 * env.cells.length, 0);
+  assert.equal(await dryRunTopology(topology, { runWrangler: async () => ({ stdout: '' }) }), expected);
   assert.throws(() => execFileSync(process.execPath, ['scripts/topology.mjs', 'compare'], { cwd: new URL('..', import.meta.url), stdio: 'pipe' }), error =>
     error.stderr.toString().includes('compare <development-inventory.json> <production-inventory.json>'));
 });
