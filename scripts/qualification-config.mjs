@@ -22,9 +22,11 @@ const config = {
   compatibility_date: '2026-09-25',
   compatibility_flags: ['nodejs_compat'],
   workers_dev: false,
+  secrets: { required: ['PROBE_TOKEN'] },
   hyperdrive: [{ binding: 'AUTHORITY', id: hyperdriveId }],
   vars: { STATEPLANE_DISPOSABLE: '1', STATEPLANE_PROBE_DATABASE: probeDatabase, STATEPLANE_PROBE_ROLE: probeRole },
   previews: {
+    secrets: { required: ['PROBE_TOKEN'] },
     hyperdrive: [{ binding: 'AUTHORITY', id: hyperdriveId }],
     vars: { STATEPLANE_DISPOSABLE: '1', STATEPLANE_PROBE_DATABASE: probeDatabase, STATEPLANE_PROBE_ROLE: probeRole }
   }

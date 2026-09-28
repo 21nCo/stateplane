@@ -78,7 +78,7 @@ async function verifyRollback(writer: ProbeClient, id: string, markRow: () => vo
   });
 }
 
-async function verifyFreshReads(writer: ProbeClient, reader: ProbeClient, id: string): Promise<{ observedConnections: number; maxConnections: number }> {
+async function verifyFreshReads(writer: ProbeClient, reader: ProbeClient, id: string): Promise<{ observedConnections: number; maxConnections: number; reservedConnections: number }> {
   await atStage('reader-connect', () => reader.connect());
   await atStage('initial-read', async () => {
     const first = await reader.query('SELECT value FROM stateplane_qualification WHERE probe_id = $1', [id]);
@@ -90,11 +90,16 @@ async function verifyFreshReads(writer: ProbeClient, reader: ProbeClient, id: st
     if (fresh.rows[0]?.value !== 2) throw new Error('Fresh read was stale');
   });
   return atStage('connection-budget', async () => {
-    const activity = await reader.query("SELECT count(*)::integer AS count, current_setting('max_connections')::integer AS max_connections FROM pg_stat_activity WHERE datname = current_database() AND usename = current_user");
+    // pg_stat_activity exposes rows for other roles/databases even without permission to read their query text.
+    // Count every client backend sharing this Postgres server, including the qualification clients.
+    const activity = await reader.query("SELECT count(*) FILTER (WHERE backend_type = 'client backend')::integer AS count, current_setting('max_connections')::integer AS max_connections, (current_setting('superuser_reserved_connections')::integer + COALESCE(current_setting('reserved_connections', true)::integer, 0)) AS reserved_connections FROM pg_stat_activity");
     const count: unknown = activity.rows[0]?.count;
     const max: unknown = activity.rows[0]?.max_connections;
-    if (!Number.isSafeInteger(count) || (count as number) < 1 || !Number.isSafeInteger(max) || (max as number) < (count as number)) throw new Error('Connection budget unavailable');
-    return { observedConnections: count as number, maxConnections: max as number };
+    const reserved: unknown = activity.rows[0]?.reserved_connections;
+    if (!Number.isSafeInteger(count) || (count as number) < 2 || !Number.isSafeInteger(max) ||
+        !Number.isSafeInteger(reserved) || (reserved as number) < 0 ||
+        (max as number) - (reserved as number) < (count as number)) throw new Error('Connection budget unavailable');
+    return { observedConnections: count as number, maxConnections: max as number, reservedConnections: reserved as number };
   });
 }
 
@@ -113,7 +118,7 @@ async function probe(connectionString: string, expectedDatabase: string, expecte
   const reader = new Client({ connectionString, connectionTimeoutMillis: 5000, query_timeout: 5000 });
   const start = Date.now();
   let rowMayExist = false;
-  let result: { pgvectorVersion: string; rollback: boolean; freshRead: boolean; observedConnections: number; maxConnections: number; elapsedMs: number } | undefined;
+  let result: { pgvectorVersion: string; rollback: boolean; freshRead: boolean; observedConnections: number; maxConnections: number; reservedConnections: number; elapsedMs: number } | undefined;
   const failures: string[] = [];
   try {
     await atStage('writer-connect', () => writer.connect());
@@ -121,8 +126,8 @@ async function probe(connectionString: string, expectedDatabase: string, expecte
     await atStage('probe-table', () => writer.query('CREATE TABLE IF NOT EXISTS stateplane_qualification (probe_id uuid PRIMARY KEY, value integer NOT NULL)'));
     await verifyRollback(writer, id, () => { rowMayExist = true; });
     await atStage('committed-insert', () => writer.query('INSERT INTO stateplane_qualification (probe_id, value) VALUES ($1, 1)', [id]));
-    const { observedConnections, maxConnections } = await verifyFreshReads(writer, reader, id);
-    result = { pgvectorVersion, rollback: true, freshRead: true, observedConnections, maxConnections, elapsedMs: Date.now() - start };
+    const { observedConnections, maxConnections, reservedConnections } = await verifyFreshReads(writer, reader, id);
+    result = { pgvectorVersion, rollback: true, freshRead: true, observedConnections, maxConnections, reservedConnections, elapsedMs: Date.now() - start };
   } catch (error) {
     failures.push(...(error instanceof QualificationFailure ? error.stages : ['probe:unexpected']));
   }

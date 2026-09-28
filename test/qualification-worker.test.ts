@@ -17,6 +17,8 @@ const database = vi.hoisted(() => ({
   endFailure: false,
   queryTimeout: 0,
   maxConnections: 100,
+  otherConnections: 0,
+  reservedConnections: 3,
   valueReads: 0,
   queries: [] as string[],
   targetDatabase: 'sta4_aaaaaaaaaaaaaaaa_dev_ap_southeast',
@@ -59,7 +61,11 @@ vi.mock('pg', () => ({
         database.valueReads++;
         return { rows: database.row === null ? [] : [{ value: (database.staleInitialRead && database.valueReads === 1) || (database.staleFreshRead && database.valueReads === 2) ? 0 : database.row }] };
       }
-      if (sql.includes('pg_stat_activity')) return { rows: [{ count: 2, max_connections: database.maxConnections }] };
+      if (sql.includes('pg_stat_activity')) return { rows: [{
+        count: sql.includes('WHERE datname') ? 2 : 2 + database.otherConnections,
+        max_connections: database.maxConnections,
+        reserved_connections: sql.includes('reserved_connections') ? database.reservedConnections : undefined
+      }] };
       return { rows: [] };
     }
   }
@@ -98,6 +104,8 @@ describe('disposable qualification row cleanup', () => {
     database.endFailure = false;
     database.queryTimeout = 0;
     database.maxConnections = 100;
+    database.otherConnections = 0;
+    database.reservedConnections = 3;
     database.targetDatabase = 'sta4_aaaaaaaaaaaaaaaa_dev_ap_southeast';
     database.targetRole = 'sta4_probe_aaaaaaaaaaaaaaaa';
   });
@@ -105,7 +113,7 @@ describe('disposable qualification row cleanup', () => {
   it('reports success only after the committed probe row is gone', async () => {
     const response = await qualify();
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ ok: true, pgvectorVersion: '0.8.6', rollback: true, freshRead: true, observedConnections: 2, maxConnections: 100 });
+    expect(await response.json()).toMatchObject({ ok: true, pgvectorVersion: '0.8.6', rollback: true, freshRead: true, observedConnections: 2, maxConnections: 100, reservedConnections: 3 });
     expect(response.headers.get('Cache-Control')).toBe('no-store');
     expect(database.queryTimeout).toBe(5000);
     expect(database.row).toBeNull();
@@ -115,6 +123,17 @@ describe('disposable qualification row cleanup', () => {
   it('fails if the database cannot report sufficient connection capacity', async () => {
     database.maxConnections = 1;
     expect((await qualify()).status).toBe(500);
+    expect(database.row).toBeNull();
+  });
+
+  it('counts other database and role sessions and reports reserved slots', async () => {
+    database.maxConnections = 20;
+    database.otherConnections = 14;
+    database.reservedConnections = 2;
+    const response = await qualify();
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ observedConnections: 16, maxConnections: 20, reservedConnections: 2 });
+    expect(database.queries.find(sql => sql.includes('pg_stat_activity'))).not.toContain('WHERE datname');
     expect(database.row).toBeNull();
   });
 

@@ -12,6 +12,8 @@ const results = await Promise.allSettled(Array.from({ length: concurrency }, asy
   const body = await response.json();
   if (body.ok !== true || body.rollback !== true || body.freshRead !== true ||
       !Number.isSafeInteger(body.observedConnections) || !Number.isSafeInteger(body.maxConnections) ||
+      !Number.isSafeInteger(body.reservedConnections) || body.reservedConnections < 0 ||
+      body.maxConnections - body.reservedConnections < body.observedConnections ||
       !Number.isFinite(body.elapsedMs)) throw new Error('Incomplete qualification result');
   return body;
 }));
@@ -20,7 +22,8 @@ if (failed.length) throw new Error(`${failed.length}/${concurrency} concurrent q
 const values = results.map(result => result.value);
 const high = Math.max(...values.map(value => value.observedConnections));
 const maximum = Math.min(...values.map(value => value.maxConnections));
-if (maximum - high < reserve) throw new Error(`Origin connection headroom below ${reserve}: observed ${high}/${maximum}`);
+const reserved = Math.max(...values.map(value => value.reservedConnections));
+if (maximum - high - reserved < reserve) throw new Error(`Origin connection headroom below ${reserve}: observed ${high}/${maximum}, reserved ${reserved}`);
 console.log(JSON.stringify({ requests: concurrency, success: values.length, peakObservedConnections: high,
-  minMaxConnections: maximum, minimumHeadroom: maximum - high,
+  minMaxConnections: maximum, maxReservedConnections: reserved, minimumHeadroom: maximum - high - reserved,
   maxElapsedMs: Math.max(...values.map(value => value.elapsedMs)) }));
