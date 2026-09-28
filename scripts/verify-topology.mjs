@@ -2,10 +2,10 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { X509Certificate } from 'node:crypto';
 import { readProtectedSqlUrls, verifySqlIdentity } from './topology-sql.mjs';
 import { validateTopology, validateInventory, cellDatabaseName, railwayServiceName } from './topology.mjs';
-import { assertLiveResources, sameProviderId } from './topology-live.mjs';
+import { assertLiveResources } from './topology-live.mjs';
+import { parseUploadedCa } from './topology-ca.mjs';
 
 const run = promisify(execFile);
 const [environment, inventoryPath] = process.argv.slice(2);
@@ -62,16 +62,7 @@ async function verifyUploadedCa(id) {
     headers: { Authorization: `Bearer ${apiToken}` }
   });
   if (!response.ok) throw new Error('Uploaded Hyperdrive CA certificate is unavailable');
-  const body = await response.json();
-  if (body.success !== true || !sameProviderId(body.result?.id, id) || body.result?.ca !== true ||
-      typeof body.result.certificates !== 'string' || !body.result.certificates.includes('-----BEGIN CERTIFICATE-----')) {
-    throw new Error('Uploaded Hyperdrive CA certificate is unavailable');
-  }
-  const blocks = body.result.certificates.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) ?? [];
-  if (blocks.length !== 1 || Date.parse(new X509Certificate(blocks[0]).validTo) <= Date.now()) {
-    throw new Error('Uploaded Hyperdrive CA must be one unexpired certificate');
-  }
-  return blocks[0];
+  return parseUploadedCa(await response.json(), id);
 }
 
 async function verify(label, definition, resource, database, serviceName) {

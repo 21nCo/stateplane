@@ -45,7 +45,7 @@ const live = (environment, label) => {
       domain: 'tcp.railway.app', proxyPort: 12345, deletedAt: null }]
   };
   const hyperdrive = { id: resource.hyperdriveId, caching: { disabled: true }, origin_connection_limit: 5,
-    origin: { scheme: 'postgres', database, host: 'tcp.railway.app', port: 12345 },
+    origin: { scheme: 'postgres', database, user: resource.databaseRole, host: 'tcp.railway.app', port: 12345 },
     mtls: { sslmode: 'verify-full', ca_certificate_id: uuid('c') } };
   return { label, environment, definition, resource, database, serviceName, projectId: inventory(environment).projectId, environmentId: inventory(environment).environmentId, railway, hyperdrive };
 };
@@ -176,6 +176,9 @@ test('provider readback rejects wrong region, volume, origin, backup, PITR, TLS 
       check(bad => { bad.hyperdrive.caching.disabled = false; });
       check(bad => { bad.hyperdrive.mtls.sslmode = 'require'; });
       check(bad => { bad.hyperdrive.origin.database = 'other'; });
+      check(bad => { bad.hyperdrive.origin.user = 'postgres'; });
+      check(bad => { bad.hyperdrive.origin.user = 'stale_role'; });
+      check(bad => { delete bad.hyperdrive.origin.user; });
       check(bad => { bad.hyperdrive.origin_connection_limit = 100; });
     }
   }

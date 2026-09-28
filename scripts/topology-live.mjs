@@ -49,8 +49,9 @@ export function assertLiveResources({ label, environment, definition, resource, 
   }
   if (hyperdrive.origin_connection_limit !== definition.originConnectionLimit) throw new Error(`${label}: Hyperdrive connection limit mismatch`);
   if (!['postgres', 'postgresql'].includes(hyperdrive.origin?.scheme) || hyperdrive.origin.database !== database ||
+      hyperdrive.origin.user !== resource.databaseRole ||
       hyperdrive.origin.host !== proxy.domain || hyperdrive.origin.port !== proxy.proxyPort) {
-    throw new Error(`${label}: Hyperdrive PostgreSQL origin differs from Railway proxy`);
+    throw new Error(`${label}: Hyperdrive PostgreSQL origin differs from declared Railway proxy, database or role`);
   }
   if (resource.network !== 'public-tls' || hyperdrive.mtls?.sslmode !== 'verify-full' ||
       !uuid.test(hyperdrive.mtls.ca_certificate_id ?? '')) throw new Error(`${label}: Hyperdrive verified TLS CA missing`);
