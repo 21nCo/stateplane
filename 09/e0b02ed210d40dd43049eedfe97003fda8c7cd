@@ -1,0 +1,20 @@
+docs/regional-topology.md
+  h_a39f9495f9ec1d 45
+scripts/qualification-target.mjs
+  h_a39f9495f9ec1d 8,13-14,30-31,47-50,67-83,88
+test/qualification-provider-query.test.js
+  h_a39f9495f9ec1d 1-20
+test/qualification-target.test.js
+  h_a39f9495f9ec1d 3,7,30,48-55,61,63-64,75-89
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "09e0b02ed210d40dd43049eedfe97003fda8c7cd",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
