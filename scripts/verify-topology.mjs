@@ -3,7 +3,7 @@ import { promisify } from 'node:util';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { readProtectedSqlUrls, verifySqlIdentity, verifyPgdataPlacement } from './topology-sql.mjs';
-import { validateTopology, validateInventory, cellDatabaseName, railwayServiceName } from './topology.mjs';
+import { validateTopology, validateInventory, cellDatabaseName, railwayServiceName, readProtectedDeploymentInventory } from './topology.mjs';
 import { assertLiveResources } from './topology-live.mjs';
 import { readUploadedCa } from './topology-ca.mjs';
 import { readHyperdrive } from './wrangler-command.mjs';
@@ -19,7 +19,7 @@ if (!environment || !inventoryPath) {
 const account = process.env.STATEPLANE_RAILWAY_ACCOUNT;
 if (!account) throw new Error('STATEPLANE_RAILWAY_ACCOUNT must select a connected Composio Railway account');
 const topology = validateTopology(JSON.parse(await readFile(new URL('../deployment/topology.json', import.meta.url))));
-const inventory = validateInventory(topology, environment, JSON.parse(await readFile(resolve(inventoryPath))));
+const inventory = validateInventory(topology, environment, await readProtectedDeploymentInventory(resolve(inventoryPath)));
 if (!process.env.STATEPLANE_SQL_URLS_FILE) throw new Error('STATEPLANE_SQL_URLS_FILE must select protected per-resource SQL URLs');
 if (!process.env.STATEPLANE_PGDATA_URLS_FILE) throw new Error('STATEPLANE_PGDATA_URLS_FILE must select protected per-resource settings SQL URLs');
 if (!process.env.PROBE_TOKEN || /[\r\n]/.test(process.env.PROBE_TOKEN)) throw new Error('Protected single-line PROBE_TOKEN required for operational Worker proof');

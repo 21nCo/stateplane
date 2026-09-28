@@ -1,4 +1,4 @@
-import { readFile, mkdir, writeFile } from 'node:fs/promises';
+import { readFile, mkdir, writeFile, stat } from 'node:fs/promises';
 import { resolve, relative, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validVolumePath } from './topology-live.mjs';
@@ -181,6 +181,13 @@ export function validateDeploymentInventories(topology, development, production)
   unique(routes, 'Public route hosts');
 }
 
+/** Read an operational inventory only when its filesystem permissions protect the provider IDs. */
+export async function readProtectedDeploymentInventory(path) {
+  if (((await stat(path)).mode & 0o777) !== 0o600) throw new Error('Protected operational inventory must be mode 0600');
+  try { return JSON.parse(await readFile(path, 'utf8')); }
+  catch { throw new Error('Protected operational inventory is unreadable or invalid JSON'); }
+}
+
 const workerPath = (out, path, projectRoot) => relative(out, resolve(projectRoot, path));
 const service = (binding, name) => ({ binding, service: name });
 const common = (out, name, main, role, environment, projectRoot) => ({
@@ -255,16 +262,16 @@ async function main() {
     return;
   }
   if (command === 'compare' && environment && inventoryPath) {
-    const development = JSON.parse(await readFile(resolve(environment), 'utf8'));
-    const production = JSON.parse(await readFile(resolve(inventoryPath), 'utf8'));
+    const development = await readProtectedDeploymentInventory(resolve(environment));
+    const production = await readProtectedDeploymentInventory(resolve(inventoryPath));
     validateDeploymentInventories(topology, development, production);
     console.log('Development and production inventories are isolated');
     return;
   }
   if (command === 'compare') throw new Error('Usage: node scripts/topology.mjs compare <development-inventory.json> <production-inventory.json>');
   if (command !== 'render' || !environment || !inventoryPath || !counterpartPath) throw new Error('Usage: node scripts/topology.mjs validate | render <environment> <private-inventory.json> <counterpart-inventory.json>');
-  const inventory = JSON.parse(await readFile(resolve(inventoryPath), 'utf8'));
-  const counterpart = JSON.parse(await readFile(resolve(counterpartPath), 'utf8'));
+  const inventory = await readProtectedDeploymentInventory(resolve(inventoryPath));
+  const counterpart = await readProtectedDeploymentInventory(resolve(counterpartPath));
   const out = resolve(root, '.data/topology', environment);
   const configs = renderTopology(topology, environment, inventory, counterpart, out);
   await mkdir(out, { recursive: true });

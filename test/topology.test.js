@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile, chmod, mkdir, copyFile, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { validateTopology, validateInventory, validateDeploymentInventories, renderTopology, cellDatabaseName, railwayServiceName } from '../scripts/topology.mjs';
+import { validateTopology, validateInventory, validateDeploymentInventories, renderTopology, cellDatabaseName, railwayServiceName, readProtectedDeploymentInventory } from '../scripts/topology.mjs';
 import { assertLiveResources } from '../scripts/topology-live.mjs';
 import { readProtectedSqlUrls, verifySqlIdentity } from '../scripts/topology-sql.mjs';
 import { dryRunTopology, syntheticInventories } from '../scripts/topology-dry-run.mjs';
@@ -206,14 +206,63 @@ test('render CLI fails before writing config when counterpart is missing or shar
     await writeFile(join(projectRoot, 'deployment/topology.json'), JSON.stringify(topology));
     const devPath = join(projectRoot, 'development.json');
     const prodPath = join(projectRoot, 'production.json');
-    await writeFile(devPath, JSON.stringify(inventories.development));
-    await writeFile(prodPath, JSON.stringify(inventories.production));
+    await writeFile(devPath, JSON.stringify(inventories.development), { mode: 0o600 });
+    await writeFile(prodPath, JSON.stringify(inventories.production), { mode: 0o600 });
     const script = join(projectRoot, 'scripts/topology.mjs');
     assert.throws(() => execFileSync(process.execPath, [script, 'render', 'development', devPath], { cwd: projectRoot, stdio: 'pipe' }),
       /counterpart-inventory/);
     assert.throws(() => execFileSync(process.execPath, [script, 'render', 'development', devPath, prodPath], { cwd: projectRoot, stdio: 'pipe' }),
       /Public route hosts must be unique across environments/);
     await assert.rejects(readFile(join(projectRoot, '.data/topology/development/app.json')), { code: 'ENOENT' });
+  } finally { await rm(projectRoot, { recursive: true, force: true }); }
+});
+
+test('operational compare, render, and verifier reject permissive inventories on each retry', { skip: process.platform === 'win32' }, async () => {
+  const projectRoot = await realpath(await mkdtemp(join(tmpdir(), 'sta4-inventory-mode-')));
+  const inventories = syntheticInventories(topology);
+  const paths = { development: join(projectRoot, 'development.json'), production: join(projectRoot, 'production.json') };
+  const run = (script, args, options = {}) => execFileSync(process.execPath, [script, ...args],
+    { cwd: projectRoot, stdio: 'pipe', ...options });
+  const rejectsMode = action => assert.throws(action, error =>
+    error.stderr?.toString().includes('Protected operational inventory must be mode 0600'));
+  try {
+    await mkdir(join(projectRoot, 'scripts'));
+    await mkdir(join(projectRoot, 'deployment'));
+    await writeFile(join(projectRoot, 'package.json'), '{"type":"module"}');
+    await copyFile(new URL('../scripts/topology.mjs', import.meta.url), join(projectRoot, 'scripts/topology.mjs'));
+    await copyFile(new URL('../scripts/topology-live.mjs', import.meta.url), join(projectRoot, 'scripts/topology-live.mjs'));
+    await writeFile(join(projectRoot, 'deployment/topology.json'), JSON.stringify(topology));
+    for (const environment of ['development', 'production']) {
+      await writeFile(paths[environment], JSON.stringify(inventories[environment]), { mode: 0o600 });
+    }
+    const script = join(projectRoot, 'scripts/topology.mjs');
+    const compare = () => run(script, ['compare', paths.development, paths.production]);
+    const render = environment => run(script, ['render', environment, paths[environment],
+      paths[environment === 'development' ? 'production' : 'development']]);
+    assert.match(compare().toString(), /inventories are isolated/);
+    for (const environment of ['development', 'production']) {
+      const path = paths[environment];
+      await chmod(path, 0o644);
+      await assert.rejects(readProtectedDeploymentInventory(path), /mode 0600/);
+      rejectsMode(compare);
+      for (const target of ['development', 'production']) rejectsMode(() => render(target));
+      for (const target of ['development', 'production']) {
+        await assert.rejects(readFile(join(projectRoot, `.data/topology/${target}/app.json`)), { code: 'ENOENT' });
+      }
+      rejectsMode(() => execFileSync(process.execPath, ['scripts/verify-topology.mjs', environment, path], {
+        cwd: new URL('..', import.meta.url), stdio: 'pipe',
+        env: { ...process.env, STATEPLANE_RAILWAY_ACCOUNT: 'mode-check-only' }
+      }));
+      await chmod(path, 0o600);
+      assert.equal((await readProtectedDeploymentInventory(path)).environment, environment);
+      assert.match(compare().toString(), /inventories are isolated/);
+      assert.match(render(environment).toString(), /Rendered/);
+      // A later retry must recheck permissions even after a successful render.
+      await chmod(path, 0o640);
+      rejectsMode(() => render(environment));
+      await chmod(path, 0o600);
+      await rm(join(projectRoot, '.data/topology'), { recursive: true, force: true });
+    }
   } finally { await rm(projectRoot, { recursive: true, force: true }); }
 });
 
