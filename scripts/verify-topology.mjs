@@ -8,6 +8,7 @@ import { assertLiveResources } from './topology-live.mjs';
 import { parseUploadedCa } from './topology-ca.mjs';
 import { readWranglerJson } from './wrangler-json.mjs';
 import { verifyOperationalBinding } from './operational-binding.mjs';
+import { verifyBindingPreflight } from './topology-verification-flow.mjs';
 
 const run = promisify(execFile);
 const [environment, inventoryPath] = process.argv.slice(2);
@@ -40,42 +41,48 @@ const providerQuery = `query ReadCell($projectId: String!, $serviceId: String!, 
   tcpProxies(serviceId: $serviceId, environmentId: $environmentId) { id serviceId environmentId applicationPort domain proxyPort deletedAt }
 }`;
 
-async function railway(resource) {
+async function railway(resource, signal) {
   const payload = JSON.stringify({ query: providerQuery, variables: {
     projectId: inventory.projectId, serviceId: resource.serviceId, environmentId: inventory.environmentId, volumeInstanceId: resource.volumeInstanceId,
     targetTimestamp: new Date(Date.now() - 15 * 60_000).toISOString()
   } });
   const { stdout } = await run('composio', ['proxy', 'https://backboard.railway.com/graphql/v2', '--toolkit', 'railway', '--account', account,
-    '-X', 'POST', '-H', 'content-type: application/json', '-d', payload], { maxBuffer: 1024 * 1024 });
+    '-X', 'POST', '-H', 'content-type: application/json', '-d', payload], { maxBuffer: 1024 * 1024, signal });
   const response = JSON.parse(stdout);
   if (response.errors?.length || !response.data) throw new Error('Connected Railway provider readback failed');
   return { ...response.data, backupSchedules: response.data.volumeInstanceBackupScheduleList,
     backups: response.data.volumeInstanceBackupList, pitrEstimate: response.data.volumeInstancePitrRestoreEstimate };
 }
 
-async function hyperdrive(id) {
-  const { stdout } = await run(wrangler, ['hyperdrive', 'get', id], { maxBuffer: 1024 * 1024 });
+async function hyperdrive(id, signal) {
+  const { stdout } = await run(wrangler, ['hyperdrive', 'get', id], { maxBuffer: 1024 * 1024, signal });
   const value = readWranglerJson(stdout);
   if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error('Wrangler Hyperdrive readback is invalid');
   return value;
 }
 
-async function verifyUploadedCa(id) {
+async function verifyUploadedCa(id, signal) {
   const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/mtls_certificates/${id}`, {
-    headers: { Authorization: `Bearer ${apiToken}` }
+    headers: { Authorization: `Bearer ${apiToken}` }, signal
   });
   if (!response.ok) throw new Error('Uploaded Hyperdrive CA certificate is unavailable');
   return parseUploadedCa(await response.json(), id);
 }
 
 async function verify(label, definition, resource, database, serviceName) {
-  const [railwayReadback, hyperdriveReadback] = await Promise.all([railway(resource), hyperdrive(resource.hyperdriveId)]);
-  if (!railwayReadback.regions?.some(region => region.name === definition.railwayRegion)) throw new Error(`${label}: target Railway region unavailable to project`);
-  assertLiveResources({ label, environment, definition, resource, database, serviceName,
-    projectId: inventory.projectId, environmentId: inventory.environmentId, railway: railwayReadback, hyperdrive: hyperdriveReadback });
-  const ca = await verifyUploadedCa(hyperdriveReadback.mtls.ca_certificate_id);
-  await verifySqlIdentity(label, resource, database, railwayReadback.tcpProxies[0], ca, sqlUrls[label]);
-  const worker = await verifyOperationalBinding(environment, label, resource, database, { signal: controller.signal });
+  const worker = await verifyBindingPreflight(controller.signal, {
+    railway: () => railway(resource, controller.signal),
+    hyperdrive: () => hyperdrive(resource.hyperdriveId, controller.signal),
+    validate: (railwayReadback, hyperdriveReadback) => {
+      if (!railwayReadback.regions?.some(region => region.name === definition.railwayRegion)) throw new Error(`${label}: target Railway region unavailable to project`);
+      assertLiveResources({ label, environment, definition, resource, database, serviceName,
+        projectId: inventory.projectId, environmentId: inventory.environmentId, railway: railwayReadback, hyperdrive: hyperdriveReadback });
+    },
+    ca: hyperdriveReadback => verifyUploadedCa(hyperdriveReadback.mtls.ca_certificate_id, controller.signal),
+    sql: (railwayReadback, _hyperdriveReadback, ca) => verifySqlIdentity(label, resource, database,
+      railwayReadback.tcpProxies[0], ca, sqlUrls[label], undefined, controller.signal),
+    worker: () => verifyOperationalBinding(environment, label, resource, database, { signal: controller.signal })
+  });
   console.log(`${label}: Railway ${definition.railwayRegion} service/volume, backup and PITR estimate, pinned PostgreSQL image, verified-TLS SQL identity/pgvector, cache-disabled Hyperdrive limit ${definition.originConnectionLimit}, operational Worker binding ${worker.hyperdriveId} at ${worker.name}; transaction and restore drill still required`);
 }
 
@@ -87,8 +94,8 @@ try {
   await verify('control', env.control, inventory.control, env.control.database, railwayServiceName(env));
   for (const cell of env.cells) await verify(cell.id, cell, inventory.cells[cell.id], cellDatabaseName(env, cell), railwayServiceName(env, cell));
 } catch (error) {
-  console.error(error instanceof Error ? error.message : 'Unknown verification failure');
-  process.exitCode = 1;
+  console.error(controller.signal.aborted ? 'Topology verification interrupted' : error instanceof Error ? error.message : 'Unknown verification failure');
+  process.exitCode = controller.signal.aborted ? 130 : 1;
 } finally {
   process.removeListener('SIGINT', interrupt);
   process.removeListener('SIGTERM', interrupt);

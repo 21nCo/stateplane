@@ -13,7 +13,11 @@ export async function readProtectedSqlUrls(path) {
 }
 
 /** Prove the declared proxy accepts a verified TLS connection to the intended PostgreSQL database and role. */
-export async function verifySqlIdentity(label, resource, database, proxy, ca, value, ClientType = Client) {
+export async function verifySqlIdentity(label, resource, database, proxy, ca, value, ClientType = Client, signal) {
+  const active = () => {
+    if (signal?.aborted) throw new Error(`${label}: topology verification interrupted`);
+  };
+  active();
   if (typeof value !== 'string') throw new Error(`${label}: protected SQL URL missing`);
   let url;
   try { url = new URL(value); }
@@ -27,17 +31,21 @@ export async function verifySqlIdentity(label, resource, database, proxy, ca, va
     ssl: { ca, rejectUnauthorized: true, servername: proxy.domain } });
   try {
     await client.connect();
+    active();
     const result = await client.query('SELECT current_database() AS database, current_user AS role, version() AS version');
+    active();
     if (result.rows[0]?.database !== database || result.rows[0]?.role !== resource.databaseRole ||
         !/^PostgreSQL /i.test(result.rows[0]?.version ?? '')) throw new Error('SQL identity mismatch');
     const grants = await client.query(operationalGrantsSql);
+    active();
     if (grants.rows.length !== 1 || !operationalGrantsAllowed(grants.rows[0])) throw new Error('SQL role grants unavailable or excessive');
     const vector = await client.query("SELECT '[1,0,0]'::vector <-> '[0,1,0]'::vector AS distance");
+    active();
     if (!Number.isFinite(vector.rows[0]?.distance) || Math.abs(vector.rows[0].distance - Math.SQRT2) > 0.00001) {
       throw new Error('pgvector query mismatch');
     }
   } catch {
-    throw new Error(`${label}: verified-TLS SQL identity or pgvector query failed`);
+    throw new Error(signal?.aborted ? `${label}: topology verification interrupted` : `${label}: verified-TLS SQL identity or pgvector query failed`);
   } finally {
     await client.end().catch(() => {});
   }

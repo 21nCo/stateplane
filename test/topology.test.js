@@ -319,6 +319,28 @@ test('protected SQL proof rejects wrong database, role and untrusted TLS for eve
   }
 });
 
+test('interrupted protected SQL read closes the client and stops before grant or vector queries', async () => {
+  const sample = live('development', 'control');
+  const proxy = sample.railway.tcpProxies[0];
+  const url = `postgres://${sample.resource.databaseRole}:private@${proxy.domain}:${proxy.proxyPort}/${sample.database}`;
+  const controller = new AbortController();
+  const queries = [];
+  let closed = 0;
+  class FakeClient {
+    async connect() {}
+    async query(sql) {
+      queries.push(sql);
+      controller.abort();
+      return { rows: [{ database: sample.database, role: sample.resource.databaseRole, version: 'PostgreSQL 17' }] };
+    }
+    async end() { closed++; }
+  }
+  await assert.rejects(verifySqlIdentity('control', sample.resource, sample.database, proxy, 'expected-ca',
+    url, FakeClient, controller.signal), /topology verification interrupted/);
+  assert.equal(queries.length, 1);
+  assert.equal(closed, 1);
+});
+
 test('synthetic dry run inventories pass cross-environment isolation and compare shows its own syntax', async () => {
   assert.equal(await dryRunTopology(topology, { runWrangler: async () => ({ stdout: '' }) }), 21);
   assert.throws(() => execFileSync(process.execPath, ['scripts/topology.mjs', 'compare'], { cwd: new URL('..', import.meta.url), stdio: 'pipe' }), error =>

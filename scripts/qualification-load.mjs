@@ -46,13 +46,13 @@ export async function runLoad(name, expectedUrl, concurrency = 10, minimumHeadro
   }
   // The first probe creates the disposable table. Complete it before any parallel
   // request so PostgreSQL catalog creation cannot race on a fresh database.
-  let serialFailure;
+  let serialFailed = false;
   try { await requestProbe(); }
-  catch (error) { serialFailure = error; }
-  const results = serialFailure ? [] : await Promise.allSettled(Array.from({ length: concurrency }, requestProbe));
+  catch { serialFailed = true; }
+  const results = serialFailed ? [] : await Promise.allSettled(Array.from({ length: concurrency }, requestProbe));
   const failed = results.filter(result => result.status === 'rejected');
   const issues = [];
-  if (serialFailure) issues.push('First qualification request failed');
+  if (serialFailed) issues.push('First qualification request failed');
   if (failed.length) issues.push(`${failed.length}/${concurrency} concurrent qualification requests failed`);
   // This read follows a failed bootstrap or every settled concurrent request.
   // It uses a fresh timeout even when the caller was interrupted, so cleanup is
