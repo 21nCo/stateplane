@@ -1,0 +1,18 @@
+scripts/topology.mjs
+  h_a39f9495f9ec1d 1,184-190,265-266,273-274
+scripts/verify-topology.mjs
+  h_a39f9495f9ec1d 6,22
+test/topology.test.js
+  h_a39f9495f9ec1d 7,209-210,220-268
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "60797ab6c06587a839732ca6323d6ee42c5f2f4f",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
