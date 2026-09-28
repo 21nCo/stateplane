@@ -57,39 +57,81 @@ test('first probe completes table bootstrap before concurrent load', async () =>
 });
 
 test('final read detects an orphan from an earlier interrupted probe after clean concurrent probes', async () => {
+  let probes = 0;
   let completed = 0;
+  let residualReads = 0;
+  let releasePending;
+  let pendingStarted;
+  const pending = new Promise(resolvePending => { releasePending = resolvePending; });
+  const started = new Promise(resolveStarted => { pendingStarted = resolveStarted; });
   const request = async target => {
     if (target.endsWith('/residual')) {
-      assert.equal(completed, 3);
+      residualReads++;
       return { ok: true, json: async () => ({ ok: true, residualRows: 1 }) };
+    }
+    const probe = probes++;
+    if (probe === 1) {
+      pendingStarted();
+      await pending;
     }
     completed++;
     return result(2);
   };
-  await assert.rejects(runLoad(name, url, 2, 5, { token: 'test-only-token', deployPreview, request }), /Final residual readback failed/);
+  const load = runLoad(name, url, 2, 5, { token: 'test-only-token', deployPreview, request });
+  const rejection = assert.rejects(load, /Final residual readback failed/);
+  try {
+    await started;
+    await new Promise(resolveImmediate => setImmediate(resolveImmediate));
+    assert.equal(probes, 3);
+    assert.equal(completed, 2);
+    assert.equal(residualReads, 0, 'final read must wait for the pending probe');
+  } finally {
+    releasePending();
+  }
+  await rejection;
+  assert.equal(completed, 3);
+  assert.equal(residualReads, 1);
 });
 
 test('final read runs after failed concurrent requests settle and read failure keeps the load failed', async () => {
   let active = 0;
-  let checked = false;
+  let residualReads = 0;
   let calls = 0;
+  let releasePending;
+  let pendingStarted;
+  const pending = new Promise(resolvePending => { releasePending = resolvePending; });
+  const started = new Promise(resolveStarted => { pendingStarted = resolveStarted; });
   const request = async target => {
     if (target.endsWith('/residual')) {
-      assert.equal(active, 0);
-      checked = true;
+      residualReads++;
       throw new Error('database read unavailable');
     }
     const call = calls++;
     if (call === 0) return result(2);
     active++;
-    await new Promise(resolveDelay => setTimeout(resolveDelay, 10));
+    if (call === 1) {
+      pendingStarted();
+      await pending;
+    }
     active--;
     if (call === 2) throw new Error('concurrent probe failed');
     return result(2);
   };
-  await assert.rejects(runLoad(name, url, 2, 5, { token: 'test-only-token', deployPreview, request }),
+  const load = runLoad(name, url, 2, 5, { token: 'test-only-token', deployPreview, request });
+  const rejection = assert.rejects(load,
     /1\/2 concurrent qualification requests failed; Final residual readback failed/);
-  assert.equal(checked, true);
+  try {
+    await started;
+    await new Promise(resolveImmediate => setImmediate(resolveImmediate));
+    assert.equal(calls, 3);
+    assert.equal(active, 1);
+    assert.equal(residualReads, 0, 'final read must wait for failed and pending probes to settle');
+  } finally {
+    releasePending();
+  }
+  await rejection;
+  assert.equal(active, 0);
+  assert.equal(residualReads, 1);
 });
 
 test('interrupted concurrent load still attempts the final read and cannot pass', async () => {
