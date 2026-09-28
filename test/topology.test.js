@@ -143,9 +143,13 @@ test('rendered control, gateways and every cell use isolated names and secret-fr
       const regional = ['api', 'mcp', 'jobs'].map(role => rendered[`${cell.id}-${role}.json`]);
       for (const config of regional) {
         assert.equal(config.hyperdrive[0].id, inventory(environment).cells[cell.id].hyperdriveId);
+        assert.deepEqual(config.placement, { mode: 'smart' });
+        assert.equal(config.r2_buckets[0].binding, 'ORIGINALS');
         assert.equal(config.r2_buckets[0].bucket_name, `${env.prefix}-${cell.id}-originals`);
         assert.equal(config.vars.STATEPLANE_CELL, cell.id);
       }
+      assert.equal(regional[0].queues.producers[0].binding, 'PROJECTION_JOBS');
+      assert.equal(regional[1].queues.producers[0].binding, 'PROJECTION_JOBS');
       assert.equal(regional[0].queues.producers[0].queue, `${env.prefix}-${cell.id}-projection`);
       assert.equal(regional[1].queues.producers[0].queue, `${env.prefix}-${cell.id}-projection`);
       assert.equal(regional[2].queues.consumers[0].queue, `${env.prefix}-${cell.id}-projection`);
@@ -221,6 +225,9 @@ test('protected SQL proof rejects wrong database, role and untrusted TLS for eve
       const sample = live(environment, label);
       const proxy = sample.railway.tcpProxies[0];
       const url = `postgres://${sample.resource.databaseRole}:private@${proxy.domain}:${proxy.proxyPort}/${sample.database}`;
+      let grantRow = { safe_login: true, no_elevated_membership: true, can_connect: true,
+        no_database_create: true, can_use_schema: true, can_create_probe_table: true,
+        no_other_schema_create: true, no_other_table_access: true };
       const FakeClient = class {
         constructor(options) { this.options = options; }
         async connect() {
@@ -228,12 +235,17 @@ test('protected SQL proof rejects wrong database, role and untrusted TLS for eve
               this.options.ssl.servername !== proxy.domain) throw new Error('untrusted TLS');
         }
         async query(sql) {
-          if (sql.includes('current_database()')) return { rows: [{ database: sample.database, role: sample.resource.databaseRole, version: 'PostgreSQL 16' }] };
+          if (sql.includes('current_database() AS database')) return { rows: [{ database: sample.database, role: sample.resource.databaseRole, version: 'PostgreSQL 16' }] };
+          if (sql.includes('FROM pg_roles')) return { rows: grantRow ? [grantRow] : [] };
           return { rows: [{ distance: Math.SQRT2 }] };
         }
         async end() {}
       };
       await verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url, FakeClient);
+      grantRow = { ...grantRow, no_elevated_membership: false };
+      await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url, FakeClient), /verified-TLS/);
+      grantRow = null;
+      await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url, FakeClient), /verified-TLS/);
       await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'unrelated-ca', url, FakeClient), /verified-TLS/);
       await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url.replace(sample.database, 'wrong_database'), FakeClient), /differs/);
       await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url.replace(sample.resource.databaseRole, 'wrong_role'), FakeClient), /differs/);

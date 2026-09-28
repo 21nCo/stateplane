@@ -1,5 +1,6 @@
 import { Client } from 'pg';
 import topology from '../topology.json' with { type: 'json' };
+import { qualificationGrantsAllowed, qualificationGrantsSql } from './role-grants.js';
 
 interface Env {
   AUTHORITY: Hyperdrive;
@@ -45,6 +46,10 @@ async function verifyTarget(writer: ProbeClient, database: string, role: string)
   await atStage('target-identity', async () => {
     const identity = await writer.query('SELECT current_database() AS database, current_user AS role');
     if (identity.rows[0]?.database !== database || identity.rows[0]?.role !== role) throw new Error('Target identity mismatch');
+  });
+  await atStage('target-grants', async () => {
+    const grants = await writer.query(qualificationGrantsSql);
+    if (grants.rows.length !== 1 || !qualificationGrantsAllowed(grants.rows[0])) throw new Error('Target grants unavailable or excessive');
   });
   const extension = await atStage('pgvector-extension', async () => {
     const response = await writer.query("SELECT extversion FROM pg_extension WHERE extname = 'vector'");

@@ -22,7 +22,12 @@ const database = vi.hoisted(() => ({
   valueReads: 0,
   queries: [] as string[],
   targetDatabase: 'sta4_aaaaaaaaaaaaaaaa_dev_ap_southeast',
-  targetRole: 'sta4_probe_aaaaaaaaaaaaaaaa'
+  targetRole: 'sta4_probe_aaaaaaaaaaaaaaaa',
+  grants: {
+    safe_login: true, no_elevated_membership: true, can_connect: true,
+    no_database_create: true, can_use_schema: true, can_create_probe_table: true,
+    no_other_schema_create: true, no_other_table_access: true
+  } as Record<string, boolean> | null
 }));
 
 vi.mock('pg', () => ({
@@ -46,6 +51,7 @@ vi.mock('pg', () => ({
         return { rows: [] };
       }
       if (sql.includes('current_database() AS database')) return { rows: [{ database: database.targetDatabase, role: database.targetRole }] };
+      if (sql.includes('FROM pg_roles')) return { rows: database.grants === null ? [] : [database.grants] };
       if (sql.includes('FROM pg_extension')) return { rows: [{ extversion: '0.8.6' }] };
       if (sql.includes('::vector')) return { rows: database.vectorMissingRow ? [] : [{ distance: database.vectorDistance }] };
       if (sql.startsWith('INSERT') && sql.includes('99')) { database.transactionRow = true; if (database.insertFailure) throw new Error('insert failed'); return { rows: [] }; }
@@ -108,6 +114,11 @@ describe('disposable qualification row cleanup', () => {
     database.reservedConnections = 3;
     database.targetDatabase = 'sta4_aaaaaaaaaaaaaaaa_dev_ap_southeast';
     database.targetRole = 'sta4_probe_aaaaaaaaaaaaaaaa';
+    database.grants = {
+      safe_login: true, no_elevated_membership: true, can_connect: true,
+      no_database_create: true, can_use_schema: true, can_create_probe_table: true,
+      no_other_schema_create: true, no_other_table_access: true
+    };
   });
 
   it('reports success only after the committed probe row is gone', async () => {
@@ -256,6 +267,27 @@ describe('disposable qualification row cleanup', () => {
       expect(database.row).toBeNull();
       database[key] = key === 'targetDatabase' ? 'sta4_aaaaaaaaaaaaaaaa_dev_ap_southeast' : 'sta4_probe_aaaaaaaaaaaaaaaa';
     }
+  });
+
+  it('rejects elevated and unavailable effective grants before any DDL or row mutation', async () => {
+    for (const key of ['safe_login', 'no_elevated_membership', 'no_database_create', 'no_other_schema_create', 'no_other_table_access',
+      'can_connect', 'can_use_schema', 'can_create_probe_table']) {
+      database.grants = { ...database.grants, [key]: false };
+      expect((await qualify()).status).toBe(500);
+      expect(database.queries.some(sql => sql.startsWith('CREATE TABLE') || sql.startsWith('INSERT'))).toBe(false);
+      expect(database.closed).toBeGreaterThanOrEqual(2);
+      database.grants = { ...database.grants, [key]: true };
+      database.queries = [];
+    }
+    database.grants = null;
+    expect((await qualify()).status).toBe(500);
+    expect(database.queries.some(sql => sql.startsWith('CREATE TABLE'))).toBe(false);
+    database.grants = { safe_login: true, no_elevated_membership: true, can_connect: true,
+      no_database_create: true, can_use_schema: true, can_create_probe_table: true,
+      no_other_schema_create: true, no_other_table_access: true };
+    database.failQuery = 'FROM pg_roles';
+    expect((await qualify()).status).toBe(500);
+    expect(database.queries.some(sql => sql.startsWith('CREATE TABLE'))).toBe(false);
   });
 
   it('denies missing, wrong and non-Bearer credentials and non-disposable deployments before connecting', async () => {
