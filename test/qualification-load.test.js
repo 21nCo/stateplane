@@ -24,3 +24,23 @@ test('concurrent load rejects headroom consumed by other sessions and reserved s
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('load rejects impossible counts and uses the worst reading across requests', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sta4-load-varied-'));
+  const mock = join(directory, 'fetch.mjs');
+  try {
+    await writeFile(mock, `let call = 0;
+globalThis.fetch = async () => {
+  const observedConnections = process.env.IMPOSSIBLE ? 1 : [2, 16, 4][call++ % 3];
+  return { ok: true, json: async () => ({ ok: true, rollback: true, freshRead: true, observedConnections,
+    maxConnections: 20, reservedConnections: 2, elapsedMs: observedConnections }) };
+};`);
+    const env = { ...process.env, PROBE_TOKEN: 'test-only-token', NODE_OPTIONS: `--import=${pathToFileURL(mock).href}` };
+    await assert.rejects(run(process.execPath, [script, 'https://preview.example/qualify', '3', '3'], { env }), /Origin connection headroom below 3/);
+    const { stdout } = await run(process.execPath, [script, 'https://preview.example/qualify', '3', '2'], { env });
+    assert.equal(JSON.parse(stdout).peakObservedConnections, 16);
+    await assert.rejects(run(process.execPath, [script, 'https://preview.example/qualify', '3', '2'], { env: { ...env, IMPOSSIBLE: '1' } }), /concurrent qualification requests failed/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

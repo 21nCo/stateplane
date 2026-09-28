@@ -9,6 +9,8 @@ const railwayRegion = /^[a-z]+(?:-[a-z0-9]+)+$/;
 const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
 const safeName = /^[a-z][a-z0-9-]*$/;
 const postgresDatabaseName = /^[a-z][a-z0-9_]{0,62}$/;
+const postgresRoleName = /^[a-z][a-z0-9_]{0,62}$/;
+const postgresImage = /^[a-z0-9][a-z0-9./_-]*:(?:[a-z0-9._-]+)$/;
 const cloudflareName = /^[a-z][a-z0-9-]{0,62}$/;
 const dnsLabel = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 // Hyperdrive permits 5-20 origin connections on Free and 5-100 on Paid.
@@ -27,7 +29,7 @@ const check = (value, pattern, label) => {
   if (typeof value !== 'string' || !pattern.test(value)) throw new Error(`${label} is invalid`);
 };
 const unique = (values, label) => {
-  if (new Set(values).size !== values.length) throw new Error(`${label} must be unique across environments`);
+  if (new Set(values.map(value => value.toLowerCase())).size !== values.length) throw new Error(`${label} must be unique across environments`);
 };
 export const cellDatabaseName = (env, cell) => `${env.prefix.replaceAll('-', '_')}_${cell.id.replaceAll('-', '_')}`;
 export const railwayServiceName = (env, cell) => `${env.prefix}-${cell?.id ?? 'control'}-db`;
@@ -132,10 +134,12 @@ export function validateInventory(topology, environment, inventory) {
   check(inventory.environmentId, uuid, 'Railway environment ID');
   const resourceIds = [];
   const validateResource = (resource, label) => {
-    allowedKeys(resource, ['hyperdriveId', 'serviceId', 'volumeInstanceId', 'network'], `${label} inventory`);
+    allowedKeys(resource, ['hyperdriveId', 'serviceId', 'volumeInstanceId', 'network', 'postgresImage', 'databaseRole'], `${label} inventory`);
     check(resource.hyperdriveId, hexId, `${label} Hyperdrive ID`);
     check(resource.serviceId, uuid, `${label} Railway service ID`);
     check(resource.volumeInstanceId, uuid, `${label} Railway volume instance ID`);
+    check(resource.postgresImage, postgresImage, `${label} pinned PostgreSQL image`);
+    check(resource.databaseRole, postgresRoleName, `${label} PostgreSQL role`);
     if (resource.network !== 'public-tls') throw new Error(`${label} network mode is unsupported until verified private connectivity is available`);
     resourceIds.push(resource.serviceId, resource.volumeInstanceId);
   };
@@ -247,6 +251,7 @@ async function main() {
     console.log('Development and production inventories are isolated');
     return;
   }
+  if (command === 'compare') throw new Error('Usage: node scripts/topology.mjs compare <development-inventory.json> <production-inventory.json>');
   if (command !== 'render' || !environment || !inventoryPath) throw new Error('Usage: node scripts/topology.mjs validate | render <environment> <private-inventory.json>');
   const inventory = JSON.parse(await readFile(resolve(inventoryPath), 'utf8'));
   const out = resolve(root, '.data/topology', environment);

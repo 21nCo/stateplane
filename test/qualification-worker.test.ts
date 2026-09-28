@@ -62,7 +62,7 @@ vi.mock('pg', () => ({
         return { rows: database.row === null ? [] : [{ value: (database.staleInitialRead && database.valueReads === 1) || (database.staleFreshRead && database.valueReads === 2) ? 0 : database.row }] };
       }
       if (sql.includes('pg_stat_activity')) return { rows: [{
-        count: sql.includes('WHERE datname') ? 2 : 2 + database.otherConnections,
+        count: 2 + database.otherConnections,
         max_connections: database.maxConnections,
         reserved_connections: sql.includes('reserved_connections') ? database.reservedConnections : undefined
       }] };

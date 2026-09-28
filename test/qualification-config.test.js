@@ -2,15 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { readWranglerJson, setupPreview, wrangler, wranglerInvocation } from '../scripts/qualification-preview-secret.mjs';
 import { promisify } from 'node:util';
 
 const run = promisify(execFile);
 const root = resolve(import.meta.dirname, '..');
 const script = resolve(root, 'scripts/qualification-config.mjs');
-const previewSecretScript = resolve(root, 'scripts/qualification-preview-secret.mjs');
 const pnpm = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
 const head = randomBytes(20).toString('hex');
 const hyperdriveId = 'a'.repeat(32);
@@ -76,38 +76,98 @@ test('same cell in development and production retains separate Preview bindings'
   }
 });
 
-test('Preview setup installs a protected token and fails if latest deployment omits it', async () => {
+test('Preview setup protects its token, requires a URL and verifies the latest binding', async () => {
   const name = `s4-${head}-d-apse`;
   const configPath = resolve(root, '.data/qualification', `${name}.json`);
-  const directory = await mkdtemp(join(tmpdir(), 'sta4-preview-test-'));
-  const fakePnpm = join(directory, 'pnpm');
-  const calls = join(directory, 'calls.jsonl');
+  const calls = [];
+  let secretFile;
+  const runWrangler = async (args) => {
+    calls.push(args);
+    if (args.includes('--secrets-file')) {
+      secretFile = args[args.indexOf('--secrets-file') + 1];
+      assert.equal((await stat(secretFile)).mode & 0o077, 0);
+      assert.equal(JSON.parse(await readFile(secretFile)).PROBE_TOKEN, 'private-test-token');
+      return 'Wrangler 4.135\n' + JSON.stringify({ urls: ['https://probe.example.workers.dev'] });
+    }
+    return 'Reading secrets...\n' + JSON.stringify([{ name: 'PROBE_TOKEN', type: 'secret_text' }]);
+  };
   try {
     await run(process.execPath, [script, name, hyperdriveId]);
-    await writeFile(fakePnpm, `#!/usr/bin/env node
-import { appendFileSync, readFileSync, statSync } from 'node:fs';
-const args = process.argv.slice(2);
-appendFileSync(process.env.FAKE_CALLS, JSON.stringify(args) + '\\n');
-if (args.includes('--secrets-file')) {
-  const path = args[args.indexOf('--secrets-file') + 1];
-  if (statSync(path).mode & 0o077) process.exit(4);
-  if (JSON.parse(readFileSync(path)).PROBE_TOKEN !== process.env.PROBE_TOKEN) process.exit(5);
-} else if (args.includes('list')) {
-  process.stdout.write(JSON.stringify(process.env.FAKE_SECRET_MISSING ? [] : [{ name: 'PROBE_TOKEN', type: 'secret_text' }]));
-}
-`);
-    await chmod(fakePnpm, 0o700);
-    const env = { ...process.env, PATH: `${directory}:${process.env.PATH}`, PROBE_TOKEN: 'private-test-token', FAKE_CALLS: calls };
-    const { stdout } = await run(process.execPath, [previewSecretScript, name], { env });
-    assert.match(stdout, /PROBE_TOKEN binding verified/);
-    assert.equal(stdout.includes(env.PROBE_TOKEN), false);
-    const callText = await readFile(calls, 'utf8');
-    assert.equal(callText.includes(env.PROBE_TOKEN), false);
-    const previewCall = JSON.parse(callText.split('\n').find(line => line.includes('--secrets-file')));
-    await assert.rejects(readFile(previewCall[previewCall.indexOf('--secrets-file') + 1]), { code: 'ENOENT' });
-    assert.equal((await readFile(configPath, 'utf8')).includes(env.PROBE_TOKEN), false);
-    await assert.rejects(run(process.execPath, [previewSecretScript, name], { env: { ...env, FAKE_SECRET_MISSING: '1' } }), /PROBE_TOKEN is absent/);
+    assert.deepEqual(await setupPreview(name, 'private-test-token', { runWrangler }), ['https://probe.example.workers.dev']);
+    assert.equal(JSON.stringify(calls).includes('private-test-token'), false);
+    await assert.rejects(readFile(secretFile), { code: 'ENOENT' });
+    assert.equal((await readFile(configPath, 'utf8')).includes('private-test-token'), false);
+    await assert.rejects(setupPreview(name, 'private-test-token', { runWrangler: async args =>
+      args.includes('--secrets-file') ? JSON.stringify({ urls: [] }) : '[]' }), /no usable HTTPS URL/);
+    await assert.rejects(setupPreview(name, 'private-test-token', { runWrangler: async args =>
+      args.includes('--secrets-file') ? JSON.stringify({ urls: ['https://probe.example.workers.dev'] }) : '[]' }), /PROBE_TOKEN is absent/);
+    assert.throws(() => readWranglerJson('Wrangler banner without JSON'), /no valid JSON/);
   } finally {
+    await rm(configPath, { force: true });
+  }
+});
+
+test('Preview interruption removes its protected token file', async () => {
+  const name = `s4-${head}-d-apse`;
+  const configPath = resolve(root, '.data/qualification', `${name}.json`);
+  const controller = new AbortController();
+  let secretFile;
+  try {
+    await run(process.execPath, [script, name, hyperdriveId]);
+    await assert.rejects(setupPreview(name, 'private-test-token', { signal: controller.signal, runWrangler: async (args, signal) => {
+      secretFile = args[args.indexOf('--secrets-file') + 1];
+      assert.equal(signal, controller.signal);
+      controller.abort();
+      throw new Error('interrupted');
+    } }), /interrupted/);
+    await assert.rejects(readFile(secretFile), { code: 'ENOENT' });
+  } finally {
+    await rm(configPath, { force: true });
+  }
+});
+
+test('aborting a real child process waits for its exit before deleting the token file', { timeout: 15_000 }, async () => {
+  const name = `s4-${head}-d-apse`;
+  const configPath = resolve(root, '.data/qualification', `${name}.json`);
+  const directory = await mkdtemp(join(tmpdir(), 'sta4-preview-child-'));
+  const entry = join(directory, 'wrangler-child.mjs');
+  const marker = join(directory, 'marker.json');
+  const controller = new AbortController();
+  try {
+    await run(process.execPath, [script, name, hyperdriveId]);
+    await writeFile(entry, `import { writeFileSync } from 'node:fs';
+const args = process.argv.slice(2);
+writeFileSync(process.env.FAKE_MARKER, JSON.stringify({ pid: process.pid, file: args[args.indexOf('--secrets-file') + 1] }));
+setInterval(() => {}, 1000);`);
+    const previous = process.env.FAKE_MARKER;
+    process.env.FAKE_MARKER = marker;
+    try {
+      const pending = setupPreview(name, 'private-test-token', { signal: controller.signal,
+        runWrangler: (args, signal) => wrangler(args, signal, entry) });
+      let observed;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        try { observed = JSON.parse(await readFile(marker, 'utf8')); break; }
+        catch { await new Promise(resolveDelay => setTimeout(resolveDelay, 25)); }
+      }
+      assert.ok(observed, 'child started');
+      assert.equal(JSON.parse(await readFile(observed.file)).PROBE_TOKEN, 'private-test-token');
+      controller.abort();
+      await assert.rejects(pending, /Wrangler Preview secret command failed/);
+      await assert.rejects(readFile(observed.file), { code: 'ENOENT' });
+      if (process.platform !== 'win32') assert.throws(() => process.kill(observed.pid, 0), { code: 'ESRCH' });
+    } finally {
+      if (previous === undefined) delete process.env.FAKE_MARKER;
+      else process.env.FAKE_MARKER = previous;
+    }
+  } finally {
+    controller.abort();
     await Promise.all([rm(configPath, { force: true }), rm(directory, { recursive: true, force: true })]);
   }
+});
+
+test('Preview helper resolves project Wrangler through the trusted Node executable', () => {
+  const invocation = wranglerInvocation(['preview', '--json']);
+  assert.equal(invocation.command, process.execPath);
+  assert.equal(invocation.args[0], resolve(root, 'app/node_modules/wrangler/bin/wrangler.js'));
+  assert.deepEqual(invocation.args.slice(1), ['preview', '--json']);
 });

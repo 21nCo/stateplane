@@ -9,7 +9,12 @@ export function assertLiveResources({ label, environment, definition, resource, 
   }
   if (serviceInstance?.serviceId !== resource.serviceId || serviceInstance.environmentId !== environmentId ||
       serviceInstance.region !== definition.railwayRegion || serviceInstance.deletedAt ||
-      serviceInstance.latestDeployment?.status !== 'SUCCESS') throw new Error(`${label}: Railway deployment region or status mismatch`);
+      serviceInstance.latestDeployment?.status !== 'SUCCESS' ||
+      serviceInstance.source?.image !== resource.postgresImage || serviceInstance.source?.repo ||
+      serviceInstance.latestDeployment?.meta?.image !== resource.postgresImage ||
+      !/^sha256:[a-f0-9]{64}$/i.test(serviceInstance.latestDeployment?.meta?.imageDigest ?? '')) {
+    throw new Error(`${label}: Railway deployment region, image or status mismatch`);
+  }
   if (volumeInstance?.id !== resource.volumeInstanceId || volumeInstance.serviceId !== resource.serviceId ||
       volumeInstance.environmentId !== environmentId || volumeInstance.region !== definition.railwayRegion ||
       volumeInstance.deletedAt || volumeInstance.isPendingDeletion) throw new Error(`${label}: Railway volume identity or region mismatch`);

@@ -1,8 +1,9 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { X509Certificate } from 'node:crypto';
+import { verifySqlIdentity } from './topology-sql.mjs';
 import { validateTopology, validateInventory, cellDatabaseName, railwayServiceName } from './topology.mjs';
 import { assertLiveResources } from './topology-live.mjs';
 
@@ -16,6 +17,10 @@ const account = process.env.STATEPLANE_RAILWAY_ACCOUNT;
 if (!account) throw new Error('STATEPLANE_RAILWAY_ACCOUNT must select a connected Composio Railway account');
 const topology = validateTopology(JSON.parse(await readFile(new URL('../deployment/topology.json', import.meta.url))));
 const inventory = validateInventory(topology, environment, JSON.parse(await readFile(resolve(inventoryPath))));
+if (!process.env.STATEPLANE_SQL_URLS_FILE) throw new Error('STATEPLANE_SQL_URLS_FILE must select protected per-resource SQL URLs');
+const sqlUrlsPath = resolve(process.env.STATEPLANE_SQL_URLS_FILE);
+if ((await stat(sqlUrlsPath)).mode & 0o077) throw new Error('Protected SQL URL file must be mode 0600');
+const sqlUrls = JSON.parse(await readFile(sqlUrlsPath, 'utf8'));
 const env = topology.environments[environment];
 const wrangler = resolve(import.meta.dirname, '../app/node_modules/.bin/wrangler');
 const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
@@ -25,7 +30,7 @@ if (!/^[a-f0-9]{32}$/i.test(accountId ?? '') || !apiToken) throw new Error('Prot
 const providerQuery = `query ReadCell($projectId: String!, $serviceId: String!, $environmentId: String!, $volumeInstanceId: String!, $targetTimestamp: DateTime!) {
   regions(projectId: $projectId) { name }
   service(id: $serviceId) { id name projectId deletedAt }
-  serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { serviceId environmentId region deletedAt latestDeployment { status } }
+  serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { serviceId environmentId region deletedAt source { image repo } latestDeployment { status meta } }
   volumeInstance(id: $volumeInstanceId) { id serviceId environmentId region deletedAt isPendingDeletion }
   volumeInstanceBackupScheduleList(volumeInstanceId: $volumeInstanceId) { id retentionSeconds }
   volumeInstanceBackupList(volumeInstanceId: $volumeInstanceId) { id createdAt expiresAt }
@@ -67,6 +72,7 @@ async function verifyUploadedCa(id) {
   if (blocks.length !== 1 || Date.parse(new X509Certificate(blocks[0]).validTo) <= Date.now()) {
     throw new Error('Uploaded Hyperdrive CA must be one unexpired certificate');
   }
+  return blocks[0];
 }
 
 async function verify(label, definition, resource, database, serviceName) {
@@ -74,8 +80,9 @@ async function verify(label, definition, resource, database, serviceName) {
   if (!railwayReadback.regions?.some(region => region.name === definition.railwayRegion)) throw new Error(`${label}: target Railway region unavailable to project`);
   assertLiveResources({ label, environment, definition, resource, database, serviceName,
     projectId: inventory.projectId, environmentId: inventory.environmentId, railway: railwayReadback, hyperdrive: hyperdriveReadback });
-  await verifyUploadedCa(hyperdriveReadback.mtls.ca_certificate_id);
-  console.log(`${label}: Railway ${definition.railwayRegion} service/volume, backup and PITR estimate, verified-TLS Hyperdrive origin and cache-disabled limit ${definition.originConnectionLimit}; Worker transaction and restore drill still required`);
+  const ca = await verifyUploadedCa(hyperdriveReadback.mtls.ca_certificate_id);
+  await verifySqlIdentity(label, resource, database, railwayReadback.tcpProxies[0], ca, sqlUrls[label]);
+  console.log(`${label}: Railway ${definition.railwayRegion} service/volume, backup and PITR estimate, pinned PostgreSQL image, verified-TLS SQL identity/pgvector and cache-disabled Hyperdrive limit ${definition.originConnectionLimit}; Worker transaction and restore drill still required`);
 }
 
 try {

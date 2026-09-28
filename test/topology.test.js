@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { validateTopology, validateInventory, validateDeploymentInventories, renderTopology, cellDatabaseName, railwayServiceName } from '../scripts/topology.mjs';
 import { assertLiveResources } from '../scripts/topology-live.mjs';
+import { verifySqlIdentity } from '../scripts/topology-sql.mjs';
+import { dryRunTopology } from '../scripts/topology-dry-run.mjs';
+import { execFileSync } from 'node:child_process';
 
 const topology = JSON.parse(readFileSync(new URL('../deployment/topology.json', import.meta.url)));
 const copy = value => structuredClone(value);
@@ -12,7 +15,8 @@ const inventory = environment => {
   const resources = [env.control, ...env.cells];
   const ids = resources.map((_, index) => ({
     hyperdriveId: (index + 1).toString(16).repeat(32), serviceId: uuid((index + 1).toString()),
-    volumeInstanceId: uuid((index + 5).toString()), network: 'public-tls'
+    volumeInstanceId: uuid((index + 5).toString()), network: 'public-tls',
+    postgresImage: 'pgvector/pgvector:pg16', databaseRole: `probe_${index}`
   }));
   return { environment, projectId: uuid('a'), environmentId: uuid('b'), control: ids[0],
     cells: Object.fromEntries(env.cells.map((cell, index) => [cell.id, ids[index + 1]])) };
@@ -28,7 +32,7 @@ const live = (environment, label) => {
   const railway = {
     service: { id: resource.serviceId, name: serviceName, projectId: uuid('a'), deletedAt: null },
     serviceInstance: { serviceId: resource.serviceId, environmentId: uuid('b'), region: definition.railwayRegion,
-      latestDeployment: { status: 'SUCCESS' }, deletedAt: null },
+      source: { image: resource.postgresImage, repo: null }, latestDeployment: { status: 'SUCCESS', meta: { image: resource.postgresImage, imageDigest: `sha256:${'a'.repeat(64)}` } }, deletedAt: null },
     volumeInstance: { id: resource.volumeInstanceId, serviceId: resource.serviceId, environmentId: uuid('b'),
       region: definition.railwayRegion, deletedAt: null, isPendingDeletion: false },
     backupSchedules: [{ retentionSeconds: environment === 'production' ? 30 * 86400 : 6 * 86400 }],
@@ -68,6 +72,15 @@ test('inventory isolates every Railway service, volume and Hyperdrive binding', 
     const reused = copy(good);
     reused.cells['us-east'].serviceId = reused.control.serviceId;
     assert.throws(() => validateInventory(topology, environment, reused), /must be unique/);
+    const caseReused = copy(good);
+    caseReused.cells['us-east'].hyperdriveId = caseReused.control.hyperdriveId.toUpperCase();
+    assert.throws(() => validateInventory(topology, environment, caseReused), /must be unique/);
+    caseReused.cells['us-east'].hyperdriveId = good.cells['us-east'].hyperdriveId;
+    caseReused.cells['us-east'].serviceId = caseReused.control.serviceId.toUpperCase();
+    assert.throws(() => validateInventory(topology, environment, caseReused), /must be unique/);
+    caseReused.cells['us-east'].serviceId = good.cells['us-east'].serviceId;
+    caseReused.cells['us-east'].volumeInstanceId = caseReused.control.volumeInstanceId.toUpperCase();
+    assert.throws(() => validateInventory(topology, environment, caseReused), /must be unique/);
     const missingVolume = copy(good);
     delete missingVolume.cells['us-east'].volumeInstanceId;
     assert.throws(() => validateInventory(topology, environment, missingVolume), /volume instance ID/);
@@ -92,6 +105,16 @@ test('development and production cannot reuse provider scope or bindings', () =>
     resource.hyperdriveId = resource.hyperdriveId.replace(/^./, 'f');
   }
   assert.doesNotThrow(() => validateDeploymentInventories(topology, development, production));
+  for (const key of ['projectId', 'environmentId']) {
+    const reused = copy(production);
+    reused[key] = development[key].toUpperCase();
+    assert.throws(() => validateDeploymentInventories(topology, development, reused), /must be unique/);
+  }
+  for (const key of ['serviceId', 'volumeInstanceId', 'hyperdriveId']) {
+    const reused = copy(production);
+    reused.control[key] = development.control[key].toUpperCase();
+    assert.throws(() => validateDeploymentInventories(topology, development, reused), /must be unique/);
+  }
 });
 
 test('rendered control, gateways and every cell use isolated names and secret-free bindings', () => {
@@ -101,11 +124,23 @@ test('rendered control, gateways and every cell use isolated names and secret-fr
     assert.equal(Object.keys(rendered).length, 3 + 3 * env.cells.length);
     assert.equal(rendered['directory.json'].hyperdrive[0].id, inventory(environment).control.hyperdriveId);
     assert.equal(rendered['app.json'].services.length, 1 + env.cells.length);
+    assert.equal(rendered['mcp.json'].services.length, 1 + env.cells.length);
+    for (const config of Object.values(rendered)) {
+      assert.equal(config.workers_dev, false);
+      assert.match(config.name, new RegExp(`^${env.prefix}-`));
+      assert.equal(config.vars.STATEPLANE_ENV, environment);
+    }
     for (const cell of env.cells) {
-      assert.equal(rendered[`${cell.id}-api.json`].hyperdrive[0].id, inventory(environment).cells[cell.id].hyperdriveId);
-      assert.equal(rendered[`${cell.id}-mcp.json`].hyperdrive[0].id, inventory(environment).cells[cell.id].hyperdriveId);
-      assert.equal(rendered[`${cell.id}-jobs.json`].hyperdrive[0].id, inventory(environment).cells[cell.id].hyperdriveId);
-      assert.equal(cellDatabaseName(env, cell).includes('in_south'), false);
+      const regional = ['api', 'mcp', 'jobs'].map(role => rendered[`${cell.id}-${role}.json`]);
+      for (const config of regional) {
+        assert.equal(config.hyperdrive[0].id, inventory(environment).cells[cell.id].hyperdriveId);
+        assert.equal(config.r2_buckets[0].bucket_name, `${env.prefix}-${cell.id}-originals`);
+        assert.equal(config.vars.STATEPLANE_CELL, cell.id);
+      }
+      assert.equal(regional[0].queues.producers[0].queue, `${env.prefix}-${cell.id}-projection`);
+      assert.equal(regional[1].queues.producers[0].queue, `${env.prefix}-${cell.id}-projection`);
+      assert.equal(regional[2].queues.consumers[0].queue, `${env.prefix}-${cell.id}-projection`);
+      assert.equal(regional[2].queues.consumers[0].dead_letter_queue, `${env.prefix}-${cell.id}-projection-dlq`);
     }
     assert.equal(/password|DATABASE_URL|POSTGRES_PASSWORD/i.test(JSON.stringify(rendered)), false);
   }
@@ -120,6 +155,10 @@ test('provider readback rejects wrong region, volume, origin, backup, PITR, TLS 
       check(bad => { bad.railway.serviceInstance.region = 'us-west2'; });
       check(bad => { bad.railway.volumeInstance.region = 'us-west2'; });
       check(bad => { bad.railway.service.name = 'another-cell'; });
+      check(bad => { bad.railway.serviceInstance.source.image = 'redis:7'; });
+      check(bad => { bad.railway.serviceInstance.latestDeployment.meta.image = 'redis:7'; });
+      check(bad => { bad.railway.serviceInstance.latestDeployment.meta.imageDigest = null; });
+      check(bad => { bad.railway.serviceInstance.source.repo = 'unrelated/repo'; });
       check(bad => { bad.railway.backupSchedules = []; });
       check(bad => { bad.railway.backups = []; });
       check(bad => { bad.railway.pitrEstimate = null; });
@@ -130,4 +169,36 @@ test('provider readback rejects wrong region, volume, origin, backup, PITR, TLS 
       check(bad => { bad.hyperdrive.origin_connection_limit = 100; });
     }
   }
+});
+
+test('protected SQL proof rejects wrong database, role and untrusted TLS for every resource', async () => {
+  for (const environment of ['development', 'production']) {
+    for (const label of ['control', ...topology.environments[environment].cells.map(cell => cell.id)]) {
+      const sample = live(environment, label);
+      const proxy = sample.railway.tcpProxies[0];
+      const url = `postgres://${sample.resource.databaseRole}:private@${proxy.domain}:${proxy.proxyPort}/${sample.database}`;
+      const FakeClient = class {
+        constructor(options) { this.options = options; }
+        async connect() {
+          if (this.options.ssl.ca !== 'expected-ca' || this.options.ssl.rejectUnauthorized !== true ||
+              this.options.ssl.servername !== proxy.domain) throw new Error('untrusted TLS');
+        }
+        async query(sql) {
+          if (sql.includes('current_database()')) return { rows: [{ database: sample.database, role: sample.resource.databaseRole, version: 'PostgreSQL 16' }] };
+          return { rows: [{ distance: Math.SQRT2 }] };
+        }
+        async end() {}
+      };
+      await verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url, FakeClient);
+      await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'unrelated-ca', url, FakeClient), /verified-TLS/);
+      await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url.replace(sample.database, 'wrong_database'), FakeClient), /differs/);
+      await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url.replace(sample.resource.databaseRole, 'wrong_role'), FakeClient), /differs/);
+    }
+  }
+});
+
+test('synthetic dry run inventories pass cross-environment isolation and compare shows its own syntax', async () => {
+  assert.equal(await dryRunTopology(topology, { runWrangler: async () => ({ stdout: '' }) }), 21);
+  assert.throws(() => execFileSync(process.execPath, ['scripts/topology.mjs', 'compare'], { cwd: new URL('..', import.meta.url), stdio: 'pipe' }), error =>
+    error.stderr.toString().includes('compare <development-inventory.json> <production-inventory.json>'));
 });
