@@ -1,0 +1,14 @@
+test/qualification-load.test.js
+  h_a39f9495f9ec1d 60,62-66,69,72-76,80-93,98,100-103,106,112-115,120-121,123-134
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c9eb3e34a6648eb8b1dd0ca052de1edb96c97840",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
