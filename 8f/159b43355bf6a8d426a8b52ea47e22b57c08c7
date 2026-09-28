@@ -1,0 +1,24 @@
+scripts/qualification-preview-secret.mjs
+  h_a39f9495f9ec1d 72
+scripts/topology-live.mjs
+  h_a39f9495f9ec1d 3-8,13-14,17-18,26-28,40-42,47-49
+scripts/verify-topology.mjs
+  h_a39f9495f9ec1d 8,66
+test/qualification-config.test.js
+  h_a39f9495f9ec1d 90,97-99,197,199,206,209-233
+test/qualification-load.test.js
+  h_a39f9495f9ec1d 34,42
+test/topology.test.js
+  h_a39f9495f9ec1d 184-214
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8f159b43355bf6a8d426a8b52ea47e22b57c08c7",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
