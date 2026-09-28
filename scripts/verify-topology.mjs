@@ -6,7 +6,7 @@ import { readProtectedSqlUrls, verifySqlIdentity } from './topology-sql.mjs';
 import { validateTopology, validateInventory, cellDatabaseName, railwayServiceName } from './topology.mjs';
 import { assertLiveResources } from './topology-live.mjs';
 import { parseUploadedCa } from './topology-ca.mjs';
-import { readWranglerJson } from './wrangler-json.mjs';
+import { readHyperdrive } from './wrangler-command.mjs';
 import { verifyOperationalBinding } from './operational-binding.mjs';
 import { verifyBindingPreflight } from './topology-verification-flow.mjs';
 
@@ -25,7 +25,6 @@ if (!process.env.PROBE_TOKEN || /[\r\n]/.test(process.env.PROBE_TOKEN)) throw ne
 const sqlUrlsPath = resolve(process.env.STATEPLANE_SQL_URLS_FILE);
 const sqlUrls = await readProtectedSqlUrls(sqlUrlsPath);
 const env = topology.environments[environment];
-const wrangler = resolve(import.meta.dirname, '../app/node_modules/.bin/wrangler');
 const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
 const apiToken = process.env.CLOUDFLARE_API_TOKEN;
 if (!/^[a-f0-9]{32}$/i.test(accountId ?? '') || !apiToken) throw new Error('Protected Cloudflare account ID and API token required for CA readback');
@@ -55,8 +54,7 @@ async function railway(resource, signal) {
 }
 
 async function hyperdrive(id, signal) {
-  const { stdout } = await run(wrangler, ['hyperdrive', 'get', id], { maxBuffer: 1024 * 1024, signal });
-  const value = readWranglerJson(stdout);
+  const value = await readHyperdrive(id, { signal });
   if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error('Wrangler Hyperdrive readback is invalid');
   return value;
 }

@@ -3,7 +3,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { qualificationTarget } from './qualification-artifact.mjs';
-import { readWranglerJson } from './wrangler-json.mjs';
+import { readHyperdrive } from './wrangler-command.mjs';
 import { sameProviderId } from './topology-live.mjs';
 import { validateDeploymentInventories } from './topology.mjs';
 
@@ -36,9 +36,8 @@ export async function connectedQualificationReadback(inventory, signal) {
   { maxBuffer: 1024 * 1024, signal });
   const railway = JSON.parse(stdout);
   if (railway.errors?.length || !railway.data) throw new Error('Connected Railway readback failed');
-  const wrangler = resolve(import.meta.dirname, '../app/node_modules/.bin/wrangler');
-  const hyperdrive = await run(wrangler, ['hyperdrive', 'get', inventory.hyperdriveId], { maxBuffer: 1024 * 1024, signal });
-  return { railway: railway.data, hyperdrive: readWranglerJson(hyperdrive.stdout) };
+  const hyperdrive = await readHyperdrive(inventory.hyperdriveId, { signal });
+  return { railway: railway.data, hyperdrive };
 }
 
 /** A separate protected target record and live provider reads must agree before disposable DDL. */

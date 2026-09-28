@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { renderTopology, validateDeploymentInventories } from './topology.mjs';
+import { wranglerInvocation } from './wrangler-command.mjs';
 
 const run = promisify(execFile);
 const root = resolve(import.meta.dirname, '..');
@@ -24,7 +25,6 @@ export function syntheticInventories(topology) {
 
 export async function dryRunTopology(topology, { projectRoot = root, runWrangler = run, inventories = syntheticInventories(topology) } = {}) {
   validateDeploymentInventories(topology, inventories.development, inventories.production);
-  const wrangler = resolve(projectRoot, 'app/node_modules/.bin/wrangler');
   if (runWrangler === run) {
     try { await access(resolve(projectRoot, 'app/.svelte-kit/cloudflare/_worker.js')); }
     catch { throw new Error('Build @stateplane/app before topology dry-run'); }
@@ -39,7 +39,8 @@ export async function dryRunTopology(topology, { projectRoot = root, runWrangler
       const path = join(out, file);
       await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
       try {
-        await runWrangler(wrangler, ['deploy', '--config', path, '--dry-run', '--outdir', join(out, 'bundles', file)], { maxBuffer: 1024 * 1024 });
+        const invocation = wranglerInvocation(['deploy', '--config', path, '--dry-run', '--outdir', join(out, 'bundles', file)], projectRoot);
+        await runWrangler(invocation.command, invocation.args, { maxBuffer: 1024 * 1024 });
       } catch (error) {
         throw new Error(`${environment}/${file} dry-run failed: ${error.stderr ?? error.message}`, { cause: error });
       }
