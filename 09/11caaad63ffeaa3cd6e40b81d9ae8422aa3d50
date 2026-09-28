@@ -1,0 +1,22 @@
+scripts/qualification-target.mjs
+  h_a39f9495f9ec1d 6,39-40
+scripts/topology-dry-run.mjs
+  h_a39f9495f9ec1d 7,42-43
+scripts/verify-topology.mjs
+  h_a39f9495f9ec1d 9,57
+scripts/wrangler-command.mjs
+  h_a39f9495f9ec1d 1-21
+test/wrangler-command.test.js
+  h_a39f9495f9ec1d 1-55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0911caaad63ffeaa3cd6e40b81d9ae8422aa3d50",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
