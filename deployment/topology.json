@@ -1,22 +1,22 @@
 {
-  "version": 1,
-  "provider": "aws-rds-postgresql",
+  "version": 2,
+  "provider": "railway-postgresql",
   "environments": {
     "development": {
       "prefix": "stateplane-dev",
-      "control": { "awsRegion": "us-east-1", "database": "stateplane_control_dev", "originConnectionLimit": 5 },
+      "control": { "railwayRegion": "us-east4-eqdc4a", "database": "stateplane_control_dev", "originConnectionLimit": 5 },
       "cells": [
-        { "id": "in-south", "awsRegion": "ap-south-1", "r2LocationHint": "apac", "originConnectionLimit": 5 },
-        { "id": "us-east", "awsRegion": "us-east-1", "r2LocationHint": "enam", "originConnectionLimit": 5 },
-        { "id": "eu-west", "awsRegion": "eu-west-1", "r2LocationHint": "weur", "originConnectionLimit": 5 }
+        { "id": "ap-southeast", "railwayRegion": "asia-southeast1-eqsg3a", "r2LocationHint": "apac", "originConnectionLimit": 5 },
+        { "id": "us-east", "railwayRegion": "us-east4-eqdc4a", "r2LocationHint": "enam", "originConnectionLimit": 5 },
+        { "id": "eu-west", "railwayRegion": "europe-west4-drams3a", "r2LocationHint": "weur", "originConnectionLimit": 5 }
       ]
     },
     "production": {
       "prefix": "stateplane-prod",
-      "control": { "awsRegion": "us-east-1", "database": "stateplane_control_prod", "originConnectionLimit": 5 },
+      "control": { "railwayRegion": "us-east4-eqdc4a", "database": "stateplane_control_prod", "originConnectionLimit": 5 },
       "cells": [
-        { "id": "in-south", "awsRegion": "ap-south-1", "r2LocationHint": "apac", "originConnectionLimit": 5 },
-        { "id": "us-east", "awsRegion": "us-east-1", "r2LocationHint": "enam", "originConnectionLimit": 5 }
+        { "id": "ap-southeast", "railwayRegion": "asia-southeast1-eqsg3a", "r2LocationHint": "apac", "originConnectionLimit": 5 },
+        { "id": "us-east", "railwayRegion": "us-east4-eqdc4a", "r2LocationHint": "enam", "originConnectionLimit": 5 }
       ]
     }
   }

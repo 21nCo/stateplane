@@ -5,21 +5,19 @@ import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const hexId = /^[a-f0-9]{32}$/i;
 const regionId = /^[a-z]{2}-[a-z]+$/;
-const awsRegion = /^[a-z]{2}-[a-z]+-\d$/;
+const railwayRegion = /^[a-z]+(?:-[a-z0-9]+)+$/;
+const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
 const safeName = /^[a-z][a-z0-9-]*$/;
-const rdsDatabaseName = /^[a-z][a-z0-9_]{0,62}$/;
+const postgresDatabaseName = /^[a-z][a-z0-9_]{0,62}$/;
 const cloudflareName = /^[a-z][a-z0-9-]{0,62}$/;
-const rdsInstanceName = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 const dnsLabel = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 // Hyperdrive permits 5-20 origin connections on Free and 5-100 on Paid.
 // The manifest does not attest a Workers plan, so admit only the shared range.
 const validOriginConnectionLimit = value => Number.isSafeInteger(value) && value >= 5 && value <= 20;
-const restoreSuffix = '-restore-';
-const minimumRestoreToken = 'a'.repeat(8);
 const cellPlacement = {
-  'in-south': { awsRegion: 'ap-south-1', r2LocationHint: 'apac' },
-  'us-east': { awsRegion: 'us-east-1', r2LocationHint: 'enam' },
-  'eu-west': { awsRegion: 'eu-west-1', r2LocationHint: 'weur' }
+  'ap-southeast': { railwayRegion: 'asia-southeast1-eqsg3a', r2LocationHint: 'apac' },
+  'us-east': { railwayRegion: 'us-east4-eqdc4a', r2LocationHint: 'enam' },
+  'eu-west': { railwayRegion: 'europe-west4-drams3a', r2LocationHint: 'weur' }
 };
 const allowedKeys = (value, keys, label) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} must be an object`);
@@ -32,9 +30,7 @@ const unique = (values, label) => {
   if (new Set(values).size !== values.length) throw new Error(`${label} must be unique across environments`);
 };
 export const cellDatabaseName = (env, cell) => `${env.prefix.replaceAll('-', '_')}_${cell.id.replaceAll('-', '_')}`;
-const rdsInstanceId = (env, cell) => `${env.prefix}-${cell?.id ?? 'control'}-db`;
-const validRdsInstanceId = value => typeof value === 'string' && value.length <= 63 && rdsInstanceName.test(value);
-const validRestorableRdsInstanceId = value => validRdsInstanceId(value) && validRdsInstanceId(`${value}${restoreSuffix}${minimumRestoreToken}`);
+export const railwayServiceName = (env, cell) => `${env.prefix}-${cell?.id ?? 'control'}-db`;
 const names = (env, cell) => {
   const prefix = env.prefix;
   return {
@@ -50,7 +46,7 @@ const names = (env, cell) => {
 };
 
 function assertDerivedNames(environment, resource) {
-  check(resource.database, rdsDatabaseName, `${environment} RDS database`);
+  check(resource.database, postgresDatabaseName, `${environment} PostgreSQL database`);
   for (const [kind, name] of Object.entries(resource)) {
     if (kind !== 'database' && name !== undefined) check(name, cloudflareName, `${environment} ${kind} name`);
   }
@@ -59,37 +55,37 @@ function assertDerivedNames(environment, resource) {
 function validateEnvironment(environment, env, all) {
   allowedKeys(env, ['prefix', 'control', 'cells'], environment);
   check(env.prefix, safeName, `${environment} prefix`);
-  allowedKeys(env.control, ['awsRegion', 'database', 'originConnectionLimit'], `${environment} control`);
-  check(env.control.awsRegion, awsRegion, `${environment} control region`);
-  if (env.control.awsRegion !== 'us-east-1') throw new Error(`${environment} control is mapped to the wrong provider region`);
-  check(env.control.database, rdsDatabaseName, `${environment} control database`);
+  allowedKeys(env.control, ['railwayRegion', 'database', 'originConnectionLimit'], `${environment} control`);
+  check(env.control.railwayRegion, railwayRegion, `${environment} control region`);
+  if (env.control.railwayRegion !== 'us-east4-eqdc4a') throw new Error(`${environment} control is mapped to the wrong provider region`);
+  check(env.control.database, postgresDatabaseName, `${environment} control database`);
   if (!validOriginConnectionLimit(env.control.originConnectionLimit)) throw new Error(`${environment} control connection limit is invalid`);
   if (!Array.isArray(env.cells) || env.cells.length === 0) throw new Error(`${environment} needs cells`);
-  const expected = environment === 'production' ? ['in-south', 'us-east'] : ['eu-west', 'in-south', 'us-east'];
+  const expected = environment === 'production' ? ['ap-southeast', 'us-east'] : ['ap-southeast', 'eu-west', 'us-east'];
   const actual = env.cells.map(cell => cell?.id);
   actual.sort((a, b) => String(a).localeCompare(String(b)));
   if (actual.join(',') !== expected.join(',')) throw new Error(`${environment} has incomplete cell pattern`);
   assertDerivedNames(environment, names(env));
-  if (!validRestorableRdsInstanceId(rdsInstanceId(env))) throw new Error(`${environment} control RDS instance name is invalid`);
+  check(railwayServiceName(env), cloudflareName, `${environment} control Railway service name`);
   const directory = `${env.prefix}-directory`;
   check(directory, cloudflareName, `${environment} directory name`);
-  all.databases.push(`${env.control.awsRegion}/${env.control.database}`);
+  all.databases.push(`${env.control.railwayRegion}/${env.control.database}`);
   all.hyperdrives.push(names(env).hyperdrive);
   all.workers.push(names(env).api, names(env).mcp, directory);
   for (const cell of env.cells) validateCell(environment, env, cell, all);
 }
 
 function validateCell(environment, env, cell, all) {
-  allowedKeys(cell, ['id', 'awsRegion', 'r2LocationHint', 'originConnectionLimit'], `${environment} cell`);
+  allowedKeys(cell, ['id', 'railwayRegion', 'r2LocationHint', 'originConnectionLimit'], `${environment} cell`);
   check(cell.id, regionId, `${environment} cell ID`);
-  check(cell.awsRegion, awsRegion, `${environment} cell AWS region`);
+  check(cell.railwayRegion, railwayRegion, `${environment} cell Railway region`);
   if (cell.r2LocationHint !== cellPlacement[cell.id]?.r2LocationHint) throw new Error(`${environment} ${cell.id} R2 hint differs from placement policy`);
   if (!validOriginConnectionLimit(cell.originConnectionLimit)) throw new Error(`${environment} cell connection limit is invalid`);
-  if (cellPlacement[cell.id]?.awsRegion !== cell.awsRegion) throw new Error(`${environment} ${cell.id} is mapped to the wrong provider region`);
+  if (cellPlacement[cell.id]?.railwayRegion !== cell.railwayRegion) throw new Error(`${environment} ${cell.id} is mapped to the wrong provider region`);
   const resource = names(env, cell);
   assertDerivedNames(`${environment} ${cell.id}`, resource);
-  if (!validRestorableRdsInstanceId(rdsInstanceId(env, cell))) throw new Error(`${environment} ${cell.id} RDS instance name is invalid`);
-  all.databases.push(`${cell.awsRegion}/${resource.database}`);
+  check(railwayServiceName(env, cell), cloudflareName, `${environment} ${cell.id} Railway service name`);
+  all.databases.push(`${cell.railwayRegion}/${resource.database}`);
   all.hyperdrives.push(resource.hyperdrive);
   all.buckets.push(resource.bucket);
   all.queues.push(resource.queue, resource.deadLetterQueue);
@@ -99,22 +95,13 @@ function validateCell(environment, env, cell, all) {
 /** Validate the complete cell pattern and every derived provider resource name. */
 export function validateTopology(topology) {
   allowedKeys(topology, ['version', 'provider', 'environments'], 'topology');
-  if (topology.version !== 1 || topology.provider !== 'aws-rds-postgresql') throw new Error('Unsupported topology version or provider');
+  if (topology.version !== 2 || topology.provider !== 'railway-postgresql') throw new Error('Unsupported topology version or provider');
   allowedKeys(topology.environments, ['development', 'production'], 'environments');
   if (Object.keys(topology.environments).length !== 2) throw new Error('Development and production are required');
   const all = { databases: [], hyperdrives: [], buckets: [], queues: [], workers: [] };
   for (const [environment, env] of Object.entries(topology.environments)) validateEnvironment(environment, env, all);
   for (const [label, values] of Object.entries(all)) unique(values, label);
   return topology;
-}
-
-function checkRdsInstanceId(value, expected, label) {
-  if (!validRestorableRdsInstanceId(expected) || !validRdsInstanceId(value)) throw new Error(`${label} RDS instance mismatch`);
-  if (value === expected) return;
-  // Restores use a new RDS instance in the same cell; the live gate still proves
-  // database, region, endpoint and Hyperdrive identity before cutover.
-  const restored = new RegExp(`^${expected}${restoreSuffix}[a-z0-9]{8,24}$`);
-  if (!restored.test(value)) throw new Error(`${label} RDS instance mismatch`);
 }
 
 /**
@@ -139,26 +126,28 @@ function publicRouteHost(route) {
 export function validateInventory(topology, environment, inventory) {
   const env = topology.environments[environment];
   if (!env) throw new Error('Unknown environment');
-  allowedKeys(inventory, ['environment', 'control', 'cells', 'routes'], 'inventory');
+  allowedKeys(inventory, ['environment', 'projectId', 'environmentId', 'control', 'cells', 'routes'], 'inventory');
   if (inventory.environment !== environment) throw new Error('Inventory environment mismatch');
-  const network = (resource, label) => {
-    if (resource.network !== 'public-tls') throw new Error(`${label} network mode is unsupported until private CA trust is proven`);
-    if (resource.network === 'public-tls' && resource.vpcServiceId !== undefined) throw new Error(`${label} public network cannot include a VPC service`);
+  check(inventory.projectId, uuid, 'Railway project ID');
+  check(inventory.environmentId, uuid, 'Railway environment ID');
+  const resourceIds = [];
+  const validateResource = (resource, label) => {
+    allowedKeys(resource, ['hyperdriveId', 'serviceId', 'volumeInstanceId', 'network'], `${label} inventory`);
+    check(resource.hyperdriveId, hexId, `${label} Hyperdrive ID`);
+    check(resource.serviceId, uuid, `${label} Railway service ID`);
+    check(resource.volumeInstanceId, uuid, `${label} Railway volume instance ID`);
+    if (resource.network !== 'public-tls') throw new Error(`${label} network mode is unsupported until verified private connectivity is available`);
+    resourceIds.push(resource.serviceId, resource.volumeInstanceId);
   };
-  allowedKeys(inventory.control, ['hyperdriveId', 'rdsInstanceId', 'network', 'vpcServiceId'], 'control inventory');
-  check(inventory.control.hyperdriveId, hexId, 'control Hyperdrive ID');
-  checkRdsInstanceId(inventory.control.rdsInstanceId, rdsInstanceId(env), 'Control');
-  network(inventory.control, 'control');
+  validateResource(inventory.control, 'control');
   allowedKeys(inventory.cells, env.cells.map(cell => cell.id), 'cell inventory');
   if (Object.keys(inventory.cells).length !== env.cells.length) throw new Error('Missing cell inventory');
   const ids = [inventory.control.hyperdriveId];
   for (const cell of env.cells) {
-    allowedKeys(inventory.cells[cell.id], ['hyperdriveId', 'rdsInstanceId', 'network', 'vpcServiceId'], `${cell.id} inventory`);
-    check(inventory.cells[cell.id].hyperdriveId, hexId, `${cell.id} Hyperdrive ID`);
-    checkRdsInstanceId(inventory.cells[cell.id].rdsInstanceId, rdsInstanceId(env, cell), cell.id);
-    network(inventory.cells[cell.id], cell.id);
+    validateResource(inventory.cells[cell.id], cell.id);
     ids.push(inventory.cells[cell.id].hyperdriveId);
   }
+  unique(resourceIds, 'Railway service and volume IDs');
   unique(ids, 'Hyperdrive IDs');
   if (inventory.routes !== undefined) {
     allowedKeys(inventory.routes, ['app', 'mcp'], 'routes');
@@ -168,6 +157,16 @@ export function validateInventory(topology, environment, inventory) {
     if (inventory.routes.app === inventory.routes.mcp) throw new Error('Public routes must differ');
   }
   return inventory;
+}
+
+/** Reject a provider environment or binding accidentally shared across dev/prod. */
+export function validateDeploymentInventories(topology, development, production) {
+  validateInventory(topology, 'development', development);
+  validateInventory(topology, 'production', production);
+  const values = inventory => [inventory.projectId, inventory.environmentId,
+    ...[inventory.control, ...Object.values(inventory.cells)].flatMap(resource =>
+      [resource.serviceId, resource.volumeInstanceId, resource.hyperdriveId])];
+  unique([...values(development), ...values(production)], 'Development and production resource IDs');
 }
 
 const workerPath = (out, path, projectRoot) => relative(out, resolve(projectRoot, path));
@@ -239,6 +238,13 @@ async function main() {
   const topology = validateTopology(JSON.parse(await readFile(resolve(root, 'deployment/topology.json'), 'utf8')));
   if (command === 'validate' && !environment && !inventoryPath) {
     console.log('Topology valid: development 3 cells, production 2 cells');
+    return;
+  }
+  if (command === 'compare' && environment && inventoryPath) {
+    const development = JSON.parse(await readFile(resolve(environment), 'utf8'));
+    const production = JSON.parse(await readFile(resolve(inventoryPath), 'utf8'));
+    validateDeploymentInventories(topology, development, production);
+    console.log('Development and production inventories are isolated');
     return;
   }
   if (command !== 'render' || !environment || !inventoryPath) throw new Error('Usage: node scripts/topology.mjs validate | render <environment> <private-inventory.json>');

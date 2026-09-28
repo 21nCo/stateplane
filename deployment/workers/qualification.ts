@@ -78,7 +78,7 @@ async function verifyRollback(writer: ProbeClient, id: string, markRow: () => vo
   });
 }
 
-async function verifyFreshReads(writer: ProbeClient, reader: ProbeClient, id: string): Promise<number> {
+async function verifyFreshReads(writer: ProbeClient, reader: ProbeClient, id: string): Promise<{ observedConnections: number; maxConnections: number }> {
   await atStage('reader-connect', () => reader.connect());
   await atStage('initial-read', async () => {
     const first = await reader.query('SELECT value FROM stateplane_qualification WHERE probe_id = $1', [id]);
@@ -89,11 +89,12 @@ async function verifyFreshReads(writer: ProbeClient, reader: ProbeClient, id: st
     const fresh = await reader.query('SELECT value FROM stateplane_qualification WHERE probe_id = $1', [id]);
     if (fresh.rows[0]?.value !== 2) throw new Error('Fresh read was stale');
   });
-  return atStage('connection-count', async () => {
-    const activity = await reader.query('SELECT count(*)::integer AS count FROM pg_stat_activity WHERE datname = current_database() AND usename = current_user');
+  return atStage('connection-budget', async () => {
+    const activity = await reader.query("SELECT count(*)::integer AS count, current_setting('max_connections')::integer AS max_connections FROM pg_stat_activity WHERE datname = current_database() AND usename = current_user");
     const count: unknown = activity.rows[0]?.count;
-    if (!Number.isSafeInteger(count) || (count as number) < 1) throw new Error('Connection count unavailable');
-    return count as number;
+    const max: unknown = activity.rows[0]?.max_connections;
+    if (!Number.isSafeInteger(count) || (count as number) < 1 || !Number.isSafeInteger(max) || (max as number) < (count as number)) throw new Error('Connection budget unavailable');
+    return { observedConnections: count as number, maxConnections: max as number };
   });
 }
 
@@ -112,7 +113,7 @@ async function probe(connectionString: string, expectedDatabase: string, expecte
   const reader = new Client({ connectionString, connectionTimeoutMillis: 5000, query_timeout: 5000 });
   const start = Date.now();
   let rowMayExist = false;
-  let result: { pgvectorVersion: string; rollback: boolean; freshRead: boolean; observedConnections: number; elapsedMs: number } | undefined;
+  let result: { pgvectorVersion: string; rollback: boolean; freshRead: boolean; observedConnections: number; maxConnections: number; elapsedMs: number } | undefined;
   const failures: string[] = [];
   try {
     await atStage('writer-connect', () => writer.connect());
@@ -120,8 +121,8 @@ async function probe(connectionString: string, expectedDatabase: string, expecte
     await atStage('probe-table', () => writer.query('CREATE TABLE IF NOT EXISTS stateplane_qualification (probe_id uuid PRIMARY KEY, value integer NOT NULL)'));
     await verifyRollback(writer, id, () => { rowMayExist = true; });
     await atStage('committed-insert', () => writer.query('INSERT INTO stateplane_qualification (probe_id, value) VALUES ($1, 1)', [id]));
-    const observedConnections = await verifyFreshReads(writer, reader, id);
-    result = { pgvectorVersion, rollback: true, freshRead: true, observedConnections, elapsedMs: Date.now() - start };
+    const { observedConnections, maxConnections } = await verifyFreshReads(writer, reader, id);
+    result = { pgvectorVersion, rollback: true, freshRead: true, observedConnections, maxConnections, elapsedMs: Date.now() - start };
   } catch (error) {
     failures.push(...(error instanceof QualificationFailure ? error.stages : ['probe:unexpected']));
   }

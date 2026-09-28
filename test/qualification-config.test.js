@@ -18,7 +18,7 @@ test('full-head qualification configs dry-run for every declared target cell', {
   const retained = [];
   for (const [environment, definition] of Object.entries(topology.environments)) {
     for (const cell of definition.cells) {
-      const name = `s4-${head}-${environment === 'development' ? 'd' : 'p'}-${cell.id}`;
+      const name = `s4-${head}-${environment === 'development' ? 'd' : 'p'}-${{ 'ap-southeast': 'apse', 'us-east': 'use', 'eu-west': 'euw' }[cell.id]}`;
       const id = environment === 'development' ? 'a'.repeat(32) : 'b'.repeat(32);
       const configPath = resolve(root, '.data/qualification', `${name}.json`);
       const bundlePath = resolve(root, '.data/qualification/bundles', environment, cell.id);
@@ -40,24 +40,24 @@ test('full-head qualification configs dry-run for every declared target cell', {
       }
     }
   }
-  const dev = retained.find(entry => entry.environment === 'development' && entry.cell === 'in-south');
-  const prod = retained.find(entry => entry.environment === 'production' && entry.cell === 'in-south');
+  const dev = retained.find(entry => entry.environment === 'development' && entry.cell === 'ap-southeast');
+  const prod = retained.find(entry => entry.environment === 'production' && entry.cell === 'ap-southeast');
   assert.equal(new Set(retained.map(entry => entry.name)).size, retained.length);
-  assert.equal(dev.name.length, 54);
+  assert.equal(dev.name.length, 50);
   assert.notEqual(dev.name, prod.name);
   assert.notEqual(dev.id, prod.id);
 });
 
 test('qualification config rejects truncated heads and undeclared cells before writing', async () => {
-  for (const name of [`s4-${head.slice(0, 39)}-d-in-south`, `s4-${head}-d-unknown`, `s4-${head}-staging-in-south`, `s4-${head}-p-eu-west`, `sta-4-${head}-dev-in-south`]) {
+  for (const name of [`s4-${head.slice(0, 39)}-d-apse`, `s4-${head}-d-unknown`, `s4-${head}-staging-in-south`, `s4-${head}-p-euw`, `sta-4-${head}-dev-apse`]) {
     await assert.rejects(run(process.execPath, [script, name, hyperdriveId]), { code: 2 });
     await assert.rejects(readFile(resolve(root, '.data/qualification', `${name}.json`)), { code: 'ENOENT' });
   }
 });
 
 test('same cell in development and production retains separate Preview bindings', async () => {
-  const devName = `s4-${head}-d-in-south`;
-  const prodName = `s4-${head}-p-in-south`;
+  const devName = `s4-${head}-d-apse`;
+  const prodName = `s4-${head}-p-apse`;
   const devPath = resolve(root, '.data/qualification', `${devName}.json`);
   const prodPath = resolve(root, '.data/qualification', `${prodName}.json`);
   const prodId = 'b'.repeat(32);

@@ -16,9 +16,10 @@ const database = vi.hoisted(() => ({
   failQuery: '' as string,
   endFailure: false,
   queryTimeout: 0,
+  maxConnections: 100,
   valueReads: 0,
   queries: [] as string[],
-  targetDatabase: 'sta4_aaaaaaaaaaaaaaaa_dev_in_south',
+  targetDatabase: 'sta4_aaaaaaaaaaaaaaaa_dev_ap_southeast',
   targetRole: 'sta4_probe_aaaaaaaaaaaaaaaa'
 }));
 
@@ -58,7 +59,7 @@ vi.mock('pg', () => ({
         database.valueReads++;
         return { rows: database.row === null ? [] : [{ value: (database.staleInitialRead && database.valueReads === 1) || (database.staleFreshRead && database.valueReads === 2) ? 0 : database.row }] };
       }
-      if (sql.includes('pg_stat_activity')) return { rows: [{ count: 2 }] };
+      if (sql.includes('pg_stat_activity')) return { rows: [{ count: 2, max_connections: database.maxConnections }] };
       return { rows: [] };
     }
   }
@@ -72,7 +73,7 @@ async function qualify(authorization: string | null = 'Bearer disposable-token',
   }), {
     AUTHORITY: { connectionString: 'postgres://disposable.example/probe' },
     PROBE_TOKEN: 'disposable-token', STATEPLANE_DISPOSABLE: disposable,
-    STATEPLANE_PROBE_DATABASE: 'sta4_aaaaaaaaaaaaaaaa_dev_in_south', STATEPLANE_PROBE_ROLE: 'sta4_probe_aaaaaaaaaaaaaaaa',
+    STATEPLANE_PROBE_DATABASE: 'sta4_aaaaaaaaaaaaaaaa_dev_ap_southeast', STATEPLANE_PROBE_ROLE: 'sta4_probe_aaaaaaaaaaaaaaaa',
     ...bindings
   } as never);
 }
@@ -96,18 +97,25 @@ describe('disposable qualification row cleanup', () => {
     database.failQuery = '';
     database.endFailure = false;
     database.queryTimeout = 0;
-    database.targetDatabase = 'sta4_aaaaaaaaaaaaaaaa_dev_in_south';
+    database.maxConnections = 100;
+    database.targetDatabase = 'sta4_aaaaaaaaaaaaaaaa_dev_ap_southeast';
     database.targetRole = 'sta4_probe_aaaaaaaaaaaaaaaa';
   });
 
   it('reports success only after the committed probe row is gone', async () => {
     const response = await qualify();
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ ok: true, pgvectorVersion: '0.8.6', rollback: true, freshRead: true, observedConnections: 2 });
+    expect(await response.json()).toMatchObject({ ok: true, pgvectorVersion: '0.8.6', rollback: true, freshRead: true, observedConnections: 2, maxConnections: 100 });
     expect(response.headers.get('Cache-Control')).toBe('no-store');
     expect(database.queryTimeout).toBe(5000);
     expect(database.row).toBeNull();
     expect(database.closed).toBe(2);
+  });
+
+  it('fails if the database cannot report sufficient connection capacity', async () => {
+    database.maxConnections = 1;
+    expect((await qualify()).status).toBe(500);
+    expect(database.row).toBeNull();
   });
 
   it('rejects missing and nonnumeric pgvector results before writing a probe row', async () => {
@@ -223,11 +231,11 @@ describe('disposable qualification row cleanup', () => {
   });
 
   it('rejects a mismatched live database or role before creating the probe table', async () => {
-    for (const [key, value] of [['targetDatabase', 'stateplane_prod_in_south'], ['targetRole', 'owner']] as const) {
+    for (const [key, value] of [['targetDatabase', 'stateplane_prod_ap_southeast'], ['targetRole', 'owner']] as const) {
       database[key] = value;
       expect((await qualify()).status).toBe(500);
       expect(database.row).toBeNull();
-      database[key] = key === 'targetDatabase' ? 'sta4_aaaaaaaaaaaaaaaa_dev_in_south' : 'sta4_probe_aaaaaaaaaaaaaaaa';
+      database[key] = key === 'targetDatabase' ? 'sta4_aaaaaaaaaaaaaaaa_dev_ap_southeast' : 'sta4_probe_aaaaaaaaaaaaaaaa';
     }
   });
 
@@ -249,7 +257,7 @@ describe('disposable qualification row cleanup', () => {
     for (const bindings of [
       { STATEPLANE_PROBE_DATABASE: 'sta4_aaaaaaaaaaaaaaaa_prod_eu_west' },
       { STATEPLANE_PROBE_DATABASE: 'sta4_aaaaaaaaaaaaaaaa_dev_unknown' },
-      { STATEPLANE_PROBE_DATABASE: 'stateplane_prod_in_south' },
+      { STATEPLANE_PROBE_DATABASE: 'stateplane_prod_ap_southeast' },
       { STATEPLANE_PROBE_DATABASE: undefined },
       { STATEPLANE_PROBE_ROLE: 'sta4_probe_bbbbbbbbbbbbbbbb' },
       { STATEPLANE_PROBE_ROLE: undefined },
@@ -261,7 +269,7 @@ describe('disposable qualification row cleanup', () => {
   });
 
   it('admits every declared development and production cell', async () => {
-    for (const suffix of ['dev_in_south', 'dev_us_east', 'dev_eu_west', 'prod_in_south', 'prod_us_east']) {
+    for (const suffix of ['dev_ap_southeast', 'dev_us_east', 'dev_eu_west', 'prod_ap_southeast', 'prod_us_east']) {
       const target = `sta4_aaaaaaaaaaaaaaaa_${suffix}`;
       database.targetDatabase = target;
       expect((await qualify('Bearer disposable-token', '1', { STATEPLANE_PROBE_DATABASE: target })).status).toBe(200);

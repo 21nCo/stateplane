@@ -20,8 +20,10 @@ export async function dryRunTopology(topology, { projectRoot = root, runWrangler
     const ids = environment === 'development' ? ['a', 'b', 'c', 'd'] : ['e', 'f', '1'];
     const inventory = {
       environment,
-      control: { hyperdriveId: ids[0].repeat(32), rdsInstanceId: `${env.prefix}-control-db`, network: 'public-tls' },
-      cells: Object.fromEntries(env.cells.map((cell, index) => [cell.id, { hyperdriveId: ids[index + 1].repeat(32), rdsInstanceId: `${env.prefix}-${cell.id}-db`, network: 'public-tls' }]))
+      projectId: environment === 'development' ? '11111111-1111-4111-8111-111111111111' : '22222222-2222-4222-8222-222222222222',
+      environmentId: environment === 'development' ? '33333333-3333-4333-8333-333333333333' : '44444444-4444-4444-8444-444444444444',
+      control: { hyperdriveId: ids[0].repeat(32), serviceId: 'a1111111-1111-4111-8111-111111111111', volumeInstanceId: 'b1111111-1111-4111-8111-111111111111', network: 'public-tls' },
+      cells: Object.fromEntries(env.cells.map((cell, index) => [cell.id, { hyperdriveId: ids[index + 1].repeat(32), serviceId: `${ids[index + 1].repeat(8)}-1111-4111-8111-111111111111`, volumeInstanceId: `${ids[index + 1].repeat(8)}-2222-4222-8222-222222222222`, network: 'public-tls' }]))
     };
     const configs = renderTopology(topology, environment, inventory, out, projectRoot);
     for (const [file, config] of Object.entries(configs)) {
