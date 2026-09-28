@@ -6,6 +6,7 @@ import { readProtectedSqlUrls, verifySqlIdentity } from './topology-sql.mjs';
 import { validateTopology, validateInventory, cellDatabaseName, railwayServiceName } from './topology.mjs';
 import { assertLiveResources } from './topology-live.mjs';
 import { parseUploadedCa } from './topology-ca.mjs';
+import { readWranglerJson } from './wrangler-json.mjs';
 
 const run = promisify(execFile);
 const [environment, inventoryPath] = process.argv.slice(2);
@@ -52,9 +53,9 @@ async function railway(resource) {
 
 async function hyperdrive(id) {
   const { stdout } = await run(wrangler, ['hyperdrive', 'get', id], { maxBuffer: 1024 * 1024 });
-  const start = stdout.indexOf('{');
-  if (start < 0) throw new Error('Wrangler Hyperdrive readback has no JSON');
-  return JSON.parse(stdout.slice(start));
+  const value = readWranglerJson(stdout);
+  if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error('Wrangler Hyperdrive readback is invalid');
+  return value;
 }
 
 async function verifyUploadedCa(id) {

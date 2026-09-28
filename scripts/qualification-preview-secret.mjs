@@ -4,21 +4,15 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
+import { currentCleanHead, qualificationConfig } from './qualification-artifact.mjs';
+import { readWranglerJson } from './wrangler-json.mjs';
+
+export { readWranglerJson } from './wrangler-json.mjs';
 
 const root = resolve(import.meta.dirname, '..');
 const wranglerEntry = resolve(root, 'app/node_modules/wrangler/bin/wrangler.js');
 export const wranglerInvocation = (args, entry = wranglerEntry) => ({ command: process.execPath, args: [entry, ...args] });
-
-/** Read one bounded JSON value after optional Wrangler status lines. */
-export function readWranglerJson(output) {
-  if (output.length > 1024 * 1024) throw new Error('Wrangler response is too large');
-  for (let index = 0; index < output.length; index++) {
-    if (output[index] !== '{' && output[index] !== '[') continue;
-    try { return JSON.parse(output.slice(index)); }
-    catch { /* A status line may contain brackets; try the next JSON start. */ }
-  }
-  throw new Error('Wrangler returned no valid JSON');
-}
 
 /** Launch only the pinned project-local Wrangler entry with the trusted Node executable. */
 export async function wrangler(args, signal, entry = wranglerEntry) {
@@ -57,8 +51,11 @@ export async function setupPreview(name, token, { runWrangler = wrangler, signal
     throw new Error('Expected a full-head Preview name and a protected single-line PROBE_TOKEN');
   }
   const configPath = resolve(root, '.data/qualification', `${name}.json`);
+  const head = await currentCleanHead(root);
   const config = JSON.parse(await readFile(configPath, 'utf8'));
-  if (config.name !== name || !config.previews?.secrets?.required?.includes('PROBE_TOKEN')) throw new Error('Preview config does not declare PROBE_TOKEN');
+  const id = config?.hyperdrive?.[0]?.id;
+  const expected = await qualificationConfig(root, name, id, head);
+  if (!isDeepStrictEqual(config, expected)) throw new Error('Preview config is not the exact-head qualification artifact');
   const target = ['--name', name, '--config', configPath, '--ignore-base-config'];
   const directory = await mkdtemp(join(tmpdir(), 'sta4-preview-secret-'));
   let deployed;

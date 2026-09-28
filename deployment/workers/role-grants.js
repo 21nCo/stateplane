@@ -28,3 +28,26 @@ export function qualificationGrantsAllowed(row) {
     Object.keys(row).length === 8 &&
     Object.values(row).every(value => value === true);
 }
+
+// Operational control/cell roles need grants on application tables after migration.
+// Keep the disposable probe's stricter table and CREATE policy separate.
+export const operationalGrantsSql = `SELECT
+  (SELECT rolcanlogin AND NOT (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls)
+     FROM pg_roles WHERE rolname = current_user) AS safe_login,
+  NOT EXISTS (SELECT 1 FROM pg_roles
+     WHERE pg_has_role(current_user, oid, 'MEMBER')
+       AND (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls
+            OR left(rolname, 3) = 'pg_')) AS no_elevated_membership,
+  has_database_privilege(current_user, current_database(), 'CONNECT') AS can_connect,
+  NOT has_database_privilege(current_user, current_database(), 'CREATE') AS no_database_create,
+  has_schema_privilege(current_user, 'public', 'USAGE') AS can_use_schema,
+  NOT EXISTS (SELECT 1 FROM pg_namespace
+     WHERE nspname <> 'public' AND left(nspname, 3) <> 'pg_'
+       AND nspname <> 'information_schema'
+       AND has_schema_privilege(current_user, oid, 'CREATE')) AS no_other_schema_create`;
+
+export function operationalGrantsAllowed(row) {
+  return row !== null && typeof row === 'object' &&
+    Object.keys(row).length === 6 &&
+    Object.values(row).every(value => value === true);
+}

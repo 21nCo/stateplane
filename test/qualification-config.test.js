@@ -1,18 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile, spawn } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { readWranglerJson, setupPreview, wrangler, wranglerInvocation } from '../scripts/qualification-preview-secret.mjs';
+import { currentCleanHead, qualificationConfig } from '../scripts/qualification-artifact.mjs';
 import { promisify } from 'node:util';
 
 const run = promisify(execFile);
 const root = resolve(import.meta.dirname, '..');
 const script = resolve(root, 'scripts/qualification-config.mjs');
 const pnpm = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
-const head = randomBytes(20).toString('hex');
+const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
 const hyperdriveId = 'a'.repeat(32);
 
 test('full-head qualification configs dry-run for every declared target cell', { timeout: 120_000 }, async () => {
@@ -52,8 +52,9 @@ test('full-head qualification configs dry-run for every declared target cell', {
   assert.notEqual(dev.id, prod.id);
 });
 
-test('qualification config rejects truncated heads and undeclared cells before writing', async () => {
-  for (const name of [`s4-${head.slice(0, 39)}-d-apse`, `s4-${head}-d-unknown`, `s4-${head}-staging-in-south`, `s4-${head}-p-euw`, `sta-4-${head}-dev-apse`]) {
+test('qualification config rejects truncated, stale and undeclared heads/cells before writing', async () => {
+  const stale = `${head[0] === 'a' ? 'b' : 'a'}${head.slice(1)}`;
+  for (const name of [`s4-${head.slice(0, 39)}-d-apse`, `s4-${stale}-d-apse`, `s4-${head}-d-unknown`, `s4-${head}-staging-in-south`, `s4-${head}-p-euw`, `sta-4-${head}-dev-apse`]) {
     await assert.rejects(run(process.execPath, [script, name, hyperdriveId]), { code: 2 });
     await assert.rejects(readFile(resolve(root, '.data/qualification', `${name}.json`)), { code: 'ENOENT' });
   }
@@ -105,6 +106,15 @@ test('Preview setup protects its token, requires a URL and verifies the latest b
     await assert.rejects(setupPreview(name, 'private-test-token', { runWrangler: async args =>
       args.includes('--secrets-file') ? JSON.stringify({ preview: { urls: ['https://probe.example.workers.dev'] } }) : '[]' }), /PROBE_TOKEN is absent/);
     assert.throws(() => readWranglerJson('Wrangler banner without JSON'), /no valid JSON/);
+    assert.deepEqual(readWranglerJson('Wrangler {status}\n' + JSON.stringify({ id: hyperdriveId, origin: { database: 'stateplane' } })),
+      { id: hyperdriveId, origin: { database: 'stateplane' } });
+    assert.throws(() => readWranglerJson('x'.repeat(1024 * 1024 + 1)), /too large/);
+    const altered = JSON.parse(await readFile(configPath));
+    altered.previews.vars.STATEPLANE_PROBE_ROLE = 'admin';
+    await writeFile(configPath, JSON.stringify(altered));
+    const callsBefore = calls.length;
+    await assert.rejects(setupPreview(name, 'private-test-token', { runWrangler }), /exact-head qualification artifact/);
+    assert.equal(calls.length, callsBefore, 'altered artifact must fail before Wrangler');
   } finally {
     await rm(configPath, { force: true });
   }
@@ -177,7 +187,6 @@ test('Preview helper resolves project Wrangler through the trusted Node executab
 
 test('documented Preview CLI reads protected token, prints Preview URL and handles interruption', { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'sta4-preview-cli-'));
-  const name = `s4-${head}-d-apse`;
   const helper = join(directory, 'scripts/qualification-preview-secret.mjs');
   const fakeWrangler = join(directory, 'app/node_modules/wrangler/bin/wrangler.js');
   const marker = join(directory, 'marker.json');
@@ -185,9 +194,13 @@ test('documented Preview CLI reads protected token, prints Preview URL and handl
     await mkdir(join(directory, 'scripts'), { recursive: true });
     await mkdir(join(directory, 'app/node_modules/wrangler/bin'), { recursive: true });
     await mkdir(join(directory, '.data/qualification'), { recursive: true });
+    await mkdir(join(directory, 'deployment'), { recursive: true });
     await writeFile(join(directory, 'package.json'), '{"type":"module"}');
+    await writeFile(join(directory, '.gitignore'), '.data/\napp/node_modules/\n');
     await copyFile(resolve(root, 'scripts/qualification-preview-secret.mjs'), helper);
-    await writeFile(join(directory, '.data/qualification', `${name}.json`), JSON.stringify({ name, previews: { secrets: { required: ['PROBE_TOKEN'] } } }));
+    await copyFile(resolve(root, 'scripts/qualification-artifact.mjs'), join(directory, 'scripts/qualification-artifact.mjs'));
+    await copyFile(resolve(root, 'scripts/wrangler-json.mjs'), join(directory, 'scripts/wrangler-json.mjs'));
+    await copyFile(resolve(root, 'deployment/topology.json'), join(directory, 'deployment/topology.json'));
     await writeFile(fakeWrangler, `import { readFileSync, writeFileSync } from 'node:fs';
 const args = process.argv.slice(2);
 if (args.includes('--secrets-file')) {
@@ -198,6 +211,13 @@ if (args.includes('--secrets-file')) {
     setInterval(() => {}, 1000);
   } else console.log(JSON.stringify({ preview_urls: ['https://probe.example.workers.dev'], deployment_urls: [] }));
 } else console.log(JSON.stringify([{ name: 'PROBE_TOKEN', type: 'secret_text' }]));`);
+    await run('git', ['init', '-q'], { cwd: directory });
+    await run('git', ['add', '.'], { cwd: directory });
+    await run('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture'], { cwd: directory });
+    const fixtureHead = await currentCleanHead(directory);
+    const name = `s4-${fixtureHead}-d-apse`;
+    await writeFile(join(directory, '.data/qualification', `${name}.json`),
+      JSON.stringify(await qualificationConfig(directory, name, hyperdriveId, fixtureHead)));
     const env = { ...process.env, PROBE_TOKEN: 'private-test-token' };
     const { stdout } = await run(process.execPath, [helper, name], { env });
     assert.deepEqual(JSON.parse(stdout), { name, urls: ['https://probe.example.workers.dev'], probeTokenBound: true });

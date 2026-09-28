@@ -225,9 +225,9 @@ test('protected SQL proof rejects wrong database, role and untrusted TLS for eve
       const sample = live(environment, label);
       const proxy = sample.railway.tcpProxies[0];
       const url = `postgres://${sample.resource.databaseRole}:private@${proxy.domain}:${proxy.proxyPort}/${sample.database}`;
+      // Operational roles may access application tables after schema migration.
       let grantRow = { safe_login: true, no_elevated_membership: true, can_connect: true,
-        no_database_create: true, can_use_schema: true, can_create_probe_table: true,
-        no_other_schema_create: true, no_other_table_access: true };
+        no_database_create: true, can_use_schema: true, no_other_schema_create: true };
       const FakeClient = class {
         constructor(options) { this.options = options; }
         async connect() {
@@ -236,7 +236,10 @@ test('protected SQL proof rejects wrong database, role and untrusted TLS for eve
         }
         async query(sql) {
           if (sql.includes('current_database() AS database')) return { rows: [{ database: sample.database, role: sample.resource.databaseRole, version: 'PostgreSQL 16' }] };
-          if (sql.includes('FROM pg_roles')) return { rows: grantRow ? [grantRow] : [] };
+          if (sql.includes('FROM pg_roles')) {
+            assert.equal(sql.includes('FROM pg_class'), false, 'operational check must allow application table grants');
+            return { rows: grantRow ? [grantRow] : [] };
+          }
           return { rows: [{ distance: Math.SQRT2 }] };
         }
         async end() {}

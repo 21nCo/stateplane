@@ -1,6 +1,6 @@
 import { Client } from 'pg';
 import { readFile, stat } from 'node:fs/promises';
-import { qualificationGrantsAllowed, qualificationGrantsSql } from '../deployment/workers/role-grants.js';
+import { operationalGrantsAllowed, operationalGrantsSql } from '../deployment/workers/role-grants.js';
 
 export async function readProtectedSqlUrls(path) {
   if (((await stat(path)).mode & 0o777) !== 0o600) throw new Error('Protected SQL URL file must be mode 0600');
@@ -25,8 +25,8 @@ export async function verifySqlIdentity(label, resource, database, proxy, ca, va
     const result = await client.query('SELECT current_database() AS database, current_user AS role, version() AS version');
     if (result.rows[0]?.database !== database || result.rows[0]?.role !== resource.databaseRole ||
         !/^PostgreSQL /i.test(result.rows[0]?.version ?? '')) throw new Error('SQL identity mismatch');
-    const grants = await client.query(qualificationGrantsSql);
-    if (grants.rows.length !== 1 || !qualificationGrantsAllowed(grants.rows[0])) throw new Error('SQL role grants unavailable or excessive');
+    const grants = await client.query(operationalGrantsSql);
+    if (grants.rows.length !== 1 || !operationalGrantsAllowed(grants.rows[0])) throw new Error('SQL role grants unavailable or excessive');
     const vector = await client.query("SELECT '[1,0,0]'::vector <-> '[0,1,0]'::vector AS distance");
     if (!Number.isFinite(vector.rows[0]?.distance) || Math.abs(vector.rows[0].distance - Math.SQRT2) > 0.00001) {
       throw new Error('pgvector query mismatch');
