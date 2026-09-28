@@ -1,0 +1,14 @@
+scripts/wrangler-json.mjs
+  h_a39f9495f9ec1d 1-40,44-52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7b51fb7b1f01721fd932e93833174b6615af8c34",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
