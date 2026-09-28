@@ -1,0 +1,36 @@
+deployment/workers/operational-verify.ts
+  h_a39f9495f9ec1d 30-31,44,46,48-49,51-52
+package.json
+  h_a39f9495f9ec1d 12,17
+scripts/qualification-load.mjs
+  h_a39f9495f9ec1d 49,51-52,55
+scripts/topology-sql.mjs
+  h_a39f9495f9ec1d 16-20,34,36,40,43,48
+scripts/topology-verification-flow.mjs
+  h_a39f9495f9ec1d 1-20
+scripts/verify-topology.mjs
+  h_a39f9495f9ec1d 11,44,50,57-58,64,66,73-85,97-98
+test/operational-binding.test.js
+  h_a39f9495f9ec1d 94-130
+test/operational-worker.test.ts
+  h_a39f9495f9ec1d 1-44
+test/qualification-load.test.js
+  h_a39f9495f9ec1d 77-95
+test/topology-verification-flow.test.js
+  h_a39f9495f9ec1d 1-45
+test/topology.test.js
+  h_a39f9495f9ec1d 322-343
+vitest.config.ts
+  h_a39f9495f9ec1d 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c4025e1bf0525e17cdfddf9b06929d5f2c5769dd",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
