@@ -13,7 +13,7 @@ export async function readProtectedSqlUrls(path) {
 }
 
 /** Prove the declared proxy accepts a verified TLS connection to the intended PostgreSQL database and role. */
-export async function verifySqlIdentity(label, resource, database, proxy, ca, value, ClientType = Client, signal) {
+export async function verifySqlIdentity({ label, resource, database, proxy, ca, value, ClientType = Client, signal }) {
   const active = () => {
     if (signal?.aborted) throw new Error(`${label}: topology verification interrupted`);
   };

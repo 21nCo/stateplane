@@ -94,6 +94,7 @@ test('failed operational Preview deletion blocks an otherwise successful proof',
 
 test('invalid token, target and configuration fail before deployment or verification request', async () => {
   for (const [environment, label, resourceValue, databaseValue, token] of [
+    ['development', 'control', resource, database, ''],
     ['development', 'control', resource, database, 'bad\ntoken'],
     ['production', 'eu-west', resource, database, 'private-test-token'],
     ['development', 'control', { ...resource, hyperdriveId: 'bad' }, database, 'private-test-token'],
@@ -108,13 +109,17 @@ test('invalid token, target and configuration fail before deployment or verifica
 });
 
 test('invalid Preview URL and missing secret readback prevent token-bearing verification and still delete Preview', async () => {
-  for (const mode of ['url', 'secret']) {
+  for (const mode of ['url', 'ambiguous-url', 'secret']) {
     const h = harness({ ok: true });
     const normal = h.dependencies.runWrangler;
     h.dependencies.runWrangler = async args => {
       if (mode === 'url' && args[1] !== 'delete' && args[1] !== 'secret') {
         h.calls.push(args);
         return JSON.stringify({ preview_urls: ['http://untrusted.example/'] });
+      }
+      if (mode === 'ambiguous-url' && args[1] !== 'delete' && args[1] !== 'secret') {
+        h.calls.push(args);
+        return JSON.stringify({ preview_urls: ['https://one.example/', 'https://two.example/'] });
       }
       if (mode === 'secret' && args[1] === 'secret') {
         h.calls.push(args);

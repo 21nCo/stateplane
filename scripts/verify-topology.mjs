@@ -79,8 +79,8 @@ async function verify(label, definition, resource, database, serviceName) {
         projectId: inventory.projectId, environmentId: inventory.environmentId, railway: railwayReadback, hyperdrive: hyperdriveReadback });
     },
     ca: hyperdriveReadback => verifyUploadedCa(hyperdriveReadback.mtls.ca_certificate_id, controller.signal),
-    sql: (railwayReadback, _hyperdriveReadback, ca) => verifySqlIdentity(label, resource, database,
-      railwayReadback.tcpProxies[0], ca, sqlUrls[label], undefined, controller.signal),
+    sql: (railwayReadback, _hyperdriveReadback, ca) => verifySqlIdentity({ label, resource, database,
+      proxy: railwayReadback.tcpProxies[0], ca, value: sqlUrls[label], signal: controller.signal }),
     worker: () => verifyOperationalBinding(environment, label, resource, database, { signal: controller.signal })
   });
   console.log(`${label}: Railway ${definition.railwayRegion} service/volume, backup and PITR estimate, pinned PostgreSQL image, verified-TLS SQL identity/pgvector, cache-disabled Hyperdrive limit ${definition.originConnectionLimit}, operational Worker binding ${worker.hyperdriveId} at ${worker.name}; transaction and restore drill still required`);
@@ -94,7 +94,10 @@ try {
   await verify('control', env.control, inventory.control, env.control.database, railwayServiceName(env));
   for (const cell of env.cells) await verify(cell.id, cell, inventory.cells[cell.id], cellDatabaseName(env, cell), railwayServiceName(env, cell));
 } catch (error) {
-  console.error(controller.signal.aborted ? 'Topology verification interrupted' : error instanceof Error ? error.message : 'Unknown verification failure');
+  let message = 'Unknown verification failure';
+  if (error instanceof Error) message = error.message;
+  if (controller.signal.aborted) message = 'Topology verification interrupted';
+  console.error(message);
   process.exitCode = controller.signal.aborted ? 130 : 1;
 } finally {
   process.removeListener('SIGINT', interrupt);

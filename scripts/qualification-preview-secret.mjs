@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { currentCleanHead, qualificationConfig } from './qualification-artifact.mjs';
+import { verifyQualificationTarget } from './qualification-target.mjs';
 import { readWranglerJson } from './wrangler-json.mjs';
 
 export { readWranglerJson } from './wrangler-json.mjs';
@@ -46,7 +47,7 @@ export async function wrangler(args, signal, entry = wranglerEntry) {
 }
 
 /** Own the temporary token file until deployment has exited or been cancelled. */
-export async function setupPreview(name, token, { runWrangler = wrangler, signal } = {}) {
+export async function setupPreview(name, token, { runWrangler = wrangler, verifyTarget = verifyQualificationTarget, signal } = {}) {
   if (!/^s4-[a-f0-9]{40}-[dp]-(apse|use|euw)$/.test(name ?? '') || !token || /[\r\n]/.test(token)) {
     throw new Error('Expected a full-head Preview name and a protected single-line PROBE_TOKEN');
   }
@@ -56,27 +57,41 @@ export async function setupPreview(name, token, { runWrangler = wrangler, signal
   const id = config?.hyperdrive?.[0]?.id;
   const expected = await qualificationConfig(root, name, id, head);
   if (!isDeepStrictEqual(config, expected)) throw new Error('Preview config is not the exact-head qualification artifact');
+  await verifyTarget(root, name, head, id, { signal });
   const target = ['--name', name, '--config', configPath, '--ignore-base-config'];
   const directory = await mkdtemp(join(tmpdir(), 'sta4-preview-secret-'));
-  let deployed;
+  let attempted = false;
   try {
     const secretFile = join(directory, 'secrets.json');
     await writeFile(secretFile, JSON.stringify({ PROBE_TOKEN: token }), { mode: 0o600 });
-    deployed = readWranglerJson(await runWrangler(['preview', ...target, '--secrets-file', secretFile, '--json'], signal));
+    attempted = true;
+    const deployed = readWranglerJson(await runWrangler(['preview', ...target, '--secrets-file', secretFile, '--json'], signal));
+    const urls = deployed?.preview_urls ?? deployed?.preview?.urls;
+    const origins = Array.isArray(urls) ? urls.map(url => {
+      try {
+        const parsed = new URL(url);
+        return parsed.protocol === 'https:' && !parsed.username && !parsed.password &&
+          parsed.pathname === '/' && !parsed.search && !parsed.hash ? parsed.origin : null;
+      } catch { return null; }
+    }) : [];
+    if (origins.length !== 1 || !origins[0]) {
+      throw new Error('Preview deployment returned no usable HTTPS URL');
+    }
+    const listed = readWranglerJson(await runWrangler(['preview', 'secret', 'list', ...target, '--json'], signal));
+    if (!Array.isArray(listed) || !listed.some(entry => entry.name === 'PROBE_TOKEN' && entry.type === 'secret_text')) {
+      throw new Error('PROBE_TOKEN is absent from the latest Preview deployment');
+    }
+    if (signal?.aborted) throw new Error('Preview setup interrupted');
+    return urls;
+  } catch (error) {
+    if (attempted) {
+      try { await runWrangler(['preview', 'delete', ...target, '--skip-confirmation', '--json']); }
+      catch { throw new Error('Preview setup failed and cleanup failed'); }
+    }
+    throw error;
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
-  const urls = deployed?.preview_urls ?? deployed?.preview?.urls;
-  if (!Array.isArray(urls) || urls.length === 0 ||
-      !urls.every(url => typeof url === 'string' && url.startsWith('https://'))) {
-    throw new Error('Preview deployment returned no usable HTTPS URL');
-  }
-  const listed = readWranglerJson(await runWrangler(['preview', 'secret', 'list', ...target, '--json'], signal));
-  if (!Array.isArray(listed) || !listed.some(entry => entry.name === 'PROBE_TOKEN' && entry.type === 'secret_text')) {
-    throw new Error('PROBE_TOKEN is absent from the latest Preview deployment');
-  }
-  if (signal?.aborted) throw new Error('Preview setup interrupted');
-  return urls;
 }
 
 if (process.argv[1] && realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url))) {

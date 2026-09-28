@@ -14,9 +14,10 @@ test('an interrupted provider read settles both reads and never deploys the Work
     sql: () => stages.push('sql'), worker: () => stages.push('worker')
   });
   const rejection = assert.rejects(proof, /Topology verification interrupted/);
-  await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(stages, ['railway', 'hyperdrive-start']);
-  release();
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(stages, ['railway', 'hyperdrive-start']);
+  } finally { release(); }
   await rejection;
   assert.deepEqual(stages, ['railway', 'hyperdrive-start', 'hyperdrive-settled']);
 });

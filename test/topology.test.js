@@ -302,19 +302,21 @@ test('protected SQL proof rejects wrong database, role and untrusted TLS for eve
         }
         async end() {}
       };
-      await verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url, FakeClient);
+      const proof = (ca = 'expected-ca', value = url) => verifySqlIdentity({ label, resource: sample.resource,
+        database: sample.database, proxy, ca, value, ClientType: FakeClient });
+      await proof();
       grantRow = { ...grantRow, no_public_schema_create: false };
-      await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url, FakeClient), /verified-TLS/);
+      await assert.rejects(proof(), /verified-TLS/);
       grantRow = { ...grantRow, no_public_schema_create: true };
       grantRow = { ...grantRow, no_elevated_membership: false };
-      await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url, FakeClient), /verified-TLS/);
+      await assert.rejects(proof(), /verified-TLS/);
       grantRow = { ...grantRow, no_elevated_membership: true, no_other_role_membership: false };
-      await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url, FakeClient), /verified-TLS/);
+      await assert.rejects(proof(), /verified-TLS/);
       grantRow = null;
-      await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url, FakeClient), /verified-TLS/);
-      await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'unrelated-ca', url, FakeClient), /verified-TLS/);
-      await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url.replace(sample.database, 'wrong_database'), FakeClient), /differs/);
-      await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url.replace(sample.resource.databaseRole, 'wrong_role'), FakeClient), /differs/);
+      await assert.rejects(proof(), /verified-TLS/);
+      await assert.rejects(proof('unrelated-ca'), /verified-TLS/);
+      await assert.rejects(proof('expected-ca', url.replace(sample.database, 'wrong_database')), /differs/);
+      await assert.rejects(proof('expected-ca', url.replace(sample.resource.databaseRole, 'wrong_role')), /differs/);
     }
   }
 });
@@ -335,8 +337,8 @@ test('interrupted protected SQL read closes the client and stops before grant or
     }
     async end() { closed++; }
   }
-  await assert.rejects(verifySqlIdentity('control', sample.resource, sample.database, proxy, 'expected-ca',
-    url, FakeClient, controller.signal), /topology verification interrupted/);
+  await assert.rejects(verifySqlIdentity({ label: 'control', resource: sample.resource, database: sample.database,
+    proxy, ca: 'expected-ca', value: url, ClientType: FakeClient, signal: controller.signal }), /topology verification interrupted/);
   assert.equal(queries.length, 1);
   assert.equal(closed, 1);
 });
