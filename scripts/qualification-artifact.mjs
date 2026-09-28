@@ -45,6 +45,7 @@ export async function qualificationConfig(root, name, hyperdriveId, head) {
     compatibility_date: '2026-09-25',
     compatibility_flags: ['nodejs_compat'],
     workers_dev: false,
+    preview_urls: true,
     secrets: { required: ['PROBE_TOKEN'] },
     hyperdrive: bindings,
     vars,

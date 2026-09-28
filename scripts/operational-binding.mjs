@@ -18,7 +18,7 @@ export function operationalConfig(name, hyperdriveId, database, role) {
   const vars = { STATEPLANE_PROBE_DATABASE: database, STATEPLANE_PROBE_ROLE: role };
   return {
     name, main: resolve(root, 'deployment/workers/operational-verify.ts'),
-    compatibility_date: '2026-09-25', compatibility_flags: ['nodejs_compat'], workers_dev: false,
+    compatibility_date: '2026-09-25', compatibility_flags: ['nodejs_compat'], workers_dev: false, preview_urls: true,
     secrets: { required: ['PROBE_TOKEN'] }, hyperdrive, vars,
     previews: { secrets: { required: ['PROBE_TOKEN'] }, hyperdrive, vars }
   };

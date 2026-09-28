@@ -51,7 +51,8 @@ test('in-flight provider child exits before an interrupted preflight settles', {
   let child;
   let exited = false;
   let ready;
-  const started = new Promise(resolve => { ready = resolve; });
+  let startFailure;
+  const started = new Promise((resolve, reject) => { ready = resolve; startFailure = reject; });
   const stages = [];
   const proof = verifyBindingPreflight(controller.signal, {
     railway: async () => {
@@ -59,6 +60,8 @@ test('in-flight provider child exits before an interrupted preflight settles', {
         { signal: controller.signal, stdio: ['ignore', 'pipe', 'ignore'] });
       child.on('error', () => {});
       child.stdout.once('data', () => ready());
+      child.once('error', startFailure);
+      child.once('close', () => startFailure(new Error('provider child closed before ready')));
       await new Promise((resolve, reject) => child.once('close', code => {
         exited = true;
         code === 0 ? resolve() : reject(new Error('provider child interrupted'));
@@ -76,6 +79,8 @@ test('in-flight provider child exits before an interrupted preflight settles', {
     assert.equal(exited, true);
     assert.deepEqual(stages, ['hyperdrive']);
   } finally {
+    controller.abort();
     if (child && !exited) child.kill('SIGKILL');
+    await rejection;
   }
 });

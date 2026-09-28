@@ -68,7 +68,8 @@ function validateEnvironment(environment, env, all) {
   const expected = environment === 'production' ? ['ap-southeast', 'us-east'] : ['ap-southeast', 'eu-west', 'us-east'];
   const actual = env.cells.map(cell => cell?.id);
   actual.sort((a, b) => String(a).localeCompare(String(b)));
-  if (actual.join(',') !== expected.sort((a, b) => a.localeCompare(b)).join(',')) throw new Error(`${environment} has incomplete cell pattern`);
+  expected.sort((a, b) => a.localeCompare(b));
+  if (actual.join(',') !== expected.join(',')) throw new Error(`${environment} has incomplete cell pattern`);
   assertDerivedNames(environment, names(env));
   check(railwayServiceName(env), cloudflareName, `${environment} control Railway service name`);
   const directory = `${env.prefix}-directory`;

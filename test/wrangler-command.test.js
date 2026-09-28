@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, mkdtemp, rm } from 'node:fs/promises';
+import { readFile, mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { dryRunTopology } from '../scripts/topology-dry-run.mjs';
@@ -26,6 +26,34 @@ test('operational and disposable Hyperdrive readback launch pinned Wrangler thro
     error => error === failure);
 });
 
+test('in-flight Wrangler Hyperdrive readback exits on abort', { timeout: 10_000 }, async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), 'sta4-hyperdrive-abort-'));
+  const entry = join(projectRoot, 'app/node_modules/wrangler/bin/wrangler.js');
+  const marker = join(projectRoot, 'child.pid');
+  const previous = process.env.STATEPLANE_TEST_CHILD_MARKER;
+  const controller = new AbortController();
+  try {
+    await mkdir(join(projectRoot, 'app/node_modules/wrangler/bin'), { recursive: true });
+    await writeFile(entry, 'require("node:fs").writeFileSync(process.env.STATEPLANE_TEST_CHILD_MARKER, String(process.pid)); setInterval(() => {}, 1000);');
+    process.env.STATEPLANE_TEST_CHILD_MARKER = marker;
+    const pending = readHyperdrive('a'.repeat(32), { signal: controller.signal, projectRoot });
+    let pid;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      try { pid = Number(await readFile(marker, 'utf8')); break; }
+      catch { await new Promise(resolveDelay => setTimeout(resolveDelay, 25)); }
+    }
+    assert.ok(pid, 'Wrangler child started');
+    controller.abort();
+    await assert.rejects(pending, /Wrangler Hyperdrive readback failed or interrupted/);
+    if (process.platform !== 'win32') assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+  } finally {
+    controller.abort();
+    if (previous === undefined) delete process.env.STATEPLANE_TEST_CHILD_MARKER;
+    else process.env.STATEPLANE_TEST_CHILD_MARKER = previous;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('all generated cell and control dry runs launch pinned Wrangler through Node', async () => {
   const topology = JSON.parse(await readFile(join(root, 'deployment/topology.json')));
   const projectRoot = await mkdtemp(join(tmpdir(), 'sta4-wrangler-portability-'));
@@ -35,7 +63,9 @@ test('all generated cell and control dry runs launch pinned Wrangler through Nod
       calls.push({ command, args, options });
       return { stdout: '' };
     } });
-    assert.equal(count, 21);
+    const expectedCount = Object.values(topology.environments).reduce((total, environment) =>
+      total + 3 + environment.cells.length * 3, 0);
+    assert.equal(count, expectedCount);
     assert.equal(calls.length, count);
     const configs = new Set();
     for (const { command, args, options } of calls) {

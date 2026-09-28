@@ -72,7 +72,9 @@ async function verify(label, definition, resource, database, serviceName) {
     sql: async (railwayReadback, _hyperdriveReadback, ca) => {
       const proxy = railwayReadback.tcpProxies[0];
       await verifyPgdataPlacement({ label, volumeInstance: railwayReadback.volumeInstance,
-        mountPath: resource.volumeMountPath, database, proxy, ca, value: pgdataUrls[label], signal: controller.signal });
+        mountPath: resource.volumeMountPath, database, proxy, ca, value: pgdataUrls[label],
+        operationalRole: resource.databaseRole, projectId: inventory.projectId,
+        environmentId: inventory.environmentId, serviceId: resource.serviceId, signal: controller.signal });
       await verifySqlIdentity({ label, resource, database, proxy, ca, value: sqlUrls[label], signal: controller.signal });
     },
     worker: () => verifyOperationalBinding(environment, label, resource, database, { signal: controller.signal })

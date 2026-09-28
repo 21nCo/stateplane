@@ -1,7 +1,68 @@
 import { Client } from 'pg';
 import { readFile, stat } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import { operationalGrantsAllowed, operationalGrantsSql } from '../deployment/workers/role-grants.js';
 import { assertVolumePlacement } from './topology-live.mjs';
+
+async function runRailway(command, args, { maxBuffer, timeout, signal }) {
+  return new Promise((resolveResult, reject) => {
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], signal });
+    let stdout = '';
+    let failed = false;
+    let launchError;
+    const timer = setTimeout(() => { failed = true; child.kill('SIGKILL'); }, timeout);
+    child.stdout.on('data', chunk => {
+      stdout += chunk;
+      if (stdout.length > maxBuffer) { failed = true; child.kill('SIGKILL'); }
+    });
+    child.stderr.resume();
+    child.on('error', error => { launchError = error; });
+    child.on('close', code => {
+      clearTimeout(timer);
+      if (signal?.aborted || launchError || code !== 0 || failed) reject(new Error('Railway SSH storage readback failed or interrupted'));
+      else resolveResult({ stdout });
+    });
+  });
+}
+
+// Railway SSH inspects the running container, because SQL cannot resolve a pg_wal symlink.
+export async function verifyRailwayStoragePaths({ label, projectId, environmentId, serviceId,
+  dataDirectory, mountPath, signal, runCommand = runRailway }) {
+  if (![projectId, environmentId, serviceId].every(id => /^[a-f0-9-]{36}$/i.test(id ?? ''))) {
+    throw new Error(`${label}: Railway SSH target IDs missing`);
+  }
+  const script = 'set -eu; readlink -f "$1"; readlink -f "$1/pg_wal"; find "$1/pg_tblspc" -mindepth 1 -maxdepth 1 -print';
+  const { stdout } = await runCommand('railway', ['ssh', '--project', projectId, '--service', serviceId,
+    '--environment', environmentId, '--', 'sh', '-c', script, 'sh', dataDirectory],
+  { maxBuffer: 64 * 1024, timeout: 15_000, killSignal: 'SIGKILL', signal });
+  const paths = stdout.trimEnd().split(/\r?\n/);
+  if (paths.length !== 2 || paths.some(path => !path.startsWith(`${mountPath}/`) && path !== mountPath)) {
+    throw new Error(`${label}: WAL, tablespace or data path is outside the inventoried Railway volume`);
+  }
+}
+
+const settingsRoleSql = `SELECT r.rolsuper, r.rolcreatedb, r.rolcreaterole, r.rolreplication, r.rolbypassrls,
+  pg_has_role(current_user, 'pg_read_all_settings', 'USAGE') AS can_read_settings,
+  has_database_privilege(current_database(), 'CREATE') AS can_create_database,
+  EXISTS (SELECT 1 FROM pg_namespace n WHERE n.nspname !~ '^pg_' AND
+    has_schema_privilege(n.oid, 'CREATE')) AS can_create_schema,
+  EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' AND
+    has_table_privilege(c.oid, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')) AS can_access_tables,
+  (SELECT count(*) = 1 AND bool_and(parent.rolname = 'pg_read_all_settings')
+    FROM pg_auth_members m JOIN pg_roles parent ON parent.oid = m.roleid WHERE m.member = r.oid) AS only_settings_membership
+  FROM pg_roles r WHERE r.rolname = current_user`;
+
+function assertSettingsRole(label, result) {
+  const row = result.rows?.[0];
+  if (result.rows?.length !== 1 || !row || row.rolsuper !== false || row.rolcreatedb !== false ||
+      row.rolcreaterole !== false || row.rolreplication !== false || row.rolbypassrls !== false ||
+      row.can_read_settings !== true || row.can_create_database !== false ||
+      row.can_create_schema !== false || row.can_access_tables !== false ||
+      row.only_settings_membership !== true) {
+    throw new Error(`${label}: settings proof credential is not least privilege`);
+  }
+}
 
 export async function readProtectedSqlUrls(path) {
   if (((await stat(path)).mode & 0o777) !== 0o600) throw new Error('Protected SQL URL file must be mode 0600');
@@ -53,7 +114,9 @@ export async function verifySqlIdentity({ label, resource, database, proxy, ca, 
 }
 
 /** A separate read-only settings credential proves the running server's PGDATA, not just its configured image path. */
-export async function verifyPgdataPlacement({ label, volumeInstance, mountPath, database, proxy, ca, value, ClientType = Client, signal }) {
+export async function verifyPgdataPlacement({ label, volumeInstance, mountPath, database, proxy, ca, value,
+  operationalRole, projectId, environmentId, serviceId, ClientType = Client, signal,
+  verifyStorage = verifyRailwayStoragePaths }) {
   if (signal?.aborted) throw new Error(`${label}: topology verification interrupted`);
   if (typeof value !== 'string') throw new Error(`${label}: protected PGDATA SQL URL missing`);
   let url;
@@ -61,7 +124,8 @@ export async function verifyPgdataPlacement({ label, volumeInstance, mountPath, 
   catch { throw new Error(`${label}: protected PGDATA SQL URL is invalid`); }
   if (!['postgres:', 'postgresql:'].includes(url.protocol) || url.hostname !== proxy.domain ||
       Number(url.port) !== proxy.proxyPort || decodeURIComponent(url.pathname.slice(1)) !== database ||
-      !url.username || !url.password || url.search || url.hash) {
+      !url.username || !url.password || decodeURIComponent(url.username) === operationalRole ||
+      !operationalRole || url.search || url.hash) {
     throw new Error(`${label}: protected PGDATA SQL URL differs from declared proxy or database`);
   }
   const client = new ClientType({ connectionString: value, connectionTimeoutMillis: 5000, query_timeout: 5000,
@@ -74,6 +138,14 @@ export async function verifyPgdataPlacement({ label, volumeInstance, mountPath, 
     if (result.rows.length !== 1 || result.rows[0].database !== database ||
         result.rows[0].role !== decodeURIComponent(url.username)) throw new Error('SQL identity mismatch');
     assertVolumePlacement(label, volumeInstance, mountPath, result.rows[0].data_directory);
+    assertSettingsRole(label, await client.query(settingsRoleSql));
+    if (signal?.aborted) throw new Error('interrupted');
+    const spaces = await client.query("SELECT spcname FROM pg_tablespace WHERE spcname NOT IN ('pg_default', 'pg_global')");
+    if (signal?.aborted) throw new Error('interrupted');
+    if (spaces.rows.length !== 0) throw new Error('Non-default tablespace requires separate storage proof');
+    await verifyStorage({ label, projectId, environmentId, serviceId,
+      dataDirectory: result.rows[0].data_directory, mountPath, signal });
+    if (signal?.aborted) throw new Error('interrupted');
   } catch {
     throw new Error(signal?.aborted ? `${label}: topology verification interrupted` : `${label}: verified-TLS PGDATA placement proof failed`);
   } finally {

@@ -30,6 +30,8 @@ test('full-head qualification configs dry-run for every declared target cell', {
         assert.equal(stdout.trim().replaceAll('\\', '/'), `.data/qualification/${name}.json`);
         const config = JSON.parse(await readFile(configPath));
         assert.equal(config.name, name);
+        assert.equal(config.workers_dev, false);
+        assert.equal(config.preview_urls, true);
         assert.ok(name.length <= 54, `${name} exceeds Cloudflare's Preview script-name limit`);
         assert.deepEqual(config.hyperdrive, [{ binding: 'AUTHORITY', id }]);
         assert.deepEqual(config.previews.hyperdrive, config.hyperdrive);

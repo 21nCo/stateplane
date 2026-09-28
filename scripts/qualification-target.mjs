@@ -56,24 +56,11 @@ export async function connectedPgdataProof(inventory, railway, hyperdrive, signa
   const ca = await readUploadedCa(hyperdrive.mtls.ca_certificate_id, signal);
   await verifyPgdataPlacement({ label: inventory.name, volumeInstance: railway.volumeInstance,
     mountPath: inventory.volumeMountPath, database: inventory.database, proxy: railway.tcpProxies[0],
-    ca, value: urls.url, signal });
+    ca, value: urls.url, operationalRole: inventory.role, projectId: inventory.projectId,
+    environmentId: inventory.environmentId, serviceId: inventory.serviceId, signal });
 }
 
-/** A separate protected target record and live provider reads must agree before disposable DDL. */
-export async function verifyQualificationTarget(root, name, head, artifactId,
-  { inventoryPath = process.env.STATEPLANE_QUALIFICATION_INVENTORY_FILE,
-    operationalInventoryPaths = {
-      development: process.env.STATEPLANE_DEVELOPMENT_INVENTORY_FILE,
-      production: process.env.STATEPLANE_PRODUCTION_INVENTORY_FILE
-    },
-    readback = connectedQualificationReadback, pgdataProof = connectedPgdataProof, signal } = {}) {
-  if (signal?.aborted) throw new Error('Qualification target verification interrupted');
-  const topology = JSON.parse(await readFile(resolve(root, 'deployment/topology.json'), 'utf8'));
-  const { environment, cell } = qualificationTarget(name, head, topology);
-  const definition = topology.environments[environment].cells.find(entry => entry.id === cell);
-  const expectedDatabase = `sta4_${head.slice(0, 16)}_${environment === 'development' ? 'dev' : 'prod'}_${cell.replaceAll('-', '_')}`;
-  const expectedRole = `sta4_probe_${head.slice(0, 16)}`;
-  const inventory = await readQualificationInventory(inventoryPath);
+function assertDisposableInventory(inventory, { name, expectedDatabase, expectedRole, artifactId }) {
   if (!inventory || Array.isArray(inventory) || typeof inventory !== 'object' ||
       Object.keys(inventory).sort((a, b) => a.localeCompare(b)).join(',') !== ['database', 'environmentId', 'hyperdriveId', 'name', 'projectId',
         'role', 'serviceId', 'volumeInstanceId', 'volumeMountPath'].sort((a, b) => a.localeCompare(b)).join(',') ||
@@ -83,14 +70,9 @@ export async function verifyQualificationTarget(root, name, head, artifactId,
       !sameProviderId(inventory.hyperdriveId, artifactId, hex)) {
     throw new Error('Disposable qualification target differs from protected inventory');
   }
-  if (!operationalInventoryPaths?.development || !operationalInventoryPaths?.production) {
-    throw new Error('Both protected operational inventory paths required');
-  }
-  const operational = {
-    development: await readQualificationInventory(operationalInventoryPaths.development),
-    production: await readQualificationInventory(operationalInventoryPaths.production)
-  };
-  validateDeploymentInventories(topology, operational.development, operational.production);
+}
+
+function assertDisposableIsolation(inventory, operational) {
   for (const deployed of Object.values(operational)) {
     for (const resource of [deployed.control, ...Object.values(deployed.cells)]) {
       if (sameProviderId(inventory.serviceId, resource.serviceId) ||
@@ -100,11 +82,10 @@ export async function verifyQualificationTarget(root, name, head, artifactId,
       }
     }
   }
-  const { railway, hyperdrive } = await readback(inventory, signal);
-  if (signal?.aborted) throw new Error('Qualification target verification interrupted');
+}
+
+function assertDisposableProvider(inventory, definition, name, railway) {
   const { service, serviceInstance, volumeInstance, tcpProxies } = railway ?? {};
-  const approvedImage = environment === 'development'
-    ? operational.development.cells[cell] : operational.production.cells[cell];
   const proxy = Array.isArray(tcpProxies) && tcpProxies.length === 1 ? tcpProxies[0] : undefined;
   if (!sameProviderId(service?.id, inventory.serviceId) || service.name !== name ||
       !sameProviderId(service?.projectId, inventory.projectId) || service.deletedAt ||
@@ -122,7 +103,10 @@ export async function verifyQualificationTarget(root, name, head, artifactId,
       proxy.applicationPort !== 5432 || !proxy.domain || !Number.isInteger(proxy.proxyPort)) {
     throw new Error('Disposable Railway service, volume, region or proxy readback mismatch');
   }
-  assertPostgresImageProvenance(name, approvedImage, serviceInstance);
+  return proxy;
+}
+
+function assertDisposableHyperdrive(inventory, definition, proxy, hyperdrive) {
   if (!sameProviderId(hyperdrive?.id, inventory.hyperdriveId, hex) ||
       hyperdrive.caching?.disabled !== true || hyperdrive.origin_connection_limit !== definition.originConnectionLimit ||
       !['postgres', 'postgresql'].includes(hyperdrive.origin?.scheme) ||
@@ -131,6 +115,40 @@ export async function verifyQualificationTarget(root, name, head, artifactId,
       hyperdrive.mtls?.sslmode !== 'verify-full' || !uuid.test(hyperdrive.mtls?.ca_certificate_id ?? '')) {
     throw new Error('Disposable Hyperdrive origin, role, cache or TLS readback mismatch');
   }
+}
+
+/** A separate protected target record and live provider reads must agree before disposable DDL. */
+export async function verifyQualificationTarget(root, name, head, artifactId,
+  { inventoryPath = process.env.STATEPLANE_QUALIFICATION_INVENTORY_FILE,
+    operationalInventoryPaths = {
+      development: process.env.STATEPLANE_DEVELOPMENT_INVENTORY_FILE,
+      production: process.env.STATEPLANE_PRODUCTION_INVENTORY_FILE
+    },
+    readback = connectedQualificationReadback, pgdataProof = connectedPgdataProof, signal } = {}) {
+  if (signal?.aborted) throw new Error('Qualification target verification interrupted');
+  const topology = JSON.parse(await readFile(resolve(root, 'deployment/topology.json'), 'utf8'));
+  const { environment, cell } = qualificationTarget(name, head, topology);
+  const definition = topology.environments[environment].cells.find(entry => entry.id === cell);
+  const expectedDatabase = `sta4_${head.slice(0, 16)}_${environment === 'development' ? 'dev' : 'prod'}_${cell.replaceAll('-', '_')}`;
+  const expectedRole = `sta4_probe_${head.slice(0, 16)}`;
+  const inventory = await readQualificationInventory(inventoryPath);
+  assertDisposableInventory(inventory, { name, expectedDatabase, expectedRole, artifactId });
+  if (!operationalInventoryPaths?.development || !operationalInventoryPaths?.production) {
+    throw new Error('Both protected operational inventory paths required');
+  }
+  const operational = {
+    development: await readQualificationInventory(operationalInventoryPaths.development),
+    production: await readQualificationInventory(operationalInventoryPaths.production)
+  };
+  validateDeploymentInventories(topology, operational.development, operational.production);
+  assertDisposableIsolation(inventory, operational);
+  const { railway, hyperdrive } = await readback(inventory, signal);
+  if (signal?.aborted) throw new Error('Qualification target verification interrupted');
+  const approvedImage = environment === 'development'
+    ? operational.development.cells[cell] : operational.production.cells[cell];
+  const proxy = assertDisposableProvider(inventory, definition, name, railway);
+  assertPostgresImageProvenance(name, approvedImage, railway.serviceInstance);
+  assertDisposableHyperdrive(inventory, definition, proxy, hyperdrive);
   await pgdataProof(inventory, railway, hyperdrive, signal);
   if (signal?.aborted) throw new Error('Qualification target verification interrupted');
   return { environment, cell, railwayRegion: definition.railwayRegion, database: inventory.database, role: inventory.role };

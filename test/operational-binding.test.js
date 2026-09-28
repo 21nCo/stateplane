@@ -49,6 +49,8 @@ test('each operational binding is proved through its exact Hyperdrive ID and Wor
     const evidence = await verifyOperationalBinding(environment, label, resource, database, h.dependencies);
     assert.equal(evidence.hyperdriveId, resource.hyperdriveId);
     assert.equal(h.config.hyperdrive[0].id, resource.hyperdriveId);
+    assert.equal(h.config.workers_dev, false);
+    assert.equal(h.config.preview_urls, true);
     assert.deepEqual(h.config.previews.hyperdrive, h.config.hyperdrive);
     assert.equal(h.config.vars.STATEPLANE_PROBE_DATABASE, database);
     assert.equal(h.config.vars.STATEPLANE_PROBE_ROLE, resource.databaseRole);
