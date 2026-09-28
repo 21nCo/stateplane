@@ -1,0 +1,30 @@
+deployment/workers/role-grants.js
+  h_a39f9495f9ec1d 10-11,30,43-44,55
+docs/regional-topology.md
+  h_a39f9495f9ec1d 20,38,54,57
+scripts/topology-live.mjs
+  h_a39f9495f9ec1d 33-39
+scripts/verify-topology.mjs
+  h_a39f9495f9ec1d 36
+scripts/wrangler-json.mjs
+  h_a39f9495f9ec1d 6-26
+test/qualification-config.test.js
+  h_a39f9495f9ec1d 102-106,117-118
+test/qualification-worker.test.ts
+  h_a39f9495f9ec1d 27,118,273,275,279,284,287-288,292,295
+test/role-grants-postgres.test.js
+  h_a39f9495f9ec1d 1-66
+test/topology.test.js
+  h_a39f9495f9ec1d 42-43,179-183,235,256-257
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0253f2ea118741cbc588ef6b0936908f80c76ebe",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
