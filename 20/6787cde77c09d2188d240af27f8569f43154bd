@@ -1,0 +1,30 @@
+deployment/workers/operational-verify.ts
+  h_a39f9495f9ec1d 1-50
+docs/regional-topology.md
+  h_a39f9495f9ec1d 42,44,54-55
+package.json
+  h_a39f9495f9ec1d 26-27
+scripts/operational-binding.mjs
+  h_a39f9495f9ec1d 1-77
+scripts/operational-dry-run.mjs
+  h_a39f9495f9ec1d 1-17
+scripts/qualification-load.mjs
+  h_a39f9495f9ec1d 49-52,55,57-59
+scripts/verify-topology.mjs
+  h_a39f9495f9ec1d 10,23,78-79,82-85,92-94
+test/operational-binding.test.js
+  h_a39f9495f9ec1d 1-93
+test/qualification-load.test.js
+  h_a39f9495f9ec1d 59-76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "206787cde77c09d2188d240af27f8569f43154bd",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
