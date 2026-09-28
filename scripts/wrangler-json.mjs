@@ -6,7 +6,8 @@ export function readWranglerJson(output) {
     const stack = [];
     let quoted = false;
     let escaped = false;
-    for (let end = index; end < output.length; end++) {
+    let end = index;
+    for (; end < output.length; end++) {
       const char = output[end];
       if (quoted) {
         if (escaped) escaped = false;
@@ -24,6 +25,9 @@ export function readWranglerJson(output) {
         }
       }
     }
+    // Candidate spans never overlap. In particular, a malformed opening
+    // bracket cannot make us scan the rest of a large response repeatedly.
+    index = end;
   }
   throw new Error('Wrangler returned no valid JSON');
 }

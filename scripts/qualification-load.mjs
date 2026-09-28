@@ -66,9 +66,13 @@ if (process.argv[1] && realpathSync(resolve(process.argv[1])) === realpathSync(f
     console.log(JSON.stringify(await runLoad(name, expectedUrl, Number(concurrencyText), Number(minimumHeadroomText),
       { signal: controller.signal })));
   } catch (error) {
-    console.error(controller.signal.aborted ? 'Qualification load interrupted' :
-      error instanceof Error ? error.message : 'Qualification load failed');
-    process.exitCode = controller.signal.aborted ? 130 : 1;
+    if (controller.signal.aborted) {
+      console.error('Qualification load interrupted');
+      process.exitCode = 130;
+    } else {
+      console.error(error instanceof Error ? error.message : 'Qualification load failed');
+      process.exitCode = 1;
+    }
   } finally {
     process.removeListener('SIGINT', cancel);
     process.removeListener('SIGTERM', cancel);

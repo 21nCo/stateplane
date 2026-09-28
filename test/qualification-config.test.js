@@ -116,6 +116,7 @@ test('Preview setup protects its token, requires a URL and verifies the latest b
       { id: hyperdriveId, origin: { database: 'stateplane' } });
     assert.deepEqual(readWranglerJson('Wrangler {status}\n' + JSON.stringify({ id: hyperdriveId }) + '\nPreview deployment complete'),
       { id: hyperdriveId });
+    assert.throws(() => readWranglerJson('['.repeat(1024 * 1024)), /no valid JSON/);
     assert.throws(() => readWranglerJson('x'.repeat(1024 * 1024 + 1)), /too large/);
     const altered = JSON.parse(await readFile(configPath));
     altered.previews.vars.STATEPLANE_PROBE_ROLE = 'admin';

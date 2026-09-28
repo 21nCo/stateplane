@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile, chmod } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile, chmod, mkdir, copyFile, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { validateTopology, validateInventory, validateDeploymentInventories, renderTopology, cellDatabaseName, railwayServiceName } from '../scripts/topology.mjs';
@@ -136,11 +136,13 @@ test('development and production cannot reuse provider scope or bindings', () =>
 });
 
 test('rendered control, gateways and every cell use isolated names and secret-free bindings', () => {
+  const inventories = syntheticInventories(topology);
   for (const environment of ['development', 'production']) {
     const env = topology.environments[environment];
-    const rendered = renderTopology(topology, environment, inventory(environment), '/tmp/stateplane-topology');
+    const counterpart = environment === 'development' ? inventories.production : inventories.development;
+    const rendered = renderTopology(topology, environment, inventories[environment], counterpart, '/tmp/stateplane-topology');
     assert.equal(Object.keys(rendered).length, 3 + 3 * env.cells.length);
-    assert.equal(rendered['directory.json'].hyperdrive[0].id, inventory(environment).control.hyperdriveId);
+    assert.equal(rendered['directory.json'].hyperdrive[0].id, inventories[environment].control.hyperdriveId);
     assert.equal(rendered['app.json'].services.length, 1 + env.cells.length);
     assert.equal(rendered['mcp.json'].services.length, 1 + env.cells.length);
     for (const config of Object.values(rendered)) {
@@ -151,7 +153,7 @@ test('rendered control, gateways and every cell use isolated names and secret-fr
     for (const cell of env.cells) {
       const regional = ['api', 'mcp', 'jobs'].map(role => rendered[`${cell.id}-${role}.json`]);
       for (const config of regional) {
-        assert.equal(config.hyperdrive[0].id, inventory(environment).cells[cell.id].hyperdriveId);
+        assert.equal(config.hyperdrive[0].id, inventories[environment].cells[cell.id].hyperdriveId);
         assert.deepEqual(config.placement, { mode: 'smart' });
         assert.equal(config.r2_buckets[0].binding, 'ORIGINALS');
         assert.equal(config.r2_buckets[0].bucket_name, `${env.prefix}-${cell.id}-originals`);
@@ -166,6 +168,48 @@ test('rendered control, gateways and every cell use isolated names and secret-fr
     }
     assert.equal(/password|DATABASE_URL|POSTGRES_PASSWORD/i.test(JSON.stringify(rendered)), false);
   }
+});
+
+test('render requires paired inventory and rechecks public app/MCP hosts on retry', () => {
+  const inventories = syntheticInventories(topology);
+  inventories.development.routes = { app: 'https://shared.example.com', mcp: 'https://dev-mcp.example.com' };
+  inventories.production.routes = { app: 'https://prod.example.com', mcp: 'https://shared.example.com' };
+  assert.throws(() => renderTopology(topology, 'development', inventories.development, undefined, '/tmp/topology'), /inventory must be an object/);
+  for (const environment of ['development', 'production']) {
+    const counterpart = environment === 'development' ? inventories.production : inventories.development;
+    assert.throws(() => renderTopology(topology, environment, inventories[environment], counterpart, '/tmp/topology'),
+      /Public route hosts must be unique across environments/);
+  }
+  inventories.production.routes.mcp = 'https://prod-mcp.example.com';
+  assert.equal(renderTopology(topology, 'production', inventories.production, inventories.development, '/tmp/topology')['mcp.json'].routes[0].pattern,
+    'prod-mcp.example.com');
+  inventories.production.routes.app = 'https://shared.example.com';
+  assert.throws(() => renderTopology(topology, 'production', inventories.production, inventories.development, '/tmp/topology'),
+    /Public route hosts must be unique across environments/);
+});
+
+test('render CLI fails before writing config when counterpart is missing or shares a route', async () => {
+  const projectRoot = await realpath(await mkdtemp(join(tmpdir(), 'sta4-render-preflight-')));
+  const inventories = syntheticInventories(topology);
+  inventories.development.routes = { app: 'https://shared.example.com', mcp: 'https://dev-mcp.example.com' };
+  inventories.production.routes = { app: 'https://prod.example.com', mcp: 'https://shared.example.com' };
+  try {
+    await mkdir(join(projectRoot, 'scripts'));
+    await mkdir(join(projectRoot, 'deployment'));
+    await writeFile(join(projectRoot, 'package.json'), '{"type":"module"}');
+    await copyFile(new URL('../scripts/topology.mjs', import.meta.url), join(projectRoot, 'scripts/topology.mjs'));
+    await writeFile(join(projectRoot, 'deployment/topology.json'), JSON.stringify(topology));
+    const devPath = join(projectRoot, 'development.json');
+    const prodPath = join(projectRoot, 'production.json');
+    await writeFile(devPath, JSON.stringify(inventories.development));
+    await writeFile(prodPath, JSON.stringify(inventories.production));
+    const script = join(projectRoot, 'scripts/topology.mjs');
+    assert.throws(() => execFileSync(process.execPath, [script, 'render', 'development', devPath], { cwd: projectRoot, stdio: 'pipe' }),
+      /counterpart-inventory/);
+    assert.throws(() => execFileSync(process.execPath, [script, 'render', 'development', devPath, prodPath], { cwd: projectRoot, stdio: 'pipe' }),
+      /Public route hosts must be unique across environments/);
+    await assert.rejects(readFile(join(projectRoot, '.data/topology/development/app.json')), { code: 'ENOENT' });
+  } finally { await rm(projectRoot, { recursive: true, force: true }); }
 });
 
 test('provider readback rejects wrong region, volume, origin, backup, PITR, TLS and cache for every resource', () => {

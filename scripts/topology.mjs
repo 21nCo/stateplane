@@ -192,9 +192,11 @@ const common = (out, name, main, role, environment, projectRoot) => ({
 const binding = (id) => [{ binding: 'AUTHORITY', id }];
 
 /** Render validated per-environment Worker configs without embedding secrets. */
-export function renderTopology(topology, environment, inventory, out, projectRoot = root) {
+export function renderTopology(topology, environment, inventory, counterpart, out, projectRoot = root) {
   validateTopology(topology);
-  validateInventory(topology, environment, inventory);
+  if (environment === 'development') validateDeploymentInventories(topology, inventory, counterpart);
+  else if (environment === 'production') validateDeploymentInventories(topology, counterpart, inventory);
+  else throw new Error('Unknown environment');
   const env = topology.environments[environment];
   const output = {};
   const local = names(env);
@@ -243,7 +245,7 @@ export function renderTopology(topology, environment, inventory, out, projectRoo
 }
 
 async function main() {
-  const [command, environment, inventoryPath] = process.argv.slice(2);
+  const [command, environment, inventoryPath, counterpartPath] = process.argv.slice(2);
   const topology = validateTopology(JSON.parse(await readFile(resolve(root, 'deployment/topology.json'), 'utf8')));
   if (command === 'validate' && !environment && !inventoryPath) {
     console.log('Topology valid: development 3 cells, production 2 cells');
@@ -257,10 +259,11 @@ async function main() {
     return;
   }
   if (command === 'compare') throw new Error('Usage: node scripts/topology.mjs compare <development-inventory.json> <production-inventory.json>');
-  if (command !== 'render' || !environment || !inventoryPath) throw new Error('Usage: node scripts/topology.mjs validate | render <environment> <private-inventory.json>');
+  if (command !== 'render' || !environment || !inventoryPath || !counterpartPath) throw new Error('Usage: node scripts/topology.mjs validate | render <environment> <private-inventory.json> <counterpart-inventory.json>');
   const inventory = JSON.parse(await readFile(resolve(inventoryPath), 'utf8'));
+  const counterpart = JSON.parse(await readFile(resolve(counterpartPath), 'utf8'));
   const out = resolve(root, '.data/topology', environment);
-  const configs = renderTopology(topology, environment, inventory, out);
+  const configs = renderTopology(topology, environment, inventory, counterpart, out);
   await mkdir(out, { recursive: true });
   for (const [file, config] of Object.entries(configs)) await writeFile(join(out, file), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
   console.log(`Rendered ${Object.keys(configs).length} ${environment} Worker configs in ${relative(root, out)}`);

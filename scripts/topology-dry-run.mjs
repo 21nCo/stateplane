@@ -33,7 +33,8 @@ export async function dryRunTopology(topology, { projectRoot = root, runWrangler
   for (const environment of Object.keys(topology.environments)) {
     const out = resolve(projectRoot, '.data/topology-dry-run', environment);
     await mkdir(out, { recursive: true });
-    const configs = renderTopology(topology, environment, inventories[environment], out, projectRoot);
+    const counterpart = environment === 'development' ? inventories.production : inventories.development;
+    const configs = renderTopology(topology, environment, inventories[environment], counterpart, out, projectRoot);
     for (const [file, config] of Object.entries(configs)) {
       const path = join(out, file);
       await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });

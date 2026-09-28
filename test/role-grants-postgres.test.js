@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, access } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from 'pg';
@@ -12,7 +13,11 @@ const run = promisify(execFile);
 let postgresBin;
 try {
   const version = execFileSync('pg_config', ['--version'], { encoding: 'utf8' });
-  if (/PostgreSQL 1[6-9]\./.test(version)) postgresBin = execFileSync('pg_config', ['--bindir'], { encoding: 'utf8' }).trim();
+  if (/PostgreSQL 1[6-9]\./.test(version)) {
+    const bin = execFileSync('pg_config', ['--bindir'], { encoding: 'utf8' }).trim();
+    await Promise.all([access(join(bin, 'initdb'), constants.X_OK), access(join(bin, 'pg_ctl'), constants.X_OK)]);
+    postgresBin = bin;
+  }
 } catch { /* The project unit suite also runs without a local PostgreSQL installation. */ }
 
 test('PostgreSQL 16 role admission rejects direct, inherited and indirect alternate roles before DDL',
@@ -22,7 +27,7 @@ test('PostgreSQL 16 role admission rejects direct, inherited and indirect altern
     let started = false;
     try {
       await run(join(postgresBin, 'initdb'), ['-D', data, '--auth-local=trust', '--auth-host=trust']);
-      await run(join(postgresBin, 'pg_ctl'), ['-D', data, '-o', `-k ${directory} -p 5432`, '-l', join(directory, 'log'), 'start']);
+      await run(join(postgresBin, 'pg_ctl'), ['-D', data, '-o', `-k ${directory} -c listen_addresses='' -p 5432`, '-l', join(directory, 'log'), 'start']);
       started = true;
       const client = new Client({ host: directory, database: 'postgres' });
       await client.connect();
