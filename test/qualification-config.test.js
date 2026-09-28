@@ -90,6 +90,7 @@ test('Preview setup protects its token, requires a URL and verifies the latest b
       assert.equal(JSON.parse(await readFile(secretFile)).PROBE_TOKEN, 'private-test-token');
       return 'Wrangler 4.135\n' + JSON.stringify({ preview_urls: ['https://probe.example.workers.dev'], deployment_urls: [] });
     }
+    assert.deepEqual(args, ['preview', 'secret', 'list', '--name', name, '--config', configPath, '--ignore-base-config', '--json']);
     return 'Reading secrets...\n' + JSON.stringify([{ name: 'PROBE_TOKEN', type: 'secret_text' }]);
   };
   try {
@@ -183,6 +184,15 @@ test('Preview helper resolves project Wrangler through the trusted Node executab
   assert.equal(invocation.command, process.execPath);
   assert.equal(invocation.args[0], resolve(root, 'app/node_modules/wrangler/bin/wrangler.js'));
   assert.deepEqual(invocation.args.slice(1), ['preview', '--json']);
+});
+
+test('pinned Wrangler exposes the Preview secret-list isolation arguments', async () => {
+  const invocation = wranglerInvocation(['preview', 'secret', 'list', '--help']);
+  const { stdout } = await run(invocation.command, invocation.args, { cwd: root });
+  assert.match(stdout, /^wrangler preview secret list$/m);
+  for (const option of ['--name', '--config', '--ignore-base-config', '--json']) {
+    assert.match(stdout, new RegExp(`(^|\\s)${option}(?=\\s)`));
+  }
 });
 
 test('documented Preview CLI reads protected token, prints Preview URL and handles interruption', { timeout: 15_000 }, async () => {
