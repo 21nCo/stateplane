@@ -87,13 +87,16 @@ test('Preview setup protects its token, requires a URL and verifies the latest b
       secretFile = args[args.indexOf('--secrets-file') + 1];
       assert.equal((await stat(secretFile)).mode & 0o077, 0);
       assert.equal(JSON.parse(await readFile(secretFile)).PROBE_TOKEN, 'private-test-token');
-      return 'Wrangler 4.135\n' + JSON.stringify({ preview: { urls: ['https://probe.example.workers.dev'] }, deployment: { urls: [] } });
+      return 'Wrangler 4.135\n' + JSON.stringify({ preview_urls: ['https://probe.example.workers.dev'], deployment_urls: [] });
     }
     return 'Reading secrets...\n' + JSON.stringify([{ name: 'PROBE_TOKEN', type: 'secret_text' }]);
   };
   try {
     await run(process.execPath, [script, name, hyperdriveId]);
     assert.deepEqual(await setupPreview(name, 'private-test-token', { runWrangler }), ['https://probe.example.workers.dev']);
+    assert.deepEqual(await setupPreview(name, 'private-test-token', { runWrangler: async args =>
+      args.includes('--secrets-file') ? JSON.stringify({ preview: { urls: ['https://probe.example.workers.dev'] } }) :
+        JSON.stringify([{ name: 'PROBE_TOKEN', type: 'secret_text' }]) }), ['https://probe.example.workers.dev']);
     assert.equal(JSON.stringify(calls).includes('private-test-token'), false);
     await assert.rejects(readFile(secretFile), { code: 'ENOENT' });
     assert.equal((await readFile(configPath, 'utf8')).includes('private-test-token'), false);
@@ -191,26 +194,44 @@ if (args.includes('--secrets-file')) {
   const file = args[args.indexOf('--secrets-file') + 1];
   if (readFileSync(file, 'utf8').includes('private-test-token') === false) process.exit(2);
   if (process.env.FAKE_WAIT) {
-    writeFileSync(process.env.FAKE_MARKER, JSON.stringify({ file }));
+    writeFileSync(process.env.FAKE_MARKER, JSON.stringify({ pid: process.pid, file }));
     setInterval(() => {}, 1000);
-  } else console.log(JSON.stringify({ preview: { urls: ['https://probe.example.workers.dev'] }, deployment: { urls: [] } }));
+  } else console.log(JSON.stringify({ preview_urls: ['https://probe.example.workers.dev'], deployment_urls: [] }));
 } else console.log(JSON.stringify([{ name: 'PROBE_TOKEN', type: 'secret_text' }]));`);
     const env = { ...process.env, PROBE_TOKEN: 'private-test-token' };
     const { stdout } = await run(process.execPath, [helper, name], { env });
     assert.deepEqual(JSON.parse(stdout), { name, urls: ['https://probe.example.workers.dev'], probeTokenBound: true });
     await assert.rejects(run(process.execPath, [helper, name], { env: { ...env, PROBE_TOKEN: '' } }), /protected single-line PROBE_TOKEN/);
     if (process.platform !== 'win32') {
-      const child = spawn(process.execPath, [helper, name], { env: { ...env, FAKE_WAIT: '1', FAKE_MARKER: marker }, stdio: ['ignore', 'pipe', 'pipe'] });
+      const child = spawn(process.execPath, [helper, name], { env: { ...env, TMPDIR: directory, FAKE_WAIT: '1', FAKE_MARKER: marker }, stdio: ['ignore', 'pipe', 'pipe'] });
       const closed = new Promise(resolveClose => child.on('close', resolveClose));
       let observed;
-      for (let attempt = 0; attempt < 100; attempt++) {
-        try { observed = JSON.parse(await readFile(marker, 'utf8')); break; }
-        catch { await new Promise(resolveDelay => setTimeout(resolveDelay, 25)); }
+      const bounded = (promise, timeout) => {
+        let timer;
+        return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Preview child did not exit')), timeout); })])
+          .finally(() => clearTimeout(timer));
+      };
+      try {
+        for (let attempt = 0; attempt < 100; attempt++) {
+          try { observed = JSON.parse(await readFile(marker, 'utf8')); break; }
+          catch { await new Promise(resolveDelay => setTimeout(resolveDelay, 25)); }
+        }
+        assert.ok(observed, 'Wrangler child started');
+        child.kill('SIGINT');
+        assert.equal(await bounded(closed, 5000), 130);
+        await assert.rejects(readFile(observed.file), { code: 'ENOENT' });
+        assert.throws(() => process.kill(observed.pid, 0), { code: 'ESRCH' });
+      } finally {
+        if (!observed) {
+          try { observed = JSON.parse(await readFile(marker, 'utf8')); } catch { /* Child may not have launched. */ }
+        }
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+        if (observed?.pid) {
+          try { process.kill(observed.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+        }
+        await bounded(closed, 2000);
+        if (observed?.file) await rm(observed.file, { force: true });
       }
-      assert.ok(observed, 'Wrangler child started');
-      child.kill('SIGINT');
-      assert.equal(await closed, 130);
-      await assert.rejects(readFile(observed.file), { code: 'ENOENT' });
     }
   } finally { await rm(directory, { recursive: true, force: true }); }
 });

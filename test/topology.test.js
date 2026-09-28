@@ -181,6 +181,37 @@ test('provider readback rejects wrong region, volume, origin, backup, PITR, TLS 
   }
 });
 
+test('live provider identity accepts canonical hex case but rejects different IDs for every resource', () => {
+  const identities = [
+    [['resource', 'serviceId'], ['railway', 'service', 'id']],
+    [['resource', 'serviceId'], ['railway', 'serviceInstance', 'serviceId']],
+    [['resource', 'serviceId'], ['railway', 'volumeInstance', 'serviceId']],
+    [['resource', 'serviceId'], ['railway', 'tcpProxies', 0, 'serviceId']],
+    [['resource', 'volumeInstanceId'], ['railway', 'volumeInstance', 'id']],
+    [['resource', 'hyperdriveId'], ['hyperdrive', 'id']],
+    [['projectId'], ['railway', 'service', 'projectId']],
+    [['environmentId'], ['railway', 'serviceInstance', 'environmentId']],
+    [['environmentId'], ['railway', 'volumeInstance', 'environmentId']],
+    [['environmentId'], ['railway', 'tcpProxies', 0, 'environmentId']]
+  ];
+  const parent = (value, path) => path.slice(0, -1).reduce((current, key) => current[key], value);
+  for (const environment of ['development', 'production']) {
+    for (const label of ['control', ...topology.environments[environment].cells.map(cell => cell.id)]) {
+      for (const [expectedPath, actualPath] of identities) {
+        const sample = live(environment, label);
+        const expected = parent(sample, expectedPath);
+        const actual = parent(sample, actualPath);
+        const expectedKey = expectedPath.at(-1);
+        const actualKey = actualPath.at(-1);
+        expected[expectedKey] = expected[expectedKey].toUpperCase();
+        assert.doesNotThrow(() => assertLiveResources(sample), `${environment}/${label} ${actualPath.join('.')}`);
+        actual[actualKey] = `0${actual[actualKey].slice(1)}`;
+        assert.throws(() => assertLiveResources(sample), /mismatch|unavailable|ambiguous/, `${environment}/${label} ${actualPath.join('.')}`);
+      }
+    }
+  }
+});
+
 test('protected SQL proof rejects wrong database, role and untrusted TLS for every resource', async () => {
   for (const environment of ['development', 'production']) {
     for (const label of ['control', ...topology.environments[environment].cells.map(cell => cell.id)]) {

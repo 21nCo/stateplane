@@ -5,7 +5,7 @@ import { resolve } from 'node:path';
 import { X509Certificate } from 'node:crypto';
 import { readProtectedSqlUrls, verifySqlIdentity } from './topology-sql.mjs';
 import { validateTopology, validateInventory, cellDatabaseName, railwayServiceName } from './topology.mjs';
-import { assertLiveResources } from './topology-live.mjs';
+import { assertLiveResources, sameProviderId } from './topology-live.mjs';
 
 const run = promisify(execFile);
 const [environment, inventoryPath] = process.argv.slice(2);
@@ -63,7 +63,7 @@ async function verifyUploadedCa(id) {
   });
   if (!response.ok) throw new Error('Uploaded Hyperdrive CA certificate is unavailable');
   const body = await response.json();
-  if (body.success !== true || body.result?.id !== id || body.result?.ca !== true ||
+  if (body.success !== true || !sameProviderId(body.result?.id, id) || body.result?.ca !== true ||
       typeof body.result.certificates !== 'string' || !body.result.certificates.includes('-----BEGIN CERTIFICATE-----')) {
     throw new Error('Uploaded Hyperdrive CA certificate is unavailable');
   }

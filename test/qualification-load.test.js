@@ -31,7 +31,7 @@ test('load rejects impossible counts and uses the worst reading across requests'
   try {
     await writeFile(mock, `let call = 0;
 globalThis.fetch = async () => {
-  const observedConnections = process.env.IMPOSSIBLE ? 1 : [2, 16, 4][call++ % 3];
+  const observedConnections = process.env.IMPOSSIBLE ? (call++ === 2 ? 1 : 2) : [2, 16, 4][call++ % 3];
   return { ok: true, json: async () => ({ ok: true, rollback: true, freshRead: true, observedConnections,
     maxConnections: 20, reservedConnections: 2, elapsedMs: observedConnections }) };
 };`);
@@ -39,7 +39,7 @@ globalThis.fetch = async () => {
     await assert.rejects(run(process.execPath, [script, 'https://preview.example/qualify', '3', '3'], { env }), /Origin connection headroom below 3/);
     const { stdout } = await run(process.execPath, [script, 'https://preview.example/qualify', '3', '2'], { env });
     assert.equal(JSON.parse(stdout).peakObservedConnections, 16);
-    await assert.rejects(run(process.execPath, [script, 'https://preview.example/qualify', '3', '2'], { env: { ...env, IMPOSSIBLE: '1' } }), /Incomplete qualification result/);
+    await assert.rejects(run(process.execPath, [script, 'https://preview.example/qualify', '3', '2'], { env: { ...env, IMPOSSIBLE: '1' } }), /1\/3 concurrent qualification requests failed/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

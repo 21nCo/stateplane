@@ -69,7 +69,7 @@ export async function setupPreview(name, token, { runWrangler = wrangler, signal
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
-  const urls = deployed?.preview?.urls;
+  const urls = deployed?.preview_urls ?? deployed?.preview?.urls;
   if (!Array.isArray(urls) || urls.length === 0 ||
       !urls.every(url => typeof url === 'string' && url.startsWith('https://'))) {
     throw new Error('Preview deployment returned no usable HTTPS URL');
