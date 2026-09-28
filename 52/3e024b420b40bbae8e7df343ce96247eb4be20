@@ -1,0 +1,40 @@
+docs/regional-topology.md
+  h_a39f9495f9ec1d 16,52,61
+scripts/operational-binding.mjs
+  h_a39f9495f9ec1d 21
+scripts/qualification-artifact.mjs
+  h_a39f9495f9ec1d 48
+scripts/qualification-target.mjs
+  h_a39f9495f9ec1d 59-60,63,73-75,85-87,106-109,118-151
+scripts/topology-sql.mjs
+  h_a39f9495f9ec1d 3-4,8-48,99-101,109-110,123-130
+scripts/topology.mjs
+  h_a39f9495f9ec1d 71-72
+scripts/verify-topology.mjs
+  h_a39f9495f9ec1d 75-77
+scripts/wrangler-command.mjs
+  h_a39f9495f9ec1d 1,7-34,43
+test/connected/qualification-provider.test.js
+  h_a39f9495f9ec1d 11,14,17-21,23-27
+test/operational-binding.test.js
+  h_a39f9495f9ec1d 52-53
+test/qualification-config.test.js
+  h_a39f9495f9ec1d 33-34
+test/topology-pgdata.test.js
+  h_a39f9495f9ec1d 3,8-12,14-16,25-29,31,33-40,42-56,59-83,86,89,92,95-96,98
+test/topology-verification-flow.test.js
+  h_a39f9495f9ec1d 54-55,63-64,82,84
+test/wrangler-command.test.js
+  h_a39f9495f9ec1d 3,29-56,66-68
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "523e024b420b40bbae8e7df343ce96247eb4be20",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
