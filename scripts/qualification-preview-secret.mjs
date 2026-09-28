@@ -1,4 +1,3 @@
-import { spawn } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -8,6 +7,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { currentCleanHead, qualificationConfig } from './qualification-artifact.mjs';
 import { verifyQualificationTarget } from './qualification-target.mjs';
 import { readWranglerJson } from './wrangler-json.mjs';
+import { runBoundedCommand } from './bounded-command.mjs';
 
 export { readWranglerJson } from './wrangler-json.mjs';
 
@@ -17,33 +17,12 @@ export const wranglerInvocation = (args, entry = wranglerEntry) => ({ command: p
 
 /** Launch only the pinned project-local Wrangler entry with the trusted Node executable. */
 export async function wrangler(args, signal, entry = wranglerEntry) {
-  return new Promise((resolveResult, reject) => {
-    const invocation = wranglerInvocation(args, entry);
-    const child = spawn(invocation.command, invocation.args, {
-      cwd: root, env: process.env, stdio: ['ignore', 'pipe', 'pipe'], signal
-    });
-    let output = '';
-    let launchError;
-    let killTimer;
-    const onAbort = () => {
-      killTimer = setTimeout(() => child.kill('SIGKILL'), 5000);
-      killTimer.unref();
-    };
-    signal?.addEventListener('abort', onAbort, { once: true });
-    child.stdout.on('data', chunk => {
-      output += chunk;
-      if (output.length > 1024 * 1024) child.kill();
-    });
-    // Deployment diagnostics can include credential-bearing metadata.
-    child.stderr.resume();
-    child.on('error', error => { launchError = error; });
-    child.on('close', code => {
-      signal?.removeEventListener('abort', onAbort);
-      if (killTimer) clearTimeout(killTimer);
-      if (!launchError && code === 0 && !signal?.aborted) resolveResult(output);
-      else reject(new Error('Wrangler Preview secret command failed'));
-    });
+  const invocation = wranglerInvocation(args, entry);
+  const { stdout } = await runBoundedCommand(invocation.command, invocation.args, {
+    cwd: root, env: process.env, maxBuffer: 1024 * 1024, timeout: 60_000, signal,
+    errorMessage: 'Wrangler Preview secret command failed'
   });
+  return stdout;
 }
 
 /** Own the temporary token file until deployment has exited or been cancelled. */

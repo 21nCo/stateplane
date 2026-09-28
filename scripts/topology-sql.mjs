@@ -1,29 +1,11 @@
 import { Client } from 'pg';
 import { readFile, stat } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
 import { operationalGrantsAllowed, operationalGrantsSql } from '../deployment/workers/role-grants.js';
 import { assertVolumePlacement } from './topology-live.mjs';
+import { runBoundedCommand } from './bounded-command.mjs';
 
-async function runRailway(command, args, { maxBuffer, timeout, signal }) {
-  return new Promise((resolveResult, reject) => {
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], signal });
-    let stdout = '';
-    let failed = false;
-    let launchError;
-    const timer = setTimeout(() => { failed = true; child.kill('SIGKILL'); }, timeout);
-    child.stdout.on('data', chunk => {
-      stdout += chunk;
-      if (stdout.length > maxBuffer) { failed = true; child.kill('SIGKILL'); }
-    });
-    child.stderr.resume();
-    child.on('error', error => { launchError = error; });
-    child.on('close', code => {
-      clearTimeout(timer);
-      if (signal?.aborted || launchError || code !== 0 || failed) reject(new Error('Railway SSH storage readback failed or interrupted'));
-      else resolveResult({ stdout });
-    });
-  });
-}
+const runRailway = (command, args, options) => runBoundedCommand(command, args,
+  { ...options, errorMessage: 'Railway SSH storage readback failed or interrupted' });
 
 // Railway SSH inspects the running container, because SQL cannot resolve a pg_wal symlink.
 export async function verifyRailwayStoragePaths({ label, projectId, environmentId, serviceId,
@@ -41,21 +23,27 @@ export async function verifyRailwayStoragePaths({ label, projectId, environmentI
   }
 }
 
-const settingsRoleSql = `SELECT r.rolsuper, r.rolcreatedb, r.rolcreaterole, r.rolreplication, r.rolbypassrls,
+export const settingsRoleSql = `WITH RECURSIVE reachable(roleid) AS (
+  SELECT oid FROM pg_roles WHERE rolname = current_user
+  UNION
+  SELECT m.roleid FROM pg_auth_members m JOIN reachable r ON m.member = r.roleid
+)
+SELECT r.rolsuper, r.rolcreatedb, r.rolcreaterole, r.rolreplication, r.rolbypassrls,
   pg_has_role(current_user, 'pg_read_all_settings', 'USAGE') AS can_read_settings,
   has_database_privilege(current_database(), 'CREATE') AS can_create_database,
   EXISTS (SELECT 1 FROM pg_namespace n WHERE n.nspname !~ '^pg_' AND
     has_schema_privilege(n.oid, 'CREATE')) AS can_create_schema,
   EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' AND
-    has_table_privilege(c.oid, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')) AS can_access_tables,
-  (SELECT count(*) = 1 AND bool_and(parent.rolname = 'pg_read_all_settings')
-    FROM pg_auth_members m JOIN pg_roles parent ON parent.oid = m.roleid WHERE m.member = r.oid) AS only_settings_membership
+    (has_table_privilege(c.oid, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') OR
+      has_any_column_privilege(c.oid, 'SELECT,INSERT,UPDATE,REFERENCES'))) AS can_access_tables,
+  (SELECT count(*) = 2 AND bool_and(member.rolname IN (current_user, 'pg_read_all_settings'))
+    FROM reachable JOIN pg_roles member ON member.oid = reachable.roleid) AS only_settings_membership
   FROM pg_roles r WHERE r.rolname = current_user`;
 
 function assertSettingsRole(label, result) {
   const row = result.rows?.[0];
-  if (result.rows?.length !== 1 || !row || row.rolsuper !== false || row.rolcreatedb !== false ||
+  if (result.rows?.length !== 1 || row?.rolsuper !== false || row.rolcreatedb !== false ||
       row.rolcreaterole !== false || row.rolreplication !== false || row.rolbypassrls !== false ||
       row.can_read_settings !== true || row.can_create_database !== false ||
       row.can_create_schema !== false || row.can_access_tables !== false ||

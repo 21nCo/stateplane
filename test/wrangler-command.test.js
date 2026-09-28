@@ -39,8 +39,11 @@ test('in-flight Wrangler Hyperdrive readback exits on abort', { timeout: 10_000 
     const pending = readHyperdrive('a'.repeat(32), { signal: controller.signal, projectRoot });
     let pid;
     for (let attempt = 0; attempt < 100; attempt++) {
-      try { pid = Number(await readFile(marker, 'utf8')); break; }
-      catch { await new Promise(resolveDelay => setTimeout(resolveDelay, 25)); }
+      try {
+        const value = (await readFile(marker, 'utf8')).trim();
+        if (/^[1-9]\d*$/.test(value)) { pid = Number(value); break; }
+      } catch { /* Child has not written its PID yet. */ }
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 25));
     }
     assert.ok(pid, 'Wrangler child started');
     controller.abort();
