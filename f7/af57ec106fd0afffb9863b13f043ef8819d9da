@@ -1,0 +1,19 @@
+test/qualification-config.test.js
+  s_ad6b4afbe2edd7::t_6a1610f65ebb1f 93,189-197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f7af57ec106fd0afffb9863b13f043ef8819d9da",
+  "prompts": {},
+  "sessions": {
+    "s_ad6b4afbe2edd7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0e6ae-9497-7823-aebf-e23e3aefe166",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
