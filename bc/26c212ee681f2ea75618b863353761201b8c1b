@@ -1,0 +1,34 @@
+docs/regional-topology.md
+  h_a39f9495f9ec1d 16,38,40,42
+scripts/qualification-load.mjs
+  h_a39f9495f9ec1d 9,20-24
+scripts/qualification-preview-secret.mjs
+  h_a39f9495f9ec1d 2,72-74,82,85,95-98
+scripts/topology-dry-run.mjs
+  h_a39f9495f9ec1d 10-26,33,36
+scripts/topology-live.mjs
+  h_a39f9495f9ec1d 15
+scripts/topology-sql.mjs
+  h_a39f9495f9ec1d 2-7
+scripts/topology.mjs
+  h_a39f9495f9ec1d 14,138,143
+scripts/verify-topology.mjs
+  h_a39f9495f9ec1d 3,6,22
+test/qualification-config.test.js
+  h_a39f9495f9ec1d 3,5,90,101,103,174-216
+test/qualification-load.test.js
+  h_a39f9495f9ec1d 42,47-69
+test/topology.test.js
+  h_a39f9495f9ec1d 4-6,9-10,20-22,24,36-37,39,44,50,96-101,109-110,112-114,170,215-238
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bc26c212ee681f2ea75618b863353761201b8c1b",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
