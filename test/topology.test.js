@@ -39,7 +39,8 @@ const live = (environment, label) => {
     volumeInstance: { id: resource.volumeInstanceId, serviceId: resource.serviceId, environmentId: inventory(environment).environmentId,
       region: definition.railwayRegion, deletedAt: null, isPendingDeletion: false },
     backupSchedules: [{ retentionSeconds: environment === 'production' ? 30 * 86400 : 6 * 86400 }],
-    backups: [{ id: 'snapshot', createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 86400_000).toISOString() }],
+    backups: [{ id: 'snapshot', externalId: 'railway-snapshot', usedMB: 0, referencedMB: 0, volumeInstanceSizeMB: 1024,
+      createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 86400_000).toISOString() }],
     pitrEstimate: { baseBackupLabel: 'full', likelyToFit: true },
     tcpProxies: [{ serviceId: resource.serviceId, environmentId: inventory(environment).environmentId, applicationPort: 5432,
       domain: 'tcp.railway.app', proxyPort: 12345, deletedAt: null }]
@@ -175,6 +176,11 @@ test('provider readback rejects wrong region, volume, origin, backup, PITR, TLS 
       check(bad => { bad.railway.serviceInstance.source.repo = 'unrelated/repo'; });
       check(bad => { bad.railway.backupSchedules = []; });
       check(bad => { bad.railway.backups = []; });
+      check(bad => { bad.railway.backups[0].externalId = ''; });
+      check(bad => { bad.railway.backups[0].usedMB = null; });
+      check(bad => { bad.railway.backups[0].referencedMB = null; });
+      check(bad => { bad.railway.backups[0].volumeInstanceSizeMB = 0; });
+      check(bad => { bad.railway.backups[0].createdAt = new Date(Date.now() + 86400_000).toISOString(); });
       check(bad => { bad.railway.pitrEstimate = null; });
       check(bad => { bad.railway.tcpProxies[0].proxyPort = 5432; });
       check(bad => { bad.hyperdrive.caching.disabled = false; });
@@ -226,7 +232,7 @@ test('protected SQL proof rejects wrong database, role and untrusted TLS for eve
       const proxy = sample.railway.tcpProxies[0];
       const url = `postgres://${sample.resource.databaseRole}:private@${proxy.domain}:${proxy.proxyPort}/${sample.database}`;
       // Operational roles may access application tables after schema migration.
-      let grantRow = { safe_login: true, no_elevated_membership: true, can_connect: true,
+      let grantRow = { safe_login: true, no_elevated_membership: true, no_other_role_membership: true, can_connect: true,
         no_database_create: true, can_use_schema: true, no_other_schema_create: true };
       const FakeClient = class {
         constructor(options) { this.options = options; }
@@ -246,6 +252,8 @@ test('protected SQL proof rejects wrong database, role and untrusted TLS for eve
       };
       await verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url, FakeClient);
       grantRow = { ...grantRow, no_elevated_membership: false };
+      await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url, FakeClient), /verified-TLS/);
+      grantRow = { ...grantRow, no_elevated_membership: true, no_other_role_membership: false };
       await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url, FakeClient), /verified-TLS/);
       grantRow = null;
       await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url, FakeClient), /verified-TLS/);

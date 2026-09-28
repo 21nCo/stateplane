@@ -24,7 +24,7 @@ const database = vi.hoisted(() => ({
   targetDatabase: 'sta4_aaaaaaaaaaaaaaaa_dev_ap_southeast',
   targetRole: 'sta4_probe_aaaaaaaaaaaaaaaa',
   grants: {
-    safe_login: true, no_elevated_membership: true, can_connect: true,
+    safe_login: true, no_elevated_membership: true, no_other_role_membership: true, can_connect: true,
     no_database_create: true, can_use_schema: true, can_create_probe_table: true,
     no_other_schema_create: true, no_other_table_access: true
   } as Record<string, boolean> | null
@@ -115,7 +115,7 @@ describe('disposable qualification row cleanup', () => {
     database.targetDatabase = 'sta4_aaaaaaaaaaaaaaaa_dev_ap_southeast';
     database.targetRole = 'sta4_probe_aaaaaaaaaaaaaaaa';
     database.grants = {
-      safe_login: true, no_elevated_membership: true, can_connect: true,
+      safe_login: true, no_elevated_membership: true, no_other_role_membership: true, can_connect: true,
       no_database_create: true, can_use_schema: true, can_create_probe_table: true,
       no_other_schema_create: true, no_other_table_access: true
     };
@@ -270,24 +270,29 @@ describe('disposable qualification row cleanup', () => {
   });
 
   it('rejects elevated and unavailable effective grants before any DDL or row mutation', async () => {
-    for (const key of ['safe_login', 'no_elevated_membership', 'no_database_create', 'no_other_schema_create', 'no_other_table_access',
+    for (const key of ['safe_login', 'no_elevated_membership', 'no_other_role_membership', 'no_database_create', 'no_other_schema_create', 'no_other_table_access',
       'can_connect', 'can_use_schema', 'can_create_probe_table']) {
+      const beforeClose = database.closed;
       database.grants = { ...database.grants, [key]: false };
       expect((await qualify()).status).toBe(500);
       expect(database.queries.some(sql => sql.startsWith('CREATE TABLE') || sql.startsWith('INSERT'))).toBe(false);
-      expect(database.closed).toBeGreaterThanOrEqual(2);
+      expect(database.closed - beforeClose).toBe(2);
       database.grants = { ...database.grants, [key]: true };
       database.queries = [];
     }
     database.grants = null;
+    let beforeClose = database.closed;
     expect((await qualify()).status).toBe(500);
     expect(database.queries.some(sql => sql.startsWith('CREATE TABLE'))).toBe(false);
-    database.grants = { safe_login: true, no_elevated_membership: true, can_connect: true,
+    expect(database.closed - beforeClose).toBe(2);
+    database.grants = { safe_login: true, no_elevated_membership: true, no_other_role_membership: true, can_connect: true,
       no_database_create: true, can_use_schema: true, can_create_probe_table: true,
       no_other_schema_create: true, no_other_table_access: true };
     database.failQuery = 'FROM pg_roles';
+    beforeClose = database.closed;
     expect((await qualify()).status).toBe(500);
     expect(database.queries.some(sql => sql.startsWith('CREATE TABLE'))).toBe(false);
+    expect(database.closed - beforeClose).toBe(2);
   });
 
   it('denies missing, wrong and non-Bearer credentials and non-disposable deployments before connecting', async () => {

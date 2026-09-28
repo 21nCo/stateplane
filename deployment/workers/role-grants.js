@@ -7,6 +7,8 @@ export const qualificationGrantsSql = `SELECT
      WHERE pg_has_role(current_user, oid, 'MEMBER')
        AND (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls
             OR left(rolname, 3) = 'pg_')) AS no_elevated_membership,
+  NOT EXISTS (SELECT 1 FROM pg_roles
+     WHERE rolname <> current_user AND pg_has_role(current_user, oid, 'MEMBER')) AS no_other_role_membership,
   has_database_privilege(current_user, current_database(), 'CONNECT') AS can_connect,
   NOT has_database_privilege(current_user, current_database(), 'CREATE') AS no_database_create,
   has_schema_privilege(current_user, 'public', 'USAGE') AS can_use_schema,
@@ -25,7 +27,7 @@ export const qualificationGrantsSql = `SELECT
 
 export function qualificationGrantsAllowed(row) {
   return row !== null && typeof row === 'object' &&
-    Object.keys(row).length === 8 &&
+    Object.keys(row).length === 9 &&
     Object.values(row).every(value => value === true);
 }
 
@@ -38,6 +40,8 @@ export const operationalGrantsSql = `SELECT
      WHERE pg_has_role(current_user, oid, 'MEMBER')
        AND (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls
             OR left(rolname, 3) = 'pg_')) AS no_elevated_membership,
+  NOT EXISTS (SELECT 1 FROM pg_roles
+     WHERE rolname <> current_user AND pg_has_role(current_user, oid, 'MEMBER')) AS no_other_role_membership,
   has_database_privilege(current_user, current_database(), 'CONNECT') AS can_connect,
   NOT has_database_privilege(current_user, current_database(), 'CREATE') AS no_database_create,
   has_schema_privilege(current_user, 'public', 'USAGE') AS can_use_schema,
@@ -48,6 +52,6 @@ export const operationalGrantsSql = `SELECT
 
 export function operationalGrantsAllowed(row) {
   return row !== null && typeof row === 'object' &&
-    Object.keys(row).length === 6 &&
+    Object.keys(row).length === 7 &&
     Object.values(row).every(value => value === true);
 }

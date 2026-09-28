@@ -30,7 +30,13 @@ export function assertLiveResources({ label, environment, definition, resource, 
   const requiredRetention = (environment === 'production' ? 7 : 1) * DAY_SECONDS;
   if (!Array.isArray(backupSchedules) || !backupSchedules.some(schedule =>
     Number.isInteger(schedule.retentionSeconds) && schedule.retentionSeconds >= requiredRetention) ||
-      !Array.isArray(backups) || !backups.some(backup => backup.id && backup.createdAt &&
+      !Array.isArray(backups) || !backups.some(backup =>
+        typeof backup.id === 'string' && backup.id.length > 0 &&
+        typeof backup.externalId === 'string' && backup.externalId.length > 0 &&
+        Number.isInteger(backup.usedMB) && backup.usedMB >= 0 &&
+        Number.isInteger(backup.referencedMB) && backup.referencedMB >= 0 &&
+        Number.isInteger(backup.volumeInstanceSizeMB) && backup.volumeInstanceSizeMB > 0 &&
+        Number.isFinite(Date.parse(backup.createdAt)) && Date.parse(backup.createdAt) <= Date.now() &&
         (!backup.expiresAt || Date.parse(backup.expiresAt) > Date.now()))) {
     throw new Error(`${label}: Railway volume backup retention or completed backup missing`);
   }

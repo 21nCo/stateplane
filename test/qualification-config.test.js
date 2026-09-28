@@ -99,6 +99,11 @@ test('Preview setup protects its token, requires a URL and verifies the latest b
     assert.deepEqual(await setupPreview(name, 'private-test-token', { runWrangler: async args =>
       args.includes('--secrets-file') ? JSON.stringify({ preview: { urls: ['https://probe.example.workers.dev'] } }) :
         JSON.stringify([{ name: 'PROBE_TOKEN', type: 'secret_text' }]) }), ['https://probe.example.workers.dev']);
+    assert.deepEqual(await setupPreview(name, 'private-test-token', { runWrangler: async args =>
+      `Wrangler {status}\n${args.includes('--secrets-file')
+        ? JSON.stringify({ preview_urls: ['https://probe.example.workers.dev'] })
+        : JSON.stringify([{ name: 'PROBE_TOKEN', type: 'secret_text' }])}\nWrangler complete` }),
+    ['https://probe.example.workers.dev']);
     assert.equal(JSON.stringify(calls).includes('private-test-token'), false);
     await assert.rejects(readFile(secretFile), { code: 'ENOENT' });
     assert.equal((await readFile(configPath, 'utf8')).includes('private-test-token'), false);
@@ -109,6 +114,8 @@ test('Preview setup protects its token, requires a URL and verifies the latest b
     assert.throws(() => readWranglerJson('Wrangler banner without JSON'), /no valid JSON/);
     assert.deepEqual(readWranglerJson('Wrangler {status}\n' + JSON.stringify({ id: hyperdriveId, origin: { database: 'stateplane' } })),
       { id: hyperdriveId, origin: { database: 'stateplane' } });
+    assert.deepEqual(readWranglerJson('Wrangler {status}\n' + JSON.stringify({ id: hyperdriveId }) + '\nPreview deployment complete'),
+      { id: hyperdriveId });
     assert.throws(() => readWranglerJson('x'.repeat(1024 * 1024 + 1)), /too large/);
     const altered = JSON.parse(await readFile(configPath));
     altered.previews.vars.STATEPLANE_PROBE_ROLE = 'admin';

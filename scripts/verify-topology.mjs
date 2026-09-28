@@ -33,7 +33,7 @@ const providerQuery = `query ReadCell($projectId: String!, $serviceId: String!, 
   serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { serviceId environmentId region deletedAt source { image repo } latestDeployment { status meta } }
   volumeInstance(id: $volumeInstanceId) { id serviceId environmentId region deletedAt isPendingDeletion }
   volumeInstanceBackupScheduleList(volumeInstanceId: $volumeInstanceId) { id retentionSeconds }
-  volumeInstanceBackupList(volumeInstanceId: $volumeInstanceId) { id createdAt expiresAt }
+  volumeInstanceBackupList(volumeInstanceId: $volumeInstanceId) { id externalId createdAt expiresAt usedMB referencedMB volumeInstanceSizeMB }
   volumeInstancePitrRestoreEstimate(volumeInstanceId: $volumeInstanceId, targetTimestamp: $targetTimestamp) { baseBackupLabel likelyToFit }
   tcpProxies(serviceId: $serviceId, environmentId: $environmentId) { id serviceId environmentId applicationPort domain proxyPort deletedAt }
 }`;
