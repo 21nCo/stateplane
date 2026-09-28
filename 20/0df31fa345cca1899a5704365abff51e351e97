@@ -1,0 +1,26 @@
+docs/regional-topology.md
+  h_a39f9495f9ec1d 39
+scripts/topology-ca.mjs
+  h_a39f9495f9ec1d 1-22
+scripts/topology-live.mjs
+  h_a39f9495f9ec1d 52,54
+scripts/verify-topology.mjs
+  h_a39f9495f9ec1d 7-8,65
+test/fixtures/sta4-ca-certificate.txt
+  h_a39f9495f9ec1d 1-19
+test/topology-ca.test.js
+  h_a39f9495f9ec1d 1-24
+test/topology.test.js
+  h_a39f9495f9ec1d 48,179-181
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "200df31fa345cca1899a5704365abff51e351e97",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
