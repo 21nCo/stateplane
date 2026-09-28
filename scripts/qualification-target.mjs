@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { qualificationTarget } from './qualification-artifact.mjs';
 import { readHyperdrive } from './wrangler-command.mjs';
-import { sameProviderId, validVolumePath } from './topology-live.mjs';
+import { assertPostgresImageProvenance, sameProviderId, validVolumePath } from './topology-live.mjs';
 import { validateDeploymentInventories } from './topology.mjs';
 import { readProtectedSqlUrls, verifyPgdataPlacement } from './topology-sql.mjs';
 import { readUploadedCa } from './topology-ca.mjs';
@@ -14,7 +14,7 @@ const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
 const hex = /^[a-f0-9]{32}$/i;
 export const qualificationProviderQuery = `query ReadDisposable($serviceId: String!, $environmentId: String!, $volumeInstanceId: String!) {
   service(id: $serviceId) { id name projectId deletedAt }
-  serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { serviceId environmentId region deletedAt latestDeployment { status } }
+  serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { serviceId environmentId region deletedAt source { image repo } latestDeployment { status meta } }
   volumeInstance(id: $volumeInstanceId) { id serviceId environmentId region mountPath deletedAt isPendingDeletion }
   tcpProxies(serviceId: $serviceId, environmentId: $environmentId) { id serviceId environmentId applicationPort domain proxyPort deletedAt }
 }`;
@@ -103,6 +103,8 @@ export async function verifyQualificationTarget(root, name, head, artifactId,
   const { railway, hyperdrive } = await readback(inventory, signal);
   if (signal?.aborted) throw new Error('Qualification target verification interrupted');
   const { service, serviceInstance, volumeInstance, tcpProxies } = railway ?? {};
+  const approvedImage = environment === 'development'
+    ? operational.development.cells[cell] : operational.production.cells[cell];
   const proxy = Array.isArray(tcpProxies) && tcpProxies.length === 1 ? tcpProxies[0] : undefined;
   if (!sameProviderId(service?.id, inventory.serviceId) || service.name !== name ||
       !sameProviderId(service?.projectId, inventory.projectId) || service.deletedAt ||
@@ -120,6 +122,7 @@ export async function verifyQualificationTarget(root, name, head, artifactId,
       proxy.applicationPort !== 5432 || !proxy.domain || !Number.isInteger(proxy.proxyPort)) {
     throw new Error('Disposable Railway service, volume, region or proxy readback mismatch');
   }
+  assertPostgresImageProvenance(name, approvedImage, serviceInstance);
   if (!sameProviderId(hyperdrive?.id, inventory.hyperdriveId, hex) ||
       hyperdrive.caching?.disabled !== true || hyperdrive.origin_connection_limit !== definition.originConnectionLimit ||
       !['postgres', 'postgresql'].includes(hyperdrive.origin?.scheme) ||

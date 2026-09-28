@@ -15,4 +15,8 @@ test('actual connected Railway query returns the target service, volume mount an
   assert.equal(data.volumeInstance?.id?.toLowerCase(), inventory.volumeInstanceId.toLowerCase());
   assert.ok(data.volumeInstance?.mountPath?.startsWith('/'));
   assert.equal(data.serviceInstance?.latestDeployment?.status, 'SUCCESS');
+  assert.equal(data.serviceInstance?.source?.repo, null);
+  assert.ok(data.serviceInstance?.source?.image);
+  assert.equal(data.serviceInstance?.latestDeployment?.meta?.image, data.serviceInstance.source.image);
+  assert.match(data.serviceInstance?.latestDeployment?.meta?.imageDigest ?? '', /^sha256:[a-f0-9]{64}$/i);
 });

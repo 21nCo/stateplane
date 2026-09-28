@@ -30,7 +30,10 @@ function fixture(short, cell, region, index) {
     railway: {
       service: { id: inventory.serviceId, name, projectId: inventory.projectId, deletedAt: null },
       serviceInstance: { serviceId: inventory.serviceId, environmentId: inventory.environmentId,
-        region, deletedAt: null, latestDeployment: { status: 'SUCCESS' } },
+        region, deletedAt: null, source: { image: 'pgvector/pgvector:pg16', repo: null },
+        latestDeployment: { status: 'SUCCESS', meta: {
+          image: 'pgvector/pgvector:pg16', imageDigest: `sha256:${'a'.repeat(64)}`
+        } } },
       volumeInstance: { id: inventory.volumeInstanceId, serviceId: inventory.serviceId,
         environmentId: inventory.environmentId, region, mountPath: inventory.volumeMountPath,
         deletedAt: null, isPendingDeletion: false },
@@ -63,6 +66,23 @@ test('each disposable cell requires an independent protected ID and physical pro
         verifyQualificationTarget(root, name, head, artifactId, { inventoryPath, operationalInventoryPaths,
           readback: async () => value, pgdataProof: async () => {} });
       assert.equal((await verify()).railwayRegion, region);
+      const provenanceCases = [
+        instance => { instance.source.image = 'redis:7'; },
+        instance => { instance.source.repo = 'unapproved/repo'; },
+        instance => { instance.latestDeployment.meta.image = 'redis:7'; },
+        instance => { instance.latestDeployment.meta.imageDigest = `sha256:${'b'.repeat(64)}`; },
+        instance => { delete instance.latestDeployment.meta.imageDigest; }
+      ];
+      for (const change of provenanceCases) {
+        const bad = structuredClone(readback);
+        change(bad.railway.serviceInstance);
+        let pgdataCalled = false;
+        await assert.rejects(verifyQualificationTarget(root, name, head, inventory.hyperdriveId, {
+          inventoryPath, operationalInventoryPaths, readback: async () => bad,
+          pgdataProof: async () => { pgdataCalled = true; }
+        }), /image or digest differs from approved inventory/);
+        assert.equal(pgdataCalled, false, `${name}: rejected image must block before SQL or DDL`);
+      }
       await assert.rejects(verify({ ...readback, railway: { ...readback.railway,
         service: { ...readback.railway.service, name: 'stateplane-dev-ap-southeast' } } }), /service, volume/);
       await assert.rejects(verify(readback, 'f'.repeat(32)), /protected inventory/);
@@ -77,6 +97,15 @@ test('each disposable cell requires an independent protected ID and physical pro
         volumeInstance: { ...readback.railway.volumeInstance, id: uuid(500) } } }), /region or proxy/);
       await assert.rejects(verify({ ...readback, railway: { ...readback.railway,
         volumeInstance: { ...readback.railway.volumeInstance, mountPath: '/wrong-volume' } } }), /region or proxy/);
+      // A protected restore/retry ID update does not waive deployment provenance.
+      const restored = structuredClone(readback);
+      restored.railway.volumeInstance.id = uuid(700 + index);
+      const restoredInventory = { ...inventory, volumeInstanceId: restored.railway.volumeInstance.id };
+      await writeFile(inventoryPath, JSON.stringify(restoredInventory), { mode: 0o600 });
+      assert.equal((await verify(restored)).railwayRegion, region);
+      delete restored.railway.serviceInstance.latestDeployment.meta.imageDigest;
+      await assert.rejects(verify(restored), /image or digest differs from approved inventory/);
+      await writeFile(inventoryPath, JSON.stringify(inventory), { mode: 0o600 });
       await assert.rejects(verifyQualificationTarget(root, name, head, inventory.hyperdriveId, {
         inventoryPath, operationalInventoryPaths, readback: async () => readback,
         pgdataProof: async () => { throw new Error('PGDATA outside mount'); }

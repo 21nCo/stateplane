@@ -19,6 +19,18 @@ export const sameProviderId = (actual, expected, pattern = uuid) =>
   typeof actual === 'string' && typeof expected === 'string' &&
   pattern.test(actual) && pattern.test(expected) && actual.toLowerCase() === expected.toLowerCase();
 
+/** The approved inventory fixes both the image reference and its deployed bytes. */
+export function assertPostgresImageProvenance(label, resource, serviceInstance) {
+  const deployment = serviceInstance?.latestDeployment;
+  if (deployment?.status !== 'SUCCESS' ||
+      serviceInstance?.source?.image !== resource.postgresImage || serviceInstance.source.repo ||
+      deployment.meta?.image !== resource.postgresImage ||
+      typeof deployment.meta?.imageDigest !== 'string' ||
+      deployment.meta.imageDigest.toLowerCase() !== resource.postgresImageDigest.toLowerCase()) {
+    throw new Error(`${label}: Railway deployment image or digest differs from approved inventory`);
+  }
+}
+
 /** Check provider readback and the corresponding cache-disabled Cloudflare origin. */
 export function assertLiveResources({ label, environment, definition, resource, database, serviceName, projectId, environmentId, railway, hyperdrive }) {
   const { service, serviceInstance, volumeInstance, backupSchedules, backups, pitrEstimate, tcpProxies } = railway ?? {};
@@ -29,12 +41,10 @@ export function assertLiveResources({ label, environment, definition, resource, 
   if (!sameProviderId(serviceInstance?.serviceId, resource.serviceId) ||
       !sameProviderId(serviceInstance.environmentId, environmentId) ||
       serviceInstance.region !== definition.railwayRegion || serviceInstance.deletedAt ||
-      serviceInstance.latestDeployment?.status !== 'SUCCESS' ||
-      serviceInstance.source?.image !== resource.postgresImage || serviceInstance.source?.repo ||
-      serviceInstance.latestDeployment?.meta?.image !== resource.postgresImage ||
-      serviceInstance.latestDeployment?.meta?.imageDigest?.toLowerCase() !== resource.postgresImageDigest.toLowerCase()) {
-    throw new Error(`${label}: Railway deployment region, image or status mismatch`);
+      serviceInstance.latestDeployment?.status !== 'SUCCESS') {
+    throw new Error(`${label}: Railway deployment region or status mismatch`);
   }
+  assertPostgresImageProvenance(label, resource, serviceInstance);
   if (!sameProviderId(volumeInstance?.id, resource.volumeInstanceId) ||
       !sameProviderId(volumeInstance.serviceId, resource.serviceId) ||
       !sameProviderId(volumeInstance.environmentId, environmentId) || volumeInstance.region !== definition.railwayRegion ||
