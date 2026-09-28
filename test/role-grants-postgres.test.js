@@ -47,6 +47,12 @@ test('PostgreSQL 16 role admission rejects direct, inherited and indirect altern
         assert.equal(qualificationGrantsAllowed(await check('probe', qualificationGrantsSql)), true);
         assert.equal(operationalGrantsAllowed(await check('operational', operationalGrantsSql)), true,
           'application table grants remain valid after schema migration');
+        await client.query('GRANT CREATE ON SCHEMA public TO operational');
+        assert.equal(operationalGrantsAllowed(await check('operational', operationalGrantsSql)), false,
+          'an operational role with public schema CREATE must be rejected');
+        await client.query('REVOKE CREATE ON SCHEMA public FROM operational');
+        assert.equal(operationalGrantsAllowed(await check('operational', operationalGrantsSql)), true,
+          'revoking CREATE restores admission without losing migrated table grants');
 
         await client.query('GRANT reader TO probe WITH INHERIT FALSE, SET TRUE');
         const settable = await check('probe', qualificationGrantsSql);

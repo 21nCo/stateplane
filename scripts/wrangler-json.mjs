@@ -31,11 +31,11 @@ function scanCandidate(output, start) {
 }
 
 function nextOpening(output, cursor) {
-  const object = output.indexOf('{', cursor);
-  const array = output.indexOf('[', cursor);
-  if (object === -1) return array;
-  if (array === -1) return object;
-  return Math.min(object, array);
+  while (cursor < output.length) {
+    if (output[cursor] === '{' || output[cursor] === '[') return cursor;
+    cursor++;
+  }
+  return -1;
 }
 
 /** Read one bounded JSON value after optional Wrangler status lines. */

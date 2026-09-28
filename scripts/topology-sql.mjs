@@ -4,7 +4,12 @@ import { operationalGrantsAllowed, operationalGrantsSql } from '../deployment/wo
 
 export async function readProtectedSqlUrls(path) {
   if (((await stat(path)).mode & 0o777) !== 0o600) throw new Error('Protected SQL URL file must be mode 0600');
-  return JSON.parse(await readFile(path, 'utf8'));
+  try {
+    return JSON.parse(await readFile(path, 'utf8'));
+  } catch {
+    // JSON.parse can include a fragment of the input (and its credentials) in its error.
+    throw new Error('Protected SQL URL file is unreadable or invalid JSON');
+  }
 }
 
 /** Prove the declared proxy accepts a verified TLS connection to the intended PostgreSQL database and role. */

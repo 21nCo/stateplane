@@ -117,6 +117,11 @@ test('Preview setup protects its token, requires a URL and verifies the latest b
     assert.deepEqual(readWranglerJson('Wrangler {status}\n' + JSON.stringify({ id: hyperdriveId }) + '\nPreview deployment complete'),
       { id: hyperdriveId });
     assert.throws(() => readWranglerJson('['.repeat(1024 * 1024)), /no valid JSON/);
+    const malformed = '{]'.repeat(450_000);
+    const started = performance.now();
+    assert.deepEqual(readWranglerJson(malformed + '\n' + JSON.stringify([{ name: 'PROBE_TOKEN', type: 'secret_text' }])),
+      [{ name: 'PROBE_TOKEN', type: 'secret_text' }]);
+    assert.ok(performance.now() - started < 1500, 'malformed near-1MiB status fragments must scan linearly');
     assert.throws(() => readWranglerJson('x'.repeat(1024 * 1024 + 1)), /too large/);
     const altered = JSON.parse(await readFile(configPath));
     altered.previews.vars.STATEPLANE_PROBE_ROLE = 'admin';
@@ -265,7 +270,7 @@ if (args.includes('--secrets-file')) {
         }
         if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
         if (observed?.pid) {
-          try { process.kill(observed.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+          try { process.kill(observed.pid, 'SIGKILL'); } catch (error) { assert.equal(error.code, 'ESRCH'); }
         }
         await bounded(closed, 2000);
         if (observed?.file) await rm(observed.file, { force: true });

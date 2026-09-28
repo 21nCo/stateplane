@@ -285,7 +285,7 @@ test('protected SQL proof rejects wrong database, role and untrusted TLS for eve
       const url = `postgres://${sample.resource.databaseRole}:private@${proxy.domain}:${proxy.proxyPort}/${sample.database}`;
       // Operational roles may access application tables after schema migration.
       let grantRow = { safe_login: true, no_elevated_membership: true, no_other_role_membership: true, can_connect: true,
-        no_database_create: true, can_use_schema: true, no_other_schema_create: true };
+        no_database_create: true, can_use_schema: true, no_public_schema_create: true, no_other_schema_create: true };
       const FakeClient = class {
         constructor(options) { this.options = options; }
         async connect() {
@@ -303,6 +303,9 @@ test('protected SQL proof rejects wrong database, role and untrusted TLS for eve
         async end() {}
       };
       await verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url, FakeClient);
+      grantRow = { ...grantRow, no_public_schema_create: false };
+      await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url, FakeClient), /verified-TLS/);
+      grantRow = { ...grantRow, no_public_schema_create: true };
       grantRow = { ...grantRow, no_elevated_membership: false };
       await assert.rejects(verifySqlIdentity(label, sample.resource, sample.database, proxy, 'expected-ca', url, FakeClient), /verified-TLS/);
       grantRow = { ...grantRow, no_elevated_membership: true, no_other_role_membership: false };
@@ -357,5 +360,19 @@ test('protected SQL URL file requires exact mode 0600', { skip: process.platform
     assert.deepEqual(await readProtectedSqlUrls(path), { control: 'postgres://test' });
     await chmod(path, 0o700);
     await assert.rejects(readProtectedSqlUrls(path), /mode 0600/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('malformed protected SQL URL file does not expose credentials through parser errors', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sta4-sql-redaction-'));
+  const path = join(directory, 'urls.json');
+  const secret = 'private-password-fragment-12345';
+  try {
+    await writeFile(path, `{"control":"postgres://role:${secret}@db.example/stateplane"`, { mode: 0o600 });
+    await assert.rejects(readProtectedSqlUrls(path), error => {
+      assert.equal(error.message, 'Protected SQL URL file is unreadable or invalid JSON');
+      assert.equal(JSON.stringify(error).includes(secret), false);
+      return true;
+    });
   } finally { await rm(directory, { recursive: true, force: true }); }
 });

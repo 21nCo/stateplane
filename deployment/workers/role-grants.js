@@ -45,6 +45,7 @@ export const operationalGrantsSql = `SELECT
   has_database_privilege(current_user, current_database(), 'CONNECT') AS can_connect,
   NOT has_database_privilege(current_user, current_database(), 'CREATE') AS no_database_create,
   has_schema_privilege(current_user, 'public', 'USAGE') AS can_use_schema,
+  NOT has_schema_privilege(current_user, 'public', 'CREATE') AS no_public_schema_create,
   NOT EXISTS (SELECT 1 FROM pg_namespace
      WHERE nspname <> 'public' AND left(nspname, 3) <> 'pg_'
        AND nspname <> 'information_schema'
@@ -52,6 +53,6 @@ export const operationalGrantsSql = `SELECT
 
 export function operationalGrantsAllowed(row) {
   return row !== null && typeof row === 'object' &&
-    Object.keys(row).length === 7 &&
+    Object.keys(row).length === 8 &&
     Object.values(row).every(value => value === true);
 }
