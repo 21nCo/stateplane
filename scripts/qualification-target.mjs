@@ -5,12 +5,13 @@ import { promisify } from 'node:util';
 import { qualificationTarget } from './qualification-artifact.mjs';
 import { readWranglerJson } from './wrangler-json.mjs';
 import { sameProviderId } from './topology-live.mjs';
+import { validateDeploymentInventories } from './topology.mjs';
 
 const run = promisify(execFile);
 const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
 const hex = /^[a-f0-9]{32}$/i;
-const query = `query ReadDisposable($projectId: String!, $serviceId: String!, $environmentId: String!, $volumeInstanceId: String!) {
-  service(id: $serviceId) { id projectId deletedAt }
+export const qualificationProviderQuery = `query ReadDisposable($serviceId: String!, $environmentId: String!, $volumeInstanceId: String!) {
+  service(id: $serviceId) { id name projectId deletedAt }
   serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { serviceId environmentId region deletedAt latestDeployment { status } }
   volumeInstance(id: $volumeInstanceId) { id serviceId environmentId region deletedAt isPendingDeletion }
   tcpProxies(serviceId: $serviceId, environmentId: $environmentId) { id serviceId environmentId applicationPort domain proxyPort deletedAt }
@@ -26,8 +27,8 @@ export async function readQualificationInventory(path) {
 export async function connectedQualificationReadback(inventory, signal) {
   const account = process.env.STATEPLANE_RAILWAY_ACCOUNT;
   if (!account) throw new Error('Connected Railway account required');
-  const payload = JSON.stringify({ query, variables: {
-    projectId: inventory.projectId, serviceId: inventory.serviceId,
+  const payload = JSON.stringify({ query: qualificationProviderQuery, variables: {
+    serviceId: inventory.serviceId,
     environmentId: inventory.environmentId, volumeInstanceId: inventory.volumeInstanceId
   } });
   const { stdout } = await run('composio', ['proxy', 'https://backboard.railway.com/graphql/v2',
@@ -43,6 +44,10 @@ export async function connectedQualificationReadback(inventory, signal) {
 /** A separate protected target record and live provider reads must agree before disposable DDL. */
 export async function verifyQualificationTarget(root, name, head, artifactId,
   { inventoryPath = process.env.STATEPLANE_QUALIFICATION_INVENTORY_FILE,
+    operationalInventoryPaths = {
+      development: process.env.STATEPLANE_DEVELOPMENT_INVENTORY_FILE,
+      production: process.env.STATEPLANE_PRODUCTION_INVENTORY_FILE
+    },
     readback = connectedQualificationReadback, signal } = {}) {
   if (signal?.aborted) throw new Error('Qualification target verification interrupted');
   const topology = JSON.parse(await readFile(resolve(root, 'deployment/topology.json'), 'utf8'));
@@ -59,11 +64,28 @@ export async function verifyQualificationTarget(root, name, head, artifactId,
       !hex.test(inventory.hyperdriveId ?? '') || !sameProviderId(inventory.hyperdriveId, artifactId, hex)) {
     throw new Error('Disposable qualification target differs from protected inventory');
   }
+  if (!operationalInventoryPaths?.development || !operationalInventoryPaths?.production) {
+    throw new Error('Both protected operational inventory paths required');
+  }
+  const operational = {
+    development: await readQualificationInventory(operationalInventoryPaths.development),
+    production: await readQualificationInventory(operationalInventoryPaths.production)
+  };
+  validateDeploymentInventories(topology, operational.development, operational.production);
+  for (const deployed of Object.values(operational)) {
+    for (const resource of [deployed.control, ...Object.values(deployed.cells)]) {
+      if (sameProviderId(inventory.serviceId, resource.serviceId) ||
+          sameProviderId(inventory.volumeInstanceId, resource.volumeInstanceId) ||
+          sameProviderId(inventory.hyperdriveId, resource.hyperdriveId, hex)) {
+        throw new Error('Disposable target reuses an operational resource');
+      }
+    }
+  }
   const { railway, hyperdrive } = await readback(inventory, signal);
   if (signal?.aborted) throw new Error('Qualification target verification interrupted');
   const { service, serviceInstance, volumeInstance, tcpProxies } = railway ?? {};
   const proxy = Array.isArray(tcpProxies) && tcpProxies.length === 1 ? tcpProxies[0] : undefined;
-  if (!sameProviderId(service?.id, inventory.serviceId) ||
+  if (!sameProviderId(service?.id, inventory.serviceId) || service.name !== name ||
       !sameProviderId(service?.projectId, inventory.projectId) || service.deletedAt ||
       !sameProviderId(serviceInstance?.serviceId, inventory.serviceId) ||
       !sameProviderId(serviceInstance?.environmentId, inventory.environmentId) ||
