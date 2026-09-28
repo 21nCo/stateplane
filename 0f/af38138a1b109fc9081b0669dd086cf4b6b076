@@ -1,0 +1,26 @@
+deployment/tsconfig.json
+  h_a39f9495f9ec1d 8
+deployment/workers/qualification.ts
+  h_a39f9495f9ec1d 3,50-53
+deployment/workers/role-grants.js
+  h_a39f9495f9ec1d 1-30
+docs/regional-topology.md
+  h_a39f9495f9ec1d 38-39
+scripts/topology-sql.mjs
+  h_a39f9495f9ec1d 3,28-29
+test/qualification-worker.test.ts
+  h_a39f9495f9ec1d 25-30,54,117-121,272-292
+test/topology.test.js
+  h_a39f9495f9ec1d 146-147,151-152,228-230,238-239,245-248
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0faf38138a1b109fc9081b0669dd086cf4b6b076",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
