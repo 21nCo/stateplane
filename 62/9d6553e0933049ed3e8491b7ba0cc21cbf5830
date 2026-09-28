@@ -1,0 +1,33 @@
+docs/regional-topology.md
+  s_ad6b4afbe2edd7::t_faf2c3a3fd87f7 42
+scripts/qualification-load.mjs
+  s_ad6b4afbe2edd7::t_373b404e803de4 69-75
+scripts/topology-dry-run.mjs
+  s_ad6b4afbe2edd7::t_6be452cd0a1880 36-37
+scripts/topology.mjs
+  s_ad6b4afbe2edd7::t_626750ed8d4b8d 195,197-199,248,262,264,266
+scripts/wrangler-json.mjs
+  s_ad6b4afbe2edd7::t_f3c364c2812aa2 9-10,28-30
+test/qualification-config.test.js
+  s_ad6b4afbe2edd7::t_ae084ace55d31e 119
+test/role-grants-postgres.test.js
+  s_ad6b4afbe2edd7::t_85f4ed6fb51127 5-6,16-20,30
+test/topology.test.js
+  s_ad6b4afbe2edd7::t_f1198351163295 4,139,142-143,145,156,173-214
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "629d6553e0933049ed3e8491b7ba0cc21cbf5830",
+  "prompts": {},
+  "sessions": {
+    "s_ad6b4afbe2edd7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0e6ae-9497-7823-aebf-e23e3aefe166",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
