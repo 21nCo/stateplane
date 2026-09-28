@@ -1,0 +1,26 @@
+scripts/bounded-command.mjs
+  h_a39f9495f9ec1d 1-44
+scripts/qualification-preview-secret.mjs
+  h_a39f9495f9ec1d 10,20-23,25
+scripts/topology-sql.mjs
+  h_a39f9495f9ec1d 5,7-8,26-31,38-41,46
+scripts/wrangler-command.mjs
+  h_a39f9495f9ec1d 3,8-9,21-22
+test/bounded-command.test.js
+  h_a39f9495f9ec1d 1-28
+test/settings-role-postgres.test.js
+  h_a39f9495f9ec1d 1-90
+test/wrangler-command.test.js
+  h_a39f9495f9ec1d 42-46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fc35fe14c04930dcfb264fc778e77ec7292ee6e9",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
