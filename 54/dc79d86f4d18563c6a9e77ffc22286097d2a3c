@@ -1,0 +1,20 @@
+.github/workflows/ci.yml
+  h_a39f9495f9ec1d 48
+test/qualification-config.test.js
+  h_a39f9495f9ec1d 95
+test/qualification-target.test.js
+  h_a39f9495f9ec1d 83-84
+test/topology.test.js
+  h_a39f9495f9ec1d 142,233
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "54dc79d86f4d18563c6a9e77ffc22286097d2a3c",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
