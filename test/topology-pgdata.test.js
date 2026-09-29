@@ -9,7 +9,7 @@ const id = '11111111-1111-4111-8111-111111111111';
 const role = { rolsuper: false, rolcreatedb: false, rolcreaterole: false,
   rolreplication: false, rolbypassrls: false, can_read_settings: true,
   can_create_database: false, can_create_schema: false, can_access_tables: false,
-  can_access_sequences: false,
+  can_access_sequences: false, can_execute_routines: false,
   only_settings_membership: true };
 
 function fixture() {
@@ -51,6 +51,8 @@ test('both placement paths require a separate least-privilege settings credentia
     () => { state.role = { ...role, can_access_tables: true }; },
     () => { state.role = { ...role, can_access_sequences: true }; },
     () => { delete state.role.can_access_sequences; },
+    () => { state.role = { ...role, can_execute_routines: true }; },
+    () => { delete state.role.can_execute_routines; },
     () => { state.tablespaces = [{ spcname: 'off_volume', location: '/tmp/storage' }]; }
   ]) {
     state.dataDirectory = `${mountPath}/pgdata`;
@@ -64,7 +66,7 @@ test('both placement paths require a separate least-privilege settings credentia
     /differs from declared proxy or database/);
   await assert.rejects(verifyPgdataPlacement({ ...options, value: 'postgres://probe_writer:private@proxy.example:15555/probe' }),
     /differs from declared proxy or database/);
-  assert.equal(state.closed, 10);
+  assert.equal(state.closed, 12);
 });
 
 test('running container WAL path must resolve inside the approved volume and have no user tablespace', async () => {

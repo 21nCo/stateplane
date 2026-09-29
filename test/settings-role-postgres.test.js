@@ -37,7 +37,7 @@ try {
   }
 } catch { /* The hermetic suite also runs without local PostgreSQL. */ }
 
-test('real PostgreSQL settings proof rejects transitive roles, table, column and sequence access',
+test('real PostgreSQL settings proof rejects transitive roles, relation and routine access',
   { skip: !postgresBin || process.platform === 'win32' }, async () => {
     const directory = await mkdtemp(join(tmpdir(), 'sta4-settings-role-'));
     const data = join(directory, 'db');
@@ -61,7 +61,7 @@ test('real PostgreSQL settings proof rejects transitive roles, table, column and
           finally { await client.query('RESET ROLE'); }
         };
         const allowed = row => row.can_read_settings && row.only_settings_membership &&
-          !row.can_access_tables && !row.can_access_sequences &&
+          !row.can_access_tables && !row.can_access_sequences && !row.can_execute_routines &&
           !row.can_create_database && !row.can_create_schema;
         assert.equal(allowed(await flags()), true, 'direct settings membership is sufficient');
 
@@ -125,6 +125,57 @@ test('real PostgreSQL settings proof rejects transitive roles, table, column and
         await client.query('REVOKE USAGE ON SEQUENCE private_seq FROM elevated');
         assert.equal(allowed(await flags()), true, 'approved settings-only role remains admissible');
         await client.query('DROP SEQUENCE private_seq');
+
+        await client.query(`INSERT INTO private_records VALUES (1, 'private-value');
+          CREATE FUNCTION public.expose_secret() RETURNS text LANGUAGE sql SECURITY DEFINER
+            AS 'SELECT secret FROM private_records LIMIT 1';`);
+        assert.equal((await flags()).can_execute_routines, true,
+          'default PUBLIC EXECUTE on a SECURITY DEFINER function is denied');
+        await client.query('SET SESSION AUTHORIZATION settings_reader');
+        try {
+          assert.equal((await client.query('SELECT public.expose_secret() AS secret')).rows[0].secret,
+            'private-value', 'the rejected routine really exposes private data');
+        } finally { await client.query('RESET SESSION AUTHORIZATION'); }
+        await client.query('REVOKE EXECUTE ON FUNCTION public.expose_secret() FROM PUBLIC');
+        assert.equal(allowed(await flags()), true, 'revoking default PUBLIC EXECUTE restores admission');
+
+        await client.query('GRANT EXECUTE ON FUNCTION public.expose_secret() TO settings_reader');
+        assert.equal((await flags()).can_execute_routines, true, 'direct routine EXECUTE is denied');
+        await client.query('REVOKE EXECUTE ON FUNCTION public.expose_secret() FROM settings_reader');
+        assert.equal(allowed(await flags()), true, 'revoking direct EXECUTE restores admission');
+
+        await client.query('GRANT EXECUTE ON FUNCTION public.expose_secret() TO elevated');
+        await client.query('GRANT elevated TO settings_reader WITH INHERIT TRUE, SET FALSE');
+        assert.equal((await flags()).can_execute_routines, true, 'inherited routine EXECUTE is denied');
+        await client.query('REVOKE elevated FROM settings_reader');
+        await client.query('REVOKE EXECUTE ON FUNCTION public.expose_secret() FROM elevated');
+        assert.equal(allowed(await flags()), true, 'revoking inherited EXECUTE restores admission');
+
+        await client.query('GRANT CREATE ON SCHEMA public TO settings_reader');
+        await client.query('SET ROLE settings_reader');
+        await client.query("CREATE FUNCTION public.owned_routine() RETURNS integer LANGUAGE sql AS 'SELECT 1'");
+        await client.query('RESET ROLE');
+        await client.query('REVOKE CREATE ON SCHEMA public FROM settings_reader');
+        await client.query('REVOKE EXECUTE ON FUNCTION public.owned_routine() FROM PUBLIC');
+        assert.equal((await flags()).can_execute_routines, true,
+          'routine ownership remains executable after CREATE and PUBLIC grants are revoked');
+        await client.query('DROP FUNCTION public.owned_routine()');
+
+        await client.query('CREATE SCHEMA private_api; REVOKE ALL ON SCHEMA private_api FROM PUBLIC');
+        await client.query("CREATE FUNCTION private_api.hidden_routine() RETURNS integer LANGUAGE sql AS 'SELECT 1'");
+        assert.equal(allowed(await flags()), true, 'an inaccessible schema does not expose its routine');
+        await client.query('GRANT USAGE ON SCHEMA private_api TO settings_reader');
+        assert.equal((await flags()).can_execute_routines, true,
+          'granting schema USAGE exposes a PUBLIC executable routine');
+        await client.query('REVOKE USAGE ON SCHEMA private_api FROM settings_reader');
+        await client.query('DROP SCHEMA private_api CASCADE');
+
+        await client.query("CREATE PROCEDURE public.write_private() LANGUAGE sql SECURITY DEFINER AS 'INSERT INTO private_records VALUES (2, ''from-procedure'')'");
+        assert.equal((await flags()).can_execute_routines, true, 'PUBLIC executable procedures are denied');
+        await client.query('REVOKE EXECUTE ON PROCEDURE public.write_private() FROM PUBLIC');
+        assert.equal(allowed(await flags()), true, 'revoked procedure EXECUTE restores admission');
+        await client.query('DROP PROCEDURE public.write_private()');
+        await client.query('DROP FUNCTION public.expose_secret()');
 
         await client.query('ALTER ROLE settings_reader CREATEDB');
         assert.equal((await flags()).rolcreatedb, true, 'elevated role attribute is denied');
