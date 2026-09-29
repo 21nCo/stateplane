@@ -4,10 +4,11 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { verifyQualificationTarget } from '../scripts/qualification-target.mjs';
-import { qualificationConfig } from '../scripts/qualification-artifact.mjs';
+import { qualificationConfig, qualificationRailwayServiceName } from '../scripts/qualification-artifact.mjs';
 import { syntheticInventories } from '../scripts/topology-dry-run.mjs';
 
 const root = resolve(import.meta.dirname, '..');
+const declaredTopology = JSON.parse(await readFile(join(root, 'deployment/topology.json'), 'utf8'));
 const head = 'a'.repeat(40);
 const uuid = index => `00000000-0000-4000-8000-a${String(index).padStart(11, '0')}`;
 const targets = [
@@ -15,6 +16,20 @@ const targets = [
   ['d', 'euw', 'europe-west4-drams3a'], ['p', 'apse', 'asia-southeast1-eqsg3a'],
   ['p', 'use', 'us-east4-eqdc4a']
 ];
+
+test('Railway names fit the provider limit and bind the full head, environment and cell', () => {
+  const names = targets.map(([short, cell]) => {
+    const preview = `s4-${head}-${short}-${cell}`;
+    const railway = qualificationRailwayServiceName(preview, head, declaredTopology);
+    assert.match(railway, /^s4-[a-f0-9]{20}-[dp]-(apse|use|euw)$/);
+    assert.ok(railway.length <= 32);
+    return railway;
+  });
+  assert.equal(new Set(names).size, targets.length);
+  const changedHead = `${head.slice(0, 8)}b${head.slice(9)}`;
+  assert.notEqual(qualificationRailwayServiceName(`s4-${changedHead}-d-apse`, changedHead, declaredTopology), names[0]);
+  assert.throws(() => qualificationRailwayServiceName(`s4-${changedHead}-d-apse`, head, declaredTopology), /clean checked-out head/);
+});
 
 test('generator and verifier reject invalid physical placement before provider or Preview work', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'sta4-invalid-placement-'));
@@ -50,8 +65,9 @@ test('generator and verifier reject invalid physical placement before provider o
 
 function fixture(short, cell, region, index) {
   const name = `s4-${head}-${short}-${cell}`;
+  const railwayServiceName = qualificationRailwayServiceName(name, head, declaredTopology);
   const inventory = {
-    name, projectId: uuid(1), environmentId: uuid(2), serviceId: uuid(index * 2 + 10),
+    name, railwayServiceName, projectId: uuid(1), environmentId: uuid(2), serviceId: uuid(index * 2 + 10),
     volumeInstanceId: uuid(index * 2 + 11), volumeMountPath: '/var/lib/postgresql/data',
     hyperdriveId: index.toString(16).padStart(32, 'a'),
     database: `sta4_${head.slice(0, 16)}_${short === 'd' ? 'dev' : 'prod'}_${{ apse: 'ap_southeast', use: 'us_east', euw: 'eu_west' }[cell]}`,
@@ -61,7 +77,7 @@ function fixture(short, cell, region, index) {
     applicationPort: 5432, domain: 'proxy.example', proxyPort: 19876, deletedAt: null };
   const readback = {
     railway: {
-      service: { id: inventory.serviceId, name, projectId: inventory.projectId, deletedAt: null },
+      service: { id: inventory.serviceId, name: railwayServiceName, projectId: inventory.projectId, deletedAt: null },
       serviceInstance: { serviceId: inventory.serviceId, environmentId: inventory.environmentId,
         region, deletedAt: null, source: { image: 'pgvector/pgvector:pg16', repo: null },
         latestDeployment: { status: 'SUCCESS', meta: {
@@ -100,6 +116,17 @@ test('each disposable cell requires an independent protected ID and physical pro
         verifyQualificationTarget(root, name, head, artifactId, { inventoryPath, operationalInventoryPaths,
           readback: async () => value, pgdataProof: async () => {} });
       assert.equal((await verify()).railwayRegion, region);
+      const wrongName = { ...inventory, railwayServiceName: name };
+      await writeFile(inventoryPath, JSON.stringify(wrongName), { mode: 0o600 });
+      let providerCalledForWrongName = false;
+      await assert.rejects(verifyQualificationTarget(root, name, head, inventory.hyperdriveId, {
+        inventoryPath, operationalInventoryPaths,
+        readback: async () => { providerCalledForWrongName = true; return readback; }, pgdataProof: async () => {}
+      }), /protected inventory/);
+      assert.equal(providerCalledForWrongName, false);
+      await writeFile(inventoryPath, JSON.stringify(inventory), { mode: 0o600 });
+      await assert.rejects(verify({ ...readback, railway: { ...readback.railway,
+        service: { ...readback.railway.service, name } } }), /service, volume/);
       const provenanceCases = [
         instance => { instance.source.image = 'redis:7'; },
         instance => { instance.source.repo = 'unapproved/repo'; },

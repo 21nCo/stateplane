@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
@@ -27,7 +28,14 @@ export function qualificationTarget(name, head, topology) {
       !topology.environments[environment]?.cells.some(entry => entry.id === cell)) {
     throw new Error('Qualification name must identify a declared cell at the clean checked-out head');
   }
-  return { environment, cell, shortEnvironment: match[2] };
+  return { environment, cell, shortEnvironment: match[2], shortCell: match[3] };
+}
+
+/** Railway limits service names to 32 characters; Preview retains the full head. */
+export function qualificationRailwayServiceName(name, head, topology) {
+  const { shortEnvironment, shortCell } = qualificationTarget(name, head, topology);
+  const digest = createHash('sha256').update(head).digest('hex').slice(0, 12);
+  return `s4-${head.slice(0, 8)}${digest}-${shortEnvironment}-${shortCell}`;
 }
 
 export async function qualificationConfig(root, name, hyperdriveId, head) {

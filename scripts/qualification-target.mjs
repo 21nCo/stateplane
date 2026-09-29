@@ -1,6 +1,6 @@
 import { readFile, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { qualificationTarget } from './qualification-artifact.mjs';
+import { qualificationRailwayServiceName, qualificationTarget } from './qualification-artifact.mjs';
 import { readHyperdrive } from './wrangler-command.mjs';
 import { assertPostgresImageProvenance, sameProviderId, validVolumePath } from './topology-live.mjs';
 import { validateDeploymentInventories, validateTopology } from './topology.mjs';
@@ -59,11 +59,12 @@ export async function connectedPgdataProof(inventory, railway, hyperdrive, signa
     environmentId: inventory.environmentId, serviceId: inventory.serviceId, signal });
 }
 
-function assertDisposableInventory(inventory, { name, expectedDatabase, expectedRole, artifactId }) {
+function assertDisposableInventory(inventory, { name, railwayServiceName, expectedDatabase, expectedRole, artifactId }) {
   if (!inventory || Array.isArray(inventory) || typeof inventory !== 'object' ||
       Object.keys(inventory).sort((a, b) => a.localeCompare(b)).join(',') !== ['database', 'environmentId', 'hyperdriveId', 'name', 'projectId',
-        'role', 'serviceId', 'volumeInstanceId', 'volumeMountPath'].sort((a, b) => a.localeCompare(b)).join(',') ||
-      inventory.name !== name || inventory.database !== expectedDatabase || inventory.role !== expectedRole ||
+        'railwayServiceName', 'role', 'serviceId', 'volumeInstanceId', 'volumeMountPath'].sort((a, b) => a.localeCompare(b)).join(',') ||
+      inventory.name !== name || inventory.railwayServiceName !== railwayServiceName ||
+      inventory.database !== expectedDatabase || inventory.role !== expectedRole ||
       ![inventory.projectId, inventory.environmentId, inventory.serviceId, inventory.volumeInstanceId].every(id => uuid.test(id ?? '')) ||
       !hex.test(inventory.hyperdriveId ?? '') || !validVolumePath(inventory.volumeMountPath) ||
       !sameProviderId(inventory.hyperdriveId, artifactId, hex)) {
@@ -83,10 +84,10 @@ function assertDisposableIsolation(inventory, operational) {
   }
 }
 
-function assertDisposableProvider(inventory, definition, name, railway) {
+function assertDisposableProvider(inventory, definition, railway) {
   const { service, serviceInstance, volumeInstance, tcpProxies } = railway ?? {};
   const proxy = Array.isArray(tcpProxies) && tcpProxies.length === 1 ? tcpProxies[0] : undefined;
-  if (!sameProviderId(service?.id, inventory.serviceId) || service.name !== name ||
+  if (!sameProviderId(service?.id, inventory.serviceId) || service.name !== inventory.railwayServiceName ||
       !sameProviderId(service?.projectId, inventory.projectId) || service.deletedAt ||
       !sameProviderId(serviceInstance?.serviceId, inventory.serviceId) ||
       !sameProviderId(serviceInstance?.environmentId, inventory.environmentId) ||
@@ -127,11 +128,12 @@ export async function verifyQualificationTarget(root, name, head, artifactId,
   if (signal?.aborted) throw new Error('Qualification target verification interrupted');
   const topology = validateTopology(JSON.parse(await readFile(resolve(root, 'deployment/topology.json'), 'utf8')));
   const { environment, cell } = qualificationTarget(name, head, topology);
+  const railwayServiceName = qualificationRailwayServiceName(name, head, topology);
   const definition = topology.environments[environment].cells.find(entry => entry.id === cell);
   const expectedDatabase = `sta4_${head.slice(0, 16)}_${environment === 'development' ? 'dev' : 'prod'}_${cell.replaceAll('-', '_')}`;
   const expectedRole = `sta4_probe_${head.slice(0, 16)}`;
   const inventory = await readQualificationInventory(inventoryPath);
-  assertDisposableInventory(inventory, { name, expectedDatabase, expectedRole, artifactId });
+  assertDisposableInventory(inventory, { name, railwayServiceName, expectedDatabase, expectedRole, artifactId });
   if (!operationalInventoryPaths?.development || !operationalInventoryPaths?.production) {
     throw new Error('Both protected operational inventory paths required');
   }
@@ -145,7 +147,7 @@ export async function verifyQualificationTarget(root, name, head, artifactId,
   if (signal?.aborted) throw new Error('Qualification target verification interrupted');
   const approvedImage = environment === 'development'
     ? operational.development.cells[cell] : operational.production.cells[cell];
-  const proxy = assertDisposableProvider(inventory, definition, name, railway);
+  const proxy = assertDisposableProvider(inventory, definition, railway);
   assertPostgresImageProvenance(name, approvedImage, railway.serviceInstance);
   assertDisposableHyperdrive(inventory, definition, proxy, hyperdrive);
   await pgdataProof(inventory, railway, hyperdrive, signal);
