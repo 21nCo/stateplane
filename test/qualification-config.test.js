@@ -33,6 +33,7 @@ test('full-head qualification configs dry-run for every declared target cell', {
         assert.equal(config.name, name);
         assert.equal(config.workers_dev, false);
         assert.equal(config.preview_urls, true);
+        assert.deepEqual(config.placement, { mode: 'smart' }, `${environment}/${cell.id} Preview placement`);
         assert.ok(name.length <= 54, `${name} exceeds Cloudflare's Preview script-name limit`);
         assert.ok(`${previewName(name)}-${config.name}`.length <= 63, 'workers.dev Preview DNS label must fit');
         assert.deepEqual(config.hyperdrive, [{ binding: 'AUTHORITY', id }]);

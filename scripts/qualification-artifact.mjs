@@ -45,6 +45,7 @@ export async function qualificationConfig(root, name, hyperdriveId, head) {
     main: relative(out, resolve(root, 'deployment/workers/qualification.ts')),
     compatibility_date: '2026-09-25',
     compatibility_flags: ['nodejs_compat'],
+    placement: { mode: 'smart' },
     workers_dev: false,
     preview_urls: true,
     secrets: { required: ['PROBE_TOKEN'] },
