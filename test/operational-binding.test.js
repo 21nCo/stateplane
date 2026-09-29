@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { verifyOperationalBinding } from '../scripts/operational-binding.mjs';
 import { previewName } from '../scripts/preview-name.mjs';
 
@@ -12,11 +12,13 @@ function harness(response) {
   const calls = [];
   let config;
   let secret;
+  let secretPath;
   let requests = 0;
   return {
     calls,
     get config() { return config; },
     get secret() { return secret; },
+    get secretPath() { return secretPath; },
     get requests() { return requests; },
     dependencies: {
       token: 'private-test-token', getHead: async () => head,
@@ -26,7 +28,9 @@ function harness(response) {
         if (args[1] === 'delete') return '{}';
         if (args[1] === 'secret') return JSON.stringify([{ name: 'PROBE_TOKEN', type: 'secret_text' }]);
         config = JSON.parse(await readFile(path, 'utf8'));
-        secret = JSON.parse(await readFile(args[args.indexOf('--secrets-file') + 1], 'utf8'));
+        secretPath = args[args.indexOf('--secrets-file') + 1];
+        assert.equal((await stat(secretPath)).mode & 0o077, 0);
+        secret = JSON.parse(await readFile(secretPath, 'utf8'));
         return JSON.stringify({ preview_urls: ['https://operational.example.workers.dev/'] });
       },
       request: async (url, init) => {
@@ -61,6 +65,7 @@ test('each operational binding is proved through its exact Hyperdrive ID and Wor
     assert.equal(JSON.stringify(h.config).includes('private-test-token'), false);
     assert.equal(h.requests, 1);
     assert.equal(h.calls.at(-1)[1], 'delete');
+    await assert.rejects(readFile(h.secretPath), { code: 'ENOENT' });
   }
 });
 
@@ -70,6 +75,7 @@ test('provider SQL proof cannot mask broken operational Hyperdrive credentials',
     /operational Hyperdrive Worker proof failed/);
   assert.equal(h.requests, 1);
   assert.equal(h.calls.at(-1)[1], 'delete');
+  await assert.rejects(readFile(h.secretPath), { code: 'ENOENT' });
 });
 
 test('wrong Worker database or role fails even when Preview returns HTTP 200', async () => {
@@ -95,6 +101,25 @@ test('failed operational Preview deletion blocks an otherwise successful proof',
   await assert.rejects(verifyOperationalBinding('development', 'control', resource, database, h.dependencies),
     /operational Preview cleanup failed/);
   assert.equal(h.requests, 1);
+  await assert.rejects(readFile(h.secretPath), { code: 'ENOENT' });
+});
+
+test('aborted operational Preview removes its token file after attempted deployment', async () => {
+  const controller = new AbortController();
+  const h = harness({ ok: true });
+  const normal = h.dependencies.runWrangler;
+  h.dependencies.runWrangler = async args => {
+    if (args.includes('--secrets-file')) {
+      await normal(args);
+      controller.abort();
+      throw new Error('interrupted');
+    }
+    return normal(args);
+  };
+  await assert.rejects(verifyOperationalBinding('development', 'control', resource, database,
+    { ...h.dependencies, signal: controller.signal }), /operational Hyperdrive Worker proof failed/);
+  assert.equal(h.calls.at(-1)[1], 'delete');
+  await assert.rejects(readFile(h.secretPath), { code: 'ENOENT' });
 });
 
 test('invalid token, target and configuration fail before deployment or verification request', async () => {

@@ -1,5 +1,5 @@
 import { realpathSync } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,6 +9,7 @@ import { verifyQualificationTarget } from './qualification-target.mjs';
 import { readWranglerJson } from './wrangler-json.mjs';
 import { runBoundedCommand } from './bounded-command.mjs';
 import { previewName } from './preview-name.mjs';
+import { requirePrivatePreviewHost, writePrivatePreviewToken } from './preview-secret-file.mjs';
 
 export { readWranglerJson } from './wrangler-json.mjs';
 
@@ -31,6 +32,7 @@ export async function setupPreview(name, token, { runWrangler = wrangler, verify
   if (!/^s4-[a-f0-9]{40}-[dp]-(apse|use|euw)$/.test(name ?? '') || !token || /[\r\n]/.test(token)) {
     throw new Error('Expected a full-head Preview name and a protected single-line PROBE_TOKEN');
   }
+  requirePrivatePreviewHost();
   const configPath = resolve(root, '.data/qualification', `${name}.json`);
   const head = await currentCleanHead(root);
   const config = JSON.parse(await readFile(configPath, 'utf8'));
@@ -43,7 +45,7 @@ export async function setupPreview(name, token, { runWrangler = wrangler, verify
   let attempted = false;
   try {
     const secretFile = join(directory, 'secrets.json');
-    await writeFile(secretFile, JSON.stringify({ PROBE_TOKEN: token }), { mode: 0o600 });
+    await writePrivatePreviewToken(secretFile, token);
     attempted = true;
     const deployed = readWranglerJson(await runWrangler(['preview', ...target, '--secrets-file', secretFile, '--json'], signal));
     const urls = deployed?.preview_urls ?? deployed?.preview?.urls;

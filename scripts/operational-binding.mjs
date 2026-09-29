@@ -5,6 +5,7 @@ import { currentCleanHead } from './qualification-artifact.mjs';
 import { wrangler } from './qualification-preview-secret.mjs';
 import { readWranglerJson } from './wrangler-json.mjs';
 import { previewName } from './preview-name.mjs';
+import { requirePrivatePreviewHost, writePrivatePreviewToken } from './preview-secret-file.mjs';
 
 const root = resolve(import.meta.dirname, '..');
 const suffixes = { control: 'ctl', 'ap-southeast': 'apse', 'us-east': 'use', 'eu-west': 'euw' };
@@ -36,6 +37,7 @@ export async function verifyOperationalBinding(environment, label, resource, dat
       !token || /[\r\n]/.test(token)) throw new Error('Invalid operational binding probe target or token');
   const name = `s4o-${head}-${shortEnvironment}-${suffix}`;
   const config = operationalConfig(name, resource.hyperdriveId, database, resource.databaseRole);
+  requirePrivatePreviewHost();
   const directory = await mkdtemp(join(tmpdir(), 'sta4-operational-'));
   const configPath = join(directory, 'wrangler.json');
   const secretPath = join(directory, 'secrets.json');
@@ -45,7 +47,7 @@ export async function verifyOperationalBinding(environment, label, resource, dat
   let evidence;
   try {
     await writeFile(configPath, JSON.stringify(config), { mode: 0o600 });
-    await writeFile(secretPath, JSON.stringify({ PROBE_TOKEN: token }), { mode: 0o600 });
+    await writePrivatePreviewToken(secretPath, token);
     attempted = true;
     const deployed = readWranglerJson(await runWrangler(['preview', ...target, '--secrets-file', secretPath, '--json'], signal));
     const urls = deployed?.preview_urls ?? deployed?.preview?.urls;
