@@ -1,0 +1,36 @@
+scripts/operational-binding.mjs
+  h_a39f9495f9ec1d 7,42
+scripts/preview-name.mjs
+  h_a39f9495f9ec1d 1-8
+scripts/qualification-artifact.mjs
+  h_a39f9495f9ec1d 5,34
+scripts/qualification-preview-secret.mjs
+  h_a39f9495f9ec1d 11,41
+scripts/qualification-target.mjs
+  h_a39f9495f9ec1d 6,9,27,36-37,128
+scripts/topology-ca.mjs
+  h_a39f9495f9ec1d 24,28-29,31
+test/bounded-command.test.js
+  h_a39f9495f9ec1d 50,54-68
+test/operational-binding.test.js
+  h_a39f9495f9ec1d 5,55-56
+test/qualification-config.test.js
+  h_a39f9495f9ec1d 9,37,99,105
+test/qualification-provider.test.js
+  h_a39f9495f9ec1d 3-5,8,17,30-78
+test/qualification-target.test.js
+  h_a39f9495f9ec1d 3,7,19-50
+test/topology-ca.test.js
+  h_a39f9495f9ec1d 4,25-52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a517274509b69f0692766ce1abaa54f2c63950f3",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
