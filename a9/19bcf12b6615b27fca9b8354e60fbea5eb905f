@@ -1,0 +1,20 @@
+docs/regional-topology.md
+  h_a39f9495f9ec1d 14-23
+test/bounded-command.test.js
+  h_a39f9495f9ec1d 38,40-46
+test/pgvector-grants-postgres.test.js
+  h_a39f9495f9ec1d 1-77
+test/process-stopped.mjs
+  h_a39f9495f9ec1d 24-30,48,50-56,61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a919bcf12b6615b27fca9b8354e60fbea5eb905f",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
