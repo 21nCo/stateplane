@@ -10,6 +10,23 @@ import { Client } from 'pg';
 import { settingsRoleSql } from '../scripts/topology-sql.mjs';
 
 const run = promisify(execFile);
+async function cleanupCluster(stop, remove, primaryError) {
+  let cleanupError;
+  try { await stop(); }
+  catch (error) { cleanupError = error; }
+  try { await remove(); }
+  catch (error) { cleanupError ??= error; }
+  if (!primaryError && cleanupError) throw cleanupError;
+}
+
+test('cluster directory is removed after stop failure without masking the original failure', async () => {
+  const primary = new Error('probe failed');
+  let removed = false;
+  await cleanupCluster(async () => { throw new Error('stop failed'); }, async () => { removed = true; }, primary);
+  assert.equal(removed, true);
+  await assert.rejects(cleanupCluster(async () => { throw new Error('stop failed'); }, async () => {}, null),
+    /stop failed/);
+});
 let postgresBin;
 try {
   const version = execFileSync('pg_config', ['--version'], { encoding: 'utf8' });
@@ -25,6 +42,7 @@ test('real PostgreSQL settings proof rejects transitive roles and column grants'
     const directory = await mkdtemp(join(tmpdir(), 'sta4-settings-role-'));
     const data = join(directory, 'db');
     let started = false;
+    let primaryError;
     try {
       await run(join(postgresBin, 'initdb'), ['-D', data, '--auth-local=trust', '--auth-host=trust']);
       await run(join(postgresBin, 'pg_ctl'), ['-D', data,
@@ -49,10 +67,12 @@ test('real PostgreSQL settings proof rejects transitive roles and column grants'
         await client.query('GRANT elevated TO pg_read_all_settings WITH INHERIT FALSE, SET TRUE');
         assert.equal((await flags()).only_settings_membership, false,
           'an alternate role reachable through the approved role must be rejected');
-        await client.query('SET ROLE settings_reader');
-        await client.query('SET ROLE elevated');
-        assert.equal((await client.query('SELECT current_user AS role')).rows[0].role, 'elevated');
-        await client.query('RESET ROLE');
+        await client.query('SET SESSION AUTHORIZATION settings_reader');
+        try {
+          assert.equal((await client.query('SELECT session_user AS role')).rows[0].role, 'settings_reader');
+          await client.query('SET ROLE elevated');
+          assert.equal((await client.query('SELECT current_user AS role')).rows[0].role, 'elevated');
+        } finally { await client.query('RESET SESSION AUTHORIZATION'); }
         await client.query('REVOKE elevated FROM pg_read_all_settings');
 
         await client.query('GRANT SELECT(secret) ON private_records TO settings_reader');
@@ -83,8 +103,12 @@ test('real PostgreSQL settings proof rejects transitive roles and column grants'
         await client.query('REVOKE elevated FROM settings_reader');
         assert.equal(allowed(await flags()), true, 'restoring the approved grants restores admission');
       } finally { await client.end(); }
+    } catch (error) {
+      primaryError = error;
+      throw error;
     } finally {
-      if (started) await run(join(postgresBin, 'pg_ctl'), ['-D', data, 'stop', '-m', 'immediate']);
-      await rm(directory, { recursive: true, force: true });
+      await cleanupCluster(
+        () => started ? run(join(postgresBin, 'pg_ctl'), ['-D', data, 'stop', '-m', 'immediate']) : undefined,
+        () => rm(directory, { recursive: true, force: true }), primaryError);
     }
   });
