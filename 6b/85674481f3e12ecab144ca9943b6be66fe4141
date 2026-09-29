@@ -1,0 +1,24 @@
+scripts/operational-railway.mjs
+  h_a39f9495f9ec1d 1-30
+scripts/verify-topology.mjs
+  h_a39f9495f9ec1d 10,37-38
+test/bounded-command.test.js
+  h_a39f9495f9ec1d 35,37-43,83
+test/operational-railway.test.js
+  h_a39f9495f9ec1d 1-85
+test/process-stopped.mjs
+  h_a39f9495f9ec1d 3,5,8,10,13-28,30-31,33-48
+test/qualification-provider.test.js
+  h_a39f9495f9ec1d 67
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6b85674481f3e12ecab144ca9943b6be66fe4141",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
