@@ -1,0 +1,18 @@
+test/bounded-command.test.js
+  h_a39f9495f9ec1d 7,35-36,39,42,51-52,72-74,76
+test/process-stopped.mjs
+  h_a39f9495f9ec1d 1-20
+test/qualification-provider.test.js
+  h_a39f9495f9ec1d 7,67
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f392c11f5387d8e5ac475fd991661fecc1100280",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
