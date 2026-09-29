@@ -1,0 +1,22 @@
+docs/regional-topology.md
+  h_a39f9495f9ec1d 59-60
+scripts/qualification-artifact.mjs
+  h_a39f9495f9ec1d 2,31-38
+scripts/qualification-railway-name.mjs
+  h_a39f9495f9ec1d 1-15
+scripts/qualification-target.mjs
+  h_a39f9495f9ec1d 3,62,65-67,87,90,131,136,150
+test/qualification-target.test.js
+  h_a39f9495f9ec1d 7,11,20-33,68,70,80,119-129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "90917bd15309fed842b9896b4683b46e1b3c0b09",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
