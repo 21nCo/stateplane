@@ -1,0 +1,25 @@
+docs/regional-topology.md
+  s_39897b513d47ae::t_1705d7577452d5 50
+scripts/operational-binding.mjs
+  s_39897b513d47ae::t_c48e8b187b4133 8,40,50
+scripts/preview-secret-file.mjs
+  s_39897b513d47ae::t_3751b5d1f3e041 1-21
+scripts/qualification-preview-secret.mjs
+  s_39897b513d47ae::t_94b554996adcd5 2,12,35,48
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f678d5050382b68a029e2b6d62a860205704b45e",
+  "prompts": {},
+  "sessions": {
+    "s_39897b513d47ae": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2620d86b-f241-4172-8aef-fe0f22fbb05d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
