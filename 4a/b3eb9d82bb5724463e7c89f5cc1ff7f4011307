@@ -1,0 +1,26 @@
+deployment/workers/role-grants.js
+  h_a39f9495f9ec1d 52-56,60
+docs/regional-topology.md
+  h_a39f9495f9ec1d 40
+scripts/preview-secret-file.mjs
+  h_a39f9495f9ec1d 1,11-12,14,16,19-31
+test/operational-worker.test.ts
+  h_a39f9495f9ec1d 3,11-12,52
+test/preview-secret-host.test.js
+  h_a39f9495f9ec1d 3,34,39-55
+test/role-grants-postgres.test.js
+  h_a39f9495f9ec1d 39,58-94
+test/topology.test.js
+  h_a39f9495f9ec1d 382-383,406-408
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4ab3eb9d82bb5724463e7c89f5cc1ff7f4011307",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
