@@ -1,0 +1,34 @@
+deployment/workers/probe-relations.js
+  h_a39f9495f9ec1d 1-44
+deployment/workers/qualification.ts
+  h_a39f9495f9ec1d 4,40-70,77,86,107,114,121,124,126,144,147,152-181,188-193,217,219-220,223,252-257,260,274,277-278,281-282
+docs/regional-topology.md
+  h_a39f9495f9ec1d 59
+package.json
+  h_a39f9495f9ec1d 12,18
+scripts/qualification-load.mjs
+  h_a39f9495f9ec1d 6-22,46,52,59-65,67,82
+test/disposable-privileges-postgres.test.js
+  h_a39f9495f9ec1d 11,53,58-59,62-63,83-89,99-123
+test/pgvector-grants-postgres.test.js
+  h_a39f9495f9ec1d 11,84,91-92,99,103,108,112-118,123-149
+test/qualification-load.test.js
+  h_a39f9495f9ec1d 21,23,65,85,102-103,127,166,205,229,235,268-293,307,311,319
+test/qualification-worker-postgres.test.ts
+  h_a39f9495f9ec1d 1-80
+test/qualification-worker.test.ts
+  h_a39f9495f9ec1d 24-25,27-31,52-67,70,72-77,79-82,108,147,150-154,192-193,205,207-210,212-213,220,242,250,259-278,350-351,373-374,444-460,491,494,497
+vitest.config.ts
+  h_a39f9495f9ec1d 3-4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cb30b2e5493597524e28b6e0f877a816bad1c209",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
