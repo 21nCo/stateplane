@@ -1,0 +1,16 @@
+scripts/qualification-railway-name.mjs
+  h_a39f9495f9ec1d 8-9,12-18,20-38
+test/qualification-target.test.js
+  h_a39f9495f9ec1d 3-4,7,13,37-109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d62b89449ff50d670db3c1d889d9563fe070f497",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
