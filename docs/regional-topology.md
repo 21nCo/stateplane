@@ -11,7 +11,16 @@ Status: definitions and a disposable qualification harness. No cell is operation
 | Development | Virginia | `ap-southeast` Singapore, `us-east` Virginia, `eu-west` Amsterdam | 4 |
 | Production | Virginia | `ap-southeast` Singapore, `us-east` Virginia | 3 |
 
-PostgreSQL grants routine `EXECUTE` to `PUBLIC` by default. Before using a settings-only PGDATA login, revoke `PUBLIC` execution on user-schema functions and procedures (including extension routines installed there) and configure default privileges for every role that creates routines. Grant required extension execution explicitly to the operational role. The verifier rejects effective routine execution through direct, inherited, `PUBLIC`, or owner grants whenever the login can use the schema. Repeat this check after restoration and before every qualification retry.
+PostgreSQL grants routine `EXECUTE` to `PUBLIC` by default. Before using a settings-only PGDATA login, revoke `PUBLIC` execution on user-schema functions and procedures (including extension routines installed there) and configure default privileges for every role that creates routines. For pgvector installed in `public`, run the following with `psql -v operational_role=<cell-role> -v probe_role=<disposable-role>` against **each** cell database after extension installation and before protected SQL or Preview verification. Supply the actual role names as protected command inputs; do not substitute a shared role across databases.
+
+<!-- pgvector-role-grants -->
+```sql
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.l2_distance(public.vector, public.vector)
+  TO :"operational_role", :"probe_role";
+```
+
+Apply equivalent `PUBLIC` revocation to other user schemas and grant only separately approved application routines to their intended roles. The distance grant is intentionally limited to the operator's backing function; it does not grant the settings-only PGDATA role or all pgvector routines. The verifier rejects effective user-schema routine execution through direct, inherited, `PUBLIC`, or owner grants whenever the login can use the schema. Reapply and read back the effective grants after restoration and before every qualification retry, including the disposable role's distance query before Preview DDL.
 
 Each control/cell is a separate Railway PostgreSQL service and volume with its own database, role, Hyperdrive config and protected credentials. Use separate Railway projects and Cloudflare accounts or equivalently isolated provider environments with distinct credentials; the private inventory records the project/environment IDs. Before promotion, compare both inventories and reject reused project, environment, service, volume or Hyperdrive IDs. The control database holds only identity and placement metadata; STA-5 owns the schema, routing and authorization. No production business content belongs in development.
 

@@ -35,8 +35,15 @@ test('timeout, abort and overflow settle after terminating descendants holding c
     await assert.rejects(assertProcessStopped(process.pid, undefined, { settleMs: 50 }), /process must stop executing/,
       'the liveness oracle must reject an executing process');
     await assert.rejects(assertProcessStopped(process.pid, undefined,
-      { readState: async () => { throw new Error('OS process-state observer unavailable'); } }),
+      { settleMs: 50, readState: async () => { throw new Error('OS process-state observer unavailable'); } }),
     /observer unavailable/, 'missing OS state cannot count as stopped');
+    let transientObservations = 0;
+    await assertProcessStopped(process.pid, undefined, { settleMs: 200,
+      readState: async () => {
+        if (++transientObservations === 1) throw Object.assign(new Error('transient /proc ENOENT'), { code: 'ENOENT' });
+        return 'Z';
+      } });
+    assert.equal(transientObservations, 2, 'a disappearing /proc entry must be reobserved before verdict');
     let observations = 0;
     await assertProcessStopped(process.pid, undefined, { settleMs: 200,
       readState: async () => ++observations < 3 ? 'S' : 'Z' });
