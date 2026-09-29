@@ -1,5 +1,3 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { readProtectedSqlUrls, verifySqlIdentity, verifyPgdataPlacement } from './topology-sql.mjs';
@@ -9,8 +7,8 @@ import { readUploadedCa } from './topology-ca.mjs';
 import { readHyperdrive } from './wrangler-command.mjs';
 import { verifyOperationalBinding } from './operational-binding.mjs';
 import { verifyBindingPreflight } from './topology-verification-flow.mjs';
+import { readOperationalRailway } from './operational-railway.mjs';
 
-const run = promisify(execFile);
 const [environment, inventoryPath] = process.argv.slice(2);
 if (!environment || !inventoryPath) {
   console.error('Usage: node scripts/verify-topology.mjs <environment> <private-inventory.json>');
@@ -28,31 +26,6 @@ const sqlUrls = await readProtectedSqlUrls(sqlUrlsPath);
 const pgdataUrls = await readProtectedSqlUrls(resolve(process.env.STATEPLANE_PGDATA_URLS_FILE));
 const env = topology.environments[environment];
 
-const providerQuery = `query ReadCell($projectId: String!, $serviceId: String!, $environmentId: String!, $volumeInstanceId: String!, $targetTimestamp: DateTime!) {
-  regions(projectId: $projectId) { name }
-  service(id: $serviceId) { id name projectId deletedAt }
-  serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { serviceId environmentId region deletedAt source { image repo } latestDeployment { status meta } }
-  volumeInstance(id: $volumeInstanceId) { id serviceId environmentId region mountPath deletedAt isPendingDeletion }
-  volumeInstanceBackupScheduleList(volumeInstanceId: $volumeInstanceId) { id retentionSeconds }
-  volumeInstanceBackupList(volumeInstanceId: $volumeInstanceId) { id externalId createdAt expiresAt usedMB referencedMB volumeInstanceSizeMB }
-  volumeInstancePitrRestoreEstimate(volumeInstanceId: $volumeInstanceId, targetTimestamp: $targetTimestamp) { baseBackupLabel likelyToFit }
-  tcpProxies(serviceId: $serviceId, environmentId: $environmentId) { id serviceId environmentId applicationPort domain proxyPort deletedAt }
-}`;
-
-async function railway(resource, signal) {
-  const payload = JSON.stringify({ query: providerQuery, variables: {
-    projectId: inventory.projectId, serviceId: resource.serviceId, environmentId: inventory.environmentId, volumeInstanceId: resource.volumeInstanceId,
-    targetTimestamp: new Date(Date.now() - 15 * 60_000).toISOString()
-  } });
-  const { stdout } = await run('composio', ['proxy', 'https://backboard.railway.com/graphql/v2', '--toolkit', 'railway', '--account', account,
-    '-X', 'POST', '-H', 'content-type: application/json', '-d', payload],
-  { maxBuffer: 1024 * 1024, timeout: 30_000, killSignal: 'SIGKILL', signal });
-  const response = JSON.parse(stdout);
-  if (response.errors?.length || !response.data) throw new Error('Connected Railway provider readback failed');
-  return { ...response.data, backupSchedules: response.data.volumeInstanceBackupScheduleList,
-    backups: response.data.volumeInstanceBackupList, pitrEstimate: response.data.volumeInstancePitrRestoreEstimate };
-}
-
 async function hyperdrive(id, signal) {
   const value = await readHyperdrive(id, { signal });
   if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error('Wrangler Hyperdrive readback is invalid');
@@ -61,7 +34,8 @@ async function hyperdrive(id, signal) {
 
 async function verify(label, definition, resource, database, serviceName) {
   const worker = await verifyBindingPreflight(controller.signal, {
-    railway: () => railway(resource, controller.signal),
+    railway: () => readOperationalRailway(resource, { projectId: inventory.projectId,
+      environmentId: inventory.environmentId, account, signal: controller.signal }),
     hyperdrive: () => hyperdrive(resource.hyperdriveId, controller.signal),
     validate: (railwayReadback, hyperdriveReadback) => {
       if (!railwayReadback.regions?.some(region => region.name === definition.railwayRegion)) throw new Error(`${label}: target Railway region unavailable to project`);

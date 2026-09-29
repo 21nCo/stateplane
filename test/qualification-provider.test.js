@@ -64,7 +64,7 @@ setTimeout(() => process.exit(0), 80);
       controller.abort();
       await assert.rejects(request, /Connected Railway readback failed/);
       assert.ok(Date.now() - started < 3000, 'real child must settle before watchdog');
-      assertProcessStopped(pid, 'Railway descendant must stop executing');
+      await assertProcessStopped(pid, 'Railway descendant must stop executing');
     } finally {
       controller.abort();
       await request?.catch(() => {});

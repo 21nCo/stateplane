@@ -32,8 +32,15 @@ test('child output is bounded in combined bytes and the child is gone before rej
 
 test('timeout, abort and overflow settle after terminating descendants holding command pipes',
   { skip: process.platform === 'win32', timeout: 15_000 }, async () => {
-    assert.throws(() => assertProcessStopped(process.pid), /process must stop executing/,
+    await assert.rejects(assertProcessStopped(process.pid, undefined, { settleMs: 50 }), /process must stop executing/,
       'the liveness oracle must reject an executing process');
+    await assert.rejects(assertProcessStopped(process.pid, undefined,
+      { readState: async () => { throw new Error('OS process-state observer unavailable'); } }),
+    /observer unavailable/, 'missing OS state cannot count as stopped');
+    let observations = 0;
+    await assertProcessStopped(process.pid, undefined, { settleMs: 200,
+      readState: async () => ++observations < 3 ? 'S' : 'Z' });
+    assert.equal(observations, 3, 'a live intermediate sample must be retried');
     const directory = await mkdtemp(join(tmpdir(), 'sta4-child-tree-'));
     try {
       for (const failure of ['timeout', 'abort', 'overflow-stdout', 'overflow-stderr']) {
@@ -73,7 +80,7 @@ test('timeout, abort and overflow settle after terminating descendants holding c
             assert.ok(Date.now() - started < 1500, `${failure} must reject on bytes before the 3000ms timeout`);
           }
           const pid = Number(await readFile(marker, 'utf8'));
-          assertProcessStopped(pid, `${failure} descendant must stop executing`);
+          await assertProcessStopped(pid, `${failure} descendant must stop executing`);
         } finally {
           try { process.kill(Number(await readFile(marker, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
           await command.catch(() => {});
