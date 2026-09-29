@@ -1,0 +1,38 @@
+deployment/workers/jobs.ts
+  h_a39f9495f9ec1d 4-5
+deployment/workers/qualification.ts
+  h_a39f9495f9ec1d 39,120-155,161,167-174,186-193,199,202,206-212,214-215,217-219,223-226,236-237,239,241-244
+deployment/workers/role-grants.js
+  h_a39f9495f9ec1d 23
+docs/regional-topology.md
+  h_a39f9495f9ec1d 59
+scripts/qualification-load.mjs
+  h_a39f9495f9ec1d 2,7-14,36,42-43,58-67,71-75,78,88
+scripts/topology-dry-run.mjs
+  h_a39f9495f9ec1d 32,37,46,48-49,51-52
+scripts/topology.mjs
+  h_a39f9495f9ec1d 283-284
+scripts/verify-topology.mjs
+  h_a39f9495f9ec1d 68-69
+test/operational-worker.test.ts
+  h_a39f9495f9ec1d 19,27-30
+test/pgvector-grants-postgres.test.js
+  h_a39f9495f9ec1d 83-115
+test/process-stopped.mjs
+  h_a39f9495f9ec1d 49-51,60-67
+test/qualification-load.test.js
+  h_a39f9495f9ec1d 20,22,64,79-93,99,123,161,199,214-258,272,276,284
+test/qualification-worker.test.ts
+  h_a39f9495f9ec1d 24-26,43,46-62,65,107-109,126-128,164-193,202,210,421,424-427,429
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bafe108e13afc7980353b40290ecad7b8abddc09",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
