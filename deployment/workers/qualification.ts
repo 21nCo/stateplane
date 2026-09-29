@@ -36,6 +36,7 @@ function declaredTarget(database: string | undefined, role: string | undefined):
 }
 
 type ProbeClient = Client;
+const attemptPattern = /^\d{13}-[a-f0-9]{32}$/;
 
 async function atStage<T>(stage: string, action: () => Promise<T>): Promise<T> {
   try { return await action(); }
@@ -84,7 +85,6 @@ async function verifyRollback(writer: ProbeClient, id: string, markRow: () => vo
 }
 
 async function verifyFreshReads(writer: ProbeClient, reader: ProbeClient, id: string): Promise<{ observedConnections: number; maxConnections: number; reservedConnections: number }> {
-  await atStage('reader-connect', () => reader.connect());
   await atStage('initial-read', async () => {
     const first = await reader.query('SELECT value FROM stateplane_qualification WHERE probe_id = $1', [id]);
     if (first.rows[0]?.value !== 1) throw new Error('Initial read was stale');
@@ -117,18 +117,61 @@ async function cleanupRow(writer: ProbeClient, id: string): Promise<void> {
   } catch { throw new QualificationFailure(['cleanup-verify']); }
 }
 
-async function probe(connectionString: string, expectedDatabase: string, expectedRole: string) {
+async function startAttempt(connectionString: string, expectedDatabase: string, expectedRole: string, attempt: string) {
+  const client = new Client({ connectionString, connectionTimeoutMillis: 5000, query_timeout: 5000 });
+  const failures: string[] = [];
+  let transactionOpen = false;
+  try {
+    await atStage('writer-connect', () => client.connect());
+    await verifyTarget(client, expectedDatabase, expectedRole);
+    await atStage('attempt-begin', () => client.query('BEGIN'));
+    transactionOpen = true;
+    await atStage('attempt-timeout', () => client.query("SET LOCAL lock_timeout = '5000ms'"));
+    await atStage('attempt-start', async () => {
+      await client.query('CREATE TABLE IF NOT EXISTS stateplane_qualification (probe_id uuid PRIMARY KEY, value integer NOT NULL)');
+      await client.query('CREATE TABLE IF NOT EXISTS stateplane_qualification_attempt (singleton boolean PRIMARY KEY CHECK (singleton), attempt_id text NOT NULL, active boolean NOT NULL)');
+      const previous = await client.query('SELECT attempt_id FROM stateplane_qualification_attempt WHERE singleton = TRUE FOR UPDATE');
+      if (previous.rows[0] && !(previous.rows[0].attempt_id < attempt)) throw new Error('Stale qualification attempt');
+      const residual = await client.query('SELECT count(*)::integer AS count FROM stateplane_qualification');
+      if (residual.rows[0]?.count !== 0) throw new Error('Residual rows block replay');
+      const opened = previous.rows[0]
+        ? await client.query('UPDATE stateplane_qualification_attempt SET attempt_id = $1, active = TRUE WHERE singleton = TRUE RETURNING attempt_id', [attempt])
+        : await client.query('INSERT INTO stateplane_qualification_attempt (singleton, attempt_id, active) VALUES (TRUE, $1, TRUE) ON CONFLICT DO NOTHING RETURNING attempt_id', [attempt]);
+      if (opened.rows[0]?.attempt_id !== attempt) throw new Error('Stale qualification attempt');
+    });
+    await atStage('attempt-commit', () => client.query('COMMIT'));
+    transactionOpen = false;
+  } catch (error) { failures.push(...(error instanceof QualificationFailure ? error.stages : ['probe:unexpected'])); }
+  if (transactionOpen) {
+    try { await client.query('ROLLBACK'); }
+    catch { failures.push('attempt:rollback'); }
+  }
+  try { await client.end(); }
+  catch { failures.push('close:writer'); }
+  if (failures.length) throw new QualificationFailure(failures);
+  return { started: true };
+}
+
+async function probe(connectionString: string, expectedDatabase: string, expectedRole: string, attempt: string) {
   const id = crypto.randomUUID();
   const writer = new Client({ connectionString, connectionTimeoutMillis: 5000, query_timeout: 5000 });
   const reader = new Client({ connectionString, connectionTimeoutMillis: 5000, query_timeout: 5000 });
   const start = Date.now();
   let rowMayExist = false;
+  let readerTransactionOpen = false;
   let result: { pgvectorVersion: string; rollback: boolean; freshRead: boolean; observedConnections: number; maxConnections: number; reservedConnections: number; elapsedMs: number } | undefined;
   const failures: string[] = [];
   try {
     await atStage('writer-connect', () => writer.connect());
     const pgvectorVersion = await verifyTarget(writer, expectedDatabase, expectedRole);
-    await atStage('probe-table', () => writer.query('CREATE TABLE IF NOT EXISTS stateplane_qualification (probe_id uuid PRIMARY KEY, value integer NOT NULL)'));
+    await atStage('reader-connect', () => reader.connect());
+    await atStage('attempt-begin', () => reader.query('BEGIN'));
+    readerTransactionOpen = true;
+    await atStage('attempt-timeout', () => reader.query("SET LOCAL lock_timeout = '5000ms'"));
+    await atStage('attempt-admission', async () => {
+      const active = await reader.query('SELECT attempt_id FROM stateplane_qualification_attempt WHERE singleton = TRUE AND active = TRUE FOR SHARE');
+      if (active.rows[0]?.attempt_id !== attempt) throw new Error('Qualification attempt is closed');
+    });
     await verifyRollback(writer, id, () => { rowMayExist = true; });
     await atStage('committed-insert', () => writer.query('INSERT INTO stateplane_qualification (probe_id, value) VALUES ($1, 1)', [id]));
     const { observedConnections, maxConnections, reservedConnections } = await verifyFreshReads(writer, reader, id);
@@ -140,26 +183,46 @@ async function probe(connectionString: string, expectedDatabase: string, expecte
     try { await cleanupRow(writer, id); }
     catch (error) { failures.push(...(error as QualificationFailure).stages); }
   }
-  const closed = await Promise.allSettled([writer.end(), reader.end()]);
-  if (closed[0].status === 'rejected') failures.push('close:writer');
-  if (closed[1].status === 'rejected') failures.push('close:reader');
+  try { await writer.end(); }
+  catch { failures.push('close:writer'); }
+  if (readerTransactionOpen) {
+    try { await reader.query('ROLLBACK'); }
+    catch { failures.push('attempt:rollback'); }
+  }
+  try { await reader.end(); }
+  catch { failures.push('close:reader'); }
   if (failures.length) throw new QualificationFailure(failures);
   if (!result) throw new Error('Qualification result missing');
   return result;
 }
 
-async function verifyNoResiduals(connectionString: string, expectedDatabase: string, expectedRole: string) {
+async function verifyNoResiduals(connectionString: string, expectedDatabase: string, expectedRole: string, attempt: string) {
   const reader = new Client({ connectionString, connectionTimeoutMillis: 5000, query_timeout: 5000 });
   const failures: string[] = [];
+  let transactionOpen = false;
   try {
     await atStage('reader-connect', () => reader.connect());
     await verifyTarget(reader, expectedDatabase, expectedRole);
-    await atStage('residual-read', async () => {
+    await atStage('attempt-begin', () => reader.query('BEGIN'));
+    transactionOpen = true;
+    await atStage('attempt-timeout', () => reader.query("SET LOCAL lock_timeout = '5000ms'"));
+    const residualRows = await atStage('residual-read', async () => {
+      const active = await reader.query('SELECT attempt_id, active FROM stateplane_qualification_attempt WHERE singleton = TRUE FOR UPDATE');
+      if (active.rows[0]?.attempt_id !== attempt || active.rows[0]?.active !== true) throw new Error('Qualification attempt is not active');
+      await reader.query('UPDATE stateplane_qualification_attempt SET active = FALSE WHERE singleton = TRUE');
       const rows = await reader.query('SELECT count(*)::integer AS count FROM stateplane_qualification');
-      if (rows.rows[0]?.count !== 0) throw new Error('Qualification rows remain');
+      if (!Number.isSafeInteger(rows.rows[0]?.count)) throw new Error('Qualification row count unavailable');
+      return rows.rows[0].count as number;
     });
+    await atStage('attempt-commit', () => reader.query('COMMIT'));
+    transactionOpen = false;
+    if (residualRows !== 0) throw new QualificationFailure(['probe:residual-read']);
   } catch (error) {
     failures.push(...(error instanceof QualificationFailure ? error.stages : ['probe:unexpected']));
+  }
+  if (transactionOpen) {
+    try { await reader.query('ROLLBACK'); }
+    catch { failures.push('attempt:rollback'); }
   }
   try { await reader.end(); }
   catch { failures.push('close:reader'); }
@@ -170,13 +233,15 @@ async function verifyNoResiduals(connectionString: string, expectedDatabase: str
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const path = new URL(request.url).pathname;
-    if (!['/qualify', '/qualify/residual'].includes(path) || request.method !== 'POST') return new Response('Not found', { status: 404 });
+    if (!['/qualify', '/qualify/start', '/qualify/residual'].includes(path) || request.method !== 'POST') return new Response('Not found', { status: 404 });
+    const attempt = request.headers.get('x-stateplane-attempt') ?? '';
     if (env.STATEPLANE_DISPOSABLE !== '1' || !declaredTarget(env.STATEPLANE_PROBE_DATABASE, env.STATEPLANE_PROBE_ROLE) ||
-        !env.AUTHORITY?.connectionString || !(await authorized(request, env.PROBE_TOKEN))) return new Response('Forbidden', { status: 403 });
+        !env.AUTHORITY?.connectionString || !attemptPattern.test(attempt) || !(await authorized(request, env.PROBE_TOKEN))) return new Response('Forbidden', { status: 403 });
     try {
-      const result = path === '/qualify'
-        ? await probe(env.AUTHORITY.connectionString, env.STATEPLANE_PROBE_DATABASE, env.STATEPLANE_PROBE_ROLE)
-        : await verifyNoResiduals(env.AUTHORITY.connectionString, env.STATEPLANE_PROBE_DATABASE, env.STATEPLANE_PROBE_ROLE);
+      let result;
+      if (path === '/qualify/start') result = await startAttempt(env.AUTHORITY.connectionString, env.STATEPLANE_PROBE_DATABASE, env.STATEPLANE_PROBE_ROLE, attempt);
+      else if (path === '/qualify') result = await probe(env.AUTHORITY.connectionString, env.STATEPLANE_PROBE_DATABASE, env.STATEPLANE_PROBE_ROLE, attempt);
+      else result = await verifyNoResiduals(env.AUTHORITY.connectionString, env.STATEPLANE_PROBE_DATABASE, env.STATEPLANE_PROBE_ROLE, attempt);
       return Response.json({ ok: true, ...result }, { headers: { 'Cache-Control': 'no-store' } });
     } catch (error) {
       console.error('Qualification failed', error instanceof QualificationFailure ? error.stages.join(',') : 'unexpected');

@@ -1,7 +1,16 @@
 import { realpathSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setupPreview } from './qualification-preview-secret.mjs';
+
+let lastAttemptTime = 0;
+function nextAttempt() {
+  // A later replay must supersede an earlier request even if that request
+  // reaches the Worker after its client has already been cancelled.
+  lastAttemptTime = Math.max(Date.now(), lastAttemptTime + 1);
+  return `${String(lastAttemptTime).padStart(13, '0')}-${randomBytes(16).toString('hex')}`;
+}
 
 export async function runLoad(name, expectedUrl, concurrency = 10, minimumHeadroom = 5,
   { token = process.env.PROBE_TOKEN, deployPreview = setupPreview, request = fetch, signal } = {}) {
@@ -24,12 +33,14 @@ export async function runLoad(name, expectedUrl, concurrency = 10, minimumHeadro
   });
   const url = expectedUrl ? targets.find(target => target === expectedUrl) : targets[0];
   if (!url) throw new Error('Probe URL does not match the named Preview deployment');
+  const attempt = nextAttempt();
 
   async function requestJson(target, allowCancel) {
     if (allowCancel && signal?.aborted) throw new Error('Qualification load interrupted');
     const timeout = AbortSignal.timeout(30000);
     const response = await request(target, { method: 'POST', redirect: 'error',
-      headers: { authorization: `Bearer ${token}` }, signal: allowCancel && signal ? AbortSignal.any([signal, timeout]) : timeout });
+      headers: { authorization: `Bearer ${token}`, 'x-stateplane-attempt': attempt },
+      signal: allowCancel && signal ? AbortSignal.any([signal, timeout]) : timeout });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     return response.json();
   }
@@ -44,14 +55,27 @@ export async function runLoad(name, expectedUrl, concurrency = 10, minimumHeadro
         !Number.isFinite(body.elapsedMs)) throw new Error('Incomplete qualification result');
     return body;
   }
+  // Start and close are deliberately independent of the caller's cancellation.
+  // A timed-out start may arrive late, but the database rejects its older ID
+  // once a newer replay has begun.
+  let started = false;
+  let startFailed = false;
+  try {
+    const body = await requestJson(`${url}/start`, false);
+    if (body.ok !== true || body.started !== true) throw new Error('Start rejected');
+    started = true;
+  } catch { startFailed = true; }
   // The first probe creates the disposable table. Complete it before any parallel
   // request so PostgreSQL catalog creation cannot race on a fresh database.
   let serialFailed = false;
-  try { await requestProbe(); }
-  catch { serialFailed = true; }
-  const results = serialFailed ? [] : await Promise.allSettled(Array.from({ length: concurrency }, requestProbe));
+  if (!startFailed && !signal?.aborted) {
+    try { await requestProbe(); }
+    catch { serialFailed = true; }
+  }
+  const results = startFailed || serialFailed || signal?.aborted ? [] : await Promise.allSettled(Array.from({ length: concurrency }, requestProbe));
   const failed = results.filter(result => result.status === 'rejected');
   const issues = [];
+  if (startFailed) issues.push('Qualification attempt start failed');
   if (serialFailed) issues.push('First qualification request failed');
   if (failed.length) issues.push(`${failed.length}/${concurrency} concurrent qualification requests failed`);
   // This read follows a failed bootstrap or every settled concurrent request.
@@ -61,6 +85,7 @@ export async function runLoad(name, expectedUrl, concurrency = 10, minimumHeadro
     const residual = await requestJson(`${url}/residual`, false);
     if (residual.ok !== true || residual.residualRows !== 0) throw new Error('Residual rows remain');
   } catch { issues.push('Final residual readback failed'); }
+  if (!started) issues.push('Qualification attempt was not confirmed');
   if (signal?.aborted) issues.push('Qualification load interrupted');
   if (issues.length) throw new Error(issues.join('; '));
   const values = results.map(result => result.value);

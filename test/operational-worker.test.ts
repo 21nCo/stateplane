@@ -16,11 +16,16 @@ vi.mock('pg', () => ({ Client: class {
 } }));
 
 import worker from '../deployment/workers/operational-verify';
+import jobs from '../deployment/workers/jobs';
 
 const env = { AUTHORITY: { connectionString: 'postgres://example/probe' }, PROBE_TOKEN: 'secret',
   STATEPLANE_PROBE_DATABASE: 'stateplane_control_dev', STATEPLANE_PROBE_ROLE: 'cell_reader' };
 const request = (token = 'secret') => new Request('https://preview.example/verify', {
   method: 'POST', headers: { authorization: `Bearer ${token}` }
+});
+
+it('projection queue rejects its batch so Cloudflare can retry and send it to the DLQ', async () => {
+  await expect(jobs.queue()).rejects.toThrow('Projection worker is not active');
 });
 
 describe('operational Worker connection proof', () => {

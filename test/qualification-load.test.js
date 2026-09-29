@@ -17,8 +17,9 @@ const deployPreview = async () => [base];
 const result = observedConnections => ({ ok: true, json: async () => ({ ok: true, rollback: true, freshRead: true,
   observedConnections, maxConnections: 20, reservedConnections: 2, elapsedMs: observedConnections }) });
 const residualResult = () => ({ ok: true, json: async () => ({ ok: true, residualRows: 0 }) });
+const startResult = () => ({ ok: true, json: async () => ({ ok: true, started: true }) });
 const options = request => ({ token: 'test-only-token', deployPreview,
-  request: (target, init) => target.endsWith('/residual') ? residualResult() : request(target, init) });
+  request: (target, init) => target.endsWith('/start') ? startResult() : target.endsWith('/residual') ? residualResult() : request(target, init) });
 
 test('concurrent load rejects headroom consumed by other sessions and reserved slots', async () => {
   const request = async () => result(16);
@@ -60,6 +61,7 @@ test('failed first probe checks table-wide residuals before reporting its failur
   let probes = 0;
   let residualReads = 0;
   const request = async target => {
+    if (target.endsWith('/start')) return startResult();
     if (target.endsWith('/residual')) {
       residualReads++;
       return { ok: true, json: async () => ({ ok: true, residualRows: 1 }) };
@@ -74,11 +76,27 @@ test('failed first probe checks table-wide residuals before reporting its failur
   assert.equal(residualReads, 1, 'post-commit failure still requires table-wide cleanup evidence');
 });
 
+test('unconfirmed attempt start never probes and cannot pass a clean residual read', async () => {
+  let probes = 0;
+  let residualReads = 0;
+  const request = async target => {
+    if (target.endsWith('/start')) throw new Error('start response lost');
+    if (target.endsWith('/residual')) { residualReads++; return residualResult(); }
+    probes++;
+    return result(2);
+  };
+  await assert.rejects(runLoad(name, url, 2, 5, { token: 'test-only-token', deployPreview, request }),
+    /Qualification attempt start failed; Qualification attempt was not confirmed/);
+  assert.equal(probes, 0);
+  assert.equal(residualReads, 1);
+});
+
 test('falsy first-probe rejection cannot start concurrent probes or pass cleanup', async () => {
   for (const reason of [undefined, null, false, 0, '']) {
     let probes = 0;
     let residualReads = 0;
     const request = async target => {
+      if (target.endsWith('/start')) return startResult();
       if (target.endsWith('/residual')) {
         residualReads++;
         return residualResult();
@@ -102,6 +120,7 @@ test('final read detects an orphan from an earlier interrupted probe after clean
   const pending = new Promise(resolvePending => { releasePending = resolvePending; });
   const started = new Promise(resolveStarted => { pendingStarted = resolveStarted; });
   const request = async target => {
+    if (target.endsWith('/start')) return startResult();
     if (target.endsWith('/residual')) {
       residualReads++;
       return { ok: true, json: async () => ({ ok: true, residualRows: 1 }) };
@@ -139,6 +158,7 @@ test('final read runs after failed concurrent requests settle and read failure k
   const pending = new Promise(resolvePending => { releasePending = resolvePending; });
   const started = new Promise(resolveStarted => { pendingStarted = resolveStarted; });
   const request = async target => {
+    if (target.endsWith('/start')) return startResult();
     if (target.endsWith('/residual')) {
       residualReads++;
       throw new Error('database read unavailable');
@@ -176,6 +196,7 @@ test('interrupted concurrent load still attempts the final read and cannot pass'
   let probes = 0;
   let residualReads = 0;
   const request = async target => {
+    if (target.endsWith('/start')) return startResult();
     if (target.endsWith('/residual')) {
       residualReads++;
       return residualResult();
@@ -188,6 +209,51 @@ test('interrupted concurrent load still attempts the final read and cannot pass'
     token: 'test-only-token', deployPreview, request, signal: controller.signal
   }), /Qualification load interrupted/);
   assert.equal(residualReads, 1);
+});
+
+test('late Worker work after client abort or timeout cannot write across a five-cell replay', async () => {
+  for (const suffix of ['d-apse', 'd-use', 'd-euw', 'p-apse', 'p-use']) {
+    for (const failure of ['abort', 'timeout']) {
+      const previewName = `s4-${'a'.repeat(40)}-${suffix}`;
+      const controller = new AbortController();
+      let activeAttempt;
+      let rows = 0;
+      let firstAttempt;
+      let calls = 0;
+      let releaseLate;
+      const late = new Promise(resolveLate => { releaseLate = resolveLate; });
+      const request = async (target, init) => {
+        const attempt = init.headers['x-stateplane-attempt'];
+        if (target.endsWith('/start')) {
+          activeAttempt = attempt;
+          return startResult();
+        }
+        if (target.endsWith('/residual')) {
+          if (activeAttempt === attempt) activeAttempt = undefined;
+          return { ok: true, json: async () => ({ ok: true, residualRows: rows }) };
+        }
+        calls++;
+        if (calls === 2) {
+          firstAttempt = attempt;
+          void late.then(() => { if (!attempt || activeAttempt === attempt) rows++; });
+          if (failure === 'abort') controller.abort();
+          throw new Error(failure === 'abort' ? 'client aborted' : 'client timed out');
+        }
+        return result(2);
+      };
+      await assert.rejects(runLoad(previewName, url, 2, 5, {
+        token: 'test-only-token', deployPreview, request, signal: controller.signal
+      }), /concurrent qualification requests failed/);
+      assert.equal(rows, 0);
+      const replay = await runLoad(previewName, url, 2, 5, { token: 'test-only-token', deployPreview, request });
+      assert.equal(replay.success, 2);
+      releaseLate();
+      await late;
+      await new Promise(resolveImmediate => setImmediate(resolveImmediate));
+      assert.equal(rows, 0, `${suffix} ${failure}: old Worker work must be fenced after replay`);
+      assert.notEqual(firstAttempt, activeAttempt);
+    }
+  }
 });
 
 test('mismatched host and URL suffix are rejected before the token is sent', async () => {
@@ -203,11 +269,11 @@ test('mismatched host and URL suffix are rejected before the token is sent', asy
 test('probe forbids redirects and cancelled Preview setup sends no request', async () => {
   let requests = 0;
   const request = async (target, init) => {
-    assert.ok([url, `${url}/residual`].includes(target));
+    assert.ok([url, `${url}/start`, `${url}/residual`].includes(target));
     assert.equal(init.redirect, 'error');
     assert.equal(init.headers.authorization, 'Bearer test-only-token');
     requests++;
-    return target.endsWith('/residual') ? residualResult() : result(2);
+    return target.endsWith('/start') ? startResult() : target.endsWith('/residual') ? residualResult() : result(2);
   };
   assert.equal((await runLoad(name, undefined, 2, 5, { token: 'test-only-token', deployPreview, request })).success, 2);
   const controller = new AbortController();
@@ -215,7 +281,7 @@ test('probe forbids redirects and cancelled Preview setup sends no request', asy
     token: 'test-only-token', signal: controller.signal,
     deployPreview: async () => { controller.abort(); return [base]; }, request
   }), /Qualification load interrupted/);
-  assert.equal(requests, 4);
+  assert.equal(requests, 5);
 });
 
 test('CLI rejects a bare HTTPS destination before sending PROBE_TOKEN', async () => {

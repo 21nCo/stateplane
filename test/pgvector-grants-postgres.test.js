@@ -80,6 +80,39 @@ test('documented role-specific pgvector grants exclude the settings login',
         await client.query('RESET ROLE');
         await client.query('SET ROLE sta4_probe');
         assert.equal(qualificationGrantsAllowed((await client.query(qualificationGrantsSql)).rows[0]), true);
+        await client.query('CREATE TABLE stateplane_qualification (probe_id uuid PRIMARY KEY, value integer NOT NULL)');
+        await client.query('CREATE TABLE stateplane_qualification_attempt (singleton boolean PRIMARY KEY CHECK (singleton), attempt_id text NOT NULL, active boolean NOT NULL)');
+        assert.equal(qualificationGrantsAllowed((await client.query(qualificationGrantsSql)).rows[0]), true,
+          'the two disposable fence tables remain admissible on replay');
+        await client.query('CREATE TABLE unexpected_probe_data (value integer)');
+        assert.equal(qualificationGrantsAllowed((await client.query(qualificationGrantsSql)).rows[0]), false,
+          'the fence exception does not admit unrelated owned tables');
+        await client.query('DROP TABLE unexpected_probe_data');
+        const attempt = '0000000000001-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+        await client.query('INSERT INTO stateplane_qualification_attempt (singleton, attempt_id, active) VALUES (TRUE, $1, TRUE)', [attempt]);
+        const shared = new Client({ host: directory, port: 5433, database: 'postgres' });
+        const closer = new Client({ host: directory, port: 5433, database: 'postgres' });
+        await Promise.all([shared.connect(), closer.connect()]);
+        try {
+          await Promise.all([shared.query('SET ROLE sta4_probe'), closer.query('SET ROLE sta4_probe')]);
+          await shared.query('BEGIN');
+          await shared.query('SELECT attempt_id FROM stateplane_qualification_attempt WHERE singleton = TRUE FOR SHARE');
+          await closer.query('BEGIN');
+          await closer.query("SET LOCAL lock_timeout = '2000ms'");
+          let exclusiveAcquired = false;
+          const exclusive = closer.query('SELECT attempt_id FROM stateplane_qualification_attempt WHERE singleton = TRUE FOR UPDATE')
+            .then(value => { exclusiveAcquired = true; return value; });
+          await new Promise(resolveDelay => setTimeout(resolveDelay, 50));
+          assert.equal(exclusiveAcquired, false, 'close must wait for an admitted Worker transaction');
+          await shared.query('ROLLBACK');
+          assert.equal((await exclusive).rows[0].attempt_id, attempt);
+          await closer.query('UPDATE stateplane_qualification_attempt SET active = FALSE WHERE singleton = TRUE');
+          await closer.query('COMMIT');
+          assert.equal((await client.query('SELECT active FROM stateplane_qualification_attempt')).rows[0].active, false);
+        } finally {
+          await Promise.allSettled([shared.query('ROLLBACK'), closer.query('ROLLBACK')]);
+          await Promise.allSettled([shared.end(), closer.end()]);
+        }
       } finally { await client.end(); }
 
       await psql('REVOKE EXECUTE ON FUNCTION public.l2_distance(public.vector, public.vector) FROM sta4_probe');

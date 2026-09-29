@@ -21,6 +21,9 @@ const database = vi.hoisted(() => ({
   otherConnections: 0,
   reservedConnections: 3,
   valueReads: 0,
+  attemptId: '0000000000001-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  storedAttemptId: '0000000000001-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as string | null,
+  activeAttempt: true,
   queries: [] as string[],
   targetDatabase: 'sta4_aaaaaaaaaaaaaaaa_dev_ap_southeast',
   targetRole: 'sta4_probe_aaaaaaaaaaaaaaaa',
@@ -37,12 +40,29 @@ vi.mock('pg', () => ({
     constructor(options: { query_timeout: number }) { database.queryTimeout = options.query_timeout; }
     async connect() { database.connections++; }
     async end() { database.closed++; if (database.endFailure) throw new Error('close failed'); }
-    async query(sql: string) {
+    async query(sql: string, parameters?: unknown[]) {
       database.queries.push(sql);
       if (database.failQuery && sql.includes(database.failQuery)) throw new Error('query timeout');
+      if (sql.startsWith('SET LOCAL lock_timeout')) return { rows: [] };
+      if (sql.startsWith('SELECT attempt_id') && sql.includes('stateplane_qualification_attempt')) {
+        if (database.storedAttemptId === null) return { rows: [] };
+        if (sql.includes('AND active = TRUE') && !database.activeAttempt) return { rows: [] };
+        return { rows: [{ attempt_id: database.storedAttemptId, active: database.activeAttempt }] };
+      }
+      if (sql.startsWith('UPDATE stateplane_qualification_attempt')) {
+        if (sql.includes('SET attempt_id')) database.storedAttemptId = String(parameters?.[0]);
+        database.activeAttempt = sql.includes('SET attempt_id');
+        return { rows: [{ attempt_id: database.storedAttemptId }] };
+      }
+      if (sql.startsWith('INSERT INTO stateplane_qualification_attempt')) {
+        if (database.storedAttemptId !== null && String(parameters?.[0]) <= database.storedAttemptId) return { rows: [] };
+        database.storedAttemptId = String(parameters?.[0]);
+        database.activeAttempt = true;
+        return { rows: [{ attempt_id: database.storedAttemptId }] };
+      }
       if (sql === 'BEGIN') { database.transactionRow = false; return { rows: [] }; }
       if (sql === 'ROLLBACK') {
-        if (database.rollbackFailure) throw new Error('rollback failed');
+        if (database.rollbackFailure) { database.rollbackFailure = false; throw new Error('rollback failed'); }
         if (database.rollbackLeavesRow && database.transactionRow) database.row = 99;
         database.transactionRow = false;
         return { rows: [] };
@@ -84,7 +104,9 @@ import worker from '../deployment/workers/qualification';
 
 async function qualify(authorization: string | null = 'Bearer disposable-token', disposable = '1', bindings: Record<string, unknown> = {}, path = '/qualify') {
   return worker.fetch(new Request(`https://preview.example${path}`, {
-    method: 'POST', headers: authorization === null ? {} : { authorization }
+    method: 'POST', headers: authorization === null
+      ? { 'x-stateplane-attempt': database.attemptId }
+      : { authorization, 'x-stateplane-attempt': database.attemptId }
   }), {
     AUTHORITY: { connectionString: 'postgres://disposable.example/probe' },
     PROBE_TOKEN: 'disposable-token', STATEPLANE_DISPOSABLE: disposable,
@@ -101,6 +123,9 @@ describe('disposable qualification row cleanup', () => {
     database.staleInitialRead = false;
     database.staleFreshRead = false;
     database.valueReads = 0;
+    database.attemptId = '0000000000001-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    database.storedAttemptId = database.attemptId;
+    database.activeAttempt = true;
     database.queries = [];
     database.vectorDistance = Math.SQRT2;
     database.vectorMissingRow = false;
@@ -136,6 +161,36 @@ describe('disposable qualification row cleanup', () => {
     expect(database.closed).toBe(2);
   });
 
+  it('fences late old probes and starts only a newer replay after zero residual rows', async () => {
+    const old = database.attemptId;
+    const newer = '0000000000002-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    database.attemptId = newer;
+    expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/start')).status).toBe(200);
+    database.attemptId = old;
+    expect((await qualify()).status).toBe(500);
+    expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/start')).status).toBe(500);
+    expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/residual')).status).toBe(500);
+    expect(database.row).toBeNull();
+    database.attemptId = newer;
+    expect((await qualify()).status).toBe(200);
+    expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/residual')).status).toBe(200);
+    expect((await qualify()).status).toBe(500);
+    database.orphanRows = 1;
+    database.attemptId = '0000000000003-cccccccccccccccccccccccccccccccc';
+    expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/start')).status).toBe(500);
+    database.orphanRows = 0;
+    expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/start')).status).toBe(200);
+  });
+
+  it('initializes the fence before the first probe on a fresh disposable database', async () => {
+    database.storedAttemptId = null;
+    database.activeAttempt = false;
+    expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/start')).status).toBe(200);
+    expect(database.storedAttemptId).toBe(database.attemptId);
+    expect((await qualify()).status).toBe(200);
+    expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/residual')).status).toBe(200);
+  });
+
   it('rejects an orphan from a prior interrupted probe in the final table-wide read', async () => {
     expect((await qualify()).status).toBe(200);
     const clean = await qualify('Bearer disposable-token', '1', {}, '/qualify/residual');
@@ -144,7 +199,7 @@ describe('disposable qualification row cleanup', () => {
     database.queries = [];
     database.closed = 0;
     database.orphanRows = 1;
-    expect((await qualify()).status).toBe(200);
+    database.activeAttempt = true;
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const response = await qualify('Bearer disposable-token', '1', {}, '/qualify/residual');
@@ -152,7 +207,7 @@ describe('disposable qualification row cleanup', () => {
       expect(await response.json()).toEqual({ ok: false });
       expect(log).toHaveBeenCalledWith('Qualification failed', 'probe:residual-read');
       expect(database.queries).toContain('SELECT count(*)::integer AS count FROM stateplane_qualification');
-      expect(database.closed).toBe(3);
+      expect(database.closed).toBe(1);
     } finally { log.mockRestore(); }
   });
 
@@ -363,10 +418,15 @@ describe('disposable qualification row cleanup', () => {
   });
 
   it('admits every declared development and production cell', async () => {
-    for (const suffix of ['dev_ap_southeast', 'dev_us_east', 'dev_eu_west', 'prod_ap_southeast', 'prod_us_east']) {
+    for (const [index, suffix] of ['dev_ap_southeast', 'dev_us_east', 'dev_eu_west', 'prod_ap_southeast', 'prod_us_east'].entries()) {
       const target = `sta4_aaaaaaaaaaaaaaaa_${suffix}`;
       database.targetDatabase = target;
+      database.attemptId = `${String(index + 1).padStart(13, '0')}-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`;
+      database.storedAttemptId = null;
+      database.activeAttempt = false;
+      expect((await qualify('Bearer disposable-token', '1', { STATEPLANE_PROBE_DATABASE: target }, '/qualify/start')).status).toBe(200);
       expect((await qualify('Bearer disposable-token', '1', { STATEPLANE_PROBE_DATABASE: target })).status).toBe(200);
+      expect((await qualify('Bearer disposable-token', '1', { STATEPLANE_PROBE_DATABASE: target }, '/qualify/residual')).status).toBe(200);
       expect(database.row).toBeNull();
     }
   });

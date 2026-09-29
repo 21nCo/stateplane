@@ -46,9 +46,9 @@ export async function assertProcessStopped(pid, message = 'process must stop exe
   { readState = processState, settleMs = 500 } = {}) {
   assert.ok(Number.isSafeInteger(pid) && pid > 0, 'process ID must be a positive safe integer');
   const deadline = Date.now() + settleMs;
-  let state;
-  let observerError;
-  do {
+  async function poll() {
+    let state;
+    let observerError;
     try {
       state = await readState(pid);
       observerError = undefined;
@@ -57,9 +57,12 @@ export async function assertProcessStopped(pid, message = 'process must stop exe
       observerError = error;
     }
     if (state === 'gone' || state === 'Z' || state === 'X') return;
-    if (Date.now() >= deadline) break;
-    await new Promise(resolve => setTimeout(resolve, 25));
-  } while (true);
-  if (observerError) throw observerError;
-  assert.fail(`${message}; observed process state ${state}`);
+    if (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+      return poll();
+    }
+    if (observerError) throw observerError;
+    assert.fail(`${message}; observed process state ${state}`);
+  }
+  await poll();
 }

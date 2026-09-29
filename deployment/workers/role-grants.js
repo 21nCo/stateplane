@@ -20,7 +20,7 @@ export const qualificationGrantsSql = `SELECT
   NOT EXISTS (SELECT 1 FROM pg_class AS relation
      JOIN pg_namespace AS schema ON schema.oid = relation.relnamespace
      WHERE left(schema.nspname, 3) <> 'pg_' AND schema.nspname <> 'information_schema'
-       AND (schema.nspname <> 'public' OR relation.relname <> 'stateplane_qualification')
+       AND (schema.nspname <> 'public' OR relation.relname NOT IN ('stateplane_qualification', 'stateplane_qualification_attempt'))
        AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
        AND (has_table_privilege(current_user, relation.oid, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
          OR has_any_column_privilege(current_user, relation.oid, 'SELECT,INSERT,UPDATE,REFERENCES'))) AS no_other_table_access,

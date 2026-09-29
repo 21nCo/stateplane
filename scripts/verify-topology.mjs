@@ -65,7 +65,8 @@ process.once('SIGINT', interrupt);
 process.once('SIGTERM', interrupt);
 try {
   await verify('control', env.control, inventory.control, env.control.database, railwayServiceName(env));
-  for (const cell of env.cells) await verify(cell.id, cell, inventory.cells[cell.id], cellDatabaseName(env, cell), railwayServiceName(env, cell));
+  await env.cells.reduce((previous, cell) => previous.then(() =>
+    verify(cell.id, cell, inventory.cells[cell.id], cellDatabaseName(env, cell), railwayServiceName(env, cell))), Promise.resolve());
 } catch (error) {
   let message = 'Unknown verification failure';
   if (error instanceof Error) message = error.message;

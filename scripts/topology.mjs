@@ -280,7 +280,8 @@ async function main() {
   const out = resolve(root, '.data/topology', environment);
   const configs = renderTopology(topology, environment, inventory, counterpart, out);
   await mkdir(out, { recursive: true });
-  for (const [file, config] of Object.entries(configs)) await writeFile(join(out, file), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  await Promise.all(Object.entries(configs).map(([file, config]) =>
+    writeFile(join(out, file), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 })));
   console.log(`Rendered ${Object.keys(configs).length} ${environment} Worker configs in ${relative(root, out)}`);
 }
 

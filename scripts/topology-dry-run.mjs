@@ -29,13 +29,12 @@ export async function dryRunTopology(topology, { projectRoot = root, runWrangler
     try { await access(resolve(projectRoot, 'app/.svelte-kit/cloudflare/_worker.js')); }
     catch { throw new Error('Build @stateplane/app before topology dry-run'); }
   }
-  let count = 0;
-  for (const environment of Object.keys(topology.environments)) {
+  async function dryRunEnvironment(environment) {
     const out = resolve(projectRoot, '.data/topology-dry-run', environment);
     await mkdir(out, { recursive: true });
     const counterpart = environment === 'development' ? inventories.production : inventories.development;
     const configs = renderTopology(topology, environment, inventories[environment], counterpart, out, projectRoot);
-    for (const [file, config] of Object.entries(configs)) {
+    async function dryRunConfig([file, config]) {
       const path = join(out, file);
       await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
       try {
@@ -44,10 +43,13 @@ export async function dryRunTopology(topology, { projectRoot = root, runWrangler
       } catch (error) {
         throw new Error(`${environment}/${file} dry-run failed: ${error.stderr ?? error.message}`, { cause: error });
       }
-      count++;
+      return 1;
     }
+    return Object.entries(configs).reduce((previous, entry) => previous.then(async count =>
+      count + await dryRunConfig(entry)), Promise.resolve(0));
   }
-  return count;
+  return Object.keys(topology.environments).reduce((previous, environment) => previous.then(async count =>
+    count + await dryRunEnvironment(environment)), Promise.resolve(0));
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
