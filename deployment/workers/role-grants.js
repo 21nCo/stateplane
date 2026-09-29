@@ -25,10 +25,21 @@ export const qualificationGrantsSql = `SELECT
        AND (has_table_privilege(current_user, relation.oid, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
          OR has_any_column_privilege(current_user, relation.oid, 'SELECT,INSERT,UPDATE,REFERENCES'))) AS no_other_table_access`;
 
+const commonGrantFields = [
+  'safe_login', 'no_elevated_membership', 'no_other_role_membership',
+  'can_connect', 'no_database_create', 'can_use_schema', 'no_other_schema_create'
+];
+const qualificationGrantFields = [...commonGrantFields, 'can_create_probe_table', 'no_other_table_access'];
+const operationalGrantFields = [...commonGrantFields, 'no_public_schema_create', 'no_owned_objects'];
+
+function grantsAllowed(row, fields) {
+  return row !== null && typeof row === 'object' && !Array.isArray(row) &&
+    Object.keys(row).length === fields.length &&
+    fields.every(field => Object.hasOwn(row, field) && row[field] === true);
+}
+
 export function qualificationGrantsAllowed(row) {
-  return row !== null && typeof row === 'object' &&
-    Object.keys(row).length === 9 &&
-    Object.values(row).every(value => value === true);
+  return grantsAllowed(row, qualificationGrantFields);
 }
 
 // Operational control/cell roles need grants on application tables after migration.
@@ -56,7 +67,5 @@ export const operationalGrantsSql = `SELECT
        AND deptype = 'o') AS no_owned_objects`;
 
 export function operationalGrantsAllowed(row) {
-  return row !== null && typeof row === 'object' &&
-    Object.keys(row).length === 9 &&
-    Object.values(row).every(value => value === true);
+  return grantsAllowed(row, operationalGrantFields);
 }

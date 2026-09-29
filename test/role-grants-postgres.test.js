@@ -20,6 +20,35 @@ try {
   }
 } catch { /* The project unit suite also runs without a local PostgreSQL installation. */ }
 
+test('grant results require the exact nine true fields of their distinct SQL policies', () => {
+  const common = {
+    safe_login: true, no_elevated_membership: true, no_other_role_membership: true,
+    can_connect: true, no_database_create: true, can_use_schema: true,
+    no_other_schema_create: true
+  };
+  const qualification = { ...common, can_create_probe_table: true, no_other_table_access: true };
+  const operational = { ...common, no_public_schema_create: true, no_owned_objects: true };
+  assert.equal(qualificationGrantsAllowed(qualification), true);
+  assert.equal(operationalGrantsAllowed(operational), true);
+  assert.equal(qualificationGrantsAllowed(operational), false);
+  assert.equal(operationalGrantsAllowed(qualification), false);
+  for (const allowed of [qualificationGrantsAllowed, operationalGrantsAllowed]) {
+    assert.equal(allowed(null), false);
+    assert.equal(allowed([]), false);
+    assert.equal(allowed({ ...common, unrelated: true, another: true }), false);
+  }
+  for (const [allowed, row] of [[qualificationGrantsAllowed, qualification], [operationalGrantsAllowed, operational]]) {
+    assert.equal(allowed({ ...row, safe_login: 'true' }), false);
+    assert.equal(allowed({ ...row, safe_login: false }), false);
+    const missing = { ...row };
+    delete missing.safe_login;
+    assert.equal(allowed(missing), false);
+    const renamed = { ...missing, unexpected: true };
+    assert.equal(allowed(renamed), false);
+    assert.equal(allowed({ ...row, unexpected: true }), false);
+  }
+});
+
 test('PostgreSQL 16 role admission rejects direct, inherited and indirect alternate roles before DDL',
   { skip: !postgresBin || process.platform === 'win32' }, async () => {
     const directory = await mkdtemp(join(tmpdir(), 'sta4-role-grants-'));

@@ -107,6 +107,28 @@ test('inventory isolates every Railway service, volume and Hyperdrive binding', 
   }
 });
 
+test('all operational inventory roles reject PostgreSQL reserved names before rendering', () => {
+  for (const environment of ['development', 'production']) {
+    const labels = ['control', ...topology.environments[environment].cells.map(cell => cell.id)];
+    for (const label of labels) {
+      for (const role of ['pg_worker', 'pg_', 'PG_worker', 'Pg_worker']) {
+        const inventories = syntheticInventories(topology);
+        const target = label === 'control' ? inventories[environment].control : inventories[environment].cells[label];
+        target.databaseRole = role;
+        assert.throws(() => validateDeploymentInventories(topology, inventories.development, inventories.production),
+          /PostgreSQL role is invalid/, `${environment}/${label} ${role}`);
+        const counterpart = environment === 'development' ? inventories.production : inventories.development;
+        assert.throws(() => renderTopology(topology, environment, inventories[environment], counterpart, '/tmp/stateplane-topology'),
+          /PostgreSQL role is invalid/, `${environment}/${label} render`);
+      }
+      const inventories = syntheticInventories(topology);
+      const target = label === 'control' ? inventories[environment].control : inventories[environment].cells[label];
+      target.databaseRole = 'worker_pg_valid';
+      assert.doesNotThrow(() => validateDeploymentInventories(topology, inventories.development, inventories.production));
+    }
+  }
+});
+
 test('development and production cannot reuse provider scope or bindings', () => {
   const development = inventory('development');
   const production = inventory('production');
