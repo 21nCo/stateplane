@@ -1,0 +1,14 @@
+fakebin/pnpm
+  h_a39f9495f9ec1d 1-6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c55c6e24edd4c985a3771c2b55c768503f3429bf",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
