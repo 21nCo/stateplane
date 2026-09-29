@@ -49,10 +49,14 @@ export const operationalGrantsSql = `SELECT
   NOT EXISTS (SELECT 1 FROM pg_namespace
      WHERE nspname <> 'public' AND left(nspname, 3) <> 'pg_'
        AND nspname <> 'information_schema'
-       AND has_schema_privilege(current_user, oid, 'CREATE')) AS no_other_schema_create`;
+       AND has_schema_privilege(current_user, oid, 'CREATE')) AS no_other_schema_create,
+  NOT EXISTS (SELECT 1 FROM pg_shdepend
+     WHERE refclassid = 'pg_authid'::regclass
+       AND refobjid = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+       AND deptype = 'o') AS no_owned_objects`;
 
 export function operationalGrantsAllowed(row) {
   return row !== null && typeof row === 'object' &&
-    Object.keys(row).length === 8 &&
+    Object.keys(row).length === 9 &&
     Object.values(row).every(value => value === true);
 }

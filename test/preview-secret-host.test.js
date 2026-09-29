@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setupPreview } from '../scripts/qualification-preview-secret.mjs';
@@ -31,8 +31,25 @@ test('Preview token writer rejects a directory accessible to other users', { ski
   try {
     await chmod(directory, 0o755);
     await assert.rejects(writePrivatePreviewToken(tokenFile, 'test-token'), /Preview token file is not private/);
-    assert.equal(JSON.parse(await readFile(tokenFile)).PROBE_TOKEN, 'test-token');
+    await assert.rejects(readFile(tokenFile), { code: 'ENOENT' });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('a post-create validation failure removes the token, while a valid parent retains a private file',
+  { skip: process.platform === 'win32' }, async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'sta4-private-preview-'));
+    const tokenFile = join(directory, 'secrets.json');
+    try {
+      await assert.rejects(writePrivatePreviewToken(tokenFile, 'test-token', {
+        inspectFile: async () => { throw new Error('file inspection failed'); }
+      }), /file inspection failed/);
+      await assert.rejects(readFile(tokenFile), { code: 'ENOENT' });
+      await writePrivatePreviewToken(tokenFile, 'test-token');
+      assert.equal((await stat(tokenFile)).mode & 0o077, 0);
+      assert.equal(JSON.parse(await readFile(tokenFile)).PROBE_TOKEN, 'test-token');
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });

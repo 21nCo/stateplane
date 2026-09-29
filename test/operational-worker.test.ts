@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-const state = vi.hoisted(() => ({ closed: 0, connected: 0, failClose: false, denyGrants: false, denyVector: false, wrongIdentity: false }));
+const state = vi.hoisted(() => ({ closed: 0, connected: 0, failClose: false, denyGrants: false, ownsObject: false, denyVector: false, wrongIdentity: false }));
 vi.mock('pg', () => ({ Client: class {
   async connect() { state.connected++; }
   async end() { state.closed++; if (state.failClose) throw new Error('close failed'); }
@@ -8,7 +8,8 @@ vi.mock('pg', () => ({ Client: class {
     if (sql.includes('current_database() AS database')) return { rows: [{ database: state.wrongIdentity ? 'other' : 'stateplane_control_dev', role: 'cell_reader', version: 'PostgreSQL 17' }] };
     if (sql.includes('FROM pg_roles')) return { rows: [{ safe_login: true, no_elevated_membership: true,
       no_other_role_membership: true, can_connect: true, no_database_create: true,
-      can_use_schema: true, no_public_schema_create: !state.denyGrants, no_other_schema_create: true }] };
+      can_use_schema: true, no_public_schema_create: !state.denyGrants,
+      no_other_schema_create: true, no_owned_objects: !state.ownsObject }] };
     if (sql.includes('::vector')) return { rows: [{ distance: state.denyVector ? 0 : Math.SQRT2 }] };
     throw new Error('unexpected SQL');
   }
@@ -48,7 +49,7 @@ describe('operational Worker connection proof', () => {
   });
 
   it('fails closed for wrong SQL identity, excessive grants and broken pgvector', async () => {
-    for (const key of ['wrongIdentity', 'denyGrants', 'denyVector'] as const) {
+    for (const key of ['wrongIdentity', 'denyGrants', 'ownsObject', 'denyVector'] as const) {
       state[key] = true;
       try {
         const response = await worker.fetch(request(), env as never);

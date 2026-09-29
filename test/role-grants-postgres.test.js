@@ -36,6 +36,7 @@ test('PostgreSQL 16 role admission rejects direct, inherited and indirect altern
           CREATE ROLE operational LOGIN;
           CREATE ROLE reader;
           CREATE ROLE reader_parent;
+          CREATE ROLE migration_owner;
           CREATE TABLE unrelated (id integer);
           GRANT USAGE, CREATE ON SCHEMA public TO probe;
           GRANT SELECT ON unrelated TO operational, reader;`);
@@ -53,6 +54,43 @@ test('PostgreSQL 16 role admission rejects direct, inherited and indirect altern
         await client.query('REVOKE CREATE ON SCHEMA public FROM operational');
         assert.equal(operationalGrantsAllowed(await check('operational', operationalGrantsSql)), true,
           'revoking CREATE restores admission without losing migrated table grants');
+
+        const owned = [
+          ['table', 'CREATE TABLE owned_records (id integer)', 'ALTER TABLE owned_records OWNER TO migration_owner'],
+          ['view', 'CREATE VIEW owned_view AS SELECT id FROM unrelated', 'ALTER VIEW owned_view OWNER TO migration_owner'],
+          ['sequence', 'CREATE SEQUENCE owned_sequence', 'ALTER SEQUENCE owned_sequence OWNER TO migration_owner'],
+          ['function', "CREATE FUNCTION owned_fn() RETURNS integer LANGUAGE SQL AS 'SELECT 1'", 'ALTER FUNCTION owned_fn() OWNER TO migration_owner'],
+          ['type', "CREATE TYPE owned_type AS ENUM ('x')", 'ALTER TYPE owned_type OWNER TO migration_owner']
+        ];
+        for (const [kind, create, transfer] of owned) {
+          await client.query('GRANT CREATE ON SCHEMA public TO operational');
+          await client.query('SET ROLE operational');
+          try { await client.query(create); }
+          finally { await client.query('RESET ROLE'); }
+          await client.query('REVOKE CREATE ON SCHEMA public FROM operational');
+          assert.equal(operationalGrantsAllowed(await check('operational', operationalGrantsSql)), false,
+            `operational ownership of a ${kind} must fail even after CREATE is revoked`);
+          await client.query(transfer);
+          assert.equal(operationalGrantsAllowed(await check('operational', operationalGrantsSql)), true,
+            `transferring the ${kind} to a migration role restores admission`);
+        }
+        await client.query('CREATE SCHEMA owned_schema AUTHORIZATION operational');
+        assert.equal(operationalGrantsAllowed(await check('operational', operationalGrantsSql)), false,
+          'owning an alternate schema must fail');
+        await client.query('ALTER SCHEMA owned_schema OWNER TO migration_owner');
+        assert.equal(operationalGrantsAllowed(await check('operational', operationalGrantsSql)), true);
+        await client.query('GRANT CREATE ON SCHEMA public TO operational');
+        await client.query('SET ROLE operational');
+        try {
+          await client.query('CREATE TABLE owned_partitioned (id integer) PARTITION BY RANGE (id)');
+          await client.query('CREATE TABLE owned_partition PARTITION OF owned_partitioned FOR VALUES FROM (0) TO (10)');
+        } finally { await client.query('RESET ROLE'); }
+        await client.query('REVOKE CREATE ON SCHEMA public FROM operational');
+        await client.query('ALTER TABLE owned_partitioned OWNER TO migration_owner');
+        assert.equal(operationalGrantsAllowed(await check('operational', operationalGrantsSql)), false,
+          'an operational-owned partition still fails after transferring its parent');
+        await client.query('ALTER TABLE owned_partition OWNER TO migration_owner');
+        assert.equal(operationalGrantsAllowed(await check('operational', operationalGrantsSql)), true);
 
         await client.query('GRANT reader TO probe WITH INHERIT FALSE, SET TRUE');
         const settable = await check('probe', qualificationGrantsSql);
