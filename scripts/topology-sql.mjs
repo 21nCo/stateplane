@@ -37,6 +37,10 @@ SELECT r.rolsuper, r.rolcreatedb, r.rolcreaterole, r.rolreplication, r.rolbypass
     WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' AND
     (has_table_privilege(c.oid, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') OR
       has_any_column_privilege(c.oid, 'SELECT,INSERT,UPDATE,REFERENCES'))) AS can_access_tables,
+  EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' AND
+      CASE WHEN c.relkind = 'S' THEN has_sequence_privilege(c.oid, 'USAGE,SELECT,UPDATE')
+        ELSE false END) AS can_access_sequences,
   (SELECT count(*) = 2 AND bool_and(member.rolname IN (current_user, 'pg_read_all_settings'))
     FROM reachable JOIN pg_roles member ON member.oid = reachable.roleid) AS only_settings_membership
   FROM pg_roles r WHERE r.rolname = current_user`;
@@ -47,6 +51,7 @@ function assertSettingsRole(label, result) {
       row.rolcreaterole !== false || row.rolreplication !== false || row.rolbypassrls !== false ||
       row.can_read_settings !== true || row.can_create_database !== false ||
       row.can_create_schema !== false || row.can_access_tables !== false ||
+      row.can_access_sequences !== false ||
       row.only_settings_membership !== true) {
     throw new Error(`${label}: settings proof credential is not least privilege`);
   }
