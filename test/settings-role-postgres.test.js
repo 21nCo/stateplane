@@ -8,16 +8,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from 'pg';
 import { settingsRoleSql } from '../scripts/topology-sql.mjs';
+import { cleanupCluster } from './postgres-cluster-cleanup.mjs';
 
 const run = promisify(execFile);
-async function cleanupCluster(stop, remove, primaryError) {
-  let cleanupError;
-  try { await stop(); }
-  catch (error) { cleanupError = error; }
-  try { await remove(); }
-  catch (error) { cleanupError ??= error; }
-  if (!primaryError && cleanupError) throw cleanupError;
-}
 
 test('cluster directory is removed after stop failure without masking the original failure', async () => {
   const primary = new Error('probe failed');

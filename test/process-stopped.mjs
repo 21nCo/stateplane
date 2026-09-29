@@ -12,6 +12,17 @@ function exists(pid) {
   }
 }
 
+function linuxFallback(pid, error) {
+  if (error.code === 'ENOENT' && !exists(pid)) return 'gone';
+  const observed = spawnSync('/bin/ps', ['-o', 'pid=,ppid=,pgid=,stat=,lstart=', '-p', String(pid)],
+    { encoding: 'utf8', timeout: 1000, maxBuffer: 4096 });
+  const detail = observed.error?.code ?? observed.stdout?.trim() ?? 'empty';
+  const psState = new RegExp(String.raw`^${pid}\s+\d+\s+\d+\s+([A-Z])`).exec(detail)?.[1];
+  if (observed.status === 0 && psState) return psState;
+  throw new Error(`OS process-state observer unavailable for PID ${pid}: /proc ${error.code ?? 'unknown'}; ps ${detail || 'empty'}`,
+    { cause: error });
+}
+
 /** Observe execution with a trusted OS source; an unreaped zombie is stopped. */
 async function processState(pid) {
   if (!exists(pid)) return 'gone';
@@ -19,16 +30,7 @@ async function processState(pid) {
     try {
       const stat = await readFile(`/proc/${pid}/stat`, 'utf8');
       return stat.slice(stat.lastIndexOf(')') + 2, stat.lastIndexOf(')') + 3);
-    } catch (error) {
-      if (error.code === 'ENOENT' && !exists(pid)) return 'gone';
-      const observed = spawnSync('/bin/ps', ['-o', 'pid=,ppid=,pgid=,stat=,lstart=', '-p', String(pid)],
-        { encoding: 'utf8', timeout: 1000, maxBuffer: 4096 });
-      const detail = observed.error?.code ?? observed.stdout?.trim() ?? 'empty';
-      const psState = new RegExp(`^${pid}\\s+\\d+\\s+\\d+\\s+([A-Z])`).exec(detail)?.[1];
-      if (observed.status === 0 && psState) return psState;
-      throw new Error(`OS process-state observer unavailable for PID ${pid}: /proc ${error.code ?? 'unknown'}; ps ${detail || 'empty'}`,
-        { cause: error });
-    }
+    } catch (error) { return linuxFallback(pid, error); }
   }
   const observed = spawnSync('/bin/ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' });
   if (observed.error) throw new Error('OS process-state observer unavailable', { cause: observed.error });

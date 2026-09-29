@@ -23,13 +23,28 @@ export const qualificationGrantsSql = `SELECT
        AND (schema.nspname <> 'public' OR relation.relname <> 'stateplane_qualification')
        AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
        AND (has_table_privilege(current_user, relation.oid, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
-         OR has_any_column_privilege(current_user, relation.oid, 'SELECT,INSERT,UPDATE,REFERENCES'))) AS no_other_table_access`;
+         OR has_any_column_privilege(current_user, relation.oid, 'SELECT,INSERT,UPDATE,REFERENCES'))) AS no_other_table_access,
+  NOT EXISTS (SELECT 1 FROM pg_class AS relation
+     JOIN pg_namespace AS schema ON schema.oid = relation.relnamespace
+     WHERE relation.relkind = 'S' AND left(schema.nspname, 3) <> 'pg_'
+       AND schema.nspname <> 'information_schema'
+       AND has_schema_privilege(current_user, schema.oid, 'USAGE')
+       AND has_sequence_privilege(current_user, relation.oid, 'USAGE,SELECT,UPDATE')) AS no_sequence_access,
+  NOT EXISTS (SELECT 1 FROM pg_proc AS routine
+     JOIN pg_namespace AS schema ON schema.oid = routine.pronamespace
+     WHERE left(schema.nspname, 3) <> 'pg_' AND schema.nspname <> 'information_schema'
+       AND has_schema_privilege(current_user, schema.oid, 'USAGE')
+       AND routine.oid IS DISTINCT FROM to_regprocedure('public.l2_distance(public.vector,public.vector)')
+       AND has_function_privilege(current_user, routine.oid, 'EXECUTE')) AS no_other_routine_execute,
+  COALESCE(has_function_privilege(current_user,
+    to_regprocedure('public.l2_distance(public.vector,public.vector)'), 'EXECUTE'), false) AS can_execute_distance`;
 
 const commonGrantFields = [
   'safe_login', 'no_elevated_membership', 'no_other_role_membership',
   'can_connect', 'no_database_create', 'can_use_schema', 'no_other_schema_create'
 ];
-const qualificationGrantFields = [...commonGrantFields, 'can_create_probe_table', 'no_other_table_access'];
+const qualificationGrantFields = [...commonGrantFields, 'can_create_probe_table', 'no_other_table_access',
+  'no_sequence_access', 'no_other_routine_execute', 'can_execute_distance'];
 const operationalGrantFields = [...commonGrantFields, 'no_public_schema_create', 'no_owned_objects'];
 
 function grantsAllowed(row, fields) {

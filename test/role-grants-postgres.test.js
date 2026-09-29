@@ -20,13 +20,14 @@ try {
   }
 } catch { /* The project unit suite also runs without a local PostgreSQL installation. */ }
 
-test('grant results require the exact nine true fields of their distinct SQL policies', () => {
+test('grant results require every exact true field of their distinct SQL policies', () => {
   const common = {
     safe_login: true, no_elevated_membership: true, no_other_role_membership: true,
     can_connect: true, no_database_create: true, can_use_schema: true,
     no_other_schema_create: true
   };
-  const qualification = { ...common, can_create_probe_table: true, no_other_table_access: true };
+  const qualification = { ...common, can_create_probe_table: true, no_other_table_access: true,
+    no_sequence_access: true, no_other_routine_execute: true, can_execute_distance: true };
   const operational = { ...common, no_public_schema_create: true, no_owned_objects: true };
   assert.equal(qualificationGrantsAllowed(qualification), true);
   assert.equal(operationalGrantsAllowed(operational), true);
@@ -66,6 +67,10 @@ test('PostgreSQL 16 role admission rejects direct, inherited and indirect altern
           CREATE ROLE reader;
           CREATE ROLE reader_parent;
           CREATE ROLE migration_owner;
+          CREATE DOMAIN vector AS text;
+          CREATE FUNCTION public.l2_distance(vector, vector) RETURNS float8 LANGUAGE SQL AS 'SELECT 1.414';
+          REVOKE EXECUTE ON ALL ROUTINES IN SCHEMA public FROM PUBLIC;
+          GRANT EXECUTE ON FUNCTION public.l2_distance(vector, vector) TO probe;
           CREATE TABLE unrelated (id integer);
           GRANT USAGE, CREATE ON SCHEMA public TO probe;
           GRANT SELECT ON unrelated TO operational, reader;`);

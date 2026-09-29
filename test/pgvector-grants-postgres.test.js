@@ -6,6 +6,10 @@ import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { settingsRoleSql } from '../scripts/topology-sql.mjs';
+import { qualificationGrantsAllowed, qualificationGrantsSql } from '../deployment/workers/role-grants.js';
+import { Client } from 'pg';
+import { cleanupCluster } from './postgres-cluster-cleanup.mjs';
 
 const run = promisify(execFile);
 let postgresBin;
@@ -21,11 +25,12 @@ try {
   }
 } catch { /* Local PostgreSQL is optional for the portable contract suite. */ }
 
-test('documented pgvector grants allow both probe roles while excluding the settings login',
+test('documented role-specific pgvector grants exclude the settings login',
   { skip: !postgresBin || process.platform === 'win32', timeout: 15_000 }, async () => {
     const directory = await mkdtemp(join(tmpdir(), 'sta4-vector-grants-'));
     const data = join(directory, 'db');
     let started = false;
+    let primaryError;
     try {
       await run(join(postgresBin, 'initdb'), ['-D', data, '--auth-local=trust', '--auth-host=trust']);
       await run(join(postgresBin, 'pg_ctl'), ['-D', data, '-o',
@@ -54,24 +59,40 @@ test('documented pgvector grants allow both probe roles while excluding the sett
       const runbook = await readFile(new URL('../docs/regional-topology.md', import.meta.url), 'utf8');
       const documented = runbook.match(/<!-- pgvector-role-grants -->\s*```sql\n([^`]+)```/)?.[1];
       assert.ok(documented, 'the executable per-cell grant sequence must remain in the runbook');
-      await psql(documented, [['operational_role', 'operational'], ['probe_role', 'sta4_probe']]);
-      for (const role of ['operational', 'sta4_probe']) {
-        const { stdout } = await psql(`SET ROLE ${role}; ${distance}`);
-        assert.match(stdout, /1\.4142135623730951/);
-      }
+      await psql(documented, [['target_role', 'operational']]);
+      await assert.rejects(psql(`SET ROLE sta4_probe; ${distance}`), /permission denied for function l2_distance/,
+        'operational databases must not grant a separately provisioned probe role');
+      await psql('REVOKE EXECUTE ON FUNCTION public.l2_distance(public.vector, public.vector) FROM operational');
+      await psql(documented, [['target_role', 'sta4_probe']]);
+      await assert.rejects(psql(`SET ROLE operational; ${distance}`), /permission denied for function l2_distance/);
+      assert.match((await psql(`SET ROLE sta4_probe; ${distance}`)).stdout, /1\.4142135623730951/);
       const { stdout: settings } = await psql(`SET ROLE settings_reader;
         SELECT has_function_privilege(current_user,
           'public.l2_distance(public.vector, public.vector)', 'EXECUTE') AS can_execute`);
       assert.match(settings, /\bf\b/);
       await assert.rejects(psql(`SET ROLE settings_reader; ${distance}`), /permission denied for function l2_distance/);
+      const client = new Client({ host: directory, port: 5433, database: 'postgres' });
+      await client.connect();
+      try {
+        await client.query('SET ROLE settings_reader');
+        const settingsRow = (await client.query(settingsRoleSql)).rows[0];
+        assert.equal(settingsRow.can_execute_routines, false, 'all user-schema functions and procedures are revoked');
+        await client.query('RESET ROLE');
+        await client.query('SET ROLE sta4_probe');
+        assert.equal(qualificationGrantsAllowed((await client.query(qualificationGrantsSql)).rows[0]), true);
+      } finally { await client.end(); }
 
       await psql('REVOKE EXECUTE ON FUNCTION public.l2_distance(public.vector, public.vector) FROM sta4_probe');
       await assert.rejects(psql(`SET ROLE sta4_probe; ${distance}`), /permission denied for function l2_distance/);
-      await psql(documented, [['operational_role', 'operational'], ['probe_role', 'sta4_probe']]);
+      await psql(documented, [['target_role', 'sta4_probe']]);
       assert.match((await psql(`SET ROLE sta4_probe; ${distance}`)).stdout, /1\.4142135623730951/,
         'retry or restore must reapply and verify the disposable grant');
+    } catch (error) {
+      primaryError = error;
+      throw error;
     } finally {
-      if (started) await run(join(postgresBin, 'pg_ctl'), ['-D', data, 'stop', '-m', 'immediate']);
-      await rm(directory, { recursive: true, force: true });
+      await cleanupCluster(
+        () => started ? run(join(postgresBin, 'pg_ctl'), ['-D', data, 'stop', '-m', 'immediate']) : undefined,
+        () => rm(directory, { recursive: true, force: true }), primaryError);
     }
   });

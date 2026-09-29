@@ -27,7 +27,8 @@ const database = vi.hoisted(() => ({
   grants: {
     safe_login: true, no_elevated_membership: true, no_other_role_membership: true, can_connect: true,
     no_database_create: true, can_use_schema: true, can_create_probe_table: true,
-    no_other_schema_create: true, no_other_table_access: true
+    no_other_schema_create: true, no_other_table_access: true,
+    no_sequence_access: true, no_other_routine_execute: true, can_execute_distance: true
   } as Record<string, boolean> | null
 }));
 
@@ -120,7 +121,8 @@ describe('disposable qualification row cleanup', () => {
     database.grants = {
       safe_login: true, no_elevated_membership: true, no_other_role_membership: true, can_connect: true,
       no_database_create: true, can_use_schema: true, can_create_probe_table: true,
-      no_other_schema_create: true, no_other_table_access: true
+      no_other_schema_create: true, no_other_table_access: true,
+      no_sequence_access: true, no_other_routine_execute: true, can_execute_distance: true
     };
   });
 
@@ -306,7 +308,7 @@ describe('disposable qualification row cleanup', () => {
 
   it('rejects elevated and unavailable effective grants before any DDL or row mutation', async () => {
     for (const key of ['safe_login', 'no_elevated_membership', 'no_other_role_membership', 'no_database_create', 'no_other_schema_create', 'no_other_table_access',
-      'can_connect', 'can_use_schema', 'can_create_probe_table']) {
+      'no_sequence_access', 'no_other_routine_execute', 'can_execute_distance', 'can_connect', 'can_use_schema', 'can_create_probe_table']) {
       const beforeClose = database.closed;
       database.grants = { ...database.grants, [key]: false };
       expect((await qualify()).status).toBe(500);
@@ -322,7 +324,8 @@ describe('disposable qualification row cleanup', () => {
     expect(database.closed - beforeClose).toBe(2);
     database.grants = { safe_login: true, no_elevated_membership: true, no_other_role_membership: true, can_connect: true,
       no_database_create: true, can_use_schema: true, can_create_probe_table: true,
-      no_other_schema_create: true, no_other_table_access: true };
+      no_other_schema_create: true, no_other_table_access: true,
+      no_sequence_access: true, no_other_routine_execute: true, can_execute_distance: true };
     database.failQuery = 'FROM pg_roles';
     beforeClose = database.closed;
     expect((await qualify()).status).toBe(500);
