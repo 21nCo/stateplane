@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile, chmod, mkdir, copyFile, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { validateTopology, validateInventory, validateDeploymentInventories, renderTopology, cellDatabaseName, railwayServiceName, readProtectedDeploymentInventory } from '../scripts/topology.mjs';
+import { validateTopology, validateInventory, validateDeploymentInventories, renderTopology, cellDatabaseName, railwayServiceName, validateRailwayServiceName, readProtectedDeploymentInventory } from '../scripts/topology.mjs';
 import { assertLiveResources } from '../scripts/topology-live.mjs';
 import { readProtectedSqlUrls, verifySqlIdentity } from '../scripts/topology-sql.mjs';
 import { dryRunTopology, syntheticInventories } from '../scripts/topology-dry-run.mjs';
@@ -68,6 +68,35 @@ test('Railway cell pattern, physical regions and legacy provider are enforced', 
   const strict = copy(topology);
   strict.environments.production.cells[0].strictResidency = true;
   assert.throws(() => validateTopology(strict), /unsupported field/);
+});
+
+test('operational Railway names obey the provider limit before render and dry run', async () => {
+  for (const environment of ['development', 'production']) {
+    const env = topology.environments[environment];
+    for (const cell of [undefined, ...env.cells]) {
+      const label = `${environment} ${cell?.id ?? 'control'}`;
+      const suffixLength = railwayServiceName({ prefix: '' }, cell).length;
+      const atLimit = railwayServiceName({ prefix: 'a'.repeat(32 - suffixLength) }, cell);
+      const overLimit = railwayServiceName({ prefix: 'a'.repeat(33 - suffixLength) }, cell);
+      assert.equal(atLimit.length, 32, label);
+      assert.equal(overLimit.length, 33, label);
+      assert.doesNotThrow(() => validateRailwayServiceName(atLimit, label));
+      assert.throws(() => validateRailwayServiceName(overLimit, label), /Railway service name is invalid/);
+      assert.throws(() => validateRailwayServiceName(`${atLimit.slice(0, -1)}/`, label), /Railway service name is invalid/);
+    }
+    const accepted = copy(topology);
+    accepted.environments[environment].prefix = 'a'.repeat(16);
+    assert.doesNotThrow(() => validateTopology(accepted));
+    const rejected = copy(accepted);
+    rejected.environments[environment].prefix += 'a';
+    assert.throws(() => validateTopology(rejected), new RegExp(`${environment} ap-southeast Railway service name is invalid`));
+    const inventories = syntheticInventories(rejected);
+    const counterpart = environment === 'development' ? 'production' : 'development';
+    assert.throws(() => renderTopology(rejected, environment, inventories[environment], inventories[counterpart], '/tmp/stateplane-topology'),
+      /Railway service name is invalid/);
+    await assert.rejects(() => dryRunTopology(rejected, { runWrangler: () => { throw new Error('provider reached'); } }),
+      /Railway service name is invalid/);
+  }
 });
 
 test('inventory isolates every Railway service, volume and Hyperdrive binding', () => {

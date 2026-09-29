@@ -14,6 +14,7 @@ const postgresRoleName = /^(?!pg_)[a-z][a-z0-9_]{0,62}$/;
 const postgresImage = /^[a-z0-9][a-z0-9./_-]*:(?:[a-z0-9._-]+)$/;
 const imageDigest = /^sha256:[a-f0-9]{64}$/i;
 const cloudflareName = /^[a-z][a-z0-9-]{0,62}$/;
+const railwayName = /^[a-z][a-z0-9-]{0,31}$/;
 const dnsLabel = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 // Hyperdrive permits 5-20 origin connections on Free and 5-100 on Paid.
 // The manifest does not attest a Workers plan, so admit only the shared range.
@@ -35,6 +36,10 @@ const unique = (values, label) => {
 };
 export const cellDatabaseName = (env, cell) => `${env.prefix.replaceAll('-', '_')}_${cell.id.replaceAll('-', '_')}`;
 export const railwayServiceName = (env, cell) => `${env.prefix}-${cell?.id ?? 'control'}-db`;
+export function validateRailwayServiceName(name, label) {
+  check(name, railwayName, `${label} Railway service name`);
+  return name;
+}
 const names = (env, cell) => {
   const prefix = env.prefix;
   return {
@@ -71,7 +76,7 @@ function validateEnvironment(environment, env, all) {
   expected.sort((a, b) => a.localeCompare(b));
   if (actual.join(',') !== expected.join(',')) throw new Error(`${environment} has incomplete cell pattern`);
   assertDerivedNames(environment, names(env));
-  check(railwayServiceName(env), cloudflareName, `${environment} control Railway service name`);
+  validateRailwayServiceName(railwayServiceName(env), `${environment} control`);
   const directory = `${env.prefix}-directory`;
   check(directory, cloudflareName, `${environment} directory name`);
   all.databases.push(`${env.control.railwayRegion}/${env.control.database}`);
@@ -89,7 +94,7 @@ function validateCell(environment, env, cell, all) {
   if (cellPlacement[cell.id]?.railwayRegion !== cell.railwayRegion) throw new Error(`${environment} ${cell.id} is mapped to the wrong provider region`);
   const resource = names(env, cell);
   assertDerivedNames(`${environment} ${cell.id}`, resource);
-  check(railwayServiceName(env, cell), cloudflareName, `${environment} ${cell.id} Railway service name`);
+  validateRailwayServiceName(railwayServiceName(env, cell), `${environment} ${cell.id}`);
   all.databases.push(`${cell.railwayRegion}/${resource.database}`);
   all.hyperdrives.push(resource.hyperdrive);
   all.buckets.push(resource.bucket);

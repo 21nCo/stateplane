@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
-import { validateTopology } from './topology.mjs';
+import { validateRailwayServiceName, validateTopology } from './topology.mjs';
 
 const run = promisify(execFile);
 const cellIds = { apse: 'ap-southeast', use: 'us-east', euw: 'eu-west' };
@@ -35,7 +35,7 @@ export function qualificationTarget(name, head, topology) {
 export function qualificationRailwayServiceName(name, head, topology) {
   const { shortEnvironment, shortCell } = qualificationTarget(name, head, topology);
   const digest = createHash('sha256').update(head).digest('hex').slice(0, 12);
-  return `s4-${head.slice(0, 8)}${digest}-${shortEnvironment}-${shortCell}`;
+  return validateRailwayServiceName(`s4-${head.slice(0, 8)}${digest}-${shortEnvironment}-${shortCell}`, 'disposable');
 }
 
 export async function qualificationConfig(root, name, hyperdriveId, head) {
