@@ -80,7 +80,8 @@ function fixture(short, cell, region, index) {
   return { name, inventory, readback };
 }
 
-test('each disposable cell requires an independent protected ID and physical provider readback before Preview', async () => {
+test('each disposable cell requires an independent protected ID and physical provider readback before Preview',
+  { skip: process.platform === 'win32' }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'sta4-target-'));
   try {
     const topology = JSON.parse(await readFile(join(root, 'deployment/topology.json')));

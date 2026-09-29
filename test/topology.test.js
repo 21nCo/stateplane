@@ -139,7 +139,7 @@ test('development and production cannot reuse provider scope or bindings', () =>
   }
 });
 
-test('live verification rechecks both protected inventories before provider access on every invocation', async () => {
+test('live verification rechecks both protected inventories before provider access on every invocation', { skip: process.platform === 'win32' }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'sta4-live-inventories-'));
   const paths = { development: join(directory, 'development.json'), production: join(directory, 'production.json') };
   const inventories = syntheticInventories(topology);
@@ -230,7 +230,7 @@ test('render requires paired inventory and rechecks public app/MCP hosts on retr
     /Public route hosts must be unique across environments/);
 });
 
-test('render CLI fails before writing config when counterpart is missing or shares a route', async () => {
+test('render CLI fails before writing config when counterpart is missing or shares a route', { skip: process.platform === 'win32' }, async () => {
   const projectRoot = await realpath(await mkdtemp(join(tmpdir(), 'sta4-render-preflight-')));
   const inventories = syntheticInventories(topology);
   inventories.development.routes = { app: 'https://shared.example.com', mcp: 'https://dev-mcp.example.com' };

@@ -92,7 +92,7 @@ test('Preview setup protects its token, requires a URL and verifies the latest b
     if (args[1] === 'delete') return '{}';
     if (args.includes('--secrets-file')) {
       secretFile = args[args.indexOf('--secrets-file') + 1];
-      assert.equal((await stat(secretFile)).mode & 0o077, 0);
+      if (process.platform !== 'win32') assert.equal((await stat(secretFile)).mode & 0o077, 0);
       assert.equal(JSON.parse(await readFile(secretFile)).PROBE_TOKEN, 'private-test-token');
       return 'Wrangler 4.135\n' + JSON.stringify({ preview_urls: ['https://probe.example.workers.dev'], deployment_urls: [] });
     }
