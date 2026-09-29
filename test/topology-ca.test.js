@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { parseUploadedCa } from '../scripts/topology-ca.mjs';
+import { parseUploadedCa, readUploadedCa } from '../scripts/topology-ca.mjs';
 
 const pem = readFileSync(new URL('./fixtures/sta4-ca-certificate.txt', import.meta.url), 'utf8').trim();
 const id = 'abcdefab-1111-4111-8111-abcdefabcdef';
@@ -22,3 +22,31 @@ test('Cloudflare CA readback rejects invalid, multiple, expired and unrelated ce
   assert.throws(() => parseUploadedCa(response(pem), id, Date.parse('2040-01-01T00:00:00Z')), /one unexpired/);
   assert.throws(() => parseUploadedCa(response(pem), id, Date.parse('2020-01-01T00:00:00Z')), /one unexpired/);
 });
+
+test('Cloudflare CA readback bounds stalled headers and body while preserving caller cancellation',
+  { timeout: 3000 }, async () => {
+    const priorId = process.env.CLOUDFLARE_ACCOUNT_ID;
+    const priorToken = process.env.CLOUDFLARE_API_TOKEN;
+    process.env.CLOUDFLARE_ACCOUNT_ID = 'a'.repeat(32);
+    process.env.CLOUDFLARE_API_TOKEN = 'test-token';
+    const keepEventLoopAlive = setInterval(() => {}, 100);
+    const stalled = signal => new Promise((_, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+    try {
+      const headers = async (_url, { signal }) => stalled(signal);
+      await assert.rejects(readUploadedCa(id, undefined, headers, 35), { name: 'TimeoutError' });
+      const body = async (_url, { signal }) => ({ ok: true, json: () => stalled(signal) });
+      await assert.rejects(readUploadedCa(id, undefined, body, 35), { name: 'TimeoutError' });
+      const controller = new AbortController();
+      const pending = readUploadedCa(id, controller.signal, headers, 1000);
+      controller.abort(new Error('caller interrupted'));
+      await assert.rejects(pending, /caller interrupted/);
+    } finally {
+      clearInterval(keepEventLoopAlive);
+      if (priorId === undefined) delete process.env.CLOUDFLARE_ACCOUNT_ID;
+      else process.env.CLOUDFLARE_ACCOUNT_ID = priorId;
+      if (priorToken === undefined) delete process.env.CLOUDFLARE_API_TOKEN;
+      else process.env.CLOUDFLARE_API_TOKEN = priorToken;
+    }
+  });

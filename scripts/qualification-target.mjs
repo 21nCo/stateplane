@@ -1,15 +1,13 @@
-import { execFile } from 'node:child_process';
 import { readFile, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { promisify } from 'node:util';
 import { qualificationTarget } from './qualification-artifact.mjs';
 import { readHyperdrive } from './wrangler-command.mjs';
 import { assertPostgresImageProvenance, sameProviderId, validVolumePath } from './topology-live.mjs';
-import { validateDeploymentInventories } from './topology.mjs';
+import { validateDeploymentInventories, validateTopology } from './topology.mjs';
 import { readProtectedSqlUrls, verifyPgdataPlacement } from './topology-sql.mjs';
 import { readUploadedCa } from './topology-ca.mjs';
+import { runBoundedCommand } from './bounded-command.mjs';
 
-const run = promisify(execFile);
 const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
 const hex = /^[a-f0-9]{32}$/i;
 export const qualificationProviderQuery = `query ReadDisposable($serviceId: String!, $environmentId: String!, $volumeInstanceId: String!) {
@@ -26,7 +24,7 @@ export async function readQualificationInventory(path) {
   catch { throw new Error('Protected qualification inventory is invalid JSON'); }
 }
 
-export async function readRailwayQualification(inventory, signal, runCommand = run) {
+export async function readRailwayQualification(inventory, signal, runCommand = runBoundedCommand) {
   const account = process.env.STATEPLANE_RAILWAY_ACCOUNT;
   if (!account) throw new Error('Connected Railway account required');
   const payload = JSON.stringify({ query: qualificationProviderQuery, variables: {
@@ -35,7 +33,8 @@ export async function readRailwayQualification(inventory, signal, runCommand = r
   } });
   const { stdout } = await runCommand('composio', ['proxy', 'https://backboard.railway.com/graphql/v2',
     '--toolkit', 'railway', '--account', account, '-X', 'POST', '-H', 'content-type: application/json', '-d', payload],
-  { maxBuffer: 1024 * 1024, timeout: 15_000, killSignal: 'SIGKILL', signal });
+  { maxBuffer: 1024 * 1024, timeout: 15_000, signal,
+    errorMessage: 'Connected Railway readback failed' });
   let railway;
   try { railway = JSON.parse(stdout); }
   catch { throw new Error('Connected Railway readback is invalid JSON'); }
@@ -126,7 +125,7 @@ export async function verifyQualificationTarget(root, name, head, artifactId,
     },
     readback = connectedQualificationReadback, pgdataProof = connectedPgdataProof, signal } = {}) {
   if (signal?.aborted) throw new Error('Qualification target verification interrupted');
-  const topology = JSON.parse(await readFile(resolve(root, 'deployment/topology.json'), 'utf8'));
+  const topology = validateTopology(JSON.parse(await readFile(resolve(root, 'deployment/topology.json'), 'utf8')));
   const { environment, cell } = qualificationTarget(name, head, topology);
   const definition = topology.environments[environment].cells.find(entry => entry.id === cell);
   const expectedDatabase = `sta4_${head.slice(0, 16)}_${environment === 'development' ? 'dev' : 'prod'}_${cell.replaceAll('-', '_')}`;

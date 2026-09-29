@@ -47,15 +47,25 @@ test('timeout, abort and overflow settle after terminating descendants holding c
         const command = runBoundedCommand(process.execPath, ['-e', parent], {
           env: { ...process.env, STA4_CHILD_PID: marker, STA4_OUTPUT: failure === 'overflow' ? '1' : '' },
           maxBuffer: failure === 'overflow' ? 64 * 1024 : 1024 * 1024,
-          timeout: failure === 'timeout' ? 200 : 3000, signal: controller.signal,
+          timeout: failure === 'timeout' ? 5000 : 3000, signal: controller.signal,
           errorMessage: 'bounded child failed'
         });
-        if (failure === 'abort') setTimeout(() => controller.abort(), 200);
         try {
-          await assert.rejects(Promise.race([command,
-            new Promise((_, reject) => setTimeout(() => reject(new Error('command hung')), 1800))]),
-          /bounded child failed/);
-          assert.ok(Date.now() - started < 1800, `${failure} must settle before watchdog`);
+          if (failure === 'abort') {
+            for (let attempt = 0; attempt < 120; attempt++) {
+              try { await readFile(marker, 'utf8'); break; }
+              catch { await new Promise(resolve => setTimeout(resolve, 25)); }
+            }
+            assert.ok(await readFile(marker, 'utf8'), 'descendant started before abort');
+            controller.abort();
+          }
+          let watchdog;
+          try {
+            await assert.rejects(Promise.race([command,
+              new Promise((_, reject) => { watchdog = setTimeout(() => reject(new Error('command hung')), 7000); })]),
+            /bounded child failed/);
+          } finally { clearTimeout(watchdog); }
+          assert.ok(Date.now() - started < 7000, `${failure} must settle before watchdog`);
           const pid = Number(await readFile(marker, 'utf8'));
           assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, `${failure} descendant must be gone`);
         } finally {

@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { readWranglerJson, setupPreview, wrangler, wranglerInvocation } from '../scripts/qualification-preview-secret.mjs';
 import { currentCleanHead, qualificationConfig } from '../scripts/qualification-artifact.mjs';
+import { previewName } from '../scripts/preview-name.mjs';
 import { promisify } from 'node:util';
 
 const run = promisify(execFile);
@@ -33,6 +34,7 @@ test('full-head qualification configs dry-run for every declared target cell', {
         assert.equal(config.workers_dev, false);
         assert.equal(config.preview_urls, true);
         assert.ok(name.length <= 54, `${name} exceeds Cloudflare's Preview script-name limit`);
+        assert.ok(`${previewName(name)}-${config.name}`.length <= 63, 'workers.dev Preview DNS label must fit');
         assert.deepEqual(config.hyperdrive, [{ binding: 'AUTHORITY', id }]);
         assert.deepEqual(config.previews.hyperdrive, config.hyperdrive);
         assert.deepEqual(config.secrets, { required: ['PROBE_TOKEN'] });
@@ -94,12 +96,13 @@ test('Preview setup protects its token, requires a URL and verifies the latest b
       assert.equal(JSON.parse(await readFile(secretFile)).PROBE_TOKEN, 'private-test-token');
       return 'Wrangler 4.135\n' + JSON.stringify({ preview_urls: ['https://probe.example.workers.dev'], deployment_urls: [] });
     }
-    assert.deepEqual(args, ['preview', 'secret', 'list', '--name', name, '--config', configPath, '--ignore-base-config', '--json']);
+    assert.deepEqual(args, ['preview', 'secret', 'list', '--name', previewName(name), '--config', configPath, '--ignore-base-config', '--json']);
     return 'Reading secrets...\n' + JSON.stringify([{ name: 'PROBE_TOKEN', type: 'secret_text' }]);
   };
   try {
     await run(process.execPath, [script, name, hyperdriveId]);
     assert.deepEqual(await preview(name, 'private-test-token', { runWrangler }), ['https://probe.example.workers.dev']);
+    for (const args of calls) assert.equal(args[args.indexOf('--name') + 1], previewName(name));
     assert.deepEqual(await preview(name, 'private-test-token', { runWrangler: async args =>
       args.includes('--secrets-file') ? JSON.stringify({ preview: { urls: ['https://probe.example.workers.dev'] } }) :
         JSON.stringify([{ name: 'PROBE_TOKEN', type: 'secret_text' }]) }), ['https://probe.example.workers.dev']);

@@ -8,6 +8,7 @@ import { currentCleanHead, qualificationConfig } from './qualification-artifact.
 import { verifyQualificationTarget } from './qualification-target.mjs';
 import { readWranglerJson } from './wrangler-json.mjs';
 import { runBoundedCommand } from './bounded-command.mjs';
+import { previewName } from './preview-name.mjs';
 
 export { readWranglerJson } from './wrangler-json.mjs';
 
@@ -37,7 +38,7 @@ export async function setupPreview(name, token, { runWrangler = wrangler, verify
   const expected = await qualificationConfig(root, name, id, head);
   if (!isDeepStrictEqual(config, expected)) throw new Error('Preview config is not the exact-head qualification artifact');
   await verifyTarget(root, name, head, id, { signal });
-  const target = ['--name', name, '--config', configPath, '--ignore-base-config'];
+  const target = ['--name', previewName(name), '--config', configPath, '--ignore-base-config'];
   const directory = await mkdtemp(join(tmpdir(), 'sta4-preview-secret-'));
   let attempted = false;
   try {

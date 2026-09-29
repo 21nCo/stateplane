@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 import { currentCleanHead } from './qualification-artifact.mjs';
 import { wrangler } from './qualification-preview-secret.mjs';
 import { readWranglerJson } from './wrangler-json.mjs';
+import { previewName } from './preview-name.mjs';
 
 const root = resolve(import.meta.dirname, '..');
 const suffixes = { control: 'ctl', 'ap-southeast': 'apse', 'us-east': 'use', 'eu-west': 'euw' };
@@ -38,7 +39,7 @@ export async function verifyOperationalBinding(environment, label, resource, dat
   const directory = await mkdtemp(join(tmpdir(), 'sta4-operational-'));
   const configPath = join(directory, 'wrangler.json');
   const secretPath = join(directory, 'secrets.json');
-  const target = ['--name', name, '--config', configPath, '--ignore-base-config'];
+  const target = ['--name', previewName(name), '--config', configPath, '--ignore-base-config'];
   let attempted = false;
   let failure;
   let evidence;

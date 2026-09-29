@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { verifyOperationalBinding } from '../scripts/operational-binding.mjs';
+import { previewName } from '../scripts/preview-name.mjs';
 
 const head = 'a'.repeat(40);
 const resource = { hyperdriveId: 'b'.repeat(32), databaseRole: 'cell_reader' };
@@ -51,6 +52,8 @@ test('each operational binding is proved through its exact Hyperdrive ID and Wor
     assert.equal(h.config.hyperdrive[0].id, resource.hyperdriveId);
     assert.equal(h.config.workers_dev, false);
     assert.equal(h.config.preview_urls, true);
+    assert.ok(`${previewName(h.config.name)}-${h.config.name}`.length <= 63);
+    for (const args of h.calls) assert.equal(args[args.indexOf('--name') + 1], previewName(h.config.name));
     assert.deepEqual(h.config.previews.hyperdrive, h.config.hyperdrive);
     assert.equal(h.config.vars.STATEPLANE_PROBE_DATABASE, database);
     assert.equal(h.config.vars.STATEPLANE_PROBE_ROLE, resource.databaseRole);

@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
+import { validateTopology } from './topology.mjs';
 
 const run = promisify(execFile);
 const cellIds = { apse: 'ap-southeast', use: 'us-east', euw: 'eu-west' };
@@ -30,7 +31,7 @@ export function qualificationTarget(name, head, topology) {
 }
 
 export async function qualificationConfig(root, name, hyperdriveId, head) {
-  const topology = JSON.parse(await readFile(resolve(root, 'deployment/topology.json')));
+  const topology = validateTopology(JSON.parse(await readFile(resolve(root, 'deployment/topology.json'))));
   const { cell, shortEnvironment } = qualificationTarget(name, head, topology);
   if (!/^[a-f0-9]{32}$/i.test(hyperdriveId ?? '')) throw new Error('Disposable Hyperdrive ID is invalid');
   const out = resolve(root, '.data/qualification');

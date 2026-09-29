@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { verifyQualificationTarget } from '../scripts/qualification-target.mjs';
+import { qualificationConfig } from '../scripts/qualification-artifact.mjs';
 import { syntheticInventories } from '../scripts/topology-dry-run.mjs';
 
 const root = resolve(import.meta.dirname, '..');
@@ -14,6 +15,38 @@ const targets = [
   ['d', 'euw', 'europe-west4-drams3a'], ['p', 'apse', 'asia-southeast1-eqsg3a'],
   ['p', 'use', 'us-east4-eqdc4a']
 ];
+
+test('generator and verifier reject invalid physical placement before provider or Preview work', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sta4-invalid-placement-'));
+  const topologyPath = join(directory, 'deployment', 'topology.json');
+  const original = JSON.parse(await readFile(join(root, 'deployment/topology.json')));
+  await mkdir(join(directory, 'deployment'));
+  try {
+    for (const [short, cell] of targets) {
+      const environment = short === 'd' ? 'development' : 'production';
+      const cellId = { apse: 'ap-southeast', use: 'us-east', euw: 'eu-west' }[cell];
+      for (const defect of ['railwayRegion', 'originConnectionLimit']) {
+        const topology = structuredClone(original);
+        const entry = topology.environments[environment].cells.find(value => value.id === cellId);
+        entry[defect] = defect === 'railwayRegion' ? 'wrong-region' : 9999;
+        await writeFile(topologyPath, JSON.stringify(topology));
+        const name = `s4-${head}-${short}-${cell}`;
+        await assert.rejects(qualificationConfig(directory, name, 'a'.repeat(32), head),
+          /wrong provider region|connection limit is invalid/);
+        let providerCalled = false;
+        await assert.rejects(verifyQualificationTarget(directory, name, head, 'a'.repeat(32), {
+          readback: async () => { providerCalled = true; throw new Error('provider reached'); }
+        }), /wrong provider region|connection limit is invalid/);
+        assert.equal(providerCalled, false, `${name}: invalid ${defect} must block provider readback`);
+      }
+    }
+    const topology = structuredClone(original);
+    topology.environments.production.cells[1].id = 'eu-west';
+    await writeFile(topologyPath, JSON.stringify(topology));
+    await assert.rejects(qualificationConfig(directory, `s4-${head}-p-apse`, 'a'.repeat(32), head),
+      /incomplete cell pattern/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
 
 function fixture(short, cell, region, index) {
   const name = `s4-${head}-${short}-${cell}`;
