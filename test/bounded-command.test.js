@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runBoundedCommand } from '../scripts/bounded-command.mjs';
+import { assertProcessStopped } from './process-stopped.mjs';
 
 test('child output is bounded in combined bytes and the child is gone before rejection',
   { skip: process.platform === 'win32', timeout: 10_000 }, async () => {
@@ -31,12 +32,14 @@ test('child output is bounded in combined bytes and the child is gone before rej
 
 test('timeout, abort and overflow settle after terminating descendants holding command pipes',
   { skip: process.platform === 'win32', timeout: 15_000 }, async () => {
+    assert.throws(() => assertProcessStopped(process.pid), /process must stop executing/,
+      'the liveness oracle must reject an executing process');
     const directory = await mkdtemp(join(tmpdir(), 'sta4-child-tree-'));
     try {
-      for (const failure of ['timeout', 'abort', 'overflow']) {
+      for (const failure of ['timeout', 'abort', 'overflow-stdout', 'overflow-stderr']) {
         const marker = join(directory, `${failure}.pid`);
         const grandchild = `require('node:fs').writeFileSync(process.env.STA4_CHILD_PID,String(process.pid));
-          if(process.env.STA4_OUTPUT)process.stderr.write('€'.repeat(30000));
+          if(process.env.STA4_OUTPUT)process[process.env.STA4_OUTPUT].write('€'.repeat(30000));
           setTimeout(()=>process.exit(0),10000);`;
         const parent = `const {spawn}=require('node:child_process');
           spawn(process.execPath,['-e',${JSON.stringify(grandchild)}],
@@ -45,8 +48,8 @@ test('timeout, abort and overflow settle after terminating descendants holding c
         const controller = new AbortController();
         const started = Date.now();
         const command = runBoundedCommand(process.execPath, ['-e', parent], {
-          env: { ...process.env, STA4_CHILD_PID: marker, STA4_OUTPUT: failure === 'overflow' ? '1' : '' },
-          maxBuffer: failure === 'overflow' ? 64 * 1024 : 1024 * 1024,
+          env: { ...process.env, STA4_CHILD_PID: marker, STA4_OUTPUT: failure.startsWith('overflow-') ? failure.slice(9) : '' },
+          maxBuffer: failure.startsWith('overflow-') ? 64 * 1024 : 1024 * 1024,
           timeout: failure === 'timeout' ? 5000 : 3000, signal: controller.signal,
           errorMessage: 'bounded child failed'
         });
@@ -66,8 +69,11 @@ test('timeout, abort and overflow settle after terminating descendants holding c
             /bounded child failed/);
           } finally { clearTimeout(watchdog); }
           assert.ok(Date.now() - started < 7000, `${failure} must settle before watchdog`);
+          if (failure.startsWith('overflow-')) {
+            assert.ok(Date.now() - started < 1500, `${failure} must reject on bytes before the 3000ms timeout`);
+          }
           const pid = Number(await readFile(marker, 'utf8'));
-          assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, `${failure} descendant must be gone`);
+          assertProcessStopped(pid, `${failure} descendant must stop executing`);
         } finally {
           try { process.kill(Number(await readFile(marker, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
           await command.catch(() => {});

@@ -4,6 +4,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readRailwayQualification } from '../scripts/qualification-target.mjs';
+import { assertProcessStopped } from './process-stopped.mjs';
 
 test('connected Railway readback rejects every GraphQL error', async () => {
   const previous = process.env.STATEPLANE_RAILWAY_ACCOUNT;
@@ -63,7 +64,7 @@ setTimeout(() => process.exit(0), 80);
       controller.abort();
       await assert.rejects(request, /Connected Railway readback failed/);
       assert.ok(Date.now() - started < 3000, 'real child must settle before watchdog');
-      assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+      assertProcessStopped(pid, 'Railway descendant must stop executing');
     } finally {
       controller.abort();
       await request?.catch(() => {});
