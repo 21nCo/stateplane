@@ -1,0 +1,18 @@
+scripts/bounded-command.mjs
+  h_a39f9495f9ec1d 1-22,30-32,37-38,40,42-48,50,53,61,63,65
+test/bounded-command.test.js
+  h_a39f9495f9ec1d 16,21,31-67
+test/settings-role-postgres.test.js
+  h_a39f9495f9ec1d 13-29,45,70-75,106-108,110-112
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "32a6a275a326331b815402dc8fde93e5e4e9cefd",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
