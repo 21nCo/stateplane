@@ -1,0 +1,27 @@
+scripts/topology-sql.mjs
+  s_6126673cc0a89e::t_07aca92b96bc09 96
+test/topology-pgdata.test.js
+  s_6126673cc0a89e::t_5e98bf9bcee365 3,16,34,38,41
+docs/regional-topology.md
+  s_6126673cc0a89e::t_e3ed3e8a82e1b4 29,65,74
+scripts/qualification-target.mjs
+  s_6126673cc0a89e::t_5e98bf9bcee365 58
+scripts/verify-topology.mjs
+  s_6126673cc0a89e::t_5e98bf9bcee365 54
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7c04fdafc1f5b9faefb24e9b679e8bb94d025dc6",
+  "prompts": {},
+  "sessions": {
+    "s_6126673cc0a89e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c2bc-9ed5-72b0-a4bd-e7dcb1d6a6eb",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
