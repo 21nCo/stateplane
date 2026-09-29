@@ -21,9 +21,14 @@ const database = vi.hoisted(() => ({
   otherConnections: 0,
   reservedConnections: 3,
   valueReads: 0,
-  attemptId: '0000000000001-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-  storedAttemptId: '0000000000001-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as string | null,
+  attemptId: '1',
+  storedAttemptId: '1' as string | null,
   activeAttempt: true,
+  relationKind: 'r',
+  relationOwner: 'sta4_probe_aaaaaaaaaaaaaaaa',
+  relationColumnsValid: true,
+  relationSchema: 'public',
+  relationTriggers: 0,
   queries: [] as string[],
   targetDatabase: 'sta4_aaaaaaaaaaaaaaaa_dev_ap_southeast',
   targetRole: 'sta4_probe_aaaaaaaaaaaaaaaa',
@@ -44,21 +49,37 @@ vi.mock('pg', () => ({
       database.queries.push(sql);
       if (database.failQuery && sql.includes(database.failQuery)) throw new Error('query timeout');
       if (sql.startsWith('SET LOCAL lock_timeout')) return { rows: [] };
-      if (sql.startsWith('SELECT attempt_id') && sql.includes('stateplane_qualification_attempt')) {
+      if (sql.startsWith('SELECT current_user AS current_role, probe.*')) {
+        const column = (name: string, type: string) => ({ name, type, notNull: true, default: null, identity: '', generated: '' });
+        const probeColumns = [column('probe_id', 'uuid'), column('value', 'integer')];
+        const attemptColumns = [column('singleton', 'boolean'), column('generation', 'bigint'), column('active', 'boolean')];
+        if (!database.relationColumnsValid) probeColumns[1].type = 'text';
+        const relation = (relname: string, columns: unknown[], constraints: unknown[]) => ({
+          current_role: database.targetRole, relname, relkind: database.relationKind, relpersistence: 'p',
+          relrowsecurity: false, relforcerowsecurity: false, owner: database.relationOwner,
+          triggers: database.relationTriggers, rules: 0, inheritance: 0, schema: database.relationSchema, columns, constraints
+        });
+        const primary = (name: string) => ({ kind: 'p', columns: [1], definition: `PRIMARY KEY (${name})` });
+        return { rows: [relation('stateplane_qualification', probeColumns, [primary('probe_id')]),
+          relation('stateplane_qualification_attempt', attemptColumns,
+            [{ kind: 'c', columns: [1], definition: 'CHECK (singleton)' }, primary('singleton')])] };
+      }
+      if (sql.startsWith('SELECT generation') && sql.includes('stateplane_qualification_attempt')) {
         if (database.storedAttemptId === null) return { rows: [] };
         if (sql.includes('AND active = TRUE') && !database.activeAttempt) return { rows: [] };
-        return { rows: [{ attempt_id: database.storedAttemptId, active: database.activeAttempt }] };
+        return { rows: [{ generation: database.storedAttemptId, active: database.activeAttempt }] };
       }
-      if (sql.startsWith('UPDATE stateplane_qualification_attempt')) {
-        if (sql.includes('SET attempt_id')) database.storedAttemptId = String(parameters?.[0]);
-        database.activeAttempt = sql.includes('SET attempt_id');
-        return { rows: [{ attempt_id: database.storedAttemptId }] };
+      if (sql.startsWith('UPDATE public.stateplane_qualification_attempt')) {
+        if (sql.includes('SET active = TRUE')) {
+          if (String(parameters?.[0]) !== database.storedAttemptId || database.activeAttempt) return { rows: [] };
+          database.activeAttempt = true;
+        } else database.activeAttempt = false;
+        return { rows: [{ generation: database.storedAttemptId }] };
       }
-      if (sql.startsWith('INSERT INTO stateplane_qualification_attempt')) {
-        if (database.storedAttemptId !== null && String(parameters?.[0]) <= database.storedAttemptId) return { rows: [] };
-        database.storedAttemptId = String(parameters?.[0]);
-        database.activeAttempt = true;
-        return { rows: [{ attempt_id: database.storedAttemptId }] };
+      if (sql.startsWith('INSERT INTO public.stateplane_qualification_attempt')) {
+        database.storedAttemptId = String(Number(database.storedAttemptId ?? 0) + 1);
+        database.activeAttempt = false;
+        return { rows: [{ generation: database.storedAttemptId }] };
       }
       if (sql === 'BEGIN') { database.transactionRow = false; return { rows: [] }; }
       if (sql === 'ROLLBACK') {
@@ -84,7 +105,7 @@ vi.mock('pg', () => ({
         if (database.deleteMode === 'ok') { database.row = null; database.transactionRow = false; }
         return { rows: [] };
       }
-      if (sql === 'SELECT count(*)::integer AS count FROM stateplane_qualification') return { rows: [{ count: database.orphanRows + (database.row === null ? 0 : 1) }] };
+      if (sql === 'SELECT count(*)::integer AS count FROM public.stateplane_qualification') return { rows: [{ count: database.orphanRows + (database.row === null ? 0 : 1) }] };
       if (sql.includes('count(*)') && sql.includes('stateplane_qualification')) return { rows: [{ count: database.row === null && !database.transactionRow ? 0 : 1 }] };
       if (sql.includes('SELECT value')) {
         database.valueReads++;
@@ -123,9 +144,14 @@ describe('disposable qualification row cleanup', () => {
     database.staleInitialRead = false;
     database.staleFreshRead = false;
     database.valueReads = 0;
-    database.attemptId = '0000000000001-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    database.attemptId = '1';
     database.storedAttemptId = database.attemptId;
     database.activeAttempt = true;
+    database.relationKind = 'r';
+    database.relationOwner = 'sta4_probe_aaaaaaaaaaaaaaaa';
+    database.relationColumnsValid = true;
+    database.relationSchema = 'public';
+    database.relationTriggers = 0;
     database.queries = [];
     database.vectorDistance = Math.SQRT2;
     database.vectorMissingRow = false;
@@ -163,7 +189,8 @@ describe('disposable qualification row cleanup', () => {
 
   it('fences late old probes and starts only a newer replay after zero residual rows', async () => {
     const old = database.attemptId;
-    const newer = '0000000000002-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    const newer = '2';
+    expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/reserve')).status).toBe(200);
     database.attemptId = newer;
     expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/start')).status).toBe(200);
     database.attemptId = old;
@@ -175,16 +202,22 @@ describe('disposable qualification row cleanup', () => {
     expect((await qualify()).status).toBe(200);
     expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/residual')).status).toBe(200);
     expect((await qualify()).status).toBe(500);
-    database.orphanRows = 1;
-    database.attemptId = '0000000000003-cccccccccccccccccccccccccccccccc';
+    database.attemptId = old;
     expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/start')).status).toBe(500);
+    expect(database.row).toBeNull();
+    database.attemptId = newer;
+    database.orphanRows = 1;
+    expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/reserve')).status).toBe(500);
     database.orphanRows = 0;
+    database.attemptId = '4';
+    expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/reserve')).status).toBe(200);
     expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/start')).status).toBe(200);
   });
 
   it('initializes the fence before the first probe on a fresh disposable database', async () => {
     database.storedAttemptId = null;
     database.activeAttempt = false;
+    expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/reserve')).status).toBe(200);
     expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/start')).status).toBe(200);
     expect(database.storedAttemptId).toBe(database.attemptId);
     expect((await qualify()).status).toBe(200);
@@ -206,7 +239,7 @@ describe('disposable qualification row cleanup', () => {
       expect(response.status).toBe(500);
       expect(await response.json()).toEqual({ ok: false });
       expect(log).toHaveBeenCalledWith('Qualification failed', 'probe:residual-read');
-      expect(database.queries).toContain('SELECT count(*)::integer AS count FROM stateplane_qualification');
+      expect(database.queries).toContain('SELECT count(*)::integer AS count FROM public.stateplane_qualification');
       expect(database.closed).toBe(1);
     } finally { log.mockRestore(); }
   });
@@ -214,12 +247,32 @@ describe('disposable qualification row cleanup', () => {
   it('requires authorization and fails closed when the final residual read fails', async () => {
     expect((await qualify(null, '1', {}, '/qualify/residual')).status).toBe(403);
     expect(database.connections).toBe(0);
-    database.failQuery = 'SELECT count(*)::integer AS count FROM stateplane_qualification';
+    database.failQuery = 'SELECT count(*)::integer AS count FROM public.stateplane_qualification';
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/residual')).status).toBe(500);
       expect(log).toHaveBeenCalledWith('Qualification failed', 'probe:residual-read');
       expect(database.closed).toBe(1);
+    } finally { log.mockRestore(); }
+  });
+
+  it('preserves rollback and client-close failures for attempt lifecycle endpoints', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (const path of ['/qualify/start', '/qualify/residual']) {
+        database.activeAttempt = path === '/qualify/residual';
+        database.failQuery = 'SET LOCAL lock_timeout';
+        database.rollbackFailure = true;
+        database.queries = [];
+        expect((await qualify('Bearer disposable-token', '1', {}, path)).status).toBe(500);
+        expect(log).toHaveBeenLastCalledWith('Qualification failed', 'probe:attempt-timeout,attempt:rollback');
+        expect(database.queries).toContain('ROLLBACK');
+        database.failQuery = '';
+      }
+      database.activeAttempt = false;
+      database.endFailure = true;
+      expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/start')).status).toBe(500);
+      expect(log).toHaveBeenLastCalledWith('Qualification failed', 'close:writer');
     } finally { log.mockRestore(); }
   });
 
@@ -294,8 +347,8 @@ describe('disposable qualification row cleanup', () => {
     expect(database.row).toBeNull();
     expect(database.transactionRow).toBe(false);
     expect(database.queries).toContain('ROLLBACK');
-    expect(database.queries.some(sql => sql.startsWith('DELETE FROM stateplane_qualification'))).toBe(true);
-    expect(database.queries.filter(sql => sql.includes('SELECT count(*)') && sql.includes('stateplane_qualification'))).toHaveLength(2);
+    expect(database.queries.some(sql => sql.startsWith('DELETE FROM public.stateplane_qualification'))).toBe(true);
+    expect(database.queries.filter(sql => sql.startsWith('SELECT count(*)') && sql.includes('stateplane_qualification'))).toHaveLength(2);
     expect(database.closed).toBe(2);
   });
 
@@ -317,8 +370,8 @@ describe('disposable qualification row cleanup', () => {
       expect(log).toHaveBeenCalledWith('Qualification failed', 'probe:transaction-rollback');
       expect(database.row).toBeNull();
       expect(database.transactionRow).toBe(false);
-      expect(database.queries.some(sql => sql.startsWith('DELETE FROM stateplane_qualification'))).toBe(true);
-      expect(database.queries.filter(sql => sql.includes('SELECT count(*)') && sql.includes('stateplane_qualification'))).toHaveLength(1);
+      expect(database.queries.some(sql => sql.startsWith('DELETE FROM public.stateplane_qualification'))).toBe(true);
+      expect(database.queries.filter(sql => sql.startsWith('SELECT count(*)') && sql.includes('stateplane_qualification'))).toHaveLength(1);
       expect(database.closed).toBe(2);
     } finally { log.mockRestore(); }
   });
@@ -388,6 +441,23 @@ describe('disposable qualification row cleanup', () => {
     expect(database.closed - beforeClose).toBe(2);
   });
 
+  it('rejects hostile reserved relations before reserve, replay or probe writes', async () => {
+    for (const [field, value] of [
+      ['relationKind', 'v'], ['relationOwner', 'other_owner'], ['relationColumnsValid', false],
+      ['relationSchema', 'other_probe'], ['relationTriggers', 1]
+    ] as const) {
+      const previous = database[field];
+      database[field] = value as never;
+      for (const path of ['/qualify/reserve', '/qualify/start', '/qualify']) {
+        database.queries = [];
+        expect((await qualify('Bearer disposable-token', '1', {}, path)).status).toBe(500);
+        expect(database.queries.some(sql => sql.startsWith('CREATE TABLE') || sql.startsWith('INSERT INTO'))).toBe(false);
+        expect(database.row).toBeNull();
+      }
+      database[field] = previous as never;
+    }
+  });
+
   it('denies missing, wrong and non-Bearer credentials and non-disposable deployments before connecting', async () => {
     for (const [authorization, disposable] of [
       [null, '1'],
@@ -418,12 +488,13 @@ describe('disposable qualification row cleanup', () => {
   });
 
   it('admits every declared development and production cell', async () => {
-    for (const [index, suffix] of ['dev_ap_southeast', 'dev_us_east', 'dev_eu_west', 'prod_ap_southeast', 'prod_us_east'].entries()) {
+    for (const suffix of ['dev_ap_southeast', 'dev_us_east', 'dev_eu_west', 'prod_ap_southeast', 'prod_us_east']) {
       const target = `sta4_aaaaaaaaaaaaaaaa_${suffix}`;
       database.targetDatabase = target;
-      database.attemptId = `${String(index + 1).padStart(13, '0')}-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`;
+      database.attemptId = '1';
       database.storedAttemptId = null;
       database.activeAttempt = false;
+      expect((await qualify('Bearer disposable-token', '1', { STATEPLANE_PROBE_DATABASE: target }, '/qualify/reserve')).status).toBe(200);
       expect((await qualify('Bearer disposable-token', '1', { STATEPLANE_PROBE_DATABASE: target }, '/qualify/start')).status).toBe(200);
       expect((await qualify('Bearer disposable-token', '1', { STATEPLANE_PROBE_DATABASE: target })).status).toBe(200);
       expect((await qualify('Bearer disposable-token', '1', { STATEPLANE_PROBE_DATABASE: target }, '/qualify/residual')).status).toBe(200);

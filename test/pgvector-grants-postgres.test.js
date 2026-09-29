@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { settingsRoleSql } from '../scripts/topology-sql.mjs';
 import { qualificationGrantsAllowed, qualificationGrantsSql } from '../deployment/workers/role-grants.js';
-import { Client } from 'pg';
+import { Client, Pool } from 'pg';
 import { cleanupCluster } from './postgres-cluster-cleanup.mjs';
 
 const run = promisify(execFile);
@@ -81,38 +81,72 @@ test('documented role-specific pgvector grants exclude the settings login',
         await client.query('SET ROLE sta4_probe');
         assert.equal(qualificationGrantsAllowed((await client.query(qualificationGrantsSql)).rows[0]), true);
         await client.query('CREATE TABLE stateplane_qualification (probe_id uuid PRIMARY KEY, value integer NOT NULL)');
-        await client.query('CREATE TABLE stateplane_qualification_attempt (singleton boolean PRIMARY KEY CHECK (singleton), attempt_id text NOT NULL, active boolean NOT NULL)');
+        await client.query('CREATE TABLE stateplane_qualification_attempt (singleton boolean PRIMARY KEY CHECK (singleton), generation bigint NOT NULL, active boolean NOT NULL)');
         assert.equal(qualificationGrantsAllowed((await client.query(qualificationGrantsSql)).rows[0]), true,
           'the two disposable fence tables remain admissible on replay');
         await client.query('CREATE TABLE unexpected_probe_data (value integer)');
         assert.equal(qualificationGrantsAllowed((await client.query(qualificationGrantsSql)).rows[0]), false,
           'the fence exception does not admit unrelated owned tables');
         await client.query('DROP TABLE unexpected_probe_data');
-        const attempt = '0000000000001-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
-        await client.query('INSERT INTO stateplane_qualification_attempt (singleton, attempt_id, active) VALUES (TRUE, $1, TRUE)', [attempt]);
+        const attempt = '1';
+        await client.query('INSERT INTO stateplane_qualification_attempt (singleton, generation, active) VALUES (TRUE, $1, TRUE)', [attempt]);
         const shared = new Client({ host: directory, port: 5433, database: 'postgres' });
         const closer = new Client({ host: directory, port: 5433, database: 'postgres' });
         await Promise.all([shared.connect(), closer.connect()]);
         try {
           await Promise.all([shared.query('SET ROLE sta4_probe'), closer.query('SET ROLE sta4_probe')]);
           await shared.query('BEGIN');
-          await shared.query('SELECT attempt_id FROM stateplane_qualification_attempt WHERE singleton = TRUE FOR SHARE');
+          await shared.query('SELECT generation FROM stateplane_qualification_attempt WHERE singleton = TRUE FOR SHARE');
           await closer.query('BEGIN');
           await closer.query("SET LOCAL lock_timeout = '2000ms'");
           let exclusiveAcquired = false;
-          const exclusive = closer.query('SELECT attempt_id FROM stateplane_qualification_attempt WHERE singleton = TRUE FOR UPDATE')
+          const exclusive = closer.query('SELECT generation FROM stateplane_qualification_attempt WHERE singleton = TRUE FOR UPDATE')
             .then(value => { exclusiveAcquired = true; return value; });
           await new Promise(resolveDelay => setTimeout(resolveDelay, 50));
           assert.equal(exclusiveAcquired, false, 'close must wait for an admitted Worker transaction');
           await shared.query('ROLLBACK');
-          assert.equal((await exclusive).rows[0].attempt_id, attempt);
+          assert.equal((await exclusive).rows[0].generation, attempt);
           await closer.query('UPDATE stateplane_qualification_attempt SET active = FALSE WHERE singleton = TRUE');
           await closer.query('COMMIT');
           assert.equal((await client.query('SELECT active FROM stateplane_qualification_attempt')).rows[0].active, false);
+          const replay = await client.query(`UPDATE stateplane_qualification_attempt
+            SET generation = generation + 1, active = TRUE WHERE singleton = TRUE RETURNING generation`);
+          assert.equal(replay.rows[0].generation, '2');
+          await client.query('UPDATE stateplane_qualification_attempt SET active = FALSE WHERE singleton = TRUE');
+          const delayedOldStart = await client.query(`UPDATE stateplane_qualification_attempt SET active = TRUE
+            WHERE singleton = TRUE AND generation = $1 AND active = FALSE RETURNING generation`, ['1']);
+          assert.equal(delayedOldStart.rowCount, 0, 'older independent start cannot reopen after newer close');
         } finally {
           await Promise.allSettled([shared.query('ROLLBACK'), closer.query('ROLLBACK')]);
           await Promise.allSettled([shared.end(), closer.end()]);
         }
+        const pool = new Pool({ host: directory, port: 5433, database: 'postgres', user: 'sta4_probe',
+          max: 5, connectionTimeoutMillis: 500 });
+        let borrowed = 0;
+        let peakBorrowed = 0;
+        const boundedProbe = async () => {
+          const reader = await pool.connect();
+          borrowed++;
+          peakBorrowed = Math.max(peakBorrowed, borrowed);
+          try {
+            await reader.query('BEGIN');
+            await reader.query('SELECT generation FROM stateplane_qualification_attempt WHERE singleton = TRUE FOR SHARE');
+            const writer = await pool.connect();
+            borrowed++;
+            peakBorrowed = Math.max(peakBorrowed, borrowed);
+            try { await writer.query('SELECT 1'); }
+            finally { borrowed--; writer.release(); }
+          } finally {
+            await reader.query('ROLLBACK');
+            borrowed--;
+            reader.release();
+          }
+        };
+        try {
+          for (let batch = 0; batch < 5; batch++) await Promise.all([boundedProbe(), boundedProbe()]);
+          assert.ok(peakBorrowed <= 4, 'ten probes in pairs keep one of five origin slots free');
+          assert.equal(borrowed, 0);
+        } finally { await pool.end(); }
       } finally { await client.end(); }
 
       await psql('REVOKE EXECUTE ON FUNCTION public.l2_distance(public.vector, public.vector) FROM sta4_probe');

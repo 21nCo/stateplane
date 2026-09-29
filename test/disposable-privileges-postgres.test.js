@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from 'pg';
 import { qualificationGrantsAllowed, qualificationGrantsSql, operationalGrantsAllowed, operationalGrantsSql } from '../deployment/workers/role-grants.js';
+import { probeRelationAllowed, probeRelationsSql } from '../deployment/workers/probe-relations.js';
 import { settingsRoleSql } from '../scripts/topology-sql.mjs';
 import { cleanupCluster } from './postgres-cluster-cleanup.mjs';
 
@@ -49,14 +50,17 @@ test('real PostgreSQL isolates control, cells and separate disposable databases 
         return run(join(postgresBin, 'psql'), ['-X', '-h', directory, '-p', '5434', '-d', database,
           '-v', 'ON_ERROR_STOP=1', ...(role ? ['-v', `target_role=${role}`] : []), '-f', script]);
       };
-      const withRole = async (database, role, sql) => {
+      const withRole = async (database, role, sql, all = false) => {
         const client = new Client({ host: directory, port: 5434, database });
         await client.connect();
         try {
           await client.query(`SET ROLE ${role}`);
-          return (await client.query(sql)).rows[0];
+          const rows = (await client.query(sql)).rows;
+          return all ? rows : rows[0];
         } finally { await client.end(); }
       };
+      const relationRows = (database, role) => withRole(database, role,
+        `SELECT current_user AS current_role, probe.* FROM (${probeRelationsSql}) AS probe`, true);
       await psql('postgres', 'CREATE ROLE settings_reader LOGIN; GRANT pg_read_all_settings TO settings_reader;');
       for (let index = 0; index < resources.length; index++) {
         const operationalDb = `sta4_operational_${index}`;
@@ -76,6 +80,13 @@ test('real PostgreSQL isolates control, cells and separate disposable databases 
         await psql(disposableDb, recipe, probeRole);
         assert.equal(qualificationGrantsAllowed(await withRole(disposableDb, probeRole, qualificationGrantsSql)), true,
           `${resources[index].name} disposable admission`);
+        await psql(disposableDb, `SET ROLE ${probeRole};
+          CREATE TABLE public.stateplane_qualification (probe_id uuid PRIMARY KEY, value integer NOT NULL);
+          CREATE TABLE public.stateplane_qualification_attempt
+            (singleton boolean PRIMARY KEY CHECK (singleton), generation bigint NOT NULL, active boolean NOT NULL);
+          RESET ROLE;`);
+        assert.equal((await relationRows(disposableDb, probeRole)).every(probeRelationAllowed), true,
+          `${resources[index].name} probe relations have exact owned base-table shape`);
         assert.equal((await withRole(disposableDb, 'settings_reader', settingsRoleSql)).can_execute_routines, false,
           `${resources[index].name} disposable settings credential`);
         assert.equal((await withRole(operationalDb, probeRole,
@@ -85,6 +96,31 @@ test('real PostgreSQL isolates control, cells and separate disposable databases 
 
       const db = 'sta4_disposable_1';
       const probe = 'sta4_probe_1';
+      await psql(db, `DROP TABLE public.stateplane_qualification;
+        CREATE TABLE hidden_business (probe_id uuid PRIMARY KEY, value integer NOT NULL);
+        CREATE VIEW public.stateplane_qualification AS SELECT probe_id, value FROM hidden_business;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON public.stateplane_qualification TO ${probe};`);
+      assert.equal(qualificationGrantsAllowed(await withRole(db, probe, qualificationGrantsSql)), true,
+        'the old grant-only admission accepts a same-name updatable view');
+      assert.equal((await relationRows(db, probe)).every(probeRelationAllowed), false,
+        'catalog admission rejects the view before probe writes hidden data');
+      assert.equal((await withRole(db, probe, 'SELECT count(*)::integer AS count FROM public.stateplane_qualification')).count, 0);
+      await psql(db, `DROP VIEW public.stateplane_qualification;
+        CREATE TABLE public.stateplane_qualification (probe_id uuid PRIMARY KEY, value integer NOT NULL);
+        ALTER TABLE public.stateplane_qualification OWNER TO ${probe};`);
+      assert.equal((await relationRows(db, probe)).every(probeRelationAllowed), true);
+      await psql(db, 'ALTER TABLE public.stateplane_qualification ADD COLUMN extra text;');
+      assert.equal((await relationRows(db, probe)).every(probeRelationAllowed), false, 'wrong shape is rejected');
+      await psql(db, 'ALTER TABLE public.stateplane_qualification DROP COLUMN extra;');
+      await psql(db, 'ALTER TABLE public.stateplane_qualification OWNER TO CURRENT_USER;');
+      assert.equal((await relationRows(db, probe)).every(probeRelationAllowed), false, 'foreign owner is rejected');
+      await psql(db, `ALTER TABLE public.stateplane_qualification OWNER TO ${probe};
+        CREATE SCHEMA other_probe;
+        CREATE TABLE other_probe.stateplane_qualification (probe_id uuid PRIMARY KEY, value integer NOT NULL);`);
+      assert.equal((await relationRows(db, probe)).every(probeRelationAllowed), false,
+        'same-name relation in another schema is rejected');
+      await psql(db, 'DROP SCHEMA other_probe CASCADE;');
+      assert.equal((await relationRows(db, probe)).every(probeRelationAllowed), true, 'clean replay relations pass');
       const flags = () => withRole(db, probe, qualificationGrantsSql);
       const admitted = async () => qualificationGrantsAllowed(await flags());
       await psql(db, `CREATE TABLE private_records(secret text);

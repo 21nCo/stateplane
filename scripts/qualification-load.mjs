@@ -1,15 +1,25 @@
 import { realpathSync } from 'node:fs';
-import { randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setupPreview } from './qualification-preview-secret.mjs';
 
-let lastAttemptTime = 0;
-function nextAttempt() {
-  // A later replay must supersede an earlier request even if that request
-  // reaches the Worker after its client has already been cancelled.
-  lastAttemptTime = Math.max(Date.now(), lastAttemptTime + 1);
-  return `${String(lastAttemptTime).padStart(13, '0')}-${randomBytes(16).toString('hex')}`;
+async function collectProbes(requestProbe, remaining, results = []) {
+  if (remaining === 0) return results;
+  // Each Worker holds one reader while obtaining a writer. Two in flight use
+  // at most four of the five origin connections; the fifth remains available.
+  const batchSize = Math.min(2, remaining);
+  const batch = await Promise.allSettled(Array.from({ length: batchSize }, requestProbe));
+  return collectProbes(requestProbe, remaining - batchSize, results.concat(batch));
+}
+
+function validateProbeResult(body) {
+  if (body.ok !== true || body.rollback !== true || body.freshRead !== true ||
+      !Number.isSafeInteger(body.observedConnections) || !Number.isSafeInteger(body.maxConnections) ||
+      body.observedConnections < 2 || body.maxConnections < 2 ||
+      !Number.isSafeInteger(body.reservedConnections) || body.reservedConnections < 0 ||
+      body.maxConnections - body.reservedConnections < body.observedConnections ||
+      !Number.isFinite(body.elapsedMs)) throw new Error('Incomplete qualification result');
+  return body;
 }
 
 export async function runLoad(name, expectedUrl, concurrency = 10, minimumHeadroom = 5,
@@ -33,31 +43,28 @@ export async function runLoad(name, expectedUrl, concurrency = 10, minimumHeadro
   });
   const url = expectedUrl ? targets.find(target => target === expectedUrl) : targets[0];
   if (!url) throw new Error('Probe URL does not match the named Preview deployment');
-  const attempt = nextAttempt();
+  let attempt;
 
   async function requestJson(target, allowCancel) {
     if (allowCancel && signal?.aborted) throw new Error('Qualification load interrupted');
     const timeout = AbortSignal.timeout(30000);
     const response = await request(target, { method: 'POST', redirect: 'error',
-      headers: { authorization: `Bearer ${token}`, 'x-stateplane-attempt': attempt },
+      headers: { authorization: `Bearer ${token}`, ...(attempt ? { 'x-stateplane-attempt': attempt } : {}) },
       signal: allowCancel && signal ? AbortSignal.any([signal, timeout]) : timeout });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     return response.json();
   }
 
   async function requestProbe() {
-    const body = await requestJson(url, true);
-    if (body.ok !== true || body.rollback !== true || body.freshRead !== true ||
-        !Number.isSafeInteger(body.observedConnections) || !Number.isSafeInteger(body.maxConnections) ||
-        body.observedConnections < 2 || body.maxConnections < 2 ||
-        !Number.isSafeInteger(body.reservedConnections) || body.reservedConnections < 0 ||
-        body.maxConnections - body.reservedConnections < body.observedConnections ||
-        !Number.isFinite(body.elapsedMs)) throw new Error('Incomplete qualification result');
-    return body;
+    return validateProbeResult(await requestJson(url, true));
   }
-  // Start and close are deliberately independent of the caller's cancellation.
-  // A timed-out start may arrive late, but the database rejects its older ID
-  // once a newer replay has begun.
+  // The database issues a generation before start. A delayed old start can
+  // never acquire a newer run's generation, even across independent CLIs.
+  const reservation = await requestJson(`${url}/reserve`, false);
+  if (reservation.ok !== true || !/^[1-9]\d{0,18}$/.test(reservation.generation ?? '')) {
+    throw new Error('Qualification attempt reservation failed');
+  }
+  attempt = reservation.generation;
   let started = false;
   let startFailed = false;
   try {
@@ -72,7 +79,7 @@ export async function runLoad(name, expectedUrl, concurrency = 10, minimumHeadro
     try { await requestProbe(); }
     catch { serialFailed = true; }
   }
-  const results = startFailed || serialFailed || signal?.aborted ? [] : await Promise.allSettled(Array.from({ length: concurrency }, requestProbe));
+  const results = startFailed || serialFailed || signal?.aborted ? [] : await collectProbes(requestProbe, concurrency);
   const failed = results.filter(result => result.status === 'rejected');
   const issues = [];
   if (startFailed) issues.push('Qualification attempt start failed');
