@@ -1,0 +1,20 @@
+deployment/workers/role-grants.js
+  h_a39f9495f9ec1d 28-40,42,70
+scripts/topology.mjs
+  h_a39f9495f9ec1d 13
+test/role-grants-postgres.test.js
+  h_a39f9495f9ec1d 23-51
+test/topology.test.js
+  h_a39f9495f9ec1d 110-131
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "69afd0c40a40478af5c9339dc70dd6959b077fe7",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
