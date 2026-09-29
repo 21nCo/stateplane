@@ -1,13 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { promisify } from 'node:util';
 import { verifyQualificationTarget } from '../scripts/qualification-target.mjs';
 import { qualificationConfig, qualificationRailwayServiceName } from '../scripts/qualification-artifact.mjs';
 import { syntheticInventories } from '../scripts/topology-dry-run.mjs';
 
 const root = resolve(import.meta.dirname, '..');
+const run = promisify(execFile);
 const declaredTopology = JSON.parse(await readFile(join(root, 'deployment/topology.json'), 'utf8'));
 const head = 'a'.repeat(40);
 const uuid = index => `00000000-0000-4000-8000-a${String(index).padStart(11, '0')}`;
@@ -29,6 +32,79 @@ test('Railway names fit the provider limit and bind the full head, environment a
   const changedHead = `${head.slice(0, 8)}b${head.slice(9)}`;
   assert.notEqual(qualificationRailwayServiceName(`s4-${changedHead}-d-apse`, changedHead, declaredTopology), names[0]);
   assert.throws(() => qualificationRailwayServiceName(`s4-${changedHead}-d-apse`, head, declaredTopology), /clean checked-out head/);
+});
+
+test('Railway name CLI reports safe, distinct failures for all five declared cells', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sta4-railway-name-cli-'));
+  const topologyPath = join(directory, 'deployment/topology.json');
+  const script = join(directory, 'scripts/qualification-railway-name.mjs');
+  const git = (...args) => run('git', args, { cwd: directory });
+  const invoke = async name => {
+    try {
+      const { stdout } = await run(process.execPath, [script, name], { cwd: directory });
+      return { stdout: stdout.trim(), stderr: '', code: 0 };
+    } catch (error) {
+      return { stdout: error.stdout, stderr: error.stderr, code: error.code };
+    }
+  };
+  try {
+    await mkdir(join(directory, 'scripts'));
+    await mkdir(join(directory, 'deployment'));
+    for (const file of ['qualification-railway-name.mjs', 'qualification-artifact.mjs',
+      'topology.mjs', 'topology-live.mjs']) {
+      await copyFile(join(root, 'scripts', file), join(directory, 'scripts', file));
+    }
+    const original = await readFile(join(root, 'deployment/topology.json'), 'utf8');
+    await writeFile(topologyPath, original);
+    await git('init', '-q');
+    const commit = async () => {
+      await git('add', '.');
+      await git('-c', 'user.name=Stateplane Test', '-c', 'user.email=stateplane@example.invalid',
+        'commit', '-qm', 'test fixture');
+      return (await git('rev-parse', 'HEAD')).stdout.trim();
+    };
+    let cleanHead = await commit();
+    for (const [short, cell] of targets) {
+      const name = `s4-${cleanHead}-${short}-${cell}`;
+      const valid = await invoke(name);
+      assert.equal(valid.code, 0, `${name}: ${valid.stderr}`);
+      assert.match(valid.stdout, /^s4-[a-f0-9]{20}-[dp]-(apse|use|euw)$/);
+      const invalidName = await invoke(`wrong-${name}`);
+      assert.equal(invalidName.code, 2);
+      assert.match(invalidName.stderr, /^Error: Qualification name must identify a declared cell at the clean checked-out head\nUsage:/);
+      const topology = JSON.parse(original);
+      const environment = short === 'd' ? 'development' : 'production';
+      const cellId = { apse: 'ap-southeast', use: 'us-east', euw: 'eu-west' }[cell];
+      topology.environments[environment].cells.find(entry => entry.id === cellId).railwayRegion = 'wrong-region';
+      await writeFile(topologyPath, JSON.stringify(topology));
+      cleanHead = await commit();
+      const invalidTopology = await invoke(`s4-${cleanHead}-${short}-${cell}`);
+      assert.equal(invalidTopology.code, 2);
+      assert.match(invalidTopology.stderr,
+        new RegExp(`^Error: ${environment} ${cellId} is mapped to the wrong provider region\\nUsage:`));
+      await writeFile(topologyPath, original);
+      cleanHead = await commit();
+    }
+    const unsupported = JSON.parse(original);
+    unsupported.privateTokenCanary = 'never-print-this-value';
+    await writeFile(topologyPath, JSON.stringify(unsupported));
+    cleanHead = await commit();
+    const sanitized = await invoke(`s4-${cleanHead}-d-apse`);
+    assert.equal(sanitized.code, 2);
+    assert.match(sanitized.stderr, /^Error: Deployment topology failed validation\nUsage:/);
+    assert.equal(sanitized.stderr.includes('privateTokenCanary'), false);
+    assert.equal(sanitized.stderr.includes('never-print-this-value'), false);
+    await writeFile(topologyPath, original);
+    cleanHead = await commit();
+    await writeFile(topologyPath, `${original}\n`);
+    for (const [short, cell] of targets) {
+      const dirty = await invoke(`s4-${cleanHead}-${short}-${cell}`);
+      assert.equal(dirty.code, 2);
+      assert.match(dirty.stderr, /^Error: Qualification requires a clean checked-out commit\nUsage:/);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('generator and verifier reject invalid physical placement before provider or Preview work', async () => {
