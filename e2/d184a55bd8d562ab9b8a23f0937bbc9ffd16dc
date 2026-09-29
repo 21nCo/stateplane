@@ -1,0 +1,16 @@
+app/node_modules
+  h_a39f9495f9ec1d 1
+node_modules
+  h_a39f9495f9ec1d 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e2d184a55bd8d562ab9b8a23f0937bbc9ffd16dc",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
