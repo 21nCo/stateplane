@@ -1,0 +1,19 @@
+test/pgvector-grants-postgres.test.js
+  s_6126673cc0a89e::t_7679add1289a66 9-12,28,33,62-68,74-83,87,90-92,94-96
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "14a5635e7c9c3a5176de45f4b6324a56aca4979c",
+  "prompts": {},
+  "sessions": {
+    "s_6126673cc0a89e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c2bc-9ed5-72b0-a4bd-e7dcb1d6a6eb",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
