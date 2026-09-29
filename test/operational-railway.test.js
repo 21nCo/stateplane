@@ -37,7 +37,7 @@ test('operational Railway cancellation and byte overflow stop inherited-pipe des
     const shim = join(bin, 'composio');
     await writeFile(shim, `#!/usr/bin/env node
 const {spawn}=require('node:child_process');
-spawn(process.execPath,['-e',"require('node:fs').writeFileSync(process.env.STA4_CHILD_PID,String(process.pid));if(process.env.STA4_OUTPUT)process[process.env.STA4_OUTPUT].write('€'.repeat(30000));setInterval(()=>{},1000)"],
+spawn(process.execPath,['-e',"setTimeout(()=>{require('node:fs').writeFileSync(process.env.STA4_CHILD_PID,String(process.pid));if(process.env.STA4_OUTPUT)process[process.env.STA4_OUTPUT].write('€'.repeat(30000));setInterval(()=>{},1000)},Number(process.env.STA4_STARTUP_DELAY)||0)"],
   {stdio:['ignore','inherit','inherit'],env:process.env});
 setTimeout(()=>process.exit(0),80);
 `);
@@ -45,25 +45,27 @@ setTimeout(()=>process.exit(0),80);
     const priorPath = process.env.PATH;
     const priorMarker = process.env.STA4_CHILD_PID;
     const priorOutput = process.env.STA4_OUTPUT;
+    const priorStartupDelay = process.env.STA4_STARTUP_DELAY;
     process.env.PATH = `${bin}:${priorPath}`;
     try {
       for (const failure of ['timeout', 'abort', 'overflow-stdout', 'overflow-stderr']) {
         const marker = join(directory, `${failure}.pid`);
         process.env.STA4_CHILD_PID = marker;
         process.env.STA4_OUTPUT = failure.startsWith('overflow-') ? failure.slice(9) : '';
+        process.env.STA4_STARTUP_DELAY = failure === 'abort' ? '2700' : '';
         const controller = new AbortController();
-        const started = Date.now();
         const request = readOperationalRailway(resource, { ...options, signal: controller.signal,
-          timeout: failure === 'timeout' ? 700 : 3000,
+          timeout: failure === 'timeout' ? 700 : failure === 'abort' ? 6000 : 3000,
           maxBuffer: failure.startsWith('overflow-') ? 64 * 1024 : 1024 * 1024 });
         request.catch(() => {});
         let pid;
         try {
-          for (let attempt = 0; attempt < 120; attempt++) {
+          for (let attempt = 0; attempt < 200; attempt++) {
             try { pid = Number(await readFile(marker, 'utf8')); break; }
             catch { await new Promise(resolve => setTimeout(resolve, 25)); }
           }
           assert.ok(pid, `${failure} descendant started`);
+          const started = Date.now();
           if (failure === 'abort') controller.abort();
           await assert.rejects(request, /Connected Railway provider readback failed/);
           assert.ok(Date.now() - started < 2500, `${failure} must settle before command timeout`);
@@ -80,6 +82,8 @@ setTimeout(()=>process.exit(0),80);
       else process.env.STA4_CHILD_PID = priorMarker;
       if (priorOutput === undefined) delete process.env.STA4_OUTPUT;
       else process.env.STA4_OUTPUT = priorOutput;
+      if (priorStartupDelay === undefined) delete process.env.STA4_STARTUP_DELAY;
+      else process.env.STA4_STARTUP_DELAY = priorStartupDelay;
       await rm(directory, { recursive: true, force: true });
     }
   });

@@ -8,7 +8,7 @@ import { validateTopology, validateInventory, validateDeploymentInventories, ren
 import { assertLiveResources } from '../scripts/topology-live.mjs';
 import { readProtectedSqlUrls, verifySqlIdentity } from '../scripts/topology-sql.mjs';
 import { dryRunTopology, syntheticInventories } from '../scripts/topology-dry-run.mjs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 
 const topology = JSON.parse(readFileSync(new URL('../deployment/topology.json', import.meta.url)));
 const copy = value => structuredClone(value);
@@ -139,6 +139,44 @@ test('development and production cannot reuse provider scope or bindings', () =>
   }
 });
 
+test('live verification rechecks both protected inventories before provider access on every invocation', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'sta4-live-inventories-'));
+  const paths = { development: join(directory, 'development.json'), production: join(directory, 'production.json') };
+  const inventories = syntheticInventories(topology);
+  const write = async (environment, value) => writeFile(paths[environment], JSON.stringify(value), { mode: 0o600 });
+  const run = environment => spawnSync(process.execPath,
+    ['scripts/verify-topology.mjs', environment, paths[environment],
+      paths[environment === 'development' ? 'production' : 'development']],
+    { cwd: new URL('..', import.meta.url), encoding: 'utf8',
+      env: { ...process.env, STATEPLANE_RAILWAY_ACCOUNT: 'preflight-only',
+        STATEPLANE_SQL_URLS_FILE: '', STATEPLANE_PGDATA_URLS_FILE: '' } });
+  try {
+    await write('development', inventories.development);
+    await write('production', inventories.production);
+    for (const environment of ['development', 'production']) {
+      const counterpart = environment === 'development' ? 'production' : 'development';
+      assert.match(run(environment).stderr, /STATEPLANE_SQL_URLS_FILE/, 'distinct inventories pass isolation preflight');
+      for (const [label, mutate] of [
+        ['project', (target, source) => { target.projectId = source.projectId.toUpperCase(); }],
+        ['environment', (target, source) => { target.environmentId = source.environmentId.toUpperCase(); }],
+        ['service', (target, source) => { target.control.serviceId = source.control.serviceId.toUpperCase(); }],
+        ['volume', (target, source) => { target.control.volumeInstanceId = source.control.volumeInstanceId.toUpperCase(); }],
+        ['Hyperdrive', (target, source) => { target.control.hyperdriveId = source.control.hyperdriveId.toUpperCase(); }]
+      ]) {
+        const changed = copy(inventories[counterpart]);
+        mutate(changed, inventories[environment]);
+        await write(counterpart, changed);
+        const result = run(environment);
+        assert.equal(result.status, 1, `${environment} retry with reused ${label} must fail`);
+        assert.match(result.stderr, /Development and production resource IDs must be unique/, `${environment} reused ${label}`);
+        await write(counterpart, inventories[counterpart]);
+      }
+    }
+    await chmod(paths.production, 0o640);
+    assert.match(run('development').stderr, /Protected operational inventory must be mode 0600/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
 test('rendered control, gateways and every cell use isolated names and secret-free bindings', () => {
   const inventories = syntheticInventories(topology);
   for (const environment of ['development', 'production']) {
@@ -249,7 +287,8 @@ test('operational compare, render, and verifier reject permissive inventories on
       for (const target of ['development', 'production']) {
         await assert.rejects(readFile(join(projectRoot, `.data/topology/${target}/app.json`)), { code: 'ENOENT' });
       }
-      rejectsMode(() => execFileSync(process.execPath, ['scripts/verify-topology.mjs', environment, path], {
+      rejectsMode(() => execFileSync(process.execPath, ['scripts/verify-topology.mjs', environment, path,
+        paths[environment === 'development' ? 'production' : 'development']], {
         cwd: new URL('..', import.meta.url), stdio: 'pipe',
         env: { ...process.env, STATEPLANE_RAILWAY_ACCOUNT: 'mode-check-only' }
       }));

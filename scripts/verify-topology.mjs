@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { readProtectedSqlUrls, verifySqlIdentity, verifyPgdataPlacement } from './topology-sql.mjs';
-import { validateTopology, validateInventory, cellDatabaseName, railwayServiceName, readProtectedDeploymentInventory } from './topology.mjs';
+import { validateTopology, validateDeploymentInventories, cellDatabaseName, railwayServiceName, readProtectedDeploymentInventory } from './topology.mjs';
 import { assertLiveResources } from './topology-live.mjs';
 import { readUploadedCa } from './topology-ca.mjs';
 import { readHyperdrive } from './wrangler-command.mjs';
@@ -9,15 +9,19 @@ import { verifyOperationalBinding } from './operational-binding.mjs';
 import { verifyBindingPreflight } from './topology-verification-flow.mjs';
 import { readOperationalRailway } from './operational-railway.mjs';
 
-const [environment, inventoryPath] = process.argv.slice(2);
-if (!environment || !inventoryPath) {
-  console.error('Usage: node scripts/verify-topology.mjs <environment> <private-inventory.json>');
+const [environment, inventoryPath, counterpartPath] = process.argv.slice(2);
+if (!environment || !inventoryPath || !counterpartPath || process.argv.length !== 5) {
+  console.error('Usage: node scripts/verify-topology.mjs <environment> <private-inventory.json> <private-counterpart-inventory.json>');
   process.exit(2);
 }
 const account = process.env.STATEPLANE_RAILWAY_ACCOUNT;
 if (!account) throw new Error('STATEPLANE_RAILWAY_ACCOUNT must select a connected Composio Railway account');
 const topology = validateTopology(JSON.parse(await readFile(new URL('../deployment/topology.json', import.meta.url))));
-const inventory = validateInventory(topology, environment, await readProtectedDeploymentInventory(resolve(inventoryPath)));
+const inventory = await readProtectedDeploymentInventory(resolve(inventoryPath));
+const counterpart = await readProtectedDeploymentInventory(resolve(counterpartPath));
+if (environment === 'development') validateDeploymentInventories(topology, inventory, counterpart);
+else if (environment === 'production') validateDeploymentInventories(topology, counterpart, inventory);
+else throw new Error('Unknown environment');
 if (!process.env.STATEPLANE_SQL_URLS_FILE) throw new Error('STATEPLANE_SQL_URLS_FILE must select protected per-resource SQL URLs');
 if (!process.env.STATEPLANE_PGDATA_URLS_FILE) throw new Error('STATEPLANE_PGDATA_URLS_FILE must select protected per-resource settings SQL URLs');
 if (!process.env.PROBE_TOKEN || /[\r\n]/.test(process.env.PROBE_TOKEN)) throw new Error('Protected single-line PROBE_TOKEN required for operational Worker proof');
