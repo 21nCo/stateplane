@@ -55,8 +55,7 @@ export async function connectedPgdataProof(inventory, railway, hyperdrive, signa
   const ca = await readUploadedCa(hyperdrive.mtls.ca_certificate_id, signal);
   await verifyPgdataPlacement({ label: inventory.name, volumeInstance: railway.volumeInstance,
     mountPath: inventory.volumeMountPath, database: inventory.database, proxy: railway.tcpProxies[0],
-    ca, value: urls.url, operationalRole: inventory.role, projectId: inventory.projectId,
-    environmentId: inventory.environmentId, serviceId: inventory.serviceId, signal });
+    ca, value: urls.url, operationalRole: inventory.role, signal });
 }
 
 function assertDisposableInventory(inventory, { name, railwayServiceName, expectedDatabase, expectedRole, artifactId }) {

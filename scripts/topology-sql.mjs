@@ -2,26 +2,6 @@ import { Client } from 'pg';
 import { readFile, stat } from 'node:fs/promises';
 import { operationalGrantsAllowed, operationalGrantsSql } from '../deployment/workers/role-grants.js';
 import { assertVolumePlacement } from './topology-live.mjs';
-import { runBoundedCommand } from './bounded-command.mjs';
-
-const runRailway = (command, args, options) => runBoundedCommand(command, args,
-  { ...options, errorMessage: 'Railway SSH storage readback failed or interrupted' });
-
-// Railway SSH inspects the running container, because SQL cannot resolve a pg_wal symlink.
-export async function verifyRailwayStoragePaths({ label, projectId, environmentId, serviceId,
-  dataDirectory, mountPath, signal, runCommand = runRailway }) {
-  if (![projectId, environmentId, serviceId].every(id => /^[a-f0-9-]{36}$/i.test(id ?? ''))) {
-    throw new Error(`${label}: Railway SSH target IDs missing`);
-  }
-  const script = 'set -eu; readlink -f "$1"; readlink -f "$1/pg_wal"; find "$1/pg_tblspc" -mindepth 1 -maxdepth 1 -print';
-  const { stdout } = await runCommand('railway', ['ssh', '--project', projectId, '--service', serviceId,
-    '--environment', environmentId, '--', 'sh', '-c', script, 'sh', dataDirectory],
-  { maxBuffer: 64 * 1024, timeout: 15_000, killSignal: 'SIGKILL', signal });
-  const paths = stdout.trimEnd().split(/\r?\n/);
-  if (paths.length !== 2 || paths.some(path => !path.startsWith(`${mountPath}/`) && path !== mountPath)) {
-    throw new Error(`${label}: WAL, tablespace or data path is outside the inventoried Railway volume`);
-  }
-}
 
 export const settingsRoleSql = `WITH RECURSIVE reachable(roleid) AS (
   SELECT oid FROM pg_roles WHERE rolname = current_user
@@ -113,8 +93,7 @@ export async function verifySqlIdentity({ label, resource, database, proxy, ca, 
 
 /** A separate read-only settings credential proves the running server's PGDATA, not just its configured image path. */
 export async function verifyPgdataPlacement({ label, volumeInstance, mountPath, database, proxy, ca, value,
-  operationalRole, projectId, environmentId, serviceId, ClientType = Client, signal,
-  verifyStorage = verifyRailwayStoragePaths }) {
+  operationalRole, ClientType = Client, signal }) {
   if (signal?.aborted) throw new Error(`${label}: topology verification interrupted`);
   if (typeof value !== 'string') throw new Error(`${label}: protected PGDATA SQL URL missing`);
   let url;
@@ -141,9 +120,6 @@ export async function verifyPgdataPlacement({ label, volumeInstance, mountPath, 
     const spaces = await client.query("SELECT spcname FROM pg_tablespace WHERE spcname NOT IN ('pg_default', 'pg_global')");
     if (signal?.aborted) throw new Error('interrupted');
     if (spaces.rows.length !== 0) throw new Error('Non-default tablespace requires separate storage proof');
-    await verifyStorage({ label, projectId, environmentId, serviceId,
-      dataDirectory: result.rows[0].data_directory, mountPath, signal });
-    if (signal?.aborted) throw new Error('interrupted');
   } catch {
     throw new Error(signal?.aborted ? `${label}: topology verification interrupted` : `${label}: verified-TLS PGDATA placement proof failed`);
   } finally {

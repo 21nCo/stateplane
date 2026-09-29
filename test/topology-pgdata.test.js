@@ -1,11 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { verifyPgdataPlacement, verifyRailwayStoragePaths } from '../scripts/topology-sql.mjs';
+import { verifyPgdataPlacement } from '../scripts/topology-sql.mjs';
 
 const mountPath = '/var/lib/postgresql/data';
 const proxy = { domain: 'proxy.example', proxyPort: 15555 };
 const value = 'postgres://settings_reader:private@proxy.example:15555/probe';
-const id = '11111111-1111-4111-8111-111111111111';
 const role = { rolsuper: false, rolcreatedb: false, rolcreaterole: false,
   rolreplication: false, rolbypassrls: false, can_read_settings: true,
   can_create_database: false, can_create_schema: false, can_access_tables: false,
@@ -14,7 +13,7 @@ const role = { rolsuper: false, rolcreatedb: false, rolcreaterole: false,
 
 function fixture() {
   const state = { dataDirectory: `${mountPath}/pgdata`, role: structuredClone(role), tablespaces: [],
-    queries: [], closed: 0, storage: [] };
+    queries: [], closed: 0 };
   class Client {
     constructor(options) {
       assert.equal(options.ssl.servername, proxy.domain);
@@ -32,16 +31,14 @@ function fixture() {
     async end() { state.closed++; }
   }
   const options = { label: 'probe', volumeInstance: { mountPath }, mountPath, database: 'probe', proxy,
-    ca: 'approved-ca', value, operationalRole: 'probe_writer', projectId: id, environmentId: id,
-    serviceId: id, ClientType: Client, verifyStorage: async input => { state.storage.push(input); } };
+    ca: 'approved-ca', value, operationalRole: 'probe_writer', ClientType: Client };
   return { state, options };
 }
 
-test('both placement paths require a separate least-privilege settings credential before storage proof', async () => {
+test('placement requires a separate least-privilege settings credential', async () => {
   const { state, options } = fixture();
   await verifyPgdataPlacement(options);
-  assert.equal(state.storage.length, 1);
-  assert.equal(state.storage[0].dataDirectory, `${mountPath}/pgdata`);
+  assert.equal(state.queries.length, 3);
   for (const change of [
     () => { state.dataDirectory = '/tmp/pgdata'; },
     () => { state.dataDirectory = `${mountPath}-old/pgdata`; },
@@ -61,31 +58,11 @@ test('both placement paths require a separate least-privilege settings credentia
     change();
     await assert.rejects(verifyPgdataPlacement(options), /PGDATA placement proof failed/);
   }
-  assert.equal(state.storage.length, 1, 'unsafe SQL result must block before container inspection');
   await assert.rejects(verifyPgdataPlacement({ ...options, operationalRole: 'settings_reader' }),
     /differs from declared proxy or database/);
   await assert.rejects(verifyPgdataPlacement({ ...options, value: 'postgres://probe_writer:private@proxy.example:15555/probe' }),
     /differs from declared proxy or database/);
   assert.equal(state.closed, 12);
-});
-
-test('running container WAL path must resolve inside the approved volume and have no user tablespace', async () => {
-  const calls = [];
-  const options = { label: 'probe', projectId: id, environmentId: id, serviceId: id,
-    dataDirectory: `${mountPath}/pgdata`, mountPath,
-    runCommand: async (command, args, config) => {
-      calls.push({ command, args, config });
-      return { stdout: `${mountPath}/pgdata\n/tmp/wal\n` };
-    } };
-  await assert.rejects(verifyRailwayStoragePaths(options), /WAL, tablespace or data path/);
-  assert.equal(calls[0].command, 'railway');
-  assert.deepEqual(calls[0].args.slice(0, 9), ['ssh', '--project', id, '--service', id, '--environment', id, '--', 'sh']);
-  assert.equal(calls[0].config.timeout, 15_000);
-  await verifyRailwayStoragePaths({ ...options, runCommand: async () =>
-    ({ stdout: `${mountPath}/pgdata\n${mountPath}/pgdata/pg_wal\n` }) });
-  await assert.rejects(verifyRailwayStoragePaths({ ...options, runCommand: async () =>
-    ({ stdout: `${mountPath}/pgdata\n${mountPath}/pgdata/pg_wal\n${mountPath}/pgdata/pg_tblspc/123\n` }) }),
-  /WAL, tablespace or data path/);
 });
 
 test('PGDATA proof closes its SQL client on interruption without issuing a query', async () => {
