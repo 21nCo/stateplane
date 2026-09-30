@@ -1,0 +1,26 @@
+deployment/workers/qualification.ts
+  h_a39f9495f9ec1d 15,66,68-70,76-80,164-189
+docs/regional-topology.md
+  h_a39f9495f9ec1d 29,59
+scripts/topology-sql.mjs
+  h_a39f9495f9ec1d 28,43-45,67,70
+test/qualification-worker-postgres.test.ts
+  h_a39f9495f9ec1d 57-63,72
+test/qualification-worker.test.ts
+  h_a39f9495f9ec1d 18,52-55,148,235-254
+test/settings-role-postgres.test.js
+  h_a39f9495f9ec1d 51,59-60,64-93
+test/topology-pgdata.test.js
+  h_a39f9495f9ec1d 11-13,54-55,61-62,79-102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "70904a1c54d9d645b867a18b7b8e54edfbef38f0",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
