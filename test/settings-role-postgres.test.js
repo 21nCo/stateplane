@@ -55,7 +55,8 @@ test('real PostgreSQL settings proof rejects transitive roles, relation and rout
         };
         const allowed = row => row.can_read_settings && row.only_settings_membership &&
           !row.can_access_tables && !row.can_access_sequences && !row.can_execute_routines &&
-          !row.can_create_database && !row.can_create_schema && !row.owns_user_objects;
+          !row.can_access_large_objects && !row.can_create_database && !row.can_create_schema &&
+          !row.owns_user_objects;
         assert.equal(allowed(await flags()), true, 'direct settings membership is sufficient');
 
         await client.query('GRANT elevated TO pg_read_all_settings WITH INHERIT FALSE, SET TRUE');
@@ -118,6 +119,57 @@ test('real PostgreSQL settings proof rejects transitive roles, relation and rout
         await client.query('REVOKE USAGE ON SEQUENCE private_seq FROM elevated');
         assert.equal(allowed(await flags()), true, 'approved settings-only role remains admissible');
         await client.query('DROP SEQUENCE private_seq');
+
+        const largeObject = Number((await client.query('SELECT lo_create(0) AS oid')).rows[0].oid);
+        await client.query('SELECT lo_put($1, 0, convert_to($2, \'UTF8\'))',
+          [largeObject, 'hidden-business-payload']);
+        for (const privilege of ['SELECT', 'UPDATE']) {
+          await client.query(`GRANT ${privilege} ON LARGE OBJECT ${largeObject} TO settings_reader`);
+          assert.equal((await flags()).can_access_large_objects, true,
+            `direct large-object ${privilege} is denied`);
+          // lo_put opens the object for an update and PostgreSQL also requires SELECT for that call.
+          if (privilege === 'UPDATE') await client.query(`GRANT SELECT ON LARGE OBJECT ${largeObject} TO settings_reader`);
+          await client.query('SET SESSION AUTHORIZATION settings_reader');
+          try {
+            if (privilege === 'SELECT') {
+              const result = await client.query('SELECT convert_from(lo_get($1), \'UTF8\') AS value', [largeObject]);
+              assert.equal(result.rows[0].value, 'hidden-business-payload');
+            } else {
+              await client.query('SELECT lo_put($1, 0, convert_to($2, \'UTF8\'))',
+                [largeObject, 'modified-business-payload']);
+            }
+          } finally { await client.query('RESET SESSION AUTHORIZATION'); }
+          await client.query(`REVOKE SELECT, UPDATE ON LARGE OBJECT ${largeObject} FROM settings_reader`);
+          assert.equal(allowed(await flags()), true, 'revoking large-object access restores admission');
+        }
+        for (const grantee of ['PUBLIC', 'elevated', 'pg_read_all_settings']) {
+          for (const privilege of ['SELECT', 'UPDATE']) {
+            await client.query(`GRANT ${privilege} ON LARGE OBJECT ${largeObject} TO ${grantee}`);
+            if (grantee === 'elevated') await client.query('GRANT elevated TO settings_reader WITH INHERIT TRUE, SET FALSE');
+            assert.equal((await flags()).can_access_large_objects, true,
+              `${grantee} large-object ${privilege} is denied`);
+            if (grantee === 'elevated') await client.query('REVOKE elevated FROM settings_reader');
+            await client.query(`REVOKE ${privilege} ON LARGE OBJECT ${largeObject} FROM ${grantee}`);
+            assert.equal(allowed(await flags()), true, 'revoking large-object access restores admission');
+          }
+        }
+        await client.query('SET lo_compat_privileges = on');
+        assert.equal((await flags()).can_access_large_objects, true,
+          'large-object ACL compatibility mode cannot admit the settings login');
+        await client.query('SET SESSION AUTHORIZATION settings_reader');
+        try {
+          const result = await client.query('SELECT convert_from(lo_get($1), \'UTF8\') AS value', [largeObject]);
+          assert.equal(result.rows[0].value, 'modified-business-payload');
+        } finally { await client.query('RESET SESSION AUTHORIZATION'); }
+        await client.query('RESET lo_compat_privileges');
+        assert.equal(allowed(await flags()), true, 'restoring large-object ACL enforcement restores admission');
+        await client.query('SET ROLE settings_reader');
+        const ownedLargeObject = Number((await client.query('SELECT lo_create(0) AS oid')).rows[0].oid);
+        await client.query('RESET ROLE');
+        assert.equal((await flags()).can_access_large_objects, true, 'large-object owner is denied');
+        await client.query('SELECT lo_unlink($1)', [ownedLargeObject]);
+        assert.equal(allowed(await flags()), true, 'removing owned large object restores admission');
+        await client.query('SELECT lo_unlink($1)', [largeObject]);
 
         await client.query(`INSERT INTO private_records VALUES (1, 'private-value');
           CREATE FUNCTION public.expose_secret() RETURNS text LANGUAGE sql SECURITY DEFINER

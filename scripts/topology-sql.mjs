@@ -25,6 +25,12 @@ SELECT r.rolsuper, r.rolcreatedb, r.rolcreaterole, r.rolreplication, r.rolbypass
     WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' AND
       has_schema_privilege(n.oid, 'USAGE') AND
       has_function_privilege(p.oid, 'EXECUTE')) AS can_execute_routines,
+  (current_setting('lo_compat_privileges')::boolean OR EXISTS (SELECT 1 FROM pg_largeobject_metadata m
+    WHERE m.lomowner = (SELECT oid FROM pg_roles WHERE rolname = current_user) OR
+      EXISTS (SELECT 1 FROM aclexplode(m.lomacl) acl
+        WHERE acl.privilege_type IN ('SELECT', 'UPDATE') AND
+          CASE WHEN acl.grantee = 0 THEN true
+            ELSE pg_has_role(current_user, acl.grantee, 'USAGE') END))) AS can_access_large_objects,
   EXISTS (SELECT 1 FROM pg_shdepend
     WHERE refclassid = 'pg_authid'::regclass
       AND refobjid = (SELECT oid FROM pg_roles WHERE rolname = current_user)
@@ -41,6 +47,7 @@ function assertSettingsRole(label, result) {
       row.can_create_schema !== false || row.can_access_tables !== false ||
       row.can_access_sequences !== false ||
       row.can_execute_routines !== false ||
+      row.can_access_large_objects !== false ||
       row.owns_user_objects !== false ||
       row.only_settings_membership !== true) {
     throw new Error(`${label}: settings proof credential is not least privilege`);

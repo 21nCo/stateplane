@@ -8,7 +8,7 @@ const value = 'postgres://settings_reader:private@proxy.example:15555/probe';
 const role = { rolsuper: false, rolcreatedb: false, rolcreaterole: false,
   rolreplication: false, rolbypassrls: false, can_read_settings: true,
   can_create_database: false, can_create_schema: false, can_access_tables: false,
-  can_access_sequences: false, can_execute_routines: false,
+  can_access_sequences: false, can_execute_routines: false, can_access_large_objects: false,
   owns_user_objects: false,
   only_settings_membership: true };
 
@@ -52,6 +52,8 @@ test('placement requires a separate least-privilege settings credential', async 
     () => { delete state.role.can_access_sequences; },
     () => { state.role = { ...role, can_execute_routines: true }; },
     () => { delete state.role.can_execute_routines; },
+    () => { state.role = { ...role, can_access_large_objects: true }; },
+    () => { delete state.role.can_access_large_objects; },
     () => { state.role = { ...role, owns_user_objects: true }; },
     () => { delete state.role.owns_user_objects; },
     () => { state.tablespaces = [{ spcname: 'off_volume', location: '/tmp/storage' }]; }
@@ -66,7 +68,27 @@ test('placement requires a separate least-privilege settings credential', async 
     /differs from declared proxy or database/);
   await assert.rejects(verifyPgdataPlacement({ ...options, value: 'postgres://probe_writer:private@proxy.example:15555/probe' }),
     /differs from declared proxy or database/);
-  assert.equal(state.closed, 14);
+  assert.equal(state.closed, 16);
+});
+
+test('large-object grants stop every operational and disposable PGDATA proof before storage, including retry', async () => {
+  for (const label of ['control', 'ap-southeast', 'us-east', 'eu-west',
+    'disposable/development-ap-southeast', 'disposable/development-us-east',
+    'disposable/development-eu-west', 'disposable/production-ap-southeast',
+    'disposable/production-us-east']) {
+    const { state, options } = fixture();
+    state.role.can_access_large_objects = true;
+    await assert.rejects(verifyPgdataPlacement({ ...options, label }), /PGDATA placement proof failed/);
+    assert.equal(state.queries.length, 2, label);
+    assert.equal(state.queries.some(sql => sql.includes("current_setting('data_directory')") ||
+      sql.includes('FROM pg_tablespace')), false, label);
+    state.role.can_access_large_objects = false;
+    await verifyPgdataPlacement({ ...options, label });
+    state.role.can_access_large_objects = true;
+    const beforeRetry = state.queries.length;
+    await assert.rejects(verifyPgdataPlacement({ ...options, label }), /PGDATA placement proof failed/);
+    assert.equal(state.queries.length - beforeRetry, 2, `${label} retry`);
+  }
 });
 
 test('owned objects stop operational and disposable PGDATA proof before storage readback', async () => {
@@ -75,7 +97,8 @@ test('owned objects stop operational and disposable PGDATA proof before storage 
     state.role.owns_user_objects = true;
     await assert.rejects(verifyPgdataPlacement({ ...options, label }), /PGDATA placement proof failed/);
     assert.equal(state.queries.length, 2, label);
-    assert.equal(state.queries.some(sql => sql.includes('current_setting') || sql.includes('pg_tablespace')), false,
+    assert.equal(state.queries.some(sql => sql.includes("current_setting('data_directory')") ||
+      sql.includes('FROM pg_tablespace')), false,
       `${label} must reject before storage readback`);
     assert.equal(state.closed, 1);
     state.role.owns_user_objects = false;
