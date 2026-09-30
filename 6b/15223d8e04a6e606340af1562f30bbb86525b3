@@ -1,0 +1,31 @@
+docs/regional-topology.md
+  s_22ab84176cadba::t_3b7acd7587ae18 29
+scripts/topology-sql.mjs
+  s_ee5d9d808851a0::t_b7410aee23d23a 29-30,47-51
+test/settings-role-postgres.test.js
+  s_ee5d9d808851a0::t_45365bee646ad4 71-110
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6b15223d8e04a6e606340af1562f30bbb86525b3",
+  "prompts": {},
+  "sessions": {
+    "s_22ab84176cadba": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f0e439f7effexh4cObhrBqfRtc",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_ee5d9d808851a0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f1e3-16d3-72f2-af1e-998d62994d47",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
