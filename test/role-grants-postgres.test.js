@@ -23,6 +23,7 @@ try {
 test('grant results require every exact true field of their distinct SQL policies', () => {
   const common = {
     safe_login: true, no_elevated_membership: true, no_other_role_membership: true,
+    no_parameter_admin: true,
     can_connect: true, no_database_create: true, can_use_schema: true,
     no_other_schema_create: true
   };
@@ -82,6 +83,19 @@ test('PostgreSQL 16 role admission rejects direct, inherited and indirect altern
         assert.equal(qualificationGrantsAllowed(await check('probe', qualificationGrantsSql)), true);
         assert.equal(operationalGrantsAllowed(await check('operational', operationalGrantsSql)), true,
           'application table grants remain valid after schema migration');
+        for (const grantee of ['probe', 'operational', 'PUBLIC']) {
+          await client.query(`GRANT SET ON PARAMETER lo_compat_privileges TO ${grantee}`);
+          assert.equal(qualificationGrantsAllowed(await check('probe', qualificationGrantsSql)),
+            grantee === 'operational', `${grantee} SET disposition for disposable probe`);
+          assert.equal(operationalGrantsAllowed(await check('operational', operationalGrantsSql)),
+            grantee === 'probe', `${grantee} SET disposition for operational role`);
+          await client.query(`REVOKE SET ON PARAMETER lo_compat_privileges FROM ${grantee}`);
+        }
+        assert.equal(qualificationGrantsAllowed(await check('probe', qualificationGrantsSql)), true);
+        assert.equal(operationalGrantsAllowed(await check('operational', operationalGrantsSql)), true);
+        await client.query('GRANT ALTER SYSTEM ON PARAMETER lo_compat_privileges TO operational');
+        assert.equal(operationalGrantsAllowed(await check('operational', operationalGrantsSql)), false);
+        await client.query('REVOKE ALTER SYSTEM ON PARAMETER lo_compat_privileges FROM operational');
         await client.query('GRANT CREATE ON SCHEMA public TO operational');
         assert.equal(operationalGrantsAllowed(await check('operational', operationalGrantsSql)), false,
           'an operational role with public schema CREATE must be rejected');

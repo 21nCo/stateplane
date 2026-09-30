@@ -56,7 +56,7 @@ test('real PostgreSQL settings proof rejects transitive roles, relation and rout
         const allowed = row => row.can_read_settings && row.only_settings_membership &&
           !row.can_access_tables && !row.can_access_sequences && !row.can_execute_routines &&
           !row.can_access_large_objects && !row.can_create_database && !row.can_create_schema &&
-          !row.owns_user_objects;
+          !row.owns_user_objects && row.no_parameter_admin;
         assert.equal(allowed(await flags()), true, 'direct settings membership is sufficient');
 
         await client.query('GRANT elevated TO pg_read_all_settings WITH INHERIT FALSE, SET TRUE');
@@ -169,6 +169,36 @@ test('real PostgreSQL settings proof rejects transitive roles, relation and rout
         assert.equal((await flags()).can_access_large_objects, true, 'large-object owner is denied');
         await client.query('SELECT lo_unlink($1)', [ownedLargeObject]);
         assert.equal(allowed(await flags()), true, 'removing owned large object restores admission');
+        await client.query(`ALTER LARGE OBJECT ${largeObject} OWNER TO pg_read_all_settings`);
+        assert.equal((await flags()).can_access_large_objects, true,
+          'ownership through the approved inherited role exposes a large object');
+        await client.query('SET SESSION AUTHORIZATION settings_reader');
+        try {
+          const result = await client.query('SELECT convert_from(lo_get($1), \'UTF8\') AS value', [largeObject]);
+          assert.equal(result.rows[0].value, 'modified-business-payload');
+        } finally { await client.query('RESET SESSION AUTHORIZATION'); }
+        await client.query(`ALTER LARGE OBJECT ${largeObject} OWNER TO CURRENT_USER`);
+        assert.equal(allowed(await flags()), true, 'transferring inherited ownership restores admission');
+
+        for (const grantee of ['settings_reader', 'pg_read_all_settings', 'PUBLIC']) {
+          await client.query(`GRANT SET ON PARAMETER lo_compat_privileges TO ${grantee}`);
+          assert.equal((await flags()).no_parameter_admin, false, `${grantee} SET is denied`);
+          if (grantee === 'settings_reader') {
+            await client.query('SET SESSION AUTHORIZATION settings_reader');
+            try {
+              await client.query('SET lo_compat_privileges = on');
+              const result = await client.query('SELECT convert_from(lo_get($1), \'UTF8\') AS value', [largeObject]);
+              assert.equal(result.rows[0].value, 'modified-business-payload');
+            } finally { await client.query('RESET SESSION AUTHORIZATION'); }
+            await client.query('RESET lo_compat_privileges');
+          }
+          await client.query(`REVOKE SET ON PARAMETER lo_compat_privileges FROM ${grantee}`);
+          assert.equal(allowed(await flags()), true, 'revocation restores settings admission');
+        }
+        await client.query('GRANT ALTER SYSTEM ON PARAMETER lo_compat_privileges TO settings_reader');
+        assert.equal((await flags()).no_parameter_admin, false, 'ALTER SYSTEM is denied');
+        await client.query('REVOKE ALTER SYSTEM ON PARAMETER lo_compat_privileges FROM settings_reader');
+        assert.equal(allowed(await flags()), true);
         await client.query('SELECT lo_unlink($1)', [largeObject]);
 
         await client.query(`INSERT INTO private_records VALUES (1, 'private-value');
@@ -228,6 +258,13 @@ test('real PostgreSQL settings proof rejects transitive roles, relation and rout
           await client.query('RESET ROLE');
           assert.equal(allowed(await flags()), true, 'dropping the owned object restores admission');
         }
+        await client.query("CREATE TYPE public.inherited_status AS ENUM ('ready')");
+        await client.query('ALTER TYPE public.inherited_status OWNER TO pg_read_all_settings');
+        assert.equal((await flags()).owns_user_objects, true,
+          'inherited owner of a user type is denied after CREATE is unavailable');
+        await client.query('ALTER TYPE public.inherited_status OWNER TO CURRENT_USER');
+        await client.query('DROP TYPE public.inherited_status');
+        assert.equal(allowed(await flags()), true);
 
         await client.query('GRANT CREATE ON DATABASE postgres TO settings_reader');
         await client.query('SET ROLE settings_reader');

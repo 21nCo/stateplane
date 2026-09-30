@@ -1,15 +1,29 @@
 import { Client } from 'pg';
 import { readFile, stat } from 'node:fs/promises';
-import { operationalGrantsAllowed, operationalGrantsSql } from '../deployment/workers/role-grants.js';
+import { noParameterAdminSql, operationalGrantsAllowed, operationalGrantsSql } from '../deployment/workers/role-grants.js';
 import { assertVolumePlacement } from './topology-live.mjs';
 
 export const settingsRoleSql = `WITH RECURSIVE reachable(roleid) AS (
   SELECT oid FROM pg_roles WHERE rolname = current_user
   UNION
   SELECT m.roleid FROM pg_auth_members m JOIN reachable r ON m.member = r.roleid
+), owned_catalog_roles(roleid) AS (
+  SELECT relowner FROM pg_class UNION ALL SELECT collowner FROM pg_collation
+  UNION ALL SELECT conowner FROM pg_conversion UNION ALL SELECT datdba FROM pg_database
+  UNION ALL SELECT evtowner FROM pg_event_trigger UNION ALL SELECT extowner FROM pg_extension
+  UNION ALL SELECT fdwowner FROM pg_foreign_data_wrapper
+  UNION ALL SELECT srvowner FROM pg_foreign_server UNION ALL SELECT lanowner FROM pg_language
+  UNION ALL SELECT lomowner FROM pg_largeobject_metadata
+  UNION ALL SELECT nspowner FROM pg_namespace UNION ALL SELECT opcowner FROM pg_opclass
+  UNION ALL SELECT oprowner FROM pg_operator UNION ALL SELECT opfowner FROM pg_opfamily
+  UNION ALL SELECT proowner FROM pg_proc UNION ALL SELECT pubowner FROM pg_publication
+  UNION ALL SELECT stxowner FROM pg_statistic_ext UNION ALL SELECT subowner FROM pg_subscription
+  UNION ALL SELECT spcowner FROM pg_tablespace UNION ALL SELECT cfgowner FROM pg_ts_config
+  UNION ALL SELECT dictowner FROM pg_ts_dict UNION ALL SELECT typowner FROM pg_type
 )
 SELECT r.rolsuper, r.rolcreatedb, r.rolcreaterole, r.rolreplication, r.rolbypassrls,
   pg_has_role(current_user, 'pg_read_all_settings', 'USAGE') AS can_read_settings,
+  ${noParameterAdminSql} AS no_parameter_admin,
   has_database_privilege(current_database(), 'CREATE') AS can_create_database,
   EXISTS (SELECT 1 FROM pg_namespace n WHERE n.nspname !~ '^pg_' AND
     has_schema_privilege(n.oid, 'CREATE')) AS can_create_schema,
@@ -26,15 +40,17 @@ SELECT r.rolsuper, r.rolcreatedb, r.rolcreaterole, r.rolreplication, r.rolbypass
       has_schema_privilege(n.oid, 'USAGE') AND
       has_function_privilege(p.oid, 'EXECUTE')) AS can_execute_routines,
   (current_setting('lo_compat_privileges')::boolean OR EXISTS (SELECT 1 FROM pg_largeobject_metadata m
-    WHERE m.lomowner = (SELECT oid FROM pg_roles WHERE rolname = current_user) OR
+    WHERE m.lomowner IN (SELECT roleid FROM reachable) OR
       EXISTS (SELECT 1 FROM aclexplode(m.lomacl) acl
         WHERE acl.privilege_type IN ('SELECT', 'UPDATE') AND
           CASE WHEN acl.grantee = 0 THEN true
             ELSE pg_has_role(current_user, acl.grantee, 'USAGE') END))) AS can_access_large_objects,
-  EXISTS (SELECT 1 FROM pg_shdepend
+  (EXISTS (SELECT 1 FROM pg_shdepend
     WHERE refclassid = 'pg_authid'::regclass
-      AND refobjid = (SELECT oid FROM pg_roles WHERE rolname = current_user)
-      AND deptype = 'o') AS owns_user_objects,
+      AND refobjid IN (SELECT roleid FROM reachable)
+      AND deptype = 'o') OR
+    EXISTS (SELECT 1 FROM owned_catalog_roles WHERE roleid IN (SELECT roleid FROM reachable)))
+    AS owns_user_objects,
   (SELECT count(*) = 2 AND bool_and(member.rolname IN (current_user, 'pg_read_all_settings'))
     FROM reachable JOIN pg_roles member ON member.oid = reachable.roleid) AS only_settings_membership
   FROM pg_roles r WHERE r.rolname = current_user`;
@@ -43,7 +59,8 @@ function assertSettingsRole(label, result) {
   const row = result.rows?.[0];
   if (result.rows?.length !== 1 || row?.rolsuper !== false || row.rolcreatedb !== false ||
       row.rolcreaterole !== false || row.rolreplication !== false || row.rolbypassrls !== false ||
-      row.can_read_settings !== true || row.can_create_database !== false ||
+      row.can_read_settings !== true || row.no_parameter_admin !== true ||
+      row.can_create_database !== false ||
       row.can_create_schema !== false || row.can_access_tables !== false ||
       row.can_access_sequences !== false ||
       row.can_execute_routines !== false ||

@@ -7,7 +7,8 @@ vi.mock('pg', () => ({ Client: class {
   async query(sql: string) {
     if (sql.includes('current_database() AS database')) return { rows: [{ database: state.wrongIdentity ? 'other' : 'stateplane_control_dev', role: 'cell_reader', version: 'PostgreSQL 17' }] };
     if (sql.includes('FROM pg_roles')) return { rows: [{ safe_login: true, no_elevated_membership: true,
-      no_other_role_membership: true, can_connect: true, no_database_create: true,
+      no_other_role_membership: true, no_parameter_admin: true,
+      can_connect: true, no_database_create: true,
       can_use_schema: true, no_public_schema_create: !state.denyGrants,
       no_other_schema_create: true, no_owned_objects: !state.ownsObject }] };
     if (sql.includes('::vector')) return { rows: [{ distance: state.denyVector ? 0 : Math.SQRT2 }] };

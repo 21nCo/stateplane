@@ -1,5 +1,12 @@
 // Check effective privileges through the same PostgreSQL connection used by the probe.
 // A matching current_user name alone does not exclude an inherited administrator role.
+// pg_parameter_acl stores explicit parameter grants. Ordinary USERSET parameters do not
+// have rows here; rejecting every has_parameter_privilege(..., 'SET') would reject all logins.
+export const noParameterAdminSql = `NOT EXISTS (SELECT 1 FROM pg_parameter_acl parameter
+  CROSS JOIN LATERAL aclexplode(parameter.paracl) acl
+  WHERE acl.privilege_type IN ('SET', 'ALTER SYSTEM')
+    AND (acl.grantee = 0 OR pg_has_role(current_user, acl.grantee, 'USAGE')))`;
+
 export const qualificationGrantsSql = `SELECT
   (SELECT rolcanlogin AND NOT (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls)
      FROM pg_roles WHERE rolname = current_user) AS safe_login,
@@ -9,6 +16,7 @@ export const qualificationGrantsSql = `SELECT
             OR left(rolname, 3) = 'pg_')) AS no_elevated_membership,
   NOT EXISTS (SELECT 1 FROM pg_roles
      WHERE rolname <> current_user AND pg_has_role(current_user, oid, 'MEMBER')) AS no_other_role_membership,
+  ${noParameterAdminSql} AS no_parameter_admin,
   has_database_privilege(current_user, current_database(), 'CONNECT') AS can_connect,
   NOT has_database_privilege(current_user, current_database(), 'CREATE') AS no_database_create,
   has_schema_privilege(current_user, 'public', 'USAGE') AS can_use_schema,
@@ -40,7 +48,7 @@ export const qualificationGrantsSql = `SELECT
     to_regprocedure('public.l2_distance(public.vector,public.vector)'), 'EXECUTE'), false) AS can_execute_distance`;
 
 const commonGrantFields = [
-  'safe_login', 'no_elevated_membership', 'no_other_role_membership',
+  'safe_login', 'no_elevated_membership', 'no_other_role_membership', 'no_parameter_admin',
   'can_connect', 'no_database_create', 'can_use_schema', 'no_other_schema_create'
 ];
 const qualificationGrantFields = [...commonGrantFields, 'can_create_probe_table', 'no_other_table_access',
@@ -68,6 +76,7 @@ export const operationalGrantsSql = `SELECT
             OR left(rolname, 3) = 'pg_')) AS no_elevated_membership,
   NOT EXISTS (SELECT 1 FROM pg_roles
      WHERE rolname <> current_user AND pg_has_role(current_user, oid, 'MEMBER')) AS no_other_role_membership,
+  ${noParameterAdminSql} AS no_parameter_admin,
   has_database_privilege(current_user, current_database(), 'CONNECT') AS can_connect,
   NOT has_database_privilege(current_user, current_database(), 'CREATE') AS no_database_create,
   has_schema_privilege(current_user, 'public', 'USAGE') AS can_use_schema,

@@ -7,6 +7,7 @@ const proxy = { domain: 'proxy.example', proxyPort: 15555 };
 const value = 'postgres://settings_reader:private@proxy.example:15555/probe';
 const role = { rolsuper: false, rolcreatedb: false, rolcreaterole: false,
   rolreplication: false, rolbypassrls: false, can_read_settings: true,
+  no_parameter_admin: true,
   can_create_database: false, can_create_schema: false, can_access_tables: false,
   can_access_sequences: false, can_execute_routines: false, can_access_large_objects: false,
   owns_user_objects: false,
@@ -47,6 +48,8 @@ test('placement requires a separate least-privilege settings credential', async 
     () => { state.dataDirectory = '/var/lib/postgresql/data/../outside'; },
     () => { state.role = { ...role, rolsuper: true }; },
     () => { state.role = { ...role, only_settings_membership: false }; },
+    () => { state.role = { ...role, no_parameter_admin: false }; },
+    () => { delete state.role.no_parameter_admin; },
     () => { state.role = { ...role, can_access_tables: true }; },
     () => { state.role = { ...role, can_access_sequences: true }; },
     () => { delete state.role.can_access_sequences; },
@@ -68,7 +71,7 @@ test('placement requires a separate least-privilege settings credential', async 
     /differs from declared proxy or database/);
   await assert.rejects(verifyPgdataPlacement({ ...options, value: 'postgres://probe_writer:private@proxy.example:15555/probe' }),
     /differs from declared proxy or database/);
-  assert.equal(state.closed, 16);
+  assert.equal(state.closed, 18);
 });
 
 test('large-object grants stop every operational and disposable PGDATA proof before storage, including retry', async () => {
@@ -81,7 +84,7 @@ test('large-object grants stop every operational and disposable PGDATA proof bef
     await assert.rejects(verifyPgdataPlacement({ ...options, label }), /PGDATA placement proof failed/);
     assert.equal(state.queries.length, 2, label);
     assert.equal(state.queries.some(sql => sql.includes("current_setting('data_directory')") ||
-      sql.includes('FROM pg_tablespace')), false, label);
+      sql.startsWith('SELECT spcname FROM pg_tablespace')), false, label);
     state.role.can_access_large_objects = false;
     await verifyPgdataPlacement({ ...options, label });
     state.role.can_access_large_objects = true;
@@ -98,7 +101,7 @@ test('owned objects stop operational and disposable PGDATA proof before storage 
     await assert.rejects(verifyPgdataPlacement({ ...options, label }), /PGDATA placement proof failed/);
     assert.equal(state.queries.length, 2, label);
     assert.equal(state.queries.some(sql => sql.includes("current_setting('data_directory')") ||
-      sql.includes('FROM pg_tablespace')), false,
+      sql.startsWith('SELECT spcname FROM pg_tablespace')), false,
       `${label} must reject before storage readback`);
     assert.equal(state.closed, 1);
     state.role.owns_user_objects = false;
@@ -107,6 +110,26 @@ test('owned objects stop operational and disposable PGDATA proof before storage 
     const beforeRetry = state.queries.length;
     await assert.rejects(verifyPgdataPlacement({ ...options, label }), /PGDATA placement proof failed/);
     assert.equal(state.queries.length - beforeRetry, 2, `${label} restored ownership must block retry`);
+  }
+});
+
+test('parameter administration stops every operational and disposable PGDATA proof before storage on retry', async () => {
+  for (const label of ['development/control', 'production/control',
+    'development/ap-southeast', 'development/us-east', 'development/eu-west',
+    'production/ap-southeast', 'production/us-east',
+    'disposable/development-ap-southeast', 'disposable/development-us-east',
+    'disposable/development-eu-west', 'disposable/production-ap-southeast',
+    'disposable/production-us-east']) {
+    const { state, options } = fixture();
+    state.role.no_parameter_admin = false;
+    await assert.rejects(verifyPgdataPlacement({ ...options, label }), /PGDATA placement proof failed/);
+    assert.equal(state.queries.length, 2, label);
+    state.role.no_parameter_admin = true;
+    await verifyPgdataPlacement({ ...options, label });
+    state.role.no_parameter_admin = false;
+    const beforeRetry = state.queries.length;
+    await assert.rejects(verifyPgdataPlacement({ ...options, label }), /PGDATA placement proof failed/);
+    assert.equal(state.queries.length - beforeRetry, 2, `${label} retry`);
   }
 });
 

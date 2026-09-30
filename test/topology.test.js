@@ -429,7 +429,8 @@ test('protected SQL proof rejects wrong database, role and untrusted TLS for eve
       const proxy = sample.railway.tcpProxies[0];
       const url = `postgres://${sample.resource.databaseRole}:private@${proxy.domain}:${proxy.proxyPort}/${sample.database}`;
       // Operational roles may access application tables after schema migration.
-      let grantRow = { safe_login: true, no_elevated_membership: true, no_other_role_membership: true, can_connect: true,
+      let grantRow = { safe_login: true, no_elevated_membership: true, no_other_role_membership: true,
+        no_parameter_admin: true, can_connect: true,
         no_database_create: true, can_use_schema: true, no_public_schema_create: true,
         no_other_schema_create: true, no_owned_objects: true };
       const FakeClient = class {
