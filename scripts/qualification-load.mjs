@@ -22,17 +22,15 @@ function validateProbeResult(body) {
   return body;
 }
 
-export async function runLoad(name, expectedUrl, concurrency = 10, minimumHeadroom = 5,
-  { token = process.env.PROBE_TOKEN, deployPreview = setupPreview, request = fetch, signal } = {}) {
+function assertLoadArguments(name, concurrency, minimumHeadroom, token) {
   if (!/^s4-[a-f0-9]{40}-[dp]-(apse|use|euw)$/.test(name ?? '') ||
       !Number.isSafeInteger(concurrency) || concurrency < 2 || concurrency > 50 ||
       !Number.isSafeInteger(minimumHeadroom) || minimumHeadroom < 1 || !token || /[\r\n]/.test(token)) {
     throw new Error('Invalid qualification load arguments');
   }
-  // setupPreview checks the clean head and exact config, deploys the named
-  // Preview, and reads its secret binding back before any token-bearing fetch.
-  const urls = await deployPreview(name, token, { signal });
-  if (signal?.aborted) throw new Error('Qualification load interrupted');
+}
+
+function resolveProbeUrl(urls, expectedUrl) {
   const targets = (Array.isArray(urls) ? urls : []).flatMap(previewUrl => {
     try {
       const base = new URL(previewUrl);
@@ -43,9 +41,11 @@ export async function runLoad(name, expectedUrl, concurrency = 10, minimumHeadro
   });
   const url = expectedUrl ? targets.find(target => target === expectedUrl) : targets[0];
   if (!url) throw new Error('Probe URL does not match the named Preview deployment');
-  let attempt;
+  return url;
+}
 
-  async function requestJson(target, allowCancel) {
+function makeRequestJson(request, token, signal) {
+  return async (target, allowCancel, attempt) => {
     if (allowCancel && signal?.aborted) throw new Error('Qualification load interrupted');
     const timeout = AbortSignal.timeout(30000);
     const response = await request(target, { method: 'POST', redirect: 'error',
@@ -53,49 +53,64 @@ export async function runLoad(name, expectedUrl, concurrency = 10, minimumHeadro
       signal: allowCancel && signal ? AbortSignal.any([signal, timeout]) : timeout });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     return response.json();
-  }
+  };
+}
 
-  async function requestProbe() {
-    return validateProbeResult(await requestJson(url, true));
-  }
+async function confirmedStart(url, requestJson, attempt) {
+  try {
+    const body = await requestJson(`${url}/start`, false, attempt);
+    return body.ok === true && body.started === true;
+  } catch { return false; }
+}
+
+async function firstProbeSucceeded(requestProbe) {
+  try { await requestProbe(); return true; }
+  catch { return false; }
+}
+
+async function residualClean(url, requestJson, attempt) {
+  try {
+    const residual = await requestJson(`${url}/residual`, false, attempt);
+    return residual.ok === true && residual.residualRows === 0;
+  } catch { return false; }
+}
+
+function attemptIssues(started, serialFailed, failed, concurrency, clean, signal) {
+  const issues = [];
+  if (!started) issues.push('Qualification attempt start failed');
+  if (serialFailed) issues.push('First qualification request failed');
+  if (failed.length) issues.push(`${failed.length}/${concurrency} concurrent qualification requests failed`);
+  if (!clean) issues.push('Final residual readback failed');
+  if (!started) issues.push('Qualification attempt was not confirmed');
+  if (signal?.aborted) issues.push('Qualification load interrupted');
+  return issues;
+}
+
+async function runAttempt(url, concurrency, requestJson, signal) {
   // The database issues a generation before start. A delayed old start can
   // never acquire a newer run's generation, even across independent CLIs.
   const reservation = await requestJson(`${url}/reserve`, false);
   if (reservation.ok !== true || !/^[1-9]\d{0,18}$/.test(reservation.generation ?? '')) {
     throw new Error('Qualification attempt reservation failed');
   }
-  attempt = reservation.generation;
-  let started = false;
-  let startFailed = false;
-  try {
-    const body = await requestJson(`${url}/start`, false);
-    if (body.ok !== true || body.started !== true) throw new Error('Start rejected');
-    started = true;
-  } catch { startFailed = true; }
+  const attempt = reservation.generation;
+  const requestProbe = async () => validateProbeResult(await requestJson(url, true, attempt));
+  const started = await confirmedStart(url, requestJson, attempt);
   // The first probe creates the disposable table. Complete it before any parallel
   // request so PostgreSQL catalog creation cannot race on a fresh database.
-  let serialFailed = false;
-  if (!startFailed && !signal?.aborted) {
-    try { await requestProbe(); }
-    catch { serialFailed = true; }
-  }
-  const results = startFailed || serialFailed || signal?.aborted ? [] : await collectProbes(requestProbe, concurrency);
+  const serialFailed = started && !signal?.aborted && !(await firstProbeSucceeded(requestProbe));
+  const results = !started || serialFailed || signal?.aborted ? [] : await collectProbes(requestProbe, concurrency);
   const failed = results.filter(result => result.status === 'rejected');
-  const issues = [];
-  if (startFailed) issues.push('Qualification attempt start failed');
-  if (serialFailed) issues.push('First qualification request failed');
-  if (failed.length) issues.push(`${failed.length}/${concurrency} concurrent qualification requests failed`);
   // This read follows a failed bootstrap or every settled concurrent request.
   // It uses a fresh timeout even when the caller was interrupted, so cleanup is
   // checked before reporting the interrupted run as failed.
-  try {
-    const residual = await requestJson(`${url}/residual`, false);
-    if (residual.ok !== true || residual.residualRows !== 0) throw new Error('Residual rows remain');
-  } catch { issues.push('Final residual readback failed'); }
-  if (!started) issues.push('Qualification attempt was not confirmed');
-  if (signal?.aborted) issues.push('Qualification load interrupted');
+  const clean = await residualClean(url, requestJson, attempt);
+  const issues = attemptIssues(started, serialFailed, failed, concurrency, clean, signal);
   if (issues.length) throw new Error(issues.join('; '));
-  const values = results.map(result => result.value);
+  return results.map(result => result.value);
+}
+
+function summarizeLoad(name, url, concurrency, minimumHeadroom, values) {
   const high = Math.max(...values.map(value => value.observedConnections));
   const maximum = Math.min(...values.map(value => value.maxConnections));
   const reserved = Math.max(...values.map(value => value.reservedConnections));
@@ -104,6 +119,18 @@ export async function runLoad(name, expectedUrl, concurrency = 10, minimumHeadro
     residualRows: 0,
     peakObservedConnections: high, minMaxConnections: maximum, maxReservedConnections: reserved,
     minimumHeadroom: maximum - high - reserved, maxElapsedMs: Math.max(...values.map(value => value.elapsedMs)) };
+}
+
+export async function runLoad(name, expectedUrl, concurrency = 10, minimumHeadroom = 5,
+  { token = process.env.PROBE_TOKEN, deployPreview = setupPreview, request = fetch, signal } = {}) {
+  assertLoadArguments(name, concurrency, minimumHeadroom, token);
+  // setupPreview checks the clean head and exact config, deploys the named
+  // Preview, and reads its secret binding back before any token-bearing fetch.
+  const urls = await deployPreview(name, token, { signal });
+  if (signal?.aborted) throw new Error('Qualification load interrupted');
+  const url = resolveProbeUrl(urls, expectedUrl);
+  const values = await runAttempt(url, concurrency, makeRequestJson(request, token, signal), signal);
+  return summarizeLoad(name, url, concurrency, minimumHeadroom, values);
 }
 
 if (process.argv[1] && realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url))) {

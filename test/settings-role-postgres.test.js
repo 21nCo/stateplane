@@ -55,7 +55,7 @@ test('real PostgreSQL settings proof rejects transitive roles, relation and rout
         };
         const allowed = row => row.can_read_settings && row.only_settings_membership &&
           !row.can_access_tables && !row.can_access_sequences && !row.can_execute_routines &&
-          !row.can_create_database && !row.can_create_schema;
+          !row.can_create_database && !row.can_create_schema && !row.owns_user_objects;
         assert.equal(allowed(await flags()), true, 'direct settings membership is sufficient');
 
         await client.query('GRANT elevated TO pg_read_all_settings WITH INHERIT FALSE, SET TRUE');
@@ -153,6 +153,40 @@ test('real PostgreSQL settings proof rejects transitive roles, relation and rout
         assert.equal((await flags()).can_execute_routines, true,
           'routine ownership remains executable after CREATE and PUBLIC grants are revoked');
         await client.query('DROP FUNCTION public.owned_routine()');
+
+        const ownedObjects = [
+          { create: "CREATE TYPE public.owned_status AS ENUM ('ready')", drop: 'DROP TYPE public.owned_status' },
+          { create: 'CREATE DOMAIN public.owned_domain AS integer', drop: 'DROP DOMAIN public.owned_domain' },
+          { create: "CREATE COLLATION public.owned_collation (provider = libc, locale = 'C')",
+            drop: 'DROP COLLATION public.owned_collation' },
+          { create: 'CREATE OPERATOR public.@@@ (PROCEDURE = pg_catalog.int4pl, LEFTARG = integer, RIGHTARG = integer)',
+            drop: 'DROP OPERATOR public.@@@ (integer, integer)' }
+        ];
+        for (const object of ownedObjects) {
+          await client.query('GRANT CREATE ON SCHEMA public TO settings_reader');
+          await client.query('SET ROLE settings_reader');
+          await client.query(object.create);
+          await client.query('RESET ROLE');
+          await client.query('REVOKE CREATE ON SCHEMA public FROM settings_reader');
+          const row = await flags();
+          assert.equal(row.owns_user_objects, true, `${object.create} ownership is denied`);
+          assert.equal(allowed(row), false, 'the settings-only admission fails for an owner');
+          await client.query('SET ROLE settings_reader');
+          await client.query(object.drop);
+          await client.query('RESET ROLE');
+          assert.equal(allowed(await flags()), true, 'dropping the owned object restores admission');
+        }
+
+        await client.query('GRANT CREATE ON DATABASE postgres TO settings_reader');
+        await client.query('SET ROLE settings_reader');
+        await client.query('CREATE SCHEMA owned_schema');
+        await client.query('RESET ROLE');
+        await client.query('REVOKE CREATE ON DATABASE postgres FROM settings_reader');
+        assert.equal((await flags()).owns_user_objects, true, 'schema ownership is denied after CREATE revoke');
+        await client.query('SET ROLE settings_reader');
+        await client.query('DROP SCHEMA owned_schema');
+        await client.query('RESET ROLE');
+        assert.equal(allowed(await flags()), true);
 
         await client.query('CREATE SCHEMA private_api; REVOKE ALL ON SCHEMA private_api FROM PUBLIC');
         await client.query("CREATE FUNCTION private_api.hidden_routine() RETURNS integer LANGUAGE sql AS 'SELECT 1'");

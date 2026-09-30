@@ -25,6 +25,10 @@ SELECT r.rolsuper, r.rolcreatedb, r.rolcreaterole, r.rolreplication, r.rolbypass
     WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' AND
       has_schema_privilege(n.oid, 'USAGE') AND
       has_function_privilege(p.oid, 'EXECUTE')) AS can_execute_routines,
+  EXISTS (SELECT 1 FROM pg_shdepend
+    WHERE refclassid = 'pg_authid'::regclass
+      AND refobjid = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+      AND deptype = 'o') AS owns_user_objects,
   (SELECT count(*) = 2 AND bool_and(member.rolname IN (current_user, 'pg_read_all_settings'))
     FROM reachable JOIN pg_roles member ON member.oid = reachable.roleid) AS only_settings_membership
   FROM pg_roles r WHERE r.rolname = current_user`;
@@ -37,6 +41,7 @@ function assertSettingsRole(label, result) {
       row.can_create_schema !== false || row.can_access_tables !== false ||
       row.can_access_sequences !== false ||
       row.can_execute_routines !== false ||
+      row.owns_user_objects !== false ||
       row.only_settings_membership !== true) {
     throw new Error(`${label}: settings proof credential is not least privilege`);
   }
@@ -110,13 +115,16 @@ export async function verifyPgdataPlacement({ label, volumeInstance, mountPath, 
   try {
     await client.connect();
     if (signal?.aborted) throw new Error('interrupted');
-    const result = await client.query('SELECT current_database() AS database, current_user AS role, current_setting(\'data_directory\') AS data_directory');
+    const result = await client.query('SELECT current_database() AS database, current_user AS role');
     if (signal?.aborted) throw new Error('interrupted');
     if (result.rows.length !== 1 || result.rows[0].database !== database ||
         result.rows[0].role !== decodeURIComponent(url.username)) throw new Error('SQL identity mismatch');
-    assertVolumePlacement(label, volumeInstance, mountPath, result.rows[0].data_directory);
     assertSettingsRole(label, await client.query(settingsRoleSql));
     if (signal?.aborted) throw new Error('interrupted');
+    const placement = await client.query("SELECT current_setting('data_directory') AS data_directory");
+    if (signal?.aborted) throw new Error('interrupted');
+    if (placement.rows.length !== 1) throw new Error('PGDATA readback missing');
+    assertVolumePlacement(label, volumeInstance, mountPath, placement.rows[0].data_directory);
     const spaces = await client.query("SELECT spcname FROM pg_tablespace WHERE spcname NOT IN ('pg_default', 'pg_global')");
     if (signal?.aborted) throw new Error('interrupted');
     if (spaces.rows.length !== 0) throw new Error('Non-default tablespace requires separate storage proof');
