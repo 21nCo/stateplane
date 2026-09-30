@@ -1,0 +1,20 @@
+scripts/qualification-load.mjs
+  h_a39f9495f9ec1d 25,31-33,44-45,47-48,56-57,59-89,96-98,101-102,107-108,110-113,124-135
+scripts/topology-sql.mjs
+  h_a39f9495f9ec1d 28-31,44,118,124-127
+test/settings-role-postgres.test.js
+  h_a39f9495f9ec1d 58,157-190
+test/topology-pgdata.test.js
+  h_a39f9495f9ec1d 12,28-29,43,55-56,69-87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "00d4dc11db61970f125738f3522191ca7e0584bc",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
