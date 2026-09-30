@@ -1,6 +1,6 @@
 import { Client } from 'pg';
 import { readFile, stat } from 'node:fs/promises';
-import { noParameterAdminSql, operationalGrantsAllowed, operationalGrantsSql } from '../deployment/workers/role-grants.js';
+import { noParameterAdminSql, operationalGrantsAllowed, operationalGrantsSql, restrictedCatalogExecuteSql } from '../deployment/workers/role-grants.js';
 import { assertVolumePlacement } from './topology-live.mjs';
 
 export const settingsRoleSql = `WITH RECURSIVE reachable(roleid) AS (
@@ -40,16 +40,7 @@ SELECT r.rolsuper, r.rolcreatedb, r.rolcreaterole, r.rolreplication, r.rolbypass
     WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' AND
       has_schema_privilege(n.oid, 'USAGE') AND
       has_function_privilege(p.oid, 'EXECUTE')) AS can_execute_routines,
-  EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-    LEFT JOIN pg_init_privs initial ON initial.classoid = 'pg_proc'::regclass AND
-      initial.objoid = p.oid AND initial.objsubid = 0
-    WHERE n.nspname = 'pg_catalog' AND has_function_privilege(p.oid, 'EXECUTE') AND
-      -- Normal objects start at PostgreSQL's FirstNormalObjectId, including later catalog routines.
-      (p.oid >= 16384::oid OR
-        NOT EXISTS (SELECT 1 FROM aclexplode(COALESCE(initial.initprivs, acldefault('f', p.proowner))) baseline
-          WHERE baseline.privilege_type = 'EXECUTE' AND
-            (baseline.grantee = 0 OR pg_has_role(current_user, baseline.grantee, 'USAGE')))))
-    AS can_execute_restricted_routines,
+  ${restrictedCatalogExecuteSql} AS can_execute_restricted_routines,
   (current_setting('lo_compat_privileges')::boolean OR EXISTS (SELECT 1 FROM pg_largeobject_metadata m
     WHERE m.lomowner IN (SELECT roleid FROM reachable) OR
       EXISTS (SELECT 1 FROM aclexplode(m.lomacl) acl

@@ -35,7 +35,7 @@ const database = vi.hoisted(() => ({
   targetRole: 'sta4_probe_aaaaaaaaaaaaaaaa',
   grants: {
     safe_login: true, no_elevated_membership: true, no_other_role_membership: true,
-    no_parameter_admin: true, can_connect: true,
+    no_parameter_admin: true, no_restricted_catalog_execute: true, can_connect: true,
     no_database_create: true, can_use_schema: true, can_create_probe_table: true,
     no_other_schema_create: true, no_other_table_access: true,
     no_sequence_access: true, no_other_routine_execute: true, can_execute_distance: true
@@ -178,7 +178,7 @@ describe('disposable qualification row cleanup', () => {
     database.targetRole = 'sta4_probe_aaaaaaaaaaaaaaaa';
     database.grants = {
       safe_login: true, no_elevated_membership: true, no_other_role_membership: true,
-      no_parameter_admin: true, can_connect: true,
+      no_parameter_admin: true, no_restricted_catalog_execute: true, can_connect: true,
       no_database_create: true, can_use_schema: true, can_create_probe_table: true,
       no_other_schema_create: true, no_other_table_access: true,
       no_sequence_access: true, no_other_routine_execute: true, can_execute_distance: true
@@ -443,7 +443,7 @@ describe('disposable qualification row cleanup', () => {
   });
 
   it('rejects elevated and unavailable effective grants before any DDL or row mutation', async () => {
-    for (const key of ['safe_login', 'no_elevated_membership', 'no_other_role_membership', 'no_parameter_admin', 'no_database_create', 'no_other_schema_create', 'no_other_table_access',
+    for (const key of ['safe_login', 'no_elevated_membership', 'no_other_role_membership', 'no_parameter_admin', 'no_restricted_catalog_execute', 'no_database_create', 'no_other_schema_create', 'no_other_table_access',
       'no_sequence_access', 'no_other_routine_execute', 'can_execute_distance', 'can_connect', 'can_use_schema', 'can_create_probe_table']) {
       const beforeClose = database.closed;
       database.grants = { ...database.grants, [key]: false };
@@ -468,6 +468,16 @@ describe('disposable qualification row cleanup', () => {
     expect((await qualify()).status).toBe(500);
     expect(database.queries.some(sql => sql.startsWith('CREATE TABLE'))).toBe(false);
     expect(database.closed - beforeClose).toBe(2);
+  });
+
+  it('rejects a restricted catalog grant on every replay endpoint before reservation or mutation', async () => {
+    database.grants = { ...database.grants, no_restricted_catalog_execute: false };
+    for (const path of ['/qualify/reserve', '/qualify/start', '/qualify', '/qualify/residual']) {
+      database.queries = [];
+      expect((await qualify('Bearer disposable-token', '1', {}, path)).status).toBe(500);
+      expect(database.queries.some(sql => sql.startsWith('CREATE TABLE') || sql.startsWith('INSERT') || sql.startsWith('UPDATE'))).toBe(false);
+      expect(database.row).toBeNull();
+    }
   });
 
   it('rejects hostile reserved relations before reserve, replay or probe writes', async () => {

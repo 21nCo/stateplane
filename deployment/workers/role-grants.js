@@ -7,6 +7,18 @@ export const noParameterAdminSql = `NOT EXISTS (SELECT 1 FROM pg_parameter_acl p
   WHERE acl.privilege_type IN ('SET', 'ALTER SYSTEM')
     AND (acl.grantee = 0 OR pg_has_role(current_user, acl.grantee, 'USAGE')))`;
 
+// A catalog routine is safe only when PostgreSQL's initial ACL already made it executable.
+// Later catalog routines have normal OIDs and are never treated as initdb builtins.
+export const restrictedCatalogExecuteSql = `EXISTS (SELECT 1 FROM pg_proc p
+  JOIN pg_namespace n ON n.oid = p.pronamespace
+  LEFT JOIN pg_init_privs initial ON initial.classoid = 'pg_proc'::regclass AND
+    initial.objoid = p.oid AND initial.objsubid = 0
+  WHERE n.nspname = 'pg_catalog' AND has_function_privilege(p.oid, 'EXECUTE') AND
+    (p.oid >= 16384::oid OR
+      NOT EXISTS (SELECT 1 FROM aclexplode(COALESCE(initial.initprivs, acldefault('f', p.proowner))) baseline
+        WHERE baseline.privilege_type = 'EXECUTE' AND
+          (baseline.grantee = 0 OR pg_has_role(current_user, baseline.grantee, 'USAGE')))))`;
+
 export const qualificationGrantsSql = `SELECT
   (SELECT rolcanlogin AND NOT (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls)
      FROM pg_roles WHERE rolname = current_user) AS safe_login,
@@ -17,6 +29,7 @@ export const qualificationGrantsSql = `SELECT
   NOT EXISTS (SELECT 1 FROM pg_roles
      WHERE rolname <> current_user AND pg_has_role(current_user, oid, 'MEMBER')) AS no_other_role_membership,
   ${noParameterAdminSql} AS no_parameter_admin,
+  NOT ${restrictedCatalogExecuteSql} AS no_restricted_catalog_execute,
   has_database_privilege(current_user, current_database(), 'CONNECT') AS can_connect,
   NOT has_database_privilege(current_user, current_database(), 'CREATE') AS no_database_create,
   has_schema_privilege(current_user, 'public', 'USAGE') AS can_use_schema,
@@ -49,6 +62,7 @@ export const qualificationGrantsSql = `SELECT
 
 const commonGrantFields = [
   'safe_login', 'no_elevated_membership', 'no_other_role_membership', 'no_parameter_admin',
+  'no_restricted_catalog_execute',
   'can_connect', 'no_database_create', 'can_use_schema', 'no_other_schema_create'
 ];
 const qualificationGrantFields = [...commonGrantFields, 'can_create_probe_table', 'no_other_table_access',
@@ -77,6 +91,7 @@ export const operationalGrantsSql = `SELECT
   NOT EXISTS (SELECT 1 FROM pg_roles
      WHERE rolname <> current_user AND pg_has_role(current_user, oid, 'MEMBER')) AS no_other_role_membership,
   ${noParameterAdminSql} AS no_parameter_admin,
+  NOT ${restrictedCatalogExecuteSql} AS no_restricted_catalog_execute,
   has_database_privilege(current_user, current_database(), 'CONNECT') AS can_connect,
   NOT has_database_privilege(current_user, current_database(), 'CREATE') AS no_database_create,
   has_schema_privilege(current_user, 'public', 'USAGE') AS can_use_schema,

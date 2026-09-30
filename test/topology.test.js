@@ -431,7 +431,7 @@ test('protected SQL proof rejects wrong database, role and untrusted TLS for eve
       const url = `postgres://${sample.resource.databaseRole}:private@${proxy.domain}:${proxy.proxyPort}/${sample.database}`;
       // Operational roles may access application tables after schema migration.
       let grantRow = { safe_login: true, no_elevated_membership: true, no_other_role_membership: true,
-        no_parameter_admin: true, can_connect: true,
+        no_parameter_admin: true, no_restricted_catalog_execute: true, can_connect: true,
         no_database_create: true, can_use_schema: true, no_public_schema_create: true,
         no_other_schema_create: true, no_owned_objects: true };
       const FakeClient = class {
@@ -459,6 +459,9 @@ test('protected SQL proof rejects wrong database, role and untrusted TLS for eve
       grantRow = { ...grantRow, no_owned_objects: false };
       await assert.rejects(proof(), /verified-TLS/);
       grantRow = { ...grantRow, no_owned_objects: true };
+      grantRow = { ...grantRow, no_restricted_catalog_execute: false };
+      await assert.rejects(proof(), /verified-TLS/);
+      grantRow = { ...grantRow, no_restricted_catalog_execute: true };
       grantRow = { ...grantRow, no_elevated_membership: false };
       await assert.rejects(proof(), /verified-TLS/);
       grantRow = { ...grantRow, no_elevated_membership: true, no_other_role_membership: false };

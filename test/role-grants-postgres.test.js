@@ -23,7 +23,7 @@ try {
 test('grant results require every exact true field of their distinct SQL policies', () => {
   const common = {
     safe_login: true, no_elevated_membership: true, no_other_role_membership: true,
-    no_parameter_admin: true,
+    no_parameter_admin: true, no_restricted_catalog_execute: true,
     can_connect: true, no_database_create: true, can_use_schema: true,
     no_other_schema_create: true
   };
@@ -83,6 +83,60 @@ test('PostgreSQL 16 role admission rejects direct, inherited and indirect altern
         assert.equal(qualificationGrantsAllowed(await check('probe', qualificationGrantsSql)), true);
         assert.equal(operationalGrantsAllowed(await check('operational', operationalGrantsSql)), true,
           'application table grants remain valid after schema migration');
+        for (const grantee of ['probe', 'operational', 'PUBLIC']) {
+          await client.query(`GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO ${grantee}`);
+          for (const [role, sql, allowed] of [
+            ['probe', qualificationGrantsSql, qualificationGrantsAllowed],
+            ['operational', operationalGrantsSql, operationalGrantsAllowed]
+          ]) {
+            const affected = grantee === role || grantee === 'PUBLIC';
+            const flags = await check(role, sql);
+            if (affected) {
+              await client.query(`SET ROLE ${role}`);
+              try {
+                assert.ok((await client.query("SELECT length(pg_catalog.pg_read_file('PG_VERSION')) AS bytes")).rows[0].bytes > 0);
+              } finally { await client.query('RESET ROLE'); }
+            }
+            assert.equal(allowed(flags), !affected, `${grantee} admission for ${role}`);
+            assert.equal(flags.no_restricted_catalog_execute, !affected, `${grantee} catalog grant for ${role}`);
+          }
+          await client.query(`REVOKE EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) FROM ${grantee}`);
+          assert.equal(qualificationGrantsAllowed(await check('probe', qualificationGrantsSql)), true);
+          assert.equal(operationalGrantsAllowed(await check('operational', operationalGrantsSql)), true);
+        }
+        await client.query('CREATE ROLE catalog_parent');
+        await client.query('GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO catalog_parent');
+        for (const [role, sql, allowed] of [
+          ['probe', qualificationGrantsSql, qualificationGrantsAllowed],
+          ['operational', operationalGrantsSql, operationalGrantsAllowed]
+        ]) {
+          await client.query(`GRANT catalog_parent TO ${role} WITH INHERIT TRUE, SET FALSE`);
+          const flags = await check(role, sql);
+          assert.equal(flags.no_restricted_catalog_execute, false, `inherited catalog grant for ${role}`);
+          assert.equal(allowed(flags), false);
+          await client.query(`REVOKE catalog_parent FROM ${role}`);
+          assert.equal(allowed(await check(role, sql)), true);
+        }
+        await client.query('REVOKE EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) FROM catalog_parent');
+        await client.query("CREATE FUNCTION pg_catalog.read_private_fixture() RETURNS integer LANGUAGE sql SECURITY DEFINER AS 'SELECT 7'");
+        for (const [role, sql, allowed] of [
+          ['probe', qualificationGrantsSql, qualificationGrantsAllowed],
+          ['operational', operationalGrantsSql, operationalGrantsAllowed]
+        ]) {
+          assert.equal(allowed(await check(role, sql)), false, `post-initdb PUBLIC catalog routine for ${role}`);
+          await client.query(`SET ROLE ${role}`);
+          try { assert.equal((await client.query('SELECT pg_catalog.read_private_fixture() AS value')).rows[0].value, 7); }
+          finally { await client.query('RESET ROLE'); }
+        }
+        await client.query('REVOKE EXECUTE ON FUNCTION pg_catalog.read_private_fixture() FROM PUBLIC');
+        assert.equal(qualificationGrantsAllowed(await check('probe', qualificationGrantsSql)), true);
+        assert.equal(operationalGrantsAllowed(await check('operational', operationalGrantsSql)), true);
+        await client.query('DROP FUNCTION pg_catalog.read_private_fixture()');
+        await client.query('GRANT EXECUTE ON FUNCTION pg_catalog.abs(integer) TO probe, operational');
+        assert.equal(qualificationGrantsAllowed(await check('probe', qualificationGrantsSql)), true,
+          'ordinary builtin execution remains admitted');
+        assert.equal(operationalGrantsAllowed(await check('operational', operationalGrantsSql)), true);
+        await client.query('REVOKE EXECUTE ON FUNCTION pg_catalog.abs(integer) FROM probe, operational');
         for (const grantee of ['probe', 'operational', 'PUBLIC']) {
           await client.query(`GRANT SET ON PARAMETER lo_compat_privileges TO ${grantee}`);
           assert.equal(qualificationGrantsAllowed(await check('probe', qualificationGrantsSql)),
