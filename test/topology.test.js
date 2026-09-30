@@ -236,6 +236,7 @@ test('rendered control, gateways and every cell use isolated names and secret-fr
     const rendered = renderTopology(topology, environment, inventories[environment], counterpart, '/tmp/stateplane-topology');
     assert.equal(Object.keys(rendered).length, 3 + 3 * env.cells.length);
     assert.equal(rendered['directory.json'].hyperdrive[0].id, inventories[environment].control.hyperdriveId);
+    assert.deepEqual(rendered['directory.json'].placement, { mode: 'smart' });
     assert.equal(rendered['app.json'].services.length, 1 + env.cells.length);
     assert.equal(rendered['mcp.json'].services.length, 1 + env.cells.length);
     for (const config of Object.values(rendered)) {

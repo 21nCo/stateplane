@@ -61,6 +61,13 @@ test('real PostgreSQL settings proof rejects transitive roles, relation and rout
           !row.owns_user_objects && row.no_parameter_admin;
         assert.equal(allowed(await flags()), true, 'direct settings membership is sufficient');
 
+        await client.query('GRANT EXECUTE ON FUNCTION pg_catalog.abs(integer) TO elevated');
+        assert.equal((await flags()).can_execute_restricted_routines, false,
+          'an unrelated grant does not change default PUBLIC builtin execution');
+        await client.query('REVOKE EXECUTE ON FUNCTION pg_catalog.abs(integer) FROM elevated');
+        assert.equal(allowed(await flags()), true,
+          'a materialized builtin ACL after revocation retains least-privilege admission');
+
         for (const grantee of ['settings_reader', 'elevated', 'PUBLIC']) {
           if (grantee === 'elevated') await client.query('GRANT elevated TO settings_reader WITH INHERIT TRUE, SET FALSE');
           await client.query(`GRANT TEMP ON DATABASE postgres TO ${grantee}`);

@@ -231,6 +231,7 @@ export function renderTopology(topology, environment, inventory, counterpart, ou
   }
   output['directory.json'] = {
     ...common(out, `${env.prefix}-directory`, 'deployment/workers/directory.ts', 'directory', environment, projectRoot),
+    placement: { mode: 'smart' },
     hyperdrive: binding(inventory.control.hyperdriveId)
   };
   for (const cell of env.cells) {
