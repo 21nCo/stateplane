@@ -68,6 +68,46 @@ test('real PostgreSQL settings proof rejects transitive roles, relation and rout
         assert.equal(allowed(await flags()), true,
           'a materialized builtin ACL after revocation retains least-privilege admission');
 
+        await client.query(`INSERT INTO private_records VALUES (1, 'private-fixture');
+          CREATE FUNCTION pg_catalog.read_private_fixture() RETURNS text LANGUAGE sql SECURITY DEFINER
+            AS 'SELECT secret FROM public.private_records LIMIT 1';
+          CREATE FUNCTION pg_catalog.write_private_fixture() RETURNS text LANGUAGE sql SECURITY DEFINER
+            AS 'UPDATE public.private_records SET secret = ''modified'' RETURNING secret';`);
+        for (const name of ['read_private_fixture', 'write_private_fixture']) {
+          const provenance = (await client.query(`SELECT p.oid >= 16384::oid AS created_after_initdb,
+              initial.objoid IS NOT NULL AS has_initial_privileges
+            FROM pg_proc p LEFT JOIN pg_init_privs initial ON initial.classoid = 'pg_proc'::regclass
+              AND initial.objoid = p.oid AND initial.objsubid = 0
+            WHERE p.oid = $1::regprocedure`, [`pg_catalog.${name}()`])).rows[0];
+          assert.deepEqual(provenance, { created_after_initdb: true, has_initial_privileges: false });
+          assert.equal((await flags()).can_execute_restricted_routines, true,
+            `post-initdb ${name} with default PUBLIC EXECUTE is denied`);
+          await client.query('SET SESSION AUTHORIZATION settings_reader');
+          try {
+            const result = await client.query(`SELECT pg_catalog.${name}() AS value`);
+            assert.equal(result.rows[0].value, name === 'read_private_fixture' ? 'private-fixture' : 'modified');
+          } finally { await client.query('RESET SESSION AUTHORIZATION'); }
+          await client.query(`REVOKE EXECUTE ON FUNCTION pg_catalog.${name}() FROM PUBLIC`);
+          assert.equal(allowed(await flags()), name === 'write_private_fixture',
+            `revoking ${name} removes its effective execution`);
+        }
+        await client.query('DROP FUNCTION pg_catalog.write_private_fixture()');
+        assert.equal(allowed(await flags()), true, 'revoking both catalog routines restores admission');
+        await client.query('GRANT EXECUTE ON FUNCTION pg_catalog.read_private_fixture() TO settings_reader');
+        assert.equal((await flags()).can_execute_restricted_routines, true,
+          'direct EXECUTE on later catalog routine is denied');
+        await client.query('REVOKE EXECUTE ON FUNCTION pg_catalog.read_private_fixture() FROM settings_reader');
+        assert.equal(allowed(await flags()), true, 'revoking direct EXECUTE restores admission');
+        await client.query('DROP FUNCTION pg_catalog.read_private_fixture()');
+        await client.query('DELETE FROM private_records');
+
+        await client.query('GRANT CREATE ON SCHEMA pg_catalog TO settings_reader');
+        assert.equal((await flags()).can_create_schema, true,
+          'catalog CREATE is denied before a settings login can add a routine');
+        await client.query('REVOKE CREATE ON SCHEMA pg_catalog FROM settings_reader');
+        assert.equal(allowed(await flags()), true,
+          'revoking catalog CREATE restores admission');
+
         for (const grantee of ['settings_reader', 'elevated', 'PUBLIC']) {
           if (grantee === 'elevated') await client.query('GRANT elevated TO settings_reader WITH INHERIT TRUE, SET FALSE');
           await client.query(`GRANT TEMP ON DATABASE postgres TO ${grantee}`);
