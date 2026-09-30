@@ -8,8 +8,9 @@ const value = 'postgres://settings_reader:private@proxy.example:15555/probe';
 const role = { rolsuper: false, rolcreatedb: false, rolcreaterole: false,
   rolreplication: false, rolbypassrls: false, can_read_settings: true,
   no_parameter_admin: true,
-  can_create_database: false, can_create_schema: false, can_access_tables: false,
-  can_access_sequences: false, can_execute_routines: false, can_access_large_objects: false,
+  can_create_database: false, can_create_temp: false, can_create_schema: false, can_access_tables: false,
+  can_access_sequences: false, can_execute_routines: false, can_execute_restricted_routines: false,
+  can_access_large_objects: false,
   owns_user_objects: false,
   only_settings_membership: true };
 
@@ -50,11 +51,15 @@ test('placement requires a separate least-privilege settings credential', async 
     () => { state.role = { ...role, only_settings_membership: false }; },
     () => { state.role = { ...role, no_parameter_admin: false }; },
     () => { delete state.role.no_parameter_admin; },
+    () => { state.role = { ...role, can_create_temp: true }; },
+    () => { delete state.role.can_create_temp; },
     () => { state.role = { ...role, can_access_tables: true }; },
     () => { state.role = { ...role, can_access_sequences: true }; },
     () => { delete state.role.can_access_sequences; },
     () => { state.role = { ...role, can_execute_routines: true }; },
     () => { delete state.role.can_execute_routines; },
+    () => { state.role = { ...role, can_execute_restricted_routines: true }; },
+    () => { delete state.role.can_execute_restricted_routines; },
     () => { state.role = { ...role, can_access_large_objects: true }; },
     () => { delete state.role.can_access_large_objects; },
     () => { state.role = { ...role, owns_user_objects: true }; },
@@ -71,7 +76,30 @@ test('placement requires a separate least-privilege settings credential', async 
     /differs from declared proxy or database/);
   await assert.rejects(verifyPgdataPlacement({ ...options, value: 'postgres://probe_writer:private@proxy.example:15555/probe' }),
     /differs from declared proxy or database/);
-  assert.equal(state.closed, 18);
+  assert.equal(state.closed, 22);
+});
+
+test('TEMP and restricted catalog execution stop all PGDATA paths before storage on initial, retry and restore', async () => {
+  const labels = ['development/control', 'production/control',
+    'development/ap-southeast', 'development/us-east', 'development/eu-west',
+    'production/ap-southeast', 'production/us-east',
+    'disposable/development-ap-southeast', 'disposable/development-us-east',
+    'disposable/development-eu-west', 'disposable/production-ap-southeast',
+    'disposable/production-us-east'];
+  for (const capability of ['can_create_temp', 'can_execute_restricted_routines']) {
+    for (const label of labels) {
+      const { state, options } = fixture();
+      for (const phase of ['initial', 'retry', 'restore']) {
+        state.role[capability] = true;
+        const before = state.queries.length;
+        await assert.rejects(verifyPgdataPlacement({ ...options, label }), /PGDATA placement proof failed/);
+        assert.equal(state.queries.length - before, 2, `${label} ${capability} ${phase}`);
+        state.role[capability] = false;
+        await verifyPgdataPlacement({ ...options, label });
+      }
+      assert.equal(state.queries.some(sql => sql.includes("current_setting('data_directory')")), true);
+    }
+  }
 });
 
 test('large-object grants stop every operational and disposable PGDATA proof before storage, including retry', async () => {

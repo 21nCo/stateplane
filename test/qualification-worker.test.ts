@@ -15,6 +15,7 @@ const database = vi.hoisted(() => ({
   rollbackFailure: false,
   insertFailure: false,
   failQuery: '' as string,
+  bootstrapConflicts: 0,
   endFailure: false,
   queryTimeout: 0,
   maxConnections: 100,
@@ -48,6 +49,10 @@ vi.mock('pg', () => ({
     async end() { database.closed++; if (database.endFailure) throw new Error('close failed'); }
     async query(sql: string, parameters?: unknown[]) {
       database.queries.push(sql);
+      if (sql.startsWith('CREATE TABLE') && database.bootstrapConflicts > 0) {
+        database.bootstrapConflicts--;
+        throw Object.assign(new Error('concurrent catalog creation'), { code: '23505' });
+      }
       if (database.failQuery && sql.includes(database.failQuery)) throw new Error('query timeout');
       if (sql.startsWith('SET LOCAL lock_timeout')) return { rows: [] };
       if (sql.startsWith('SELECT current_user AS current_role, probe.*')) {
@@ -140,6 +145,7 @@ async function qualify(authorization: string | null = 'Bearer disposable-token',
 describe('disposable qualification row cleanup', () => {
   beforeEach(() => {
     database.row = null;
+    database.bootstrapConflicts = 0;
     database.orphanRows = 0;
     database.deleteMode = 'ok';
     database.staleInitialRead = false;
@@ -224,6 +230,26 @@ describe('disposable qualification row cleanup', () => {
     expect(database.storedAttemptId).toBe(database.attemptId);
     expect((await qualify()).status).toBe(200);
     expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/residual')).status).toBe(200);
+  });
+
+  it('retries only a rolled-back bootstrap catalog conflict and rechecks target admission', async () => {
+    database.storedAttemptId = null;
+    database.activeAttempt = false;
+    database.bootstrapConflicts = 1;
+    expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/reserve')).status).toBe(200);
+    expect(database.queries.filter(sql => sql === 'ROLLBACK')).toHaveLength(1);
+    expect(database.queries.filter(sql => sql.includes('FROM pg_roles'))).toHaveLength(2);
+    expect(database.closed).toBe(1);
+
+    database.queries = [];
+    database.bootstrapConflicts = 1;
+    database.rollbackFailure = true;
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect((await qualify('Bearer disposable-token', '1', {}, '/qualify/reserve')).status).toBe(500);
+      expect(database.queries.filter(sql => sql.startsWith('CREATE TABLE'))).toHaveLength(1);
+      expect(log).toHaveBeenLastCalledWith('Qualification failed', 'probe:attempt-bootstrap,attempt:rollback');
+    } finally { log.mockRestore(); }
   });
 
   it('rejects an orphan from a prior interrupted probe in the final table-wide read', async () => {

@@ -12,7 +12,7 @@ interface Env {
 }
 
 class QualificationFailure extends Error {
-  constructor(readonly stages: string[]) {
+  constructor(readonly stages: string[], readonly retryableBootstrapConflict = false) {
     super('Disposable qualification failed');
   }
 }
@@ -63,15 +63,21 @@ async function attemptTransaction<T>(client: ProbeClient, work: () => Promise<T>
     return result;
   } catch (error) {
     const stages = error instanceof QualificationFailure ? error.stages : ['probe:unexpected'];
+    let rolledBack = true;
     try { await client.query('ROLLBACK'); }
-    catch { stages.push('attempt:rollback'); }
-    throw new QualificationFailure(stages);
+    catch { stages.push('attempt:rollback'); rolledBack = false; }
+    throw new QualificationFailure(stages,
+      rolledBack && error instanceof QualificationFailure && error.retryableBootstrapConflict);
   }
 }
 
 async function atStage<T>(stage: string, action: () => Promise<T>): Promise<T> {
   try { return await action(); }
-  catch { throw new QualificationFailure([`probe:${stage}`]); }
+  catch (error) {
+    const sqlState = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+    throw new QualificationFailure([`probe:${stage}`],
+      stage === 'attempt-bootstrap' && (sqlState === '23505' || sqlState === '42P07'));
+  }
 }
 
 async function verifyTarget(writer: ProbeClient, database: string, role: string, requireRelations = true): Promise<string> {
@@ -155,23 +161,32 @@ async function reserveAttempt(connectionString: string, expectedDatabase: string
   let generation: string | undefined;
   try {
     await atStage('writer-connect', () => client.connect());
-    await verifyTarget(client, expectedDatabase, expectedRole, false);
-    generation = await attemptTransaction(client, async () => {
-      await atStage('attempt-reserve', async () => {
-        await client.query('CREATE TABLE IF NOT EXISTS public.stateplane_qualification (probe_id uuid PRIMARY KEY, value integer NOT NULL)');
-        await client.query('CREATE TABLE IF NOT EXISTS public.stateplane_qualification_attempt (singleton boolean PRIMARY KEY CHECK (singleton), generation bigint NOT NULL, active boolean NOT NULL)');
-      });
-      await verifyProbeRelations(client, true);
-      const reserved = await atStage('attempt-reserve', () => client.query(`INSERT INTO public.stateplane_qualification_attempt (singleton, generation, active)
-        VALUES (TRUE, 1, FALSE) ON CONFLICT (singleton) DO UPDATE
-        SET generation = public.stateplane_qualification_attempt.generation + 1, active = FALSE
-        RETURNING generation`));
-      const next = String(reserved.rows[0]?.generation ?? '');
-      if (!attemptPattern.test(next)) throw new QualificationFailure(['probe:attempt-reserve']);
-      const residual = await atStage('residual-read', () => client.query('SELECT count(*)::integer AS count FROM public.stateplane_qualification'));
-      if (residual.rows[0]?.count !== 0) throw new QualificationFailure(['probe:residual-read']);
-      return next;
-    });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await verifyTarget(client, expectedDatabase, expectedRole, false);
+      try {
+        generation = await attemptTransaction(client, async () => {
+          await atStage('attempt-bootstrap', async () => {
+            await client.query('CREATE TABLE IF NOT EXISTS public.stateplane_qualification (probe_id uuid PRIMARY KEY, value integer NOT NULL)');
+            await client.query('CREATE TABLE IF NOT EXISTS public.stateplane_qualification_attempt (singleton boolean PRIMARY KEY CHECK (singleton), generation bigint NOT NULL, active boolean NOT NULL)');
+          });
+          await verifyProbeRelations(client, true);
+          const reserved = await atStage('attempt-reserve', () => client.query(`INSERT INTO public.stateplane_qualification_attempt (singleton, generation, active)
+            VALUES (TRUE, 1, FALSE) ON CONFLICT (singleton) DO UPDATE
+            SET generation = public.stateplane_qualification_attempt.generation + 1, active = FALSE
+            RETURNING generation`));
+          const next = String(reserved.rows[0]?.generation ?? '');
+          if (!attemptPattern.test(next)) throw new QualificationFailure(['probe:attempt-reserve']);
+          const residual = await atStage('residual-read', () => client.query('SELECT count(*)::integer AS count FROM public.stateplane_qualification'));
+          if (residual.rows[0]?.count !== 0) throw new QualificationFailure(['probe:residual-read']);
+          return next;
+        });
+        break;
+      } catch (error) {
+        if (!(error instanceof QualificationFailure && error.retryableBootstrapConflict && attempt < 2)) throw error;
+        // PostgreSQL can report 23505 or 42P07 when another first reservation wins CREATE IF NOT EXISTS.
+        // The failed transaction has rolled back; recheck grants and relation shape before trying again.
+      }
+    }
   } catch (error) { failures.push(...(error instanceof QualificationFailure ? error.stages : ['probe:unexpected'])); }
   try { await client.end(); }
   catch { failures.push('close:writer'); }

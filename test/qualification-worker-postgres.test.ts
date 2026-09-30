@@ -54,10 +54,13 @@ it.skipIf(!postgresBin || process.platform === 'win32')('fences complete Worker 
           method: 'POST', headers: { authorization: 'Bearer disposable-token',
             ...(generation ? { 'x-stateplane-attempt': generation } : {}) }
         }), env);
-        const reserved = await call('/qualify/reserve');
-        expect(reserved.status, `${suffix}: reserve`).toBe(200);
-        const first = (await reserved.json() as { generation: string }).generation;
-        expect(first).toBe('1');
+        const reservations = await Promise.all([call('/qualify/reserve'), call('/qualify/reserve')]);
+        expect(reservations.map(response => response.status), `${suffix}: concurrent first reserves`).toEqual([200, 200]);
+        const generations = await Promise.all(reservations.map(async response =>
+          (await response.json() as { generation: string }).generation));
+        expect(generations.sort()).toEqual(['1', '2']);
+        const first = '2';
+        expect((await call('/qualify/start', '1')).status, `${suffix}: superseded concurrent start`).toBe(500);
         expect((await call('/qualify/start', first)).status, `${suffix}: start`).toBe(200);
         const probe = await call('/qualify', first);
         expect(probe.status, `${suffix}: probe`).toBe(200);
@@ -66,7 +69,7 @@ it.skipIf(!postgresBin || process.platform === 'win32')('fences complete Worker 
         const replay = await call('/qualify/reserve');
         expect(replay.status, `${suffix}: replay reservation`).toBe(200);
         const second = (await replay.json() as { generation: string }).generation;
-        expect(second).toBe('2');
+        expect(second).toBe('3');
         expect((await call('/qualify/start', first)).status, `${suffix}: late old start`).toBe(500);
         expect((await call('/qualify/start', second)).status, `${suffix}: replay start`).toBe(200);
         expect((await call('/qualify', first)).status, `${suffix}: late old probe`).toBe(500);

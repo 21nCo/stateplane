@@ -25,6 +25,7 @@ SELECT r.rolsuper, r.rolcreatedb, r.rolcreaterole, r.rolreplication, r.rolbypass
   pg_has_role(current_user, 'pg_read_all_settings', 'USAGE') AS can_read_settings,
   ${noParameterAdminSql} AS no_parameter_admin,
   has_database_privilege(current_database(), 'CREATE') AS can_create_database,
+  has_database_privilege(current_database(), 'TEMP') AS can_create_temp,
   EXISTS (SELECT 1 FROM pg_namespace n WHERE n.nspname !~ '^pg_' AND
     has_schema_privilege(n.oid, 'CREATE')) AS can_create_schema,
   EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -39,6 +40,9 @@ SELECT r.rolsuper, r.rolcreatedb, r.rolcreaterole, r.rolreplication, r.rolbypass
     WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' AND
       has_schema_privilege(n.oid, 'USAGE') AND
       has_function_privilege(p.oid, 'EXECUTE')) AS can_execute_routines,
+  EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'pg_catalog' AND p.proacl IS NOT NULL AND
+      has_function_privilege(p.oid, 'EXECUTE')) AS can_execute_restricted_routines,
   (current_setting('lo_compat_privileges')::boolean OR EXISTS (SELECT 1 FROM pg_largeobject_metadata m
     WHERE m.lomowner IN (SELECT roleid FROM reachable) OR
       EXISTS (SELECT 1 FROM aclexplode(m.lomacl) acl
@@ -60,10 +64,10 @@ function assertSettingsRole(label, result) {
   if (result.rows?.length !== 1 || row?.rolsuper !== false || row.rolcreatedb !== false ||
       row.rolcreaterole !== false || row.rolreplication !== false || row.rolbypassrls !== false ||
       row.can_read_settings !== true || row.no_parameter_admin !== true ||
-      row.can_create_database !== false ||
+      row.can_create_database !== false || row.can_create_temp !== false ||
       row.can_create_schema !== false || row.can_access_tables !== false ||
       row.can_access_sequences !== false ||
-      row.can_execute_routines !== false ||
+      row.can_execute_routines !== false || row.can_execute_restricted_routines !== false ||
       row.can_access_large_objects !== false ||
       row.owns_user_objects !== false ||
       row.only_settings_membership !== true) {

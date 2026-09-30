@@ -48,6 +48,7 @@ test('real PostgreSQL settings proof rejects transitive roles, relation and rout
           GRANT pg_read_all_settings TO settings_reader;
           CREATE ROLE elevated NOLOGIN;
           CREATE TABLE private_records(id integer, secret text);`);
+        await client.query('REVOKE TEMP ON DATABASE postgres FROM PUBLIC');
         const flags = async () => {
           await client.query('SET ROLE settings_reader');
           try { return (await client.query(settingsRoleSql)).rows[0]; }
@@ -55,9 +56,40 @@ test('real PostgreSQL settings proof rejects transitive roles, relation and rout
         };
         const allowed = row => row.can_read_settings && row.only_settings_membership &&
           !row.can_access_tables && !row.can_access_sequences && !row.can_execute_routines &&
-          !row.can_access_large_objects && !row.can_create_database && !row.can_create_schema &&
+          !row.can_access_large_objects && !row.can_create_database && !row.can_create_temp &&
+          !row.can_create_schema && !row.can_execute_restricted_routines &&
           !row.owns_user_objects && row.no_parameter_admin;
         assert.equal(allowed(await flags()), true, 'direct settings membership is sufficient');
+
+        for (const grantee of ['settings_reader', 'elevated', 'PUBLIC']) {
+          if (grantee === 'elevated') await client.query('GRANT elevated TO settings_reader WITH INHERIT TRUE, SET FALSE');
+          await client.query(`GRANT TEMP ON DATABASE postgres TO ${grantee}`);
+          assert.equal((await flags()).can_create_temp, true, `${grantee} TEMP is denied`);
+          await client.query('SET SESSION AUTHORIZATION settings_reader');
+          try {
+            await client.query('CREATE TEMP TABLE admitted_temp(value text)');
+            await client.query('DROP TABLE admitted_temp');
+          }
+          finally { await client.query('RESET SESSION AUTHORIZATION'); }
+          await client.query(`REVOKE TEMP ON DATABASE postgres FROM ${grantee}`);
+          if (grantee === 'elevated') await client.query('REVOKE elevated FROM settings_reader');
+          assert.equal(allowed(await flags()), true, `${grantee} TEMP revocation restores admission`);
+        }
+
+        for (const grantee of ['settings_reader', 'elevated', 'PUBLIC']) {
+          if (grantee === 'elevated') await client.query('GRANT elevated TO settings_reader WITH INHERIT TRUE, SET FALSE');
+          await client.query(`GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO ${grantee}`);
+          assert.equal((await flags()).can_execute_restricted_routines, true,
+            `${grantee} restricted pg_catalog EXECUTE is denied`);
+          await client.query('SET SESSION AUTHORIZATION settings_reader');
+          try {
+            const result = await client.query("SELECT length(pg_catalog.pg_read_file('PG_VERSION')) AS bytes");
+            assert.ok(result.rows[0].bytes > 0);
+          } finally { await client.query('RESET SESSION AUTHORIZATION'); }
+          await client.query(`REVOKE EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) FROM ${grantee}`);
+          if (grantee === 'elevated') await client.query('REVOKE elevated FROM settings_reader');
+          assert.equal(allowed(await flags()), true, `${grantee} restricted EXECUTE revocation restores admission`);
+        }
 
         await client.query('GRANT elevated TO pg_read_all_settings WITH INHERIT FALSE, SET TRUE');
         assert.equal((await flags()).only_settings_membership, false,
