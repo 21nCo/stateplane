@@ -1,0 +1,25 @@
+docs/regional-topology.md
+  s_ad500513bc9987::t_a0f5601c805053 25
+test/operational-worker.test.ts
+  s_ad500513bc9987::t_b79cf4ebdb2dd4 3,11,59
+test/qualification-worker.test.ts
+  s_ad500513bc9987::t_33337f4ce43f20 38,181,446,473-482
+test/topology.test.js
+  s_ad500513bc9987::t_3d91e1750965b3 434,462-464
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9faa5d66f8f2ad751f40d4876eaf4b1a14dd799a",
+  "prompts": {},
+  "sessions": {
+    "s_ad500513bc9987": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0f222-fb22-76a5-a77e-b7c92826db44",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
