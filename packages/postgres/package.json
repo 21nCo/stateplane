@@ -19,6 +19,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@stateplane/contracts": "workspace:*"
+    "@stateplane/contracts": "workspace:*",
+    "pg": "8.22.0",
+    "@types/pg": "8.20.0"
   }
 }
