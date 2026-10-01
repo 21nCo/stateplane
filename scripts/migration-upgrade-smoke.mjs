@@ -1,34 +1,69 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import pg from 'pg';
 
 if (process.env.DATABASE_URL) throw new Error('Upgrade smoke uses the isolated local Postgres database only');
 const password = (await readFile(new URL('../.data/local-db-password', import.meta.url), 'utf8')).trim();
 const baseUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:55432/stateplane`;
 const names = ['upgrade','fresh'].map(kind => `stateplane_${kind}_${randomBytes(4).toString('hex')}`);
+const marker = new URL(`../.data/migration-upgrade-${process.pid}-${randomBytes(6).toString('hex')}.json`,import.meta.url);
 const url = name => baseUrl.replace(/\/stateplane$/, `/${name}`);
 const admin = new pg.Client({ connectionString:baseUrl });
 const created = [];
+const dropDatabase = async name => {
+  if (!/^stateplane_(upgrade|fresh)_[0-9a-f]{8}$/.test(name)) throw new Error('Invalid upgrade smoke database name');
+  await admin.query(`DROP DATABASE IF EXISTS ${name}`);
+};
+const recoverInterrupted = async () => {
+  const directory=new URL('../.data/',import.meta.url);
+  for (const filename of await readdir(directory)) {
+    if (!/^migration-upgrade-[0-9]+-[0-9a-f]{12}\.json$/.test(filename)) continue;
+    const path=new URL(filename,directory);
+    const entry=JSON.parse(await readFile(path,'utf8'));
+    if (!Number.isSafeInteger(entry.pid) || !Array.isArray(entry.names) ||
+      !entry.names.every(name=>/^stateplane_(upgrade|fresh)_[0-9a-f]{8}$/.test(name))) throw new Error(`Invalid upgrade cleanup marker: ${filename}`);
+    try { process.kill(entry.pid,0); continue; }
+    catch (error) { if (error.code!=='ESRCH') throw error; }
+    for (const name of [...entry.names].reverse()) await dropDatabase(name);
+    await unlink(path);
+  }
+};
 const migration = async name => readFile(new URL(`../migrations/${name}`,import.meta.url),'utf8');
 const runMigrator = name => execFileSync(process.execPath,['scripts/migrate.mjs'],{
   cwd:new URL('..',import.meta.url), env:{...process.env,DATABASE_URL:url(name)},encoding:'utf8'
 });
 const index = async client => (await client.query(`SELECT indexdef FROM pg_indexes
   WHERE tablename='projection_outbox' AND indexname='projection_outbox_claim'`)).rows[0].indexdef;
-const facts = async client => (await client.query(`SELECT
-  (SELECT count(*)::int FROM records) AS records,
-  (SELECT count(*)::int FROM record_events) AS events,
-  (SELECT count(*)::int FROM idempotency_receipts) AS receipts,
-  (SELECT count(*)::int FROM projection_outbox) AS outbox,
-  (SELECT md5(string_agg(record_id || ':' || revision::text || ':' || canonical_data, ',' ORDER BY record_id)) FROM records) AS records_hash,
-  (SELECT md5(string_agg(event_id || ':' || record_id || ':' || revision::text, ',' ORDER BY event_id)) FROM record_events) AS events_hash,
-  (SELECT md5(string_agg(receipt_id || ':' || record_id || ':' || request_digest, ',' ORDER BY receipt_id)) FROM idempotency_receipts) AS receipts_hash,
-  (SELECT md5(string_agg(event_id || ':' || delivery_state || ':' || attempts::text || ':' || available_at::text,
-    ',' ORDER BY event_id)) FROM projection_outbox) AS outbox_hash`)).rows[0];
+const preservedTables = ['spaces','collections','collection_versions','collection_grants',
+  'collection_unique_declarations','collection_index_declarations','records','record_unique_keys',
+  'record_index_values','record_events','idempotency_receipts','record_tombstones','projection_outbox',
+  'entity_refs'];
+const facts = async client => {
+  const result={};
+  for (const table of preservedTables) {
+    result[table]=(await client.query(`SELECT row_to_json(t) AS fact FROM ${table} t ORDER BY row_to_json(t)::text`))
+      .rows.map(row=>row.fact);
+  }
+  return result;
+};
+const constraints = async client => (await client.query(`SELECT conrelid::regclass::text AS relation,conname,contype,
+  pg_get_constraintdef(oid) AS definition FROM pg_constraint
+  WHERE connamespace='public'::regnamespace ORDER BY relation,conname`)).rows;
+const enforceUniqueRecord = async client => {
+  await client.query('BEGIN');
+  try {
+    await assert.rejects(client.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,
+      key_mode,normalized_key,canonical_data,data)
+      VALUES('sp_upgrade','entries','rec_duplicate_probe',1,1,'generated','rec_1','{}','{}'::jsonb)`),
+    error=>error.code==='23505');
+  } finally { await client.query('ROLLBACK'); }
+};
 try {
   await admin.connect();
+  await recoverInterrupted();
+  await writeFile(marker,JSON.stringify({pid:process.pid,names}),{flag:'wx',mode:0o600});
   for (const name of names) { await admin.query(`CREATE DATABASE ${name}`); created.push(name); }
   const upgraded = new pg.Client({connectionString:url(names[0])});
   const fresh = new pg.Client({connectionString:url(names[1])});
@@ -75,8 +110,10 @@ try {
     const build006And007Ms=Math.round(performance.now()-secondStart);
     assert.match(output,/Applied 006_outbox_due_order.sql/);
     assert.match(output,/Applied 007_receipt_reservations.sql/);
+    assert.match(output,/Applied 008_receipt_reservation_scopes.sql/);
     assert.deepEqual(await facts(upgraded),before);
     assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM receipt_reservations')).rows[0].n,0);
+    assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM receipt_reservation_scopes')).rows[0].n,0);
     assert.match(await index(upgraded),/\(space_id, collection_id, available_at, event_id\)/);
     await upgraded.query('SET enable_seqscan=off');
     const plan=(await upgraded.query(`EXPLAIN SELECT event_id FROM projection_outbox
@@ -88,11 +125,16 @@ try {
     runMigrator(names[1]);
     await fresh.connect();
     assert.equal(await index(upgraded),await index(fresh));
-    assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,7);
+    assert.deepEqual(await constraints(upgraded),await constraints(fresh));
+    await enforceUniqueRecord(upgraded);
+    assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,8);
     assert.equal(runMigrator(names[0]),'');
-    console.log(`Upgrade smoke passed: 2000 records/events/receipts/outbox rows preserved; final index matches fresh install; 005 build ${build005Ms}ms, 006-007 migrator ${build006And007Ms}ms`);
+    console.log(`Upgrade smoke passed: complete 2000 record/event/receipt/outbox rows preserved; final index matches fresh install; 005 build ${build005Ms}ms, 006-008 migrator ${build006And007Ms}ms`);
   } finally { await Promise.allSettled([upgraded.end(),fresh.end()]); }
 } finally {
-  for (const name of created.reverse()) await admin.query(`DROP DATABASE ${name}`).catch(() => {});
+  created.reverse();
+  let cleaned=true;
+  for (const name of created) await dropDatabase(name).catch(() => { cleaned=false; });
+  if (cleaned) await unlink(marker).catch(() => {});
   await admin.end().catch(() => {});
 }

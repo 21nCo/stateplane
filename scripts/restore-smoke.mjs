@@ -31,6 +31,7 @@ const restored = new pg.Pool({ connectionString:targetUrl });
 const tables = ['stateplane_migrations','spaces','collections','collection_versions','collection_unique_declarations',
   'collection_index_declarations','collection_grants','records',
   'record_unique_keys','record_index_values','record_events','idempotency_receipts','receipt_reservations',
+  'receipt_reservation_scopes',
   'record_tombstones','projection_outbox','entity_refs'];
 async function snapshot(pool) {
   const entries = await Promise.all(tables.map(async table => {

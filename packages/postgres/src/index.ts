@@ -249,9 +249,10 @@ export class AuthorityTransaction {
   private mutationFailed = false;
   private mutationError: unknown;
   private readonly pendingReceipts = new Map<string, { response: Receipt; returned: Receipt[]; digest: string; collectionId: CollectionId; key: string }>();
-  private readonly activeMutations = new Set<Promise<Receipt>>();
+  private readonly activeOperations = new Set<Promise<unknown>>();
   private mutationTail: Promise<void> = Promise.resolve();
   private readonly reservedIdentities = new Map<string, { operation: RecordMutation; key: string }>();
+  private priorLockTimeout: string | undefined;
   private admittingMutations = true;
   private readonly replayCollections = new Set<CollectionId>();
   readonly #scope: Readonly<AuthorityScope>;
@@ -259,13 +260,21 @@ export class AuthorityTransaction {
   constructor(private readonly client: Client, scope: AuthorityScope, private readonly retentionSeconds: number) {
     this.#scope = Object.freeze({ ...scope });
   }
-  close() { this.active = false; this.admittingMutations = false; this.activeMutations.clear(); this.reservedIdentities.clear(); this.replayCollections.clear(); }
+  close() { this.active = false; this.admittingMutations = false; this.activeOperations.clear(); this.reservedIdentities.clear(); this.replayCollections.clear(); }
   /** A caught mutation error must not turn a partial write into a successful commit. */
   assertCommittable() {
     if (this.mutationFailed) throw this.mutationError;
   }
   sealMutations() { this.admittingMutations = false; }
-  async settleMutations() { await Promise.allSettled(this.activeMutations); }
+  async settleMutations() { await Promise.allSettled(this.activeOperations); }
+  private admitOperation<T>(work: () => Promise<T>, rollbackOnError = false): Promise<T> {
+    if (!this.admittingMutations || !this.active) return Promise.reject(new AuthorityError('INVALID_ARGUMENT', 'Transaction admission ended'));
+    const running = Promise.resolve().then(() => { this.assertCommittable(); return work(); })
+      .catch(error => { if (rollbackOnError) { this.mutationFailed = true; this.mutationError = error; } throw error; });
+    this.activeOperations.add(running);
+    void running.then(() => this.activeOperations.delete(running), () => this.activeOperations.delete(running));
+    return running;
+  }
   private query(sql: string, values: unknown[] = []) {
     if (!this.active) throw new AuthorityError('INVALID_ARGUMENT', 'Transaction ended');
     return this.client.query(sql, values);
@@ -294,7 +303,10 @@ export class AuthorityTransaction {
   }
 
   private ref(id: string): RecordRef { return { spaceId: this.#scope.spaceId, collectionId: this.#scope.collectionId, id }; }
-  async getRecord(recordId: string, includeTombstone = false): Promise<AuthorityRecord | null> {
+  getRecord(recordId: string, includeTombstone = false): Promise<AuthorityRecord | null> {
+    return this.admitOperation(() => this.readRecord(recordId,includeTombstone));
+  }
+  private async readRecord(recordId: string, includeTombstone = false): Promise<AuthorityRecord | null> {
     if (this.#scope.capability !== 'records:read') throw new AuthorityError('FORBIDDEN');
     if (!scalarString(recordId)) throw new AuthorityError('INVALID_ARGUMENT');
     const result = await this.query(`SELECT record_id,revision,schema_version,canonical_data,key_mode,normalized_key,tombstone FROM records
@@ -303,12 +315,14 @@ export class AuthorityTransaction {
     return row ? { ref: this.ref(row.record_id), revision: Number(row.revision), schemaVersion: Number(row.schema_version),
       canonicalData: row.canonical_data, keyMode: row.key_mode, normalizedKey: row.normalized_key, tombstone: row.tombstone } : null;
   }
-  async getByKey(mode: 'generated' | 'external', key: string): Promise<AuthorityRecord | null> {
+  getByKey(mode: 'generated' | 'external', key: string): Promise<AuthorityRecord | null> {
+    return this.admitOperation(async () => {
     if (this.#scope.capability !== 'records:read') throw new AuthorityError('FORBIDDEN');
     if (!['generated','external'].includes(mode) || !scalarString(key)) throw new AuthorityError('INVALID_ARGUMENT');
     const result = await this.query(`SELECT record_id FROM records WHERE space_id=$1 AND collection_id=$2
       AND key_mode=$3 AND normalized_key=$4 AND NOT tombstone`, [...scopeIds(this.#scope), mode, key]);
-    return result.rows[0] ? this.getRecord(result.rows[0].record_id) : null;
+    return result.rows[0] ? this.readRecord(result.rows[0].record_id) : null;
+    });
   }
   private async findReceipt(operation: RecordMutation, key: string): Promise<{ collectionId: CollectionId; requestDigest: string; response: Receipt } | null> {
     const result = await this.query(`SELECT collection_id,request_digest,response FROM idempotency_receipts
@@ -339,8 +353,11 @@ export class AuthorityTransaction {
       this.pendingReceipts.clear();
     }
     for (const { operation, key } of this.reservedIdentities.values()) {
-      await this.query(`DELETE FROM receipt_reservations WHERE space_id=$1 AND credential_id=$2 AND operation=$3 AND idempotency_key=$4`,
-        [this.#scope.spaceId, this.#scope.credentialId, operation, key]);
+      await this.query(`WITH identity AS (DELETE FROM receipt_reservations
+          WHERE space_id=$1 AND credential_id=$3 AND operation=$4 AND idempotency_key=$5 RETURNING 1)
+        DELETE FROM receipt_reservation_scopes WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3
+          AND operation=$4 AND idempotency_key=$5 AND EXISTS(SELECT 1 FROM identity)`,
+        [this.#scope.spaceId,this.#scope.collectionId,this.#scope.credentialId,operation,key]);
     }
     this.reservedIdentities.clear();
   }
@@ -365,10 +382,10 @@ export class AuthorityTransaction {
       const work = (async () => { await tail; this.assertCommittable(); return this.mutateOnce(fixed); })()
         .catch(error => { this.mutationFailed = true; this.mutationError = error; throw error; });
       this.mutationTail = work.then(() => {}, () => {});
-      this.activeMutations.add(work);
+      this.activeOperations.add(work);
       try { return await work; }
       finally {
-        this.activeMutations.delete(work);
+        this.activeOperations.delete(work);
       }
     }
     catch (error) {
@@ -378,24 +395,59 @@ export class AuthorityTransaction {
     }
   }
 
-  /** A unique, uncommitted row provides a Hyperdrive-compatible per-key try-lock. */
+  /** Uncommitted unique rows provide Hyperdrive-compatible, scoped try-locks. */
   private async reserveIdentity(change: Readonly<RecordChange>, identity: string): Promise<void> {
     if (this.reservedIdentities.has(identity)) return;
-    const priorTimeout = (await this.query('SHOW lock_timeout')).rows[0].lock_timeout as string;
+    this.priorLockTimeout ??= (await this.query('SHOW lock_timeout')).rows[0].lock_timeout as string;
     await this.query('SAVEPOINT receipt_reservation');
     try {
-      await this.query("SELECT set_config('lock_timeout','50ms',true)");
-      await this.query(`INSERT INTO receipt_reservations(space_id,credential_id,operation,idempotency_key)
-        VALUES($1,$2,$3,$4)`, [this.#scope.spaceId,this.#scope.credentialId,change.operation,change.idempotencyKey]);
-      await this.query("SELECT set_config('lock_timeout',$1,true)",[priorTimeout]);
+      await this.query(`WITH timeout AS MATERIALIZED (SELECT set_config('lock_timeout','50ms',true) AS value),
+        scoped AS (INSERT INTO receipt_reservation_scopes(space_id,collection_id,credential_id,operation,idempotency_key)
+          SELECT $1,$2,$3,$4,$5 FROM timeout RETURNING 1)
+        INSERT INTO receipt_reservations(space_id,credential_id,operation,idempotency_key)
+          SELECT $1,$3,$4,$5 FROM scoped`,
+        [this.#scope.spaceId,this.#scope.collectionId,this.#scope.credentialId,change.operation,change.idempotencyKey]);
+      await this.query("SELECT set_config('lock_timeout',$1,true)",[this.priorLockTimeout]);
       await this.query('RELEASE SAVEPOINT receipt_reservation');
       this.reservedIdentities.set(identity,{operation:change.operation,key:change.idempotencyKey});
     } catch (error) {
       await this.query('ROLLBACK TO SAVEPOINT receipt_reservation');
       await this.query('RELEASE SAVEPOINT receipt_reservation');
-      if ((error as { code?: string }).code === '55P03') throw new AuthorityError('RECEIPT_PENDING');
+      if ((error as { code?: string }).code === '55P03') {
+        await this.authorizePendingScope(change);
+      }
       throw error;
     }
+  }
+
+  /** Probe only collections whose grant is live; an unauthorized owner stays undisclosed. */
+  private async authorizePendingScope(change: Readonly<RecordChange>): Promise<never> {
+    const { spaceId, credentialId, principalId } = this.#scope;
+    const candidates = await this.query(`SELECT c.collection_id FROM collections c JOIN spaces s ON s.space_id=c.space_id
+      LEFT JOIN collection_grants g ON g.space_id=c.space_id AND g.collection_id=c.collection_id AND g.credential_id=$2
+      WHERE c.space_id=$1 AND
+        (s.owner_principal_id=$3 OR (g.capabilities @> ARRAY['records:write']::text[]
+          AND (g.expires_at IS NULL OR g.expires_at>clock_timestamp())))
+      ORDER BY c.collection_id`, [spaceId,credentialId,principalId]);
+    for (const row of candidates.rows) {
+      await this.query('SAVEPOINT receipt_scope_probe');
+      try {
+        await this.query("SELECT set_config('lock_timeout','50ms',true)");
+        await this.query(`INSERT INTO receipt_reservation_scopes(space_id,collection_id,credential_id,operation,idempotency_key)
+          VALUES($1,$2,$3,$4,$5)`, [spaceId,row.collection_id,credentialId,change.operation,change.idempotencyKey]);
+      } catch (error) {
+        await this.query('ROLLBACK TO SAVEPOINT receipt_scope_probe');
+        await this.query('RELEASE SAVEPOINT receipt_scope_probe');
+        if ((error as { code?: string }).code === '55P03') {
+          await this.authorizeOriginal(row.collection_id);
+          throw new AuthorityError('RECEIPT_PENDING');
+        }
+        throw error;
+      }
+      await this.query('ROLLBACK TO SAVEPOINT receipt_scope_probe');
+      await this.query('RELEASE SAVEPOINT receipt_scope_probe');
+    }
+    throw new AuthorityError('FORBIDDEN');
   }
 
   private async lookupReplay(change: RecordChange, identity: string): Promise<Receipt | null> {
@@ -558,7 +610,8 @@ export class AuthorityTransaction {
   }
 
   /** Declaration allowlists, signed cursors and public sort behavior belong to STA-8. */
-  async queryRecords(predicates: readonly ScalarPredicate[], limit: number): Promise<AuthorityRecord[]> {
+  queryRecords(predicates: readonly ScalarPredicate[], limit: number): Promise<AuthorityRecord[]> {
+    return this.admitOperation(async () => {
     if (!isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE) throw new AuthorityError('INVALID_ARGUMENT');
     const { params, where } = this.compilePredicates(predicates);
     params.push(limit);
@@ -567,24 +620,30 @@ export class AuthorityTransaction {
       ORDER BY r.created_at,r.record_id LIMIT $${params.length}`, params);
     return result.rows.map(row => ({ ref:this.ref(row.record_id),revision:Number(row.revision),schemaVersion:Number(row.schema_version),
       canonicalData:row.canonical_data,keyMode:row.key_mode,normalizedKey:row.normalized_key,tombstone:row.tombstone }));
+    });
   }
 
-  async countRecords(predicates: readonly ScalarPredicate[]): Promise<number> {
+  countRecords(predicates: readonly ScalarPredicate[]): Promise<number> {
+    return this.admitOperation(async () => {
     const { params, where } = this.compilePredicates(predicates);
     const result = await this.query(`SELECT count(*)::bigint AS total FROM records r WHERE ${where}`,params);
     const count = Number(result.rows[0].total);
     if (!isSafeInteger(count)) throw new RangeError('Count exceeds JavaScript safe integer range');
     return count;
+    });
   }
 
-  async existsRecord(predicates: readonly ScalarPredicate[]): Promise<boolean> {
+  existsRecord(predicates: readonly ScalarPredicate[]): Promise<boolean> {
+    return this.admitOperation(async () => {
     const { params, where } = this.compilePredicates(predicates);
     const result = await this.query(`SELECT EXISTS(SELECT 1 FROM records r WHERE ${where}) AS found`,params);
     return result.rows[0].found;
+    });
   }
 
   /** Claim only this collection's due jobs. Attempt number fences late workers after lease expiry. */
-  async claimOutbox(limit: number, leaseSeconds: number): Promise<OutboxDelivery[]> {
+  claimOutbox(limit: number, leaseSeconds: number): Promise<OutboxDelivery[]> {
+    return this.admitOperation(async () => {
     if (this.#scope.capability !== 'space:admin') throw new AuthorityError('FORBIDDEN');
     if (!isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE || !isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 3600) throw new AuthorityError('INVALID_ARGUMENT');
     const result = await this.query(`UPDATE projection_outbox o SET delivery_state='delivering',attempts=o.attempts+1,
@@ -596,9 +655,11 @@ export class AuthorityTransaction {
     [...scopeIds(this.#scope),leaseSeconds,limit]);
     return result.rows.map(row => ({ eventId:row.event_id,ref:this.ref(row.record_id),revision:Number(row.revision),
       generation:Number(row.generation),attempt:row.attempts }));
+    },true);
   }
 
-  async finishOutbox(delivery: OutboxDelivery, success: boolean, error?: string): Promise<boolean> {
+  finishOutbox(delivery: OutboxDelivery, success: boolean, error?: string): Promise<boolean> {
+    return this.admitOperation(async () => {
     if (this.#scope.capability !== 'space:admin') throw new AuthorityError('FORBIDDEN');
     if (!scalarString(delivery.eventId) || typeof success !== 'boolean' || !isSafeInteger(delivery.attempt) || delivery.attempt < 1 ||
       (error !== undefined && (typeof error !== 'string' || error.includes('\0') || error.length > 4096))) throw new AuthorityError('INVALID_ARGUMENT');
@@ -612,5 +673,6 @@ export class AuthorityTransaction {
     [...scopeIds(this.#scope),delivery.eventId,delivery.attempt,success ? 'delivered' : 'degraded',success ? null : (error ?? 'projection failed'),
       delivery.revision,delivery.generation]);
     return result.rowCount === 1;
+    },true);
   }
 }

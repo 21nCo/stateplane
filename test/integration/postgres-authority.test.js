@@ -190,6 +190,118 @@ test('an in-flight receipt returns pending before commit, then replays one effec
     idempotency_receipts:1,record_tombstones:0,projection_outbox:1
   });
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM receipt_reservations WHERE space_id=$1',[scope.spaceId])).rows[0].n,0);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM receipt_reservation_scopes WHERE space_id=$1',[scope.spaceId])).rows[0].n,0);
+});
+
+test('a pending identity cannot disclose an expired original collection grant', async () => {
+  const { scope, otherId } = await fixture();
+  await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
+    VALUES($1,$2,$3,ARRAY['records:write']::text[])`, [scope.spaceId,otherId,scope.credentialId]);
+  await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '400 milliseconds'
+    WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,
+  [scope.spaceId,scope.collectionId,scope.credentialId]);
+  const request=change('create','pending-expiry','{"label":"held"}');
+  let release;
+  let entered;
+  const held=new Promise(resolve=>{release=resolve;});
+  const ready=new Promise(resolve=>{entered=resolve;});
+  const owner=authority.transaction(scope,async tx=>{
+    await tx.mutate(request);
+    entered();
+    await held;
+  });
+  await ready;
+  await new Promise(resolve=>setTimeout(resolve,450));
+  try {
+    await assert.rejects(authority.mutate({...scope,collectionId:otherId},request),
+      error=>error.code==='FORBIDDEN');
+  } finally {release();}
+  await assert.rejects(owner,error=>error.code==='FORBIDDEN');
+  assert.deepEqual(await counts(scope.spaceId),{
+    records:0,record_unique_keys:0,record_index_values:0,record_events:0,
+    idempotency_receipts:0,record_tombstones:0,projection_outbox:0
+  });
+});
+
+test('a cross-collection retry with both grants gets pending, then the original receipt', async () => {
+  const { scope,otherId }=await fixture();
+  await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
+    VALUES($1,$2,$3,ARRAY['records:write']::text[])`,[scope.spaceId,otherId,scope.credentialId]);
+  const request=change('create','cross-pending','{"label":"held"}');
+  let release;
+  let entered;
+  const held=new Promise(resolve=>{release=resolve;});
+  const ready=new Promise(resolve=>{entered=resolve;});
+  const owner=authority.transaction(scope,async tx=>{
+    const receipt=await tx.mutate(request);
+    entered();
+    await held;
+    return receipt;
+  });
+  await ready;
+  try {
+    await assert.rejects(authority.mutate({...scope,collectionId:otherId},request),
+      error=>error.code==='RECEIPT_PENDING');
+  } finally {release();}
+  const original=await owner;
+  const replay=await authority.mutate({...scope,collectionId:otherId},request);
+  assert.equal(replay.receiptId,original.receiptId);
+  assert.equal(replay.replayed,true);
+  assert.deepEqual(await counts(scope.spaceId),{
+    records:1,record_unique_keys:0,record_index_values:0,record_events:1,
+    idempotency_receipts:1,record_tombstones:0,projection_outbox:1
+  });
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM receipt_reservation_scopes WHERE space_id=$1',[scope.spaceId])).rows[0].n,0);
+});
+
+test('unawaited outbox writes drain before commit and rollback on callback failure', async () => {
+  const { scope } = await fixture();
+  const receipt=await authority.mutate(scope,change('create','outbox-drain','{"label":"drain"}'));
+  const admin={...scope,principalId:'owner',capability:'space:admin'};
+  const delayedAuthority=(match) => {
+    let unblock;
+    let entered;
+    const gate=new Promise(resolve=>{unblock=resolve;});
+    const ready=new Promise(resolve=>{entered=resolve;});
+    const wrapper={connect:async()=>{
+      const client=await pool.connect();
+      return {query:(sql,values)=>{
+        if (typeof sql==='string' && sql.includes(match)) {
+          entered();
+          return gate.then(()=>client.query(sql,values));
+        }
+        return client.query(sql,values);
+      },release:discard=>client.release(discard)};
+    }};
+    return {authority:new PostgresAuthority(wrapper,3600),ready,unblock};
+  };
+  const claim=delayedAuthority('UPDATE projection_outbox o SET');
+  let pendingClaim;
+  const committing=claim.authority.transaction(admin,tx=>{
+    pendingClaim=tx.claimOutbox(1,30);
+    return Promise.resolve('callback complete');
+  });
+  await claim.ready;
+  assert.equal(await Promise.race([committing.then(()=>true),new Promise(resolve=>setTimeout(()=>resolve(false),25))]),false);
+  claim.unblock();
+  await committing;
+  const [delivery]=await pendingClaim;
+  assert.equal(delivery.ref.id,receipt.ref.id);
+  assert.equal((await pool.query('SELECT delivery_state FROM projection_outbox WHERE event_id=$1',[delivery.eventId])).rows[0].delivery_state,'delivering');
+
+  const finish=delayedAuthority('UPDATE projection_outbox SET delivery_state');
+  let pendingFinish;
+  const aborting=finish.authority.transaction(admin,tx=>{
+    pendingFinish=tx.finishOutbox(delivery,true);
+    throw new Error('callback interrupted');
+  });
+  await finish.ready;
+  assert.equal(await Promise.race([aborting.then(()=>true,()=>true),new Promise(resolve=>setTimeout(()=>resolve(false),25))]),false);
+  finish.unblock();
+  await assert.rejects(aborting,/callback interrupted/);
+  assert.equal(await pendingFinish,true);
+  assert.equal((await pool.query('SELECT delivery_state FROM projection_outbox WHERE event_id=$1',[delivery.eventId])).rows[0].delivery_state,'delivering');
+  assert.equal(await authority.transaction(admin,tx=>tx.finishOutbox(delivery,true)),true);
 });
 
 test('receipt reservation is scoped by identity and rolls back cleanly', async () => {
