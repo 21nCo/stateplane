@@ -21,6 +21,7 @@ export interface RecordChange {
   recordId?: string; expectedRevision?: Revision; expectedSchemaVersion?: number;
   /** Canonical UTF-8 JSON object; omitted on delete. */
   canonicalData?: string; normalizedExternalKey?: string;
+  /** Complete derived sets are required for replace and patch, including empty arrays. */
   unique?: readonly UniqueValue[]; indexes?: readonly IndexValue[];
 }
 export interface Receipt {
@@ -47,7 +48,8 @@ function comparison(predicate: Exclude<ScalarPredicate, { kind: 'null' }>, alias
   if (!operator) throw new AuthorityError('INVALID_ARGUMENT');
   if ((predicate.kind === 'number' && (typeof predicate.value !== 'number' || !Number.isFinite(predicate.value)))
     || (predicate.kind === 'boolean' && typeof predicate.value !== 'boolean')
-    || ((predicate.kind === 'string' || predicate.kind === 'date-time') && !scalarString(predicate.value))) throw new AuthorityError('INVALID_ARGUMENT');
+    || (predicate.kind === 'string' && !valueString(predicate.value))
+    || (predicate.kind === 'date-time' && !scalarString(predicate.value))) throw new AuthorityError('INVALID_ARGUMENT');
   params.push(predicate.value);
   if (predicate.kind === 'date-time') {
     return ` AND stateplane_instant_sort_key(${alias}.${column}) COLLATE "C" ${operator} stateplane_instant_sort_key($${params.length}::text) COLLATE "C"`;
@@ -81,6 +83,9 @@ function validUnicode(value: string): boolean {
 }
 function scalarString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && validUnicode(value);
+}
+function valueString(value: unknown): value is string {
+  return typeof value === 'string' && validUnicode(value);
 }
 
 function canonicalValue(value: unknown, depth: number): string {
@@ -133,6 +138,7 @@ function validateChangeShape(change: RecordChange): void {
   if (change.expectedRevision !== undefined) parseRevision(change.expectedRevision);
   if (change.expectedSchemaVersion !== undefined && (!isSafeInteger(change.expectedSchemaVersion) || change.expectedSchemaVersion < 1)) throw new AuthorityError('INVALID_ARGUMENT');
   if (change.operation === 'delete' && (change.canonicalData !== undefined || change.unique?.length || change.indexes?.length)) throw new AuthorityError('INVALID_ARGUMENT');
+  if ((change.operation === 'replace' || change.operation === 'patch') && (!change.unique || !change.indexes)) throw new AuthorityError('INVALID_ARGUMENT');
 }
 
 function snapshotUnique(source: readonly UniqueValue[] | undefined): readonly UniqueValue[] | undefined {
@@ -162,8 +168,10 @@ function snapshotIndexes(source: readonly IndexValue[] | undefined): readonly In
     seen.add(entry.field);
     const value = 'value' in entry ? entry.value : null;
     if ((entry.kind === 'number' && (typeof value !== 'number' || !Number.isFinite(value)))
-      || ((entry.kind === 'string' || entry.kind === 'date-time') && !scalarString(value))
+      || (entry.kind === 'string' && !valueString(value))
+      || (entry.kind === 'date-time' && !scalarString(value))
       || (entry.kind === 'boolean' && typeof value !== 'boolean')
+      || (entry.kind === 'null' && value !== null && value !== undefined)
       || !['null','string','date-time','number','boolean'].includes(entry.kind)) throw new AuthorityError('INVALID_ARGUMENT');
     values.push(Object.freeze({ ...entry }));
   }
@@ -205,6 +213,7 @@ export class PostgresAuthority {
       tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds);
       await tx.checkScope();
       const result = await fn(tx);
+      tx.sealMutations();
       await tx.settleMutations();
       tx.assertCommittable();
       await tx.checkScope();
@@ -214,7 +223,7 @@ export class PostgresAuthority {
       catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
       return result;
     } catch (error) {
-      if (tx) await tx.settleMutations();
+      if (tx) { tx.sealMutations(); await tx.settleMutations(); }
       if (begun) { try { await client.query('ROLLBACK'); } catch { discard = true; } }
       else if (beginAttempted) discard = true;
       throw error;
@@ -241,18 +250,21 @@ export class AuthorityTransaction {
   private mutationError: unknown;
   private readonly pendingReceipts = new Map<string, { response: Receipt; returned: Receipt[]; digest: string; collectionId: CollectionId; key: string }>();
   private readonly inFlight = new Map<string, Promise<Receipt>>();
+  private readonly activeMutations = new Set<Promise<Receipt>>();
+  private admittingMutations = true;
   private readonly replayCollections = new Set<CollectionId>();
   readonly #scope: Readonly<AuthorityScope>;
   get scope(): Readonly<AuthorityScope> { return this.#scope; }
   constructor(private readonly client: Client, scope: AuthorityScope, private readonly retentionSeconds: number) {
     this.#scope = Object.freeze({ ...scope });
   }
-  close() { this.active = false; this.inFlight.clear(); this.replayCollections.clear(); }
+  close() { this.active = false; this.admittingMutations = false; this.inFlight.clear(); this.activeMutations.clear(); this.replayCollections.clear(); }
   /** A caught mutation error must not turn a partial write into a successful commit. */
   assertCommittable() {
     if (this.mutationFailed) throw this.mutationError;
   }
-  async settleMutations() { await Promise.allSettled([...this.inFlight.values()]); }
+  sealMutations() { this.admittingMutations = false; }
+  async settleMutations() { await Promise.allSettled([...this.activeMutations]); }
   private async query(sql: string, values: unknown[] = []) {
     if (!this.active) throw new AuthorityError('INVALID_ARGUMENT', 'Transaction ended');
     return this.client.query(sql, values);
@@ -265,7 +277,7 @@ export class AuthorityTransaction {
       c.lifecycle AS collection_lifecycle, g.capabilities, g.expires_at
       FROM spaces s JOIN collections c ON c.space_id=s.space_id
       LEFT JOIN collection_grants g ON g.space_id=c.space_id AND g.collection_id=c.collection_id AND g.credential_id=$3
-      WHERE s.space_id=$1 AND c.collection_id=$2 FOR SHARE OF s,c`, [spaceId, collectionId, credentialId]);
+      WHERE s.space_id=$1 AND c.collection_id=$2 ${capability === 'records:write' ? 'FOR UPDATE OF s,c' : 'FOR SHARE OF s,c'}`, [spaceId, collectionId, credentialId]);
     const row = result.rows[0];
     if (!row) throw new AuthorityError('NOT_FOUND');
     if (Number(row.policy_version) !== policyVersion || Number(row.placement_generation) !== placementGeneration) throw new AuthorityError('FORBIDDEN', 'Policy or placement changed');
@@ -338,16 +350,21 @@ export class AuthorityTransaction {
   }
 
   async mutate(change: RecordChange): Promise<Receipt> {
-    this.assertCommittable();
     let identity: string | undefined;
     try {
+      if (!this.admittingMutations || !this.active) throw new AuthorityError('INVALID_ARGUMENT', 'Transaction mutation admission ended');
+      this.assertCommittable();
       const fixed = snapshotChange(change);
       identity = JSON.stringify([this.#scope.spaceId,this.#scope.credentialId,fixed.operation,fixed.idempotencyKey]);
       const prior = this.inFlight.get(identity);
       const work = (async () => { if (prior) await prior; return this.mutateOnce(fixed); })();
       this.inFlight.set(identity, work);
+      this.activeMutations.add(work);
       try { return await work; }
-      finally { if (this.inFlight.get(identity) === work) this.inFlight.delete(identity); }
+      finally {
+        this.activeMutations.delete(work);
+        if (this.inFlight.get(identity) === work) this.inFlight.delete(identity);
+      }
     }
     catch (error) {
       this.mutationFailed = true;
@@ -358,8 +375,8 @@ export class AuthorityTransaction {
 
   private async lookupReplay(change: RecordChange, identity: string): Promise<Receipt | null> {
     const scope = this.#scope;
-    const reservation = await this.query('SELECT pg_try_advisory_xact_lock(hashtextextended($1,19305)) AS acquired', [identity]);
-    if (!reservation.rows[0].acquired) throw new AuthorityError('RECEIPT_PENDING');
+    // checkScope holds a space row lock through commit, serializing receipt
+    // identities across connections without unsupported advisory locks.
     const pending = this.pendingReceipts.get(identity);
     if (pending) {
       await this.authorizeOriginal(pending.collectionId);
@@ -559,7 +576,7 @@ export class AuthorityTransaction {
 
   async finishOutbox(delivery: OutboxDelivery, success: boolean, error?: string): Promise<boolean> {
     if (this.#scope.capability !== 'space:admin') throw new AuthorityError('FORBIDDEN');
-    if (!scalarString(delivery.eventId) || !isSafeInteger(delivery.attempt) || delivery.attempt < 1 ||
+    if (!scalarString(delivery.eventId) || typeof success !== 'boolean' || !isSafeInteger(delivery.attempt) || delivery.attempt < 1 ||
       (error !== undefined && (typeof error !== 'string' || error.includes('\0') || error.length > 4096))) throw new AuthorityError('INVALID_ARGUMENT');
     const result = await this.query(`UPDATE projection_outbox SET delivery_state=$5,
       delivered_at=CASE WHEN $5='delivered' THEN clock_timestamp() ELSE NULL END,

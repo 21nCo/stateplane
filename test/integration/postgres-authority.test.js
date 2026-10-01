@@ -61,8 +61,10 @@ async function fixture() {
 }
 
 function change(operation, idempotencyKey, data, extras = {}) {
-  return { operation, idempotencyKey, requestDigest: digest(JSON.stringify([operation,idempotencyKey,data,extras])),
-    ...(data === undefined ? {} : { canonicalData: data }), ...extras };
+  const complete = operation === 'replace' || operation === 'patch'
+    ? { unique:[], indexes:[], ...extras } : extras;
+  return { operation, idempotencyKey, requestDigest: digest(JSON.stringify([operation,idempotencyKey,data,complete])),
+    ...(data === undefined ? {} : { canonicalData: data }), ...complete };
 }
 
 async function counts(spaceId) {
@@ -173,9 +175,10 @@ test('an in-flight receipt cannot cause a duplicate write', async () => {
     return receipt;
   });
   await inTransaction;
-  await assert.rejects(authority.mutate(scope,request), error => error.code === 'RECEIPT_PENDING');
+  const contender = authority.mutate(scope,request);
   release();
   const receipt = await first;
+  assert.equal((await contender).receiptId,receipt.receiptId);
   assert.equal((await authority.mutate(scope,request)).receiptId,receipt.receiptId);
   assert.equal((await counts(scope.spaceId)).record_events,1);
 });
@@ -428,7 +431,7 @@ test('a server-confirmed serialization rollback retries once without duplicate r
   const retryPool = { connect: async () => {
     const client = await pool.connect();
     return { query: async (...args) => {
-      if (!injected && String(args[0]).includes('pg_try_advisory_xact_lock')) {
+      if (!injected && String(args[0]).includes('SELECT s.lifecycle,s.placement_generation,c.lifecycle')) {
         injected = true;
         scope.collectionId = otherId;
         request.idempotencyKey='changed-on-retry';
@@ -595,6 +598,103 @@ test('callback interruption waits for an unawaited mutation before rollback and 
   } finally { await single.end(); }
 });
 
+test('chained mutations after callback admission closes cannot commit partial facts', async () => {
+  const { scope } = await fixture();
+  const single = new pg.Pool({connectionString:url,max:1});
+  const repository = new PostgresAuthority(single,3600);
+  let follow;
+  try {
+    await assert.rejects(repository.transaction(scope,async tx => {
+      const first=tx.mutate(change('create','chained-first','{"label":"first"}'));
+      follow=first.then(()=>tx.mutate(change('create','chained-second','{"label":"second"}')));
+      void follow.catch(()=>{});
+      return 'callback finished';
+    }),error=>error.code==='INVALID_ARGUMENT');
+    await assert.rejects(follow,error=>error.code==='INVALID_ARGUMENT');
+    assert.deepEqual(await counts(scope.spaceId),{
+      records:0,record_unique_keys:0,record_index_values:0,record_events:0,
+      idempotency_receipts:0,record_tombstones:0,projection_outbox:0
+    });
+    const safe=await repository.mutate(scope,change('create','after-chain','{"label":"safe"}'));
+    assert.equal(safe.revision,1);
+    assert.equal((await counts(scope.spaceId)).record_events,1);
+  } finally { await single.end(); }
+});
+
+test('runtime mutations use row locks and no advisory SQL', async () => {
+  const { scope } = await fixture();
+  let sawWriteLock=false;
+  const supportedPool={connect:async()=>{
+    const client=await pool.connect();
+    return {query:(sql,...args)=>{
+      if (String(sql).includes('advisory')) throw new Error('Hyperdrive rejects advisory locks');
+      if (String(sql).includes('FOR UPDATE OF s,c')) sawWriteLock=true;
+      return client.query(sql,...args);
+    },release:discard=>client.release(discard)};
+  }};
+  const repository=new PostgresAuthority(supportedPool,3600);
+  const request=change('create','supported-lock','{"label":"one"}');
+  const first=await repository.mutate(scope,request);
+  const replay=await repository.mutate(scope,request);
+  assert.equal(replay.receiptId,first.receiptId);
+  assert.equal(replay.replayed,true);
+  assert.equal(sawWriteLock,true);
+  assert.equal((await counts(scope.spaceId)).record_events,1);
+});
+
+test('replace and patch require complete declared values and keep read indexes consistent', async () => {
+  const { scope } = await fixture();
+  const initial=await authority.mutate(scope,change('create','complete-first','{"label":"one","score":1}',{
+    unique:[{name:'label',encodedValue:'s:3:one'}],indexes:[{field:'score',kind:'number',value:1}]
+  }));
+  const read={...scope,capability:'records:read'};
+  const score=value=>[{field:'score',kind:'number',operator:'eq',value}];
+  const incomplete=change('patch','incomplete','{"label":"two","score":2}',{recordId:initial.ref.id,expectedRevision:1});
+  delete incomplete.unique;
+  delete incomplete.indexes;
+  await assert.rejects(authority.mutate(scope,incomplete),error=>error.code==='INVALID_ARGUMENT');
+  assert.equal(await authority.transaction(read,tx=>tx.countRecords(score(1))),1);
+  const patched=await authority.mutate(scope,change('patch','complete-patch','{"label":"two","score":2}',{
+    recordId:initial.ref.id,expectedRevision:1,
+    unique:[{name:'label',encodedValue:'s:3:two'}],indexes:[{field:'score',kind:'number',value:2}]
+  }));
+  assert.equal(patched.revision,2);
+  assert.equal(await authority.transaction(read,tx=>tx.countRecords(score(1))),0);
+  assert.equal(await authority.transaction(read,tx=>tx.countRecords(score(2))),1);
+  assert.equal(await authority.transaction(read,tx=>tx.existsRecord(score(2))),true);
+  await assert.rejects(authority.mutate(scope,change('create','conflict-after-patch','{"label":"two"}',{
+    unique:[{name:'label',encodedValue:'s:3:two'}]
+  })),error=>error.code==='UNIQUE_CONFLICT');
+  const replay=await authority.mutate(scope,change('patch','complete-patch','{"label":"two","score":2}',{
+    recordId:initial.ref.id,expectedRevision:1,
+    unique:[{name:'label',encodedValue:'s:3:two'}],indexes:[{field:'score',kind:'number',value:2}]
+  }));
+  assert.equal(replay.receiptId,patched.receiptId);
+  assert.equal((await counts(scope.spaceId)).record_events,2);
+});
+
+test('empty indexed strings work and malformed null values and outbox booleans fail', async () => {
+  const { scope } = await fixture();
+  await pool.query(`INSERT INTO collection_index_declarations(space_id,collection_id,field_name,value_kind,filterable,sortable,ready,accepted_version)
+    VALUES($1,$2,'text','string',TRUE,TRUE,TRUE,1),($1,$2,'nothing','string',TRUE,FALSE,TRUE,1)`,
+  [scope.spaceId,scope.collectionId]);
+  const saved=await authority.mutate(scope,change('create','empty-string','{"text":""}',{
+    indexes:[{field:'text',kind:'string',value:''},{field:'nothing',kind:'null'}]
+  }));
+  const read={...scope,capability:'records:read'};
+  const predicate=[{field:'text',kind:'string',operator:'eq',value:''}];
+  assert.equal(await authority.transaction(read,tx=>tx.countRecords(predicate)),1);
+  assert.equal(await authority.transaction(read,tx=>tx.existsRecord(predicate)),true);
+  assert.equal((await authority.transaction(read,tx=>tx.queryRecords(predicate,10)))[0].ref.id,saved.ref.id);
+  await assert.rejects(authority.mutate(scope,change('create','bad-null','{}',{
+    indexes:[{field:'nothing',kind:'null',value:'ignored'}]
+  })),error=>error.code==='INVALID_ARGUMENT');
+  const admin={...scope,principalId:'owner',capability:'space:admin'};
+  const [delivery]=await authority.transaction(admin,tx=>tx.claimOutbox(1,30));
+  await assert.rejects(authority.transaction(admin,tx=>tx.finishOutbox(delivery,'false')),error=>error.code==='INVALID_ARGUMENT');
+  assert.equal((await pool.query('SELECT delivery_state FROM projection_outbox WHERE event_id=$1',[delivery.eventId])).rows[0].delivery_state,'delivering');
+});
+
 test('mutation facts use entry snapshots across waits and indexed list traversal', async () => {
   const { scope } = await fixture();
   let entered,release;
@@ -624,6 +724,7 @@ test('mutation facts use entry snapshots across waits and indexed list traversal
   assert.equal(facts.rows[0].canonical_data,'{"label":"entry"}');
   assert.equal(facts.rows[0].event_data,'{"label":"entry"}');
   assert.equal(facts.rows[0].idempotency_key,'entry-key');
+  assert.equal(facts.rows[0].request_digest,digest(JSON.stringify(['create','entry-key','{"label":"entry"}',{}])));
   const unique=[{name:'label',encodedValue:'s:4:list'}];
   unique[Symbol.iterator]=function* () {};
   const indexed=await authority.mutate(scope,change('create','indexed','{"label":"list"}',{unique}));

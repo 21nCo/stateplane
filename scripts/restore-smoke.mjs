@@ -3,17 +3,26 @@ import { readFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
-import { existsSync } from 'node:fs';
+import { accessSync, constants, existsSync } from 'node:fs';
+import { isAbsolute } from 'node:path';
 import pg from 'pg';
-import { PostgresAuthority } from '../packages/postgres/dist/index.js';
 
 if (process.env.DATABASE_URL) throw new Error('Local restore smoke uses the isolated Docker Compose database only');
+const authorityModule = new URL('../packages/postgres/dist/index.js', import.meta.url);
+if (!existsSync(authorityModule)) throw new Error('Build @stateplane/postgres before db:restore-smoke: pnpm --filter @stateplane/postgres build');
+const { PostgresAuthority } = await import(authorityModule.href);
+
 const password = (await readFile(new URL('../.data/local-db-password', import.meta.url), 'utf8')).trim();
 const root = fileURLToPath(new URL('..', import.meta.url));
 const sourceName = `stateplane_restore_source_${randomBytes(4).toString('hex')}`;
 const name = `stateplane_restore_${randomBytes(4).toString('hex')}`;
-const dockerExecutable = ['/usr/local/bin/docker','/opt/homebrew/bin/docker','/usr/bin/docker'].find(existsSync);
-if (!dockerExecutable) throw new Error('Docker executable not found at a supported absolute path');
+const configuredDocker = process.env.STATEPLANE_DOCKER_EXECUTABLE;
+if (configuredDocker && (!isAbsolute(configuredDocker) || !existsSync(configuredDocker)))
+  throw new Error('STATEPLANE_DOCKER_EXECUTABLE must name an existing absolute executable path');
+const dockerExecutable = configuredDocker ?? ['/usr/local/bin/docker','/opt/homebrew/bin/docker','/usr/bin/docker'].find(existsSync);
+if (!dockerExecutable) throw new Error('Docker executable not found; set STATEPLANE_DOCKER_EXECUTABLE to its absolute path');
+try { accessSync(dockerExecutable,constants.X_OK); }
+catch { throw new Error('Docker executable is not runnable'); }
 const docker = args => execFileSync(dockerExecutable, ['compose','exec','-T','postgres',...args], { cwd:root, maxBuffer:64 * 1024 * 1024 });
 const sourceUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:55432/${sourceName}`;
 const targetUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:55432/${name}`;
@@ -58,7 +67,7 @@ try {
   await authority.transaction(admin,tx=>tx.finishOutbox(claimed[0],true));
   const expected = await snapshot(base);
   assert.ok(expected.records.length && expected.record_events.length && expected.projection_outbox.length,
-    'run the populated authority integration suite before the restore smoke');
+    'expected this restore smoke seed to populate records, events, and outbox');
   const archive = docker(['pg_dump','-U','stateplane','-Fc',sourceName]);
   docker(['createdb','-U','stateplane',name]);
   execFileSync(dockerExecutable, ['compose','exec','-T','postgres','pg_restore','-U','stateplane','-d',name],
