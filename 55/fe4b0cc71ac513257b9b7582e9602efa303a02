@@ -1,0 +1,26 @@
+README.md
+  h_a39f9495f9ec1d 27
+docs/postgres-authority.md
+  h_a39f9495f9ec1d 3,5,13,19
+migrations/008_receipt_reservation_scopes.sql
+  h_a39f9495f9ec1d 1-12
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 252,255,263,269-277,306-309,318-319,324-325,356-360,385,388,398,401,404-410,416-418,423-452,613-614,623,626-627,633,636-637,641,645-646,658,661-662,676
+scripts/migration-upgrade-smoke.mjs
+  h_a39f9495f9ec1d 4,11,15-32,39-62,65-66,113,116,128-130,132,135-138
+scripts/restore-smoke.mjs
+  h_a39f9495f9ec1d 34
+test/integration/postgres-authority.test.js
+  h_a39f9495f9ec1d 193-304
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "55fe4b0cc71ac513257b9b7582e9602efa303a02",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
