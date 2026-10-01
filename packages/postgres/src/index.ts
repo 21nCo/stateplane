@@ -127,6 +127,7 @@ export class PostgresAuthority {
       await tx.checkScope();
       const result = await fn(tx);
       await tx.checkScope();
+      await tx.finalizeReceipts();
       try { await client.query('COMMIT'); begun = false; }
       catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
       return result;
@@ -150,6 +151,7 @@ export class PostgresAuthority {
 
 export class AuthorityTransaction {
   private active = true;
+  private readonly pendingReceipts = new Map<string, { response: Receipt; replays: Receipt[]; digest: string; collectionId: CollectionId; key: string }>();
   constructor(private readonly client: Client, readonly scope: AuthorityScope, private readonly retentionSeconds: number) {}
   close() { this.active = false; }
   private async query(sql: string, values: unknown[] = []) {
@@ -171,11 +173,12 @@ export class AuthorityTransaction {
     if (['suspended','deleting','deleted'].includes(row.lifecycle)) throw new AuthorityError('SPACE_UNAVAILABLE');
     if (row.collection_lifecycle === 'deleted') throw new AuthorityError('NOT_FOUND');
     if (row.owner_principal_id !== principalId) {
-      const grant = await this.query(`SELECT capabilities,expires_at FROM collection_grants
+      const grant = await this.query(`SELECT capabilities,expires_at,expires_at > clock_timestamp() AS grant_current FROM collection_grants
         WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 FOR SHARE`, [spaceId, collectionId, credentialId]);
       const current = grant.rows[0];
-      if (!current?.capabilities.includes(capability) || (current.expires_at && new Date(current.expires_at) <= new Date())) throw new AuthorityError('FORBIDDEN');
+      if (!current?.capabilities.includes(capability) || (current.expires_at && !current.grant_current)) throw new AuthorityError('FORBIDDEN');
     }
+    if (row.collection_lifecycle === 'readOnly' && capability === 'records:write') throw new AuthorityError('SPACE_UNAVAILABLE');
   }
 
   private ref(id: string): RecordRef { return { spaceId: this.scope.spaceId, collectionId: this.scope.collectionId, id }; }
@@ -201,6 +204,27 @@ export class AuthorityTransaction {
     const row = result.rows[0];
     return row ? { collectionId: row.collection_id, requestDigest: row.request_digest, response: row.response } : null;
   }
+  private async receiptTimes(): Promise<{ committedAt: string; expiresAt: string }> {
+    const clock = await this.query(`WITH stamp AS MATERIALIZED (SELECT clock_timestamp() AS at)
+      SELECT at AS committed_at, at + ($1::bigint * interval '1 second') AS expires_at FROM stamp`, [this.retentionSeconds]);
+    return { committedAt:(clock.rows[0].committed_at as Date).toISOString(),
+      expiresAt:(clock.rows[0].expires_at as Date).toISOString() };
+  }
+  /** Stamp receipts using the database clock after callback work, immediately before COMMIT. */
+  async finalizeReceipts(): Promise<void> {
+    if (!this.pendingReceipts.size) return;
+    const { committedAt, expiresAt } = await this.receiptTimes();
+    for (const pending of this.pendingReceipts.values()) {
+      pending.response.committedAt = committedAt;
+      pending.response.expiresAt = expiresAt;
+      for (const replay of pending.replays) { replay.committedAt = committedAt; replay.expiresAt = expiresAt; }
+      await this.query(`INSERT INTO idempotency_receipts(receipt_id,space_id,collection_id,credential_id,operation,idempotency_key,request_digest,record_id,response,committed_at,expires_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)`, [pending.response.receiptId,this.scope.spaceId,pending.collectionId,
+        this.scope.credentialId,pending.response.operation,pending.key,pending.digest,pending.response.ref.id,
+        JSON.stringify(pending.response),committedAt,expiresAt]);
+    }
+    this.pendingReceipts.clear();
+  }
   private async authorizeOriginal(collectionId: CollectionId): Promise<void> {
     if (collectionId === this.scope.collectionId) return;
     await new AuthorityTransaction(this.client, { ...this.scope, collectionId }, this.retentionSeconds).checkScope();
@@ -222,6 +246,15 @@ export class AuthorityTransaction {
     const identity = JSON.stringify([scope.spaceId,scope.credentialId,change.operation,change.idempotencyKey]);
     const reservation = await this.query('SELECT pg_try_advisory_xact_lock(hashtextextended($1,19305)) AS acquired', [identity]);
     if (!reservation.rows[0].acquired) throw new AuthorityError('RECEIPT_PENDING');
+    const pending = this.pendingReceipts.get(identity);
+    if (pending) {
+      await this.authorizeOriginal(pending.collectionId);
+      if (change.operation !== 'delete') canonicalJsonObject(change.canonicalData!);
+      if (pending.digest !== change.requestDigest) throw new AuthorityError('IDEMPOTENCY_MISMATCH');
+      const replay = { ...pending.response, replayed: true };
+      pending.replays.push(replay);
+      return replay;
+    }
     const previous = await this.findReceipt(change.operation, change.idempotencyKey);
     if (previous) {
       await this.authorizeOriginal(previous.collectionId);
@@ -241,8 +274,6 @@ export class AuthorityTransaction {
     const schemaVersion = Number(version.schema_version);
     const generation = Number(version.placement_generation);
     const recordId = change.operation === 'create' ? `rec_${randomUUID()}` : change.recordId!;
-    const now = new Date().toISOString();
-    const expiresAt = new Date(Date.now() + this.retentionSeconds * 1000).toISOString();
     let beforeRevision: number | null = null;
     let revision = 1;
     try {
@@ -278,8 +309,16 @@ export class AuthorityTransaction {
           const key = JSON.stringify([unique.name,unique.encodedValue]);
           if (seenUnique.has(key)) throw new AuthorityError('INVALID_ARGUMENT');
           seenUnique.add(key);
-          await this.query(`INSERT INTO record_unique_keys(space_id,collection_id,constraint_name,encoded_value,record_id)
-            VALUES($1,$2,$3,$4,$5)`, [...scopeIds(scope),unique.name,unique.encodedValue,recordId]);
+          const inserted = await this.query(`INSERT INTO record_unique_keys(space_id,collection_id,constraint_name,encoded_value,record_id)
+            VALUES($1,$2,$3,$4,$5) ON CONFLICT (space_id,collection_id,constraint_name,encoded_value) DO NOTHING
+            RETURNING record_id`, [...scopeIds(scope),unique.name,unique.encodedValue,recordId]);
+          if (!inserted.rowCount) {
+            const holder = await this.query(`SELECT r.tombstone FROM record_unique_keys u JOIN records r
+              ON r.space_id=u.space_id AND r.collection_id=u.collection_id AND r.record_id=u.record_id
+              WHERE u.space_id=$1 AND u.collection_id=$2 AND u.constraint_name=$3 AND u.encoded_value=$4`,
+            [...scopeIds(scope),unique.name,unique.encodedValue]);
+            throw new AuthorityError(holder.rows[0]?.tombstone ? 'KEY_RESERVED' : 'UNIQUE_CONFLICT');
+          }
         }
         const seenFields = new Set<string>();
         for (const field of change.indexes ?? []) {
@@ -300,13 +339,12 @@ export class AuthorityTransaction {
       await this.query(`INSERT INTO record_events(event_id,space_id,collection_id,record_id,revision,operation,credential_id,schema_version,canonical_data)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [eventId,...scopeIds(scope),recordId,revision,change.operation,scope.credentialId,schemaVersion,change.canonicalData ?? '{}']);
       const receiptId = `rcpt_${randomUUID()}`;
+      const { committedAt, expiresAt } = await this.receiptTimes();
       const response: Receipt = { contractVersion:'1',receiptId,spaceId:scope.spaceId,ref:{kind:'record',id:recordId},operation:change.operation,
-        beforeRevision,revision,schemaVersion,committedAt:now,expiresAt,projection:{generation,state:'pending'},replayed:false };
-      await this.query(`INSERT INTO idempotency_receipts(receipt_id,space_id,collection_id,credential_id,operation,idempotency_key,request_digest,record_id,response,committed_at,expires_at)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)`, [receiptId,...scopeIds(scope),scope.credentialId,change.operation,
-        change.idempotencyKey,change.requestDigest,recordId,JSON.stringify(response),now,expiresAt]);
+        beforeRevision,revision,schemaVersion,committedAt,expiresAt,projection:{generation,state:'pending'},replayed:false };
       await this.query('INSERT INTO projection_outbox(event_id,space_id,collection_id,record_id,revision,generation) VALUES($1,$2,$3,$4,$5,$6)',
         [eventId,...scopeIds(scope),recordId,revision,generation]);
+      this.pendingReceipts.set(identity, { response, replays: [], digest:change.requestDigest, collectionId:scope.collectionId, key:change.idempotencyKey });
       return response;
     } catch (error) {
       if ((error as { code?: string }).code === '23505') {
@@ -341,7 +379,9 @@ export class AuthorityTransaction {
           || (predicate.kind === 'boolean' && typeof predicate.value !== 'boolean')
           || ((predicate.kind === 'string' || predicate.kind === 'date-time') && typeof predicate.value !== 'string')) throw new AuthorityError('INVALID_ARGUMENT');
         params.push(predicate.value);
-        compare = ` AND ${alias}.${column} ${operator} $${params.length}`;
+        compare = predicate.kind === 'date-time'
+          ? ` AND stateplane_instant_sort_key(${alias}.${column}) COLLATE "C" ${operator} stateplane_instant_sort_key($${params.length}::text) COLLATE "C"`
+          : ` AND ${alias}.${column} ${operator} $${params.length}`;
       }
       fragments.push(`EXISTS (SELECT 1 FROM record_index_values ${alias} WHERE ${alias}.space_id=r.space_id
         AND ${alias}.collection_id=r.collection_id AND ${alias}.record_id=r.record_id

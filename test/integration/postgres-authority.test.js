@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { randomUUID, createHash } from 'node:crypto';
 import pg from 'pg';
-import { PostgresAuthority, AuthorityError } from '../../packages/postgres/dist/index.js';
+import { PostgresAuthority, AuthorityError, CommitOutcomeUnknownError } from '../../packages/postgres/dist/index.js';
 
 const password = process.env.DATABASE_URL ? null : (await readFile(new URL('../../.data/local-db-password', import.meta.url), 'utf8')).trim();
 const url = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:55432/stateplane`;
@@ -214,6 +214,179 @@ test('a failed transaction cannot leak state into the next borrower of one poole
     await assert.rejects(escaped.checkScope(),error => error.code === 'INVALID_ARGUMENT');
     const receipt = await repository.mutate(scope,request);
     assert.equal(receipt.revision,1);
+    assert.equal((await counts(scope.spaceId)).record_events,1);
+  } finally { await single.end(); }
+});
+
+test('receipt retention starts at the database precommit clock, even after a held write and app clock skew', async () => {
+  const { scope } = await fixture();
+  const short = new PostgresAuthority(pool,1);
+  const request = change('create','delayed-commit','{"label":"delayed"}');
+  const originalNow = Date.now;
+  let receipt;
+  let sameTransactionReplay;
+  try {
+    Date.now = () => originalNow() - 86_400_000;
+    receipt = await short.transaction(scope,async tx => {
+      const pending = await tx.mutate(request);
+      sameTransactionReplay = await tx.mutate(request);
+      assert.equal(sameTransactionReplay.receiptId,pending.receiptId);
+      await new Promise(resolve => setTimeout(resolve,1400));
+      return pending;
+    });
+  } finally { Date.now = originalNow; }
+  assert.ok(Date.parse(receipt.expiresAt) > Date.now());
+  assert.equal(sameTransactionReplay.expiresAt,receipt.expiresAt);
+  const replay = await short.mutate(scope,request);
+  assert.equal(replay.receiptId,receipt.receiptId);
+  assert.equal(replay.replayed,true);
+  assert.equal((await counts(scope.spaceId)).record_events,1);
+});
+
+test('date-time filters compare full UTC instants across query, count and exists', async () => {
+  const { scope } = await fixture();
+  await pool.query(`INSERT INTO collection_index_declarations(space_id,collection_id,field_name,value_kind,filterable,sortable,ready,accepted_version)
+    VALUES($1,$2,'observedAt','date-time',TRUE,TRUE,TRUE,1)`,[scope.spaceId,scope.collectionId]);
+  for (const [key,time] of [
+    ['whole','2020-01-01T00:00:00Z'],
+    ['fraction','2020-01-01T00:00:00.1Z'],
+    ['precise','2020-01-01T00:00:00.100000001Z'],
+    ['next','2020-01-01T00:00:01Z']
+  ]) await authority.mutate(scope,change('create',key,JSON.stringify({observedAt:time}),
+    { indexes:[{field:'observedAt',kind:'date-time',value:time}] }));
+  const readScope = { ...scope,capability:'records:read' };
+  const predicate = (operator,value) => [{field:'observedAt',kind:'date-time',operator,value}];
+  const result = await authority.transaction(readScope, async tx => ({
+    afterWhole:await tx.queryRecords(predicate('gt','2020-01-01T00:00:00Z'),10),
+    beforeFraction:await tx.countRecords(predicate('lt','2020-01-01T00:00:00.1Z')),
+    equalFraction:await tx.countRecords(predicate('eq','2020-01-01T00:00:00.10Z')),
+    precise:await tx.existsRecord(predicate('gt','2020-01-01T00:00:00.100000000Z'))
+  }));
+  assert.equal(result.afterWhole.length,3);
+  assert.equal(result.beforeFraction,1);
+  assert.equal(result.equalFraction,1);
+  assert.equal(result.precise,true);
+  for (const [key,time] of [
+    ['leap','2016-12-31T23:59:60.000000001Z'],
+    ['next-day','2017-01-01T00:00:00Z']
+  ]) await authority.mutate(scope,change('create',key,JSON.stringify({observedAt:time}),
+    {indexes:[{field:'observedAt',kind:'date-time',value:time}]}));
+  assert.equal(await authority.transaction(readScope,tx => tx.countRecords(predicate('lt','2017-01-01T00:00:00Z'))),1);
+});
+
+test('patch/delete, key lookup and tombstoned external and composite reservations are atomic', async () => {
+  const { scope } = await fixture();
+  const initial = await authority.mutate(scope,change('create','key-first','{"label":"first"}',
+    { normalizedExternalKey:'name',unique:[{name:'label',encodedValue:'s:5:first'}] }));
+  const read = { ...scope,capability:'records:read' };
+  assert.equal((await authority.transaction(read,tx => tx.getByKey('external','name'))).ref.id,initial.ref.id);
+  const patched = await authority.mutate(scope,change('patch','key-patch','{"label":"second"}',
+    { recordId:initial.ref.id,expectedRevision:1,unique:[{name:'label',encodedValue:'s:6:second'}] }));
+  assert.equal(patched.revision,2);
+  await authority.mutate(scope,change('delete','key-delete',undefined,{recordId:initial.ref.id,expectedRevision:2}));
+  assert.equal(await authority.transaction(read,tx => tx.getByKey('external','name')),null);
+  const before = await counts(scope.spaceId);
+  for (const extras of [
+    {normalizedExternalKey:'name'},
+    {unique:[{name:'label',encodedValue:'s:6:second'}]}
+  ]) await assert.rejects(authority.mutate(scope,change('create',`reuse-${JSON.stringify(extras)}`,'{"label":"new"}',extras)),
+    error => error.code === 'KEY_RESERVED');
+  assert.deepEqual(await counts(scope.spaceId),before);
+});
+
+test('collection readOnly blocks replay on the requested and original collection', async () => {
+  const { scope,otherId } = await fixture();
+  const request = change('create','lifecycle','{"label":"one"}');
+  const receipt = await authority.mutate(scope,request);
+  await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
+    VALUES($1,$2,$3,ARRAY['records:write'])`,[scope.spaceId,otherId,scope.credentialId]);
+  await pool.query("UPDATE collections SET lifecycle='readOnly' WHERE space_id=$1 AND collection_id=$2",[scope.spaceId,scope.collectionId]);
+  await assert.rejects(authority.mutate(scope,request),error => error.code === 'SPACE_UNAVAILABLE');
+  await assert.rejects(authority.mutate({...scope,collectionId:otherId},request),error => error.code === 'SPACE_UNAVAILABLE');
+  await pool.query("UPDATE collections SET lifecycle='active' WHERE space_id=$1 AND collection_id=$2",[scope.spaceId,scope.collectionId]);
+  assert.equal((await authority.mutate(scope,request)).receiptId,receipt.receiptId);
+  assert.equal((await counts(scope.spaceId)).record_events,1);
+});
+
+test('ambiguous committed response replays, expired grant denies, and expired outbox lease is fenced', async () => {
+  const { scope } = await fixture();
+  const request = change('create','lost-commit','{"label":"committed"}');
+  const faultPool = { connect: async () => {
+    const client = await pool.connect();
+    return { query: async (...args) => {
+      const result = await client.query(...args);
+      if (args[0] === 'COMMIT') throw new Error('lost response after commit');
+      return result;
+    }, release: discard => client.release(discard) };
+  } };
+  await assert.rejects(new PostgresAuthority(faultPool,3600).mutate(scope,request),error => error instanceof CommitOutcomeUnknownError);
+  const receipt = await authority.mutate(scope,request);
+  assert.equal(receipt.replayed,true);
+  assert.equal((await counts(scope.spaceId)).record_events,1);
+  const admin = {...scope,principalId:'owner',capability:'space:admin'};
+  const first = (await authority.transaction(admin,tx => tx.claimOutbox(1,1)))[0];
+  await pool.query("UPDATE projection_outbox SET available_at=clock_timestamp()-interval '1 second' WHERE event_id=$1",[first.eventId]);
+  const second = (await authority.transaction(admin,tx => tx.claimOutbox(1,1)))[0];
+  assert.equal(second.attempt,first.attempt+1);
+  assert.equal(await authority.transaction(admin,tx => tx.finishOutbox(first,true)),false);
+  assert.equal(await authority.transaction(admin,tx => tx.finishOutbox(second,true)),true);
+  await pool.query("UPDATE collection_grants SET expires_at=clock_timestamp()-interval '1 second' WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3",
+    [scope.spaceId,scope.collectionId,scope.credentialId]);
+  await assert.rejects(authority.mutate(scope,request),error => error.code === 'FORBIDDEN');
+});
+
+test('concurrent external and composite conflicts leave only winning rows', async () => {
+  const { scope } = await fixture();
+  const external = await Promise.allSettled(['a','b'].map(key => authority.mutate(scope,
+    change('create',`external-${key}`,JSON.stringify({label:key}),{normalizedExternalKey:'shared'}))));
+  assert.equal(external.filter(result => result.status === 'fulfilled').length,1);
+  assert.equal(external.find(result => result.status === 'rejected').reason.code,'KEY_RESERVED');
+  const composite = await Promise.allSettled(['a','b'].map(key => authority.mutate(scope,
+    change('create',`composite-${key}`,JSON.stringify({label:key}),
+      {unique:[{name:'label',encodedValue:'s:6:shared'}]}))));
+  assert.equal(composite.filter(result => result.status === 'fulfilled').length,1);
+  assert.equal(composite.find(result => result.status === 'rejected').reason.code,'UNIQUE_CONFLICT');
+  assert.deepEqual(await counts(scope.spaceId),{
+    records:2,record_unique_keys:1,record_index_values:0,record_events:2,
+    idempotency_receipts:2,record_tombstones:0,projection_outbox:2 });
+});
+
+test('a server-confirmed serialization rollback retries once without duplicate receipts', async () => {
+  const { scope } = await fixture();
+  let injected = false;
+  const retryPool = { connect: async () => {
+    const client = await pool.connect();
+    return { query: async (...args) => {
+      if (!injected && String(args[0]).includes('pg_try_advisory_xact_lock')) {
+        injected = true;
+        await client.query("DO $$BEGIN RAISE EXCEPTION 'forced serialization' USING ERRCODE='40001'; END$$");
+      }
+      return client.query(...args);
+    }, release: discard => client.release(discard) };
+  } };
+  const receipt = await new PostgresAuthority(retryPool,3600).mutate(scope,change('create','retry','{"label":"retry"}'));
+  assert.equal(injected,true);
+  assert.equal(receipt.revision,1);
+  assert.equal((await counts(scope.spaceId)).idempotency_receipts,1);
+});
+
+test('failed ROLLBACK discards the pooled client and its uncommitted receipt', async () => {
+  const { scope } = await fixture();
+  const single = new pg.Pool({connectionString:url,max:1});
+  const brokenRollbackPool = { connect: async () => {
+    const client = await single.connect();
+    return {query:(sql,...args) => sql === 'ROLLBACK'
+      ? Promise.reject(new Error('lost rollback connection')) : client.query(sql,...args),
+    release:discard => client.release(discard)};
+  } };
+  const request = change('create','rollback-loss','{"label":"rolled back"}');
+  try {
+    await assert.rejects(new PostgresAuthority(brokenRollbackPool,3600).transaction(scope,async tx => {
+      await tx.mutate(request);
+      throw new Error('abort before commit');
+    }),/abort before commit/);
+    const receipt = await new PostgresAuthority(single,3600).mutate(scope,request);
+    assert.equal(receipt.replayed,false);
     assert.equal((await counts(scope.spaceId)).record_events,1);
   } finally { await single.end(); }
 });
