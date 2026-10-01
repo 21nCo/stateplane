@@ -41,6 +41,20 @@ export type ScalarPredicate =
   | { field: string; kind: 'null'; operator: 'isNull' }
   | { field: string; kind: 'string' | 'date-time' | 'number' | 'boolean'; operator: 'eq' | 'lt' | 'lte' | 'gt' | 'gte'; value: string | number | boolean };
 
+function comparison(predicate: Exclude<ScalarPredicate, { kind: 'null' }>, alias: string, params: unknown[]): string {
+  const column = { string:'string_value','date-time':'time_value',number:'number_value',boolean:'boolean_value' }[predicate.kind];
+  const operator = { eq:'=',lt:'<',lte:'<=',gt:'>',gte:'>=' }[predicate.operator];
+  if (!operator) throw new AuthorityError('INVALID_ARGUMENT');
+  if ((predicate.kind === 'number' && (typeof predicate.value !== 'number' || !Number.isFinite(predicate.value)))
+    || (predicate.kind === 'boolean' && typeof predicate.value !== 'boolean')
+    || ((predicate.kind === 'string' || predicate.kind === 'date-time') && !scalarString(predicate.value))) throw new AuthorityError('INVALID_ARGUMENT');
+  params.push(predicate.value);
+  if (predicate.kind === 'date-time') {
+    return ` AND stateplane_instant_sort_key(${alias}.${column}) COLLATE "C" ${operator} stateplane_instant_sort_key($${params.length}::text) COLLATE "C"`;
+  }
+  return ` AND ${alias}.${column} ${operator} $${params.length}`;
+}
+
 export class AuthorityError extends Error {
   constructor(public readonly code: string, message = code) { super(message); this.name = 'AuthorityError'; }
 }
@@ -57,16 +71,41 @@ const utf8Compare = (a: string, b: string) => Buffer.compare(Buffer.from(a), Buf
 function copyReceipt(receipt: Receipt, replayed = receipt.replayed): Receipt {
   return { ...receipt, ref: { ...receipt.ref }, projection: { ...receipt.projection }, replayed };
 }
-function scalarString(value: unknown): value is string {
-  if (typeof value !== 'string' || value.length === 0) return false;
+function validUnicode(value: string): boolean {
   for (let i = 0; i < value.length; i++) {
-    const unit = value.charCodeAt(i);
-    if (unit >= 0xd800 && unit <= 0xdbff) {
-      const next = value.charCodeAt(++i);
-      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
-    } else if (unit >= 0xdc00 && unit <= 0xdfff) return false;
+    const point = value.codePointAt(i)!;
+    if (point === 0 || (point >= 0xd800 && point <= 0xdfff)) return false;
+    if (point > 0xffff) i++;
   }
   return true;
+}
+function scalarString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && validUnicode(value);
+}
+
+function canonicalValue(value: unknown, depth: number): string {
+  if (depth > 64) throw new AuthorityError('SCHEMA_INVALID');
+  if (value === null) return 'null';
+  if (typeof value === 'string') {
+    if (!validUnicode(value)) throw new AuthorityError('SCHEMA_INVALID');
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new AuthorityError('SCHEMA_INVALID');
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  if (Array.isArray(value)) {
+    const parts: string[] = [];
+    for (let i = 0; i < value.length; i++) parts.push(canonicalValue(value[i], depth + 1));
+    return `[${parts.join(',')}]`;
+  }
+  if (typeof value === 'object') {
+    const object = value as Record<string, unknown>;
+    const parts = Object.keys(object).sort(utf8Compare).map(key => canonicalValue(key, depth + 1) + ':' + canonicalValue(object[key], depth + 1));
+    return `{${parts.join(',')}}`;
+  }
+  throw new AuthorityError('SCHEMA_INVALID');
 }
 
 /** Admit serialized JSON only. Never stringify caller-owned objects or proxies. */
@@ -75,36 +114,7 @@ export function canonicalJsonObject(serialized: string): string {
   let parsed: unknown;
   try { parsed = JSON.parse(serialized); } catch { throw new AuthorityError('SCHEMA_INVALID'); }
   if (parsed === null || Array.isArray(parsed) || typeof parsed !== 'object') throw new AuthorityError('SCHEMA_INVALID');
-  const canonical = (value: unknown, depth: number): string => {
-    if (depth > 64) throw new AuthorityError('SCHEMA_INVALID');
-    if (value === null) return 'null';
-    if (typeof value === 'string') {
-      for (let i = 0; i < value.length; i++) {
-        const unit = value.charCodeAt(i);
-        if (unit >= 0xd800 && unit <= 0xdbff) {
-          const next = value.charCodeAt(++i);
-          if (!(next >= 0xdc00 && next <= 0xdfff)) throw new AuthorityError('SCHEMA_INVALID');
-        } else if (unit >= 0xdc00 && unit <= 0xdfff) throw new AuthorityError('SCHEMA_INVALID');
-      }
-      return JSON.stringify(value);
-    }
-    if (typeof value === 'number') {
-      if (!Number.isFinite(value)) throw new AuthorityError('SCHEMA_INVALID');
-      return JSON.stringify(value);
-    }
-    if (typeof value === 'boolean') return value ? 'true' : 'false';
-    if (Array.isArray(value)) {
-      const parts: string[] = [];
-      for (let i = 0; i < value.length; i++) parts.push(canonical(value[i], depth + 1));
-      return `[${parts.join(',')}]`;
-    }
-    if (typeof value === 'object') {
-      const object = value as Record<string, unknown>;
-      return `{${Object.keys(object).sort(utf8Compare).map(key => `${canonical(key, depth + 1)}:${canonical(object[key], depth + 1)}`).join(',')}}`;
-    }
-    throw new AuthorityError('SCHEMA_INVALID');
-  };
-  const result = canonical(parsed, 0);
+  const result = canonicalValue(parsed, 0);
   if (result !== serialized || Buffer.byteLength(result, 'utf8') > MAX_JSON_BYTES) throw new AuthorityError('SCHEMA_INVALID', 'JSON must be canonical and within the byte limit');
   return result;
 }
@@ -112,6 +122,67 @@ export function canonicalJsonObject(serialized: string): string {
 type PoolLike = Pick<pg.Pool, 'connect'>;
 type Client = pg.PoolClient;
 const scopeIds = (scope: AuthorityScope) => [scope.spaceId, scope.collectionId];
+
+function validateChangeShape(change: RecordChange): void {
+  if (!['create','replace','patch','delete'].includes(change.operation) || !scalarString(change.idempotencyKey)
+    || typeof change.requestDigest !== 'string' || !validDigest.test(change.requestDigest)) throw new AuthorityError('INVALID_ARGUMENT');
+  if (change.operation === 'create') {
+    if (change.recordId !== undefined || change.expectedRevision !== undefined) throw new AuthorityError('INVALID_ARGUMENT');
+  } else if (!scalarString(change.recordId) || change.expectedRevision === undefined) throw new AuthorityError('INVALID_ARGUMENT');
+  if (change.normalizedExternalKey !== undefined && (change.operation !== 'create' || !scalarString(change.normalizedExternalKey))) throw new AuthorityError('INVALID_ARGUMENT');
+  if (change.expectedRevision !== undefined) parseRevision(change.expectedRevision);
+  if (change.expectedSchemaVersion !== undefined && (!isSafeInteger(change.expectedSchemaVersion) || change.expectedSchemaVersion < 1)) throw new AuthorityError('INVALID_ARGUMENT');
+  if (change.operation === 'delete' && (change.canonicalData !== undefined || change.unique?.length || change.indexes?.length)) throw new AuthorityError('INVALID_ARGUMENT');
+}
+
+function snapshotUnique(source: readonly UniqueValue[] | undefined): readonly UniqueValue[] | undefined {
+  if (source === undefined) return undefined;
+  if (!Array.isArray(source)) throw new AuthorityError('INVALID_ARGUMENT');
+  const seen = new Set<string>();
+  const values: UniqueValue[] = [];
+  for (let i = 0; i < source.length; i++) {
+    const entry = source[i];
+    if (!entry || !scalarString(entry.name) || !scalarString(entry.encodedValue)) throw new AuthorityError('INVALID_ARGUMENT');
+    const key = JSON.stringify([entry.name, entry.encodedValue]);
+    if (seen.has(key)) throw new AuthorityError('INVALID_ARGUMENT');
+    seen.add(key);
+    values.push(Object.freeze({ name: entry.name, encodedValue: entry.encodedValue }));
+  }
+  return Object.freeze(values);
+}
+
+function snapshotIndexes(source: readonly IndexValue[] | undefined): readonly IndexValue[] | undefined {
+  if (source === undefined) return undefined;
+  if (!Array.isArray(source)) throw new AuthorityError('INVALID_ARGUMENT');
+  const seen = new Set<string>();
+  const values: IndexValue[] = [];
+  for (let i = 0; i < source.length; i++) {
+    const entry = source[i];
+    if (!entry || !scalarString(entry.field) || seen.has(entry.field)) throw new AuthorityError('INVALID_ARGUMENT');
+    seen.add(entry.field);
+    const value = 'value' in entry ? entry.value : null;
+    if ((entry.kind === 'number' && (typeof value !== 'number' || !Number.isFinite(value)))
+      || ((entry.kind === 'string' || entry.kind === 'date-time') && !scalarString(value))
+      || (entry.kind === 'boolean' && typeof value !== 'boolean')
+      || !['null','string','date-time','number','boolean'].includes(entry.kind)) throw new AuthorityError('INVALID_ARGUMENT');
+    values.push(Object.freeze({ ...entry }));
+  }
+  return Object.freeze(values);
+}
+
+/** Detach caller-owned fields before any await, including the first retry attempt. */
+function snapshotChange(source: RecordChange): Readonly<RecordChange> {
+  if (!source || typeof source !== 'object') throw new AuthorityError('INVALID_ARGUMENT');
+  const change: RecordChange = {
+    operation: source.operation, idempotencyKey: source.idempotencyKey, requestDigest: source.requestDigest,
+    recordId: source.recordId, expectedRevision: source.expectedRevision,
+    expectedSchemaVersion: source.expectedSchemaVersion, canonicalData: source.canonicalData,
+    normalizedExternalKey: source.normalizedExternalKey,
+    unique: snapshotUnique(source.unique), indexes: snapshotIndexes(source.indexes)
+  };
+  validateChangeShape(change);
+  return Object.freeze(change);
+}
 
 export class PostgresAuthority {
   constructor(private readonly pool: PoolLike, private readonly receiptRetentionSeconds: number) {
@@ -122,6 +193,7 @@ export class PostgresAuthority {
   async transaction<T>(scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T>): Promise<T> {
     // Capture the authenticated identity before waiting for a pooled connection.
     const fixedScope = Object.freeze({ ...scope });
+    if (![fixedScope.spaceId,fixedScope.collectionId,fixedScope.principalId,fixedScope.credentialId].every(scalarString)) throw new AuthorityError('INVALID_ARGUMENT');
     const client = await this.pool.connect();
     let begun = false;
     let beginAttempted = false;
@@ -133,13 +205,16 @@ export class PostgresAuthority {
       tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds);
       await tx.checkScope();
       const result = await fn(tx);
+      await tx.settleMutations();
       tx.assertCommittable();
       await tx.checkScope();
+      await tx.checkReplayScopes();
       await tx.finalizeReceipts();
       try { await client.query('COMMIT'); begun = false; }
       catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
       return result;
     } catch (error) {
+      if (tx) await tx.settleMutations();
       if (begun) { try { await client.query('ROLLBACK'); } catch { discard = true; } }
       else if (beginAttempted) discard = true;
       throw error;
@@ -149,8 +224,9 @@ export class PostgresAuthority {
   /** Retry only server-confirmed deadlock/serialization rollbacks, never failed COMMIT. */
   async mutate(scope: AuthorityScope, change: RecordChange): Promise<Receipt> {
     const fixedScope = Object.freeze({ ...scope });
+    const fixedChange = snapshotChange(change);
     for (let attempt = 0; attempt < 3; attempt++) {
-      try { return await this.transaction(fixedScope, tx => tx.mutate(change)); }
+      try { return await this.transaction(fixedScope, tx => tx.mutate(fixedChange)); }
       catch (error) {
         if (!retryCodes.has((error as { code?: string }).code ?? '') || attempt === 2) throw error;
       }
@@ -164,16 +240,19 @@ export class AuthorityTransaction {
   private mutationFailed = false;
   private mutationError: unknown;
   private readonly pendingReceipts = new Map<string, { response: Receipt; returned: Receipt[]; digest: string; collectionId: CollectionId; key: string }>();
+  private readonly inFlight = new Map<string, Promise<Receipt>>();
+  private readonly replayCollections = new Set<CollectionId>();
   readonly #scope: Readonly<AuthorityScope>;
   get scope(): Readonly<AuthorityScope> { return this.#scope; }
   constructor(private readonly client: Client, scope: AuthorityScope, private readonly retentionSeconds: number) {
     this.#scope = Object.freeze({ ...scope });
   }
-  close() { this.active = false; }
+  close() { this.active = false; this.inFlight.clear(); this.replayCollections.clear(); }
   /** A caught mutation error must not turn a partial write into a successful commit. */
   assertCommittable() {
     if (this.mutationFailed) throw this.mutationError;
   }
+  async settleMutations() { await Promise.allSettled([...this.inFlight.values()]); }
   private async query(sql: string, values: unknown[] = []) {
     if (!this.active) throw new AuthorityError('INVALID_ARGUMENT', 'Transaction ended');
     return this.client.query(sql, values);
@@ -204,6 +283,7 @@ export class AuthorityTransaction {
   private ref(id: string): RecordRef { return { spaceId: this.#scope.spaceId, collectionId: this.#scope.collectionId, id }; }
   async getRecord(recordId: string, includeTombstone = false): Promise<AuthorityRecord | null> {
     if (this.#scope.capability !== 'records:read') throw new AuthorityError('FORBIDDEN');
+    if (!scalarString(recordId)) throw new AuthorityError('INVALID_ARGUMENT');
     const result = await this.query(`SELECT record_id,revision,schema_version,canonical_data,key_mode,normalized_key,tombstone FROM records
       WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 ${includeTombstone ? '' : 'AND NOT tombstone'}`, [...scopeIds(this.#scope), recordId]);
     const row = result.rows[0];
@@ -248,11 +328,27 @@ export class AuthorityTransaction {
   private async authorizeOriginal(collectionId: CollectionId): Promise<void> {
     if (collectionId === this.#scope.collectionId) return;
     await new AuthorityTransaction(this.client, { ...this.#scope, collectionId }, this.retentionSeconds).checkScope();
+    this.replayCollections.add(collectionId);
+  }
+
+  async checkReplayScopes(): Promise<void> {
+    for (const collectionId of this.replayCollections) {
+      await new AuthorityTransaction(this.client, { ...this.#scope, collectionId }, this.retentionSeconds).checkScope();
+    }
   }
 
   async mutate(change: RecordChange): Promise<Receipt> {
     this.assertCommittable();
-    try { return await this.mutateOnce(change); }
+    let identity: string | undefined;
+    try {
+      const fixed = snapshotChange(change);
+      identity = JSON.stringify([this.#scope.spaceId,this.#scope.credentialId,fixed.operation,fixed.idempotencyKey]);
+      const prior = this.inFlight.get(identity);
+      const work = (async () => { if (prior) await prior; return this.mutateOnce(fixed); })();
+      this.inFlight.set(identity, work);
+      try { return await work; }
+      finally { if (this.inFlight.get(identity) === work) this.inFlight.delete(identity); }
+    }
     catch (error) {
       this.mutationFailed = true;
       this.mutationError = error;
@@ -260,20 +356,8 @@ export class AuthorityTransaction {
     }
   }
 
-  private async mutateOnce(change: RecordChange): Promise<Receipt> {
+  private async lookupReplay(change: RecordChange, identity: string): Promise<Receipt | null> {
     const scope = this.#scope;
-    if (scope.capability !== 'records:write') throw new AuthorityError('FORBIDDEN');
-    if (!['create','replace','patch','delete'].includes(change.operation) || !scalarString(change.idempotencyKey)
-      || typeof change.requestDigest !== 'string' || !validDigest.test(change.requestDigest)) throw new AuthorityError('INVALID_ARGUMENT');
-    if (change.operation === 'create') {
-      if (change.recordId !== undefined || change.expectedRevision !== undefined) throw new AuthorityError('INVALID_ARGUMENT');
-    } else if (!scalarString(change.recordId) || change.expectedRevision === undefined) throw new AuthorityError('INVALID_ARGUMENT');
-    if (change.operation === 'delete') {
-      if (change.canonicalData !== undefined || change.unique?.length || change.indexes?.length) throw new AuthorityError('INVALID_ARGUMENT');
-    }
-    if (change.normalizedExternalKey !== undefined && (change.operation !== 'create' || !scalarString(change.normalizedExternalKey))) throw new AuthorityError('INVALID_ARGUMENT');
-    if (change.expectedRevision !== undefined) parseRevision(change.expectedRevision);
-    const identity = JSON.stringify([scope.spaceId,scope.credentialId,change.operation,change.idempotencyKey]);
     const reservation = await this.query('SELECT pg_try_advisory_xact_lock(hashtextextended($1,19305)) AS acquired', [identity]);
     if (!reservation.rows[0].acquired) throw new AuthorityError('RECEIPT_PENDING');
     const pending = this.pendingReceipts.get(identity);
@@ -295,88 +379,108 @@ export class AuthorityTransaction {
     await this.query(`DELETE FROM idempotency_receipts WHERE space_id=$1 AND credential_id=$2
       AND operation=$3 AND idempotency_key=$4 AND expires_at<=clock_timestamp()`,
     [scope.spaceId,scope.credentialId,change.operation,change.idempotencyKey]);
+    return null;
+  }
+
+  private async currentVersion(change: RecordChange): Promise<{ schemaVersion: number; generation: number }> {
+    const scope = this.#scope;
     const versions = await this.query(`SELECT s.lifecycle,s.placement_generation,c.lifecycle AS collection_lifecycle,c.schema_version
       FROM spaces s JOIN collections c ON c.space_id=s.space_id WHERE s.space_id=$1 AND c.collection_id=$2`, scopeIds(scope));
     const version = versions.rows[0];
     if (version.lifecycle !== 'active' || version.collection_lifecycle !== 'active') throw new AuthorityError('SPACE_UNAVAILABLE');
     if (change.operation !== 'delete') canonicalJsonObject(change.canonicalData!);
     if (change.expectedSchemaVersion !== undefined && change.expectedSchemaVersion !== Number(version.schema_version)) throw new AuthorityError('SCHEMA_CONFLICT');
-    const schemaVersion = Number(version.schema_version);
-    const generation = Number(version.placement_generation);
+    return { schemaVersion:Number(version.schema_version), generation:Number(version.placement_generation) };
+  }
+
+  private async writeRecord(change: RecordChange, schemaVersion: number): Promise<{ recordId: string; beforeRevision: number | null; revision: number }> {
+    const scope = this.#scope;
     const recordId = change.operation === 'create' ? `rec_${randomUUID()}` : change.recordId!;
-    let beforeRevision: number | null = null;
-    let revision = 1;
+    if (change.operation === 'create') {
+      const mode = change.normalizedExternalKey === undefined ? 'generated' : 'external';
+      await this.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+        VALUES($1,$2,$3,1,$4,$5,$6,$7::text,$7::jsonb)`, [...scopeIds(scope),recordId,schemaVersion,mode,change.normalizedExternalKey ?? recordId,change.canonicalData]);
+      return { recordId, beforeRevision:null, revision:1 };
+    }
+    const updated = await this.query(`UPDATE records SET revision=revision+1,schema_version=$5,
+      canonical_data=CASE WHEN $6::boolean THEN canonical_data ELSE $7::text END,
+      data=CASE WHEN $6::boolean THEN data ELSE $7::jsonb END,
+      tombstone=$6,updated_at=clock_timestamp()
+      WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 AND revision=$4 AND NOT tombstone RETURNING revision`,
+    [...scopeIds(scope),recordId,change.expectedRevision,schemaVersion,change.operation === 'delete',change.canonicalData ?? null]);
+    if (!updated.rowCount) {
+      const exists = await this.query('SELECT 1 FROM records WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 AND NOT tombstone',
+        [...scopeIds(scope),recordId]);
+      throw new AuthorityError(exists.rowCount ? 'REVISION_CONFLICT' : 'NOT_FOUND');
+    }
+    const revision = Number(updated.rows[0].revision);
+    if (change.operation === 'delete') {
+      await this.query('INSERT INTO record_tombstones(space_id,collection_id,record_id,revision) VALUES($1,$2,$3,$4)', [...scopeIds(scope),recordId,revision]);
+    } else {
+      await this.query('DELETE FROM record_unique_keys WHERE space_id=$1 AND collection_id=$2 AND record_id=$3', [...scopeIds(scope),recordId]);
+      await this.query('DELETE FROM record_index_values WHERE space_id=$1 AND collection_id=$2 AND record_id=$3', [...scopeIds(scope),recordId]);
+    }
+    return { recordId, beforeRevision:change.expectedRevision!, revision };
+  }
+
+  private async reserveUnique(unique: UniqueValue, recordId: string): Promise<void> {
+    const scope = this.#scope;
+    const inserted = await this.query(`INSERT INTO record_unique_keys(space_id,collection_id,constraint_name,encoded_value,record_id)
+      VALUES($1,$2,$3,$4,$5) ON CONFLICT (space_id,collection_id,constraint_name,encoded_value) DO NOTHING
+      RETURNING record_id`, [...scopeIds(scope),unique.name,unique.encodedValue,recordId]);
+    if (inserted.rowCount) return;
+    const holder = await this.query(`SELECT r.tombstone FROM record_unique_keys u JOIN records r
+      ON r.space_id=u.space_id AND r.collection_id=u.collection_id AND r.record_id=u.record_id
+      WHERE u.space_id=$1 AND u.collection_id=$2 AND u.constraint_name=$3 AND u.encoded_value=$4`,
+    [...scopeIds(scope),unique.name,unique.encodedValue]);
+    throw new AuthorityError(holder.rows[0]?.tombstone ? 'KEY_RESERVED' : 'UNIQUE_CONFLICT');
+  }
+
+  private async writeIndex(field: IndexValue, recordId: string): Promise<void> {
+    const value = 'value' in field ? field.value : null;
+    await this.query(`INSERT INTO record_index_values(space_id,collection_id,record_id,field_name,value_kind,string_value,number_value,boolean_value,time_value)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [...scopeIds(this.#scope),recordId,field.field,field.kind,
+      field.kind === 'string' ? value : null,field.kind === 'number' ? value : null,
+      field.kind === 'boolean' ? value : null,field.kind === 'date-time' ? value : null]);
+  }
+
+  private async writeValues(change: RecordChange, recordId: string): Promise<void> {
+    if (change.operation === 'delete') return;
+    const uniqueValues = change.unique ?? [];
+    for (let i = 0; i < uniqueValues.length; i++) await this.reserveUnique(uniqueValues[i], recordId);
+    const indexValues = change.indexes ?? [];
+    for (let i = 0; i < indexValues.length; i++) await this.writeIndex(indexValues[i], recordId);
+  }
+
+  private async appendFacts(change: RecordChange, identity: string, version: { schemaVersion: number; generation: number },
+    written: { recordId: string; beforeRevision: number | null; revision: number }): Promise<Receipt> {
+    const scope = this.#scope;
+    const { recordId, beforeRevision, revision } = written;
+    const eventId = `evt_${randomUUID()}`;
+    await this.query(`INSERT INTO record_events(event_id,space_id,collection_id,record_id,revision,operation,credential_id,schema_version,canonical_data)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [eventId,...scopeIds(scope),recordId,revision,change.operation,scope.credentialId,version.schemaVersion,change.canonicalData ?? '{}']);
+    const receiptId = `rcpt_${randomUUID()}`;
+    const { committedAt, expiresAt } = await this.receiptTimes();
+    const response: Receipt = { contractVersion:'1',receiptId,spaceId:scope.spaceId,ref:{kind:'record',id:recordId},operation:change.operation,
+      beforeRevision,revision,schemaVersion:version.schemaVersion,committedAt,expiresAt,projection:{generation:version.generation,state:'pending'},replayed:false };
+    await this.query('INSERT INTO projection_outbox(event_id,space_id,collection_id,record_id,revision,generation) VALUES($1,$2,$3,$4,$5,$6)',
+      [eventId,...scopeIds(scope),recordId,revision,version.generation]);
+    const returned = copyReceipt(response);
+    this.pendingReceipts.set(identity, { response, returned: [returned], digest:change.requestDigest, collectionId:scope.collectionId, key:change.idempotencyKey });
+    return returned;
+  }
+
+  private async mutateOnce(change: RecordChange): Promise<Receipt> {
+    const scope = this.#scope;
+    if (scope.capability !== 'records:write') throw new AuthorityError('FORBIDDEN');
+    const identity = JSON.stringify([scope.spaceId,scope.credentialId,change.operation,change.idempotencyKey]);
+    const replay = await this.lookupReplay(change, identity);
+    if (replay) return replay;
+    const version = await this.currentVersion(change);
     try {
-      if (change.operation === 'create') {
-        const mode = change.normalizedExternalKey === undefined ? 'generated' : 'external';
-        await this.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
-          VALUES($1,$2,$3,1,$4,$5,$6,$7::text,$7::jsonb)`, [...scopeIds(scope),recordId,schemaVersion,mode,change.normalizedExternalKey ?? recordId,change.canonicalData]);
-      } else {
-        const updated = await this.query(`UPDATE records SET revision=revision+1,schema_version=$5,
-          canonical_data=CASE WHEN $6::boolean THEN canonical_data ELSE $7::text END,
-          data=CASE WHEN $6::boolean THEN data ELSE $7::jsonb END,
-          tombstone=$6,updated_at=clock_timestamp()
-          WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 AND revision=$4 AND NOT tombstone RETURNING revision`,
-        [...scopeIds(scope),recordId,change.expectedRevision,schemaVersion,change.operation === 'delete',change.canonicalData ?? null]);
-        if (!updated.rowCount) {
-          const exists = await this.query('SELECT 1 FROM records WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 AND NOT tombstone',
-            [...scopeIds(scope),recordId]);
-          throw new AuthorityError(exists.rowCount ? 'REVISION_CONFLICT' : 'NOT_FOUND');
-        }
-        beforeRevision = change.expectedRevision!;
-        revision = Number(updated.rows[0].revision);
-        if (change.operation === 'delete') {
-          await this.query('INSERT INTO record_tombstones(space_id,collection_id,record_id,revision) VALUES($1,$2,$3,$4)', [...scopeIds(scope),recordId,revision]);
-        } else {
-          await this.query('DELETE FROM record_unique_keys WHERE space_id=$1 AND collection_id=$2 AND record_id=$3', [...scopeIds(scope),recordId]);
-          await this.query('DELETE FROM record_index_values WHERE space_id=$1 AND collection_id=$2 AND record_id=$3', [...scopeIds(scope),recordId]);
-        }
-      }
-      if (change.operation !== 'delete') {
-        const seenUnique = new Set<string>();
-        for (const unique of change.unique ?? []) {
-          if (!scalarString(unique.name) || !scalarString(unique.encodedValue)) throw new AuthorityError('INVALID_ARGUMENT');
-          const key = JSON.stringify([unique.name,unique.encodedValue]);
-          if (seenUnique.has(key)) throw new AuthorityError('INVALID_ARGUMENT');
-          seenUnique.add(key);
-          const inserted = await this.query(`INSERT INTO record_unique_keys(space_id,collection_id,constraint_name,encoded_value,record_id)
-            VALUES($1,$2,$3,$4,$5) ON CONFLICT (space_id,collection_id,constraint_name,encoded_value) DO NOTHING
-            RETURNING record_id`, [...scopeIds(scope),unique.name,unique.encodedValue,recordId]);
-          if (!inserted.rowCount) {
-            const holder = await this.query(`SELECT r.tombstone FROM record_unique_keys u JOIN records r
-              ON r.space_id=u.space_id AND r.collection_id=u.collection_id AND r.record_id=u.record_id
-              WHERE u.space_id=$1 AND u.collection_id=$2 AND u.constraint_name=$3 AND u.encoded_value=$4`,
-            [...scopeIds(scope),unique.name,unique.encodedValue]);
-            throw new AuthorityError(holder.rows[0]?.tombstone ? 'KEY_RESERVED' : 'UNIQUE_CONFLICT');
-          }
-        }
-        const seenFields = new Set<string>();
-        for (const field of change.indexes ?? []) {
-          if (!scalarString(field.field) || seenFields.has(field.field)) throw new AuthorityError('INVALID_ARGUMENT');
-          seenFields.add(field.field);
-          const value = 'value' in field ? field.value : null;
-          if ((field.kind === 'number' && (typeof value !== 'number' || !Number.isFinite(value)))
-            || ((field.kind === 'string' || field.kind === 'date-time') && typeof value !== 'string')
-            || (field.kind === 'boolean' && typeof value !== 'boolean')
-            || !['null','string','date-time','number','boolean'].includes(field.kind)) throw new AuthorityError('INVALID_ARGUMENT');
-          await this.query(`INSERT INTO record_index_values(space_id,collection_id,record_id,field_name,value_kind,string_value,number_value,boolean_value,time_value)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [...scopeIds(scope),recordId,field.field,field.kind,
-            field.kind === 'string' ? value : null,field.kind === 'number' ? value : null,
-            field.kind === 'boolean' ? value : null,field.kind === 'date-time' ? value : null]);
-        }
-      }
-      const eventId = `evt_${randomUUID()}`;
-      await this.query(`INSERT INTO record_events(event_id,space_id,collection_id,record_id,revision,operation,credential_id,schema_version,canonical_data)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [eventId,...scopeIds(scope),recordId,revision,change.operation,scope.credentialId,schemaVersion,change.canonicalData ?? '{}']);
-      const receiptId = `rcpt_${randomUUID()}`;
-      const { committedAt, expiresAt } = await this.receiptTimes();
-      const response: Receipt = { contractVersion:'1',receiptId,spaceId:scope.spaceId,ref:{kind:'record',id:recordId},operation:change.operation,
-        beforeRevision,revision,schemaVersion,committedAt,expiresAt,projection:{generation,state:'pending'},replayed:false };
-      await this.query('INSERT INTO projection_outbox(event_id,space_id,collection_id,record_id,revision,generation) VALUES($1,$2,$3,$4,$5,$6)',
-        [eventId,...scopeIds(scope),recordId,revision,generation]);
-      const returned = copyReceipt(response);
-      this.pendingReceipts.set(identity, { response, returned: [returned], digest:change.requestDigest, collectionId:scope.collectionId, key:change.idempotencyKey });
-      return returned;
+      const written = await this.writeRecord(change, version.schemaVersion);
+      await this.writeValues(change, written.recordId);
+      return await this.appendFacts(change, identity, version, written);
     } catch (error) {
       if ((error as { code?: string }).code === '23505') {
         const constraint = (error as { constraint?: string }).constraint;
@@ -390,10 +494,12 @@ export class AuthorityTransaction {
   /** Shared AND predicate compiler for exact page, count and exists statement snapshots. */
   private compilePredicates(predicates: readonly ScalarPredicate[]) {
     if (this.#scope.capability !== 'records:read') throw new AuthorityError('FORBIDDEN');
-    if (predicates.length > 16) throw new AuthorityError('INVALID_ARGUMENT');
+    if (!Array.isArray(predicates) || predicates.length > 16) throw new AuthorityError('INVALID_ARGUMENT');
     const params: unknown[] = [...scopeIds(this.#scope)];
     const fragments: string[] = [];
-    for (const [index,predicate] of predicates.entries()) {
+    for (let index = 0; index < predicates.length; index++) {
+      const predicate = predicates[index];
+      if (!predicate) throw new AuthorityError('INVALID_ARGUMENT');
       if (!scalarString(predicate.field) || !['null','string','date-time','number','boolean'].includes(predicate.kind)) throw new AuthorityError('INVALID_ARGUMENT');
       const alias = `v${index}`;
       params.push(predicate.field,predicate.kind);
@@ -402,23 +508,12 @@ export class AuthorityTransaction {
       let compare = '';
       if (predicate.kind === 'null') {
         if (predicate.operator !== 'isNull') throw new AuthorityError('INVALID_ARGUMENT');
-      } else {
-        const column = { string:'string_value','date-time':'time_value',number:'number_value',boolean:'boolean_value' }[predicate.kind];
-        const operator = { eq:'=',lt:'<',lte:'<=',gt:'>',gte:'>=' }[predicate.operator];
-        if (!operator) throw new AuthorityError('INVALID_ARGUMENT');
-        if ((predicate.kind === 'number' && (typeof predicate.value !== 'number' || !Number.isFinite(predicate.value)))
-          || (predicate.kind === 'boolean' && typeof predicate.value !== 'boolean')
-          || ((predicate.kind === 'string' || predicate.kind === 'date-time') && typeof predicate.value !== 'string')) throw new AuthorityError('INVALID_ARGUMENT');
-        params.push(predicate.value);
-        compare = predicate.kind === 'date-time'
-          ? ` AND stateplane_instant_sort_key(${alias}.${column}) COLLATE "C" ${operator} stateplane_instant_sort_key($${params.length}::text) COLLATE "C"`
-          : ` AND ${alias}.${column} ${operator} $${params.length}`;
-      }
+      } else compare = comparison(predicate, alias, params);
       fragments.push(`EXISTS (SELECT 1 FROM record_index_values ${alias} WHERE ${alias}.space_id=r.space_id
         AND ${alias}.collection_id=r.collection_id AND ${alias}.record_id=r.record_id
         AND ${alias}.field_name=${fieldParam} AND ${alias}.value_kind=${kindParam}${compare})`);
     }
-    return { params, where:`r.space_id=$1 AND r.collection_id=$2 AND NOT r.tombstone ${fragments.map(x => `AND ${x}`).join(' ')}` };
+    return { params, where:'r.space_id=$1 AND r.collection_id=$2 AND NOT r.tombstone ' + fragments.map(x => `AND ${x}`).join(' ') };
   }
 
   /** Declaration allowlists, signed cursors and public sort behavior belong to STA-8. */
@@ -464,10 +559,12 @@ export class AuthorityTransaction {
 
   async finishOutbox(delivery: OutboxDelivery, success: boolean, error?: string): Promise<boolean> {
     if (this.#scope.capability !== 'space:admin') throw new AuthorityError('FORBIDDEN');
-    if (!isSafeInteger(delivery.attempt) || delivery.attempt < 1 || (error !== undefined && (typeof error !== 'string' || error.length > 4096))) throw new AuthorityError('INVALID_ARGUMENT');
+    if (!scalarString(delivery.eventId) || !isSafeInteger(delivery.attempt) || delivery.attempt < 1 ||
+      (error !== undefined && (typeof error !== 'string' || error.includes('\0') || error.length > 4096))) throw new AuthorityError('INVALID_ARGUMENT');
     const result = await this.query(`UPDATE projection_outbox SET delivery_state=$5,
       delivered_at=CASE WHEN $5='delivered' THEN clock_timestamp() ELSE NULL END,
-      last_error=$6,available_at=clock_timestamp()
+      last_error=$6,available_at=CASE WHEN $5='delivered' THEN clock_timestamp()
+        ELSE clock_timestamp() + (LEAST(3600, 5 * (1 << LEAST(attempts-1, 10))) * interval '1 second') END
       WHERE space_id=$1 AND collection_id=$2 AND event_id=$3 AND attempts=$4
         AND revision=$7 AND generation=$8 AND delivery_state='delivering'
         AND available_at>clock_timestamp()`,

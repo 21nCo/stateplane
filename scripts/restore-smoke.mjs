@@ -3,15 +3,22 @@ import { readFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
+import { existsSync } from 'node:fs';
 import pg from 'pg';
+import { PostgresAuthority } from '../packages/postgres/dist/index.js';
 
 if (process.env.DATABASE_URL) throw new Error('Local restore smoke uses the isolated Docker Compose database only');
 const password = (await readFile(new URL('../.data/local-db-password', import.meta.url), 'utf8')).trim();
 const root = fileURLToPath(new URL('..', import.meta.url));
+const sourceName = `stateplane_restore_source_${randomBytes(4).toString('hex')}`;
 const name = `stateplane_restore_${randomBytes(4).toString('hex')}`;
-const docker = args => execFileSync('docker', ['compose','exec','-T','postgres',...args], { cwd:root, maxBuffer:64 * 1024 * 1024 });
-const base = new pg.Pool({ connectionString:`postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:55432/stateplane` });
-const restored = new pg.Pool({ connectionString:`postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:55432/${name}` });
+const dockerExecutable = ['/usr/local/bin/docker','/opt/homebrew/bin/docker','/usr/bin/docker'].find(existsSync);
+if (!dockerExecutable) throw new Error('Docker executable not found at a supported absolute path');
+const docker = args => execFileSync(dockerExecutable, ['compose','exec','-T','postgres',...args], { cwd:root, maxBuffer:64 * 1024 * 1024 });
+const sourceUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:55432/${sourceName}`;
+const targetUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:55432/${name}`;
+const base = new pg.Pool({ connectionString:sourceUrl });
+const restored = new pg.Pool({ connectionString:targetUrl });
 const tables = ['stateplane_migrations','spaces','collections','collection_versions','collection_unique_declarations',
   'collection_index_declarations','collection_grants','records',
   'record_unique_keys','record_index_values','record_events','idempotency_receipts','record_tombstones','projection_outbox','entity_refs'];
@@ -24,12 +31,37 @@ async function snapshot(pool) {
   return result;
 }
 try {
+  docker(['createdb','-U','stateplane',sourceName]);
+  execFileSync(process.execPath,['scripts/migrate.mjs'],{cwd:root,env:{...process.env,DATABASE_URL:sourceUrl},stdio:'inherit'});
+  const spaceId=`sp_restore_${randomBytes(6).toString('hex')}`;
+  const collectionId='entries';
+  const seed=await base.connect();
+  try {
+    await seed.query('BEGIN');
+    await seed.query("INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id) VALUES($1,'owner','cell-a','cell-a','target-a')",[spaceId]);
+    await seed.query('INSERT INTO collections(space_id,collection_id) VALUES($1,$2)',[spaceId,collectionId]);
+    await seed.query("INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition) VALUES($1,$2,1,'{}')",[spaceId,collectionId]);
+    await seed.query("INSERT INTO collection_unique_declarations(space_id,collection_id,constraint_name,paths,accepted_version) VALUES($1,$2,'label',ARRAY['label'],1)",[spaceId,collectionId]);
+    await seed.query("INSERT INTO collection_index_declarations(space_id,collection_id,field_name,value_kind,filterable,sortable,ready,accepted_version) VALUES($1,$2,'score','number',TRUE,TRUE,TRUE,1)",[spaceId,collectionId]);
+    await seed.query('COMMIT');
+  } catch (error) { await seed.query('ROLLBACK'); throw error; }
+  finally { seed.release(); }
+  const authority=new PostgresAuthority(base,3600);
+  const scope={spaceId,collectionId,principalId:'owner',credentialId:'restore',capability:'records:write',policyVersion:1,placementGeneration:1};
+  const first=await authority.mutate(scope,{operation:'create',idempotencyKey:'first',requestDigest:'a'.repeat(64),canonicalData:'{"label":"one","score":1}',
+    unique:[{name:'label',encodedValue:'s:3:one'}],indexes:[{field:'score',kind:'number',value:1}]});
+  await authority.mutate(scope,{operation:'create',idempotencyKey:'second',requestDigest:'b'.repeat(64),canonicalData:'{"label":"two","score":2}',
+    unique:[{name:'label',encodedValue:'s:3:two'}],indexes:[{field:'score',kind:'number',value:2}]});
+  await authority.mutate(scope,{operation:'delete',idempotencyKey:'delete',requestDigest:'c'.repeat(64),recordId:first.ref.id,expectedRevision:1});
+  const admin={...scope,capability:'space:admin'};
+  const claimed=await authority.transaction(admin,tx=>tx.claimOutbox(1,30));
+  await authority.transaction(admin,tx=>tx.finishOutbox(claimed[0],true));
   const expected = await snapshot(base);
   assert.ok(expected.records.length && expected.record_events.length && expected.projection_outbox.length,
     'run the populated authority integration suite before the restore smoke');
-  const archive = docker(['pg_dump','-U','stateplane','-Fc','stateplane']);
+  const archive = docker(['pg_dump','-U','stateplane','-Fc',sourceName]);
   docker(['createdb','-U','stateplane',name]);
-  execFileSync('docker', ['compose','exec','-T','postgres','pg_restore','-U','stateplane','-d',name],
+  execFileSync(dockerExecutable, ['compose','exec','-T','postgres','pg_restore','-U','stateplane','-d',name],
     { cwd:root, input:archive, maxBuffer:64 * 1024 * 1024 });
   assert.deepEqual(await snapshot(restored),expected);
   const constraints = await Promise.all([base,restored].map(async pool => (await pool.query(`SELECT conname,contype
@@ -44,4 +76,5 @@ try {
 } finally {
   await Promise.allSettled([base.end(),restored.end()]);
   try { docker(['dropdb','-U','stateplane','--if-exists',name]); } catch { /* Preserve original failure. */ }
+  try { docker(['dropdb','-U','stateplane','--if-exists',sourceName]); } catch { /* Preserve original failure. */ }
 }

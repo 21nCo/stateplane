@@ -2,12 +2,32 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { randomUUID, createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { PostgresAuthority, AuthorityError, CommitOutcomeUnknownError } from '../../packages/postgres/dist/index.js';
 
 const password = process.env.DATABASE_URL ? null : (await readFile(new URL('../../.data/local-db-password', import.meta.url), 'utf8')).trim();
-const url = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:55432/stateplane`;
+const baseUrl = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:55432/stateplane`;
+const disposableName = process.env.DATABASE_URL ? null : `stateplane_test_${randomUUID().replaceAll('-', '')}`;
+const url = disposableName ? baseUrl.replace(/\/stateplane$/, `/${disposableName}`) : baseUrl;
+if (disposableName) {
+  const admin = new pg.Client({ connectionString:baseUrl });
+  await admin.connect();
+  try { await admin.query(`CREATE DATABASE ${disposableName}`); }
+  finally { await admin.end(); }
+  execFileSync(process.execPath,['scripts/migrate.mjs'],{cwd:fileURLToPath(new URL('../..',import.meta.url)),env:{...process.env,DATABASE_URL:url},stdio:'inherit'});
+}
 const pool = new pg.Pool({ connectionString: url, max: 5 });
+test.after(async () => {
+  await pool.end();
+  if (disposableName) {
+    const admin = new pg.Client({ connectionString:baseUrl });
+    await admin.connect();
+    try { await admin.query(`DROP DATABASE ${disposableName}`); }
+    finally { await admin.end(); }
+  }
+});
 const authority = new PostgresAuthority(pool, 3600);
 const digest = value => createHash('sha256').update(value).digest('hex');
 
@@ -404,12 +424,16 @@ test('a server-confirmed serialization rollback retries once without duplicate r
   const { scope,otherId } = await fixture();
   const originalId = scope.collectionId;
   let injected = false;
+  const request=change('create','retry','{"label":"retry"}');
   const retryPool = { connect: async () => {
     const client = await pool.connect();
     return { query: async (...args) => {
       if (!injected && String(args[0]).includes('pg_try_advisory_xact_lock')) {
         injected = true;
         scope.collectionId = otherId;
+        request.idempotencyKey='changed-on-retry';
+        request.requestDigest=digest('changed-on-retry');
+        request.canonicalData='{"label":"changed"}';
         await client.query("DO $$BEGIN RAISE EXCEPTION 'forced serialization' USING ERRCODE='40001'; END$$");
       }
       return client.query(...args);
@@ -417,14 +441,15 @@ test('a server-confirmed serialization rollback retries once without duplicate r
   } };
   let receipt;
   try {
-    receipt = await new PostgresAuthority(retryPool,3600).mutate(scope,change('create','retry','{"label":"retry"}'));
+    receipt = await new PostgresAuthority(retryPool,3600).mutate(scope,request);
   } finally { scope.collectionId = originalId; }
   assert.equal(injected,true);
   assert.equal(receipt.revision,1);
   assert.equal((await counts(scope.spaceId)).idempotency_receipts,1);
-  const rows = await pool.query('SELECT collection_id FROM records WHERE space_id=$1 AND record_id=$2',
+  const rows = await pool.query(`SELECT r.collection_id,r.canonical_data,i.idempotency_key FROM records r
+    JOIN idempotency_receipts i USING(space_id,collection_id,record_id) WHERE r.space_id=$1 AND r.record_id=$2`,
     [scope.spaceId,receipt.ref.id]);
-  assert.deepEqual(rows.rows.map(row => row.collection_id),[originalId]);
+  assert.deepEqual(rows.rows,[{collection_id:originalId,canonical_data:'{"label":"retry"}',idempotency_key:'retry'}]);
 });
 
 test('failed ROLLBACK discards the pooled client and its uncommitted receipt', async () => {
@@ -535,4 +560,113 @@ test('caught create, replace and patch mutation errors make the transaction roll
   }
 });
 
-test.after(async () => { await pool.end(); });
+test('overlapping same-key calls inside one transaction reserve one effect and mismatches roll back', async () => {
+  const { scope } = await fixture();
+  const request=change('create','same-transaction','{"label":"one"}');
+  const [first,second]=await authority.transaction(scope,tx=>Promise.all([tx.mutate(request),tx.mutate(request)]));
+  assert.equal(second.receiptId,first.receiptId);
+  assert.equal(second.replayed,true);
+  assert.deepEqual(await counts(scope.spaceId),{
+    records:1,record_unique_keys:0,record_index_values:0,record_events:1,idempotency_receipts:1,record_tombstones:0,projection_outbox:1
+  });
+  await assert.rejects(authority.transaction(scope,async tx => {
+    const results=await Promise.allSettled([
+      tx.mutate(change('create','mismatch','{"label":"two"}')),
+      tx.mutate(change('create','mismatch','{"label":"three"}'))
+    ]);
+    assert.equal(results.filter(result=>result.status==='rejected').length,1);
+  }),error=>error.code==='IDEMPOTENCY_MISMATCH');
+  assert.equal((await counts(scope.spaceId)).records,1);
+});
+
+test('callback interruption waits for an unawaited mutation before rollback and pool reuse', async () => {
+  const { scope } = await fixture();
+  const single=new pg.Pool({connectionString:url,max:1});
+  const repository=new PostgresAuthority(single,3600);
+  try {
+    await assert.rejects(repository.transaction(scope,async tx=>{
+      void tx.mutate(change('create','abandoned','{"label":"temporary"}'));
+      throw new Error('interrupted callback');
+    }),/interrupted callback/);
+    assert.equal((await counts(scope.spaceId)).records,0);
+    const safe=await repository.mutate(scope,change('create','after-interruption','{"label":"safe"}'));
+    assert.equal(safe.revision,1);
+    assert.equal((await counts(scope.spaceId)).record_events,1);
+  } finally { await single.end(); }
+});
+
+test('mutation facts use entry snapshots across waits and indexed list traversal', async () => {
+  const { scope } = await fixture();
+  let entered,release;
+  const queryStarted=new Promise(resolve=>entered=resolve);
+  const queryHeld=new Promise(resolve=>release=resolve);
+  const heldPool={connect:async()=>{
+    const client=await pool.connect();
+    return {query:async(sql,...args)=>{
+      if (typeof sql==='string' && sql.includes('SELECT s.lifecycle,s.placement_generation,c.lifecycle')) {
+        entered(); await queryHeld;
+      }
+      return client.query(sql,...args);
+    },release:discard=>client.release(discard)};
+  }};
+  const original=change('create','entry-key','{"label":"entry"}');
+  const moving=new PostgresAuthority(heldPool,3600).mutate(scope,original);
+  await queryStarted;
+  original.idempotencyKey='changed-key';
+  original.requestDigest=digest('changed');
+  original.canonicalData='{"label":"changed"}';
+  release();
+  const saved=await moving;
+  const facts=await pool.query(`SELECT r.canonical_data,e.canonical_data AS event_data,i.idempotency_key,i.request_digest
+    FROM records r JOIN record_events e USING(space_id,collection_id,record_id)
+    JOIN idempotency_receipts i USING(space_id,collection_id,record_id)
+    WHERE r.space_id=$1 AND r.record_id=$2`,[scope.spaceId,saved.ref.id]);
+  assert.equal(facts.rows[0].canonical_data,'{"label":"entry"}');
+  assert.equal(facts.rows[0].event_data,'{"label":"entry"}');
+  assert.equal(facts.rows[0].idempotency_key,'entry-key');
+  const unique=[{name:'label',encodedValue:'s:4:list'}];
+  unique[Symbol.iterator]=function* () {};
+  const indexed=await authority.mutate(scope,change('create','indexed','{"label":"list"}',{unique}));
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM record_unique_keys WHERE space_id=$1 AND record_id=$2',
+    [scope.spaceId,indexed.ref.id])).rows[0].n,1);
+});
+
+test('NUL in identifiers, JSON and typed values is a typed rejection without rows', async () => {
+  const { scope } = await fixture();
+  for (const request of [
+    change('create','bad\0key','{"label":"one"}'),
+    change('create','bad-json','{"label":"\\u0000"}'),
+    change('create','bad-unique','{"label":"one"}',{unique:[{name:'label',encodedValue:'bad\0key'}]}),
+    change('create','bad-index','{"label":"one"}',{indexes:[{field:'score',kind:'string',value:'bad\0value'}]})
+  ]) await assert.rejects(authority.mutate(scope,request),error=>error instanceof AuthorityError &&
+    ['INVALID_ARGUMENT','SCHEMA_INVALID'].includes(error.code));
+  assert.equal((await counts(scope.spaceId)).records,0);
+});
+
+test('original collection grant must remain live at replay commit', async () => {
+  const { scope,otherId } = await fixture();
+  const request=change('create','expiring-original','{"label":"one"}');
+  await authority.mutate(scope,request);
+  await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
+    VALUES($1,$2,$3,ARRAY['records:write'])`,[scope.spaceId,otherId,scope.credentialId]);
+  await pool.query("UPDATE collection_grants SET expires_at=clock_timestamp()+interval '300 milliseconds' WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3",
+    [scope.spaceId,scope.collectionId,scope.credentialId]);
+  await assert.rejects(authority.transaction({...scope,collectionId:otherId},async tx=>{
+    const replay=await tx.mutate(request);
+    assert.equal(replay.replayed,true);
+    await new Promise(resolve=>setTimeout(resolve,450));
+  }),error=>error.code==='FORBIDDEN');
+  assert.equal((await counts(scope.spaceId)).record_events,1);
+});
+
+test('failed outbox delivery is not claimable on every poll', async () => {
+  const { scope } = await fixture();
+  await authority.mutate(scope,change('create','backoff','{"label":"one"}'));
+  const admin={...scope,principalId:'owner',capability:'space:admin'};
+  const [delivery]=await authority.transaction(admin,tx=>tx.claimOutbox(1,30));
+  assert.equal(await authority.transaction(admin,tx=>tx.finishOutbox(delivery,false,'projection failed')),true);
+  assert.deepEqual(await authority.transaction(admin,tx=>tx.claimOutbox(1,30)),[]);
+  const row=await pool.query('SELECT delivery_state,available_at>clock_timestamp() AS delayed FROM projection_outbox WHERE event_id=$1',[delivery.eventId]);
+  assert.equal(row.rows[0].delivery_state,'degraded');
+  assert.equal(row.rows[0].delayed,true);
+});
