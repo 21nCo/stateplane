@@ -161,7 +161,7 @@ test('readOnly replays authorized receipt, stale and malformed inputs do not com
   assert.equal((await counts(scope.spaceId)).record_events,1);
 });
 
-test('an in-flight receipt cannot cause a duplicate write', async () => {
+test('an in-flight receipt returns pending before commit, then replays one effect', async () => {
   const { scope } = await fixture();
   const request = change('create','pending','{"label":"pending"}');
   let release;
@@ -176,11 +176,63 @@ test('an in-flight receipt cannot cause a duplicate write', async () => {
   });
   await inTransaction;
   const contender = authority.mutate(scope,request);
-  release();
+  try {
+    await assert.rejects(Promise.race([
+      contender,
+      new Promise((_,reject) => setTimeout(() => reject(new Error('pending response timed out while owner was held')),250))
+    ]),error => error.code === 'RECEIPT_PENDING');
+  } finally { release(); }
+  await Promise.allSettled([contender]);
   const receipt = await first;
-  assert.equal((await contender).receiptId,receipt.receiptId);
   assert.equal((await authority.mutate(scope,request)).receiptId,receipt.receiptId);
-  assert.equal((await counts(scope.spaceId)).record_events,1);
+  assert.deepEqual(await counts(scope.spaceId),{
+    records:1,record_unique_keys:0,record_index_values:0,record_events:1,
+    idempotency_receipts:1,record_tombstones:0,projection_outbox:1
+  });
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM receipt_reservations WHERE space_id=$1',[scope.spaceId])).rows[0].n,0);
+});
+
+test('receipt reservation is scoped by identity and rolls back cleanly', async () => {
+  const { scope } = await fixture();
+  const firstRequest=change('create','held-rollback','{"label":"held"}');
+  let release;
+  let entered;
+  const held=new Promise(resolve=>{release=resolve;});
+  const ready=new Promise(resolve=>{entered=resolve;});
+  const owner=authority.transaction(scope,async tx=>{
+    await tx.mutate(firstRequest);
+    entered();
+    await held;
+    throw new Error('owner interrupted before commit');
+  });
+  await ready;
+  try {
+    await assert.rejects(authority.mutate(scope,{...firstRequest,requestDigest:digest('different')}),
+      error=>error.code==='RECEIPT_PENDING');
+    const independent=await authority.mutate(scope,change('create','independent','{"label":"other"}'));
+    assert.equal(independent.revision,1);
+  } finally {release();}
+  await assert.rejects(owner,/owner interrupted/);
+  const replacement=await authority.mutate(scope,firstRequest);
+  assert.equal(replacement.replayed,false);
+  assert.deepEqual(await counts(scope.spaceId),{
+    records:2,record_unique_keys:0,record_index_values:0,record_events:2,
+    idempotency_receipts:2,record_tombstones:0,projection_outbox:2
+  });
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM receipt_reservations WHERE space_id=$1',[scope.spaceId])).rows[0].n,0);
+});
+
+test('receipt lock timeout and reservation leave no pooled session state', async () => {
+  const { scope } = await fixture();
+  const single=new pg.Pool({connectionString:url,max:1});
+  try {
+    await new PostgresAuthority(single,3600).mutate(scope,change('create','pool-clean','{"label":"clean"}'));
+    const borrowed=await single.connect();
+    try {
+      assert.equal((await borrowed.query('SHOW lock_timeout')).rows[0].lock_timeout,'0');
+      assert.equal((await borrowed.query('SELECT count(*)::int AS n FROM receipt_reservations WHERE space_id=$1',[scope.spaceId])).rows[0].n,0);
+    } finally { borrowed.release(); }
+  } finally { await single.end(); }
 });
 
 test('audit facts stay immutable while outbox delivery is leased and fenced', async () => {
@@ -621,14 +673,14 @@ test('chained mutations after callback admission closes cannot commit partial fa
   } finally { await single.end(); }
 });
 
-test('runtime mutations use row locks and no advisory SQL', async () => {
+test('runtime mutations use shared policy locks and no advisory SQL', async () => {
   const { scope } = await fixture();
-  let sawWriteLock=false;
+  let sawPolicyLock=false;
   const supportedPool={connect:async()=>{
     const client=await pool.connect();
     return {query:(sql,...args)=>{
       if (String(sql).includes('advisory')) throw new Error('Hyperdrive rejects advisory locks');
-      if (String(sql).includes('FOR UPDATE OF s,c')) sawWriteLock=true;
+      if (String(sql).includes('FOR SHARE OF s,c')) sawPolicyLock=true;
       return client.query(sql,...args);
     },release:discard=>client.release(discard)};
   }};
@@ -638,7 +690,7 @@ test('runtime mutations use row locks and no advisory SQL', async () => {
   const replay=await repository.mutate(scope,request);
   assert.equal(replay.receiptId,first.receiptId);
   assert.equal(replay.replayed,true);
-  assert.equal(sawWriteLock,true);
+  assert.equal(sawPolicyLock,true);
   assert.equal((await counts(scope.spaceId)).record_events,1);
 });
 

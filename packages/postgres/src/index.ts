@@ -249,8 +249,9 @@ export class AuthorityTransaction {
   private mutationFailed = false;
   private mutationError: unknown;
   private readonly pendingReceipts = new Map<string, { response: Receipt; returned: Receipt[]; digest: string; collectionId: CollectionId; key: string }>();
-  private readonly inFlight = new Map<string, Promise<Receipt>>();
   private readonly activeMutations = new Set<Promise<Receipt>>();
+  private mutationTail: Promise<void> = Promise.resolve();
+  private readonly reservedIdentities = new Map<string, { operation: RecordMutation; key: string }>();
   private admittingMutations = true;
   private readonly replayCollections = new Set<CollectionId>();
   readonly #scope: Readonly<AuthorityScope>;
@@ -258,14 +259,14 @@ export class AuthorityTransaction {
   constructor(private readonly client: Client, scope: AuthorityScope, private readonly retentionSeconds: number) {
     this.#scope = Object.freeze({ ...scope });
   }
-  close() { this.active = false; this.admittingMutations = false; this.inFlight.clear(); this.activeMutations.clear(); this.replayCollections.clear(); }
+  close() { this.active = false; this.admittingMutations = false; this.activeMutations.clear(); this.reservedIdentities.clear(); this.replayCollections.clear(); }
   /** A caught mutation error must not turn a partial write into a successful commit. */
   assertCommittable() {
     if (this.mutationFailed) throw this.mutationError;
   }
   sealMutations() { this.admittingMutations = false; }
-  async settleMutations() { await Promise.allSettled([...this.activeMutations]); }
-  private async query(sql: string, values: unknown[] = []) {
+  async settleMutations() { await Promise.allSettled(this.activeMutations); }
+  private query(sql: string, values: unknown[] = []) {
     if (!this.active) throw new AuthorityError('INVALID_ARGUMENT', 'Transaction ended');
     return this.client.query(sql, values);
   }
@@ -277,7 +278,7 @@ export class AuthorityTransaction {
       c.lifecycle AS collection_lifecycle, g.capabilities, g.expires_at
       FROM spaces s JOIN collections c ON c.space_id=s.space_id
       LEFT JOIN collection_grants g ON g.space_id=c.space_id AND g.collection_id=c.collection_id AND g.credential_id=$3
-      WHERE s.space_id=$1 AND c.collection_id=$2 ${capability === 'records:write' ? 'FOR UPDATE OF s,c' : 'FOR SHARE OF s,c'}`, [spaceId, collectionId, credentialId]);
+      WHERE s.space_id=$1 AND c.collection_id=$2 FOR SHARE OF s,c`, [spaceId, collectionId, credentialId]);
     const row = result.rows[0];
     if (!row) throw new AuthorityError('NOT_FOUND');
     if (Number(row.policy_version) !== policyVersion || Number(row.placement_generation) !== placementGeneration) throw new AuthorityError('FORBIDDEN', 'Policy or placement changed');
@@ -324,18 +325,24 @@ export class AuthorityTransaction {
   }
   /** Stamp receipts using the database clock after callback work, immediately before COMMIT. */
   async finalizeReceipts(): Promise<void> {
-    if (!this.pendingReceipts.size) return;
-    const { committedAt, expiresAt } = await this.receiptTimes();
-    for (const pending of this.pendingReceipts.values()) {
-      pending.response.committedAt = committedAt;
-      pending.response.expiresAt = expiresAt;
-      for (const returned of pending.returned) { returned.committedAt = committedAt; returned.expiresAt = expiresAt; }
-      await this.query(`INSERT INTO idempotency_receipts(receipt_id,space_id,collection_id,credential_id,operation,idempotency_key,request_digest,record_id,response,committed_at,expires_at)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)`, [pending.response.receiptId,this.#scope.spaceId,pending.collectionId,
-        this.#scope.credentialId,pending.response.operation,pending.key,pending.digest,pending.response.ref.id,
-        JSON.stringify(pending.response),committedAt,expiresAt]);
+    if (this.pendingReceipts.size) {
+      const { committedAt, expiresAt } = await this.receiptTimes();
+      for (const pending of this.pendingReceipts.values()) {
+        pending.response.committedAt = committedAt;
+        pending.response.expiresAt = expiresAt;
+        for (const returned of pending.returned) { returned.committedAt = committedAt; returned.expiresAt = expiresAt; }
+        await this.query(`INSERT INTO idempotency_receipts(receipt_id,space_id,collection_id,credential_id,operation,idempotency_key,request_digest,record_id,response,committed_at,expires_at)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)`, [pending.response.receiptId,this.#scope.spaceId,pending.collectionId,
+          this.#scope.credentialId,pending.response.operation,pending.key,pending.digest,pending.response.ref.id,
+          JSON.stringify(pending.response),committedAt,expiresAt]);
+      }
+      this.pendingReceipts.clear();
     }
-    this.pendingReceipts.clear();
+    for (const { operation, key } of this.reservedIdentities.values()) {
+      await this.query(`DELETE FROM receipt_reservations WHERE space_id=$1 AND credential_id=$2 AND operation=$3 AND idempotency_key=$4`,
+        [this.#scope.spaceId, this.#scope.credentialId, operation, key]);
+    }
+    this.reservedIdentities.clear();
   }
   private async authorizeOriginal(collectionId: CollectionId): Promise<void> {
     if (collectionId === this.#scope.collectionId) return;
@@ -350,20 +357,18 @@ export class AuthorityTransaction {
   }
 
   async mutate(change: RecordChange): Promise<Receipt> {
-    let identity: string | undefined;
     try {
       if (!this.admittingMutations || !this.active) throw new AuthorityError('INVALID_ARGUMENT', 'Transaction mutation admission ended');
       this.assertCommittable();
       const fixed = snapshotChange(change);
-      identity = JSON.stringify([this.#scope.spaceId,this.#scope.credentialId,fixed.operation,fixed.idempotencyKey]);
-      const prior = this.inFlight.get(identity);
-      const work = (async () => { if (prior) await prior; return this.mutateOnce(fixed); })();
-      this.inFlight.set(identity, work);
+      const tail = this.mutationTail;
+      const work = (async () => { await tail; this.assertCommittable(); return this.mutateOnce(fixed); })()
+        .catch(error => { this.mutationFailed = true; this.mutationError = error; throw error; });
+      this.mutationTail = work.then(() => {}, () => {});
       this.activeMutations.add(work);
       try { return await work; }
       finally {
         this.activeMutations.delete(work);
-        if (this.inFlight.get(identity) === work) this.inFlight.delete(identity);
       }
     }
     catch (error) {
@@ -373,10 +378,28 @@ export class AuthorityTransaction {
     }
   }
 
+  /** A unique, uncommitted row provides a Hyperdrive-compatible per-key try-lock. */
+  private async reserveIdentity(change: Readonly<RecordChange>, identity: string): Promise<void> {
+    if (this.reservedIdentities.has(identity)) return;
+    const priorTimeout = (await this.query('SHOW lock_timeout')).rows[0].lock_timeout as string;
+    await this.query('SAVEPOINT receipt_reservation');
+    try {
+      await this.query("SELECT set_config('lock_timeout','50ms',true)");
+      await this.query(`INSERT INTO receipt_reservations(space_id,credential_id,operation,idempotency_key)
+        VALUES($1,$2,$3,$4)`, [this.#scope.spaceId,this.#scope.credentialId,change.operation,change.idempotencyKey]);
+      await this.query("SELECT set_config('lock_timeout',$1,true)",[priorTimeout]);
+      await this.query('RELEASE SAVEPOINT receipt_reservation');
+      this.reservedIdentities.set(identity,{operation:change.operation,key:change.idempotencyKey});
+    } catch (error) {
+      await this.query('ROLLBACK TO SAVEPOINT receipt_reservation');
+      await this.query('RELEASE SAVEPOINT receipt_reservation');
+      if ((error as { code?: string }).code === '55P03') throw new AuthorityError('RECEIPT_PENDING');
+      throw error;
+    }
+  }
+
   private async lookupReplay(change: RecordChange, identity: string): Promise<Receipt | null> {
     const scope = this.#scope;
-    // checkScope holds a space row lock through commit, serializing receipt
-    // identities across connections without unsupported advisory locks.
     const pending = this.pendingReceipts.get(identity);
     if (pending) {
       await this.authorizeOriginal(pending.collectionId);
@@ -386,6 +409,7 @@ export class AuthorityTransaction {
       pending.returned.push(replay);
       return replay;
     }
+    await this.reserveIdentity(change,identity);
     const previous = await this.findReceipt(change.operation, change.idempotencyKey);
     if (previous) {
       await this.authorizeOriginal(previous.collectionId);

@@ -17,12 +17,12 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const sourceName = `stateplane_restore_source_${randomBytes(4).toString('hex')}`;
 const name = `stateplane_restore_${randomBytes(4).toString('hex')}`;
 const configuredDocker = process.env.STATEPLANE_DOCKER_EXECUTABLE;
-if (configuredDocker && (!isAbsolute(configuredDocker) || !existsSync(configuredDocker)))
-  throw new Error('STATEPLANE_DOCKER_EXECUTABLE must name an existing absolute executable path');
+if (configuredDocker && !isAbsolute(configuredDocker))
+  throw new Error('STATEPLANE_DOCKER_EXECUTABLE must name an absolute executable path');
 const dockerExecutable = configuredDocker ?? ['/usr/local/bin/docker','/opt/homebrew/bin/docker','/usr/bin/docker'].find(existsSync);
 if (!dockerExecutable) throw new Error('Docker executable not found; set STATEPLANE_DOCKER_EXECUTABLE to its absolute path');
 try { accessSync(dockerExecutable,constants.X_OK); }
-catch { throw new Error('Docker executable is not runnable'); }
+catch (cause) { throw new Error(`Docker executable is not runnable: ${dockerExecutable}`, { cause }); }
 const docker = args => execFileSync(dockerExecutable, ['compose','exec','-T','postgres',...args], { cwd:root, maxBuffer:64 * 1024 * 1024 });
 const sourceUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:55432/${sourceName}`;
 const targetUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:55432/${name}`;
@@ -30,14 +30,14 @@ const base = new pg.Pool({ connectionString:sourceUrl });
 const restored = new pg.Pool({ connectionString:targetUrl });
 const tables = ['stateplane_migrations','spaces','collections','collection_versions','collection_unique_declarations',
   'collection_index_declarations','collection_grants','records',
-  'record_unique_keys','record_index_values','record_events','idempotency_receipts','record_tombstones','projection_outbox','entity_refs'];
+  'record_unique_keys','record_index_values','record_events','idempotency_receipts','receipt_reservations',
+  'record_tombstones','projection_outbox','entity_refs'];
 async function snapshot(pool) {
-  const result = {};
-  for (const table of tables) {
+  const entries = await Promise.all(tables.map(async table => {
     const rows = await pool.query(`SELECT to_jsonb(t) AS value FROM ${table} t`);
-    result[table] = rows.rows.map(row => JSON.stringify(row.value)).sort();
-  }
-  return result;
+    return [table, rows.rows.map(row => JSON.stringify(row.value)).sort()];
+  }));
+  return Object.fromEntries(entries);
 }
 try {
   docker(['createdb','-U','stateplane',sourceName]);
