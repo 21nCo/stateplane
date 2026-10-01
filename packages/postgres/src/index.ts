@@ -54,6 +54,9 @@ const retryCodes = new Set(['40P01', '40001']);
 const validDigest = /^[0-9a-f]{64}$/;
 const isSafeInteger = Number.isSafeInteger;
 const utf8Compare = (a: string, b: string) => Buffer.compare(Buffer.from(a), Buffer.from(b));
+function copyReceipt(receipt: Receipt, replayed = receipt.replayed): Receipt {
+  return { ...receipt, ref: { ...receipt.ref }, projection: { ...receipt.projection }, replayed };
+}
 function scalarString(value: unknown): value is string {
   if (typeof value !== 'string' || value.length === 0) return false;
   for (let i = 0; i < value.length; i++) {
@@ -160,7 +163,7 @@ export class AuthorityTransaction {
   private active = true;
   private mutationFailed = false;
   private mutationError: unknown;
-  private readonly pendingReceipts = new Map<string, { response: Receipt; replays: Receipt[]; digest: string; collectionId: CollectionId; key: string }>();
+  private readonly pendingReceipts = new Map<string, { response: Receipt; returned: Receipt[]; digest: string; collectionId: CollectionId; key: string }>();
   readonly #scope: Readonly<AuthorityScope>;
   get scope(): Readonly<AuthorityScope> { return this.#scope; }
   constructor(private readonly client: Client, scope: AuthorityScope, private readonly retentionSeconds: number) {
@@ -234,7 +237,7 @@ export class AuthorityTransaction {
     for (const pending of this.pendingReceipts.values()) {
       pending.response.committedAt = committedAt;
       pending.response.expiresAt = expiresAt;
-      for (const replay of pending.replays) { replay.committedAt = committedAt; replay.expiresAt = expiresAt; }
+      for (const returned of pending.returned) { returned.committedAt = committedAt; returned.expiresAt = expiresAt; }
       await this.query(`INSERT INTO idempotency_receipts(receipt_id,space_id,collection_id,credential_id,operation,idempotency_key,request_digest,record_id,response,committed_at,expires_at)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)`, [pending.response.receiptId,this.#scope.spaceId,pending.collectionId,
         this.#scope.credentialId,pending.response.operation,pending.key,pending.digest,pending.response.ref.id,
@@ -278,8 +281,8 @@ export class AuthorityTransaction {
       await this.authorizeOriginal(pending.collectionId);
       if (change.operation !== 'delete') canonicalJsonObject(change.canonicalData!);
       if (pending.digest !== change.requestDigest) throw new AuthorityError('IDEMPOTENCY_MISMATCH');
-      const replay = { ...pending.response, replayed: true };
-      pending.replays.push(replay);
+      const replay = copyReceipt(pending.response, true);
+      pending.returned.push(replay);
       return replay;
     }
     const previous = await this.findReceipt(change.operation, change.idempotencyKey);
@@ -287,7 +290,7 @@ export class AuthorityTransaction {
       await this.authorizeOriginal(previous.collectionId);
       if (change.operation !== 'delete') canonicalJsonObject(change.canonicalData!);
       if (previous.requestDigest !== change.requestDigest) throw new AuthorityError('IDEMPOTENCY_MISMATCH');
-      return { ...previous.response, replayed: true };
+      return copyReceipt(previous.response, true);
     }
     await this.query(`DELETE FROM idempotency_receipts WHERE space_id=$1 AND credential_id=$2
       AND operation=$3 AND idempotency_key=$4 AND expires_at<=clock_timestamp()`,
@@ -371,8 +374,9 @@ export class AuthorityTransaction {
         beforeRevision,revision,schemaVersion,committedAt,expiresAt,projection:{generation,state:'pending'},replayed:false };
       await this.query('INSERT INTO projection_outbox(event_id,space_id,collection_id,record_id,revision,generation) VALUES($1,$2,$3,$4,$5,$6)',
         [eventId,...scopeIds(scope),recordId,revision,generation]);
-      this.pendingReceipts.set(identity, { response, replays: [], digest:change.requestDigest, collectionId:scope.collectionId, key:change.idempotencyKey });
-      return response;
+      const returned = copyReceipt(response);
+      this.pendingReceipts.set(identity, { response, returned: [returned], digest:change.requestDigest, collectionId:scope.collectionId, key:change.idempotencyKey });
+      return returned;
     } catch (error) {
       if ((error as { code?: string }).code === '23505') {
         const constraint = (error as { constraint?: string }).constraint;
@@ -465,7 +469,8 @@ export class AuthorityTransaction {
       delivered_at=CASE WHEN $5='delivered' THEN clock_timestamp() ELSE NULL END,
       last_error=$6,available_at=clock_timestamp()
       WHERE space_id=$1 AND collection_id=$2 AND event_id=$3 AND attempts=$4
-        AND revision=$7 AND generation=$8 AND delivery_state='delivering'`,
+        AND revision=$7 AND generation=$8 AND delivery_state='delivering'
+        AND available_at>clock_timestamp()`,
     [...scopeIds(this.#scope),delivery.eventId,delivery.attempt,success ? 'delivered' : 'degraded',success ? null : (error ?? 'projection failed'),
       delivery.revision,delivery.generation]);
     return result.rowCount === 1;

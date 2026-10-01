@@ -243,6 +243,52 @@ test('receipt retention starts at the database precommit clock, even after a hel
   assert.equal((await counts(scope.spaceId)).record_events,1);
 });
 
+test('caller changes to create, replace and delete receipts cannot alter saved facts or replay', async () => {
+  const { scope } = await fixture();
+  let recordId;
+  for (const [operation, key, data, extras, revision] of [
+    ['create','alias-create','{"label":"one"}',{},1],
+    ['replace','alias-replace','{"label":"two"}',() => ({recordId,expectedRevision:1}),2],
+    ['delete','alias-delete',undefined,() => ({recordId,expectedRevision:2}),3]
+  ]) {
+    const request = change(operation,key,data,typeof extras === 'function' ? extras() : extras);
+    const result = await authority.transaction(scope,async tx => {
+      const original = await tx.mutate(request);
+      const actualId = original.ref.id;
+      original.revision = 999;
+      original.ref.id = 'rec_corrupted';
+      original.projection.generation = 999;
+      const replay = await tx.mutate(request);
+      assert.equal(replay.revision,revision);
+      assert.equal(replay.ref.id,actualId);
+      assert.equal(replay.projection.generation,1);
+      replay.revision = 888;
+      replay.ref.id = 'rec_replay_corrupted';
+      replay.projection.generation = 888;
+      return {actualId,receiptId:original.receiptId};
+    });
+    recordId ??= result.actualId;
+    const saved = (await pool.query(`SELECT response,record_id FROM idempotency_receipts
+      WHERE space_id=$1 AND operation=$2 AND idempotency_key=$3`,[scope.spaceId,operation,key])).rows[0];
+    assert.equal(saved.response.revision,revision);
+    assert.equal(saved.response.ref.id,recordId);
+    assert.equal(saved.response.projection.generation,1);
+    assert.equal(saved.record_id,recordId);
+    const replay = await authority.mutate(scope,request);
+    assert.equal(replay.receiptId,result.receiptId);
+    assert.equal(replay.revision,revision);
+    assert.equal(replay.ref.id,recordId);
+    assert.equal(replay.projection.generation,1);
+    assert.equal(replay.replayed,true);
+  }
+  const record = (await pool.query('SELECT revision,tombstone FROM records WHERE space_id=$1 AND record_id=$2',
+    [scope.spaceId,recordId])).rows[0];
+  assert.deepEqual({revision:Number(record.revision),tombstone:record.tombstone},{revision:3,tombstone:true});
+  assert.deepEqual(await counts(scope.spaceId),{
+    records:1,record_unique_keys:0,record_index_values:0,record_events:3,
+    idempotency_receipts:3,record_tombstones:1,projection_outbox:3 });
+});
+
 test('date-time filters compare full UTC instants across query, count and exists', async () => {
   const { scope } = await fixture();
   await pool.query(`INSERT INTO collection_index_declarations(space_id,collection_id,field_name,value_kind,filterable,sortable,ready,accepted_version)
@@ -326,6 +372,9 @@ test('ambiguous committed response replays, expired grant denies, and expired ou
   const admin = {...scope,principalId:'owner',capability:'space:admin'};
   const first = (await authority.transaction(admin,tx => tx.claimOutbox(1,1)))[0];
   await pool.query("UPDATE projection_outbox SET available_at=clock_timestamp()-interval '1 second' WHERE event_id=$1",[first.eventId]);
+  assert.equal(await authority.transaction(admin,tx => tx.finishOutbox(first,true)),false);
+  assert.deepEqual((await pool.query('SELECT delivery_state,attempts FROM projection_outbox WHERE event_id=$1',
+    [first.eventId])).rows[0],{delivery_state:'delivering',attempts:1});
   const second = (await authority.transaction(admin,tx => tx.claimOutbox(1,1)))[0];
   assert.equal(second.attempt,first.attempt+1);
   assert.equal(await authority.transaction(admin,tx => tx.finishOutbox(first,true)),false);
