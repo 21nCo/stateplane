@@ -1,0 +1,33 @@
+migrations/007_receipt_reservations.sql
+  s_c21fd820d3c09f::t_f6d830734527f3 1-10
+package.json
+  s_59e3c54d73c9b2::t_c63f4f027cdf0f 26
+packages/postgres/src/index.ts
+  s_59e3c54d73c9b2::t_b634ef901506f8 253-254,262,268-269,281,328-343,345,364-367,381-400,412
+scripts/restore-smoke.mjs
+  s_59e3c54d73c9b2::t_eacb16bcad43b3 20-21,25,33-34,36,38-40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4110b2fbd4d2798853bd23b1f2ff4ebadd5c4d46",
+  "prompts": {},
+  "sessions": {
+    "s_59e3c54d73c9b2": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f0751ddc4ffefDYcIFxmREijJZ",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_c21fd820d3c09f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f828-b1f7-7171-a758-1b4c085d88f7",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
