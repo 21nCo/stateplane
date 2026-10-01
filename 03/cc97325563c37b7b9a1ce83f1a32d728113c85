@@ -1,0 +1,26 @@
+README.md
+  h_a39f9495f9ec1d 27
+docs/postgres-authority.md
+  h_a39f9495f9ec1d 3,13,17
+migrations/005_scoped_query_indexes.sql
+  h_a39f9495f9ec1d 1-8
+migrations/006_outbox_due_order.sql
+  h_a39f9495f9ec1d 1-6
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 44-57,74,76-78,82-109,117,126-186,196,208,211,217,227,229,243-244,250,255,286,331-337,342-351,359,382-386,393-397,399-479,481-483,497,500-502,511,516,562-563,566-567
+scripts/restore-smoke.mjs
+  h_a39f9495f9ec1d 6,8,13,15-21,34-58,62,64,79
+test/integration/postgres-authority.test.js
+  h_a39f9495f9ec1d 5-6,11-20,22-30,427,434-436,444,449-450,452,563-672
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "03cc97325563c37b7b9a1ce83f1a32d728113c85",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
