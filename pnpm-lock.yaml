@@ -17,6 +17,9 @@ importers:
       '@authfn/multi-region':
         specifier: 0.1.2
         version: 0.1.2(drizzle-orm@0.45.3(@cloudflare/workers-types@5.20260918.1)(@types/pg@8.20.0)(pg@8.22.0))
+      '@cloudflare/workers-types':
+        specifier: 5.20260918.1
+        version: 5.20260918.1
       '@datafn/core':
         specifier: 0.1.1
         version: 0.1.1

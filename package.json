@@ -8,11 +8,14 @@
   },
   "scripts": {
     "build": "turbo run build",
-    "typecheck": "turbo run typecheck",
-    "lint": "eslint packages scripts test/qualification.test.ts && node scripts/check-boundaries.mjs",
+    "typecheck": "turbo run typecheck && pnpm exec tsc -p deployment/tsconfig.json",
+    "lint": "eslint packages scripts deployment/workers test/qualification.test.ts test/qualification-worker.test.ts test/qualification-worker-postgres.test.ts test/operational-worker.test.ts && node scripts/check-boundaries.mjs",
     "test": "pnpm test:contracts && pnpm test:qualification",
+    "topology:validate": "node scripts/topology.mjs validate",
+    "topology:dry-run": "node scripts/topology-dry-run.mjs",
     "test:contracts": "node --test test/*.test.js",
-    "test:qualification": "pnpm --filter @stateplane/contracts build && pnpm --filter @stateplane/read-model build && vitest run test/qualification.test.ts && node scripts/qualify-exports.mjs",
+    "test:provider": "node --test test/connected/*.test.js",
+    "test:qualification": "pnpm --filter @stateplane/contracts build && pnpm --filter @stateplane/read-model build && vitest run test/qualification.test.ts test/qualification-worker.test.ts test/qualification-worker-postgres.test.ts test/operational-worker.test.ts && node scripts/qualify-exports.mjs",
     "test:consumer": "node scripts/test-consumer.mjs",
     "test:e2e": "playwright test",
     "db:up": "node scripts/local-db.mjs up",
@@ -21,10 +24,12 @@
     "dev:worker": "pnpm --filter @stateplane/app dev:worker",
     "worker:dry-run": "pnpm --filter @stateplane/app exec wrangler deploy --dry-run --outdir ../.data/worker-dry-run",
     "worker:package-dry-run": "pnpm --filter @stateplane/app exec wrangler deploy ../scripts/qualification-worker.ts --config wrangler.jsonc --dry-run --outdir ../.data/package-worker-dry-run",
-    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm test:consumer && pnpm worker:dry-run && pnpm worker:package-dry-run"
+    "worker:operational-dry-run": "node scripts/operational-dry-run.mjs",
+    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm test:consumer && pnpm worker:dry-run && pnpm worker:package-dry-run && pnpm worker:operational-dry-run && pnpm topology:validate && pnpm topology:dry-run"
   },
   "devDependencies": {
     "@authfn/api-keys": "0.1.2",
+    "@cloudflare/workers-types": "5.20260918.1",
     "@authfn/core": "0.1.1",
     "@authfn/multi-region": "0.1.2",
     "@datafn/core": "0.1.1",

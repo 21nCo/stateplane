@@ -1,0 +1,79 @@
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { readProtectedSqlUrls, verifySqlIdentity, verifyPgdataPlacement } from './topology-sql.mjs';
+import { validateTopology, validateDeploymentInventories, cellDatabaseName, railwayServiceName, readProtectedDeploymentInventory } from './topology.mjs';
+import { assertLiveResources } from './topology-live.mjs';
+import { readUploadedCa } from './topology-ca.mjs';
+import { readHyperdrive } from './wrangler-command.mjs';
+import { verifyOperationalBinding } from './operational-binding.mjs';
+import { verifyBindingPreflight } from './topology-verification-flow.mjs';
+import { readOperationalRailway } from './operational-railway.mjs';
+
+const [environment, inventoryPath, counterpartPath] = process.argv.slice(2);
+if (!environment || !inventoryPath || !counterpartPath || process.argv.length !== 5) {
+  console.error('Usage: node scripts/verify-topology.mjs <environment> <private-inventory.json> <private-counterpart-inventory.json>');
+  process.exit(2);
+}
+const account = process.env.STATEPLANE_RAILWAY_ACCOUNT;
+if (!account) throw new Error('STATEPLANE_RAILWAY_ACCOUNT must select a connected Composio Railway account');
+const topology = validateTopology(JSON.parse(await readFile(new URL('../deployment/topology.json', import.meta.url))));
+const inventory = await readProtectedDeploymentInventory(resolve(inventoryPath));
+const counterpart = await readProtectedDeploymentInventory(resolve(counterpartPath));
+if (environment === 'development') validateDeploymentInventories(topology, inventory, counterpart);
+else if (environment === 'production') validateDeploymentInventories(topology, counterpart, inventory);
+else throw new Error('Unknown environment');
+if (!process.env.STATEPLANE_SQL_URLS_FILE) throw new Error('STATEPLANE_SQL_URLS_FILE must select protected per-resource SQL URLs');
+if (!process.env.STATEPLANE_PGDATA_URLS_FILE) throw new Error('STATEPLANE_PGDATA_URLS_FILE must select protected per-resource settings SQL URLs');
+if (!process.env.PROBE_TOKEN || /[\r\n]/.test(process.env.PROBE_TOKEN)) throw new Error('Protected single-line PROBE_TOKEN required for operational Worker proof');
+const sqlUrlsPath = resolve(process.env.STATEPLANE_SQL_URLS_FILE);
+const sqlUrls = await readProtectedSqlUrls(sqlUrlsPath);
+const pgdataUrls = await readProtectedSqlUrls(resolve(process.env.STATEPLANE_PGDATA_URLS_FILE));
+const env = topology.environments[environment];
+
+async function hyperdrive(id, signal) {
+  const value = await readHyperdrive(id, { signal });
+  if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error('Wrangler Hyperdrive readback is invalid');
+  return value;
+}
+
+async function verify(label, definition, resource, database, serviceName) {
+  const worker = await verifyBindingPreflight(controller.signal, {
+    railway: () => readOperationalRailway(resource, { projectId: inventory.projectId,
+      environmentId: inventory.environmentId, account, signal: controller.signal }),
+    hyperdrive: () => hyperdrive(resource.hyperdriveId, controller.signal),
+    validate: (railwayReadback, hyperdriveReadback) => {
+      if (!railwayReadback.regions?.some(region => region.name === definition.railwayRegion)) throw new Error(`${label}: target Railway region unavailable to project`);
+      assertLiveResources({ label, environment, definition, resource, database, serviceName,
+        projectId: inventory.projectId, environmentId: inventory.environmentId, railway: railwayReadback, hyperdrive: hyperdriveReadback });
+    },
+    ca: hyperdriveReadback => readUploadedCa(hyperdriveReadback.mtls.ca_certificate_id, controller.signal),
+    sql: async (railwayReadback, _hyperdriveReadback, ca) => {
+      const proxy = railwayReadback.tcpProxies[0];
+      await verifyPgdataPlacement({ label, volumeInstance: railwayReadback.volumeInstance,
+        mountPath: resource.volumeMountPath, database, proxy, ca, value: pgdataUrls[label],
+        operationalRole: resource.databaseRole, signal: controller.signal });
+      await verifySqlIdentity({ label, resource, database, proxy, ca, value: sqlUrls[label], signal: controller.signal });
+    },
+    worker: () => verifyOperationalBinding(environment, label, resource, database, { signal: controller.signal })
+  });
+  console.log(`${label}: Railway ${definition.railwayRegion} service/volume, backup and PITR estimate, pinned PostgreSQL image, verified-TLS SQL identity/pgvector, cache-disabled Hyperdrive limit ${definition.originConnectionLimit}, operational Worker binding ${worker.hyperdriveId} at ${worker.name}; transaction and restore drill still required`);
+}
+
+const controller = new AbortController();
+const interrupt = () => controller.abort();
+process.once('SIGINT', interrupt);
+process.once('SIGTERM', interrupt);
+try {
+  await verify('control', env.control, inventory.control, env.control.database, railwayServiceName(env));
+  await env.cells.reduce((previous, cell) => previous.then(() =>
+    verify(cell.id, cell, inventory.cells[cell.id], cellDatabaseName(env, cell), railwayServiceName(env, cell))), Promise.resolve());
+} catch (error) {
+  let message = 'Unknown verification failure';
+  if (error instanceof Error) message = error.message;
+  if (controller.signal.aborted) message = 'Topology verification interrupted';
+  console.error(message);
+  process.exitCode = controller.signal.aborted ? 130 : 1;
+} finally {
+  process.removeListener('SIGINT', interrupt);
+  process.removeListener('SIGTERM', interrupt);
+}

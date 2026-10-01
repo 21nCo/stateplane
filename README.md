@@ -1,5 +1,7 @@
 # Stateplane foundation
 
+STA-4's [regional topology, provider budget and provisioning runbook](docs/regional-topology.md) define isolated development and production cells and a disposable Cloudflare-to-Postgres qualification path. Generated configs live under ignored `.data/`; no production route or database is inferred from a local build.
+
 Stateplane is a generic owned-state service under construction. [The v1 logical contract](contracts/v1.md) is normative; this checkout currently supplies a Cloudflare/SvelteKit foundation, package boundaries, a fixed read-model schema, and qualification probes. The `/api/health` route reports `scaffold`, not operational state readiness.
 
 ## Fresh checkout
