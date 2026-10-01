@@ -117,15 +117,20 @@ export class PostgresAuthority {
 
   /** Callback side effects are never retried. A COMMIT failure is deliberately ambiguous. */
   async transaction<T>(scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T>): Promise<T> {
+    // Capture the authenticated identity before waiting for a pooled connection.
+    const fixedScope = Object.freeze({ ...scope });
     const client = await this.pool.connect();
     let begun = false;
+    let beginAttempted = false;
     let discard = false;
     let tx: AuthorityTransaction | undefined;
     try {
+      beginAttempted = true;
       await client.query('BEGIN'); begun = true;
-      tx = new AuthorityTransaction(client, scope, this.receiptRetentionSeconds);
+      tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds);
       await tx.checkScope();
       const result = await fn(tx);
+      tx.assertCommittable();
       await tx.checkScope();
       await tx.finalizeReceipts();
       try { await client.query('COMMIT'); begun = false; }
@@ -133,14 +138,16 @@ export class PostgresAuthority {
       return result;
     } catch (error) {
       if (begun) { try { await client.query('ROLLBACK'); } catch { discard = true; } }
+      else if (beginAttempted) discard = true;
       throw error;
     } finally { tx?.close(); client.release(discard); }
   }
 
   /** Retry only server-confirmed deadlock/serialization rollbacks, never failed COMMIT. */
   async mutate(scope: AuthorityScope, change: RecordChange): Promise<Receipt> {
+    const fixedScope = Object.freeze({ ...scope });
     for (let attempt = 0; attempt < 3; attempt++) {
-      try { return await this.transaction(scope, tx => tx.mutate(change)); }
+      try { return await this.transaction(fixedScope, tx => tx.mutate(change)); }
       catch (error) {
         if (!retryCodes.has((error as { code?: string }).code ?? '') || attempt === 2) throw error;
       }
@@ -151,9 +158,19 @@ export class PostgresAuthority {
 
 export class AuthorityTransaction {
   private active = true;
+  private mutationFailed = false;
+  private mutationError: unknown;
   private readonly pendingReceipts = new Map<string, { response: Receipt; replays: Receipt[]; digest: string; collectionId: CollectionId; key: string }>();
-  constructor(private readonly client: Client, readonly scope: AuthorityScope, private readonly retentionSeconds: number) {}
+  readonly #scope: Readonly<AuthorityScope>;
+  get scope(): Readonly<AuthorityScope> { return this.#scope; }
+  constructor(private readonly client: Client, scope: AuthorityScope, private readonly retentionSeconds: number) {
+    this.#scope = Object.freeze({ ...scope });
+  }
   close() { this.active = false; }
+  /** A caught mutation error must not turn a partial write into a successful commit. */
+  assertCommittable() {
+    if (this.mutationFailed) throw this.mutationError;
+  }
   private async query(sql: string, values: unknown[] = []) {
     if (!this.active) throw new AuthorityError('INVALID_ARGUMENT', 'Transaction ended');
     return this.client.query(sql, values);
@@ -161,7 +178,7 @@ export class AuthorityTransaction {
 
   /** Hold shared policy/placement/collection locks through commit. Application policy remains explicit. */
   async checkScope(): Promise<void> {
-    const { spaceId, collectionId, principalId, credentialId, capability, policyVersion, placementGeneration } = this.scope;
+    const { spaceId, collectionId, principalId, credentialId, capability, policyVersion, placementGeneration } = this.#scope;
     const result = await this.query(`SELECT s.owner_principal_id, s.lifecycle, s.policy_version, s.placement_generation,
       c.lifecycle AS collection_lifecycle, g.capabilities, g.expires_at
       FROM spaces s JOIN collections c ON c.space_id=s.space_id
@@ -181,26 +198,26 @@ export class AuthorityTransaction {
     if (row.collection_lifecycle === 'readOnly' && capability === 'records:write') throw new AuthorityError('SPACE_UNAVAILABLE');
   }
 
-  private ref(id: string): RecordRef { return { spaceId: this.scope.spaceId, collectionId: this.scope.collectionId, id }; }
+  private ref(id: string): RecordRef { return { spaceId: this.#scope.spaceId, collectionId: this.#scope.collectionId, id }; }
   async getRecord(recordId: string, includeTombstone = false): Promise<AuthorityRecord | null> {
-    if (this.scope.capability !== 'records:read') throw new AuthorityError('FORBIDDEN');
+    if (this.#scope.capability !== 'records:read') throw new AuthorityError('FORBIDDEN');
     const result = await this.query(`SELECT record_id,revision,schema_version,canonical_data,key_mode,normalized_key,tombstone FROM records
-      WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 ${includeTombstone ? '' : 'AND NOT tombstone'}`, [...scopeIds(this.scope), recordId]);
+      WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 ${includeTombstone ? '' : 'AND NOT tombstone'}`, [...scopeIds(this.#scope), recordId]);
     const row = result.rows[0];
     return row ? { ref: this.ref(row.record_id), revision: Number(row.revision), schemaVersion: Number(row.schema_version),
       canonicalData: row.canonical_data, keyMode: row.key_mode, normalizedKey: row.normalized_key, tombstone: row.tombstone } : null;
   }
   async getByKey(mode: 'generated' | 'external', key: string): Promise<AuthorityRecord | null> {
-    if (this.scope.capability !== 'records:read') throw new AuthorityError('FORBIDDEN');
+    if (this.#scope.capability !== 'records:read') throw new AuthorityError('FORBIDDEN');
     if (!['generated','external'].includes(mode) || !scalarString(key)) throw new AuthorityError('INVALID_ARGUMENT');
     const result = await this.query(`SELECT record_id FROM records WHERE space_id=$1 AND collection_id=$2
-      AND key_mode=$3 AND normalized_key=$4 AND NOT tombstone`, [...scopeIds(this.scope), mode, key]);
+      AND key_mode=$3 AND normalized_key=$4 AND NOT tombstone`, [...scopeIds(this.#scope), mode, key]);
     return result.rows[0] ? this.getRecord(result.rows[0].record_id) : null;
   }
   private async findReceipt(operation: RecordMutation, key: string): Promise<{ collectionId: CollectionId; requestDigest: string; response: Receipt } | null> {
     const result = await this.query(`SELECT collection_id,request_digest,response FROM idempotency_receipts
       WHERE space_id=$1 AND credential_id=$2 AND operation=$3 AND idempotency_key=$4 AND expires_at>clock_timestamp()`,
-    [this.scope.spaceId, this.scope.credentialId, operation, key]);
+    [this.#scope.spaceId, this.#scope.credentialId, operation, key]);
     const row = result.rows[0];
     return row ? { collectionId: row.collection_id, requestDigest: row.request_digest, response: row.response } : null;
   }
@@ -219,19 +236,29 @@ export class AuthorityTransaction {
       pending.response.expiresAt = expiresAt;
       for (const replay of pending.replays) { replay.committedAt = committedAt; replay.expiresAt = expiresAt; }
       await this.query(`INSERT INTO idempotency_receipts(receipt_id,space_id,collection_id,credential_id,operation,idempotency_key,request_digest,record_id,response,committed_at,expires_at)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)`, [pending.response.receiptId,this.scope.spaceId,pending.collectionId,
-        this.scope.credentialId,pending.response.operation,pending.key,pending.digest,pending.response.ref.id,
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)`, [pending.response.receiptId,this.#scope.spaceId,pending.collectionId,
+        this.#scope.credentialId,pending.response.operation,pending.key,pending.digest,pending.response.ref.id,
         JSON.stringify(pending.response),committedAt,expiresAt]);
     }
     this.pendingReceipts.clear();
   }
   private async authorizeOriginal(collectionId: CollectionId): Promise<void> {
-    if (collectionId === this.scope.collectionId) return;
-    await new AuthorityTransaction(this.client, { ...this.scope, collectionId }, this.retentionSeconds).checkScope();
+    if (collectionId === this.#scope.collectionId) return;
+    await new AuthorityTransaction(this.client, { ...this.#scope, collectionId }, this.retentionSeconds).checkScope();
   }
 
   async mutate(change: RecordChange): Promise<Receipt> {
-    const { scope } = this;
+    this.assertCommittable();
+    try { return await this.mutateOnce(change); }
+    catch (error) {
+      this.mutationFailed = true;
+      this.mutationError = error;
+      throw error;
+    }
+  }
+
+  private async mutateOnce(change: RecordChange): Promise<Receipt> {
+    const scope = this.#scope;
     if (scope.capability !== 'records:write') throw new AuthorityError('FORBIDDEN');
     if (!['create','replace','patch','delete'].includes(change.operation) || !scalarString(change.idempotencyKey)
       || typeof change.requestDigest !== 'string' || !validDigest.test(change.requestDigest)) throw new AuthorityError('INVALID_ARGUMENT');
@@ -358,9 +385,9 @@ export class AuthorityTransaction {
 
   /** Shared AND predicate compiler for exact page, count and exists statement snapshots. */
   private compilePredicates(predicates: readonly ScalarPredicate[]) {
-    if (this.scope.capability !== 'records:read') throw new AuthorityError('FORBIDDEN');
+    if (this.#scope.capability !== 'records:read') throw new AuthorityError('FORBIDDEN');
     if (predicates.length > 16) throw new AuthorityError('INVALID_ARGUMENT');
-    const params: unknown[] = [...scopeIds(this.scope)];
+    const params: unknown[] = [...scopeIds(this.#scope)];
     const fragments: string[] = [];
     for (const [index,predicate] of predicates.entries()) {
       if (!scalarString(predicate.field) || !['null','string','date-time','number','boolean'].includes(predicate.kind)) throw new AuthorityError('INVALID_ARGUMENT');
@@ -418,7 +445,7 @@ export class AuthorityTransaction {
 
   /** Claim only this collection's due jobs. Attempt number fences late workers after lease expiry. */
   async claimOutbox(limit: number, leaseSeconds: number): Promise<OutboxDelivery[]> {
-    if (this.scope.capability !== 'space:admin') throw new AuthorityError('FORBIDDEN');
+    if (this.#scope.capability !== 'space:admin') throw new AuthorityError('FORBIDDEN');
     if (!isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE || !isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 3600) throw new AuthorityError('INVALID_ARGUMENT');
     const result = await this.query(`UPDATE projection_outbox o SET delivery_state='delivering',attempts=o.attempts+1,
       available_at=clock_timestamp()+($3::integer * interval '1 second')
@@ -426,20 +453,20 @@ export class AuthorityTransaction {
         AND delivery_state IN ('pending','delivering','degraded') AND available_at<=clock_timestamp()
         ORDER BY available_at,event_id FOR UPDATE SKIP LOCKED LIMIT $4) due
       WHERE o.event_id=due.event_id RETURNING o.event_id,o.record_id,o.revision,o.generation,o.attempts`,
-    [...scopeIds(this.scope),leaseSeconds,limit]);
+    [...scopeIds(this.#scope),leaseSeconds,limit]);
     return result.rows.map(row => ({ eventId:row.event_id,ref:this.ref(row.record_id),revision:Number(row.revision),
       generation:Number(row.generation),attempt:row.attempts }));
   }
 
   async finishOutbox(delivery: OutboxDelivery, success: boolean, error?: string): Promise<boolean> {
-    if (this.scope.capability !== 'space:admin') throw new AuthorityError('FORBIDDEN');
+    if (this.#scope.capability !== 'space:admin') throw new AuthorityError('FORBIDDEN');
     if (!isSafeInteger(delivery.attempt) || delivery.attempt < 1 || (error !== undefined && (typeof error !== 'string' || error.length > 4096))) throw new AuthorityError('INVALID_ARGUMENT');
     const result = await this.query(`UPDATE projection_outbox SET delivery_state=$5,
       delivered_at=CASE WHEN $5='delivered' THEN clock_timestamp() ELSE NULL END,
       last_error=$6,available_at=clock_timestamp()
       WHERE space_id=$1 AND collection_id=$2 AND event_id=$3 AND attempts=$4
         AND revision=$7 AND generation=$8 AND delivery_state='delivering'`,
-    [...scopeIds(this.scope),delivery.eventId,delivery.attempt,success ? 'delivered' : 'degraded',success ? null : (error ?? 'projection failed'),
+    [...scopeIds(this.#scope),delivery.eventId,delivery.attempt,success ? 'delivered' : 'degraded',success ? null : (error ?? 'projection failed'),
       delivery.revision,delivery.generation]);
     return result.rowCount === 1;
   }

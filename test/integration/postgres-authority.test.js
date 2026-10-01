@@ -352,22 +352,30 @@ test('concurrent external and composite conflicts leave only winning rows', asyn
 });
 
 test('a server-confirmed serialization rollback retries once without duplicate receipts', async () => {
-  const { scope } = await fixture();
+  const { scope,otherId } = await fixture();
+  const originalId = scope.collectionId;
   let injected = false;
   const retryPool = { connect: async () => {
     const client = await pool.connect();
     return { query: async (...args) => {
       if (!injected && String(args[0]).includes('pg_try_advisory_xact_lock')) {
         injected = true;
+        scope.collectionId = otherId;
         await client.query("DO $$BEGIN RAISE EXCEPTION 'forced serialization' USING ERRCODE='40001'; END$$");
       }
       return client.query(...args);
     }, release: discard => client.release(discard) };
   } };
-  const receipt = await new PostgresAuthority(retryPool,3600).mutate(scope,change('create','retry','{"label":"retry"}'));
+  let receipt;
+  try {
+    receipt = await new PostgresAuthority(retryPool,3600).mutate(scope,change('create','retry','{"label":"retry"}'));
+  } finally { scope.collectionId = originalId; }
   assert.equal(injected,true);
   assert.equal(receipt.revision,1);
   assert.equal((await counts(scope.spaceId)).idempotency_receipts,1);
+  const rows = await pool.query('SELECT collection_id FROM records WHERE space_id=$1 AND record_id=$2',
+    [scope.spaceId,receipt.ref.id]);
+  assert.deepEqual(rows.rows.map(row => row.collection_id),[originalId]);
 });
 
 test('failed ROLLBACK discards the pooled client and its uncommitted receipt', async () => {
@@ -389,6 +397,93 @@ test('failed ROLLBACK discards the pooled client and its uncommitted receipt', a
     assert.equal(receipt.replayed,false);
     assert.equal((await counts(scope.spaceId)).record_events,1);
   } finally { await single.end(); }
+});
+
+test('a transaction keeps its entry scope when the caller changes and restores its scope object', async () => {
+  const { scope, otherId } = await fixture();
+  const originalId = scope.collectionId;
+  const request = change('create','scope-snapshot','{"label":"kept"}');
+  const receipt = await authority.transaction(scope,async tx => {
+    scope.collectionId = otherId;
+    try {
+      assert.equal(tx.scope.collectionId,originalId);
+      assert.throws(() => { tx.scope.collectionId = otherId; },TypeError);
+      return await tx.mutate(request);
+    } finally { scope.collectionId = originalId; }
+  });
+  const rows = await pool.query('SELECT collection_id FROM records WHERE space_id=$1 AND record_id=$2',
+    [scope.spaceId,receipt.ref.id]);
+  assert.deepEqual(rows.rows.map(row => row.collection_id),[originalId]);
+  assert.equal((await counts(scope.spaceId)).idempotency_receipts,1);
+  const readScope = { ...scope,capability:'records:read' };
+  const read = await authority.transaction(readScope,async tx => {
+    readScope.collectionId = otherId;
+    try { return await tx.getRecord(receipt.ref.id); }
+    finally { readScope.collectionId = originalId; }
+  });
+  assert.equal(read.ref.collectionId,originalId);
+});
+
+test('a lost BEGIN response discards a possibly open transaction before pool reuse', async () => {
+  const { scope } = await fixture();
+  const single = new pg.Pool({connectionString:url,max:1});
+  let discarded;
+  const beginLossPool = { connect: async () => {
+    const client = await single.connect();
+    return {query: async (...args) => {
+      const result = await client.query(...args);
+      if (args[0] === 'BEGIN') throw new Error('lost BEGIN response');
+      return result;
+    },release: discard => { discarded = discard; client.release(discard); }};
+  } };
+  try {
+    await assert.rejects(new PostgresAuthority(beginLossPool,3600).transaction(scope,async () => {
+      throw new Error('callback must not run');
+    }),/lost BEGIN response/);
+    assert.equal(discarded,true);
+    assert.deepEqual(await counts(scope.spaceId),{
+      records:0,record_unique_keys:0,record_index_values:0,record_events:0,
+      idempotency_receipts:0,record_tombstones:0,projection_outbox:0 });
+    const borrower = await single.connect();
+    try {
+      assert.equal((await borrower.query('SELECT txid_current_if_assigned() AS id')).rows[0].id,null);
+    } finally { borrower.release(); }
+    assert.equal((await new PostgresAuthority(single,3600).mutate(scope,
+      change('create','after-begin-loss','{"label":"safe"}'))).revision,1);
+  } finally { await single.end(); }
+});
+
+test('caught create, replace and patch mutation errors make the transaction rollback-only', async () => {
+  const { scope } = await fixture();
+  const badCreate = change('create','bad-create','{"label":"bad"}',
+    {unique:[{name:'',encodedValue:'s:3:bad'}]});
+  await assert.rejects(authority.transaction(scope,async tx => {
+    await assert.rejects(tx.mutate(badCreate),error => error.code === 'INVALID_ARGUMENT');
+    return 'caught';
+  }),error => error.code === 'INVALID_ARGUMENT');
+  assert.equal((await counts(scope.spaceId)).records,0);
+
+  const initial = await authority.mutate(scope,change('create','good-create','{"label":"good","score":1}',{
+    unique:[{name:'label',encodedValue:'s:4:good'}],indexes:[{field:'score',kind:'number',value:1}]
+  }));
+  const before = await counts(scope.spaceId);
+  for (const [operation,extras] of [
+    ['replace',{unique:[{name:'',encodedValue:'s:3:bad'}]}],
+    ['patch',{indexes:[{field:'',kind:'number',value:2}]}]
+  ]) {
+    const bad = change(operation,`bad-${operation}`,'{"label":"changed","score":2}',{
+      recordId:initial.ref.id,expectedRevision:1,...extras
+    });
+    await assert.rejects(authority.transaction(scope,async tx => {
+      await assert.rejects(tx.mutate(bad),error => error.code === 'INVALID_ARGUMENT');
+      return 'caught';
+    }),error => error.code === 'INVALID_ARGUMENT');
+    assert.deepEqual(await counts(scope.spaceId),before);
+    const stored = await authority.transaction({ ...scope,capability:'records:read' },
+      tx => tx.getRecord(initial.ref.id));
+    assert.equal(stored.revision,1);
+    assert.equal(stored.canonicalData,'{"label":"good","score":1}');
+  }
 });
 
 test.after(async () => { await pool.end(); });
