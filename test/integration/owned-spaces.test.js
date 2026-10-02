@@ -419,7 +419,10 @@ test('cell pool waits and ambiguous BEGIN fail before effects and discard uncert
   const beginFailurePool = {connect:async () => {
     connections++;
     return connections === 1 ? {query:async () => ({rowCount:1}),release:() => {}} :
-      {query:async () => { throw new Error('lost BEGIN'); },release:argument => { releaseArgument=argument; }};
+      {query:async sql => {
+        if (sql.includes('AS assertion_current')) return {rows:[{assertion_current:true}]};
+        throw new Error('lost BEGIN');
+      },release:argument => { releaseArgument=argument; }};
   }};
   await assert.rejects(new PostgresCellPolicy(beginFailurePool,'cell-a',{current:async () => true},() => now)
     .run(claims,async () => { effects++; }),/lost BEGIN/);
@@ -438,6 +441,7 @@ test('cell context closes on callback return and settles unawaited work before p
   let credentialActive = true;
   let now = 1_000;
   const client = {query:async sql => {
+    if (sql.includes('AS assertion_current')) return {rows:[{assertion_current:true}]};
     if (sql.includes('SELECT s.owner_principal_id')) return {rows:[{owner_principal_id:'owner',lifecycle:'active',cell_id:'cell-a',
       policy_version:1,placement_generation:1,collection_lifecycle:'active'}]};
     return {rowCount:1};
@@ -528,6 +532,107 @@ test('database-clock nonce admission stays closed across skew and bounded cleanu
   const ahead = new PostgresCellPolicy(pool,'cell-a',{current:async () => true},() => (now+60)*1000);
   await assert.rejects(ahead.run({...claims,expiresAt:now+30,nonce:'worker-ahead'},async () => { effects++; }),denied('FORBIDDEN'));
   assert.equal(effects,0);
+});
+
+test('a nonce consumed before expiry cannot reach an effect after waiting for the cell pool', async () => {
+  const config = {database:memoryAdapter(),namespace:`sta6-pool-expiry-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user = await createUser(config,{primaryEmail:`pool-expiry-${crypto.randomUUID()}@example.invalid`});
+  const session = await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity = new AuthFnIdentityVerifier(config);
+  const owner = await identity.verify(request(session.sessionToken));
+  const spaces = new PostgresSpaces(controlPool,new Map([['cell-a',{pool,storageTargetId:'target-a'}]]),
+    'cell-a',new AuthFnAgentKeys(config),identity);
+  const {spaceId} = await spaces.create(owner);
+  const expiry = Math.floor(Date.now()/1000)+2;
+  const claims = {spaceId,collectionId:'unused',capability:'records:read',credentialId:owner.credentialId,
+    kind:'session',userPrincipalId:owner.userPrincipalId,cellId:'cell-a',policyVersion:1,placementGeneration:1,
+    audience:'stateplane-cell:cell-a',issuedAt:expiry-30,expiresAt:expiry,nonce:`wait-${crypto.randomUUID()}`};
+  let connections = 0;
+  let effects = 0;
+  const heldPool = {connect:async () => {
+    connections++;
+    if (connections === 2) await pause(Math.max(0,expiry*1000-Date.now()+50));
+    return pool.connect();
+  }};
+  const behind = new PostgresCellPolicy(heldPool,'cell-a',identity,() => (expiry-20)*1000);
+  await assert.rejects(behind.run(claims,async () => { effects++; }),denied('FORBIDDEN'));
+  assert.equal(connections,2,'nonce admission precedes the delayed effect connection');
+  assert.equal(effects,0);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM routing_nonces WHERE space_id=$1 AND nonce=$2',
+    [spaceId,claims.nonce])).rows[0].n,1,'rejected effect cannot replay the consumed assertion');
+});
+
+test('database expiry denies later record and external effects and prevents commit', async () => {
+  const claims = {spaceId:'space',collectionId:'collection',capability:'records:read',credentialId:'session',
+    kind:'session',userPrincipalId:'owner',cellId:'cell-a',policyVersion:1,placementGeneration:1,
+    audience:'stateplane-cell:cell-a',issuedAt:1,expiresAt:30,nonce:'expired-at-boundary'};
+  let databaseCurrent = true;
+  let commits = 0;
+  let recordEffects = 0;
+  let externalEffects = 0;
+  const client = {query:async sql => {
+    if (sql.includes('AS assertion_current')) return {rows:[{assertion_current:databaseCurrent}]};
+    if (sql.includes('SELECT s.owner_principal_id')) return {rows:[{owner_principal_id:'owner',lifecycle:'active',
+      cell_id:'cell-a',policy_version:1,placement_generation:1,collection_lifecycle:'active'}]};
+    if (sql === 'COMMIT') commits++;
+    return {rowCount:1};
+  },release:() => {}};
+  const policy = new PostgresCellPolicy({connect:async () => client},'cell-a',
+    {current:async () => true},() => 1000);
+  await assert.rejects(policy.run(claims,async (_principal,context) => {
+    databaseCurrent = false;
+    await context.records({transactionOnClient:async () => { recordEffects++; }},async () => {});
+  }),denied('FORBIDDEN'));
+  assert.equal(recordEffects,0);
+  databaseCurrent = true;
+  await assert.rejects(policy.run({...claims,nonce:'external-boundary'},async (_principal,context) => {
+    databaseCurrent = false;
+    await context.authorizeEffect('read');
+    externalEffects++;
+  }),denied('FORBIDDEN'));
+  assert.equal(externalEffects,0);
+  databaseCurrent = true;
+  await assert.rejects(policy.run({...claims,nonce:'commit-boundary'},async () => {
+    databaseCurrent = false;
+  }),denied('FORBIDDEN'));
+  assert.equal(commits,0);
+});
+
+test('owner audit reads use bounded stable pages and reject cross-space cursors', async () => {
+  const current = {current:async () => true};
+  const keys = {create:async () => { throw new Error('unused'); },find:async () => null,revoke:async () => {}};
+  const spaces = new PostgresSpaces(controlPool,new Map([['cell-a',{pool,storageTargetId:'target-a'}]]),
+    'cell-a',keys,current);
+  const owner = {kind:'session',credentialId:'owner-session',userPrincipalId:`owner-${crypto.randomUUID()}`};
+  const stranger = {kind:'session',credentialId:'other-session',userPrincipalId:`other-${crypto.randomUUID()}`};
+  const first = await spaces.create(owner);
+  const second = await spaces.create(owner);
+  await pool.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,action,policy_version,placement_generation,recorded_at)
+    SELECT $1 || lpad(n::text,3,'0'),$2,$3,'audit:page',1,1,clock_timestamp()
+    FROM generate_series(1,205) AS n`,[`aud_page_${crypto.randomUUID()}_`,first.spaceId,owner.userPrincipalId]);
+  const expected = (await pool.query(`SELECT audit_id FROM space_audit WHERE space_id=$1 ORDER BY recorded_at,audit_id`,
+    [first.spaceId])).rows.map(row => row.audit_id);
+  const seen = [];
+  let cursor;
+  let pages = 0;
+  do {
+    const page = await spaces.audit(owner,first.spaceId,cursor);
+    pages++;
+    assert.ok(page.entries.length <= 100);
+    assert.equal(page.entries.some(entry => 'cursor_time' in entry),false);
+    seen.push(...page.entries.map(entry => entry.audit_id));
+    cursor = page.nextCursor ?? undefined;
+  } while (cursor);
+  assert.equal(pages,3);
+  assert.deepEqual(seen,expected,'equal timestamps and page boundaries neither skip nor repeat audit rows');
+  const firstPage = await spaces.audit(owner,first.spaceId);
+  await assert.rejects(spaces.audit(owner,second.spaceId,firstPage.nextCursor),denied('INVALID_ARGUMENT'));
+  await assert.rejects(spaces.audit(owner,first.spaceId,'malformed!'),denied('INVALID_ARGUMENT'));
+  await assert.rejects(spaces.audit(stranger,first.spaceId),denied('NOT_FOUND'));
+  await spaces.archive(owner,first.spaceId);
+  assert.equal((await spaces.audit(owner,first.spaceId)).entries.length,100,
+    'archived audit history remains readable and bounded');
 });
 
 test('interrupted lifecycle publication reconciles and deleted publication retries', async () => {

@@ -18,6 +18,9 @@ export interface SpaceInfo extends DirectoryPlacement {
 }
 export interface CollectionGrant { collectionId: string; capabilities: readonly Capability[]; expiresAt?: Date }
 export interface IssuedAgentKey { id: string; secret: string; confirmation?: 'unknown' }
+export interface SpaceAuditPage { entries: ReadonlyArray<Record<string, unknown>>; nextCursor: string | null }
+/** A fixed cap bounds one owner audit read even when audit history is retained after deletion. */
+const auditPageSize = 100;
 const capabilities = new Set<Capability>(['schema:write','records:read','records:write','sources:read','sources:write','claims:read','claims:write','claims:review','events:read','export:read','space:admin']);
 const validId = (id: unknown): id is string => typeof id === 'string' && id.length > 0 && id.length <= 256 && !id.includes('\0');
 function safeVersion(value: unknown): number {
@@ -707,13 +710,36 @@ export class PostgresSpaces {
     await this.revokeAgentKey(actor,spaceId,oldKeyId);
     return this.issueAgentKey(actor,spaceId,expiresAt,grants);
   }
-  async audit(actor: VerifiedCredential, spaceId: string): Promise<ReadonlyArray<Record<string, unknown>>> {
+  async audit(actor: VerifiedCredential, spaceId: string, cursor?: string): Promise<SpaceAuditPage> {
     actor = snapshotOwner(actor);
+    let after: { recordedAt: string; auditId: string } | undefined;
+    if (cursor !== undefined) {
+      if (typeof cursor !== 'string' || cursor.length === 0 || cursor.length > 1024 || !/^[A-Za-z0-9_-]+$/.test(cursor)) {
+        throw new AuthorityError('INVALID_ARGUMENT');
+      }
+      try {
+        const decoded: unknown = JSON.parse(Buffer.from(cursor,'base64url').toString('utf8'));
+        if (!decoded || typeof decoded !== 'object' || types.isProxy(decoded)) throw new Error('Invalid cursor');
+        const value = decoded as Record<string, unknown>;
+        if (value.spaceId !== spaceId || typeof value.recordedAt !== 'string' ||
+          !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/.test(value.recordedAt) ||
+          !Number.isFinite(Date.parse(value.recordedAt)) || !validId(value.auditId)) throw new Error('Invalid cursor');
+        after = {recordedAt:value.recordedAt,auditId:value.auditId};
+      } catch { throw new AuthorityError('INVALID_ARGUMENT'); }
+    }
     const space = await this.owned(actor,spaceId);
     await this.current(actor);
-    const rows = await this.cell(space.cellId).pool.query(`SELECT audit_id,action,credential_id,policy_version,placement_generation,recorded_at,details
-      FROM space_audit WHERE space_id=$1 ORDER BY recorded_at,audit_id`,[spaceId]);
+    const rows = await this.cell(space.cellId).pool.query(`SELECT audit_id,action,credential_id,policy_version,placement_generation,recorded_at,details,
+        to_char(recorded_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_time
+      FROM space_audit WHERE space_id=$1 AND ($2::timestamptz IS NULL OR (recorded_at,audit_id)>($2::timestamptz,$3))
+      ORDER BY recorded_at,audit_id LIMIT $4`,[spaceId,after?.recordedAt ?? null,after?.auditId ?? null,auditPageSize+1]);
     await this.current(actor);
-    return rows.rows;
+    const page = rows.rows.slice(0,auditPageSize);
+    const entries = page.map(row => ({audit_id:row.audit_id,action:row.action,credential_id:row.credential_id,
+      policy_version:row.policy_version,placement_generation:row.placement_generation,
+      recorded_at:row.recorded_at,details:row.details}));
+    const last = page.at(-1);
+    return { entries, nextCursor: rows.rows.length > auditPageSize && last ?
+      Buffer.from(JSON.stringify({spaceId,recordedAt:last.cursor_time,auditId:last.audit_id})).toString('base64url') : null };
   }
 }

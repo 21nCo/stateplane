@@ -50,6 +50,11 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       ORDER BY expires_at LIMIT 32 FOR UPDATE SKIP LOCKED)`)).rowCount ?? 0;
   }
 
+  private async checkDatabaseTime(client: pg.PoolClient, claims: RouteClaims): Promise<void> {
+    const result = await client.query('SELECT to_timestamp($1) > clock_timestamp() AS assertion_current', [claims.expiresAt]);
+    if (result.rows[0]?.assertion_current !== true) throw new AuthorityError('FORBIDDEN', 'Routing assertion expired');
+  }
+
   /** Optional maintenance uses the same bounded database-clock rule as admission. */
   async cleanupExpiredNonces(): Promise<number> {
     const result = await this.pool.connect();
@@ -102,9 +107,11 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     let discard = false;
     try {
       this.checkAssertionTime(claims);
+      await this.checkDatabaseTime(client,claims);
       beginAttempted = true;
       await client.query('BEGIN'); begun = true;
       this.checkAssertionTime(claims);
+      await this.checkDatabaseTime(client,claims);
       const principalId = await this.check(client, claims);
       const scope: Readonly<AuthorityScope> = Object.freeze({ spaceId:claims.spaceId as SpaceId,collectionId:claims.collectionId as CollectionId,
         principalId,credentialId:claims.credentialId,capability:claims.capability,
@@ -117,11 +124,13 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
         const running = (async () => {
           this.checkAssertionTime(claims);
           await this.check(client,claims,requireActiveSpace);
+          await this.checkDatabaseTime(client,claims);
           if (!accepting) throw new AuthorityError('FORBIDDEN', 'Cell effect context ended');
           const value = await work();
           if (!accepting) throw new AuthorityError('FORBIDDEN', 'Cell effect context ended');
           this.checkAssertionTime(claims);
           await this.check(client,claims,requireActiveSpace);
+          await this.checkDatabaseTime(client,claims);
           if (!accepting) throw new AuthorityError('FORBIDDEN', 'Cell effect context ended');
           return value;
         })();
@@ -152,6 +161,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       // Clock-based expiry can occur while locks are held. Recheck immediately before commit.
       await this.check(client, claims);
       this.checkAssertionTime(claims);
+      await this.checkDatabaseTime(client,claims);
       try { await client.query('COMMIT'); begun = false; }
       catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
       return result;
