@@ -1,0 +1,22 @@
+docs/owned-spaces.md
+  h_a39f9495f9ec1d 17-18
+migrations/019_space_provisioning_recovery.sql
+  h_a39f9495f9ec1d 1-12
+packages/postgres/src/spaces.ts
+  h_a39f9495f9ec1d 175-184,186-215,234-235,239-267,271-276
+scripts/migration-upgrade-smoke.mjs
+  h_a39f9495f9ec1d 136,177,179
+test/integration/owned-spaces.test.js
+  h_a39f9495f9ec1d 482-483,707-713,762-872,1196,1328,1373
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bf69df96c52014b86c73df2852776d8af07c5e19",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
