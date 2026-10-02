@@ -1,0 +1,34 @@
+docs/owned-spaces.md
+  h_a39f9495f9ec1d 19-21,34
+migrations/016_existing_space_directory.sql
+  h_a39f9495f9ec1d 1-8
+migrations/017_agent_key_issuances.sql
+  h_a39f9495f9ec1d 1-16
+package.json
+  h_a39f9495f9ec1d 27
+packages/auth/src/index.ts
+  h_a39f9495f9ec1d 2,45-47,50-55
+packages/postgres/src/spaces.ts
+  h_a39f9495f9ec1d 12-13,304,310,327,338,373-402,434-435,503-510,512-516,521,524,535,541,558,561,571,580,590,592,596-604,617-618
+scripts/backfill-directory-core.mjs
+  h_a39f9495f9ec1d 1-38
+scripts/backfill-space-directory.mjs
+  h_a39f9495f9ec1d 1-18
+scripts/migration-upgrade-smoke.mjs
+  h_a39f9495f9ec1d 6-7,11,133-134,136-150,165-173,175,177
+scripts/restore-smoke.mjs
+  h_a39f9495f9ec1d 34,57,81-82
+test/integration/owned-spaces.test.js
+  h_a39f9495f9ec1d 838-969
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e146f4de94a78b047dd9e4fac65c0619b0829ae4",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
