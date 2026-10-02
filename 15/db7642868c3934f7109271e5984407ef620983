@@ -1,0 +1,20 @@
+docs/postgres-authority.md
+  h_a39f9495f9ec1d 3,13,19
+migrations/010_receipt_scope_probe_rollback.sql
+  h_a39f9495f9ec1d 1-69
+scripts/migration-upgrade-smoke.mjs
+  h_a39f9495f9ec1d 110,114,131,133
+test/integration/postgres-authority.test.js
+  h_a39f9495f9ec1d 302-369
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "15db7642868c3934f7109271e5984407ef620983",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
