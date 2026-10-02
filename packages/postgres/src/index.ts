@@ -399,29 +399,33 @@ export class AuthorityTransaction {
   private async reserveIdentity(change: Readonly<RecordChange>, identity: string): Promise<void> {
     if (this.reservedIdentities.has(identity)) return;
     this.priorLockTimeout ??= (await this.query('SHOW lock_timeout')).rows[0].lock_timeout as string;
-    await this.query('SAVEPOINT receipt_reservation');
-    try {
-      await this.query(`WITH timeout AS MATERIALIZED (SELECT set_config('lock_timeout','50ms',true) AS value),
-        scoped AS (INSERT INTO receipt_reservation_scopes(space_id,collection_id,credential_id,operation,idempotency_key)
-          SELECT $1,$2,$3,$4,$5 FROM timeout RETURNING 1)
-        INSERT INTO receipt_reservations(space_id,credential_id,operation,idempotency_key)
-          SELECT $1,$3,$4,$5 FROM scoped`,
-        [this.#scope.spaceId,this.#scope.collectionId,this.#scope.credentialId,change.operation,change.idempotencyKey]);
-      await this.query("SELECT set_config('lock_timeout',$1,true)",[this.priorLockTimeout]);
-      await this.query('RELEASE SAVEPOINT receipt_reservation');
-      this.reservedIdentities.set(identity,{operation:change.operation,key:change.idempotencyKey});
-    } catch (error) {
-      await this.query('ROLLBACK TO SAVEPOINT receipt_reservation');
-      await this.query('RELEASE SAVEPOINT receipt_reservation');
-      if ((error as { code?: string }).code === '55P03') {
+    // A timeout describes an earlier owner state. It may commit or roll back
+    // while scoped probes run, so retry the reservation before denying access.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await this.query('SAVEPOINT receipt_reservation');
+      try {
+        await this.query(`WITH timeout AS MATERIALIZED (SELECT set_config('lock_timeout','50ms',true) AS value),
+          scoped AS (INSERT INTO receipt_reservation_scopes(space_id,collection_id,credential_id,operation,idempotency_key)
+            SELECT $1,$2,$3,$4,$5 FROM timeout RETURNING 1)
+          INSERT INTO receipt_reservations(space_id,credential_id,operation,idempotency_key)
+            SELECT $1,$3,$4,$5 FROM scoped`,
+          [this.#scope.spaceId,this.#scope.collectionId,this.#scope.credentialId,change.operation,change.idempotencyKey]);
+        await this.query("SELECT set_config('lock_timeout',$1,true)",[this.priorLockTimeout]);
+        await this.query('RELEASE SAVEPOINT receipt_reservation');
+        this.reservedIdentities.set(identity,{operation:change.operation,key:change.idempotencyKey});
+        return;
+      } catch (error) {
+        await this.query('ROLLBACK TO SAVEPOINT receipt_reservation');
+        await this.query('RELEASE SAVEPOINT receipt_reservation');
+        if ((error as { code?: string }).code !== '55P03') throw error;
         await this.authorizePendingScope(change);
       }
-      throw error;
     }
+    throw new AuthorityError('FORBIDDEN');
   }
 
   /** Probe only collections whose grant is live; an unauthorized owner stays undisclosed. */
-  private async authorizePendingScope(change: Readonly<RecordChange>): Promise<never> {
+  private async authorizePendingScope(change: Readonly<RecordChange>): Promise<void> {
     const { spaceId, credentialId, principalId } = this.#scope;
     const candidates = await this.query(`SELECT c.collection_id FROM collections c JOIN spaces s ON s.space_id=c.space_id
       LEFT JOIN collection_grants g ON g.space_id=c.space_id AND g.collection_id=c.collection_id AND g.credential_id=$2
@@ -439,6 +443,9 @@ export class AuthorityTransaction {
         await this.query('ROLLBACK TO SAVEPOINT receipt_scope_probe');
         await this.query('RELEASE SAVEPOINT receipt_scope_probe');
         if ((error as { code?: string }).code === '55P03') {
+          // Candidate selection precedes the probe and may outlive a grant.
+          // Recheck both requested and original scope at the disclosure point.
+          await this.checkScope();
           await this.authorizeOriginal(row.collection_id);
           throw new AuthorityError('RECEIPT_PENDING');
         }
@@ -447,7 +454,6 @@ export class AuthorityTransaction {
       await this.query('ROLLBACK TO SAVEPOINT receipt_scope_probe');
       await this.query('RELEASE SAVEPOINT receipt_scope_probe');
     }
-    throw new AuthorityError('FORBIDDEN');
   }
 
   private async lookupReplay(change: RecordChange, identity: string): Promise<Receipt | null> {

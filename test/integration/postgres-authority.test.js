@@ -76,6 +76,15 @@ async function counts(spaceId) {
   return result;
 }
 
+async function within(promise, milliseconds = 3000) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`operation did not settle within ${milliseconds} ms`)), milliseconds);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
 test('atomic mutation, real competing writers, rollback, replay and scope', async () => {
   const { scope, otherId } = await fixture();
   const first = change('create','create-a','{"label":"A","score":1}', {
@@ -177,10 +186,7 @@ test('an in-flight receipt returns pending before commit, then replays one effec
   await inTransaction;
   const contender = authority.mutate(scope,request);
   try {
-    await assert.rejects(Promise.race([
-      contender,
-      new Promise((_,reject) => setTimeout(() => reject(new Error('pending response timed out while owner was held')),250))
-    ]),error => error.code === 'RECEIPT_PENDING');
+    await assert.rejects(within(contender,250),error => error.code === 'RECEIPT_PENDING');
   } finally { release(); }
   await Promise.allSettled([contender]);
   const receipt = await first;
@@ -213,7 +219,7 @@ test('a pending identity cannot disclose an expired original collection grant', 
   await ready;
   await new Promise(resolve=>setTimeout(resolve,450));
   try {
-    await assert.rejects(authority.mutate({...scope,collectionId:otherId},request),
+    await assert.rejects(within(authority.mutate({...scope,collectionId:otherId},request)),
       error=>error.code==='FORBIDDEN');
   } finally {release();}
   await assert.rejects(owner,error=>error.code==='FORBIDDEN');
@@ -240,7 +246,7 @@ test('a cross-collection retry with both grants gets pending, then the original 
   });
   await ready;
   try {
-    await assert.rejects(authority.mutate({...scope,collectionId:otherId},request),
+    await assert.rejects(within(authority.mutate({...scope,collectionId:otherId},request)),
       error=>error.code==='RECEIPT_PENDING');
   } finally {release();}
   const original=await owner;
@@ -253,6 +259,153 @@ test('a cross-collection retry with both grants gets pending, then the original 
   });
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM receipt_reservation_scopes WHERE space_id=$1',[scope.spaceId])).rows[0].n,0);
 });
+
+function delayedPendingPool() {
+  let signal, unblock;
+  const reached = new Promise(resolve => { signal = resolve; });
+  const gated = new Promise(resolve => { unblock = resolve; });
+  const delayed = { connect: async () => {
+    const client = await pool.connect();
+    return { query: async (sql, values) => {
+      const result = await client.query(sql, values);
+      if (String(sql).startsWith('SELECT c.collection_id FROM collections c')) {
+        signal();
+        await gated;
+      }
+      return result;
+    }, release: discard => client.release(discard) };
+  } };
+  return { repository: new PostgresAuthority(delayed, 3600), reached, unblock: () => unblock() };
+}
+
+for (const outcome of ['commit','rollback']) for (const crossCollection of [false,true]) {
+  test(`pending owner ${outcome} during ${crossCollection ? 'cross' : 'same'}-collection probe resolves the identity`, async () => {
+    const { scope,otherId } = await fixture();
+    if (crossCollection) await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
+      VALUES($1,$2,$3,ARRAY['records:write']::text[])`,[scope.spaceId,otherId,scope.credentialId]);
+    const requested = crossCollection ? {...scope,collectionId:otherId} : scope;
+    const request=change('create',`probe-${outcome}-${crossCollection}`,'{"label":"held"}');
+    let releaseOwner, ownerEntered;
+    const held=new Promise(resolve=>{releaseOwner=resolve;});
+    const ready=new Promise(resolve=>{ownerEntered=resolve;});
+    const owner=authority.transaction(scope,async tx=>{
+      const receipt=await tx.mutate(request);
+      ownerEntered();
+      await held;
+      if (outcome==='rollback') throw new Error('injected owner rollback');
+      return receipt;
+    });
+    await ready;
+    const gate=delayedPendingPool();
+    const contender=gate.repository.mutate(requested,request);
+    try {
+      await within(gate.reached);
+      releaseOwner();
+      const original=await Promise.allSettled([owner]);
+      gate.unblock();
+      const result=await within(contender);
+      if (outcome==='commit') {
+        assert.equal(original[0].status,'fulfilled');
+        assert.equal(result.receiptId,original[0].value.receiptId);
+        assert.equal(result.replayed,true);
+      } else {
+        assert.equal(original[0].status,'rejected');
+        assert.equal(result.replayed,false);
+        const stored=await pool.query('SELECT collection_id FROM records WHERE space_id=$1 AND record_id=$2',
+          [scope.spaceId,result.ref.id]);
+        assert.equal(stored.rows[0].collection_id,requested.collectionId);
+      }
+    } finally {
+      gate.unblock();
+      releaseOwner();
+      await Promise.allSettled([contender,owner]);
+    }
+    assert.equal((await counts(scope.spaceId)).record_events,1);
+    assert.equal((await counts(scope.spaceId)).idempotency_receipts,1);
+    assert.equal((await counts(scope.spaceId)).projection_outbox,1);
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM receipt_reservations WHERE space_id=$1',[scope.spaceId])).rows[0].n,0);
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM receipt_reservation_scopes WHERE space_id=$1',[scope.spaceId])).rows[0].n,0);
+  });
+}
+
+for (const operation of ['replace','patch','delete']) {
+  test(`${operation} retry replays when its owner commits during the pending probe`, async () => {
+    const { scope }=await fixture();
+    const initial=await authority.mutate(scope,change('create',`initial-${operation}`,'{"label":"before"}'));
+    const request=change(operation,`probe-${operation}`,
+      operation==='delete' ? undefined : '{"label":"after"}',
+      {recordId:initial.ref.id,expectedRevision:1});
+    let releaseOwner, ownerEntered;
+    const held=new Promise(resolve=>{releaseOwner=resolve;});
+    const ready=new Promise(resolve=>{ownerEntered=resolve;});
+    const owner=authority.transaction(scope,async tx=>{
+      const receipt=await tx.mutate(request);
+      ownerEntered();
+      await held;
+      return receipt;
+    });
+    await ready;
+    const gate=delayedPendingPool();
+    const contender=gate.repository.mutate(scope,request);
+    try {
+      await within(gate.reached);
+      releaseOwner();
+      const original=await owner;
+      gate.unblock();
+      const replay=await within(contender);
+      assert.equal(replay.receiptId,original.receiptId);
+      assert.equal(replay.replayed,true);
+    } finally {
+      gate.unblock();
+      releaseOwner();
+      await Promise.allSettled([contender,owner]);
+    }
+    const result=await counts(scope.spaceId);
+    assert.equal(result.record_events,2);
+    assert.equal(result.idempotency_receipts,2);
+    assert.equal(result.projection_outbox,2);
+    assert.equal(result.record_tombstones,operation==='delete' ? 1 : 0);
+  });
+}
+
+for (const expiringCollection of ['requested-same','requested-cross','original-cross']) {
+  test(`pending probe denies disclosure after ${expiringCollection} grant expiry`, async () => {
+    const { scope,otherId }=await fixture();
+    const crossCollection=expiringCollection!=='requested-same';
+    if (crossCollection) await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
+      VALUES($1,$2,$3,ARRAY['records:write']::text[])`,[scope.spaceId,otherId,scope.credentialId]);
+    const expiringId=expiringCollection==='requested-cross' ? otherId : scope.collectionId;
+    await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '500 milliseconds'
+      WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[scope.spaceId,expiringId,scope.credentialId]);
+    const requested=crossCollection ? {...scope,collectionId:otherId} : scope;
+    const request=change('create',`expiry-${expiringCollection}`,'{"label":"held"}');
+    let releaseOwner, ownerEntered;
+    const held=new Promise(resolve=>{releaseOwner=resolve;});
+    const ready=new Promise(resolve=>{ownerEntered=resolve;});
+    const owner=authority.transaction(scope,async tx=>{
+      await tx.mutate(request);
+      ownerEntered();
+      await held;
+    });
+    await ready;
+    const gate=delayedPendingPool();
+    const contender=gate.repository.mutate(requested,request);
+    try {
+      await within(gate.reached);
+      await new Promise(resolve=>setTimeout(resolve,550));
+      gate.unblock();
+      await assert.rejects(within(contender),error=>error.code==='FORBIDDEN');
+    } finally {
+      gate.unblock();
+      releaseOwner();
+      await Promise.allSettled([contender,owner]);
+    }
+    const result=await counts(scope.spaceId);
+    assert.equal(result.record_events,expiringCollection==='requested-cross' ? 1 : 0);
+    assert.equal(result.idempotency_receipts,result.record_events);
+    assert.equal(result.projection_outbox,result.record_events);
+  });
+}
 
 test('unawaited outbox writes drain before commit and rollback on callback failure', async () => {
   const { scope } = await fixture();

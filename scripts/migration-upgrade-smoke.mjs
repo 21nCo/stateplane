@@ -19,7 +19,7 @@ const dropDatabase = async name => {
 const recoverInterrupted = async () => {
   const directory=new URL('../.data/',import.meta.url);
   for (const filename of await readdir(directory)) {
-    if (!/^migration-upgrade-[0-9]+-[0-9a-f]{12}\.json$/.test(filename)) continue;
+    if (!/^migration-upgrade-\d+-[0-9a-f]{12}\.json$/.test(filename)) continue;
     const path=new URL(filename,directory);
     const entry=JSON.parse(await readFile(path,'utf8'));
     if (!Number.isSafeInteger(entry.pid) || !Array.isArray(entry.names) ||
