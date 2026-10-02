@@ -1,0 +1,21 @@
+scripts/migrate.mjs
+  s_f35acf97713caf::t_ecd06a58d883ac 29-35
+scripts/migration-index-race-smoke.mjs
+  s_f35acf97713caf::t_69188ec283389f 1-196
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "415e957d2df4d2f3da01457cfe71d9decfa46a38",
+  "prompts": {},
+  "sessions": {
+    "s_f35acf97713caf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0fc84-64a0-7e21-abe8-470ad56e7650",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
