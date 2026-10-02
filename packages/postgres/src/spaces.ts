@@ -372,12 +372,20 @@ export class PostgresSpaces {
 
   /** The control journal survives cell erasure and ambiguous cell commits. */
   private async cleanupIssuances(space: SpaceInfo, force: boolean): Promise<void> {
-    const pending = await this.control.query(`SELECT issuance_id,credential_id,owner_principal_id,cell_id
-      FROM agent_key_issuances WHERE space_id=$1 AND provider_revoked_at IS NULL ORDER BY created_at,issuance_id`,[space.spaceId]);
+    const pending = await this.control.query(`SELECT issuance_id,credential_id,owner_principal_id,cell_id,create_failed_at
+      FROM agent_key_issuances WHERE space_id=$1 AND provider_revoked_at IS NULL
+        AND settled_without_key_at IS NULL ORDER BY created_at,issuance_id`,[space.spaceId]);
     for (const row of pending.rows) {
       if (row.owner_principal_id !== space.ownerPrincipalId || row.cell_id !== space.cellId) throw new AuthorityError('STALE_PLACEMENT');
       const id = row.credential_id ?? await this.keys.find(space.ownerPrincipalId,row.issuance_id);
       if (!id) {
+        if (row.create_failed_at) {
+          // The create promise rejected. A successful provider lookup now proves
+          // that no bearer was issued, even if lookup was unavailable at failure.
+          await this.control.query(`UPDATE agent_key_issuances SET settled_without_key_at=clock_timestamp()
+            WHERE issuance_id=$1 AND credential_id IS NULL AND settled_without_key_at IS NULL`,[row.issuance_id]);
+          continue;
+        }
         if (force) throw new AuthorityError('STALE_PLACEMENT','Provider issuance has not settled');
         continue;
       }
@@ -388,7 +396,8 @@ export class PostgresSpaces {
         LEFT JOIN space_credentials sc ON sc.space_id=s.space_id AND sc.credential_id=$2
         WHERE s.space_id=$1`,[space.spaceId,id]);
       const record = local.rows[0];
-      if (!force && record?.confirmed_at && !record.revoked_at && record.lifecycle === 'active') continue;
+      if (!force && record?.confirmed_at && !record.revoked_at &&
+        ['active','readOnly','suspended'].includes(record.lifecycle)) continue;
       if (record && record.lifecycle !== 'deleted' && record.confirmed_at == null && record.revoked_at == null)
         await this.failIssuedKey(cell,space.spaceId,space.ownerPrincipalId,id);
       await this.keys.revoke(id,space.ownerPrincipalId);
@@ -429,7 +438,7 @@ export class PostgresSpaces {
     const row = control.rows[0];
     if (!row) throw new AuthorityError('NOT_FOUND');
     const first = await this.cell(row.cell_id).pool.query(`SELECT * FROM spaces WHERE space_id=$1`,[spaceId]);
-    if (first.rows[0] && (first.rows[0].owner_principal_id !== row.owner_principal_id || first.rows[0].cell_id !== row.cell_id ||
+    if (!first.rows[0] || (first.rows[0].owner_principal_id !== row.owner_principal_id || first.rows[0].cell_id !== row.cell_id ||
       first.rows[0].storage_target_id !== row.storage_target_id)) throw new AuthorityError('STALE_PLACEMENT');
     await this.cleanupIssuances(info(row),row.lifecycle === 'deleted' || first.rows[0]?.lifecycle === 'deleting' ||
       first.rows[0]?.lifecycle === 'deleted');
@@ -445,18 +454,20 @@ export class PostgresSpaces {
     }
     const current = await this.cell(row.cell_id).pool.query(`SELECT * FROM spaces WHERE space_id=$1`,[spaceId]);
     const local = current.rows[0];
+    if (!local || local.owner_principal_id !== row.owner_principal_id || local.cell_id !== row.cell_id ||
+      local.storage_target_id !== row.storage_target_id) throw new AuthorityError('STALE_PLACEMENT');
     if (row.lifecycle === 'deleted') {
-      if (local && !await this.erased(this.cell(row.cell_id),spaceId)) throw new AuthorityError('STALE_PLACEMENT');
+      if (!await this.erased(this.cell(row.cell_id),spaceId)) throw new AuthorityError('STALE_PLACEMENT');
       return info(row);
     }
-    const lifecycle = local?.lifecycle ?? 'deleted';
-    if (local && (safeVersion(local.policy_version) < safeVersion(row.policy_version) ||
-      safeVersion(local.placement_generation) < safeVersion(row.placement_generation))) throw new AuthorityError('STALE_PLACEMENT');
+    const lifecycle = local.lifecycle;
+    if (safeVersion(local.policy_version) < safeVersion(row.policy_version) ||
+      safeVersion(local.placement_generation) < safeVersion(row.placement_generation)) throw new AuthorityError('STALE_PLACEMENT');
     const updated = await this.control.query(`UPDATE space_directory SET lifecycle=$2,policy_version=$3,
       placement_generation=$4,updated_at=clock_timestamp()
       WHERE space_id=$1 AND lifecycle=$5 AND policy_version=$6 AND placement_generation=$7
         AND cell_id=$8 AND owner_principal_id=$9 AND storage_target_id=$10 RETURNING *`,
-    [spaceId,lifecycle,local?.policy_version ?? row.policy_version,local?.placement_generation ?? row.placement_generation,
+    [spaceId,lifecycle,local.policy_version,local.placement_generation,
       row.lifecycle,row.policy_version,row.placement_generation,row.cell_id,row.owner_principal_id,row.storage_target_id]);
     if (!updated.rows[0]) throw new AuthorityError('STALE_PLACEMENT');
     return info(updated.rows[0]);
@@ -508,8 +519,11 @@ export class PostgresSpaces {
     [issuanceId,spaceId,owner(actor),space.cellId,space.policyVersion,space.placementGeneration]);
     if (reserved.rowCount !== 1) throw new AuthorityError('STALE_PLACEMENT');
     let created: {id: string; secret: string} | undefined;
+    let createFailed = false;
     try {
-      const issued = await this.keys.create(owner(actor),new Date(expiryMs),issuanceId);
+      let issued: {id: string; secret: string};
+      try { issued = await this.keys.create(owner(actor),new Date(expiryMs),issuanceId); }
+      catch (error) { createFailed = true; throw error; }
       created = issued;
       if (!validId(issued.id)) throw new AuthorityError('INVALID_ARGUMENT','Provider returned an invalid key ID');
       await this.control.query(`UPDATE agent_key_issuances SET credential_id=$2
@@ -591,6 +605,26 @@ export class PostgresSpaces {
       }
       return issued;
     } catch (error) {
+      if (createFailed) {
+        // The create call has settled, but a lost provider acknowledgement can
+        // still hide a key. Correlation readback must succeed before declaring
+        // an empty issuance settled; provider outages leave it retryable.
+        await this.control.query(`UPDATE agent_key_issuances SET create_failed_at=clock_timestamp()
+          WHERE issuance_id=$1 AND create_failed_at IS NULL`,[issuanceId]).catch(() => {});
+        let found: string | null | undefined;
+        try { found = await this.keys.find(owner(actor),issuanceId); }
+        catch { found = undefined; }
+        if (found === null) await this.control.query(`UPDATE agent_key_issuances
+          SET settled_without_key_at=clock_timestamp() WHERE issuance_id=$1 AND credential_id IS NULL
+            AND provider_revoked_at IS NULL AND settled_without_key_at IS NULL`,[issuanceId]);
+        else if (found) {
+          await this.control.query(`UPDATE agent_key_issuances SET credential_id=$2
+            WHERE issuance_id=$1 AND (credential_id IS NULL OR credential_id=$2)`,[issuanceId,found]).catch(() => {});
+          await this.keys.revoke(found,owner(actor)).then(() => this.control.query(`UPDATE agent_key_issuances
+            SET credential_id=$2,provider_revoked_at=clock_timestamp()
+            WHERE issuance_id=$1 AND (credential_id IS NULL OR credential_id=$2)`,[issuanceId,found])).catch(() => {});
+        }
+      }
       // Compensation is cell-first so an interrupted directory publication or
       // later reconcile cannot turn a rejected issuance into usable authority.
       if (created) {

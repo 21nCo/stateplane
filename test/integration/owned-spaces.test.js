@@ -835,6 +835,171 @@ test('reconcile and delete refuse a deleted directory with unpurged cell content
   await spaces.reconcile(spaceId);
 });
 
+test('failed provider creation settles an empty journal for issue and rotation, while uncertain creation stays recoverable', async () => {
+  const config={database:memoryAdapter(),namespace:`sta6-create-failure-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user=await createUser(config,{primaryEmail:`create-failure-${crypto.randomUUID()}@example.invalid`});
+  const session=await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity=new AuthFnIdentityVerifier(config);
+  const actor=await identity.verify(request(session.sessionToken));
+  const actual=new AuthFnAgentKeys(config);
+  let mode='normal'; let lastIssued; let revokeOffline=false; let findOffline=false;
+  const keys={
+    create:async (...args) => {
+      if (mode==='empty') throw new Error('provider create rejected');
+      const issued=await actual.create(...args);
+      lastIssued=issued;
+      if (mode==='lost-ack') throw new Error('provider create acknowledgement lost');
+      return issued;
+    },
+    find:(...args)=>{if(findOffline) throw new Error('provider lookup offline');return actual.find(...args);},
+    revoke:async (...args)=>{if(revokeOffline) throw new Error('provider revoke offline');return actual.revoke(...args);},
+  };
+  const cells=new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
+  const spaces=new PostgresSpaces(controlPool,cells,'cell-a',keys,identity);
+  const {spaceId}=await spaces.create(actor);
+  const collectionId=`entries_${crypto.randomUUID()}`;
+  await collection(spaceId,collectionId);
+  const expires=new Date(Date.now()+3_600_000);
+  const grants=[{collectionId,capabilities:['records:read']}];
+  mode='empty';findOffline=true;
+  await assert.rejects(spaces.issueAgentKey(actor,spaceId,expires,grants),/provider create rejected/);
+  let journal=(await controlPool.query(`SELECT credential_id,provider_revoked_at,settled_without_key_at,create_failed_at
+    FROM agent_key_issuances WHERE space_id=$1 ORDER BY created_at`,[spaceId])).rows;
+  assert.equal(journal.length,1);
+  assert.equal(journal[0].credential_id,null);
+  assert.equal(journal[0].provider_revoked_at,null);
+  assert.equal(journal[0].settled_without_key_at,null);
+  assert.ok(journal[0].create_failed_at);
+  await assert.rejects(spaces.reconcile(spaceId),/provider lookup offline/);
+  findOffline=false;
+  await spaces.reconcile(spaceId);
+  assert.ok((await controlPool.query(`SELECT settled_without_key_at FROM agent_key_issuances
+    WHERE space_id=$1`,[spaceId])).rows[0].settled_without_key_at);
+  await assert.rejects(spaces.issueAgentKey(actor,spaceId,expires,grants),/provider create rejected/);
+  mode='normal';
+  const old=await spaces.issueAgentKey(actor,spaceId,expires,grants);
+  mode='empty';
+  await assert.rejects(spaces.rotateAgentKey(actor,spaceId,old.id,expires,grants),/provider create rejected/);
+  journal=(await controlPool.query(`SELECT credential_id,settled_without_key_at
+    FROM agent_key_issuances WHERE space_id=$1 AND credential_id IS NULL`,[spaceId])).rows;
+  assert.equal(journal.length,3);
+  assert.ok(journal.every(row=>row.settled_without_key_at));
+  await spaces.reconcile(spaceId);
+  const signer=new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const router=new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
+  await assert.rejects(router.assertion(request(old.secret),spaceId,collectionId,'records:read'),denied('UNAUTHENTICATED'));
+  mode='lost-ack';revokeOffline=true;
+  await assert.rejects(spaces.issueAgentKey(actor,spaceId,expires,grants),/provider create acknowledgement lost/);
+  await assert.rejects(router.assertion(request(lastIssued.secret),spaceId,collectionId,'records:read'),denied('NOT_FOUND'));
+  journal=(await controlPool.query(`SELECT credential_id,settled_without_key_at FROM agent_key_issuances
+    WHERE space_id=$1 AND credential_id=$2`,[spaceId,lastIssued.id])).rows;
+  assert.equal(journal.length,1);
+  assert.equal(journal[0].settled_without_key_at,null);
+  await assert.rejects(spaces.reconcile(spaceId),/provider revoke offline/);
+  revokeOffline=false;
+  await spaces.reconcile(spaceId);
+  await assert.rejects(router.assertion(request(lastIssued.secret),spaceId,collectionId,'records:read'),denied('UNAUTHENTICATED'));
+  await spaces.archive(actor,spaceId);
+  await spaces.delete(actor,spaceId);
+  await spaces.delete(actor,spaceId);
+  assert.equal((await pool.query(`SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1
+    AND action='space:deleted'`,[spaceId])).rows[0].n,1);
+});
+
+test('reconcile fails closed when the configured cell is missing or points at another database', async () => {
+  const config={database:memoryAdapter(),namespace:`sta6-missing-cell-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user=await createUser(config,{primaryEmail:`missing-cell-${crypto.randomUUID()}@example.invalid`});
+  const session=await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity=new AuthFnIdentityVerifier(config);
+  const actor=await identity.verify(request(session.sessionToken));
+  const actual=new AuthFnAgentKeys(config);
+  const correct=new PostgresSpaces(controlPool,new Map([['cell-a',{pool,storageTargetId:'target-a'}]]),'cell-a',actual,identity);
+  const {spaceId}=await correct.create(actor);
+  const wrong=new PostgresSpaces(controlPool,new Map([['cell-a',{pool:cellBPool,storageTargetId:'target-a'}]]),
+    'cell-a',actual,identity);
+  await assert.rejects(wrong.reconcile(spaceId),denied('STALE_PLACEMENT'));
+  assert.equal((await controlPool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1',[spaceId])).rows[0].lifecycle,'active');
+  assert.equal((await correct.reconcile(spaceId)).lifecycle,'active');
+  const missingPool={query:(sql,args)=>typeof sql==='string' && sql.includes('SELECT * FROM spaces WHERE space_id=$1')
+    ? Promise.resolve({rows:[],rowCount:0}) : pool.query(sql,args),connect:()=>pool.connect()};
+  const missing=new PostgresSpaces(controlPool,new Map([['cell-a',{pool:missingPool,storageTargetId:'target-a'}]]),
+    'cell-a',actual,identity);
+  await assert.rejects(missing.reconcile(spaceId),denied('STALE_PLACEMENT'));
+  assert.equal((await controlPool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1',[spaceId])).rows[0].lifecycle,'active');
+  assert.equal((await correct.reconcile(spaceId)).lifecycle,'active');
+});
+
+test('interrupted create with no settled outcome blocks erasure until provider readback can settle it', async () => {
+  const config={database:memoryAdapter(),namespace:`sta6-create-stop-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user=await createUser(config,{primaryEmail:`create-stop-${crypto.randomUUID()}@example.invalid`});
+  const session=await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity=new AuthFnIdentityVerifier(config);
+  const actor=await identity.verify(request(session.sessionToken));
+  const keys=new AuthFnAgentKeys(config);
+  const spaces=new PostgresSpaces(controlPool,new Map([['cell-a',{pool,storageTargetId:'target-a'}]]),
+    'cell-a',keys,identity);
+  const {spaceId}=await spaces.create(actor);
+  const issuanceId=`iss_${crypto.randomUUID()}`;
+  await controlPool.query(`INSERT INTO agent_key_issuances(issuance_id,space_id,owner_principal_id,cell_id)
+    VALUES($1,$2,$3,'cell-a')`,[issuanceId,spaceId,user.id]);
+  await spaces.archive(actor,spaceId);
+  await assert.rejects(spaces.delete(actor,spaceId),denied('STALE_PLACEMENT'));
+  assert.equal((await pool.query('SELECT lifecycle FROM spaces WHERE space_id=$1',[spaceId])).rows[0].lifecycle,'deleting');
+  assert.equal((await controlPool.query(`SELECT settled_without_key_at FROM agent_key_issuances
+    WHERE issuance_id=$1`,[issuanceId])).rows[0].settled_without_key_at,null);
+  // A durable provider failure outcome plus a fresh empty lookup resolves the
+  // interrupted journal; an empty lookup alone was insufficient above.
+  await controlPool.query(`UPDATE agent_key_issuances SET create_failed_at=clock_timestamp()
+    WHERE issuance_id=$1`,[issuanceId]);
+  await spaces.delete(actor,spaceId);
+  assert.ok((await controlPool.query(`SELECT settled_without_key_at FROM agent_key_issuances
+    WHERE issuance_id=$1`,[issuanceId])).rows[0].settled_without_key_at);
+  await assert.rejects(spaces.get(actor,spaceId),denied('NOT_FOUND'));
+});
+
+test('reconcile preserves confirmed agent grants across interrupted archive publication and restore', async () => {
+  const config={database:memoryAdapter(),namespace:`sta6-archive-reconcile-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user=await createUser(config,{primaryEmail:`archive-reconcile-${crypto.randomUUID()}@example.invalid`});
+  const session=await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity=new AuthFnIdentityVerifier(config);
+  const actor=await identity.verify(request(session.sessionToken));
+  const actual=new AuthFnAgentKeys(config);
+  let revocations=0;let publicationOffline=false;
+  const keys={create:(...args)=>actual.create(...args),find:(...args)=>actual.find(...args),
+    revoke:async (...args)=>{revocations++;return actual.revoke(...args);}};
+  const control={query:async (sql,args)=>{
+    if (publicationOffline && typeof sql==='string' && sql.includes('UPDATE space_directory SET policy_version=$3,lifecycle=$4'))
+      throw new Error('publication offline');
+    return controlPool.query(sql,args);
+  }};
+  const cells=new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
+  const spaces=new PostgresSpaces(control,cells,'cell-a',keys,identity);
+  const {spaceId}=await spaces.create(actor);
+  const collectionId=`entries_${crypto.randomUUID()}`;
+  await collection(spaceId,collectionId);
+  const issued=await spaces.issueAgentKey(actor,spaceId,new Date(Date.now()+3_600_000),
+    [{collectionId,capabilities:['records:read']}]);
+  publicationOffline=true;
+  await assert.rejects(spaces.archive(actor,spaceId),/publication offline/);
+  publicationOffline=false;
+  assert.equal((await spaces.reconcile(spaceId)).lifecycle,'readOnly');
+  assert.equal(revocations,0);
+  const signer=new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const router=new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
+  const cell=new RegionalCell('cell-a',signer,new PostgresCellPolicy(pool,'cell-a',identity));
+  const route=()=>router.assertion(request(issued.secret),spaceId,collectionId,'records:read');
+  assert.equal(await cell.execute((await route()).token,async()=> 'read'),'read');
+  await spaces.restore(actor,spaceId);
+  assert.equal(await cell.execute((await route()).token,async()=> 'read'),'read');
+  assert.equal(revocations,0);
+  assert.equal((await pool.query(`SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1
+    AND action='key:provider-revoke'`,[spaceId])).rows[0].n,0);
+});
+
 test('deletion racing provider creation retains cleanup authority through provider outage', async () => {
   const config={database:memoryAdapter(),namespace:`sta6-delete-create-${crypto.randomUUID()}`,plugins:[]};
   createAuthFn(config);
