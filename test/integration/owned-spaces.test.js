@@ -12,7 +12,7 @@ import { RegionalRouter, RegionalCell, RoutingKeys } from '../../packages/applic
 import { PostgresAuthority, PostgresSpaces, PostgresRoutingDirectory, PostgresCellPolicy } from '../../packages/postgres/dist/index.js';
 
 const password = process.env.DATABASE_URL ? null : (await readFile(new URL('../../.data/local-db-password',import.meta.url),'utf8')).trim();
-const url = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:55432/stateplane`;
+const url = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT ?? '55432'}/stateplane`;
 const databaseNames = [];
 let controlUrl = url; let cellAUrl = url; let cellBUrl = url;
 if (process.env.STATEPLANE_TEST_SEPARATE_DBS === '1') {
@@ -322,11 +322,14 @@ test('archived spaces replay owner and agent receipts but deny external writes a
   await collection(spaceId,collectionId);
   const agent = await spaces.issueAgentKey(owner,spaceId,new Date(Date.now()+3_600_000),
     [{collectionId,capabilities:['records:write']}]);
+  const reader = await spaces.issueAgentKey(owner,spaceId,new Date(Date.now()+3_600_000),
+    [{collectionId,capabilities:['records:read']}]);
   const keys = new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
   const router = new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),keys);
   const cell = new RegionalCell('cell-a',keys,new PostgresCellPolicy(pool,'cell-a',identity));
   const authority = new PostgresAuthority(pool,3600);
   const route = secret => router.assertion(request(secret),spaceId,collectionId,'records:write');
+  const routeRead = secret => router.assertion(request(secret),spaceId,collectionId,'records:read');
   const actors = [session.sessionToken,agent.secret];
   const changes = actors.map(() => ({operation:'create',idempotencyKey:`write-${crypto.randomUUID()}`,
     requestDigest:createHash('sha256').update('{}').digest('hex'),canonicalData:'{}'}));
@@ -340,14 +343,33 @@ test('archived spaces replay owner and agent receipts but deny external writes a
     }));
   }
   assert.equal(externalEffects,2,'active owner and agent effects remain available');
+  let externalReads = 0;
+  const readers = [session.sessionToken,reader.secret];
+  for (const secret of readers) await cell.execute((await routeRead(secret)).token,async (_principal,context) => {
+    await context.authorizeEffect('read');
+    externalReads++;
+  });
+  assert.equal(externalReads,2);
+  await assert.rejects(cell.execute((await routeRead(reader.secret)).token,(_principal,context) =>
+    context.authorizeEffect()),denied('FORBIDDEN'));
 
   await pool.query("UPDATE collections SET lifecycle='readOnly' WHERE space_id=$1 AND collection_id=$2",[spaceId,collectionId]);
   let collectionCallbacks = 0;
   await assert.rejects(cell.execute((await route(agent.secret)).token,async () => { collectionCallbacks++; }),denied('SPACE_UNAVAILABLE'));
   assert.equal(collectionCallbacks,0,'a readOnly collection denies writes before the callback');
+  await cell.execute((await routeRead(reader.secret)).token,async (_principal,context) => {
+    await context.authorizeEffect('read');
+    externalReads++;
+  });
+  assert.equal(externalReads,3,'a readOnly collection permits granted external reads in an active space');
   await pool.query("UPDATE collections SET lifecycle='active' WHERE space_id=$1 AND collection_id=$2",[spaceId,collectionId]);
 
   await spaces.archive(owner,spaceId);
+  for (const secret of readers) await cell.execute((await routeRead(secret)).token,async (_principal,context) => {
+    await context.authorizeEffect('read');
+    externalReads++;
+  });
+  assert.equal(externalReads,5,'archived owner and agent can perform granted external reads');
   for (const [index,secret] of actors.entries()) {
     const replay = await cell.execute((await route(secret)).token,(_principal,context) =>
       context.records(authority,tx => tx.mutate(changes[index])));
@@ -359,6 +381,19 @@ test('archived spaces replay owner and agent receipts but deny external writes a
     }),denied('SPACE_UNAVAILABLE'));
   }
   assert.equal(externalEffects,2,'archived owner and agent assertions cannot start external writes');
+  await pool.query("UPDATE collections SET lifecycle='readOnly' WHERE space_id=$1 AND collection_id=$2",[spaceId,collectionId]);
+  for (const secret of readers) await cell.execute((await routeRead(secret)).token,async (_principal,context) => {
+    await context.authorizeEffect('read');
+    externalReads++;
+  });
+  assert.equal(externalReads,7,'collection readOnly also preserves granted external reads');
+  const preRevocation = await routeRead(reader.secret);
+  await spaces.revokeAgentKey(owner,spaceId,reader.id);
+  await assert.rejects(cell.execute(preRevocation.token,async (_principal,context) => {
+    await context.authorizeEffect('read');
+    externalReads++;
+  }),denied('STALE_PLACEMENT'));
+  assert.equal(externalReads,7,'revocation prevents external reads at cell admission');
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM records WHERE space_id=$1',[spaceId])).rows[0].n,2);
 });
 
@@ -640,11 +675,20 @@ test('malformed grant arrays fail before issuance or rotation effects', async ()
   Object.setPrototypeOf(capabilityPrototype,Object.create(Array.prototype));
   const hiddenIndex = ['records:read'];
   Object.defineProperty(hiddenIndex,'0',{value:'records:read',enumerable:false});
+  const duplicate = [{collectionId,capabilities:['records:read','records:read']}];
+  const originalIterator = Array.prototype[Symbol.iterator];
+  const withInheritedIterator = operation => {
+    Array.prototype[Symbol.iterator] = function* () { yield 'records:read'; yield 'records:write'; };
+    try { return operation(); }
+    finally { Array.prototype[Symbol.iterator] = originalIterator; }
+  };
   for (const malformed of [decorated,custom,[{collectionId,capabilities:capabilityExtra}],
     [{collectionId,capabilities:capabilityPrototype}],[{collectionId,capabilities:hiddenIndex}]]) {
     await assert.rejects(spaces.issueAgentKey(actor,spaceId,expires,malformed),denied('INVALID_ARGUMENT'));
     await assert.rejects(spaces.rotateAgentKey(actor,spaceId,old.id,expires,malformed),denied('INVALID_ARGUMENT'));
   }
+  await assert.rejects(withInheritedIterator(() => spaces.issueAgentKey(actor,spaceId,expires,duplicate)),denied('INVALID_ARGUMENT'));
+  await assert.rejects(withInheritedIterator(() => spaces.rotateAgentKey(actor,spaceId,old.id,expires,duplicate)),denied('INVALID_ARGUMENT'));
   assert.equal(creates,1,'malformed arrays never reach AuthFn creation');
   assert.equal((await pool.query('SELECT policy_version FROM spaces WHERE space_id=$1',[spaceId])).rows[0].policy_version,before);
   assert.equal((await pool.query('SELECT revoked_at FROM space_credentials WHERE space_id=$1 AND credential_id=$2',

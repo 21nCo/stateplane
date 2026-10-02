@@ -11,7 +11,7 @@ export interface CurrentCredential {
 export interface AuthorizedCellContext {
   readonly scope: Readonly<AuthorityScope>;
   /** Call immediately before a blob or provider effect that cannot join the SQL transaction. */
-  authorizeEffect(): Promise<void>;
+  authorizeEffect(kind?: 'read' | 'write'): Promise<void>;
   /** The caller cannot substitute a second space, collection or capability. */
   records<T>(authority: PostgresAuthority, fn: (tx: AuthorityTransaction) => Promise<T>): Promise<T>;
 }
@@ -133,7 +133,13 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
         return running;
       };
       const context: AuthorizedCellContext = Object.freeze({ scope,
-        authorizeEffect: () => admit(async () => {}, true),
+        authorizeEffect: (kind = 'write') => {
+          if (kind !== 'read' && kind !== 'write') return Promise.reject(new AuthorityError('INVALID_ARGUMENT'));
+          const allowed = kind === 'read' ? claims.capability.endsWith(':read') :
+            claims.capability.endsWith(':write') || claims.capability === 'claims:review';
+          if (!allowed) return Promise.reject(new AuthorityError('FORBIDDEN'));
+          return admit(async () => {}, kind === 'write');
+        },
         records: <TResult>(authority: PostgresAuthority, fn: (tx: AuthorityTransaction) => Promise<TResult>) =>
           admit(() => authority.transactionOnClient(client,scope,fn)) });
       let result: T;

@@ -8,7 +8,7 @@ import pg from 'pg';
 import { PostgresAuthority, AuthorityError, CommitOutcomeUnknownError } from '../../packages/postgres/dist/index.js';
 
 const password = process.env.DATABASE_URL ? null : (await readFile(new URL('../../.data/local-db-password', import.meta.url), 'utf8')).trim();
-const baseUrl = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:55432/stateplane`;
+const baseUrl = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT ?? '55432'}/stateplane`;
 const disposableName = process.env.DATABASE_URL ? null : `stateplane_test_${randomUUID().replaceAll('-', '')}`;
 const url = disposableName ? baseUrl.replace(/\/stateplane$/, `/${disposableName}`) : baseUrl;
 if (disposableName) {

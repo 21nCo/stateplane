@@ -81,17 +81,19 @@ function snapshotGrants(grants: readonly CollectionGrant[], keyExpiry: Date): Re
     if (!validId(collectionId) || seen.has(collectionId) ||
       !ordinaryDenseArray(grantCapabilities) || !grantCapabilities.length) throw new AuthorityError('INVALID_ARGUMENT');
     const values: Capability[] = [];
+    const seenCapabilities = new Set<Capability>();
     for (let member = 0; member < grantCapabilities.length; member++) {
       const item = Object.getOwnPropertyDescriptor(grantCapabilities,member);
-      if (!item || !item.enumerable || !('value' in item) || !capabilities.has(item.value)) throw new AuthorityError('INVALID_ARGUMENT');
-      values.push(item.value);
+      if (!item || !item.enumerable || !('value' in item) || !capabilities.has(item.value) ||
+        seenCapabilities.has(item.value)) throw new AuthorityError('INVALID_ARGUMENT');
+      seenCapabilities.add(item.value);
+      values[member] = item.value;
     }
-    if (new Set(values).size !== values.length) throw new AuthorityError('INVALID_ARGUMENT');
     if (grantExpiry !== undefined && (types.isProxy(grantExpiry) || !(grantExpiry instanceof Date) ||
       !Number.isFinite(grantExpiry.getTime()) || grantExpiry.getTime() > keyExpiry.getTime())) throw new AuthorityError('INVALID_ARGUMENT');
     seen.add(collectionId);
-    copied.push(Object.freeze({collectionId,capabilities:Object.freeze(values),
-      ...(grantExpiry ? {expiresAt:new Date(grantExpiry.getTime())} : {})}));
+    copied[index] = Object.freeze({collectionId,capabilities:Object.freeze(values),
+      ...(grantExpiry ? {expiresAt:new Date(grantExpiry.getTime())} : {})});
   }
   return Object.freeze(copied);
 }
@@ -456,13 +458,18 @@ export class PostgresSpaces {
         if (!locked.rows[0] || Number(locked.rows[0].policy_version) !== space.policyVersion || locked.rows[0].lifecycle !== 'active') throw new AuthorityError('STALE_PLACEMENT');
         await db.query(`INSERT INTO space_credentials(space_id,credential_id,principal_id,owner_principal_id,expires_at,activated_at)
           VALUES($1,$2,$3,$4,$5,NULL)`,[spaceId,created.id,`agent_${randomUUID()}`,owner(actor),new Date(expiryMs)]);
-        for (const grant of grants) await db.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities,expires_at)
-          VALUES($1,$2,$3,$4,$5)`,[spaceId,grant.collectionId,created.id,grant.capabilities,grant.expiresAt ?? null]);
+        const auditGrants: {collectionId: string; capabilities: readonly Capability[]; expiresAt: string | null}[] = [];
+        for (let index = 0; index < grants.length; index++) {
+          const grant = grants[index];
+          await db.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities,expires_at)
+            VALUES($1,$2,$3,$4,$5)`,[spaceId,grant.collectionId,created.id,grant.capabilities,grant.expiresAt ?? null]);
+          auditGrants[index] = {collectionId:grant.collectionId,capabilities:grant.capabilities,expiresAt:grant.expiresAt?.toISOString() ?? null};
+        }
         const changed = await db.query(`UPDATE spaces SET policy_version=policy_version+1 WHERE space_id=$1 RETURNING policy_version,placement_generation`,[spaceId]);
         await db.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation,details)
           VALUES($1,$2,$3,$4,'key:issue-pending',$5,$6,$7::jsonb)`,[`aud_${randomUUID()}`,spaceId,owner(actor),created.id,
           changed.rows[0].policy_version,changed.rows[0].placement_generation,JSON.stringify({ expiresAt:new Date(expiryMs).toISOString(),
-            grants:grants.map(g => ({collectionId:g.collectionId,capabilities:g.capabilities,expiresAt:g.expiresAt?.toISOString() ?? null})) })]);
+            grants:auditGrants })]);
         await this.current(actor);
         return Number(changed.rows[0].policy_version);
       });

@@ -24,11 +24,15 @@ if (!dockerExecutable) throw new Error('Docker executable not found; set STATEPL
 try { accessSync(dockerExecutable,constants.X_OK); }
 catch (cause) { throw new Error(`Docker executable is not runnable: ${dockerExecutable}`, { cause }); }
 const docker = args => execFileSync(dockerExecutable, ['compose','exec','-T','postgres',...args], { cwd:root, maxBuffer:64 * 1024 * 1024 });
-const sourceUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:55432/${sourceName}`;
-const targetUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:55432/${name}`;
+const localPort = process.env.STATEPLANE_LOCAL_DB_PORT ?? '55432';
+if (!/^\d{1,5}$/.test(localPort) || Number(localPort) < 1 || Number(localPort) > 65535)
+  throw new Error('STATEPLANE_LOCAL_DB_PORT must be a TCP port');
+const sourceUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${localPort}/${sourceName}`;
+const targetUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${localPort}/${name}`;
 const base = new pg.Pool({ connectionString:sourceUrl });
 const restored = new pg.Pool({ connectionString:targetUrl });
-const tables = ['stateplane_migrations','spaces','collections','collection_versions','collection_unique_declarations',
+const tables = ['stateplane_migrations','space_directory','spaces','space_credentials','routing_nonces','space_audit',
+  'collections','collection_versions','collection_unique_declarations',
   'collection_index_declarations','collection_grants','records',
   'record_unique_keys','record_index_values','record_events','idempotency_receipts','receipt_reservations',
   'receipt_reservation_scopes',
@@ -49,7 +53,12 @@ try {
   try {
     await seed.query('BEGIN');
     await seed.query("INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id) VALUES($1,'owner','cell-a','cell-a','target-a')",[spaceId]);
+    await seed.query("INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,lifecycle) VALUES($1,'owner','cell-a','target-a','active')",[spaceId]);
     await seed.query('INSERT INTO collections(space_id,collection_id) VALUES($1,$2)',[spaceId,collectionId]);
+    await seed.query("INSERT INTO space_credentials(space_id,credential_id,principal_id,owner_principal_id,expires_at,activated_at,confirmed_at) VALUES($1,'restore-agent','agent','owner',clock_timestamp()+interval '1 hour',clock_timestamp(),clock_timestamp())",[spaceId]);
+    await seed.query("INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities) VALUES($1,$2,'restore-agent',ARRAY['records:read']::text[])",[spaceId,collectionId]);
+    await seed.query("INSERT INTO routing_nonces(space_id,nonce,expires_at) VALUES($1,'restore-nonce',clock_timestamp()+interval '1 hour')",[spaceId]);
+    await seed.query("INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation) VALUES($1,$2,'owner','restore','space:create',1,1)",[`aud_${randomBytes(6).toString('hex')}`,spaceId]);
     await seed.query("INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition) VALUES($1,$2,1,'{}')",[spaceId,collectionId]);
     await seed.query("INSERT INTO collection_unique_declarations(space_id,collection_id,constraint_name,paths,accepted_version) VALUES($1,$2,'label',ARRAY['label'],1)",[spaceId,collectionId]);
     await seed.query("INSERT INTO collection_index_declarations(space_id,collection_id,field_name,value_kind,filterable,sortable,ready,accepted_version) VALUES($1,$2,'score','number',TRUE,TRUE,TRUE,1)",[spaceId,collectionId]);
@@ -63,12 +72,14 @@ try {
   await authority.mutate(scope,{operation:'create',idempotencyKey:'second',requestDigest:'b'.repeat(64),canonicalData:'{"label":"two","score":2}',
     unique:[{name:'label',encodedValue:'s:3:two'}],indexes:[{field:'score',kind:'number',value:2}]});
   await authority.mutate(scope,{operation:'delete',idempotencyKey:'delete',requestDigest:'c'.repeat(64),recordId:first.ref.id,expectedRevision:1});
-  const admin={...scope,capability:'space:admin'};
-  const claimed=await authority.transaction(admin,tx=>tx.claimOutbox(1,30));
-  await authority.transaction(admin,tx=>tx.finishOutbox(claimed[0],true));
+  const worker={...scope,principalId:'system:projection',credentialId:'system:projection',capability:'outbox:worker'};
+  const claimed=await authority.transaction(worker,tx=>tx.claimOutbox(1,30));
+  await authority.transaction(worker,tx=>tx.finishOutbox(claimed[0],true));
   const expected = await snapshot(base);
-  assert.ok(expected.records.length && expected.record_events.length && expected.projection_outbox.length,
-    'expected this restore smoke seed to populate records, events, and outbox');
+  assert.ok(expected.records.length && expected.record_events.length && expected.projection_outbox.length &&
+    expected.space_directory.length && expected.space_credentials.length && expected.collection_grants.length &&
+    expected.routing_nonces.length && expected.space_audit.length,
+  'expected this restore smoke seed to populate records, outbox, and owned-space authority');
   const archive = docker(['pg_dump','-U','stateplane','-Fc',sourceName]);
   docker(['createdb','-U','stateplane',name]);
   execFileSync(dockerExecutable, ['compose','exec','-T','postgres','pg_restore','-U','stateplane','-d',name],
