@@ -551,6 +551,133 @@ test('interrupted lifecycle publication reconciles and deleted publication retri
   assert.equal((await pool.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:deleted'",[created.spaceId])).rows[0].n,1);
 });
 
+test('lost control publication acknowledgements preserve create and make lifecycle retries idempotent', async () => {
+  const config = {database:memoryAdapter(),namespace:`sta6-control-ack-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user = await createUser(config,{primaryEmail:`control-ack-${crypto.randomUUID()}@example.invalid`});
+  const session = await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity = new AuthFnIdentityVerifier(config);
+  const actor = await identity.verify(request(session.sessionToken));
+  const original = controlPool.query.bind(controlPool);
+  let loseCreateAck = true;
+  let loseReadback = false;
+  let lostSpaceId;
+  let loseLifecycleAck;
+  const control = {query:async (sql,...args) => {
+    if (loseReadback && typeof sql === 'string' && sql === 'SELECT * FROM space_directory WHERE space_id=$1')
+      throw new Error('control readback offline');
+    const result = await original(sql,...args);
+    if (typeof sql === 'string' && sql.includes("UPDATE space_directory SET lifecycle='active'") && loseCreateAck) {
+      loseCreateAck = false;
+      throw new Error('lost create acknowledgement');
+    }
+    if (typeof sql === 'string' && sql.includes('UPDATE space_directory SET policy_version=$3,lifecycle=$4') &&
+      args[0]?.[3] === loseLifecycleAck) {
+      loseLifecycleAck = undefined;
+      throw new Error('lost lifecycle acknowledgement');
+    }
+    if (typeof sql === 'string' && sql.includes('INSERT INTO space_directory') && loseReadback) lostSpaceId=args[0][0];
+    return result;
+  }};
+  const cells = new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
+  const spaces = new PostgresSpaces(control,cells,'cell-a',new AuthFnAgentKeys(config),identity);
+  const created = await spaces.create(actor);
+  assert.equal(created.lifecycle,'active','a committed create returns a live route after its lost acknowledgement');
+  assert.equal((await pool.query('SELECT lifecycle FROM spaces WHERE space_id=$1',[created.spaceId])).rows[0].lifecycle,'active');
+
+  loseCreateAck = true;
+  loseReadback = true;
+  await assert.rejects(spaces.create(actor),/lost create acknowledgement/);
+  loseReadback = false;
+  assert.equal((await original('SELECT lifecycle FROM space_directory WHERE space_id=$1',[lostSpaceId])).rows[0].lifecycle,'active');
+  assert.equal((await pool.query('SELECT lifecycle FROM spaces WHERE space_id=$1',[lostSpaceId])).rows[0].lifecycle,'active',
+    'an unavailable control readback cannot trigger cell deletion');
+  assert.equal((await spaces.reconcile(lostSpaceId)).lifecycle,'active');
+
+  loseLifecycleAck = 'readOnly';
+  await spaces.archive(actor,created.spaceId);
+  const archiveVersion = (await spaces.get(actor,created.spaceId)).policyVersion;
+  await spaces.archive(actor,created.spaceId);
+  assert.equal((await spaces.get(actor,created.spaceId)).policyVersion,archiveVersion);
+  loseLifecycleAck = 'active';
+  await spaces.update(actor,created.spaceId,'active');
+  const restoreVersion = (await spaces.get(actor,created.spaceId)).policyVersion;
+  await spaces.update(actor,created.spaceId,'active');
+  assert.equal((await spaces.get(actor,created.spaceId)).policyVersion,restoreVersion);
+  await spaces.archive(actor,created.spaceId);
+  loseLifecycleAck = 'deleted';
+  await spaces.delete(actor,created.spaceId);
+  assert.equal((await original('SELECT lifecycle FROM space_directory WHERE space_id=$1',[created.spaceId])).rows[0].lifecycle,'deleted');
+  await spaces.delete(actor,created.spaceId);
+  assert.equal((await pool.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:deleted'",
+    [created.spaceId])).rows[0].n,1);
+});
+
+test('malformed grant arrays fail before issuance or rotation effects', async () => {
+  const config = {database:memoryAdapter(),namespace:`sta6-grant-shape-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user = await createUser(config,{primaryEmail:`grant-shape-${crypto.randomUUID()}@example.invalid`});
+  const session = await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity = new AuthFnIdentityVerifier(config);
+  const actor = await identity.verify(request(session.sessionToken));
+  const actual = new AuthFnAgentKeys(config);
+  let creates = 0;
+  const keys = {create:async (...args) => { creates++; return actual.create(...args); },revoke:(...args) => actual.revoke(...args)};
+  const spaces = new PostgresSpaces(controlPool,new Map([['cell-a',{pool,storageTargetId:'target-a'}]]),'cell-a',keys,identity);
+  const {spaceId} = await spaces.create(actor);
+  const collectionId = `grant_${crypto.randomUUID()}`;
+  await collection(spaceId,collectionId);
+  const expires = new Date(Date.now()+3_600_000);
+  const old = await spaces.issueAgentKey(actor,spaceId,expires,[{collectionId,capabilities:['records:read']}]);
+  const before = (await pool.query('SELECT policy_version FROM spaces WHERE space_id=$1',[spaceId])).rows[0].policy_version;
+  const decorated = [{collectionId,capabilities:['records:read']}];
+  Object.defineProperty(decorated,'extra',{value:true});
+  const custom = [{collectionId,capabilities:['records:read']}];
+  Object.setPrototypeOf(custom,Object.create(Array.prototype));
+  const capabilityExtra = ['records:read'];
+  Object.defineProperty(capabilityExtra,'extra',{value:true});
+  const capabilityPrototype = ['records:read'];
+  Object.setPrototypeOf(capabilityPrototype,Object.create(Array.prototype));
+  const hiddenIndex = ['records:read'];
+  Object.defineProperty(hiddenIndex,'0',{value:'records:read',enumerable:false});
+  for (const malformed of [decorated,custom,[{collectionId,capabilities:capabilityExtra}],
+    [{collectionId,capabilities:capabilityPrototype}],[{collectionId,capabilities:hiddenIndex}]]) {
+    await assert.rejects(spaces.issueAgentKey(actor,spaceId,expires,malformed),denied('INVALID_ARGUMENT'));
+    await assert.rejects(spaces.rotateAgentKey(actor,spaceId,old.id,expires,malformed),denied('INVALID_ARGUMENT'));
+  }
+  assert.equal(creates,1,'malformed arrays never reach AuthFn creation');
+  assert.equal((await pool.query('SELECT policy_version FROM spaces WHERE space_id=$1',[spaceId])).rows[0].policy_version,before);
+  assert.equal((await pool.query('SELECT revoked_at FROM space_credentials WHERE space_id=$1 AND credential_id=$2',
+    [spaceId,old.id])).rows[0].revoked_at,null,'malformed rotation leaves the prior key active');
+});
+
+test('reconcile and delete refuse a deleted directory with unpurged cell content', async () => {
+  const config = {database:memoryAdapter(),namespace:`sta6-erasure-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user = await createUser(config,{primaryEmail:`erasure-${crypto.randomUUID()}@example.invalid`});
+  const session = await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity = new AuthFnIdentityVerifier(config);
+  const actor = await identity.verify(request(session.sessionToken));
+  const spaces = new PostgresSpaces(controlPool,new Map([['cell-a',{pool,storageTargetId:'target-a'}]]),
+    'cell-a',new AuthFnAgentKeys(config),identity);
+  const {spaceId} = await spaces.create(actor);
+  const collectionId = `unpurged_${crypto.randomUUID()}`;
+  await collection(spaceId,collectionId);
+  await controlPool.query("UPDATE space_directory SET lifecycle='deleted' WHERE space_id=$1",[spaceId]);
+  await assert.rejects(spaces.reconcile(spaceId),denied('STALE_PLACEMENT'));
+  await assert.rejects(spaces.delete(actor,spaceId),denied('STALE_PLACEMENT'));
+  assert.equal((await pool.query('SELECT lifecycle FROM spaces WHERE space_id=$1',[spaceId])).rows[0].lifecycle,'active');
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM collections WHERE space_id=$1',[spaceId])).rows[0].n,1);
+  await pool.query("UPDATE spaces SET lifecycle='deleted' WHERE space_id=$1",[spaceId]);
+  await assert.rejects(spaces.reconcile(spaceId),denied('STALE_PLACEMENT'));
+  await assert.rejects(spaces.delete(actor,spaceId),denied('STALE_PLACEMENT'));
+  await pool.query("UPDATE spaces SET lifecycle='active' WHERE space_id=$1",[spaceId]);
+  await controlPool.query("UPDATE space_directory SET lifecycle='active' WHERE space_id=$1",[spaceId]);
+  await spaces.archive(actor,spaceId);
+  await spaces.delete(actor,spaceId);
+  await spaces.reconcile(spaceId);
+});
+
 test('failed issuance and rotation never expose grants after publication and provider outages', async () => {
   const config = {database:memoryAdapter(),namespace:`sta6-failed-key-${crypto.randomUUID()}`,plugins:[]};
   createAuthFn(config);

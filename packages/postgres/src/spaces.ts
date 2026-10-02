@@ -62,23 +62,28 @@ function snapshotOwner(actor: VerifiedCredential): VerifiedCredential {
   if (!validId(userPrincipalId) || !validId(credentialId)) throw new AuthorityError('FORBIDDEN');
   return Object.freeze({kind:'session',userPrincipalId,credentialId});
 }
+function ordinaryDenseArray(value: unknown): value is readonly unknown[] {
+  return !types.isProxy(value) && Array.isArray(value) && Object.getPrototypeOf(value) === Array.prototype &&
+    Reflect.ownKeys(value).length === value.length + 1;
+}
 function snapshotGrants(grants: readonly CollectionGrant[], keyExpiry: Date): ReadonlyArray<CollectionGrant> {
-  if (types.isProxy(grants) || !Array.isArray(grants) || grants.length === 0) throw new AuthorityError('INVALID_ARGUMENT');
+  if (!ordinaryDenseArray(grants) || grants.length === 0) throw new AuthorityError('INVALID_ARGUMENT');
   const seen = new Set<string>();
   const copied: CollectionGrant[] = [];
   for (let index = 0; index < grants.length; index++) {
     const descriptor = Object.getOwnPropertyDescriptor(grants,index);
-    if (!descriptor || !('value' in descriptor) || !descriptor.value || types.isProxy(descriptor.value)) throw new AuthorityError('INVALID_ARGUMENT');
+    if (!descriptor || !descriptor.enumerable || !('value' in descriptor) || !descriptor.value ||
+      types.isProxy(descriptor.value)) throw new AuthorityError('INVALID_ARGUMENT');
     const grant = descriptor.value as CollectionGrant;
     const collectionId = ownData(grant,'collectionId');
     const grantCapabilities = ownData(grant,'capabilities');
     const grantExpiry = Object.hasOwn(grant,'expiresAt') ? ownData(grant,'expiresAt') : undefined;
-    if (!validId(collectionId) || seen.has(collectionId) || types.isProxy(grantCapabilities) ||
-      !Array.isArray(grantCapabilities) || !grantCapabilities.length) throw new AuthorityError('INVALID_ARGUMENT');
+    if (!validId(collectionId) || seen.has(collectionId) ||
+      !ordinaryDenseArray(grantCapabilities) || !grantCapabilities.length) throw new AuthorityError('INVALID_ARGUMENT');
     const values: Capability[] = [];
     for (let member = 0; member < grantCapabilities.length; member++) {
       const item = Object.getOwnPropertyDescriptor(grantCapabilities,member);
-      if (!item || !('value' in item) || !capabilities.has(item.value)) throw new AuthorityError('INVALID_ARGUMENT');
+      if (!item || !item.enumerable || !('value' in item) || !capabilities.has(item.value)) throw new AuthorityError('INVALID_ARGUMENT');
       values.push(item.value);
     }
     if (new Set(values).size !== values.length) throw new AuthorityError('INVALID_ARGUMENT');
@@ -142,12 +147,13 @@ export class PostgresSpaces {
   private async current(actor: VerifiedCredential, ownerPrincipalId: string = owner(actor)): Promise<void> {
     if (!await this.credentials.current(actor,ownerPrincipalId)) throw new AuthorityError('FORBIDDEN');
   }
-  private async owned(actor: VerifiedCredential, spaceId: string): Promise<SpaceInfo> {
+  private async owned(actor: VerifiedCredential, spaceId: string, includeDeleted = false): Promise<SpaceInfo> {
     const principal = owner(actor);
     if (!validId(spaceId)) throw new AuthorityError('NOT_FOUND');
     await this.current(actor);
     const result = await this.control.query(`SELECT * FROM space_directory WHERE space_id=$1 AND owner_principal_id=$2`,[spaceId,principal]);
-    if (!result.rows[0] || ['provisioning','deleted'].includes(result.rows[0].lifecycle)) throw new AuthorityError('NOT_FOUND');
+    if (!result.rows[0] || result.rows[0].lifecycle === 'provisioning' ||
+      (!includeDeleted && result.rows[0].lifecycle === 'deleted')) throw new AuthorityError('NOT_FOUND');
     await this.current(actor);
     return info(result.rows[0]);
   }
@@ -160,6 +166,7 @@ export class PostgresSpaces {
     await this.current(actor);
     await this.control.query(`INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,lifecycle)
       VALUES($1,$2,$3,$4,'provisioning')`,[spaceId,principal,cellId,cell.storageTargetId]);
+    let publicationAttempted = false;
     try {
       await transaction(cell.pool, async db => {
         await this.current(actor);
@@ -170,15 +177,27 @@ export class PostgresSpaces {
         await this.current(actor);
       });
       await this.current(actor);
+      publicationAttempted = true;
       const published = await this.control.query(`UPDATE space_directory SET lifecycle='active',updated_at=clock_timestamp()
         WHERE space_id=$1 AND lifecycle='provisioning' RETURNING *`,[spaceId]);
       if (!published.rows[0]) throw new Error('Space publication was interrupted');
       return info(published.rows[0]);
     } catch (error) {
-      // The row remains unrouteable if either database becomes unavailable.
-      await this.control.query(`UPDATE space_directory SET lifecycle='deleted',updated_at=clock_timestamp()
-        WHERE space_id=$1 AND lifecycle='provisioning'`,[spaceId]).catch(() => {});
-      await cell.pool.query(`UPDATE spaces SET lifecycle='deleted' WHERE space_id=$1 AND lifecycle='active'`,[spaceId]).catch(() => {});
+      if (publicationAttempted) {
+        // A control write may have committed even when its acknowledgement was
+        // lost. Never delete its live cell until the directory is known to be
+        // unrouteable. An unavailable readback leaves reconciliation possible.
+        const observed = await this.control.query('SELECT * FROM space_directory WHERE space_id=$1',[spaceId]).catch(() => null);
+        if (!observed) throw error;
+        const row = observed.rows[0];
+        if (row?.lifecycle === 'active' && row.owner_principal_id === principal && row.cell_id === cellId &&
+          row.storage_target_id === cell.storageTargetId) return info(row);
+        if (row?.lifecycle !== 'provisioning') throw error;
+      }
+      const marked = await this.control.query(`UPDATE space_directory SET lifecycle='deleted',updated_at=clock_timestamp()
+        WHERE space_id=$1 AND lifecycle='provisioning' RETURNING 1`,[spaceId]).catch(() => null);
+      if (marked?.rowCount === 1) await cell.pool.query(`UPDATE spaces SET lifecycle='deleted'
+        WHERE space_id=$1 AND lifecycle='active'`,[spaceId]).catch(() => {});
       throw error;
     }
   }
@@ -220,10 +239,19 @@ export class PostgresSpaces {
   }
 
   private async publish(space: SpaceInfo, policyVersion: number, lifecycle: string): Promise<void> {
-    const updated = await this.control.query(`UPDATE space_directory SET policy_version=$3,lifecycle=$4,updated_at=clock_timestamp()
-      WHERE space_id=$1 AND policy_version=$2 AND placement_generation=$5 AND cell_id=$6 RETURNING 1`,
-    [space.spaceId,space.policyVersion,policyVersion,lifecycle,space.placementGeneration,space.cellId]);
-    if (updated.rowCount !== 1) throw new AuthorityError('STALE_PLACEMENT');
+    try {
+      const updated = await this.control.query(`UPDATE space_directory SET policy_version=$3,lifecycle=$4,updated_at=clock_timestamp()
+        WHERE space_id=$1 AND policy_version=$2 AND placement_generation=$5 AND cell_id=$6 RETURNING 1`,
+      [space.spaceId,space.policyVersion,policyVersion,lifecycle,space.placementGeneration,space.cellId]);
+      if (updated.rowCount !== 1) throw new AuthorityError('STALE_PLACEMENT');
+    } catch (error) {
+      const observed = await this.control.query('SELECT * FROM space_directory WHERE space_id=$1',[space.spaceId]).catch(() => null);
+      const row = observed?.rows[0];
+      if (row?.owner_principal_id === space.ownerPrincipalId && row.cell_id === space.cellId &&
+        row.storage_target_id === space.storageTargetId && row.lifecycle === lifecycle &&
+        safeVersion(row.policy_version) === policyVersion && safeVersion(row.placement_generation) === space.placementGeneration) return;
+      throw error;
+    }
   }
   /** Recover a cell-first transition before retrying an owner's control request. */
   private async publicationForRetry(actor: VerifiedCredential, space: SpaceInfo): Promise<SpaceInfo> {
@@ -244,8 +272,8 @@ export class PostgresSpaces {
     const observed = await this.owned(actor,spaceId);
     const space = await this.publicationForRetry(actor,observed);
     const prior = space.lifecycle;
-    if (space !== observed && prior === lifecycle) return;
-    if (prior === 'deleting' || prior === 'deleted' || (lifecycle === 'active' && prior === 'active')) throw new AuthorityError('SPACE_UNAVAILABLE');
+    if (prior === lifecycle) return;
+    if (prior === 'deleting' || prior === 'deleted') throw new AuthorityError('SPACE_UNAVAILABLE');
     if (lifecycle === 'deleting' && prior !== 'readOnly' && prior !== 'suspended') throw new AuthorityError('INVALID_ARGUMENT', 'Archive or suspend before deletion');
     const next = lifecycle;
     const version = await transaction(this.cell(space.cellId).pool, async db => {
@@ -268,8 +296,16 @@ export class PostgresSpaces {
   suspend(actor: VerifiedCredential, spaceId: string): Promise<void> { return this.changeLifecycle(actor,spaceId,'suspended'); }
   async delete(actor: VerifiedCredential, spaceId: string): Promise<void> {
     actor = snapshotOwner(actor);
-    const current = await this.publicationForRetry(actor,await this.owned(actor,spaceId));
-    if (current.lifecycle === 'deleted') return;
+    const observed = await this.owned(actor,spaceId,true);
+    if (observed.lifecycle === 'deleted') {
+      if (!await this.erased(this.cell(observed.cellId),spaceId)) throw new AuthorityError('STALE_PLACEMENT');
+      return;
+    }
+    const current = await this.publicationForRetry(actor,observed);
+    if (current.lifecycle === 'deleted') {
+      if (!await this.erased(this.cell(current.cellId),spaceId)) throw new AuthorityError('STALE_PLACEMENT');
+      return;
+    }
     if (current.lifecycle !== 'deleting') await this.changeLifecycle(actor,spaceId,'deleting');
     const space = await this.owned(actor,spaceId);
     const cell = this.cell(space.cellId);
@@ -302,6 +338,29 @@ export class PostgresSpaces {
   update(actor: VerifiedCredential, spaceId: string, lifecycle: 'active' | 'readOnly' | 'suspended'): Promise<void> {
     if (!['active','readOnly','suspended'].includes(lifecycle)) throw new AuthorityError('INVALID_ARGUMENT');
     return this.changeLifecycle(actor,spaceId,lifecycle);
+  }
+
+  private async erased(cell: CellDatabase, spaceId: string): Promise<boolean> {
+    const result = await cell.pool.query(`SELECT lifecycle='deleted' AND
+      NOT EXISTS (SELECT 1 FROM projection_outbox WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM receipt_reservation_scopes WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM receipt_reservations WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM idempotency_receipts WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM record_tombstones WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM record_unique_keys WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM record_index_values WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM record_events WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM records WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM entity_refs WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM collection_grants WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM collection_unique_declarations WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM collection_index_declarations WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM collection_versions WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM collections WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM space_credentials WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM routing_nonces WHERE space_id=$1) AS erased
+      FROM spaces WHERE space_id=$1`,[spaceId]);
+    return result.rows[0]?.erased === true;
   }
 
   /** Control-plane operation after a verified placement configuration change. No data move occurs here. */
@@ -348,7 +407,7 @@ export class PostgresSpaces {
     const current = await this.cell(row.cell_id).pool.query(`SELECT * FROM spaces WHERE space_id=$1`,[spaceId]);
     const local = current.rows[0];
     if (row.lifecycle === 'deleted') {
-      if (local && local.lifecycle !== 'deleted') await this.cell(row.cell_id).pool.query(`UPDATE spaces SET lifecycle='deleted',policy_version=policy_version+1 WHERE space_id=$1`,[spaceId]);
+      if (local && !await this.erased(this.cell(row.cell_id),spaceId)) throw new AuthorityError('STALE_PLACEMENT');
       return info(row);
     }
     const lifecycle = local?.lifecycle ?? 'deleted';
