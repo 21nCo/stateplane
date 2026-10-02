@@ -1,0 +1,20 @@
+README.md
+  h_a39f9495f9ec1d 27
+docs/postgres-authority.md
+  h_a39f9495f9ec1d 5-8
+scripts/migrate.mjs
+  h_a39f9495f9ec1d 24-34
+scripts/migration-upgrade-smoke.mjs
+  h_a39f9495f9ec1d 2,34-37,39-46,110-112,121-123,125
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ceb0e32c495c87e7b14729555b714c0bd9b1e757",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
