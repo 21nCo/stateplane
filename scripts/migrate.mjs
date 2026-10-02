@@ -10,7 +10,10 @@ const directory = resolve(import.meta.dirname, '../migrations');
 let transactionOpen = false;
 try {
   await client.connect();
-  await client.query('BEGIN');
+  // Set isolation before the advisory lock or migration ledger can establish a
+  // snapshot. Administrative defaults may otherwise make the post-lock outbox
+  // preflight read a snapshot from before an in-flight writer committed.
+  await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
   transactionOpen = true;
   await client.query('SELECT pg_advisory_xact_lock(73003)');
   await client.query('CREATE TABLE IF NOT EXISTS stateplane_migrations (name text PRIMARY KEY, sha256 text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())');

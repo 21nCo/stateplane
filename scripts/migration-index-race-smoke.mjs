@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import pg from 'pg';
 
@@ -18,6 +18,29 @@ const migrationNames = [
   '001_foundation.sql', '002_authority.sql', '003_immutable_facts.sql',
   '004_instant_order.sql', '005_scoped_query_indexes.sql'
 ];
+const markerDirectory = new URL('../.data/', import.meta.url);
+const raceDatabase = /^stateplane_race_[0-9a-f]{8}$/;
+
+async function dropDatabase(name) {
+  if (!raceDatabase.test(name)) throw new Error('Invalid index race database name');
+  await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+}
+
+async function recoverInterrupted() {
+  for (const filename of await readdir(markerDirectory)) {
+    if (!/^migration-index-race-stateplane_race_[0-9a-f]{8}\.json$/.test(filename)) continue;
+    const marker = new URL(filename, markerDirectory);
+    const entry = JSON.parse(await readFile(marker, 'utf8'));
+    if (!raceDatabase.test(entry.name) || !Number.isSafeInteger(entry.pid) || entry.pid <= 0 ||
+      filename !== `migration-index-race-${entry.name}.json`) {
+      throw new Error(`Invalid index race cleanup marker: ${filename}`);
+    }
+    try { process.kill(entry.pid, 0); continue; }
+    catch (error) { if (error.code !== 'ESRCH') throw error; }
+    await dropDatabase(entry.name);
+    await unlink(marker);
+  }
+}
 
 function databaseUrl(name, app) {
   return baseUrl.replace(/\/stateplane$/, `/${name}?application_name=${app}`);
@@ -113,14 +136,58 @@ async function waitForLock(app, run) {
   throw new Error('Migrator did not reach a relation lock wait');
 }
 
+async function assertOutcome({ action, prefix, result, client, writer, name, beforeLedger, beforeIndex }) {
+  if (action === 'timeout') {
+    assert.equal(result.code, 1, JSON.stringify(result));
+    assert.match(result.stderr, /canceling statement due to lock timeout/);
+  }
+  if (action === 'timeout' || action === 'interrupt') await writer.query('ROLLBACK');
+  const after = await facts(client);
+  const afterLedger = await migrationLedger(client);
+  if (action === 'commit') {
+    assert.equal(result.code, 1, `Unflagged migration crossed a committed writer: ${JSON.stringify(result)}`);
+    assert.match(result.stderr, /Populated outbox index upgrade requires drained traffic/);
+    assert.deepEqual(afterLedger, beforeLedger);
+    assert.equal(after.records, 2000);
+    assert.equal(after.events, 2000);
+    assert.equal(after.outbox, 2000);
+    assert.match(after.outbox_hash, /^[0-9a-f]{32}$/);
+    assert.equal(await claimIndex(client), beforeIndex);
+    const drained = startMigrator(databaseUrl(name, 'sta5_race_drained'), true);
+    const retry = await boundedResult(drained);
+    assert.equal(retry.code, 0, JSON.stringify(retry));
+    assert.deepEqual(await facts(client), after);
+    assert.equal((await migrationLedger(client)).length, 10);
+  } else {
+    if (action === 'rollback' || action === 'empty') {
+      assert.equal(result.code, 0, JSON.stringify(result));
+      assert.equal(afterLedger.length, 10);
+    } else {
+      assert.deepEqual(afterLedger, beforeLedger);
+      const retry = startMigrator(databaseUrl(name, 'sta5_race_retry'));
+      assert.equal((await boundedResult(retry)).code, 0);
+      assert.equal((await migrationLedger(client)).length, 10);
+    }
+    assert.equal(after.outbox, 0);
+  }
+  assert.match(await claimIndex(client), /\(space_id, collection_id, available_at, event_id\)/);
+  const migrations = action === 'commit' ? `${prefix} then 10` : '10';
+  console.log(`Index race ${prefix}/${action} passed: outbox=${after.outbox}, migrations=${migrations}`);
+}
+
 async function runCase(prefix, action) {
   const name = `stateplane_race_${randomBytes(4).toString('hex')}`;
   const app = `sta5_race_${name.slice(-8)}`;
-  await admin.query(`CREATE DATABASE ${name}`);
+  const marker = new URL(`migration-index-race-${name}.json`, markerDirectory);
   const client = new pg.Client({ connectionString: databaseUrl(name, `${app}_setup`) });
   const writer = new pg.Client({ connectionString: databaseUrl(name, `${app}_writer`) });
   let run;
+  let markerCreated = false;
   try {
+    await writeFile(marker, JSON.stringify({ pid: process.pid, name }), { flag: 'wx', mode: 0o600 });
+    markerCreated = true;
+    await admin.query(`CREATE DATABASE ${name}`);
+    if (process.env.STATEPLANE_TEST_CRASH_AFTER_CREATE === '1') process.kill(process.pid, 'SIGKILL');
     await Promise.all([client.connect(), writer.connect()]);
     await prepare(client, prefix);
     const beforeLedger = await migrationLedger(client);
@@ -142,55 +209,24 @@ async function runCase(prefix, action) {
       }
     }
     const result = await boundedResult(run);
-    if (action === 'timeout') {
-      assert.equal(result.code, 1, JSON.stringify(result));
-      assert.match(result.stderr, /canceling statement due to lock timeout/);
-    }
-    if (action === 'timeout' || action === 'interrupt') await writer.query('ROLLBACK');
-    const after = await facts(client);
-    const afterLedger = await migrationLedger(client);
-    const count = after.outbox;
-    const migrations = afterLedger.length;
-    if (action === 'commit') {
-      assert.equal(result.code, 1, `Unflagged migration crossed a committed writer: ${JSON.stringify(result)}`);
-      assert.match(result.stderr, /Populated outbox index upgrade requires drained traffic/);
-      assert.deepEqual(afterLedger, beforeLedger);
-      assert.equal(after.records, 2000);
-      assert.equal(after.events, 2000);
-      assert.equal(after.outbox, 2000);
-      assert.match(after.outbox_hash, /^[0-9a-f]{32}$/);
-      assert.equal(await claimIndex(client), beforeIndex);
-      const drained = startMigrator(databaseUrl(name, `${app}_drained`), true);
-      const retry = await boundedResult(drained);
-      assert.equal(retry.code, 0, JSON.stringify(retry));
-      assert.deepEqual(await facts(client), after);
-      assert.equal((await migrationLedger(client)).length, 10);
-    } else {
-      if (action === 'rollback' || action === 'empty') {
-        assert.equal(result.code, 0, JSON.stringify(result));
-        assert.equal(migrations, 10);
-      } else {
-        assert.deepEqual(afterLedger, beforeLedger);
-        const retry = startMigrator(databaseUrl(name, `${app}_retry`));
-        assert.equal((await boundedResult(retry)).code, 0);
-        assert.equal((await migrationLedger(client)).length, 10);
-      }
-      assert.equal(count, 0);
-    }
-    const index = await claimIndex(client);
-    assert.match(index, /\(space_id, collection_id, available_at, event_id\)/);
-    console.log(`Index race ${prefix}/${action} passed: outbox=${count}, migrations=${action === 'commit' ? `${prefix} then 10` : 10}`);
+    await assertOutcome({ action, prefix, result, client, writer, name, beforeLedger, beforeIndex });
   } finally {
     if (run && !run.isFinished()) run.child.kill('SIGKILL');
     await writer.query('ROLLBACK').catch(() => {});
     await Promise.allSettled([client.end(), writer.end()]);
-    await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+    if (markerCreated) {
+      await dropDatabase(name);
+      await unlink(marker);
+    }
   }
 }
 
 try {
   await admin.connect();
-  for (const [prefix, action] of cases) await runCase(prefix, action);
+  await recoverInterrupted();
+  if (!process.argv.includes('--recover-only')) {
+    for (const [prefix, action] of cases) await runCase(prefix, action);
+  }
 } finally {
   await admin.end().catch(() => {});
 }
