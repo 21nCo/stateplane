@@ -6,7 +6,7 @@ import type { AuthorityScope, AuthorityTransaction } from './index.js';
 
 type PoolLike = Pick<pg.Pool, 'connect'>;
 export interface CurrentCredential {
-  current(claims: Pick<RouteClaims, 'kind' | 'credentialId'>, ownerPrincipalId: string): Promise<boolean>;
+  current(claims: Pick<RouteClaims, 'kind' | 'credentialId'>, ownerPrincipalId?: string): Promise<boolean>;
 }
 export interface AuthorizedCellContext {
   readonly scope: Readonly<AuthorityScope>;
@@ -31,18 +31,29 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     let discard = false;
     try {
       this.checkAssertionTime(claims);
+      // Bound maintenance to each admission so idle Workers do not need a timer.
+      // The same database clock governs pruning and insertion; Worker clock skew
+      // cannot make a pruned assertion admissible again.
+      await this.prune(client);
       const nonce = await client.query(`INSERT INTO routing_nonces(space_id,nonce,expires_at)
-        VALUES($1,$2,to_timestamp($3)) ON CONFLICT DO NOTHING RETURNING nonce`,
+        SELECT $1,$2,to_timestamp($3) WHERE to_timestamp($3)>clock_timestamp()
+        ON CONFLICT DO NOTHING RETURNING nonce`,
       [claims.spaceId,claims.nonce,claims.expiresAt]);
       if (nonce.rowCount !== 1) throw new AuthorityError('FORBIDDEN', 'Routing assertion already consumed');
     } catch (error) { if (!(error instanceof AuthorityError)) discard = true; throw error; }
     finally { client.release(discard); }
   }
 
-  /** Scheduled maintenance may remove only assertions that can no longer verify. */
+  private async prune(client: pg.PoolClient): Promise<number> {
+    return (await client.query(`DELETE FROM routing_nonces WHERE ctid IN (
+      SELECT ctid FROM routing_nonces WHERE expires_at<=clock_timestamp()
+      ORDER BY expires_at LIMIT 32 FOR UPDATE SKIP LOCKED)`)).rowCount ?? 0;
+  }
+
+  /** Optional maintenance uses the same bounded database-clock rule as admission. */
   async cleanupExpiredNonces(): Promise<number> {
     const result = await this.pool.connect();
-    try { return (await result.query('DELETE FROM routing_nonces WHERE expires_at<=clock_timestamp()')).rowCount ?? 0; }
+    try { return await this.prune(result); }
     finally { result.release(); }
   }
 

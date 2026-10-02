@@ -29,12 +29,12 @@ export class AuthFnIdentityVerifier implements IdentityVerifier {
     return { credentialId:session.id, kind:'session', userPrincipalId:session.actorId };
   }
   /** Re-read the provider at cell admission; a signed assertion is not proof of current status. */
-  async current(claims: Pick<VerifiedCredential, 'kind' | 'credentialId'>, ownerPrincipalId: string): Promise<boolean> {
+  async current(claims: Pick<VerifiedCredential, 'kind' | 'credentialId'>, ownerPrincipalId?: string): Promise<boolean> {
     const record = await this.config.database.findOne<{
       id: string; userId: string; revokedAt?: Date | null; expiresAt?: Date | null;
     }>({ model:claims.kind === 'api-key' ? 'api_keys' : 'sessions',
       where:[{field:'id',operator:'eq',value:claims.credentialId}],namespace:this.config.namespace ?? 'authfn' });
-    return !!record && record.userId === ownerPrincipalId && !record.revokedAt &&
+    return !!record && (ownerPrincipalId === undefined || record.userId === ownerPrincipalId) && !record.revokedAt &&
       (record.expiresAt == null || new Date(record.expiresAt).getTime() > Date.now());
   }
 }

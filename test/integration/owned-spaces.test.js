@@ -68,7 +68,7 @@ test('owned spaces, AuthFn identities and cell effects share a revocable authori
   // With STATEPLANE_TEST_SEPARATE_DBS=1 these are three isolated databases;
   // the default also exercises their logical routing and policy boundaries.
   const cells = new Map([['cell-a',{pool,storageTargetId:'target-a'}],['cell-b',{pool:cellBPool,storageTargetId:'target-b'}]]);
-  const spaces = new PostgresSpaces(controlPool,cells,'cell-a',keyProvider);
+  const spaces = new PostgresSpaces(controlPool,cells,'cell-a',keyProvider,identity);
   const first = await spaces.create(owner);
   const second = await spaces.create(owner,'cell-b');
   assert.notEqual(first.spaceId,second.spaceId);
@@ -153,8 +153,10 @@ test('owned spaces, AuthFn identities and cell effects share a revocable authori
   await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()-interval '1 second' WHERE space_id=$1 AND credential_id=$2`,[first.spaceId,expiredGrant.id]);
   await assert.rejects(route(expiredGrant.secret,first.spaceId,c1),denied('NOT_FOUND'));
   const providerRevoked = await spaces.issueAgentKey(owner,first.spaceId,expires,[{collectionId:c1,capabilities:['records:read']}]);
+  const providerRevokedActor = await identity.verify(request(providerRevoked.secret));
   const preissued = await route(providerRevoked.secret,first.spaceId,c1);
   await keyProvider.revoke(providerRevoked.id,user.id);
+  await assert.rejects(spaces.get(providerRevokedActor,first.spaceId),denied('FORBIDDEN'));
   await assert.rejects(cellA.execute(preissued.token,async () => { throw new Error('provider effect admitted'); }),denied('FORBIDDEN'));
   const midwayKey = await spaces.issueAgentKey(owner,first.spaceId,expires,[{collectionId:c1,capabilities:['records:read']}]);
   const midwayAssertion = await route(midwayKey.secret,first.spaceId,c1);
@@ -175,10 +177,22 @@ test('owned spaces, AuthFn identities and cell effects share a revocable authori
   await assert.rejects(midway,denied('FORBIDDEN'));
   assert.equal(externalEffects,0);
   const transientSession = await issueSession(config,{}, { userId:user.id,methods:['password'] });
+  const transientActor = await identity.verify(request(transientSession.sessionToken));
   const ownerPreissued = await route(transientSession.sessionToken,first.spaceId,c1);
   const { revokeSessionById } = await import('@authfn/core');
   await revokeSessionById(config,transientSession.session.id,{userId:user.id});
   await assert.rejects(cellA.execute(ownerPreissued.token,async () => { throw new Error('session effect admitted'); }),denied('FORBIDDEN'));
+  for (const operation of [
+    () => spaces.create(transientActor),
+    () => spaces.list(transientActor),
+    () => spaces.get(transientActor,first.spaceId),
+    () => spaces.archive(transientActor,first.spaceId),
+    () => spaces.issueAgentKey(transientActor,first.spaceId,expires,[{collectionId:c1,capabilities:['records:read']}]),
+    () => spaces.revokeAgentKey(transientActor,first.spaceId,key2.id),
+    () => spaces.rotateAgentKey(transientActor,first.spaceId,key2.id,expires,[{collectionId:c2,capabilities:['records:read']}]),
+    () => spaces.audit(transientActor,first.spaceId),
+    () => spaces.delete(transientActor,first.spaceId),
+  ]) await assert.rejects(operation(),denied('FORBIDDEN'));
   const retryKey = await spaces.issueAgentKey(owner,first.spaceId,expires,[{collectionId:c1,capabilities:['records:read']}]);
   const actualProviderRevoke = keyProvider.revoke.bind(keyProvider);
   let failRevoke = true;
@@ -307,9 +321,99 @@ test('space lifecycle discards a client after an ambiguous BEGIN', async () => {
     release:value => { discarded=value; }}),query:async () => ({rowCount:0})};
   const control = {query:async () => ({rowCount:1})};
   const spaces = new PostgresSpaces(control,new Map([['cell-a',{pool:cellPool,storageTargetId:'target'}]]),'cell-a',
-    {create:async () => { throw new Error('unused'); },revoke:async () => {}});
+    {create:async () => { throw new Error('unused'); },revoke:async () => {}},{current:async () => true});
   await assert.rejects(spaces.create({kind:'session',credentialId:'session',userPrincipalId:'owner'}),/lost BEGIN/);
   assert.equal(discarded,true);
+});
+
+test('an unavailable identity provider stops owner control reads and writes before SQL', async () => {
+  let controlEffects = 0;
+  const control = {query:async () => { controlEffects++; throw new Error('control should not be reached'); }};
+  const cellPool = {connect:async () => { throw new Error('cell should not be reached'); },
+    query:async () => { throw new Error('cell should not be reached'); }};
+  const spaces = new PostgresSpaces(control,new Map([['cell-a',{pool:cellPool,storageTargetId:'target'}]]),
+    'cell-a',{create:async () => { throw new Error('provider key should not be created'); },revoke:async () => {}},
+    {current:async () => { throw new Error('identity provider unavailable'); }});
+  const actor = {kind:'session',credentialId:'session',userPrincipalId:'owner'};
+  for (const operation of [() => spaces.create(actor),() => spaces.list(actor),
+    () => spaces.get(actor,'space'),() => spaces.archive(actor,'space'),() => spaces.audit(actor,'space')]) {
+    await assert.rejects(operation(),/identity provider unavailable/);
+  }
+  assert.equal(controlEffects,0);
+});
+
+test('database-clock nonce admission stays closed across skew and bounded cleanup', async () => {
+  const config = {database:memoryAdapter(),namespace:`sta6-nonce-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user = await createUser(config,{primaryEmail:`nonce-${crypto.randomUUID()}@example.invalid`});
+  const session = await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity = new AuthFnIdentityVerifier(config);
+  const actor = await identity.verify(request(session.sessionToken));
+  const spaces = new PostgresSpaces(controlPool,new Map([['cell-a',{pool,storageTargetId:'target-a'}]]),
+    'cell-a',new AuthFnAgentKeys(config),identity);
+  const {spaceId} = await spaces.create(actor);
+  const now = Math.floor(Date.now()/1000);
+  for (let index = 0; index < 40; index++) await pool.query(
+    'INSERT INTO routing_nonces(space_id,nonce,expires_at) VALUES($1,$2,to_timestamp($3))',
+    [spaceId,`expired_${index}`,now-10]);
+  const claims = {spaceId,collectionId:'collection',capability:'records:read',credentialId:'key',kind:'api-key',
+    cellId:'cell-a',policyVersion:1,placementGeneration:1,audience:'stateplane-cell:cell-a',
+    issuedAt:now-30,expiresAt:now-5,nonce:'replay'};
+  let effects = 0;
+  // The Worker is behind Postgres and would accept this assertion by its own clock.
+  const behind = new PostgresCellPolicy(pool,'cell-a',{current:async () => true},() => (now-20)*1000);
+  await assert.rejects(behind.run(claims,async () => { effects++; }),denied('FORBIDDEN'));
+  assert.equal(effects,0);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM routing_nonces WHERE space_id=$1',[spaceId])).rows[0].n,8,
+    'each admission prunes at most 32 expired rows');
+  assert.equal(await behind.cleanupExpiredNonces(),8);
+  await assert.rejects(behind.run(claims,async () => { effects++; }),denied('FORBIDDEN'));
+  assert.equal(effects,0,'a pruned nonce cannot be replayed while the Worker clock lags');
+  const ahead = new PostgresCellPolicy(pool,'cell-a',{current:async () => true},() => (now+60)*1000);
+  await assert.rejects(ahead.run({...claims,expiresAt:now+30,nonce:'worker-ahead'},async () => { effects++; }),denied('FORBIDDEN'));
+  assert.equal(effects,0);
+});
+
+test('interrupted lifecycle publication reconciles and deleted publication retries', async () => {
+  const config = {database:memoryAdapter(),namespace:`sta6-publication-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user = await createUser(config,{primaryEmail:`publication-${crypto.randomUUID()}@example.invalid`});
+  const session = await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity = new AuthFnIdentityVerifier(config);
+  const actor = await identity.verify(request(session.sessionToken));
+  const cell = {pool,storageTargetId:'target-a'};
+  const spaces = new PostgresSpaces(controlPool,new Map([['cell-a',cell]]),'cell-a',new AuthFnAgentKeys(config),identity);
+  const created = await spaces.create(actor);
+  const original = controlPool.query.bind(controlPool);
+  let failReadOnly = true;
+  controlPool.query = async (sql,...args) => {
+    if (failReadOnly && typeof sql === 'string' && sql.includes('UPDATE space_directory SET policy_version=$3,lifecycle=$4') && args[0]?.[3] === 'readOnly') {
+      failReadOnly = false;
+      throw new Error('directory offline');
+    }
+    return original(sql,...args);
+  };
+  try { await assert.rejects(spaces.archive(actor,created.spaceId),/directory offline/); }
+  finally { controlPool.query = original; }
+  assert.equal((await spaces.get(actor,created.spaceId)).lifecycle,'active');
+  assert.equal((await pool.query('SELECT lifecycle FROM spaces WHERE space_id=$1',[created.spaceId])).rows[0].lifecycle,'readOnly');
+  assert.equal((await spaces.reconcile(created.spaceId)).lifecycle,'readOnly');
+
+  let failDeleted = true;
+  controlPool.query = async (sql,...args) => {
+    if (failDeleted && typeof sql === 'string' && sql.includes('UPDATE space_directory SET policy_version=$3,lifecycle=$4') && args[0]?.[3] === 'deleted') {
+      failDeleted = false;
+      throw new Error('directory offline');
+    }
+    return original(sql,...args);
+  };
+  try { await assert.rejects(spaces.delete(actor,created.spaceId),/directory offline/); }
+  finally { controlPool.query = original; }
+  assert.equal((await spaces.get(actor,created.spaceId)).lifecycle,'deleting');
+  assert.equal((await pool.query('SELECT lifecycle FROM spaces WHERE space_id=$1',[created.spaceId])).rows[0].lifecycle,'deleted');
+  await spaces.delete(actor,created.spaceId);
+  await assert.rejects(spaces.get(actor,created.spaceId),denied('NOT_FOUND'));
+  assert.equal((await pool.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:deleted'",[created.spaceId])).rows[0].n,1);
 });
 
 test('signing key rotation retains then retires old assertions', async () => {
