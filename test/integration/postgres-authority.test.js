@@ -531,7 +531,7 @@ for (const expiringCollection of ['requested-same','requested-cross','original-c
 test('unawaited outbox writes drain before commit and rollback on callback failure', async () => {
   const { scope } = await fixture();
   const receipt=await authority.mutate(scope,change('create','outbox-drain','{"label":"drain"}'));
-  const admin={...scope,principalId:'owner',capability:'space:admin'};
+  const admin={...scope,principalId:'system:projection',credentialId:'system:projection',capability:'outbox:worker'};
   const delayedAuthority=(match) => {
     let unblock;
     let entered;
@@ -624,7 +624,7 @@ test('receipt lock timeout and reservation leave no pooled session state', async
 test('audit facts stay immutable while outbox delivery is leased and fenced', async () => {
   const { scope } = await fixture();
   await authority.mutate(scope,change('create','outbox','{"label":"outbox"}'));
-  const admin = { ...scope,principalId:'owner',capability:'space:admin' };
+  const admin = { ...scope,principalId:'system:projection',credentialId:'system:projection',capability:'outbox:worker' };
   const first = await authority.transaction(admin,tx => tx.claimOutbox(10,30));
   assert.equal(first.length,1);
   assert.deepEqual(await authority.transaction(admin,tx => tx.claimOutbox(10,30)),[]);
@@ -830,7 +830,7 @@ test('ambiguous committed response replays, expired grant denies, and expired ou
   const receipt = await authority.mutate(scope,request);
   assert.equal(receipt.replayed,true);
   assert.equal((await counts(scope.spaceId)).record_events,1);
-  const admin = {...scope,principalId:'owner',capability:'space:admin'};
+  const admin = {...scope,principalId:'system:projection',credentialId:'system:projection',capability:'outbox:worker'};
   const first = (await authority.transaction(admin,tx => tx.claimOutbox(1,1)))[0];
   await pool.query("UPDATE projection_outbox SET available_at=clock_timestamp()-interval '1 second' WHERE event_id=$1",[first.eventId]);
   assert.equal(await authority.transaction(admin,tx => tx.finishOutbox(first,true)),false);
@@ -1127,7 +1127,7 @@ test('empty indexed strings work and malformed null values and outbox booleans f
   await assert.rejects(authority.mutate(scope,change('create','bad-null','{}',{
     indexes:[{field:'nothing',kind:'null',value:'ignored'}]
   })),error=>error.code==='INVALID_ARGUMENT');
-  const admin={...scope,principalId:'owner',capability:'space:admin'};
+  const admin={...scope,principalId:'system:projection',credentialId:'system:projection',capability:'outbox:worker'};
   const [delivery]=await authority.transaction(admin,tx=>tx.claimOutbox(1,30));
   await assert.rejects(authority.transaction(admin,tx=>tx.finishOutbox(delivery,'false')),error=>error.code==='INVALID_ARGUMENT');
   assert.equal((await pool.query('SELECT delivery_state FROM projection_outbox WHERE event_id=$1',[delivery.eventId])).rows[0].delivery_state,'delivering');
@@ -1200,7 +1200,7 @@ test('original collection grant must remain live at replay commit', async () => 
 test('failed outbox delivery is not claimable on every poll', async () => {
   const { scope } = await fixture();
   await authority.mutate(scope,change('create','backoff','{"label":"one"}'));
-  const admin={...scope,principalId:'owner',capability:'space:admin'};
+  const admin={...scope,principalId:'system:projection',credentialId:'system:projection',capability:'outbox:worker'};
   const [delivery]=await authority.transaction(admin,tx=>tx.claimOutbox(1,30));
   assert.equal(await authority.transaction(admin,tx=>tx.finishOutbox(delivery,false,'projection failed')),true);
   assert.deepEqual(await authority.transaction(admin,tx=>tx.claimOutbox(1,30)),[]);

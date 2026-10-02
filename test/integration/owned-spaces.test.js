@@ -87,6 +87,7 @@ test('owned spaces, AuthFn identities and cell effects share a revocable authori
   const key1 = await spaces.issueAgentKey(owner,first.spaceId,expires,[{collectionId:c1,capabilities:['records:read']}]);
   const key2 = await spaces.issueAgentKey(owner,first.spaceId,expires,[{collectionId:c2,capabilities:['records:read']}]);
   const adminKey = await spaces.issueAgentKey(owner,first.spaceId,expires,[{collectionId:c1,capabilities:['space:admin']}]);
+  const reviewerKey = await spaces.issueAgentKey(owner,first.spaceId,expires,[{collectionId:c1,capabilities:['claims:review']}]);
   const adminActor = await identity.verify(request(adminKey.secret));
   assert.equal((await spaces.get(adminActor,first.spaceId)).spaceId,first.spaceId);
   await assert.rejects(spaces.archive(adminActor,first.spaceId),denied('FORBIDDEN'));
@@ -100,6 +101,25 @@ test('owned spaces, AuthFn identities and cell effects share a revocable authori
   const authority = new PostgresAuthority(pool,3600);
   const read = (cell,token) => cell.execute(token,(_principalId,context) => context.records(authority,tx => tx.countRecords([])));
   const route = (secret,spaceId,collectionId,capability='records:read') => router.assertion(request(secret),spaceId,collectionId,capability);
+  let adminCallbacks = 0;
+  for (const operation of [
+    tx => tx.claimOutbox(1,30),
+    tx => tx.finishOutbox({eventId:'untrusted',ref:{spaceId:first.spaceId,collectionId:c1,id:'record'},
+      revision:1,generation:1,attempt:1},true),
+  ]) {
+    const assertion = await route(adminKey.secret,first.spaceId,c1,'space:admin');
+    await assert.rejects(cellA.execute(assertion.token,(_principal,context) => {
+      adminCallbacks++;
+      return context.records(authority,operation);
+    }),denied('FORBIDDEN'));
+  }
+  assert.equal(adminCallbacks,2,'admin is admitted only to metadata, never projection effects');
+  await pool.query("UPDATE collections SET lifecycle='readOnly' WHERE space_id=$1 AND collection_id=$2",[first.spaceId,c1]);
+  const collectionReview = await route(reviewerKey.secret,first.spaceId,c1,'claims:review');
+  let reviewCallbacks = 0;
+  await assert.rejects(cellA.execute(collectionReview.token,async () => { reviewCallbacks++; }),denied('SPACE_UNAVAILABLE'));
+  assert.equal(reviewCallbacks,0);
+  await pool.query("UPDATE collections SET lifecycle='active' WHERE space_id=$1 AND collection_id=$2",[first.spaceId,c1]);
   const otherUser = await createUser(config,{primaryEmail:`other-${crypto.randomUUID()}@example.invalid`});
   const otherSession = await issueSession(config,{}, {userId:otherUser.id,methods:['password']});
   await assert.rejects(route(otherSession.sessionToken,first.spaceId,c1),denied('NOT_FOUND'));
@@ -245,6 +265,9 @@ test('owned spaces, AuthFn identities and cell effects share a revocable authori
   await spaces.archive(owner,first.spaceId);
   await assert.rejects(read(cellA,stale.token),denied('STALE_PLACEMENT'));
   assert.equal(await read(cellA,(await route(rotated.secret,first.spaceId,c2)).token),1);
+  const spaceReview = await route(reviewerKey.secret,first.spaceId,c1,'claims:review');
+  await assert.rejects(cellA.execute(spaceReview.token,async () => { reviewCallbacks++; }),denied('SPACE_UNAVAILABLE'));
+  assert.equal(reviewCallbacks,0);
   const actualRevoke = keyProvider.revoke.bind(keyProvider);
   let unavailable = true;
   keyProvider.revoke = async (...args) => { if (unavailable) throw new Error('provider unavailable'); return actualRevoke(...args); };
@@ -556,7 +579,7 @@ test('failed issuance and rotation never expose grants after publication and pro
     AND action='key:issue-failed'`,[spaceId,issued.id])).rows[0].n,1);
 });
 
-test('lost activation COMMIT acknowledgement resolves by readback for issue and rotate', async () => {
+test('lost issuance acknowledgements keep unconfirmed issue and rotation keys inert and repairable', async () => {
   const config = {database:memoryAdapter(),namespace:`sta6-ack-${crypto.randomUUID()}`,plugins:[]};
   createAuthFn(config);
   const user = await createUser(config,{primaryEmail:`ack-${crypto.randomUUID()}@example.invalid`});
@@ -564,26 +587,41 @@ test('lost activation COMMIT acknowledgement resolves by readback for issue and 
   const identity = new AuthFnIdentityVerifier(config);
   const actor = await identity.verify(request(session.sessionToken));
   let revokeCalls = 0;
+  let providerOffline = true;
+  let offlineAfterCreate = false;
+  let issued;
   const realKeys = new AuthFnAgentKeys(config);
-  const keys = {create:(...args) => realKeys.create(...args),revoke:async () => { revokeCalls++; throw new Error('provider unavailable'); }};
+  const keys = {
+    create:async (...args) => { issued=await realKeys.create(...args); if (offlineAfterCreate) { providerOffline=true; compensationOffline=true; } return issued; },
+    revoke:async (...args) => { revokeCalls++; if (providerOffline) throw new Error('provider unavailable'); return realKeys.revoke(...args); },
+  };
   let loseAck = false;
+  let loseConfirmationAck = false;
+  let readbackOffline = false;
+  let compensationOffline = false;
   let compensationCalls = 0;
-  let oldKeyId;
   const cellPool = {
-    query:(...args) => pool.query(...args),
+    query:(...args) => {
+      if (readbackOffline && typeof args[0] === 'string' && args[0].includes('SELECT activated_at,revoked_at FROM space_credentials'))
+        throw new Error('cell readback unavailable');
+      return pool.query(...args);
+    },
     connect:async () => {
       const client = await pool.connect();
       let activated = false;
+      let confirmed = false;
       return {
         query:async (...args) => {
           const sql = args[0];
           if (typeof sql === 'string' && sql.includes('UPDATE space_credentials SET activated_at=')) activated=true;
-          if (typeof sql === 'string' && sql.includes('UPDATE space_credentials SET revoked_at=') && args[1]?.[1] !== oldKeyId) {
+          if (typeof sql === 'string' && sql.includes('UPDATE space_credentials SET confirmed_at=')) confirmed=true;
+          if (compensationOffline && typeof sql === 'string' && sql.includes('UPDATE space_credentials SET revoked_at=')) {
             compensationCalls++;
             throw new Error('cell compensation unavailable');
           }
           const result = await client.query(...args);
           if (sql === 'COMMIT' && activated && loseAck) { loseAck=false; throw new Error('lost activation acknowledgement'); }
+          if (sql === 'COMMIT' && confirmed && loseConfirmationAck) { loseConfirmationAck=false; throw new Error('lost confirmation acknowledgement'); }
           return result;
         },
         release:discard => client.release(discard),
@@ -606,14 +644,67 @@ test('lost activation COMMIT acknowledgement resolves by readback for issue and 
   const signer = new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
   const router = new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
   assert.ok((await router.assertion(request(first.secret),spaceId,collectionId,'records:read')).token);
-  // Rotation first revokes the old provider primitive; use the real provider for that step.
-  keys.revoke = (...args) => realKeys.revoke(...args);
-  oldKeyId=first.id;
+  // Rotation first revokes the old provider primitive.
+  providerOffline=false;
   loseAck=true;
   const second = await spaces.rotateAgentKey(actor,spaceId,first.id,expires,grants);
   assert.notEqual(second.id,first.id);
   assert.ok((await router.assertion(request(second.secret),spaceId,collectionId,'records:read')).token);
   await assert.rejects(router.assertion(request(first.secret),spaceId,collectionId,'records:read'),denied('UNAUTHENTICATED'));
+
+  const cell = new RegionalCell('cell-a',signer,new PostgresCellPolicy(pool,'cell-a',identity));
+  let effects = 0;
+  async function assertUnconfirmedDenied() {
+    const key = issued;
+    const row = (await pool.query(`SELECT activated_at,confirmed_at,revoked_at,provider_revoked_at,
+      (SELECT count(*)::int FROM collection_grants g WHERE g.space_id=sc.space_id AND g.credential_id=sc.credential_id) AS grants
+      FROM space_credentials sc WHERE sc.space_id=$1 AND sc.credential_id=$2`,[spaceId,key.id])).rows[0];
+    assert.ok(row.activated_at,'activation really committed despite the lost acknowledgement');
+    assert.equal(row.confirmed_at,null,'unconfirmed activation is inert');
+    assert.equal(row.revoked_at,null,'cell compensation was unavailable');
+    assert.equal(row.provider_revoked_at,null,'provider compensation was unavailable');
+    assert.equal(row.grants,1);
+    await assert.rejects(router.assertion(request(key.secret),spaceId,collectionId,'records:read'),denied('NOT_FOUND'));
+    const placement = (await pool.query('SELECT policy_version,placement_generation FROM spaces WHERE space_id=$1',[spaceId])).rows[0];
+    const now = Math.floor(Date.now()/1000);
+    const token = await signer.sign({spaceId,collectionId,capability:'records:read',credentialId:key.id,kind:'api-key',
+      cellId:'cell-a',policyVersion:placement.policyVersion,placementGeneration:placement.placementGeneration,
+      audience:'stateplane-cell:cell-a',issuedAt:now,expiresAt:now+30,nonce:crypto.randomUUID()});
+    await assert.rejects(cell.execute(token,async () => { effects++; }),denied('FORBIDDEN'));
+    assert.equal(effects,0);
+  }
+  async function repairFailedIssuance() {
+    const keyId=issued.id;
+    compensationOffline=false;
+    await assert.rejects(spaces.reconcile(spaceId),/provider unavailable/);
+    assert.ok((await pool.query('SELECT revoked_at FROM space_credentials WHERE space_id=$1 AND credential_id=$2',
+      [spaceId,keyId])).rows[0].revoked_at);
+    providerOffline=false;
+    await spaces.reconcile(spaceId);
+    assert.ok((await pool.query('SELECT provider_revoked_at FROM space_credentials WHERE space_id=$1 AND credential_id=$2',
+      [spaceId,keyId])).rows[0].provider_revoked_at);
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND credential_id=$2
+      AND action='key:issue-failed'`,[spaceId,keyId])).rows[0].n,1);
+  }
+
+  loseAck=true; readbackOffline=true; compensationOffline=true; providerOffline=true;
+  await assert.rejects(spaces.issueAgentKey(actor,spaceId,expires,grants),/cell readback unavailable/);
+  readbackOffline=false;
+  await assertUnconfirmedDenied();
+  await repairFailedIssuance();
+
+  loseAck=true; readbackOffline=true; compensationOffline=false; offlineAfterCreate=true;
+  await assert.rejects(spaces.rotateAgentKey(actor,spaceId,second.id,expires,grants),/cell readback unavailable/);
+  readbackOffline=false; offlineAfterCreate=false;
+  await assertUnconfirmedDenied();
+  await repairFailedIssuance();
+  await assert.rejects(router.assertion(request(second.secret),spaceId,collectionId,'records:read'),denied('UNAUTHENTICATED'));
+
+  loseConfirmationAck=true;
+  const uncertain = await spaces.issueAgentKey(actor,spaceId,expires,grants);
+  assert.equal(uncertain.confirmation,'unknown');
+  assert.ok((await router.assertion(request(uncertain.secret),spaceId,collectionId,'records:read')).token,
+    'a confirmed key is returned rather than reported as a failed issuance after its acknowledgement is lost');
 });
 
 test('signing key rotation retains then retires old assertions', async () => {

@@ -12,7 +12,8 @@ export type IndexValue =
 export interface UniqueValue { name: string; encodedValue: string }
 export interface AuthorityScope {
   spaceId: SpaceId; collectionId: CollectionId; principalId: string; credentialId: string;
-  capability: Capability; policyVersion: number; placementGeneration: number;
+  /** outbox:worker is internal and is never grantable or routable. */
+  capability: Capability | 'outbox:worker'; policyVersion: number; placementGeneration: number;
 }
 export interface RecordChange {
   operation: RecordMutation; idempotencyKey: string;
@@ -322,9 +323,11 @@ export class AuthorityTransaction {
     if (Number(row.policy_version) !== policyVersion || Number(row.placement_generation) !== placementGeneration) throw new AuthorityError('FORBIDDEN', 'Policy or placement changed');
     if (['suspended','deleting','deleted'].includes(row.lifecycle)) throw new AuthorityError('SPACE_UNAVAILABLE');
     if (row.collection_lifecycle === 'deleted') throw new AuthorityError('NOT_FOUND');
-    if (row.owner_principal_id !== principalId &&
+    if (capability === 'outbox:worker' && (principalId !== 'system:projection' || credentialId !== 'system:projection'))
+      throw new AuthorityError('FORBIDDEN');
+    if (row.owner_principal_id !== principalId && capability !== 'outbox:worker' &&
       (!row.capabilities?.includes(capability) || (row.expires_at && !row.grant_current))) throw new AuthorityError('FORBIDDEN');
-    if (row.collection_lifecycle === 'readOnly' && capability === 'records:write') throw new AuthorityError('SPACE_UNAVAILABLE');
+    if (row.collection_lifecycle === 'readOnly' && (capability === 'records:write' || capability === 'claims:review')) throw new AuthorityError('SPACE_UNAVAILABLE');
   }
 
   private ref(id: string): RecordRef { return { spaceId: this.#scope.spaceId, collectionId: this.#scope.collectionId, id }; }
@@ -639,7 +642,7 @@ export class AuthorityTransaction {
   /** Claim only this collection's due jobs. Attempt number fences late workers after lease expiry. */
   claimOutbox(limit: number, leaseSeconds: number): Promise<OutboxDelivery[]> {
     return this.admitOperation(async () => {
-    if (this.#scope.capability !== 'space:admin') throw new AuthorityError('FORBIDDEN');
+    if (this.#scope.capability !== 'outbox:worker') throw new AuthorityError('FORBIDDEN');
     if (!isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE || !isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 3600) throw new AuthorityError('INVALID_ARGUMENT');
     const result = await this.query(`UPDATE projection_outbox o SET delivery_state='delivering',attempts=o.attempts+1,
       available_at=clock_timestamp()+($3::integer * interval '1 second')
@@ -655,7 +658,7 @@ export class AuthorityTransaction {
 
   finishOutbox(delivery: OutboxDelivery, success: boolean, error?: string): Promise<boolean> {
     return this.admitOperation(async () => {
-    if (this.#scope.capability !== 'space:admin') throw new AuthorityError('FORBIDDEN');
+    if (this.#scope.capability !== 'outbox:worker') throw new AuthorityError('FORBIDDEN');
     if (!scalarString(delivery.eventId) || typeof success !== 'boolean' || !isSafeInteger(delivery.attempt) || delivery.attempt < 1 ||
       (error !== undefined && (typeof error !== 'string' || error.includes('\0') || error.length > 4096))) throw new AuthorityError('INVALID_ARGUMENT');
     const result = await this.query(`UPDATE projection_outbox SET delivery_state=$5,

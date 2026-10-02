@@ -16,6 +16,7 @@ export interface SpaceInfo extends DirectoryPlacement {
   ownerPrincipalId: string; storageTargetId: string;
 }
 export interface CollectionGrant { collectionId: string; capabilities: readonly Capability[]; expiresAt?: Date }
+export interface IssuedAgentKey { id: string; secret: string; confirmation?: 'unknown' }
 const capabilities = new Set<Capability>(['schema:write','records:read','records:write','sources:read','sources:write','claims:read','claims:write','claims:review','events:read','export:read','space:admin']);
 const validId = (id: unknown): id is string => typeof id === 'string' && id.length > 0 && id.length <= 256 && !id.includes('\0');
 function safeVersion(value: unknown): number {
@@ -119,7 +120,7 @@ export class PostgresRoutingDirectory implements RoutingDirectory {
       JOIN collections c ON c.space_id=g.space_id AND c.collection_id=g.collection_id
       WHERE sc.space_id=$1 AND sc.credential_id=$2 AND sc.owner_principal_id=$3
         AND g.collection_id=$4 AND $5=ANY(g.capabilities) AND c.lifecycle<>'deleted'
-        AND sc.activated_at IS NOT NULL AND sc.revoked_at IS NULL AND sc.expires_at>clock_timestamp()
+        AND sc.activated_at IS NOT NULL AND sc.confirmed_at IS NOT NULL AND sc.revoked_at IS NULL AND sc.expires_at>clock_timestamp()
         AND (g.expires_at IS NULL OR g.expires_at>clock_timestamp()) LIMIT 1`,
     [spaceId,actor.credentialId,row.owner_principal_id,collectionId,capability]);
     return result.rowCount === 1;
@@ -207,7 +208,7 @@ export class PostgresSpaces {
       JOIN collections c ON c.space_id=g.space_id AND c.collection_id=g.collection_id
       WHERE s.space_id=$1 AND s.lifecycle<>'deleted' AND c.lifecycle<>'deleted'
         AND sc.owner_principal_id=s.owner_principal_id
-        AND sc.activated_at IS NOT NULL AND sc.revoked_at IS NULL AND sc.expires_at>clock_timestamp()
+        AND sc.activated_at IS NOT NULL AND sc.confirmed_at IS NOT NULL AND sc.revoked_at IS NULL AND sc.expires_at>clock_timestamp()
         AND (g.expires_at IS NULL OR g.expires_at>clock_timestamp())
         AND g.capabilities @> ARRAY['space:admin']::text[] LIMIT 1`,[spaceId,credentialId]);
     const local = cell.rows[0];
@@ -331,15 +332,21 @@ export class PostgresSpaces {
     const control = await this.control.query('SELECT * FROM space_directory WHERE space_id=$1',[spaceId]);
     const row = control.rows[0];
     if (!row) throw new AuthorityError('NOT_FOUND');
-    const current = await this.cell(row.cell_id).pool.query(`SELECT * FROM spaces WHERE space_id=$1`,[spaceId]);
-    const local = current.rows[0];
-    if (local && (local.owner_principal_id !== row.owner_principal_id || local.cell_id !== row.cell_id ||
-      local.storage_target_id !== row.storage_target_id)) throw new AuthorityError('STALE_PLACEMENT');
-    if (local && local.lifecycle !== 'deleted') {
+    const first = await this.cell(row.cell_id).pool.query(`SELECT * FROM spaces WHERE space_id=$1`,[spaceId]);
+    if (first.rows[0] && (first.rows[0].owner_principal_id !== row.owner_principal_id || first.rows[0].cell_id !== row.cell_id ||
+      first.rows[0].storage_target_id !== row.storage_target_id)) throw new AuthorityError('STALE_PLACEMENT');
+    if (first.rows[0] && first.rows[0].lifecycle !== 'deleted') {
+      // An interrupted issuance is never promoted by directory repair. Locally
+      // revoke it first, then retry the external provider revocation below.
+      const unconfirmed = await this.cell(row.cell_id).pool.query(`SELECT credential_id FROM space_credentials
+        WHERE space_id=$1 AND confirmed_at IS NULL AND revoked_at IS NULL`,[spaceId]);
+      for (const key of unconfirmed.rows) await this.failIssuedKey(this.cell(row.cell_id),spaceId,row.owner_principal_id,key.credential_id);
       const pending = await this.cell(row.cell_id).pool.query(`SELECT credential_id FROM space_credentials
         WHERE space_id=$1 AND revoked_at IS NOT NULL AND provider_revoked_at IS NULL`,[spaceId]);
       for (const key of pending.rows) await this.revokeProvider(this.cell(row.cell_id),info(row),row.owner_principal_id,key.credential_id);
     }
+    const current = await this.cell(row.cell_id).pool.query(`SELECT * FROM spaces WHERE space_id=$1`,[spaceId]);
+    const local = current.rows[0];
     if (row.lifecycle === 'deleted') {
       if (local && local.lifecycle !== 'deleted') await this.cell(row.cell_id).pool.query(`UPDATE spaces SET lifecycle='deleted',policy_version=policy_version+1 WHERE space_id=$1`,[spaceId]);
       return info(row);
@@ -357,7 +364,23 @@ export class PostgresSpaces {
     return info(updated.rows[0]);
   }
 
-  async issueAgentKey(actor: VerifiedCredential, spaceId: string, expiresAt: Date, grants: readonly CollectionGrant[]): Promise<{ id: string; secret: string }> {
+  private async failIssuedKey(cell: CellDatabase, spaceId: string, ownerPrincipalId: string, keyId: string): Promise<void> {
+    await transaction(cell.pool, async db => {
+      const revoked = await db.query(`UPDATE space_credentials SET revoked_at=clock_timestamp()
+        WHERE space_id=$1 AND credential_id=$2 AND owner_principal_id=$3
+          AND confirmed_at IS NULL AND revoked_at IS NULL RETURNING 1`,
+      [spaceId,keyId,ownerPrincipalId]);
+      if (revoked.rowCount !== 1) return;
+      await db.query('DELETE FROM collection_grants WHERE space_id=$1 AND credential_id=$2',[spaceId,keyId]);
+      const changed = await db.query(`UPDATE spaces SET policy_version=policy_version+1
+        WHERE space_id=$1 RETURNING policy_version,placement_generation`,[spaceId]);
+      await db.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
+        VALUES($1,$2,$3,$4,'key:issue-failed',$5,$6)`,[`aud_${randomUUID()}`,spaceId,ownerPrincipalId,keyId,
+        changed.rows[0].policy_version,changed.rows[0].placement_generation]);
+    });
+  }
+
+  async issueAgentKey(actor: VerifiedCredential, spaceId: string, expiresAt: Date, grants: readonly CollectionGrant[]): Promise<IssuedAgentKey> {
     actor = snapshotOwner(actor);
     if (!expiresAt || types.isProxy(expiresAt) || !(expiresAt instanceof Date) || !Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= Date.now()) throw new AuthorityError('INVALID_ARGUMENT');
     expiresAt = new Date(expiresAt.getTime());
@@ -411,21 +434,29 @@ export class PostgresSpaces {
           WHERE space_id=$1 AND credential_id=$2`,[spaceId,created.id]);
         if (!observed.rows[0]?.activated_at || observed.rows[0].revoked_at) throw error;
       }
+      // Only confirmation grants authority. Activation alone can commit while
+      // its acknowledgement or the recovery read fails, so it remains inert.
+      try { await transaction(this.cell(space.cellId).pool, async db => {
+        await this.current(actor);
+        const confirmed = await db.query(`UPDATE space_credentials SET confirmed_at=clock_timestamp()
+          WHERE space_id=$1 AND credential_id=$2 AND activated_at IS NOT NULL
+            AND confirmed_at IS NULL AND revoked_at IS NULL RETURNING 1`,[spaceId,created.id]);
+        if (confirmed.rowCount !== 1) throw new AuthorityError('FORBIDDEN');
+        await this.current(actor);
+      }); }
+      catch (error) {
+        if (!(error instanceof CommitOutcomeUnknownError)) throw error;
+        // A final confirmation COMMIT may have succeeded. Returning the key
+        // with an explicit uncertain outcome avoids rejecting a live bearer.
+        // If it did not commit, regional admission keeps it inert and
+        // reconciliation revokes it; the caller must check before using it.
+        return { ...created, confirmation: 'unknown' };
+      }
       return created;
     } catch (error) {
       // Compensation is cell-first so an interrupted directory publication or
       // later reconcile cannot turn a rejected issuance into usable authority.
-      await transaction(this.cell(space.cellId).pool, async db => {
-        const revoked = await db.query(`UPDATE space_credentials SET revoked_at=clock_timestamp()
-          WHERE space_id=$1 AND credential_id=$2 AND revoked_at IS NULL RETURNING 1`,[spaceId,created.id]);
-        if (revoked.rowCount !== 1) return;
-        await db.query('DELETE FROM collection_grants WHERE space_id=$1 AND credential_id=$2',[spaceId,created.id]);
-        const changed = await db.query(`UPDATE spaces SET policy_version=policy_version+1
-          WHERE space_id=$1 RETURNING policy_version,placement_generation`,[spaceId]);
-        await db.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
-          VALUES($1,$2,$3,$4,'key:issue-failed',$5,$6)`,[`aud_${randomUUID()}`,spaceId,owner(actor),created.id,
-          changed.rows[0].policy_version,changed.rows[0].placement_generation]);
-      }).catch(() => {});
+      await this.failIssuedKey(this.cell(space.cellId),spaceId,owner(actor),created.id).catch(() => {});
       await this.revokeProvider(this.cell(space.cellId),space,owner(actor),created.id).catch(() => {});
       throw error;
     }
@@ -485,7 +516,7 @@ export class PostgresSpaces {
     if (publishError) throw publishError;
   }
   async rotateAgentKey(actor: VerifiedCredential, spaceId: string, oldKeyId: string, expiresAt: Date,
-    grants: readonly CollectionGrant[]): Promise<{ id: string; secret: string }> {
+    grants: readonly CollectionGrant[]): Promise<IssuedAgentKey> {
     actor = snapshotOwner(actor);
     if (!expiresAt || types.isProxy(expiresAt) || !(expiresAt instanceof Date) || !Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= Date.now()) throw new AuthorityError('INVALID_ARGUMENT');
     expiresAt = new Date(expiresAt.getTime());

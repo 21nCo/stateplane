@@ -60,11 +60,11 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
   private async check(client: pg.PoolClient, claims: RouteClaims): Promise<string> {
     const result = await client.query(`SELECT s.owner_principal_id,s.lifecycle,s.cell_id,s.policy_version,s.placement_generation,
       c.lifecycle AS collection_lifecycle, sc.principal_id AS key_principal_id,
-      sc.owner_principal_id AS key_owner_id,sc.revoked_at,sc.activated_at,
+      sc.owner_principal_id AS key_owner_id,sc.revoked_at,sc.activated_at,sc.confirmed_at,
       sc.expires_at > clock_timestamp() AS key_current,
       g.capabilities,(g.expires_at IS NULL OR g.expires_at > clock_timestamp()) AS grant_current
       FROM spaces s JOIN collections c ON c.space_id=s.space_id AND c.collection_id=$2
-      LEFT JOIN LATERAL (SELECT principal_id,owner_principal_id,revoked_at,activated_at,expires_at FROM space_credentials
+      LEFT JOIN LATERAL (SELECT principal_id,owner_principal_id,revoked_at,activated_at,confirmed_at,expires_at FROM space_credentials
         WHERE space_id=s.space_id AND credential_id=$3 FOR SHARE) sc ON TRUE
       LEFT JOIN LATERAL (SELECT capabilities,expires_at FROM collection_grants
         WHERE space_id=s.space_id AND collection_id=c.collection_id AND credential_id=$3 FOR SHARE) g ON TRUE
@@ -78,14 +78,15 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       policyVersion !== claims.policyVersion || placementGeneration !== claims.placementGeneration) throw new AuthorityError('STALE_PLACEMENT');
     if (row.lifecycle === 'deleted' || row.collection_lifecycle === 'deleted') throw new AuthorityError('NOT_FOUND');
     if (!['active','readOnly'].includes(row.lifecycle)) throw new AuthorityError('SPACE_UNAVAILABLE');
-    if (row.collection_lifecycle === 'readOnly' && claims.capability.endsWith(':write')) throw new AuthorityError('SPACE_UNAVAILABLE');
-    if (row.lifecycle === 'readOnly' && claims.capability.endsWith(':write') && claims.capability !== 'records:write') throw new AuthorityError('SPACE_UNAVAILABLE');
+    const mutates = claims.capability.endsWith(':write') || claims.capability === 'claims:review';
+    if (row.collection_lifecycle === 'readOnly' && mutates) throw new AuthorityError('SPACE_UNAVAILABLE');
+    if (row.lifecycle === 'readOnly' && mutates && claims.capability !== 'records:write') throw new AuthorityError('SPACE_UNAVAILABLE');
     if (!await this.credentials.current(claims,row.owner_principal_id)) throw new AuthorityError('FORBIDDEN');
     if (claims.kind === 'session') {
       if (claims.userPrincipalId !== row.owner_principal_id) throw new AuthorityError('FORBIDDEN');
       return row.owner_principal_id;
     }
-    if (!row.key_principal_id || row.key_owner_id !== row.owner_principal_id || !row.activated_at || row.revoked_at ||
+    if (!row.key_principal_id || row.key_owner_id !== row.owner_principal_id || !row.activated_at || !row.confirmed_at || row.revoked_at ||
       !row.key_current || !row.capabilities?.includes(claims.capability) || !row.grant_current) throw new AuthorityError('FORBIDDEN');
     return row.key_principal_id;
   }
