@@ -1,0 +1,24 @@
+migrations/015_confirmed_agent_keys.sql
+  h_a39f9495f9ec1d 1-4
+packages/postgres/src/cell-policy.ts
+  h_a39f9495f9ec1d 63,67,81-83,89
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 15-16,326-328,330,645,661
+packages/postgres/src/spaces.ts
+  h_a39f9495f9ec1d 19,123,211,335-343,348-349,367-383,437-454,459,519
+test/integration/owned-spaces.test.js
+  h_a39f9495f9ec1d 90,104-122,268-270,582,590-592,594-597,599-601,604-608,612,617-618,624,647-648,654-707
+test/integration/postgres-authority.test.js
+  h_a39f9495f9ec1d 534,627,833,1130,1203
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8d44363af5086f94f10232cf18ec5a177cfeed11",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
