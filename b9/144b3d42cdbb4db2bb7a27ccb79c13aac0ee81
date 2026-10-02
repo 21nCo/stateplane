@@ -1,0 +1,18 @@
+packages/postgres/src/cell-policy.ts
+  h_a39f9495f9ec1d 110-132,134,136-143
+packages/postgres/src/spaces.ts
+  h_a39f9495f9ec1d 227-240,243-244,246,270-271,389,404-413
+test/integration/owned-spaces.test.js
+  h_a39f9495f9ec1d 318-361,444-458,559-618
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b9144b3d42cdbb4db2bb7a27ccb79c13aac0ee81",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
