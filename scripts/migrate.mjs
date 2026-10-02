@@ -10,7 +10,10 @@ const directory = resolve(import.meta.dirname, '../migrations');
 let transactionOpen = false;
 try {
   await client.connect();
-  await client.query('BEGIN');
+  // Set isolation before the advisory lock or migration ledger can establish a
+  // snapshot. Administrative defaults may otherwise make the post-lock outbox
+  // preflight read a snapshot from before an in-flight writer committed.
+  await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
   transactionOpen = true;
   await client.query('SELECT pg_advisory_xact_lock(73003)');
   await client.query('CREATE TABLE IF NOT EXISTS stateplane_migrations (name text PRIMARY KEY, sha256 text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())');
@@ -20,6 +23,23 @@ try {
   const recordedNames = [...recorded.keys()].sort(migrationOrder);
   for (const [index, name] of recordedNames.entries()) {
     if (files[index] !== name) throw new Error(`Migration drift: applied history is not a prefix of current files at ${name}`);
+  }
+  const pendingOutboxIndexBuild = files.some(name =>
+    (name === '005_scoped_query_indexes.sql' || name === '006_outbox_due_order.sql') && !recorded.has(name));
+  if (pendingOutboxIndexBuild && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained') {
+    const relation = await client.query("SELECT to_regclass('public.projection_outbox') AS name");
+    if (relation.rows[0].name !== null) {
+      // Hold the emptiness decision through migration commit. SHARE excludes writers and
+      // claim updates, and waits for any writer that began before this preflight.
+      const previousLockTimeout = (await client.query('SHOW lock_timeout')).rows[0].lock_timeout;
+      if (previousLockTimeout === '0') await client.query("SET LOCAL lock_timeout = '5s'");
+      await client.query('LOCK TABLE public.projection_outbox IN SHARE MODE');
+      if (previousLockTimeout === '0') await client.query("SET LOCAL lock_timeout = '0'");
+      const populated = await client.query('SELECT EXISTS (SELECT 1 FROM public.projection_outbox) AS present');
+      if (populated.rows[0].present) {
+        throw new Error('Populated outbox index upgrade requires drained traffic; set STATEPLANE_POPULATED_INDEX_UPGRADE=drained only after stopping claim workers and writers');
+      }
+    }
   }
   for (const name of files) {
     const sql = await readFile(resolve(directory, name), 'utf8');

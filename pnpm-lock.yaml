@@ -44,6 +44,9 @@ importers:
       '@stateplane/contracts':
         specifier: workspace:*
         version: link:packages/contracts
+      '@stateplane/postgres':
+        specifier: workspace:*
+        version: link:packages/postgres
       '@stateplane/read-model':
         specifier: workspace:*
         version: link:packages/read-model
@@ -170,6 +173,12 @@ importers:
       '@stateplane/contracts':
         specifier: workspace:*
         version: link:../contracts
+      '@types/pg':
+        specifier: 8.20.0
+        version: 8.20.0
+      pg:
+        specifier: 8.22.0
+        version: 8.22.0
 
   packages/read-model:
     dependencies:
