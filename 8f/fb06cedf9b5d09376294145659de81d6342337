@@ -1,0 +1,20 @@
+migrations/014_staged_agent_keys.sql
+  h_a39f9495f9ec1d 1-4
+packages/postgres/src/cell-policy.ts
+  h_a39f9495f9ec1d 63-64,67,88
+packages/postgres/src/spaces.ts
+  h_a39f9495f9ec1d 122,210,321-325,358-359,364,372-387,390-403
+test/integration/owned-spaces.test.js
+  h_a39f9495f9ec1d 419-500
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8ffb06cedf9b5d09376294145659de81d6342337",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
