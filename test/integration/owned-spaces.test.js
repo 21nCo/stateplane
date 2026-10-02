@@ -315,6 +315,50 @@ test('cell pool waits and ambiguous BEGIN fail before effects and discard uncert
   assert.equal(effects,0);
 });
 
+test('cell context closes on callback return and settles unawaited work before pool reuse', async () => {
+  const claims = {spaceId:'space',collectionId:'collection',capability:'records:read',credentialId:'session',kind:'session',
+    userPrincipalId:'owner',cellId:'cell-a',policyVersion:1,placementGeneration:1,audience:'stateplane-cell:cell-a',
+    issuedAt:1,expiresAt:30,nonce:'retained-context'};
+  let released = false;
+  let providerChecks = 0;
+  let recordCalls = 0;
+  let retained;
+  let credentialActive = true;
+  let now = 1_000;
+  const client = {query:async sql => {
+    if (sql.includes('SELECT s.owner_principal_id')) return {rows:[{owner_principal_id:'owner',lifecycle:'active',cell_id:'cell-a',
+      policy_version:1,placement_generation:1,collection_lifecycle:'active'}]};
+    return {rowCount:1};
+  },release:() => { released=true; }};
+  const policy = new PostgresCellPolicy({connect:async () => client},'cell-a',
+    {current:async () => { providerChecks++; return credentialActive; }},() => now);
+  await policy.run(claims,async (_principal,context) => { retained=context; });
+  assert.equal(released,true);
+  const checksAtRelease = providerChecks;
+  await assert.rejects(retained.records({transactionOnClient:async () => { recordCalls++; }},async () => {}),denied('FORBIDDEN'));
+  await assert.rejects(retained.authorizeEffect(),denied('FORBIDDEN'));
+  assert.equal(recordCalls,0);
+  assert.equal(providerChecks,checksAtRelease);
+
+  released=false;
+  const pending = {transactionOnClient:async () => { recordCalls++; await pause(10); }};
+  await assert.rejects(policy.run({...claims,nonce:'unawaited'},async (_principal,context) => {
+    void context.records(pending,async () => {}).catch(() => {});
+  }),denied('FORBIDDEN'));
+  assert.equal(released,true);
+  assert.equal(recordCalls,0);
+
+  await assert.rejects(policy.run({...claims,nonce:'revoked-during-record'},async (_principal,context) => {
+    await context.records({transactionOnClient:async () => { credentialActive=false; recordCalls++; }},async () => {});
+  }),denied('FORBIDDEN'));
+  assert.equal(recordCalls,1);
+  credentialActive=true;
+  await assert.rejects(policy.run({...claims,nonce:'expired-during-record'},async (_principal,context) => {
+    await context.records({transactionOnClient:async () => { now=31_000; recordCalls++; }},async () => {});
+  }),denied('FORBIDDEN'));
+  assert.equal(recordCalls,2);
+});
+
 test('space lifecycle discards a client after an ambiguous BEGIN', async () => {
   let discarded;
   const cellPool = {connect:async () => ({query:async () => { throw new Error('lost BEGIN'); },
@@ -397,7 +441,21 @@ test('interrupted lifecycle publication reconciles and deleted publication retri
   finally { controlPool.query = original; }
   assert.equal((await spaces.get(actor,created.spaceId)).lifecycle,'active');
   assert.equal((await pool.query('SELECT lifecycle FROM spaces WHERE space_id=$1',[created.spaceId])).rows[0].lifecycle,'readOnly');
-  assert.equal((await spaces.reconcile(created.spaceId)).lifecycle,'readOnly');
+  await spaces.archive(actor,created.spaceId);
+  assert.equal((await spaces.get(actor,created.spaceId)).lifecycle,'readOnly');
+
+  let failSuspended = true;
+  controlPool.query = async (sql,...args) => {
+    if (failSuspended && typeof sql === 'string' && sql.includes('UPDATE space_directory SET policy_version=$3,lifecycle=$4') && args[0]?.[3] === 'suspended') {
+      failSuspended = false;
+      throw new Error('directory offline');
+    }
+    return original(sql,...args);
+  };
+  try { await assert.rejects(spaces.update(actor,created.spaceId,'suspended'),/directory offline/); }
+  finally { controlPool.query = original; }
+  await spaces.update(actor,created.spaceId,'suspended');
+  assert.equal((await spaces.get(actor,created.spaceId)).lifecycle,'suspended');
 
   let failDeleted = true;
   controlPool.query = async (sql,...args) => {
@@ -496,6 +554,66 @@ test('failed issuance and rotation never expose grants after publication and pro
   await spaces.reconcile(spaceId);
   assert.equal((await pool.query(`SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND credential_id=$2
     AND action='key:issue-failed'`,[spaceId,issued.id])).rows[0].n,1);
+});
+
+test('lost activation COMMIT acknowledgement resolves by readback for issue and rotate', async () => {
+  const config = {database:memoryAdapter(),namespace:`sta6-ack-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user = await createUser(config,{primaryEmail:`ack-${crypto.randomUUID()}@example.invalid`});
+  const session = await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity = new AuthFnIdentityVerifier(config);
+  const actor = await identity.verify(request(session.sessionToken));
+  let revokeCalls = 0;
+  const realKeys = new AuthFnAgentKeys(config);
+  const keys = {create:(...args) => realKeys.create(...args),revoke:async () => { revokeCalls++; throw new Error('provider unavailable'); }};
+  let loseAck = false;
+  let compensationCalls = 0;
+  let oldKeyId;
+  const cellPool = {
+    query:(...args) => pool.query(...args),
+    connect:async () => {
+      const client = await pool.connect();
+      let activated = false;
+      return {
+        query:async (...args) => {
+          const sql = args[0];
+          if (typeof sql === 'string' && sql.includes('UPDATE space_credentials SET activated_at=')) activated=true;
+          if (typeof sql === 'string' && sql.includes('UPDATE space_credentials SET revoked_at=') && args[1]?.[1] !== oldKeyId) {
+            compensationCalls++;
+            throw new Error('cell compensation unavailable');
+          }
+          const result = await client.query(...args);
+          if (sql === 'COMMIT' && activated && loseAck) { loseAck=false; throw new Error('lost activation acknowledgement'); }
+          return result;
+        },
+        release:discard => client.release(discard),
+      };
+    },
+  };
+  const cells = new Map([['cell-a',{pool:cellPool,storageTargetId:'target-a'}]]);
+  const spaces = new PostgresSpaces(controlPool,cells,'cell-a',keys,identity);
+  const {spaceId} = await spaces.create(actor);
+  const collectionId = `ack_${crypto.randomUUID()}`;
+  await collection(spaceId,collectionId);
+  const expires = new Date(Date.now()+3_600_000);
+  const grants = [{collectionId,capabilities:['records:read']}];
+  loseAck=true;
+  const first = await spaces.issueAgentKey(actor,spaceId,expires,grants);
+  assert.equal(compensationCalls,0);
+  assert.equal(revokeCalls,0);
+  assert.ok((await pool.query('SELECT activated_at FROM space_credentials WHERE space_id=$1 AND credential_id=$2',
+    [spaceId,first.id])).rows[0].activated_at);
+  const signer = new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const router = new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
+  assert.ok((await router.assertion(request(first.secret),spaceId,collectionId,'records:read')).token);
+  // Rotation first revokes the old provider primitive; use the real provider for that step.
+  keys.revoke = (...args) => realKeys.revoke(...args);
+  oldKeyId=first.id;
+  loseAck=true;
+  const second = await spaces.rotateAgentKey(actor,spaceId,first.id,expires,grants);
+  assert.notEqual(second.id,first.id);
+  assert.ok((await router.assertion(request(second.secret),spaceId,collectionId,'records:read')).token);
+  await assert.rejects(router.assertion(request(first.secret),spaceId,collectionId,'records:read'),denied('UNAUTHENTICATED'));
 });
 
 test('signing key rotation retains then retires old assertions', async () => {

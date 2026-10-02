@@ -224,10 +224,26 @@ export class PostgresSpaces {
     [space.spaceId,space.policyVersion,policyVersion,lifecycle,space.placementGeneration,space.cellId]);
     if (updated.rowCount !== 1) throw new AuthorityError('STALE_PLACEMENT');
   }
+  /** Recover a cell-first transition before retrying an owner's control request. */
+  private async publicationForRetry(actor: VerifiedCredential, space: SpaceInfo): Promise<SpaceInfo> {
+    await this.current(actor);
+    const local = await this.cell(space.cellId).pool.query(
+      'SELECT lifecycle,policy_version,placement_generation FROM spaces WHERE space_id=$1',[space.spaceId]);
+    const row = local.rows[0];
+    if (!row) throw new AuthorityError('STALE_PLACEMENT');
+    const version = safeVersion(row.policy_version);
+    const generation = safeVersion(row.placement_generation);
+    if (version < space.policyVersion || generation < space.placementGeneration) throw new AuthorityError('STALE_PLACEMENT');
+    if (version === space.policyVersion && generation === space.placementGeneration && row.lifecycle === space.lifecycle) return space;
+    await this.current(actor);
+    return this.reconcile(space.spaceId);
+  }
   private async changeLifecycle(actor: VerifiedCredential, spaceId: string, lifecycle: 'active' | 'readOnly' | 'suspended' | 'deleting'): Promise<void> {
     actor = snapshotOwner(actor);
-    const space = await this.owned(actor,spaceId);
+    const observed = await this.owned(actor,spaceId);
+    const space = await this.publicationForRetry(actor,observed);
     const prior = space.lifecycle;
+    if (space !== observed && prior === lifecycle) return;
     if (prior === 'deleting' || prior === 'deleted' || (lifecycle === 'active' && prior === 'active')) throw new AuthorityError('SPACE_UNAVAILABLE');
     if (lifecycle === 'deleting' && prior !== 'readOnly' && prior !== 'suspended') throw new AuthorityError('INVALID_ARGUMENT', 'Archive or suspend before deletion');
     const next = lifecycle;
@@ -251,7 +267,8 @@ export class PostgresSpaces {
   suspend(actor: VerifiedCredential, spaceId: string): Promise<void> { return this.changeLifecycle(actor,spaceId,'suspended'); }
   async delete(actor: VerifiedCredential, spaceId: string): Promise<void> {
     actor = snapshotOwner(actor);
-    const current = await this.owned(actor,spaceId);
+    const current = await this.publicationForRetry(actor,await this.owned(actor,spaceId));
+    if (current.lifecycle === 'deleted') return;
     if (current.lifecycle !== 'deleting') await this.changeLifecycle(actor,spaceId,'deleting');
     const space = await this.owned(actor,spaceId);
     const cell = this.cell(space.cellId);
@@ -369,7 +386,7 @@ export class PostgresSpaces {
       });
       await this.current(actor);
       await this.publish(space,version,space.lifecycle);
-      await transaction(this.cell(space.cellId).pool, async db => {
+      try { await transaction(this.cell(space.cellId).pool, async db => {
         await this.current(actor);
         const locked = await db.query(`SELECT policy_version,lifecycle,placement_generation FROM spaces
           WHERE space_id=$1 AND owner_principal_id=$2 FOR UPDATE`,[spaceId,owner(actor)]);
@@ -384,7 +401,16 @@ export class PostgresSpaces {
           VALUES($1,$2,$3,$4,'key:issue',$5,$6)`,[`aud_${randomUUID()}`,spaceId,owner(actor),created.id,
           version,space.placementGeneration]);
         await this.current(actor);
-      });
+      }); }
+      catch (error) {
+        if (!(error instanceof CommitOutcomeUnknownError)) throw error;
+        // A lost COMMIT acknowledgement is not proof of failed activation.
+        // Resolve it by readback before entering failure compensation: returning
+        // a failure for an already active key would strand usable authority.
+        const observed = await this.cell(space.cellId).pool.query(`SELECT activated_at,revoked_at FROM space_credentials
+          WHERE space_id=$1 AND credential_id=$2`,[spaceId,created.id]);
+        if (!observed.rows[0]?.activated_at || observed.rows[0].revoked_at) throw error;
+      }
       return created;
     } catch (error) {
       // Compensation is cell-first so an interrupted directory publication or

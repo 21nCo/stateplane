@@ -107,11 +107,40 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       const scope: Readonly<AuthorityScope> = Object.freeze({ spaceId:claims.spaceId as SpaceId,collectionId:claims.collectionId as CollectionId,
         principalId,credentialId:claims.credentialId,capability:claims.capability,
         policyVersion:claims.policyVersion,placementGeneration:claims.placementGeneration });
+      let accepting = true;
+      let operationError: unknown;
+      const operations = new Set<Promise<unknown>>();
+      const admit = <TResult>(work: () => Promise<TResult>): Promise<TResult> => {
+        if (!accepting) return Promise.reject(new AuthorityError('FORBIDDEN', 'Cell effect context ended'));
+        const running = (async () => {
+          this.checkAssertionTime(claims);
+          await this.check(client,claims);
+          if (!accepting) throw new AuthorityError('FORBIDDEN', 'Cell effect context ended');
+          const value = await work();
+          if (!accepting) throw new AuthorityError('FORBIDDEN', 'Cell effect context ended');
+          this.checkAssertionTime(claims);
+          await this.check(client,claims);
+          if (!accepting) throw new AuthorityError('FORBIDDEN', 'Cell effect context ended');
+          return value;
+        })();
+        operations.add(running);
+        void running.then(() => operations.delete(running), error => {
+          operationError ??= error;
+          operations.delete(running);
+        });
+        return running;
+      };
       const context: AuthorizedCellContext = Object.freeze({ scope,
-        authorizeEffect: async () => { this.checkAssertionTime(claims); await this.check(client,claims); },
+        authorizeEffect: () => admit(async () => {}),
         records: <TResult>(authority: PostgresAuthority, fn: (tx: AuthorityTransaction) => Promise<TResult>) =>
-          authority.transactionOnClient(client,scope,fn) });
-      const result = await effect(principalId, context);
+          admit(() => authority.transactionOnClient(client,scope,fn)) });
+      let result: T;
+      try { result = await effect(principalId, context); }
+      finally {
+        accepting = false;
+        await Promise.allSettled(operations);
+      }
+      if (operationError) throw operationError;
       // Clock-based expiry can occur while locks are held. Recheck immediately before commit.
       await this.check(client, claims);
       this.checkAssertionTime(claims);
