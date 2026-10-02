@@ -308,6 +308,60 @@ test('owned spaces, AuthFn identities and cell effects share a revocable authori
   assert.equal((await originalControlQuery('SELECT lifecycle FROM space_directory WHERE space_id=$1',[second.spaceId])).rows[0].lifecycle,'suspended');
 });
 
+test('archived spaces replay owner and agent receipts but deny external writes at the effect boundary', async () => {
+  const config = { database:memoryAdapter(),namespace:`sta6-${crypto.randomUUID()}`,plugins:[] };
+  createAuthFn(config);
+  const user = await createUser(config,{primaryEmail:`owner-${crypto.randomUUID()}@example.invalid`});
+  const session = await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity = new AuthFnIdentityVerifier(config);
+  const owner = await identity.verify(request(session.sessionToken));
+  const cells = new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
+  const spaces = new PostgresSpaces(controlPool,cells,'cell-a',new AuthFnAgentKeys(config),identity);
+  const {spaceId} = await spaces.create(owner);
+  const collectionId = `entries_${crypto.randomUUID()}`;
+  await collection(spaceId,collectionId);
+  const agent = await spaces.issueAgentKey(owner,spaceId,new Date(Date.now()+3_600_000),
+    [{collectionId,capabilities:['records:write']}]);
+  const keys = new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const router = new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),keys);
+  const cell = new RegionalCell('cell-a',keys,new PostgresCellPolicy(pool,'cell-a',identity));
+  const authority = new PostgresAuthority(pool,3600);
+  const route = secret => router.assertion(request(secret),spaceId,collectionId,'records:write');
+  const actors = [session.sessionToken,agent.secret];
+  const changes = actors.map(() => ({operation:'create',idempotencyKey:`write-${crypto.randomUUID()}`,
+    requestDigest:createHash('sha256').update('{}').digest('hex'),canonicalData:'{}'}));
+  const receipts = [];
+  let externalEffects = 0;
+  for (const [index,secret] of actors.entries()) {
+    receipts.push(await cell.execute((await route(secret)).token,async (_principal,context) => {
+      await context.authorizeEffect();
+      externalEffects++;
+      return context.records(authority,tx => tx.mutate(changes[index]));
+    }));
+  }
+  assert.equal(externalEffects,2,'active owner and agent effects remain available');
+
+  await pool.query("UPDATE collections SET lifecycle='readOnly' WHERE space_id=$1 AND collection_id=$2",[spaceId,collectionId]);
+  let collectionCallbacks = 0;
+  await assert.rejects(cell.execute((await route(agent.secret)).token,async () => { collectionCallbacks++; }),denied('SPACE_UNAVAILABLE'));
+  assert.equal(collectionCallbacks,0,'a readOnly collection denies writes before the callback');
+  await pool.query("UPDATE collections SET lifecycle='active' WHERE space_id=$1 AND collection_id=$2",[spaceId,collectionId]);
+
+  await spaces.archive(owner,spaceId);
+  for (const [index,secret] of actors.entries()) {
+    const replay = await cell.execute((await route(secret)).token,(_principal,context) =>
+      context.records(authority,tx => tx.mutate(changes[index])));
+    assert.equal(replay.replayed,true);
+    assert.equal(replay.receiptId,receipts[index].receiptId);
+    await assert.rejects(cell.execute((await route(secret)).token,async (_principal,context) => {
+      await context.authorizeEffect();
+      externalEffects++;
+    }),denied('SPACE_UNAVAILABLE'));
+  }
+  assert.equal(externalEffects,2,'archived owner and agent assertions cannot start external writes');
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM records WHERE space_id=$1',[spaceId])).rows[0].n,2);
+});
+
 test('cell pool waits and ambiguous BEGIN fail before effects and discard uncertain clients', async () => {
   const claims = {spaceId:'space',collectionId:'collection',capability:'records:read',credentialId:'key',kind:'api-key',
     cellId:'cell-a',policyVersion:1,placementGeneration:1,audience:'stateplane-cell:cell-a',issuedAt:1,expiresAt:30,nonce:'nonce'};

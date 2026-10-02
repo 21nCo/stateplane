@@ -57,7 +57,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     finally { result.release(); }
   }
 
-  private async check(client: pg.PoolClient, claims: RouteClaims): Promise<string> {
+  private async check(client: pg.PoolClient, claims: RouteClaims, requireActiveSpace = false): Promise<string> {
     const result = await client.query(`SELECT s.owner_principal_id,s.lifecycle,s.cell_id,s.policy_version,s.placement_generation,
       c.lifecycle AS collection_lifecycle, sc.principal_id AS key_principal_id,
       sc.owner_principal_id AS key_owner_id,sc.revoked_at,sc.activated_at,sc.confirmed_at,
@@ -78,6 +78,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       policyVersion !== claims.policyVersion || placementGeneration !== claims.placementGeneration) throw new AuthorityError('STALE_PLACEMENT');
     if (row.lifecycle === 'deleted' || row.collection_lifecycle === 'deleted') throw new AuthorityError('NOT_FOUND');
     if (!['active','readOnly'].includes(row.lifecycle)) throw new AuthorityError('SPACE_UNAVAILABLE');
+    if (requireActiveSpace && row.lifecycle !== 'active') throw new AuthorityError('SPACE_UNAVAILABLE');
     const mutates = claims.capability.endsWith(':write') || claims.capability === 'claims:review';
     if (row.collection_lifecycle === 'readOnly' && mutates) throw new AuthorityError('SPACE_UNAVAILABLE');
     if (row.lifecycle === 'readOnly' && mutates && claims.capability !== 'records:write') throw new AuthorityError('SPACE_UNAVAILABLE');
@@ -111,16 +112,16 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       let accepting = true;
       let operationError: unknown;
       const operations = new Set<Promise<unknown>>();
-      const admit = <TResult>(work: () => Promise<TResult>): Promise<TResult> => {
+      const admit = <TResult>(work: () => Promise<TResult>, requireActiveSpace = false): Promise<TResult> => {
         if (!accepting) return Promise.reject(new AuthorityError('FORBIDDEN', 'Cell effect context ended'));
         const running = (async () => {
           this.checkAssertionTime(claims);
-          await this.check(client,claims);
+          await this.check(client,claims,requireActiveSpace);
           if (!accepting) throw new AuthorityError('FORBIDDEN', 'Cell effect context ended');
           const value = await work();
           if (!accepting) throw new AuthorityError('FORBIDDEN', 'Cell effect context ended');
           this.checkAssertionTime(claims);
-          await this.check(client,claims);
+          await this.check(client,claims,requireActiveSpace);
           if (!accepting) throw new AuthorityError('FORBIDDEN', 'Cell effect context ended');
           return value;
         })();
@@ -132,7 +133,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
         return running;
       };
       const context: AuthorizedCellContext = Object.freeze({ scope,
-        authorizeEffect: () => admit(async () => {}),
+        authorizeEffect: () => admit(async () => {}, true),
         records: <TResult>(authority: PostgresAuthority, fn: (tx: AuthorityTransaction) => Promise<TResult>) =>
           admit(() => authority.transactionOnClient(client,scope,fn)) });
       let result: T;
