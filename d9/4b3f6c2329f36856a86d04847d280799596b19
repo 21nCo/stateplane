@@ -1,0 +1,21 @@
+packages/application/src/routing.ts
+  s_ad500513bc9987::t_4c2cb559ef1edb 18-21,90,102
+test/integration/owned-spaces.test.js
+  s_ad500513bc9987::t_b7201cf1e55274 96,98-99,103-105,112-116,122-127,129,151,154-204,217-220,243,250-251,260-312
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d94b3f6c2329f36856a86d04847d280799596b19",
+  "prompts": {},
+  "sessions": {
+    "s_ad500513bc9987": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0f222-fb22-76a5-a77e-b7c92826db44",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
