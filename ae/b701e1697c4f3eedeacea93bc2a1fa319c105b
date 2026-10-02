@@ -1,0 +1,19 @@
+packages/application/src/routing.ts
+  s_d52385ad0fbd0d::t_f34f4173a9e10a 1-109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "aeb701e1697c4f3eedeacea93bc2a1fa319c105b",
+  "prompts": {},
+  "sessions": {
+    "s_d52385ad0fbd0d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f1cc-46a9-73a2-bf93-2e81a58b21fc",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
