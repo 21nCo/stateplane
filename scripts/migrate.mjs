@@ -21,6 +21,17 @@ try {
   for (const [index, name] of recordedNames.entries()) {
     if (files[index] !== name) throw new Error(`Migration drift: applied history is not a prefix of current files at ${name}`);
   }
+  const pendingOutboxIndexBuild = files.some(name =>
+    (name === '005_scoped_query_indexes.sql' || name === '006_outbox_due_order.sql') && !recorded.has(name));
+  if (pendingOutboxIndexBuild && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained') {
+    const relation = await client.query("SELECT to_regclass('public.projection_outbox') AS name");
+    if (relation.rows[0].name !== null) {
+      const populated = await client.query('SELECT EXISTS (SELECT 1 FROM projection_outbox) AS present');
+      if (populated.rows[0].present) {
+        throw new Error('Populated outbox index upgrade requires drained traffic; set STATEPLANE_POPULATED_INDEX_UPGRADE=drained only after stopping claim workers and writers');
+      }
+    }
+  }
   for (const name of files) {
     const sql = await readFile(resolve(directory, name), 'utf8');
     const sha256 = createHash('sha256').update(sql).digest('hex');

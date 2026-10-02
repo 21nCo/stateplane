@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import pg from 'pg';
@@ -31,9 +31,19 @@ const recoverInterrupted = async () => {
   }
 };
 const migration = async name => readFile(new URL(`../migrations/${name}`,import.meta.url),'utf8');
-const runMigrator = name => execFileSync(process.execPath,['scripts/migrate.mjs'],{
-  cwd:new URL('..',import.meta.url), env:{...process.env,DATABASE_URL:url(name)},encoding:'utf8'
+const runMigrator = (name, drained=false) => execFileSync(process.execPath,['scripts/migrate.mjs'],{
+  cwd:new URL('..',import.meta.url),
+  env:{...process.env,DATABASE_URL:url(name),
+    ...(drained ? {STATEPLANE_POPULATED_INDEX_UPGRADE:'drained'} : {})},encoding:'utf8'
 });
+const assertOnlineRefusal = name => {
+  const refusal=spawnSync(process.execPath,['scripts/migrate.mjs'],{
+    cwd:new URL('..',import.meta.url),env:{...process.env,DATABASE_URL:url(name),
+      STATEPLANE_POPULATED_INDEX_UPGRADE:''},encoding:'utf8'
+  });
+  assert.equal(refusal.status,1);
+  assert.match(refusal.stderr,/Populated outbox index upgrade requires drained traffic/);
+};
 const index = async client => (await client.query(`SELECT indexdef FROM pg_indexes
   WHERE tablename='projection_outbox' AND indexname='projection_outbox_claim'`)).rows[0].indexdef;
 const preservedTables = ['spaces','collections','collection_versions','collection_grants',
@@ -97,6 +107,9 @@ try {
       SELECT 'rcpt_'||n,'sp_upgrade','entries','writer','create','key_'||n,repeat('a',64),'rec_'||n,'{}'::jsonb,
         clock_timestamp()+interval '1 hour' FROM generate_series(1,2000) n`);
     const before=await facts(upgraded);
+    assertOnlineRefusal(names[0]);
+    assert.deepEqual(await facts(upgraded),before);
+    assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,4);
     const sql005=await migration('005_scoped_query_indexes.sql');
     const started=performance.now();
     await upgraded.query('BEGIN');
@@ -105,8 +118,11 @@ try {
       ['005_scoped_query_indexes.sql',createHash('sha256').update(sql005).digest('hex')]);
     await upgraded.query('COMMIT');
     const build005Ms=Math.round(performance.now()-started);
+    assertOnlineRefusal(names[0]);
+    assert.deepEqual(await facts(upgraded),before);
+    assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,5);
     const secondStart=performance.now();
-    const output=runMigrator(names[0]);
+    const output=runMigrator(names[0],true);
     const buildRemainingMs=Math.round(performance.now()-secondStart);
     assert.match(output,/Applied 006_outbox_due_order.sql/);
     assert.match(output,/Applied 007_receipt_reservations.sql/);
