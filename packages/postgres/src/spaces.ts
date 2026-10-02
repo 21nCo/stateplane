@@ -170,18 +170,49 @@ export class PostgresSpaces {
     const cell = this.cell(cellId); // only server-configured cells are selectable
     const spaceId = `sp_${randomUUID()}`;
     await this.current(actor);
-    await this.control.query(`INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,lifecycle)
-      VALUES($1,$2,$3,$4,'provisioning')`,[spaceId,principal,cellId,cell.storageTargetId]);
     let publicationAttempted = false;
     try {
-      await transaction(cell.pool, async db => {
+      const directory = await this.control.connect();
+      let advisoryHeld = false;
+      let beginAttempted = false;
+      let begun = false;
+      let discard = false;
+      try {
+        // The session lock closes the gap between a committed reservation and
+        // its row lock. Recovery takes the matching transaction lock first.
+        await directory.query('SELECT pg_advisory_lock(hashtextextended($1,0))',[spaceId]);
+        advisoryHeld = true;
         await this.current(actor);
-        await db.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
-          VALUES($1,$2,$3,$3,$4)`,[spaceId,principal,cellId,cell.storageTargetId]);
-        await db.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
-          VALUES($1,$2,$3,$4,'space:create',1,1)`,[`aud_${randomUUID()}`,spaceId,principal,actor.credentialId]);
-        await this.current(actor);
-      });
+        await directory.query(`INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,lifecycle)
+          VALUES($1,$2,$3,$4,'provisioning')`,[spaceId,principal,cellId,cell.storageTargetId]);
+        beginAttempted = true;
+        await directory.query('BEGIN'); begun = true;
+        const reserved = await directory.query(`SELECT 1 FROM space_directory
+          WHERE space_id=$1 AND owner_principal_id=$2 AND lifecycle='provisioning' FOR UPDATE`,[spaceId,principal]);
+        if (!reserved.rows[0]) throw new AuthorityError('STALE_PLACEMENT');
+        await directory.query('SELECT pg_advisory_unlock(hashtextextended($1,0))',[spaceId]);
+        advisoryHeld = false;
+        const insertCell = async (db: pg.PoolClient): Promise<void> => {
+          await this.current(actor);
+          await db.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+            VALUES($1,$2,$3,$3,$4)`,[spaceId,principal,cellId,cell.storageTargetId]);
+          await db.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
+            VALUES($1,$2,$3,$4,'space:create',1,1)`,[`aud_${randomUUID()}`,spaceId,principal,actor.credentialId]);
+          await this.current(actor);
+        };
+        if (cell.pool === this.control) await insertCell(directory);
+        else await transaction(cell.pool,insertCell);
+        try { await directory.query('COMMIT'); begun = false; }
+        catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
+      } catch (error) {
+        if (begun) await directory.query('ROLLBACK').catch(() => { discard = true; });
+        else if (beginAttempted) discard = true;
+        throw error;
+      } finally {
+        if (advisoryHeld && !discard) await directory.query('SELECT pg_advisory_unlock(hashtextextended($1,0))',
+          [spaceId]).catch(() => { discard = true; });
+        directory.release(discard);
+      }
       await this.current(actor);
       publicationAttempted = true;
       const published = await this.control.query(`UPDATE space_directory SET lifecycle='active',updated_at=clock_timestamp()
@@ -200,16 +231,49 @@ export class PostgresSpaces {
           row.storage_target_id === cell.storageTargetId) return info(row);
         if (row?.lifecycle !== 'provisioning') throw error;
       }
-      const marked = await this.control.query(`UPDATE space_directory SET lifecycle='deleted',updated_at=clock_timestamp()
-        WHERE space_id=$1 AND lifecycle='provisioning' RETURNING 1`,[spaceId]).catch(() => null);
-      if (marked?.rowCount === 1) await cell.pool.query(`UPDATE spaces SET lifecycle='deleted'
-        WHERE space_id=$1 AND lifecycle='active'`,[spaceId]).catch(() => {});
+      // The cell commit may have succeeded even when its acknowledgement was
+      // lost. Leave the reservation for owner recovery to inspect under lock.
       throw error;
     }
+  }
+  private async recoverProvisioning(spaceId: string, ownerPrincipalId: string): Promise<void> {
+    await transaction(this.control, async directory => {
+      await directory.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[spaceId]);
+      const result = await directory.query(`SELECT * FROM space_directory
+        WHERE space_id=$1 AND owner_principal_id=$2 FOR UPDATE`,[spaceId,ownerPrincipalId]);
+      const row = result.rows[0];
+      if (!row || row.lifecycle !== 'provisioning') return;
+      const cell = this.cell(row.cell_id);
+      if (cell.storageTargetId !== row.storage_target_id) throw new AuthorityError('STALE_PLACEMENT');
+      const local = await (cell.pool === this.control ? directory : cell.pool).query(`SELECT s.owner_principal_id,s.cell_id,s.storage_target_id,s.lifecycle,
+        s.policy_version,s.placement_generation,
+        EXISTS (SELECT 1 FROM space_audit a WHERE a.space_id=s.space_id AND a.action='space:create') AS created
+        FROM spaces s WHERE s.space_id=$1`,[spaceId]);
+      const existing = local.rows[0];
+      if (!existing) {
+        await directory.query(`UPDATE space_directory SET lifecycle='deleted',updated_at=clock_timestamp()
+          WHERE space_id=$1 AND lifecycle='provisioning'`,[spaceId]);
+        await directory.query(`INSERT INTO space_provisioning_audit(space_id,owner_principal_id,cell_id,action)
+          VALUES($1,$2,$3,'space:provision-retired')`,[spaceId,ownerPrincipalId,row.cell_id]);
+        return;
+      }
+      if (existing.owner_principal_id !== ownerPrincipalId || existing.cell_id !== row.cell_id ||
+        existing.storage_target_id !== row.storage_target_id || existing.lifecycle !== 'active' ||
+        safeVersion(existing.policy_version) !== 1 || safeVersion(existing.placement_generation) !== 1 ||
+        existing.created !== true) throw new AuthorityError('STALE_PLACEMENT');
+      await directory.query(`UPDATE space_directory SET lifecycle='active',updated_at=clock_timestamp()
+        WHERE space_id=$1 AND lifecycle='provisioning'`,[spaceId]);
+    });
   }
   async list(actor: VerifiedCredential): Promise<SpaceInfo[]> {
     actor = snapshotOwner(actor);
     await this.current(actor);
+    const pending = await this.control.query(`SELECT space_id FROM space_directory
+      WHERE owner_principal_id=$1 AND lifecycle='provisioning' ORDER BY created_at,space_id`,[owner(actor)]);
+    for (const row of pending.rows) {
+      await this.current(actor);
+      await this.recoverProvisioning(row.space_id,owner(actor));
+    }
     const rows = await this.control.query(`SELECT * FROM space_directory WHERE owner_principal_id=$1 AND lifecycle NOT IN ('provisioning','deleted')
       ORDER BY created_at,space_id`,[owner(actor)]);
     await this.current(actor);
