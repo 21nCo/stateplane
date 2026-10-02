@@ -201,7 +201,9 @@ export class PostgresAuthority {
   async transaction<T>(scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T>): Promise<T> {
     // Capture the authenticated identity before waiting for a pooled connection.
     const fixedScope = Object.freeze({ ...scope });
-    if (![fixedScope.spaceId,fixedScope.collectionId,fixedScope.principalId,fixedScope.credentialId].every(scalarString)) throw new AuthorityError('INVALID_ARGUMENT');
+    if (![fixedScope.spaceId,fixedScope.collectionId,fixedScope.principalId,fixedScope.credentialId].every(scalarString) ||
+      !isSafeInteger(fixedScope.policyVersion) || fixedScope.policyVersion < 1 ||
+      !isSafeInteger(fixedScope.placementGeneration) || fixedScope.placementGeneration < 1) throw new AuthorityError('INVALID_ARGUMENT');
     const client = await this.pool.connect();
     let begun = false;
     let beginAttempted = false;
@@ -228,6 +230,30 @@ export class PostgresAuthority {
       else if (beginAttempted) discard = true;
       throw error;
     } finally { tx?.close(); client.release(discard); }
+  }
+
+  /** Join an already authorized cell transaction; the caller owns COMMIT/ROLLBACK. */
+  async transactionOnClient<T>(client: Client, scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T>): Promise<T> {
+    const fixedScope = Object.freeze({ ...scope });
+    if (![fixedScope.spaceId,fixedScope.collectionId,fixedScope.principalId,fixedScope.credentialId].every(scalarString) ||
+      !isSafeInteger(fixedScope.policyVersion) || fixedScope.policyVersion < 1 ||
+      !isSafeInteger(fixedScope.placementGeneration) || fixedScope.placementGeneration < 1) throw new AuthorityError('INVALID_ARGUMENT');
+    const tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds);
+    try {
+      await tx.checkScope();
+      const result = await fn(tx);
+      tx.sealMutations();
+      await tx.settleMutations();
+      tx.assertCommittable();
+      await tx.checkScope();
+      await tx.checkReplayScopes();
+      await tx.finalizeReceipts();
+      return result;
+    } catch (error) {
+      tx.sealMutations();
+      await tx.settleMutations();
+      throw error;
+    } finally { tx.close(); }
   }
 
   /** Retry only server-confirmed deadlock/serialization rollbacks, never failed COMMIT. */
@@ -645,3 +671,6 @@ export class AuthorityTransaction {
     },true);
   }
 }
+
+export * from './spaces.js';
+export * from './cell-policy.js';

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { AuthFnApiKeyRevokedError, createAuthFn, authenticateApiKey, authenticateSessionToken, createApiKey, createUser, issueSession, revokeApiKeyById, revokeSessionById } from '@authfn/core';
+import { AuthFnApiKeyRevokedError, createAuthFn, authenticateApiKey, authenticateSessionToken, createApiKey, createUser, issueSession,
+  issueSessionCookies, resolveCookiePolicy, revokeApiKeyById, revokeSessionById } from '@authfn/core';
 import { authFnApiKeyPlugin } from '@authfn/api-keys';
 import { authFnMultiRegionPlugin, createInMemoryAuthFnPlacementDirectory } from '@authfn/multi-region';
 import { McpFnRegistry, createManifest, createMcpFnServer, textResult } from '@mcpfn/core';
@@ -10,6 +11,7 @@ import { validateSchema } from '@datafn/core';
 import { memoryAdapter } from '@superfunctions/db/testing';
 import { readModelSchema } from '@stateplane/read-model';
 import { parseRevision } from '@stateplane/contracts';
+import { AuthFnIdentityVerifier } from '../packages/auth/src/index.js';
 
 describe('published package boundary', () => {
   it('AuthFn composes API key and region plugins and revocation denies replay', async () => {
@@ -31,6 +33,26 @@ describe('published package boundary', () => {
     expect((await authenticateSessionToken(config, issued.sessionToken))?.actorId).toBe(user.id);
     await revokeSessionById(config, issued.session.id, { userId: user.id });
     expect(await authenticateSessionToken(config, issued.sessionToken)).toBeNull();
+  });
+
+  it('Stateplane accepts current AuthFn bearer/cookie sessions and enforces cookie CSRF before mutation', async () => {
+    const config = { database:memoryAdapter(),namespace:'stateplane-session',plugins:[] };
+    createAuthFn(config);
+    const user = await createUser(config,{primaryEmail:'owner@example.invalid'});
+    const issued = await issueSession(config,{}, { userId:user.id,methods:['oauth-github'] });
+    const verifier = new AuthFnIdentityVerifier(config);
+    const url = 'https://stateplane.example.invalid/spaces';
+    const bearer = new Request(url,{ headers:{ Authorization:`Bearer ${issued.sessionToken}` } });
+    expect(await verifier.verify(bearer)).toEqual({credentialId:issued.session.id,kind:'session',userPrincipalId:user.id});
+    const policy = resolveCookiePolicy(config,new Request(url));
+    const cookies = issueSessionCookies(policy,issued.sessionToken,issued.csrfToken);
+    const cookieHeader = `${cookies.sessionCookie.split(';')[0]}; ${cookies.csrfCookie.split(';')[0]}`;
+    expect((await verifier.verify(new Request(url,{ headers:{ Cookie:cookieHeader } })))?.userPrincipalId).toBe(user.id);
+    await expect(verifier.verify(new Request(url,{method:'POST',headers:{Cookie:cookieHeader}}))).rejects.toThrow();
+    expect((await verifier.verify(new Request(url,{method:'POST',headers:{Cookie:cookieHeader,'x-authfn-csrf':issued.csrfToken}})))?.userPrincipalId).toBe(user.id);
+    await revokeSessionById(config,issued.session.id,{userId:user.id});
+    expect(await verifier.verify(bearer)).toBeNull();
+    expect(await verifier.verify(new Request(url,{headers:{Cookie:cookieHeader}}))).toBeNull();
   });
 
   it('AuthFn identity placement compare-and-set rejects a stale epoch', async () => {

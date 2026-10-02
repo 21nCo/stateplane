@@ -2,7 +2,7 @@
 
 STA-4's [regional topology, provider budget and provisioning runbook](docs/regional-topology.md) define isolated development and production cells and a disposable Cloudflare-to-Postgres qualification path. Generated configs live under ignored `.data/`; no production route or database is inferred from a local build.
 
-Stateplane is a generic owned-state service under construction. [The v1 logical contract](contracts/v1.md) is normative; this checkout supplies a Cloudflare/SvelteKit foundation, package boundaries, a fixed read-model schema, qualification probes, and the [transactional Postgres authority](docs/postgres-authority.md). The `/api/health` route reports `scaffold`, not operational state readiness.
+Stateplane is a generic owned-state service under construction. [The v1 logical contract](contracts/v1.md) is normative; this checkout supplies a Cloudflare/SvelteKit foundation, package boundaries, a fixed read-model schema, qualification probes, the [transactional Postgres authority](docs/postgres-authority.md), and [owned-space identity and regional policy services](docs/owned-spaces.md). The `/api/health` route reports `scaffold`, not operational state readiness.
 
 ## Fresh checkout
 
@@ -32,14 +32,14 @@ The isolated Postgres service binds only `127.0.0.1:55432` and uses the `statepl
 | --- | --- |
 | `packages/contracts` | Public generic IDs, capabilities and envelopes; browser-safe |
 | `packages/application` | Service ports and policy boundary |
-| `packages/postgres`, `migrations` | Stateplane-owned authority transaction port and future SQL |
-| `packages/auth` | AuthFn-backed identity integration port; space grants remain Stateplane-owned |
+| `packages/postgres`, `migrations` | Transactional record authority, space directory, cell grants and erasure SQL |
+| `packages/auth` | AuthFn bearer/cookie verification and agent-key lifecycle; space grants remain Stateplane-owned |
 | `packages/storage`, `packages/retrieval`, `packages/workers` | Originals, candidate indexes and durable projection work ports |
 | `packages/api`, `packages/mcp`, `packages/cli` | Transport boundaries that must call the same services |
 | `packages/read-model` | Fixed read-only DataFn resource declaration |
 | `packages/testing`, `test` | Generic fixtures, package qualification and consumer checks |
 | `app` | SvelteKit UI and Cloudflare HTTP entry point |
 
-`scripts/check-boundaries.mjs` enforces the package dependency graph and keeps browser sources from importing server packages. The packed external consumer checks exports and TypeScript declarations independently of pnpm workspace links. Interfaces in scaffold packages are seam definitions; they do not implement CRUD, grant checks, source storage, search, MCP transport, or job processing. See [package qualification](docs/package-qualification.md) for version evidence and upstream dependencies.
+`scripts/check-boundaries.mjs` enforces the package dependency graph and keeps browser sources from importing server packages. The packed external consumer checks exports and TypeScript declarations independently of pnpm workspace links. Space, identity and routing services now have package implementations; public HTTP/MCP/CLI CRUD, source storage, search and job processing remain later transport or feature work. See [package qualification](docs/package-qualification.md) for version evidence and upstream dependencies.
 
 Cloudflare's [SvelteKit Worker guide](https://developers.cloudflare.com/workers/framework-guides/web-apps/sveltekit/) documents the adapter and generated Worker entry; its [Wrangler bundling guide](https://developers.cloudflare.com/workers/wrangler/bundling/) documents `deploy --dry-run` as a bundle inspection step. A successful dry-run does not establish deployed behavior.

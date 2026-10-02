@@ -1,0 +1,355 @@
+import { randomUUID } from 'node:crypto';
+import { types } from 'node:util';
+import type pg from 'pg';
+import type { DirectoryPlacement, RoutingDirectory } from '@stateplane/application';
+import type { Capability, VerifiedCredential } from '@stateplane/contracts';
+import { AuthorityError, CommitOutcomeUnknownError } from './index.js';
+
+type PoolLike = Pick<pg.Pool, 'connect' | 'query'>;
+export interface CellDatabase { pool: PoolLike; storageTargetId: string }
+export interface AgentKeyProvider {
+  create(ownerPrincipalId: string, expiresAt: Date): Promise<{ id: string; secret: string }>;
+  revoke(id: string, ownerPrincipalId: string): Promise<void>;
+}
+export interface SpaceInfo extends DirectoryPlacement {
+  ownerPrincipalId: string; storageTargetId: string;
+}
+export interface CollectionGrant { collectionId: string; capabilities: readonly Capability[]; expiresAt?: Date }
+const capabilities = new Set<Capability>(['schema:write','records:read','records:write','sources:read','sources:write','claims:read','claims:write','claims:review','events:read','export:read','space:admin']);
+const validId = (id: unknown): id is string => typeof id === 'string' && id.length > 0 && id.length <= 256 && !id.includes('\0');
+function safeVersion(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) throw new AuthorityError('STALE_PLACEMENT');
+  return parsed;
+}
+
+async function transaction<T>(pool: PoolLike, fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  let begun = false;
+  let discard = false;
+  try {
+    await client.query('BEGIN'); begun = true;
+    const result = await fn(client);
+    try { await client.query('COMMIT'); begun = false; }
+    catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
+    return result;
+  } catch (error) {
+    if (begun) await client.query('ROLLBACK').catch(() => { discard = true; });
+    throw error;
+  } finally { client.release(discard); }
+}
+
+function owner(actor: VerifiedCredential): string {
+  if (actor?.kind !== 'session' || !validId(actor.userPrincipalId)) throw new AuthorityError('FORBIDDEN');
+  return actor.userPrincipalId;
+}
+function ownData(source: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(source,key);
+  if (!descriptor || !('value' in descriptor)) throw new AuthorityError('INVALID_ARGUMENT');
+  return descriptor.value;
+}
+function snapshotOwner(actor: VerifiedCredential): VerifiedCredential {
+  if (!actor || types.isProxy(actor)) throw new AuthorityError('FORBIDDEN');
+  const kind = ownData(actor,'kind');
+  if (kind !== 'session') throw new AuthorityError('FORBIDDEN');
+  const userPrincipalId = ownData(actor,'userPrincipalId');
+  const credentialId = ownData(actor,'credentialId');
+  if (!validId(userPrincipalId) || !validId(credentialId)) throw new AuthorityError('FORBIDDEN');
+  return Object.freeze({kind:'session',userPrincipalId,credentialId});
+}
+function snapshotGrants(grants: readonly CollectionGrant[], keyExpiry: Date): ReadonlyArray<CollectionGrant> {
+  if (types.isProxy(grants) || !Array.isArray(grants) || grants.length === 0) throw new AuthorityError('INVALID_ARGUMENT');
+  const seen = new Set<string>();
+  const copied: CollectionGrant[] = [];
+  for (let index = 0; index < grants.length; index++) {
+    const descriptor = Object.getOwnPropertyDescriptor(grants,index);
+    if (!descriptor || !('value' in descriptor) || !descriptor.value || types.isProxy(descriptor.value)) throw new AuthorityError('INVALID_ARGUMENT');
+    const grant = descriptor.value as CollectionGrant;
+    const collectionId = ownData(grant,'collectionId');
+    const grantCapabilities = ownData(grant,'capabilities');
+    const grantExpiry = Object.hasOwn(grant,'expiresAt') ? ownData(grant,'expiresAt') : undefined;
+    if (!validId(collectionId) || seen.has(collectionId) || types.isProxy(grantCapabilities) ||
+      !Array.isArray(grantCapabilities) || !grantCapabilities.length) throw new AuthorityError('INVALID_ARGUMENT');
+    const values: Capability[] = [];
+    for (let member = 0; member < grantCapabilities.length; member++) {
+      const item = Object.getOwnPropertyDescriptor(grantCapabilities,member);
+      if (!item || !('value' in item) || !capabilities.has(item.value)) throw new AuthorityError('INVALID_ARGUMENT');
+      values.push(item.value);
+    }
+    if (new Set(values).size !== values.length) throw new AuthorityError('INVALID_ARGUMENT');
+    if (grantExpiry !== undefined && (types.isProxy(grantExpiry) || !(grantExpiry instanceof Date) ||
+      !Number.isFinite(grantExpiry.getTime()) || grantExpiry.getTime() > keyExpiry.getTime())) throw new AuthorityError('INVALID_ARGUMENT');
+    seen.add(collectionId);
+    copied.push(Object.freeze({collectionId,capabilities:Object.freeze(values),
+      ...(grantExpiry ? {expiresAt:new Date(grantExpiry.getTime())} : {})}));
+  }
+  return Object.freeze(copied);
+}
+function info(row: Record<string, unknown>): SpaceInfo {
+  return { spaceId:String(row.space_id),ownerPrincipalId:String(row.owner_principal_id),
+    cellId:String(row.cell_id),storageTargetId:String(row.storage_target_id),lifecycle:String(row.lifecycle),
+    policyVersion:safeVersion(row.policy_version),placementGeneration:safeVersion(row.placement_generation) };
+}
+
+/** Control authority contains placement and owner metadata, never agent grants. */
+export class PostgresRoutingDirectory implements RoutingDirectory {
+  constructor(private readonly control: PoolLike) {}
+  async lookup(spaceId: string): Promise<DirectoryPlacement | null> {
+    if (!validId(spaceId)) return null;
+    const result = await this.control.query(`SELECT space_id,cell_id,lifecycle,policy_version,placement_generation
+      FROM space_directory WHERE space_id=$1`,[spaceId]);
+    const row = result.rows[0];
+    return row ? { spaceId:row.space_id,cellId:row.cell_id,lifecycle:row.lifecycle,
+      policyVersion:safeVersion(row.policy_version),placementGeneration:safeVersion(row.placement_generation) } : null;
+  }
+}
+
+/** Personal-space lifecycle. Cell changes precede directory publication; a sync failure makes old assertions stale. */
+export class PostgresSpaces {
+  constructor(private readonly control: PoolLike, private readonly cells: ReadonlyMap<string, CellDatabase>,
+    private readonly defaultCellId: string, private readonly keys: AgentKeyProvider) {
+    if (!cells.has(defaultCellId)) throw new Error('Default cell is not configured');
+  }
+  private cell(id: string): CellDatabase {
+    const cell = this.cells.get(id);
+    if (!cell) throw new AuthorityError('INVALID_ARGUMENT', 'Home cell is not selectable');
+    return cell;
+  }
+  private async owned(actor: VerifiedCredential, spaceId: string): Promise<SpaceInfo> {
+    const principal = owner(actor);
+    if (!validId(spaceId)) throw new AuthorityError('NOT_FOUND');
+    const result = await this.control.query(`SELECT * FROM space_directory WHERE space_id=$1 AND owner_principal_id=$2`,[spaceId,principal]);
+    if (!result.rows[0] || ['provisioning','deleted'].includes(result.rows[0].lifecycle)) throw new AuthorityError('NOT_FOUND');
+    return info(result.rows[0]);
+  }
+  async create(actor: VerifiedCredential, requestedCellId?: string): Promise<SpaceInfo> {
+    actor = snapshotOwner(actor);
+    const principal = owner(actor);
+    const cellId = requestedCellId ?? this.defaultCellId;
+    const cell = this.cell(cellId); // only server-configured cells are selectable
+    const spaceId = `sp_${randomUUID()}`;
+    await this.control.query(`INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,lifecycle)
+      VALUES($1,$2,$3,$4,'provisioning')`,[spaceId,principal,cellId,cell.storageTargetId]);
+    try {
+      await transaction(cell.pool, async db => {
+        await db.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+          VALUES($1,$2,$3,$3,$4)`,[spaceId,principal,cellId,cell.storageTargetId]);
+        await db.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
+          VALUES($1,$2,$3,$4,'space:create',1,1)`,[`aud_${randomUUID()}`,spaceId,principal,actor.credentialId]);
+      });
+      const published = await this.control.query(`UPDATE space_directory SET lifecycle='active',updated_at=clock_timestamp()
+        WHERE space_id=$1 AND lifecycle='provisioning' RETURNING *`,[spaceId]);
+      if (!published.rows[0]) throw new Error('Space publication was interrupted');
+      return info(published.rows[0]);
+    } catch (error) {
+      // The row remains unrouteable if either database becomes unavailable.
+      await this.control.query(`UPDATE space_directory SET lifecycle='deleted',updated_at=clock_timestamp()
+        WHERE space_id=$1 AND lifecycle='provisioning'`,[spaceId]).catch(() => {});
+      await cell.pool.query(`UPDATE spaces SET lifecycle='deleted' WHERE space_id=$1 AND lifecycle='active'`,[spaceId]).catch(() => {});
+      throw error;
+    }
+  }
+  async list(actor: VerifiedCredential): Promise<SpaceInfo[]> {
+    actor = snapshotOwner(actor);
+    const rows = await this.control.query(`SELECT * FROM space_directory WHERE owner_principal_id=$1 AND lifecycle NOT IN ('provisioning','deleted')
+      ORDER BY created_at,space_id`,[owner(actor)]);
+    return rows.rows.map(info);
+  }
+  async get(actor: VerifiedCredential, spaceId: string): Promise<SpaceInfo> {
+    if (!actor || types.isProxy(actor) || !validId(spaceId)) throw new AuthorityError('NOT_FOUND');
+    const kind = ownData(actor,'kind');
+    if (kind === 'session') return this.owned(snapshotOwner(actor),spaceId);
+    if (kind !== 'api-key') throw new AuthorityError('FORBIDDEN');
+    const credentialId = ownData(actor,'credentialId');
+    if (!validId(credentialId)) throw new AuthorityError('FORBIDDEN');
+    const control = await this.control.query('SELECT * FROM space_directory WHERE space_id=$1 AND lifecycle<>$2',[spaceId,'deleted']);
+    const row = control.rows[0];
+    if (!row) throw new AuthorityError('NOT_FOUND');
+    const cell = await this.cell(row.cell_id).pool.query(`SELECT s.policy_version,s.placement_generation,s.cell_id
+      FROM spaces s JOIN space_credentials sc ON sc.space_id=s.space_id AND sc.credential_id=$2
+      JOIN collection_grants g ON g.space_id=s.space_id AND g.credential_id=sc.credential_id
+      JOIN collections c ON c.space_id=g.space_id AND c.collection_id=g.collection_id
+      WHERE s.space_id=$1 AND s.lifecycle<>'deleted' AND c.lifecycle<>'deleted'
+        AND sc.owner_principal_id=s.owner_principal_id
+        AND sc.revoked_at IS NULL AND sc.expires_at>clock_timestamp()
+        AND (g.expires_at IS NULL OR g.expires_at>clock_timestamp())
+        AND g.capabilities @> ARRAY['space:admin']::text[] LIMIT 1`,[spaceId,credentialId]);
+    const local = cell.rows[0];
+    if (!local) throw new AuthorityError('FORBIDDEN');
+    if (local.cell_id !== row.cell_id || safeVersion(local.policy_version) !== safeVersion(row.policy_version) ||
+      safeVersion(local.placement_generation) !== safeVersion(row.placement_generation)) throw new AuthorityError('STALE_PLACEMENT');
+    return info(row);
+  }
+
+  private async publish(space: SpaceInfo, policyVersion: number, lifecycle: string): Promise<void> {
+    const updated = await this.control.query(`UPDATE space_directory SET policy_version=$3,lifecycle=$4,updated_at=clock_timestamp()
+      WHERE space_id=$1 AND policy_version=$2 AND placement_generation=$5 AND cell_id=$6 RETURNING 1`,
+    [space.spaceId,space.policyVersion,policyVersion,lifecycle,space.placementGeneration,space.cellId]);
+    if (updated.rowCount !== 1) throw new AuthorityError('STALE_PLACEMENT');
+  }
+  private async changeLifecycle(actor: VerifiedCredential, spaceId: string, lifecycle: 'active' | 'readOnly' | 'suspended' | 'deleting'): Promise<void> {
+    actor = snapshotOwner(actor);
+    const space = await this.owned(actor,spaceId);
+    const prior = space.lifecycle;
+    if (prior === 'deleting' || prior === 'deleted' || (lifecycle === 'active' && prior === 'active')) throw new AuthorityError('SPACE_UNAVAILABLE');
+    if (lifecycle === 'deleting' && prior !== 'readOnly' && prior !== 'suspended') throw new AuthorityError('INVALID_ARGUMENT', 'Archive or suspend before deletion');
+    const next = lifecycle;
+    const version = await transaction(this.cell(space.cellId).pool, async db => {
+      const changed = await db.query(`UPDATE spaces SET lifecycle=$3,policy_version=policy_version+1
+        WHERE space_id=$1 AND owner_principal_id=$2 AND policy_version=$4 AND lifecycle=$5 RETURNING policy_version,placement_generation`,
+      [spaceId,owner(actor),next,space.policyVersion,prior]);
+      if (!changed.rows[0]) throw new AuthorityError('STALE_PLACEMENT');
+      await db.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
+        VALUES($1,$2,$3,$4,$5,$6,$7)`,[`aud_${randomUUID()}`,spaceId,owner(actor),actor.credentialId,
+        `space:${next}`,changed.rows[0].policy_version,changed.rows[0].placement_generation]);
+      return Number(changed.rows[0].policy_version);
+    });
+    await this.publish(space,version,next);
+  }
+  archive(actor: VerifiedCredential, spaceId: string): Promise<void> { return this.changeLifecycle(actor,spaceId,'readOnly'); }
+  restore(actor: VerifiedCredential, spaceId: string): Promise<void> { return this.changeLifecycle(actor,spaceId,'active'); }
+  suspend(actor: VerifiedCredential, spaceId: string): Promise<void> { return this.changeLifecycle(actor,spaceId,'suspended'); }
+  async delete(actor: VerifiedCredential, spaceId: string): Promise<void> {
+    actor = snapshotOwner(actor);
+    const current = await this.owned(actor,spaceId);
+    if (current.lifecycle !== 'deleting') await this.changeLifecycle(actor,spaceId,'deleting');
+    const space = await this.owned(actor,spaceId);
+    const cell = this.cell(space.cellId);
+    const local = await cell.pool.query('SELECT lifecycle,policy_version FROM spaces WHERE space_id=$1',[spaceId]);
+    if (local.rows[0]?.lifecycle === 'deleting') {
+      const keys = await cell.pool.query('SELECT credential_id FROM space_credentials WHERE space_id=$1 AND revoked_at IS NULL',[spaceId]);
+      // Provider revocation is retryable. Until it succeeds, deleting denies every content effect.
+      for (const row of keys.rows) await this.keys.revoke(row.credential_id,owner(actor));
+      await transaction(cell.pool, async db => {
+        await db.query('SELECT stateplane_purge_space($1)',[spaceId]);
+        const version = await db.query('SELECT policy_version,placement_generation FROM spaces WHERE space_id=$1',[spaceId]);
+        await db.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
+          VALUES($1,$2,$3,$4,'space:deleted',$5,$6)`,[`aud_${randomUUID()}`,spaceId,owner(actor),actor.credentialId,
+          version.rows[0].policy_version,version.rows[0].placement_generation]);
+      });
+    } else if (local.rows[0]?.lifecycle !== 'deleted') throw new AuthorityError('STALE_PLACEMENT');
+    const deleted = await cell.pool.query('SELECT policy_version FROM spaces WHERE space_id=$1 AND lifecycle=$2',[spaceId,'deleted']);
+    if (!deleted.rows[0]) throw new AuthorityError('STALE_PLACEMENT');
+    await this.publish(space,Number(deleted.rows[0].policy_version),'deleted');
+  }
+  update(actor: VerifiedCredential, spaceId: string, lifecycle: 'active' | 'readOnly' | 'suspended'): Promise<void> {
+    if (!['active','readOnly','suspended'].includes(lifecycle)) throw new AuthorityError('INVALID_ARGUMENT');
+    return this.changeLifecycle(actor,spaceId,lifecycle);
+  }
+
+  /** Control-plane operation after a verified placement configuration change. No data move occurs here. */
+  async fencePlacement(spaceId: string, expectedCellId: string, expectedGeneration: number): Promise<number> {
+    if (!validId(spaceId) || !this.cells.has(expectedCellId) || !Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) throw new AuthorityError('INVALID_ARGUMENT');
+    const directory = await this.control.query('SELECT * FROM space_directory WHERE space_id=$1',[spaceId]);
+    const row = directory.rows[0];
+    if (!row || row.cell_id !== expectedCellId || Number(row.placement_generation) !== expectedGeneration || row.lifecycle === 'deleted') throw new AuthorityError('STALE_PLACEMENT');
+    const next = await transaction(this.cell(expectedCellId).pool, async db => {
+      const changed = await db.query(`UPDATE spaces SET placement_generation=placement_generation+1
+        WHERE space_id=$1 AND cell_id=$2 AND placement_generation=$3 RETURNING placement_generation,policy_version`,
+      [spaceId,expectedCellId,expectedGeneration]);
+      if (!changed.rows[0]) throw new AuthorityError('STALE_PLACEMENT');
+      await db.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,action,policy_version,placement_generation)
+        VALUES($1,$2,'system:placement','placement:fence',$3,$4)`,[`aud_${randomUUID()}`,spaceId,
+        changed.rows[0].policy_version,changed.rows[0].placement_generation]);
+      return Number(changed.rows[0].placement_generation);
+    });
+    const published = await this.control.query(`UPDATE space_directory SET placement_generation=$3,updated_at=clock_timestamp()
+      WHERE space_id=$1 AND cell_id=$2 AND placement_generation=$4 RETURNING 1`,[spaceId,expectedCellId,next,expectedGeneration]);
+    if (published.rowCount !== 1) throw new AuthorityError('STALE_PLACEMENT');
+    return next;
+  }
+
+  /** Repair an interrupted cell-first publication from the cell's current authority. */
+  async reconcile(spaceId: string): Promise<SpaceInfo> {
+    if (!validId(spaceId)) throw new AuthorityError('INVALID_ARGUMENT');
+    const control = await this.control.query('SELECT * FROM space_directory WHERE space_id=$1',[spaceId]);
+    const row = control.rows[0];
+    if (!row) throw new AuthorityError('NOT_FOUND');
+    const current = await this.cell(row.cell_id).pool.query(`SELECT * FROM spaces WHERE space_id=$1`,[spaceId]);
+    const local = current.rows[0];
+    if (local && (local.owner_principal_id !== row.owner_principal_id || local.cell_id !== row.cell_id ||
+      local.storage_target_id !== row.storage_target_id)) throw new AuthorityError('STALE_PLACEMENT');
+    if (row.lifecycle === 'deleted') {
+      if (local && local.lifecycle !== 'deleted') await this.cell(row.cell_id).pool.query(`UPDATE spaces SET lifecycle='deleted',policy_version=policy_version+1 WHERE space_id=$1`,[spaceId]);
+      return info(row);
+    }
+    const lifecycle = local?.lifecycle ?? 'deleted';
+    const updated = await this.control.query(`UPDATE space_directory SET lifecycle=$2,policy_version=$3,
+      placement_generation=$4,updated_at=clock_timestamp() WHERE space_id=$1 RETURNING *`,
+    [spaceId,lifecycle,local?.policy_version ?? row.policy_version,local?.placement_generation ?? row.placement_generation]);
+    return info(updated.rows[0]);
+  }
+
+  async issueAgentKey(actor: VerifiedCredential, spaceId: string, expiresAt: Date, grants: readonly CollectionGrant[]): Promise<{ id: string; secret: string }> {
+    actor = snapshotOwner(actor);
+    if (!expiresAt || types.isProxy(expiresAt) || !(expiresAt instanceof Date) || !Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= Date.now()) throw new AuthorityError('INVALID_ARGUMENT');
+    expiresAt = new Date(expiresAt.getTime());
+    const expiryMs = expiresAt.getTime();
+    grants = snapshotGrants(grants,expiresAt);
+    const space = await this.owned(actor,spaceId);
+    if (space.lifecycle !== 'active') throw new AuthorityError('SPACE_UNAVAILABLE');
+    const created = await this.keys.create(owner(actor),new Date(expiryMs));
+    try {
+      const version = await transaction(this.cell(space.cellId).pool, async db => {
+        const locked = await db.query(`SELECT policy_version,lifecycle FROM spaces WHERE space_id=$1 AND owner_principal_id=$2 FOR UPDATE`,[spaceId,owner(actor)]);
+        if (!locked.rows[0] || Number(locked.rows[0].policy_version) !== space.policyVersion || locked.rows[0].lifecycle !== 'active') throw new AuthorityError('STALE_PLACEMENT');
+        await db.query(`INSERT INTO space_credentials(space_id,credential_id,principal_id,owner_principal_id,expires_at)
+          VALUES($1,$2,$3,$4,$5)`,[spaceId,created.id,`agent_${randomUUID()}`,owner(actor),new Date(expiryMs)]);
+        for (const grant of grants) await db.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities,expires_at)
+          VALUES($1,$2,$3,$4,$5)`,[spaceId,grant.collectionId,created.id,grant.capabilities,grant.expiresAt ?? null]);
+        const changed = await db.query(`UPDATE spaces SET policy_version=policy_version+1 WHERE space_id=$1 RETURNING policy_version,placement_generation`,[spaceId]);
+        await db.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation,details)
+          VALUES($1,$2,$3,$4,'key:issue',$5,$6,$7::jsonb)`,[`aud_${randomUUID()}`,spaceId,owner(actor),created.id,
+          changed.rows[0].policy_version,changed.rows[0].placement_generation,JSON.stringify({ expiresAt:new Date(expiryMs).toISOString(),
+            grants:grants.map(g => ({collectionId:g.collectionId,capabilities:g.capabilities,expiresAt:g.expiresAt?.toISOString() ?? null})) })]);
+        return Number(changed.rows[0].policy_version);
+      });
+      await this.publish(space,version,space.lifecycle);
+      return created;
+    } catch (error) {
+      await this.keys.revoke(created.id,owner(actor)).catch(() => {});
+      throw error;
+    }
+  }
+  async revokeAgentKey(actor: VerifiedCredential, spaceId: string, keyId: string): Promise<void> {
+    actor = snapshotOwner(actor);
+    const space = await this.owned(actor,spaceId);
+    if (!validId(keyId)) throw new AuthorityError('INVALID_ARGUMENT');
+    const version = await transaction(this.cell(space.cellId).pool, async db => {
+      const locked = await db.query(`SELECT policy_version FROM spaces WHERE space_id=$1 AND owner_principal_id=$2 FOR UPDATE`,[spaceId,owner(actor)]);
+      if (!locked.rows[0] || Number(locked.rows[0].policy_version) !== space.policyVersion) throw new AuthorityError('STALE_PLACEMENT');
+      const revoked = await db.query(`UPDATE space_credentials SET revoked_at=clock_timestamp()
+        WHERE space_id=$1 AND credential_id=$2 AND owner_principal_id=$3 AND revoked_at IS NULL RETURNING 1`,[spaceId,keyId,owner(actor)]);
+      if (revoked.rowCount !== 1) throw new AuthorityError('NOT_FOUND');
+      await db.query(`DELETE FROM collection_grants WHERE space_id=$1 AND credential_id=$2`,[spaceId,keyId]);
+      const changed = await db.query(`UPDATE spaces SET policy_version=policy_version+1 WHERE space_id=$1 RETURNING policy_version,placement_generation`,[spaceId]);
+      await db.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
+        VALUES($1,$2,$3,$4,'key:revoke',$5,$6)`,[`aud_${randomUUID()}`,spaceId,owner(actor),keyId,
+        changed.rows[0].policy_version,changed.rows[0].placement_generation]);
+      return Number(changed.rows[0].policy_version);
+    });
+    let publishError: unknown;
+    try { await this.publish(space,version,space.lifecycle); }
+    catch (error) { publishError = error; }
+    // Local revocation is authoritative. Revoke the AuthFn primitive even when
+    // the control directory is unavailable, then report the failed publication.
+    await this.keys.revoke(keyId,owner(actor));
+    if (publishError) throw publishError;
+  }
+  async rotateAgentKey(actor: VerifiedCredential, spaceId: string, oldKeyId: string, expiresAt: Date,
+    grants: readonly CollectionGrant[]): Promise<{ id: string; secret: string }> {
+    actor = snapshotOwner(actor);
+    if (!expiresAt || types.isProxy(expiresAt) || !(expiresAt instanceof Date) || !Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= Date.now()) throw new AuthorityError('INVALID_ARGUMENT');
+    expiresAt = new Date(expiresAt.getTime());
+    grants = snapshotGrants(grants,expiresAt);
+    await this.revokeAgentKey(actor,spaceId,oldKeyId);
+    return this.issueAgentKey(actor,spaceId,expiresAt,grants);
+  }
+  async audit(actor: VerifiedCredential, spaceId: string): Promise<ReadonlyArray<Record<string, unknown>>> {
+    actor = snapshotOwner(actor);
+    const space = await this.owned(actor,spaceId);
+    const rows = await this.cell(space.cellId).pool.query(`SELECT audit_id,action,credential_id,policy_version,placement_generation,recorded_at,details
+      FROM space_audit WHERE space_id=$1 ORDER BY recorded_at,audit_id`,[spaceId]);
+    return rows.rows;
+  }
+}

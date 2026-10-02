@@ -19,6 +19,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@stateplane/contracts": "workspace:*"
+    "@stateplane/contracts": "workspace:*",
+    "@authfn/core": "0.1.1"
   }
 }

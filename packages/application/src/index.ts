@@ -4,3 +4,4 @@ export interface UnitOfWork { transaction<T>(operation: () => Promise<T>): Promi
 export interface ApplicationPorts { authorizer: Authorizer; unitOfWork: UnitOfWork; }
 /** Bind the scaffold application to its supplied service ports. */
 export function createApplication(ports: ApplicationPorts): ApplicationPorts { return ports; }
+export * from './routing.js';

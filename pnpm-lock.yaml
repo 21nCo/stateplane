@@ -147,6 +147,9 @@ importers:
 
   packages/auth:
     dependencies:
+      '@authfn/core':
+        specifier: 0.1.1
+        version: 0.1.1(drizzle-orm@0.45.3(@cloudflare/workers-types@5.20260918.1)(@types/pg@8.20.0)(pg@8.22.0))
       '@stateplane/contracts':
         specifier: workspace:*
         version: link:../contracts
@@ -170,6 +173,9 @@ importers:
 
   packages/postgres:
     dependencies:
+      '@stateplane/application':
+        specifier: workspace:*
+        version: link:../application
       '@stateplane/contracts':
         specifier: workspace:*
         version: link:../contracts

@@ -12,5 +12,12 @@ export function parseRevision(value: unknown): Revision {
 export interface RecordRef { spaceId: SpaceId; collectionId: CollectionId; id: string; }
 export type Capability = 'schema:write' | 'records:read' | 'records:write' | 'sources:read' | 'sources:write' | 'claims:read' | 'claims:write' | 'claims:review' | 'events:read' | 'export:read' | 'space:admin';
 export interface ActorContext { principalId: string; credentialId: string; }
+/** AuthFn proves the credential; Stateplane assigns the principal for agent keys. */
+export interface VerifiedCredential {
+  credentialId: string;
+  kind: 'session' | 'api-key';
+  /** Only sessions carry a user principal directly. API keys require a Stateplane mapping. */
+  userPrincipalId?: string;
+}
 export interface Placement { cellId: string; storageTargetId: string; generation: number; }
 export interface ProjectionStatus { state: 'pending' | 'current' | 'degraded'; generation: number; }
