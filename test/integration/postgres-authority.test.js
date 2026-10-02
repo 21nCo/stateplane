@@ -85,6 +85,27 @@ async function within(promise, milliseconds = 3000) {
   } finally { clearTimeout(timer); }
 }
 
+async function scheduleGrantExpiry(scope, collectionId) {
+  // A held authority transaction SELECTs its grant FOR SHARE, so the expiry
+  // must be scheduled before it starts. Eight seconds leaves room for both
+  // bounded gates, including a deliberately delayed connection.
+  const result=await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '8 seconds'
+    WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 RETURNING expires_at`,
+  [scope.spaceId,collectionId,scope.credentialId]);
+  assert.equal(result.rowCount,1);
+  return result.rows[0].expires_at;
+}
+
+async function awaitGrantExpiry(expiry) {
+  await pool.query(`SELECT pg_sleep(GREATEST(0,EXTRACT(EPOCH FROM ($1::timestamptz-clock_timestamp()))+0.05))`,[expiry]);
+}
+
+async function awaitOwnerGate(ready, ownerResult) {
+  await within(Promise.race([ready,ownerResult.then(error => {
+    throw error ?? new Error('owner finished before reaching its gate');
+  })]));
+}
+
 test('atomic mutation, real competing writers, rollback, replay and scope', async () => {
   const { scope, otherId } = await fixture();
   const first = change('create','create-a','{"label":"A","score":1}', {
@@ -203,26 +224,25 @@ test('a pending identity cannot disclose an expired original collection grant', 
   const { scope, otherId } = await fixture();
   await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
     VALUES($1,$2,$3,ARRAY['records:write']::text[])`, [scope.spaceId,otherId,scope.credentialId]);
-  await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '400 milliseconds'
-    WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,
-  [scope.spaceId,scope.collectionId,scope.credentialId]);
+  const expiry=await scheduleGrantExpiry(scope,scope.collectionId);
   const request=change('create','pending-expiry','{"label":"held"}');
   let release;
   let entered;
   const held=new Promise(resolve=>{release=resolve;});
   const ready=new Promise(resolve=>{entered=resolve;});
-  const owner=authority.transaction(scope,async tx=>{
+  const owner=delayedConnectionAuthority(600).transaction(scope,async tx=>{
     await tx.mutate(request);
     entered();
     await held;
   });
-  await ready;
-  await new Promise(resolve=>setTimeout(resolve,450));
+  const ownerResult=owner.then(() => null,error => error);
   try {
+    await awaitOwnerGate(ready,ownerResult);
+    await awaitGrantExpiry(expiry);
     await assert.rejects(within(authority.mutate({...scope,collectionId:otherId},request)),
       error=>error.code==='FORBIDDEN');
-  } finally {release();}
-  await assert.rejects(owner,error=>error.code==='FORBIDDEN');
+  } finally {release(); await within(ownerResult,10000);}
+  assert.equal((await ownerResult)?.code,'FORBIDDEN');
   assert.deepEqual(await counts(scope.spaceId),{
     records:0,record_unique_keys:0,record_index_values:0,record_events:0,
     idempotency_receipts:0,record_tombstones:0,projection_outbox:0
@@ -276,6 +296,13 @@ function delayedPendingPool() {
     }, release: discard => client.release(discard) };
   } };
   return { repository: new PostgresAuthority(delayed, 3600), reached, unblock: () => unblock() };
+}
+
+function delayedConnectionAuthority(milliseconds) {
+  return new PostgresAuthority({ connect: async () => {
+    await new Promise(resolve => setTimeout(resolve, milliseconds));
+    return pool.connect();
+  } }, 3600);
 }
 
 for (const outcome of ['commit','rollback']) for (const crossCollection of [false,true]) {
@@ -375,35 +402,42 @@ for (const expiringCollection of ['requested-same','requested-cross','original-c
     if (crossCollection) await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
       VALUES($1,$2,$3,ARRAY['records:write']::text[])`,[scope.spaceId,otherId,scope.credentialId]);
     const expiringId=expiringCollection==='requested-cross' ? otherId : scope.collectionId;
-    await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '500 milliseconds'
-      WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[scope.spaceId,expiringId,scope.credentialId]);
+    const expiry=await scheduleGrantExpiry(scope,expiringId);
     const requested=crossCollection ? {...scope,collectionId:otherId} : scope;
     const request=change('create',`expiry-${expiringCollection}`,'{"label":"held"}');
     let releaseOwner, ownerEntered;
     const held=new Promise(resolve=>{releaseOwner=resolve;});
     const ready=new Promise(resolve=>{ownerEntered=resolve;});
-    const owner=authority.transaction(scope,async tx=>{
+    // Simulate a connection slower than the old 500 ms expiry window.
+    const owner=delayedConnectionAuthority(600).transaction(scope,async tx=>{
       await tx.mutate(request);
       ownerEntered();
       await held;
     });
-    await ready;
-    const gate=delayedPendingPool();
-    const contender=gate.repository.mutate(requested,request);
+    const ownerResult=owner.then(() => null,error => error);
+    let gate, contender;
     try {
+      await awaitOwnerGate(ready,ownerResult);
+      gate=delayedPendingPool();
+      contender=gate.repository.mutate(requested,request);
       await within(gate.reached);
-      await new Promise(resolve=>setTimeout(resolve,550));
+      await awaitGrantExpiry(expiry);
       gate.unblock();
       await assert.rejects(within(contender),error=>error.code==='FORBIDDEN');
     } finally {
-      gate.unblock();
+      gate?.unblock();
       releaseOwner();
-      await Promise.allSettled([contender,owner]);
+      await within(Promise.allSettled([contender,ownerResult].filter(Boolean)),10000);
     }
+    assert.equal((await ownerResult)?.code,expiringCollection==='requested-cross' ? undefined : 'FORBIDDEN');
     const result=await counts(scope.spaceId);
     assert.equal(result.record_events,expiringCollection==='requested-cross' ? 1 : 0);
     assert.equal(result.idempotency_receipts,result.record_events);
     assert.equal(result.projection_outbox,result.record_events);
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM receipt_reservations WHERE space_id=$1',
+      [scope.spaceId])).rows[0].n,0);
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM receipt_reservation_scopes WHERE space_id=$1',
+      [scope.spaceId])).rows[0].n,0);
   });
 }
 
@@ -1067,12 +1101,11 @@ test('original collection grant must remain live at replay commit', async () => 
   await authority.mutate(scope,request);
   await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
     VALUES($1,$2,$3,ARRAY['records:write'])`,[scope.spaceId,otherId,scope.credentialId]);
-  await pool.query("UPDATE collection_grants SET expires_at=clock_timestamp()+interval '300 milliseconds' WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3",
-    [scope.spaceId,scope.collectionId,scope.credentialId]);
+  const expiry=await scheduleGrantExpiry(scope,scope.collectionId);
   await assert.rejects(authority.transaction({...scope,collectionId:otherId},async tx=>{
     const replay=await tx.mutate(request);
     assert.equal(replay.replayed,true);
-    await new Promise(resolve=>setTimeout(resolve,450));
+    await awaitGrantExpiry(expiry);
   }),error=>error.code==='FORBIDDEN');
   assert.equal((await counts(scope.spaceId)).record_events,1);
 });
