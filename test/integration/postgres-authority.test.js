@@ -299,6 +299,74 @@ test('a cross-collection retry with both grants gets pending, then the original 
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM receipt_reservation_scopes WHERE space_id=$1',[scope.spaceId])).rows[0].n,0);
 });
 
+for (const operation of ['create','replace','patch','delete']) for (const outcome of ['commit','rollback']) {
+  test(`a completed ${operation} scope probe cannot impersonate an owner that will ${outcome}`, async () => {
+    const {scope,otherId}=await fixture();
+    const ownerScope={...scope,collectionId:otherId,principalId:'owner'};
+    const initial=operation==='create' ? null : await authority.mutate(ownerScope,
+      change('create',`false-pending-initial-${operation}-${outcome}`,'{"label":"initial"}'));
+    const request=change(operation,`false-pending-${operation}-${outcome}`,
+      operation==='delete' ? undefined : '{"label":"held"}',
+      initial ? {recordId:initial.ref.id,expectedRevision:1} : {});
+    let releaseOwner, ownerEntered;
+    const held=new Promise(resolve=>{releaseOwner=resolve;});
+    const ready=new Promise(resolve=>{ownerEntered=resolve;});
+    const owner=authority.transaction(ownerScope,async tx=>{
+      const receipt=await tx.mutate(request);
+      ownerEntered();
+      await held;
+      if (outcome==='rollback') throw new Error('injected owner rollback');
+      return receipt;
+    });
+    const ownerResult=owner.then(value=>({value}),error=>({error}));
+    const intermediate=await pool.connect();
+    try {
+      await awaitOwnerGate(ready,ownerResult.then(result=>result.error));
+      await intermediate.query('BEGIN');
+      const timeoutBefore=(await intermediate.query('SHOW lock_timeout')).rows[0].lock_timeout;
+      const probe=await intermediate.query(
+        'SELECT reservation_state FROM stateplane_try_reserve_receipt($1,$2,$3,$4,$5,$6)',
+        [scope.spaceId,scope.collectionId,scope.credentialId,scope.principalId,
+          request.operation,request.idempotencyKey]);
+      assert.equal(probe.rows[0].reservation_state,'unresolved');
+      assert.equal((await intermediate.query('SHOW lock_timeout')).rows[0].lock_timeout,timeoutBefore);
+      // The intermediate transaction remains open while a third connection
+      // asks about the same identity. Its successful probe owns no identity.
+      await assert.rejects(within(authority.mutate(scope,request)),error=>error.code==='FORBIDDEN');
+    } finally {
+      try { await intermediate.query('ROLLBACK'); }
+      finally {
+        intermediate.release();
+        releaseOwner();
+        await within(ownerResult,10000);
+      }
+    }
+    const result=await within(ownerResult);
+    if (outcome==='commit') {
+      assert.ok(result.value);
+      assert.equal((await authority.mutate(ownerScope,request)).receiptId,result.value.receiptId);
+      await assert.rejects(authority.mutate(scope,request),error=>error.code==='FORBIDDEN');
+    } else {
+      assert.match(result.error.message,/injected owner rollback/);
+      const fresh=await authority.mutate(operation==='create' ? scope : ownerScope,request);
+      assert.equal(fresh.replayed,false);
+    }
+    assert.deepEqual(await counts(scope.spaceId),{
+      records:1,record_unique_keys:0,record_index_values:0,record_events:initial ? 2 : 1,
+      idempotency_receipts:initial ? 2 : 1,record_tombstones:operation==='delete' ? 1 : 0,
+      projection_outbox:initial ? 2 : 1
+    });
+    const placed=await pool.query('SELECT collection_id,revision,tombstone FROM records WHERE space_id=$1',
+      [scope.spaceId]);
+    assert.equal(placed.rows[0].collection_id,outcome==='rollback' && operation==='create' ? scope.collectionId : otherId);
+    assert.equal(Number(placed.rows[0].revision),initial ? 2 : 1);
+    assert.equal(placed.rows[0].tombstone,operation==='delete');
+    for (const table of ['receipt_reservations','receipt_reservation_scopes']) {
+      assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[scope.spaceId])).rows[0].n,0);
+    }
+  });
+}
+
 function delayedPendingPool() {
   let signal, unblock;
   const reached = new Promise(resolve => { signal = resolve; });

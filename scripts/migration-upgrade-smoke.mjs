@@ -107,11 +107,11 @@ try {
     const build005Ms=Math.round(performance.now()-started);
     const secondStart=performance.now();
     const output=runMigrator(names[0]);
-    const build006And007Ms=Math.round(performance.now()-secondStart);
+    const buildRemainingMs=Math.round(performance.now()-secondStart);
     assert.match(output,/Applied 006_outbox_due_order.sql/);
     assert.match(output,/Applied 007_receipt_reservations.sql/);
     assert.match(output,/Applied 008_receipt_reservation_scopes.sql/);
-    assert.match(output,/Applied 009_receipt_reservation_round_trips.sql/);
+    assert.match(output,/Applied 010_receipt_scope_probe_rollback.sql/);
     assert.deepEqual(await facts(upgraded),before);
     assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM receipt_reservations')).rows[0].n,0);
     assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM receipt_reservation_scopes')).rows[0].n,0);
@@ -128,9 +128,9 @@ try {
     assert.equal(await index(upgraded),await index(fresh));
     assert.deepEqual(await constraints(upgraded),await constraints(fresh));
     await enforceUniqueRecord(upgraded);
-    assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,9);
+    assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,10);
     assert.equal(runMigrator(names[0]),'');
-    console.log(`Upgrade smoke passed: complete 2000 record/event/receipt/outbox rows preserved; final index matches fresh install; 005 build ${build005Ms}ms, 006-009 migrator ${build006And007Ms}ms`);
+    console.log(`Upgrade smoke passed: complete 2000 record/event/receipt/outbox rows preserved; final index matches fresh install; 005 build ${build005Ms}ms, 006-010 migrator ${buildRemainingMs}ms`);
   } finally { await Promise.allSettled([upgraded.end(),fresh.end()]); }
 } finally {
   created.reverse();
