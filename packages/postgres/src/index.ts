@@ -252,7 +252,6 @@ export class AuthorityTransaction {
   private readonly activeOperations = new Set<Promise<unknown>>();
   private mutationTail: Promise<void> = Promise.resolve();
   private readonly reservedIdentities = new Map<string, { operation: RecordMutation; key: string }>();
-  private priorLockTimeout: string | undefined;
   private admittingMutations = true;
   private readonly replayCollections = new Set<CollectionId>();
   readonly #scope: Readonly<AuthorityScope>;
@@ -284,21 +283,21 @@ export class AuthorityTransaction {
   async checkScope(): Promise<void> {
     const { spaceId, collectionId, principalId, credentialId, capability, policyVersion, placementGeneration } = this.#scope;
     const result = await this.query(`SELECT s.owner_principal_id, s.lifecycle, s.policy_version, s.placement_generation,
-      c.lifecycle AS collection_lifecycle, g.capabilities, g.expires_at
+      c.lifecycle AS collection_lifecycle, g.capabilities, g.expires_at, g.grant_current
       FROM spaces s JOIN collections c ON c.space_id=s.space_id
-      LEFT JOIN collection_grants g ON g.space_id=c.space_id AND g.collection_id=c.collection_id AND g.credential_id=$3
-      WHERE s.space_id=$1 AND c.collection_id=$2 FOR SHARE OF s,c`, [spaceId, collectionId, credentialId]);
+      LEFT JOIN LATERAL (
+        SELECT capabilities,expires_at,expires_at > clock_timestamp() AS grant_current FROM collection_grants
+        WHERE space_id=c.space_id AND collection_id=c.collection_id AND credential_id=$3
+          AND s.owner_principal_id<>$4 FOR SHARE
+      ) g ON TRUE
+      WHERE s.space_id=$1 AND c.collection_id=$2 FOR SHARE OF s,c`, [spaceId, collectionId, credentialId, principalId]);
     const row = result.rows[0];
     if (!row) throw new AuthorityError('NOT_FOUND');
     if (Number(row.policy_version) !== policyVersion || Number(row.placement_generation) !== placementGeneration) throw new AuthorityError('FORBIDDEN', 'Policy or placement changed');
     if (['suspended','deleting','deleted'].includes(row.lifecycle)) throw new AuthorityError('SPACE_UNAVAILABLE');
     if (row.collection_lifecycle === 'deleted') throw new AuthorityError('NOT_FOUND');
-    if (row.owner_principal_id !== principalId) {
-      const grant = await this.query(`SELECT capabilities,expires_at,expires_at > clock_timestamp() AS grant_current FROM collection_grants
-        WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 FOR SHARE`, [spaceId, collectionId, credentialId]);
-      const current = grant.rows[0];
-      if (!current?.capabilities.includes(capability) || (current.expires_at && !current.grant_current)) throw new AuthorityError('FORBIDDEN');
-    }
+    if (row.owner_principal_id !== principalId &&
+      (!row.capabilities?.includes(capability) || (row.expires_at && !row.grant_current))) throw new AuthorityError('FORBIDDEN');
     if (row.collection_lifecycle === 'readOnly' && capability === 'records:write') throw new AuthorityError('SPACE_UNAVAILABLE');
   }
 
@@ -398,61 +397,25 @@ export class AuthorityTransaction {
   /** Uncommitted unique rows provide Hyperdrive-compatible, scoped try-locks. */
   private async reserveIdentity(change: Readonly<RecordChange>, identity: string): Promise<void> {
     if (this.reservedIdentities.has(identity)) return;
-    this.priorLockTimeout ??= (await this.query('SHOW lock_timeout')).rows[0].lock_timeout as string;
-    // A timeout describes an earlier owner state. It may commit or roll back
-    // while scoped probes run, so retry the reservation before denying access.
-    for (let attempt = 0; attempt < 3; attempt++) {
-      await this.query('SAVEPOINT receipt_reservation');
-      try {
-        await this.query(`WITH timeout AS MATERIALIZED (SELECT set_config('lock_timeout','50ms',true) AS value),
-          scoped AS (INSERT INTO receipt_reservation_scopes(space_id,collection_id,credential_id,operation,idempotency_key)
-            SELECT $1,$2,$3,$4,$5 FROM timeout RETURNING 1)
-          INSERT INTO receipt_reservations(space_id,credential_id,operation,idempotency_key)
-            SELECT $1,$3,$4,$5 FROM scoped`,
-          [this.#scope.spaceId,this.#scope.collectionId,this.#scope.credentialId,change.operation,change.idempotencyKey]);
-        await this.query("SELECT set_config('lock_timeout',$1,true)",[this.priorLockTimeout]);
-        await this.query('RELEASE SAVEPOINT receipt_reservation');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = await this.query(`SELECT reservation_state,original_collection_id FROM stateplane_try_reserve_receipt($1,$2,$3,$4,$5,$6)`,
+        [this.#scope.spaceId,this.#scope.collectionId,this.#scope.credentialId,this.#scope.principalId,
+          change.operation,change.idempotencyKey]);
+      const row = result.rows[0];
+      if (row?.reservation_state === 'reserved') {
         this.reservedIdentities.set(identity,{operation:change.operation,key:change.idempotencyKey});
         return;
-      } catch (error) {
-        await this.query('ROLLBACK TO SAVEPOINT receipt_reservation');
-        await this.query('RELEASE SAVEPOINT receipt_reservation');
-        if ((error as { code?: string }).code !== '55P03') throw error;
-        await this.authorizePendingScope(change);
       }
-    }
-    throw new AuthorityError('FORBIDDEN');
-  }
-
-  /** Probe only collections whose grant is live; an unauthorized owner stays undisclosed. */
-  private async authorizePendingScope(change: Readonly<RecordChange>): Promise<void> {
-    const { spaceId, credentialId, principalId } = this.#scope;
-    const candidates = await this.query(`SELECT c.collection_id FROM collections c JOIN spaces s ON s.space_id=c.space_id
-      LEFT JOIN collection_grants g ON g.space_id=c.space_id AND g.collection_id=c.collection_id AND g.credential_id=$2
-      WHERE c.space_id=$1 AND
-        (s.owner_principal_id=$3 OR (g.capabilities @> ARRAY['records:write']::text[]
-          AND (g.expires_at IS NULL OR g.expires_at>clock_timestamp())))
-      ORDER BY c.collection_id`, [spaceId,credentialId,principalId]);
-    for (const row of candidates.rows) {
-      await this.query('SAVEPOINT receipt_scope_probe');
-      try {
-        await this.query("SELECT set_config('lock_timeout','50ms',true)");
-        await this.query(`INSERT INTO receipt_reservation_scopes(space_id,collection_id,credential_id,operation,idempotency_key)
-          VALUES($1,$2,$3,$4,$5)`, [spaceId,row.collection_id,credentialId,change.operation,change.idempotencyKey]);
-      } catch (error) {
-        await this.query('ROLLBACK TO SAVEPOINT receipt_scope_probe');
-        await this.query('RELEASE SAVEPOINT receipt_scope_probe');
-        if ((error as { code?: string }).code === '55P03') {
-          // Candidate selection precedes the probe and may outlive a grant.
-          // Recheck both requested and original scope at the disclosure point.
-          await this.checkScope();
-          await this.authorizeOriginal(row.collection_id);
-          throw new AuthorityError('RECEIPT_PENDING');
-        }
-        throw error;
+      if (row?.reservation_state === 'pending' && scalarString(row.original_collection_id)) {
+        // The owner can finish between the server probe and response delivery.
+        // Retry once before disclosing pending state or denying a fresh write.
+        if (attempt === 0) continue;
+        await this.checkScope();
+        await this.authorizeOriginal(row.original_collection_id);
+        throw new AuthorityError('RECEIPT_PENDING');
       }
-      await this.query('ROLLBACK TO SAVEPOINT receipt_scope_probe');
-      await this.query('RELEASE SAVEPOINT receipt_scope_probe');
+      if (row?.reservation_state === 'unresolved') throw new AuthorityError('FORBIDDEN');
+      throw new Error('Invalid receipt reservation result');
     }
   }
 

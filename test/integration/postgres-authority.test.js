@@ -85,6 +85,24 @@ async function within(promise, milliseconds = 3000) {
   } finally { clearTimeout(timer); }
 }
 
+async function pendingResponseBudget() {
+  // Keep three connections warm so a remote TLS handshake is not charged to
+  // the reservation path while its owner holds one connection.
+  const warm = [];
+  try { for (let i = 0; i < 3; i++) warm.push(await pool.connect()); }
+  finally { for (const client of warm) client.release(); }
+  const roundTrips = [];
+  for (let i = 0; i < 5; i++) {
+    const started = performance.now();
+    await pool.query('SELECT 1');
+    roundTrips.push(performance.now() - started);
+  }
+  roundTrips.sort((a,b) => a-b);
+  // The budget allows ten measured network round trips plus two 50 ms lock
+  // probes. It still rejects the old remote path's 17 serial statements.
+  return Math.max(250,Math.ceil(roundTrips[2] * 10 + 100));
+}
+
 async function scheduleGrantExpiry(scope, collectionId) {
   // A held authority transaction SELECTs its grant FOR SHARE, so the expiry
   // must be scheduled before it starts. Eight seconds leaves room for both
@@ -193,6 +211,7 @@ test('readOnly replays authorized receipt, stale and malformed inputs do not com
 
 test('an in-flight receipt returns pending before commit, then replays one effect', async () => {
   const { scope } = await fixture();
+  const pendingDeadline = await pendingResponseBudget();
   const request = change('create','pending','{"label":"pending"}');
   let release;
   let entered;
@@ -207,7 +226,7 @@ test('an in-flight receipt returns pending before commit, then replays one effec
   await inTransaction;
   const contender = authority.mutate(scope,request);
   try {
-    await assert.rejects(within(contender,250),error => error.code === 'RECEIPT_PENDING');
+    await assert.rejects(within(contender,pendingDeadline),error => error.code === 'RECEIPT_PENDING');
   } finally { release(); }
   await Promise.allSettled([contender]);
   const receipt = await first;
@@ -288,7 +307,7 @@ function delayedPendingPool() {
     const client = await pool.connect();
     return { query: async (sql, values) => {
       const result = await client.query(sql, values);
-      if (String(sql).startsWith('SELECT c.collection_id FROM collections c')) {
+      if (String(sql).startsWith('SELECT reservation_state,original_collection_id FROM stateplane_try_reserve_receipt')) {
         signal();
         await gated;
       }
