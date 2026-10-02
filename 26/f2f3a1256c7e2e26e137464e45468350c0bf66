@@ -1,0 +1,18 @@
+docs/postgres-authority.md
+  h_a39f9495f9ec1d 23
+scripts/migrate.mjs
+  h_a39f9495f9ec1d 13-16
+scripts/migration-index-race-smoke.mjs
+  h_a39f9495f9ec1d 4,21-43,139-177,181,185,187-190,212,217-220,226-229
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "26f2f3a1256c7e2e26e137464e45468350c0bf66",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
