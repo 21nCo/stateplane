@@ -5,15 +5,39 @@ import { AuthorityError, CommitOutcomeUnknownError, PostgresAuthority } from './
 import type { AuthorityScope, AuthorityTransaction } from './index.js';
 
 type PoolLike = Pick<pg.Pool, 'connect'>;
+export interface CurrentCredential {
+  current(claims: Pick<RouteClaims, 'kind' | 'credentialId'>, ownerPrincipalId: string): Promise<boolean>;
+}
 export interface AuthorizedCellContext {
   readonly scope: Readonly<AuthorityScope>;
+  /** Call immediately before a blob or provider effect that cannot join the SQL transaction. */
+  authorizeEffect(): Promise<void>;
   /** The caller cannot substitute a second space, collection or capability. */
   records<T>(authority: PostgresAuthority, fn: (tx: AuthorityTransaction) => Promise<T>): Promise<T>;
 }
 
 /** The cell never accepts a bearer credential or requested principal directly. */
 export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
-  constructor(private readonly pool: PoolLike, private readonly cellId: string) {}
+  constructor(private readonly pool: PoolLike, private readonly cellId: string,
+    private readonly credentials: CurrentCredential, private readonly clock: () => number = () => Date.now()) {}
+
+  private checkAssertionTime(claims: RouteClaims): void {
+    if (claims.expiresAt * 1000 <= this.clock()) throw new AuthorityError('FORBIDDEN', 'Routing assertion expired');
+  }
+
+  /** Autocommit on a separate connection keeps replay denied even if the effect rolls back. */
+  private async consume(claims: RouteClaims): Promise<void> {
+    const client = await this.pool.connect();
+    let discard = false;
+    try {
+      this.checkAssertionTime(claims);
+      const nonce = await client.query(`INSERT INTO routing_nonces(space_id,nonce,expires_at)
+        VALUES($1,$2,to_timestamp($3)) ON CONFLICT DO NOTHING RETURNING nonce`,
+      [claims.spaceId,claims.nonce,claims.expiresAt]);
+      if (nonce.rowCount !== 1) throw new AuthorityError('FORBIDDEN', 'Routing assertion already consumed');
+    } catch (error) { if (!(error instanceof AuthorityError)) discard = true; throw error; }
+    finally { client.release(discard); }
+  }
 
   /** Scheduled maintenance may remove only assertions that can no longer verify. */
   async cleanupExpiredNonces(): Promise<number> {
@@ -44,6 +68,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     if (!['active','readOnly'].includes(row.lifecycle)) throw new AuthorityError('SPACE_UNAVAILABLE');
     if (row.collection_lifecycle === 'readOnly' && claims.capability.endsWith(':write')) throw new AuthorityError('SPACE_UNAVAILABLE');
     if (row.lifecycle === 'readOnly' && claims.capability.endsWith(':write') && claims.capability !== 'records:write') throw new AuthorityError('SPACE_UNAVAILABLE');
+    if (!await this.credentials.current(claims,row.owner_principal_id)) throw new AuthorityError('FORBIDDEN');
     if (claims.kind === 'session') {
       if (claims.userPrincipalId !== row.owner_principal_id) throw new AuthorityError('FORBIDDEN');
       return row.owner_principal_id;
@@ -55,30 +80,35 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
 
   async run<T>(claims: RouteClaims, effect: (principalId: string, context: AuthorizedCellContext) => Promise<T>): Promise<T> {
     claims = Object.freeze({ ...claims });
+    this.checkAssertionTime(claims);
+    await this.consume(claims);
     const client = await this.pool.connect();
     let begun = false;
+    let beginAttempted = false;
     let discard = false;
     try {
+      this.checkAssertionTime(claims);
+      beginAttempted = true;
       await client.query('BEGIN'); begun = true;
+      this.checkAssertionTime(claims);
       const principalId = await this.check(client, claims);
-      const nonce = await client.query(`INSERT INTO routing_nonces(space_id,nonce,expires_at)
-        VALUES($1,$2,to_timestamp($3)) ON CONFLICT DO NOTHING RETURNING nonce`,
-      [claims.spaceId,claims.nonce,claims.expiresAt]);
-      if (nonce.rowCount !== 1) throw new AuthorityError('FORBIDDEN', 'Routing assertion already consumed');
       const scope: Readonly<AuthorityScope> = Object.freeze({ spaceId:claims.spaceId as SpaceId,collectionId:claims.collectionId as CollectionId,
         principalId,credentialId:claims.credentialId,capability:claims.capability,
         policyVersion:claims.policyVersion,placementGeneration:claims.placementGeneration });
       const context: AuthorizedCellContext = Object.freeze({ scope,
+        authorizeEffect: async () => { this.checkAssertionTime(claims); await this.check(client,claims); },
         records: <TResult>(authority: PostgresAuthority, fn: (tx: AuthorityTransaction) => Promise<TResult>) =>
           authority.transactionOnClient(client,scope,fn) });
       const result = await effect(principalId, context);
       // Clock-based expiry can occur while locks are held. Recheck immediately before commit.
       await this.check(client, claims);
+      this.checkAssertionTime(claims);
       try { await client.query('COMMIT'); begun = false; }
       catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
       return result;
     } catch (error) {
       if (begun) { try { await client.query('ROLLBACK'); } catch { discard = true; } }
+      else if (beginAttempted) discard = true;
       throw error;
     } finally { client.release(discard); }
   }

@@ -15,7 +15,10 @@ export interface RouteClaims {
 export interface DirectoryPlacement {
   spaceId: string; cellId: string; lifecycle: string; policyVersion: number; placementGeneration: number;
 }
-export interface RoutingDirectory { lookup(spaceId: string): Promise<DirectoryPlacement | null>; }
+export interface RoutingDirectory {
+  lookup(spaceId: string): Promise<DirectoryPlacement | null>;
+  authorized(actor: VerifiedCredential, spaceId: string, collectionId: string, capability: Capability): Promise<boolean>;
+}
 export interface RouteIdentity { verify(request: Request): Promise<VerifiedCredential | null>; }
 
 const encode = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replaceAll('+','-').replaceAll('/','_').replace(/=+$/, '');
@@ -84,6 +87,7 @@ export class RegionalRouter {
     if (!actor) throw new RoutingDenied('UNAUTHENTICATED');
     const placement = await this.directory.lookup(spaceId);
     if (!placement || placement.lifecycle === 'deleted') throw new RoutingDenied('NOT_FOUND');
+    if (!await this.directory.authorized(actor,spaceId,collectionId,capability)) throw new RoutingDenied('NOT_FOUND');
     if (placement.lifecycle !== 'active' && placement.lifecycle !== 'readOnly') throw new RoutingDenied('SPACE_UNAVAILABLE');
     const issuedAt = this.clock();
     const claims: RouteClaims = { spaceId,collectionId,capability,credentialId:actor.credentialId,kind:actor.kind,
@@ -95,7 +99,7 @@ export class RegionalRouter {
 }
 
 export interface CellPolicy<Context> {
-  /** Atomically consumes nonce and runs the effect under current policy/placement locks. */
+  /** Durably consumes the nonce before running the effect under current policy/placement locks. */
   run<T>(claims: RouteClaims, effect: (principalId: string, context: Context) => Promise<T>): Promise<T>;
 }
 /** Direct callers without a gateway assertion cannot enter an effect boundary. */

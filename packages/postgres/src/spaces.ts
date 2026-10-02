@@ -26,8 +26,10 @@ function safeVersion(value: unknown): number {
 async function transaction<T>(pool: PoolLike, fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();
   let begun = false;
+  let beginAttempted = false;
   let discard = false;
   try {
+    beginAttempted = true;
     await client.query('BEGIN'); begun = true;
     const result = await fn(client);
     try { await client.query('COMMIT'); begun = false; }
@@ -35,6 +37,7 @@ async function transaction<T>(pool: PoolLike, fn: (client: pg.PoolClient) => Pro
     return result;
   } catch (error) {
     if (begun) await client.query('ROLLBACK').catch(() => { discard = true; });
+    else if (beginAttempted) discard = true;
     throw error;
   } finally { client.release(discard); }
 }
@@ -93,7 +96,7 @@ function info(row: Record<string, unknown>): SpaceInfo {
 
 /** Control authority contains placement and owner metadata, never agent grants. */
 export class PostgresRoutingDirectory implements RoutingDirectory {
-  constructor(private readonly control: PoolLike) {}
+  constructor(private readonly control: PoolLike, private readonly cells: ReadonlyMap<string, CellDatabase>) {}
   async lookup(spaceId: string): Promise<DirectoryPlacement | null> {
     if (!validId(spaceId)) return null;
     const result = await this.control.query(`SELECT space_id,cell_id,lifecycle,policy_version,placement_generation
@@ -101,6 +104,24 @@ export class PostgresRoutingDirectory implements RoutingDirectory {
     const row = result.rows[0];
     return row ? { spaceId:row.space_id,cellId:row.cell_id,lifecycle:row.lifecycle,
       policyVersion:safeVersion(row.policy_version),placementGeneration:safeVersion(row.placement_generation) } : null;
+  }
+  async authorized(actor: VerifiedCredential, spaceId: string, collectionId: string, capability: Capability): Promise<boolean> {
+    const directory = await this.control.query('SELECT owner_principal_id,cell_id FROM space_directory WHERE space_id=$1 AND lifecycle<>$2',
+      [spaceId,'deleted']);
+    const row = directory.rows[0];
+    if (!row) return false;
+    if (actor.kind === 'session') return actor.userPrincipalId === row.owner_principal_id;
+    const cell = this.cells.get(row.cell_id);
+    if (!cell) return false;
+    const result = await cell.pool.query(`SELECT 1 FROM space_credentials sc
+      JOIN collection_grants g ON g.space_id=sc.space_id AND g.credential_id=sc.credential_id
+      JOIN collections c ON c.space_id=g.space_id AND c.collection_id=g.collection_id
+      WHERE sc.space_id=$1 AND sc.credential_id=$2 AND sc.owner_principal_id=$3
+        AND g.collection_id=$4 AND $5=ANY(g.capabilities) AND c.lifecycle<>'deleted'
+        AND sc.revoked_at IS NULL AND sc.expires_at>clock_timestamp()
+        AND (g.expires_at IS NULL OR g.expires_at>clock_timestamp()) LIMIT 1`,
+    [spaceId,actor.credentialId,row.owner_principal_id,collectionId,capability]);
+    return result.rowCount === 1;
   }
 }
 
@@ -217,9 +238,9 @@ export class PostgresSpaces {
     const cell = this.cell(space.cellId);
     const local = await cell.pool.query('SELECT lifecycle,policy_version FROM spaces WHERE space_id=$1',[spaceId]);
     if (local.rows[0]?.lifecycle === 'deleting') {
-      const keys = await cell.pool.query('SELECT credential_id FROM space_credentials WHERE space_id=$1 AND revoked_at IS NULL',[spaceId]);
+      const keys = await cell.pool.query('SELECT credential_id FROM space_credentials WHERE space_id=$1 AND provider_revoked_at IS NULL',[spaceId]);
       // Provider revocation is retryable. Until it succeeds, deleting denies every content effect.
-      for (const row of keys.rows) await this.keys.revoke(row.credential_id,owner(actor));
+      for (const row of keys.rows) await this.revokeProvider(cell,space,owner(actor),row.credential_id);
       await transaction(cell.pool, async db => {
         await db.query('SELECT stateplane_purge_space($1)',[spaceId]);
         const version = await db.query('SELECT policy_version,placement_generation FROM spaces WHERE space_id=$1',[spaceId]);
@@ -274,9 +295,15 @@ export class PostgresSpaces {
       return info(row);
     }
     const lifecycle = local?.lifecycle ?? 'deleted';
+    if (local && (safeVersion(local.policy_version) < safeVersion(row.policy_version) ||
+      safeVersion(local.placement_generation) < safeVersion(row.placement_generation))) throw new AuthorityError('STALE_PLACEMENT');
     const updated = await this.control.query(`UPDATE space_directory SET lifecycle=$2,policy_version=$3,
-      placement_generation=$4,updated_at=clock_timestamp() WHERE space_id=$1 RETURNING *`,
-    [spaceId,lifecycle,local?.policy_version ?? row.policy_version,local?.placement_generation ?? row.placement_generation]);
+      placement_generation=$4,updated_at=clock_timestamp()
+      WHERE space_id=$1 AND lifecycle=$5 AND policy_version=$6 AND placement_generation=$7
+        AND cell_id=$8 AND owner_principal_id=$9 AND storage_target_id=$10 RETURNING *`,
+    [spaceId,lifecycle,local?.policy_version ?? row.policy_version,local?.placement_generation ?? row.placement_generation,
+      row.lifecycle,row.policy_version,row.placement_generation,row.cell_id,row.owner_principal_id,row.storage_target_id]);
+    if (!updated.rows[0]) throw new AuthorityError('STALE_PLACEMENT');
     return info(updated.rows[0]);
   }
 
@@ -311,10 +338,29 @@ export class PostgresSpaces {
       throw error;
     }
   }
+  private async revokeProvider(cell: CellDatabase, space: SpaceInfo, ownerPrincipalId: string, keyId: string): Promise<void> {
+    await this.keys.revoke(keyId,ownerPrincipalId);
+    await transaction(cell.pool, async db => {
+      const changed = await db.query(`UPDATE space_credentials SET provider_revoked_at=clock_timestamp()
+        WHERE space_id=$1 AND credential_id=$2 AND provider_revoked_at IS NULL RETURNING 1`,[space.spaceId,keyId]);
+      if (changed.rowCount === 1) await db.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
+        SELECT $1,$2,$3,$4,'key:provider-revoke',policy_version,placement_generation FROM spaces WHERE space_id=$2`,
+      [`aud_${randomUUID()}`,space.spaceId,ownerPrincipalId,keyId]);
+    });
+  }
   async revokeAgentKey(actor: VerifiedCredential, spaceId: string, keyId: string): Promise<void> {
     actor = snapshotOwner(actor);
     const space = await this.owned(actor,spaceId);
     if (!validId(keyId)) throw new AuthorityError('INVALID_ARGUMENT');
+    const existing = await this.cell(space.cellId).pool.query(`SELECT revoked_at,provider_revoked_at FROM space_credentials
+      WHERE space_id=$1 AND credential_id=$2 AND owner_principal_id=$3`,[spaceId,keyId,owner(actor)]);
+    if (!existing.rows[0]) throw new AuthorityError('NOT_FOUND');
+    if (existing.rows[0].revoked_at) {
+      if (!existing.rows[0].provider_revoked_at) await this.revokeProvider(this.cell(space.cellId),space,owner(actor),keyId);
+      if (space.policyVersion !== safeVersion((await this.cell(space.cellId).pool.query('SELECT policy_version FROM spaces WHERE space_id=$1',[spaceId])).rows[0].policy_version))
+        await this.reconcile(spaceId);
+      return;
+    }
     const version = await transaction(this.cell(space.cellId).pool, async db => {
       const locked = await db.query(`SELECT policy_version FROM spaces WHERE space_id=$1 AND owner_principal_id=$2 FOR UPDATE`,[spaceId,owner(actor)]);
       if (!locked.rows[0] || Number(locked.rows[0].policy_version) !== space.policyVersion) throw new AuthorityError('STALE_PLACEMENT');
@@ -333,7 +379,7 @@ export class PostgresSpaces {
     catch (error) { publishError = error; }
     // Local revocation is authoritative. Revoke the AuthFn primitive even when
     // the control directory is unavailable, then report the failed publication.
-    await this.keys.revoke(keyId,owner(actor));
+    await this.revokeProvider(this.cell(space.cellId),space,owner(actor),keyId);
     if (publishError) throw publishError;
   }
   async rotateAgentKey(actor: VerifiedCredential, spaceId: string, oldKeyId: string, expiresAt: Date,
