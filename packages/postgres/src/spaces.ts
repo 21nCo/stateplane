@@ -87,13 +87,13 @@ function snapshotGrants(grants: readonly CollectionGrant[], keyExpiry: Date): Re
       if (!item || !item.enumerable || !('value' in item) || !capabilities.has(item.value) ||
         seenCapabilities.has(item.value)) throw new AuthorityError('INVALID_ARGUMENT');
       seenCapabilities.add(item.value);
-      values[member] = item.value;
+      Object.defineProperty(values,member,{value:item.value,writable:true,enumerable:true,configurable:true});
     }
     if (grantExpiry !== undefined && (types.isProxy(grantExpiry) || !(grantExpiry instanceof Date) ||
       !Number.isFinite(grantExpiry.getTime()) || grantExpiry.getTime() > keyExpiry.getTime())) throw new AuthorityError('INVALID_ARGUMENT');
     seen.add(collectionId);
-    copied[index] = Object.freeze({collectionId,capabilities:Object.freeze(values),
-      ...(grantExpiry ? {expiresAt:new Date(grantExpiry.getTime())} : {})});
+    Object.defineProperty(copied,index,{value:Object.freeze({collectionId,capabilities:Object.freeze(values),
+      ...(grantExpiry ? {expiresAt:new Date(grantExpiry.getTime())} : {})}),writable:true,enumerable:true,configurable:true});
   }
   return Object.freeze(copied);
 }
@@ -441,6 +441,15 @@ export class PostgresSpaces {
     });
   }
 
+  private async requireGrantCollections(db: PoolLike | pg.PoolClient, spaceId: string,
+    grants: ReadonlyArray<CollectionGrant>): Promise<void> {
+    for (let index = 0; index < grants.length; index++) {
+      const found = await db.query(`SELECT 1 FROM collections
+        WHERE space_id=$1 AND collection_id=$2 AND lifecycle<>'deleted' FOR SHARE`,[spaceId,grants[index].collectionId]);
+      if (found.rowCount !== 1) throw new AuthorityError('INVALID_ARGUMENT', 'Grant collection does not exist');
+    }
+  }
+
   async issueAgentKey(actor: VerifiedCredential, spaceId: string, expiresAt: Date, grants: readonly CollectionGrant[]): Promise<IssuedAgentKey> {
     actor = snapshotOwner(actor);
     if (!expiresAt || types.isProxy(expiresAt) || !(expiresAt instanceof Date) || !Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= Date.now()) throw new AuthorityError('INVALID_ARGUMENT');
@@ -450,20 +459,33 @@ export class PostgresSpaces {
     const space = await this.owned(actor,spaceId);
     if (space.lifecycle !== 'active') throw new AuthorityError('SPACE_UNAVAILABLE');
     await this.current(actor);
+    // Reject bad selectors before AuthFn creates a bearer. Recheck under row
+    // locks in the grant transaction because a collection can change meanwhile.
+    await this.requireGrantCollections(this.cell(space.cellId).pool,spaceId,grants);
+    await this.current(actor);
     const created = await this.keys.create(owner(actor),new Date(expiryMs));
     try {
+      // This independent commit keeps a provider key discoverable by reconcile
+      // if a later grant FK, publication or activation transaction fails.
+      await transaction(this.cell(space.cellId).pool, async db => {
+        await db.query(`INSERT INTO space_credentials(space_id,credential_id,principal_id,owner_principal_id,expires_at,activated_at)
+          VALUES($1,$2,$3,$4,$5,NULL)`,[spaceId,created.id,`agent_${randomUUID()}`,owner(actor),new Date(expiryMs)]);
+        await db.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
+          SELECT $1,$2,$3,$4,'key:created-pending',policy_version,placement_generation FROM spaces WHERE space_id=$2`,
+        [`aud_${randomUUID()}`,spaceId,owner(actor),created.id]);
+      });
       const version = await transaction(this.cell(space.cellId).pool, async db => {
         await this.current(actor);
         const locked = await db.query(`SELECT policy_version,lifecycle FROM spaces WHERE space_id=$1 AND owner_principal_id=$2 FOR UPDATE`,[spaceId,owner(actor)]);
         if (!locked.rows[0] || Number(locked.rows[0].policy_version) !== space.policyVersion || locked.rows[0].lifecycle !== 'active') throw new AuthorityError('STALE_PLACEMENT');
-        await db.query(`INSERT INTO space_credentials(space_id,credential_id,principal_id,owner_principal_id,expires_at,activated_at)
-          VALUES($1,$2,$3,$4,$5,NULL)`,[spaceId,created.id,`agent_${randomUUID()}`,owner(actor),new Date(expiryMs)]);
+        await this.requireGrantCollections(db,spaceId,grants);
         const auditGrants: {collectionId: string; capabilities: readonly Capability[]; expiresAt: string | null}[] = [];
         for (let index = 0; index < grants.length; index++) {
           const grant = grants[index];
           await db.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities,expires_at)
             VALUES($1,$2,$3,$4,$5)`,[spaceId,grant.collectionId,created.id,grant.capabilities,grant.expiresAt ?? null]);
-          auditGrants[index] = {collectionId:grant.collectionId,capabilities:grant.capabilities,expiresAt:grant.expiresAt?.toISOString() ?? null};
+          Object.defineProperty(auditGrants,index,{value:{collectionId:grant.collectionId,capabilities:grant.capabilities,
+            expiresAt:grant.expiresAt?.toISOString() ?? null},writable:true,enumerable:true,configurable:true});
         }
         const changed = await db.query(`UPDATE spaces SET policy_version=policy_version+1 WHERE space_id=$1 RETURNING policy_version,placement_generation`,[spaceId]);
         await db.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation,details)
@@ -587,6 +609,9 @@ export class PostgresSpaces {
     if (!expiresAt || types.isProxy(expiresAt) || !(expiresAt instanceof Date) || !Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= Date.now()) throw new AuthorityError('INVALID_ARGUMENT');
     expiresAt = new Date(expiresAt.getTime());
     grants = snapshotGrants(grants,expiresAt);
+    const space = await this.owned(actor,spaceId);
+    if (space.lifecycle !== 'active') throw new AuthorityError('SPACE_UNAVAILABLE');
+    await this.requireGrantCollections(this.cell(space.cellId).pool,spaceId,grants);
     await this.revokeAgentKey(actor,spaceId,oldKeyId);
     return this.issueAgentKey(actor,spaceId,expiresAt,grants);
   }

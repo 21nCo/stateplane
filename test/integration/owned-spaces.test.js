@@ -695,6 +695,119 @@ test('malformed grant arrays fail before issuance or rotation effects', async ()
     [spaceId,old.id])).rows[0].revoked_at,null,'malformed rotation leaves the prior key active');
 });
 
+test('grant snapshots ignore inherited numeric accessors on issue and rotation', async () => {
+  const config = {database:memoryAdapter(),namespace:`sta6-grant-accessor-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user = await createUser(config,{primaryEmail:`grant-accessor-${crypto.randomUUID()}@example.invalid`});
+  const session = await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity = new AuthFnIdentityVerifier(config);
+  const actor = await identity.verify(request(session.sessionToken));
+  const spaces = new PostgresSpaces(controlPool,new Map([['cell-a',{pool,storageTargetId:'target-a'}]]),
+    'cell-a',new AuthFnAgentKeys(config),identity);
+  const {spaceId} = await spaces.create(actor);
+  const collectionId = `accessor_${crypto.randomUUID()}`;
+  await collection(spaceId,collectionId);
+  const expires = new Date(Date.now()+3_600_000);
+  const grants = [{collectionId,capabilities:['records:read']}];
+  let intercepted = 0;
+  const withInheritedSlot = operation => {
+    Object.defineProperty(Array.prototype,'0',{configurable:true,
+      get() { return {collectionId,capabilities:['schema:write']}; },
+      set(value) { intercepted++; Object.defineProperty(this,'length',{value:0,writable:true}); }});
+    try { return operation(); }
+    finally { delete Array.prototype[0]; }
+  };
+  const first = await withInheritedSlot(() => spaces.issueAgentKey(actor,spaceId,expires,grants));
+  const second = await withInheritedSlot(() => spaces.rotateAgentKey(actor,spaceId,first.id,expires,grants));
+  assert.equal(intercepted,0,'snapshot and audit arrays never assign through inherited slots');
+  for (const key of [first,second]) {
+    const saved = (await pool.query('SELECT capabilities FROM collection_grants WHERE space_id=$1 AND credential_id=$2',
+      [spaceId,key.id])).rows;
+    if (key.id === first.id) assert.equal(saved.length,0,'rotation removes the old grant');
+    else assert.deepEqual(saved.map(row => row.capabilities),[['records:read']]);
+    const audit = (await pool.query(`SELECT details FROM space_audit WHERE space_id=$1 AND credential_id=$2
+      AND action='key:issue-pending'`,[spaceId,key.id])).rows[0];
+    assert.deepEqual(audit.details.grants,[{collectionId,capabilities:['records:read'],expiresAt:null}]);
+  }
+});
+
+test('missing grants never create a key and a raced collection deletion retains failed issuance', async () => {
+  const config = {database:memoryAdapter(),namespace:`sta6-grant-race-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user = await createUser(config,{primaryEmail:`grant-race-${crypto.randomUUID()}@example.invalid`});
+  const session = await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity = new AuthFnIdentityVerifier(config);
+  const actor = await identity.verify(request(session.sessionToken));
+  const realKeys = new AuthFnAgentKeys(config);
+  let creates = 0;
+  let issued;
+  let deleteAfterCreate = false;
+  let providerOffline = false;
+  const collectionId = `race_${crypto.randomUUID()}`;
+  const keys = {
+    create:async (...args) => {
+      creates++;
+      issued = await realKeys.create(...args);
+      if (deleteAfterCreate) {
+        await pool.query("UPDATE collections SET lifecycle='deleted' WHERE collection_id=$1",[collectionId]);
+        providerOffline = true;
+      }
+      return issued;
+    },
+    revoke:async (...args) => {
+      if (providerOffline) throw new Error('provider revoke unavailable');
+      return realKeys.revoke(...args);
+    },
+  };
+  const cells = new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
+  const spaces = new PostgresSpaces(controlPool,cells,'cell-a',keys,identity);
+  const {spaceId} = await spaces.create(actor);
+  await collection(spaceId,collectionId);
+  const expires = new Date(Date.now()+3_600_000);
+  const valid = [{collectionId,capabilities:['records:read']}];
+  const old = await spaces.issueAgentKey(actor,spaceId,expires,valid);
+  const missing = [{collectionId:`missing_${crypto.randomUUID()}`,capabilities:['records:read']}];
+  await assert.rejects(spaces.issueAgentKey(actor,spaceId,expires,missing),denied('INVALID_ARGUMENT'));
+  await assert.rejects(spaces.rotateAgentKey(actor,spaceId,old.id,expires,missing),denied('INVALID_ARGUMENT'));
+  assert.equal(creates,1);
+  assert.equal((await pool.query('SELECT revoked_at FROM space_credentials WHERE space_id=$1 AND credential_id=$2',
+    [spaceId,old.id])).rows[0].revoked_at,null);
+
+  deleteAfterCreate = true;
+  await assert.rejects(spaces.issueAgentKey(actor,spaceId,expires,valid),denied('INVALID_ARGUMENT'));
+  deleteAfterCreate = false;
+  await pool.query("UPDATE collections SET lifecycle='active' WHERE space_id=$1 AND collection_id=$2",[spaceId,collectionId]);
+  const failed = (await pool.query(`SELECT activated_at,confirmed_at,revoked_at,provider_revoked_at FROM space_credentials
+    WHERE space_id=$1 AND credential_id=$2`,[spaceId,issued.id])).rows[0];
+  assert.ok(failed?.revoked_at,'failed key remains locally tracked and revoked');
+  assert.equal(failed.activated_at,null);
+  assert.equal(failed.confirmed_at,null);
+  assert.equal(failed.provider_revoked_at,null);
+  const signer = new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const router = new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
+  await assert.rejects(router.assertion(request(issued.secret),spaceId,collectionId,'records:read'),denied('NOT_FOUND'));
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM collection_grants WHERE space_id=$1 AND credential_id=$2',
+    [spaceId,issued.id])).rows[0].n,0);
+  const placement = (await pool.query('SELECT policy_version,placement_generation FROM spaces WHERE space_id=$1',
+    [spaceId])).rows[0];
+  const now = Math.floor(Date.now()/1000);
+  const assertion = await signer.sign({spaceId,collectionId,capability:'records:read',credentialId:issued.id,kind:'api-key',
+    cellId:'cell-a',policyVersion:placement.policy_version,placementGeneration:placement.placement_generation,
+    audience:'stateplane-cell:cell-a',issuedAt:now,expiresAt:now+30,nonce:crypto.randomUUID()});
+  let effects = 0;
+  await assert.rejects(new RegionalCell('cell-a',signer,new PostgresCellPolicy(pool,'cell-a',identity))
+    .execute(assertion,async () => { effects++; }),denied('FORBIDDEN'));
+  assert.equal(effects,0);
+  assert.equal((await pool.query(`SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND credential_id=$2
+    AND action IN ('key:created-pending','key:issue-failed')`,[spaceId,issued.id])).rows[0].n,2);
+  await assert.rejects(spaces.reconcile(spaceId),/provider revoke unavailable/);
+  providerOffline = false;
+  await spaces.reconcile(spaceId);
+  assert.ok((await pool.query('SELECT provider_revoked_at FROM space_credentials WHERE space_id=$1 AND credential_id=$2',
+    [spaceId,issued.id])).rows[0].provider_revoked_at);
+  await assert.rejects(router.assertion(request(issued.secret),spaceId,collectionId,'records:read'),denied('UNAUTHENTICATED'));
+});
+
 test('reconcile and delete refuse a deleted directory with unpurged cell content', async () => {
   const config = {database:memoryAdapter(),namespace:`sta6-erasure-${crypto.randomUUID()}`,plugins:[]};
   createAuthFn(config);
