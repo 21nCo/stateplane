@@ -26,7 +26,13 @@ try {
   if (pendingOutboxIndexBuild && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained') {
     const relation = await client.query("SELECT to_regclass('public.projection_outbox') AS name");
     if (relation.rows[0].name !== null) {
-      const populated = await client.query('SELECT EXISTS (SELECT 1 FROM projection_outbox) AS present');
+      // Hold the emptiness decision through migration commit. SHARE excludes writers and
+      // claim updates, and waits for any writer that began before this preflight.
+      const previousLockTimeout = (await client.query('SHOW lock_timeout')).rows[0].lock_timeout;
+      if (previousLockTimeout === '0') await client.query("SET LOCAL lock_timeout = '5s'");
+      await client.query('LOCK TABLE public.projection_outbox IN SHARE MODE');
+      if (previousLockTimeout === '0') await client.query("SET LOCAL lock_timeout = '0'");
+      const populated = await client.query('SELECT EXISTS (SELECT 1 FROM public.projection_outbox) AS present');
       if (populated.rows[0].present) {
         throw new Error('Populated outbox index upgrade requires drained traffic; set STATEPLANE_POPULATED_INDEX_UPGRADE=drained only after stopping claim workers and writers');
       }

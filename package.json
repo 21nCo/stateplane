@@ -24,6 +24,7 @@
     "db:migrate": "node scripts/local-db.mjs migrate",
     "db:restore-smoke": "node scripts/restore-smoke.mjs",
     "db:upgrade-smoke": "node scripts/migration-upgrade-smoke.mjs",
+    "db:index-race-smoke": "node scripts/migration-index-race-smoke.mjs",
     "dev:worker": "pnpm --filter @stateplane/app dev:worker",
     "worker:dry-run": "pnpm --filter @stateplane/app exec wrangler deploy --dry-run --outdir ../.data/worker-dry-run",
     "worker:package-dry-run": "pnpm --filter @stateplane/app exec wrangler deploy ../scripts/qualification-worker.ts --config wrangler.jsonc --dry-run --outdir ../.data/package-worker-dry-run",
