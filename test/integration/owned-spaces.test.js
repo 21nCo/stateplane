@@ -416,6 +416,88 @@ test('interrupted lifecycle publication reconciles and deleted publication retri
   assert.equal((await pool.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:deleted'",[created.spaceId])).rows[0].n,1);
 });
 
+test('failed issuance and rotation never expose grants after publication and provider outages', async () => {
+  const config = {database:memoryAdapter(),namespace:`sta6-failed-key-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user = await createUser(config,{primaryEmail:`failed-key-${crypto.randomUUID()}@example.invalid`});
+  const session = await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity = new AuthFnIdentityVerifier(config);
+  const owner = await identity.verify(request(session.sessionToken));
+  const realProvider = new AuthFnAgentKeys(config);
+  let issued;
+  let providerOffline = false;
+  const provider = {
+    create:async (...args) => { issued = await realProvider.create(...args); return issued; },
+    revoke:async (...args) => { if (providerOffline) throw new Error('provider revoke offline'); return realProvider.revoke(...args); },
+  };
+  const originalQuery = controlPool.query.bind(controlPool);
+  let directoryOffline = false;
+  const control = {query:async (sql,...args) => {
+    if (directoryOffline && typeof sql === 'string' && sql.includes('UPDATE space_directory SET policy_version=$3,lifecycle=$4')) {
+      throw new Error('directory publish offline');
+    }
+    return originalQuery(sql,...args);
+  }};
+  const cells = new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
+  const spaces = new PostgresSpaces(control,cells,'cell-a',provider,identity);
+  const {spaceId} = await spaces.create(owner);
+  const collectionId = `failed_${crypto.randomUUID()}`;
+  await collection(spaceId,collectionId);
+  const expires = new Date(Date.now()+3_600_000);
+  const grants = [{collectionId,capabilities:['records:read']}];
+  const signer = new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const router = new RegionalRouter(identity,new PostgresRoutingDirectory(control,cells),signer);
+  const cell = new RegionalCell('cell-a',signer,new PostgresCellPolicy(pool,'cell-a',identity));
+  const route = secret => router.assertion(request(secret),spaceId,collectionId,'records:read');
+  let effects = 0;
+  async function assertFailedKeyIsDenied() {
+    const row = (await pool.query(`SELECT sc.revoked_at,sc.activated_at,sc.provider_revoked_at,
+      (SELECT count(*)::int FROM collection_grants g WHERE g.space_id=sc.space_id AND g.credential_id=sc.credential_id) AS grants
+      FROM space_credentials sc WHERE sc.space_id=$1 AND sc.credential_id=$2`,[spaceId,issued.id])).rows[0];
+    assert.ok(row.revoked_at,'failed issuance is locally revoked');
+    assert.equal(row.activated_at,null);
+    assert.equal(row.provider_revoked_at,null,'failed provider cleanup remains retryable');
+    assert.equal(row.grants,0);
+    await assert.rejects(route(issued.secret),denied('NOT_FOUND'));
+    const placement = (await pool.query('SELECT policy_version,placement_generation FROM spaces WHERE space_id=$1',[spaceId])).rows[0];
+    const now = Math.floor(Date.now()/1000);
+    const token = await signer.sign({spaceId,collectionId,capability:'records:read',credentialId:issued.id,kind:'api-key',
+      cellId:'cell-a',policyVersion:placement.policyVersion,placementGeneration:placement.placementGeneration,
+      audience:'stateplane-cell:cell-a',issuedAt:now,expiresAt:now+30,nonce:crypto.randomUUID()});
+    await assert.rejects(cell.execute(token,async () => { effects++; }),denied('FORBIDDEN'));
+    assert.equal(effects,0);
+  }
+
+  directoryOffline = true; providerOffline = true;
+  await assert.rejects(spaces.issueAgentKey(owner,spaceId,expires,grants),/directory publish offline/);
+  directoryOffline = false;
+  await assertFailedKeyIsDenied();
+  await assert.rejects(spaces.reconcile(spaceId),/provider revoke offline/);
+  providerOffline = false;
+  await spaces.reconcile(spaceId);
+  assert.ok((await pool.query('SELECT provider_revoked_at FROM space_credentials WHERE space_id=$1 AND credential_id=$2',
+    [spaceId,issued.id])).rows[0].provider_revoked_at);
+  await assert.rejects(route(issued.secret),denied('UNAUTHENTICATED'));
+
+  const old = await spaces.issueAgentKey(owner,spaceId,expires,grants);
+  directoryOffline = true; providerOffline = true;
+  await assert.rejects(spaces.rotateAgentKey(owner,spaceId,old.id,expires,grants),/provider revoke offline/);
+  // Rotation's old key is locally denied even when its provider revoke failed.
+  directoryOffline = false;
+  await assert.rejects(route(old.secret),denied('NOT_FOUND'));
+  // Retry old-key revocation, then fail publication of the newly issued key.
+  providerOffline = false;
+  await spaces.revokeAgentKey(owner,spaceId,old.id);
+  directoryOffline = true; providerOffline = true;
+  await assert.rejects(spaces.rotateAgentKey(owner,spaceId,old.id,expires,grants),/directory publish offline/);
+  directoryOffline = false;
+  await assertFailedKeyIsDenied();
+  providerOffline = false;
+  await spaces.reconcile(spaceId);
+  assert.equal((await pool.query(`SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND credential_id=$2
+    AND action='key:issue-failed'`,[spaceId,issued.id])).rows[0].n,1);
+});
+
 test('signing key rotation retains then retires old assertions', async () => {
   const v1 = crypto.getRandomValues(new Uint8Array(32));
   const v2 = crypto.getRandomValues(new Uint8Array(32));

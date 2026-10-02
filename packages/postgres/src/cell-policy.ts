@@ -60,10 +60,11 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
   private async check(client: pg.PoolClient, claims: RouteClaims): Promise<string> {
     const result = await client.query(`SELECT s.owner_principal_id,s.lifecycle,s.cell_id,s.policy_version,s.placement_generation,
       c.lifecycle AS collection_lifecycle, sc.principal_id AS key_principal_id,
-      sc.owner_principal_id AS key_owner_id,sc.revoked_at,sc.expires_at > clock_timestamp() AS key_current,
+      sc.owner_principal_id AS key_owner_id,sc.revoked_at,sc.activated_at,
+      sc.expires_at > clock_timestamp() AS key_current,
       g.capabilities,(g.expires_at IS NULL OR g.expires_at > clock_timestamp()) AS grant_current
       FROM spaces s JOIN collections c ON c.space_id=s.space_id AND c.collection_id=$2
-      LEFT JOIN LATERAL (SELECT principal_id,owner_principal_id,revoked_at,expires_at FROM space_credentials
+      LEFT JOIN LATERAL (SELECT principal_id,owner_principal_id,revoked_at,activated_at,expires_at FROM space_credentials
         WHERE space_id=s.space_id AND credential_id=$3 FOR SHARE) sc ON TRUE
       LEFT JOIN LATERAL (SELECT capabilities,expires_at FROM collection_grants
         WHERE space_id=s.space_id AND collection_id=c.collection_id AND credential_id=$3 FOR SHARE) g ON TRUE
@@ -84,7 +85,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       if (claims.userPrincipalId !== row.owner_principal_id) throw new AuthorityError('FORBIDDEN');
       return row.owner_principal_id;
     }
-    if (!row.key_principal_id || row.key_owner_id !== row.owner_principal_id || row.revoked_at ||
+    if (!row.key_principal_id || row.key_owner_id !== row.owner_principal_id || !row.activated_at || row.revoked_at ||
       !row.key_current || !row.capabilities?.includes(claims.capability) || !row.grant_current) throw new AuthorityError('FORBIDDEN');
     return row.key_principal_id;
   }
