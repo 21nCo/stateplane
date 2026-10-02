@@ -1,0 +1,14 @@
+test/integration/postgres-authority.test.js
+  h_a39f9495f9ec1d 88-108,227,233,238,240-241,244-245,301-307,405,411-412,417-418,420-422,424,428,430,432,437-440,1104,1108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "dad9d12a0169bda281f72a01eecfe5dd87869c80",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
