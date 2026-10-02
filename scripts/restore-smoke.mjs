@@ -31,7 +31,7 @@ const sourceUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0
 const targetUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${localPort}/${name}`;
 const base = new pg.Pool({ connectionString:sourceUrl });
 const restored = new pg.Pool({ connectionString:targetUrl });
-const tables = ['stateplane_migrations','space_directory','spaces','space_credentials','routing_nonces','space_audit',
+const tables = ['stateplane_migrations','space_directory','agent_key_issuances','spaces','space_credentials','routing_nonces','space_audit',
   'collections','collection_versions','collection_unique_declarations',
   'collection_index_declarations','collection_grants','records',
   'record_unique_keys','record_index_values','record_events','idempotency_receipts','receipt_reservations',
@@ -54,6 +54,7 @@ try {
     await seed.query('BEGIN');
     await seed.query("INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id) VALUES($1,'owner','cell-a','cell-a','target-a')",[spaceId]);
     await seed.query("INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,lifecycle) VALUES($1,'owner','cell-a','target-a','active')",[spaceId]);
+    await seed.query("INSERT INTO agent_key_issuances(issuance_id,space_id,owner_principal_id,cell_id,credential_id) VALUES('restore-issuance',$1,'owner','cell-a','restore-agent')",[spaceId]);
     await seed.query('INSERT INTO collections(space_id,collection_id) VALUES($1,$2)',[spaceId,collectionId]);
     await seed.query("INSERT INTO space_credentials(space_id,credential_id,principal_id,owner_principal_id,expires_at,activated_at,confirmed_at) VALUES($1,'restore-agent','agent','owner',clock_timestamp()+interval '1 hour',clock_timestamp(),clock_timestamp())",[spaceId]);
     await seed.query("INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities) VALUES($1,$2,'restore-agent',ARRAY['records:read']::text[])",[spaceId,collectionId]);
@@ -77,7 +78,8 @@ try {
   await authority.transaction(worker,tx=>tx.finishOutbox(claimed[0],true));
   const expected = await snapshot(base);
   assert.ok(expected.records.length && expected.record_events.length && expected.projection_outbox.length &&
-    expected.space_directory.length && expected.space_credentials.length && expected.collection_grants.length &&
+    expected.space_directory.length && expected.agent_key_issuances.length &&
+    expected.space_credentials.length && expected.collection_grants.length &&
     expected.routing_nonces.length && expected.space_audit.length,
   'expected this restore smoke seed to populate records, outbox, and owned-space authority');
   const archive = docker(['pg_dump','-U','stateplane','-Fc',sourceName]);

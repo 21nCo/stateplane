@@ -835,6 +835,138 @@ test('reconcile and delete refuse a deleted directory with unpurged cell content
   await spaces.reconcile(spaceId);
 });
 
+test('deletion racing provider creation retains cleanup authority through provider outage', async () => {
+  const config={database:memoryAdapter(),namespace:`sta6-delete-create-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user=await createUser(config,{primaryEmail:`delete-create-${crypto.randomUUID()}@example.invalid`});
+  const session=await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity=new AuthFnIdentityVerifier(config);
+  const actor=await identity.verify(request(session.sessionToken));
+  const realKeys=new AuthFnAgentKeys(config);
+  let issued; let providerOffline=false; let race=false;
+  const keys={
+    create:async (...args) => {
+      issued=await realKeys.create(...args);
+      if (race) {
+        await spaces.archive(actor,spaceId);
+        providerOffline=true;
+        await assert.rejects(spaces.delete(actor,spaceId),/provider unavailable/);
+      }
+      return issued;
+    },
+    find:(...args) => realKeys.find(...args),
+    revoke:async (...args) => { if (providerOffline) throw new Error('provider unavailable'); return realKeys.revoke(...args); },
+  };
+  const cells=new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
+  const spaces=new PostgresSpaces(controlPool,cells,'cell-a',keys,identity);
+  const {spaceId}=await spaces.create(actor);
+  const collectionId=`entries_${crypto.randomUUID()}`;
+  await collection(spaceId,collectionId);
+  race=true;
+  await assert.rejects(spaces.issueAgentKey(actor,spaceId,new Date(Date.now()+3_600_000),
+    [{collectionId,capabilities:['records:read']}]),/provider unavailable|STALE_PLACEMENT/);
+  const pending=(await controlPool.query(`SELECT credential_id,provider_revoked_at FROM agent_key_issuances
+    WHERE space_id=$1`,[spaceId])).rows;
+  assert.deepEqual(pending.map(row=>row.credential_id),[issued.id]);
+  assert.equal(pending[0].provider_revoked_at,null);
+  assert.equal((await pool.query('SELECT lifecycle FROM spaces WHERE space_id=$1',[spaceId])).rows[0].lifecycle,'deleting');
+  const signer=new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const router=new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
+  await assert.rejects(router.assertion(request(issued.secret),spaceId,collectionId,'records:read'),denied('NOT_FOUND'));
+  await assert.rejects(spaces.reconcile(spaceId),/provider unavailable/);
+  providerOffline=false;
+  await spaces.reconcile(spaceId);
+  await spaces.delete(actor,spaceId);
+  await spaces.delete(actor,spaceId);
+  assert.ok((await controlPool.query(`SELECT provider_revoked_at FROM agent_key_issuances
+    WHERE space_id=$1`,[spaceId])).rows[0].provider_revoked_at);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM space_credentials WHERE space_id=$1',[spaceId])).rows[0].n,0);
+  await assert.rejects(router.assertion(request(issued.secret),spaceId,collectionId,'records:read'),denied('UNAUTHENTICATED'));
+  assert.equal((await pool.query(`SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:deleted'`,
+    [spaceId])).rows[0].n,1);
+});
+
+test('cell staging outage after AuthFn creation remains discoverable and revocable', async () => {
+  const config={database:memoryAdapter(),namespace:`sta6-stage-outage-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user=await createUser(config,{primaryEmail:`stage-outage-${crypto.randomUUID()}@example.invalid`});
+  const session=await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity=new AuthFnIdentityVerifier(config);
+  const actor=await identity.verify(request(session.sessionToken));
+  const realKeys=new AuthFnAgentKeys(config);
+  let issued; let stageOffline=false; let providerOffline=false;
+  const keys={
+    create:async (...args) => { issued=await realKeys.create(...args); stageOffline=true; providerOffline=true; return issued; },
+    find:(...args) => realKeys.find(...args),
+    revoke:async (...args) => { if (providerOffline) throw new Error('provider unavailable'); return realKeys.revoke(...args); },
+  };
+  const cell={pool:{query:(...args)=>pool.query(...args),connect:() => {
+    if (stageOffline) throw new Error('cell staging unavailable');
+    return pool.connect();
+  }},storageTargetId:'target-a'};
+  const cells=new Map([['cell-a',cell]]);
+  const spaces=new PostgresSpaces(controlPool,cells,'cell-a',keys,identity);
+  const {spaceId}=await spaces.create(actor);
+  const collectionId=`entries_${crypto.randomUUID()}`;
+  await collection(spaceId,collectionId);
+  await assert.rejects(spaces.issueAgentKey(actor,spaceId,new Date(Date.now()+3_600_000),
+    [{collectionId,capabilities:['records:read']}]),/cell staging unavailable/);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM space_credentials WHERE credential_id=$1',[issued.id])).rows[0].n,0);
+  assert.equal((await controlPool.query(`SELECT credential_id FROM agent_key_issuances WHERE space_id=$1`,
+    [spaceId])).rows[0].credential_id,issued.id);
+  const signer=new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const router=new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
+  await assert.rejects(router.assertion(request(issued.secret),spaceId,collectionId,'records:read'),denied('NOT_FOUND'));
+  stageOffline=false;
+  await assert.rejects(spaces.reconcile(spaceId),/provider unavailable/);
+  providerOffline=false;
+  await spaces.reconcile(spaceId);
+  assert.ok((await controlPool.query(`SELECT provider_revoked_at FROM agent_key_issuances WHERE space_id=$1`,
+    [spaceId])).rows[0].provider_revoked_at);
+  await assert.rejects(router.assertion(request(issued.secret),spaceId,collectionId,'records:read'),denied('UNAUTHENTICATED'));
+});
+
+test('lost journal key-ID write recovers the AuthFn key by issuance correlation', async () => {
+  const config={database:memoryAdapter(),namespace:`sta6-id-write-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user=await createUser(config,{primaryEmail:`id-write-${crypto.randomUUID()}@example.invalid`});
+  const session=await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity=new AuthFnIdentityVerifier(config);
+  const actor=await identity.verify(request(session.sessionToken));
+  const actual=new AuthFnAgentKeys(config);
+  let issued; let unavailable=true; let loseIdWrite=true;
+  const keys={create:async (...args)=>{issued=await actual.create(...args);return issued;},
+    find:(...args)=>actual.find(...args),
+    revoke:async (...args)=>{if(unavailable) throw new Error('provider unavailable');return actual.revoke(...args);}};
+  const control={query:async (sql,args)=>{
+    if (loseIdWrite && typeof sql==='string' && sql.includes('UPDATE agent_key_issuances SET credential_id=$2')) {
+      loseIdWrite=false;
+      throw new Error('control ID write unavailable');
+    }
+    return controlPool.query(sql,args);
+  }};
+  const cells=new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
+  const spaces=new PostgresSpaces(control,cells,'cell-a',keys,identity);
+  const {spaceId}=await spaces.create(actor);
+  const collectionId=`entries_${crypto.randomUUID()}`;
+  await collection(spaceId,collectionId);
+  await assert.rejects(spaces.issueAgentKey(actor,spaceId,new Date(Date.now()+3_600_000),
+    [{collectionId,capabilities:['records:read']}]),/control ID write unavailable/);
+  const journal=(await controlPool.query('SELECT credential_id FROM agent_key_issuances WHERE space_id=$1',[spaceId])).rows[0];
+  assert.equal(journal.credential_id,null);
+  const signer=new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const router=new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
+  await assert.rejects(router.assertion(request(issued.secret),spaceId,collectionId,'records:read'),denied('NOT_FOUND'));
+  await assert.rejects(spaces.reconcile(spaceId),/provider unavailable/);
+  unavailable=false;
+  await spaces.reconcile(spaceId);
+  const resolved=(await controlPool.query(`SELECT credential_id,provider_revoked_at FROM agent_key_issuances
+    WHERE space_id=$1`,[spaceId])).rows[0];
+  assert.equal(resolved.credential_id,issued.id);
+  assert.ok(resolved.provider_revoked_at);
+  await assert.rejects(router.assertion(request(issued.secret),spaceId,collectionId,'records:read'),denied('UNAUTHENTICATED'));
+});
+
 test('failed issuance and rotation never expose grants after publication and provider outages', async () => {
   const config = {database:memoryAdapter(),namespace:`sta6-failed-key-${crypto.randomUUID()}`,plugins:[]};
   createAuthFn(config);

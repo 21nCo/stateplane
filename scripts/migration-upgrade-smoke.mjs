@@ -3,10 +3,12 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import pg from 'pg';
+import { PostgresRoutingDirectory, PostgresSpaces } from '../packages/postgres/dist/index.js';
+import { backfillDirectory } from './backfill-directory-core.mjs';
 
 if (process.env.DATABASE_URL) throw new Error('Upgrade smoke uses the isolated local Postgres database only');
 const password = (await readFile(new URL('../.data/local-db-password', import.meta.url), 'utf8')).trim();
-const baseUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:55432/stateplane`;
+const baseUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT ?? '55432'}/stateplane`;
 const names = ['upgrade','fresh'].map(kind => `stateplane_${kind}_${randomBytes(4).toString('hex')}`);
 const marker = new URL(`../.data/migration-upgrade-${process.pid}-${randomBytes(6).toString('hex')}.json`,import.meta.url);
 const url = name => baseUrl.replace(/\/stateplane$/, `/${name}`);
@@ -128,7 +130,24 @@ try {
     assert.match(output,/Applied 007_receipt_reservations.sql/);
     assert.match(output,/Applied 008_receipt_reservation_scopes.sql/);
     assert.match(output,/Applied 010_receipt_scope_probe_rollback.sql/);
+    assert.match(output,/Applied 016_existing_space_directory.sql/);
+    assert.match(output,/Applied 017_agent_key_issuances.sql/);
     assert.deepEqual(await facts(upgraded),before);
+    const actor={kind:'session',userPrincipalId:'owner',credentialId:'upgrade-session'};
+    const pool=new pg.Pool({connectionString:url(names[0])});
+    try {
+      const cells=new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
+      const spaces=new PostgresSpaces(pool,cells,'cell-a',
+        {create:async () => { throw new Error('unexpected provider create'); },
+          find:async () => null,revoke:async () => {}},{current:async () => true});
+      const directory=new PostgresRoutingDirectory(pool,cells);
+      const listed=await spaces.list(actor);
+      assert.deepEqual(listed.map(space=>space.spaceId),['sp_upgrade']);
+      assert.deepEqual(await spaces.get(actor,'sp_upgrade'),listed[0]);
+      assert.deepEqual(await directory.lookup('sp_upgrade'),{
+        spaceId:'sp_upgrade',cellId:'cell-a',lifecycle:'active',policyVersion:1,placementGeneration:1});
+      assert.equal(await directory.authorized(actor,'sp_upgrade','entries','records:read'),true);
+    } finally { await pool.end(); }
     assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM receipt_reservations')).rows[0].n,0);
     assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM receipt_reservation_scopes')).rows[0].n,0);
     assert.match(await index(upgraded),/\(space_id, collection_id, available_at, event_id\)/);
@@ -143,10 +162,19 @@ try {
     await fresh.connect();
     assert.equal(await index(upgraded),await index(fresh));
     assert.deepEqual(await constraints(upgraded),await constraints(fresh));
+    assert.equal(await backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}]),1);
+    assert.equal(await backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}]),1);
+    const splitCells=new Map([['cell-a',{pool:upgraded,storageTargetId:'target-a'}]]);
+    const splitSpaces=new PostgresSpaces(fresh,splitCells,'cell-a',
+      {create:async () => { throw new Error('unexpected provider create'); },
+        find:async () => null,revoke:async () => {}},{current:async () => true});
+    assert.equal((await splitSpaces.get({kind:'session',userPrincipalId:'owner',credentialId:'upgrade-session'},
+      'sp_upgrade')).spaceId,'sp_upgrade');
+    assert.equal((await new PostgresRoutingDirectory(fresh,splitCells).lookup('sp_upgrade')).cellId,'cell-a');
     await enforceUniqueRecord(upgraded);
-    assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,10);
+    assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,17);
     assert.equal(runMigrator(names[0]),'');
-    console.log(`Upgrade smoke passed: complete 2000 record/event/receipt/outbox rows preserved; final index matches fresh install; 005 build ${build005Ms}ms, 006-010 migrator ${buildRemainingMs}ms`);
+    console.log(`Upgrade smoke passed: 2000 record/event/receipt/outbox rows and upgraded owner route preserved; final index matches fresh install; 005 build ${build005Ms}ms, 006-017 migrator ${buildRemainingMs}ms`);
   } finally { await Promise.allSettled([upgraded.end(),fresh.end()]); }
 } finally {
   created.reverse();

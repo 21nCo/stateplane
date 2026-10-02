@@ -1,5 +1,5 @@
 import { AuthFnApiKeyRevokedError, assertValidCsrf, authenticateApiKey, authenticateSessionToken, createApiKey,
-  getCookieSessionState, revokeApiKeyById } from '@authfn/core';
+  getCookieSessionState, listApiKeysForUser, revokeApiKeyById } from '@authfn/core';
 import type { AuthFnConfig } from '@authfn/core';
 import type { VerifiedCredential } from '@stateplane/contracts';
 
@@ -42,9 +42,16 @@ export class AuthFnIdentityVerifier implements IdentityVerifier {
 /** The AuthFn key is created first; Stateplane grants it only after cell authority commits. */
 export class AuthFnAgentKeys {
   constructor(private readonly config: AuthFnConfig) {}
-  async create(ownerPrincipalId: string, expiresAt: Date): Promise<{ id: string; secret: string }> {
-    const key = await createApiKey(this.config,{ userId:ownerPrincipalId,name:'Stateplane agent',expiresAt });
+  async create(ownerPrincipalId: string, expiresAt: Date, issuanceId: string): Promise<{ id: string; secret: string }> {
+    const key = await createApiKey(this.config,{ userId:ownerPrincipalId,name:'Stateplane agent',expiresAt,
+      metadata:{stateplaneIssuanceId:issuanceId} });
     return { id:key.keyId,secret:key.secret };
+  }
+  async find(ownerPrincipalId: string, issuanceId: string): Promise<string | null> {
+    const matches = (await listApiKeysForUser(this.config,ownerPrincipalId))
+      .filter(key => key.metadata?.stateplaneIssuanceId === issuanceId);
+    if (matches.length > 1) throw new Error('Duplicate AuthFn issuance correlation');
+    return matches[0]?.id ?? null;
   }
   async revoke(id: string, ownerPrincipalId: string): Promise<void> {
     await revokeApiKeyById(this.config,id,{ userId:ownerPrincipalId });
