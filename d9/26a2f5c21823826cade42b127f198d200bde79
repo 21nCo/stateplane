@@ -1,0 +1,24 @@
+README.md
+  h_a39f9495f9ec1d 27
+docs/postgres-authority.md
+  h_a39f9495f9ec1d 3,5,13,19
+migrations/009_receipt_reservation_round_trips.sql
+  h_a39f9495f9ec1d 1-63
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 286,288-293,299-300,400-405,409-415,417-418
+scripts/migration-upgrade-smoke.mjs
+  h_a39f9495f9ec1d 114,131,133
+test/integration/postgres-authority.test.js
+  h_a39f9495f9ec1d 88-105,214,229,310
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d926a2f5c21823826cade42b127f198d200bde79",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
