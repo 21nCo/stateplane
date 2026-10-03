@@ -7,6 +7,8 @@ import type { AuthorityScope, AuthorityTransaction, JoinedReceiptState } from '.
 
 type PoolLike = Pick<pg.Pool, 'connect'>;
 const recordsCallback = new AsyncLocalStorage<symbol>();
+type JoinedAuthority = { finish: () => Promise<void>; verify: () => Promise<void>; ensureCurrent: () => Promise<number>;
+  expose: () => void; close: () => void };
 export interface CurrentCredential {
   current(claims: Pick<RouteClaims, 'kind' | 'credentialId'>, ownerPrincipalId?: string): Promise<boolean>;
 }
@@ -117,6 +119,29 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     return this.checkAgentGrant(row,claims);
   }
 
+  /** One database instant fences every time-based authority after the last provider await. */
+  private async fenceCommit(client: pg.PoolClient, claims: RouteClaims, receipts: JoinedReceiptState,
+    receiptRemaining: number, fenceStarted: number): Promise<void> {
+    const collections = [...new Set([claims.collectionId,...[...receipts.replayed.values()].map(replay => replay.collectionId)])];
+    const receiptIds = receipts.ready.map(receipt => receipt.receiptId);
+    const result = await client.query(`WITH stamp AS MATERIALIZED (SELECT clock_timestamp() AS at)
+      SELECT to_timestamp($3)>stamp.at AS assertion_current,
+        (SELECT sc.expires_at>stamp.at AND sc.revoked_at IS NULL FROM space_credentials sc
+          WHERE sc.space_id=$1 AND sc.credential_id=$2) AS credential_current,
+        NOT EXISTS (SELECT 1 FROM unnest($4::text[]) AS required(collection_id)
+          LEFT JOIN collection_grants g ON g.space_id=$1 AND g.collection_id=required.collection_id AND g.credential_id=$2
+          WHERE g.collection_id IS NULL OR NOT ($5=ANY(g.capabilities)) OR
+            (g.expires_at IS NOT NULL AND g.expires_at<=stamp.at)) AS grants_current,
+        (SELECT count(*)::int FROM idempotency_receipts r
+          WHERE r.receipt_id=ANY($6::text[]) AND r.expires_at>stamp.at) AS current_receipts
+      FROM stamp`, [claims.spaceId,claims.credentialId,claims.expiresAt,collections,claims.capability,receiptIds]);
+    const row = result.rows[0];
+    if (!row?.assertion_current) throw new AuthorityError('FORBIDDEN', 'Routing assertion expired');
+    if (claims.kind !== 'session' && (!row.credential_current || !row.grants_current)) throw new AuthorityError('FORBIDDEN');
+    if (Number(row.current_receipts) !== receiptIds.length || performance.now() - fenceStarted >= receiptRemaining)
+      throw new AuthorityError('RECEIPT_EXPIRED', 'Receipt expired before commit');
+  }
+
   async run<T>(claims: RouteClaims, effect: (principalId: string, context: AuthorizedCellContext) => Promise<T>): Promise<T> {
     claims = Object.freeze({ ...claims });
     this.checkAssertionTime(claims);
@@ -125,8 +150,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     let begun = false;
     let beginAttempted = false;
     let discard = false;
-    const joined: Array<{ finish: () => Promise<void>; verify: () => Promise<void>; ensureCurrent: () => Promise<number>; expose: () => void;
-      close: () => void }> = [];
+    const joined: JoinedAuthority[] = [];
     const joinedReceipts: JoinedReceiptState = {pending:new Map(),replayed:new Map(),ready:[]};
     try {
       this.checkAssertionTime(claims);
@@ -219,9 +243,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       const receiptFenceStarted = performance.now();
       const receiptRemaining = joined.length ? await joined[0].ensureCurrent() : Infinity;
       await this.check(client,claims);
-      this.checkAssertionTime(claims);
-      if (performance.now() - receiptFenceStarted >= receiptRemaining)
-        throw new AuthorityError('RECEIPT_EXPIRED', 'Receipt expired before commit');
+      await this.fenceCommit(client,claims,joinedReceipts,receiptRemaining,receiptFenceStarted);
       try { await client.query('COMMIT'); begun = false; }
       catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
       for (const entry of joined) entry.expose();

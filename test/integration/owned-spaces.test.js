@@ -53,6 +53,20 @@ async function collection(spaceId,collectionId,cellPool=pool) {
   } catch (error) { await db.query('ROLLBACK'); throw error; }
   finally { db.release(); }
 }
+async function cellSpace(...collectionIds) {
+  const spaceId=`sp_${crypto.randomUUID()}`;
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
+  for (const collectionId of collectionIds) await collection(spaceId,collectionId);
+  return spaceId;
+}
+function signRecordRoute(signer,spaceId,collectionId,credentialId='owner-session') {
+  const now=Math.floor(Date.now()/1000);
+  const identity=credentialId==='owner-session' ? {kind:'session',userPrincipalId:'owner'} : {kind:'api-key'};
+  return signer.sign({spaceId,collectionId,capability:'records:write',credentialId,...identity,
+    cellId:'cell-a',policyVersion:1,placementGeneration:1,audience:'stateplane-cell:cell-a',
+    issuedAt:now,expiresAt:now+30,nonce:crypto.randomUUID()});
+}
 const request = secret => new Request('https://gateway.example.invalid',{headers:{Authorization:`Bearer ${secret}`}});
 const denied = code => error => error?.code === code;
 const pause = ms => new Promise(resolve => setTimeout(resolve,ms));
@@ -473,7 +487,7 @@ test('cell context closes on callback return and settles unawaited work before p
   let credentialActive = true;
   let now = 1_000;
   const client = {query:async sql => {
-    if (sql.includes('AS assertion_current')) return {rows:[{assertion_current:true}]};
+    if (sql.includes('AS assertion_current')) return {rows:[{assertion_current:true,current_receipts:0}]};
     if (sql.includes('SELECT s.owner_principal_id')) return {rows:[{owner_principal_id:'owner',lifecycle:'active',cell_id:'cell-a',
       policy_version:1,placement_generation:1,collection_lifecycle:'active',validity_ms:claims.expiresAt*1000-now}]};
     return {rowCount:1};
@@ -2534,18 +2548,12 @@ test('a final cell check that outlasts receipt retention rolls the joined write 
 });
 
 test('joined calls replay one pending receipt and reject copies before outer commit', async () => {
-  const spaceId=`sp_${crypto.randomUUID()}`;
   const collectionId=`entries_${crypto.randomUUID()}`;
-  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
-    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
-  await collection(spaceId,collectionId);
+  const spaceId=await cellSpace(collectionId);
   const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
   const cell=new RegionalCell('cell-a',signer,new PostgresCellPolicy(pool,'cell-a',{current:async () => true}));
   const authority=new PostgresAuthority(pool,60);
-  const token=()=>{ const now=Math.floor(Date.now()/1000); return signer.sign({spaceId,collectionId,
-    capability:'records:write',credentialId:'owner-session',kind:'session',userPrincipalId:'owner',cellId:'cell-a',
-    policyVersion:1,placementGeneration:1,audience:'stateplane-cell:cell-a',issuedAt:now,expiresAt:now+30,
-    nonce:crypto.randomUUID()}); };
+  const token=()=>signRecordRoute(signer,spaceId,collectionId);
   const change={operation:'create',idempotencyKey:`joined-${crypto.randomUUID()}`,requestDigest:'a'.repeat(64),canonicalData:'{}'};
   const [first,replay]=await cell.execute(await token(),async (_principal,context) => {
     const original=await context.records(authority,tx=>tx.mutate(change));
@@ -2569,18 +2577,12 @@ test('joined calls replay one pending receipt and reject copies before outer com
 });
 
 test('concurrent joined calls serialize same-key admission and expose frozen receipts only after commit', async () => {
-  const spaceId=`sp_${crypto.randomUUID()}`;
   const collectionId=`entries_${crypto.randomUUID()}`;
-  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
-    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
-  await collection(spaceId,collectionId);
+  const spaceId=await cellSpace(collectionId);
   const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
   const cell=new RegionalCell('cell-a',signer,new PostgresCellPolicy(pool,'cell-a',{current:async()=>true}));
   const authority=new PostgresAuthority(pool,60);
-  const token=()=>{const now=Math.floor(Date.now()/1000);return signer.sign({spaceId,collectionId,
-    capability:'records:write',credentialId:'owner-session',kind:'session',userPrincipalId:'owner',cellId:'cell-a',
-    policyVersion:1,placementGeneration:1,audience:'stateplane-cell:cell-a',issuedAt:now,expiresAt:now+30,
-    nonce:crypto.randomUUID()});};
+  const token=()=>signRecordRoute(signer,spaceId,collectionId);
   const change={operation:'create',idempotencyKey:`parallel-${crypto.randomUUID()}`,requestDigest:'a'.repeat(64),canonicalData:'{}'};
   const [first,replay]=await cell.execute(await token(),async (_principal,context) => {
     const receipts=await Promise.all([context.records(authority,tx=>tx.mutate(change)),
@@ -2675,11 +2677,8 @@ test('provider revocation during joined receipt finalization rolls back all SQL 
 });
 
 test('a slow last provider lookup cannot consume the joined receipt retry window', async () => {
-  const spaceId=`sp_${crypto.randomUUID()}`;
   const collectionId=`entries_${crypto.randomUUID()}`;
-  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
-    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
-  await collection(spaceId,collectionId);
+  const spaceId=await cellSpace(collectionId);
   let fenced=false; let delayed=false;
   const slowPool={connect:async()=>{const client=await pool.connect();return {query:async(...args)=>{
     const result=await client.query(...args);
@@ -2688,37 +2687,36 @@ test('a slow last provider lookup cannot consume the joined receipt retry window
   },release:discard=>client.release(discard)};}};
   const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
   const cell=new RegionalCell('cell-a',signer,new PostgresCellPolicy(slowPool,'cell-a',{current:async()=>{
-    if (fenced && !delayed) {delayed=true;await pause(1250);}
+    if (fenced && !delayed) {delayed=true;await pause(5250);}
     return true;
   }}));
-  const now=Math.floor(Date.now()/1000);
-  const token=await signer.sign({spaceId,collectionId,capability:'records:write',credentialId:'owner-session',
-    kind:'session',userPrincipalId:'owner',cellId:'cell-a',policyVersion:1,placementGeneration:1,
-    audience:'stateplane-cell:cell-a',issuedAt:now,expiresAt:now+30,nonce:crypto.randomUUID()});
-  await assert.rejects(cell.execute(token,(_principal,context)=>context.records(new PostgresAuthority(pool,1),
+  const token=await signRecordRoute(signer,spaceId,collectionId);
+  await assert.rejects(cell.execute(token,(_principal,context)=>context.records(new PostgresAuthority(pool,5),
     tx=>tx.mutate({operation:'create',idempotencyKey:`late-provider-${spaceId}`,
       requestDigest:'a'.repeat(64),canonicalData:'{}'}))),denied('RECEIPT_EXPIRED'));
+  assert.equal(fenced,true);
   assert.equal(delayed,true);
   for (const table of ['records','record_events','idempotency_receipts','receipt_reservations','projection_outbox'])
     assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[spaceId])).rows[0].n,0,table);
 });
 
 test('grant expiry during the final provider lookup denies the joined commit', async () => {
-  const spaceId=`sp_${crypto.randomUUID()}`;
   const collectionId=`entries_${crypto.randomUUID()}`;
+  const spaceId=await cellSpace(collectionId);
   const credentialId=`key_${crypto.randomUUID()}`;
-  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
-    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
-  await collection(spaceId,collectionId);
   await pool.query(`INSERT INTO space_credentials(space_id,credential_id,principal_id,owner_principal_id,expires_at,activated_at,confirmed_at)
     VALUES($1,$2,'agent','owner',clock_timestamp()+interval '1 minute',clock_timestamp(),clock_timestamp())`,[spaceId,credentialId]);
   await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities,expires_at)
-    VALUES($1,$2,$3,ARRAY['records:write']::text[],clock_timestamp()+interval '1 second')`,
+    VALUES($1,$2,$3,ARRAY['records:write']::text[],clock_timestamp()+interval '1 minute')`,
   [spaceId,collectionId,credentialId]);
   let fenced=false; let delayed=false;
   const slowPool={connect:async()=>{const client=await pool.connect();return {query:async(...args)=>{
     const result=await client.query(...args);
-    if (typeof args[0]==='string' && args[0].includes('remaining_ms')) fenced=true;
+    if (typeof args[0]==='string' && args[0].includes('remaining_ms')) {
+      fenced=true;
+      await client.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '1 second'
+        WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[spaceId,collectionId,credentialId]);
+    }
     return result;
   },release:discard=>client.release(discard)};}};
   const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
@@ -2726,24 +2724,71 @@ test('grant expiry during the final provider lookup denies the joined commit', a
     if (fenced && !delayed) {delayed=true;await pause(1250);}
     return true;
   }}));
-  const now=Math.floor(Date.now()/1000);
-  const token=await signer.sign({spaceId,collectionId,capability:'records:write',credentialId,
-    kind:'api-key',cellId:'cell-a',policyVersion:1,placementGeneration:1,
-    audience:'stateplane-cell:cell-a',issuedAt:now,expiresAt:now+30,nonce:crypto.randomUUID()});
+  const token=await signRecordRoute(signer,spaceId,collectionId,credentialId);
   await assert.rejects(cell.execute(token,(_principal,context)=>context.records(new PostgresAuthority(pool,60),
     tx=>tx.mutate({operation:'create',idempotencyKey:`late-grant-${spaceId}`,
       requestDigest:'a'.repeat(64),canonicalData:'{}'}))),denied('FORBIDDEN'));
+  assert.equal(fenced,true);
   assert.equal(delayed,true);
   for (const table of ['records','record_events','idempotency_receipts','receipt_reservations','projection_outbox'])
     assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[spaceId])).rows[0].n,0,table);
 });
 
+test('an original replay grant expiring during the final provider lookup rolls back a joined write', async () => {
+  const collectionA=`a_${crypto.randomUUID()}`;
+  const collectionB=`b_${crypto.randomUUID()}`;
+  const spaceId=await cellSpace(collectionA,collectionB);
+  const credentialId=`key_${crypto.randomUUID()}`;
+  await pool.query(`INSERT INTO space_credentials(space_id,credential_id,principal_id,owner_principal_id,expires_at,activated_at,confirmed_at)
+    VALUES($1,$2,'agent','owner',clock_timestamp()+interval '1 minute',clock_timestamp(),clock_timestamp())`,[spaceId,credentialId]);
+  for (const collectionId of [collectionA,collectionB]) await pool.query(`INSERT INTO collection_grants
+    (space_id,collection_id,credential_id,capabilities,expires_at)
+    VALUES($1,$2,$3,ARRAY['records:write']::text[],clock_timestamp()+interval '1 minute')`,
+  [spaceId,collectionId,credentialId]);
+  const authority=new PostgresAuthority(pool,60);
+  const replay={operation:'create',idempotencyKey:`original-${spaceId}`,requestDigest:'a'.repeat(64),canonicalData:'{}'};
+  const original=await authority.mutate({spaceId,collectionId:collectionA,principalId:'agent',credentialId,
+    capability:'records:write',policyVersion:1,placementGeneration:1},replay);
+  let fenced=false; let delayed=false;
+  const slowPool={connect:async()=>{const client=await pool.connect();return {query:async(...args)=>{
+    const result=await client.query(...args);
+    if (!fenced && typeof args[0]==='string' && args[0].includes('remaining_ms')) {
+      fenced=true;
+      await client.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '1 second'
+        WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[spaceId,collectionA,credentialId]);
+    }
+    return result;
+  },release:discard=>client.release(discard)};}};
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const cell=new RegionalCell('cell-a',signer,new PostgresCellPolicy(slowPool,'cell-a',{current:async()=>{
+    if (fenced && !delayed) { delayed=true; await pause(1250); }
+    return true;
+  }}));
+  const token=()=>signRecordRoute(signer,spaceId,collectionB,credentialId);
+  const fresh={operation:'create',idempotencyKey:`fresh-${spaceId}`,requestDigest:'b'.repeat(64),canonicalData:'{}'};
+  const execute=async()=>cell.execute(await token(),async (_principal,context)=>{
+    const prior=await context.records(authority,tx=>tx.mutate(replay));
+    const next=await context.records(authority,tx=>tx.mutate(fresh));
+    return [prior,next];
+  });
+  await assert.rejects(execute(),denied('FORBIDDEN'));
+  assert.equal(fenced,true);
+  assert.equal(delayed,true);
+  for (const table of ['records','record_events','idempotency_receipts','projection_outbox'])
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[spaceId])).rows[0].n,1,table);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM receipt_reservations WHERE space_id=$1',[spaceId])).rows[0].n,0);
+  await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '1 minute'
+    WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[spaceId,collectionA,credentialId]);
+  const [replayed,written]=await execute();
+  assert.equal(replayed.receiptId,original.receiptId);
+  assert.equal(replayed.replayed,true);
+  assert.notEqual(written.receiptId,original.receiptId);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM records WHERE space_id=$1',[spaceId])).rows[0].n,2);
+});
+
 test('joined receipts use one database clock query with per-authority retention', async () => {
-  const spaceId=`sp_${crypto.randomUUID()}`;
   const collectionId=`entries_${crypto.randomUUID()}`;
-  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
-    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
-  await collection(spaceId,collectionId);
+  const spaceId=await cellSpace(collectionId);
   let clockQueries=0;
   const countingPool={connect:async()=>{const client=await pool.connect();return {query:async(...args)=>{
     if (typeof args[0]==='string' && args[0].includes('SELECT at AS committed_at')) clockQueries++;
