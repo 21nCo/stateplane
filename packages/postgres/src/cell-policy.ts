@@ -39,11 +39,24 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       // The same database clock governs pruning and insertion; Worker clock skew
       // cannot make a pruned assertion admissible again.
       await this.prune(client);
-      const nonce = await client.query(`INSERT INTO routing_nonces(space_id,nonce,expires_at)
-        SELECT $1,$2,to_timestamp($3) WHERE to_timestamp($3)>clock_timestamp()
+      const nonce = await client.query(`WITH eligible AS MATERIALIZED (
+          SELECT 1 FROM spaces s WHERE s.space_id=$1 AND s.cell_id=$4
+            AND s.policy_version=$5 AND s.placement_generation=$6
+            AND s.lifecycle IN ('active','readOnly') FOR SHARE OF s
+        ) INSERT INTO routing_nonces(space_id,nonce,expires_at)
+        SELECT $1,$2,to_timestamp($3) FROM eligible WHERE to_timestamp($3)>clock_timestamp()
         ON CONFLICT DO NOTHING RETURNING nonce`,
-      [claims.spaceId,claims.nonce,claims.expiresAt]);
-      if (nonce.rowCount !== 1) throw new AuthorityError('FORBIDDEN', 'Routing assertion already consumed');
+      [claims.spaceId,claims.nonce,claims.expiresAt,claims.cellId,claims.policyVersion,claims.placementGeneration]);
+      if (nonce.rowCount !== 1) {
+        const state = await client.query(`SELECT lifecycle,cell_id,policy_version,placement_generation
+          FROM spaces WHERE space_id=$1`,[claims.spaceId]);
+        const row = state.rows[0];
+        if (!row || row.lifecycle === 'deleted') throw new AuthorityError('NOT_FOUND');
+        if (row.cell_id !== claims.cellId || Number(row.policy_version) !== claims.policyVersion ||
+          Number(row.placement_generation) !== claims.placementGeneration) throw new AuthorityError('STALE_PLACEMENT');
+        if (row.lifecycle !== 'active' && row.lifecycle !== 'readOnly') throw new AuthorityError('SPACE_UNAVAILABLE');
+        throw new AuthorityError('FORBIDDEN', 'Routing assertion already consumed');
+      }
     } catch (error) {
       if (!(error instanceof AuthorityError)) { discard = true; }
       throw error;
@@ -123,7 +136,8 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
   private async fenceCommit(client: pg.PoolClient, claims: RouteClaims, receipts: JoinedReceiptState,
     receiptRemaining: number, fenceStarted: number): Promise<void> {
     const collections = [...new Set([claims.collectionId,...[...receipts.replayed.values()].map(replay => replay.collectionId)])];
-    const receiptIds = receipts.ready.map(receipt => receipt.receiptId);
+    const receiptIds = [...new Set([...receipts.ready.map(receipt => receipt.receiptId),
+      ...[...receipts.replayed.values()].map(replay => replay.response.receiptId)])];
     const result = await client.query(`WITH stamp AS MATERIALIZED (SELECT clock_timestamp() AS at)
       SELECT to_timestamp($3)>stamp.at AS assertion_current,
         (SELECT sc.expires_at>stamp.at AND sc.revoked_at IS NULL FROM space_credentials sc

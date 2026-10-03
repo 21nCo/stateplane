@@ -581,6 +581,38 @@ test('database-clock nonce admission stays closed across skew and bounded cleanu
   assert.equal(effects,0);
 });
 
+test('nonce admission racing space erasure cannot repopulate a deleted space', {timeout:10000}, async () => {
+  const collectionId=`entries_${crypto.randomUUID()}`;
+  const spaceId=await cellSpace(collectionId);
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  let admissionStarted;
+  const started=new Promise(resolve=>{admissionStarted=resolve;});
+  const admissionPool={connect:async()=>{const client=await pool.connect();return {query:(...args)=>{
+    if (typeof args[0]==='string' && args[0].includes('INSERT INTO routing_nonces')) admissionStarted();
+    return client.query(...args);
+  },release:discard=>client.release(discard)};}};
+  const cell=new RegionalCell('cell-a',signer,new PostgresCellPolicy(admissionPool,'cell-a',{current:async()=>true}));
+  const eraser=await pool.connect();
+  let effects=0;
+  try {
+    await eraser.query('BEGIN');
+    await eraser.query("UPDATE spaces SET lifecycle='deleting',policy_version=policy_version+1 WHERE space_id=$1",[spaceId]);
+    const attempt=cell.execute(await signRecordRoute(signer,spaceId,collectionId),async()=>{effects++;});
+    await Promise.race([started,pause(3000).then(()=>{throw new Error('Nonce admission did not reach SQL');})]);
+    await eraser.query('SELECT stateplane_purge_space($1)',[spaceId]);
+    await eraser.query('COMMIT');
+    await assert.rejects(attempt,denied('NOT_FOUND'));
+    await assert.rejects(cell.execute(await signRecordRoute(signer,spaceId,collectionId),async()=>{effects++;}),
+      denied('NOT_FOUND'));
+  } catch (error) {
+    await eraser.query('ROLLBACK').catch(()=>{});
+    throw error;
+  } finally { eraser.release(); }
+  assert.equal(effects,0);
+  assert.equal((await pool.query('SELECT lifecycle FROM spaces WHERE space_id=$1',[spaceId])).rows[0].lifecycle,'deleted');
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM routing_nonces WHERE space_id=$1',[spaceId])).rows[0].n,0);
+});
+
 test('a nonce consumed before expiry cannot reach an effect after waiting for the cell pool', async () => {
   const config = {database:memoryAdapter(),namespace:`sta6-pool-expiry-${crypto.randomUUID()}`,plugins:[]};
   createAuthFn(config);
@@ -2784,6 +2816,53 @@ test('an original replay grant expiring during the final provider lookup rolls b
   assert.equal(replayed.replayed,true);
   assert.notEqual(written.receiptId,original.receiptId);
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM records WHERE space_id=$1',[spaceId])).rows[0].n,2);
+});
+
+test('a persisted replay expiring during the final provider lookup rolls back a joined write and permits one retry', async () => {
+  const collectionA=`a_${crypto.randomUUID()}`;
+  const collectionB=`b_${crypto.randomUUID()}`;
+  const spaceId=await cellSpace(collectionA,collectionB);
+  const short=new PostgresAuthority(pool,5);
+  const long=new PostgresAuthority(pool,60);
+  const scope={spaceId,collectionId:collectionA,principalId:'owner',credentialId:'owner-session',
+    capability:'records:write',policyVersion:1,placementGeneration:1};
+  const replay={operation:'create',idempotencyKey:`replay-${spaceId}`,requestDigest:'a'.repeat(64),canonicalData:'{}'};
+  const fresh={operation:'create',idempotencyKey:`fresh-${spaceId}`,requestDigest:'b'.repeat(64),canonicalData:'{}'};
+  const original=await short.mutate(scope,replay);
+  const expiry=Date.parse(original.expiresAt);
+  let fenced=false; let delayed=false;
+  const slowPool={connect:async()=>{const client=await pool.connect();return {query:async(...args)=>{
+    const result=await client.query(...args);
+    if (typeof args[0]==='string' && args[0].includes('AS remaining_ms')) fenced=true;
+    return result;
+  },release:discard=>client.release(discard)};}};
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const cell=new RegionalCell('cell-a',signer,new PostgresCellPolicy(slowPool,'cell-a',{current:async()=>{
+    if (fenced && !delayed) {
+      delayed=true;
+      await pause(Math.max(0,expiry-Date.now()+100));
+    }
+    return true;
+  }}));
+  const execute=async()=>cell.execute(await signRecordRoute(signer,spaceId,collectionB),async (_principal,context)=>[
+    await context.records(short,tx=>tx.mutate(replay)),
+    await context.records(long,tx=>tx.mutate(fresh))
+  ]);
+  await assert.rejects(execute(),denied('RECEIPT_EXPIRED'));
+  assert.equal(fenced,true,'the final receipt deadline check must run');
+  assert.equal(delayed,true,'the provider lookup must cross the replay deadline');
+  for (const table of ['records','record_events','idempotency_receipts','projection_outbox']) {
+    const rows=(await pool.query(`SELECT collection_id,count(*)::int AS n FROM ${table} WHERE space_id=$1 GROUP BY collection_id`,
+      [spaceId])).rows;
+    assert.deepEqual(rows,[{collection_id:collectionA,n:1}],table);
+  }
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM receipt_reservations WHERE space_id=$1',[spaceId])).rows[0].n,0);
+  const [retried,retriedFresh]=await execute();
+  assert.notEqual(retried.receiptId,original.receiptId,'the expired replay can create one new effect');
+  assert.equal(retried.replayed,false);
+  assert.equal(retriedFresh.replayed,false);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM records WHERE space_id=$1 AND collection_id=$2',
+    [spaceId,collectionB])).rows[0].n,2);
 });
 
 test('joined receipts use one database clock query with per-authority retention', async () => {

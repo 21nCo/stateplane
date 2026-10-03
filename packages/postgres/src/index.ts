@@ -442,8 +442,9 @@ export class AuthorityTransaction {
   /** A slow final cell check must abort rather than commit an already expired
    * receipt and let an immediate retry create a second record. */
   async ensureReceiptsCurrent(): Promise<number> {
-    if (!this.readyReceipts.length) return Infinity;
-    const ids=this.readyReceipts.map(ready=>ready.receiptId);
+    const ids=[...new Set([...this.readyReceipts.map(ready=>ready.receiptId),
+      ...[...this.joinedReplays.values()].map(replay=>replay.response.receiptId)])];
+    if (!ids.length) return Infinity;
     const result=await this.query(`WITH stamp AS MATERIALIZED (SELECT clock_timestamp() AS at)
       SELECT count(r.receipt_id)::int AS found,
         count(r.receipt_id) FILTER (WHERE r.expires_at<=stamp.at)::int AS expired,
