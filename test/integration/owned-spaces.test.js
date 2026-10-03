@@ -1714,6 +1714,197 @@ test('expired live issuance cannot stage after reconciliation reclaims its provi
   } finally { release?.(); await issuing?.catch(() => {}); await single.end(); }
 });
 
+test('expired reconciliation cannot revoke an issue or rotation confirmed by the successor claim',
+  {timeout:20_000}, async () => {
+    for (const topology of ['separate','shared-one']) for (const operation of ['issue','rotate']) {
+      const single=topology === 'shared-one' ? new pg.Pool({connectionString:url,max:1}) : null;
+      const database=single ?? pool;
+      const directory=single ?? controlPool;
+      const actor={kind:'session',credentialId:'session',userPrincipalId:`lease-race-${crypto.randomUUID()}`};
+      const active=new Set();
+      const correlations=new Map();
+      const revoked=[];
+      let serial=0;
+      const keys={
+        create:async (_owner,_expiry,issuanceId) => {
+          const id=`lease-key-${crypto.randomUUID()}-${++serial}`;
+          correlations.set(issuanceId,id); active.add(id);
+          return {id,secret:`secret-${id}`};
+        },
+        find:async (_owner,issuanceId) => correlations.get(issuanceId) ?? null,
+        revoke:async id => { revoked.push(id); active.delete(id); },
+      };
+      let armed=false; let pauseConfirmation=false; let pendingRead; let releasePending; let staleRead; let releaseStale;
+      let beforeConfirmation; let releaseConfirmation; let activationCommitted=false;
+      const pendingGate=new Promise(resolve => { releasePending=resolve; });
+      const staleGate=new Promise(resolve => { releaseStale=resolve; });
+      const confirmationGate=new Promise(resolve => { releaseConfirmation=resolve; });
+      const atPending=new Promise(resolve => { pendingRead=resolve; });
+      const atStale=new Promise(resolve => { staleRead=resolve; });
+      const atConfirmation=new Promise(resolve => { beforeConfirmation=resolve; });
+      const proxy={
+        query:async (...args) => {
+          const sql=args[0];
+          if (armed && typeof sql === 'string' && sql.includes('FROM agent_key_issuances WHERE space_id=$1') &&
+            sql.includes('ORDER BY created_at')) {
+            armed=false; pendingRead(); await pendingGate;
+          }
+          const result=await directory.query(...args);
+          if (typeof sql === 'string' && sql.includes('SELECT sc.confirmed_at,sc.revoked_at,s.lifecycle') &&
+            args[1]?.[1] === correlations.get(newIssuanceId)) {
+            staleRead(); await staleGate;
+          }
+          return result;
+        },
+        connect:async () => {
+          if (activationCommitted) {
+            activationCommitted=false;
+            if (pauseConfirmation) { pauseConfirmation=false; beforeConfirmation(); await confirmationGate; }
+          }
+          const client=await database.connect();
+          let activating=false;
+          return {query:async (...args) => {
+            if (typeof args[0] === 'string' && args[0].includes('UPDATE space_credentials SET activated_at='))
+              activating=true;
+            const result=await client.query(...args);
+            if (args[0] === 'COMMIT' && activating) { activating=false; activationCommitted=true; }
+            return result;
+          },release:discard => client.release(discard)};
+        },
+      };
+      // With one connection the same proxy is both control and cell. With
+      // separate databases only control queries use the directory wrapper.
+      const control=topology === 'shared-one' ? proxy : {query:proxy.query,connect:() => directory.connect()};
+      const cellPool=topology === 'shared-one' ? proxy : {
+        query:async (...args) => {
+          const result=await database.query(...args);
+          if (typeof args[0] === 'string' && args[0].includes('SELECT sc.confirmed_at,sc.revoked_at,s.lifecycle') &&
+            args[1]?.[1] === correlations.get(newIssuanceId)) {
+            staleRead(); await staleGate;
+          }
+          return result;
+        },
+        connect:proxy.connect,
+      };
+      const spaces=new PostgresSpaces(control,new Map([['cell-a',{pool:cellPool,storageTargetId:'target-a'}]]),
+        'cell-a',keys,{current:async () => true});
+      let newIssuanceId;
+      let reconciling; let issuing;
+      try {
+        const {spaceId}=await spaces.create(actor);
+        const collectionId=`lease_${crypto.randomUUID()}`;
+        await collection(spaceId,collectionId,database);
+        const expires=new Date(Date.now()+3_600_000);
+        const grants=[{collectionId,capabilities:['records:read']}];
+        const old=operation==='rotate' ? await spaces.issueAgentKey(actor,spaceId,expires,grants) : null;
+        const revokedBefore=revoked.length;
+        armed=true;
+        pauseConfirmation=true;
+        reconciling=spaces.reconcile(spaceId);
+        await atPending;
+        await directory.query(`UPDATE space_directory SET issuance_lease_until=clock_timestamp()-interval '1 second'
+          WHERE space_id=$1`,[spaceId]);
+        issuing=operation==='rotate'
+          ? spaces.rotateAgentKey(actor,spaceId,old.id,expires,grants)
+          : spaces.issueAgentKey(actor,spaceId,expires,grants);
+        await atConfirmation;
+        newIssuanceId=[...correlations.keys()].at(-1);
+        releasePending();
+        await atStale;
+        releaseConfirmation();
+        const result=await issuing;
+        assert.equal(result.id,correlations.get(newIssuanceId));
+        assert.equal(active.has(result.id),true,'provider key survives stale reconciliation');
+        releaseStale();
+        await assert.rejects(reconciling,denied('STALE_PLACEMENT'));
+        assert.equal(active.has(result.id),true);
+        assert.equal(revoked.length,revokedBefore+(operation==='rotate' ? 1 : 0));
+        const journal=(await directory.query(`SELECT completed_at,cancelled_at,provider_revoked_at
+          FROM agent_key_issuances WHERE issuance_id=$1`,[newIssuanceId])).rows[0];
+        assert.ok(journal.completed_at);
+        assert.equal(journal.cancelled_at,null);
+        assert.equal(journal.provider_revoked_at,null);
+        const credential=(await database.query(`SELECT activated_at,confirmed_at,revoked_at FROM space_credentials
+          WHERE space_id=$1 AND credential_id=$2`,[spaceId,result.id])).rows[0];
+        assert.ok(credential.activated_at && credential.confirmed_at);
+        assert.equal(credential.revoked_at,null);
+        assert.equal((await database.query(`SELECT count(*)::int AS n FROM collection_grants
+          WHERE space_id=$1 AND credential_id=$2`,[spaceId,result.id])).rows[0].n,1);
+        assert.equal((await database.query(`SELECT count(*)::int AS n FROM space_audit
+          WHERE space_id=$1 AND credential_id=$2 AND action='key:issue-failed'`,[spaceId,result.id])).rows[0].n,0);
+        const local=(await database.query('SELECT policy_version FROM spaces WHERE space_id=$1',[spaceId])).rows[0];
+        const published=(await directory.query('SELECT policy_version FROM space_directory WHERE space_id=$1',[spaceId])).rows[0];
+        assert.equal(published.policy_version,local.policy_version);
+      } finally {
+        releasePending(); releaseConfirmation(); releaseStale();
+        await Promise.allSettled([reconciling,issuing]);
+        await single?.end();
+      }
+    }
+  });
+
+test('reconciliation cancellation after cell confirmation prevents a late definite key success',
+  {timeout:10_000}, async () => {
+    const actor={kind:'session',credentialId:'session',userPrincipalId:`completion-race-${crypto.randomUUID()}`};
+    const active=new Set();
+    const correlations=new Map();
+    let issued; let reached; let release;
+    const atCompletion=new Promise(resolve => { reached=resolve; });
+    const completionGate=new Promise(resolve => { release=resolve; });
+    const keys={
+      create:async (_owner,_expiry,issuanceId) => {
+        issued={id:`completion-key-${crypto.randomUUID()}`,secret:'unused'};
+        correlations.set(issuanceId,issued.id); active.add(issued.id);
+        return issued;
+      },
+      find:async (_owner,issuanceId) => correlations.get(issuanceId) ?? null,
+      revoke:async id => { active.delete(id); },
+    };
+    const control={
+      query:async (...args) => {
+        if (typeof args[0] === 'string' && args[0].includes('UPDATE agent_key_issuances i SET completed_at=')) {
+          reached(); await completionGate;
+        }
+        return controlPool.query(...args);
+      },
+      connect:() => controlPool.connect(),
+    };
+    const spaces=new PostgresSpaces(control,new Map([['cell-a',{pool,storageTargetId:'target-a'}]]),
+      'cell-a',keys,{current:async () => true});
+    let pending;
+    try {
+      const {spaceId}=await spaces.create(actor);
+      const collectionId=`completion_${crypto.randomUUID()}`;
+      await collection(spaceId,collectionId);
+      pending=spaces.issueAgentKey(actor,spaceId,new Date(Date.now()+3_600_000),
+        [{collectionId,capabilities:['records:read']}]);
+      await atCompletion;
+      assert.equal(active.has(issued.id),true);
+      assert.ok((await pool.query(`SELECT confirmed_at FROM space_credentials
+        WHERE space_id=$1 AND credential_id=$2`,[spaceId,issued.id])).rows[0].confirmed_at);
+      await controlPool.query(`UPDATE space_directory SET issuance_lease_until=clock_timestamp()-interval '1 second'
+        WHERE space_id=$1`,[spaceId]);
+      await spaces.reconcile(spaceId);
+      release();
+      await assert.rejects(pending,denied('STALE_PLACEMENT'));
+      assert.equal(active.has(issued.id),false);
+      const journal=(await controlPool.query(`SELECT cancelled_at,completed_at,provider_revoked_at
+        FROM agent_key_issuances WHERE space_id=$1 AND credential_id=$2`,[spaceId,issued.id])).rows[0];
+      assert.ok(journal.cancelled_at && journal.provider_revoked_at);
+      assert.equal(journal.completed_at,null);
+      const local=(await pool.query(`SELECT revoked_at,provider_revoked_at FROM space_credentials
+        WHERE space_id=$1 AND credential_id=$2`,[spaceId,issued.id])).rows[0];
+      assert.ok(local.revoked_at && local.provider_revoked_at);
+      assert.equal((await pool.query(`SELECT count(*)::int AS n FROM collection_grants
+        WHERE space_id=$1 AND credential_id=$2`,[spaceId,issued.id])).rows[0].n,0);
+      assert.equal((await pool.query(`SELECT count(*)::int AS n FROM space_audit
+        WHERE space_id=$1 AND credential_id=$2 AND action='key:issue-failed'`,[spaceId,issued.id])).rows[0].n,1);
+      assert.equal((await controlPool.query('SELECT policy_version FROM space_directory WHERE space_id=$1',
+        [spaceId])).rows[0].policy_version,
+      (await pool.query('SELECT policy_version FROM spaces WHERE space_id=$1',[spaceId])).rows[0].policy_version);
+    } finally { release(); await pending?.catch(() => {}); }
+  });
+
 test('cell staging outage after AuthFn creation remains discoverable and revocable', async () => {
   const config={database:memoryAdapter(),namespace:`sta6-stage-outage-${crypto.randomUUID()}`,plugins:[]};
   createAuthFn(config);
