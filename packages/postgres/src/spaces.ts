@@ -153,11 +153,12 @@ export class PostgresSpaces {
   private async current(actor: VerifiedCredential, ownerPrincipalId: string = owner(actor)): Promise<void> {
     if (!await this.credentials.current(actor,ownerPrincipalId)) throw new AuthorityError('FORBIDDEN');
   }
-  private async owned(actor: VerifiedCredential, spaceId: string, includeDeleted = false): Promise<SpaceInfo> {
+  private async owned(actor: VerifiedCredential, spaceId: string, includeDeleted = false,
+    control: Pick<pg.Pool, 'query'> = this.control): Promise<SpaceInfo> {
     const principal = owner(actor);
     if (!validId(spaceId)) throw new AuthorityError('NOT_FOUND');
     await this.current(actor);
-    const result = await this.control.query(`SELECT * FROM space_directory WHERE space_id=$1 AND owner_principal_id=$2`,[spaceId,principal]);
+    const result = await control.query(`SELECT * FROM space_directory WHERE space_id=$1 AND owner_principal_id=$2`,[spaceId,principal]);
     if (!result.rows[0] || result.rows[0].lifecycle === 'provisioning' ||
       (!includeDeleted && result.rows[0].lifecycle === 'deleted')) throw new AuthorityError('NOT_FOUND');
     await this.current(actor);
@@ -313,14 +314,15 @@ export class PostgresSpaces {
     return info(row);
   }
 
-  private async publish(space: SpaceInfo, policyVersion: number, lifecycle: string): Promise<void> {
+  private async publish(space: SpaceInfo, policyVersion: number, lifecycle: string,
+    control: Pick<pg.Pool, 'query'> = this.control): Promise<void> {
     try {
-      const updated = await this.control.query(`UPDATE space_directory SET policy_version=$3,lifecycle=$4,updated_at=clock_timestamp()
+      const updated = await control.query(`UPDATE space_directory SET policy_version=$3,lifecycle=$4,updated_at=clock_timestamp()
         WHERE space_id=$1 AND policy_version=$2 AND placement_generation=$5 AND cell_id=$6 RETURNING 1`,
       [space.spaceId,space.policyVersion,policyVersion,lifecycle,space.placementGeneration,space.cellId]);
       if (updated.rowCount !== 1) throw new AuthorityError('STALE_PLACEMENT');
     } catch (error) {
-      const observed = await this.control.query('SELECT * FROM space_directory WHERE space_id=$1',[space.spaceId]).catch(() => null);
+      const observed = await control.query('SELECT * FROM space_directory WHERE space_id=$1',[space.spaceId]).catch(() => null);
       const row = observed?.rows[0];
       if (row?.owner_principal_id === space.ownerPrincipalId && row.cell_id === space.cellId &&
         row.storage_target_id === space.storageTargetId && row.lifecycle === lifecycle &&
@@ -490,26 +492,62 @@ export class PostgresSpaces {
     return result.rows[0]?.erased === true;
   }
 
+  /** A session lock distinguishes a live issuer from an interrupted journal.
+   * Use the pinned client for control queries so a one-connection control pool
+   * remains usable while the issuer holds the lock. A crashed process releases
+   * the lock, allowing the next reconciliation to revoke its orphaned key. */
+  private async withIssuanceLock<T>(spaceId: string,
+    operation: (control: pg.PoolClient) => Promise<T>): Promise<T> {
+    // Let callers finish their synchronous argument snapshot before pg-pool
+    // touches its internal arrays (which may have inherited user accessors).
+    await Promise.resolve();
+    const client = await this.control.connect();
+    let held = false;
+    let discard = false;
+    try {
+      const result = await client.query('SELECT pg_try_advisory_lock(hashtextextended($1,0)) AS locked',
+        [`stateplane:issuance:${spaceId}`]);
+      held = result.rows[0]?.locked === true;
+      if (!held) throw new AuthorityError('STALE_PLACEMENT','Issuance is still active');
+      return await operation(client);
+    } finally {
+      if (held) {
+        try { await client.query('SELECT pg_advisory_unlock(hashtextextended($1,0))',
+          [`stateplane:issuance:${spaceId}`]); }
+        catch { discard = true; }
+      }
+      client.release(discard);
+    }
+  }
+
   /** The control journal survives cell erasure and ambiguous cell commits. */
-  private async cleanupIssuances(space: SpaceInfo, force: boolean): Promise<void> {
-    const pending = await this.control.query(`SELECT issuance_id,credential_id,owner_principal_id,cell_id,create_failed_at
+  private async cleanupIssuances(space: SpaceInfo, force: boolean,
+    lockedControl?: Pick<pg.Pool, 'query'>): Promise<void> {
+    // Deletion has already fenced the cell lifecycle. It must be able to
+    // cancel a paused provider create without waiting for that promise.
+    if (!lockedControl && force) return this.cleanupIssuances(space,force,this.control);
+    if (!lockedControl) return this.withIssuanceLock(space.spaceId,
+      control => this.cleanupIssuances(space,force,control));
+    const pending = await lockedControl.query(`SELECT issuance_id,credential_id,owner_principal_id,cell_id,create_failed_at
       FROM agent_key_issuances WHERE space_id=$1 AND provider_revoked_at IS NULL
         AND settled_without_key_at IS NULL ORDER BY created_at,issuance_id`,[space.spaceId]);
     for (const row of pending.rows) {
       if (row.owner_principal_id !== space.ownerPrincipalId || row.cell_id !== space.cellId) throw new AuthorityError('STALE_PLACEMENT');
+      if (force) await lockedControl.query(`UPDATE agent_key_issuances SET cancelled_at=COALESCE(cancelled_at,clock_timestamp())
+        WHERE issuance_id=$1 AND provider_revoked_at IS NULL AND settled_without_key_at IS NULL`,[row.issuance_id]);
       const id = row.credential_id ?? await this.keys.find(space.ownerPrincipalId,row.issuance_id);
       if (!id) {
         if (row.create_failed_at) {
           // The create promise rejected. A successful provider lookup now proves
           // that no bearer was issued, even if lookup was unavailable at failure.
-          await this.control.query(`UPDATE agent_key_issuances SET settled_without_key_at=clock_timestamp()
+          await lockedControl.query(`UPDATE agent_key_issuances SET settled_without_key_at=clock_timestamp()
             WHERE issuance_id=$1 AND credential_id IS NULL AND settled_without_key_at IS NULL`,[row.issuance_id]);
           continue;
         }
         if (force) throw new AuthorityError('STALE_PLACEMENT','Provider issuance has not settled');
         continue;
       }
-      await this.control.query(`UPDATE agent_key_issuances SET credential_id=$2
+      await lockedControl.query(`UPDATE agent_key_issuances SET credential_id=$2
         WHERE issuance_id=$1 AND (credential_id IS NULL OR credential_id=$2)`,[row.issuance_id,id]);
       const cell = this.cell(space.cellId);
       const local = await cell.pool.query(`SELECT sc.confirmed_at,sc.revoked_at,s.lifecycle FROM spaces s
@@ -521,7 +559,7 @@ export class PostgresSpaces {
       if (record && record.lifecycle !== 'deleted' && record.confirmed_at == null && record.revoked_at == null)
         await this.failIssuedKey(cell,space.spaceId,space.ownerPrincipalId,id);
       await this.keys.revoke(id,space.ownerPrincipalId);
-      await this.control.query(`UPDATE agent_key_issuances SET provider_revoked_at=clock_timestamp()
+      await lockedControl.query(`UPDATE agent_key_issuances SET provider_revoked_at=clock_timestamp()
         WHERE issuance_id=$1 AND provider_revoked_at IS NULL`,[row.issuance_id]);
       if (record && record.lifecycle !== 'deleted') await cell.pool.query(`UPDATE space_credentials
         SET provider_revoked_at=COALESCE(provider_revoked_at,clock_timestamp())
@@ -554,14 +592,26 @@ export class PostgresSpaces {
   /** Repair an interrupted cell-first publication from the cell's current authority. */
   async reconcile(spaceId: string): Promise<SpaceInfo> {
     if (!validId(spaceId)) throw new AuthorityError('INVALID_ARGUMENT');
-    const control = await this.control.query('SELECT * FROM space_directory WHERE space_id=$1',[spaceId]);
+    // A deleted cell cannot accept staging or confirmation. Its retained
+    // journal must remain repairable even if an old provider create is paused.
+    const directory = await this.control.query('SELECT cell_id FROM space_directory WHERE space_id=$1',[spaceId]);
+    if (!directory.rows[0]) throw new AuthorityError('NOT_FOUND');
+    const cell = this.cell(directory.rows[0].cell_id);
+    const lifecycle = await cell.pool.query('SELECT lifecycle FROM spaces WHERE space_id=$1',[spaceId]);
+    if (lifecycle.rows[0]?.lifecycle === 'deleted') return this.reconcileLocked(spaceId,this.control,true);
+    return this.withIssuanceLock(spaceId,controlClient => this.reconcileLocked(spaceId,controlClient));
+  }
+  private async reconcileLocked(spaceId: string, controlClient: Pick<pg.Pool, 'query'>,
+    requireDeleted = false): Promise<SpaceInfo> {
+    const control = await controlClient.query('SELECT * FROM space_directory WHERE space_id=$1',[spaceId]);
     const row = control.rows[0];
     if (!row) throw new AuthorityError('NOT_FOUND');
     const first = await this.cell(row.cell_id).pool.query(`SELECT * FROM spaces WHERE space_id=$1`,[spaceId]);
     if (!first.rows[0] || (first.rows[0].owner_principal_id !== row.owner_principal_id || first.rows[0].cell_id !== row.cell_id ||
       first.rows[0].storage_target_id !== row.storage_target_id)) throw new AuthorityError('STALE_PLACEMENT');
+    if (requireDeleted && first.rows[0].lifecycle !== 'deleted') throw new AuthorityError('STALE_PLACEMENT');
     await this.cleanupIssuances(info(row),row.lifecycle === 'deleted' || first.rows[0]?.lifecycle === 'deleting' ||
-      first.rows[0]?.lifecycle === 'deleted');
+      first.rows[0]?.lifecycle === 'deleted',controlClient);
     if (first.rows[0] && first.rows[0].lifecycle !== 'deleted') {
       // An interrupted issuance is never promoted by directory repair. Locally
       // revoke it first, then retry the external provider revocation below.
@@ -570,7 +620,7 @@ export class PostgresSpaces {
       for (const key of unconfirmed.rows) await this.failIssuedKey(this.cell(row.cell_id),spaceId,row.owner_principal_id,key.credential_id);
       const pending = await this.cell(row.cell_id).pool.query(`SELECT credential_id FROM space_credentials
         WHERE space_id=$1 AND revoked_at IS NOT NULL AND provider_revoked_at IS NULL`,[spaceId]);
-      for (const key of pending.rows) await this.revokeProvider(this.cell(row.cell_id),info(row),row.owner_principal_id,key.credential_id);
+      for (const key of pending.rows) await this.revokeProvider(this.cell(row.cell_id),info(row),row.owner_principal_id,key.credential_id,controlClient);
     }
     const current = await this.cell(row.cell_id).pool.query(`SELECT * FROM spaces WHERE space_id=$1`,[spaceId]);
     const local = current.rows[0];
@@ -585,7 +635,7 @@ export class PostgresSpaces {
       throw new AuthorityError('STALE_PLACEMENT');
     if (safeVersion(local.policy_version) < safeVersion(row.policy_version) ||
       safeVersion(local.placement_generation) < safeVersion(row.placement_generation)) throw new AuthorityError('STALE_PLACEMENT');
-    const updated = await this.control.query(`UPDATE space_directory SET lifecycle=$2,policy_version=$3,
+    const updated = await controlClient.query(`UPDATE space_directory SET lifecycle=$2,policy_version=$3,
       placement_generation=$4,updated_at=clock_timestamp()
       WHERE space_id=$1 AND lifecycle=$5 AND policy_version=$6 AND placement_generation=$7
         AND cell_id=$8 AND owner_principal_id=$9 AND storage_target_id=$10 RETURNING *`,
@@ -620,13 +670,25 @@ export class PostgresSpaces {
     }
   }
 
+  private async requireLiveIssuance(control: Pick<pg.Pool, 'query'>, issuanceId: string): Promise<void> {
+    const live = await control.query(`SELECT 1 FROM agent_key_issuances
+      WHERE issuance_id=$1 AND cancelled_at IS NULL AND provider_revoked_at IS NULL
+        AND settled_without_key_at IS NULL`,[issuanceId]);
+    if (live.rowCount !== 1) throw new AuthorityError('STALE_PLACEMENT','Issuance was cancelled');
+  }
+
   async issueAgentKey(actor: VerifiedCredential, spaceId: string, expiresAt: Date, grants: readonly CollectionGrant[]): Promise<IssuedAgentKey> {
     actor = snapshotOwner(actor);
     if (!expiresAt || types.isProxy(expiresAt) || !(expiresAt instanceof Date) || !Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= Date.now()) throw new AuthorityError('INVALID_ARGUMENT');
     expiresAt = new Date(expiresAt.getTime());
-    const expiryMs = expiresAt.getTime();
     grants = snapshotGrants(grants,expiresAt);
-    const space = await this.owned(actor,spaceId);
+    if (!validId(spaceId)) throw new AuthorityError('NOT_FOUND');
+    return this.withIssuanceLock(spaceId,control => this.issueAgentKeyLocked(actor,spaceId,expiresAt,grants,control));
+  }
+  private async issueAgentKeyLocked(actor: VerifiedCredential, spaceId: string, expiresAt: Date,
+    grants: readonly CollectionGrant[], control: pg.PoolClient): Promise<IssuedAgentKey> {
+    const expiryMs = expiresAt.getTime();
+    const space = await this.owned(actor,spaceId,false,control);
     if (space.lifecycle !== 'active') throw new AuthorityError('SPACE_UNAVAILABLE');
     await this.current(actor);
     // Reject bad selectors before AuthFn creates a bearer. Recheck under row
@@ -634,7 +696,7 @@ export class PostgresSpaces {
     await this.requireGrantCollections(this.cell(space.cellId).pool,spaceId,grants);
     await this.current(actor);
     const issuanceId = `iss_${randomUUID()}`;
-    const reserved = await this.control.query(`INSERT INTO agent_key_issuances(issuance_id,space_id,owner_principal_id,cell_id)
+    const reserved = await control.query(`INSERT INTO agent_key_issuances(issuance_id,space_id,owner_principal_id,cell_id)
       SELECT $1,space_id,owner_principal_id,cell_id FROM space_directory
       WHERE space_id=$2 AND owner_principal_id=$3 AND cell_id=$4 AND lifecycle='active'
         AND policy_version=$5 AND placement_generation=$6 RETURNING 1`,
@@ -648,11 +710,13 @@ export class PostgresSpaces {
       catch (error) { createFailed = true; throw error; }
       created = issued;
       if (!validId(issued.id)) throw new AuthorityError('INVALID_ARGUMENT','Provider returned an invalid key ID');
-      await this.control.query(`UPDATE agent_key_issuances SET credential_id=$2
+      await this.requireLiveIssuance(control,issuanceId);
+      await control.query(`UPDATE agent_key_issuances SET credential_id=$2
         WHERE issuance_id=$1 AND (credential_id IS NULL OR credential_id=$2)`,[issuanceId,issued.id]);
       // This independent commit keeps a provider key discoverable by reconcile
       // if a later grant FK, publication or activation transaction fails.
       await transaction(this.cell(space.cellId).pool, async db => {
+        await this.requireLiveIssuance(control,issuanceId);
         // Serialize staging with deletion and erasure repair. A provider create
         // can finish after either path has purged the cell; its old directory
         // snapshot must never insert a credential into the deleted tombstone.
@@ -671,6 +735,7 @@ export class PostgresSpaces {
         [`aud_${randomUUID()}`,spaceId,owner(actor),issued.id]);
       });
       const version = await transaction(this.cell(space.cellId).pool, async db => {
+        await this.requireLiveIssuance(control,issuanceId);
         await this.current(actor);
         const locked = await db.query(`SELECT policy_version,lifecycle FROM spaces WHERE space_id=$1 AND owner_principal_id=$2 FOR UPDATE`,[spaceId,owner(actor)]);
         if (!locked.rows[0] || Number(locked.rows[0].policy_version) !== space.policyVersion || locked.rows[0].lifecycle !== 'active') throw new AuthorityError('STALE_PLACEMENT');
@@ -692,8 +757,10 @@ export class PostgresSpaces {
         return Number(changed.rows[0].policy_version);
       });
       await this.current(actor);
-      await this.publish(space,version,space.lifecycle);
+      await this.requireLiveIssuance(control,issuanceId);
+      await this.publish(space,version,space.lifecycle,control);
       try { await transaction(this.cell(space.cellId).pool, async db => {
+        await this.requireLiveIssuance(control,issuanceId);
         await this.current(actor);
         const locked = await db.query(`SELECT policy_version,lifecycle,placement_generation FROM spaces
           WHERE space_id=$1 AND owner_principal_id=$2 FOR UPDATE`,[spaceId,owner(actor)]);
@@ -722,6 +789,13 @@ export class PostgresSpaces {
       // its acknowledgement or the recovery read fails, so it remains inert.
       try { await transaction(this.cell(space.cellId).pool, async db => {
         await this.current(actor);
+        const local = await db.query(`SELECT lifecycle,policy_version,placement_generation FROM spaces
+          WHERE space_id=$1 AND owner_principal_id=$2 FOR UPDATE`,[spaceId,owner(actor)]);
+        if (!local.rows[0] || local.rows[0].lifecycle !== 'active' ||
+          Number(local.rows[0].policy_version) !== version ||
+          Number(local.rows[0].placement_generation) !== space.placementGeneration)
+          throw new AuthorityError('STALE_PLACEMENT');
+        await this.requireLiveIssuance(control,issuanceId);
         const confirmed = await db.query(`UPDATE space_credentials SET confirmed_at=clock_timestamp()
           WHERE space_id=$1 AND credential_id=$2 AND activated_at IS NOT NULL
             AND confirmed_at IS NULL AND revoked_at IS NULL RETURNING 1`,[spaceId,issued.id]);
@@ -736,24 +810,25 @@ export class PostgresSpaces {
         // reconciliation revokes it; the caller must check before using it.
         return { ...issued, confirmation: 'unknown' };
       }
+      await this.requireLiveIssuance(control,issuanceId);
       return issued;
     } catch (error) {
       if (createFailed) {
         // The create call has settled, but a lost provider acknowledgement can
         // still hide a key. Correlation readback must succeed before declaring
         // an empty issuance settled; provider outages leave it retryable.
-        await this.control.query(`UPDATE agent_key_issuances SET create_failed_at=clock_timestamp()
+        await control.query(`UPDATE agent_key_issuances SET create_failed_at=clock_timestamp()
           WHERE issuance_id=$1 AND create_failed_at IS NULL`,[issuanceId]).catch(() => {});
         let found: string | null | undefined;
         try { found = await this.keys.find(owner(actor),issuanceId); }
         catch { found = undefined; }
-        if (found === null) await this.control.query(`UPDATE agent_key_issuances
+        if (found === null) await control.query(`UPDATE agent_key_issuances
           SET settled_without_key_at=clock_timestamp() WHERE issuance_id=$1 AND credential_id IS NULL
             AND provider_revoked_at IS NULL AND settled_without_key_at IS NULL`,[issuanceId]);
         else if (found) {
-          await this.control.query(`UPDATE agent_key_issuances SET credential_id=$2
+          await control.query(`UPDATE agent_key_issuances SET credential_id=$2
             WHERE issuance_id=$1 AND (credential_id IS NULL OR credential_id=$2)`,[issuanceId,found]).catch(() => {});
-          await this.keys.revoke(found,owner(actor)).then(() => this.control.query(`UPDATE agent_key_issuances
+          await this.keys.revoke(found,owner(actor)).then(() => control.query(`UPDATE agent_key_issuances
             SET credential_id=$2,provider_revoked_at=clock_timestamp()
             WHERE issuance_id=$1 AND (credential_id IS NULL OR credential_id=$2)`,[issuanceId,found])).catch(() => {});
         }
@@ -763,8 +838,8 @@ export class PostgresSpaces {
       if (created) {
         const failed = created;
         await this.failIssuedKey(this.cell(space.cellId),spaceId,owner(actor),failed.id).catch(() => {});
-        await this.revokeProvider(this.cell(space.cellId),space,owner(actor),failed.id).catch(async () => {
-          await this.keys.revoke(failed.id,owner(actor)).then(() => this.control.query(`UPDATE agent_key_issuances
+        await this.revokeProvider(this.cell(space.cellId),space,owner(actor),failed.id,control).catch(async () => {
+          await this.keys.revoke(failed.id,owner(actor)).then(() => control.query(`UPDATE agent_key_issuances
             SET credential_id=$2,provider_revoked_at=clock_timestamp()
             WHERE issuance_id=$1 AND (credential_id IS NULL OR credential_id=$2)`,[issuanceId,failed.id])).catch(() => {});
         });
@@ -772,7 +847,8 @@ export class PostgresSpaces {
       throw error;
     }
   }
-  private async revokeProvider(cell: CellDatabase, space: SpaceInfo, ownerPrincipalId: string, keyId: string): Promise<void> {
+  private async revokeProvider(cell: CellDatabase, space: SpaceInfo, ownerPrincipalId: string, keyId: string,
+    control: Pick<pg.Pool, 'query'> = this.control): Promise<void> {
     await this.keys.revoke(keyId,ownerPrincipalId);
     await transaction(cell.pool, async db => {
       const changed = await db.query(`UPDATE space_credentials SET provider_revoked_at=clock_timestamp()
@@ -781,7 +857,7 @@ export class PostgresSpaces {
         SELECT $1,$2,$3,$4,'key:provider-revoke',policy_version,placement_generation FROM spaces WHERE space_id=$2`,
       [`aud_${randomUUID()}`,space.spaceId,ownerPrincipalId,keyId]);
     });
-    await this.control.query(`UPDATE agent_key_issuances SET provider_revoked_at=clock_timestamp()
+    await control.query(`UPDATE agent_key_issuances SET provider_revoked_at=clock_timestamp()
       WHERE space_id=$1 AND credential_id=$2 AND provider_revoked_at IS NULL`,[space.spaceId,keyId]);
   }
   async revokeAgentKey(actor: VerifiedCredential, spaceId: string, keyId: string): Promise<void> {

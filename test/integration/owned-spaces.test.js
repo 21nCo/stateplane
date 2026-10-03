@@ -55,6 +55,18 @@ async function collection(spaceId,collectionId,cellPool=pool) {
 const request = secret => new Request('https://gateway.example.invalid',{headers:{Authorization:`Bearer ${secret}`}});
 const denied = code => error => error?.code === code;
 const pause = ms => new Promise(resolve => setTimeout(resolve,ms));
+function controlWithQueryHook(hook) {
+  return {
+    query:(sql,...args)=>hook(sql,args,()=>controlPool.query(sql,...args)),
+    connect:async () => {
+      const client=await controlPool.connect();
+      return {
+        query:(sql,...args)=>hook(sql,args,()=>client.query(sql,...args)),
+        release:discard=>client.release(discard),
+      };
+    },
+  };
+}
 
 test('owned spaces, AuthFn identities and cell effects share a revocable authority boundary', async () => {
   const config = { database:memoryAdapter(),namespace:`sta6-${crypto.randomUUID()}`,plugins:[] };
@@ -307,18 +319,17 @@ test('owned spaces, AuthFn identities and cell effects share a revocable authori
   await assert.rejects(read(cellB,(await route(session.sessionToken,second.spaceId,c1)).token),denied('STALE_PLACEMENT'));
   assert.equal((await spaces.reconcile(second.spaceId)).policyVersion,2);
   assert.equal(await read(cellB,(await route(session.sessionToken,second.spaceId,c1)).token),0);
-  const originalControlQuery = controlPool.query.bind(controlPool);
   let raced = false;
-  controlPool.query = async (sql,...args) => {
+  const racedControl=controlWithQueryHook(async (sql,args,next) => {
     if (!raced && typeof sql === 'string' && sql.includes('UPDATE space_directory SET lifecycle=$2,policy_version=$3')) {
       raced = true;
-      await originalControlQuery("UPDATE space_directory SET policy_version=policy_version+1,lifecycle='suspended' WHERE space_id=$1",[second.spaceId]);
+      await controlPool.query("UPDATE space_directory SET policy_version=policy_version+1,lifecycle='suspended' WHERE space_id=$1",[second.spaceId]);
     }
-    return originalControlQuery(sql,...args);
-  };
-  try { await assert.rejects(spaces.reconcile(second.spaceId),denied('STALE_PLACEMENT')); }
-  finally { controlPool.query = originalControlQuery; }
-  assert.equal((await originalControlQuery('SELECT lifecycle FROM space_directory WHERE space_id=$1',[second.spaceId])).rows[0].lifecycle,'suspended');
+    return next();
+  });
+  const racedSpaces=new PostgresSpaces(racedControl,cells,'cell-a',keyProvider,identity);
+  await assert.rejects(racedSpaces.reconcile(second.spaceId),denied('STALE_PLACEMENT'));
+  assert.equal((await controlPool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1',[second.spaceId])).rows[0].lifecycle,'suspended');
 });
 
 test('archived spaces replay owner and agent receipts but deny external writes at the effect boundary', async () => {
@@ -1368,7 +1379,8 @@ test('deletion racing provider creation retains cleanup authority through provid
   await collection(spaceId,collectionId);
   race=true;
   await assert.rejects(spaces.issueAgentKey(actor,spaceId,new Date(Date.now()+3_600_000),
-    [{collectionId,capabilities:['records:read']}]),/provider unavailable|STALE_PLACEMENT/);
+    [{collectionId,capabilities:['records:read']}]),error =>
+      denied('STALE_PLACEMENT')(error) || /provider unavailable/.test(error?.message));
   const pending=(await controlPool.query(`SELECT credential_id,provider_revoked_at FROM agent_key_issuances
     WHERE space_id=$1`,[spaceId])).rows;
   assert.deepEqual(pending.map(row=>row.credential_id),[issued.id]);
@@ -1457,6 +1469,10 @@ test('issuance staging and deletion or erasure repair serialize without late cre
       assert.equal(directoryBefore.lifecycle,'deleted');
       assert.equal(cellBefore.lifecycle,'deleted');
       assert.equal((await pool.query('SELECT count(*)::int AS n FROM space_credentials WHERE space_id=$1',[spaceId])).rows[0].n,0);
+      const journalBefore=(await controlPool.query(`SELECT cancelled_at,provider_revoked_at FROM agent_key_issuances
+        WHERE space_id=$1`,[spaceId])).rows[0];
+      assert.ok(journalBefore.cancelled_at || journalBefore.provider_revoked_at,
+        'deletion durably cancels or revokes the paused issuer before regional erasure');
       release();
       await assert.rejects(issuance,denied('STALE_PLACEMENT'));
       assert.ok(revocations > 0,'provider key was revoked');
@@ -1477,6 +1493,116 @@ test('issuance staging and deletion or erasure repair serialize without late cre
         [spaceId])).rows[0].n,1);
     } finally { release(); }
   }
+});
+
+test('live issue and rotation cannot be revoked by reconciliation before staging or confirmation', async () => {
+  for (const operation of ['issue','rotate']) for (const boundary of ['staging','confirmation']) {
+    const config={database:memoryAdapter(),namespace:`sta6-reconcile-issue-${crypto.randomUUID()}`,plugins:[]};
+    createAuthFn(config);
+    const user=await createUser(config,{primaryEmail:`reconcile-issue-${crypto.randomUUID()}@example.invalid`});
+    const session=await issueSession(config,{}, {userId:user.id,methods:['password']});
+    const identity=new AuthFnIdentityVerifier(config);
+    const actor=await identity.verify(request(session.sessionToken));
+    const realKeys=new AuthFnAgentKeys(config);
+    let armed=false; let issued; let revocations=0; let reached; let release;
+    const atBoundary=new Promise(resolve => { reached=resolve; });
+    const resume=new Promise(resolve => { release=resolve; });
+    const keys={
+      create:async (...args) => {
+        issued=await realKeys.create(...args);
+        if (armed && boundary==='staging') { reached(); await resume; }
+        return issued;
+      },
+      find:(...args)=>realKeys.find(...args),
+      revoke:async (...args)=>{ revocations++; return realKeys.revoke(...args); },
+    };
+    const cellPool={
+      query:(...args)=>pool.query(...args),
+      connect:async () => {
+        const client=await pool.connect();
+        return {
+          query:async (...args) => {
+            if (armed && boundary==='confirmation' && typeof args[0]==='string' &&
+              args[0].includes('UPDATE space_credentials SET confirmed_at=')) {
+              reached(); await resume;
+            }
+            return client.query(...args);
+          },
+          release:discard=>client.release(discard),
+        };
+      },
+    };
+    const cells=new Map([['cell-a',{pool:cellPool,storageTargetId:'target-a'}]]);
+    const spaces=new PostgresSpaces(controlPool,cells,'cell-a',keys,identity);
+    const {spaceId}=await spaces.create(actor);
+    const collectionId=`race_${crypto.randomUUID()}`;
+    await collection(spaceId,collectionId);
+    const expires=new Date(Date.now()+3_600_000);
+    const grants=[{collectionId,capabilities:['records:read']}];
+    const old=operation==='rotate' ? await spaces.issueAgentKey(actor,spaceId,expires,grants) : null;
+    armed=true;
+    const pending=operation==='rotate'
+      ? spaces.rotateAgentKey(actor,spaceId,old.id,expires,grants)
+      : spaces.issueAgentKey(actor,spaceId,expires,grants);
+    await atBoundary;
+    try {
+      await assert.rejects(spaces.reconcile(spaceId),denied('STALE_PLACEMENT'));
+      assert.equal((await identity.verify(request(issued.secret)))?.credentialId,issued.id,
+        'provider key remains present while its issuer is live');
+      assert.equal(revocations,operation==='rotate' ? 1 : 0,
+        'reconciliation did not revoke the new provider key');
+    } finally { release(); }
+    const result=await pending;
+    assert.equal(result.id,issued.id);
+    const signer=new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+    const router=new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
+    assert.ok((await router.assertion(request(result.secret),spaceId,collectionId,'records:read')).token);
+    const local=(await pool.query(`SELECT activated_at,confirmed_at,revoked_at,
+      (SELECT count(*)::int FROM collection_grants g WHERE g.space_id=sc.space_id AND g.credential_id=sc.credential_id) AS grants
+      FROM space_credentials sc WHERE sc.space_id=$1 AND sc.credential_id=$2`,[spaceId,result.id])).rows[0];
+    assert.ok(local.activated_at && local.confirmed_at);
+    assert.equal(local.revoked_at,null);
+    assert.equal(local.grants,1);
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM space_audit
+      WHERE space_id=$1 AND credential_id=$2 AND action='key:issue-failed'`,[spaceId,result.id])).rows[0].n,0);
+    assert.equal((await controlPool.query(`SELECT provider_revoked_at FROM agent_key_issuances
+      WHERE space_id=$1 AND credential_id=$2`,[spaceId,result.id])).rows[0].provider_revoked_at,null);
+    assert.equal((await spaces.reconcile(spaceId)).policyVersion,
+      Number((await pool.query('SELECT policy_version FROM spaces WHERE space_id=$1',[spaceId])).rows[0].policy_version));
+  }
+});
+
+test('reconciliation revokes a retained issuance after its control session stops', async () => {
+  const config={database:memoryAdapter(),namespace:`sta6-issuer-stop-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user=await createUser(config,{primaryEmail:`issuer-stop-${crypto.randomUUID()}@example.invalid`});
+  const session=await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity=new AuthFnIdentityVerifier(config);
+  const actor=await identity.verify(request(session.sessionToken));
+  const keys=new AuthFnAgentKeys(config);
+  const spaces=new PostgresSpaces(controlPool,new Map([['cell-a',{pool,storageTargetId:'target-a'}]]),
+    'cell-a',keys,identity);
+  const {spaceId}=await spaces.create(actor);
+  const issuanceId=`iss_${crypto.randomUUID()}`;
+  const client=await controlPool.connect();
+  let stopped=false;
+  try {
+    await client.query('SELECT pg_advisory_lock(hashtextextended($1,0))',[`stateplane:issuance:${spaceId}`]);
+    await client.query(`INSERT INTO agent_key_issuances(issuance_id,space_id,owner_principal_id,cell_id)
+      VALUES($1,$2,$3,'cell-a')`,[issuanceId,spaceId,user.id]);
+    const key=await keys.create(user.id,new Date(Date.now()+3_600_000),issuanceId);
+    await client.query('UPDATE agent_key_issuances SET credential_id=$2 WHERE issuance_id=$1',[issuanceId,key.id]);
+    assert.equal((await identity.verify(request(key.secret)))?.credentialId,key.id);
+    await assert.rejects(spaces.reconcile(spaceId),denied('STALE_PLACEMENT'));
+    assert.equal((await identity.verify(request(key.secret)))?.credentialId,key.id);
+    client.release(true); stopped=true; // dropped backend releases its session advisory lock
+    await spaces.reconcile(spaceId);
+    assert.equal(await identity.verify(request(key.secret)),null);
+    assert.ok((await controlPool.query(`SELECT provider_revoked_at FROM agent_key_issuances
+      WHERE issuance_id=$1`,[issuanceId])).rows[0].provider_revoked_at);
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM space_credentials WHERE space_id=$1',[spaceId])).rows[0].n,0);
+    await spaces.reconcile(spaceId);
+  } finally { if (!stopped) client.release(true); }
 });
 
 test('cell staging outage after AuthFn creation remains discoverable and revocable', async () => {
@@ -1531,13 +1657,13 @@ test('lost journal key-ID write recovers the AuthFn key by issuance correlation'
   const keys={create:async (...args)=>{issued=await actual.create(...args);return issued;},
     find:(...args)=>actual.find(...args),
     revoke:async (...args)=>{if(unavailable) throw new Error('provider unavailable');return actual.revoke(...args);}};
-  const control={connect:() => controlPool.connect(),query:async (sql,args)=>{
+  const control=controlWithQueryHook(async (sql,args,next)=>{
     if (loseIdWrite && typeof sql==='string' && sql.includes('UPDATE agent_key_issuances SET credential_id=$2')) {
       loseIdWrite=false;
       throw new Error('control ID write unavailable');
     }
-    return controlPool.query(sql,args);
-  }};
+    return next();
+  });
   const cells=new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
   const spaces=new PostgresSpaces(control,cells,'cell-a',keys,identity);
   const {spaceId}=await spaces.create(actor);
@@ -1574,14 +1700,13 @@ test('failed issuance and rotation never expose grants after publication and pro
     create:async (...args) => { issued = await realProvider.create(...args); return issued; },
     revoke:async (...args) => { if (providerOffline) throw new Error('provider revoke offline'); return realProvider.revoke(...args); },
   };
-  const originalQuery = controlPool.query.bind(controlPool);
   let directoryOffline = false;
-  const control = {connect:() => controlPool.connect(),query:async (sql,...args) => {
+  const control = controlWithQueryHook(async (sql,args,next) => {
     if (directoryOffline && typeof sql === 'string' && sql.includes('UPDATE space_directory SET policy_version=$3,lifecycle=$4')) {
       throw new Error('directory publish offline');
     }
-    return originalQuery(sql,...args);
-  }};
+    return next();
+  });
   const cells = new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
   const spaces = new PostgresSpaces(control,cells,'cell-a',provider,identity);
   const {spaceId} = await spaces.create(owner);
