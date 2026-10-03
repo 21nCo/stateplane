@@ -3,10 +3,16 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import pg from 'pg';
+import { existsSync } from 'node:fs';
+import { backfillDirectory } from './backfill-directory-core.mjs';
+
+const authorityModule = new URL('../packages/postgres/dist/index.js',import.meta.url);
+if (!existsSync(authorityModule)) throw new Error('Build @stateplane/postgres before db:upgrade-smoke: pnpm --filter @stateplane/postgres build');
+const { PostgresRoutingDirectory, PostgresSpaces } = await import(authorityModule.href);
 
 if (process.env.DATABASE_URL) throw new Error('Upgrade smoke uses the isolated local Postgres database only');
 const password = (await readFile(new URL('../.data/local-db-password', import.meta.url), 'utf8')).trim();
-const baseUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:55432/stateplane`;
+const baseUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT || '55432'}/stateplane`;
 const names = ['upgrade','fresh'].map(kind => `stateplane_${kind}_${randomBytes(4).toString('hex')}`);
 const marker = new URL(`../.data/migration-upgrade-${process.pid}-${randomBytes(6).toString('hex')}.json`,import.meta.url);
 const url = name => baseUrl.replace(/\/stateplane$/, `/${name}`);
@@ -90,7 +96,7 @@ try {
     }
     await upgraded.query('COMMIT');
     await upgraded.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
-      VALUES('sp_upgrade','owner','cell-a','cell-a','target-a')`);
+      VALUES('sp_upgrade','owner','cell-origin','cell-a','target-a')`);
     await upgraded.query('BEGIN');
     await upgraded.query(`INSERT INTO collections(space_id,collection_id) VALUES('sp_upgrade','entries')`);
     await upgraded.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition)
@@ -128,7 +134,31 @@ try {
     assert.match(output,/Applied 007_receipt_reservations.sql/);
     assert.match(output,/Applied 008_receipt_reservation_scopes.sql/);
     assert.match(output,/Applied 010_receipt_scope_probe_rollback.sql/);
+    assert.match(output,/Applied 016_existing_space_directory.sql/);
+    assert.match(output,/Applied 017_agent_key_issuances.sql/);
+    assert.match(output,/Applied 018_agent_key_no_key_settlement.sql/);
+    assert.match(output,/Applied 019_space_provisioning_recovery.sql/);
+    assert.match(output,/Applied 020_immutable_space_audits.sql/);
+    assert.match(output,/Applied 023_agent_key_completion_fence.sql/);
+    assert.match(output,/Applied 025_space_directory_home_cell.sql/);
     assert.deepEqual(await facts(upgraded),before);
+    const actor={kind:'session',userPrincipalId:'owner',credentialId:'upgrade-session'};
+    const pool=new pg.Pool({connectionString:url(names[0])});
+    try {
+      const cells=new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
+      const spaces=new PostgresSpaces(pool,cells,'cell-a',
+        {create:async () => { throw new Error('unexpected provider create'); },
+          find:async () => null,revoke:async () => {}},{current:async () => true});
+      const directory=new PostgresRoutingDirectory(pool,cells);
+      const listed=await spaces.list(actor);
+      assert.deepEqual(listed.map(space=>space.spaceId),['sp_upgrade']);
+      assert.equal(listed[0].homeCellId,'cell-origin');
+      assert.equal(listed[0].cellId,'cell-a');
+      assert.deepEqual(await spaces.get(actor,'sp_upgrade'),listed[0]);
+      assert.deepEqual(await directory.lookup('sp_upgrade'),{
+        spaceId:'sp_upgrade',cellId:'cell-a',lifecycle:'active',policyVersion:1,placementGeneration:1});
+      assert.equal(await directory.authorized(actor,'sp_upgrade','entries','records:read'),true);
+    } finally { await pool.end(); }
     assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM receipt_reservations')).rows[0].n,0);
     assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM receipt_reservation_scopes')).rows[0].n,0);
     assert.match(await index(upgraded),/\(space_id, collection_id, available_at, event_id\)/);
@@ -143,10 +173,144 @@ try {
     await fresh.connect();
     assert.equal(await index(upgraded),await index(fresh));
     assert.deepEqual(await constraints(upgraded),await constraints(fresh));
+    await upgraded.query("UPDATE spaces SET created_at='2026-01-02 03:04:05.123456+00' WHERE space_id='sp_upgrade'");
+    await assert.rejects(backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],
+      {expectedCellIds:['cell-a','cell-b'],drained:true}),/every configured cell/);
+    await assert.rejects(backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],
+      {expectedCellIds:['cell-a'],drained:false}),/drained traffic/);
+    const writer=new pg.Client({connectionString:url(names[0])});
+    const observer=new pg.Client({connectionString:url(names[0])});
+    await writer.connect();
+    let attempted=false;
+    let writerSettled=false;
+    let writerUpdate;
+    try {
+      await observer.connect();
+      const writerPid=(await writer.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+      await writer.query('BEGIN');
+      const guardedControl={query:async (sql,...args) => {
+        if (!attempted && sql.includes('FROM space_directory WHERE space_id')) {
+          attempted=true;
+          writerUpdate=writer.query("UPDATE spaces SET policy_version=policy_version+1 WHERE space_id='sp_upgrade'")
+            .then(() => { writerSettled=true; });
+          let blocked=false;
+          for (let attempt=0;attempt<100;attempt++) {
+            // pg_stat_activity is cached per transaction. The control client
+            // is in the backfill transaction, so observe from autocommit.
+            const state=(await observer.query('SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1',[writerPid])).rows[0];
+            if (state?.wait_event_type==='Lock') { blocked=true; break; }
+            if (writerSettled) break;
+            await new Promise(resolve=>setTimeout(resolve,20));
+          }
+          assert.equal(blocked,true,'source writer reached PostgreSQL and waits on the source lock');
+          assert.equal(writerSettled,false,'source writer waits for the backfill snapshot lock');
+        }
+        return fresh.query(sql,...args);
+      }};
+      assert.deepEqual(await backfillDirectory(guardedControl,[{cellId:'cell-a',client:upgraded}],
+        {expectedCellIds:['cell-a'],drained:true}),{copied:1,existing:0});
+      assert.equal(attempted,true,'source writer guard executed');
+      await writerUpdate;
+      assert.equal(writerSettled,true,'source writer resumes after backfill commits');
+    } finally {
+      await writer.query('ROLLBACK').catch(()=>{});
+      await writer.end();
+      await observer.end().catch(()=>{});
+    }
+    assert.deepEqual(await backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],{expectedCellIds:['cell-a'],drained:true}),{copied:0,existing:1});
+    assert.equal((await fresh.query("SELECT home_cell_id FROM space_directory WHERE space_id='sp_upgrade'")).rows[0].home_cell_id,'cell-origin');
+    await fresh.query("UPDATE space_directory SET home_cell_id=NULL WHERE space_id='sp_upgrade'");
+    assert.deepEqual(await backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],{expectedCellIds:['cell-a'],drained:true}),{copied:0,existing:1});
+    assert.equal((await fresh.query("SELECT home_cell_id FROM space_directory WHERE space_id='sp_upgrade'")).rows[0].home_cell_id,'cell-origin');
+    await fresh.query("UPDATE space_directory SET home_cell_id='wrong-home' WHERE space_id='sp_upgrade'");
+    await assert.rejects(backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],
+      {expectedCellIds:['cell-a'],drained:true}),/home_cell_id/);
+    await fresh.query("UPDATE space_directory SET home_cell_id='cell-origin' WHERE space_id='sp_upgrade'");
+    await fresh.query("UPDATE space_directory SET created_at='2026-01-02 03:04:05.123+00' WHERE space_id='sp_upgrade'");
+    await assert.rejects(backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],
+      {expectedCellIds:['cell-a'],drained:true}),/created_at/);
+    await fresh.query("UPDATE space_directory SET created_at='2026-01-02 03:04:05.123456+00' WHERE space_id='sp_upgrade'");
+    assert.equal((await fresh.query("SELECT created_at::text AS created_at FROM space_directory WHERE space_id='sp_upgrade'")).rows[0].created_at,
+      (await upgraded.query("SELECT created_at::text AS created_at FROM spaces WHERE space_id='sp_upgrade'")).rows[0].created_at);
+    const splitCellPool=new pg.Pool({connectionString:url(names[0])});
+    const splitControlPool=new pg.Pool({connectionString:url(names[1])});
+    try {
+      const splitCells=new Map([['cell-a',{pool:splitCellPool,storageTargetId:'target-a'}]]);
+      const splitSpaces=new PostgresSpaces(splitControlPool,splitCells,'cell-a',
+        {create:async () => { throw new Error('unexpected provider create'); },
+          find:async () => null,revoke:async () => {}},{current:async () => true});
+      assert.equal((await splitSpaces.get({kind:'session',userPrincipalId:'owner',credentialId:'upgrade-session'},
+        'sp_upgrade')).homeCellId,'cell-origin');
+      assert.equal((await new PostgresRoutingDirectory(fresh,splitCells).lookup('sp_upgrade')).cellId,'cell-a');
+      assert.equal(await splitSpaces.fencePlacement('sp_upgrade','cell-a',1),2);
+      assert.equal((await splitSpaces.reconcile('sp_upgrade')).homeCellId,'cell-origin');
+      assert.equal((await splitSpaces.list({kind:'session',userPrincipalId:'owner',credentialId:'upgrade-session'}))[0].homeCellId,'cell-origin');
+      const pending='sp_pre025_reservation';
+      await upgraded.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+        VALUES($1,'pending-owner','cell-a','cell-a','target-a')`,[pending]);
+      await upgraded.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
+        VALUES('aud_pre025_reservation',$1,'pending-owner','session','space:create',1,1)`,[pending]);
+      await fresh.query(`INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,lifecycle,
+        provisioning_lease_until) VALUES($1,'pending-owner','cell-a','target-a','provisioning',clock_timestamp()-interval '1 second')`,[pending]);
+      await assert.rejects(fresh.query("UPDATE space_directory SET home_cell_id='' WHERE space_id=$1",[pending]),
+        error=>error.code==='23514');
+      assert.equal((await fresh.query('SELECT home_cell_id FROM space_directory WHERE space_id=$1',[pending]))
+        .rows[0].home_cell_id,null);
+      assert.deepEqual((await splitSpaces.list({kind:'session',userPrincipalId:'pending-owner',credentialId:'session'})),
+        [await splitSpaces.get({kind:'session',userPrincipalId:'pending-owner',credentialId:'session'},pending)]);
+      assert.equal((await fresh.query('SELECT home_cell_id,lifecycle FROM space_directory WHERE space_id=$1',[pending]))
+        .rows[0].home_cell_id,'cell-a');
+      assert.equal((await new PostgresRoutingDirectory(splitControlPool,splitCells).lookup(pending)).lifecycle,'active');
+      assert.equal((await upgraded.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:create'",
+        [pending])).rows[0].n,1);
+      // Recreate the same migrated reservation and let drained backfill hydrate it.
+      await fresh.query(`UPDATE space_directory SET home_cell_id=NULL,lifecycle='provisioning',
+        provisioning_lease_until=clock_timestamp()+interval '60 seconds' WHERE space_id=$1`,[pending]);
+      assert.deepEqual(await backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],
+        {expectedCellIds:['cell-a'],drained:true}),{copied:0,existing:2});
+      assert.equal((await fresh.query('SELECT home_cell_id,lifecycle FROM space_directory WHERE space_id=$1',[pending]))
+        .rows[0].lifecycle,'provisioning');
+      assert.equal((await fresh.query('SELECT home_cell_id FROM space_directory WHERE space_id=$1',[pending]))
+        .rows[0].home_cell_id,'cell-a');
+      assert.deepEqual(await splitSpaces.list({kind:'session',userPrincipalId:'pending-owner',credentialId:'session'}),[]);
+      await fresh.query("UPDATE space_directory SET provisioning_lease_until=clock_timestamp()-interval '1 second' WHERE space_id=$1",
+        [pending]);
+      assert.equal((await splitSpaces.list({kind:'session',userPrincipalId:'pending-owner',credentialId:'session'}))[0]
+        .spaceId,pending);
+      await fresh.query("UPDATE space_directory SET home_cell_id='wrong-home' WHERE space_id=$1",[pending]);
+      await assert.rejects(backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],
+        {expectedCellIds:['cell-a'],drained:true}),/home_cell_id/);
+      assert.equal((await fresh.query('SELECT home_cell_id FROM space_directory WHERE space_id=$1',[pending]))
+        .rows[0].home_cell_id,'wrong-home');
+      await fresh.query(`UPDATE space_directory SET home_cell_id=NULL,lifecycle='provisioning'
+        WHERE space_id=$1`,[pending]);
+      await fresh.query("UPDATE space_directory SET home_cell_id='wrong-home' WHERE space_id='sp_upgrade'");
+      let hydratedInsideTransaction=false;
+      const observingControl={query:async (...args)=>{
+        const result=await fresh.query(...args);
+        if (args[0]==='UPDATE space_directory SET home_cell_id=$2 WHERE space_id=$1' && args[1][0]===pending) {
+          hydratedInsideTransaction=(await fresh.query('SELECT home_cell_id FROM space_directory WHERE space_id=$1',
+            [pending])).rows[0].home_cell_id==='cell-a';
+        }
+        return result;
+      }};
+      await assert.rejects(backfillDirectory(observingControl,[{cellId:'cell-a',client:upgraded}],
+        {expectedCellIds:['cell-a'],drained:true}),/home_cell_id/);
+      assert.equal(hydratedInsideTransaction,true,'earlier row hydrated before the later mismatch');
+      assert.equal((await fresh.query('SELECT home_cell_id FROM space_directory WHERE space_id=$1',[pending]))
+        .rows[0].home_cell_id,null,'later mismatch rolls back earlier hydration');
+      await fresh.query("UPDATE space_directory SET home_cell_id='cell-origin' WHERE space_id='sp_upgrade'");
+      await fresh.query("UPDATE space_directory SET home_cell_id=NULL,lifecycle='provisioning' WHERE space_id=$1",[pending]);
+      await upgraded.query("UPDATE spaces SET policy_version=2 WHERE space_id=$1",[pending]);
+      await assert.rejects(backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],
+        {expectedCellIds:['cell-a'],drained:true}),/policy_version/);
+      assert.equal((await fresh.query('SELECT home_cell_id FROM space_directory WHERE space_id=$1',[pending]))
+        .rows[0].home_cell_id,null);
+    } finally { await Promise.all([splitCellPool.end(),splitControlPool.end()]); }
     await enforceUniqueRecord(upgraded);
-    assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,10);
+    assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,25);
     assert.equal(runMigrator(names[0]),'');
-    console.log(`Upgrade smoke passed: complete 2000 record/event/receipt/outbox rows preserved; final index matches fresh install; 005 build ${build005Ms}ms, 006-010 migrator ${buildRemainingMs}ms`);
+    console.log(`Upgrade smoke passed: 2000 record/event/receipt/outbox rows and upgraded owner route preserved; final index matches fresh install; 005 build ${build005Ms}ms, 006-025 migrator ${buildRemainingMs}ms`);
   } finally { await Promise.allSettled([upgraded.end(),fresh.end()]); }
 } finally {
   created.reverse();

@@ -4,11 +4,12 @@ import { createHash, randomBytes } from 'node:crypto';
 import { readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import pg from 'pg';
+import { migrationInventory } from './migration-order.mjs';
 
 if (process.env.DATABASE_URL) throw new Error('Index race smoke uses the isolated local Postgres database only');
 const root = resolve(import.meta.dirname, '..');
 const password = (await readFile(new URL('../.data/local-db-password', import.meta.url), 'utf8')).trim();
-const baseUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:55432/stateplane`;
+const baseUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT || '55432'}/stateplane`;
 const admin = new pg.Client({ connectionString: baseUrl });
 const cases = process.argv.includes('--single')
   ? [[4, 'commit']]
@@ -18,6 +19,7 @@ const migrationNames = [
   '001_foundation.sql', '002_authority.sql', '003_immutable_facts.sql',
   '004_instant_order.sql', '005_scoped_query_indexes.sql'
 ];
+const completeMigrationCount = (await migrationInventory(resolve(root,'migrations'))).length;
 const markerDirectory = new URL('../.data/', import.meta.url);
 const raceDatabase = /^stateplane_race_[0-9a-f]{8}$/;
 
@@ -157,21 +159,21 @@ async function assertOutcome({ action, prefix, result, client, writer, name, bef
     const retry = await boundedResult(drained);
     assert.equal(retry.code, 0, JSON.stringify(retry));
     assert.deepEqual(await facts(client), after);
-    assert.equal((await migrationLedger(client)).length, 10);
+    assert.equal((await migrationLedger(client)).length, completeMigrationCount);
   } else {
     if (action === 'rollback' || action === 'empty') {
       assert.equal(result.code, 0, JSON.stringify(result));
-      assert.equal(afterLedger.length, 10);
+      assert.equal(afterLedger.length, completeMigrationCount);
     } else {
       assert.deepEqual(afterLedger, beforeLedger);
       const retry = startMigrator(databaseUrl(name, 'sta5_race_retry'));
       assert.equal((await boundedResult(retry)).code, 0);
-      assert.equal((await migrationLedger(client)).length, 10);
+      assert.equal((await migrationLedger(client)).length, completeMigrationCount);
     }
     assert.equal(after.outbox, 0);
   }
   assert.match(await claimIndex(client), /\(space_id, collection_id, available_at, event_id\)/);
-  const migrations = action === 'commit' ? `${prefix} then 10` : '10';
+  const migrations = action === 'commit' ? `${prefix} then ${completeMigrationCount}` : String(completeMigrationCount);
   console.log(`Index race ${prefix}/${action} passed: outbox=${after.outbox}, migrations=${migrations}`);
 }
 

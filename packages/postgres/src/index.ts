@@ -12,7 +12,8 @@ export type IndexValue =
 export interface UniqueValue { name: string; encodedValue: string }
 export interface AuthorityScope {
   spaceId: SpaceId; collectionId: CollectionId; principalId: string; credentialId: string;
-  capability: Capability; policyVersion: number; placementGeneration: number;
+  /** outbox:worker is internal and is never grantable or routable. */
+  capability: Capability | 'outbox:worker'; policyVersion: number; placementGeneration: number;
 }
 export interface RecordChange {
   operation: RecordMutation; idempotencyKey: string;
@@ -73,6 +74,17 @@ const utf8Compare = (a: string, b: string) => Buffer.compare(Buffer.from(a), Buf
 function copyReceipt(receipt: Receipt, replayed = receipt.replayed): Receipt {
   return { ...receipt, ref: { ...receipt.ref }, projection: { ...receipt.projection }, replayed };
 }
+function pendingReceiptWithExposure(receipt: Receipt, exposure: ReceiptExposure, replayed = receipt.replayed): Receipt {
+  const result = copyReceipt(receipt, replayed);
+  for (const field of ['committedAt', 'expiresAt'] as const) {
+    Object.defineProperty(result, field, { enumerable: true,
+      get() {
+        if (!exposure.committedAt) throw new AuthorityError('RECEIPT_PENDING', 'Receipt has not committed');
+        return exposure[field];
+      } });
+  }
+  return result;
+}
 function validUnicode(value: string): boolean {
   for (let i = 0; i < value.length; i++) {
     const point = value.codePointAt(i)!;
@@ -126,6 +138,15 @@ export function canonicalJsonObject(serialized: string): string {
 
 type PoolLike = Pick<pg.Pool, 'connect'>;
 type Client = pg.PoolClient;
+type ReceiptExposure = { committedAt: string; expiresAt: string };
+type PendingReceipt = { response: Receipt; exposure: ReceiptExposure; retentionSeconds: number;
+  digest: string; collectionId: CollectionId; key: string };
+type ReadyReceipt = { receiptId: string; exposure: ReceiptExposure; committedAt: string; expiresAt: string };
+export interface JoinedReceiptState {
+  pending: Map<string, PendingReceipt>;
+  replayed: Map<string, { collectionId: CollectionId; digest: string; response: Receipt }>;
+  ready: ReadyReceipt[];
+}
 const scopeIds = (scope: AuthorityScope) => [scope.spaceId, scope.collectionId];
 
 function validateChangeShape(change: RecordChange): void {
@@ -201,7 +222,9 @@ export class PostgresAuthority {
   async transaction<T>(scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T>): Promise<T> {
     // Capture the authenticated identity before waiting for a pooled connection.
     const fixedScope = Object.freeze({ ...scope });
-    if (![fixedScope.spaceId,fixedScope.collectionId,fixedScope.principalId,fixedScope.credentialId].every(scalarString)) throw new AuthorityError('INVALID_ARGUMENT');
+    if (![fixedScope.spaceId,fixedScope.collectionId,fixedScope.principalId,fixedScope.credentialId].every(scalarString) ||
+      !isSafeInteger(fixedScope.policyVersion) || fixedScope.policyVersion < 1 ||
+      !isSafeInteger(fixedScope.placementGeneration) || fixedScope.placementGeneration < 1) throw new AuthorityError('INVALID_ARGUMENT');
     const client = await this.pool.connect();
     let begun = false;
     let beginAttempted = false;
@@ -219,8 +242,12 @@ export class PostgresAuthority {
       await tx.checkScope();
       await tx.checkReplayScopes();
       await tx.finalizeReceipts();
+      await tx.checkScope();
+      await tx.checkReplayScopes();
+      await tx.ensureReceiptsCurrent();
       try { await client.query('COMMIT'); begun = false; }
       catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
+      tx.exposeReceipts();
       return result;
     } catch (error) {
       if (tx) { tx.sealMutations(); await tx.settleMutations(); }
@@ -228,6 +255,44 @@ export class PostgresAuthority {
       else if (beginAttempted) discard = true;
       throw error;
     } finally { tx?.close(); client.release(discard); }
+  }
+
+  /** Join an already authorized cell transaction; the caller owns COMMIT/ROLLBACK. */
+  async transactionOnClient<T>(client: Client, scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T>,
+    deferUntilCommit: (finish: () => Promise<void>, verify: () => Promise<void>, ensureCurrent: () => Promise<number>, expose: () => void,
+      close: () => void) => void,
+    joinedReceipts?: JoinedReceiptState): Promise<T> {
+    const fixedScope = Object.freeze({ ...scope });
+    if (![fixedScope.spaceId,fixedScope.collectionId,fixedScope.principalId,fixedScope.credentialId].every(scalarString) ||
+      !isSafeInteger(fixedScope.policyVersion) || fixedScope.policyVersion < 1 ||
+      !isSafeInteger(fixedScope.placementGeneration) || fixedScope.placementGeneration < 1) throw new AuthorityError('INVALID_ARGUMENT');
+    const tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds, joinedReceipts);
+    let deferred = false;
+    try {
+      await tx.checkScope();
+      const result = await fn(tx);
+      tx.sealMutations();
+      await tx.settleMutations();
+      tx.assertCommittable();
+      const finish = async () => {
+        tx.assertCommittable();
+        await tx.checkScope();
+        await tx.checkReplayScopes();
+      };
+      const verify = async () => {
+        tx.assertCommittable();
+        await tx.checkScope();
+        await tx.checkReplayScopes();
+        await tx.finalizeReceipts();
+      };
+      deferUntilCommit(finish, verify, () => tx.ensureReceiptsCurrent(), () => tx.exposeReceipts(), () => tx.close());
+      deferred = true;
+      return result;
+    } catch (error) {
+      tx.sealMutations();
+      await tx.settleMutations();
+      throw error;
+    } finally { if (!deferred) tx.close(); }
   }
 
   /** Retry only server-confirmed deadlock/serialization rollbacks, never failed COMMIT. */
@@ -248,7 +313,9 @@ export class AuthorityTransaction {
   private active = true;
   private mutationFailed = false;
   private mutationError: unknown;
-  private readonly pendingReceipts = new Map<string, { response: Receipt; returned: Receipt[]; digest: string; collectionId: CollectionId; key: string }>();
+  private readonly pendingReceipts: JoinedReceiptState['pending'];
+  private readonly joinedReplays: JoinedReceiptState['replayed'];
+  private readonly readyReceipts: JoinedReceiptState['ready'];
   private readonly activeOperations = new Set<Promise<unknown>>();
   private mutationTail: Promise<void> = Promise.resolve();
   private readonly reservedIdentities = new Map<string, { operation: RecordMutation; key: string }>();
@@ -256,8 +323,12 @@ export class AuthorityTransaction {
   private readonly replayCollections = new Set<CollectionId>();
   readonly #scope: Readonly<AuthorityScope>;
   get scope(): Readonly<AuthorityScope> { return this.#scope; }
-  constructor(private readonly client: Client, scope: AuthorityScope, private readonly retentionSeconds: number) {
+  constructor(private readonly client: Client, scope: AuthorityScope, private readonly retentionSeconds: number,
+    joinedReceipts?: JoinedReceiptState) {
     this.#scope = Object.freeze({ ...scope });
+    this.pendingReceipts = joinedReceipts?.pending ?? new Map();
+    this.joinedReplays = joinedReceipts?.replayed ?? new Map();
+    this.readyReceipts = joinedReceipts?.ready ?? [];
   }
   close() { this.active = false; this.admittingMutations = false; this.activeOperations.clear(); this.reservedIdentities.clear(); this.replayCollections.clear(); }
   /** A caught mutation error must not turn a partial write into a successful commit. */
@@ -296,9 +367,14 @@ export class AuthorityTransaction {
     if (Number(row.policy_version) !== policyVersion || Number(row.placement_generation) !== placementGeneration) throw new AuthorityError('FORBIDDEN', 'Policy or placement changed');
     if (['suspended','deleting','deleted'].includes(row.lifecycle)) throw new AuthorityError('SPACE_UNAVAILABLE');
     if (row.collection_lifecycle === 'deleted') throw new AuthorityError('NOT_FOUND');
-    if (row.owner_principal_id !== principalId &&
+    if (capability === 'outbox:worker' && (principalId !== 'system:projection' || credentialId !== 'system:projection'))
+      throw new AuthorityError('FORBIDDEN');
+    // Archiving stops new writes, but committed projection jobs still need to drain.
+    if (capability === 'outbox:worker' && row.lifecycle !== 'active' && row.lifecycle !== 'readOnly')
+      throw new AuthorityError('SPACE_UNAVAILABLE');
+    if (row.owner_principal_id !== principalId && capability !== 'outbox:worker' &&
       (!row.capabilities?.includes(capability) || (row.expires_at && !row.grant_current))) throw new AuthorityError('FORBIDDEN');
-    if (row.collection_lifecycle === 'readOnly' && capability === 'records:write') throw new AuthorityError('SPACE_UNAVAILABLE');
+    if (row.collection_lifecycle === 'readOnly' && (capability === 'records:write' || capability === 'claims:review')) throw new AuthorityError('SPACE_UNAVAILABLE');
   }
 
   private ref(id: string): RecordRef { return { spaceId: this.#scope.spaceId, collectionId: this.#scope.collectionId, id }; }
@@ -330,24 +406,29 @@ export class AuthorityTransaction {
     const row = result.rows[0];
     return row ? { collectionId: row.collection_id, requestDigest: row.request_digest, response: row.response } : null;
   }
-  private async receiptTimes(): Promise<{ committedAt: string; expiresAt: string }> {
+  private async receiptTimes(retentions: number[]): Promise<Array<{ committedAt: string; expiresAt: string }>> {
     const clock = await this.query(`WITH stamp AS MATERIALIZED (SELECT clock_timestamp() AS at)
-      SELECT at AS committed_at, at + ($1::bigint * interval '1 second') AS expires_at FROM stamp`, [this.retentionSeconds]);
-    return { committedAt:(clock.rows[0].committed_at as Date).toISOString(),
-      expiresAt:(clock.rows[0].expires_at as Date).toISOString() };
+      SELECT at AS committed_at, at + (retention * interval '1 second') AS expires_at
+      FROM stamp CROSS JOIN unnest($1::bigint[]) WITH ORDINALITY AS policy(retention, position)
+      ORDER BY position`, [retentions]);
+    if (clock.rows.length !== retentions.length) throw new Error('Receipt clock row count mismatch');
+    return clock.rows.map(row => ({ committedAt:(row.committed_at as Date).toISOString(),
+      expiresAt:(row.expires_at as Date).toISOString() }));
   }
   /** Stamp receipts using the database clock after callback work, immediately before COMMIT. */
   async finalizeReceipts(): Promise<void> {
     if (this.pendingReceipts.size) {
-      const { committedAt, expiresAt } = await this.receiptTimes();
-      for (const pending of this.pendingReceipts.values()) {
+      const pendingReceipts = [...this.pendingReceipts.values()];
+      const times = await this.receiptTimes(pendingReceipts.map(pending => pending.retentionSeconds));
+      for (const [index, pending] of pendingReceipts.entries()) {
+        const { committedAt, expiresAt } = times[index];
         pending.response.committedAt = committedAt;
         pending.response.expiresAt = expiresAt;
-        for (const returned of pending.returned) { returned.committedAt = committedAt; returned.expiresAt = expiresAt; }
         await this.query(`INSERT INTO idempotency_receipts(receipt_id,space_id,collection_id,credential_id,operation,idempotency_key,request_digest,record_id,response,committed_at,expires_at)
           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)`, [pending.response.receiptId,this.#scope.spaceId,pending.collectionId,
           this.#scope.credentialId,pending.response.operation,pending.key,pending.digest,pending.response.ref.id,
           JSON.stringify(pending.response),committedAt,expiresAt]);
+        this.readyReceipts.push({receiptId:pending.response.receiptId,exposure:pending.exposure,committedAt,expiresAt});
       }
       this.pendingReceipts.clear();
     }
@@ -359,6 +440,32 @@ export class AuthorityTransaction {
         [this.#scope.spaceId,this.#scope.collectionId,this.#scope.credentialId,operation,key]);
     }
     this.reservedIdentities.clear();
+  }
+  /** A slow final cell check must abort rather than commit an already expired
+   * receipt and let an immediate retry create a second record. */
+  async ensureReceiptsCurrent(): Promise<number> {
+    const ids=[...new Set([...this.readyReceipts.map(ready=>ready.receiptId),
+      ...[...this.joinedReplays.values()].map(replay=>replay.response.receiptId)])];
+    if (!ids.length) return Infinity;
+    const result=await this.query(`WITH stamp AS MATERIALIZED (SELECT clock_timestamp() AS at)
+      SELECT count(r.receipt_id)::int AS found,
+        count(r.receipt_id) FILTER (WHERE r.expires_at<=stamp.at)::int AS expired,
+        EXTRACT(EPOCH FROM (min(r.expires_at)-stamp.at)) * 1000 AS remaining_ms
+      FROM stamp LEFT JOIN idempotency_receipts r ON r.receipt_id=ANY($1::text[])
+      GROUP BY stamp.at`,[ids]);
+    if (result.rows[0]?.found !== ids.length || result.rows[0]?.expired !== 0)
+      throw new AuthorityError('RECEIPT_EXPIRED','Receipt expired before commit');
+    const remainingMs = Number(result.rows[0]?.remaining_ms);
+    if (!Number.isFinite(remainingMs) || remainingMs <= 0)
+      throw new AuthorityError('RECEIPT_EXPIRED','Receipt expired before commit');
+    return remainingMs;
+  }
+  exposeReceipts(): void {
+    for (const ready of this.readyReceipts) {
+      ready.exposure.committedAt = ready.committedAt;
+      ready.exposure.expiresAt = ready.expiresAt;
+    }
+    this.readyReceipts.length = 0;
   }
   private async authorizeOriginal(collectionId: CollectionId): Promise<void> {
     if (collectionId === this.#scope.collectionId) return;
@@ -426,9 +533,14 @@ export class AuthorityTransaction {
       await this.authorizeOriginal(pending.collectionId);
       if (change.operation !== 'delete') canonicalJsonObject(change.canonicalData!);
       if (pending.digest !== change.requestDigest) throw new AuthorityError('IDEMPOTENCY_MISMATCH');
-      const replay = copyReceipt(pending.response, true);
-      pending.returned.push(replay);
-      return replay;
+      return pendingReceiptWithExposure(pending.response, pending.exposure, true);
+    }
+    const joinedReplay = this.joinedReplays.get(identity);
+    if (joinedReplay) {
+      await this.authorizeOriginal(joinedReplay.collectionId);
+      if (change.operation !== 'delete') canonicalJsonObject(change.canonicalData!);
+      if (joinedReplay.digest !== change.requestDigest) throw new AuthorityError('IDEMPOTENCY_MISMATCH');
+      return copyReceipt(joinedReplay.response, true);
     }
     await this.reserveIdentity(change,identity);
     const previous = await this.findReceipt(change.operation, change.idempotencyKey);
@@ -436,6 +548,7 @@ export class AuthorityTransaction {
       await this.authorizeOriginal(previous.collectionId);
       if (change.operation !== 'delete') canonicalJsonObject(change.canonicalData!);
       if (previous.requestDigest !== change.requestDigest) throw new AuthorityError('IDEMPOTENCY_MISMATCH');
+      this.joinedReplays.set(identity,{collectionId:previous.collectionId,digest:previous.requestDigest,response:previous.response});
       return copyReceipt(previous.response, true);
     }
     await this.query(`DELETE FROM idempotency_receipts WHERE space_id=$1 AND credential_id=$2
@@ -522,13 +635,15 @@ export class AuthorityTransaction {
     await this.query(`INSERT INTO record_events(event_id,space_id,collection_id,record_id,revision,operation,credential_id,schema_version,canonical_data)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [eventId,...scopeIds(scope),recordId,revision,change.operation,scope.credentialId,version.schemaVersion,change.canonicalData ?? '{}']);
     const receiptId = `rcpt_${randomUUID()}`;
-    const { committedAt, expiresAt } = await this.receiptTimes();
     const response: Receipt = { contractVersion:'1',receiptId,spaceId:scope.spaceId,ref:{kind:'record',id:recordId},operation:change.operation,
-      beforeRevision,revision,schemaVersion:version.schemaVersion,committedAt,expiresAt,projection:{generation:version.generation,state:'pending'},replayed:false };
+      beforeRevision,revision,schemaVersion:version.schemaVersion,committedAt:'',expiresAt:'',
+      projection:{generation:version.generation,state:'pending'},replayed:false };
     await this.query('INSERT INTO projection_outbox(event_id,space_id,collection_id,record_id,revision,generation) VALUES($1,$2,$3,$4,$5,$6)',
       [eventId,...scopeIds(scope),recordId,revision,version.generation]);
-    const returned = copyReceipt(response);
-    this.pendingReceipts.set(identity, { response, returned: [returned], digest:change.requestDigest, collectionId:scope.collectionId, key:change.idempotencyKey });
+    const exposure: ReceiptExposure = { committedAt:'', expiresAt:'' };
+    const returned = pendingReceiptWithExposure(response, exposure);
+    this.pendingReceipts.set(identity, { response, exposure, retentionSeconds:this.retentionSeconds,
+      digest:change.requestDigest, collectionId:scope.collectionId, key:change.idempotencyKey });
     return returned;
   }
 
@@ -613,7 +728,7 @@ export class AuthorityTransaction {
   /** Claim only this collection's due jobs. Attempt number fences late workers after lease expiry. */
   claimOutbox(limit: number, leaseSeconds: number): Promise<OutboxDelivery[]> {
     return this.admitOperation(async () => {
-    if (this.#scope.capability !== 'space:admin') throw new AuthorityError('FORBIDDEN');
+    if (this.#scope.capability !== 'outbox:worker') throw new AuthorityError('FORBIDDEN');
     if (!isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE || !isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 3600) throw new AuthorityError('INVALID_ARGUMENT');
     const result = await this.query(`UPDATE projection_outbox o SET delivery_state='delivering',attempts=o.attempts+1,
       available_at=clock_timestamp()+($3::integer * interval '1 second')
@@ -629,7 +744,7 @@ export class AuthorityTransaction {
 
   finishOutbox(delivery: OutboxDelivery, success: boolean, error?: string): Promise<boolean> {
     return this.admitOperation(async () => {
-    if (this.#scope.capability !== 'space:admin') throw new AuthorityError('FORBIDDEN');
+    if (this.#scope.capability !== 'outbox:worker') throw new AuthorityError('FORBIDDEN');
     if (!scalarString(delivery.eventId) || typeof success !== 'boolean' || !isSafeInteger(delivery.attempt) || delivery.attempt < 1 ||
       (error !== undefined && (typeof error !== 'string' || error.includes('\0') || error.length > 4096))) throw new AuthorityError('INVALID_ARGUMENT');
     const result = await this.query(`UPDATE projection_outbox SET delivery_state=$5,
@@ -645,3 +760,6 @@ export class AuthorityTransaction {
     },true);
   }
 }
+
+export * from './spaces.js';
+export * from './cell-policy.js';
