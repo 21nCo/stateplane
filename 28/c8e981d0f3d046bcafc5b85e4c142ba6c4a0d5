@@ -1,0 +1,34 @@
+packages/auth/src/index.ts
+  h_a39f9495f9ec1d 20-26,34
+packages/postgres/src/cell-policy.ts
+  h_a39f9495f9ec1d 5,111-113,160,175-178,181
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 77-84,138-144,242,254-256,261,275-281,308-310,318-319,321-323,416,429-435,502,506-512,519,611
+packages/postgres/src/spaces.ts
+  h_a39f9495f9ec1d 18,114-115,380-387,392,397,532,565-580,589,591,595,601-603,606,612-613,615-618,620,804-831,883-915,956
+scripts/backfill-directory-core.mjs
+  h_a39f9495f9ec1d 25-27,41-43,49
+scripts/grant-control-journal.mjs
+  h_a39f9495f9ec1d 16
+scripts/migration-index-race-smoke.mjs
+  h_a39f9495f9ec1d 7,22
+scripts/migration-upgrade-smoke.mjs
+  h_a39f9495f9ec1d 183,187,191-198,205,212-215
+scripts/restore-smoke.mjs
+  h_a39f9495f9ec1d 97,116-127
+test/integration/owned-spaces.test.js
+  h_a39f9495f9ec1d 2371-2442,2470-2599
+test/qualification.test.ts
+  h_a39f9495f9ec1d 39-48,55,57-58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "28c8e981d0f3d046bcafc5b85e4c142ba6c4a0d5",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
