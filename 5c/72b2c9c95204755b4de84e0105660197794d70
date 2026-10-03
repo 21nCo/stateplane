@@ -1,0 +1,21 @@
+packages/postgres/src/spaces.ts
+  h_a39f9495f9ec1d 156-157,161,317-318,320,325,495-522,524-531,536-537,543,550,562,595-606,612,614,623,638,673-679,685-691,699,713-714,719,738,760-761,763,792-798,813,820,825,829,831,841-842,850-851,860
+scripts/migration-upgrade-smoke.mjs
+  h_a39f9495f9ec1d 178,180
+test/integration/owned-spaces.test.js
+  h_a39f9495f9ec1d 58-69,323,326,328-332,1382-1383,1498-1607,1660,1665-1666,1704,1708-1709
+  h_a39f9495f9ec1d 1472-1475
+migrations/021_cancelled_agent_key_issuances.sql
+  h_a39f9495f9ec1d 1-4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5c72b2c9c95204755b4de84e0105660197794d70",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
