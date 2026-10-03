@@ -1,0 +1,20 @@
+.sonarcloud.properties
+  h_a39f9495f9ec1d 1-4
+packages/postgres/src/spaces.ts
+  h_a39f9495f9ec1d 804-805,808-811,816-817,819,822-835,842-843,845,848,852-866,871-878,939-943,1017
+scripts/migration-upgrade-smoke.mjs
+  h_a39f9495f9ec1d 285-297,299-301
+test/integration/owned-spaces.test.js
+  h_a39f9495f9ec1d 2121-2191,2623
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "79876865e03736ddef2aad57aec4754f889e4486",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
