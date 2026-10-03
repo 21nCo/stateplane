@@ -1122,6 +1122,58 @@ test('reconcile and delete refuse a deleted directory with unpurged cell content
   await spaces.reconcile(spaceId);
 });
 
+test('deleted cell with retained records cannot publish until owner repairs erasure', async () => {
+  const actor={kind:'session',credentialId:'session',userPrincipalId:'repair-owner'};
+  const stranger={kind:'session',credentialId:'session',userPrincipalId:'other-owner'};
+  const cells=new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
+  const spaces=new PostgresSpaces(controlPool,cells,'cell-a',
+    {create:async () => { throw new Error('unexpected key'); },find:async () => null,revoke:async () => {}},
+    {current:async () => true});
+  const {spaceId}=await spaces.create(actor);
+  const collectionId=`repair_${crypto.randomUUID()}`;
+  await collection(spaceId,collectionId);
+  await pool.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,
+    normalized_key,canonical_data,data) VALUES($1,$2,$3,1,1,'generated',$3,'{}','{}')`,
+  [spaceId,collectionId,`record_${crypto.randomUUID()}`]);
+  await controlPool.query("UPDATE space_directory SET lifecycle='deleting' WHERE space_id=$1",[spaceId]);
+  await pool.query("UPDATE spaces SET lifecycle='deleted' WHERE space_id=$1",[spaceId]);
+  const before=(await pool.query('SELECT audit_id,action FROM space_audit WHERE space_id=$1 ORDER BY recorded_at,audit_id',
+    [spaceId])).rows;
+  await assert.rejects(spaces.delete(actor,spaceId),denied('STALE_PLACEMENT'));
+  await assert.rejects(spaces.reconcile(spaceId),denied('STALE_PLACEMENT'));
+  await assert.rejects(spaces.repairDeletedErasure(stranger,spaceId),denied('NOT_FOUND'));
+  assert.equal((await controlPool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1',[spaceId])).rows[0].lifecycle,
+    'deleting','unproven erasure cannot publish deleted');
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM records WHERE space_id=$1',[spaceId])).rows[0].n,1);
+  assert.deepEqual((await pool.query('SELECT audit_id,action FROM space_audit WHERE space_id=$1 ORDER BY recorded_at,audit_id',
+    [spaceId])).rows,before,'failed publication does not invent a deletion audit');
+
+  await spaces.repairDeletedErasure(actor,spaceId);
+  await spaces.delete(actor,spaceId);
+  await spaces.delete(actor,spaceId);
+  await spaces.reconcile(spaceId);
+  assert.equal((await controlPool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1',[spaceId])).rows[0].lifecycle,'deleted');
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM records WHERE space_id=$1',[spaceId])).rows[0].n,0);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM collections WHERE space_id=$1',[spaceId])).rows[0].n,0);
+  const actions=(await pool.query('SELECT action FROM space_audit WHERE space_id=$1',[spaceId])).rows.map(row => row.action);
+  assert.equal(actions.filter(action => action==='space:erasure-repair').length,1);
+  assert.equal(actions.filter(action => action==='space:deleted').length,1);
+  await spaces.repairDeletedErasure(actor,spaceId);
+  assert.equal((await pool.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:erasure-repair'",
+    [spaceId])).rows[0].n,1,'replayed repair cannot repeat its audit');
+
+  // An inconsistent restore can also introduce data after directory publication.
+  const restoredCollection=`restored_${crypto.randomUUID()}`;
+  await collection(spaceId,restoredCollection);
+  await assert.rejects(spaces.delete(actor,spaceId),denied('STALE_PLACEMENT'));
+  await assert.rejects(spaces.reconcile(spaceId),denied('STALE_PLACEMENT'));
+  await spaces.repairDeletedErasure(actor,spaceId);
+  await spaces.delete(actor,spaceId);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM collections WHERE space_id=$1',[spaceId])).rows[0].n,0);
+  assert.equal((await pool.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:deleted'",
+    [spaceId])).rows[0].n,1,'repair of a published tombstone cannot duplicate deletion');
+});
+
 test('failed provider creation settles an empty journal for issue and rotation, while uncertain creation stays recoverable', async () => {
   const config={database:memoryAdapter(),namespace:`sta6-create-failure-${crypto.randomUUID()}`,plugins:[]};
   createAuthFn(config);
