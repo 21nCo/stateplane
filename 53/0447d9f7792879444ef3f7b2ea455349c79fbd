@@ -1,0 +1,18 @@
+docs/owned-spaces.md
+  h_a39f9495f9ec1d 15,36
+packages/postgres/src/spaces.ts
+  h_a39f9495f9ec1d 377,383,414,418-464,470-471,580,584-585
+test/integration/owned-spaces.test.js
+  h_a39f9495f9ec1d 1125-1176
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "530447d9f7792879444ef3f7b2ea455349c79fbd",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
