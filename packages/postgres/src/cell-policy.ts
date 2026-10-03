@@ -58,6 +58,14 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     if (result.rows[0]?.assertion_current !== true) throw new AuthorityError('FORBIDDEN', 'Routing assertion expired');
   }
 
+  private checkAgentGrant(row: { key_principal_id?: string; key_owner_id?: string; owner_principal_id: string;
+    activated_at?: Date; confirmed_at?: Date; revoked_at?: Date; key_current?: boolean;
+    capabilities?: string[]; grant_current?: boolean }, claims: RouteClaims): string {
+    if (!row.key_principal_id || row.key_owner_id !== row.owner_principal_id || !row.activated_at || !row.confirmed_at || row.revoked_at ||
+      !row.key_current || !row.capabilities?.includes(claims.capability) || !row.grant_current) throw new AuthorityError('FORBIDDEN');
+    return row.key_principal_id;
+  }
+
   /** Optional maintenance uses the same bounded database-clock rule as admission. */
   async cleanupExpiredNonces(): Promise<number> {
     const result = await this.pool.connect();
@@ -96,9 +104,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       if (claims.userPrincipalId !== row.owner_principal_id) throw new AuthorityError('FORBIDDEN');
       return row.owner_principal_id;
     }
-    if (!row.key_principal_id || row.key_owner_id !== row.owner_principal_id || !row.activated_at || !row.confirmed_at || row.revoked_at ||
-      !row.key_current || !row.capabilities?.includes(claims.capability) || !row.grant_current) throw new AuthorityError('FORBIDDEN');
-    return row.key_principal_id;
+    return this.checkAgentGrant(row,claims);
   }
 
   async run<T>(claims: RouteClaims, effect: (principalId: string, context: AuthorizedCellContext) => Promise<T>): Promise<T> {
@@ -126,6 +132,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       let accepting = true;
       let operationError: unknown;
       const operations = new Set<Promise<unknown>>();
+      let recordsTail: Promise<void> = Promise.resolve();
       const admit = <TResult>(work: () => Promise<TResult>, requireActiveSpace = false): Promise<TResult> => {
         if (!accepting) return Promise.reject(new AuthorityError('FORBIDDEN', 'Cell effect context ended'));
         const running = (async () => {
@@ -156,9 +163,16 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
           if (!allowed) return Promise.reject(new AuthorityError('FORBIDDEN'));
           return admit(async () => {}, kind === 'write');
         },
-        records: <TResult>(authority: PostgresAuthority, fn: (tx: AuthorityTransaction) => Promise<TResult>) =>
-          admit(() => authority.transactionOnClient(client,scope,fn,
-            (finish,verify,ensureCurrent,expose,close) => { joined.push({finish,verify,ensureCurrent,expose,close}); },joinedReceipts)) });
+        records: <TResult>(authority: PostgresAuthority, fn: (tx: AuthorityTransaction) => Promise<TResult>) => {
+          const previous = recordsTail;
+          const running = admit(async () => {
+            await previous;
+            return authority.transactionOnClient(client,scope,fn,
+              (finish,verify,ensureCurrent,expose,close) => { joined.push({finish,verify,ensureCurrent,expose,close}); },joinedReceipts);
+          });
+          recordsTail = running.then(() => {}, () => {});
+          return running;
+        } });
       let result: T;
       try { result = await effect(principalId, context); }
       finally {
@@ -177,6 +191,9 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       await this.check(client,claims);
       await this.checkDatabaseTime(client,claims);
       for (const entry of joined) await entry.verify();
+      // Finalization may wait on SQL. Every joined call, including a replay of
+      // an original collection, must still be authorized after that wait.
+      for (const entry of joined) await entry.finish();
       await this.check(client,claims,false,false);
       this.checkAssertionTime(claims);
       await this.checkDatabaseTime(client,claims);

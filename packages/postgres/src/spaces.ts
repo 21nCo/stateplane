@@ -918,12 +918,18 @@ export class PostgresSpaces {
     // cannot become usable after publication resumes.
     if (created) {
       await this.failIssuedKey(this.cell(space.cellId),space.spaceId,owner(actor),created.id).catch(() => {});
-      await this.revokeProvider(this.cell(space.cellId),space,owner(actor),created.id,control).catch(async () => {
-        await this.keys.revoke(created.id,owner(actor)).then(() => control.query(`UPDATE agent_key_issuances
-          SET credential_id=$2,provider_revoked_at=clock_timestamp()
-          WHERE issuance_id=$1 AND (credential_id IS NULL OR credential_id=$2)`,[issuanceId,created.id])).catch(() => {});
-      });
+      try { await this.revokeProvider(this.cell(space.cellId),space,owner(actor),created.id,control); }
+      catch { await this.revokeIssuedProviderFallback(actor,issuanceId,created.id,control); }
     }
+  }
+  private async revokeIssuedProviderFallback(actor: VerifiedCredential, issuanceId: string, keyId: string,
+    control: Pick<pg.Pool, 'query'>): Promise<void> {
+    try {
+      await this.keys.revoke(keyId,owner(actor));
+      await control.query(`UPDATE agent_key_issuances
+        SET credential_id=$2,provider_revoked_at=clock_timestamp()
+        WHERE issuance_id=$1 AND (credential_id IS NULL OR credential_id=$2)`,[issuanceId,keyId]);
+    } catch { /* Keep the journal pending for reconciliation. */ }
   }
   private async issueAgentKeyLocked(actor: VerifiedCredential, spaceId: string, expiresAt: Date,
     grants: readonly CollectionGrant[], leaseToken: string): Promise<IssuedAgentKey> {

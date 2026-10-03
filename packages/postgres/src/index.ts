@@ -74,11 +74,14 @@ const utf8Compare = (a: string, b: string) => Buffer.compare(Buffer.from(a), Buf
 function copyReceipt(receipt: Receipt, replayed = receipt.replayed): Receipt {
   return { ...receipt, ref: { ...receipt.ref }, projection: { ...receipt.projection }, replayed };
 }
-function pendingReceipt(receipt: Receipt, replayed = receipt.replayed): Receipt {
+function pendingReceiptWithExposure(receipt: Receipt, exposure: ReceiptExposure, replayed = receipt.replayed): Receipt {
   const result = copyReceipt(receipt, replayed);
   for (const field of ['committedAt', 'expiresAt'] as const) {
-    Object.defineProperty(result, field, { configurable: true, enumerable: true,
-      get() { throw new AuthorityError('RECEIPT_PENDING', 'Receipt has not committed'); } });
+    Object.defineProperty(result, field, { enumerable: true,
+      get() {
+        if (!exposure.committedAt) throw new AuthorityError('RECEIPT_PENDING', 'Receipt has not committed');
+        return exposure[field];
+      } });
   }
   return result;
 }
@@ -135,8 +138,10 @@ export function canonicalJsonObject(serialized: string): string {
 
 type PoolLike = Pick<pg.Pool, 'connect'>;
 type Client = pg.PoolClient;
-type PendingReceipt = { response: Receipt; returned: Receipt[]; digest: string; collectionId: CollectionId; key: string };
-type ReadyReceipt = { receiptId: string; returned: Receipt[]; committedAt: string; expiresAt: string };
+type ReceiptExposure = { committedAt: string; expiresAt: string };
+type PendingReceipt = { response: Receipt; exposure: ReceiptExposure; retentionSeconds: number;
+  digest: string; collectionId: CollectionId; key: string };
+type ReadyReceipt = { receiptId: string; exposure: ReceiptExposure; committedAt: string; expiresAt: string };
 export interface JoinedReceiptState {
   pending: Map<string, PendingReceipt>;
   replayed: Map<string, { collectionId: CollectionId; digest: string; response: Receipt }>;
@@ -399,24 +404,24 @@ export class AuthorityTransaction {
     const row = result.rows[0];
     return row ? { collectionId: row.collection_id, requestDigest: row.request_digest, response: row.response } : null;
   }
-  private async receiptTimes(): Promise<{ committedAt: string; expiresAt: string }> {
+  private async receiptTimes(retentionSeconds: number): Promise<{ committedAt: string; expiresAt: string }> {
     const clock = await this.query(`WITH stamp AS MATERIALIZED (SELECT clock_timestamp() AS at)
-      SELECT at AS committed_at, at + ($1::bigint * interval '1 second') AS expires_at FROM stamp`, [this.retentionSeconds]);
+      SELECT at AS committed_at, at + ($1::bigint * interval '1 second') AS expires_at FROM stamp`, [retentionSeconds]);
     return { committedAt:(clock.rows[0].committed_at as Date).toISOString(),
       expiresAt:(clock.rows[0].expires_at as Date).toISOString() };
   }
   /** Stamp receipts using the database clock after callback work, immediately before COMMIT. */
   async finalizeReceipts(): Promise<void> {
     if (this.pendingReceipts.size) {
-      const { committedAt, expiresAt } = await this.receiptTimes();
       for (const pending of this.pendingReceipts.values()) {
+        const { committedAt, expiresAt } = await this.receiptTimes(pending.retentionSeconds);
         pending.response.committedAt = committedAt;
         pending.response.expiresAt = expiresAt;
         await this.query(`INSERT INTO idempotency_receipts(receipt_id,space_id,collection_id,credential_id,operation,idempotency_key,request_digest,record_id,response,committed_at,expires_at)
           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)`, [pending.response.receiptId,this.#scope.spaceId,pending.collectionId,
           this.#scope.credentialId,pending.response.operation,pending.key,pending.digest,pending.response.ref.id,
           JSON.stringify(pending.response),committedAt,expiresAt]);
-        this.readyReceipts.push({receiptId:pending.response.receiptId,returned:pending.returned,committedAt,expiresAt});
+        this.readyReceipts.push({receiptId:pending.response.receiptId,exposure:pending.exposure,committedAt,expiresAt});
       }
       this.pendingReceipts.clear();
     }
@@ -436,12 +441,12 @@ export class AuthorityTransaction {
     const ids=this.readyReceipts.map(ready=>ready.receiptId);
     const result=await this.query(`SELECT count(*)::int AS expired FROM idempotency_receipts
       WHERE receipt_id=ANY($1::text[]) AND expires_at<=clock_timestamp()`,[ids]);
-    if (result.rows[0]?.expired !== 0) throw new AuthorityError('RECEIPT_PENDING','Receipt expired before commit');
+    if (result.rows[0]?.expired !== 0) throw new AuthorityError('RECEIPT_EXPIRED','Receipt expired before commit');
   }
   exposeReceipts(): void {
-    for (const ready of this.readyReceipts) for (const returned of ready.returned) {
-      Object.defineProperty(returned, 'committedAt', { value:ready.committedAt, writable:true, enumerable:true, configurable:true });
-      Object.defineProperty(returned, 'expiresAt', { value:ready.expiresAt, writable:true, enumerable:true, configurable:true });
+    for (const ready of this.readyReceipts) {
+      ready.exposure.committedAt = ready.committedAt;
+      ready.exposure.expiresAt = ready.expiresAt;
     }
     this.readyReceipts.length = 0;
   }
@@ -511,9 +516,7 @@ export class AuthorityTransaction {
       await this.authorizeOriginal(pending.collectionId);
       if (change.operation !== 'delete') canonicalJsonObject(change.canonicalData!);
       if (pending.digest !== change.requestDigest) throw new AuthorityError('IDEMPOTENCY_MISMATCH');
-      const replay = pendingReceipt(pending.response, true);
-      pending.returned.push(replay);
-      return replay;
+      return pendingReceiptWithExposure(pending.response, pending.exposure, true);
     }
     const joinedReplay = this.joinedReplays.get(identity);
     if (joinedReplay) {
@@ -620,8 +623,10 @@ export class AuthorityTransaction {
       projection:{generation:version.generation,state:'pending'},replayed:false };
     await this.query('INSERT INTO projection_outbox(event_id,space_id,collection_id,record_id,revision,generation) VALUES($1,$2,$3,$4,$5,$6)',
       [eventId,...scopeIds(scope),recordId,revision,version.generation]);
-    const returned = pendingReceipt(response);
-    this.pendingReceipts.set(identity, { response, returned: [returned], digest:change.requestDigest, collectionId:scope.collectionId, key:change.idempotencyKey });
+    const exposure: ReceiptExposure = { committedAt:'', expiresAt:'' };
+    const returned = pendingReceiptWithExposure(response, exposure);
+    this.pendingReceipts.set(identity, { response, exposure, retentionSeconds:this.retentionSeconds,
+      digest:change.requestDigest, collectionId:scope.collectionId, key:change.idempotencyKey });
     return returned;
   }
 

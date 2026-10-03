@@ -116,10 +116,18 @@ try {
   // A reserved-word role proves identifier quoting. Keep its creation and
   // ownership marker atomic so an interrupted run can safely reuse it.
   const reservedRole=await restored.connect();
+  // Roles are cluster-wide. Every restore run locks the same maintenance DB,
+  // even though each run restores into a different disposable database.
+  const maintenanceUrl=new URL(targetUrl);
+  maintenanceUrl.pathname='/postgres';
+  const maintenance=new pg.Client({connectionString:maintenanceUrl.toString()});
   const marker='stateplane:restore-smoke:reserved-role:v1';
   let ownedRole=false;
+  let locked=false;
   try {
-    await reservedRole.query("SELECT pg_advisory_lock(hashtext('stateplane:restore-smoke:select'))");
+    await maintenance.connect();
+    await maintenance.query("SELECT pg_advisory_lock(hashtext('stateplane:restore-smoke:select'))");
+    locked=true;
     const existing=(await reservedRole.query(`SELECT shobj_description(oid,'pg_authid') AS marker
       FROM pg_roles WHERE rolname='select'`)).rows[0];
     if (existing && existing.marker!==marker) throw new Error('Reserved restore fixture role is owned by another user');
@@ -139,16 +147,23 @@ try {
       has_table_privilege('select','public.agent_key_issuances','UPDATE') AS can_update`)).rows[0];
     assert.deepEqual(grants,{can_read:true,can_create:true,can_update:true});
   } finally {
-    if (ownedRole) {
-      await reservedRole.query('REVOKE ALL ON agent_key_issuances FROM "select"').catch(()=>{});
-      // A killed earlier run may still have a disposable database dependency.
-      // Retain only our marked role so the next run can reuse it safely.
-      await reservedRole.query('DROP ROLE IF EXISTS "select"').catch(error=>{
-        if (error.code!=='2BP01') throw error;
-      });
+    try {
+      if (ownedRole) {
+        await reservedRole.query('REVOKE ALL ON agent_key_issuances FROM "select"').catch(()=>{});
+        // A killed earlier run may still have a disposable database dependency.
+        // Retain only our marked role so the next run can reuse it safely.
+        await reservedRole.query('DROP ROLE IF EXISTS "select"').catch(error=>{
+          if (error.code!=='2BP01') throw error;
+        });
+      }
+    } finally {
+      try {
+        if (locked) await maintenance.query("SELECT pg_advisory_unlock(hashtext('stateplane:restore-smoke:select'))");
+      } finally {
+        try { await maintenance.end(); }
+        finally { reservedRole.release(); }
+      }
     }
-    await reservedRole.query("SELECT pg_advisory_unlock(hashtext('stateplane:restore-smoke:select'))").catch(()=>{});
-    reservedRole.release();
   }
   const constraints = await Promise.all([base,restored].map(async pool => (await pool.query(`SELECT conname,contype
     FROM pg_constraint WHERE conrelid='records'::regclass ORDER BY conname`)).rows));
