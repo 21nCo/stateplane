@@ -794,6 +794,13 @@ test('owner audit reads use bounded stable pages and reject cross-space cursors'
   const firstPage = await spaces.audit(owner,first.spaceId);
   await assert.rejects(spaces.audit(owner,second.spaceId,firstPage.nextCursor),denied('INVALID_ARGUMENT'));
   await assert.rejects(spaces.audit(owner,first.spaceId,'malformed!'),denied('INVALID_ARGUMENT'));
+  const crafted = recordedAt => Buffer.from(JSON.stringify({spaceId:first.spaceId,recordedAt,
+    auditId:'aud_cursor'})).toString('base64url');
+  for (const invalid of ['2026-02-30T00:00:00.000000Z','2025-02-29T00:00:00.000000Z',
+    '2026-04-31T00:00:00.000000Z','2026-13-01T00:00:00.000000Z','0000-01-01T00:00:00.000000Z']) {
+    await assert.rejects(spaces.audit(owner,first.spaceId,crafted(invalid)),denied('INVALID_ARGUMENT'),invalid);
+  }
+  await spaces.audit(owner,first.spaceId,crafted('2024-02-29T23:59:59.123456Z'));
   await assert.rejects(spaces.audit(stranger,first.spaceId),denied('NOT_FOUND'));
   await spaces.archive(owner,first.spaceId);
   assert.equal((await spaces.audit(owner,first.spaceId)).entries.length,100,
@@ -2688,6 +2695,129 @@ test('uncertain completion gives issue and rotation a recoverable bearer without
         [spaceId,key.id])).rows[0].revoked_at);
       await assert.rejects(router.assertion(request(key.secret),spaceId,collectionId,'records:read'),denied('UNAUTHENTICATED'));
     }
+  }
+});
+
+test('a committed completion retry with unavailable validation preserves issue and rotation recovery', async () => {
+  const config={database:memoryAdapter(),namespace:`sta6-retry-validation-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user=await createUser(config,{primaryEmail:`retry-validation-${crypto.randomUUID()}@example.invalid`});
+  const session=await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity=new AuthFnIdentityVerifier(config);
+  const actor=await identity.verify(request(session.sessionToken));
+  const realKeys=new AuthFnAgentKeys(config);
+  let armed=false;
+  let injectNext=false;
+  let firstUpdateFailed=false;
+  let retryCommitted=false;
+  let validationFailed=false;
+  let cancellationAttempts=0;
+  let cellCompensationAttempts=0;
+  let providerCompensationAttempts=0;
+  const keys={
+    create:async (...args)=>{
+      const created=await realKeys.create(...args);
+      if (injectNext) { armed=true; injectNext=false; }
+      return created;
+    },
+    find:async (...args)=>realKeys.find(...args),
+    revoke:async (...args)=>{
+      if (armed) { providerCompensationAttempts++; throw new Error('provider compensation unavailable'); }
+      return realKeys.revoke(...args);
+    },
+  };
+  const control=controlWithQueryHook(async (sql,_args,next)=>{
+    if (armed && typeof sql==='string') {
+      if (sql.includes('UPDATE agent_key_issuances i SET completed_at=') && !firstUpdateFailed) {
+        firstUpdateFailed=true;
+        throw new Error('initial completion unavailable');
+      }
+      if (sql.includes('SELECT i.completed_at,i.cancelled_at') && sql.includes('FROM agent_key_issuances'))
+        throw new Error('completion readback unavailable');
+      if (sql.includes('SET completed_at=COALESCE(i.completed_at')) {
+        const result=await next();
+        retryCommitted=true;
+        return result;
+      }
+      if (retryCommitted && sql.includes('SELECT 1 FROM agent_key_issuances i')) {
+        validationFailed=true;
+        throw new Error('completion validation unavailable');
+      }
+      if (sql.includes('UPDATE agent_key_issuances') && sql.includes('SET cancelled_at=')) {
+        cancellationAttempts++;
+        throw new Error('journal cancellation unavailable');
+      }
+    }
+    return next();
+  });
+  const cellPool={query:(...args)=>pool.query(...args),connect:async()=>{
+    const client=await pool.connect();
+    return {query:(...args)=>{
+      if (armed && typeof args[0]==='string' && args[0].includes('UPDATE space_credentials SET revoked_at=')) {
+        cellCompensationAttempts++;
+        throw new Error('cell compensation unavailable');
+      }
+      return client.query(...args);
+    },release:discard=>client.release(discard)};
+  }};
+  const cells=new Map([['cell-a',{pool:cellPool,storageTargetId:'target-a'}]]);
+  const spaces=new PostgresSpaces(control,cells,'cell-a',keys,identity);
+  const {spaceId}=await spaces.create(actor);
+  const collectionId=`retry_validation_${crypto.randomUUID()}`;
+  await collection(spaceId,collectionId);
+  const grants=[{collectionId,capabilities:['records:read']}];
+  const expires=new Date(Date.now()+3_600_000);
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const router=new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
+  const cell=new RegionalCell('cell-a',signer,new PostgresCellPolicy(pool,'cell-a',identity));
+  const authority=new PostgresAuthority(pool,3600);
+  let previous;
+  for (const operation of ['issue','rotate']) {
+    armed=false;
+    injectNext=true;
+    firstUpdateFailed=false;
+    retryCommitted=false;
+    validationFailed=false;
+    cancellationAttempts=0;
+    cellCompensationAttempts=0;
+    providerCompensationAttempts=0;
+    let recovered;
+    await assert.rejects(operation==='issue' ? spaces.issueAgentKey(actor,spaceId,expires,grants) :
+      spaces.rotateAgentKey(actor,spaceId,previous.id,expires,grants),error=>{
+      assert.equal(error.name,'AgentKeyOutcomeUnknownError',`${operation}: ${error.message}`);
+      recovered=error.takeKey();
+      assert.throws(()=>error.takeKey(),denied('INVALID_ARGUMENT'));
+      return true;
+    });
+    assert.equal(firstUpdateFailed,true);
+    assert.equal(retryCommitted,true);
+    assert.equal(validationFailed,true);
+    assert.equal(cancellationAttempts,0,'uncertain completion cannot enter ordinary compensation');
+    assert.equal(cellCompensationAttempts,0);
+    assert.equal(providerCompensationAttempts,0);
+    armed=false;
+    const journal=(await controlPool.query(`SELECT completed_at,cancelled_at,provider_revoked_at
+      FROM agent_key_issuances WHERE space_id=$1 AND credential_id=$2`,[spaceId,recovered.id])).rows[0];
+    assert.ok(journal.completed_at);
+    assert.equal(journal.cancelled_at,null);
+    assert.equal(journal.provider_revoked_at,null);
+    const local=(await pool.query(`SELECT confirmed_at,revoked_at,provider_revoked_at FROM space_credentials
+      WHERE space_id=$1 AND credential_id=$2`,[spaceId,recovered.id])).rows[0];
+    assert.ok(local.confirmed_at);
+    assert.equal(local.revoked_at,null);
+    assert.equal(local.provider_revoked_at,null);
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1
+      AND credential_id=$2 AND action='key:issue-failed'`,[spaceId,recovered.id])).rows[0].n,0);
+    await controlPool.query(`UPDATE space_directory SET issuance_lease_token='expired-lease',
+      issuance_lease_until=clock_timestamp()-interval '1 second'
+      WHERE space_id=$1`,[spaceId]);
+    await spaces.reconcile(spaceId);
+    await spaces.reconcile(spaceId);
+    const assertion=await router.assertion(request(recovered.secret),spaceId,collectionId,'records:read');
+    await cell.execute(assertion.token,(_principal,context)=>context.records(authority,tx=>tx.countRecords([])));
+    if (previous) await assert.rejects(router.assertion(request(previous.secret),spaceId,collectionId,'records:read'),
+      denied('UNAUTHENTICATED'));
+    previous=recovered;
   }
 });
 

@@ -873,7 +873,13 @@ export class PostgresSpaces {
         AND $4::timestamptz>clock_timestamp()
       RETURNING 1`,[issuanceId,keyId,leaseToken,new Date(expiryMs)]).catch(() => null);
     if (retried?.rowCount === 1) {
-      await this.requireCompletedIssuedKey(issuanceId,keyId,leaseToken,expiryMs);
+      try { await this.requireCompletedIssuedKey(issuanceId,keyId,leaseToken,expiryMs); }
+      catch (error) {
+        if (error instanceof AuthorityError) throw error;
+        // The retry committed, but its final validation could not be observed.
+        // Ordinary compensation may fail and leave a completed, usable key.
+        throw new CompletionOutcomeUnknownError(error);
+      }
       return;
     }
     // A failed readback and retry cannot establish a definite outcome.
@@ -1116,7 +1122,10 @@ export class PostgresSpaces {
         const value = decoded as Record<string, unknown>;
         if (value.spaceId !== spaceId || typeof value.recordedAt !== 'string' ||
           !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/.test(value.recordedAt) ||
-          !Number.isFinite(Date.parse(value.recordedAt)) || !validId(value.auditId)) throw new Error('Invalid cursor');
+          value.recordedAt.startsWith('0000') || !validId(value.auditId)) throw new Error('Invalid cursor');
+        const instant = Date.parse(value.recordedAt);
+        if (!Number.isFinite(instant) || new Date(instant).toISOString().slice(0,23) !==
+          value.recordedAt.slice(0,23)) throw new Error('Invalid cursor');
         after = {recordedAt:value.recordedAt,auditId:value.auditId};
       } catch { throw new AuthorityError('INVALID_ARGUMENT'); }
     }
