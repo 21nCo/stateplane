@@ -1,0 +1,24 @@
+docs/owned-spaces.md
+  h_a39f9495f9ec1d 23-24,27
+packages/postgres/src/cell-policy.ts
+  h_a39f9495f9ec1d 61-68,107,135,166-175,194-196
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 77,80-84,141-144,407,409,417,424,444,447-449,519,626-629
+packages/postgres/src/spaces.ts
+  h_a39f9495f9ec1d 921-922,925-933
+scripts/restore-smoke.mjs
+  h_a39f9495f9ec1d 119-123,126,128-130,150-165
+test/integration/owned-spaces.test.js
+  h_a39f9495f9ec1d 2530,2571-2670
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c200f2884c70d5dff38c2cfa706913c0f5ea3dbe",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
