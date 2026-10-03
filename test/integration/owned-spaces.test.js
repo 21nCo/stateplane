@@ -443,6 +443,56 @@ test('archived spaces replay owner and agent receipts but deny external writes a
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM records WHERE space_id=$1',[spaceId])).rows[0].n,2);
 });
 
+test('archived outbox jobs drain under current worker scope, while suspension and deletion close admission', async () => {
+  const actor={kind:'session',credentialId:'owner-session',userPrincipalId:`owner-${crypto.randomUUID()}`};
+  const spaces=new PostgresSpaces(controlPool,new Map([['cell-a',{pool,storageTargetId:'target-a'}]]),
+    'cell-a',{}, {current:async()=>true});
+  const {spaceId}=await spaces.create(actor);
+  const collectionId=`entries_${crypto.randomUUID()}`;
+  await collection(spaceId,collectionId);
+  const authority=new PostgresAuthority(pool,60);
+  const scope={spaceId,collectionId,principalId:actor.userPrincipalId,credentialId:actor.credentialId,
+    capability:'records:write',policyVersion:1,placementGeneration:1};
+  for (let index=0;index<3;index++) await authority.mutate(scope,{operation:'create',
+    idempotencyKey:`outbox-${index}`,requestDigest:String(index).repeat(64),canonicalData:'{}'});
+  const worker=version=>({...scope,principalId:'system:projection',credentialId:'system:projection',
+    capability:'outbox:worker',policyVersion:version});
+  const [leased]=await authority.transaction(worker(1),tx=>tx.claimOutbox(1,30));
+  await spaces.archive(actor,spaceId);
+  await assert.rejects(authority.mutate({...scope,policyVersion:2},{operation:'create',
+    idempotencyKey:'archived-write',requestDigest:'f'.repeat(64),canonicalData:'{}'}),denied('SPACE_UNAVAILABLE'));
+  await assert.rejects(authority.transaction(worker(1),tx=>tx.finishOutbox(leased,true)),denied('FORBIDDEN'));
+  for (const bad of [{principalId:'agent'},{credentialId:'agent'}])
+    await assert.rejects(authority.transaction({...worker(2),...bad},tx=>tx.claimOutbox(1,30)),denied('FORBIDDEN'));
+  assert.equal(await authority.transaction(worker(2),tx=>tx.finishOutbox(leased,true)),true);
+  const [retry]=await authority.transaction(worker(2),tx=>tx.claimOutbox(1,30));
+  assert.equal(await authority.transaction(worker(2),tx=>tx.finishOutbox(retry,false,'temporary failure')),true);
+  await pool.query("UPDATE projection_outbox SET available_at=clock_timestamp()-interval '1 second' WHERE event_id=$1",[retry.eventId]);
+  const [again]=await authority.transaction(worker(2),tx=>tx.claimOutbox(1,30));
+  assert.equal(again.eventId,retry.eventId);
+  assert.equal(await authority.transaction(worker(2),tx=>tx.finishOutbox(retry,true)),false);
+  assert.equal(await authority.transaction(worker(2),tx=>tx.finishOutbox(again,true)),true);
+  assert.deepEqual((await pool.query(`SELECT delivery_state,attempts FROM projection_outbox
+    WHERE space_id=$1 ORDER BY attempts DESC,delivery_state`,[spaceId])).rows,
+    [{delivery_state:'delivered',attempts:2},{delivery_state:'delivered',attempts:1},
+      {delivery_state:'pending',attempts:0}]);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM record_events WHERE space_id=$1',[spaceId])).rows[0].n,3);
+  await spaces.suspend(actor,spaceId);
+  await assert.rejects(authority.transaction(worker(3),tx=>tx.claimOutbox(1,30)),denied('SPACE_UNAVAILABLE'));
+  await assert.rejects(authority.transaction(worker(3),tx=>tx.finishOutbox(again,true)),denied('SPACE_UNAVAILABLE'));
+  await spaces.restore(actor,spaceId);
+  const [beforeDelete]=await authority.transaction(worker(4),tx=>tx.claimOutbox(1,30));
+  assert.ok(beforeDelete);
+  await spaces.archive(actor,spaceId);
+  await spaces.delete(actor,spaceId);
+  await assert.rejects(authority.transaction(worker(6),tx=>tx.finishOutbox(beforeDelete,true)),
+    error=>['SPACE_UNAVAILABLE','NOT_FOUND'].includes(error?.code));
+  for (const table of ['records','record_events','idempotency_receipts','projection_outbox'])
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[spaceId])).rows[0].n,0,table);
+  assert.equal((await pool.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:deleted'",
+    [spaceId])).rows[0].n,1);
+});
+
 test('cell pool waits and ambiguous BEGIN fail before effects and discard uncertain clients', async () => {
   const claims = {spaceId:'space',collectionId:'collection',capability:'records:read',credentialId:'key',kind:'api-key',
     cellId:'cell-a',policyVersion:1,placementGeneration:1,audience:'stateplane-cell:cell-a',issuedAt:1,expiresAt:30,nonce:'nonce'};
@@ -2829,7 +2879,6 @@ test('a persisted replay expiring during the final provider lookup rolls back a 
   const replay={operation:'create',idempotencyKey:`replay-${spaceId}`,requestDigest:'a'.repeat(64),canonicalData:'{}'};
   const fresh={operation:'create',idempotencyKey:`fresh-${spaceId}`,requestDigest:'b'.repeat(64),canonicalData:'{}'};
   const original=await short.mutate(scope,replay);
-  const expiry=Date.parse(original.expiresAt);
   let fenced=false; let delayed=false;
   const slowPool={connect:async()=>{const client=await pool.connect();return {query:async(...args)=>{
     const result=await client.query(...args);
@@ -2840,7 +2889,15 @@ test('a persisted replay expiring during the final provider lookup rolls back a 
   const cell=new RegionalCell('cell-a',signer,new PostgresCellPolicy(slowPool,'cell-a',{current:async()=>{
     if (fenced && !delayed) {
       delayed=true;
-      await pause(Math.max(0,expiry-Date.now()+100));
+      const processNow=Date.now;
+      Date.now=()=>processNow()+(databaseNames.length ? -60_000 : 60_000);
+      try {
+        const deadline=await pool.query(`SELECT GREATEST(0,CEIL(EXTRACT(EPOCH FROM
+          ($1::timestamptz-clock_timestamp()))*1000))::int AS remaining_ms`,[original.expiresAt]);
+        await pause(deadline.rows[0].remaining_ms+100);
+        const reached=await pool.query('SELECT clock_timestamp()>$1::timestamptz AS expired',[original.expiresAt]);
+        assert.equal(reached.rows[0].expired,true,'the PostgreSQL receipt deadline must pass inside the provider hook');
+      } finally { Date.now=processNow; }
     }
     return true;
   }}));

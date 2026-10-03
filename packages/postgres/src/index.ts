@@ -369,7 +369,9 @@ export class AuthorityTransaction {
     if (row.collection_lifecycle === 'deleted') throw new AuthorityError('NOT_FOUND');
     if (capability === 'outbox:worker' && (principalId !== 'system:projection' || credentialId !== 'system:projection'))
       throw new AuthorityError('FORBIDDEN');
-    if (capability === 'outbox:worker' && row.lifecycle !== 'active') throw new AuthorityError('SPACE_UNAVAILABLE');
+    // Archiving stops new writes, but committed projection jobs still need to drain.
+    if (capability === 'outbox:worker' && row.lifecycle !== 'active' && row.lifecycle !== 'readOnly')
+      throw new AuthorityError('SPACE_UNAVAILABLE');
     if (row.owner_principal_id !== principalId && capability !== 'outbox:worker' &&
       (!row.capabilities?.includes(capability) || (row.expires_at && !row.grant_current))) throw new AuthorityError('FORBIDDEN');
     if (row.collection_lifecycle === 'readOnly' && (capability === 'records:write' || capability === 'claims:review')) throw new AuthorityError('SPACE_UNAVAILABLE');
