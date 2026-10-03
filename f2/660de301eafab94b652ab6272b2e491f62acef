@@ -1,0 +1,22 @@
+docs/owned-spaces.md
+  h_a39f9495f9ec1d 17,23,38
+migrations/022_runtime_coordination_leases.sql
+  h_a39f9495f9ec1d 1-9
+packages/postgres/src/spaces.ts
+  h_a39f9495f9ec1d 182-187,214,237,241,250,260,490-494,496-505,515-516,588,659-665,675-676,679-680,704,710,729,751,754,789,804
+scripts/migration-upgrade-smoke.mjs
+  h_a39f9495f9ec1d 178,180
+test/integration/owned-spaces.test.js
+  h_a39f9495f9ec1d 925-926,933-954,957-960,962,966-976,986-1024,1651,1663-1696,1698-1705,1707-1714
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f2660de301eafab94b652ab6272b2e491f62acef",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
