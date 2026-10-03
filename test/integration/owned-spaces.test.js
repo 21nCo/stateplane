@@ -2118,6 +2118,77 @@ test('cell staging outage after AuthFn creation remains discoverable and revocab
   await assert.rejects(router.assertion(request(issued.secret),spaceId,collectionId,'records:read'),denied('UNAUTHENTICATED'));
 });
 
+test('issue and rotation reject keys that expire during confirmation or completion',
+  {timeout:45_000}, async () => {
+    for (const operation of ['issue','rotate']) for (const boundary of ['confirmation','completion','completion-ack']) {
+      const actor={kind:'session',credentialId:'session',userPrincipalId:`expiry-owner-${crypto.randomUUID()}`};
+      const live=new Set();
+      let created; let armed=false; let expiry;
+      const keys={
+        create:async () => {
+          created={id:`expiry-key-${crypto.randomUUID()}`,secret:'unused'};
+          live.add(created.id);
+          return created;
+        },
+        find:async () => null,
+        revoke:async id => { live.delete(id); },
+      };
+      const expireAtBoundary=async sql => {
+        if (!armed || typeof sql!=='string' ||
+          !(boundary==='confirmation' && sql.includes('UPDATE space_credentials SET confirmed_at=') ||
+            boundary==='completion' && sql.includes('UPDATE agent_key_issuances i SET completed_at='))) return;
+        armed=false;
+        await pause(Math.max(0,expiry.getTime()-Date.now()+75));
+      };
+      const control=controlWithQueryHook(async (sql,_args,next)=>{
+        if (armed && boundary==='completion-ack' && typeof sql==='string' &&
+          sql.includes('UPDATE agent_key_issuances i SET completed_at=')) {
+          const result=await next();
+          armed=false;
+          await pause(Math.max(0,expiry.getTime()-Date.now()+75));
+          assert.equal(result.rowCount,1,'completion committed before acknowledgement was lost');
+          throw new Error('lost completion acknowledgement');
+        }
+        if (boundary==='completion') await expireAtBoundary(sql);
+        return next();
+      });
+      const cellPool={query:(...args)=>pool.query(...args),connect:async()=>{
+        const client=await pool.connect();
+        return {query:async (...args)=>{
+          if (boundary==='confirmation') await expireAtBoundary(args[0]);
+          return client.query(...args);
+        },release:discard=>client.release(discard)};
+      }};
+      const spaces=new PostgresSpaces(control,new Map([['cell-a',{pool:cellPool,storageTargetId:'target-a'}]]),
+        'cell-a',keys,{current:async()=>true});
+      const {spaceId}=await spaces.create(actor);
+      const collectionId=`expiry_${crypto.randomUUID()}`;
+      await collection(spaceId,collectionId);
+      const grants=[{collectionId,capabilities:['records:read']}];
+      const old=operation==='rotate' ? await spaces.issueAgentKey(actor,spaceId,
+        new Date(Date.now()+3_600_000),grants) : null;
+      expiry=new Date(Date.now()+1_500);
+      armed=true;
+      await assert.rejects(operation==='rotate'
+        ? spaces.rotateAgentKey(actor,spaceId,old.id,expiry,grants)
+        : spaces.issueAgentKey(actor,spaceId,expiry,grants));
+      assert.equal(armed,false,`${operation} reached ${boundary}`);
+      assert.equal(live.has(created.id),false,'provider key was revoked');
+      const local=(await pool.query(`SELECT revoked_at,provider_revoked_at FROM space_credentials
+        WHERE space_id=$1 AND credential_id=$2`,[spaceId,created.id])).rows[0];
+      assert.ok(local.revoked_at && local.provider_revoked_at);
+      assert.equal((await pool.query(`SELECT count(*)::int AS n FROM collection_grants
+        WHERE space_id=$1 AND credential_id=$2`,[spaceId,created.id])).rows[0].n,0);
+      assert.equal((await pool.query(`SELECT count(*)::int AS n FROM space_audit
+        WHERE space_id=$1 AND credential_id=$2 AND action='key:issue-failed'`,[spaceId,created.id])).rows[0].n,1);
+      const journal=(await controlPool.query(`SELECT completed_at,cancelled_at,provider_revoked_at FROM agent_key_issuances
+        WHERE space_id=$1 AND credential_id=$2`,[spaceId,created.id])).rows[0];
+      assert.equal(Boolean(journal.completed_at),boundary==='completion-ack');
+      assert.ok(journal.cancelled_at,'failed completion remains recoverable after a committed acknowledgement loss');
+      assert.ok(journal.provider_revoked_at);
+    }
+  });
+
 test('lost journal key-ID write recovers the AuthFn key by issuance correlation', async () => {
   const config={database:memoryAdapter(),namespace:`sta6-id-write-${crypto.randomUUID()}`,plugins:[]};
   createAuthFn(config);
@@ -2549,7 +2620,7 @@ test('uncertain completion gives issue and rotation a recoverable bearer without
       if (updateApplied) await next();
       throw new Error('lost completion acknowledgement');
     }
-    if (typeof sql==='string' && sql.includes('SELECT completed_at FROM agent_key_issuances'))
+    if (typeof sql==='string' && sql.includes('SELECT i.completed_at,i.cancelled_at') && sql.includes('FROM agent_key_issuances'))
       throw new Error('completion readback unavailable');
     if (retryOffline && typeof sql==='string' && sql.includes('SET completed_at=COALESCE(i.completed_at'))
       throw new Error('completion retry unavailable');

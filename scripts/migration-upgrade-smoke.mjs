@@ -282,11 +282,23 @@ try {
         {expectedCellIds:['cell-a'],drained:true}),/home_cell_id/);
       assert.equal((await fresh.query('SELECT home_cell_id FROM space_directory WHERE space_id=$1',[pending]))
         .rows[0].home_cell_id,'wrong-home');
-      await fresh.query("UPDATE space_directory SET home_cell_id=NULL WHERE space_id='sp_upgrade'");
-      await assert.rejects(backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],
+      await fresh.query(`UPDATE space_directory SET home_cell_id=NULL,lifecycle='provisioning'
+        WHERE space_id=$1`,[pending]);
+      await fresh.query("UPDATE space_directory SET home_cell_id='wrong-home' WHERE space_id='sp_upgrade'");
+      let hydratedInsideTransaction=false;
+      const observingControl={query:async (...args)=>{
+        const result=await fresh.query(...args);
+        if (args[0]==='UPDATE space_directory SET home_cell_id=$2 WHERE space_id=$1' && args[1][0]===pending) {
+          hydratedInsideTransaction=(await fresh.query('SELECT home_cell_id FROM space_directory WHERE space_id=$1',
+            [pending])).rows[0].home_cell_id==='cell-a';
+        }
+        return result;
+      }};
+      await assert.rejects(backfillDirectory(observingControl,[{cellId:'cell-a',client:upgraded}],
         {expectedCellIds:['cell-a'],drained:true}),/home_cell_id/);
-      assert.equal((await fresh.query("SELECT home_cell_id FROM space_directory WHERE space_id='sp_upgrade'"))
-        .rows[0].home_cell_id,null,'a later mismatch rolls back earlier hydration');
+      assert.equal(hydratedInsideTransaction,true,'earlier row hydrated before the later mismatch');
+      assert.equal((await fresh.query('SELECT home_cell_id FROM space_directory WHERE space_id=$1',[pending]))
+        .rows[0].home_cell_id,null,'later mismatch rolls back earlier hydration');
       await fresh.query("UPDATE space_directory SET home_cell_id='cell-origin' WHERE space_id='sp_upgrade'");
       await fresh.query("UPDATE space_directory SET home_cell_id=NULL,lifecycle='provisioning' WHERE space_id=$1",[pending]);
       await upgraded.query("UPDATE spaces SET policy_version=2 WHERE space_id=$1",[pending]);

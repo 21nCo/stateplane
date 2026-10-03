@@ -801,45 +801,81 @@ export class PostgresSpaces {
       await this.requireLiveIssuance(this.cell(space.cellId).pool === this.control ? db : this.control,issuanceId,leaseToken);
       const confirmed = await db.query(`UPDATE space_credentials SET confirmed_at=clock_timestamp()
         WHERE space_id=$1 AND credential_id=$2 AND activated_at IS NOT NULL
-          AND confirmed_at IS NULL AND revoked_at IS NULL RETURNING 1`,[space.spaceId,keyId]);
+          AND confirmed_at IS NULL AND revoked_at IS NULL
+          AND expires_at>clock_timestamp() RETURNING 1`,[space.spaceId,keyId]);
       if (confirmed.rowCount !== 1) throw new AuthorityError('FORBIDDEN');
       await this.current(actor);
+      const live = await db.query(`SELECT 1 FROM space_credentials
+        WHERE space_id=$1 AND credential_id=$2 AND revoked_at IS NULL
+          AND expires_at>clock_timestamp()`,[space.spaceId,keyId]);
+      if (live.rowCount !== 1) throw new AuthorityError('FORBIDDEN');
     }); }
     catch (error) {
       if (!(error instanceof CommitOutcomeUnknownError)) throw error;
       // Readback is mandatory before the bearer can cross the response boundary.
-      const observed = await this.cell(space.cellId).pool.query(`SELECT confirmed_at,revoked_at FROM space_credentials
+      const observed = await this.cell(space.cellId).pool.query(`SELECT confirmed_at,revoked_at,
+        expires_at>clock_timestamp() AS live FROM space_credentials
         WHERE space_id=$1 AND credential_id=$2`,[space.spaceId,keyId]);
-      if (!observed.rows[0]?.confirmed_at || observed.rows[0].revoked_at) throw error;
+      if (!observed.rows[0]?.confirmed_at || observed.rows[0].revoked_at || !observed.rows[0].live) throw error;
     }
   }
-  private async completeIssuedKey(issuanceId: string, keyId: string, leaseToken: string): Promise<void> {
+  private async requireCompletedIssuedKey(issuanceId: string, keyId: string,
+    leaseToken: string, expiryMs: number): Promise<void> {
+    const valid = await this.control.query(`SELECT 1 FROM agent_key_issuances i
+      JOIN space_directory d ON d.space_id=i.space_id
+      WHERE i.issuance_id=$1 AND i.credential_id=$2 AND i.completed_at IS NOT NULL
+        AND i.cancelled_at IS NULL AND i.provider_revoked_at IS NULL
+        AND i.settled_without_key_at IS NULL AND d.lifecycle='active'
+        AND d.issuance_lease_token=$3 AND d.issuance_lease_until>clock_timestamp()
+        AND $4::timestamptz>clock_timestamp()`,
+    [issuanceId,keyId,leaseToken,new Date(expiryMs)]);
+    if (valid.rowCount !== 1) throw new AuthorityError('STALE_PLACEMENT','Agent key expired or issuance was cancelled');
+  }
+  private async completeIssuedKey(issuanceId: string, keyId: string,
+    leaseToken: string, expiryMs: number): Promise<void> {
     try {
       const completed = await this.control.query(`UPDATE agent_key_issuances i SET completed_at=clock_timestamp()
         FROM space_directory d WHERE i.issuance_id=$1 AND i.space_id=d.space_id
           AND i.credential_id=$2 AND i.cancelled_at IS NULL AND i.provider_revoked_at IS NULL
           AND i.settled_without_key_at IS NULL AND i.completed_at IS NULL
           AND d.issuance_lease_token=$3 AND d.issuance_lease_until>clock_timestamp()
-        RETURNING 1`,[issuanceId,keyId,leaseToken]);
+          AND $4::timestamptz>clock_timestamp()
+        RETURNING 1`,[issuanceId,keyId,leaseToken,new Date(expiryMs)]);
       if (completed.rowCount !== 1) throw new AuthorityError('STALE_PLACEMENT','Issuance was cancelled');
+      await this.requireCompletedIssuedKey(issuanceId,keyId,leaseToken,expiryMs);
     } catch (error) {
       if (error instanceof AuthorityError) throw error;
-      await this.recoverIssuedKeyCompletion(issuanceId,keyId,leaseToken,error);
+      await this.recoverIssuedKeyCompletion(issuanceId,keyId,leaseToken,expiryMs,error);
     }
   }
   private async recoverIssuedKeyCompletion(issuanceId: string, keyId: string,
-    leaseToken: string, cause: unknown): Promise<void> {
-    const observed = await this.control.query(`SELECT completed_at FROM agent_key_issuances
-      WHERE issuance_id=$1`,[issuanceId]).catch(() => null);
-    if (observed?.rows[0]?.completed_at) return;
+    leaseToken: string, expiryMs: number, cause: unknown): Promise<void> {
+    const observed = await this.control.query(`SELECT i.completed_at,i.cancelled_at,i.provider_revoked_at,
+      i.settled_without_key_at,
+      d.lifecycle='active' AND d.issuance_lease_token=$3 AND
+      d.issuance_lease_until>clock_timestamp() AND
+      $4::timestamptz>clock_timestamp() AS live
+      FROM agent_key_issuances i JOIN space_directory d ON d.space_id=i.space_id
+      WHERE i.issuance_id=$1 AND i.credential_id=$2`,
+    [issuanceId,keyId,leaseToken,new Date(expiryMs)]).catch(() => null);
+    if (observed?.rows[0]?.completed_at) {
+      if (!observed.rows[0].live || observed.rows[0].cancelled_at || observed.rows[0].provider_revoked_at ||
+        observed.rows[0].settled_without_key_at)
+        throw new AuthorityError('STALE_PLACEMENT','Agent key expired or issuance was cancelled');
+      return;
+    }
     const retried = await this.control.query(`UPDATE agent_key_issuances i
       SET completed_at=COALESCE(i.completed_at,clock_timestamp())
       FROM space_directory d WHERE i.issuance_id=$1 AND i.space_id=d.space_id
         AND i.credential_id=$2 AND i.cancelled_at IS NULL AND i.provider_revoked_at IS NULL
-        AND i.settled_without_key_at IS NULL AND
-        (i.completed_at IS NOT NULL OR (d.issuance_lease_token=$3 AND d.issuance_lease_until>clock_timestamp()))
-      RETURNING 1`,[issuanceId,keyId,leaseToken]).catch(() => null);
-    if (retried?.rowCount === 1) return;
+        AND i.settled_without_key_at IS NULL AND d.lifecycle='active'
+        AND d.issuance_lease_token=$3 AND d.issuance_lease_until>clock_timestamp()
+        AND $4::timestamptz>clock_timestamp()
+      RETURNING 1`,[issuanceId,keyId,leaseToken,new Date(expiryMs)]).catch(() => null);
+    if (retried?.rowCount === 1) {
+      await this.requireCompletedIssuedKey(issuanceId,keyId,leaseToken,expiryMs);
+      return;
+    }
     // A failed readback and retry cannot establish a definite outcome.
     if (!observed && !retried) throw new CompletionOutcomeUnknownError(cause);
     const cancelled = await this.control.query(`UPDATE agent_key_issuances
@@ -900,6 +936,11 @@ export class PostgresSpaces {
   private async compensateFailedIssuance(actor: VerifiedCredential, space: SpaceInfo, issuanceId: string,
     created: IssuedAgentKey | undefined, createFailed: boolean): Promise<void> {
     const control = this.control;
+    // A definite failure after durable completion must remain visible to
+    // reconciliation until local and provider compensation both settle.
+    await control.query(`UPDATE agent_key_issuances
+      SET cancelled_at=COALESCE(cancelled_at,clock_timestamp()) WHERE issuance_id=$1`,
+    [issuanceId]).catch(() => {});
     if (createFailed) {
       // A lost provider acknowledgement can hide a created key. Correlation
       // readback must settle before this journal can be considered empty.
@@ -973,7 +1014,7 @@ export class PostgresSpaces {
       await this.publish(space,version,space.lifecycle,control);
       await this.activateIssuedKey(actor,space,issued.id,issuanceId,leaseToken,version);
       await this.confirmIssuedKey(actor,space,issued.id,issuanceId,leaseToken,version);
-      await this.completeIssuedKey(issuanceId,issued.id,leaseToken);
+      await this.completeIssuedKey(issuanceId,issued.id,leaseToken,expiryMs);
       return issued;
     } catch (error) {
       if (error instanceof CompletionOutcomeUnknownError && created)
