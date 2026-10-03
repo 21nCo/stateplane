@@ -26,6 +26,9 @@ jobs:
       - run: pnpm test:e2e
       - run: pnpm db:up
       - run: pnpm db:migrate
+      - run: pnpm test:postgres
+        env:
+          STATEPLANE_TEST_SEPARATE_DBS: '1'
       - if: always()
         run: pnpm db:down
   windows-boundaries:

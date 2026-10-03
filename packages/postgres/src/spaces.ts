@@ -272,7 +272,10 @@ export class PostgresSpaces {
       WHERE owner_principal_id=$1 AND lifecycle='provisioning' ORDER BY created_at,space_id`,[owner(actor)]);
     for (const row of pending.rows) {
       await this.current(actor);
-      await this.recoverProvisioning(row.space_id,owner(actor));
+      // A pending cell can be offline while the owner's other spaces remain
+      // available. Its directory row stays unrouteable until a later retry.
+      try { await this.recoverProvisioning(row.space_id,owner(actor)); }
+      catch { /* Keep this reservation pending and continue with healthy cells. */ }
     }
     const rows = await this.control.query(`SELECT * FROM space_directory WHERE owner_principal_id=$1 AND lifecycle NOT IN ('provisioning','deleted')
       ORDER BY created_at,space_id`,[owner(actor)]);

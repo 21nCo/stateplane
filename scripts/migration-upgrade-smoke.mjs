@@ -134,6 +134,7 @@ try {
     assert.match(output,/Applied 017_agent_key_issuances.sql/);
     assert.match(output,/Applied 018_agent_key_no_key_settlement.sql/);
     assert.match(output,/Applied 019_space_provisioning_recovery.sql/);
+    assert.match(output,/Applied 020_immutable_space_audits.sql/);
     assert.deepEqual(await facts(upgraded),before);
     const actor={kind:'session',userPrincipalId:'owner',credentialId:'upgrade-session'};
     const pool=new pg.Pool({connectionString:url(names[0])});
@@ -174,9 +175,9 @@ try {
       'sp_upgrade')).spaceId,'sp_upgrade');
     assert.equal((await new PostgresRoutingDirectory(fresh,splitCells).lookup('sp_upgrade')).cellId,'cell-a');
     await enforceUniqueRecord(upgraded);
-    assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,19);
+    assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,20);
     assert.equal(runMigrator(names[0]),'');
-    console.log(`Upgrade smoke passed: 2000 record/event/receipt/outbox rows and upgraded owner route preserved; final index matches fresh install; 005 build ${build005Ms}ms, 006-019 migrator ${buildRemainingMs}ms`);
+    console.log(`Upgrade smoke passed: 2000 record/event/receipt/outbox rows and upgraded owner route preserved; final index matches fresh install; 005 build ${build005Ms}ms, 006-020 migrator ${buildRemainingMs}ms`);
   } finally { await Promise.allSettled([upgraded.end(),fresh.end()]); }
 } finally {
   created.reverse();

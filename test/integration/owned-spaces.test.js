@@ -793,6 +793,58 @@ test('owner listing retires an interrupted reservation without a cell and publis
   assert.equal((await spaces.list({...actor,userPrincipalId:'other-owner'})).some(space => space.spaceId === completed),false);
 });
 
+test('erasure mode cannot remove space or retired-provisioning audit rows', async () => {
+  const actor={kind:'session',credentialId:'session',userPrincipalId:'audit-owner'};
+  const cells=new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
+  const spaces=new PostgresSpaces(controlPool,cells,'cell-a',
+    {create:async () => { throw new Error('unexpected key'); },revoke:async () => {}},{current:async () => true});
+  const created=await spaces.create(actor);
+  const pending=`sp_${crypto.randomUUID()}`;
+  await controlPool.query(`INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,lifecycle)
+    VALUES($1,$2,'cell-a','target-a','provisioning')`,[pending,actor.userPrincipalId]);
+  await spaces.list(actor);
+  for (const [database,table,spaceId] of [[pool,'space_audit',created.spaceId],
+    [controlPool,'space_provisioning_audit',pending]]) {
+    const before=(await database.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[spaceId])).rows[0].n;
+    assert.ok(before > 0);
+    const client=await database.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query("SELECT set_config('stateplane.erasing_space',$1,true)",[spaceId]);
+      await assert.rejects(client.query(`DELETE FROM ${table} WHERE space_id=$1`,[spaceId]),
+        /space audit rows are immutable/);
+    } finally { await client.query('ROLLBACK'); client.release(); }
+    assert.equal((await database.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[spaceId])).rows[0].n,before);
+  }
+});
+
+test('unavailable pending cell does not hide healthy spaces in another cell', async () => {
+  const actor={kind:'session',credentialId:'session',userPrincipalId:'listing-owner'};
+  const cells=new Map([['cell-a',{pool,storageTargetId:'target-a'}],['cell-b',{pool:cellBPool,storageTargetId:'target-b'}]]);
+  const provider={create:async () => { throw new Error('unexpected key'); },revoke:async () => {}};
+  const credentials={current:async () => true};
+  const spaces=new PostgresSpaces(controlPool,cells,'cell-a',provider,credentials);
+  const healthy=await spaces.create(actor,'cell-b');
+  const pending=`sp_${crypto.randomUUID()}`;
+  await controlPool.query(`INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,lifecycle)
+    VALUES($1,$2,'cell-a','target-a','provisioning')`,[pending,actor.userPrincipalId]);
+  const unavailable=new Map(cells);
+  unavailable.set('cell-a',{storageTargetId:'target-a',pool:{query:async () => { throw new Error('cell-a offline'); }}});
+  const listed=await new PostgresSpaces(controlPool,unavailable,'cell-a',provider,credentials).list(actor);
+  assert.deepEqual(listed.map(space => space.spaceId),[healthy.spaceId]);
+  assert.equal((await controlPool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1',[pending])).rows[0].lifecycle,
+    'provisioning');
+  const router=new RegionalRouter({verify:async () => actor},new PostgresRoutingDirectory(controlPool,cells),
+    new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1'));
+  await assert.rejects(router.assertion(new Request('https://gateway.example.invalid'),pending,'collection','records:read'),
+    denied('SPACE_UNAVAILABLE'));
+  assert.deepEqual((await spaces.list(actor)).map(space => space.spaceId),[healthy.spaceId]);
+  assert.equal((await controlPool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1',[pending])).rows[0].lifecycle,
+    'deleted');
+  assert.equal((await controlPool.query('SELECT count(*)::int AS n FROM space_provisioning_audit WHERE space_id=$1',
+    [pending])).rows[0].n,1);
+});
+
 test('owner recovery waits for a live create and cannot retire its reserved directory row', async () => {
   const actor={kind:'session',credentialId:'session',userPrincipalId:'concurrent-owner'};
   let releaseReservation;
