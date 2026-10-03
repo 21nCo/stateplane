@@ -1390,6 +1390,95 @@ test('deletion racing provider creation retains cleanup authority through provid
     [spaceId])).rows[0].n,1);
 });
 
+test('issuance staging and deletion or erasure repair serialize without late credentials', async () => {
+  for (const order of ['delete-first','stage-first','repair-first']) {
+    const config={database:memoryAdapter(),namespace:`sta6-issue-delete-${order}-${crypto.randomUUID()}`,plugins:[]};
+    createAuthFn(config);
+    const user=await createUser(config,{primaryEmail:`issue-delete-${crypto.randomUUID()}@example.invalid`});
+    const session=await issueSession(config,{}, {userId:user.id,methods:['password']});
+    const identity=new AuthFnIdentityVerifier(config);
+    const actor=await identity.verify(request(session.sessionToken));
+    const realKeys=new AuthFnAgentKeys(config);
+    let issued; let revocations=0; let reached; let release;
+    const atBoundary=new Promise(resolve => { reached=resolve; });
+    const resume=new Promise(resolve => { release=resolve; });
+    const keys={
+      create:async (...args) => {
+        issued=await realKeys.create(...args);
+        if (order !== 'stage-first') { reached(); await resume; }
+        return issued;
+      },
+      find:(...args) => realKeys.find(...args),
+      revoke:async (...args) => { revocations++; return realKeys.revoke(...args); },
+    };
+    const cellPool=order === 'stage-first' ? {
+      query:(...args) => pool.query(...args),
+      connect:async () => {
+        const client=await pool.connect();
+        let staged=false;
+        return {
+          query:async (...args) => {
+            const sql=args[0];
+            if (typeof sql === 'string' && sql.includes("'key:created-pending'")) staged=true;
+            const result=await client.query(...args);
+            if (sql === 'COMMIT' && staged) { staged=false; reached(); await resume; }
+            return result;
+          },
+          release:discard => client.release(discard),
+        };
+      },
+    } : pool;
+    const spaces=new PostgresSpaces(controlPool,new Map([['cell-a',{pool:cellPool,storageTargetId:'target-a'}]]),
+      'cell-a',keys,identity);
+    const {spaceId}=await spaces.create(actor);
+    const collectionId=`race_${crypto.randomUUID()}`;
+    await collection(spaceId,collectionId);
+    await pool.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,
+      normalized_key,canonical_data,data) VALUES($1,$2,$3,1,1,'generated',$3,'{}','{}')`,
+    [spaceId,collectionId,`record_${crypto.randomUUID()}`]);
+    const issuance=spaces.issueAgentKey(actor,spaceId,new Date(Date.now()+3_600_000),
+      [{collectionId,capabilities:['records:read']}]);
+    await atBoundary;
+    try {
+      await spaces.archive(actor,spaceId);
+      if (order === 'repair-first') {
+        // An interrupted restore left a deleted cell tombstone with content.
+        await controlPool.query("UPDATE space_directory SET lifecycle='deleting' WHERE space_id=$1",[spaceId]);
+        await pool.query("UPDATE spaces SET lifecycle='deleted' WHERE space_id=$1",[spaceId]);
+        await spaces.repairDeletedErasure(actor,spaceId);
+      }
+      await spaces.delete(actor,spaceId);
+      const directoryBefore=(await controlPool.query(`SELECT lifecycle,policy_version,placement_generation
+        FROM space_directory WHERE space_id=$1`,[spaceId])).rows[0];
+      const cellBefore=(await pool.query(`SELECT lifecycle,policy_version,placement_generation
+        FROM spaces WHERE space_id=$1`,[spaceId])).rows[0];
+      const auditsBefore=(await pool.query('SELECT audit_id,action FROM space_audit WHERE space_id=$1 ORDER BY audit_id',
+        [spaceId])).rows;
+      assert.equal(directoryBefore.lifecycle,'deleted');
+      assert.equal(cellBefore.lifecycle,'deleted');
+      assert.equal((await pool.query('SELECT count(*)::int AS n FROM space_credentials WHERE space_id=$1',[spaceId])).rows[0].n,0);
+      release();
+      await assert.rejects(issuance,denied('STALE_PLACEMENT'));
+      assert.ok(revocations > 0,'provider key was revoked');
+      assert.equal(await identity.verify(request(issued.secret)),null);
+      assert.deepEqual((await controlPool.query(`SELECT lifecycle,policy_version,placement_generation
+        FROM space_directory WHERE space_id=$1`,[spaceId])).rows[0],directoryBefore);
+      assert.deepEqual((await pool.query(`SELECT lifecycle,policy_version,placement_generation
+        FROM spaces WHERE space_id=$1`,[spaceId])).rows[0],cellBefore);
+      assert.deepEqual((await pool.query('SELECT audit_id,action FROM space_audit WHERE space_id=$1 ORDER BY audit_id',
+        [spaceId])).rows,auditsBefore,'late compensation cannot mutate deleted audit');
+      for (const table of ['space_credentials','collection_grants','collections','records'])
+        assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[spaceId])).rows[0].n,0,table);
+      assert.ok((await controlPool.query(`SELECT provider_revoked_at FROM agent_key_issuances
+        WHERE space_id=$1`,[spaceId])).rows[0].provider_revoked_at);
+      await spaces.delete(actor,spaceId);
+      await spaces.reconcile(spaceId);
+      assert.equal((await pool.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:deleted'",
+        [spaceId])).rows[0].n,1);
+    } finally { release(); }
+  }
+});
+
 test('cell staging outage after AuthFn creation remains discoverable and revocable', async () => {
   const config={database:memoryAdapter(),namespace:`sta6-stage-outage-${crypto.randomUUID()}`,plugins:[]};
   createAuthFn(config);

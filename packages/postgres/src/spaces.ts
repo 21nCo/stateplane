@@ -653,6 +653,17 @@ export class PostgresSpaces {
       // This independent commit keeps a provider key discoverable by reconcile
       // if a later grant FK, publication or activation transaction fails.
       await transaction(this.cell(space.cellId).pool, async db => {
+        // Serialize staging with deletion and erasure repair. A provider create
+        // can finish after either path has purged the cell; its old directory
+        // snapshot must never insert a credential into the deleted tombstone.
+        const locked = await db.query(`SELECT lifecycle,policy_version,placement_generation,cell_id,storage_target_id
+          FROM spaces WHERE space_id=$1 AND owner_principal_id=$2 FOR UPDATE`,[spaceId,owner(actor)]);
+        const local = locked.rows[0];
+        if (!local || local.lifecycle !== 'active' || local.cell_id !== space.cellId ||
+          local.storage_target_id !== space.storageTargetId ||
+          safeVersion(local.policy_version) !== space.policyVersion ||
+          safeVersion(local.placement_generation) !== space.placementGeneration)
+          throw new AuthorityError('STALE_PLACEMENT');
         await db.query(`INSERT INTO space_credentials(space_id,credential_id,principal_id,owner_principal_id,expires_at,activated_at)
           VALUES($1,$2,$3,$4,$5,NULL)`,[spaceId,issued.id,`agent_${randomUUID()}`,owner(actor),new Date(expiryMs)]);
         await db.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
