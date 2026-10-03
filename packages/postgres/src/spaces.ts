@@ -14,7 +14,7 @@ export interface AgentKeyProvider {
   revoke(id: string, ownerPrincipalId: string): Promise<void>;
 }
 export interface SpaceInfo extends DirectoryPlacement {
-  ownerPrincipalId: string; storageTargetId: string;
+  ownerPrincipalId: string; homeCellId: string; storageTargetId: string;
   createdAt: string; updatedAt: string;
 }
 export interface CollectionGrant { collectionId: string; capabilities: readonly Capability[]; expiresAt?: Date }
@@ -128,8 +128,9 @@ function snapshotGrants(grants: readonly CollectionGrant[], keyExpiry: Date): Re
   return Object.freeze(copied);
 }
 function info(row: Record<string, unknown>): SpaceInfo {
+  if (!validId(row.home_cell_id)) throw new AuthorityError('STALE_PLACEMENT');
   return { spaceId:String(row.space_id),ownerPrincipalId:String(row.owner_principal_id),
-    cellId:String(row.cell_id),storageTargetId:String(row.storage_target_id),lifecycle:String(row.lifecycle),
+    homeCellId:row.home_cell_id,cellId:String(row.cell_id),storageTargetId:String(row.storage_target_id),lifecycle:String(row.lifecycle),
     policyVersion:safeVersion(row.policy_version),placementGeneration:safeVersion(row.placement_generation),
     createdAt:new Date(row.created_at as string).toISOString(),updatedAt:new Date(row.updated_at as string).toISOString() };
 }
@@ -210,8 +211,8 @@ export class PostgresSpaces {
       await this.current(actor);
       // Recovery may see this committed reservation before the creator can
       // lock it. The bounded claim keeps it pending until the cell commit.
-      await directory.query(`INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,lifecycle,provisioning_lease_until)
-        VALUES($1,$2,$3,$4,'provisioning',clock_timestamp()+interval '60 seconds')`,
+      await directory.query(`INSERT INTO space_directory(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,lifecycle,provisioning_lease_until)
+        VALUES($1,$2,$3,$3,$4,'provisioning',clock_timestamp()+interval '60 seconds')`,
       [spaceId,owner(actor),cellId,cell.storageTargetId]);
       beginAttempted = true;
       await directory.query('BEGIN'); begun = true;
@@ -252,7 +253,7 @@ export class PostgresSpaces {
         const observed = await this.control.query('SELECT * FROM space_directory WHERE space_id=$1',[spaceId]).catch(() => null);
         if (!observed) throw error;
         const row = observed.rows[0];
-        if (row?.lifecycle === 'active' && row.owner_principal_id === principal && row.cell_id === cellId &&
+        if (row?.lifecycle === 'active' && row.owner_principal_id === principal && row.home_cell_id === cellId && row.cell_id === cellId &&
           row.storage_target_id === cell.storageTargetId) return info(row);
         if (row?.lifecycle !== 'provisioning') throw error;
       }
@@ -270,7 +271,7 @@ export class PostgresSpaces {
       if (row.provisioning_claim_live === true) return;
       const cell = this.cell(row.cell_id);
       if (cell.storageTargetId !== row.storage_target_id) throw new AuthorityError('STALE_PLACEMENT');
-      const local = await (cell.pool === this.control ? directory : cell.pool).query(`SELECT s.owner_principal_id,s.cell_id,s.storage_target_id,s.lifecycle,
+      const local = await (cell.pool === this.control ? directory : cell.pool).query(`SELECT s.owner_principal_id,s.home_cell_id,s.cell_id,s.storage_target_id,s.lifecycle,
         s.policy_version,s.placement_generation,
         EXISTS (SELECT 1 FROM space_audit a WHERE a.space_id=s.space_id AND a.action='space:create') AS created
         FROM spaces s WHERE s.space_id=$1`,[spaceId]);
@@ -282,7 +283,7 @@ export class PostgresSpaces {
           VALUES($1,$2,$3,'space:provision-retired')`,[spaceId,ownerPrincipalId,row.cell_id]);
         return;
       }
-      if (existing.owner_principal_id !== ownerPrincipalId || existing.cell_id !== row.cell_id ||
+      if (existing.owner_principal_id !== ownerPrincipalId || existing.home_cell_id !== row.home_cell_id || existing.cell_id !== row.cell_id ||
         existing.storage_target_id !== row.storage_target_id || existing.lifecycle !== 'active' ||
         safeVersion(existing.policy_version) !== 1 || safeVersion(existing.placement_generation) !== 1 ||
         existing.created !== true) throw new AuthorityError('STALE_PLACEMENT');
@@ -322,7 +323,7 @@ export class PostgresSpaces {
     if (!await this.credentials.current({kind:'api-key',credentialId},row.owner_principal_id))
       throw new AuthorityError('NOT_FOUND');
     if (!this.cells.has(row.cell_id)) throw new AuthorityError('NOT_FOUND');
-    const cell = await this.cell(row.cell_id).pool.query(`SELECT s.policy_version,s.placement_generation,s.cell_id
+    const cell = await this.cell(row.cell_id).pool.query(`SELECT s.policy_version,s.placement_generation,s.home_cell_id,s.cell_id
       FROM spaces s JOIN space_credentials sc ON sc.space_id=s.space_id AND sc.credential_id=$2
       JOIN collection_grants g ON g.space_id=s.space_id AND g.credential_id=sc.credential_id
       JOIN collections c ON c.space_id=g.space_id AND c.collection_id=g.collection_id
@@ -333,7 +334,8 @@ export class PostgresSpaces {
         AND g.capabilities @> ARRAY['space:admin']::text[] LIMIT 1`,[spaceId,credentialId]);
     const local = cell.rows[0];
     if (!local) throw new AuthorityError('NOT_FOUND');
-    if (local.cell_id !== row.cell_id || safeVersion(local.policy_version) !== safeVersion(row.policy_version) ||
+    if (local.home_cell_id !== row.home_cell_id || local.cell_id !== row.cell_id ||
+      safeVersion(local.policy_version) !== safeVersion(row.policy_version) ||
       safeVersion(local.placement_generation) !== safeVersion(row.placement_generation)) throw new AuthorityError('STALE_PLACEMENT');
     await this.current({kind:'api-key',credentialId},row.owner_principal_id);
     return info(row);
@@ -343,13 +345,13 @@ export class PostgresSpaces {
     control: Pick<pg.Pool, 'query'> = this.control): Promise<void> {
     try {
       const updated = await control.query(`UPDATE space_directory SET policy_version=$3,lifecycle=$4,updated_at=clock_timestamp()
-        WHERE space_id=$1 AND policy_version=$2 AND placement_generation=$5 AND cell_id=$6 RETURNING 1`,
-      [space.spaceId,space.policyVersion,policyVersion,lifecycle,space.placementGeneration,space.cellId]);
+        WHERE space_id=$1 AND policy_version=$2 AND placement_generation=$5 AND cell_id=$6 AND home_cell_id=$7 RETURNING 1`,
+      [space.spaceId,space.policyVersion,policyVersion,lifecycle,space.placementGeneration,space.cellId,space.homeCellId]);
       if (updated.rowCount !== 1) throw new AuthorityError('STALE_PLACEMENT');
     } catch (error) {
       const observed = await control.query('SELECT * FROM space_directory WHERE space_id=$1',[space.spaceId]).catch(() => null);
       const row = observed?.rows[0];
-      if (row?.owner_principal_id === space.ownerPrincipalId && row.cell_id === space.cellId &&
+      if (row?.owner_principal_id === space.ownerPrincipalId && row.home_cell_id === space.homeCellId && row.cell_id === space.cellId &&
         row.storage_target_id === space.storageTargetId && row.lifecycle === lifecycle &&
         safeVersion(row.policy_version) === policyVersion && safeVersion(row.placement_generation) === space.placementGeneration) return;
       throw error;
@@ -359,9 +361,9 @@ export class PostgresSpaces {
   private async publicationForRetry(actor: VerifiedCredential, space: SpaceInfo): Promise<SpaceInfo> {
     await this.current(actor);
     const local = await this.cell(space.cellId).pool.query(
-      'SELECT lifecycle,policy_version,placement_generation FROM spaces WHERE space_id=$1',[space.spaceId]);
+      'SELECT home_cell_id,lifecycle,policy_version,placement_generation FROM spaces WHERE space_id=$1',[space.spaceId]);
     const row = local.rows[0];
-    if (!row) throw new AuthorityError('STALE_PLACEMENT');
+    if (!row || row.home_cell_id !== space.homeCellId) throw new AuthorityError('STALE_PLACEMENT');
     const version = safeVersion(row.policy_version);
     const generation = safeVersion(row.placement_generation);
     if (version < space.policyVersion || generation < space.placementGeneration) throw new AuthorityError('STALE_PLACEMENT');
@@ -682,7 +684,7 @@ export class PostgresSpaces {
     const row = control.rows[0];
     if (!row) throw new AuthorityError('NOT_FOUND');
     const first = await this.cell(row.cell_id).pool.query(`SELECT * FROM spaces WHERE space_id=$1`,[spaceId]);
-    if (!first.rows[0] || (first.rows[0].owner_principal_id !== row.owner_principal_id || first.rows[0].cell_id !== row.cell_id ||
+    if (!first.rows[0] || (first.rows[0].owner_principal_id !== row.owner_principal_id || first.rows[0].home_cell_id !== row.home_cell_id || first.rows[0].cell_id !== row.cell_id ||
       first.rows[0].storage_target_id !== row.storage_target_id)) throw new AuthorityError('STALE_PLACEMENT');
     if (requireDeleted && first.rows[0].lifecycle !== 'deleted') throw new AuthorityError('STALE_PLACEMENT');
     await this.cleanupIssuances(info(row),row.lifecycle === 'deleted' || first.rows[0]?.lifecycle === 'deleting' ||
@@ -690,7 +692,7 @@ export class PostgresSpaces {
     if (first.rows[0].lifecycle !== 'deleted') await this.repairCellCredentials(info(row),controlClient);
     const current = await this.cell(row.cell_id).pool.query(`SELECT * FROM spaces WHERE space_id=$1`,[spaceId]);
     const local = current.rows[0];
-    if (!local || local.owner_principal_id !== row.owner_principal_id || local.cell_id !== row.cell_id ||
+    if (!local || local.owner_principal_id !== row.owner_principal_id || local.home_cell_id !== row.home_cell_id || local.cell_id !== row.cell_id ||
       local.storage_target_id !== row.storage_target_id) throw new AuthorityError('STALE_PLACEMENT');
     if (row.lifecycle === 'deleted') {
       if (!await this.erased(this.cell(row.cell_id).pool,spaceId)) throw new AuthorityError('STALE_PLACEMENT');
@@ -704,11 +706,11 @@ export class PostgresSpaces {
     const updated = await controlClient.query(`UPDATE space_directory SET lifecycle=$2,policy_version=$3,
       placement_generation=$4,updated_at=clock_timestamp()
       WHERE space_id=$1 AND lifecycle=$5 AND policy_version=$6 AND placement_generation=$7
-        AND cell_id=$8 AND owner_principal_id=$9 AND storage_target_id=$10
+        AND cell_id=$8 AND owner_principal_id=$9 AND storage_target_id=$10 AND home_cell_id=$12
         AND ($11::text IS NULL OR (issuance_lease_token=$11 AND issuance_lease_until>clock_timestamp())) RETURNING *`,
     [spaceId,lifecycle,local.policy_version,local.placement_generation,
       row.lifecycle,row.policy_version,row.placement_generation,row.cell_id,row.owner_principal_id,row.storage_target_id,
-      leaseToken ?? null]);
+      leaseToken ?? null,row.home_cell_id]);
     if (!updated.rows[0]) throw new AuthorityError('STALE_PLACEMENT');
     return info(updated.rows[0]);
   }

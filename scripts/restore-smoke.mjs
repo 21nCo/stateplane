@@ -54,8 +54,8 @@ try {
   try {
     await seed.query('BEGIN');
     await seed.query("INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id) VALUES($1,'owner','cell-a','cell-a','target-a')",[spaceId]);
-    await seed.query("INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,lifecycle) VALUES($1,'owner','cell-a','target-a','active')",[spaceId]);
-    await seed.query("INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,lifecycle) VALUES($1,'owner','cell-a','target-a','deleted')",[retiredSpaceId]);
+    await seed.query("INSERT INTO space_directory(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,lifecycle) VALUES($1,'owner','cell-a','cell-a','target-a','active')",[spaceId]);
+    await seed.query("INSERT INTO space_directory(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,lifecycle) VALUES($1,'owner','cell-a','cell-a','target-a','deleted')",[retiredSpaceId]);
     await seed.query("INSERT INTO space_provisioning_audit(space_id,owner_principal_id,cell_id,action) VALUES($1,'owner','cell-a','space:provision-retired')",[retiredSpaceId]);
     await seed.query("INSERT INTO agent_key_issuances(issuance_id,space_id,owner_principal_id,cell_id,credential_id) VALUES('restore-issuance',$1,'owner','cell-a','restore-agent')",[spaceId]);
     await seed.query('INSERT INTO collections(space_id,collection_id) VALUES($1,$2)',[spaceId,collectionId]);

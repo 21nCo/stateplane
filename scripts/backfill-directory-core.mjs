@@ -21,7 +21,7 @@ async function sourceRows(cells) {
   const rows = [];
   const seenSpaces = new Set();
   for (const { cellId, client } of cells) {
-    const result = await client.query(`SELECT space_id,owner_principal_id,cell_id,storage_target_id,
+    const result = await client.query(`SELECT space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,
       lifecycle,policy_version,placement_generation,
       to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at
       FROM spaces ORDER BY space_id`);
@@ -46,12 +46,18 @@ async function copyRows(control, rows) {
       for (const key of ['owner_principal_id','cell_id','storage_target_id','lifecycle','policy_version','placement_generation']) {
         if (String(found[key]) !== String(row[key])) throw new Error(`Directory mismatch for ${row.space_id}: ${key}`);
       }
+      if (found.home_cell_id === null) {
+        await control.query('UPDATE space_directory SET home_cell_id=$2 WHERE space_id=$1',
+          [row.space_id,row.home_cell_id]);
+      } else if (found.home_cell_id !== row.home_cell_id) {
+        throw new Error(`Directory mismatch for ${row.space_id}: home_cell_id`);
+      }
       if (found.precise_created_at !== row.created_at) throw new Error(`Directory mismatch for ${row.space_id}: created_at`);
       existing++;
     } else {
-      await control.query(`INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,
+      await control.query(`INSERT INTO space_directory(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,
         lifecycle,policy_version,placement_generation,created_at)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8::timestamptz)`,[row.space_id,row.owner_principal_id,row.cell_id,row.storage_target_id,
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::timestamptz)`,[row.space_id,row.owner_principal_id,row.home_cell_id,row.cell_id,row.storage_target_id,
         row.lifecycle,row.policy_version,row.placement_generation,row.created_at]);
       copied++;
     }

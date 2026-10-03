@@ -99,12 +99,15 @@ test('owned spaces, AuthFn identities and cell effects share a revocable authori
   const first = await spaces.create(owner);
   const second = await spaces.create(owner,'cell-b');
   assert.notEqual(first.spaceId,second.spaceId);
+  assert.equal(first.homeCellId,'cell-a');
+  assert.equal(second.homeCellId,'cell-b');
   if (databaseNames.length) {
     assert.equal((await controlPool.query('SELECT count(*)::int AS n FROM spaces')).rows[0].n,0);
     assert.equal((await pool.query('SELECT count(*)::int AS n FROM spaces WHERE space_id=$1',[second.spaceId])).rows[0].n,0);
     assert.equal((await cellBPool.query('SELECT count(*)::int AS n FROM spaces WHERE space_id=$1',[first.spaceId])).rows[0].n,0);
   }
   assert.deepEqual((await spaces.list(owner)).map(space => space.spaceId).sort(),[first.spaceId,second.spaceId].sort());
+  assert.equal((await spaces.get(owner,first.spaceId)).homeCellId,'cell-a');
   await assert.rejects(spaces.create({kind:'api-key',credentialId:'key-untrusted'}),denied('FORBIDDEN'));
   await assert.rejects(spaces.create(owner,'unlisted-cell'),denied('INVALID_ARGUMENT'));
   const c1 = `entries_${crypto.randomUUID()}`;
@@ -116,7 +119,7 @@ test('owned spaces, AuthFn identities and cell effects share a revocable authori
   const adminKey = await spaces.issueAgentKey(owner,first.spaceId,expires,[{collectionId:c1,capabilities:['space:admin']}]);
   const reviewerKey = await spaces.issueAgentKey(owner,first.spaceId,expires,[{collectionId:c1,capabilities:['claims:review']}]);
   const adminActor = await identity.verify(request(adminKey.secret));
-  assert.equal((await spaces.get(adminActor,first.spaceId)).spaceId,first.spaceId);
+  assert.equal((await spaces.get(adminActor,first.spaceId)).homeCellId,'cell-a');
   await assert.rejects(spaces.archive(adminActor,first.spaceId),denied('FORBIDDEN'));
   await assert.rejects(spaces.get(adminActor,second.spaceId),denied('NOT_FOUND'),
     'an admin grant on another space cannot disclose this space');
@@ -352,6 +355,39 @@ test('owned spaces, AuthFn identities and cell effects share a revocable authori
   const racedSpaces=new PostgresSpaces(racedControl,cells,'cell-a',keyProvider,identity);
   await assert.rejects(racedSpaces.reconcile(second.spaceId),denied('STALE_PLACEMENT'));
   assert.equal((await controlPool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1',[second.spaceId])).rows[0].lifecycle,'suspended');
+});
+
+test('stable home metadata survives a different current cell and placement fencing', async () => {
+  const actor={kind:'session',credentialId:'session',userPrincipalId:`home-owner-${crypto.randomUUID()}`};
+  const spaceId=`sp_${crypto.randomUUID()}`;
+  const collectionId=`entries_${crypto.randomUUID()}`;
+  const credentialId=`home-admin-${crypto.randomUUID()}`;
+  const cells=new Map([['cell-a',{pool,storageTargetId:'target-a'}],['cell-b',{pool:cellBPool,storageTargetId:'target-b'}]]);
+  const spaces=new PostgresSpaces(controlPool,cells,'cell-a',
+    {create:async () => { throw new Error('unexpected provider create'); },find:async () => null,revoke:async () => {}},
+    {current:async () => true});
+  await cellBPool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,$2,'cell-a','cell-b','target-b')`,[spaceId,actor.userPrincipalId]);
+  await controlPool.query(`INSERT INTO space_directory(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,lifecycle)
+    VALUES($1,$2,'cell-a','cell-b','target-b','active')`,[spaceId,actor.userPrincipalId]);
+  await collection(spaceId,collectionId,cellBPool);
+  await cellBPool.query(`INSERT INTO space_credentials(space_id,credential_id,principal_id,owner_principal_id,expires_at,activated_at,confirmed_at)
+    VALUES($1,$2,$3,$4,clock_timestamp()+interval '1 hour',clock_timestamp(),clock_timestamp())`,
+  [spaceId,credentialId,`agent-${credentialId}`,actor.userPrincipalId]);
+  await cellBPool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
+    VALUES($1,$2,$3,ARRAY['space:admin']::text[])`,[spaceId,collectionId,credentialId]);
+  for (const metadata of [await spaces.get(actor,spaceId),
+    (await spaces.list(actor)).find(row => row.spaceId === spaceId),
+    await spaces.get({kind:'api-key',credentialId},spaceId)]) {
+    assert.equal(metadata.homeCellId,'cell-a');
+    assert.equal(metadata.cellId,'cell-b');
+  }
+  assert.equal(await spaces.fencePlacement(spaceId,'cell-b',1),2);
+  assert.equal((await spaces.reconcile(spaceId)).homeCellId,'cell-a');
+  assert.equal((await spaces.get({kind:'api-key',credentialId},spaceId)).placementGeneration,2);
+  await controlPool.query("UPDATE space_directory SET home_cell_id='wrong-home' WHERE space_id=$1",[spaceId]);
+  await assert.rejects(spaces.reconcile(spaceId),denied('STALE_PLACEMENT'));
+  await controlPool.query("UPDATE space_directory SET home_cell_id='cell-a' WHERE space_id=$1",[spaceId]);
 });
 
 test('archived spaces replay owner and agent receipts but deny external writes at the effect boundary', async () => {
@@ -896,8 +932,8 @@ test('owner listing retires an interrupted reservation without a cell and publis
   const retired=`sp_${crypto.randomUUID()}`;
   const completed=`sp_${crypto.randomUUID()}`;
   for (const spaceId of [retired,completed]) await controlPool.query(`INSERT INTO space_directory
-    (space_id,owner_principal_id,cell_id,storage_target_id,lifecycle)
-    VALUES($1,$2,'cell-a','target-a','provisioning')`,[spaceId,actor.userPrincipalId]);
+    (space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,lifecycle)
+    VALUES($1,$2,'cell-a','cell-a','target-a','provisioning')`,[spaceId,actor.userPrincipalId]);
   await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
     VALUES($1,$2,'cell-a','cell-a','target-a')`,[completed,actor.userPrincipalId]);
   await pool.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
