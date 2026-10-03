@@ -15,7 +15,7 @@ export class AuthFnIdentityVerifier implements IdentityVerifier {
       if (!['GET','HEAD','OPTIONS'].includes(request.method)) assertValidCsrf(request,state);
       return { credentialId:state.session.id,kind:'session',userPrincipalId:state.session.actorId };
     }
-    if (!/^Bearer [^\s]+$/.test(header)) return null;
+    if (!/^Bearer [^\s]+$/i.test(header)) return null;
     const secret = header.slice(7);
     // API-key revocation raises a provider error. Authentication failure is a denial,
     // while an unavailable adapter must fail closed and must not reach Stateplane effects.

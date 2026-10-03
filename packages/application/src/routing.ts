@@ -39,19 +39,24 @@ const capabilitySet = new Set<Capability>(['schema:write','records:read','record
 
 /** HMAC keyring. Only the active key signs; retained keys verify until removed. */
 export class RoutingKeys {
-  private readonly keys = new Map<string, Promise<CryptoKey>>();
-  constructor(entries: ReadonlyArray<{ id: string; secret: Uint8Array }>, readonly activeId: string) {
+  private constructor(private readonly keys: ReadonlyMap<string, CryptoKey>, readonly activeId: string) {}
+  static async create(entries: ReadonlyArray<{ id: string; secret: Uint8Array }>, activeId: string): Promise<RoutingKeys> {
+    const seen = new Set<string>();
     for (const entry of entries) {
-      if (!string(entry.id) || entry.secret.byteLength < 32 || this.keys.has(entry.id)) throw new Error('Invalid routing keyring');
-      this.keys.set(entry.id, crypto.subtle.importKey('raw', cryptoBytes(entry.secret), { name:'HMAC', hash:'SHA-256' }, false, ['sign','verify']));
+      if (!string(entry?.id) || !(entry.secret instanceof Uint8Array) || entry.secret.byteLength < 32 || seen.has(entry.id))
+        throw new Error('Invalid routing keyring');
+      seen.add(entry.id);
     }
-    if (!this.keys.has(activeId)) throw new Error('Missing active routing key');
+    if (!seen.has(activeId)) throw new Error('Missing active routing key');
+    const imported = await Promise.all(entries.map(async entry => [entry.id,
+      await crypto.subtle.importKey('raw',cryptoBytes(entry.secret),{ name:'HMAC',hash:'SHA-256' },false,['sign','verify'])] as const));
+    return new RoutingKeys(new Map(imported),activeId);
   }
   async sign(claims: RouteClaims): Promise<string> {
     const body = encode(bytes(JSON.stringify(claims)));
     const header = encode(bytes(JSON.stringify({ alg:'HS256', kid:this.activeId })));
     const input = `${header}.${body}`;
-    return `${input}.${encode(new Uint8Array(await crypto.subtle.sign('HMAC', await this.keys.get(this.activeId)!, bytes(input))))}`;
+    return `${input}.${encode(new Uint8Array(await crypto.subtle.sign('HMAC', this.keys.get(this.activeId)!, bytes(input))))}`;
   }
   async verify(token: string, cellId: string, now: number): Promise<RouteClaims> {
     if (typeof token !== 'string' || token.length > 4096) throw new RoutingDenied('FORBIDDEN');
@@ -62,7 +67,7 @@ export class RoutingKeys {
     catch { throw new RoutingDenied('FORBIDDEN'); }
     if (header?.alg !== 'HS256' || !string(header.kid)) throw new RoutingDenied('FORBIDDEN');
     const key = this.keys.get(header.kid);
-    if (!key || !await crypto.subtle.verify('HMAC', await key, cryptoBytes(decode(parts[2])), bytes(`${parts[0]}.${parts[1]}`))) throw new RoutingDenied('FORBIDDEN');
+    if (!key || !await crypto.subtle.verify('HMAC', key, cryptoBytes(decode(parts[2])), bytes(`${parts[0]}.${parts[1]}`))) throw new RoutingDenied('FORBIDDEN');
     let value: RouteClaims;
     try { value = JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(decode(parts[1]))); }
     catch { throw new RoutingDenied('FORBIDDEN'); }
@@ -72,7 +77,7 @@ export class RoutingKeys {
       !string(value.cellId) || value.cellId !== cellId || value.audience !== `stateplane-cell:${cellId}` ||
       !version(value.policyVersion) || !version(value.placementGeneration) || !string(value.nonce) ||
       !Number.isSafeInteger(value.issuedAt) || !Number.isSafeInteger(value.expiresAt) ||
-      value.issuedAt > now || value.expiresAt <= now || value.expiresAt - value.issuedAt > 60) throw new RoutingDenied('FORBIDDEN');
+      value.issuedAt > now + 5 || value.expiresAt <= now || value.expiresAt - value.issuedAt > 60) throw new RoutingDenied('FORBIDDEN');
     return Object.freeze(value);
   }
 }
@@ -85,6 +90,8 @@ export class RegionalRouter {
     if (!string(spaceId) || !string(collectionId) || !capabilitySet.has(capability)) throw new RoutingDenied('NOT_FOUND');
     const actor = await this.identity.verify(request);
     if (!actor) throw new RoutingDenied('UNAUTHENTICATED');
+    if (!string(actor.credentialId) || (actor.kind === 'session' ? !string(actor.userPrincipalId) :
+      actor.kind !== 'api-key' || actor.userPrincipalId !== undefined)) throw new RoutingDenied('FORBIDDEN');
     const placement = await this.directory.lookup(spaceId);
     if (!placement || placement.lifecycle === 'deleted') throw new RoutingDenied('NOT_FOUND');
     if (!await this.directory.authorized(actor,spaceId,collectionId,capability)) throw new RoutingDenied('NOT_FOUND');

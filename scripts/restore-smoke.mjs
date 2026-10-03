@@ -24,7 +24,7 @@ if (!dockerExecutable) throw new Error('Docker executable not found; set STATEPL
 try { accessSync(dockerExecutable,constants.X_OK); }
 catch (cause) { throw new Error(`Docker executable is not runnable: ${dockerExecutable}`, { cause }); }
 const docker = args => execFileSync(dockerExecutable, ['compose','exec','-T','postgres',...args], { cwd:root, maxBuffer:64 * 1024 * 1024 });
-const localPort = process.env.STATEPLANE_LOCAL_DB_PORT ?? '55432';
+const localPort = process.env.STATEPLANE_LOCAL_DB_PORT || '55432';
 if (!/^\d{1,5}$/.test(localPort) || Number(localPort) < 1 || Number(localPort) > 65535)
   throw new Error('STATEPLANE_LOCAL_DB_PORT must be a TCP port');
 const sourceUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${localPort}/${sourceName}`;
@@ -90,6 +90,29 @@ try {
   execFileSync(dockerExecutable, ['compose','exec','-T','postgres','pg_restore','-U','stateplane','-d',name],
     { cwd:root, input:archive, maxBuffer:64 * 1024 * 1024 });
   assert.deepEqual(await snapshot(restored),expected);
+  const journalRole=`sta6_restore_${randomBytes(8).toString('hex')}`;
+  await restored.query(`CREATE ROLE ${journalRole} LOGIN`);
+  try {
+    execFileSync(process.execPath,['scripts/grant-control-journal.mjs'],{cwd:root,
+      env:{...process.env,STATEPLANE_CONTROL_URL:targetUrl,STATEPLANE_CONTROL_ROLE:journalRole},stdio:'ignore'});
+    const operational=await restored.connect();
+    const issuance=`iss_restore_${randomBytes(8).toString('hex')}`;
+    try {
+      await operational.query(`SET ROLE ${journalRole}`);
+      await operational.query(`INSERT INTO agent_key_issuances(issuance_id,space_id,owner_principal_id,cell_id)
+        VALUES($1,$2,'owner','cell-a')`,[issuance,spaceId]);
+      await operational.query('UPDATE agent_key_issuances SET create_failed_at=clock_timestamp() WHERE issuance_id=$1',[issuance]);
+      assert.ok((await operational.query('SELECT create_failed_at FROM agent_key_issuances WHERE issuance_id=$1',[issuance]))
+        .rows[0]?.create_failed_at,'restored operational role can use the journal');
+    } finally {
+      await operational.query('RESET ROLE').catch(()=>{});
+      operational.release();
+      await restored.query('DELETE FROM agent_key_issuances WHERE issuance_id=$1',[issuance]).catch(()=>{});
+    }
+  } finally {
+    await restored.query(`REVOKE ALL ON agent_key_issuances FROM ${journalRole}`).catch(()=>{});
+    await restored.query(`DROP ROLE IF EXISTS ${journalRole}`).catch(()=>{});
+  }
   const constraints = await Promise.all([base,restored].map(async pool => (await pool.query(`SELECT conname,contype
     FROM pg_constraint WHERE conrelid='records'::regclass ORDER BY conname`)).rows));
   assert.deepEqual(constraints[1],constraints[0]);

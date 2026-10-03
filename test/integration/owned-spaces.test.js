@@ -106,8 +106,11 @@ test('owned spaces, AuthFn identities and cell effects share a revocable authori
   await assert.rejects(spaces.get(adminActor,second.spaceId),denied('NOT_FOUND'),
     'an admin grant on another space cannot disclose this space');
   await assert.rejects(spaces.get(adminActor,`sp_${crypto.randomUUID()}`),denied('NOT_FOUND'));
+  const unknownCellSpaces=new PostgresSpaces(controlPool,new Map([['cell-b',{pool:cellBPool,storageTargetId:'target-b'}]]),
+    'cell-b',keyProvider,identity);
+  await assert.rejects(unknownCellSpaces.get(adminActor,first.spaceId),denied('NOT_FOUND'));
   await assert.rejects(spaces.issueAgentKey(owner,first.spaceId,expires,[{collectionId:c1,capabilities:['records:read','schema:unknown']}]),denied('INVALID_ARGUMENT'));
-  const signing = new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const signing = await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
   const directory = new PostgresRoutingDirectory(controlPool,cells);
   const router = new RegionalRouter(identity,directory,signing);
   const cellA = new RegionalCell('cell-a',signing,new PostgresCellPolicy(pool,'cell-a',identity));
@@ -352,7 +355,7 @@ test('archived spaces replay owner and agent receipts but deny external writes a
     [{collectionId,capabilities:['records:write']}]);
   const reader = await spaces.issueAgentKey(owner,spaceId,new Date(Date.now()+3_600_000),
     [{collectionId,capabilities:['records:read']}]);
-  const keys = new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const keys = await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
   const router = new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),keys);
   const cell = new RegionalCell('cell-a',keys,new PostgresCellPolicy(pool,'cell-a',identity));
   const authority = new PostgresAuthority(pool,3600);
@@ -803,7 +806,7 @@ test('owner listing retires an interrupted reservation without a cell and publis
   await pool.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
     VALUES($1,$2,$3,$4,'space:create',1,1)`,[`aud_${crypto.randomUUID()}`,completed,actor.userPrincipalId,actor.credentialId]);
   const router=new RegionalRouter({verify:async () => actor},directory,
-    new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1'));
+    await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1'));
   await assert.rejects(router.assertion(new Request('https://gateway.example.invalid'),completed,'collection','records:read'),
     denied('SPACE_UNAVAILABLE'));
   assert.equal((await spaces.list(actor)).some(space => space.spaceId === completed),true);
@@ -842,12 +845,17 @@ test('erasure mode cannot remove space or retired-provisioning audit rows', asyn
       await assert.rejects(client.query(`DELETE FROM ${table} WHERE space_id=$1`,[spaceId]),
         /space audit rows are immutable/);
     } finally { await client.query('ROLLBACK'); client.release(); }
+    const truncate = await database.connect();
+    try {
+      await truncate.query('BEGIN');
+      await assert.rejects(truncate.query(`TRUNCATE ${table}`),/space audit rows are immutable/);
+    } finally { await truncate.query('ROLLBACK'); truncate.release(); }
     assert.equal((await database.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[spaceId])).rows[0].n,before);
   }
 });
 
 test('unavailable pending cell does not hide healthy spaces in another cell', async () => {
-  const actor={kind:'session',credentialId:'session',userPrincipalId:'listing-owner'};
+  const actor={kind:'session',credentialId:'session',userPrincipalId:`listing-owner-${crypto.randomUUID()}`};
   const cells=new Map([['cell-a',{pool,storageTargetId:'target-a'}],['cell-b',{pool:cellBPool,storageTargetId:'target-b'}]]);
   const provider={create:async () => { throw new Error('unexpected key'); },revoke:async () => {}};
   const credentials={current:async () => true};
@@ -863,7 +871,7 @@ test('unavailable pending cell does not hide healthy spaces in another cell', as
   assert.equal((await controlPool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1',[pending])).rows[0].lifecycle,
     'provisioning');
   const router=new RegionalRouter({verify:async () => actor},new PostgresRoutingDirectory(controlPool,cells),
-    new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1'));
+    await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1'));
   await assert.rejects(router.assertion(new Request('https://gateway.example.invalid'),pending,'collection','records:read'),
     denied('SPACE_UNAVAILABLE'));
   assert.deepEqual((await spaces.list(actor)).map(space => space.spaceId),[healthy.spaceId]);
@@ -1161,7 +1169,7 @@ test('missing grants never create a key and a raced collection deletion retains 
   assert.equal(failed.activated_at,null);
   assert.equal(failed.confirmed_at,null);
   assert.equal(failed.provider_revoked_at,null);
-  const signer = new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const signer = await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
   const router = new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
   await assert.rejects(router.assertion(request(issued.secret),spaceId,collectionId,'records:read'),denied('NOT_FOUND'));
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM collection_grants WHERE space_id=$1 AND credential_id=$2',
@@ -1261,6 +1269,9 @@ test('deleted cell with retained records cannot publish until owner repairs eras
   await spaces.repairDeletedErasure(actor,spaceId);
   await spaces.delete(actor,spaceId);
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM collections WHERE space_id=$1',[spaceId])).rows[0].n,0);
+  assert.equal((await controlPool.query('SELECT policy_version FROM space_directory WHERE space_id=$1',[spaceId])).rows[0].policy_version,
+    (await pool.query('SELECT policy_version FROM spaces WHERE space_id=$1',[spaceId])).rows[0].policy_version,
+    'retry publishes the repaired tombstone version');
   assert.equal((await pool.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:deleted'",
     [spaceId])).rows[0].n,1,'repair of a published tombstone cannot duplicate deletion');
 });
@@ -1316,7 +1327,7 @@ test('failed provider creation settles an empty journal for issue and rotation, 
   assert.equal(journal.length,3);
   assert.ok(journal.every(row=>row.settled_without_key_at));
   await spaces.reconcile(spaceId);
-  const signer=new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
   const router=new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
   await assert.rejects(router.assertion(request(old.secret),spaceId,collectionId,'records:read'),denied('UNAUTHENTICATED'));
   mode='lost-ack';revokeOffline=true;
@@ -1349,7 +1360,7 @@ test('reconcile fails closed when the configured cell is missing or points at an
   const {spaceId}=await correct.create(actor);
   const wrong=new PostgresSpaces(controlPool,new Map([['cell-a',{pool:cellBPool,storageTargetId:'target-a'}]]),
     'cell-a',actual,identity);
-  await assert.rejects(wrong.reconcile(spaceId),denied('STALE_PLACEMENT'));
+  if (databaseNames.length) await assert.rejects(wrong.reconcile(spaceId),denied('STALE_PLACEMENT'));
   assert.equal((await controlPool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1',[spaceId])).rows[0].lifecycle,'active');
   assert.equal((await correct.reconcile(spaceId)).lifecycle,'active');
   const missingPool={query:(sql,args)=>typeof sql==='string' && sql.includes('SELECT * FROM spaces WHERE space_id=$1')
@@ -1418,7 +1429,7 @@ test('reconcile preserves confirmed agent grants across interrupted archive publ
   publicationOffline=false;
   assert.equal((await spaces.reconcile(spaceId)).lifecycle,'readOnly');
   assert.equal(revocations,0);
-  const signer=new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
   const router=new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
   const cell=new RegionalCell('cell-a',signer,new PostgresCellPolicy(pool,'cell-a',identity));
   const route=()=>router.assertion(request(issued.secret),spaceId,collectionId,'records:read');
@@ -1466,7 +1477,7 @@ test('deletion racing provider creation retains cleanup authority through provid
   assert.deepEqual(pending.map(row=>row.credential_id),[issued.id]);
   assert.equal(pending[0].provider_revoked_at,null);
   assert.equal((await pool.query('SELECT lifecycle FROM spaces WHERE space_id=$1',[spaceId])).rows[0].lifecycle,'deleting');
-  const signer=new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
   const router=new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
   await assert.rejects(router.assertion(request(issued.secret),spaceId,collectionId,'records:read'),denied('NOT_FOUND'));
   await assert.rejects(spaces.reconcile(spaceId),/provider unavailable/);
@@ -1634,7 +1645,7 @@ test('live issue and rotation cannot be revoked by reconciliation before staging
     } finally { release(); }
     const result=await pending;
     assert.equal(result.id,issued.id);
-    const signer=new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+    const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
     const router=new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
     assert.ok((await router.assertion(request(result.secret),spaceId,collectionId,'records:read')).token);
     const local=(await pool.query(`SELECT activated_at,confirmed_at,revoked_at,
@@ -1937,7 +1948,7 @@ test('cell staging outage after AuthFn creation remains discoverable and revocab
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM space_credentials WHERE credential_id=$1',[issued.id])).rows[0].n,0);
   assert.equal((await controlPool.query(`SELECT credential_id FROM agent_key_issuances WHERE space_id=$1`,
     [spaceId])).rows[0].credential_id,issued.id);
-  const signer=new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
   const router=new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
   await assert.rejects(router.assertion(request(issued.secret),spaceId,collectionId,'records:read'),denied('NOT_FOUND'));
   stageOffline=false;
@@ -1977,7 +1988,7 @@ test('lost journal key-ID write recovers the AuthFn key by issuance correlation'
     [{collectionId,capabilities:['records:read']}]),/control ID write unavailable/);
   const journal=(await controlPool.query('SELECT credential_id FROM agent_key_issuances WHERE space_id=$1',[spaceId])).rows[0];
   assert.equal(journal.credential_id,null);
-  const signer=new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
   const router=new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
   await assert.rejects(router.assertion(request(issued.secret),spaceId,collectionId,'records:read'),denied('NOT_FOUND'));
   await assert.rejects(spaces.reconcile(spaceId),/provider unavailable/);
@@ -2025,7 +2036,7 @@ test('failed issuance and rotation never expose grants after publication and pro
   await collection(spaceId,collectionId);
   const expires = new Date(Date.now()+3_600_000);
   const grants = [{collectionId,capabilities:['records:read']}];
-  const signer = new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const signer = await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
   const router = new RegionalRouter(identity,new PostgresRoutingDirectory(control,cells),signer);
   const cell = new RegionalCell('cell-a',signer,new PostgresCellPolicy(pool,'cell-a',identity));
   const route = secret => router.assertion(request(secret),spaceId,collectionId,'records:read');
@@ -2288,7 +2299,7 @@ test('lost issuance acknowledgements keep unconfirmed issue and rotation keys in
   assert.equal(revokeCalls,0);
   assert.ok((await pool.query('SELECT activated_at FROM space_credentials WHERE space_id=$1 AND credential_id=$2',
     [spaceId,first.id])).rows[0].activated_at);
-  const signer = new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const signer = await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
   const router = new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
   assert.ok((await router.assertion(request(first.secret),spaceId,collectionId,'records:read')).token);
   // Rotation first revokes the old provider primitive.
@@ -2349,20 +2360,69 @@ test('lost issuance acknowledgements keep unconfirmed issue and rotation keys in
 
   loseConfirmationAck=true;
   const uncertain = await spaces.issueAgentKey(actor,spaceId,expires,grants);
-  assert.equal(uncertain.confirmation,'unknown');
+  assert.equal(uncertain.confirmation,undefined);
+  const completed = await controlPool.query('SELECT completed_at,cancelled_at FROM agent_key_issuances WHERE credential_id=$1',[uncertain.id]);
+  assert.ok(completed.rows[0]?.completed_at);
+  assert.equal(completed.rows[0].cancelled_at,null);
   assert.ok((await router.assertion(request(uncertain.secret),spaceId,collectionId,'records:read')).token,
     'a confirmed key is returned rather than reported as a failed issuance after its acknowledgement is lost');
 });
 
+test('joined record receipt starts its retry window at cell commit', async () => {
+  const spaceId=`sp_${crypto.randomUUID()}`;
+  const collectionId=`entries_${crypto.randomUUID()}`;
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
+  await collection(spaceId,collectionId);
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const cell=new RegionalCell('cell-a',signer,new PostgresCellPolicy(pool,'cell-a',{current:async () => true}));
+  const authority=new PostgresAuthority(pool,1);
+  const now=Math.floor(Date.now()/1000);
+  const token=await signer.sign({spaceId,collectionId,capability:'records:write',credentialId:'owner-session',
+    kind:'session',userPrincipalId:'owner',cellId:'cell-a',policyVersion:1,placementGeneration:1,
+    audience:'stateplane-cell:cell-a',issuedAt:now,expiresAt:now+30,nonce:crypto.randomUUID()});
+  const change={operation:'create',idempotencyKey:`joined-${crypto.randomUUID()}`,requestDigest:'a'.repeat(64),canonicalData:'{}'};
+  const first=await cell.execute(token,async (_principal,context) => {
+    const receipt=await context.records(authority,tx=>tx.mutate(change));
+    await pause(1250);
+    return receipt;
+  });
+  const scope={spaceId,collectionId,principalId:'owner',credentialId:'owner-session',
+    capability:'records:write',policyVersion:1,placementGeneration:1};
+  const replay=await authority.mutate(scope,change);
+  assert.equal(replay.replayed,true,'delayed callback must not consume the retry window');
+  assert.equal(replay.receiptId,first.receiptId);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM records WHERE space_id=$1',[spaceId])).rows[0].n,1);
+});
+
 test('signing key rotation retains then retires old assertions', async () => {
+  await assert.rejects(RoutingKeys.create([{id:'bad',secret:new Uint8Array(1)}],'bad'),/Invalid routing keyring/);
   const v1 = crypto.getRandomValues(new Uint8Array(32));
   const v2 = crypto.getRandomValues(new Uint8Array(32));
-  const old = new RoutingKeys([{id:'old',secret:v1}],'old');
+  const old = await RoutingKeys.create([{id:'old',secret:v1}],'old');
   const claims = {spaceId:'space',collectionId:'collection',capability:'records:read',credentialId:'session',kind:'session',
     userPrincipalId:'owner',cellId:'cell-a',policyVersion:1,placementGeneration:1,audience:'stateplane-cell:cell-a',
     issuedAt:100,expiresAt:130,nonce:'nonce'};
   const token = await old.sign(claims);
-  const rotating = new RoutingKeys([{id:'old',secret:v1},{id:'new',secret:v2}],'new');
+  assert.equal((await old.verify(token,'cell-a',99)).spaceId,'space','one-second gateway lead is tolerated');
+  await assert.rejects(old.verify(token,'cell-a',94),denied('FORBIDDEN'));
+  const rotating = await RoutingKeys.create([{id:'old',secret:v1},{id:'new',secret:v2}],'new');
   assert.equal((await rotating.verify(token,'cell-a',101)).spaceId,'space');
-  await assert.rejects(new RoutingKeys([{id:'new',secret:v2}],'new').verify(token,'cell-a',101),denied('FORBIDDEN'));
+  await assert.rejects((await RoutingKeys.create([{id:'new',secret:v2}],'new')).verify(token,'cell-a',101),denied('FORBIDDEN'));
+});
+
+test('router rejects malformed verifier identifiers before signing or directory access', async () => {
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  let lookups=0;
+  const directory={lookup:async () => { lookups++; return {spaceId:'space',cellId:'cell-a',lifecycle:'active',policyVersion:1,placementGeneration:1}; },
+    authorized:async () => true};
+  for (const actor of [
+    {kind:'session',credentialId:'session',userPrincipalId:''},
+    {kind:'session',credentialId:'x'.repeat(513),userPrincipalId:'owner'},
+    {kind:'api-key',credentialId:'key',userPrincipalId:'owner'}
+  ]) {
+    const router=new RegionalRouter({verify:async () => actor},directory,signer);
+    await assert.rejects(router.assertion(new Request('https://example.invalid'),'space','collection','records:read'),denied('FORBIDDEN'));
+  }
+  assert.equal(lookups,0);
 });

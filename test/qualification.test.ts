@@ -44,6 +44,10 @@ describe('published package boundary', () => {
     const url = 'https://stateplane.example.invalid/spaces';
     const bearer = new Request(url,{ headers:{ Authorization:`Bearer ${issued.sessionToken}` } });
     expect(await verifier.verify(bearer)).toEqual({credentialId:issued.session.id,kind:'session',userPrincipalId:user.id});
+    for (const scheme of ['bearer','BEARER']) {
+      expect(await verifier.verify(new Request(url,{headers:{Authorization:`${scheme} ${issued.sessionToken}`}})))
+        .toEqual({credentialId:issued.session.id,kind:'session',userPrincipalId:user.id});
+    }
     const policy = resolveCookiePolicy(config,new Request(url));
     const cookies = issueSessionCookies(policy,issued.sessionToken,issued.csrfToken);
     const cookieHeader = `${cookies.sessionCookie.split(';')[0]}; ${cookies.csrfCookie.split(';')[0]}`;

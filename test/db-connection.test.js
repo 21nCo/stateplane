@@ -4,9 +4,24 @@ import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import pg from 'pg';
+import { spawnSync } from 'node:child_process';
 import { connectionOptions } from '../scripts/db-connection.mjs';
 import { localPassword } from '../scripts/local-db-password.mjs';
 import { migrationInventory, migrationOrder } from '../scripts/migration-order.mjs';
+
+test('directory backfill rejects malformed and incomplete topology before any connection', () => {
+  const run=cells=>spawnSync(process.execPath,['scripts/backfill-space-directory.mjs'],{
+    cwd:new URL('..',import.meta.url),encoding:'utf8',env:{...process.env,
+      STATEPLANE_CONTROL_URL:'postgres://invalid@127.0.0.1:1/control',
+      STATEPLANE_CELL_URLS:JSON.stringify(cells),STATEPLANE_TOPOLOGY_ENV:'production',
+      STATEPLANE_BACKFILL_DIRECTORY_DRAINED:'1'}});
+  for (const cells of [[null],[{cellId:'ap-southeast',url:'postgres://invalid@127.0.0.1:1/cell'}]]) {
+    const result=run(cells);
+    assert.equal(result.status,1);
+    assert.match(result.stderr,/complete STATEPLANE_CELL_URLS/);
+    assert.doesNotMatch(result.stderr,/ECONNREFUSED|TypeError/);
+  }
+});
 
 test('external database connections require certificate-verified TLS', () => {
   assert.throws(() => connectionOptions('postgres://user@db.example.test/stateplane', ''), /verify-full/);

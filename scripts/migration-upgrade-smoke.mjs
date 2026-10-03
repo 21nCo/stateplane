@@ -3,12 +3,16 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import pg from 'pg';
-import { PostgresRoutingDirectory, PostgresSpaces } from '../packages/postgres/dist/index.js';
+import { existsSync } from 'node:fs';
 import { backfillDirectory } from './backfill-directory-core.mjs';
+
+const authorityModule = new URL('../packages/postgres/dist/index.js',import.meta.url);
+if (!existsSync(authorityModule)) throw new Error('Build @stateplane/postgres before db:upgrade-smoke: pnpm --filter @stateplane/postgres build');
+const { PostgresRoutingDirectory, PostgresSpaces } = await import(authorityModule.href);
 
 if (process.env.DATABASE_URL) throw new Error('Upgrade smoke uses the isolated local Postgres database only');
 const password = (await readFile(new URL('../.data/local-db-password', import.meta.url), 'utf8')).trim();
-const baseUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT ?? '55432'}/stateplane`;
+const baseUrl = `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT || '55432'}/stateplane`;
 const names = ['upgrade','fresh'].map(kind => `stateplane_${kind}_${randomBytes(4).toString('hex')}`);
 const marker = new URL(`../.data/migration-upgrade-${process.pid}-${randomBytes(6).toString('hex')}.json`,import.meta.url);
 const url = name => baseUrl.replace(/\/stateplane$/, `/${name}`);
@@ -166,8 +170,38 @@ try {
     await fresh.connect();
     assert.equal(await index(upgraded),await index(fresh));
     assert.deepEqual(await constraints(upgraded),await constraints(fresh));
-    assert.equal(await backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}]),1);
-    assert.equal(await backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}]),1);
+    await upgraded.query("UPDATE spaces SET created_at='2026-01-02 03:04:05.123456+00' WHERE space_id='sp_upgrade'");
+    await assert.rejects(backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],
+      {expectedCellIds:['cell-a','cell-b'],drained:true}),/every configured cell/);
+    await assert.rejects(backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],
+      {expectedCellIds:['cell-a'],drained:false}),/drained traffic/);
+    const writer=new pg.Client({connectionString:url(names[0])});
+    await writer.connect();
+    let attempted=false;
+    let writerSettled=false;
+    let writerUpdate;
+    try {
+      await writer.query('BEGIN');
+      const guardedControl={query:async (sql,...args) => {
+        if (!attempted && sql.startsWith('SELECT * FROM space_directory')) {
+          attempted=true;
+          writerUpdate=writer.query("UPDATE spaces SET policy_version=policy_version+1 WHERE space_id='sp_upgrade'")
+            .then(() => { writerSettled=true; });
+          await new Promise(resolve=>setTimeout(resolve,60));
+          assert.equal(writerSettled,false,'source writer waits for the backfill snapshot lock');
+        }
+        return fresh.query(sql,...args);
+      }};
+      assert.deepEqual(await backfillDirectory(guardedControl,[{cellId:'cell-a',client:upgraded}],
+        {expectedCellIds:['cell-a'],drained:true}),{copied:1,existing:0});
+      await writerUpdate;
+    } finally {
+      await writer.query('ROLLBACK').catch(()=>{});
+      await writer.end();
+    }
+    assert.deepEqual(await backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],{expectedCellIds:['cell-a'],drained:true}),{copied:0,existing:1});
+    assert.equal((await fresh.query("SELECT created_at::text AS created_at FROM space_directory WHERE space_id='sp_upgrade'")).rows[0].created_at,
+      (await upgraded.query("SELECT created_at::text AS created_at FROM spaces WHERE space_id='sp_upgrade'")).rows[0].created_at);
     const splitCells=new Map([['cell-a',{pool:upgraded,storageTargetId:'target-a'}]]);
     const splitSpaces=new PostgresSpaces(fresh,splitCells,'cell-a',
       {create:async () => { throw new Error('unexpected provider create'); },
@@ -176,9 +210,9 @@ try {
       'sp_upgrade')).spaceId,'sp_upgrade');
     assert.equal((await new PostgresRoutingDirectory(fresh,splitCells).lookup('sp_upgrade')).cellId,'cell-a');
     await enforceUniqueRecord(upgraded);
-    assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,23);
+    assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,24);
     assert.equal(runMigrator(names[0]),'');
-    console.log(`Upgrade smoke passed: 2000 record/event/receipt/outbox rows and upgraded owner route preserved; final index matches fresh install; 005 build ${build005Ms}ms, 006-023 migrator ${buildRemainingMs}ms`);
+    console.log(`Upgrade smoke passed: 2000 record/event/receipt/outbox rows and upgraded owner route preserved; final index matches fresh install; 005 build ${build005Ms}ms, 006-024 migrator ${buildRemainingMs}ms`);
   } finally { await Promise.allSettled([upgraded.end(),fresh.end()]); }
 } finally {
   created.reverse();

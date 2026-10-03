@@ -40,7 +40,10 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
         ON CONFLICT DO NOTHING RETURNING nonce`,
       [claims.spaceId,claims.nonce,claims.expiresAt]);
       if (nonce.rowCount !== 1) throw new AuthorityError('FORBIDDEN', 'Routing assertion already consumed');
-    } catch (error) { if (!(error instanceof AuthorityError)) discard = true; throw error; }
+    } catch (error) {
+      if (!(error instanceof AuthorityError)) { discard = true; }
+      throw error;
+    }
     finally { client.release(discard); }
   }
 
@@ -105,6 +108,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     let begun = false;
     let beginAttempted = false;
     let discard = false;
+    const joined: Array<{ finish: () => Promise<void>; close: () => void }> = [];
     try {
       this.checkAssertionTime(claims);
       await this.checkDatabaseTime(client,claims);
@@ -150,7 +154,8 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
           return admit(async () => {}, kind === 'write');
         },
         records: <TResult>(authority: PostgresAuthority, fn: (tx: AuthorityTransaction) => Promise<TResult>) =>
-          admit(() => authority.transactionOnClient(client,scope,fn)) });
+          admit(() => authority.transactionOnClient(client,scope,fn,
+            (finish,close) => { joined.push({finish,close}); })) });
       let result: T;
       try { result = await effect(principalId, context); }
       finally {
@@ -162,6 +167,9 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       await this.check(client, claims);
       this.checkAssertionTime(claims);
       await this.checkDatabaseTime(client,claims);
+      // Joined record work remains live until the enclosing cell transaction's
+      // final boundary. A later callback cannot consume grant or receipt time.
+      for (const entry of joined) await entry.finish();
       try { await client.query('COMMIT'); begun = false; }
       catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
       return result;
@@ -169,6 +177,9 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       if (begun) { try { await client.query('ROLLBACK'); } catch { discard = true; } }
       else if (beginAttempted) discard = true;
       throw error;
-    } finally { client.release(discard); }
+    } finally {
+      for (const entry of joined) entry.close();
+      client.release(discard);
+    }
   }
 }

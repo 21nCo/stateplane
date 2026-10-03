@@ -234,27 +234,36 @@ export class PostgresAuthority {
   }
 
   /** Join an already authorized cell transaction; the caller owns COMMIT/ROLLBACK. */
-  async transactionOnClient<T>(client: Client, scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T>): Promise<T> {
+  async transactionOnClient<T>(client: Client, scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T>,
+    deferUntilCommit?: (finish: () => Promise<void>, close: () => void) => void): Promise<T> {
     const fixedScope = Object.freeze({ ...scope });
     if (![fixedScope.spaceId,fixedScope.collectionId,fixedScope.principalId,fixedScope.credentialId].every(scalarString) ||
       !isSafeInteger(fixedScope.policyVersion) || fixedScope.policyVersion < 1 ||
       !isSafeInteger(fixedScope.placementGeneration) || fixedScope.placementGeneration < 1) throw new AuthorityError('INVALID_ARGUMENT');
     const tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds);
+    let deferred = false;
     try {
       await tx.checkScope();
       const result = await fn(tx);
       tx.sealMutations();
       await tx.settleMutations();
       tx.assertCommittable();
-      await tx.checkScope();
-      await tx.checkReplayScopes();
-      await tx.finalizeReceipts();
+      const finish = async () => {
+        tx.assertCommittable();
+        await tx.checkScope();
+        await tx.checkReplayScopes();
+        await tx.finalizeReceipts();
+      };
+      if (deferUntilCommit) {
+        deferUntilCommit(finish, () => tx.close());
+        deferred = true;
+      } else await finish();
       return result;
     } catch (error) {
       tx.sealMutations();
       await tx.settleMutations();
       throw error;
-    } finally { tx.close(); }
+    } finally { if (!deferred) tx.close(); }
   }
 
   /** Retry only server-confirmed deadlock/serialization rollbacks, never failed COMMIT. */
@@ -325,6 +334,7 @@ export class AuthorityTransaction {
     if (row.collection_lifecycle === 'deleted') throw new AuthorityError('NOT_FOUND');
     if (capability === 'outbox:worker' && (principalId !== 'system:projection' || credentialId !== 'system:projection'))
       throw new AuthorityError('FORBIDDEN');
+    if (capability === 'outbox:worker' && row.lifecycle !== 'active') throw new AuthorityError('SPACE_UNAVAILABLE');
     if (row.owner_principal_id !== principalId && capability !== 'outbox:worker' &&
       (!row.capabilities?.includes(capability) || (row.expires_at && !row.grant_current))) throw new AuthorityError('FORBIDDEN');
     if (row.collection_lifecycle === 'readOnly' && (capability === 'records:write' || capability === 'claims:review')) throw new AuthorityError('SPACE_UNAVAILABLE');

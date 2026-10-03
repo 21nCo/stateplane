@@ -17,7 +17,7 @@ if (operation === 'up') {
   run('docker', ['compose', 'up', '-d', '--wait', 'postgres'], process.env);
 } else if (operation === 'migrate') {
   const password = process.env.DATABASE_URL ? null : await localPassword(root, false);
-  const url = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT ?? '55432'}/stateplane`;
+  const url = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT || '55432'}/stateplane`;
   run(process.execPath, ['scripts/migrate.mjs'], { ...process.env, DATABASE_URL: url });
 } else if (operation === 'down') {
   run('docker', ['compose', 'down'], process.env);
