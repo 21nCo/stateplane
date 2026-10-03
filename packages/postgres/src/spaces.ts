@@ -19,6 +19,25 @@ export interface SpaceInfo extends DirectoryPlacement {
 }
 export interface CollectionGrant { collectionId: string; capabilities: readonly Capability[]; expiresAt?: Date }
 export interface IssuedAgentKey { id: string; secret: string }
+/** Completion could not be observed. Explicit recovery can take the bearer;
+ * ordinary error formatting never exposes its secret. */
+export class AgentKeyOutcomeUnknownError extends Error {
+  #key: IssuedAgentKey | null;
+  constructor(key: IssuedAgentKey, cause: unknown) {
+    super('Agent key completion outcome unknown', {cause});
+    this.name = 'AgentKeyOutcomeUnknownError';
+    this.#key = Object.freeze({...key});
+  }
+  takeKey(): IssuedAgentKey {
+    if (!this.#key) throw new AuthorityError('INVALID_ARGUMENT','Recovery key already taken');
+    const key=this.#key;
+    this.#key=null;
+    return key;
+  }
+}
+class CompletionOutcomeUnknownError extends Error {
+  constructor(cause: unknown) { super('Journal completion outcome unknown',{cause}); }
+}
 export interface SpaceAuditPage { entries: ReadonlyArray<Record<string, unknown>>; nextCursor: string | null }
 /** A fixed cap bounds one owner audit read even when audit history is retained after deletion. */
 const auditPageSize = 100;
@@ -790,47 +809,40 @@ export class PostgresSpaces {
     }
   }
   private async completeIssuedKey(issuanceId: string, keyId: string, leaseToken: string): Promise<void> {
-    let completed;
     try {
-      completed = await this.control.query(`UPDATE agent_key_issuances i SET completed_at=clock_timestamp()
+      const completed = await this.control.query(`UPDATE agent_key_issuances i SET completed_at=clock_timestamp()
         FROM space_directory d WHERE i.issuance_id=$1 AND i.space_id=d.space_id
           AND i.credential_id=$2 AND i.cancelled_at IS NULL AND i.provider_revoked_at IS NULL
           AND i.settled_without_key_at IS NULL AND i.completed_at IS NULL
           AND d.issuance_lease_token=$3 AND d.issuance_lease_until>clock_timestamp()
         RETURNING 1`,[issuanceId,keyId,leaseToken]);
+      if (completed.rowCount !== 1) throw new AuthorityError('STALE_PLACEMENT','Issuance was cancelled');
     } catch (error) {
-      const observed = await this.control.query(`SELECT completed_at FROM agent_key_issuances
-        WHERE issuance_id=$1`,[issuanceId]).catch(() => null);
-      if (observed?.rows[0]?.completed_at) return;
-      // The completion write is idempotent. A lost acknowledgement followed
-      // by a failed readback must not turn a delivered, confirmed key into an
-      // unreachable completed journal row. Retry before deciding to reject.
-      const retried = await this.control.query(`UPDATE agent_key_issuances i
-        SET completed_at=COALESCE(i.completed_at,clock_timestamp())
-        FROM space_directory d WHERE i.issuance_id=$1 AND i.space_id=d.space_id
-          AND i.credential_id=$2 AND i.cancelled_at IS NULL AND i.provider_revoked_at IS NULL
-          AND i.settled_without_key_at IS NULL AND
-          (i.completed_at IS NOT NULL OR (d.issuance_lease_token=$3 AND d.issuance_lease_until>clock_timestamp()))
-        RETURNING 1`,[issuanceId,keyId,leaseToken]).catch(() => null);
-      if (retried?.rowCount === 1) return;
-      if (!observed && !retried) return;
-      // A rejected response must remain repairable even if both provider and
-      // cell compensation fail. Cancellation wins over uncertain completion.
-      try {
-        const cancelled = await this.control.query(`UPDATE agent_key_issuances SET cancelled_at=COALESCE(cancelled_at,clock_timestamp())
-          WHERE issuance_id=$1 AND credential_id=$2 AND provider_revoked_at IS NULL
-          RETURNING 1`,[issuanceId,keyId]);
-        if (cancelled.rowCount === 1) throw error;
-      } catch (cancellationError) {
-        if (cancellationError === error) throw error;
-        // If the control plane cannot durably record cancellation, the only
-        // recoverable result is the bearer already confirmed in the cell.
-        if (observed) throw error;
-        return;
-      }
-      throw error;
+      if (error instanceof AuthorityError) throw error;
+      await this.recoverIssuedKeyCompletion(issuanceId,keyId,leaseToken,error);
     }
-    if (completed.rowCount !== 1) throw new AuthorityError('STALE_PLACEMENT','Issuance was cancelled');
+  }
+  private async recoverIssuedKeyCompletion(issuanceId: string, keyId: string,
+    leaseToken: string, cause: unknown): Promise<void> {
+    const observed = await this.control.query(`SELECT completed_at FROM agent_key_issuances
+      WHERE issuance_id=$1`,[issuanceId]).catch(() => null);
+    if (observed?.rows[0]?.completed_at) return;
+    const retried = await this.control.query(`UPDATE agent_key_issuances i
+      SET completed_at=COALESCE(i.completed_at,clock_timestamp())
+      FROM space_directory d WHERE i.issuance_id=$1 AND i.space_id=d.space_id
+        AND i.credential_id=$2 AND i.cancelled_at IS NULL AND i.provider_revoked_at IS NULL
+        AND i.settled_without_key_at IS NULL AND
+        (i.completed_at IS NOT NULL OR (d.issuance_lease_token=$3 AND d.issuance_lease_until>clock_timestamp()))
+      RETURNING 1`,[issuanceId,keyId,leaseToken]).catch(() => null);
+    if (retried?.rowCount === 1) return;
+    // A failed readback and retry cannot establish a definite outcome.
+    if (!observed && !retried) throw new CompletionOutcomeUnknownError(cause);
+    const cancelled = await this.control.query(`UPDATE agent_key_issuances
+      SET cancelled_at=COALESCE(cancelled_at,clock_timestamp())
+      WHERE issuance_id=$1 AND credential_id=$2 AND provider_revoked_at IS NULL RETURNING 1`,
+    [issuanceId,keyId]).catch(() => null);
+    if (!cancelled) throw new CompletionOutcomeUnknownError(cause);
+    throw cause;
   }
   private async stageIssuedKey(actor: VerifiedCredential, space: SpaceInfo, keyId: string,
     issuanceId: string, leaseToken: string, expiryMs: number): Promise<void> {
@@ -953,6 +965,8 @@ export class PostgresSpaces {
       await this.completeIssuedKey(issuanceId,issued.id,leaseToken);
       return issued;
     } catch (error) {
+      if (error instanceof CompletionOutcomeUnknownError && created)
+        throw new AgentKeyOutcomeUnknownError(created,error);
       await this.compensateFailedIssuance(actor,space,issuanceId,created,createFailed);
       throw error;
     }

@@ -136,7 +136,7 @@ export function canonicalJsonObject(serialized: string): string {
 type PoolLike = Pick<pg.Pool, 'connect'>;
 type Client = pg.PoolClient;
 type PendingReceipt = { response: Receipt; returned: Receipt[]; digest: string; collectionId: CollectionId; key: string };
-type ReadyReceipt = { returned: Receipt[]; committedAt: string; expiresAt: string };
+type ReadyReceipt = { receiptId: string; returned: Receipt[]; committedAt: string; expiresAt: string };
 export interface JoinedReceiptState {
   pending: Map<string, PendingReceipt>;
   replayed: Map<string, { collectionId: CollectionId; digest: string; response: Receipt }>;
@@ -237,6 +237,9 @@ export class PostgresAuthority {
       await tx.checkScope();
       await tx.checkReplayScopes();
       await tx.finalizeReceipts();
+      await tx.checkScope();
+      await tx.checkReplayScopes();
+      await tx.ensureReceiptsCurrent();
       try { await client.query('COMMIT'); begun = false; }
       catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
       tx.exposeReceipts();
@@ -251,7 +254,7 @@ export class PostgresAuthority {
 
   /** Join an already authorized cell transaction; the caller owns COMMIT/ROLLBACK. */
   async transactionOnClient<T>(client: Client, scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T>,
-    deferUntilCommit: (finish: () => Promise<void>, verify: () => Promise<void>, expose: () => void,
+    deferUntilCommit: (finish: () => Promise<void>, verify: () => Promise<void>, ensureCurrent: () => Promise<void>, expose: () => void,
       close: () => void) => void,
     joinedReceipts?: JoinedReceiptState): Promise<T> {
     const fixedScope = Object.freeze({ ...scope });
@@ -270,14 +273,14 @@ export class PostgresAuthority {
         tx.assertCommittable();
         await tx.checkScope();
         await tx.checkReplayScopes();
-        await tx.finalizeReceipts();
       };
       const verify = async () => {
         tx.assertCommittable();
         await tx.checkScope();
         await tx.checkReplayScopes();
+        await tx.finalizeReceipts();
       };
-      deferUntilCommit(finish, verify, () => tx.exposeReceipts(), () => tx.close());
+      deferUntilCommit(finish, verify, () => tx.ensureReceiptsCurrent(), () => tx.exposeReceipts(), () => tx.close());
       deferred = true;
       return result;
     } catch (error) {
@@ -413,7 +416,7 @@ export class AuthorityTransaction {
           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)`, [pending.response.receiptId,this.#scope.spaceId,pending.collectionId,
           this.#scope.credentialId,pending.response.operation,pending.key,pending.digest,pending.response.ref.id,
           JSON.stringify(pending.response),committedAt,expiresAt]);
-        this.readyReceipts.push({returned:pending.returned,committedAt,expiresAt});
+        this.readyReceipts.push({receiptId:pending.response.receiptId,returned:pending.returned,committedAt,expiresAt});
       }
       this.pendingReceipts.clear();
     }
@@ -425,6 +428,15 @@ export class AuthorityTransaction {
         [this.#scope.spaceId,this.#scope.collectionId,this.#scope.credentialId,operation,key]);
     }
     this.reservedIdentities.clear();
+  }
+  /** A slow final cell check must abort rather than commit an already expired
+   * receipt and let an immediate retry create a second record. */
+  async ensureReceiptsCurrent(): Promise<void> {
+    if (!this.readyReceipts.length) return;
+    const ids=this.readyReceipts.map(ready=>ready.receiptId);
+    const result=await this.query(`SELECT count(*)::int AS expired FROM idempotency_receipts
+      WHERE receipt_id=ANY($1::text[]) AND expires_at<=clock_timestamp()`,[ids]);
+    if (result.rows[0]?.expired !== 0) throw new AuthorityError('RECEIPT_PENDING','Receipt expired before commit');
   }
   exposeReceipts(): void {
     for (const ready of this.readyReceipts) for (const returned of ready.returned) {
@@ -603,9 +615,9 @@ export class AuthorityTransaction {
     await this.query(`INSERT INTO record_events(event_id,space_id,collection_id,record_id,revision,operation,credential_id,schema_version,canonical_data)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [eventId,...scopeIds(scope),recordId,revision,change.operation,scope.credentialId,version.schemaVersion,change.canonicalData ?? '{}']);
     const receiptId = `rcpt_${randomUUID()}`;
-    const { committedAt, expiresAt } = await this.receiptTimes();
     const response: Receipt = { contractVersion:'1',receiptId,spaceId:scope.spaceId,ref:{kind:'record',id:recordId},operation:change.operation,
-      beforeRevision,revision,schemaVersion:version.schemaVersion,committedAt,expiresAt,projection:{generation:version.generation,state:'pending'},replayed:false };
+      beforeRevision,revision,schemaVersion:version.schemaVersion,committedAt:'',expiresAt:'',
+      projection:{generation:version.generation,state:'pending'},replayed:false };
     await this.query('INSERT INTO projection_outbox(event_id,space_id,collection_id,record_id,revision,generation) VALUES($1,$2,$3,$4,$5,$6)',
       [eventId,...scopeIds(scope),recordId,revision,version.generation]);
     const returned = pendingReceipt(response);

@@ -176,12 +176,14 @@ try {
     await assert.rejects(backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],
       {expectedCellIds:['cell-a'],drained:false}),/drained traffic/);
     const writer=new pg.Client({connectionString:url(names[0])});
+    const observer=new pg.Client({connectionString:url(names[0])});
     await writer.connect();
     let attempted=false;
     let writerSettled=false;
     let writerUpdate;
-    const writerPid=(await writer.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
     try {
+      await observer.connect();
+      const writerPid=(await writer.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
       await writer.query('BEGIN');
       const guardedControl={query:async (sql,...args) => {
         if (!attempted && sql.includes('FROM space_directory WHERE space_id')) {
@@ -190,7 +192,9 @@ try {
             .then(() => { writerSettled=true; });
           let blocked=false;
           for (let attempt=0;attempt<100;attempt++) {
-            const state=(await fresh.query('SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1',[writerPid])).rows[0];
+            // pg_stat_activity is cached per transaction. The control client
+            // is in the backfill transaction, so observe from autocommit.
+            const state=(await observer.query('SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1',[writerPid])).rows[0];
             if (state?.wait_event_type==='Lock') { blocked=true; break; }
             if (writerSettled) break;
             await new Promise(resolve=>setTimeout(resolve,20));
@@ -204,9 +208,11 @@ try {
         {expectedCellIds:['cell-a'],drained:true}),{copied:1,existing:0});
       assert.equal(attempted,true,'source writer guard executed');
       await writerUpdate;
+      assert.equal(writerSettled,true,'source writer resumes after backfill commits');
     } finally {
       await writer.query('ROLLBACK').catch(()=>{});
       await writer.end();
+      await observer.end().catch(()=>{});
     }
     assert.deepEqual(await backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],{expectedCellIds:['cell-a'],drained:true}),{copied:0,existing:1});
     await fresh.query("UPDATE space_directory SET created_at='2026-01-02 03:04:05.123+00' WHERE space_id='sp_upgrade'");

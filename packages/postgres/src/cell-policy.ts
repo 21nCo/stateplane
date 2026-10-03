@@ -65,7 +65,8 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     finally { result.release(); }
   }
 
-  private async check(client: pg.PoolClient, claims: RouteClaims, requireActiveSpace = false): Promise<string> {
+  private async check(client: pg.PoolClient, claims: RouteClaims, requireActiveSpace = false,
+    checkProvider = true): Promise<string> {
     const result = await client.query(`SELECT s.owner_principal_id,s.lifecycle,s.cell_id,s.policy_version,s.placement_generation,
       c.lifecycle AS collection_lifecycle, sc.principal_id AS key_principal_id,
       sc.owner_principal_id AS key_owner_id,sc.revoked_at,sc.activated_at,sc.confirmed_at,
@@ -90,7 +91,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     const mutates = claims.capability.endsWith(':write') || claims.capability === 'claims:review';
     if (row.collection_lifecycle === 'readOnly' && mutates) throw new AuthorityError('SPACE_UNAVAILABLE');
     if (row.lifecycle === 'readOnly' && mutates && claims.capability !== 'records:write') throw new AuthorityError('SPACE_UNAVAILABLE');
-    if (!await this.credentials.current(claims,row.owner_principal_id)) throw new AuthorityError('FORBIDDEN');
+    if (checkProvider && !await this.credentials.current(claims,row.owner_principal_id)) throw new AuthorityError('FORBIDDEN');
     if (claims.kind === 'session') {
       if (claims.userPrincipalId !== row.owner_principal_id) throw new AuthorityError('FORBIDDEN');
       return row.owner_principal_id;
@@ -108,7 +109,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     let begun = false;
     let beginAttempted = false;
     let discard = false;
-    const joined: Array<{ finish: () => Promise<void>; verify: () => Promise<void>; expose: () => void;
+    const joined: Array<{ finish: () => Promise<void>; verify: () => Promise<void>; ensureCurrent: () => Promise<void>; expose: () => void;
       close: () => void }> = [];
     const joinedReceipts: JoinedReceiptState = {pending:new Map(),replayed:new Map(),ready:[]};
     try {
@@ -157,7 +158,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
         },
         records: <TResult>(authority: PostgresAuthority, fn: (tx: AuthorityTransaction) => Promise<TResult>) =>
           admit(() => authority.transactionOnClient(client,scope,fn,
-            (finish,verify,expose,close) => { joined.push({finish,verify,expose,close}); },joinedReceipts)) });
+            (finish,verify,ensureCurrent,expose,close) => { joined.push({finish,verify,ensureCurrent,expose,close}); },joinedReceipts)) });
       let result: T;
       try { result = await effect(principalId, context); }
       finally {
@@ -169,13 +170,17 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       await this.check(client, claims);
       this.checkAssertionTime(claims);
       await this.checkDatabaseTime(client,claims);
-      // Joined record work remains live until the enclosing cell transaction's
-      // final boundary. A later callback cannot consume grant or receipt time.
+      // Check provider freshness before starting the receipt retry window.
+      // Joined record work remains live until the enclosing cell commit.
       for (const entry of joined) await entry.finish();
-      for (const entry of joined) await entry.verify();
       this.checkAssertionTime(claims);
       await this.check(client,claims);
       await this.checkDatabaseTime(client,claims);
+      for (const entry of joined) await entry.verify();
+      await this.check(client,claims,false,false);
+      this.checkAssertionTime(claims);
+      await this.checkDatabaseTime(client,claims);
+      if (joined.length) await joined[0].ensureCurrent();
       try { await client.query('COMMIT'); begun = false; }
       catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
       for (const entry of joined) entry.expose();

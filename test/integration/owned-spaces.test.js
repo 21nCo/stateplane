@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { createHash } from 'node:crypto';
+import { inspect } from 'node:util';
 import { memoryAdapter } from '@superfunctions/db/testing';
 import { createAuthFn, createUser, issueSession } from '@authfn/core';
 import { AuthFnIdentityVerifier, AuthFnAgentKeys } from '../../packages/auth/dist/index.js';
@@ -2368,7 +2369,7 @@ test('lost issuance acknowledgements keep unconfirmed issue and rotation keys in
     'a confirmed key is returned rather than reported as a failed issuance after its acknowledgement is lost');
 });
 
-test('lost completion acknowledgement and readback return the confirmed issue and rotation bearer', async () => {
+test('uncertain completion gives issue and rotation a recoverable bearer without claiming success', async () => {
   const config={database:memoryAdapter(),namespace:`sta6-completion-${crypto.randomUUID()}`,plugins:[]};
   createAuthFn(config);
   const user=await createUser(config,{primaryEmail:`completion-${crypto.randomUUID()}@example.invalid`});
@@ -2384,10 +2385,11 @@ test('lost completion acknowledgement and readback return the confirmed issue an
   };
   let loseAck=false;
   let retryOffline=false;
+  let updateApplied=false;
   const control=controlWithQueryHook(async (sql,_args,next)=>{
     if (loseAck && typeof sql==='string' && sql.includes('UPDATE agent_key_issuances i SET completed_at=')) {
       loseAck=false;
-      await next();
+      if (updateApplied) await next();
       throw new Error('lost completion acknowledgement');
     }
     if (typeof sql==='string' && sql.includes('SELECT completed_at FROM agent_key_issuances'))
@@ -2413,19 +2415,29 @@ test('lost completion acknowledgement and readback return the confirmed issue an
   const expires=new Date(Date.now()+3_600_000);
   const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
   const router=new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
-  for (const operation of ['issue','rotate']) {
+  for (const [operation,applied] of [['issue',true],['rotate',true],['issue',false],['rotate',false]]) {
     compensationOffline=false;
     loseAck=true;
-    retryOffline=operation==='rotate';
+    retryOffline=true;
+    updateApplied=applied;
     const previous=operation==='rotate' ? await pool.query(`SELECT credential_id FROM space_credentials
       WHERE space_id=$1 AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1`,[spaceId]) : null;
-    const key=operation==='issue' ? await spaces.issueAgentKey(actor,spaceId,expires,grants) :
-      await spaces.rotateAgentKey(actor,spaceId,previous.rows[0].credential_id,expires,grants);
+    let uncertain;
+    await assert.rejects(operation==='issue' ? spaces.issueAgentKey(actor,spaceId,expires,grants) :
+      spaces.rotateAgentKey(actor,spaceId,previous.rows[0].credential_id,expires,grants),error=>{
+      assert.equal(error.name,'AgentKeyOutcomeUnknownError');
+      assert.equal(Object.keys(error).includes('key'),false,'bearer is not enumerable in error logs');
+      uncertain=error.takeKey();
+      assert.equal(inspect(error).includes(uncertain.secret),false,'ordinary error logs omit the bearer');
+      assert.throws(()=>error.takeKey(),denied('INVALID_ARGUMENT'));
+      return true;
+    });
+    const key=uncertain;
     assert.equal(loseAck,false);
     assert.ok((await router.assertion(request(key.secret),spaceId,collectionId,'records:read')).token);
     const journal=(await controlPool.query(`SELECT completed_at,cancelled_at FROM agent_key_issuances
       WHERE space_id=$1 AND credential_id=$2`,[spaceId,key.id])).rows[0];
-    assert.ok(journal.completed_at);
+    assert.equal(Boolean(journal.completed_at),applied);
     assert.equal(journal.cancelled_at,null);
     const local=(await pool.query(`SELECT confirmed_at,revoked_at FROM space_credentials WHERE space_id=$1 AND credential_id=$2`,
       [spaceId,key.id])).rows[0];
@@ -2436,7 +2448,18 @@ test('lost completion acknowledgement and readback return the confirmed issue an
     compensationOffline=false;
     retryOffline=false;
     await spaces.reconcile(spaceId);
-    assert.ok((await router.assertion(request(key.secret),spaceId,collectionId,'records:read')).token);
+    const settled=(await controlPool.query(`SELECT completed_at,cancelled_at,provider_revoked_at
+      FROM agent_key_issuances WHERE space_id=$1 AND credential_id=$2`,[spaceId,key.id])).rows[0];
+    if (applied) {
+      assert.ok(settled.completed_at);
+      assert.equal(settled.cancelled_at,null);
+      assert.ok((await router.assertion(request(key.secret),spaceId,collectionId,'records:read')).token);
+    } else {
+      assert.ok(settled.cancelled_at && settled.provider_revoked_at);
+      assert.ok((await pool.query(`SELECT revoked_at FROM space_credentials WHERE space_id=$1 AND credential_id=$2`,
+        [spaceId,key.id])).rows[0].revoked_at);
+      await assert.rejects(router.assertion(request(key.secret),spaceId,collectionId,'records:read'),denied('UNAUTHENTICATED'));
+    }
   }
 });
 
@@ -2447,7 +2470,12 @@ test('joined record receipt starts its retry window at cell commit', async () =>
     VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
   await collection(spaceId,collectionId);
   const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
-  const cell=new RegionalCell('cell-a',signer,new PostgresCellPolicy(pool,'cell-a',{current:async () => true}));
+  let lookups=0;
+  let delayedLookup=false;
+  const cell=new RegionalCell('cell-a',signer,new PostgresCellPolicy(pool,'cell-a',{current:async () => {
+    if (++lookups===5) { delayedLookup=true; await pause(1250); }
+    return true;
+  }}));
   const authority=new PostgresAuthority(pool,1);
   const now=Math.floor(Date.now()/1000);
   const token=await signer.sign({spaceId,collectionId,capability:'records:write',credentialId:'owner-session',
@@ -2456,15 +2484,53 @@ test('joined record receipt starts its retry window at cell commit', async () =>
   const change={operation:'create',idempotencyKey:`joined-${crypto.randomUUID()}`,requestDigest:'a'.repeat(64),canonicalData:'{}'};
   const first=await cell.execute(token,async (_principal,context) => {
     const receipt=await context.records(authority,tx=>tx.mutate(change));
-    await pause(1250);
     return receipt;
   });
+  assert.equal(delayedLookup,true,'final provider lookup crossed the one-second retention window');
   const scope={spaceId,collectionId,principalId:'owner',credentialId:'owner-session',
     capability:'records:write',policyVersion:1,placementGeneration:1};
   const replay=await authority.mutate(scope,change);
   assert.equal(replay.replayed,true,'delayed callback must not consume the retry window');
   assert.equal(replay.receiptId,first.receiptId);
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM records WHERE space_id=$1',[spaceId])).rows[0].n,1);
+  const stored=(await pool.query('SELECT committed_at,expires_at FROM idempotency_receipts WHERE receipt_id=$1',
+    [first.receiptId])).rows[0];
+  assert.equal(first.committedAt,stored.committed_at.toISOString());
+  assert.equal(first.expiresAt,stored.expires_at.toISOString());
+});
+
+test('a final cell check that outlasts receipt retention rolls the joined write back', async () => {
+  const spaceId=`sp_${crypto.randomUUID()}`;
+  const collectionId=`entries_${crypto.randomUUID()}`;
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
+  await collection(spaceId,collectionId);
+  let inserted=false;
+  let delayed=false;
+  const slowPool={connect:async()=>{
+    const client=await pool.connect();
+    return {query:async (...args)=>{
+      const sql=args[0];
+      if (typeof sql==='string' && sql.includes('INSERT INTO idempotency_receipts')) inserted=true;
+      if (inserted && !delayed && typeof sql==='string' && sql.startsWith('SELECT to_timestamp')) {
+        delayed=true;
+        await pause(1250);
+      }
+      return client.query(...args);
+    },release:discard=>client.release(discard)};
+  }};
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const cell=new RegionalCell('cell-a',signer,new PostgresCellPolicy(slowPool,'cell-a',{current:async()=>true}));
+  const now=Math.floor(Date.now()/1000);
+  const token=await signer.sign({spaceId,collectionId,capability:'records:write',credentialId:'owner-session',
+    kind:'session',userPrincipalId:'owner',cellId:'cell-a',policyVersion:1,placementGeneration:1,
+    audience:'stateplane-cell:cell-a',issuedAt:now,expiresAt:now+30,nonce:crypto.randomUUID()});
+  await assert.rejects(cell.execute(token,(_principal,context)=>context.records(new PostgresAuthority(pool,1),
+    tx=>tx.mutate({operation:'create',idempotencyKey:`late-${crypto.randomUUID()}`,
+      requestDigest:'a'.repeat(64),canonicalData:'{}'}))),denied('RECEIPT_PENDING'));
+  assert.equal(delayed,true);
+  for (const table of ['records','record_events','idempotency_receipts','receipt_reservations','projection_outbox'])
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[spaceId])).rows[0].n,0,table);
 });
 
 test('joined calls replay one pending receipt and reject copies before outer commit', async () => {
@@ -2568,7 +2634,7 @@ test('a joined finalizer crossing grant expiry rolls back before the cell effect
   const {spaceId}=await spaces.create(actor);
   const collectionId=`entries_${crypto.randomUUID()}`;
   await collection(spaceId,collectionId);
-  const grantExpiry=new Date(Date.now()+2_000);
+  const grantExpiry=new Date(Date.now()+60_000);
   const key=await spaces.issueAgentKey(actor,spaceId,new Date(Date.now()+60_000),
     [{collectionId,capabilities:['records:write'],expiresAt:grantExpiry}]);
   const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
@@ -2587,6 +2653,8 @@ test('a joined finalizer crossing grant expiry rolls back before the cell effect
     },release:discard=>client.release(discard)};
   }};
   const cell=new RegionalCell('cell-a',signer,new PostgresCellPolicy(slowPool,'cell-a',identity));
+  await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '2 seconds'
+    WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[spaceId,collectionId,key.id]);
   let pendingReceipt;
   await assert.rejects(cell.execute(token,(_principal,context)=>context.records(new PostgresAuthority(pool,60),
     tx=>tx.mutate({operation:'create',idempotencyKey:`expired-grant-${crypto.randomUUID()}`,

@@ -113,8 +113,25 @@ try {
     await restored.query(`REVOKE ALL ON agent_key_issuances FROM ${journalRole}`).catch(()=>{});
     await restored.query(`DROP ROLE IF EXISTS ${journalRole}`).catch(()=>{});
   }
-  await restored.query('CREATE ROLE "select" LOGIN');
+  // A reserved-word role proves identifier quoting. Keep its creation and
+  // ownership marker atomic so an interrupted run can safely reuse it.
+  const reservedRole=await restored.connect();
+  const marker='stateplane:restore-smoke:reserved-role:v1';
+  let ownedRole=false;
   try {
+    await reservedRole.query("SELECT pg_advisory_lock(hashtext('stateplane:restore-smoke:select'))");
+    const existing=(await reservedRole.query(`SELECT shobj_description(oid,'pg_authid') AS marker
+      FROM pg_roles WHERE rolname='select'`)).rows[0];
+    if (existing && existing.marker!==marker) throw new Error('Reserved restore fixture role is owned by another user');
+    if (!existing) {
+      await reservedRole.query('BEGIN');
+      try {
+        await reservedRole.query('CREATE ROLE "select" LOGIN');
+        await reservedRole.query(`COMMENT ON ROLE "select" IS '${marker}'`);
+        await reservedRole.query('COMMIT');
+      } catch (error) { await reservedRole.query('ROLLBACK').catch(()=>{}); throw error; }
+    }
+    ownedRole=true;
     execFileSync(process.execPath,['scripts/grant-control-journal.mjs'],{cwd:root,
       env:{...process.env,STATEPLANE_CONTROL_URL:targetUrl,STATEPLANE_CONTROL_ROLE:'select'},stdio:'inherit'});
     const grants=(await restored.query(`SELECT has_table_privilege('select','public.agent_key_issuances','SELECT') AS can_read,
@@ -122,8 +139,16 @@ try {
       has_table_privilege('select','public.agent_key_issuances','UPDATE') AS can_update`)).rows[0];
     assert.deepEqual(grants,{can_read:true,can_create:true,can_update:true});
   } finally {
-    await restored.query('REVOKE ALL ON agent_key_issuances FROM "select"').catch(()=>{});
-    await restored.query('DROP ROLE IF EXISTS "select"').catch(()=>{});
+    if (ownedRole) {
+      await reservedRole.query('REVOKE ALL ON agent_key_issuances FROM "select"').catch(()=>{});
+      // A killed earlier run may still have a disposable database dependency.
+      // Retain only our marked role so the next run can reuse it safely.
+      await reservedRole.query('DROP ROLE IF EXISTS "select"').catch(error=>{
+        if (error.code!=='2BP01') throw error;
+      });
+    }
+    await reservedRole.query("SELECT pg_advisory_unlock(hashtext('stateplane:restore-smoke:select'))").catch(()=>{});
+    reservedRole.release();
   }
   const constraints = await Promise.all([base,restored].map(async pool => (await pool.query(`SELECT conname,contype
     FROM pg_constraint WHERE conrelid='records'::regclass ORDER BY conname`)).rows));
