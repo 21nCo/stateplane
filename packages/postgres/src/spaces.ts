@@ -174,25 +174,22 @@ export class PostgresSpaces {
     let publicationAttempted = false;
     try {
       const directory = await this.control.connect();
-      let advisoryHeld = false;
       let beginAttempted = false;
       let begun = false;
       let discard = false;
       try {
-        // The session lock closes the gap between a committed reservation and
-        // its row lock. Recovery takes the matching transaction lock first.
-        await directory.query('SELECT pg_advisory_lock(hashtextextended($1,0))',[spaceId]);
-        advisoryHeld = true;
         await this.current(actor);
-        await directory.query(`INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,lifecycle)
-          VALUES($1,$2,$3,$4,'provisioning')`,[spaceId,principal,cellId,cell.storageTargetId]);
+        // Recovery may see this committed reservation before the creator can
+        // lock it. A bounded claim keeps it pending; after expiry the creator
+        // must win the row lock and verify provisioning before cell effects.
+        await directory.query(`INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,lifecycle,provisioning_lease_until)
+          VALUES($1,$2,$3,$4,'provisioning',clock_timestamp()+interval '60 seconds')`,
+        [spaceId,principal,cellId,cell.storageTargetId]);
         beginAttempted = true;
         await directory.query('BEGIN'); begun = true;
         const reserved = await directory.query(`SELECT 1 FROM space_directory
           WHERE space_id=$1 AND owner_principal_id=$2 AND lifecycle='provisioning' FOR UPDATE`,[spaceId,principal]);
         if (!reserved.rows[0]) throw new AuthorityError('STALE_PLACEMENT');
-        await directory.query('SELECT pg_advisory_unlock(hashtextextended($1,0))',[spaceId]);
-        advisoryHeld = false;
         const insertCell = async (db: pg.PoolClient): Promise<void> => {
           await this.current(actor);
           await db.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
@@ -210,13 +207,11 @@ export class PostgresSpaces {
         else if (beginAttempted) discard = true;
         throw error;
       } finally {
-        if (advisoryHeld && !discard) await directory.query('SELECT pg_advisory_unlock(hashtextextended($1,0))',
-          [spaceId]).catch(() => { discard = true; });
         directory.release(discard);
       }
       await this.current(actor);
       publicationAttempted = true;
-      const published = await this.control.query(`UPDATE space_directory SET lifecycle='active',updated_at=clock_timestamp()
+      const published = await this.control.query(`UPDATE space_directory SET lifecycle='active',provisioning_lease_until=NULL,updated_at=clock_timestamp()
         WHERE space_id=$1 AND lifecycle='provisioning' RETURNING *`,[spaceId]);
       if (!published.rows[0]) throw new Error('Space publication was interrupted');
       return info(published.rows[0]);
@@ -239,11 +234,11 @@ export class PostgresSpaces {
   }
   private async recoverProvisioning(spaceId: string, ownerPrincipalId: string): Promise<void> {
     await transaction(this.control, async directory => {
-      await directory.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[spaceId]);
-      const result = await directory.query(`SELECT * FROM space_directory
+      const result = await directory.query(`SELECT *, provisioning_lease_until>clock_timestamp() AS provisioning_claim_live FROM space_directory
         WHERE space_id=$1 AND owner_principal_id=$2 FOR UPDATE`,[spaceId,ownerPrincipalId]);
       const row = result.rows[0];
       if (!row || row.lifecycle !== 'provisioning') return;
+      if (row.provisioning_claim_live === true) return;
       const cell = this.cell(row.cell_id);
       if (cell.storageTargetId !== row.storage_target_id) throw new AuthorityError('STALE_PLACEMENT');
       const local = await (cell.pool === this.control ? directory : cell.pool).query(`SELECT s.owner_principal_id,s.cell_id,s.storage_target_id,s.lifecycle,
@@ -252,7 +247,7 @@ export class PostgresSpaces {
         FROM spaces s WHERE s.space_id=$1`,[spaceId]);
       const existing = local.rows[0];
       if (!existing) {
-        await directory.query(`UPDATE space_directory SET lifecycle='deleted',updated_at=clock_timestamp()
+        await directory.query(`UPDATE space_directory SET lifecycle='deleted',provisioning_lease_until=NULL,updated_at=clock_timestamp()
           WHERE space_id=$1 AND lifecycle='provisioning'`,[spaceId]);
         await directory.query(`INSERT INTO space_provisioning_audit(space_id,owner_principal_id,cell_id,action)
           VALUES($1,$2,$3,'space:provision-retired')`,[spaceId,ownerPrincipalId,row.cell_id]);
@@ -262,7 +257,7 @@ export class PostgresSpaces {
         existing.storage_target_id !== row.storage_target_id || existing.lifecycle !== 'active' ||
         safeVersion(existing.policy_version) !== 1 || safeVersion(existing.placement_generation) !== 1 ||
         existing.created !== true) throw new AuthorityError('STALE_PLACEMENT');
-      await directory.query(`UPDATE space_directory SET lifecycle='active',updated_at=clock_timestamp()
+      await directory.query(`UPDATE space_directory SET lifecycle='active',provisioning_lease_until=NULL,updated_at=clock_timestamp()
         WHERE space_id=$1 AND lifecycle='provisioning'`,[spaceId]);
     });
   }
@@ -492,31 +487,22 @@ export class PostgresSpaces {
     return result.rows[0]?.erased === true;
   }
 
-  /** A session lock distinguishes a live issuer from an interrupted journal.
-   * Use the pinned client for control queries so a one-connection control pool
-   * remains usable while the issuer holds the lock. A crashed process releases
-   * the lock, allowing the next reconciliation to revoke its orphaned key. */
-  private async withIssuanceLock<T>(spaceId: string,
-    operation: (control: pg.PoolClient) => Promise<T>): Promise<T> {
-    // Let callers finish their synchronous argument snapshot before pg-pool
-    // touches its internal arrays (which may have inherited user accessors).
+  /** A database-clock claim distinguishes live issuance from an interrupted
+   * journal. No connection is held during provider I/O. Expiry fences a slow
+   * issuer; its eventual result is compensated, and reconciliation can retry. */
+  private async withIssuanceLease<T>(spaceId: string,
+    operation: (leaseToken: string) => Promise<T>): Promise<T> {
     await Promise.resolve();
-    const client = await this.control.connect();
-    let held = false;
-    let discard = false;
-    try {
-      const result = await client.query('SELECT pg_try_advisory_lock(hashtextextended($1,0)) AS locked',
-        [`stateplane:issuance:${spaceId}`]);
-      held = result.rows[0]?.locked === true;
-      if (!held) throw new AuthorityError('STALE_PLACEMENT','Issuance is still active');
-      return await operation(client);
-    } finally {
-      if (held) {
-        try { await client.query('SELECT pg_advisory_unlock(hashtextextended($1,0))',
-          [`stateplane:issuance:${spaceId}`]); }
-        catch { discard = true; }
-      }
-      client.release(discard);
+    const token = `lease_${randomUUID()}`;
+    const claimed = await this.control.query(`UPDATE space_directory
+      SET issuance_lease_token=$2,issuance_lease_until=clock_timestamp()+interval '60 seconds'
+      WHERE space_id=$1 AND (issuance_lease_token IS NULL OR issuance_lease_until<=clock_timestamp())
+      RETURNING 1`,[spaceId,token]);
+    if (claimed.rowCount !== 1) throw new AuthorityError('STALE_PLACEMENT','Issuance is still active');
+    try { return await operation(token); }
+    finally {
+      await this.control.query(`UPDATE space_directory SET issuance_lease_token=NULL,issuance_lease_until=NULL
+        WHERE space_id=$1 AND issuance_lease_token=$2`,[spaceId,token]).catch(() => {});
     }
   }
 
@@ -526,8 +512,8 @@ export class PostgresSpaces {
     // Deletion has already fenced the cell lifecycle. It must be able to
     // cancel a paused provider create without waiting for that promise.
     if (!lockedControl && force) return this.cleanupIssuances(space,force,this.control);
-    if (!lockedControl) return this.withIssuanceLock(space.spaceId,
-      control => this.cleanupIssuances(space,force,control));
+    if (!lockedControl) return this.withIssuanceLease(space.spaceId,
+      () => this.cleanupIssuances(space,force,this.control));
     const pending = await lockedControl.query(`SELECT issuance_id,credential_id,owner_principal_id,cell_id,create_failed_at
       FROM agent_key_issuances WHERE space_id=$1 AND provider_revoked_at IS NULL
         AND settled_without_key_at IS NULL ORDER BY created_at,issuance_id`,[space.spaceId]);
@@ -599,7 +585,7 @@ export class PostgresSpaces {
     const cell = this.cell(directory.rows[0].cell_id);
     const lifecycle = await cell.pool.query('SELECT lifecycle FROM spaces WHERE space_id=$1',[spaceId]);
     if (lifecycle.rows[0]?.lifecycle === 'deleted') return this.reconcileLocked(spaceId,this.control,true);
-    return this.withIssuanceLock(spaceId,controlClient => this.reconcileLocked(spaceId,controlClient));
+    return this.withIssuanceLease(spaceId,() => this.reconcileLocked(spaceId,this.control));
   }
   private async reconcileLocked(spaceId: string, controlClient: Pick<pg.Pool, 'query'>,
     requireDeleted = false): Promise<SpaceInfo> {
@@ -670,10 +656,13 @@ export class PostgresSpaces {
     }
   }
 
-  private async requireLiveIssuance(control: Pick<pg.Pool, 'query'>, issuanceId: string): Promise<void> {
-    const live = await control.query(`SELECT 1 FROM agent_key_issuances
-      WHERE issuance_id=$1 AND cancelled_at IS NULL AND provider_revoked_at IS NULL
-        AND settled_without_key_at IS NULL`,[issuanceId]);
+  private async requireLiveIssuance(control: Pick<pg.Pool, 'query'>, issuanceId: string,
+    leaseToken: string): Promise<void> {
+    const live = await control.query(`SELECT 1 FROM agent_key_issuances i
+      JOIN space_directory d ON d.space_id=i.space_id
+      WHERE i.issuance_id=$1 AND i.cancelled_at IS NULL AND i.provider_revoked_at IS NULL
+        AND i.settled_without_key_at IS NULL AND d.issuance_lease_token=$2
+        AND d.issuance_lease_until>clock_timestamp()`,[issuanceId,leaseToken]);
     if (live.rowCount !== 1) throw new AuthorityError('STALE_PLACEMENT','Issuance was cancelled');
   }
 
@@ -683,10 +672,12 @@ export class PostgresSpaces {
     expiresAt = new Date(expiresAt.getTime());
     grants = snapshotGrants(grants,expiresAt);
     if (!validId(spaceId)) throw new AuthorityError('NOT_FOUND');
-    return this.withIssuanceLock(spaceId,control => this.issueAgentKeyLocked(actor,spaceId,expiresAt,grants,control));
+    await this.owned(actor,spaceId);
+    return this.withIssuanceLease(spaceId,leaseToken => this.issueAgentKeyLocked(actor,spaceId,expiresAt,grants,leaseToken));
   }
   private async issueAgentKeyLocked(actor: VerifiedCredential, spaceId: string, expiresAt: Date,
-    grants: readonly CollectionGrant[], control: pg.PoolClient): Promise<IssuedAgentKey> {
+    grants: readonly CollectionGrant[], leaseToken: string): Promise<IssuedAgentKey> {
+    const control = this.control;
     const expiryMs = expiresAt.getTime();
     const space = await this.owned(actor,spaceId,false,control);
     if (space.lifecycle !== 'active') throw new AuthorityError('SPACE_UNAVAILABLE');
@@ -710,13 +701,13 @@ export class PostgresSpaces {
       catch (error) { createFailed = true; throw error; }
       created = issued;
       if (!validId(issued.id)) throw new AuthorityError('INVALID_ARGUMENT','Provider returned an invalid key ID');
-      await this.requireLiveIssuance(control,issuanceId);
+      await this.requireLiveIssuance(control,issuanceId,leaseToken);
       await control.query(`UPDATE agent_key_issuances SET credential_id=$2
         WHERE issuance_id=$1 AND (credential_id IS NULL OR credential_id=$2)`,[issuanceId,issued.id]);
       // This independent commit keeps a provider key discoverable by reconcile
       // if a later grant FK, publication or activation transaction fails.
       await transaction(this.cell(space.cellId).pool, async db => {
-        await this.requireLiveIssuance(control,issuanceId);
+        await this.requireLiveIssuance(this.cell(space.cellId).pool === this.control ? db : control,issuanceId,leaseToken);
         // Serialize staging with deletion and erasure repair. A provider create
         // can finish after either path has purged the cell; its old directory
         // snapshot must never insert a credential into the deleted tombstone.
@@ -735,7 +726,7 @@ export class PostgresSpaces {
         [`aud_${randomUUID()}`,spaceId,owner(actor),issued.id]);
       });
       const version = await transaction(this.cell(space.cellId).pool, async db => {
-        await this.requireLiveIssuance(control,issuanceId);
+        await this.requireLiveIssuance(this.cell(space.cellId).pool === this.control ? db : control,issuanceId,leaseToken);
         await this.current(actor);
         const locked = await db.query(`SELECT policy_version,lifecycle FROM spaces WHERE space_id=$1 AND owner_principal_id=$2 FOR UPDATE`,[spaceId,owner(actor)]);
         if (!locked.rows[0] || Number(locked.rows[0].policy_version) !== space.policyVersion || locked.rows[0].lifecycle !== 'active') throw new AuthorityError('STALE_PLACEMENT');
@@ -757,10 +748,10 @@ export class PostgresSpaces {
         return Number(changed.rows[0].policy_version);
       });
       await this.current(actor);
-      await this.requireLiveIssuance(control,issuanceId);
+      await this.requireLiveIssuance(control,issuanceId,leaseToken);
       await this.publish(space,version,space.lifecycle,control);
       try { await transaction(this.cell(space.cellId).pool, async db => {
-        await this.requireLiveIssuance(control,issuanceId);
+        await this.requireLiveIssuance(this.cell(space.cellId).pool === this.control ? db : control,issuanceId,leaseToken);
         await this.current(actor);
         const locked = await db.query(`SELECT policy_version,lifecycle,placement_generation FROM spaces
           WHERE space_id=$1 AND owner_principal_id=$2 FOR UPDATE`,[spaceId,owner(actor)]);
@@ -795,7 +786,7 @@ export class PostgresSpaces {
           Number(local.rows[0].policy_version) !== version ||
           Number(local.rows[0].placement_generation) !== space.placementGeneration)
           throw new AuthorityError('STALE_PLACEMENT');
-        await this.requireLiveIssuance(control,issuanceId);
+        await this.requireLiveIssuance(this.cell(space.cellId).pool === this.control ? db : control,issuanceId,leaseToken);
         const confirmed = await db.query(`UPDATE space_credentials SET confirmed_at=clock_timestamp()
           WHERE space_id=$1 AND credential_id=$2 AND activated_at IS NOT NULL
             AND confirmed_at IS NULL AND revoked_at IS NULL RETURNING 1`,[spaceId,issued.id]);
@@ -810,7 +801,7 @@ export class PostgresSpaces {
         // reconciliation revokes it; the caller must check before using it.
         return { ...issued, confirmation: 'unknown' };
       }
-      await this.requireLiveIssuance(control,issuanceId);
+      await this.requireLiveIssuance(control,issuanceId,leaseToken);
       return issued;
     } catch (error) {
       if (createFailed) {
