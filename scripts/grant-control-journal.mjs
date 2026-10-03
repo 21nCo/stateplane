@@ -13,7 +13,7 @@ try {
   await client.query('BEGIN');
   const found=await client.query('SELECT 1 FROM pg_roles WHERE rolname=$1',[role]);
   if (found.rowCount!==1) throw new Error('Control operational role does not exist');
-  await client.query(`GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_key_issuances TO ${role}`);
+  await client.query(`GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_key_issuances TO "${role}"`);
   const grants=await client.query(`SELECT has_table_privilege($1,'public.agent_key_issuances','SELECT') AS can_read,
     has_table_privilege($1,'public.agent_key_issuances','INSERT') AS can_create,
     has_table_privilege($1,'public.agent_key_issuances','UPDATE') AS can_update`,[role]);

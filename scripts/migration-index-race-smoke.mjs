@@ -4,6 +4,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import pg from 'pg';
+import { migrationInventory } from './migration-order.mjs';
 
 if (process.env.DATABASE_URL) throw new Error('Index race smoke uses the isolated local Postgres database only');
 const root = resolve(import.meta.dirname, '..');
@@ -18,7 +19,7 @@ const migrationNames = [
   '001_foundation.sql', '002_authority.sql', '003_immutable_facts.sql',
   '004_instant_order.sql', '005_scoped_query_indexes.sql'
 ];
-const completeMigrationCount = (await readdir(resolve(root,'migrations'))).filter(name => /^\d{3}_[a-z0-9_]+\.sql$/.test(name)).length;
+const completeMigrationCount = (await migrationInventory(resolve(root,'migrations'))).length;
 const markerDirectory = new URL('../.data/', import.meta.url);
 const raceDatabase = /^stateplane_race_[0-9a-f]{8}$/;
 

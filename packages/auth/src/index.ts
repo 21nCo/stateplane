@@ -17,6 +17,13 @@ export class AuthFnIdentityVerifier implements IdentityVerifier {
     }
     if (!/^Bearer [^\s]+$/i.test(header)) return null;
     const secret = header.slice(7);
+    if (secret.startsWith('st_')) {
+      const session = await authenticateSessionToken(this.config, secret, request);
+      if (session?.type === 'session' && session.actorId)
+        return { credentialId:session.id, kind:'session', userPrincipalId:session.actorId };
+      // AuthFn permits custom API-key prefixes; a non-session remains eligible
+      // for a key lookup, which still checks provider revocation.
+    }
     // API-key revocation raises a provider error. Authentication failure is a denial,
     // while an unavailable adapter must fail closed and must not reach Stateplane effects.
     const key = await authenticateApiKey(this.config, secret).catch(error => {
@@ -24,9 +31,7 @@ export class AuthFnIdentityVerifier implements IdentityVerifier {
       throw error;
     });
     if (key) return { credentialId:key.id, kind:'api-key' };
-    const session = await authenticateSessionToken(this.config, secret, request);
-    if (!session || session.type !== 'session' || !session.actorId) return null;
-    return { credentialId:session.id, kind:'session', userPrincipalId:session.actorId };
+    return null;
   }
   /** Re-read the provider at cell admission; a signed assertion is not proof of current status. */
   async current(claims: Pick<VerifiedCredential, 'kind' | 'credentialId'>, ownerPrincipalId?: string): Promise<boolean> {

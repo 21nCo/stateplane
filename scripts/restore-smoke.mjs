@@ -94,7 +94,7 @@ try {
   await restored.query(`CREATE ROLE ${journalRole} LOGIN`);
   try {
     execFileSync(process.execPath,['scripts/grant-control-journal.mjs'],{cwd:root,
-      env:{...process.env,STATEPLANE_CONTROL_URL:targetUrl,STATEPLANE_CONTROL_ROLE:journalRole},stdio:'ignore'});
+      env:{...process.env,STATEPLANE_CONTROL_URL:targetUrl,STATEPLANE_CONTROL_ROLE:journalRole},stdio:'inherit'});
     const operational=await restored.connect();
     const issuance=`iss_restore_${randomBytes(8).toString('hex')}`;
     try {
@@ -112,6 +112,18 @@ try {
   } finally {
     await restored.query(`REVOKE ALL ON agent_key_issuances FROM ${journalRole}`).catch(()=>{});
     await restored.query(`DROP ROLE IF EXISTS ${journalRole}`).catch(()=>{});
+  }
+  await restored.query('CREATE ROLE "select" LOGIN');
+  try {
+    execFileSync(process.execPath,['scripts/grant-control-journal.mjs'],{cwd:root,
+      env:{...process.env,STATEPLANE_CONTROL_URL:targetUrl,STATEPLANE_CONTROL_ROLE:'select'},stdio:'inherit'});
+    const grants=(await restored.query(`SELECT has_table_privilege('select','public.agent_key_issuances','SELECT') AS can_read,
+      has_table_privilege('select','public.agent_key_issuances','INSERT') AS can_create,
+      has_table_privilege('select','public.agent_key_issuances','UPDATE') AS can_update`)).rows[0];
+    assert.deepEqual(grants,{can_read:true,can_create:true,can_update:true});
+  } finally {
+    await restored.query('REVOKE ALL ON agent_key_issuances FROM "select"').catch(()=>{});
+    await restored.query('DROP ROLE IF EXISTS "select"').catch(()=>{});
   }
   const constraints = await Promise.all([base,restored].map(async pool => (await pool.query(`SELECT conname,contype
     FROM pg_constraint WHERE conrelid='records'::regclass ORDER BY conname`)).rows));

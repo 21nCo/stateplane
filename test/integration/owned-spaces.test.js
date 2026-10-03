@@ -2368,6 +2368,78 @@ test('lost issuance acknowledgements keep unconfirmed issue and rotation keys in
     'a confirmed key is returned rather than reported as a failed issuance after its acknowledgement is lost');
 });
 
+test('lost completion acknowledgement and readback return the confirmed issue and rotation bearer', async () => {
+  const config={database:memoryAdapter(),namespace:`sta6-completion-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user=await createUser(config,{primaryEmail:`completion-${crypto.randomUUID()}@example.invalid`});
+  const session=await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity=new AuthFnIdentityVerifier(config);
+  const actor=await identity.verify(request(session.sessionToken));
+  const realKeys=new AuthFnAgentKeys(config);
+  let compensationOffline=false;
+  const keys={
+    create:async (...args)=>{ const key=await realKeys.create(...args); compensationOffline=true; return key; },
+    revoke:async (...args)=>{ if (compensationOffline) throw new Error('provider revoke unavailable'); return realKeys.revoke(...args); },
+    find:async (...args)=>realKeys.find(...args),
+  };
+  let loseAck=false;
+  let retryOffline=false;
+  const control=controlWithQueryHook(async (sql,_args,next)=>{
+    if (loseAck && typeof sql==='string' && sql.includes('UPDATE agent_key_issuances i SET completed_at=')) {
+      loseAck=false;
+      await next();
+      throw new Error('lost completion acknowledgement');
+    }
+    if (typeof sql==='string' && sql.includes('SELECT completed_at FROM agent_key_issuances'))
+      throw new Error('completion readback unavailable');
+    if (retryOffline && typeof sql==='string' && sql.includes('SET completed_at=COALESCE(i.completed_at'))
+      throw new Error('completion retry unavailable');
+    return next();
+  });
+  const cellPool={query:(...args)=>pool.query(...args),connect:async()=>{
+    const client=await pool.connect();
+    return {query:(...args)=>{
+      if (compensationOffline && typeof args[0]==='string' && args[0].includes('UPDATE space_credentials SET revoked_at='))
+        throw new Error('cell compensation unavailable');
+      return client.query(...args);
+    },release:discard=>client.release(discard)};
+  }};
+  const cells=new Map([['cell-a',{pool:cellPool,storageTargetId:'target-a'}]]);
+  const spaces=new PostgresSpaces(control,cells,'cell-a',keys,identity);
+  const {spaceId}=await spaces.create(actor);
+  const collectionId=`complete_${crypto.randomUUID()}`;
+  await collection(spaceId,collectionId);
+  const grants=[{collectionId,capabilities:['records:read']}];
+  const expires=new Date(Date.now()+3_600_000);
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const router=new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,cells),signer);
+  for (const operation of ['issue','rotate']) {
+    compensationOffline=false;
+    loseAck=true;
+    retryOffline=operation==='rotate';
+    const previous=operation==='rotate' ? await pool.query(`SELECT credential_id FROM space_credentials
+      WHERE space_id=$1 AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1`,[spaceId]) : null;
+    const key=operation==='issue' ? await spaces.issueAgentKey(actor,spaceId,expires,grants) :
+      await spaces.rotateAgentKey(actor,spaceId,previous.rows[0].credential_id,expires,grants);
+    assert.equal(loseAck,false);
+    assert.ok((await router.assertion(request(key.secret),spaceId,collectionId,'records:read')).token);
+    const journal=(await controlPool.query(`SELECT completed_at,cancelled_at FROM agent_key_issuances
+      WHERE space_id=$1 AND credential_id=$2`,[spaceId,key.id])).rows[0];
+    assert.ok(journal.completed_at);
+    assert.equal(journal.cancelled_at,null);
+    const local=(await pool.query(`SELECT confirmed_at,revoked_at FROM space_credentials WHERE space_id=$1 AND credential_id=$2`,
+      [spaceId,key.id])).rows[0];
+    assert.ok(local.confirmed_at);
+    assert.equal(local.revoked_at,null);
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM collection_grants WHERE space_id=$1 AND credential_id=$2`,
+      [spaceId,key.id])).rows[0].n,1);
+    compensationOffline=false;
+    retryOffline=false;
+    await spaces.reconcile(spaceId);
+    assert.ok((await router.assertion(request(key.secret),spaceId,collectionId,'records:read')).token);
+  }
+});
+
 test('joined record receipt starts its retry window at cell commit', async () => {
   const spaceId=`sp_${crypto.randomUUID()}`;
   const collectionId=`entries_${crypto.randomUUID()}`;
@@ -2393,6 +2465,136 @@ test('joined record receipt starts its retry window at cell commit', async () =>
   assert.equal(replay.replayed,true,'delayed callback must not consume the retry window');
   assert.equal(replay.receiptId,first.receiptId);
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM records WHERE space_id=$1',[spaceId])).rows[0].n,1);
+});
+
+test('joined calls replay one pending receipt and reject copies before outer commit', async () => {
+  const spaceId=`sp_${crypto.randomUUID()}`;
+  const collectionId=`entries_${crypto.randomUUID()}`;
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
+  await collection(spaceId,collectionId);
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const cell=new RegionalCell('cell-a',signer,new PostgresCellPolicy(pool,'cell-a',{current:async () => true}));
+  const authority=new PostgresAuthority(pool,60);
+  const token=()=>{ const now=Math.floor(Date.now()/1000); return signer.sign({spaceId,collectionId,
+    capability:'records:write',credentialId:'owner-session',kind:'session',userPrincipalId:'owner',cellId:'cell-a',
+    policyVersion:1,placementGeneration:1,audience:'stateplane-cell:cell-a',issuedAt:now,expiresAt:now+30,
+    nonce:crypto.randomUUID()}); };
+  const change={operation:'create',idempotencyKey:`joined-${crypto.randomUUID()}`,requestDigest:'a'.repeat(64),canonicalData:'{}'};
+  const [first,replay]=await cell.execute(await token(),async (_principal,context) => {
+    const original=await context.records(authority,tx=>tx.mutate(change));
+    const repeated=await context.records(authority,tx=>tx.mutate(change));
+    assert.throws(()=>({...original}),denied('RECEIPT_PENDING'));
+    assert.throws(()=>JSON.stringify(repeated),denied('RECEIPT_PENDING'));
+    return [original,repeated];
+  });
+  assert.equal(replay.receiptId,first.receiptId);
+  assert.equal(replay.replayed,true);
+  assert.equal(replay.committedAt,first.committedAt);
+  assert.equal(replay.expiresAt,first.expiresAt);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM records WHERE space_id=$1',[spaceId])).rows[0].n,1);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM idempotency_receipts WHERE space_id=$1',[spaceId])).rows[0].n,1);
+  const mismatch={...change,requestDigest:'b'.repeat(64)};
+  await assert.rejects(cell.execute(await token(),async (_principal,context) => {
+    await context.records(authority,tx=>tx.mutate(change));
+    await context.records(authority,tx=>tx.mutate(mismatch));
+  }),denied('IDEMPOTENCY_MISMATCH'));
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM idempotency_receipts WHERE space_id=$1',[spaceId])).rows[0].n,1);
+});
+
+test('placement fence publishes the full cell tuple after interrupted lifecycle publication', async () => {
+  const actor={kind:'session',credentialId:'session',userPrincipalId:`fence-${crypto.randomUUID()}`};
+  const cells=new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
+  const spaces=new PostgresSpaces(controlPool,cells,'cell-a',
+    {create:async()=>{throw new Error('unexpected create');},find:async()=>null,revoke:async()=>{}},
+    {current:async()=>true});
+  const {spaceId,createdAt,updatedAt}=await spaces.create(actor);
+  assert.ok(Number.isFinite(Date.parse(createdAt)) && Number.isFinite(Date.parse(updatedAt)));
+  assert.equal((await spaces.list(actor)).find(space=>space.spaceId===spaceId).createdAt,createdAt);
+  assert.equal((await spaces.get(actor,spaceId)).createdAt,createdAt);
+  await pool.query(`UPDATE spaces SET lifecycle='readOnly',policy_version=policy_version+1 WHERE space_id=$1`,[spaceId]);
+  assert.equal(await spaces.fencePlacement(spaceId,'cell-a',1),2);
+  const directory=(await controlPool.query(`SELECT lifecycle,policy_version,placement_generation
+    FROM space_directory WHERE space_id=$1`,[spaceId])).rows[0];
+  const local=(await pool.query(`SELECT lifecycle,policy_version,placement_generation
+    FROM spaces WHERE space_id=$1`,[spaceId])).rows[0];
+  assert.deepEqual(directory,local);
+  assert.deepEqual({lifecycle:directory.lifecycle,policyVersion:Number(directory.policy_version),
+    placementGeneration:Number(directory.placement_generation)},
+  {lifecycle:'readOnly',policyVersion:2,placementGeneration:2});
+});
+
+test('a joined finalizer crossing assertion expiry rolls back its record and receipt', async () => {
+  const spaceId=`sp_${crypto.randomUUID()}`;
+  const collectionId=`entries_${crypto.randomUUID()}`;
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
+  await collection(spaceId,collectionId);
+  let delayed=false;
+  const slowPool={connect:async () => {
+    const client=await pool.connect();
+    return {query:async (...args) => {
+      if (!delayed && typeof args[0]==='string' && args[0].includes('INSERT INTO idempotency_receipts')) {
+        delayed=true;
+        await pause(2400);
+      }
+      return client.query(...args);
+    },release:discard=>client.release(discard)};
+  }};
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const cell=new RegionalCell('cell-a',signer,new PostgresCellPolicy(slowPool,'cell-a',{current:async () => true}));
+  const authority=new PostgresAuthority(pool,60);
+  const now=Math.floor(Date.now()/1000);
+  const token=await signer.sign({spaceId,collectionId,capability:'records:write',credentialId:'owner-session',
+    kind:'session',userPrincipalId:'owner',cellId:'cell-a',policyVersion:1,placementGeneration:1,
+    audience:'stateplane-cell:cell-a',issuedAt:now,expiresAt:now+2,nonce:crypto.randomUUID()});
+  await assert.rejects(cell.execute(token,(_principal,context)=>context.records(authority,tx=>tx.mutate({
+    operation:'create',idempotencyKey:`expired-${crypto.randomUUID()}`,requestDigest:'a'.repeat(64),canonicalData:'{}'
+  }))),denied('FORBIDDEN'));
+  assert.equal(delayed,true);
+  for (const table of ['records','record_events','idempotency_receipts','receipt_reservations','projection_outbox'])
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[spaceId])).rows[0].n,0,table);
+});
+
+test('a joined finalizer crossing grant expiry rolls back before the cell effect commits', async () => {
+  const config={database:memoryAdapter(),namespace:`sta6-final-grant-${crypto.randomUUID()}`,plugins:[]};
+  createAuthFn(config);
+  const user=await createUser(config,{primaryEmail:`final-grant-${crypto.randomUUID()}@example.invalid`});
+  const session=await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity=new AuthFnIdentityVerifier(config);
+  const actor=await identity.verify(request(session.sessionToken));
+  const spaces=new PostgresSpaces(controlPool,new Map([['cell-a',{pool,storageTargetId:'target-a'}]]),
+    'cell-a',new AuthFnAgentKeys(config),identity);
+  const {spaceId}=await spaces.create(actor);
+  const collectionId=`entries_${crypto.randomUUID()}`;
+  await collection(spaceId,collectionId);
+  const grantExpiry=new Date(Date.now()+2_000);
+  const key=await spaces.issueAgentKey(actor,spaceId,new Date(Date.now()+60_000),
+    [{collectionId,capabilities:['records:write'],expiresAt:grantExpiry}]);
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const router=new RegionalRouter(identity,new PostgresRoutingDirectory(controlPool,
+    new Map([['cell-a',{pool,storageTargetId:'target-a'}]])),signer);
+  const token=(await router.assertion(request(key.secret),spaceId,collectionId,'records:write')).token;
+  let delayed=false;
+  const slowPool={connect:async () => {
+    const client=await pool.connect();
+    return {query:async (...args) => {
+      if (!delayed && typeof args[0]==='string' && args[0].includes('INSERT INTO idempotency_receipts')) {
+        delayed=true;
+        await pause(2400);
+      }
+      return client.query(...args);
+    },release:discard=>client.release(discard)};
+  }};
+  const cell=new RegionalCell('cell-a',signer,new PostgresCellPolicy(slowPool,'cell-a',identity));
+  let pendingReceipt;
+  await assert.rejects(cell.execute(token,(_principal,context)=>context.records(new PostgresAuthority(pool,60),
+    tx=>tx.mutate({operation:'create',idempotencyKey:`expired-grant-${crypto.randomUUID()}`,
+      requestDigest:'a'.repeat(64),canonicalData:'{}'}).then(receipt=>{pendingReceipt=receipt;return receipt;}))),denied('FORBIDDEN'));
+  assert.equal(delayed,true);
+  assert.throws(()=>JSON.stringify(pendingReceipt),denied('RECEIPT_PENDING'));
+  for (const table of ['records','record_events','idempotency_receipts','receipt_reservations','projection_outbox'])
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[spaceId])).rows[0].n,0,table);
 });
 
 test('signing key rotation retains then retires old assertions', async () => {

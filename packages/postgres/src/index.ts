@@ -74,6 +74,14 @@ const utf8Compare = (a: string, b: string) => Buffer.compare(Buffer.from(a), Buf
 function copyReceipt(receipt: Receipt, replayed = receipt.replayed): Receipt {
   return { ...receipt, ref: { ...receipt.ref }, projection: { ...receipt.projection }, replayed };
 }
+function pendingReceipt(receipt: Receipt, replayed = receipt.replayed): Receipt {
+  const result = copyReceipt(receipt, replayed);
+  for (const field of ['committedAt', 'expiresAt'] as const) {
+    Object.defineProperty(result, field, { configurable: true, enumerable: true,
+      get() { throw new AuthorityError('RECEIPT_PENDING', 'Receipt has not committed'); } });
+  }
+  return result;
+}
 function validUnicode(value: string): boolean {
   for (let i = 0; i < value.length; i++) {
     const point = value.codePointAt(i)!;
@@ -127,6 +135,13 @@ export function canonicalJsonObject(serialized: string): string {
 
 type PoolLike = Pick<pg.Pool, 'connect'>;
 type Client = pg.PoolClient;
+type PendingReceipt = { response: Receipt; returned: Receipt[]; digest: string; collectionId: CollectionId; key: string };
+type ReadyReceipt = { returned: Receipt[]; committedAt: string; expiresAt: string };
+export interface JoinedReceiptState {
+  pending: Map<string, PendingReceipt>;
+  replayed: Map<string, { collectionId: CollectionId; digest: string; response: Receipt }>;
+  ready: ReadyReceipt[];
+}
 const scopeIds = (scope: AuthorityScope) => [scope.spaceId, scope.collectionId];
 
 function validateChangeShape(change: RecordChange): void {
@@ -224,6 +239,7 @@ export class PostgresAuthority {
       await tx.finalizeReceipts();
       try { await client.query('COMMIT'); begun = false; }
       catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
+      tx.exposeReceipts();
       return result;
     } catch (error) {
       if (tx) { tx.sealMutations(); await tx.settleMutations(); }
@@ -235,12 +251,14 @@ export class PostgresAuthority {
 
   /** Join an already authorized cell transaction; the caller owns COMMIT/ROLLBACK. */
   async transactionOnClient<T>(client: Client, scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T>,
-    deferUntilCommit?: (finish: () => Promise<void>, close: () => void) => void): Promise<T> {
+    deferUntilCommit: (finish: () => Promise<void>, verify: () => Promise<void>, expose: () => void,
+      close: () => void) => void,
+    joinedReceipts?: JoinedReceiptState): Promise<T> {
     const fixedScope = Object.freeze({ ...scope });
     if (![fixedScope.spaceId,fixedScope.collectionId,fixedScope.principalId,fixedScope.credentialId].every(scalarString) ||
       !isSafeInteger(fixedScope.policyVersion) || fixedScope.policyVersion < 1 ||
       !isSafeInteger(fixedScope.placementGeneration) || fixedScope.placementGeneration < 1) throw new AuthorityError('INVALID_ARGUMENT');
-    const tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds);
+    const tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds, joinedReceipts);
     let deferred = false;
     try {
       await tx.checkScope();
@@ -254,10 +272,13 @@ export class PostgresAuthority {
         await tx.checkReplayScopes();
         await tx.finalizeReceipts();
       };
-      if (deferUntilCommit) {
-        deferUntilCommit(finish, () => tx.close());
-        deferred = true;
-      } else await finish();
+      const verify = async () => {
+        tx.assertCommittable();
+        await tx.checkScope();
+        await tx.checkReplayScopes();
+      };
+      deferUntilCommit(finish, verify, () => tx.exposeReceipts(), () => tx.close());
+      deferred = true;
       return result;
     } catch (error) {
       tx.sealMutations();
@@ -284,7 +305,9 @@ export class AuthorityTransaction {
   private active = true;
   private mutationFailed = false;
   private mutationError: unknown;
-  private readonly pendingReceipts = new Map<string, { response: Receipt; returned: Receipt[]; digest: string; collectionId: CollectionId; key: string }>();
+  private readonly pendingReceipts: JoinedReceiptState['pending'];
+  private readonly joinedReplays: JoinedReceiptState['replayed'];
+  private readonly readyReceipts: JoinedReceiptState['ready'];
   private readonly activeOperations = new Set<Promise<unknown>>();
   private mutationTail: Promise<void> = Promise.resolve();
   private readonly reservedIdentities = new Map<string, { operation: RecordMutation; key: string }>();
@@ -292,8 +315,12 @@ export class AuthorityTransaction {
   private readonly replayCollections = new Set<CollectionId>();
   readonly #scope: Readonly<AuthorityScope>;
   get scope(): Readonly<AuthorityScope> { return this.#scope; }
-  constructor(private readonly client: Client, scope: AuthorityScope, private readonly retentionSeconds: number) {
+  constructor(private readonly client: Client, scope: AuthorityScope, private readonly retentionSeconds: number,
+    joinedReceipts?: JoinedReceiptState) {
     this.#scope = Object.freeze({ ...scope });
+    this.pendingReceipts = joinedReceipts?.pending ?? new Map();
+    this.joinedReplays = joinedReceipts?.replayed ?? new Map();
+    this.readyReceipts = joinedReceipts?.ready ?? [];
   }
   close() { this.active = false; this.admittingMutations = false; this.activeOperations.clear(); this.reservedIdentities.clear(); this.replayCollections.clear(); }
   /** A caught mutation error must not turn a partial write into a successful commit. */
@@ -382,11 +409,11 @@ export class AuthorityTransaction {
       for (const pending of this.pendingReceipts.values()) {
         pending.response.committedAt = committedAt;
         pending.response.expiresAt = expiresAt;
-        for (const returned of pending.returned) { returned.committedAt = committedAt; returned.expiresAt = expiresAt; }
         await this.query(`INSERT INTO idempotency_receipts(receipt_id,space_id,collection_id,credential_id,operation,idempotency_key,request_digest,record_id,response,committed_at,expires_at)
           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)`, [pending.response.receiptId,this.#scope.spaceId,pending.collectionId,
           this.#scope.credentialId,pending.response.operation,pending.key,pending.digest,pending.response.ref.id,
           JSON.stringify(pending.response),committedAt,expiresAt]);
+        this.readyReceipts.push({returned:pending.returned,committedAt,expiresAt});
       }
       this.pendingReceipts.clear();
     }
@@ -398,6 +425,13 @@ export class AuthorityTransaction {
         [this.#scope.spaceId,this.#scope.collectionId,this.#scope.credentialId,operation,key]);
     }
     this.reservedIdentities.clear();
+  }
+  exposeReceipts(): void {
+    for (const ready of this.readyReceipts) for (const returned of ready.returned) {
+      Object.defineProperty(returned, 'committedAt', { value:ready.committedAt, writable:true, enumerable:true, configurable:true });
+      Object.defineProperty(returned, 'expiresAt', { value:ready.expiresAt, writable:true, enumerable:true, configurable:true });
+    }
+    this.readyReceipts.length = 0;
   }
   private async authorizeOriginal(collectionId: CollectionId): Promise<void> {
     if (collectionId === this.#scope.collectionId) return;
@@ -465,9 +499,16 @@ export class AuthorityTransaction {
       await this.authorizeOriginal(pending.collectionId);
       if (change.operation !== 'delete') canonicalJsonObject(change.canonicalData!);
       if (pending.digest !== change.requestDigest) throw new AuthorityError('IDEMPOTENCY_MISMATCH');
-      const replay = copyReceipt(pending.response, true);
+      const replay = pendingReceipt(pending.response, true);
       pending.returned.push(replay);
       return replay;
+    }
+    const joinedReplay = this.joinedReplays.get(identity);
+    if (joinedReplay) {
+      await this.authorizeOriginal(joinedReplay.collectionId);
+      if (change.operation !== 'delete') canonicalJsonObject(change.canonicalData!);
+      if (joinedReplay.digest !== change.requestDigest) throw new AuthorityError('IDEMPOTENCY_MISMATCH');
+      return copyReceipt(joinedReplay.response, true);
     }
     await this.reserveIdentity(change,identity);
     const previous = await this.findReceipt(change.operation, change.idempotencyKey);
@@ -475,6 +516,7 @@ export class AuthorityTransaction {
       await this.authorizeOriginal(previous.collectionId);
       if (change.operation !== 'delete') canonicalJsonObject(change.canonicalData!);
       if (previous.requestDigest !== change.requestDigest) throw new AuthorityError('IDEMPOTENCY_MISMATCH');
+      this.joinedReplays.set(identity,{collectionId:previous.collectionId,digest:previous.requestDigest,response:previous.response});
       return copyReceipt(previous.response, true);
     }
     await this.query(`DELETE FROM idempotency_receipts WHERE space_id=$1 AND credential_id=$2
@@ -566,7 +608,7 @@ export class AuthorityTransaction {
       beforeRevision,revision,schemaVersion:version.schemaVersion,committedAt,expiresAt,projection:{generation:version.generation,state:'pending'},replayed:false };
     await this.query('INSERT INTO projection_outbox(event_id,space_id,collection_id,record_id,revision,generation) VALUES($1,$2,$3,$4,$5,$6)',
       [eventId,...scopeIds(scope),recordId,revision,version.generation]);
-    const returned = copyReceipt(response);
+    const returned = pendingReceipt(response);
     this.pendingReceipts.set(identity, { response, returned: [returned], digest:change.requestDigest, collectionId:scope.collectionId, key:change.idempotencyKey });
     return returned;
   }

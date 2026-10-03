@@ -22,7 +22,9 @@ async function sourceRows(cells) {
   const seenSpaces = new Set();
   for (const { cellId, client } of cells) {
     const result = await client.query(`SELECT space_id,owner_principal_id,cell_id,storage_target_id,
-      lifecycle,policy_version,placement_generation,created_at::text AS created_at FROM spaces ORDER BY space_id`);
+      lifecycle,policy_version,placement_generation,
+      to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at
+      FROM spaces ORDER BY space_id`);
     for (const row of result.rows) {
       if (row.cell_id !== cellId || seenSpaces.has(row.space_id)) throw new Error(`Cell placement mismatch for ${row.space_id}`);
       seenSpaces.add(row.space_id);
@@ -36,12 +38,15 @@ async function copyRows(control, rows) {
   let copied = 0;
   let existing = 0;
   for (const row of rows) {
-    const current = await control.query('SELECT * FROM space_directory WHERE space_id=$1 FOR UPDATE',[row.space_id]);
+    const current = await control.query(`SELECT *,
+      to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS precise_created_at
+      FROM space_directory WHERE space_id=$1 FOR UPDATE`,[row.space_id]);
     if (current.rows[0]) {
       const found = current.rows[0];
       for (const key of ['owner_principal_id','cell_id','storage_target_id','lifecycle','policy_version','placement_generation']) {
         if (String(found[key]) !== String(row[key])) throw new Error(`Directory mismatch for ${row.space_id}: ${key}`);
       }
+      if (found.precise_created_at !== row.created_at) throw new Error(`Directory mismatch for ${row.space_id}: created_at`);
       existing++;
     } else {
       await control.query(`INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,

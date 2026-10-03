@@ -180,26 +180,39 @@ try {
     let attempted=false;
     let writerSettled=false;
     let writerUpdate;
+    const writerPid=(await writer.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
     try {
       await writer.query('BEGIN');
       const guardedControl={query:async (sql,...args) => {
-        if (!attempted && sql.startsWith('SELECT * FROM space_directory')) {
+        if (!attempted && sql.includes('FROM space_directory WHERE space_id')) {
           attempted=true;
           writerUpdate=writer.query("UPDATE spaces SET policy_version=policy_version+1 WHERE space_id='sp_upgrade'")
             .then(() => { writerSettled=true; });
-          await new Promise(resolve=>setTimeout(resolve,60));
+          let blocked=false;
+          for (let attempt=0;attempt<100;attempt++) {
+            const state=(await fresh.query('SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1',[writerPid])).rows[0];
+            if (state?.wait_event_type==='Lock') { blocked=true; break; }
+            if (writerSettled) break;
+            await new Promise(resolve=>setTimeout(resolve,20));
+          }
+          assert.equal(blocked,true,'source writer reached PostgreSQL and waits on the source lock');
           assert.equal(writerSettled,false,'source writer waits for the backfill snapshot lock');
         }
         return fresh.query(sql,...args);
       }};
       assert.deepEqual(await backfillDirectory(guardedControl,[{cellId:'cell-a',client:upgraded}],
         {expectedCellIds:['cell-a'],drained:true}),{copied:1,existing:0});
+      assert.equal(attempted,true,'source writer guard executed');
       await writerUpdate;
     } finally {
       await writer.query('ROLLBACK').catch(()=>{});
       await writer.end();
     }
     assert.deepEqual(await backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],{expectedCellIds:['cell-a'],drained:true}),{copied:0,existing:1});
+    await fresh.query("UPDATE space_directory SET created_at='2026-01-02 03:04:05.123+00' WHERE space_id='sp_upgrade'");
+    await assert.rejects(backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],
+      {expectedCellIds:['cell-a'],drained:true}),/created_at/);
+    await fresh.query("UPDATE space_directory SET created_at='2026-01-02 03:04:05.123456+00' WHERE space_id='sp_upgrade'");
     assert.equal((await fresh.query("SELECT created_at::text AS created_at FROM space_directory WHERE space_id='sp_upgrade'")).rows[0].created_at,
       (await upgraded.query("SELECT created_at::text AS created_at FROM spaces WHERE space_id='sp_upgrade'")).rows[0].created_at);
     const splitCells=new Map([['cell-a',{pool:upgraded,storageTargetId:'target-a'}]]);

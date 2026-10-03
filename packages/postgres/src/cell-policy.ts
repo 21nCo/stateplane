@@ -2,7 +2,7 @@ import type pg from 'pg';
 import type { CellPolicy, RouteClaims } from '@stateplane/application';
 import type { SpaceId, CollectionId } from '@stateplane/contracts';
 import { AuthorityError, CommitOutcomeUnknownError, PostgresAuthority } from './index.js';
-import type { AuthorityScope, AuthorityTransaction } from './index.js';
+import type { AuthorityScope, AuthorityTransaction, JoinedReceiptState } from './index.js';
 
 type PoolLike = Pick<pg.Pool, 'connect'>;
 export interface CurrentCredential {
@@ -108,7 +108,9 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     let begun = false;
     let beginAttempted = false;
     let discard = false;
-    const joined: Array<{ finish: () => Promise<void>; close: () => void }> = [];
+    const joined: Array<{ finish: () => Promise<void>; verify: () => Promise<void>; expose: () => void;
+      close: () => void }> = [];
+    const joinedReceipts: JoinedReceiptState = {pending:new Map(),replayed:new Map(),ready:[]};
     try {
       this.checkAssertionTime(claims);
       await this.checkDatabaseTime(client,claims);
@@ -155,7 +157,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
         },
         records: <TResult>(authority: PostgresAuthority, fn: (tx: AuthorityTransaction) => Promise<TResult>) =>
           admit(() => authority.transactionOnClient(client,scope,fn,
-            (finish,close) => { joined.push({finish,close}); })) });
+            (finish,verify,expose,close) => { joined.push({finish,verify,expose,close}); },joinedReceipts)) });
       let result: T;
       try { result = await effect(principalId, context); }
       finally {
@@ -170,8 +172,13 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       // Joined record work remains live until the enclosing cell transaction's
       // final boundary. A later callback cannot consume grant or receipt time.
       for (const entry of joined) await entry.finish();
+      for (const entry of joined) await entry.verify();
+      this.checkAssertionTime(claims);
+      await this.check(client,claims);
+      await this.checkDatabaseTime(client,claims);
       try { await client.query('COMMIT'); begun = false; }
       catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
+      for (const entry of joined) entry.expose();
       return result;
     } catch (error) {
       if (begun) { try { await client.query('ROLLBACK'); } catch { discard = true; } }

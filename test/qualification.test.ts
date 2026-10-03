@@ -36,14 +36,26 @@ describe('published package boundary', () => {
   });
 
   it('Stateplane accepts current AuthFn bearer/cookie sessions and enforces cookie CSRF before mutation', async () => {
-    const config = { database:memoryAdapter(),namespace:'stateplane-session',plugins:[] };
+    const adapter = memoryAdapter();
+    const lookups: string[] = [];
+    const database = new Proxy(adapter,{ get(target,property,receiver) {
+      if (property === 'findOne') return (input: Parameters<typeof adapter.findOne>[0]) => {
+        lookups.push(input.model);
+        return adapter.findOne(input);
+      };
+      return Reflect.get(target,property,receiver);
+    } });
+    const config = { database,namespace:'stateplane-session',plugins:[] };
     createAuthFn(config);
     const user = await createUser(config,{primaryEmail:'owner@example.invalid'});
     const issued = await issueSession(config,{}, { userId:user.id,methods:['oauth-github'] });
     const verifier = new AuthFnIdentityVerifier(config);
     const url = 'https://stateplane.example.invalid/spaces';
     const bearer = new Request(url,{ headers:{ Authorization:`Bearer ${issued.sessionToken}` } });
+    lookups.length = 0;
     expect(await verifier.verify(bearer)).toEqual({credentialId:issued.session.id,kind:'session',userPrincipalId:user.id});
+    expect(lookups).toContain('sessions');
+    expect(lookups).not.toContain('api_keys');
     for (const scheme of ['bearer','BEARER']) {
       expect(await verifier.verify(new Request(url,{headers:{Authorization:`${scheme} ${issued.sessionToken}`}})))
         .toEqual({credentialId:issued.session.id,kind:'session',userPrincipalId:user.id});
