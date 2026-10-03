@@ -23,6 +23,9 @@ async function sourceRows(cells) {
   for (const { cellId, client } of cells) {
     const result = await client.query(`SELECT space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,
       lifecycle,policy_version,placement_generation,
+      EXISTS (SELECT 1 FROM space_audit a WHERE a.space_id=spaces.space_id
+        AND a.actor_principal_id=spaces.owner_principal_id AND a.action='space:create'
+        AND a.policy_version=1 AND a.placement_generation=1) AS created,
       to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at
       FROM spaces ORDER BY space_id`);
     for (const row of result.rows) {
@@ -34,6 +37,26 @@ async function sourceRows(cells) {
   return rows;
 }
 
+function validateExisting(found, row) {
+  const pending = found.lifecycle === 'provisioning' && row.lifecycle === 'active';
+  for (const key of ['owner_principal_id','cell_id','storage_target_id','policy_version','placement_generation']) {
+    if (String(found[key]) !== String(row[key])) throw new Error(`Directory mismatch for ${row.space_id}: ${key}`);
+  }
+  if (pending) {
+    // A reservation and its committed cell have independent creation clocks.
+    // Only the initial audited cell may complete this unpublished transition.
+    if (row.created !== true || row.home_cell_id !== row.cell_id ||
+      Number(row.policy_version) !== 1 || Number(row.placement_generation) !== 1)
+      throw new Error(`Directory mismatch for ${row.space_id}: provisioning cell`);
+  } else if (found.lifecycle !== row.lifecycle) {
+    throw new Error(`Directory mismatch for ${row.space_id}: lifecycle`);
+  }
+  if (found.home_cell_id !== null && found.home_cell_id !== row.home_cell_id)
+    throw new Error(`Directory mismatch for ${row.space_id}: home_cell_id`);
+  if (!pending && found.precise_created_at !== row.created_at)
+    throw new Error(`Directory mismatch for ${row.space_id}: created_at`);
+}
+
 async function copyRows(control, rows) {
   let copied = 0;
   let existing = 0;
@@ -43,16 +66,11 @@ async function copyRows(control, rows) {
       FROM space_directory WHERE space_id=$1 FOR UPDATE`,[row.space_id]);
     if (current.rows[0]) {
       const found = current.rows[0];
-      for (const key of ['owner_principal_id','cell_id','storage_target_id','lifecycle','policy_version','placement_generation']) {
-        if (String(found[key]) !== String(row[key])) throw new Error(`Directory mismatch for ${row.space_id}: ${key}`);
-      }
+      validateExisting(found,row);
       if (found.home_cell_id === null) {
         await control.query('UPDATE space_directory SET home_cell_id=$2 WHERE space_id=$1',
           [row.space_id,row.home_cell_id]);
-      } else if (found.home_cell_id !== row.home_cell_id) {
-        throw new Error(`Directory mismatch for ${row.space_id}: home_cell_id`);
       }
-      if (found.precise_created_at !== row.created_at) throw new Error(`Directory mismatch for ${row.space_id}: created_at`);
       existing++;
     } else {
       await control.query(`INSERT INTO space_directory(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,

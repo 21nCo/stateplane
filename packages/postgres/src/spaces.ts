@@ -273,7 +273,8 @@ export class PostgresSpaces {
       if (cell.storageTargetId !== row.storage_target_id) throw new AuthorityError('STALE_PLACEMENT');
       const local = await (cell.pool === this.control ? directory : cell.pool).query(`SELECT s.owner_principal_id,s.home_cell_id,s.cell_id,s.storage_target_id,s.lifecycle,
         s.policy_version,s.placement_generation,
-        EXISTS (SELECT 1 FROM space_audit a WHERE a.space_id=s.space_id AND a.action='space:create') AS created
+        EXISTS (SELECT 1 FROM space_audit a WHERE a.space_id=s.space_id AND a.actor_principal_id=s.owner_principal_id
+          AND a.action='space:create' AND a.policy_version=1 AND a.placement_generation=1) AS created
         FROM spaces s WHERE s.space_id=$1`,[spaceId]);
       const existing = local.rows[0];
       if (!existing) {
@@ -283,12 +284,14 @@ export class PostgresSpaces {
           VALUES($1,$2,$3,'space:provision-retired')`,[spaceId,ownerPrincipalId,row.cell_id]);
         return;
       }
-      if (existing.owner_principal_id !== ownerPrincipalId || existing.home_cell_id !== row.home_cell_id || existing.cell_id !== row.cell_id ||
+      if (existing.owner_principal_id !== ownerPrincipalId || existing.home_cell_id !== row.cell_id ||
+        (row.home_cell_id !== null && existing.home_cell_id !== row.home_cell_id) || existing.cell_id !== row.cell_id ||
         existing.storage_target_id !== row.storage_target_id || existing.lifecycle !== 'active' ||
         safeVersion(existing.policy_version) !== 1 || safeVersion(existing.placement_generation) !== 1 ||
         existing.created !== true) throw new AuthorityError('STALE_PLACEMENT');
-      await directory.query(`UPDATE space_directory SET lifecycle='active',provisioning_lease_until=NULL,updated_at=clock_timestamp()
-        WHERE space_id=$1 AND lifecycle='provisioning'`,[spaceId]);
+      await directory.query(`UPDATE space_directory SET home_cell_id=COALESCE(home_cell_id,$2),
+        lifecycle='active',provisioning_lease_until=NULL,updated_at=clock_timestamp()
+        WHERE space_id=$1 AND lifecycle='provisioning'`,[spaceId,existing.home_cell_id]);
     });
   }
   async list(actor: VerifiedCredential): Promise<SpaceInfo[]> {

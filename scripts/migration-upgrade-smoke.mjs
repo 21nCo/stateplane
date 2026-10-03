@@ -233,9 +233,10 @@ try {
     assert.equal((await fresh.query("SELECT created_at::text AS created_at FROM space_directory WHERE space_id='sp_upgrade'")).rows[0].created_at,
       (await upgraded.query("SELECT created_at::text AS created_at FROM spaces WHERE space_id='sp_upgrade'")).rows[0].created_at);
     const splitCellPool=new pg.Pool({connectionString:url(names[0])});
+    const splitControlPool=new pg.Pool({connectionString:url(names[1])});
     try {
       const splitCells=new Map([['cell-a',{pool:splitCellPool,storageTargetId:'target-a'}]]);
-      const splitSpaces=new PostgresSpaces(fresh,splitCells,'cell-a',
+      const splitSpaces=new PostgresSpaces(splitControlPool,splitCells,'cell-a',
         {create:async () => { throw new Error('unexpected provider create'); },
           find:async () => null,revoke:async () => {}},{current:async () => true});
       assert.equal((await splitSpaces.get({kind:'session',userPrincipalId:'owner',credentialId:'upgrade-session'},
@@ -244,7 +245,56 @@ try {
       assert.equal(await splitSpaces.fencePlacement('sp_upgrade','cell-a',1),2);
       assert.equal((await splitSpaces.reconcile('sp_upgrade')).homeCellId,'cell-origin');
       assert.equal((await splitSpaces.list({kind:'session',userPrincipalId:'owner',credentialId:'upgrade-session'}))[0].homeCellId,'cell-origin');
-    } finally { await splitCellPool.end(); }
+      const pending='sp_pre025_reservation';
+      await upgraded.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+        VALUES($1,'pending-owner','cell-a','cell-a','target-a')`,[pending]);
+      await upgraded.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
+        VALUES('aud_pre025_reservation',$1,'pending-owner','session','space:create',1,1)`,[pending]);
+      await fresh.query(`INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,lifecycle,
+        provisioning_lease_until) VALUES($1,'pending-owner','cell-a','target-a','provisioning',clock_timestamp()-interval '1 second')`,[pending]);
+      await assert.rejects(fresh.query("UPDATE space_directory SET home_cell_id='' WHERE space_id=$1",[pending]),
+        error=>error.code==='23514');
+      assert.equal((await fresh.query('SELECT home_cell_id FROM space_directory WHERE space_id=$1',[pending]))
+        .rows[0].home_cell_id,null);
+      assert.deepEqual((await splitSpaces.list({kind:'session',userPrincipalId:'pending-owner',credentialId:'session'})),
+        [await splitSpaces.get({kind:'session',userPrincipalId:'pending-owner',credentialId:'session'},pending)]);
+      assert.equal((await fresh.query('SELECT home_cell_id,lifecycle FROM space_directory WHERE space_id=$1',[pending]))
+        .rows[0].home_cell_id,'cell-a');
+      assert.equal((await new PostgresRoutingDirectory(splitControlPool,splitCells).lookup(pending)).lifecycle,'active');
+      assert.equal((await upgraded.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:create'",
+        [pending])).rows[0].n,1);
+      // Recreate the same migrated reservation and let drained backfill hydrate it.
+      await fresh.query(`UPDATE space_directory SET home_cell_id=NULL,lifecycle='provisioning',
+        provisioning_lease_until=clock_timestamp()+interval '60 seconds' WHERE space_id=$1`,[pending]);
+      assert.deepEqual(await backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],
+        {expectedCellIds:['cell-a'],drained:true}),{copied:0,existing:2});
+      assert.equal((await fresh.query('SELECT home_cell_id,lifecycle FROM space_directory WHERE space_id=$1',[pending]))
+        .rows[0].lifecycle,'provisioning');
+      assert.equal((await fresh.query('SELECT home_cell_id FROM space_directory WHERE space_id=$1',[pending]))
+        .rows[0].home_cell_id,'cell-a');
+      assert.deepEqual(await splitSpaces.list({kind:'session',userPrincipalId:'pending-owner',credentialId:'session'}),[]);
+      await fresh.query("UPDATE space_directory SET provisioning_lease_until=clock_timestamp()-interval '1 second' WHERE space_id=$1",
+        [pending]);
+      assert.equal((await splitSpaces.list({kind:'session',userPrincipalId:'pending-owner',credentialId:'session'}))[0]
+        .spaceId,pending);
+      await fresh.query("UPDATE space_directory SET home_cell_id='wrong-home' WHERE space_id=$1",[pending]);
+      await assert.rejects(backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],
+        {expectedCellIds:['cell-a'],drained:true}),/home_cell_id/);
+      assert.equal((await fresh.query('SELECT home_cell_id FROM space_directory WHERE space_id=$1',[pending]))
+        .rows[0].home_cell_id,'wrong-home');
+      await fresh.query("UPDATE space_directory SET home_cell_id=NULL WHERE space_id='sp_upgrade'");
+      await assert.rejects(backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],
+        {expectedCellIds:['cell-a'],drained:true}),/home_cell_id/);
+      assert.equal((await fresh.query("SELECT home_cell_id FROM space_directory WHERE space_id='sp_upgrade'"))
+        .rows[0].home_cell_id,null,'a later mismatch rolls back earlier hydration');
+      await fresh.query("UPDATE space_directory SET home_cell_id='cell-origin' WHERE space_id='sp_upgrade'");
+      await fresh.query("UPDATE space_directory SET home_cell_id=NULL,lifecycle='provisioning' WHERE space_id=$1",[pending]);
+      await upgraded.query("UPDATE spaces SET policy_version=2 WHERE space_id=$1",[pending]);
+      await assert.rejects(backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],
+        {expectedCellIds:['cell-a'],drained:true}),/policy_version/);
+      assert.equal((await fresh.query('SELECT home_cell_id FROM space_directory WHERE space_id=$1',[pending]))
+        .rows[0].home_cell_id,null);
+    } finally { await Promise.all([splitCellPool.end(),splitControlPool.end()]); }
     await enforceUniqueRecord(upgraded);
     assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,25);
     assert.equal(runMigrator(names[0]),'');

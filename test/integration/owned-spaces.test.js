@@ -934,6 +934,8 @@ test('owner listing retires an interrupted reservation without a cell and publis
   for (const spaceId of [retired,completed]) await controlPool.query(`INSERT INTO space_directory
     (space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,lifecycle)
     VALUES($1,$2,'cell-a','cell-a','target-a','provisioning')`,[spaceId,actor.userPrincipalId]);
+  // Migration 025 cannot fill a split-control reservation before cell readback.
+  await controlPool.query('UPDATE space_directory SET home_cell_id=NULL WHERE space_id=$1',[completed]);
   await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
     VALUES($1,$2,'cell-a','cell-a','target-a')`,[completed,actor.userPrincipalId]);
   await pool.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
@@ -943,6 +945,9 @@ test('owner listing retires an interrupted reservation without a cell and publis
   await assert.rejects(router.assertion(new Request('https://gateway.example.invalid'),completed,'collection','records:read'),
     denied('SPACE_UNAVAILABLE'));
   assert.equal((await spaces.list(actor)).some(space => space.spaceId === completed),true);
+  assert.equal((await spaces.get(actor,completed)).homeCellId,'cell-a');
+  assert.equal((await controlPool.query('SELECT home_cell_id FROM space_directory WHERE space_id=$1',
+    [completed])).rows[0].home_cell_id,'cell-a');
   assert.equal((await spaces.list(actor)).some(space => space.spaceId === retired),false);
   assert.equal((await directory.lookup(completed)).lifecycle,'active');
   assert.equal((await directory.lookup(retired)).lifecycle,'deleted');
@@ -955,6 +960,26 @@ test('owner listing retires an interrupted reservation without a cell and publis
   assert.equal((await pool.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:create'",
     [completed])).rows[0].n,1);
   assert.equal((await spaces.list({...actor,userPrincipalId:'other-owner'})).some(space => space.spaceId === completed),false);
+  const unverified=`sp_${crypto.randomUUID()}`;
+  await controlPool.query(`INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,lifecycle)
+    VALUES($1,$2,'cell-a','target-a','provisioning')`,[unverified,actor.userPrincipalId]);
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,$2,'wrong-home','cell-a','target-a')`,[unverified,actor.userPrincipalId]);
+  await pool.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
+    VALUES($1,$2,$3,$4,'space:create',1,1)`,[`aud_${crypto.randomUUID()}`,unverified,actor.userPrincipalId,actor.credentialId]);
+  const stillPending=async () => {
+    assert.equal((await spaces.list(actor)).some(space => space.spaceId === unverified),false);
+    assert.deepEqual((await controlPool.query('SELECT lifecycle,home_cell_id FROM space_directory WHERE space_id=$1',
+      [unverified])).rows[0],{lifecycle:'provisioning',home_cell_id:null});
+  };
+  await stillPending();
+  await pool.query("UPDATE spaces SET home_cell_id='cell-a',owner_principal_id='wrong-owner' WHERE space_id=$1",[unverified]);
+  await stillPending();
+  await pool.query("UPDATE spaces SET owner_principal_id=$2,storage_target_id='wrong-target' WHERE space_id=$1",
+    [unverified,actor.userPrincipalId]);
+  await stillPending();
+  await pool.query("UPDATE spaces SET storage_target_id='target-a' WHERE space_id=$1",[unverified]);
+  assert.equal((await spaces.list(actor)).find(space => space.spaceId === unverified)?.homeCellId,'cell-a');
 });
 
 test('erasure mode cannot remove space or retired-provisioning audit rows', async () => {
