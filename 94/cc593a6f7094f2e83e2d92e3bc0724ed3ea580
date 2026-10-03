@@ -1,0 +1,22 @@
+docs/owned-spaces.md
+  h_a39f9495f9ec1d 23,38
+migrations/023_agent_key_completion_fence.sql
+  h_a39f9495f9ec1d 1-9
+packages/postgres/src/spaces.ts
+  h_a39f9495f9ec1d 511,516-518,523-543,558,561-562,567,605,608,617,623-627,648-649,651-652,661,713-714,827-848
+scripts/migration-upgrade-smoke.mjs
+  h_a39f9495f9ec1d 138,179,181
+test/integration/owned-spaces.test.js
+  h_a39f9495f9ec1d 1717-1907
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "94cc593a6f7094f2e83e2d92e3bc0724ed3ea580",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
