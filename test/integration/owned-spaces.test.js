@@ -257,7 +257,11 @@ test('owned spaces, AuthFn identities and cell effects share a revocable authori
   await assert.rejects(spaces.rotateAgentKey(owner,first.spaceId,rotateRetryKey.id,expires,
     [{collectionId:c1,capabilities:['records:read']}]),/provider revoke failed/);
   failRevoke = false;
-  const rotatedRetry = await spaces.rotateAgentKey(owner,first.spaceId,rotateRetryKey.id,expires,
+  await assert.rejects(spaces.rotateAgentKey(owner,first.spaceId,rotateRetryKey.id,expires,
+    [{collectionId:c1,capabilities:['records:read']}]),denied('STALE_PLACEMENT'));
+  await spaces.revokeAgentKey(owner,first.spaceId,rotateRetryKey.id);
+  const freshRotationSource = await spaces.issueAgentKey(owner,first.spaceId,expires,[{collectionId:c1,capabilities:['records:read']}]);
+  const rotatedRetry = await spaces.rotateAgentKey(owner,first.spaceId,freshRotationSource.id,expires,
     [{collectionId:c1,capabilities:['records:read']}]);
   await assert.rejects(route(rotateRetryKey.secret,first.spaceId,c1),denied('UNAUTHENTICATED'));
   assert.equal(await read(cellA,(await route(rotatedRetry.secret,first.spaceId,c1)).token),0);
@@ -1996,8 +2000,15 @@ test('failed issuance and rotation never expose grants after publication and pro
   const realProvider = new AuthFnAgentKeys(config);
   let issued;
   let providerOffline = false;
+  let providerOfflineAfterCreate = false;
+  let directoryOfflineAfterCreate = false;
   const provider = {
-    create:async (...args) => { issued = await realProvider.create(...args); return issued; },
+    create:async (...args) => {
+      issued = await realProvider.create(...args);
+      if (providerOfflineAfterCreate) providerOffline=true;
+      if (directoryOfflineAfterCreate) directoryOffline=true;
+      return issued;
+    },
     revoke:async (...args) => { if (providerOffline) throw new Error('provider revoke offline'); return realProvider.revoke(...args); },
   };
   let directoryOffline = false;
@@ -2057,8 +2068,10 @@ test('failed issuance and rotation never expose grants after publication and pro
   // Retry old-key revocation, then fail publication of the newly issued key.
   providerOffline = false;
   await spaces.revokeAgentKey(owner,spaceId,old.id);
-  directoryOffline = true; providerOffline = true;
-  await assert.rejects(spaces.rotateAgentKey(owner,spaceId,old.id,expires,grants),/directory publish offline/);
+  const usableOld = await spaces.issueAgentKey(owner,spaceId,expires,grants);
+  directoryOfflineAfterCreate = true; providerOfflineAfterCreate = true;
+  await assert.rejects(spaces.rotateAgentKey(owner,spaceId,usableOld.id,expires,grants),/directory publish offline/);
+  providerOfflineAfterCreate = false; directoryOfflineAfterCreate = false;
   directoryOffline = false;
   await assertFailedKeyIsDenied();
   providerOffline = false;
@@ -2066,6 +2079,152 @@ test('failed issuance and rotation never expose grants after publication and pro
   assert.equal((await pool.query(`SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND credential_id=$2
     AND action='key:issue-failed'`,[spaceId,issued.id])).rows[0].n,1);
 });
+
+test('rotation consumes its source once across failed validation, concurrent calls and response retries',
+  {timeout:10_000}, async () => {
+    const actor={kind:'session',credentialId:'session',userPrincipalId:`rotate-once-${crypto.randomUUID()}`};
+    const active=new Set();
+    const correlations=new Map();
+    let creates=0; let failCreate=false; let pauseRevoke=false; let reached; let release;
+    const atRevoke=new Promise(resolve => { reached=resolve; });
+    const revokeGate=new Promise(resolve => { release=resolve; });
+    const keys={
+      create:async (_owner,_expiry,issuanceId) => {
+        if (failCreate) { failCreate=false; throw new Error('provider create rejected'); }
+        const id=`rotate-once-key-${++creates}-${crypto.randomUUID()}`;
+        active.add(id); correlations.set(issuanceId,id);
+        return {id,secret:`secret-${id}`};
+      },
+      find:async (_owner,issuanceId) => correlations.get(issuanceId) ?? null,
+      revoke:async id => {
+        if (pauseRevoke) { pauseRevoke=false; reached(); await revokeGate; }
+        active.delete(id);
+      },
+    };
+    const spaces=new PostgresSpaces(controlPool,new Map([['cell-a',{pool,storageTargetId:'target-a'}]]),
+      'cell-a',keys,{current:async () => true});
+    const {spaceId}=await spaces.create(actor);
+    const collectionId=`rotate_once_${crypto.randomUUID()}`;
+    await collection(spaceId,collectionId);
+    const expires=new Date(Date.now()+3_600_000);
+    const grants=[{collectionId,capabilities:['records:read']}];
+    const old=await spaces.issueAgentKey(actor,spaceId,expires,grants);
+    await assert.rejects(spaces.rotateAgentKey(actor,spaceId,old.id,expires,
+      [{collectionId:'missing',capabilities:['records:read']}]),denied('INVALID_ARGUMENT'));
+    assert.equal(creates,1,'failed preflight leaves the source reusable');
+    pauseRevoke=true;
+    let rotating;
+    try {
+      rotating=spaces.rotateAgentKey(actor,spaceId,old.id,expires,grants);
+      await atRevoke;
+      await assert.rejects(spaces.rotateAgentKey(actor,spaceId,old.id,expires,grants),denied('STALE_PLACEMENT'));
+      assert.equal(creates,1,'concurrent retry creates no provider key');
+      release();
+      const replacement=await rotating;
+      assert.equal(creates,2);
+      await assert.rejects(spaces.rotateAgentKey(actor,spaceId,old.id,expires,grants),denied('STALE_PLACEMENT'));
+      assert.deepEqual([...active],[replacement.id]);
+      assert.equal((await controlPool.query(`SELECT count(*)::int AS n FROM agent_key_issuances
+        WHERE space_id=$1`,[spaceId])).rows[0].n,2);
+      assert.equal((await pool.query(`SELECT count(*)::int AS n FROM collection_grants
+        WHERE space_id=$1 AND credential_id=$2`,[spaceId,replacement.id])).rows[0].n,1);
+      assert.equal((await pool.query(`SELECT count(*)::int AS n FROM space_audit
+        WHERE space_id=$1 AND credential_id=$2 AND action='key:revoke'`,[spaceId,old.id])).rows[0].n,1);
+      assert.equal((await controlPool.query(`SELECT policy_version FROM space_directory WHERE space_id=$1`,
+        [spaceId])).rows[0].policy_version,
+      (await pool.query(`SELECT policy_version FROM spaces WHERE space_id=$1`,[spaceId])).rows[0].policy_version);
+      failCreate=true;
+      await assert.rejects(spaces.rotateAgentKey(actor,spaceId,replacement.id,expires,grants),/provider create rejected/);
+      await assert.rejects(spaces.rotateAgentKey(actor,spaceId,replacement.id,expires,grants),denied('STALE_PLACEMENT'));
+      assert.equal(creates,2,'a failed replacement and retry do not overissue');
+      assert.equal(active.size,0);
+      const journals=(await controlPool.query(`SELECT credential_id,settled_without_key_at FROM agent_key_issuances
+        WHERE space_id=$1 ORDER BY created_at`,[spaceId])).rows;
+      assert.equal(journals.length,3);
+      assert.equal(journals[2].credential_id,null);
+      assert.ok(journals[2].settled_without_key_at);
+      assert.equal((await pool.query(`SELECT count(*)::int AS n FROM collection_grants
+        WHERE space_id=$1 AND credential_id=$2`,[spaceId,replacement.id])).rows[0].n,0);
+      assert.equal((await pool.query(`SELECT count(*)::int AS n FROM space_audit
+        WHERE space_id=$1 AND credential_id=$2 AND action='key:revoke'`,[spaceId,replacement.id])).rows[0].n,1);
+    } finally { release(); await rotating?.catch(() => {}); }
+  });
+
+test('reconcile clears local grants after provider revoke succeeds but cell compensation fails for issue and rotation',
+  {timeout:10_000}, async () => {
+    for (const operation of ['issue','rotate']) {
+      const actor={kind:'session',credentialId:'session',userPrincipalId:`repair-key-${crypto.randomUUID()}`};
+      const active=new Set();
+      const correlations=new Map();
+      let created; let arm=false; let failPublish=false; let failCellCompensation=false;
+      const keys={
+        create:async (_owner,_expiry,issuanceId) => {
+          created={id:`repair-key-${crypto.randomUUID()}`,secret:'unused'};
+          correlations.set(issuanceId,created.id); active.add(created.id);
+          if (arm) { failPublish=true; failCellCompensation=true; }
+          return created;
+        },
+        find:async (_owner,issuanceId) => correlations.get(issuanceId) ?? null,
+        revoke:async id => { active.delete(id); },
+      };
+      const control=controlWithQueryHook((sql,_args,next) => {
+        if (failPublish && typeof sql==='string' && sql.includes('UPDATE space_directory SET policy_version=$3,lifecycle=$4'))
+          throw new Error('directory publish unavailable');
+        return next();
+      });
+      const cellPool={
+        query:(...args) => pool.query(...args),
+        connect:async () => {
+          const client=await pool.connect();
+          return {query:(...args) => {
+            if (failCellCompensation && typeof args[0]==='string' &&
+              (args[0].includes('UPDATE space_credentials SET revoked_at=') ||
+                args[0].includes('UPDATE space_credentials SET provider_revoked_at=')))
+              throw new Error('cell compensation unavailable');
+            return client.query(...args);
+          },release:discard => client.release(discard)};
+        },
+      };
+      const spaces=new PostgresSpaces(control,new Map([['cell-a',{pool:cellPool,storageTargetId:'target-a'}]]),
+        'cell-a',keys,{current:async () => true});
+      const {spaceId}=await spaces.create(actor);
+      const collectionId=`repair_${crypto.randomUUID()}`;
+      await collection(spaceId,collectionId);
+      const expires=new Date(Date.now()+3_600_000);
+      const grants=[{collectionId,capabilities:['records:read']}];
+      const old=operation==='rotate' ? await spaces.issueAgentKey(actor,spaceId,expires,grants) : null;
+      arm=true;
+      await assert.rejects(operation==='rotate'
+        ? spaces.rotateAgentKey(actor,spaceId,old.id,expires,grants)
+        : spaces.issueAgentKey(actor,spaceId,expires,grants),/directory publish unavailable/);
+      const failed=created;
+      const journal=(await controlPool.query(`SELECT provider_revoked_at FROM agent_key_issuances
+        WHERE space_id=$1 AND credential_id=$2`,[spaceId,failed.id])).rows[0];
+      assert.ok(journal.provider_revoked_at,'fallback records successful provider revocation');
+      assert.equal(active.has(failed.id),false);
+      const before=(await pool.query(`SELECT revoked_at,provider_revoked_at FROM space_credentials
+        WHERE space_id=$1 AND credential_id=$2`,[spaceId,failed.id])).rows[0];
+      assert.equal(before.revoked_at,null,'injected cell outage leaves local authority to repair');
+      assert.equal(before.provider_revoked_at,null);
+      assert.equal((await pool.query(`SELECT count(*)::int AS n FROM collection_grants
+        WHERE space_id=$1 AND credential_id=$2`,[spaceId,failed.id])).rows[0].n,1);
+      failPublish=false; failCellCompensation=false;
+      await spaces.reconcile(spaceId);
+      const after=(await pool.query(`SELECT revoked_at,provider_revoked_at FROM space_credentials
+        WHERE space_id=$1 AND credential_id=$2`,[spaceId,failed.id])).rows[0];
+      assert.ok(after.revoked_at && after.provider_revoked_at);
+      assert.equal((await pool.query(`SELECT count(*)::int AS n FROM collection_grants
+        WHERE space_id=$1 AND credential_id=$2`,[spaceId,failed.id])).rows[0].n,0);
+      assert.equal((await pool.query(`SELECT count(*)::int AS n FROM space_audit
+        WHERE space_id=$1 AND credential_id=$2 AND action='key:issue-failed'`,[spaceId,failed.id])).rows[0].n,1);
+      assert.equal((await controlPool.query(`SELECT policy_version FROM space_directory WHERE space_id=$1`,
+        [spaceId])).rows[0].policy_version,
+      (await pool.query(`SELECT policy_version FROM spaces WHERE space_id=$1`,[spaceId])).rows[0].policy_version);
+      await spaces.reconcile(spaceId);
+      assert.equal((await pool.query(`SELECT count(*)::int AS n FROM space_audit
+        WHERE space_id=$1 AND credential_id=$2 AND action='key:issue-failed'`,[spaceId,failed.id])).rows[0].n,1);
+    }
+  });
 
 test('lost issuance acknowledgements keep unconfirmed issue and rotation keys inert and repairable', async () => {
   const config = {database:memoryAdapter(),namespace:`sta6-ack-${crypto.randomUUID()}`,plugins:[]};

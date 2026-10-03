@@ -26,6 +26,8 @@ Migration 016 backfills the directory from existing spaces when the control and 
 
 Migration 012's scoped purge routine is `SECURITY DEFINER`, revokes default `PUBLIC` execution, requires `deleting`, and is the sole deletion path through immutable record-event and collection-version triggers. Provisioning must explicitly grant `EXECUTE ON FUNCTION public.stateplane_purge_space(text)` to the cell's operational role only, after the repository's role-admission checks. Do not grant it to a settings, disposable probe or control role. The routine retains audit metadata but erases records, versions, grants, receipts, outbox, entity references and nonces. Future child tables must join that purge transaction before their features can ship.
 
+Rotation consumes an active source key once. If validation fails before revocation, the owner may retry the same source. Once local revocation commits, a repeated or concurrent rotation with that source fails with `STALE_PLACEMENT` before AuthFn creates another key, even if provider revocation or replacement issuance failed. The owner can retry provider cleanup with `revokeAgentKey` and issue a new key explicitly. Reconciliation treats a journaled provider revocation as terminal and repairs any remaining local credential and grants before publishing the cell version; a failed cell compensation write remains retryable without another provider revoke.
+
 ## Focused risk matrix
 
 | Surface | Failure to prevent | Evidence |
@@ -36,6 +38,7 @@ Migration 012's scoped purge routine is `SECURITY DEFINER`, revokes default `PUB
 | Lifecycle | Interrupted provision/delete or inconsistent restore leaves usable content or publishes an unpurged tombstone | Provisioning is unrouteable; `deleting` denies effects; deleted-cell repair, erasure proof, retry and immutable-audit SQL readback |
 | Operations | A failed remote/provider call or process stop loses the control/cell version sync | Durable pending provider acknowledgement, cell-first publication, reconcile CAS and ambiguous-BEGIN client discard; exact-head Railway/Preview checks remain required |
 | Runtime coordination | Hyperdrive transaction pooling drops session locks; one-connection pool stalls while provider create is paused; an expired reconciler revokes a successor's key | Database-clock claims, explicit row locks, journal completion/cancellation barriers for issue and rotation in separate and one-connection pools, paused-provider archive/delete and interrupted-issuer recovery; exact-head Hyperdrive readback remains required |
+| Rotation and cleanup | A reused source issues two replacements; provider revoke succeeds but failed cell compensation strands grants | Concurrent and response-retry rotation, failed preflight retry, issue/rotation compensation outage and reconciliation journal/cell/audit readback |
 | Upgrade | Existing cell spaces disappear from the new control directory | Single-database migration backfill and drained cross-database copy with owner list/get and route readback |
 | Audit | Retained history grows beyond one response or a cursor crosses spaces | Fixed 100-row keyset pages, tie ordering, malformed/cross-space cursor and owner denial cases |
 

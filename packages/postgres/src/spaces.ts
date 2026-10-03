@@ -616,6 +616,20 @@ export class PostgresSpaces {
     await this.cleanupIssuances(info(row),row.lifecycle === 'deleted' || first.rows[0]?.lifecycle === 'deleting' ||
       first.rows[0]?.lifecycle === 'deleted',controlClient,leaseToken);
     if (first.rows[0] && first.rows[0].lifecycle !== 'deleted') {
+      // A provider revoke can succeed while cell compensation fails. The
+      // durable journal is terminal even then: clear any remaining local
+      // authority before publishing the repaired directory version.
+      const providerRevoked = await controlClient.query(`SELECT credential_id FROM agent_key_issuances
+        WHERE space_id=$1 AND provider_revoked_at IS NOT NULL AND credential_id IS NOT NULL`,[spaceId]);
+      for (const key of providerRevoked.rows) {
+        const localKey = await this.cell(row.cell_id).pool.query(`SELECT revoked_at,provider_revoked_at FROM space_credentials
+          WHERE space_id=$1 AND credential_id=$2`,[spaceId,key.credential_id]);
+        if (!localKey.rows[0]) continue;
+        if (!localKey.rows[0].revoked_at)
+          await this.failIssuedKey(this.cell(row.cell_id),spaceId,row.owner_principal_id,key.credential_id);
+        if (!localKey.rows[0].provider_revoked_at)
+          await this.markProviderRevoked(this.cell(row.cell_id),info(row),row.owner_principal_id,key.credential_id);
+      }
       // An interrupted issuance is never promoted by directory repair. Locally
       // revoke it first, then retry the external provider revocation below.
       const unconfirmed = await this.cell(row.cell_id).pool.query(`SELECT credential_id FROM space_credentials
@@ -885,6 +899,12 @@ export class PostgresSpaces {
   private async revokeProvider(cell: CellDatabase, space: SpaceInfo, ownerPrincipalId: string, keyId: string,
     control: Pick<pg.Pool, 'query'> = this.control): Promise<void> {
     await this.keys.revoke(keyId,ownerPrincipalId);
+    await this.markProviderRevoked(cell,space,ownerPrincipalId,keyId);
+    await control.query(`UPDATE agent_key_issuances SET provider_revoked_at=clock_timestamp()
+      WHERE space_id=$1 AND credential_id=$2 AND provider_revoked_at IS NULL`,[space.spaceId,keyId]);
+  }
+  private async markProviderRevoked(cell: CellDatabase, space: SpaceInfo, ownerPrincipalId: string,
+    keyId: string): Promise<void> {
     await transaction(cell.pool, async db => {
       const changed = await db.query(`UPDATE space_credentials SET provider_revoked_at=clock_timestamp()
         WHERE space_id=$1 AND credential_id=$2 AND provider_revoked_at IS NULL RETURNING 1`,[space.spaceId,keyId]);
@@ -892,10 +912,12 @@ export class PostgresSpaces {
         SELECT $1,$2,$3,$4,'key:provider-revoke',policy_version,placement_generation FROM spaces WHERE space_id=$2`,
       [`aud_${randomUUID()}`,space.spaceId,ownerPrincipalId,keyId]);
     });
-    await control.query(`UPDATE agent_key_issuances SET provider_revoked_at=clock_timestamp()
-      WHERE space_id=$1 AND credential_id=$2 AND provider_revoked_at IS NULL`,[space.spaceId,keyId]);
   }
   async revokeAgentKey(actor: VerifiedCredential, spaceId: string, keyId: string): Promise<void> {
+    return this.revokeAgentKeyInternal(actor,spaceId,keyId,false);
+  }
+  private async revokeAgentKeyInternal(actor: VerifiedCredential, spaceId: string, keyId: string,
+    requireActive: boolean): Promise<void> {
     actor = snapshotOwner(actor);
     const space = await this.owned(actor,spaceId);
     if (!validId(keyId)) throw new AuthorityError('INVALID_ARGUMENT');
@@ -904,6 +926,7 @@ export class PostgresSpaces {
       WHERE space_id=$1 AND credential_id=$2 AND owner_principal_id=$3`,[spaceId,keyId,owner(actor)]);
     if (!existing.rows[0]) throw new AuthorityError('NOT_FOUND');
     if (existing.rows[0].revoked_at) {
+      if (requireActive) throw new AuthorityError('STALE_PLACEMENT','Rotation source already revoked');
       if (!existing.rows[0].provider_revoked_at) {
         await this.current(actor);
         await this.revokeProvider(this.cell(space.cellId),space,owner(actor),keyId);
@@ -921,7 +944,7 @@ export class PostgresSpaces {
       if (!locked.rows[0] || Number(locked.rows[0].policy_version) !== space.policyVersion) throw new AuthorityError('STALE_PLACEMENT');
       const revoked = await db.query(`UPDATE space_credentials SET revoked_at=clock_timestamp()
         WHERE space_id=$1 AND credential_id=$2 AND owner_principal_id=$3 AND revoked_at IS NULL RETURNING 1`,[spaceId,keyId,owner(actor)]);
-      if (revoked.rowCount !== 1) throw new AuthorityError('NOT_FOUND');
+      if (revoked.rowCount !== 1) throw new AuthorityError(requireActive ? 'STALE_PLACEMENT' : 'NOT_FOUND');
       await db.query(`DELETE FROM collection_grants WHERE space_id=$1 AND credential_id=$2`,[spaceId,keyId]);
       const changed = await db.query(`UPDATE spaces SET policy_version=policy_version+1 WHERE space_id=$1 RETURNING policy_version,placement_generation`,[spaceId]);
       await db.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
@@ -948,7 +971,9 @@ export class PostgresSpaces {
     const space = await this.owned(actor,spaceId);
     if (space.lifecycle !== 'active') throw new AuthorityError('SPACE_UNAVAILABLE');
     await this.requireGrantCollections(this.cell(space.cellId).pool,spaceId,grants);
-    await this.revokeAgentKey(actor,spaceId,oldKeyId);
+    // Rotation consumes the old key once. A repeated or concurrent request
+    // cannot turn an idempotent revoke into another provider issuance.
+    await this.revokeAgentKeyInternal(actor,spaceId,oldKeyId,true);
     return this.issueAgentKey(actor,spaceId,expiresAt,grants);
   }
   async audit(actor: VerifiedCredential, spaceId: string, cursor?: string): Promise<SpaceAuditPage> {
