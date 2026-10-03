@@ -1,0 +1,21 @@
+migrations/025_space_directory_home_cell.sql
+  s_ad500513bc9987::t_3b3571e5c32f1c 1-9
+scripts/backfill-directory-core.mjs
+  s_ad500513bc9987::t_489195f738b399 24,49-54,58,60
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d63c253528f7c88f59c974540758c3d7e472a019",
+  "prompts": {},
+  "sessions": {
+    "s_ad500513bc9987": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0f222-fb22-76a5-a77e-b7c92826db44",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
