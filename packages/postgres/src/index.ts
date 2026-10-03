@@ -259,7 +259,7 @@ export class PostgresAuthority {
 
   /** Join an already authorized cell transaction; the caller owns COMMIT/ROLLBACK. */
   async transactionOnClient<T>(client: Client, scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T>,
-    deferUntilCommit: (finish: () => Promise<void>, verify: () => Promise<void>, ensureCurrent: () => Promise<void>, expose: () => void,
+    deferUntilCommit: (finish: () => Promise<void>, verify: () => Promise<void>, ensureCurrent: () => Promise<number>, expose: () => void,
       close: () => void) => void,
     joinedReceipts?: JoinedReceiptState): Promise<T> {
     const fixedScope = Object.freeze({ ...scope });
@@ -404,17 +404,22 @@ export class AuthorityTransaction {
     const row = result.rows[0];
     return row ? { collectionId: row.collection_id, requestDigest: row.request_digest, response: row.response } : null;
   }
-  private async receiptTimes(retentionSeconds: number): Promise<{ committedAt: string; expiresAt: string }> {
+  private async receiptTimes(retentions: number[]): Promise<Array<{ committedAt: string; expiresAt: string }>> {
     const clock = await this.query(`WITH stamp AS MATERIALIZED (SELECT clock_timestamp() AS at)
-      SELECT at AS committed_at, at + ($1::bigint * interval '1 second') AS expires_at FROM stamp`, [retentionSeconds]);
-    return { committedAt:(clock.rows[0].committed_at as Date).toISOString(),
-      expiresAt:(clock.rows[0].expires_at as Date).toISOString() };
+      SELECT at AS committed_at, at + (retention * interval '1 second') AS expires_at
+      FROM stamp CROSS JOIN unnest($1::bigint[]) WITH ORDINALITY AS policy(retention, position)
+      ORDER BY position`, [retentions]);
+    if (clock.rows.length !== retentions.length) throw new Error('Receipt clock row count mismatch');
+    return clock.rows.map(row => ({ committedAt:(row.committed_at as Date).toISOString(),
+      expiresAt:(row.expires_at as Date).toISOString() }));
   }
   /** Stamp receipts using the database clock after callback work, immediately before COMMIT. */
   async finalizeReceipts(): Promise<void> {
     if (this.pendingReceipts.size) {
-      for (const pending of this.pendingReceipts.values()) {
-        const { committedAt, expiresAt } = await this.receiptTimes(pending.retentionSeconds);
+      const pendingReceipts = [...this.pendingReceipts.values()];
+      const times = await this.receiptTimes(pendingReceipts.map(pending => pending.retentionSeconds));
+      for (const [index, pending] of pendingReceipts.entries()) {
+        const { committedAt, expiresAt } = times[index];
         pending.response.committedAt = committedAt;
         pending.response.expiresAt = expiresAt;
         await this.query(`INSERT INTO idempotency_receipts(receipt_id,space_id,collection_id,credential_id,operation,idempotency_key,request_digest,record_id,response,committed_at,expires_at)
@@ -436,12 +441,21 @@ export class AuthorityTransaction {
   }
   /** A slow final cell check must abort rather than commit an already expired
    * receipt and let an immediate retry create a second record. */
-  async ensureReceiptsCurrent(): Promise<void> {
-    if (!this.readyReceipts.length) return;
+  async ensureReceiptsCurrent(): Promise<number> {
+    if (!this.readyReceipts.length) return Infinity;
     const ids=this.readyReceipts.map(ready=>ready.receiptId);
-    const result=await this.query(`SELECT count(*)::int AS expired FROM idempotency_receipts
-      WHERE receipt_id=ANY($1::text[]) AND expires_at<=clock_timestamp()`,[ids]);
-    if (result.rows[0]?.expired !== 0) throw new AuthorityError('RECEIPT_EXPIRED','Receipt expired before commit');
+    const result=await this.query(`WITH stamp AS MATERIALIZED (SELECT clock_timestamp() AS at)
+      SELECT count(r.receipt_id)::int AS found,
+        count(r.receipt_id) FILTER (WHERE r.expires_at<=stamp.at)::int AS expired,
+        EXTRACT(EPOCH FROM (min(r.expires_at)-stamp.at)) * 1000 AS remaining_ms
+      FROM stamp LEFT JOIN idempotency_receipts r ON r.receipt_id=ANY($1::text[])
+      GROUP BY stamp.at`,[ids]);
+    if (result.rows[0]?.found !== ids.length || result.rows[0]?.expired !== 0)
+      throw new AuthorityError('RECEIPT_EXPIRED','Receipt expired before commit');
+    const remainingMs = Number(result.rows[0]?.remaining_ms);
+    if (!Number.isFinite(remainingMs) || remainingMs <= 0)
+      throw new AuthorityError('RECEIPT_EXPIRED','Receipt expired before commit');
+    return remainingMs;
   }
   exposeReceipts(): void {
     for (const ready of this.readyReceipts) {

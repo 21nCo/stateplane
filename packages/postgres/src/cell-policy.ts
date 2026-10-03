@@ -1,10 +1,12 @@
 import type pg from 'pg';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { CellPolicy, RouteClaims } from '@stateplane/application';
 import type { SpaceId, CollectionId } from '@stateplane/contracts';
 import { AuthorityError, CommitOutcomeUnknownError, PostgresAuthority } from './index.js';
 import type { AuthorityScope, AuthorityTransaction, JoinedReceiptState } from './index.js';
 
 type PoolLike = Pick<pg.Pool, 'connect'>;
+const recordsCallback = new AsyncLocalStorage<symbol>();
 export interface CurrentCredential {
   current(claims: Pick<RouteClaims, 'kind' | 'credentialId'>, ownerPrincipalId?: string): Promise<boolean>;
 }
@@ -73,19 +75,22 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     finally { result.release(); }
   }
 
-  private async check(client: pg.PoolClient, claims: RouteClaims, requireActiveSpace = false,
-    checkProvider = true): Promise<string> {
+  private async check(client: pg.PoolClient, claims: RouteClaims, requireActiveSpace = false): Promise<string> {
+    const checkStarted = performance.now();
     const result = await client.query(`SELECT s.owner_principal_id,s.lifecycle,s.cell_id,s.policy_version,s.placement_generation,
       c.lifecycle AS collection_lifecycle, sc.principal_id AS key_principal_id,
       sc.owner_principal_id AS key_owner_id,sc.revoked_at,sc.activated_at,sc.confirmed_at,
       sc.expires_at > clock_timestamp() AS key_current,
-      g.capabilities,(g.expires_at IS NULL OR g.expires_at > clock_timestamp()) AS grant_current
+      g.capabilities,(g.expires_at IS NULL OR g.expires_at > clock_timestamp()) AS grant_current,
+      EXTRACT(EPOCH FROM (CASE WHEN $5='session' THEN to_timestamp($4)
+        ELSE LEAST(to_timestamp($4),COALESCE(sc.expires_at,'infinity'::timestamptz),
+          COALESCE(g.expires_at,'infinity'::timestamptz)) END - clock_timestamp())) * 1000 AS validity_ms
       FROM spaces s JOIN collections c ON c.space_id=s.space_id AND c.collection_id=$2
       LEFT JOIN LATERAL (SELECT principal_id,owner_principal_id,revoked_at,activated_at,confirmed_at,expires_at FROM space_credentials
         WHERE space_id=s.space_id AND credential_id=$3 FOR SHARE) sc ON TRUE
       LEFT JOIN LATERAL (SELECT capabilities,expires_at FROM collection_grants
         WHERE space_id=s.space_id AND collection_id=c.collection_id AND credential_id=$3 FOR SHARE) g ON TRUE
-      WHERE s.space_id=$1 FOR SHARE OF s,c`, [claims.spaceId,claims.collectionId,claims.credentialId]);
+      WHERE s.space_id=$1 FOR SHARE OF s,c`, [claims.spaceId,claims.collectionId,claims.credentialId,claims.expiresAt,claims.kind]);
     const row = result.rows[0];
     if (!row) throw new AuthorityError('NOT_FOUND');
     const policyVersion = Number(row.policy_version);
@@ -99,7 +104,12 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     const mutates = claims.capability.endsWith(':write') || claims.capability === 'claims:review';
     if (row.collection_lifecycle === 'readOnly' && mutates) throw new AuthorityError('SPACE_UNAVAILABLE');
     if (row.lifecycle === 'readOnly' && mutates && claims.capability !== 'records:write') throw new AuthorityError('SPACE_UNAVAILABLE');
-    if (checkProvider && !await this.credentials.current(claims,row.owner_principal_id)) throw new AuthorityError('FORBIDDEN');
+    if (!await this.credentials.current(claims,row.owner_principal_id)) throw new AuthorityError('FORBIDDEN');
+    // The provider call is outside PostgreSQL. Reject if its latency crossed
+    // any deadline observed by the database query before that call.
+    const validityMs = Number(row.validity_ms);
+    if (!Number.isFinite(validityMs) || performance.now() - checkStarted >= validityMs)
+      throw new AuthorityError('FORBIDDEN');
     if (claims.kind === 'session') {
       if (claims.userPrincipalId !== row.owner_principal_id) throw new AuthorityError('FORBIDDEN');
       return row.owner_principal_id;
@@ -115,7 +125,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     let begun = false;
     let beginAttempted = false;
     let discard = false;
-    const joined: Array<{ finish: () => Promise<void>; verify: () => Promise<void>; ensureCurrent: () => Promise<void>; expose: () => void;
+    const joined: Array<{ finish: () => Promise<void>; verify: () => Promise<void>; ensureCurrent: () => Promise<number>; expose: () => void;
       close: () => void }> = [];
     const joinedReceipts: JoinedReceiptState = {pending:new Map(),replayed:new Map(),ready:[]};
     try {
@@ -133,9 +143,12 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       let operationError: unknown;
       const operations = new Set<Promise<unknown>>();
       let recordsTail: Promise<void> = Promise.resolve();
-      const admit = <TResult>(work: () => Promise<TResult>, requireActiveSpace = false): Promise<TResult> => {
+      const callbackToken = Symbol('records callback');
+      const admit = <TResult>(work: () => Promise<TResult>, requireActiveSpace = false,
+        previous?: Promise<void>): Promise<TResult> => {
         if (!accepting) return Promise.reject(new AuthorityError('FORBIDDEN', 'Cell effect context ended'));
         const running = (async () => {
+          if (previous) await previous;
           this.checkAssertionTime(claims);
           await this.check(client,claims,requireActiveSpace);
           await this.checkDatabaseTime(client,claims);
@@ -164,12 +177,16 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
           return admit(async () => {}, kind === 'write');
         },
         records: <TResult>(authority: PostgresAuthority, fn: (tx: AuthorityTransaction) => Promise<TResult>) => {
+          // A nested awaited call would queue behind the callback awaiting it.
+          // Async context distinguishes it from independent sibling calls.
+          if (recordsCallback.getStore() === callbackToken)
+            return Promise.reject(new AuthorityError('INVALID_ARGUMENT', 'Nested records calls are not supported'));
           const previous = recordsTail;
           const running = admit(async () => {
-            await previous;
-            return authority.transactionOnClient(client,scope,fn,
+            return authority.transactionOnClient(client,scope,
+              tx => recordsCallback.run(callbackToken, () => fn(tx)),
               (finish,verify,ensureCurrent,expose,close) => { joined.push({finish,verify,ensureCurrent,expose,close}); },joinedReceipts);
-          });
+          }, false, previous);
           recordsTail = running.then(() => {}, () => {});
           return running;
         } });
@@ -194,10 +211,17 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       // Finalization may wait on SQL. Every joined call, including a replay of
       // an original collection, must still be authorized after that wait.
       for (const entry of joined) await entry.finish();
-      await this.check(client,claims,false,false);
+      await this.check(client,claims);
       this.checkAssertionTime(claims);
       await this.checkDatabaseTime(client,claims);
-      if (joined.length) await joined[0].ensureCurrent();
+      // The final provider lookup follows all joined SQL work. A slow lookup
+      // must not consume the retry window stamped by the database clock.
+      const receiptFenceStarted = performance.now();
+      const receiptRemaining = joined.length ? await joined[0].ensureCurrent() : Infinity;
+      await this.check(client,claims);
+      this.checkAssertionTime(claims);
+      if (performance.now() - receiptFenceStarted >= receiptRemaining)
+        throw new AuthorityError('RECEIPT_EXPIRED', 'Receipt expired before commit');
       try { await client.query('COMMIT'); begun = false; }
       catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
       for (const entry of joined) entry.expose();
