@@ -1,0 +1,18 @@
+docs/postgres-authority.md
+  h_a39f9495f9ec1d 23-24
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 372-374
+test/integration/owned-spaces.test.js
+  h_a39f9495f9ec1d 446-495,2892-2900
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "98149023ddb38d1700243c908b0e09e4d2e87f6f",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
