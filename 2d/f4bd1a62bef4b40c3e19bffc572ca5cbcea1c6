@@ -1,0 +1,19 @@
+packages/postgres/src/cell-policy.ts
+  s_300423db8f69f3::t_16910ecf72778a 10-11,122-144,153,246
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2df4bd1a62bef4b40c3e19bffc572ca5cbcea1c6",
+  "prompts": {},
+  "sessions": {
+    "s_300423db8f69f3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a101a1-a91c-77f0-a0c3-51b2e5b62f4e",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
