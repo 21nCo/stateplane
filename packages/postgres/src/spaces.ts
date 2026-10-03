@@ -293,7 +293,9 @@ export class PostgresSpaces {
     const control = await this.control.query('SELECT * FROM space_directory WHERE space_id=$1 AND lifecycle<>$2',[spaceId,'deleted']);
     const row = control.rows[0];
     if (!row) throw new AuthorityError('NOT_FOUND');
-    await this.current({kind:'api-key',credentialId},row.owner_principal_id);
+    // A live key for another owner must not reveal that this selector exists.
+    if (!await this.credentials.current({kind:'api-key',credentialId},row.owner_principal_id))
+      throw new AuthorityError('NOT_FOUND');
     const cell = await this.cell(row.cell_id).pool.query(`SELECT s.policy_version,s.placement_generation,s.cell_id
       FROM spaces s JOIN space_credentials sc ON sc.space_id=s.space_id AND sc.credential_id=$2
       JOIN collection_grants g ON g.space_id=s.space_id AND g.credential_id=sc.credential_id
@@ -304,7 +306,7 @@ export class PostgresSpaces {
         AND (g.expires_at IS NULL OR g.expires_at>clock_timestamp())
         AND g.capabilities @> ARRAY['space:admin']::text[] LIMIT 1`,[spaceId,credentialId]);
     const local = cell.rows[0];
-    if (!local) throw new AuthorityError('FORBIDDEN');
+    if (!local) throw new AuthorityError('NOT_FOUND');
     if (local.cell_id !== row.cell_id || safeVersion(local.policy_version) !== safeVersion(row.policy_version) ||
       safeVersion(local.placement_generation) !== safeVersion(row.placement_generation)) throw new AuthorityError('STALE_PLACEMENT');
     await this.current({kind:'api-key',credentialId},row.owner_principal_id);

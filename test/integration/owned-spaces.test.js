@@ -91,7 +91,9 @@ test('owned spaces, AuthFn identities and cell effects share a revocable authori
   const adminActor = await identity.verify(request(adminKey.secret));
   assert.equal((await spaces.get(adminActor,first.spaceId)).spaceId,first.spaceId);
   await assert.rejects(spaces.archive(adminActor,first.spaceId),denied('FORBIDDEN'));
-  await assert.rejects(spaces.get(adminActor,second.spaceId),denied('FORBIDDEN'));
+  await assert.rejects(spaces.get(adminActor,second.spaceId),denied('NOT_FOUND'),
+    'an admin grant on another space cannot disclose this space');
+  await assert.rejects(spaces.get(adminActor,`sp_${crypto.randomUUID()}`),denied('NOT_FOUND'));
   await assert.rejects(spaces.issueAgentKey(owner,first.spaceId,expires,[{collectionId:c1,capabilities:['records:read','schema:unknown']}]),denied('INVALID_ARGUMENT'));
   const signing = new RoutingKeys([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
   const directory = new PostgresRoutingDirectory(controlPool,cells);
@@ -123,6 +125,17 @@ test('owned spaces, AuthFn identities and cell effects share a revocable authori
   const otherUser = await createUser(config,{primaryEmail:`other-${crypto.randomUUID()}@example.invalid`});
   const otherSession = await issueSession(config,{}, {userId:otherUser.id,methods:['password']});
   await assert.rejects(route(otherSession.sessionToken,first.spaceId,c1),denied('NOT_FOUND'));
+  const otherOwner = await identity.verify(request(otherSession.sessionToken));
+  const otherSpace = await spaces.create(otherOwner);
+  let crossOwnerCellReads = 0;
+  const guardedCell = {query:async () => { crossOwnerCellReads++; throw new Error('cross-owner cell read'); }};
+  const concealedSpaces = new PostgresSpaces(controlPool,
+    new Map([['cell-a',{pool:guardedCell,storageTargetId:'target-a'}],
+      ['cell-b',{pool:guardedCell,storageTargetId:'target-b'}]]),
+    'cell-a',keyProvider,identity);
+  await assert.rejects(concealedSpaces.get(adminActor,otherSpace.spaceId),denied('NOT_FOUND'));
+  await assert.rejects(concealedSpaces.get(adminActor,`sp_${crypto.randomUUID()}`),denied('NOT_FOUND'));
+  assert.equal(crossOwnerCellReads,0,'cross-owner and unknown IDs never reach a regional cell');
 
   const routed = await route(key1.secret,first.spaceId,c1);
   assert.equal(routed.cellId,'cell-a');
