@@ -78,6 +78,7 @@ const validDigest = /^[0-9a-f]{64}$/;
 const serializedMarker=Symbol('stateplane parsed JSON');
 const isFiniteNumber = Number.isFinite;
 const isSafeInteger = Number.isSafeInteger;
+const nativeStringIncludes = String.prototype.includes;
 const nativeSetHas=Set.prototype.has;
 const nativeSetAdd=Set.prototype.add;
 const nativeSetClear=Set.prototype.clear;
@@ -110,7 +111,7 @@ const setValues=<T>(source:Set<T>):T[]=>{
   return values;
 };
 function containsNul(value: Json): boolean {
-  if (typeof value==='string') return value.includes('\0');
+  if (typeof value==='string') return Reflect.apply(nativeStringIncludes,value,['\0']) as boolean;
   if (value===null || typeof value!=='object') return false;
   const keys=Object.keys(value);
   for (let i=0;i<keys.length;i++) if (containsNul((value as Record<string,Json>)[keys[i]])) return true;
@@ -118,7 +119,7 @@ function containsNul(value: Json): boolean {
 }
 /** PostgreSQL jsonb cannot represent U+0000. The canonical text remains the authority. */
 function jsonbProjection(canonicalData:string):string|null {
-  return canonicalData.includes('\\u0000') && containsNul(JSON.parse(canonicalData) as Json) ? null : canonicalData;
+  return Reflect.apply(nativeStringIncludes,canonicalData,['\\u0000']) && containsNul(JSON.parse(canonicalData) as Json) ? null : canonicalData;
 }
 const validScope=(scope:AuthorityScope):boolean =>
   scalarString(scope.spaceId) && Buffer.byteLength(scope.spaceId)<=MAX_SCOPE_ID_BYTES &&

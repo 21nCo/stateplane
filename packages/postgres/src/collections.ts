@@ -205,7 +205,10 @@ export class CollectionRegistry {
       const declaration=(await client.query(`SELECT ready,backfill_after FROM collection_index_declarations
         WHERE space_id=$1 AND collection_id=$2 AND field_name=$3 FOR NO KEY UPDATE`,[scope.spaceId,scope.collectionId,field])).rows[0];
       if (!declaration) throw new AuthorityError('SCHEMA_UNSUPPORTED','Index is not declared');
-      if (declaration.ready) return {processed:0,ready:true};
+      if (declaration.ready) {
+        await this.authorize(client,scope,scope.collectionId);
+        return {processed:0,ready:true};
+      }
       const version=(await client.query(`SELECT canonical_definition FROM collection_versions
         WHERE space_id=$1 AND collection_id=$2 AND version=$3`,[scope.spaceId,scope.collectionId,collection.schema_version])).rows[0];
       if (!version) throw new AuthorityError('SCHEMA_CONFLICT','Current collection definition is unavailable');

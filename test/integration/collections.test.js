@@ -104,6 +104,51 @@ test('unindexed Unicode NUL survives writes and replay while indexed siblings fa
   assert.equal((await pool.query('SELECT data FROM records WHERE record_id=$1',[created.ref.id])).rows[0].data.note,'clean');
 });
 
+test('NUL projection and ordinary JSONB remain atomic when string includes is replaced',async()=>{
+  const {owner,writer}=await fixture();
+  const wide={...schema,properties:{...schema.properties,note:{type:'string'}}};
+  await registry.revise(owner,1,definition(owner.collectionId,{version:2,schema:wide}));
+  const original=String.prototype.includes;
+  const withTamperedIncludes=async(answer,run)=>{
+    String.prototype.includes=function(search,...rest){
+      if (search==='\0' || search==='\\u0000') return answer;
+      return Reflect.apply(original,this,[search,...rest]);
+    };
+    try { return await run(); } finally { String.prototype.includes=original; }
+  };
+  const nul='left\0right';
+  const create={operation:'create',idempotencyKey:'nul-includes-create',data:{label:'nul-includes',score:1,note:nul}};
+  const facts=async id=>(await pool.query(`SELECT r.canonical_data,r.data,
+    (SELECT count(*)::int FROM idempotency_receipts WHERE space_id=r.space_id) AS receipts,
+    (SELECT count(*)::int FROM record_events WHERE space_id=r.space_id) AS events,
+    (SELECT count(*)::int FROM projection_outbox WHERE space_id=r.space_id) AS outbox,
+    (SELECT count(*)::int FROM record_unique_keys WHERE space_id=r.space_id) AS unique_keys,
+    (SELECT count(*)::int FROM record_index_values WHERE space_id=r.space_id) AS indexes
+    FROM records r WHERE r.space_id=$1 AND r.record_id=$2`,[writer.spaceId,id])).rows[0];
+  const first=await withTamperedIncludes(false,()=>authority.mutateRequest(writer,create));
+  const replace={operation:'replace',idempotencyKey:'nul-includes-replace',id:first.ref.id,expectedRevision:1,
+    data:{label:'nul-includes',score:1,note:`${nul}!`}};
+  await withTamperedIncludes(false,()=>authority.mutateSerializedRequest(writer,JSON.stringify(replace)));
+  const patch={operation:'patch',idempotencyKey:'nul-includes-patch',id:first.ref.id,expectedRevision:2,
+    set:{score:2,note:`${nul}?`},unset:[]};
+  await withTamperedIncludes(false,()=>authority.mutateRequest(writer,patch));
+  const replay=await withTamperedIncludes(false,()=>authority.mutateRequest(writer,create));
+  assert.equal(replay.replayed,true);
+  assert.equal(replay.receiptId,first.receiptId);
+  const stored=await facts(first.ref.id);
+  assert.deepEqual({receipts:stored.receipts,events:stored.events,outbox:stored.outbox,uniqueKeys:stored.unique_keys,indexes:stored.indexes},
+    {receipts:3,events:3,outbox:3,uniqueKeys:1,indexes:1});
+  assert.equal(stored.data,null);
+  assert.equal(JSON.parse(stored.canonical_data).note,`${nul}?`);
+  const ordinary=await withTamperedIncludes(true,()=>authority.mutateSerializedRequest(writer,
+    JSON.stringify({operation:'create',idempotencyKey:'ordinary-includes',data:{label:'ordinary',score:3}})));
+  const ordinaryStored=await facts(ordinary.ref.id);
+  assert.equal(ordinaryStored.data.label,'ordinary');
+  assert.deepEqual({receipts:ordinaryStored.receipts,events:ordinaryStored.events,outbox:ordinaryStored.outbox,
+    uniqueKeys:ordinaryStored.unique_keys,indexes:ordinaryStored.indexes},
+  {receipts:4,events:4,outbox:4,uniqueKeys:2,indexes:2});
+});
+
 test('altered iterators cannot commit an active mutation or omit its receipt',async()=>{
   const {writer}=await fixture();
   const originalSetIterator=Set.prototype[Symbol.iterator];
@@ -973,6 +1018,44 @@ test('current nonowner schema grant permits revision and backfill; expiry and st
   assert.deepEqual((await registry.discover({...owner,policyVersion:2}))[0].pending,['score']);
   assert.equal((await registry.revise({...grantee,policyVersion:2},2,third)).version,3);
   assert.deepEqual(await registry.backfill({...grantee,policyVersion:2},'score'),{processed:0,ready:true});
+});
+
+test('waiting backfill cannot return ready after its schema grant expires',async()=>{
+  const {owner,writer}=await fixture();
+  const grantee={...writer,capability:'schema:write'};
+  let held,release,attempted;
+  const ownerLocked=new Promise(resolve=>held=resolve),gate=new Promise(resolve=>release=resolve);
+  const granteeAttempted=new Promise(resolve=>attempted=resolve);
+  const ownerRegistry=new CollectionRegistry({connect:async()=>{
+    const client=await pool.connect();
+    return {query:async(sql,...args)=>{
+      const result=await client.query(sql,...args);
+      if (String(sql).includes('SELECT ready,backfill_after FROM collection_index_declarations')) {
+        held(); await gate;
+      }
+      return result;
+    },release:discard=>client.release(discard)};
+  }});
+  const granteeRegistry=new CollectionRegistry({connect:async()=>{
+    const client=await pool.connect();
+    return {query:(sql,...args)=>{
+      if (String(sql).includes('SELECT ready,backfill_after FROM collection_index_declarations')) attempted();
+      return client.query(sql,...args);
+    },release:discard=>client.release(discard)};
+  }});
+  const winner=ownerRegistry.backfill(owner,'score');
+  try {
+    await ownerLocked;
+    const waiting=granteeRegistry.backfill(grantee,'score');
+    void waiting.catch(()=>{});
+    await granteeAttempted;
+    await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()-interval '1 second'
+      WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[owner.spaceId,owner.collectionId,grantee.credentialId]);
+    release();
+    assert.deepEqual(await winner,{processed:0,ready:true});
+    await assert.rejects(waiting,{code:'FORBIDDEN'});
+    assert.deepEqual(await registry.backfill(owner,'score'),{processed:0,ready:true});
+  } finally { release(); }
 });
 
 test('ordinary malformed envelopes are rejected after collection authorization without invoking accessors',async()=>{
