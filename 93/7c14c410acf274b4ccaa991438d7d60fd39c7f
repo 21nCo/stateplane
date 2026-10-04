@@ -1,0 +1,18 @@
+packages/postgres/src/collections.ts
+  h_a39f9495f9ec1d 9,52,155
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 203-204,206-208,213,222,227-229,233-234,239-246,350,353,361,363,426,434,454,889
+test/integration/collections.test.js
+  h_a39f9495f9ec1d 283,452-557
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "937c14c410acf274b4ccaa991438d7d60fd39c7f",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
