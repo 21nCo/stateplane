@@ -6,7 +6,7 @@ import type { CollectionDefinition, Json } from './schema.js';
 type PoolLike = Pick<pg.Pool,'connect'>;
 type Client = pg.PoolClient;
 const validVersion=(n:unknown)=>Number.isSafeInteger(n) && (n as number)>0;
-const has=(values:readonly string[],value:string)=>{ for (let i=0;i<values.length;i++) if (values[i]===value) return true; return false; };
+const has=(values:readonly string[],value:string)=>{ for (let i=0;i<values.length;i++) if (Object.getOwnPropertyDescriptor(values,i)?.value===value) return true; return false; };
 const append=<T>(values:T[],value:T)=>{ Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
 const snapshotDefinition=(input:unknown):(()=>unknown)=>{
   try {
@@ -49,7 +49,7 @@ export class CollectionRegistry {
     if (Number(row.policy_version)!==scope.policyVersion || Number(row.placement_generation)!==scope.placementGeneration) throw new AuthorityError('FORBIDDEN');
     if (row.lifecycle!=='active' || (row.collection_lifecycle && row.collection_lifecycle!=='active')) throw new AuthorityError('SPACE_UNAVAILABLE');
     if (create ? row.owner_principal_id!==scope.principalId : row.owner_principal_id!==scope.principalId &&
-      (!row.capabilities?.includes('schema:write') || !row.grant_current)) throw new AuthorityError('FORBIDDEN');
+      (!Array.isArray(row.capabilities) || !has(row.capabilities,'schema:write') || !row.grant_current)) throw new AuthorityError('FORBIDDEN');
   }
   private async insertDeclarations(client:Client,scope:AuthorityScope,definition:CollectionDefinition,previous?:CollectionDefinition):Promise<void> {
     if (!previous) for (let i=0;i<definition.unique.length;i++) {
@@ -152,7 +152,7 @@ export class CollectionRegistry {
       const space=row.rows[0];
       if (!space) throw new AuthorityError('NOT_FOUND');
       if (Number(space.policy_version)!==scope.policyVersion || Number(space.placement_generation)!==scope.placementGeneration) throw new AuthorityError('FORBIDDEN');
-      if (!['active','readOnly'].includes(space.lifecycle)) throw new AuthorityError('SPACE_UNAVAILABLE');
+      if (space.lifecycle!=='active' && space.lifecycle!=='readOnly') throw new AuthorityError('SPACE_UNAVAILABLE');
       const result=await client.query(`SELECT c.collection_id,v.canonical_definition,i.field_name,i.ready,
         g.capabilities,(g.expires_at IS NULL OR g.expires_at>clock_timestamp()) AS grant_current
         FROM collections c JOIN collection_versions v ON v.space_id=c.space_id AND v.collection_id=c.collection_id AND v.version=c.schema_version

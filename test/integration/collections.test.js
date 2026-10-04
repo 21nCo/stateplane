@@ -280,7 +280,7 @@ test('a partial backfill remains unavailable until a bounded final activation',a
   await assert.rejects(authority.transaction(reader,tx=>tx.countRecords(predicate)),{code:'SCHEMA_CONFLICT'});
   const misleadingPredicate=[predicate[0]];
   misleadingPredicate.map=()=>[];
-  await assert.rejects(authority.transaction(reader,tx=>tx.countRecords(misleadingPredicate)),{code:'SCHEMA_CONFLICT'});
+  await assert.rejects(authority.transaction(reader,tx=>tx.countRecords(misleadingPredicate)),{code:'INVALID_ARGUMENT'});
   assert.deepEqual(await registry.backfill(owner,'note'),{processed:100,ready:false});
   await assert.rejects(authority.transaction(reader,tx=>tx.countRecords(predicate)),{code:'SCHEMA_CONFLICT'});
   assert.deepEqual(await registry.backfill(owner,'note'),{processed:1,ready:true});
@@ -448,4 +448,110 @@ test('serialized boundary supports schema and mutation without object input',asy
   const next=definition(collectionId,{version:2,schema:{...schema,properties:{...schema.properties,note:{type:'string'}}}});
   assert.equal((await registry.reviseSerialized(owner,1,JSON.stringify(next))).version,2);
   await assert.rejects(authority.mutateSerializedRequest(writer,'{"operation":'),{code:'INVALID_ARGUMENT'});
+});
+
+test('ordinary malformed envelopes are rejected after collection authorization without invoking accessors',async()=>{
+  const {owner,writer}=await fixture();
+  const denied={...writer,credentialId:'revoked'};
+  const base={operation:'create',idempotencyKey:'malformed',data:{label:'malformed'}};
+  let invoked=0;
+  const variants=[
+    Object.defineProperty({...base},'hidden',{value:true,enumerable:false}),
+    Object.defineProperty({...base},'extra',{enumerable:true,get(){ invoked++; throw new Error('getter ran'); }}),
+    Object.defineProperty({...base},Symbol('extra'),{value:true,enumerable:true}),
+    Object.assign(Object.create({inherited:true}),base)
+  ];
+  for (const request of variants) {
+    await assert.rejects(authority.mutateRequest(denied,request),{code:'FORBIDDEN'});
+    await assert.rejects(authority.mutateRequest(writer,request),{code:'INVALID_ARGUMENT'});
+  }
+  assert.equal(invoked,0);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM records WHERE space_id=$1',[owner.spaceId])).rows[0].n,0);
+});
+
+test('request retry keeps the original authenticated scope for object and serialized boundaries',async()=>{
+  const {owner,writer}=await fixture();
+  for (const serialized of [false,true]) {
+    let attempts=0;
+    const retryScope={...writer};
+    const retryAuthority=new PostgresAuthority({connect:async()=>{
+      attempts++;
+      if (attempts===1) {
+        retryScope.spaceId='sp_replaced';
+        retryScope.collectionId='collection_replaced';
+        retryScope.principalId='principal_replaced';
+        retryScope.credentialId='credential_replaced';
+        retryScope.capability='records:read';
+        retryScope.policyVersion=2;
+        retryScope.placementGeneration=2;
+        throw Object.assign(new Error('serialization rollback'),{code:'40001'});
+      }
+      return pool.connect();
+    }},3600);
+    const request={operation:'create',idempotencyKey:`scope-${serialized}`,data:{label:`scope-${serialized}`}};
+    const receipt=serialized ?
+      await retryAuthority.mutateSerializedRequest(retryScope,JSON.stringify(request)) :
+      await retryAuthority.mutateRequest(retryScope,request);
+    assert.equal(attempts,2);
+    assert.equal(receipt.spaceId,owner.spaceId);
+    assert.equal((await authority.transaction(read(writer),tx=>tx.getRecord(receipt.ref.id))).canonicalData,
+      JSON.stringify(request.data));
+  }
+});
+
+test('prototype tampering cannot grant schema rights, expose suspended discovery or admit invalid read arguments',async()=>{
+  const {owner,writer}=await fixture();
+  const readOnlyGrant={...writer,capability:'schema:write'};
+  await pool.query(`UPDATE collection_grants SET capabilities=ARRAY['records:read']
+    WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[owner.spaceId,owner.collectionId,writer.credentialId]);
+  const original=Array.prototype.includes;
+  let suspendedGate=true;
+  try {
+    Array.prototype.includes=function(value){
+      if (value==='schema:write' || value==='generated' || value==='number') return true;
+      if (value==='suspended') return suspendedGate;
+      return Reflect.apply(original,this,[value]);
+    };
+    await assert.rejects(registry.revise(readOnlyGrant,1,definition(owner.collectionId,{version:2})),{code:'FORBIDDEN'});
+    await assert.rejects(authority.transaction({...writer,capability:'records:write'},tx=>tx.mutateSerializedRequest(
+      JSON.stringify({operation:'create',idempotencyKey:'ungranted',data:{label:'ungranted'}}))),{code:'FORBIDDEN'});
+    await assert.rejects(authority.transaction(read(writer),tx=>tx.getByKey('invalid','key')),{code:'INVALID_ARGUMENT'});
+    await assert.rejects(authority.transaction(read(writer),tx=>tx.countRecords([{field:'score',kind:'invalid',operator:'eq',value:1}])),{code:'INVALID_ARGUMENT'});
+    await pool.query("UPDATE spaces SET lifecycle='suspended' WHERE space_id=$1",[owner.spaceId]);
+    await assert.rejects(registry.discover(owner),{code:'SPACE_UNAVAILABLE'});
+    suspendedGate=false;
+    await assert.rejects(authority.transaction(read(writer),tx=>tx.getRecord('missing')),{code:'SPACE_UNAVAILABLE'});
+  } finally { Array.prototype.includes=original; }
+});
+
+test('predicate snapshots reject decorated objects before index readiness and preserve ready queries',async()=>{
+  const {owner,writer}=await fixture();
+  const reader=read(writer);
+  const predicate={field:'score',kind:'number',operator:'eq',value:2};
+  await assert.rejects(authority.transaction(reader,tx=>tx.countRecords([predicate])),{code:'SCHEMA_CONFLICT'});
+  let invoked=0;
+  const decorated=Object.defineProperty({...predicate},'extra',{enumerable:true,get(){ invoked++; throw new Error('getter ran'); }});
+  await assert.rejects(authority.transaction(reader,tx=>tx.countRecords([decorated])),{code:'INVALID_ARGUMENT'});
+  assert.equal(invoked,0);
+  await registry.backfill(owner,'score');
+  await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'indexed',data:{label:'indexed',score:2}});
+  assert.equal(await authority.transaction(reader,tx=>tx.countRecords([predicate])),1);
+  assert.equal(await authority.transaction(reader,tx=>tx.existsRecord([predicate])),true);
+  assert.equal((await authority.transaction(reader,tx=>tx.queryRecords([predicate],10))).length,1);
+});
+
+test('a runtime without trap-free proxy detection fails closed for in-process predicates',()=>{
+  const script=`import {types} from 'node:util';
+    types.isProxy=undefined;
+    const {AuthorityTransaction}=await import('./packages/postgres/dist/index.js');
+    const tx=new AuthorityTransaction({query(){throw Error('query reached')}},
+      {spaceId:'space',collectionId:'collection',principalId:'principal',credentialId:'credential',
+       capability:'records:read',policyVersion:1,placementGeneration:1},3600);
+    const predicate=[{field:'score',kind:'number',operator:'eq',value:2}];
+    for (const run of [()=>tx.queryRecords(predicate,10),()=>tx.countRecords(predicate),()=>tx.existsRecord(predicate)]) {
+      try { await run(); throw Error('accepted untrusted predicate'); }
+      catch (error) { if (error.code!=='INVALID_ARGUMENT') throw error; }
+    }
+    process.stdout.write('closed');`;
+  assert.equal(execFileSync(process.execPath,['--input-type=module','-e',script],{encoding:'utf8'}),'closed');
 });

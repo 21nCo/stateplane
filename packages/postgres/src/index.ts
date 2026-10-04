@@ -200,14 +200,17 @@ function snapshotChange(source: RecordChange): Readonly<RecordChange> {
 }
 
 function snapshotRequest(input: unknown, trustedParsed = false): unknown {
-  if (input === null || typeof input !== 'object' || Array.isArray(input) ||
-    (!trustedParsed && (!acceptsInProcessObjects || types.isProxy(input)))) throw new AuthorityError('INVALID_ARGUMENT');
+  if (input === null || typeof input !== 'object') return input;
+  if (!trustedParsed && (!acceptsInProcessObjects || types.isProxy(input))) throw new AuthorityError('INVALID_ARGUMENT');
   const fixed:Record<string,unknown>=Object.create(null);
+  // Retain malformed shape as data so the requested collection is authorized first.
+  // Never retain the caller's prototype or invoke an accessor while taking the snapshot.
+  let malformed=Array.isArray(input) || (Object.getPrototypeOf(input)!==Object.prototype && Object.getPrototypeOf(input)!==null);
   const keys=Reflect.ownKeys(input);
   for (let i=0;i<keys.length;i++) {
     const key=Object.getOwnPropertyDescriptor(keys,i)!.value as PropertyKey;
     const descriptor=Object.getOwnPropertyDescriptor(input,key);
-    if (typeof key!=='string' || !descriptor?.enumerable || !Object.hasOwn(descriptor,'value')) throw new AuthorityError('INVALID_ARGUMENT');
+    if (typeof key!=='string' || !descriptor?.enumerable || !Object.hasOwn(descriptor,'value')) { malformed=true; continue; }
     const value=descriptor.value;
     if (key==='data' || key==='set' || key==='unset') {
       try {
@@ -216,19 +219,31 @@ function snapshotRequest(input: unknown, trustedParsed = false): unknown {
       } catch { Object.defineProperty(fixed,key,{value:undefined,enumerable:true}); }
     } else Object.defineProperty(fixed,key,{value:value !== null && typeof value==='object' ? undefined : value,enumerable:true});
   }
+  if (malformed) Object.defineProperty(fixed,Symbol('malformed envelope'),{value:true,enumerable:true});
   return fixed;
 }
 
 function snapshotPredicates(source: readonly ScalarPredicate[]): readonly ScalarPredicate[] {
-  if (!Array.isArray(source) || source.length > 16) throw new AuthorityError('INVALID_ARGUMENT');
+  if (!acceptsInProcessObjects || types.isProxy(source) || !Array.isArray(source) ||
+    Object.getPrototypeOf(source)!==Array.prototype || source.length > 16 || Reflect.ownKeys(source).length!==source.length+1)
+    throw new AuthorityError('INVALID_ARGUMENT');
   const result: ScalarPredicate[]=[];
   for (let i=0;i<source.length;i++) {
     const item=Object.getOwnPropertyDescriptor(source,i)?.value;
-    if (!item || typeof item!=='object' || types.isProxy(item)) throw new AuthorityError('INVALID_ARGUMENT');
+    if (!item || typeof item!=='object' || types.isProxy(item) ||
+      (Object.getPrototypeOf(item)!==Object.prototype && Object.getPrototypeOf(item)!==null)) throw new AuthorityError('INVALID_ARGUMENT');
     const field=Object.getOwnPropertyDescriptor(item,'field')?.value;
     const kind=Object.getOwnPropertyDescriptor(item,'kind')?.value;
     const operator=Object.getOwnPropertyDescriptor(item,'operator')?.value;
     const value=Object.getOwnPropertyDescriptor(item,'value')?.value;
+    const accepted=kind==='null' ? ['field','kind','operator'] : ['field','kind','operator','value'];
+    const keys=Reflect.ownKeys(item);
+    if (keys.length!==accepted.length) throw new AuthorityError('INVALID_ARGUMENT');
+    for (let j=0;j<keys.length;j++) {
+      const key=keys[j],descriptor=Object.getOwnPropertyDescriptor(item,key);
+      if (typeof key!=='string' || !arrayHas(accepted,key) || !descriptor?.enumerable || !Object.hasOwn(descriptor,'value'))
+        throw new AuthorityError('INVALID_ARGUMENT');
+    }
     if (kind==='null') append(result,Object.freeze({field,kind,operator}) as ScalarPredicate);
     else append(result,Object.freeze({field,kind,operator,value}) as ScalarPredicate);
   }
@@ -332,9 +347,10 @@ export class PostgresAuthority {
 
   /** Public record entrypoint: derive validation, reservations and indexes inside authority. */
   async mutateRequest(scope: AuthorityScope, request: unknown): Promise<Receipt> {
+    const fixedScope=Object.freeze({...scope});
     const fixedRequest=snapshotRequest(request);
     for (let attempt=0;attempt<3;attempt++) {
-      try { return await this.transaction(scope,tx=>tx.mutateRequest(fixedRequest)); }
+      try { return await this.transaction(fixedScope,tx=>tx.mutateRequest(fixedRequest)); }
       catch (error) { if (!retryCodes.has((error as {code?:string}).code ?? '') || attempt===2) throw error; }
     }
     throw new Error('unreachable');
@@ -342,8 +358,9 @@ export class PostgresAuthority {
 
   /** Cloudflare-safe boundary: parse primitive JSON bytes after scope authorization. */
   async mutateSerializedRequest(scope:AuthorityScope,serialized:string):Promise<Receipt> {
+    const fixedScope=Object.freeze({...scope});
     for (let attempt=0;attempt<3;attempt++) {
-      try { return await this.transaction(scope,tx=>tx.mutateSerializedRequest(serialized)); }
+      try { return await this.transaction(fixedScope,tx=>tx.mutateSerializedRequest(serialized)); }
       catch (error) { if (!retryCodes.has((error as {code?:string}).code ?? '') || attempt===2) throw error; }
     }
     throw new Error('unreachable');
@@ -406,7 +423,7 @@ export class AuthorityTransaction {
     const row = result.rows[0];
     if (!row) throw new AuthorityError('NOT_FOUND');
     if (Number(row.policy_version) !== policyVersion || Number(row.placement_generation) !== placementGeneration) throw new AuthorityError('FORBIDDEN', 'Policy or placement changed');
-    if (['suspended','deleting','deleted'].includes(row.lifecycle)) throw new AuthorityError('SPACE_UNAVAILABLE');
+    if (arrayHas(['suspended','deleting','deleted'],row.lifecycle)) throw new AuthorityError('SPACE_UNAVAILABLE');
     if (row.collection_lifecycle === 'deleted') throw new AuthorityError('NOT_FOUND');
     if (capability === 'outbox:worker' && (principalId !== 'system:projection' || credentialId !== 'system:projection'))
       throw new AuthorityError('FORBIDDEN');
@@ -414,7 +431,7 @@ export class AuthorityTransaction {
     if (capability === 'outbox:worker' && row.lifecycle !== 'active' && row.lifecycle !== 'readOnly')
       throw new AuthorityError('SPACE_UNAVAILABLE');
     if (row.owner_principal_id !== principalId && capability !== 'outbox:worker' &&
-      (!row.capabilities?.includes(capability) || (row.expires_at && !row.grant_current))) throw new AuthorityError('FORBIDDEN');
+      (!Array.isArray(row.capabilities) || !arrayHas(row.capabilities,capability) || (row.expires_at && !row.grant_current))) throw new AuthorityError('FORBIDDEN');
     if (row.collection_lifecycle === 'readOnly' && (capability === 'records:write' || capability === 'claims:review')) throw new AuthorityError('SPACE_UNAVAILABLE');
   }
 
@@ -434,7 +451,7 @@ export class AuthorityTransaction {
   getByKey(mode: 'generated' | 'external', key: string): Promise<AuthorityRecord | null> {
     return this.admitOperation(async () => {
     if (this.#scope.capability !== 'records:read') throw new AuthorityError('FORBIDDEN');
-    if (!['generated','external'].includes(mode) || !scalarString(key)) throw new AuthorityError('INVALID_ARGUMENT');
+    if (!arrayHas(['generated','external'],mode) || !scalarString(key)) throw new AuthorityError('INVALID_ARGUMENT');
     const normalized=mode==='external' ? externalKey(key) : key;
     const result = await this.query(`SELECT record_id FROM records WHERE space_id=$1 AND collection_id=$2
       AND key_mode=$3 AND normalized_key=$4 AND NOT tombstone`, [...scopeIds(this.#scope), mode, normalized]);
@@ -869,7 +886,7 @@ export class AuthorityTransaction {
     for (let index = 0; index < predicates.length; index++) {
       const predicate = predicates[index];
       if (!predicate) throw new AuthorityError('INVALID_ARGUMENT');
-      if (!scalarString(predicate.field) || !['null','string','date-time','number','boolean'].includes(predicate.kind)) throw new AuthorityError('INVALID_ARGUMENT');
+      if (!scalarString(predicate.field) || !arrayHas(['null','string','date-time','number','boolean'],predicate.kind)) throw new AuthorityError('INVALID_ARGUMENT');
       const alias = `v${index}`;
       params.push(predicate.field,predicate.kind);
       const fieldParam = `$${params.length - 1}`;
