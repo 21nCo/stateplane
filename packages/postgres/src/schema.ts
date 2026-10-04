@@ -93,7 +93,14 @@ export function scalarString(value: unknown): value is string {
   }
   return true;
 }
-export function plainJson(value: unknown, code = 'SCHEMA_INVALID', depth = 0, seen = new Set<object>(), trustedParsed = false): asserts value is Json {
+export function plainJson(value: unknown, code = 'SCHEMA_INVALID', depth = 0, seen = new Set<object>(), trustedParsed = false,
+  budget = { nodes:0, bytes:0 }): asserts value is Json {
+  // Shared-reference DAGs are legal in-process input. Charge each occurrence,
+  // not each distinct object, before canonical expansion can multiply it.
+  if (++budget.nodes > maxBytes) fail(code,'JSON exceeds node budget');
+  budget.bytes += value === null || typeof value === 'boolean' || typeof value === 'number' || typeof value === 'string'
+    ? Buffer.byteLength(JSON.stringify(value)) : 2;
+  if (budget.bytes > maxBytes) fail(code,'JSON exceeds byte budget');
   if ((!trustedParsed && (!proxyDetector || proxyDetector(value))) || depth > maxDepth) fail(code);
   if (value === null || typeof value === 'boolean') return;
   if (typeof value === 'string') { if (!scalarString(value)) fail(code); return; }
@@ -107,7 +114,8 @@ export function plainJson(value: unknown, code = 'SCHEMA_INVALID', depth = 0, se
     for (let i=0;i<value.length;i++) {
       const descriptor = Object.getOwnPropertyDescriptor(value,i);
       if (!descriptor?.enumerable || !own(descriptor,'value')) fail(code);
-      plainJson(descriptor!.value,code,depth+1,seen,trustedParsed);
+      if (i) budget.bytes++;
+      plainJson(descriptor!.value,code,depth+1,seen,trustedParsed,budget);
     }
   } else {
     const keys=Reflect.ownKeys(object);
@@ -115,7 +123,9 @@ export function plainJson(value: unknown, code = 'SCHEMA_INVALID', depth = 0, se
       const key=Object.getOwnPropertyDescriptor(keys,i)!.value as PropertyKey;
       const descriptor = Object.getOwnPropertyDescriptor(object,key);
       if (typeof key !== 'string' || !scalarString(key) || !descriptor?.enumerable || !own(descriptor,'value')) fail(code);
-      plainJson(descriptor!.value,code,depth+1,seen,trustedParsed);
+      budget.bytes += Buffer.byteLength(JSON.stringify(key))+1+(i ? 1 : 0);
+      if (budget.bytes > maxBytes) fail(code,'JSON exceeds byte budget');
+      plainJson(descriptor!.value,code,depth+1,seen,trustedParsed,budget);
     }
   }
   setDelete(seen,object);

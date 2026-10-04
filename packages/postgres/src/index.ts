@@ -199,6 +199,42 @@ function snapshotChange(source: RecordChange): Readonly<RecordChange> {
   return Object.freeze(change);
 }
 
+function snapshotRequest(input: unknown, trustedParsed = false): unknown {
+  if (input === null || typeof input !== 'object' || Array.isArray(input) ||
+    (!trustedParsed && (!acceptsInProcessObjects || types.isProxy(input)))) throw new AuthorityError('INVALID_ARGUMENT');
+  const fixed:Record<string,unknown>=Object.create(null);
+  const keys=Reflect.ownKeys(input);
+  for (let i=0;i<keys.length;i++) {
+    const key=Object.getOwnPropertyDescriptor(keys,i)!.value as PropertyKey;
+    const descriptor=Object.getOwnPropertyDescriptor(input,key);
+    if (typeof key!=='string' || !descriptor?.enumerable || !Object.hasOwn(descriptor,'value')) throw new AuthorityError('INVALID_ARGUMENT');
+    const value=descriptor.value;
+    if (key==='data' || key==='set' || key==='unset') {
+      try {
+        plainJson(value,'SCHEMA_INVALID',0,new Set<object>(),trustedParsed);
+        Object.defineProperty(fixed,key,{value:JSON.parse(canonical(value as Json)),enumerable:true});
+      } catch { Object.defineProperty(fixed,key,{value:undefined,enumerable:true}); }
+    } else Object.defineProperty(fixed,key,{value:value !== null && typeof value==='object' ? undefined : value,enumerable:true});
+  }
+  return fixed;
+}
+
+function snapshotPredicates(source: readonly ScalarPredicate[]): readonly ScalarPredicate[] {
+  if (!Array.isArray(source) || source.length > 16) throw new AuthorityError('INVALID_ARGUMENT');
+  const result: ScalarPredicate[]=[];
+  for (let i=0;i<source.length;i++) {
+    const item=Object.getOwnPropertyDescriptor(source,i)?.value;
+    if (!item || typeof item!=='object' || types.isProxy(item)) throw new AuthorityError('INVALID_ARGUMENT');
+    const field=Object.getOwnPropertyDescriptor(item,'field')?.value;
+    const kind=Object.getOwnPropertyDescriptor(item,'kind')?.value;
+    const operator=Object.getOwnPropertyDescriptor(item,'operator')?.value;
+    const value=Object.getOwnPropertyDescriptor(item,'value')?.value;
+    if (kind==='null') append(result,Object.freeze({field,kind,operator}) as ScalarPredicate);
+    else append(result,Object.freeze({field,kind,operator,value}) as ScalarPredicate);
+  }
+  return Object.freeze(result);
+}
+
 export class PostgresAuthority {
   constructor(private readonly pool: PoolLike, private readonly receiptRetentionSeconds: number) {
     if (!isSafeInteger(receiptRetentionSeconds) || receiptRetentionSeconds < 1) throw new RangeError('Invalid receipt retention');
@@ -296,9 +332,9 @@ export class PostgresAuthority {
 
   /** Public record entrypoint: derive validation, reservations and indexes inside authority. */
   async mutateRequest(scope: AuthorityScope, request: unknown): Promise<Receipt> {
-    if (!acceptsInProcessObjects || types.isProxy(request)) throw new AuthorityError('INVALID_ARGUMENT');
+    const fixedRequest=snapshotRequest(request);
     for (let attempt=0;attempt<3;attempt++) {
-      try { return await this.transaction(scope,tx=>tx.mutateRequest(request)); }
+      try { return await this.transaction(scope,tx=>tx.mutateRequest(fixedRequest)); }
       catch (error) { if (!retryCodes.has((error as {code?:string}).code ?? '') || attempt===2) throw error; }
     }
     throw new Error('unreachable');
@@ -510,13 +546,20 @@ export class AuthorityTransaction {
   /** Validate the user envelope after scope authorization, before receipt disclosure. */
   async mutateRequest(input: unknown, trustedMarker?: symbol): Promise<Receipt> {
     const trustedParsed=trustedMarker===serializedMarker;
-    try { return await this.mutateRequestOnce(input,trustedParsed); }
+    try {
+      if (!this.admittingMutations || !this.active) throw new AuthorityError('INVALID_ARGUMENT','Transaction mutation admission ended');
+      const fixedInput=snapshotRequest(input,trustedParsed);
+      this.assertCommittable();
+      return await this.mutateRequestOnce(fixedInput,true);
+    }
     catch (error) { this.mutationFailed=true; this.mutationError=error; throw error; }
   }
 
   /** Use inside a joined regional cell transaction to retain its credential fence. */
   async mutateSerializedRequest(serialized:string):Promise<Receipt> {
     try {
+      if (!this.admittingMutations || !this.active) throw new AuthorityError('INVALID_ARGUMENT','Transaction mutation admission ended');
+      this.assertCommittable();
       if (typeof serialized!=='string' || Buffer.byteLength(serialized)>MAX_JSON_BYTES) throw new AuthorityError('INVALID_ARGUMENT');
       let input:unknown;
       try { input=JSON.parse(serialized); } catch { throw new AuthorityError('INVALID_ARGUMENT'); }
@@ -871,10 +914,12 @@ export class AuthorityTransaction {
 
   /** Declaration allowlists, signed cursors and public sort behavior belong to STA-8. */
   queryRecords(predicates: readonly ScalarPredicate[], limit: number): Promise<AuthorityRecord[]> {
+    let fixed:readonly ScalarPredicate[];
+    try { fixed=snapshotPredicates(predicates); } catch (error) { return Promise.reject(error); }
     return this.admitOperation(async () => {
     if (!isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE) throw new AuthorityError('INVALID_ARGUMENT');
-    const { params, where } = this.compilePredicates(predicates);
-    await this.requireReadyIndexes(predicates);
+    const { params, where } = this.compilePredicates(fixed);
+    await this.requireReadyIndexes(fixed);
     params.push(limit);
     const result = await this.query(`SELECT record_id,revision,schema_version,canonical_data,key_mode,normalized_key,tombstone FROM records r
       WHERE ${where}
@@ -885,9 +930,11 @@ export class AuthorityTransaction {
   }
 
   countRecords(predicates: readonly ScalarPredicate[]): Promise<number> {
+    let fixed:readonly ScalarPredicate[];
+    try { fixed=snapshotPredicates(predicates); } catch (error) { return Promise.reject(error); }
     return this.admitOperation(async () => {
-    const { params, where } = this.compilePredicates(predicates);
-    await this.requireReadyIndexes(predicates);
+    const { params, where } = this.compilePredicates(fixed);
+    await this.requireReadyIndexes(fixed);
     const result = await this.query(`SELECT count(*)::bigint AS total FROM records r WHERE ${where}`,params);
     const count = Number(result.rows[0].total);
     if (!isSafeInteger(count)) throw new RangeError('Count exceeds JavaScript safe integer range');
@@ -896,9 +943,11 @@ export class AuthorityTransaction {
   }
 
   existsRecord(predicates: readonly ScalarPredicate[]): Promise<boolean> {
+    let fixed:readonly ScalarPredicate[];
+    try { fixed=snapshotPredicates(predicates); } catch (error) { return Promise.reject(error); }
     return this.admitOperation(async () => {
-    const { params, where } = this.compilePredicates(predicates);
-    await this.requireReadyIndexes(predicates);
+    const { params, where } = this.compilePredicates(fixed);
+    await this.requireReadyIndexes(fixed);
     const result = await this.query(`SELECT EXISTS(SELECT 1 FROM records r WHERE ${where}) AS found`,params);
     return result.rows[0].found;
     });

@@ -1,6 +1,6 @@
 import type pg from 'pg';
 import { AuthorityError, type AuthorityScope } from './index.js';
-import { canonical, compatible, derivedValues, scalarString, validateDefinition } from './schema.js';
+import { canonical, compatible, derivedValues, plainJson, scalarString, validateDefinition } from './schema.js';
 import type { CollectionDefinition, Json } from './schema.js';
 
 type PoolLike = Pick<pg.Pool,'connect'>;
@@ -8,6 +8,16 @@ type Client = pg.PoolClient;
 const validVersion=(n:unknown)=>Number.isSafeInteger(n) && (n as number)>0;
 const has=(values:readonly string[],value:string)=>{ for (let i=0;i<values.length;i++) if (values[i]===value) return true; return false; };
 const append=<T>(values:T[],value:T)=>{ Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
+const snapshotDefinition=(input:unknown):(()=>unknown)=>{
+  try {
+    plainJson(input,'SCHEMA_UNSUPPORTED');
+    const fixed=JSON.parse(canonical(input as Json));
+    return ()=>fixed;
+  } catch (error) {
+    // Keep malformed input detached, but retain the authorization boundary.
+    return ()=>{ throw error; };
+  }
+};
 
 /** Schema administration and explicit index activation in the regional authority. */
 export class CollectionRegistry {
@@ -75,7 +85,8 @@ export class CollectionRegistry {
     }
   }
   async define(scope:AuthorityScope,input:unknown):Promise<CollectionDefinition> {
-    return this.defineUsing(scope,()=>validateDefinition(input));
+    const snapshot=snapshotDefinition(input);
+    return this.defineUsing(scope,()=>validateDefinition(snapshot(),true));
   }
   async defineSerialized(scope:AuthorityScope,serialized:string):Promise<CollectionDefinition> {
     return this.defineUsing(scope,()=>validateDefinition(this.parseDefinition(serialized),true));
@@ -92,7 +103,11 @@ export class CollectionRegistry {
       if (definition.version!==1 || definition.slug!==scope.collectionId) throw new AuthorityError('SCHEMA_UNSUPPORTED');
       const exists=await client.query('SELECT 1 FROM collections WHERE space_id=$1 AND collection_id=$2',[scope.spaceId,definition.slug]);
       if (exists.rowCount) throw new AuthorityError('SCHEMA_CONFLICT','Collection already exists');
-      await client.query('INSERT INTO collections(space_id,collection_id) VALUES($1,$2)',[scope.spaceId,definition.slug]);
+      try { await client.query('INSERT INTO collections(space_id,collection_id) VALUES($1,$2)',[scope.spaceId,definition.slug]); }
+      catch (error) {
+        if ((error as {code?:string}).code==='23505') throw new AuthorityError('SCHEMA_CONFLICT','Collection already exists');
+        throw error;
+      }
       await client.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition)
         VALUES($1,$2,1,$3)`,[scope.spaceId,definition.slug,canonical(definition as unknown as Json)]);
       await this.insertDeclarations(client,scope,definition);
@@ -100,7 +115,8 @@ export class CollectionRegistry {
     });
   }
   async revise(scope:AuthorityScope,expectedVersion:number,input:unknown):Promise<CollectionDefinition> {
-    return this.reviseUsing(scope,expectedVersion,()=>validateDefinition(input));
+    const snapshot=snapshotDefinition(input);
+    return this.reviseUsing(scope,expectedVersion,()=>validateDefinition(snapshot(),true));
   }
   async reviseSerialized(scope:AuthorityScope,expectedVersion:number,serialized:string):Promise<CollectionDefinition> {
     return this.reviseUsing(scope,expectedVersion,()=>validateDefinition(this.parseDefinition(serialized),true));

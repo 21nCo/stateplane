@@ -61,6 +61,90 @@ test('definition subset, additive revisions and normalization have explicit fail
   assert.throws(()=>compatible(d,{...next,unique:[{name:'new',paths:['label']}]}),{code:'SCHEMA_BREAKING'});
 });
 
+test('shared schema DAG expansion is bounded before canonical allocation',()=>{
+  let child={type:'string'};
+  for (let depth=0;depth<30;depth++) child={type:'object',additionalProperties:false,properties:{left:child,right:child}};
+  const shared={...schema,properties:{branch:child}};
+  assert.throws(()=>validateDefinition(definition('dag',{schema:shared})),{code:'SCHEMA_UNSUPPORTED'});
+  const small={type:'string'};
+  assert.equal(validateDefinition(definition('shared',{schema:{...schema,properties:{...schema.properties,left:small,right:small}}})).slug,'shared');
+});
+
+test('definitions and requests keep entry snapshots across pool and query waits',async()=>{
+  const suffix=randomUUID(),spaceId=`sp_${suffix}`,collectionId=`entries_${suffix}`;
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
+  const owner={spaceId,collectionId,principalId:'owner',credentialId:'session',capability:'schema:write',policyVersion:1,placementGeneration:1};
+  let entered,release;
+  const waiting=new Promise(resolve=>entered=resolve),gate=new Promise(resolve=>release=resolve);
+  const heldRegistry=new CollectionRegistry({connect:async()=>{entered();await gate;return pool.connect();}});
+  const draft=structuredClone(definition(collectionId));
+  const defining=heldRegistry.define(owner,draft);
+  await waiting;
+  draft.schema.properties.label.type='number';
+  draft.filterable.length=0;
+  release();
+  assert.equal((await defining).schema.properties.label.type,'string');
+  assert.deepEqual((await registry.discover(owner))[0].definition.filterable,['score']);
+
+  const writer={...owner,capability:'records:write'};
+  let queried,continueQuery;
+  const queryStarted=new Promise(resolve=>queried=resolve),queryGate=new Promise(resolve=>continueQuery=resolve);
+  const heldAuthority=new PostgresAuthority({connect:async()=>{
+    const client=await pool.connect();
+    return {query:async(sql,...args)=>{
+      if (String(sql).includes('stateplane_try_reserve_receipt')) { queried(); await queryGate; }
+      return client.query(sql,...args);
+    },release:discard=>client.release(discard)};
+  }},3600);
+  const request={operation:'create',idempotencyKey:'snapshot',data:{label:'original'}};
+  const creating=heldAuthority.mutateRequest(writer,request);
+  await queryStarted;
+  request.data.label='changed';
+  continueQuery();
+  const receipt=await creating;
+  assert.equal(JSON.parse((await authority.transaction(read(writer),tx=>tx.getRecord(receipt.ref.id))).canonicalData).label,'original');
+
+  let connected,allowConnection;
+  const poolWaiting=new Promise(resolve=>connected=resolve),poolGate=new Promise(resolve=>allowConnection=resolve);
+  const poolHeld=new PostgresAuthority({connect:async()=>{connected();await poolGate;return pool.connect();}},3600);
+  const queued={operation:'create',idempotencyKey:'pool-snapshot',data:{label:'before-pool'}};
+  const queuedWrite=poolHeld.mutateRequest(writer,queued);
+  await poolWaiting;
+  queued.data.label='after-pool';
+  allowConnection();
+  const queuedReceipt=await queuedWrite;
+  assert.equal(JSON.parse((await authority.transaction(read(writer),tx=>tx.getRecord(queuedReceipt.ref.id))).canonicalData).label,'before-pool');
+
+  let revisingEntered,allowRevision;
+  const revisionWaiting=new Promise(resolve=>revisingEntered=resolve),revisionGate=new Promise(resolve=>allowRevision=resolve);
+  const revisionRegistry=new CollectionRegistry({connect:async()=>{revisingEntered();await revisionGate;return pool.connect();}});
+  const next=definition(collectionId,{version:2,schema:{...schema,properties:{...schema.properties,note:{type:'string'}}}});
+  const revising=revisionRegistry.revise(owner,1,next);
+  await revisionWaiting;
+  next.schema.properties.note.type='number';
+  allowRevision();
+  assert.equal((await revising).schema.properties.note.type,'string');
+});
+
+test('schema authorization precedes malformed-definition disclosure',async()=>{
+  const {owner}=await fixture();
+  const stranger={...owner,principalId:'stranger',credentialId:'stranger'};
+  const malformed=definition(owner.collectionId,{schema:{...schema,patternProperties:{}}});
+  await assert.rejects(registry.revise(stranger,1,malformed),{code:'FORBIDDEN'});
+  await assert.rejects(registry.define({...stranger,collectionId:`new_${randomUUID()}`},malformed),{code:'FORBIDDEN'});
+});
+
+test('concurrent first definitions return the public schema conflict',async()=>{
+  const suffix=randomUUID(),spaceId=`sp_${suffix}`,collectionId=`entries_${suffix}`;
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
+  const owner={spaceId,collectionId,principalId:'owner',credentialId:'session',capability:'schema:write',policyVersion:1,placementGeneration:1};
+  const results=await Promise.allSettled([registry.define(owner,definition(collectionId)),registry.define(owner,definition(collectionId))]);
+  assert.equal(results.filter(result=>result.status==='fulfilled').length,1);
+  assert.equal(results.find(result=>result.status==='rejected').reason.code,'SCHEMA_CONFLICT');
+});
+
 test('schema and reservation decisions use own array members after iterator replacement',()=>{
   const original=Array.prototype[Symbol.iterator];
   let accepted,bad,derived;
@@ -105,6 +189,7 @@ test('registry, safe mutation, replay, races, tombstones and index readiness',as
   const replace=(key)=>({operation:'replace',idempotencyKey:key,id:saved.ref.id,expectedRevision:1,data:{label:'B',score:2,state:'open'}});
   const raced=await Promise.allSettled([authority.mutateRequest(writer,replace('r1')),authority.mutateRequest(writer,replace('r2'))]);
   assert.equal(raced.filter(x=>x.status==='fulfilled').length,1,JSON.stringify(raced.map(x=>x.status==='rejected' ? {code:x.reason.code,message:x.reason.message} : {status:x.status})));
+  const winningKey=raced[0].status==='fulfilled' ? 'r1' : 'r2';
   const conflict=raced.find(x=>x.status==='rejected').reason;
   assert.equal(conflict.code,'REVISION_CONFLICT');
   assert.equal(conflict.currentRevision,2);
@@ -116,7 +201,7 @@ test('registry, safe mutation, replay, races, tombstones and index readiness',as
   await registry.revise(owner,1,added);
   assert.deepEqual((await registry.discover(owner))[0].pending.sort(),['note','score']);
   await assert.rejects(authority.transaction(read(writer),tx=>tx.countRecords([{field:'note',kind:'string',operator:'eq',value:'x'}])),{code:'SCHEMA_CONFLICT'});
-  assert.equal((await authority.mutateRequest(writer,replace('r1'))).replayed,true);
+  assert.equal((await authority.mutateRequest(writer,replace(winningKey))).replayed,true);
   assert.equal((await authority.mutateRequest(writer,create)).receiptId,saved.receiptId);
   await assert.rejects(authority.mutateRequest(writer,{operation:'patch',idempotencyKey:'version-fail',id:saved.ref.id,expectedRevision:3,expectedSchemaVersion:1,set:{note:'x'},unset:[]}),{code:'SCHEMA_CONFLICT'});
   const patch=await authority.mutateRequest(writer,{operation:'patch',idempotencyKey:'patch-new',id:saved.ref.id,expectedRevision:3,set:{note:'x'},unset:[]});
@@ -200,6 +285,104 @@ test('a partial backfill remains unavailable until a bounded final activation',a
   await assert.rejects(authority.transaction(reader,tx=>tx.countRecords(predicate)),{code:'SCHEMA_CONFLICT'});
   assert.deepEqual(await registry.backfill(owner,'note'),{processed:1,ready:true});
   assert.equal(await authority.transaction(reader,tx=>tx.countRecords(predicate)),1);
+});
+
+test('backfill lock orders preserve indexes across concurrent update and delete',async()=>{
+  const suffix=randomUUID(),spaceId=`sp_${suffix}`,collectionId=`entries_${suffix}`;
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
+  const owner={spaceId,collectionId,principalId:'owner',credentialId:'session',capability:'schema:write',policyVersion:1,placementGeneration:1};
+  const withNote={...schema,properties:{...schema.properties,note:{type:'string'}}};
+  await registry.define(owner,definition(collectionId,{schema:withNote,unique:[],filterable:[]}));
+  const writer={...owner,capability:'records:write'};
+  const changing=await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'changing',data:{label:'a',note:'old'}});
+  const removing=await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'removing',data:{label:'b',note:'old'}});
+  await registry.revise(owner,1,definition(collectionId,{version:2,schema:withNote,unique:[],filterable:['note']}));
+  let entered,release;
+  const waiting=new Promise(resolve=>entered=resolve),gate=new Promise(resolve=>release=resolve);
+  const heldRegistry=new CollectionRegistry({connect:async()=>{
+    const client=await pool.connect();
+    return {query:async(sql,...args)=>{
+      const result=await client.query(sql,...args);
+      if (String(sql).includes('LIMIT 100 FOR UPDATE')) { entered(); await gate; }
+      return result;
+    },release:discard=>client.release(discard)};
+  }});
+  const backfill=heldRegistry.backfill(owner,'note');
+  await waiting;
+  const update=authority.mutateRequest(writer,{operation:'patch',idempotencyKey:'update',id:changing.ref.id,expectedRevision:1,set:{note:'new'},unset:[]});
+  const deletion=authority.mutateRequest(writer,{operation:'delete',idempotencyKey:'delete',id:removing.ref.id,expectedRevision:1});
+  release();
+  await Promise.all([backfill,update,deletion]);
+  const reader=read(writer);
+  const count=value=>authority.transaction(reader,tx=>tx.countRecords([{field:'note',kind:'string',operator:'eq',value}]));
+  assert.equal(await count('old'),0);
+  assert.equal(await count('new'),1);
+  assert.deepEqual((await registry.discover(owner))[0].ready,['note']);
+});
+
+test('composite uniqueness skips missing and null, then reserves normalized tombstones',async()=>{
+  const suffix=randomUUID(),spaceId=`sp_${suffix}`,collectionId=`entries_${suffix}`;
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
+  const owner={spaceId,collectionId,principalId:'owner',credentialId:'session',capability:'schema:write',policyVersion:1,placementGeneration:1};
+  const composite={...schema,properties:{...schema.properties,group:{type:['string','null']}}};
+  await registry.define(owner,definition(collectionId,{schema:composite,unique:[{name:'pair',paths:['label','group']}],filterable:[]}));
+  const writer={...owner,capability:'records:write'};
+  for (const [id,data] of [['missing-a',{label:'x'}],['missing-b',{label:'x'}],['null-a',{label:'x',group:null}],['null-b',{label:'x',group:null}]])
+    await authority.mutateRequest(writer,{operation:'create',idempotencyKey:id,data});
+  const saved=await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'present',data:{label:'x',group:'e\u0301'}});
+  await assert.rejects(authority.mutateRequest(writer,{operation:'create',idempotencyKey:'normalized',data:{label:'x',group:'é'}}),{code:'UNIQUE_CONFLICT'});
+  await authority.mutateRequest(writer,{operation:'delete',idempotencyKey:'tombstone',id:saved.ref.id,expectedRevision:1});
+  await assert.rejects(authority.mutateRequest(writer,{operation:'create',idempotencyKey:'reserved',data:{label:'x',group:'é'}}),{code:'KEY_RESERVED'});
+  const rows=await pool.query('SELECT count(*)::int AS total FROM record_unique_keys WHERE space_id=$1',[spaceId]);
+  assert.equal(rows.rows[0].total,1);
+});
+
+test('readiness uses the same predicate snapshot as the indexed SQL',async()=>{
+  const {owner,writer}=await fixture();
+  const reader=read(writer);
+  const predicate=[{field:'score',kind:'number',operator:'eq',value:1}];
+  let entered,release;
+  const waiting=new Promise(resolve=>entered=resolve),gate=new Promise(resolve=>release=resolve);
+  const held=new PostgresAuthority({connect:async()=>{
+    const client=await pool.connect();
+    return {query:async(sql,...args)=>{
+      if (String(sql).includes('FROM collection_index_declarations')) { entered(); await gate; }
+      return client.query(sql,...args);
+    },release:discard=>client.release(discard)};
+  }},3600);
+  const counting=held.transaction(reader,tx=>tx.countRecords(predicate));
+  await waiting;
+  predicate.length=0;
+  release();
+  await assert.rejects(counting,{code:'SCHEMA_CONFLICT'});
+  assert.equal(await authority.transaction(reader,tx=>tx.countRecords([])),0);
+  assert.deepEqual((await registry.discover(owner))[0].pending,['score']);
+});
+
+test('sealed transaction rejects late request entrypoints during receipt finalization',async()=>{
+  const {owner,writer}=await fixture();
+  let entered,release,escaped;
+  const waiting=new Promise(resolve=>entered=resolve),gate=new Promise(resolve=>release=resolve);
+  const held=new PostgresAuthority({connect:async()=>{
+    const client=await pool.connect();
+    return {query:async(sql,...args)=>{
+      if (String(sql).includes('WITH stamp AS MATERIALIZED') && String(sql).includes('unnest')) { entered(); await gate; }
+      return client.query(sql,...args);
+    },release:discard=>client.release(discard)};
+  }},3600);
+  const first=held.transaction(writer,async tx=>{
+    escaped=tx;
+    return tx.mutateRequest({operation:'create',idempotencyKey:'first',data:{label:'first'}});
+  });
+  await waiting;
+  await assert.rejects(escaped.mutateRequest({operation:'create',idempotencyKey:'late',data:{label:'late'}}),{code:'INVALID_ARGUMENT'});
+  await assert.rejects(escaped.mutateSerializedRequest(JSON.stringify({operation:'create',idempotencyKey:'later',data:{label:'later'}})),{code:'INVALID_ARGUMENT'});
+  release();
+  await first;
+  const rows=await pool.query('SELECT canonical_data FROM records WHERE space_id=$1',[owner.spaceId]);
+  assert.deepEqual(rows.rows.map(row=>JSON.parse(row.canonical_data).label),['first']);
 });
 
 test('generated and external keys are distinct, revoked retries disclose no receipt',async()=>{
