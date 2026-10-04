@@ -1,0 +1,30 @@
+docs/postgres-authority.md
+  h_a39f9495f9ec1d 21-22
+docs/versioned-collections.md
+  h_a39f9495f9ec1d 5-6
+migrations/028_schema_commit_fence.sql
+  h_a39f9495f9ec1d 1-48
+packages/postgres/src/collections.ts
+  h_a39f9495f9ec1d 2,11,13,15-21,34,49,63,67,83-91,93-102,108-117,119-127,129,134,138,143,163,168,172,194,247,273
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 91,114,247,280-338,365-372,508,515,517,727,742,752,828,871,968,1019,1024-1025,1034
+packages/postgres/src/schema.ts
+  h_a39f9495f9ec1d 57,92,105,143,159,174,241,258,337,362,389,400,437
+scripts/migration-upgrade-smoke.mjs
+  h_a39f9495f9ec1d 146,167
+scripts/restore-smoke.mjs
+  h_a39f9495f9ec1d 38
+test/integration/collections.test.js
+  h_a39f9495f9ec1d 1133,1215-1247
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "498c18e5c27c95ae069919591549aca0b39375a2",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
