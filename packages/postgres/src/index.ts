@@ -216,7 +216,15 @@ function snapshotRequest(input: unknown, trustedParsed = false): unknown {
       try {
         plainJson(value,'SCHEMA_INVALID',0,new Set<object>(),trustedParsed);
         Object.defineProperty(fixed,key,{value:JSON.parse(canonical(value as Json)),enumerable:true});
-      } catch { Object.defineProperty(fixed,key,{value:undefined,enumerable:true}); }
+      } catch {
+        // Keep an invalid object-shaped patch as invalid JSON so payload
+        // validation, after authorization and replay lookup, reports
+        // SCHEMA_INVALID. Preserve a non-object set for shape validation.
+        const deferred = key==='set' && value !== null && typeof value==='object' && !Array.isArray(value)
+          ? Object.defineProperty(Object.create(null),'invalid',{value:undefined,enumerable:true})
+          : undefined;
+        Object.defineProperty(fixed,key,{value:deferred,enumerable:true});
+      }
     } else Object.defineProperty(fixed,key,{value:value !== null && typeof value==='object' ? undefined : value,enumerable:true});
   }
   if (malformed) Object.defineProperty(fixed,Symbol('malformed envelope'),{value:true,enumerable:true});

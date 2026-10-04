@@ -51,6 +51,12 @@ test('definition subset, additive revisions and normalization have explicit fail
   assert.equal(externalKey('\ufeffx\ufeff'),'\ufeffx\ufeff');
   assert.equal(derivedValues({label:'e\u0301',score:null},d).unique[0].encodedValue,
     derivedValues({label:'é',score:null},d).unique[0].encodedValue);
+  for (const [decomposed,composed] of [['e\u0301','é'],['A\u030a','Å'],['가','가']]) {
+    assert.equal(externalKey(`\u0085 ${decomposed} \u0085`),externalKey(composed));
+    assert.equal(externalKey(externalKey(decomposed)),externalKey(composed));
+    assert.equal(derivedValues({label:decomposed},d).unique[0].encodedValue,
+      derivedValues({label:composed},d).unique[0].encodedValue);
+  }
   assert.equal(derivedValues({label:'x'},d).indexes.length,0);
   assert.equal(derivedValues({label:'x',score:null},d).indexes[0].kind,'null');
   assert.throws(()=>validateDefinition(definition('bad',{schema:{...schema,patternProperties:{}}})),{code:'SCHEMA_UNSUPPORTED'});
@@ -283,8 +289,22 @@ test('a partial backfill remains unavailable until a bounded final activation',a
   await assert.rejects(authority.transaction(reader,tx=>tx.countRecords(misleadingPredicate)),{code:'INVALID_ARGUMENT'});
   assert.deepEqual(await registry.backfill(owner,'note'),{processed:100,ready:false});
   await assert.rejects(authority.transaction(reader,tx=>tx.countRecords(predicate)),{code:'SCHEMA_CONFLICT'});
-  assert.deepEqual(await registry.backfill(owner,'note'),{processed:1,ready:true});
-  assert.equal(await authority.transaction(reader,tx=>tx.countRecords(predicate)),1);
+  const interrupted=new CollectionRegistry({connect:async()=>{
+    const client=await pool.connect();
+    return {query:(sql,...args)=>{
+      if (String(sql).includes('INSERT INTO record_index_values')) throw new Error('interrupted batch');
+      return client.query(sql,...args);
+    },release:discard=>client.release(discard)};
+  }});
+  await assert.rejects(interrupted.backfill(owner,'note'),/interrupted batch/);
+  const cursor=await pool.query(`SELECT backfill_after,ready FROM collection_index_declarations
+    WHERE space_id=$1 AND collection_id=$2 AND field_name='note'`,[spaceId,collectionId]);
+  assert.deepEqual(cursor.rows[0],{backfill_after:'rec_100',ready:false});
+  await assert.rejects(authority.transaction(reader,tx=>tx.countRecords(predicate)),{code:'SCHEMA_CONFLICT'});
+  await authority.mutateRequest({...owner,capability:'records:write'},
+    {operation:'create',idempotencyKey:'between-batches',data:{label:'later',note:'v101'}});
+  assert.deepEqual(await new CollectionRegistry(pool).backfill(owner,'note'),{processed:2,ready:true});
+  assert.equal(await authority.transaction(reader,tx=>tx.countRecords(predicate)),2);
 });
 
 test('backfill lock orders preserve indexes across concurrent update and delete',async()=>{
@@ -337,6 +357,35 @@ test('composite uniqueness skips missing and null, then reserves normalized tomb
   await assert.rejects(authority.mutateRequest(writer,{operation:'create',idempotencyKey:'reserved',data:{label:'x',group:'é'}}),{code:'KEY_RESERVED'});
   const rows=await pool.query('SELECT count(*)::int AS total FROM record_unique_keys WHERE space_id=$1',[spaceId]);
   assert.equal(rows.rows[0].total,1);
+});
+
+test('optional unique fields never read inherited values on writes or backfill',async()=>{
+  const suffix=randomUUID(),spaceId=`sp_${suffix}`,collectionId=`entries_${suffix}`;
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
+  const owner={spaceId,collectionId,principalId:'owner',credentialId:'session',capability:'schema:write',policyVersion:1,placementGeneration:1};
+  const writer={...owner,capability:'records:write'};
+  const optional='optionalUniqueSTA7';
+  const withOptional={...schema,properties:{...schema.properties,[optional]:{type:['string','null']}}};
+  await registry.define(owner,definition(collectionId,{schema:withOptional,unique:[{name:'pair',paths:['label',optional]}],filterable:[]}));
+  const previous=Object.getOwnPropertyDescriptor(Object.prototype,optional);
+  let inheritedReads=0;
+  Object.defineProperty(Object.prototype,optional,{configurable:true,get(){ inheritedReads++; throw new Error('inherited unique getter'); }});
+  try {
+    const missing=await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'missing',data:{label:'missing',score:1}});
+    await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'null',data:{label:'null',[optional]:null}});
+    await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'present',data:{label:'present',[optional]:'value'}});
+    await authority.mutateRequest(writer,{operation:'replace',idempotencyKey:'replace',id:missing.ref.id,expectedRevision:1,data:{label:'missing',score:2}});
+    await authority.mutateRequest(writer,{operation:'patch',idempotencyKey:'patch',id:missing.ref.id,expectedRevision:2,set:{score:3},unset:[]});
+    await registry.revise(owner,1,definition(collectionId,{version:2,schema:withOptional,
+      unique:[{name:'pair',paths:['label',optional]}],filterable:['score']}));
+    assert.deepEqual(await registry.backfill(owner,'score'),{processed:3,ready:true});
+    assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([{field:'score',kind:'number',operator:'eq',value:3}])),1);
+    assert.equal(inheritedReads,0);
+  } finally {
+    if (previous) Object.defineProperty(Object.prototype,optional,previous);
+    else delete Object.prototype[optional];
+  }
 });
 
 test('readiness uses the same predicate snapshot as the indexed SQL',async()=>{
@@ -419,6 +468,20 @@ test('readOnly permits an authorized replay and denies a fresh malformed payload
   assert.equal((await authority.mutateRequest(writer,request)).receiptId,saved.receiptId);
   await assert.rejects(authority.mutateRequest(writer,{operation:'create',idempotencyKey:'fresh',data:{label:undefined}}),{code:'SPACE_UNAVAILABLE'});
   await assert.rejects(authority.mutateRequest(writer,{operation:'create',idempotencyKey:'one',data:{label:undefined}}),{code:'SCHEMA_INVALID'});
+});
+
+test('invalid patch set keeps schema errors after authorization, replay lookup and readOnly gating',async()=>{
+  const {owner,writer}=await fixture();
+  const saved=await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'base',data:{label:'base'}});
+  const valid={operation:'patch',idempotencyKey:'replay',id:saved.ref.id,expectedRevision:1,set:{score:1},unset:[]};
+  await authority.mutateRequest(writer,valid);
+  const invalid={...valid,set:{label:undefined}};
+  await assert.rejects(authority.mutateRequest({...writer,credentialId:'revoked'},invalid),{code:'FORBIDDEN'});
+  await assert.rejects(authority.mutateRequest(writer,{...invalid,idempotencyKey:'fresh'}),{code:'SCHEMA_INVALID'});
+  await assert.rejects(authority.mutateRequest(writer,invalid),{code:'SCHEMA_INVALID'});
+  await pool.query("UPDATE spaces SET lifecycle='readOnly' WHERE space_id=$1",[owner.spaceId]);
+  await assert.rejects(authority.mutateRequest(writer,{...invalid,idempotencyKey:'read-only-fresh'}),{code:'SPACE_UNAVAILABLE'});
+  await assert.rejects(authority.mutateRequest(writer,invalid),{code:'SCHEMA_INVALID'});
 });
 
 test('a retained grant on another collection cannot disclose a revoked receipt',async()=>{

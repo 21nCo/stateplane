@@ -383,8 +383,9 @@ export function derivedValues(data: Record<string,Json>, definition: CollectionD
     const parts: string[]=[]; let skip=false;
     for (let j=0;j<item.paths.length;j++) {
       const path=item.paths[j];
+      if (!own(data,path)) { skip=true; break; }
       const value=data[path];
-      if (!own(data,path) || value===null) { skip=true; break; }
+      if (value===null) { skip=true; break; }
       const field=props(definition.schema)[path];
       const tag=typeOf(field); const normalized=typeof value==='string' ?
         (own(field,'format') && field.format==='date-time' ? utcInstant(value) : Reflect.apply(normalize,value,['NFC']) as string) : canonical(value);
