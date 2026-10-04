@@ -1183,11 +1183,10 @@ test('mutation facts use entry snapshots across waits and indexed list traversal
     [scope.spaceId,indexed.ref.id])).rows[0].n,1);
 });
 
-test('NUL in identifiers, JSON and typed values is a typed rejection without rows', async () => {
+test('NUL in identifiers and typed values is a typed rejection without rows', async () => {
   const { scope } = await fixture();
   for (const request of [
     change('create','bad\0key','{"label":"one"}'),
-    change('create','bad-json','{"label":"\\u0000"}'),
     change('create','bad-unique','{"label":"one"}',{unique:[{name:'label',encodedValue:'bad\0key'}]}),
     change('create','bad-index','{"label":"one"}',{indexes:[{field:'score',kind:'string',value:'bad\0value'}]})
   ]) await assert.rejects(authority.mutate(scope,request),error=>error instanceof AuthorityError &&

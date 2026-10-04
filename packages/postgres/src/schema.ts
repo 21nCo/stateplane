@@ -88,11 +88,11 @@ const ordinary = (value: unknown): value is Record<string, unknown> => value !==
   (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 const fail = (code: string, message?: string): never => { throw new AuthorityError(code,message); };
 
-export function scalarString(value: unknown): value is string {
+export function scalarString(value: unknown, allowNul = false): value is string {
   if (typeof value !== 'string') return false;
   for (let i=0;i<value.length;i++) {
     const unit = Reflect.apply(codeUnit,value,[i]) as number;
-    if (unit === 0 || (unit >= 0xdc00 && unit <= 0xdfff)) return false;
+    if ((!allowNul && unit === 0) || (unit >= 0xdc00 && unit <= 0xdfff)) return false;
     if (unit >= 0xd800 && unit <= 0xdbff) {
       const next = Reflect.apply(codeUnit,value,[++i]) as number;
       if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
@@ -110,7 +110,7 @@ export function plainJson(value: unknown, code = 'SCHEMA_INVALID', depth = 0, se
   if (budget.bytes > maxBytes) fail(code,'JSON exceeds byte budget');
   if ((!trustedParsed && (!proxyDetector || proxyDetector(value))) || depth > maxCanonicalDepth) fail(code);
   if (value === null || typeof value === 'boolean') return;
-  if (typeof value === 'string') { if (!scalarString(value)) fail(code); return; }
+  if (typeof value === 'string') { if (!scalarString(value,true)) fail(code); return; }
   if (typeof value === 'number') { if (!isFiniteNumber(value)) fail(code); return; }
   if (!ordinary(value) && !Array.isArray(value)) fail(code);
   const object = value as object;
@@ -183,7 +183,7 @@ function validateNode(node: SchemaNode, root: boolean, depth: number, counter: {
       (spec[0] === 'null' && includes(['string','integer','number','boolean'],spec[1])))) kind=spec[0]==='null' ? spec[1] : spec[0];
   else fail('SCHEMA_UNSUPPORTED','Unsupported type');
   if (root && kind !== 'object') fail('SCHEMA_UNSUPPORTED');
-  if (own(node,'description') && (typeof node.description !== 'string' || !scalarString(node.description))) fail('SCHEMA_UNSUPPORTED');
+  if (own(node,'description') && (typeof node.description !== 'string' || !scalarString(node.description,true))) fail('SCHEMA_UNSUPPORTED');
   const sizeBounds=[['minLength','maxLength','string'],['minItems','maxItems','array']] as const;
   for (let i=0;i<sizeBounds.length;i++) {
     const bound=sizeBounds[i],min=bound[0],max=bound[1],expected=bound[2];
@@ -269,7 +269,7 @@ export function validateValue(value: Json, node: SchemaNode, depth=0): void {
     const members=value as Json[];
     for (let i=0;i<members.length;i++) validateValue(members[i],node.items!,depth+1);
   } else if (kind==='string') {
-    if (typeof value!=='string' || !scalarString(value)) fail('SCHEMA_INVALID');
+    if (typeof value!=='string' || !scalarString(value,true)) fail('SCHEMA_INVALID');
     const length=scalarLength(value as string);
     if ((node.minLength!==undefined && length<node.minLength) || (node.maxLength!==undefined && length>node.maxLength)) fail('SCHEMA_INVALID');
     if (node.format==='date-time') utcInstant(value as string);
@@ -394,6 +394,7 @@ export function derivedValues(data: Record<string,Json>, definition: CollectionD
       if (!own(data,path)) { skip=true; break; }
       const value=data[path];
       if (value===null) { skip=true; break; }
+      if (typeof value==='string' && !scalarString(value)) fail('SCHEMA_INVALID','Unique value contains a database-unsupported character');
       const field=props(definition.schema)[path];
       const tag=typeOf(field); const normalized=typeof value==='string' ?
         (own(field,'format') && field.format==='date-time' ? utcInstant(value) : Reflect.apply(normalize,value,['NFC']) as string) : canonical(value);
@@ -417,6 +418,7 @@ export function derivedValues(data: Record<string,Json>, definition: CollectionD
     const value=data[field];
     if (value===null) append(indexes,{field,kind:'null'});
     else if (typeof value==='string') {
+      if (!scalarString(value)) fail('SCHEMA_INVALID','Indexed value contains a database-unsupported character');
       const node=props(definition.schema)[field],instant=own(node,'format') && node.format==='date-time';
       const indexed=instant ? utcInstant(value) : value;
       if (!withinBytes(indexed,MAX_INDEX_VALUE_BYTES)) fail('SCHEMA_INVALID','Indexed value exceeds byte limit');

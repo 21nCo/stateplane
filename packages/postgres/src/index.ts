@@ -80,6 +80,8 @@ const isFiniteNumber = Number.isFinite;
 const isSafeInteger = Number.isSafeInteger;
 const nativeSetHas=Set.prototype.has;
 const nativeSetAdd=Set.prototype.add;
+const nativeSetForEach=Set.prototype.forEach;
+const nativeMapForEach=Map.prototype.forEach;
 const arrayHas=(values:readonly unknown[],wanted:unknown):boolean=>{
   for (let i=0;i<values.length;i++) if (Object.getOwnPropertyDescriptor(values,i)?.value===wanted) return true;
   return false;
@@ -87,6 +89,27 @@ const arrayHas=(values:readonly unknown[],wanted:unknown):boolean=>{
 const append=<T>(values:T[],value:T):void=>{ Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
 const setHas=<T>(values:Set<T>,wanted:T):boolean=>Reflect.apply(nativeSetHas,values,[wanted]) as boolean;
 const setAdd=<T>(values:Set<T>,wanted:T):void=>{ Reflect.apply(nativeSetAdd,values,[wanted]); };
+const mapValues=<T>(source:Map<string,T>):T[]=>{
+  const values:T[]=[];
+  Reflect.apply(nativeMapForEach,source,[(value:T)=>append(values,value)]);
+  return values;
+};
+const setValues=<T>(source:Set<T>):T[]=>{
+  const values:T[]=[];
+  Reflect.apply(nativeSetForEach,source,[(value:T)=>append(values,value)]);
+  return values;
+};
+function containsNul(value: Json): boolean {
+  if (typeof value==='string') return value.includes('\0');
+  if (value===null || typeof value!=='object') return false;
+  const keys=Object.keys(value);
+  for (let i=0;i<keys.length;i++) if (containsNul((value as Record<string,Json>)[keys[i]])) return true;
+  return false;
+}
+/** PostgreSQL jsonb cannot represent U+0000. The canonical text remains the authority. */
+function jsonbProjection(canonicalData:string):string|null {
+  return canonicalData.includes('\\u0000') && containsNul(JSON.parse(canonicalData) as Json) ? null : canonicalData;
+}
 const validScope=(scope:AuthorityScope):boolean =>
   scalarString(scope.spaceId) && Buffer.byteLength(scope.spaceId)<=MAX_SCOPE_ID_BYTES &&
   scalarString(scope.collectionId) && Buffer.byteLength(scope.collectionId)<=MAX_INDEX_PART_BYTES &&
@@ -386,7 +409,7 @@ export class AuthorityTransaction {
   private readonly pendingReceipts: JoinedReceiptState['pending'];
   private readonly joinedReplays: JoinedReceiptState['replayed'];
   private readonly readyReceipts: JoinedReceiptState['ready'];
-  private readonly activeOperations = new Set<Promise<unknown>>();
+  private activeOperationTail: Promise<void> = Promise.resolve();
   private mutationTail: Promise<void> = Promise.resolve();
   private readonly reservedIdentities = new Map<string, { operation: RecordMutation; key: string }>();
   private admittingMutations = true;
@@ -400,19 +423,22 @@ export class AuthorityTransaction {
     this.joinedReplays = joinedReceipts?.replayed ?? new Map();
     this.readyReceipts = joinedReceipts?.ready ?? [];
   }
-  close() { this.active = false; this.admittingMutations = false; this.activeOperations.clear(); this.reservedIdentities.clear(); this.replayCollections.clear(); }
+  close() { this.active = false; this.admittingMutations = false; this.reservedIdentities.clear(); this.replayCollections.clear(); }
   /** A caught mutation error must not turn a partial write into a successful commit. */
   assertCommittable() {
     if (this.mutationFailed) throw this.mutationError;
   }
   sealMutations() { this.admittingMutations = false; }
-  async settleMutations() { await Promise.allSettled(this.activeOperations); }
+  async settleMutations() { await this.activeOperationTail; await this.mutationTail; }
+  private trackOperation(work:Promise<unknown>):void {
+    const settled=work.then(()=>{},()=>{});
+    this.activeOperationTail=this.activeOperationTail.then(()=>settled);
+  }
   private admitOperation<T>(work: () => Promise<T>, rollbackOnError = false): Promise<T> {
     if (!this.admittingMutations || !this.active) return Promise.reject(new AuthorityError('INVALID_ARGUMENT', 'Transaction admission ended'));
     const running = Promise.resolve().then(() => { this.assertCommittable(); return work(); })
       .catch(error => { if (rollbackOnError) { this.mutationFailed = true; this.mutationError = error; } throw error; });
-    this.activeOperations.add(running);
-    void running.then(() => this.activeOperations.delete(running), () => this.activeOperations.delete(running));
+    this.trackOperation(running);
     return running;
   }
   private query(sql: string, values: unknown[] = []) {
@@ -483,15 +509,22 @@ export class AuthorityTransaction {
       FROM stamp CROSS JOIN unnest($1::bigint[]) WITH ORDINALITY AS policy(retention, position)
       ORDER BY position`, [retentions]);
     if (clock.rows.length !== retentions.length) throw new Error('Receipt clock row count mismatch');
-    return clock.rows.map(row => ({ committedAt:(row.committed_at as Date).toISOString(),
-      expiresAt:(row.expires_at as Date).toISOString() }));
+    const times:Array<{committedAt:string;expiresAt:string}>=[];
+    for (let i=0;i<clock.rows.length;i++) {
+      const row=clock.rows[i];
+      append(times,{committedAt:(row.committed_at as Date).toISOString(),expiresAt:(row.expires_at as Date).toISOString()});
+    }
+    return times;
   }
   /** Stamp receipts using the database clock after callback work, immediately before COMMIT. */
   async finalizeReceipts(): Promise<void> {
     if (this.pendingReceipts.size) {
-      const pendingReceipts = [...this.pendingReceipts.values()];
-      const times = await this.receiptTimes(pendingReceipts.map(pending => pending.retentionSeconds));
-      for (const [index, pending] of pendingReceipts.entries()) {
+      const pendingReceipts = mapValues(this.pendingReceipts);
+      const retentions:number[]=[];
+      for (let i=0;i<pendingReceipts.length;i++) append(retentions,pendingReceipts[i].retentionSeconds);
+      const times = await this.receiptTimes(retentions);
+      for (let index=0;index<pendingReceipts.length;index++) {
+        const pending=pendingReceipts[index];
         const { committedAt, expiresAt } = times[index];
         pending.response.committedAt = committedAt;
         pending.response.expiresAt = expiresAt;
@@ -499,11 +532,13 @@ export class AuthorityTransaction {
           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)`, [pending.response.receiptId,this.#scope.spaceId,pending.collectionId,
           this.#scope.credentialId,pending.response.operation,pending.key,pending.digest,pending.response.ref.id,
           JSON.stringify(pending.response),committedAt,expiresAt]);
-        this.readyReceipts.push({receiptId:pending.response.receiptId,exposure:pending.exposure,committedAt,expiresAt});
+        append(this.readyReceipts,{receiptId:pending.response.receiptId,exposure:pending.exposure,committedAt,expiresAt});
       }
       this.pendingReceipts.clear();
     }
-    for (const { operation, key } of this.reservedIdentities.values()) {
+    const reserved=mapValues(this.reservedIdentities);
+    for (let i=0;i<reserved.length;i++) {
+      const { operation, key }=reserved[i];
       await this.query(`WITH identity AS (DELETE FROM receipt_reservations
           WHERE space_id=$1 AND credential_id=$3 AND operation=$4 AND idempotency_key=$5 RETURNING 1)
         DELETE FROM receipt_reservation_scopes WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3
@@ -515,8 +550,12 @@ export class AuthorityTransaction {
   /** A slow final cell check must abort rather than commit an already expired
    * receipt and let an immediate retry create a second record. */
   async ensureReceiptsCurrent(): Promise<number> {
-    const ids=[...new Set([...this.readyReceipts.map(ready=>ready.receiptId),
-      ...[...this.joinedReplays.values()].map(replay=>replay.response.receiptId)])];
+    const ids:string[]=[];
+    const seen=new Set<string>();
+    const addId=(id:string)=>{ if (!setHas(seen,id)) { setAdd(seen,id); append(ids,id); } };
+    for (let i=0;i<this.readyReceipts.length;i++) addId(this.readyReceipts[i].receiptId);
+    const replays=mapValues(this.joinedReplays);
+    for (let i=0;i<replays.length;i++) addId(replays[i].response.receiptId);
     if (!ids.length) return Infinity;
     const result=await this.query(`WITH stamp AS MATERIALIZED (SELECT clock_timestamp() AS at)
       SELECT count(r.receipt_id)::int AS found,
@@ -532,7 +571,8 @@ export class AuthorityTransaction {
     return remainingMs;
   }
   exposeReceipts(): void {
-    for (const ready of this.readyReceipts) {
+    for (let i=0;i<this.readyReceipts.length;i++) {
+      const ready=this.readyReceipts[i];
       ready.exposure.committedAt = ready.committedAt;
       ready.exposure.expiresAt = ready.expiresAt;
     }
@@ -545,7 +585,9 @@ export class AuthorityTransaction {
   }
 
   async checkReplayScopes(): Promise<void> {
-    for (const collectionId of this.replayCollections) {
+    const collections=setValues(this.replayCollections);
+    for (let i=0;i<collections.length;i++) {
+      const collectionId=collections[i];
       await new AuthorityTransaction(this.client, { ...this.#scope, collectionId }, this.retentionSeconds).checkScope();
     }
   }
@@ -559,11 +601,8 @@ export class AuthorityTransaction {
       const work = (async () => { await tail; this.assertCommittable(); return this.mutateOnce(fixed); })()
         .catch(error => { this.mutationFailed = true; this.mutationError = error; throw error; });
       this.mutationTail = work.then(() => {}, () => {});
-      this.activeOperations.add(work);
-      try { return await work; }
-      finally {
-        this.activeOperations.delete(work);
-      }
+      this.trackOperation(work);
+      return await work;
     }
     catch (error) {
       this.mutationFailed = true;
@@ -702,8 +741,8 @@ export class AuthorityTransaction {
       },preparePayload);
     })().catch(error=>{this.mutationFailed=true;this.mutationError=error;throw error;});
     this.mutationTail=work.then(()=>{},()=>{});
-    this.activeOperations.add(work);
-    try { return await work; } finally { this.activeOperations.delete(work); }
+    this.trackOperation(work);
+    return await work;
   }
 
   /** Uncommitted unique rows provide Hyperdrive-compatible, scoped try-locks. */
@@ -792,15 +831,16 @@ export class AuthorityTransaction {
     if (change.operation === 'create') {
       const mode = change.normalizedExternalKey === undefined ? 'generated' : 'external';
       await this.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
-        VALUES($1,$2,$3,1,$4,$5,$6,$7::text,$7::jsonb)`, [...scopeIds(scope),recordId,schemaVersion,mode,change.normalizedExternalKey ?? recordId,change.canonicalData]);
+        VALUES($1,$2,$3,1,$4,$5,$6,$7::text,$8::jsonb)`, [...scopeIds(scope),recordId,schemaVersion,mode,change.normalizedExternalKey ?? recordId,change.canonicalData,jsonbProjection(change.canonicalData!)]);
       return { recordId, beforeRevision:null, revision:1 };
     }
     const updated = await this.query(`UPDATE records SET revision=revision+1,schema_version=$5,
       canonical_data=CASE WHEN $6::boolean THEN canonical_data ELSE $7::text END,
-      data=CASE WHEN $6::boolean THEN data ELSE $7::jsonb END,
+      data=CASE WHEN $6::boolean THEN data ELSE $8::jsonb END,
       tombstone=$6,updated_at=clock_timestamp()
       WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 AND revision=$4 AND NOT tombstone RETURNING revision`,
-    [...scopeIds(scope),recordId,change.expectedRevision,schemaVersion,change.operation === 'delete',change.canonicalData ?? null]);
+    [...scopeIds(scope),recordId,change.expectedRevision,schemaVersion,change.operation === 'delete',change.canonicalData ?? null,
+      change.operation==='delete' ? null : jsonbProjection(change.canonicalData!)]);
     if (!updated.rowCount) {
       const exists = await this.query('SELECT revision FROM records WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 AND NOT tombstone',
         [...scopeIds(scope),recordId]);

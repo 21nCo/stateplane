@@ -68,6 +68,87 @@ test('definition subset, additive revisions and normalization have explicit fail
   assert.throws(()=>compatible(d,{...next,unique:[{name:'new',paths:['label']}]}),{code:'SCHEMA_BREAKING'});
 });
 
+test('unindexed Unicode NUL survives writes and replay while indexed siblings fail explicitly',async()=>{
+  const suffix=randomUUID(),spaceId=`sp_${suffix}`,collectionId=`entries_${suffix}`;
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
+  const owner={spaceId,collectionId,principalId:'owner',credentialId:'session',capability:'schema:write',policyVersion:1,placementGeneration:1};
+  const wide={...schema,properties:{...schema.properties,note:{type:'string'}}};
+  await registry.define(owner,definition(collectionId,{schema:wide,filterable:['score']}));
+  const writer={...owner,capability:'records:write'};
+  const nul='left\0right';
+  assert.doesNotThrow(()=>validateValue({label:'one',note:nul},wide));
+  const create={operation:'create',idempotencyKey:'nul-create',data:{label:'one',note:nul,score:3}};
+  const created=await authority.mutateRequest(writer,create);
+  assert.equal((await authority.mutateRequest(writer,create)).receiptId,created.receiptId);
+  assert.equal((await pool.query('SELECT canonical_data,data FROM records WHERE record_id=$1',[created.ref.id])).rows[0].data,null);
+  const replace={operation:'replace',idempotencyKey:'nul-replace',id:created.ref.id,expectedRevision:1,data:{label:'one',note:`${nul}!`,score:3}};
+  const replaced=await authority.mutateRequest(writer,replace);
+  assert.equal((await authority.mutateRequest(writer,replace)).receiptId,replaced.receiptId);
+  const patch={operation:'patch',idempotencyKey:'nul-patch',id:created.ref.id,expectedRevision:2,set:{note:`${nul}?`},unset:[]};
+  const patched=await authority.mutateRequest(writer,patch);
+  assert.equal((await authority.mutateRequest(writer,patch)).receiptId,patched.receiptId);
+  const stored=await authority.transaction(read(writer),tx=>tx.getRecord(created.ref.id));
+  assert.equal(JSON.parse(stored.canonicalData).note,`${nul}?`);
+  assert.equal((await pool.query('SELECT data FROM records WHERE record_id=$1',[created.ref.id])).rows[0].data,null);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM record_index_values WHERE record_id=$1',[created.ref.id])).rows[0].n,1);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM record_unique_keys WHERE record_id=$1',[created.ref.id])).rows[0].n,1);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM record_events WHERE record_id=$1',[created.ref.id])).rows[0].n,3);
+  await assert.rejects(authority.mutateRequest(writer,{operation:'create',idempotencyKey:'nul-unique',data:{label:nul}}),{code:'SCHEMA_INVALID'});
+  await registry.revise(owner,1,definition(collectionId,{version:2,schema:wide,filterable:['score','note']}));
+  await assert.rejects(registry.backfill(owner,'note'),{code:'SCHEMA_INVALID'});
+  assert.deepEqual((await registry.discover(owner))[0].pending,['note','score']);
+  await authority.mutateRequest(writer,{operation:'replace',idempotencyKey:'clean-note',id:created.ref.id,expectedRevision:3,
+    data:{label:'one',note:'clean',score:3}});
+  assert.deepEqual(await registry.backfill(owner,'note'),{processed:1,ready:true});
+  assert.equal((await pool.query('SELECT data FROM records WHERE record_id=$1',[created.ref.id])).rows[0].data.note,'clean');
+});
+
+test('altered iterators cannot commit an active mutation or omit its receipt',async()=>{
+  const {writer}=await fixture();
+  const originalSetIterator=Set.prototype[Symbol.iterator];
+  const originalEntries=Array.prototype.entries;
+  let entered,release;
+  const waiting=new Promise(resolve=>entered=resolve),gate=new Promise(resolve=>release=resolve);
+  const held=new PostgresAuthority({connect:async()=>{
+    const client=await pool.connect();
+    return {query:async(sql,...args)=>{
+      if (String(sql).includes('INSERT INTO records(')) { entered(); await gate; }
+      return client.query(sql,...args);
+    },release:discard=>client.release(discard)};
+  }},3600);
+  let pending;
+  let completed=false;
+  try {
+    const committing=held.transaction(writer,async tx=>{
+      pending=tx.mutateRequest({operation:'create',idempotencyKey:'iterated',data:{label:'iterated'}});
+      void pending.catch(()=>{});
+      await waiting;
+      Set.prototype[Symbol.iterator]=function*(){};
+      Array.prototype.entries=function*(){};
+    }).then(value=>{completed=true;return value;});
+    await new Promise(resolve=>setTimeout(resolve,30));
+    assert.equal(completed,false,'commit must wait for the pending record write');
+    release();
+    await committing;
+    Set.prototype[Symbol.iterator]=originalSetIterator;
+    Array.prototype.entries=originalEntries;
+    const receipt=await pending;
+    assert.equal(receipt.revision,1);
+    const facts=await pool.query(`SELECT
+      (SELECT count(*)::int FROM records WHERE space_id=$1) AS records,
+      (SELECT count(*)::int FROM idempotency_receipts WHERE space_id=$1) AS receipts,
+      (SELECT count(*)::int FROM record_events WHERE space_id=$1) AS events,
+      (SELECT count(*)::int FROM projection_outbox WHERE space_id=$1) AS outbox`,[writer.spaceId]);
+    assert.deepEqual(facts.rows[0],{records:1,receipts:1,events:1,outbox:1});
+    assert.equal((await held.mutateRequest(writer,{operation:'create',idempotencyKey:'iterated',data:{label:'iterated'}})).replayed,true);
+  } finally {
+    release?.();
+    Set.prototype[Symbol.iterator]=originalSetIterator;
+    Array.prototype.entries=originalEntries;
+  }
+});
+
 test('shared schema DAG expansion is bounded before canonical allocation',()=>{
   let child={type:'string'};
   for (let depth=0;depth<30;depth++) child={type:'object',additionalProperties:false,properties:{left:child,right:child}};
