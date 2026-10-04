@@ -2,6 +2,8 @@
 
 Status: definitions and a disposable qualification harness. No cell is operational until its connected provider and Cloudflare observations pass. The amended [STA-4 issue](https://linear.app/21n/issue/STA-4/03-provision-full-regional-cloudflare-topology-and-postgres) supersedes the former AWS RDS plan. Skillplane's control/cell split is retained; its historical region choices are not deployment requirements.
 
+STA-6 space erasure also requires a cell-only grant after migration: `GRANT EXECUTE ON FUNCTION public.stateplane_purge_space(text) TO <cell_operational_role>`. Grant it to each intended cell operational role only, never a control, settings or disposable probe role; the function has no default `PUBLIC` execution. The role must still pass the operational admission checks. See [owned spaces](owned-spaces.md) for deletion and retry semantics.
+
 ## Provider, regions and budget (2026-09-28)
 
 [Railway's current region list](https://docs.railway.com/deployments/regions) maps `asia-southeast1-eqsg3a` to Singapore, `us-east4-eqdc4a` to Virginia and `europe-west4-drams3a` to Amsterdam. The provider region must be read back from **both** the deployed service instance and attached volume; a logical cell ID or DNS name is insufficient. Railway says moving a volume between regions entails migration and downtime. Recheck availability before provisioning.
