@@ -361,7 +361,8 @@ export function compatible(old: CollectionDefinition, next: CollectionDefinition
   const nextNames=Object.keys(nextProps);
   for (let i=0;i<nextNames.length;i++) {
     const name=nextNames[i];
-    if (!own(oldProps,name) && includes(next.schema.required??[],name)) fail('SCHEMA_BREAKING',`New field ${name} must be optional`);
+    if (!own(oldProps,name) && includes(own(next.schema,'required') ? next.schema.required! : [],name))
+      fail('SCHEMA_BREAKING',`New field ${name} must be optional`);
   }
   const compatibleDeclarations=['filterable','sortable'] as const;
   for (let i=0;i<compatibleDeclarations.length;i++) {

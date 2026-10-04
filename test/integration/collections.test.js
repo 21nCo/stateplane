@@ -184,6 +184,30 @@ test('absent optional schema keywords cannot be supplied by later prototype poll
   assert.equal(Object.hasOwn(accepted.schema,'required'),false);
 });
 
+test('compatible optional additions ignore inherited required lists in direct and registry revisions',async()=>{
+  const {owner}=await fixture();
+  const scope={...owner,collectionId:`optional_${randomUUID()}`};
+  const oldSchema={...schema};
+  delete oldSchema.required;
+  const oldDefinition=validateDefinition(definition('generic',{schema:oldSchema}));
+  const nextSchema={...oldSchema,properties:{...oldSchema.properties,note:{type:'string'}}};
+  const nextDefinition=validateDefinition(definition('generic',{version:2,schema:nextSchema}));
+  await registry.define(scope,definition(scope.collectionId,{schema:oldSchema}));
+  const previous=Object.getOwnPropertyDescriptor(Object.prototype,'required');
+  try {
+    Object.defineProperty(Object.prototype,'required',{value:['note'],configurable:true});
+    assert.doesNotThrow(()=>compatible(oldDefinition,nextDefinition));
+    assert.throws(()=>compatible(oldDefinition,{...nextDefinition,schema:{...nextSchema,required:['note']}}),{code:'SCHEMA_BREAKING'});
+    // The stored definition also lacks an own required keyword after parsing.
+    const current=await registry.revise(scope,1,definition(scope.collectionId,{version:2,schema:nextSchema}));
+    assert.equal(current.version,2);
+    assert.equal(Object.hasOwn(current.schema,'required'),false);
+  } finally {
+    if (previous) Object.defineProperty(Object.prototype,'required',previous);
+    else delete Object.prototype.required;
+  }
+});
+
 test('registry, safe mutation, replay, races, tombstones and index readiness',async()=>{
   const {owner,writer}=await fixture();
   const create={operation:'create',idempotencyKey:'create-a',externalKey:' \u00e9 ',expectedSchemaVersion:1,data:{label:'A',score:null,state:'open'}};
@@ -608,6 +632,52 @@ test('serialized boundary supports schema and mutation without object input',asy
   const next=definition(collectionId,{version:2,schema:{...schema,properties:{...schema.properties,note:{type:'string'}}}});
   assert.equal((await registry.reviseSerialized(owner,1,JSON.stringify(next))).version,2);
   await assert.rejects(authority.mutateSerializedRequest(writer,'{"operation":'),{code:'INVALID_ARGUMENT'});
+});
+
+test('object and serialized replay reject a changed payload without new facts',async()=>{
+  const {owner,writer}=await fixture();
+  for (const serialized of [false,true]) {
+    const request={operation:'create',idempotencyKey:`replay-${serialized}`,data:{label:`original-${serialized}`}};
+    const invoke=value=>serialized ? authority.mutateSerializedRequest(writer,JSON.stringify(value)) : authority.mutateRequest(writer,value);
+    const receipt=await invoke(request);
+    const before=(await pool.query(`SELECT
+      (SELECT count(*)::int FROM records WHERE space_id=$1) AS records,
+      (SELECT count(*)::int FROM record_events WHERE space_id=$1) AS events,
+      (SELECT count(*)::int FROM idempotency_receipts WHERE space_id=$1) AS receipts,
+      (SELECT count(*)::int FROM projection_outbox WHERE space_id=$1) AS outbox`,[owner.spaceId])).rows[0];
+    await assert.rejects(invoke({...request,data:{label:`changed-${serialized}`}}),{code:'IDEMPOTENCY_MISMATCH'});
+    assert.equal((await invoke(request)).receiptId,receipt.receiptId);
+    const after=(await pool.query(`SELECT
+      (SELECT count(*)::int FROM records WHERE space_id=$1) AS records,
+      (SELECT count(*)::int FROM record_events WHERE space_id=$1) AS events,
+      (SELECT count(*)::int FROM idempotency_receipts WHERE space_id=$1) AS receipts,
+      (SELECT count(*)::int FROM projection_outbox WHERE space_id=$1) AS outbox`,[owner.spaceId])).rows[0];
+    assert.deepEqual(after,before);
+  }
+});
+
+test('current nonowner schema grant permits revision and backfill; expiry and stale policy deny both',async()=>{
+  const {owner,writer}=await fixture();
+  const grantee={...writer,capability:'schema:write'};
+  const next=definition(owner.collectionId,{version:2,
+    schema:{...schema,properties:{...schema.properties,note:{type:'string'}}},filterable:['score','note']});
+  assert.equal((await registry.revise(grantee,1,next)).version,2);
+  assert.deepEqual(await registry.backfill(grantee,'note'),{processed:0,ready:true});
+  const third=definition(owner.collectionId,{version:3,
+    schema:{...next.schema,properties:{...next.schema.properties,later:{type:'string'}}},filterable:['score','note','later']});
+  await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()-interval '1 second'
+    WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[owner.spaceId,owner.collectionId,grantee.credentialId]);
+  await assert.rejects(registry.revise(grantee,2,third),{code:'FORBIDDEN'});
+  await assert.rejects(registry.backfill(grantee,'score'),{code:'FORBIDDEN'});
+  await pool.query(`UPDATE collection_grants SET expires_at=NULL
+    WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[owner.spaceId,owner.collectionId,grantee.credentialId]);
+  await pool.query('UPDATE spaces SET policy_version=2 WHERE space_id=$1',[owner.spaceId]);
+  await assert.rejects(registry.revise(grantee,2,third),{code:'FORBIDDEN'});
+  await assert.rejects(registry.backfill(grantee,'score'),{code:'FORBIDDEN'});
+  assert.equal((await registry.discover({...owner,policyVersion:2}))[0].definition.version,2);
+  assert.deepEqual((await registry.discover({...owner,policyVersion:2}))[0].pending,['score']);
+  assert.equal((await registry.revise({...grantee,policyVersion:2},2,third)).version,3);
+  assert.deepEqual(await registry.backfill({...grantee,policyVersion:2},'score'),{processed:0,ready:true});
 });
 
 test('ordinary malformed envelopes are rejected after collection authorization without invoking accessors',async()=>{
