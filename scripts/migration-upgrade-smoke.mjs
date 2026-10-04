@@ -143,6 +143,7 @@ try {
     assert.match(output,/Applied 025_space_directory_home_cell.sql/);
     assert.match(output,/Applied 026_collection_backfill.sql/);
     assert.match(output,/Applied 027_nul_canonical_records.sql/);
+    assert.match(output,/Applied 028_schema_commit_fence.sql/);
     assert.deepEqual(await facts(upgraded),before);
     const actor={kind:'session',userPrincipalId:'owner',credentialId:'upgrade-session'};
     const pool=new pg.Pool({connectionString:url(names[0])});
@@ -163,6 +164,7 @@ try {
     } finally { await pool.end(); }
     assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM receipt_reservations')).rows[0].n,0);
     assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM receipt_reservation_scopes')).rows[0].n,0);
+    assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM schema_commit_fences')).rows[0].n,0);
     assert.match(await index(upgraded),/\(space_id, collection_id, available_at, event_id\)/);
     await upgraded.query('SET enable_seqscan=off');
     const plan=(await upgraded.query(`EXPLAIN SELECT event_id FROM projection_outbox

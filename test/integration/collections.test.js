@@ -1130,6 +1130,7 @@ test('current nonowner schema grant permits revision and backfill; expiry and st
   assert.deepEqual((await registry.discover({...owner,policyVersion:2}))[0].pending,['score']);
   assert.equal((await registry.revise({...grantee,policyVersion:2},2,third)).version,3);
   assert.deepEqual(await registry.backfill({...grantee,policyVersion:2},'score'),{processed:0,ready:true});
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM schema_commit_fences WHERE space_id=$1',[owner.spaceId])).rows[0].n,0);
 });
 
 test('schema revision and backfill serialize with the space-policy revocation fence',async()=>{
@@ -1208,6 +1209,39 @@ test('schema revision and backfill roll back when grants expire while waiting fo
     } finally {
       await blocker.query('ROLLBACK'); blocker.release();
     }
+  }
+});
+
+test('schema revision and backfill reject natural grant expiry after their last application check',async()=>{
+  for (const operation of ['revise','backfill','backfill-ready']) {
+    const {owner,writer}=await fixture();
+    const grantee={...writer,capability:'schema:write'};
+    if (operation==='backfill-ready') await registry.backfill(owner,'score');
+    await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '2 seconds'
+      WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[owner.spaceId,owner.collectionId,grantee.credentialId]);
+    let reachedCommit=false;
+    const delayed=new CollectionRegistry({connect:async()=>{
+      const client=await pool.connect();
+      return {query:async(sql,...args)=>{
+        if (sql==='COMMIT') {
+          reachedCommit=true;
+          // The database clock, not the process clock, crosses the grant deadline
+          // after the registry's final authorization query.
+          await client.query(`SELECT pg_sleep(GREATEST(0, EXTRACT(EPOCH FROM
+            ((SELECT expires_at FROM collection_grants WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3)
+             - clock_timestamp())) + 0.05))`,[owner.spaceId,owner.collectionId,grantee.credentialId]);
+        }
+        return client.query(sql,...args);
+      },release:discard=>client.release(discard)};
+    }});
+    const next=definition(owner.collectionId,{version:2,schema:{...schema,properties:{...schema.properties,note:{type:'string'}}}});
+    const effect=operation==='revise' ? delayed.revise(grantee,1,next) : delayed.backfill(grantee,'score');
+    await assert.rejects(effect,{code:'FORBIDDEN'});
+    assert.equal(reachedCommit,true,'the expiry must occur after the final application check');
+    const found=(await registry.discover(owner))[0];
+    assert.equal(found.definition.version,1);
+    assert.deepEqual(found.pending,operation==='backfill-ready' ? [] : ['score']);
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM schema_commit_fences WHERE space_id=$1',[owner.spaceId])).rows[0].n,0);
   }
 });
 

@@ -54,6 +54,7 @@ const proxyDetector=(()=>{
   } catch { return null; }
 })();
 export const acceptsInProcessObjects=proxyDetector!==null;
+/** Treat objects as unsafe when the runtime cannot reliably detect proxies. */
 export const isInProcessProxy = (value:unknown):boolean => proxyDetector ? proxyDetector(value) : true;
 const compare = (a: string,b: string) => Buffer.compare(Buffer.from(a),Buffer.from(b));
 const append = <T>(values:T[],value:T):void => { Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
@@ -88,6 +89,7 @@ const ordinary = (value: unknown): value is Record<string, unknown> => value !==
   (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 const fail = (code: string, message?: string): never => { throw new AuthorityError(code,message); };
 
+/** Reject unpaired surrogates and, for identifiers, U+0000. */
 export function scalarString(value: unknown, allowNul = false): value is string {
   if (typeof value !== 'string') return false;
   for (let i=0;i<value.length;i++) {
@@ -100,6 +102,7 @@ export function scalarString(value: unknown, allowNul = false): value is string 
   }
   return true;
 }
+/** Admit bounded ordinary JSON without invoking accessors or proxy traps. */
 export function plainJson(value: unknown, code = 'SCHEMA_INVALID', depth = 0, seen = new Set<object>(), trustedParsed = false,
   budget = { nodes:0, bytes:0 }): asserts value is Json {
   // Shared-reference DAGs are legal in-process input. Charge each occurrence,
@@ -137,6 +140,7 @@ export function plainJson(value: unknown, code = 'SCHEMA_INVALID', depth = 0, se
   }
   setDelete(seen,object);
 }
+/** Serialize already admitted JSON in stable UTF-8 key order. */
 export function canonical(value: Json): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) {
@@ -152,6 +156,7 @@ export function canonical(value: Json): string {
   }
   return `{${joined(fields,',')}}`;
 }
+/** Hash the canonical representation used by receipt replay. */
 export function fingerprint(value: Json): string { return createHash('sha256').update(canonical(value)).digest('hex'); }
 const typeOf = (node: SchemaNode) => Array.isArray(node.type) ? (node.type[0]==='null' ? node.type[1] : node.type[0]) : node.type;
 const nullable = (node: SchemaNode) => Array.isArray(node.type);
@@ -166,6 +171,7 @@ const list = (value: unknown, code: string): unknown[] => {
   }
   return members;
 };
+/** Validate one node of the closed schema subset within shared depth and node budgets. */
 function validateNode(node: SchemaNode, root: boolean, depth: number, counter: { count: number }): void {
   if (!ordinary(node) || depth > maxDepth || ++counter.count > maxFields) fail('SCHEMA_UNSUPPORTED','Schema exceeds node/depth budget');
   node=Object.assign(Object.create(null),node) as SchemaNode;
@@ -232,6 +238,7 @@ function validateNode(node: SchemaNode, root: boolean, depth: number, counter: {
   }
 }
 const leapDays = new Set(['1972-06-30','1972-12-31','1973-12-31','1974-12-31','1975-12-31','1976-12-31','1977-12-31','1978-12-31','1979-12-31','1981-06-30','1982-06-30','1983-06-30','1985-06-30','1987-12-31','1989-12-31','1990-12-31','1992-06-30','1993-06-30','1994-06-30','1995-12-31','1997-06-30','1998-12-31','2005-12-31','2008-12-31','2012-06-30','2015-06-30','2016-12-31']);
+/** Normalize an accepted UTC instant while preserving precise fractional ordering. */
 export function utcInstant(value: string): string {
   const match=Reflect.apply(nativeRegexExec,/^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z$/,[value]) as RegExpExecArray | null;
   if (!match || Reflect.apply(startsWith,match[1],['0000-'])) fail('SCHEMA_INVALID');
@@ -248,6 +255,7 @@ export function utcInstant(value: string): string {
     fraction=Reflect.apply(slice,fraction,[0,-1]) as string;
   return `${checkedMatch[1]}${fraction ? `.${fraction}` : ''}Z`;
 }
+/** Validate a canonical record or enum member against an accepted schema node. */
 export function validateValue(value: Json, node: SchemaNode, depth=0): void {
   if (depth > maxDepth) fail('SCHEMA_INVALID');
   node=Object.assign(Object.create(null),node) as SchemaNode;
@@ -326,6 +334,7 @@ export function validateDefinition(input: unknown, trustedParsed = false): Colle
   if (Buffer.byteLength(encoded)>maxBytes) fail('SCHEMA_UNSUPPORTED','Definition exceeds byte budget');
   return JSON.parse(encoded) as CollectionDefinition;
 }
+/** Remove only descriptions when comparing immutable constraints. */
 function withoutAnnotations(node: SchemaNode): Json {
   const clone:Record<string,Json>=Object.create(null);
   const keys=Object.keys(node) as Array<keyof SchemaNode>;
@@ -350,6 +359,7 @@ function withoutAnnotations(node: SchemaNode): Json {
   }
   return clone;
 }
+/** Permit additive optional fields, descriptions and index declarations only. */
 export function compatible(old: CollectionDefinition, next: CollectionDefinition): void {
   if (old.slug!==next.slug || next.version!==old.version+1 || canonical(old.unique as unknown as Json)!==canonical(next.unique as unknown as Json) ||
     canonical((own(old,'lifecycle') ? old.lifecycle! : null) as Json)!==canonical((own(next,'lifecycle') ? next.lifecycle! : null) as Json)) fail('SCHEMA_BREAKING','Slug, uniqueness or lifecycle change requires migration');
@@ -376,6 +386,7 @@ export function compatible(old: CollectionDefinition, next: CollectionDefinition
 const whites = new Set([0x20,0x85,0xa0,0x1680,0x2028,0x2029,0x202f,0x205f,0x3000]);
 for (let i=9;i<=13;i++) whites.add(i);
 for (let i=0x2000;i<=0x200a;i++) whites.add(i);
+/** Normalize a caller key using the fixed v1 Unicode trim and NFC rule. */
 export function externalKey(value: unknown): string {
   if (!scalarString(value)) fail('INVALID_ARGUMENT');
   const n=Reflect.apply(normalize,value,['NFC']) as string;
@@ -386,6 +397,7 @@ export function externalKey(value: unknown): string {
   if (!result || !withinBytes(result,MAX_INDEX_PART_BYTES)) fail('INVALID_ARGUMENT','External key exceeds indexed byte limit');
   return result;
 }
+/** Derive atomic unique reservations and typed index values from accepted data. */
 export function derivedValues(data: Record<string,Json>, definition: CollectionDefinition): {unique: UniqueValue[]; indexes: IndexValue[]} {
   const unique: UniqueValue[]=[]; const indexes: IndexValue[]=[];
   for (let i=0;i<definition.unique.length;i++) {
@@ -422,7 +434,7 @@ export function derivedValues(data: Record<string,Json>, definition: CollectionD
   return {unique,indexes};
 }
 
-/** Backfill a declaration independently of other pending indexes. */
+/** Derive one declared typed value for a bounded backfill batch. */
 export function derivedIndexValue(data: Record<string,Json>, definition: CollectionDefinition, field:string): IndexValue|undefined {
   if (!own(data,field)) return undefined;
   const value=data[field];

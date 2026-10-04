@@ -1,4 +1,5 @@
 import type pg from 'pg';
+import { randomUUID } from 'node:crypto';
 import { AuthorityError, type AuthorityScope } from './index.js';
 import { canonical, compatible, derivedIndexValue, MAX_INDEX_PART_BYTES, plainJson, scalarString, validateDefinition } from './schema.js';
 import type { CollectionDefinition, Json } from './schema.js';
@@ -7,8 +8,17 @@ type PoolLike = Pick<pg.Pool,'connect'>;
 type Client = pg.PoolClient;
 const isSafeInteger=Number.isSafeInteger;
 const validVersion=(n:unknown)=>isSafeInteger(n) && (n as number)>0;
+/** Test own array slots without calling a caller-replaced includes method. */
 const has=(values:readonly string[],value:string)=>{ for (let i=0;i<values.length;i++) if (Object.getOwnPropertyDescriptor(values,i)?.value===value) return true; return false; };
+/** Append to trusted arrays without invoking a replaced push method. */
 const append=<T>(values:T[],value:T)=>{ Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
+/** Merge declared paths without trusting a replaced Set or array method. */
+const declaredFields=(first:readonly string[],second:readonly string[]):string[]=>{
+  const fields:string[]=[];
+  for (let i=0;i<first.length;i++) if (!has(fields,first[i])) append(fields,first[i]);
+  for (let i=0;i<second.length;i++) if (!has(fields,second[i])) append(fields,second[i]);
+  return fields;
+};
 /** Snapshot a schema scope; discovery accepts a space scope without a collection ID. */
 const snapshotScope=(scope:AuthorityScope,collectionRequired=true):AuthorityScope=>{
   const fixed=Object.freeze({...scope});
@@ -21,6 +31,7 @@ const snapshotScope=(scope:AuthorityScope,collectionRequired=true):AuthorityScop
     !validVersion(fixed.policyVersion) || !validVersion(fixed.placementGeneration)) throw new AuthorityError('INVALID_ARGUMENT');
   return fixed;
 };
+/** Detach a definition before asynchronous authorization and validation. */
 const snapshotDefinition=(input:unknown):(()=>unknown)=>{
   try {
     plainJson(input,'SCHEMA_UNSUPPORTED');
@@ -35,6 +46,7 @@ const snapshotDefinition=(input:unknown):(()=>unknown)=>{
 /** Schema administration and explicit index activation in the regional authority. */
 export class CollectionRegistry {
   constructor(private readonly pool: PoolLike) {}
+  /** Roll back failed schema work and discard clients with ambiguous boundaries. */
   private async transaction<T>(fn:(client:Client)=>Promise<T>):Promise<T> {
     const client=await this.pool.connect();
     let begun=false,beginAttempted=false,discard=false;
@@ -48,9 +60,11 @@ export class CollectionRegistry {
     } catch (error) {
       if (begun) try { await client.query('ROLLBACK'); } catch { discard=true; }
       else if (beginAttempted) discard=true;
+      if ((error as {code?:string}).code==='PZ002') throw new AuthorityError('FORBIDDEN');
       throw error;
     } finally { client.release(discard); }
   }
+  /** Check the current regional policy and collection grant under the space lock. */
   private async authorize(client:Client,scope:AuthorityScope,collectionId:string,create=false):Promise<void> {
     if (scope.capability!=='schema:write') throw new AuthorityError('FORBIDDEN');
     const result=await client.query(`SELECT s.owner_principal_id,s.lifecycle,s.policy_version,s.placement_generation,
@@ -66,50 +80,67 @@ export class CollectionRegistry {
     if (create ? row.owner_principal_id!==scope.principalId : row.owner_principal_id!==scope.principalId &&
       (!Array.isArray(row.capabilities) || !has(row.capabilities,'schema:write') || !row.grant_current)) throw new AuthorityError('FORBIDDEN');
   }
+  /** Register the authenticated scope for a database-clock check during COMMIT. */
+  private async fenceCommit(client:Client,scope:AuthorityScope):Promise<void> {
+    await client.query(`INSERT INTO schema_commit_fences
+      (nonce,space_id,collection_id,principal_id,credential_id,policy_version,placement_generation)
+      VALUES($1,$2,$3,$4,$5,$6,$7)`,
+    [randomUUID(),scope.spaceId,scope.collectionId,scope.principalId,scope.credentialId,
+      scope.policyVersion,scope.placementGeneration]);
+  }
+  /** Persist unique and typed-index declarations for one accepted version. */
   private async insertDeclarations(client:Client,scope:AuthorityScope,definition:CollectionDefinition,previous?:CollectionDefinition):Promise<void> {
-    if (!previous) for (let i=0;i<definition.unique.length;i++) {
+    if (!previous) await this.insertUniqueDeclarations(client,scope,definition);
+    const old=declaredFields(previous?.filterable??[],previous?.sortable??[]);
+    const fields=declaredFields(definition.filterable,definition.sortable);
+    for (let i=0;i<fields.length;i++) {
+      await this.upsertIndexDeclaration(client,scope,definition,fields[i],has(old,fields[i]));
+    }
+  }
+  /** Insert immutable uniqueness declarations for the first version. */
+  private async insertUniqueDeclarations(client:Client,scope:AuthorityScope,definition:CollectionDefinition):Promise<void> {
+    for (let i=0;i<definition.unique.length;i++) {
       const item=definition.unique[i];
       await client.query(`INSERT INTO collection_unique_declarations
         (space_id,collection_id,constraint_name,paths,accepted_version) VALUES($1,$2,$3,$4,$5)`,
       [scope.spaceId,definition.slug,item.name,item.paths,definition.version]);
     }
-    const old:string[]=[];
-    const previousPaths=[previous?.filterable??[],previous?.sortable??[]];
-    for (let j=0;j<previousPaths.length;j++) for (let i=0;i<previousPaths[j].length;i++) append(old,previousPaths[j][i]);
-    const fields:string[]=[];
-    const declaredPaths=[definition.filterable,definition.sortable];
-    for (let j=0;j<declaredPaths.length;j++) {
-      const paths=declaredPaths[j];
-      for (let i=0;i<paths.length;i++) if (!has(fields,paths[i])) append(fields,paths[i]);
-    }
-    for (let i=0;i<fields.length;i++) {
-      const field=fields[i];
-      if (has(old,field)) {
-        await client.query(`UPDATE collection_index_declarations SET filterable=$4,sortable=$5
-          WHERE space_id=$1 AND collection_id=$2 AND field_name=$3`,
-        [scope.spaceId,definition.slug,field,has(definition.filterable,field),has(definition.sortable,field)]);
-        continue;
-      }
-      const node=definition.schema.properties![field];
-      const type=Array.isArray(node.type) ? (node.type[0]==='null' ? node.type[1] : node.type[0]) : node.type;
-      const kind=Object.hasOwn(node,'format') && node.format==='date-time' ? 'date-time' : type==='integer' ? 'number' : type;
-      await client.query(`INSERT INTO collection_index_declarations
-        (space_id,collection_id,field_name,value_kind,filterable,sortable,ready,accepted_version)
-        VALUES($1,$2,$3,$4,$5,$6,FALSE,$7)`,
-      [scope.spaceId,definition.slug,field,kind,has(definition.filterable,field),has(definition.sortable,field),definition.version]);
-    }
   }
+  /** Activate added filter/sort flags or stage a new typed index for backfill. */
+  private async upsertIndexDeclaration(client:Client,scope:AuthorityScope,definition:CollectionDefinition,
+    field:string,existing:boolean):Promise<void> {
+    const filterable=has(definition.filterable,field),sortable=has(definition.sortable,field);
+    if (existing) {
+      await client.query(`UPDATE collection_index_declarations SET filterable=$4,sortable=$5
+        WHERE space_id=$1 AND collection_id=$2 AND field_name=$3`,
+      [scope.spaceId,definition.slug,field,filterable,sortable]);
+      return;
+    }
+    const node=definition.schema.properties![field];
+    const type=Array.isArray(node.type) ? (node.type[0]==='null' ? node.type[1] : node.type[0]) : node.type;
+    let kind=type;
+    if (Object.hasOwn(node,'format') && node.format==='date-time') kind='date-time';
+    else if (type==='integer') kind='number';
+    await client.query(`INSERT INTO collection_index_declarations
+      (space_id,collection_id,field_name,value_kind,filterable,sortable,ready,accepted_version)
+      VALUES($1,$2,$3,$4,$5,$6,FALSE,$7)`,
+    [scope.spaceId,definition.slug,field,kind,filterable,sortable,definition.version]);
+  }
+  /** Create the first version of an owner-controlled collection from an object. */
   async define(scope:AuthorityScope,input:unknown):Promise<CollectionDefinition> {
     const snapshot=snapshotDefinition(input);
     return this.defineUsing(scope,()=>validateDefinition(snapshot(),true));
   }
+  /** Create the first version from serialized JSON for runtimes without proxy detection. */
   async defineSerialized(scope:AuthorityScope,serialized:string):Promise<CollectionDefinition> {
     return this.defineUsing(scope,()=>validateDefinition(this.parseDefinition(serialized),true));
   }
+  /** Bound and parse a serialized schema after its caller is authorized. */
   private parseDefinition(serialized:string):unknown {
     if (typeof serialized!=='string' || Buffer.byteLength(serialized)>1_048_576) throw new AuthorityError('SCHEMA_UNSUPPORTED');
     try { return JSON.parse(serialized); } catch { throw new AuthorityError('SCHEMA_UNSUPPORTED'); }
   }
+  /** Share the definition transaction across object and serialized entrypoints. */
   private async defineUsing(scope:AuthorityScope,load:()=>CollectionDefinition):Promise<CollectionDefinition> {
     scope=snapshotScope(scope);
     return this.transaction(async client=>{
@@ -129,13 +160,16 @@ export class CollectionRegistry {
       return definition;
     });
   }
+  /** Accept a compatible object revision at an exact expected version. */
   async revise(scope:AuthorityScope,expectedVersion:number,input:unknown):Promise<CollectionDefinition> {
     const snapshot=snapshotDefinition(input);
     return this.reviseUsing(scope,expectedVersion,()=>validateDefinition(snapshot(),true));
   }
+  /** Accept a compatible serialized revision at an exact expected version. */
   async reviseSerialized(scope:AuthorityScope,expectedVersion:number,serialized:string):Promise<CollectionDefinition> {
     return this.reviseUsing(scope,expectedVersion,()=>validateDefinition(this.parseDefinition(serialized),true));
   }
+  /** Serialize version changes with record writes and fence grant expiry at commit. */
   private async reviseUsing(scope:AuthorityScope,expectedVersion:number,load:()=>CollectionDefinition):Promise<CollectionDefinition> {
     scope=snapshotScope(scope);
     if (!validVersion(expectedVersion)) throw new AuthorityError('INVALID_ARGUMENT');
@@ -157,6 +191,7 @@ export class CollectionRegistry {
       await this.insertDeclarations(client,scope,next,previous);
       await client.query(`UPDATE collections SET schema_version=$3 WHERE space_id=$1 AND collection_id=$2`,[scope.spaceId,next.slug,next.version]);
       await this.authorize(client,scope,scope.collectionId);
+      await this.fenceCommit(client,scope);
       return next;
     });
   }
@@ -209,6 +244,7 @@ export class CollectionRegistry {
       if (!declaration) throw new AuthorityError('SCHEMA_UNSUPPORTED','Index is not declared');
       if (declaration.ready) {
         await this.authorize(client,scope,scope.collectionId);
+        await this.fenceCommit(client,scope);
         return {processed:0,ready:true};
       }
       const version=(await client.query(`SELECT canonical_definition FROM collection_versions
@@ -234,6 +270,7 @@ export class CollectionRegistry {
       if (rows.rows.length<100) await client.query(`UPDATE collection_index_declarations SET ready=TRUE
         WHERE space_id=$1 AND collection_id=$2 AND field_name=$3`,[scope.spaceId,scope.collectionId,field]);
       await this.authorize(client,scope,scope.collectionId);
+      await this.fenceCommit(client,scope);
       return {processed:rows.rows.length,ready:rows.rows.length<100};
     });
   }
