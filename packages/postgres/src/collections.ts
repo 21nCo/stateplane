@@ -5,7 +5,8 @@ import type { CollectionDefinition, Json } from './schema.js';
 
 type PoolLike = Pick<pg.Pool,'connect'>;
 type Client = pg.PoolClient;
-const validVersion=(n:unknown)=>Number.isSafeInteger(n) && (n as number)>0;
+const isSafeInteger=Number.isSafeInteger;
+const validVersion=(n:unknown)=>isSafeInteger(n) && (n as number)>0;
 const has=(values:readonly string[],value:string)=>{ for (let i=0;i<values.length;i++) if (Object.getOwnPropertyDescriptor(values,i)?.value===value) return true; return false; };
 const append=<T>(values:T[],value:T)=>{ Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
 const snapshotScope=(scope:AuthorityScope):AuthorityScope=>{
@@ -34,8 +35,9 @@ export class CollectionRegistry {
   constructor(private readonly pool: PoolLike) {}
   private async transaction<T>(fn:(client:Client)=>Promise<T>):Promise<T> {
     const client=await this.pool.connect();
-    let begun=false,discard=false;
+    let begun=false,beginAttempted=false,discard=false;
     try {
+      beginAttempted=true;
       await client.query('BEGIN'); begun=true;
       const result=await fn(client);
       try { await client.query('COMMIT'); begun=false; }
@@ -43,6 +45,7 @@ export class CollectionRegistry {
       return result;
     } catch (error) {
       if (begun) try { await client.query('ROLLBACK'); } catch { discard=true; }
+      else if (beginAttempted) discard=true;
       throw error;
     } finally { client.release(discard); }
   }
@@ -138,12 +141,14 @@ export class CollectionRegistry {
       await this.authorize(client,scope,scope.collectionId);
       const next=load();
       if (next.slug!==scope.collectionId) throw new AuthorityError('SCHEMA_UNSUPPORTED');
-      const row=(await client.query(`SELECT c.schema_version,v.canonical_definition FROM collections c
-        JOIN collection_versions v ON v.space_id=c.space_id AND v.collection_id=c.collection_id AND v.version=c.schema_version
-        WHERE c.space_id=$1 AND c.collection_id=$2 FOR UPDATE OF c`,[scope.spaceId,next.slug])).rows[0];
+      const row=(await client.query(`SELECT schema_version FROM collections
+        WHERE space_id=$1 AND collection_id=$2 FOR UPDATE`,[scope.spaceId,next.slug])).rows[0];
       if (!row) throw new AuthorityError('NOT_FOUND');
       if (Number(row.schema_version)!==expectedVersion) throw new AuthorityError('SCHEMA_CONFLICT',`Current collection version: ${row.schema_version}`);
-      const previous=validateDefinition(JSON.parse(row.canonical_definition),true);
+      const prior=(await client.query(`SELECT canonical_definition FROM collection_versions
+        WHERE space_id=$1 AND collection_id=$2 AND version=$3`,[scope.spaceId,next.slug,row.schema_version])).rows[0];
+      if (!prior) throw new AuthorityError('SCHEMA_CONFLICT','Current collection definition is unavailable');
+      const previous=validateDefinition(JSON.parse(prior.canonical_definition),true);
       compatible(previous,next);
       await client.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition)
         VALUES($1,$2,$3,$4)`,[scope.spaceId,next.slug,next.version,canonical(next as unknown as Json)]);
@@ -194,13 +199,17 @@ export class CollectionRegistry {
       // The collection share lock precedes the declaration lock, matching
       // revision ordering. NO KEY UPDATE serializes workers while remaining
       // compatible with writers' FK KEY SHARE on this declaration.
-      const declaration=(await client.query(`SELECT i.ready,i.backfill_after,v.canonical_definition FROM collection_index_declarations i
-        JOIN collections c ON c.space_id=i.space_id AND c.collection_id=i.collection_id
-        JOIN collection_versions v ON v.space_id=c.space_id AND v.collection_id=c.collection_id AND v.version=c.schema_version
-        WHERE i.space_id=$1 AND i.collection_id=$2 AND i.field_name=$3 FOR SHARE OF c FOR NO KEY UPDATE OF i`,[scope.spaceId,scope.collectionId,field])).rows[0];
+      const collection=(await client.query(`SELECT schema_version FROM collections
+        WHERE space_id=$1 AND collection_id=$2 FOR SHARE`,[scope.spaceId,scope.collectionId])).rows[0];
+      if (!collection) throw new AuthorityError('NOT_FOUND');
+      const declaration=(await client.query(`SELECT ready,backfill_after FROM collection_index_declarations
+        WHERE space_id=$1 AND collection_id=$2 AND field_name=$3 FOR NO KEY UPDATE`,[scope.spaceId,scope.collectionId,field])).rows[0];
       if (!declaration) throw new AuthorityError('SCHEMA_UNSUPPORTED','Index is not declared');
       if (declaration.ready) return {processed:0,ready:true};
-      const definition=JSON.parse(declaration.canonical_definition) as CollectionDefinition;
+      const version=(await client.query(`SELECT canonical_definition FROM collection_versions
+        WHERE space_id=$1 AND collection_id=$2 AND version=$3`,[scope.spaceId,scope.collectionId,collection.schema_version])).rows[0];
+      if (!version) throw new AuthorityError('SCHEMA_CONFLICT','Current collection definition is unavailable');
+      const definition=JSON.parse(version.canonical_definition) as CollectionDefinition;
       const rows=await client.query(`SELECT record_id,canonical_data FROM records WHERE space_id=$1 AND collection_id=$2
         AND NOT tombstone AND record_id>$3 ORDER BY record_id LIMIT 100 FOR UPDATE`,[scope.spaceId,scope.collectionId,declaration.backfill_after??'']);
       for (let i=0;i<rows.rows.length;i++) {

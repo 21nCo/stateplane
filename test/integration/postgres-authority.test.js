@@ -5,7 +5,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
-import { PostgresAuthority, AuthorityError, CommitOutcomeUnknownError } from '../../packages/postgres/dist/index.js';
+import { PostgresAuthority, AuthorityError, CommitOutcomeUnknownError, canonicalJsonObject } from '../../packages/postgres/dist/index.js';
 
 const password = process.env.DATABASE_URL ? null : (await readFile(new URL('../../.data/local-db-password', import.meta.url), 'utf8')).trim();
 const baseUrl = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT ?? '55432'}/stateplane`;
@@ -185,6 +185,19 @@ test('atomic mutation, real competing writers, rollback, replay and scope', asyn
   await pool.query('UPDATE spaces SET policy_version=policy_version+1 WHERE space_id=$1',[scope.spaceId]);
   await assert.rejects(authority.mutate({ ...scope,policyVersion:2 },first), error => error.code === 'FORBIDDEN');
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM record_events WHERE space_id=$1',[scope.spaceId])).rows[0].n,2);
+});
+
+test('low-level canonical payloads retain the established 64-level budget and replay',async()=>{
+  const {scope}=await fixture();
+  let nested={leaf:'ok'};
+  for (let i=0;i<63;i++) nested={child:nested};
+  const payload=JSON.stringify(nested);
+  assert.equal(canonicalJsonObject(payload),payload);
+  const request=change('create','deep-64',payload);
+  const saved=await authority.mutate(scope,request);
+  assert.equal((await authority.mutate(scope,request)).receiptId,saved.receiptId);
+  assert.equal((await authority.transaction({...scope,capability:'records:read'},tx=>tx.getRecord(saved.ref.id))).canonicalData,payload);
+  assert.throws(()=>canonicalJsonObject(JSON.stringify({child:nested})),{code:'SCHEMA_INVALID'});
 });
 
 test('readOnly replays authorized receipt, stale and malformed inputs do not commit', async () => {

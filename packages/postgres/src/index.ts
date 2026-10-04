@@ -52,7 +52,7 @@ function comparison(predicate: Exclude<ScalarPredicate, { kind: 'null' }>, alias
   const column = { string:'string_value','date-time':'time_value',number:'number_value',boolean:'boolean_value' }[predicate.kind];
   const operator = { eq:'=',lt:'<',lte:'<=',gt:'>',gte:'>=' }[predicate.operator];
   if (!operator) throw new AuthorityError('INVALID_ARGUMENT');
-  if ((predicate.kind === 'number' && (typeof predicate.value !== 'number' || !Number.isFinite(predicate.value)))
+  if ((predicate.kind === 'number' && (typeof predicate.value !== 'number' || !isFiniteNumber(predicate.value)))
     || (predicate.kind === 'boolean' && typeof predicate.value !== 'boolean')
     || (predicate.kind === 'string' && !valueString(predicate.value))
     || (predicate.kind === 'date-time' && !scalarString(predicate.value))) throw new AuthorityError('INVALID_ARGUMENT');
@@ -76,6 +76,7 @@ const MAX_PAGE = 100;
 const retryCodes = new Set(['40P01', '40001']);
 const validDigest = /^[0-9a-f]{64}$/;
 const serializedMarker=Symbol('stateplane parsed JSON');
+const isFiniteNumber = Number.isFinite;
 const isSafeInteger = Number.isSafeInteger;
 const nativeSetHas=Set.prototype.has;
 const nativeSetAdd=Set.prototype.add;
@@ -181,7 +182,7 @@ function snapshotIndexes(source: readonly IndexValue[] | undefined): readonly In
     if (!entry || !scalarString(entry.field) || Buffer.byteLength(entry.field)>MAX_INDEX_PART_BYTES || setHas(seen,entry.field)) throw new AuthorityError('INVALID_ARGUMENT');
     setAdd(seen,entry.field);
     const value = 'value' in entry ? entry.value : null;
-    if ((entry.kind === 'number' && (typeof value !== 'number' || !Number.isFinite(value)))
+    if ((entry.kind === 'number' && (typeof value !== 'number' || !isFiniteNumber(value)))
       || (entry.kind === 'string' && (!valueString(value) || Buffer.byteLength(value)>MAX_INDEX_VALUE_BYTES))
       || (entry.kind === 'date-time' && (!scalarString(value) || Buffer.byteLength(value)>MAX_INDEX_VALUE_BYTES))
       || (entry.kind === 'boolean' && typeof value !== 'boolean')
@@ -526,7 +527,7 @@ export class AuthorityTransaction {
     if (result.rows[0]?.found !== ids.length || result.rows[0]?.expired !== 0)
       throw new AuthorityError('RECEIPT_EXPIRED','Receipt expired before commit');
     const remainingMs = Number(result.rows[0]?.remaining_ms);
-    if (!Number.isFinite(remainingMs) || remainingMs <= 0)
+    if (!isFiniteNumber(remainingMs) || remainingMs <= 0)
       throw new AuthorityError('RECEIPT_EXPIRED','Receipt expired before commit');
     return remainingMs;
   }
@@ -688,9 +689,11 @@ export class AuthorityTransaction {
           if (Buffer.byteLength(canonicalData,'utf8')>MAX_JSON_BYTES) throw new AuthorityError('SCHEMA_INVALID','Record exceeds canonical byte limit');
           if (Object.hasOwn(definition,'lifecycle') && definition.lifecycle) {
             const {field,transitions}=definition.lifecycle;
-            const to=data[field]; const from=previous?.[field];
+            const to=Object.hasOwn(data,field) ? data[field] : undefined;
+            const from=previous && Object.hasOwn(previous,field) ? previous[field] : undefined;
             if (operation==='create' ? !arrayHas(definition.lifecycle.initial,to) :
-              from!==to && !arrayHas(transitions[String(from)]??[],to)) throw new AuthorityError('SCHEMA_INVALID','Lifecycle transition is not declared');
+              from!==to && (!Object.hasOwn(transitions,String(from)) || !arrayHas(transitions[String(from)],to)))
+              throw new AuthorityError('SCHEMA_INVALID','Lifecycle transition is not declared');
           }
           const values=derivedValues(data,definition);
           return {...base,canonicalData,...values};

@@ -21,6 +21,7 @@ const allowed = new Set(['$schema','type','properties','required','additionalPro
 const typesAllowed = new Set(['string','integer','number','boolean','object','array']);
 const maxBytes = 1_048_576;
 const maxDepth = 32;
+const maxCanonicalDepth = 64;
 const maxFields = 256;
 // Keep each B-tree tuple well below PostgreSQL's roughly one-third-page entry
 // limit even when the scoped identifiers and value share a multicolumn index.
@@ -107,7 +108,7 @@ export function plainJson(value: unknown, code = 'SCHEMA_INVALID', depth = 0, se
   budget.bytes += value === null || typeof value === 'boolean' || typeof value === 'number' || typeof value === 'string'
     ? Buffer.byteLength(JSON.stringify(value)) : 2;
   if (budget.bytes > maxBytes) fail(code,'JSON exceeds byte budget');
-  if ((!trustedParsed && (!proxyDetector || proxyDetector(value))) || depth > maxDepth) fail(code);
+  if ((!trustedParsed && (!proxyDetector || proxyDetector(value))) || depth > maxCanonicalDepth) fail(code);
   if (value === null || typeof value === 'boolean') return;
   if (typeof value === 'string') { if (!scalarString(value)) fail(code); return; }
   if (typeof value === 'number') { if (!isFiniteNumber(value)) fail(code); return; }
@@ -240,7 +241,7 @@ export function utcInstant(value: string): string {
     (!leap || !setHas(leapDays,Reflect.apply(slice,checkedMatch[1],[0,10]) as string))) fail('SCHEMA_INVALID');
   const checked=leap ? `${Reflect.apply(slice,checkedMatch[1],[0,-2])}59` : checkedMatch[1];
   const instant=new NativeDate(`${checked}Z`);
-  if (!Number.isFinite(Reflect.apply(nativeGetTime,instant,[])) ||
+  if (!isFiniteNumber(Reflect.apply(nativeGetTime,instant,[])) ||
     (Reflect.apply(slice,Reflect.apply(nativeISOString,instant,[]) as string,[0,19]) as string)!==checked) fail('SCHEMA_INVALID');
   let fraction=checkedMatch[2]??'';
   while (fraction.length && Reflect.apply(codeUnit,fraction,[fraction.length-1])===48)
