@@ -1,9 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { types } from 'node:util';
 import pg from 'pg';
 import { parseRevision } from '@stateplane/contracts';
 import type { Capability, CollectionId, RecordRef, Revision, SpaceId } from '@stateplane/contracts';
-import { acceptsInProcessObjects, canonical, derivedValues, externalKey, fingerprint, plainJson, scalarString as unicodeString, validateValue } from './schema.js';
+import { acceptsInProcessObjects, canonical, derivedValues, externalKey, fingerprint, isInProcessProxy, MAX_INDEX_PART_BYTES, MAX_INDEX_VALUE_BYTES, plainJson, scalarString as unicodeString, validateValue } from './schema.js';
 import type { CollectionDefinition, Json } from './schema.js';
 export { CollectionRegistry } from './collections.js';
 export { externalKey, validateDefinition, validateValue, compatible, derivedValues } from './schema.js';
@@ -72,6 +71,7 @@ export class CommitOutcomeUnknownError extends Error {
 }
 
 const MAX_JSON_BYTES = 1_048_576;
+const MAX_SCOPE_ID_BYTES = 512;
 const MAX_PAGE = 100;
 const retryCodes = new Set(['40P01', '40001']);
 const validDigest = /^[0-9a-f]{64}$/;
@@ -86,6 +86,13 @@ const arrayHas=(values:readonly unknown[],wanted:unknown):boolean=>{
 const append=<T>(values:T[],value:T):void=>{ Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
 const setHas=<T>(values:Set<T>,wanted:T):boolean=>Reflect.apply(nativeSetHas,values,[wanted]) as boolean;
 const setAdd=<T>(values:Set<T>,wanted:T):void=>{ Reflect.apply(nativeSetAdd,values,[wanted]); };
+const validScope=(scope:AuthorityScope):boolean =>
+  scalarString(scope.spaceId) && Buffer.byteLength(scope.spaceId)<=MAX_SCOPE_ID_BYTES &&
+  scalarString(scope.collectionId) && Buffer.byteLength(scope.collectionId)<=MAX_INDEX_PART_BYTES &&
+  scalarString(scope.principalId) && Buffer.byteLength(scope.principalId)<=MAX_SCOPE_ID_BYTES &&
+  scalarString(scope.credentialId) && Buffer.byteLength(scope.credentialId)<=MAX_SCOPE_ID_BYTES &&
+  isSafeInteger(scope.policyVersion) && scope.policyVersion>0 &&
+  isSafeInteger(scope.placementGeneration) && scope.placementGeneration>0;
 function copyReceipt(receipt: Receipt, replayed = receipt.replayed): Receipt {
   return { ...receipt, ref: { ...receipt.ref }, projection: { ...receipt.projection }, replayed };
 }
@@ -136,12 +143,12 @@ export interface JoinedReceiptState {
 const scopeIds = (scope: AuthorityScope) => [scope.spaceId, scope.collectionId];
 
 function validateChangeShape(change: RecordChange): void {
-  if (!arrayHas(['create','replace','patch','delete'],change.operation) || !scalarString(change.idempotencyKey)
+  if (!arrayHas(['create','replace','patch','delete'],change.operation) || !scalarString(change.idempotencyKey) || Buffer.byteLength(change.idempotencyKey)>MAX_INDEX_PART_BYTES
     || typeof change.requestDigest !== 'string' || !validDigest.test(change.requestDigest)) throw new AuthorityError('INVALID_ARGUMENT');
   if (change.operation === 'create') {
     if (change.recordId !== undefined || change.expectedRevision !== undefined) throw new AuthorityError('INVALID_ARGUMENT');
   } else if (!scalarString(change.recordId) || change.expectedRevision === undefined) throw new AuthorityError('INVALID_ARGUMENT');
-  if (change.normalizedExternalKey !== undefined && (change.operation !== 'create' || !scalarString(change.normalizedExternalKey))) throw new AuthorityError('INVALID_ARGUMENT');
+  if (change.normalizedExternalKey !== undefined && (change.operation !== 'create' || !scalarString(change.normalizedExternalKey) || Buffer.byteLength(change.normalizedExternalKey)>MAX_INDEX_PART_BYTES)) throw new AuthorityError('INVALID_ARGUMENT');
   if (change.expectedRevision !== undefined) parseRevision(change.expectedRevision);
   if (change.expectedSchemaVersion !== undefined && (!isSafeInteger(change.expectedSchemaVersion) || change.expectedSchemaVersion < 1)) throw new AuthorityError('INVALID_ARGUMENT');
   if (change.operation === 'delete' && (change.canonicalData !== undefined || change.unique?.length || change.indexes?.length)) throw new AuthorityError('INVALID_ARGUMENT');
@@ -155,7 +162,7 @@ function snapshotUnique(source: readonly UniqueValue[] | undefined): readonly Un
   const values: UniqueValue[] = [];
   for (let i = 0; i < source.length; i++) {
     const entry = source[i];
-    if (!entry || !scalarString(entry.name) || !scalarString(entry.encodedValue)) throw new AuthorityError('INVALID_ARGUMENT');
+    if (!entry || !scalarString(entry.name) || !scalarString(entry.encodedValue) || Buffer.byteLength(entry.name)>MAX_INDEX_PART_BYTES || Buffer.byteLength(entry.encodedValue)>MAX_INDEX_VALUE_BYTES) throw new AuthorityError('INVALID_ARGUMENT');
     const key = JSON.stringify([entry.name, entry.encodedValue]);
     if (setHas(seen,key)) throw new AuthorityError('INVALID_ARGUMENT');
     setAdd(seen,key);
@@ -171,12 +178,12 @@ function snapshotIndexes(source: readonly IndexValue[] | undefined): readonly In
   const values: IndexValue[] = [];
   for (let i = 0; i < source.length; i++) {
     const entry = source[i];
-    if (!entry || !scalarString(entry.field) || setHas(seen,entry.field)) throw new AuthorityError('INVALID_ARGUMENT');
+    if (!entry || !scalarString(entry.field) || Buffer.byteLength(entry.field)>MAX_INDEX_PART_BYTES || setHas(seen,entry.field)) throw new AuthorityError('INVALID_ARGUMENT');
     setAdd(seen,entry.field);
     const value = 'value' in entry ? entry.value : null;
     if ((entry.kind === 'number' && (typeof value !== 'number' || !Number.isFinite(value)))
-      || (entry.kind === 'string' && !valueString(value))
-      || (entry.kind === 'date-time' && !scalarString(value))
+      || (entry.kind === 'string' && (!valueString(value) || Buffer.byteLength(value)>MAX_INDEX_VALUE_BYTES))
+      || (entry.kind === 'date-time' && (!scalarString(value) || Buffer.byteLength(value)>MAX_INDEX_VALUE_BYTES))
       || (entry.kind === 'boolean' && typeof value !== 'boolean')
       || (entry.kind === 'null' && value !== null && value !== undefined)
       || !arrayHas(['null','string','date-time','number','boolean'],entry.kind)) throw new AuthorityError('INVALID_ARGUMENT');
@@ -201,7 +208,7 @@ function snapshotChange(source: RecordChange): Readonly<RecordChange> {
 
 function snapshotRequest(input: unknown, trustedParsed = false): unknown {
   if (input === null || typeof input !== 'object') return input;
-  if (!trustedParsed && (!acceptsInProcessObjects || types.isProxy(input))) throw new AuthorityError('INVALID_ARGUMENT');
+  if (!trustedParsed && (!acceptsInProcessObjects || isInProcessProxy(input))) throw new AuthorityError('INVALID_ARGUMENT');
   const fixed:Record<string,unknown>=Object.create(null);
   // Retain malformed shape as data so the requested collection is authorized first.
   // Never retain the caller's prototype or invoke an accessor while taking the snapshot.
@@ -232,13 +239,13 @@ function snapshotRequest(input: unknown, trustedParsed = false): unknown {
 }
 
 function snapshotPredicates(source: readonly ScalarPredicate[]): readonly ScalarPredicate[] {
-  if (!acceptsInProcessObjects || types.isProxy(source) || !Array.isArray(source) ||
+  if (!acceptsInProcessObjects || isInProcessProxy(source) || !Array.isArray(source) ||
     Object.getPrototypeOf(source)!==Array.prototype || source.length > 16 || Reflect.ownKeys(source).length!==source.length+1)
     throw new AuthorityError('INVALID_ARGUMENT');
   const result: ScalarPredicate[]=[];
   for (let i=0;i<source.length;i++) {
     const item=Object.getOwnPropertyDescriptor(source,i)?.value;
-    if (!item || typeof item!=='object' || types.isProxy(item) ||
+    if (!item || typeof item!=='object' || isInProcessProxy(item) ||
       (Object.getPrototypeOf(item)!==Object.prototype && Object.getPrototypeOf(item)!==null)) throw new AuthorityError('INVALID_ARGUMENT');
     const field=Object.getOwnPropertyDescriptor(item,'field')?.value;
     const kind=Object.getOwnPropertyDescriptor(item,'kind')?.value;
@@ -267,9 +274,7 @@ export class PostgresAuthority {
   async transaction<T>(scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T>): Promise<T> {
     // Capture the authenticated identity before waiting for a pooled connection.
     const fixedScope = Object.freeze({ ...scope });
-    if (![fixedScope.spaceId,fixedScope.collectionId,fixedScope.principalId,fixedScope.credentialId].every(scalarString) ||
-      !isSafeInteger(fixedScope.policyVersion) || fixedScope.policyVersion < 1 ||
-      !isSafeInteger(fixedScope.placementGeneration) || fixedScope.placementGeneration < 1) throw new AuthorityError('INVALID_ARGUMENT');
+    if (!validScope(fixedScope)) throw new AuthorityError('INVALID_ARGUMENT');
     const client = await this.pool.connect();
     let begun = false;
     let beginAttempted = false;
@@ -308,9 +313,7 @@ export class PostgresAuthority {
       close: () => void) => void,
     joinedReceipts?: JoinedReceiptState): Promise<T> {
     const fixedScope = Object.freeze({ ...scope });
-    if (![fixedScope.spaceId,fixedScope.collectionId,fixedScope.principalId,fixedScope.credentialId].every(scalarString) ||
-      !isSafeInteger(fixedScope.policyVersion) || fixedScope.policyVersion < 1 ||
-      !isSafeInteger(fixedScope.placementGeneration) || fixedScope.placementGeneration < 1) throw new AuthorityError('INVALID_ARGUMENT');
+    if (!validScope(fixedScope)) throw new AuthorityError('INVALID_ARGUMENT');
     const tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds, joinedReceipts);
     let deferred = false;
     try {
@@ -595,7 +598,7 @@ export class AuthorityTransaction {
   private async mutateRequestOnce(input: unknown, trustedParsed:boolean): Promise<Receipt> {
     if (this.#scope.capability !== 'records:write') throw new AuthorityError('FORBIDDEN');
     if ((!trustedParsed && !acceptsInProcessObjects) || !input || typeof input!=='object' ||
-      (!trustedParsed && acceptsInProcessObjects && types.isProxy(input)) || Array.isArray(input) ||
+      (!trustedParsed && acceptsInProcessObjects && isInProcessProxy(input)) || Array.isArray(input) ||
       (Object.getPrototypeOf(input)!==Object.prototype && Object.getPrototypeOf(input)!==null)) throw new AuthorityError('INVALID_ARGUMENT');
     const fields: Record<string,unknown>=Object.create(null);
     const accepted=['operation','idempotencyKey','id','externalKey','data','set','unset','expectedRevision','expectedSchemaVersion'];
@@ -607,7 +610,7 @@ export class AuthorityTransaction {
       fields[key]=descriptor.value;
     }
     const operation=fields.operation;
-    if (!arrayHas(['create','replace','patch','delete'],operation) || !unicodeString(fields.idempotencyKey) || !fields.idempotencyKey) throw new AuthorityError('INVALID_ARGUMENT');
+    if (!arrayHas(['create','replace','patch','delete'],operation) || !unicodeString(fields.idempotencyKey) || !fields.idempotencyKey || Buffer.byteLength(fields.idempotencyKey)>MAX_INDEX_PART_BYTES) throw new AuthorityError('INVALID_ARGUMENT');
     const has=(key:string)=>Object.hasOwn(fields,key);
     if (operation==='create' ? (has('id') || has('expectedRevision') || has('set') || has('unset') || !has('data')) :
       (!unicodeString(fields.id) || !fields.id || !isSafeInteger(fields.expectedRevision) || (fields.expectedRevision as number)<1 || has('externalKey') ||
@@ -681,6 +684,8 @@ export class AuthorityTransaction {
         }
         if (data) {
           validateValue(data as Json,definition.schema);
+          const canonicalData=canonical(data);
+          if (Buffer.byteLength(canonicalData,'utf8')>MAX_JSON_BYTES) throw new AuthorityError('SCHEMA_INVALID','Record exceeds canonical byte limit');
           if (Object.hasOwn(definition,'lifecycle') && definition.lifecycle) {
             const {field,transitions}=definition.lifecycle;
             const to=data[field]; const from=previous?.[field];
@@ -688,7 +693,7 @@ export class AuthorityTransaction {
               from!==to && !arrayHas(transitions[String(from)]??[],to)) throw new AuthorityError('SCHEMA_INVALID','Lifecycle transition is not declared');
           }
           const values=derivedValues(data,definition);
-          return {...base,canonicalData:canonical(data),...values};
+          return {...base,canonicalData,...values};
         }
         return base;
       },preparePayload);

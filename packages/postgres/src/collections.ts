@@ -1,6 +1,6 @@
 import type pg from 'pg';
 import { AuthorityError, type AuthorityScope } from './index.js';
-import { canonical, compatible, derivedValues, plainJson, scalarString, validateDefinition } from './schema.js';
+import { canonical, compatible, derivedValues, MAX_INDEX_PART_BYTES, plainJson, scalarString, validateDefinition } from './schema.js';
 import type { CollectionDefinition, Json } from './schema.js';
 
 type PoolLike = Pick<pg.Pool,'connect'>;
@@ -8,6 +8,16 @@ type Client = pg.PoolClient;
 const validVersion=(n:unknown)=>Number.isSafeInteger(n) && (n as number)>0;
 const has=(values:readonly string[],value:string)=>{ for (let i=0;i<values.length;i++) if (Object.getOwnPropertyDescriptor(values,i)?.value===value) return true; return false; };
 const append=<T>(values:T[],value:T)=>{ Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
+const snapshotScope=(scope:AuthorityScope):AuthorityScope=>{
+  const fixed=Object.freeze({...scope});
+  if (!scalarString(fixed.spaceId) || !fixed.spaceId || Buffer.byteLength(fixed.spaceId)>512 ||
+    !scalarString(fixed.principalId) || !fixed.principalId || Buffer.byteLength(fixed.principalId)>512 ||
+    !scalarString(fixed.credentialId) || !fixed.credentialId || Buffer.byteLength(fixed.credentialId)>512)
+    throw new AuthorityError('INVALID_ARGUMENT');
+  if (!scalarString(fixed.collectionId) || !fixed.collectionId || Buffer.byteLength(fixed.collectionId)>MAX_INDEX_PART_BYTES ||
+    !validVersion(fixed.policyVersion) || !validVersion(fixed.placementGeneration)) throw new AuthorityError('INVALID_ARGUMENT');
+  return fixed;
+};
 const snapshotDefinition=(input:unknown):(()=>unknown)=>{
   try {
     plainJson(input,'SCHEMA_UNSUPPORTED');
@@ -96,7 +106,7 @@ export class CollectionRegistry {
     try { return JSON.parse(serialized); } catch { throw new AuthorityError('SCHEMA_UNSUPPORTED'); }
   }
   private async defineUsing(scope:AuthorityScope,load:()=>CollectionDefinition):Promise<CollectionDefinition> {
-    scope=Object.freeze({...scope});
+    scope=snapshotScope(scope);
     return this.transaction(async client=>{
       await this.authorize(client,scope,scope.collectionId,true);
       const definition=load();
@@ -122,7 +132,7 @@ export class CollectionRegistry {
     return this.reviseUsing(scope,expectedVersion,()=>validateDefinition(this.parseDefinition(serialized),true));
   }
   private async reviseUsing(scope:AuthorityScope,expectedVersion:number,load:()=>CollectionDefinition):Promise<CollectionDefinition> {
-    scope=Object.freeze({...scope});
+    scope=snapshotScope(scope);
     if (!validVersion(expectedVersion)) throw new AuthorityError('INVALID_ARGUMENT');
     return this.transaction(async client=>{
       await this.authorize(client,scope,scope.collectionId);
@@ -145,7 +155,7 @@ export class CollectionRegistry {
   }
   /** A result includes only indexes proven ready; clients must not infer readiness from declaration. */
   async discover(scope:AuthorityScope):Promise<Array<{definition:CollectionDefinition;ready:string[];pending:string[]}>> {
-    scope=Object.freeze({...scope});
+    scope=snapshotScope(scope);
     return this.transaction(async client=>{
       const row=await client.query(`SELECT s.owner_principal_id,s.lifecycle,s.policy_version,s.placement_generation
         FROM spaces s WHERE s.space_id=$1 FOR SHARE OF s`,[scope.spaceId]);
@@ -177,18 +187,17 @@ export class CollectionRegistry {
   }
   /** One committed batch; repeat until ready. Cursor and values commit together. */
   async backfill(scope:AuthorityScope,field:string):Promise<{processed:number;ready:boolean}> {
-    scope=Object.freeze({...scope});
+    scope=snapshotScope(scope);
     if (!scalarString(field) || !field) throw new AuthorityError('INVALID_ARGUMENT');
     return this.transaction(async client=>{
       await this.authorize(client,scope,scope.collectionId);
-      // Serialize backfill workers without taking the index row ahead of record
-      // locks. A writer takes record locks before FK key-share locks on indexes.
-      await client.query('SELECT pg_advisory_xact_lock(hashtext($1),hashtext($2))',
-        [scope.spaceId,JSON.stringify([scope.collectionId,field])]);
+      // The collection share lock precedes the declaration lock, matching
+      // revision ordering. NO KEY UPDATE serializes workers while remaining
+      // compatible with writers' FK KEY SHARE on this declaration.
       const declaration=(await client.query(`SELECT i.ready,i.backfill_after,v.canonical_definition FROM collection_index_declarations i
         JOIN collections c ON c.space_id=i.space_id AND c.collection_id=i.collection_id
         JOIN collection_versions v ON v.space_id=c.space_id AND v.collection_id=c.collection_id AND v.version=c.schema_version
-        WHERE i.space_id=$1 AND i.collection_id=$2 AND i.field_name=$3 FOR SHARE OF c`,[scope.spaceId,scope.collectionId,field])).rows[0];
+        WHERE i.space_id=$1 AND i.collection_id=$2 AND i.field_name=$3 FOR SHARE OF c FOR NO KEY UPDATE OF i`,[scope.spaceId,scope.collectionId,field])).rows[0];
       if (!declaration) throw new AuthorityError('SCHEMA_UNSUPPORTED','Index is not declared');
       if (declaration.ready) return {processed:0,ready:true};
       const definition=JSON.parse(declaration.canonical_definition) as CollectionDefinition;

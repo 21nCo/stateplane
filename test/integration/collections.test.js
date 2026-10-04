@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { types } from 'node:util';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
@@ -303,8 +304,104 @@ test('a partial backfill remains unavailable until a bounded final activation',a
   await assert.rejects(authority.transaction(reader,tx=>tx.countRecords(predicate)),{code:'SCHEMA_CONFLICT'});
   await authority.mutateRequest({...owner,capability:'records:write'},
     {operation:'create',idempotencyKey:'between-batches',data:{label:'later',note:'v101'}});
-  assert.deepEqual(await new CollectionRegistry(pool).backfill(owner,'note'),{processed:2,ready:true});
+  const remaining=(await pool.query(`SELECT count(*)::int AS n FROM records
+    WHERE space_id=$1 AND collection_id=$2 AND record_id>'rec_100'`,[spaceId,collectionId])).rows[0].n;
+  let locked,release,competing;
+  const firstLocked=new Promise(resolve=>locked=resolve),gate=new Promise(resolve=>release=resolve);
+  const secondEntered=new Promise(resolve=>competing=resolve);
+  const worker=(pause,signal)=>new CollectionRegistry({connect:async()=>{
+    const client=await pool.connect();
+    return {query:async(sql,...args)=>{
+      if (String(sql).includes('pg_advisory')) throw new Error('Hyperdrive rejects advisory locks');
+      if (String(sql).includes('SELECT i.ready')) {
+        if (signal) signal();
+        const result=await client.query(sql,...args);
+        if (pause) { locked(); await gate; }
+        return result;
+      }
+      return client.query(sql,...args);
+    },release:discard=>client.release(discard)};
+  }});
+  const first=worker(true).backfill(owner,'note');
+  await firstLocked;
+  const second=worker(false,competing).backfill(owner,'note');
+  await secondEntered;
+  release();
+  const final=await Promise.all([first,second]);
+  assert.deepEqual(final.map(result=>result.processed).sort((a,b)=>a-b),[0,remaining]);
+  assert.ok(final.every(result=>result.ready));
   assert.equal(await authority.transaction(reader,tx=>tx.countRecords(predicate)),2);
+});
+
+test('oversized merged patch rolls back record, reservation, event, receipt and outbox',async()=>{
+  const suffix=randomUUID(),spaceId=`sp_${suffix}`,collectionId=`entries_${suffix}`;
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
+  const owner={spaceId,collectionId,principalId:'owner',credentialId:'session',capability:'schema:write',policyVersion:1,placementGeneration:1};
+  const wide={...schema,properties:{...schema.properties,payload:{type:'string'},note:{type:'string'}}};
+  await registry.define(owner,definition(collectionId,{schema:wide,filterable:[]}));
+  const writer={...owner,capability:'records:write'};
+  const created=await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'base',
+    data:{label:'base',payload:'x'.repeat(1_048_400)}});
+  const state=()=>pool.query(`SELECT
+    (SELECT revision FROM records WHERE space_id=$1 AND record_id=$2) AS revision,
+    (SELECT count(*)::int FROM record_unique_keys WHERE space_id=$1) AS unique_keys,
+    (SELECT count(*)::int FROM record_events WHERE space_id=$1) AS events,
+    (SELECT count(*)::int FROM idempotency_receipts WHERE space_id=$1) AS receipts,
+    (SELECT count(*)::int FROM projection_outbox WHERE space_id=$1) AS outbox`,[spaceId,created.ref.id]);
+  const before=(await state()).rows[0];
+  await assert.rejects(authority.mutateRequest(writer,{operation:'patch',idempotencyKey:'too-wide',
+    id:created.ref.id,expectedRevision:1,set:{note:'y'.repeat(200)},unset:[]}),{code:'SCHEMA_INVALID'});
+  assert.deepEqual((await state()).rows[0],before);
+  assert.equal((await authority.transaction(read(writer),tx=>tx.getRecord(created.ref.id))).revision,1);
+});
+
+test('indexed byte budgets reject long values before SQL and on backfill',async()=>{
+  const long=randomBytes(300).toString('hex'),longName=randomBytes(140).toString('hex');
+  assert.throws(()=>validateDefinition(definition(longName)),{code:'SCHEMA_UNSUPPORTED'});
+  assert.throws(()=>validateDefinition(definition('short',{unique:[{name:longName,paths:['label']}]})),{code:'SCHEMA_UNSUPPORTED'});
+  assert.throws(()=>validateDefinition(definition('short',{schema:{...schema,properties:{...schema.properties,[longName]:{type:'string'}}}})),{code:'SCHEMA_UNSUPPORTED'});
+  assert.throws(()=>externalKey(long),{code:'INVALID_ARGUMENT'});
+  const withText=definition('short',{schema:{...schema,properties:{...schema.properties,note:{type:'string'},instant:{type:'string',format:'date-time'}}},
+    unique:[{name:'pair',paths:['label','note']}],filterable:['note','instant']});
+  assert.throws(()=>derivedValues({label:randomBytes(125).toString('hex'),note:randomBytes(125).toString('hex')},withText),{code:'SCHEMA_INVALID'});
+  assert.throws(()=>derivedValues({label:'ok',note:long},withText),{code:'SCHEMA_INVALID'});
+  assert.throws(()=>derivedValues({label:'ok',instant:`2024-01-01T00:00:00.${'1'.repeat(500)}Z`},withText),{code:'SCHEMA_INVALID'});
+  const {writer}=await fixture();
+  await assert.rejects(authority.mutateRequest(writer,{operation:'create',idempotencyKey:long,data:{label:'short'}}),{code:'INVALID_ARGUMENT'});
+  await assert.rejects(authority.mutateRequest(writer,{operation:'create',idempotencyKey:'long-key',externalKey:long,data:{label:'short'}}),{code:'INVALID_ARGUMENT'});
+
+  const suffix=randomUUID(),spaceId=`sp_${suffix}`,collectionId=`entries_${suffix}`;
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
+  const owner={spaceId,collectionId,principalId:'owner',credentialId:'session',capability:'schema:write',policyVersion:1,placementGeneration:1};
+  const indexedSchema={...schema,properties:{...schema.properties,note:{type:'string'}}};
+  await registry.define(owner,definition(collectionId,{schema:indexedSchema,unique:[],filterable:[]}));
+  const writer2={...owner,capability:'records:write'};
+  const created=await authority.mutateRequest(writer2,{operation:'create',idempotencyKey:'long-note',data:{label:'ok',note:long}});
+  await registry.revise(owner,1,definition(collectionId,{version:2,schema:indexedSchema,unique:[],filterable:['note']}));
+  await assert.rejects(registry.backfill(owner,'note'),{code:'SCHEMA_INVALID'});
+  const readiness=await pool.query(`SELECT ready,backfill_after FROM collection_index_declarations WHERE space_id=$1 AND collection_id=$2 AND field_name='note'`,[spaceId,collectionId]);
+  assert.deepEqual(readiness.rows[0],{ready:false,backfill_after:null});
+  await assert.rejects(authority.mutateRequest(writer2,{operation:'patch',idempotencyKey:'still-long',id:created.ref.id,
+    expectedRevision:1,set:{label:'updated'},unset:[]}),{code:'SCHEMA_INVALID'});
+});
+
+test('proxy detection stays pinned after runtime method replacement',async()=>{
+  const {writer}=await fixture();
+  const original=types.isProxy;
+  let traps=0;
+  const proxy=new Proxy({operation:'create',idempotencyKey:'proxy',data:{label:'proxy'}},{get(){traps++;throw Error('proxy trap');}});
+  try {
+    for (const replacement of [undefined,()=>false]) {
+      types.isProxy=replacement;
+      await assert.rejects(authority.mutateRequest({...writer,credentialId:'revoked'},proxy),{code:'INVALID_ARGUMENT'});
+      await assert.rejects(authority.mutateRequest(writer,proxy),{code:'INVALID_ARGUMENT'});
+      const receipt=await authority.mutateRequest(writer,{operation:'create',idempotencyKey:`valid-${String(replacement)}`,data:{label:`valid-${String(replacement)}`}});
+      assert.equal(receipt.revision,1);
+    }
+    assert.equal(traps,0);
+  } finally { types.isProxy=original; }
 });
 
 test('backfill lock orders preserve indexes across concurrent update and delete',async()=>{

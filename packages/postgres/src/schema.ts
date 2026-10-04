@@ -22,6 +22,11 @@ const typesAllowed = new Set(['string','integer','number','boolean','object','ar
 const maxBytes = 1_048_576;
 const maxDepth = 32;
 const maxFields = 256;
+// Keep each B-tree tuple well below PostgreSQL's roughly one-third-page entry
+// limit even when the scoped identifiers and value share a multicolumn index.
+export const MAX_INDEX_PART_BYTES = 256;
+export const MAX_INDEX_VALUE_BYTES = 512;
+const withinBytes = (value:string, limit:number):boolean => Buffer.byteLength(value,'utf8') <= limit;
 const own = Object.hasOwn;
 const isFiniteNumber = Number.isFinite;
 const isIntegerNumber = Number.isInteger;
@@ -48,6 +53,7 @@ const proxyDetector=(()=>{
   } catch { return null; }
 })();
 export const acceptsInProcessObjects=proxyDetector!==null;
+export const isInProcessProxy = (value:unknown):boolean => proxyDetector ? proxyDetector(value) : true;
 const compare = (a: string,b: string) => Buffer.compare(Buffer.from(a),Buffer.from(b));
 const append = <T>(values:T[],value:T):void => { Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
 const includes = <T>(values:readonly T[],value:T):boolean => {
@@ -201,7 +207,7 @@ function validateNode(node: SchemaNode, root: boolean, depth: number, counter: {
     for (let i=0;i<entries.length;i++) {
       const pair=Object.getOwnPropertyDescriptor(entries,i)!.value as [string,SchemaNode];
       const key=pair[0],child=pair[1];
-      if (!scalarString(key)) fail('SCHEMA_UNSUPPORTED');
+      if (!scalarString(key) || !withinBytes(key,MAX_INDEX_PART_BYTES)) fail('SCHEMA_UNSUPPORTED','Field name exceeds indexed byte limit');
       validateNode(child,false,depth+1,counter);
     }
     if (own(node,'required')) {
@@ -280,7 +286,7 @@ export function validateDefinition(input: unknown, trustedParsed = false): Colle
   if (!ordinary(input) || any(Object.keys(input),key=>!includes(['slug','version','schema','unique','filterable','sortable','lifecycle'],key))) fail('SCHEMA_UNSUPPORTED');
   const definition=input as unknown as CollectionDefinition;
   if (!own(definition,'slug') || !own(definition,'version') || !own(definition,'schema')) fail('SCHEMA_UNSUPPORTED');
-  if (!scalarString(definition.slug) || !definition.slug || !isSafeInteger(definition.version) || definition.version<1) fail('SCHEMA_UNSUPPORTED');
+  if (!scalarString(definition.slug) || !definition.slug || !withinBytes(definition.slug,MAX_INDEX_PART_BYTES) || !isSafeInteger(definition.version) || definition.version<1) fail('SCHEMA_UNSUPPORTED');
   validateNode(definition.schema,true,0,{count:0});
   if (!own(definition,'unique') || !own(definition,'filterable') || !own(definition,'sortable')) fail('SCHEMA_UNSUPPORTED');
   const uniques=list(definition.unique,'SCHEMA_UNSUPPORTED');
@@ -290,7 +296,7 @@ export function validateDefinition(input: unknown, trustedParsed = false): Colle
     if (!ordinary(entry) || Reflect.ownKeys(entry).length!==2 || !own(entry,'name') || !own(entry,'paths')) fail('SCHEMA_UNSUPPORTED');
     const item=entry as {name:unknown;paths:unknown};
     const paths=list(item.paths,'SCHEMA_UNSUPPORTED');
-    if (!scalarString(item.name) || !item.name || includes(names,item.name) || !paths.length || !distinct(paths) || any(paths,path=>!scalarField(definition.schema,path))) fail('SCHEMA_UNSUPPORTED');
+    if (!scalarString(item.name) || !item.name || !withinBytes(item.name,MAX_INDEX_PART_BYTES) || includes(names,item.name) || !paths.length || !distinct(paths) || any(paths,path=>!scalarField(definition.schema,path))) fail('SCHEMA_UNSUPPORTED');
     append(names,item.name as string);
   }
   const declarations=['filterable','sortable'] as const;
@@ -373,7 +379,7 @@ export function externalKey(value: unknown): string {
   while (start<end && setHas(whites,Reflect.apply(codeUnit,n,[start]) as number)) start++;
   while (end>start && setHas(whites,Reflect.apply(codeUnit,n,[end-1]) as number)) end--;
   const result=Reflect.apply(slice,n,[start,end]) as string;
-  if (!result) fail('INVALID_ARGUMENT');
+  if (!result || !withinBytes(result,MAX_INDEX_PART_BYTES)) fail('INVALID_ARGUMENT','External key exceeds indexed byte limit');
   return result;
 }
 export function derivedValues(data: Record<string,Json>, definition: CollectionDefinition): {unique: UniqueValue[]; indexes: IndexValue[]} {
@@ -391,7 +397,11 @@ export function derivedValues(data: Record<string,Json>, definition: CollectionD
         (own(field,'format') && field.format==='date-time' ? utcInstant(value) : Reflect.apply(normalize,value,['NFC']) as string) : canonical(value);
       append(parts,`${tag}:${Buffer.byteLength(normalized)}:${normalized}`);
     }
-    if (!skip) append(unique,{name:item.name,encodedValue:joined(parts,'')});
+    if (!skip) {
+      const encodedValue=joined(parts,'');
+      if (!withinBytes(encodedValue,MAX_INDEX_VALUE_BYTES)) fail('SCHEMA_INVALID','Unique value exceeds indexed byte limit');
+      append(unique,{name:item.name,encodedValue});
+    }
   }
   const fields:string[]=[];
   const pathLists=[definition.filterable,definition.sortable];
@@ -406,7 +416,9 @@ export function derivedValues(data: Record<string,Json>, definition: CollectionD
     if (value===null) append(indexes,{field,kind:'null'});
     else if (typeof value==='string') {
       const node=props(definition.schema)[field],instant=own(node,'format') && node.format==='date-time';
-      append(indexes,{field,kind:instant ? 'date-time' : 'string',value:instant ? utcInstant(value) : value});
+      const indexed=instant ? utcInstant(value) : value;
+      if (!withinBytes(indexed,MAX_INDEX_VALUE_BYTES)) fail('SCHEMA_INVALID','Indexed value exceeds byte limit');
+      append(indexes,{field,kind:instant ? 'date-time' : 'string',value:indexed});
     }
     else if (typeof value==='boolean') append(indexes,{field,kind:'boolean',value});
     else append(indexes,{field,kind:'number',value:value as number});
