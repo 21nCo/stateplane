@@ -1,0 +1,22 @@
+docs/postgres-authority.md
+  h_a39f9495f9ec1d 25-30
+packages/postgres/src/collections.ts
+  h_a39f9495f9ec1d 3,11-20,109,135,158,190,194-196,200
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 5,74,89-95,146,151,165,181,185-186,211,242,248,277,316,601,613,687-688,696
+packages/postgres/src/schema.ts
+  h_a39f9495f9ec1d 25-29,56,210,289,299,382,400-404,419-421
+test/integration/collections.test.js
+  h_a39f9495f9ec1d 4-5,307-332,336-406
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f7b56076cb22ace46fc413bf80e80d87d2d2ff2b",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
