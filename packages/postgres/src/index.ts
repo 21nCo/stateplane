@@ -234,7 +234,8 @@ function snapshotChange(source: RecordChange): Readonly<RecordChange> {
     operation: source.operation, idempotencyKey: source.idempotencyKey, requestDigest: source.requestDigest,
     recordId: source.recordId, expectedRevision: source.expectedRevision,
     expectedSchemaVersion: source.expectedSchemaVersion, canonicalData: source.canonicalData,
-    normalizedExternalKey: source.normalizedExternalKey,
+    // The low-level path shares the public key normalizer; old rows are handled at lookup.
+    normalizedExternalKey: source.normalizedExternalKey === undefined ? undefined : externalKey(source.normalizedExternalKey),
     unique: snapshotUnique(source.unique), indexes: snapshotIndexes(source.indexes)
   };
   validateChangeShape(change);
@@ -497,13 +498,17 @@ export class AuthorityTransaction {
     return row ? { ref: this.ref(row.record_id), revision: Number(row.revision), schemaVersion: Number(row.schema_version),
       canonicalData: row.canonical_data, keyMode: row.key_mode, normalizedKey: row.normalized_key, tombstone: row.tombstone } : null;
   }
+  /** Resolve a live key, retaining exact lookup for historical unnormalized external keys. */
   getByKey(mode: 'generated' | 'external', key: string): Promise<AuthorityRecord | null> {
     return this.admitOperation(async () => {
     if (this.#scope.capability !== 'records:read') throw new AuthorityError('FORBIDDEN');
     if (!arrayHas(['generated','external'],mode) || !scalarString(key)) throw new AuthorityError('INVALID_ARGUMENT');
     const normalized=mode==='external' ? externalKey(key) : key;
+    // Exact raw matches preserve pre-normalization rows when both spellings exist.
     const result = await this.query(`SELECT record_id FROM records WHERE space_id=$1 AND collection_id=$2
-      AND key_mode=$3 AND normalized_key=$4 AND NOT tombstone`, [...scopeIds(this.#scope), mode, normalized]);
+      AND key_mode=$3 AND normalized_key IN ($4,$5) AND NOT tombstone
+      ORDER BY CASE WHEN normalized_key=$5 THEN 0 ELSE 1 END LIMIT 1`,
+      [...scopeIds(this.#scope), mode, normalized, key]);
     return result.rows[0] ? this.readRecord(result.rows[0].record_id) : null;
     });
   }
@@ -727,7 +732,7 @@ export class AuthorityTransaction {
           const unset=fields.unset as string[];
           for (let i=0;i<unset.length;i++) {
             const path=unset[i];
-            if (!Object.hasOwn(definition.schema.properties??{},path) ||
+            if (!Object.hasOwn(definition.schema,'properties') || !Object.hasOwn(definition.schema.properties!,path) ||
               arrayHas(Object.hasOwn(definition.schema,'required') ? definition.schema.required! : [],path))
               throw new AuthorityError('INVALID_ARGUMENT','Unset requires a declared optional field');
             delete data[path];
@@ -980,7 +985,7 @@ export class AuthorityTransaction {
     }
     if (!fields.length) return;
     const result=await this.query(`SELECT field_name,ready,filterable,value_kind FROM collection_index_declarations
-      WHERE space_id=$1 AND collection_id=$2 AND field_name=ANY($3::text[]) FOR SHARE`,
+      WHERE space_id=$1 AND collection_id=$2 AND field_name=ANY($3::text[])`,
       [...scopeIds(this.#scope),fields]);
     if (result.rows.length!==fields.length) throw new AuthorityError('SCHEMA_CONFLICT','Filter index is not ready');
     for (let i=0;i<predicates.length;i++) {

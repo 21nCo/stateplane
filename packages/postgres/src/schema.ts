@@ -282,6 +282,7 @@ export function validateValue(value: Json, node: SchemaNode, depth=0): void {
 }
 const scalarField = (schema: SchemaNode, path: unknown): path is string => typeof path==='string' && path.length>0 && scalarString(path) &&
   own(props(schema),path) && includes(['string','number','integer','boolean'],typeOf(props(schema)[path]));
+/** Admit only the bounded schema subset and declarations shared by every collection. */
 export function validateDefinition(input: unknown, trustedParsed = false): CollectionDefinition {
   plainJson(input,'SCHEMA_UNSUPPORTED',0,new Set<object>(),trustedParsed);
   if (!ordinary(input) || any(Object.keys(input),key=>!includes(['slug','version','schema','unique','filterable','sortable','lifecycle'],key))) fail('SCHEMA_UNSUPPORTED');
@@ -309,7 +310,8 @@ export function validateDefinition(input: unknown, trustedParsed = false): Colle
   if (own(definition,'lifecycle')) {
     const rule=definition.lifecycle;
     if (!ordinary(rule) || joined(sorted(Object.keys(rule),compare),',')!=='field,initial,transitions' || !scalarField(definition.schema,rule.field) ||
-      typeOf(props(definition.schema)[rule.field])!=='string' || nullable(props(definition.schema)[rule.field]) || !ordinary(rule.transitions) ||
+      typeOf(props(definition.schema)[rule.field])!=='string' || nullable(props(definition.schema)[rule.field]) ||
+      !includes(own(definition.schema,'required') ? definition.schema.required! : [],rule.field) || !ordinary(rule.transitions) ||
       !own(props(definition.schema)[rule.field],'enum')) fail('SCHEMA_UNSUPPORTED');
     if (any(list(rule!.initial,'SCHEMA_UNSUPPORTED'),value=>!includes(props(definition.schema)[rule!.field].enum!,value as Json))) fail('SCHEMA_UNSUPPORTED');
     const transitions=Object.entries(rule!.transitions);

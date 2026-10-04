@@ -9,13 +9,15 @@ const isSafeInteger=Number.isSafeInteger;
 const validVersion=(n:unknown)=>isSafeInteger(n) && (n as number)>0;
 const has=(values:readonly string[],value:string)=>{ for (let i=0;i<values.length;i++) if (Object.getOwnPropertyDescriptor(values,i)?.value===value) return true; return false; };
 const append=<T>(values:T[],value:T)=>{ Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
-const snapshotScope=(scope:AuthorityScope):AuthorityScope=>{
+/** Snapshot a schema scope; discovery accepts a space scope without a collection ID. */
+const snapshotScope=(scope:AuthorityScope,collectionRequired=true):AuthorityScope=>{
   const fixed=Object.freeze({...scope});
   if (!scalarString(fixed.spaceId) || !fixed.spaceId || Buffer.byteLength(fixed.spaceId)>512 ||
     !scalarString(fixed.principalId) || !fixed.principalId || Buffer.byteLength(fixed.principalId)>512 ||
     !scalarString(fixed.credentialId) || !fixed.credentialId || Buffer.byteLength(fixed.credentialId)>512)
     throw new AuthorityError('INVALID_ARGUMENT');
-  if (!scalarString(fixed.collectionId) || !fixed.collectionId || Buffer.byteLength(fixed.collectionId)>MAX_INDEX_PART_BYTES ||
+  if (((collectionRequired || fixed.collectionId !== undefined) &&
+      (!scalarString(fixed.collectionId) || !fixed.collectionId || Buffer.byteLength(fixed.collectionId)>MAX_INDEX_PART_BYTES)) ||
     !validVersion(fixed.policyVersion) || !validVersion(fixed.placementGeneration)) throw new AuthorityError('INVALID_ARGUMENT');
   return fixed;
 };
@@ -159,8 +161,8 @@ export class CollectionRegistry {
     });
   }
   /** A result includes only indexes proven ready; clients must not infer readiness from declaration. */
-  async discover(scope:AuthorityScope):Promise<Array<{definition:CollectionDefinition;ready:string[];pending:string[]}>> {
-    scope=snapshotScope(scope);
+  async discover(scope:Omit<AuthorityScope,'collectionId'> & {collectionId?:string}):Promise<Array<{definition:CollectionDefinition;ready:string[];pending:string[]}>> {
+    scope=snapshotScope(scope as AuthorityScope,false);
     return this.transaction(async client=>{
       const row=await client.query(`SELECT s.owner_principal_id,s.lifecycle,s.policy_version,s.placement_generation
         FROM spaces s WHERE s.space_id=$1 FOR SHARE OF s`,[scope.spaceId]);
@@ -193,7 +195,7 @@ export class CollectionRegistry {
   /** One committed batch; repeat until ready. Cursor and values commit together. */
   async backfill(scope:AuthorityScope,field:string):Promise<{processed:number;ready:boolean}> {
     scope=snapshotScope(scope);
-    if (!scalarString(field) || !field) throw new AuthorityError('INVALID_ARGUMENT');
+    if (!scalarString(field) || !field || Buffer.byteLength(field)>MAX_INDEX_PART_BYTES) throw new AuthorityError('INVALID_ARGUMENT');
     return this.transaction(async client=>{
       await this.authorize(client,scope,scope.collectionId);
       // The collection share lock precedes the declaration lock, matching

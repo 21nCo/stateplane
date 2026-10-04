@@ -44,6 +44,18 @@ async function fixture() {
   return {owner,writer};
 }
 const read=scope=>({...scope,capability:'records:read'});
+function observedRegistry(matches) {
+  let signal;
+  const attempted=new Promise(resolve=>{signal=resolve;});
+  const observed=new CollectionRegistry({connect:async()=>{
+    const client=await pool.connect();
+    return {query:(sql,...args)=>{
+      if (matches(String(sql))) signal();
+      return client.query(sql,...args);
+    },release:discard=>client.release(discard)};
+  }});
+  return {observed,attempted};
+}
 
 test('definition subset, additive revisions and normalization have explicit failures',()=>{
   const d=definition('generic');
@@ -453,7 +465,9 @@ test('schema revision waits for an in-flight validated write and rollback has no
   await started;
   const next=definition(owner.collectionId,{version:2,schema:{...schema,properties:{...schema.properties,note:{type:'string'}}}});
   let revised=false;
-  const revision=registry.revise(owner,1,next).then(value=>{revised=true;return value;});
+  const {observed,attempted}=observedRegistry(sql=>sql.includes('FROM collections') && sql.includes('FOR UPDATE'));
+  const revision=observed.revise(owner,1,next).then(value=>{revised=true;return value;});
+  await attempted;
   await new Promise(resolve=>setTimeout(resolve,50));
   assert.equal(revised,false);
   release();
@@ -513,7 +527,9 @@ test('revision waits for a backfill batch and reads its committed readiness',asy
   await atBatch;
   const next=definition(owner.collectionId,{version:2,schema:{...schema,properties:{...schema.properties,note:{type:'string'}}},filterable:['score','note']});
   let revised=false;
-  const revising=registry.revise(owner,1,next).then(value=>{revised=true;return value;});
+  const {observed,attempted}=observedRegistry(sql=>sql.includes('FROM collections') && sql.includes('FOR UPDATE'));
+  const revising=observed.revise(owner,1,next).then(value=>{revised=true;return value;});
+  await attempted;
   await new Promise(resolve=>setTimeout(resolve,50));
   assert.equal(revised,false);
   release();
@@ -541,7 +557,9 @@ test('backfill waits for a revision and reads the newly committed declaration',a
   const revising=held.revise(owner,1,next);
   await atRevision;
   let completed=false;
-  const backfilling=registry.backfill(owner,'note').then(result=>{completed=true;return result;});
+  const {observed,attempted}=observedRegistry(sql=>sql.includes('SELECT schema_version FROM collections') && sql.includes('FOR SHARE'));
+  const backfilling=observed.backfill(owner,'note').then(result=>{completed=true;return result;});
+  await attempted;
   await new Promise(resolve=>setTimeout(resolve,50));
   assert.equal(completed,false);
   release();
@@ -611,6 +629,39 @@ test('a partial backfill remains unavailable until a bounded final activation',a
   assert.deepEqual(final.map(result=>result.processed).sort((a,b)=>a-b),[0,remaining]);
   assert.ok(final.every(result=>result.ready));
   assert.equal(await authority.transaction(reader,tx=>tx.countRecords(predicate)),2);
+});
+
+test('space-scoped discovery, bounded backfill input and nonblocking readiness reads',async()=>{
+  const {owner,writer}=await fixture();
+  const spaceScope={...owner};
+  delete spaceScope.collectionId;
+  assert.equal((await registry.discover(spaceScope)).length,1);
+  await assert.rejects(registry.backfill(owner,'x'.repeat(257)),{code:'INVALID_ARGUMENT'});
+  const created=await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'index-wait',data:{label:'index-wait',score:3}});
+  let entered,release;
+  const atLock=new Promise(resolve=>{entered=resolve;});
+  const gate=new Promise(resolve=>{release=resolve;});
+  const held=new CollectionRegistry({connect:async()=>{
+    const client=await pool.connect();
+    return {query:async(sql,...args)=>{
+      const result=await client.query(sql,...args);
+      if (String(sql).includes('FOR NO KEY UPDATE')) { entered(); await gate; }
+      return result;
+    },release:discard=>client.release(discard)};
+  }});
+  const backfill=held.backfill(owner,'score');
+  try {
+    await atLock;
+    const predicate={field:'score',kind:'number',operator:'eq',value:3};
+    await assert.rejects(Promise.race([
+      authority.transaction(read(writer),tx=>tx.queryRecords([predicate],10)),
+      new Promise((_,reject)=>setTimeout(()=>reject(new Error('read blocked by backfill')),1000))
+    ]),{code:'SCHEMA_CONFLICT'});
+    release();
+    assert.deepEqual(await backfill,{processed:1,ready:true});
+    const rows=await authority.transaction(read(writer),tx=>tx.queryRecords([predicate],10));
+    assert.equal(rows[0].ref.id,created.ref.id);
+  } finally { release(); await backfill.catch(()=>{}); }
 });
 
 test('backfill activates one valid index independently of an invalid pending sibling',async()=>{
@@ -849,13 +900,73 @@ test('generated and external keys are distinct, revoked retries disclose no rece
   await assert.rejects(authority.mutateRequest({...writer,policyVersion:2},{operation:'create',idempotencyKey:'external',externalKey:generated.ref.id,data:{label:'external'}}),{code:'FORBIDDEN'});
 });
 
+test('external keys normalize on low-level writes and historical raw keys remain readable',async()=>{
+  const {writer}=await fixture();
+  const data={label:'low-level'};
+  const values=derivedValues(data,definition(writer.collectionId));
+  const raw=' e\u0301 ';
+  const change={operation:'create',idempotencyKey:'low-level-key',
+    requestDigest:'a'.repeat(64),canonicalData:JSON.stringify(data),normalizedExternalKey:raw,...values};
+  const created=await authority.mutate(writer,change);
+  assert.equal((await authority.mutate(writer,change)).receiptId,created.receiptId);
+  const stored=(await pool.query('SELECT normalized_key FROM records WHERE record_id=$1',[created.ref.id])).rows[0];
+  assert.equal(stored.normalized_key,'é');
+  assert.equal((await authority.transaction(read(writer),tx=>tx.getByKey('external',raw))).ref.id,created.ref.id);
+  await pool.query('UPDATE records SET normalized_key=$2 WHERE record_id=$1',[created.ref.id,raw]);
+  assert.equal((await authority.transaction(read(writer),tx=>tx.getByKey('external',raw))).ref.id,created.ref.id);
+  const normalized=await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'normalized-key',externalKey:'é',data:{label:'normalized-key'}});
+  assert.equal((await authority.transaction(read(writer),tx=>tx.getByKey('external',raw))).ref.id,created.ref.id);
+  assert.equal((await authority.transaction(read(writer),tx=>tx.getByKey('external','é'))).ref.id,normalized.ref.id);
+});
+
+test('patch unset ignores inherited properties and rejects invalid requests without effects',async()=>{
+  const suffix=randomUUID(),spaceId=`sp_${suffix}`,collectionId=`entries_${suffix}`;
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
+  const owner={spaceId,collectionId,principalId:'owner',credentialId:'session',capability:'schema:write',policyVersion:1,placementGeneration:1};
+  await registry.define(owner,definition(collectionId,{schema:{$schema:schema.$schema,type:'object',additionalProperties:false},unique:[],filterable:[]}));
+  const writer={...owner,capability:'records:write'};
+  const created=await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'empty',data:{}});
+  const facts=async()=>(await pool.query(`SELECT
+    (SELECT revision FROM records WHERE record_id=$2) AS revision,
+    (SELECT count(*)::int FROM record_unique_keys WHERE space_id=$1) AS unique_keys,
+    (SELECT count(*)::int FROM record_index_values WHERE space_id=$1) AS indexes,
+    (SELECT count(*)::int FROM record_events WHERE space_id=$1) AS events,
+    (SELECT count(*)::int FROM idempotency_receipts WHERE space_id=$1) AS receipts,
+    (SELECT count(*)::int FROM projection_outbox WHERE space_id=$1) AS outbox`,[spaceId,created.ref.id])).rows[0];
+  const before=await facts();
+  const request={operation:'patch',idempotencyKey:'ghost',id:created.ref.id,expectedRevision:1,set:{},unset:['ghost']};
+  const original=Object.getOwnPropertyDescriptor(Object.prototype,'properties');
+  try {
+    for (const descriptor of [{value:{ghost:{type:'string'}},configurable:true},
+      {get(){throw new Error('inherited getter executed');},configurable:true}]) {
+      Object.defineProperty(Object.prototype,'properties',descriptor);
+      for (const serialized of [false,true]) {
+        const invoke=()=>serialized ? authority.mutateSerializedRequest(writer,JSON.stringify(request)) : authority.mutateRequest(writer,request);
+        await assert.rejects(invoke(),{code:'INVALID_ARGUMENT'});
+        assert.deepEqual(await facts(),before);
+      }
+    }
+  } finally {
+    if (original) Object.defineProperty(Object.prototype,'properties',original);
+    else delete Object.prototype.properties;
+  }
+  const valid=await authority.mutateRequest(writer,{operation:'patch',idempotencyKey:'valid',id:created.ref.id,
+    expectedRevision:1,set:{},unset:[]});
+  assert.equal((await authority.mutateRequest(writer,{operation:'patch',idempotencyKey:'valid',id:created.ref.id,
+    expectedRevision:1,set:{},unset:[]})).receiptId,valid.receiptId);
+});
+
 test('declared lifecycle transitions gate generic writes',async()=>{
   const suffix=randomUUID(); const spaceId=`sp_${suffix}`,collectionId=`entries_${suffix}`;
   await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
     VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
   const scope={spaceId,collectionId,principalId:'owner',credentialId:'session',capability:'schema:write',policyVersion:1,placementGeneration:1};
-  await registry.define(scope,definition(collectionId,{lifecycle:{field:'state',initial:['open'],transitions:{open:['closed'],closed:[]}}}));
+  await assert.rejects(registry.define(scope,definition(collectionId,{lifecycle:{field:'state',initial:['open'],transitions:{open:['closed'],closed:[]}}})),{code:'SCHEMA_UNSUPPORTED'});
+  await registry.define(scope,definition(collectionId,{schema:{...schema,required:['label','state']},
+    lifecycle:{field:'state',initial:['open'],transitions:{open:['closed'],closed:[]}}}));
   const writer={...scope,capability:'records:write'};
+  await assert.rejects(authority.mutateRequest(writer,{operation:'create',idempotencyKey:'missing-initial',data:{label:'x'}}),{code:'SCHEMA_INVALID'});
   await assert.rejects(authority.mutateRequest(writer,{operation:'create',idempotencyKey:'wrong-initial',data:{label:'x',state:'closed'}}),{code:'SCHEMA_INVALID'});
   const created=await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'initial',data:{label:'x',state:'open'}});
   await authority.mutateRequest(writer,{operation:'patch',idempotencyKey:'advance',id:created.ref.id,expectedRevision:1,set:{state:'closed'},unset:[]});
@@ -867,7 +978,8 @@ test('inherited lifecycle transitions cannot authorize undeclared replacement or
   await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
     VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
   const scope={spaceId,collectionId,principalId:'owner',credentialId:'session',capability:'schema:write',policyVersion:1,placementGeneration:1};
-  await registry.define(scope,definition(collectionId,{lifecycle:{field:'state',initial:['open'],transitions:{}}}));
+  await registry.define(scope,definition(collectionId,{schema:{...schema,required:['label','state']},
+    lifecycle:{field:'state',initial:['open'],transitions:{}}}));
   const writer={...scope,capability:'records:write'};
   const created=await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'initial',data:{label:'x',state:'open'}});
   const previous=Object.getOwnPropertyDescriptor(Object.prototype,'open');
@@ -1018,6 +1130,85 @@ test('current nonowner schema grant permits revision and backfill; expiry and st
   assert.deepEqual((await registry.discover({...owner,policyVersion:2}))[0].pending,['score']);
   assert.equal((await registry.revise({...grantee,policyVersion:2},2,third)).version,3);
   assert.deepEqual(await registry.backfill({...grantee,policyVersion:2},'score'),{processed:0,ready:true});
+});
+
+test('schema revision and backfill serialize with the space-policy revocation fence',async()=>{
+  for (const operation of ['revise','backfill']) {
+    const {owner,writer}=await fixture();
+    const grantee={...writer,capability:'schema:write'};
+    let entered,release;
+    const atFinalCheck=new Promise(resolve=>{entered=resolve;});
+    const gate=new Promise(resolve=>{release=resolve;});
+    let authorizationCount=0;
+    const held=new CollectionRegistry({connect:async()=>{
+      const client=await pool.connect();
+      return {query:async(sql,...args)=>{
+        const result=await client.query(sql,...args);
+        if (String(sql).includes('WHERE s.space_id=$1 FOR SHARE OF s') && ++authorizationCount===2) {
+          entered(); await gate;
+        }
+        return result;
+      },release:discard=>client.release(discard)};
+    }});
+    const next=definition(owner.collectionId,{version:2,schema:{...schema,properties:{...schema.properties,note:{type:'string'}}}});
+    const schemaChange=operation==='revise' ? held.revise(grantee,1,next) : held.backfill(grantee,'score');
+    const revoker=await pool.connect();
+    try {
+      await atFinalCheck;
+      let revoked=false;
+      let signalAttempt;
+      const attempted=new Promise(resolve=>{signalAttempt=resolve;});
+      const revoke=(async()=>{
+        await revoker.query('BEGIN');
+        // The supported key revocation path in spaces.ts takes this same lock before deleting grants.
+        signalAttempt();
+        await revoker.query('SELECT policy_version FROM spaces WHERE space_id=$1 FOR UPDATE',[owner.spaceId]);
+        await revoker.query('DELETE FROM collection_grants WHERE space_id=$1 AND credential_id=$2',[owner.spaceId,grantee.credentialId]);
+        await revoker.query('UPDATE spaces SET policy_version=policy_version+1 WHERE space_id=$1',[owner.spaceId]);
+        await revoker.query('COMMIT');
+        revoked=true;
+      })();
+      void revoke.catch(()=>{});
+      await attempted;
+      await new Promise(resolve=>setTimeout(resolve,50));
+      assert.equal(revoked,false);
+      release();
+      await schemaChange;
+      await revoke;
+      assert.equal(Number((await pool.query('SELECT policy_version FROM spaces WHERE space_id=$1',[owner.spaceId])).rows[0].policy_version),2);
+      await assert.rejects(registry.backfill({...grantee,policyVersion:2},'score'),{code:'FORBIDDEN'});
+      if (operation==='revise') assert.equal((await registry.discover({...owner,policyVersion:2}))[0].definition.version,2);
+      else assert.deepEqual((await registry.discover({...owner,policyVersion:2}))[0].ready,['score']);
+    } finally { release(); await schemaChange.catch(()=>{}); revoker.release(); }
+  }
+});
+
+test('schema revision and backfill roll back when grants expire while waiting for collection locks',async()=>{
+  for (const operation of ['revise','backfill']) {
+    const {owner,writer}=await fixture();
+    const grantee={...writer,capability:'schema:write'};
+    const blocker=await pool.connect();
+    await blocker.query('BEGIN');
+    await blocker.query('SELECT 1 FROM collections WHERE space_id=$1 AND collection_id=$2 FOR UPDATE',
+      [owner.spaceId,owner.collectionId]);
+    const {observed,attempted}=observedRegistry(sql=>sql.includes('FROM collections') &&
+      sql.includes(operation==='revise' ? 'FOR UPDATE' : 'FOR SHARE'));
+    const next=definition(owner.collectionId,{version:2,schema:{...schema,properties:{...schema.properties,note:{type:'string'}}}});
+    const pending=operation==='revise' ? observed.revise(grantee,1,next) : observed.backfill(grantee,'score');
+    void pending.catch(()=>{});
+    try {
+      await attempted;
+      await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()-interval '1 second'
+        WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[owner.spaceId,owner.collectionId,grantee.credentialId]);
+      await blocker.query('COMMIT');
+      await assert.rejects(pending,{code:'FORBIDDEN'});
+      const found=(await registry.discover(owner))[0];
+      assert.equal(found.definition.version,1);
+      assert.deepEqual(found.pending,['score']);
+    } finally {
+      await blocker.query('ROLLBACK'); blocker.release();
+    }
+  }
 });
 
 test('waiting backfill cannot return ready after its schema grant expires',async()=>{
