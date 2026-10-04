@@ -1,6 +1,6 @@
 import type pg from 'pg';
 import { AuthorityError, type AuthorityScope } from './index.js';
-import { canonical, compatible, derivedValues, MAX_INDEX_PART_BYTES, plainJson, scalarString, validateDefinition } from './schema.js';
+import { canonical, compatible, derivedIndexValue, MAX_INDEX_PART_BYTES, plainJson, scalarString, validateDefinition } from './schema.js';
 import type { CollectionDefinition, Json } from './schema.js';
 
 type PoolLike = Pick<pg.Pool,'connect'>;
@@ -215,9 +215,7 @@ export class CollectionRegistry {
       for (let i=0;i<rows.rows.length;i++) {
         const row=rows.rows[i];
         const data=JSON.parse(row.canonical_data) as Record<string,Json>;
-        const indexes=derivedValues(data,definition).indexes;
-        let index=undefined as typeof indexes[number] | undefined;
-        for (let j=0;j<indexes.length;j++) if (indexes[j].field===field) { index=indexes[j]; break; }
+        const index=derivedIndexValue(data,definition,field);
         if (!index) continue;
         const value='value' in index ? index.value : null;
         await client.query(`INSERT INTO record_index_values

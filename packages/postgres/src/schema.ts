@@ -414,18 +414,24 @@ export function derivedValues(data: Record<string,Json>, definition: CollectionD
   }
   for (let i=0;i<fields.length;i++) {
     const field=fields[i];
-    if (!own(data,field)) continue;
-    const value=data[field];
-    if (value===null) append(indexes,{field,kind:'null'});
-    else if (typeof value==='string') {
-      if (!scalarString(value)) fail('SCHEMA_INVALID','Indexed value contains a database-unsupported character');
-      const node=props(definition.schema)[field],instant=own(node,'format') && node.format==='date-time';
-      const indexed=instant ? utcInstant(value) : value;
-      if (!withinBytes(indexed,MAX_INDEX_VALUE_BYTES)) fail('SCHEMA_INVALID','Indexed value exceeds byte limit');
-      append(indexes,{field,kind:instant ? 'date-time' : 'string',value:indexed});
-    }
-    else if (typeof value==='boolean') append(indexes,{field,kind:'boolean',value});
-    else append(indexes,{field,kind:'number',value:value as number});
+    const index=derivedIndexValue(data,definition,field);
+    if (index) append(indexes,index);
   }
   return {unique,indexes};
+}
+
+/** Backfill a declaration independently of other pending indexes. */
+export function derivedIndexValue(data: Record<string,Json>, definition: CollectionDefinition, field:string): IndexValue|undefined {
+  if (!own(data,field)) return undefined;
+  const value=data[field];
+  if (value===null) return {field,kind:'null'};
+  if (typeof value==='string') {
+    if (!scalarString(value)) fail('SCHEMA_INVALID','Indexed value contains a database-unsupported character');
+    const node=props(definition.schema)[field],instant=own(node,'format') && node.format==='date-time';
+    const indexed=instant ? utcInstant(value) : value;
+    if (!withinBytes(indexed,MAX_INDEX_VALUE_BYTES)) fail('SCHEMA_INVALID','Indexed value exceeds byte limit');
+    return {field,kind:instant ? 'date-time' : 'string',value:indexed};
+  }
+  if (typeof value==='boolean') return {field,kind:'boolean',value};
+  return {field,kind:'number',value:value as number};
 }

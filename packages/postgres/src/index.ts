@@ -80,7 +80,12 @@ const isFiniteNumber = Number.isFinite;
 const isSafeInteger = Number.isSafeInteger;
 const nativeSetHas=Set.prototype.has;
 const nativeSetAdd=Set.prototype.add;
+const nativeSetClear=Set.prototype.clear;
 const nativeSetForEach=Set.prototype.forEach;
+const nativeMapGet=Map.prototype.get;
+const nativeMapSet=Map.prototype.set;
+const nativeMapHas=Map.prototype.has;
+const nativeMapClear=Map.prototype.clear;
 const nativeMapForEach=Map.prototype.forEach;
 const arrayHas=(values:readonly unknown[],wanted:unknown):boolean=>{
   for (let i=0;i<values.length;i++) if (Object.getOwnPropertyDescriptor(values,i)?.value===wanted) return true;
@@ -89,6 +94,11 @@ const arrayHas=(values:readonly unknown[],wanted:unknown):boolean=>{
 const append=<T>(values:T[],value:T):void=>{ Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
 const setHas=<T>(values:Set<T>,wanted:T):boolean=>Reflect.apply(nativeSetHas,values,[wanted]) as boolean;
 const setAdd=<T>(values:Set<T>,wanted:T):void=>{ Reflect.apply(nativeSetAdd,values,[wanted]); };
+const setClear=<T>(values:Set<T>):void=>{ Reflect.apply(nativeSetClear,values,[]); };
+const mapGet=<T>(values:Map<string,T>,key:string):T|undefined=>Reflect.apply(nativeMapGet,values,[key]) as T|undefined;
+const mapSet=<T>(values:Map<string,T>,key:string,value:T):void=>{ Reflect.apply(nativeMapSet,values,[key,value]); };
+const mapHas=<T>(values:Map<string,T>,key:string):boolean=>Reflect.apply(nativeMapHas,values,[key]) as boolean;
+const mapClear=<T>(values:Map<string,T>):void=>{ Reflect.apply(nativeMapClear,values,[]); };
 const mapValues=<T>(source:Map<string,T>):T[]=>{
   const values:T[]=[];
   Reflect.apply(nativeMapForEach,source,[(value:T)=>append(values,value)]);
@@ -374,7 +384,7 @@ export class PostgresAuthority {
     for (let attempt = 0; attempt < 3; attempt++) {
       try { return await this.transaction(fixedScope, tx => tx.mutate(fixedChange)); }
       catch (error) {
-        if (!retryCodes.has((error as { code?: string }).code ?? '') || attempt === 2) throw error;
+        if (!setHas(retryCodes,(error as { code?: string }).code ?? '') || attempt === 2) throw error;
       }
     }
     throw new Error('unreachable');
@@ -386,7 +396,7 @@ export class PostgresAuthority {
     const fixedRequest=snapshotRequest(request);
     for (let attempt=0;attempt<3;attempt++) {
       try { return await this.transaction(fixedScope,tx=>tx.mutateRequest(fixedRequest)); }
-      catch (error) { if (!retryCodes.has((error as {code?:string}).code ?? '') || attempt===2) throw error; }
+      catch (error) { if (!setHas(retryCodes,(error as {code?:string}).code ?? '') || attempt===2) throw error; }
     }
     throw new Error('unreachable');
   }
@@ -396,7 +406,7 @@ export class PostgresAuthority {
     const fixedScope=Object.freeze({...scope});
     for (let attempt=0;attempt<3;attempt++) {
       try { return await this.transaction(fixedScope,tx=>tx.mutateSerializedRequest(serialized)); }
-      catch (error) { if (!retryCodes.has((error as {code?:string}).code ?? '') || attempt===2) throw error; }
+      catch (error) { if (!setHas(retryCodes,(error as {code?:string}).code ?? '') || attempt===2) throw error; }
     }
     throw new Error('unreachable');
   }
@@ -423,7 +433,7 @@ export class AuthorityTransaction {
     this.joinedReplays = joinedReceipts?.replayed ?? new Map();
     this.readyReceipts = joinedReceipts?.ready ?? [];
   }
-  close() { this.active = false; this.admittingMutations = false; this.reservedIdentities.clear(); this.replayCollections.clear(); }
+  close() { this.active = false; this.admittingMutations = false; mapClear(this.reservedIdentities); setClear(this.replayCollections); }
   /** A caught mutation error must not turn a partial write into a successful commit. */
   assertCommittable() {
     if (this.mutationFailed) throw this.mutationError;
@@ -518,8 +528,8 @@ export class AuthorityTransaction {
   }
   /** Stamp receipts using the database clock after callback work, immediately before COMMIT. */
   async finalizeReceipts(): Promise<void> {
-    if (this.pendingReceipts.size) {
-      const pendingReceipts = mapValues(this.pendingReceipts);
+    const pendingReceipts = mapValues(this.pendingReceipts);
+    if (pendingReceipts.length) {
       const retentions:number[]=[];
       for (let i=0;i<pendingReceipts.length;i++) append(retentions,pendingReceipts[i].retentionSeconds);
       const times = await this.receiptTimes(retentions);
@@ -534,7 +544,7 @@ export class AuthorityTransaction {
           JSON.stringify(pending.response),committedAt,expiresAt]);
         append(this.readyReceipts,{receiptId:pending.response.receiptId,exposure:pending.exposure,committedAt,expiresAt});
       }
-      this.pendingReceipts.clear();
+      mapClear(this.pendingReceipts);
     }
     const reserved=mapValues(this.reservedIdentities);
     for (let i=0;i<reserved.length;i++) {
@@ -545,7 +555,7 @@ export class AuthorityTransaction {
           AND operation=$4 AND idempotency_key=$5 AND EXISTS(SELECT 1 FROM identity)`,
         [this.#scope.spaceId,this.#scope.collectionId,this.#scope.credentialId,operation,key]);
     }
-    this.reservedIdentities.clear();
+    mapClear(this.reservedIdentities);
   }
   /** A slow final cell check must abort rather than commit an already expired
    * receipt and let an immediate retry create a second record. */
@@ -581,7 +591,7 @@ export class AuthorityTransaction {
   private async authorizeOriginal(collectionId: CollectionId): Promise<void> {
     if (collectionId === this.#scope.collectionId) return;
     await new AuthorityTransaction(this.client, { ...this.#scope, collectionId }, this.retentionSeconds).checkScope();
-    this.replayCollections.add(collectionId);
+    setAdd(this.replayCollections,collectionId);
   }
 
   async checkReplayScopes(): Promise<void> {
@@ -747,14 +757,14 @@ export class AuthorityTransaction {
 
   /** Uncommitted unique rows provide Hyperdrive-compatible, scoped try-locks. */
   private async reserveIdentity(change: Readonly<RecordChange>, identity: string): Promise<void> {
-    if (this.reservedIdentities.has(identity)) return;
+    if (mapHas(this.reservedIdentities,identity)) return;
     for (let attempt = 0; attempt < 2; attempt++) {
       const result = await this.query(`SELECT reservation_state,original_collection_id FROM stateplane_try_reserve_receipt($1,$2,$3,$4,$5,$6)`,
         [this.#scope.spaceId,this.#scope.collectionId,this.#scope.credentialId,this.#scope.principalId,
           change.operation,change.idempotencyKey]);
       const row = result.rows[0];
       if (row?.reservation_state === 'reserved') {
-        this.reservedIdentities.set(identity,{operation:change.operation,key:change.idempotencyKey});
+        mapSet(this.reservedIdentities,identity,{operation:change.operation,key:change.idempotencyKey});
         return;
       }
       if (row?.reservation_state === 'pending' && scalarString(row.original_collection_id)) {
@@ -778,14 +788,14 @@ export class AuthorityTransaction {
       if (actual.operation !== 'delete') canonicalJsonObject(actual.canonicalData!);
       return actual;
     };
-    const pending = this.pendingReceipts.get(identity);
+    const pending = mapGet(this.pendingReceipts,identity);
     if (pending) {
       await this.authorizeOriginal(pending.collectionId);
       const actual=validated();
       if (pending.digest !== actual.requestDigest) throw new AuthorityError('IDEMPOTENCY_MISMATCH');
       return {replay:pendingReceiptWithExposure(pending.response, pending.exposure, true),change:actual};
     }
-    const joinedReplay = this.joinedReplays.get(identity);
+    const joinedReplay = mapGet(this.joinedReplays,identity);
     if (joinedReplay) {
       await this.authorizeOriginal(joinedReplay.collectionId);
       const actual=validated();
@@ -798,7 +808,7 @@ export class AuthorityTransaction {
       await this.authorizeOriginal(previous.collectionId);
       const actual=validated();
       if (previous.requestDigest !== actual.requestDigest) throw new AuthorityError('IDEMPOTENCY_MISMATCH');
-      this.joinedReplays.set(identity,{collectionId:previous.collectionId,digest:previous.requestDigest,response:previous.response});
+      mapSet(this.joinedReplays,identity,{collectionId:previous.collectionId,digest:previous.requestDigest,response:previous.response});
       return {replay:copyReceipt(previous.response, true),change:actual};
     }
     await this.query(`DELETE FROM idempotency_receipts WHERE space_id=$1 AND credential_id=$2
@@ -903,7 +913,7 @@ export class AuthorityTransaction {
       [eventId,...scopeIds(scope),recordId,revision,version.generation]);
     const exposure: ReceiptExposure = { committedAt:'', expiresAt:'' };
     const returned = pendingReceiptWithExposure(response, exposure);
-    this.pendingReceipts.set(identity, { response, exposure, retentionSeconds:this.retentionSeconds,
+    mapSet(this.pendingReceipts,identity, { response, exposure, retentionSeconds:this.retentionSeconds,
       digest:change.requestDigest, collectionId:scope.collectionId, key:change.idempotencyKey });
     return returned;
   }

@@ -149,6 +149,49 @@ test('altered iterators cannot commit an active mutation or omit its receipt',as
   }
 });
 
+test('altered Map methods cannot separate records from receipts or bypass replay',async()=>{
+  const {writer}=await fixture();
+  const original={set:Map.prototype.set,get:Map.prototype.get,has:Map.prototype.has,clear:Map.prototype.clear};
+  const facts=async()=>(await pool.query(`SELECT
+    (SELECT count(*)::int FROM records WHERE space_id=$1) AS records,
+    (SELECT count(*)::int FROM idempotency_receipts WHERE space_id=$1) AS receipts,
+    (SELECT count(*)::int FROM record_events WHERE space_id=$1) AS events,
+    (SELECT count(*)::int FROM projection_outbox WHERE space_id=$1) AS outbox`,[writer.spaceId])).rows[0];
+  try {
+    Map.prototype.set=function(){return this;};
+    const created=await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'map-create',data:{label:'map'}});
+    assert.ok(created.committedAt);
+    assert.deepEqual(await facts(),{records:1,receipts:1,events:1,outbox:1});
+    const replaced=await authority.mutateSerializedRequest(writer,JSON.stringify({operation:'replace',idempotencyKey:'map-replace',
+      id:created.ref.id,expectedRevision:1,data:{label:'map',score:1}}));
+    assert.equal(replaced.revision,2);
+    const patched=await authority.mutateRequest(writer,{operation:'patch',idempotencyKey:'map-patch',
+      id:created.ref.id,expectedRevision:2,set:{score:2},unset:[]});
+    assert.equal(patched.revision,3);
+    const deleted=await authority.mutateSerializedRequest(writer,JSON.stringify({operation:'delete',idempotencyKey:'map-delete',
+      id:created.ref.id,expectedRevision:3}));
+    assert.equal(deleted.revision,4);
+    assert.deepEqual(await facts(),{records:1,receipts:4,events:4,outbox:4});
+    await assert.rejects(authority.transaction(writer,async tx=>{
+      await tx.mutateRequest({operation:'create',idempotencyKey:'map-batch-good',data:{label:'batch-good'}});
+      await tx.mutateRequest({operation:'create',idempotencyKey:'map-batch-duplicate',data:{label:'batch-good'}});
+    }),{code:'UNIQUE_CONFLICT'});
+    assert.deepEqual(await facts(),{records:1,receipts:4,events:4,outbox:4},'failed batch rolls back every fact');
+    const pair=await authority.transaction(writer,async tx=>[
+      await tx.mutateRequest({operation:'create',idempotencyKey:'map-pair-a',data:{label:'pair-a'}}),
+      await tx.mutateRequest({operation:'create',idempotencyKey:'map-pair-b',data:{label:'pair-b'}})]);
+    assert.ok(pair.every(receipt=>receipt.committedAt));
+    assert.deepEqual(await facts(),{records:3,receipts:6,events:6,outbox:6});
+    Map.prototype.get=function(){return undefined;};
+    Map.prototype.has=function(){return false;};
+    Map.prototype.clear=function(){return this;};
+    const replay=await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'map-create',data:{label:'map'}});
+    assert.equal(replay.replayed,true);
+    assert.equal(replay.receiptId,created.receiptId);
+    assert.deepEqual(await facts(),{records:3,receipts:6,events:6,outbox:6});
+  } finally { Object.assign(Map.prototype,original); }
+});
+
 test('shared schema DAG expansion is bounded before canonical allocation',()=>{
   let child={type:'string'};
   for (let depth=0;depth<30;depth++) child={type:'object',additionalProperties:false,properties:{left:child,right:child}};
@@ -523,6 +566,31 @@ test('a partial backfill remains unavailable until a bounded final activation',a
   assert.deepEqual(final.map(result=>result.processed).sort((a,b)=>a-b),[0,remaining]);
   assert.ok(final.every(result=>result.ready));
   assert.equal(await authority.transaction(reader,tx=>tx.countRecords(predicate)),2);
+});
+
+test('backfill activates one valid index independently of an invalid pending sibling',async()=>{
+  const suffix=randomUUID(),spaceId=`sp_${suffix}`,collectionId=`entries_${suffix}`;
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
+  const owner={spaceId,collectionId,principalId:'owner',credentialId:'session',capability:'schema:write',policyVersion:1,placementGeneration:1};
+  const wide={...schema,properties:{...schema.properties,a:{type:'string'},b:{type:'string'}}};
+  await registry.define(owner,definition(collectionId,{schema:wide,unique:[],filterable:[]}));
+  const writer={...owner,capability:'records:write'},reader=read(owner);
+  await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'old-wide',data:{label:'one',a:'valid',b:randomBytes(300).toString('hex')}});
+  await registry.revise(owner,1,definition(collectionId,{version:2,schema:wide,unique:[],filterable:['a','b']}));
+  const a=[{field:'a',kind:'string',operator:'eq',value:'valid'}];
+  const b=[{field:'b',kind:'string',operator:'eq',value:'anything'}];
+  await assert.rejects(authority.transaction(reader,tx=>tx.countRecords(a)),{code:'SCHEMA_CONFLICT'});
+  assert.deepEqual(await registry.backfill(owner,'a'),{processed:1,ready:true});
+  assert.equal(await authority.transaction(reader,tx=>tx.countRecords(a)),1);
+  await assert.rejects(registry.backfill(owner,'b'),{code:'SCHEMA_INVALID'});
+  await assert.rejects(authority.transaction(reader,tx=>tx.countRecords(b)),{code:'SCHEMA_CONFLICT'});
+  const declarations=await pool.query(`SELECT field_name,ready,backfill_after FROM collection_index_declarations
+    WHERE space_id=$1 AND collection_id=$2 AND field_name IN ('a','b') ORDER BY field_name`,[spaceId,collectionId]);
+  assert.equal(declarations.rows[0].field_name,'a');
+  assert.equal(declarations.rows[0].ready,true);
+  assert.ok(declarations.rows[0].backfill_after);
+  assert.deepEqual(declarations.rows[1],{field_name:'b',ready:false,backfill_after:null});
 });
 
 test('oversized merged patch rolls back record, reservation, event, receipt and outbox',async()=>{
