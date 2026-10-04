@@ -1,0 +1,16 @@
+packages/postgres/src/schema.ts
+  h_a39f9495f9ec1d 364-365
+test/integration/collections.test.js
+  h_a39f9495f9ec1d 187-210,637-682
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7f152a30199d84ec2bbdaaba924180bee9e037bd",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
