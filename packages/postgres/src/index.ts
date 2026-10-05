@@ -46,34 +46,48 @@ export interface OutboxDelivery {
 }
 export type ScalarPredicate =
   | { field: string; kind: 'null'; operator: 'isNull' }
-  | { field: string; kind: 'string' | 'date-time' | 'number' | 'boolean'; operator: 'eq' | 'lt' | 'lte' | 'gt' | 'gte'; value: string | number | boolean };
+  | { field: string; kind: 'string' | 'date-time' | 'number' | 'boolean'; operator: 'eq' | 'lt' | 'lte' | 'gt' | 'gte'; value: string | number | boolean }
+  | { field: string; kind: 'string' | 'date-time' | 'number' | 'boolean'; operator: 'in'; value: readonly (string | number | boolean)[] };
 export interface RecordSort { field: string; direction: 'asc' | 'desc' }
 export interface RecordPage { records: AuthorityRecord[]; nextCursor: string | null; schemaVersion: number }
 export interface BatchItemStatus { ordinal:number; state:'pending'|'failed'|'succeeded'; attempts:number; receipt:Receipt|null; failureCode:string|null }
 export interface BatchProgress { operationKey:string; state:'active'|'cancelled'; items:BatchItemStatus[] }
 interface PageCursor {
   space: string; collection: string; principal: string; credential: string;
-  policy: number; placement: number; schema: number; query: string;
-  id: string; value: string | number | boolean | null;
+  policy: number; placement: number; schema: number; query: string; expiresAt: number;
+  id: string; rank: 0 | 1 | 2; value: string | number | boolean | null;
 }
 
 /** Compile one typed comparison after checking its scalar parameter. */
 function comparison(predicate: Exclude<ScalarPredicate, { kind: 'null' }>, alias: string, params: unknown[]): string {
   const column = { string:'string_value','date-time':'time_value',number:'number_value',boolean:'boolean_value' }[predicate.kind];
+  if (predicate.operator==='in') {
+    if (!Array.isArray(predicate.value) || predicate.value.length<1 || predicate.value.length>16 ||
+      predicate.value.some(value=>!validPredicateValue(predicate.kind,value))) throw new AuthorityError('INVALID_ARGUMENT');
+    params.push(predicate.value);
+    const arrayType=predicate.kind==='number' ? 'numeric' : predicate.kind==='boolean' ? 'boolean' : 'text';
+    if (predicate.kind==='date-time') return ` AND EXISTS (SELECT 1 FROM unnest($${params.length}::text[]) AS choice(value)
+      WHERE stateplane_instant_sort_key(${alias}.${column}) COLLATE "C" = stateplane_instant_sort_key(choice.value) COLLATE "C")`;
+    return ` AND ${alias}.${column} = ANY($${params.length}::${arrayType}[])`;
+  }
   const operator = { eq:'=',lt:'<',lte:'<=',gt:'>',gte:'>=' }[predicate.operator];
   if (!operator) throw new AuthorityError('INVALID_ARGUMENT');
-  if ((predicate.kind === 'number' && (typeof predicate.value !== 'number' || !isFiniteNumber(predicate.value)))
-    || (predicate.kind === 'boolean' && typeof predicate.value !== 'boolean')
-    || (predicate.kind === 'string' && (!valueString(predicate.value) || Buffer.byteLength(predicate.value)>MAX_INDEX_VALUE_BYTES))
-    || (predicate.kind === 'date-time' && (!scalarString(predicate.value) || Buffer.byteLength(predicate.value)>MAX_INDEX_VALUE_BYTES))) throw new AuthorityError('INVALID_ARGUMENT');
-  if (predicate.kind==='date-time') {
-    try { utcInstant(predicate.value as string); } catch { throw new AuthorityError('INVALID_ARGUMENT'); }
-  }
+  if (!validPredicateValue(predicate.kind,predicate.value)) throw new AuthorityError('INVALID_ARGUMENT');
   params.push(predicate.value);
   if (predicate.kind === 'date-time') {
     return ` AND stateplane_instant_sort_key(${alias}.${column}) COLLATE "C" ${operator} stateplane_instant_sort_key($${params.length}::text) COLLATE "C"`;
   }
   return ` AND ${alias}.${column} ${operator} $${params.length}`;
+}
+function validPredicateValue(kind:string,value:unknown):boolean {
+  if (kind==='number') return typeof value==='number' && isFiniteNumber(value);
+  if (kind==='boolean') return typeof value==='boolean';
+  if (kind==='string') return valueString(value) && Buffer.byteLength(value)<=MAX_INDEX_VALUE_BYTES;
+  if (kind==='date-time') {
+    if (!scalarString(value) || Buffer.byteLength(value)>MAX_INDEX_VALUE_BYTES) return false;
+    try { utcInstant(value); return true; } catch { return false; }
+  }
+  return false;
 }
 
 export class AuthorityError extends Error {
@@ -420,6 +434,19 @@ function snapshotPredicate(item:unknown,trustedParsed=false):ScalarPredicate {
       throw new AuthorityError('INVALID_ARGUMENT');
   }
   if (kind==='null') return Object.freeze({field,kind,operator}) as ScalarPredicate;
+  if (operator==='in') {
+    if (!Array.isArray(value) || (!trustedParsed && isInProcessProxy(value)) ||
+      Object.getPrototypeOf(value)!==Array.prototype || value.length<1 || value.length>16 ||
+      Reflect.ownKeys(value).length!==value.length+1) throw new AuthorityError('INVALID_ARGUMENT');
+    const values:(string|number|boolean)[]=[];
+    for (let i=0;i<value.length;i++) {
+      const descriptor=Object.getOwnPropertyDescriptor(value,i);
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor,'value') || !validPredicateValue(kind,descriptor.value))
+        throw new AuthorityError('INVALID_ARGUMENT');
+      append(values,descriptor.value);
+    }
+    return Object.freeze({field,kind,operator,value:Object.freeze(values)}) as ScalarPredicate;
+  }
   return Object.freeze({field,kind,operator,value}) as ScalarPredicate;
 }
 /** Match a declared index using only trusted own result-array slots. */
@@ -436,8 +463,12 @@ function snapshotSort(input: RecordSort | undefined,trustedParsed=false): Record
     (Object.getPrototypeOf(input)!==Object.prototype && Object.getPrototypeOf(input)!==null) ||
     Reflect.ownKeys(input).length!==2 || !Object.hasOwn(input,'field') || !Object.hasOwn(input,'direction'))
     throw new AuthorityError('INVALID_ARGUMENT');
-  const field=Object.getOwnPropertyDescriptor(input,'field')?.value;
-  const direction=Object.getOwnPropertyDescriptor(input,'direction')?.value;
+  const fieldDescriptor=Object.getOwnPropertyDescriptor(input,'field');
+  const directionDescriptor=Object.getOwnPropertyDescriptor(input,'direction');
+  if (!fieldDescriptor?.enumerable || !Object.hasOwn(fieldDescriptor,'value') ||
+    !directionDescriptor?.enumerable || !Object.hasOwn(directionDescriptor,'value')) throw new AuthorityError('INVALID_ARGUMENT');
+  const field=fieldDescriptor.value;
+  const direction=directionDescriptor.value;
   if (!scalarString(field) || !field || Buffer.byteLength(field)>MAX_INDEX_PART_BYTES ||
     !arrayHas(['asc','desc'],direction)) throw new AuthorityError('INVALID_ARGUMENT');
   return Object.freeze({field,direction});
@@ -453,19 +484,21 @@ function signCursor(cursor:PageCursor, secret:Uint8Array):string {
 }
 function decodeCursor(token:string, secret:Uint8Array):PageCursor {
   if (typeof token!=='string' || token.length>4096 || !/^[A-Za-z0-9_-]+$/.test(token))
-    throw new AuthorityError('INVALID_CURSOR');
+    throw new AuthorityError('CURSOR_INVALID');
   try {
     const bytes=Buffer.from(token,'base64url');
-    if (bytes.length<29) throw new Error('size');
+    if (bytes.length<29 || bytes.toString('base64url')!==token) throw new Error('wire');
     const decipher=createDecipheriv('aes-256-gcm',createHash('sha256').update(secret).digest(),bytes.subarray(0,12));
     decipher.setAuthTag(bytes.subarray(bytes.length-16));
     const plain=Buffer.concat([decipher.update(bytes.subarray(12,bytes.length-16)),decipher.final()]);
     const cursor=JSON.parse(plain.toString('utf8')) as PageCursor;
     if (!cursor || typeof cursor!=='object' || typeof cursor.id!=='string' || !cursor.id ||
       typeof cursor.query!=='string' || !/^[0-9a-f]{64}$/.test(cursor.query) ||
+      !Number.isSafeInteger(cursor.expiresAt) || cursor.expiresAt<=Date.now() ||
+      !arrayHas([0,1,2],cursor.rank) ||
       !(cursor.value===null || ['string','number','boolean'].includes(typeof cursor.value))) throw new Error('shape');
     return cursor;
-  } catch { throw new AuthorityError('INVALID_CURSOR'); }
+  } catch { throw new AuthorityError('CURSOR_INVALID'); }
 }
 
 export class PostgresAuthority {
@@ -478,11 +511,20 @@ export class PostgresAuthority {
   }
 
   /** Callback side effects are never retried. A COMMIT failure is deliberately ambiguous. */
-  async transaction<T>(scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T>): Promise<T> {
+  async transaction<T>(scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T>, deadlineMs?: number): Promise<T> {
     // Capture the authenticated identity before waiting for a pooled connection.
     const fixedScope = Object.freeze({ ...scope });
     if (!validScope(fixedScope)) throw new AuthorityError('INVALID_ARGUMENT');
-    const client = await this.pool.connect();
+    const client = deadlineMs===undefined ? await this.pool.connect() : await new Promise<Client>((resolve,reject)=>{
+      const remaining=deadlineMs-Date.now();
+      if (remaining<=0) { reject(new AuthorityError('RATE_LIMITED','Request time budget exceeded')); return; }
+      let expired=false;
+      const timer=setTimeout(()=>{ expired=true; reject(new AuthorityError('RATE_LIMITED','Request time budget exceeded')); },remaining);
+      this.pool.connect().then(connected=>{
+        clearTimeout(timer);
+        if (expired) connected.release(); else resolve(connected);
+      },error=>{ clearTimeout(timer); if (!expired) reject(error); });
+    });
     let begun = false;
     let beginAttempted = false;
     let discard = false;
@@ -490,7 +532,7 @@ export class PostgresAuthority {
     try {
       beginAttempted = true;
       await client.query('BEGIN'); begun = true;
-      tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds, undefined, this.cursorSecret);
+      tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds, undefined, this.cursorSecret, deadlineMs);
       await tx.checkScope();
       const result = await fn(tx);
       tx.sealMutations();
@@ -620,22 +662,23 @@ export class PostgresAuthority {
       append(fixed,item);
     }
     const digest=createHash('sha256').update(JSON.stringify(fixed)).digest('hex');
-    await this.transaction(scope,tx=>tx.startBatch(operationKey,digest,fixed));
     const deadline=Date.now()+30_000;
+    await this.transaction(scope,tx=>tx.startBatch(operationKey,digest,fixed),deadline);
     for (let ordinal=0;ordinal<fixed.length;ordinal++) {
-      if (Date.now()>=deadline) break;
-      try { await this.transaction(scope,tx=>tx.processBatchItem(operationKey,ordinal,retryFailed)); }
+      const remaining=deadline-Date.now();
+      if (remaining<=0) break;
+      try { await this.transaction(scope,tx=>tx.processBatchItem(operationKey,ordinal,retryFailed,remaining),deadline); }
       catch (error) {
         if (error instanceof AuthorityError && error.code==='BATCH_CANCELLED') break;
         if (error instanceof BatchItemFailure) {
-          try { await this.transaction(scope,tx=>tx.failBatchItem(operationKey,ordinal,error.code)); }
+          try { await this.transaction(scope,tx=>tx.failBatchItem(operationKey,ordinal,error.code),deadline); }
           catch (failure) { if (failure instanceof AuthorityError && failure.code==='BATCH_CANCELLED') break; throw failure; }
           continue;
         }
         throw error;
       }
     }
-    return this.batchProgress(scope,operationKey);
+    return this.transaction(scope,tx=>tx.batchProgress(operationKey),deadline);
   }
 
   batchProgress(scope:AuthorityScope,operationKey:string):Promise<BatchProgress> {
@@ -660,13 +703,15 @@ export class AuthorityTransaction {
   private admittingMutations = true;
   private readonly replayCollections = new Set<CollectionId>();
   private readonly batchReceiptIds = new Set<string>();
+  private requestDeadlineMs: number | undefined;
   readonly #scope: Readonly<AuthorityScope>;
   /** Expose the frozen scope used by every operation in this transaction. */
   get scope(): Readonly<AuthorityScope> { return this.#scope; }
   /** Join an authorized client and optionally share pending receipt state. */
   constructor(private readonly client: Client, scope: AuthorityScope, private readonly retentionSeconds: number,
-    joinedReceipts?: JoinedReceiptState, private readonly cursorSecret?: Uint8Array) {
+    joinedReceipts?: JoinedReceiptState, private readonly cursorSecret?: Uint8Array, deadlineMs?: number) {
     this.#scope = Object.freeze({ ...scope });
+    this.requestDeadlineMs = deadlineMs;
     this.pendingReceipts = joinedReceipts?.pending ?? new Map();
     this.joinedReplays = joinedReceipts?.replayed ?? new Map();
     this.readyReceipts = joinedReceipts?.ready ?? [];
@@ -695,9 +740,21 @@ export class AuthorityTransaction {
     return running;
   }
   /** Deny SQL after transaction-local authority state has closed. */
-  private query(sql: string, values: unknown[] = []) {
+  private async query(sql: string, values: unknown[] = []) {
     if (!this.active) throw new AuthorityError('INVALID_ARGUMENT', 'Transaction ended');
+    if (this.requestDeadlineMs!==undefined) {
+      const remaining=this.requestDeadlineMs-Date.now();
+      if (remaining<=0) throw new AuthorityError('RATE_LIMITED','Request time budget exceeded');
+      await this.client.query(`SET LOCAL statement_timeout = '${Math.max(1,Math.min(15_000,Math.trunc(remaining)))}ms'`);
+    }
     return this.client.query(sql, values);
+  }
+
+  private limitBatchTime(milliseconds:number):void {
+    if (!Number.isSafeInteger(milliseconds) || milliseconds<1 || milliseconds>30_000)
+      throw new AuthorityError('INVALID_ARGUMENT');
+    const until=Date.now()+milliseconds;
+    this.requestDeadlineMs=this.requestDeadlineMs===undefined ? until : Math.min(this.requestDeadlineMs,until);
   }
 
   private batchKey(operationKey:string,allowRead=false):unknown[] {
@@ -711,6 +768,7 @@ export class AuthorityTransaction {
   startBatch(operationKey:string,digest:string,requests:readonly string[]):Promise<void> {
     return this.admitOperation(async()=>{
       const key=this.batchKey(operationKey);
+      this.limitBatchTime(15_000);
       await this.query("SET LOCAL lock_timeout = '100ms'");
       await this.query("SET LOCAL statement_timeout = '15000ms'");
       try {
@@ -728,11 +786,12 @@ export class AuthorityTransaction {
     },true);
   }
 
-  processBatchItem(operationKey:string,ordinal:number,retryFailed:boolean):Promise<void> {
+  processBatchItem(operationKey:string,ordinal:number,retryFailed:boolean,remainingMs=15_000):Promise<void> {
     return this.admitOperation(async()=>{
       const key=this.batchKey(operationKey);
+      this.limitBatchTime(Math.min(15_000,remainingMs));
       await this.query("SET LOCAL lock_timeout = '100ms'");
-      await this.query("SET LOCAL statement_timeout = '15000ms'");
+      await this.query(`SET LOCAL statement_timeout = '${Math.max(1,Math.min(15_000,Math.trunc(remainingMs)))}ms'`);
       try {
         const batch=(await this.query(`SELECT state FROM batch_operations WHERE space_id=$1 AND collection_id=$2
           AND credential_id=$3 AND operation_key=$4 FOR UPDATE`,key)).rows[0];
@@ -770,6 +829,7 @@ export class AuthorityTransaction {
   failBatchItem(operationKey:string,ordinal:number,code:string):Promise<void> {
     return this.admitOperation(async()=>{
       const key=this.batchKey(operationKey);
+      this.limitBatchTime(5_000);
       const result=await this.query(`UPDATE batch_items SET state='failed',failure_code=$6,attempts=attempts+1
         WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 AND operation_key=$4 AND ordinal=$5
           AND state<>'succeeded' AND EXISTS (SELECT 1 FROM batch_operations b
@@ -782,15 +842,21 @@ export class AuthorityTransaction {
   cancelBatch(operationKey:string):Promise<void> {
     return this.admitOperation(async()=>{
       const key=this.batchKey(operationKey);
-      const result=await this.query(`UPDATE batch_operations SET state='cancelled'
-        WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 AND operation_key=$4`,key);
-      if (!result.rowCount) throw new AuthorityError('NOT_FOUND');
+      this.limitBatchTime(5_000);
+      await this.query("SET LOCAL lock_timeout = '100ms'");
+      await this.query("SET LOCAL statement_timeout = '5000ms'");
+      try {
+        const result=await this.query(`UPDATE batch_operations SET state='cancelled'
+          WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 AND operation_key=$4`,key);
+        if (!result.rowCount) throw new AuthorityError('NOT_FOUND');
+      } catch(error) { if ((error as {code?:string}).code==='55P03') throw new AuthorityError('BACKPRESSURE'); throw error; }
     },true);
   }
 
   batchProgress(operationKey:string):Promise<BatchProgress> {
     return this.admitOperation(async()=>{
       const key=this.batchKey(operationKey,true);
+      this.limitBatchTime(5_000);
       const rows=await this.query(`SELECT b.state AS batch_state,i.ordinal,i.state,i.attempts,i.failure_code,i.receipt
         FROM batch_operations b JOIN batch_items i USING(space_id,collection_id,credential_id,operation_key)
         WHERE b.space_id=$1 AND b.collection_id=$2 AND b.credential_id=$3 AND b.operation_key=$4 ORDER BY i.ordinal`,key);
@@ -1413,7 +1479,9 @@ export class AuthorityTransaction {
       if (parsed && (parsed.space!==scope.spaceId || parsed.collection!==scope.collectionId ||
         parsed.principal!==scope.principalId || parsed.credential!==scope.credentialId ||
         parsed.policy!==scope.policyVersion || parsed.placement!==scope.placementGeneration ||
-        parsed.schema!==schemaVersion || parsed.query!==query)) throw new AuthorityError('INVALID_CURSOR');
+        parsed.schema!==schemaVersion || parsed.query!==query ||
+        (!fixedSort && parsed.rank!==2) ||
+        (parsed.rank===2 ? parsed.value===null : parsed.value!==null))) throw new AuthorityError('CURSOR_INVALID');
       let expr='r.created_at',sortFieldParam='';
       const direction=fixedSort?.direction==='desc' ? 'DESC' : 'ASC';
       if (fixedSort) {
@@ -1422,62 +1490,77 @@ export class AuthorityTransaction {
         expr=kind==='date-time' ? 'stateplane_instant_sort_key(sv.time_value) COLLATE "C"' :
           `sv.${{string:'string_value',number:'number_value',boolean:'boolean_value'}[kind!]}`;
       }
-      let after='',presentAfter='',missingAfter='';
+      let after='',presentAfter='',nullAfter='',missingAfter='';
       if (parsed) {
         params.push(parsed.id);
         const idParam=`$${params.length}`;
-        if (parsed.value===null) {
-          after=` AND ${expr} IS NULL AND r.record_id>${idParam}`;
-          presentAfter=' AND FALSE';
-          missingAfter=` AND r.record_id>${idParam}`;
-        }
-        else {
+        if (fixedSort) {
+          const afterRank=(rank:0|1|2):string=>{
+            if (rank===parsed.rank) return ` AND r.record_id>${idParam}`;
+            return (direction==='ASC' ? rank>parsed.rank : rank<parsed.rank) ? '' : ' AND FALSE';
+          };
+          missingAfter=afterRank(0);
+          nullAfter=afterRank(1);
+          if (parsed.rank===2) {
+            params.push(parsed.value);
+            const valueParam=`$${params.length}${kind==='number' ? '::numeric' : kind==='boolean' ? '::boolean' : '::text'}`;
+            const operator=direction==='ASC' ? '>' : '<';
+            presentAfter=` AND (${expr} ${operator} ${valueParam} OR (${expr}=${valueParam} AND r.record_id>${idParam}))`;
+          } else presentAfter=afterRank(2);
+        } else {
           params.push(parsed.value);
-          const valueParam=`$${params.length}${fixedSort ? (kind==='number' ? '::numeric' : kind==='boolean' ? '::boolean' : '::text') : '::timestamptz'}`;
-          const operator=direction==='ASC' ? '>' : '<';
-          after=` AND (${expr} ${operator} ${valueParam} OR (${expr}=${valueParam} AND r.record_id>${idParam})${fixedSort ? ` OR ${expr} IS NULL` : ''})`;
-          presentAfter=` AND (${expr} ${operator} ${valueParam} OR (${expr}=${valueParam} AND r.record_id>${idParam}))`;
+          const valueParam=`$${params.length}::timestamptz`;
+          after=` AND (${expr}>${valueParam} OR (${expr}=${valueParam} AND r.record_id>${idParam}))`;
         }
       }
       await this.query(`SET LOCAL statement_timeout = '${QUERY_TIMEOUT_MS}ms'`);
       params.push(limit+1,limit,MAX_PAGE_BYTES);
       const candidateLimit=`$${params.length-2}`,pageLimit=`$${params.length-1}`,byteLimit=`$${params.length}`;
+      const sortedOrder=`sort_rank ${direction},sort_value ${direction} NULLS LAST,record_id ASC`;
+      const nullValueType=kind==='number' ? 'numeric' : kind==='boolean' ? 'boolean' : 'text';
       const candidates=fixedSort ? `WITH present AS MATERIALIZED (
-          SELECT r.record_id,${expr} AS sort_value,${expr} AS sort_cursor,octet_length(r.canonical_data) AS bytes
+          SELECT r.record_id,2 AS sort_rank,${expr} AS sort_value,${expr} AS sort_cursor,octet_length(r.canonical_data) AS bytes
           FROM record_index_values sv JOIN records r ON r.space_id=sv.space_id AND r.collection_id=sv.collection_id
             AND r.record_id=sv.record_id
           WHERE ${where} AND sv.field_name=${sortFieldParam} AND sv.value_kind='${kind}'${presentAfter}
           ORDER BY ${expr} ${direction},r.record_id LIMIT ${candidateLimit}
+        ), explicit_null AS MATERIALIZED (
+          SELECT r.record_id,1 AS sort_rank,NULL::${nullValueType} AS sort_value,NULL::${nullValueType} AS sort_cursor,
+            octet_length(r.canonical_data) AS bytes
+          FROM record_index_values sv JOIN records r ON r.space_id=sv.space_id AND r.collection_id=sv.collection_id
+            AND r.record_id=sv.record_id
+          WHERE ${where} AND sv.field_name=${sortFieldParam} AND sv.value_kind='null'${nullAfter}
+          ORDER BY r.record_id LIMIT ${candidateLimit}
         ), missing AS MATERIALIZED (
-          SELECT r.record_id,NULL::${kind==='number' ? 'numeric' : kind==='boolean' ? 'boolean' : 'text'} AS sort_value,
-            NULL::${kind==='number' ? 'numeric' : kind==='boolean' ? 'boolean' : 'text'} AS sort_cursor,
+          SELECT r.record_id,0 AS sort_rank,NULL::${nullValueType} AS sort_value,
+            NULL::${nullValueType} AS sort_cursor,
             octet_length(r.canonical_data) AS bytes
           FROM records r WHERE ${where} AND NOT EXISTS (
             SELECT 1 FROM record_index_values sv2 WHERE sv2.space_id=r.space_id AND sv2.collection_id=r.collection_id
-              AND sv2.record_id=r.record_id AND sv2.field_name=${sortFieldParam} AND sv2.value_kind='${kind}'
-          )${missingAfter} AND (SELECT count(*) FROM present)<${candidateLimit}
+              AND sv2.record_id=r.record_id AND sv2.field_name=${sortFieldParam}
+          )${missingAfter}
           ORDER BY r.record_id LIMIT ${candidateLimit}
         ), candidates AS MATERIALIZED (
-          SELECT * FROM present UNION ALL SELECT * FROM missing
-          ORDER BY sort_value ${direction} NULLS LAST,record_id LIMIT ${candidateLimit}
+          SELECT * FROM present UNION ALL SELECT * FROM explicit_null UNION ALL SELECT * FROM missing
+          ORDER BY ${sortedOrder} LIMIT ${candidateLimit}
         )` : `WITH candidates AS MATERIALIZED (
-          SELECT r.record_id,${expr} AS sort_value,
+          SELECT r.record_id,2 AS sort_rank,${expr} AS sort_value,
             r.created_at::text AS sort_cursor,
             octet_length(r.canonical_data) AS bytes
           FROM records r WHERE ${where}${after}
           ORDER BY ${expr} ${direction} NULLS LAST,r.record_id ASC LIMIT ${candidateLimit}
         )`;
       const result=await this.query(`${candidates}, ranked AS MATERIALIZED (
-          SELECT c.*,row_number() OVER (ORDER BY c.sort_value ${direction} NULLS LAST,c.record_id) AS position,
-            sum(c.bytes) OVER (ORDER BY c.sort_value ${direction} NULLS LAST,c.record_id) AS consumed
+          SELECT c.*,row_number() OVER (ORDER BY c.sort_rank ${direction},c.sort_value ${direction} NULLS LAST,c.record_id) AS position,
+            sum(c.bytes) OVER (ORDER BY c.sort_rank ${direction},c.sort_value ${direction} NULLS LAST,c.record_id) AS consumed
           FROM candidates c
         ), chosen AS MATERIALIZED (
           SELECT * FROM ranked WHERE position<=${pageLimit} AND consumed<=${byteLimit}
         )
         SELECT r.record_id,r.revision,r.schema_version,r.canonical_data,r.key_mode,r.normalized_key,r.tombstone,
-          c.sort_value,c.sort_cursor,(SELECT EXISTS(SELECT 1 FROM ranked k WHERE k.position>${pageLimit} OR k.consumed>${byteLimit})) AS more
+          c.sort_rank,c.sort_value,c.sort_cursor,(SELECT EXISTS(SELECT 1 FROM ranked k WHERE k.position>${pageLimit} OR k.consumed>${byteLimit})) AS more
         FROM chosen c JOIN records r ON r.space_id=$1 AND r.collection_id=$2 AND r.record_id=c.record_id
-        ORDER BY c.sort_value ${direction} NULLS LAST,c.record_id`,params);
+        ORDER BY c.sort_rank ${direction},c.sort_value ${direction} NULLS LAST,c.record_id`,params);
       const records:AuthorityRecord[]=result.rows.map(row=>({ref:this.ref(row.record_id),revision:Number(row.revision),
         schemaVersion:Number(row.schema_version),canonicalData:row.canonical_data,keyMode:row.key_mode,
         normalizedKey:row.normalized_key,tombstone:row.tombstone}));
@@ -1485,7 +1568,8 @@ export class AuthorityTransaction {
       const more=Boolean(last?.more);
       return {records,schemaVersion,nextCursor:more && last ? signCursor({space:scope.spaceId,collection:scope.collectionId,
         principal:scope.principalId,credential:scope.credentialId,policy:scope.policyVersion,
-        placement:scope.placementGeneration,schema:schemaVersion,query,id:last.record_id,
+        placement:scope.placementGeneration,schema:schemaVersion,query,expiresAt:Date.now()+15*60_000,
+        id:last.record_id,rank:last.sort_rank,
         value:last.sort_cursor},this.cursorSecret) : null};
     });
   }

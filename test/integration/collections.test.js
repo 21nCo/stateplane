@@ -79,6 +79,15 @@ test('definition subset, additive revisions and normalization have explicit fail
     schema:{...schema,properties:{...schema.properties,...indexed}},
     filterable:Object.keys(indexed)
   })),{code:'SCHEMA_UNSUPPORTED'});
+  const uniqueFields=Object.fromEntries(Array.from({length:17},(_,i)=>[`unique${i}`,{type:'string'}]));
+  assert.throws(()=>validateDefinition(definition('too-many-unique-fields',{
+    schema:{...schema,properties:{...schema.properties,...uniqueFields}},
+    unique:Object.keys(uniqueFields).map((field,i)=>({name:`u${i}`,paths:[field]})),filterable:[]
+  })),{code:'SCHEMA_UNSUPPORTED'});
+  assert.throws(()=>validateDefinition(definition('too-many-total-indexed-fields',{
+    schema:{...schema,properties:{...schema.properties,...uniqueFields}},
+    unique:[{name:'one',paths:['unique0']}],filterable:Object.keys(uniqueFields).slice(1)
+  })),{code:'SCHEMA_UNSUPPORTED'});
   const next=definition('generic',{version:2,schema:{...schema,properties:{...schema.properties,note:{type:'string',description:'optional'}}}});
   assert.doesNotThrow(()=>compatible(d,next));
   assert.throws(()=>compatible(d,{...next,schema:{...next.schema,required:['label','note']}}),{code:'SCHEMA_BREAKING'});
@@ -1461,31 +1470,135 @@ test('signed pages bind scope, query and schema; mutable sorts expose live trave
     created.push(await authority.mutateRequest(writer,{operation:'create',idempotencyKey:`page-${i}`,data:{label:`page-${i}`,score}}));
   await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'page-missing',data:{label:'page-missing'}});
   const reader=read(writer),sort={field:'score',direction:'asc'};
-  const descending=await paged.transaction(reader,tx=>tx.queryPage([],3,{field:'score',direction:'desc'}));
+  for (const malformed of [
+    Object.defineProperty({direction:'asc'},'field',{value:'score',enumerable:false}),
+    Object.defineProperty({field:'score'},'direction',{value:'asc',enumerable:false})
+  ]) await assert.rejects(paged.transaction(reader,tx=>tx.queryPage([],1,malformed)),{code:'INVALID_ARGUMENT'});
+  const positive=[{field:'score',kind:'number',operator:'gte',value:0}];
+  const descending=await paged.transaction(reader,tx=>tx.queryPage(positive,3,{field:'score',direction:'desc'}));
   assert.deepEqual(descending.records.map(row=>JSON.parse(row.canonicalData).score),[3,2,1]);
-  const first=await paged.transaction(reader,tx=>tx.queryPage([],1,sort));
+  const first=await paged.transaction(reader,tx=>tx.queryPage(positive,1,sort));
   assert.equal(first.records.length,1);
   assert.equal(JSON.parse(first.records[0].canonicalData).score,1);
   assert.ok(first.nextCursor);
-  await assert.rejects(paged.transaction(read(owner),tx=>tx.queryPage([],1,sort,first.nextCursor)),{code:'INVALID_CURSOR'});
-  await assert.rejects(paged.transaction({...reader,spaceId:'another-space'},tx=>tx.queryPage([],1,sort,first.nextCursor)),{code:'NOT_FOUND'});
+  await assert.rejects(paged.transaction(read(owner),tx=>tx.queryPage(positive,1,sort,first.nextCursor)),{code:'CURSOR_INVALID'});
+  await assert.rejects(paged.transaction({...reader,spaceId:'another-space'},tx=>tx.queryPage(positive,1,sort,first.nextCursor)),{code:'NOT_FOUND'});
   const other=await fixture();
   await registry.revise(other.owner,1,definition(other.owner.collectionId,{version:2,sortable:['score']}));
   await registry.backfill(other.owner,'score');
-  await assert.rejects(paged.transaction(read(other.writer),tx=>tx.queryPage([],1,sort,first.nextCursor)),{code:'INVALID_CURSOR'});
-  await assert.rejects(paged.transaction(reader,tx=>tx.queryPage([{field:'score',kind:'number',operator:'gt',value:0}],1,sort,first.nextCursor)),{code:'INVALID_CURSOR'});
-  await assert.rejects(paged.transaction(reader,tx=>tx.queryPage([],1,sort,`${first.nextCursor[0]==='A' ? 'B' : 'A'}${first.nextCursor.slice(1)}`)),{code:'INVALID_CURSOR'});
+  await assert.rejects(paged.transaction(read(other.writer),tx=>tx.queryPage(positive,1,sort,first.nextCursor)),{code:'CURSOR_INVALID'});
+  await assert.rejects(paged.transaction(reader,tx=>tx.queryPage([{field:'score',kind:'number',operator:'gt',value:0}],1,sort,first.nextCursor)),{code:'CURSOR_INVALID'});
+  await assert.rejects(paged.transaction(reader,tx=>tx.queryPage(positive,1,sort,`${first.nextCursor[0]==='A' ? 'B' : 'A'}${first.nextCursor.slice(1)}`)),{code:'CURSOR_INVALID'});
   await authority.mutateRequest(writer,{operation:'replace',idempotencyKey:'move-before',id:created[1].ref.id,
     expectedRevision:1,data:{label:'page-1',score:0}});
-  const second=await paged.transaction(reader,tx=>tx.queryPage([],1,sort,first.nextCursor));
+  const second=await paged.transaction(reader,tx=>tx.queryPage(positive,1,sort,first.nextCursor));
   assert.equal(JSON.parse(second.records[0].canonicalData).score,3);
-  const last=await paged.transaction(reader,tx=>tx.queryPage([],1,sort,second.nextCursor));
-  assert.equal(JSON.parse(last.records[0].canonicalData).label,'page-missing');
-  assert.equal(last.nextCursor,null);
+  assert.equal(second.nextCursor,null);
   assert.equal(await paged.transaction(reader,tx=>tx.countRecords([])),4);
   assert.equal(await paged.transaction(reader,tx=>tx.existsRecord([{field:'score',kind:'number',operator:'eq',value:0}])),true);
   await registry.revise(owner,2,definition(owner.collectionId,{version:3,sortable:['score']}));
-  await assert.rejects(paged.transaction(reader,tx=>tx.queryPage([],1,sort,first.nextCursor)),{code:'INVALID_CURSOR'});
+  await assert.rejects(paged.transaction(reader,tx=>tx.queryPage(positive,1,sort,first.nextCursor)),{code:'CURSOR_INVALID'});
+  await pool.query('UPDATE spaces SET policy_version=2 WHERE space_id=$1',[owner.spaceId]);
+  const afterPolicy={...reader,policyVersion:2};
+  await assert.rejects(paged.transaction(afterPolicy,tx=>tx.queryPage(positive,1,sort,first.nextCursor)),{code:'CURSOR_INVALID'});
+  const fresh=await paged.transaction(afterPolicy,tx=>tx.queryPage(positive,1,sort));
+  assert.ok(fresh.nextCursor);
+  await pool.query('UPDATE spaces SET placement_generation=2 WHERE space_id=$1',[owner.spaceId]);
+  await assert.rejects(paged.transaction({...afterPolicy,placementGeneration:2},tx=>
+    tx.queryPage(positive,1,sort,fresh.nextCursor)),{code:'CURSOR_INVALID'});
+});
+
+test('explicit sort pages preserve missing, null and value ranks in both directions',async()=>{
+  const {owner,writer}=await fixture();
+  await registry.revise(owner,1,definition(owner.collectionId,{version:2,sortable:['score']}));
+  await registry.backfill(owner,'score');
+  const values=[undefined,null,2,1,null,undefined,1];
+  const ids=[];
+  for (let i=0;i<values.length;i++) ids.push((await authority.mutateRequest(writer,{operation:'create',
+    idempotencyKey:`rank-${i}`,data:{label:`rank-${i}`,...(values[i]===undefined ? {} : {score:values[i]})}})).ref.id);
+  const paged=new PostgresAuthority(pool,3600,randomBytes(32)),reader=read(writer);
+  for (const direction of ['asc','desc']) {
+    const seen=[];
+    let cursor;
+    do {
+      const page=await paged.transaction(reader,tx=>tx.queryPage([],1,{field:'score',direction},cursor));
+      assert.equal(page.records.length,1);
+      seen.push(JSON.parse(page.records[0].canonicalData).label);
+      cursor=page.nextCursor;
+    } while(cursor);
+    const expected=direction==='asc'
+      ? [['rank-0','rank-5'],['rank-1','rank-4'],['rank-3','rank-6'],['rank-2']]
+      : [['rank-2'],['rank-3','rank-6'],['rank-1','rank-4'],['rank-0','rank-5']];
+    assert.deepEqual(seen.map(label=>expected.findIndex(group=>group.includes(label))),
+      expected.flatMap((group,rank)=>group.map(()=>rank)));
+    for (const group of expected) {
+      assert.deepEqual(seen.filter(label=>group.includes(label)),[...group].sort((a,b)=>
+        ids[Number(a.slice(5))].localeCompare(ids[Number(b.slice(5))])));
+    }
+  }
+});
+
+test('string, boolean and full-precision instant sorts page through null and missing ranks',async()=>{
+  const {owner,writer}=await fixture();
+  const expanded={...schema,properties:{...schema.properties,s:{type:['string','null']},
+    b:{type:['boolean','null']},t:{type:['string','null'],format:'date-time'}}};
+  await registry.revise(owner,1,definition(owner.collectionId,{version:2,schema:expanded,sortable:['s','b','t']}));
+  for (const field of ['s','b','t']) await registry.backfill(owner,field);
+  const cases=[
+    {label:'missing'},
+    {label:'null',s:null,b:null,t:null},
+    {label:'high',s:'é',b:true,t:'2026-01-01T00:00:00.1Z'},
+    {label:'low',s:'a',b:false,t:'2026-01-01T00:00:00.01Z'}
+  ];
+  for (const data of cases) await authority.mutateRequest(writer,{operation:'create',idempotencyKey:`typed-sort-${data.label}`,data});
+  const paged=new PostgresAuthority(pool,3600,randomBytes(32));
+  for (const field of ['s','b','t']) for (const direction of ['asc','desc']) {
+    let cursor,labels=[];
+    do {
+      const page=await paged.transaction(read(writer),tx=>tx.queryPage([],1,{field,direction},cursor));
+      labels.push(JSON.parse(page.records[0].canonicalData).label);
+      cursor=page.nextCursor;
+    } while(cursor);
+    assert.deepEqual(labels,direction==='asc' ? ['missing','null','low','high'] : ['high','low','null','missing']);
+  }
+});
+
+test('cursor rejects noncanonical base64url and expiry without losing authorization order',async()=>{
+  const {writer}=await fixture();
+  const paged=new PostgresAuthority(pool,3600,randomBytes(32));
+  for(let i=0;i<3;i++) await authority.mutateRequest(writer,{operation:'create',idempotencyKey:`cursor-${i}`,data:{label:`cursor-${i}`}});
+  const reader=read(writer),first=await paged.transaction(reader,tx=>tx.queryPage([],1));
+  const token=first.nextCursor;
+  assert.ok(token);
+  const alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  const last=alphabet.indexOf(token.at(-1)),unused=token.length%4===2 ? 4 : 2;
+  const alias=token.slice(0,-1)+alphabet[(last & ~((1<<unused)-1)) | ((last+1)&((1<<unused)-1))];
+  assert.ok(Buffer.from(token,'base64url').equals(Buffer.from(alias,'base64url')));
+  await assert.rejects(paged.transaction(reader,tx=>tx.queryPage([],1,undefined,alias)),{code:'CURSOR_INVALID'});
+  const now=Date.now;
+  try {
+    Date.now=()=>now()+16*60_000;
+    await assert.rejects(paged.transaction(reader,tx=>tx.queryPage([],1,undefined,token)),{code:'CURSOR_INVALID'});
+  } finally { Date.now=now; }
+});
+
+test('typed IN uses authoritative indexes and rejects malformed or oversized lists',async()=>{
+  const {owner,writer}=await fixture();
+  const expanded={...schema,properties:{...schema.properties,active:{type:'boolean'},at:{type:'string',format:'date-time'}}};
+  await registry.revise(owner,1,definition(owner.collectionId,{version:2,schema:expanded,filterable:['score','label','active','at']}));
+  for (const field of ['score','label','active','at']) await registry.backfill(owner,field);
+  for (const [i,score,active,at] of [[0,1,true,'2026-01-01T00:00:00Z'],[1,2,false,'2026-01-02T00:00:00Z'],
+    [2,3,true,'2026-01-03T00:00:00Z']].values()) await authority.mutateRequest(writer,{operation:'create',
+      idempotencyKey:`in-${i}`,data:{label:`in-${i}`,score,active,at}});
+  const reader=read(writer);
+  for (const [field,kind,values] of [['score','number',[1,3]],['label','string',['in-0','in-2']],
+    ['active','boolean',[true]],['at','date-time',['2026-01-01T00:00:00.000Z','2026-01-03T00:00:00Z']]]) {
+    const predicate=[{field,kind,operator:'in',value:values}];
+    assert.equal(await authority.transaction(reader,tx=>tx.countRecords(predicate)),2);
+    assert.equal(await authority.transaction(reader,tx=>tx.existsRecord(predicate)),true);
+  }
+  for (const value of [[],Array(17).fill(1),[1,'2'],[NaN]])
+    await assert.rejects(authority.transaction(reader,tx=>tx.countRecords([{field:'score',kind:'number',operator:'in',value}])),{code:'INVALID_ARGUMENT'});
 });
 
 test('durable batch checkpoint resumes partial success, rejects changed retries and permits failed-item retry',async()=>{
@@ -1527,6 +1640,55 @@ test('durable batch checkpoint resumes partial success, rejects changed retries 
   await pool.query('SELECT stateplane_purge_space($1)',[writer.spaceId]);
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM batch_operations WHERE space_id=$1',[writer.spaceId])).rows[0].n,0);
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM collection_write_slots WHERE space_id=$1',[writer.spaceId])).rows[0].n,0);
+});
+
+test('in-flight batch cancellation backs off, then preserves the committed item receipt',async()=>{
+  const {writer}=await fixture();
+  const key='cancel-in-flight',requests=[JSON.stringify({operation:'create',data:{label:'cancel-in-flight'}})];
+  const digest=createHash('sha256').update(JSON.stringify(requests)).digest('hex');
+  await authority.transaction(writer,tx=>tx.startBatch(key,digest,requests));
+  let entered,release;
+  const processing=new Promise(resolve=>{entered=resolve;});
+  const held=new Promise(resolve=>{release=resolve;});
+  const item=authority.transaction(writer,async tx=>{
+    await tx.processBatchItem(key,0,false);
+    entered();
+    await held;
+  });
+  try {
+    await processing;
+    await assert.rejects(authority.cancelBatch(writer,key),{code:'BACKPRESSURE'});
+  } finally { release(); await item; }
+  const receipt=(await authority.batchProgress(writer,key)).items[0].receipt;
+  assert.ok(receipt?.receiptId);
+  assert.equal((await authority.cancelBatch(writer,key)).state,'cancelled');
+  assert.equal((await authority.batchProgress(writer,key)).items[0].receipt.receiptId,receipt.receiptId);
+  assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),1);
+});
+
+test('batch item lock wait respects the remaining request budget',async()=>{
+  const {writer}=await fixture();
+  const key='budget-locked',requests=[JSON.stringify({operation:'create',data:{label:'budget-locked'}})];
+  const digest=createHash('sha256').update(JSON.stringify(requests)).digest('hex');
+  await authority.transaction(writer,tx=>tx.startBatch(key,digest,requests));
+  const blocker=await pool.connect();
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query(`SELECT 1 FROM batch_operations WHERE space_id=$1 AND collection_id=$2
+      AND credential_id=$3 AND operation_key=$4 FOR UPDATE`,[writer.spaceId,writer.collectionId,writer.credentialId,key]);
+    await assert.rejects(authority.transaction(writer,tx=>tx.processBatchItem(key,0,false,25)),{code:'RATE_LIMITED'});
+  } finally { await blocker.query('ROLLBACK'); blocker.release(); }
+  assert.deepEqual((await authority.batchProgress(writer,key)).items.map(item=>item.state),['pending']);
+});
+
+test('batch transaction budget also bounds pool admission and releases a late connection',async()=>{
+  const {writer}=await fixture();
+  let connect,releaseCount=0;
+  const delayed=new PostgresAuthority({connect:()=>new Promise(resolve=>{connect=resolve;})},3600);
+  await assert.rejects(delayed.transaction(writer,async()=>{},Date.now()+20),{code:'RATE_LIMITED'});
+  connect({release:()=>{releaseCount++;}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(releaseCount,1);
 });
 
 test('paged reads cap payload bytes and a 5000-row selective typed query uses the declared index',async()=>{

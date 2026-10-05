@@ -381,6 +381,7 @@ export function validateParsedDefinition(input: unknown, trustedParsed = true): 
 /** Check immutable unique names and paths against scalar root fields. */
 function validateUniqueDeclarations(definition:CollectionDefinition):void {
   const uniques=list(definition.unique,'SCHEMA_UNSUPPORTED');
+  if (uniques.length>16) fail('SCHEMA_UNSUPPORTED','Unique reservation limit exceeded');
   const names:string[]=[];
   for (let i=0;i<uniques.length;i++) {
     const entry=Object.getOwnPropertyDescriptor(uniques,i)!.value;
@@ -395,6 +396,14 @@ function validateUniqueDeclarations(definition:CollectionDefinition):void {
 function validateScalarDeclarations(definition:CollectionDefinition):void {
   const declarations=['filterable','sortable'] as const;
   const combined:string[]=[];
+  const uniques=list(definition.unique,'SCHEMA_UNSUPPORTED');
+  for (let i=0;i<uniques.length;i++) {
+    const paths=list((Object.getOwnPropertyDescriptor(uniques,i)!.value as {paths:unknown}).paths,'SCHEMA_UNSUPPORTED');
+    for (let j=0;j<paths.length;j++) {
+      const path=Object.getOwnPropertyDescriptor(paths,j)!.value as string;
+      if (!includes(combined,path)) append(combined,path);
+    }
+  }
   for (let i=0;i<declarations.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
     const key=declarations[i];
     const paths=list(definition[key],'SCHEMA_UNSUPPORTED');
