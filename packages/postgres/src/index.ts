@@ -10,6 +10,7 @@ export { externalKey, validateDefinition, validateValue, compatible, derivedValu
 export type { CollectionDefinition } from './schema.js';
 
 export type RecordMutation = 'create' | 'replace' | 'patch' | 'delete';
+type ReceiptOperation = RecordMutation | `batch:${RecordMutation}`;
 export type IndexValue =
   | { field: string; kind: 'null' | 'missing' }
   | { field: string; kind: 'string' | 'date-time'; value: string }
@@ -212,7 +213,7 @@ type PoolLike = Pick<pg.Pool, 'connect'>;
 type Client = pg.PoolClient;
 type ReceiptExposure = { committedAt: string; expiresAt: string };
 type PendingReceipt = { response: Receipt; exposure: ReceiptExposure; retentionSeconds: number;
-  digest: string; collectionId: CollectionId; key: string };
+  digest: string; collectionId: CollectionId; key: string; receiptOperation: ReceiptOperation };
 type ReadyReceipt = { receiptId: string; exposure: ReceiptExposure; committedAt: string; expiresAt: string };
 export interface JoinedReceiptState {
   pending: Map<string, PendingReceipt>;
@@ -559,8 +560,9 @@ function decodeCursor(token:string, secret:Uint8Array):PageCursor {
 }
 
 type PageContinuation={after:string;presentAfter:string;nullAfter:string;missingAfter:string};
+type SortValueKind='string'|'number'|'boolean'|'date-time';
 function pageContinuation(params:unknown[],cursor:PageCursor|undefined,sort:RecordSort|undefined,
-  kind:'string'|'number'|'boolean'|'date-time'|undefined,expr:string,direction:'ASC'|'DESC'):PageContinuation {
+  kind:SortValueKind|undefined,expr:string,direction:'ASC'|'DESC'):PageContinuation {
   let after='',presentAfter='',nullAfter='',missingAfter='';
   if (!cursor) return {after,presentAfter,nullAfter,missingAfter};
   params.push(cursor.id);
@@ -573,7 +575,8 @@ function pageContinuation(params:unknown[],cursor:PageCursor|undefined,sort:Reco
   }
   const afterRank=(rank:0|1|2):string=>{
     if (rank===cursor.rank) return ` AND r.record_id>${idParam}`;
-    return (direction==='ASC' ? rank>cursor.rank : rank<cursor.rank) ? '' : ' AND FALSE';
+    const follows=direction==='ASC' ? rank>cursor.rank : rank<cursor.rank;
+    return follows ? '' : ' AND FALSE';
   };
   missingAfter=afterRank(0);
   nullAfter=afterRank(1);
@@ -802,6 +805,7 @@ export class PostgresAuthority {
     return this.ingestBatchUsing(fixedScope,operationKey,requests,retryFailed,deadline);
   }
 
+  /** Persist one immutable manifest, then settle items in separate transactions. */
   private async ingestBatchUsing(scope:AuthorityScope,operationKey:string,requests:readonly string[],retryFailed:boolean,deadline:number):Promise<BatchProgress> {
     const fixed=snapshotBatchManifest(operationKey,requests,retryFailed);
     const digest=createHash('sha256').update(JSON.stringify(fixed)).digest('hex');
@@ -819,6 +823,7 @@ export class PostgresAuthority {
     return this.transaction(scope,tx=>tx.batchProgress(operationKey),Date.now()>=deadline ? undefined : deadline);
   }
 
+  /** Record only a confirmed item failure; leave a rolled-back item pending. */
   private async processBatchOrdinal(scope:AuthorityScope,operationKey:string,ordinal:number,retryFailed:boolean,
     remaining:number,deadline:number):Promise<'continued'|'cancelled'> {
     try {
@@ -841,10 +846,12 @@ export class PostgresAuthority {
     }
   }
 
+  /** Read the committed ledger for this credential and collection. */
   batchProgress(scope:AuthorityScope,operationKey:string):Promise<BatchProgress> {
     return this.transaction(scope,tx=>tx.batchProgress(operationKey));
   }
 
+  /** Fence future item starts while preserving receipts already committed. */
   cancelBatch(scope:AuthorityScope,operationKey:string):Promise<BatchProgress> {
     return this.transaction(scope,async tx=>{ await tx.cancelBatch(operationKey); return tx.batchProgress(operationKey); });
   }
@@ -859,7 +866,7 @@ export class AuthorityTransaction {
   private readonly readyReceipts: JoinedReceiptState['ready'];
   private activeOperationTail: Promise<void> = Promise.resolve();
   private mutationTail: Promise<void> = Promise.resolve();
-  private readonly reservedIdentities = new Map<string, { operation: RecordMutation; key: string }>();
+  private readonly reservedIdentities = new Map<string, { operation: ReceiptOperation; key: string }>();
   private admittingMutations = true;
   private readonly replayCollections = new Set<CollectionId>();
   private readonly batchReceiptIds = new Set<string>();
@@ -906,7 +913,7 @@ export class AuthorityTransaction {
     this.trackOperation(running);
     return running;
   }
-  /** Deny SQL after transaction-local authority state has closed. */
+  /** Deny SQL after closure and bound each statement by the remaining request budget. */
   private async query(sql: string, values: unknown[] = []) {
     if (!this.active) throw new AuthorityError('INVALID_ARGUMENT', 'Transaction ended');
     if (this.signal?.aborted) throw new AuthorityError('RATE_LIMITED', 'Transaction time budget exceeded');
@@ -931,6 +938,7 @@ export class AuthorityTransaction {
     return this.client.query(sql, values);
   }
 
+  /** Narrow an existing deadline for one bounded batch transaction. */
   private limitBatchTime(milliseconds:number):void {
     if (!Number.isSafeInteger(milliseconds) || milliseconds<1 || milliseconds>30_000)
       throw new AuthorityError('INVALID_ARGUMENT');
@@ -938,10 +946,12 @@ export class AuthorityTransaction {
     this.requestDeadlineMs=this.requestDeadlineMs===undefined ? until : Math.min(this.requestDeadlineMs,until);
   }
 
+  /** Bound subsequent statements without extending an earlier limit. */
   private limitStatementTime(milliseconds:number):void {
     this.statementTimeoutMs=Math.min(this.statementTimeoutMs,milliseconds);
   }
 
+  /** Validate the operation key and bind it to the authenticated ledger scope. */
   private batchKey(operationKey:string,allowRead=false):unknown[] {
     if (this.#scope.capability!=='records:write' && !(allowRead && this.#scope.capability==='records:read'))
       throw new AuthorityError('FORBIDDEN');
@@ -950,6 +960,7 @@ export class AuthorityTransaction {
     return [...scopeIds(this.#scope),this.#scope.credentialId,operationKey];
   }
 
+  /** Commit the manifest before item work; reject reuse with different bytes. */
   startBatch(operationKey:string,digest:string,requests:readonly string[]):Promise<void> {
     return this.admitOperation(async()=>{
       const key=this.batchKey(operationKey);
@@ -974,6 +985,7 @@ export class AuthorityTransaction {
     },true);
   }
 
+  /** Lock one item and write its record, receipt and success status atomically. */
   processBatchItem(operationKey:string,ordinal:number,retryFailed:boolean,remainingMs=15_000):Promise<void> {
     return this.admitOperation(async()=>{
       const key=this.batchKey(operationKey);
@@ -998,7 +1010,7 @@ export class AuthorityTransaction {
         const itemDigest=createHash('sha256').update(JSON.stringify(key)).update(`:${ordinal}`).digest('hex');
         const itemKey=`b_${itemDigest}`;
         let receipt:Receipt;
-        try { receipt=await this.mutateSerializedRequest(JSON.stringify({...request,idempotencyKey:itemKey})); }
+        try { receipt=await this.mutateBatchSerializedRequest(JSON.stringify({...request,idempotencyKey:itemKey})); }
         catch (error) {
           if (error instanceof AuthorityError && arrayHas(['INVALID_ARGUMENT','SCHEMA_INVALID','SCHEMA_CONFLICT',
             'REVISION_CONFLICT','UNIQUE_CONFLICT','KEY_RESERVED','NOT_FOUND'],error.code))
@@ -1017,6 +1029,7 @@ export class AuthorityTransaction {
     },true);
   }
 
+  /** Persist a confirmed item error without overwriting a concurrent success. */
   failBatchItem(operationKey:string,ordinal:number,code:string):Promise<void> {
     return this.admitOperation(async()=>{
       const key=this.batchKey(operationKey);
@@ -1126,7 +1139,7 @@ export class AuthorityTransaction {
     });
   }
   /** Look up a committed receipt before admitting a new mutation effect. */
-  private async findReceipt(operation: RecordMutation, key: string): Promise<{ collectionId: CollectionId; requestDigest: string; response: Receipt } | null> {
+  private async findReceipt(operation: ReceiptOperation, key: string): Promise<{ collectionId: CollectionId; requestDigest: string; response: Receipt } | null> {
     const result = await this.query(`SELECT collection_id,request_digest,response FROM idempotency_receipts
       WHERE space_id=$1 AND credential_id=$2 AND operation=$3 AND idempotency_key=$4 AND expires_at>clock_timestamp()`,
     [this.#scope.spaceId, this.#scope.credentialId, operation, key]);
@@ -1161,7 +1174,7 @@ export class AuthorityTransaction {
         pending.response.expiresAt = expiresAt;
         await this.query(`INSERT INTO idempotency_receipts(receipt_id,space_id,collection_id,credential_id,operation,idempotency_key,request_digest,record_id,response,committed_at,expires_at)
           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)`, [pending.response.receiptId,this.#scope.spaceId,pending.collectionId,
-          this.#scope.credentialId,pending.response.operation,pending.key,pending.digest,pending.response.ref.id,
+          this.#scope.credentialId,pending.receiptOperation,pending.key,pending.digest,pending.response.ref.id,
           JSON.stringify(pending.response),committedAt,expiresAt]);
         if (setHas(this.batchReceiptIds,pending.response.receiptId))
           await this.query(`UPDATE batch_items SET receipt=$2::jsonb WHERE receipt_id=$1`,
@@ -1263,18 +1276,28 @@ export class AuthorityTransaction {
 
   /** Use inside a joined regional cell transaction to retain its credential fence. */
   async mutateSerializedRequest(serialized:string):Promise<Receipt> {
+    return this.mutateSerializedUsing(serialized,'standalone');
+  }
+
+  /** Keep batch receipts in a database identity domain unavailable to standalone requests. */
+  private async mutateBatchSerializedRequest(serialized:string):Promise<Receipt> {
+    return this.mutateSerializedUsing(serialized,'batch');
+  }
+
+  /** Parse serialized bytes once and preserve the normal mutation admission queue. */
+  private async mutateSerializedUsing(serialized:string,receiptDomain:'standalone'|'batch'):Promise<Receipt> {
     try {
       if (!this.admittingMutations || !this.active) throw new AuthorityError('INVALID_ARGUMENT','Transaction mutation admission ended');
       this.assertCommittable();
       if (typeof serialized!=='string' || Buffer.byteLength(serialized)>MAX_JSON_BYTES) throw new AuthorityError('INVALID_ARGUMENT');
       let input:unknown;
       try { input=JSON.parse(serialized); } catch { throw new AuthorityError('INVALID_ARGUMENT'); }
-      return await this.mutateRequest(input,serializedMarker);
+      return await this.mutateRequestOnce(snapshotRequest(input,true),true,receiptDomain);
     } catch (error) { this.mutationFailed=true; this.mutationError=error; throw error; }
   }
 
   /** Validate one envelope and derive its canonical effect inside the collection lock. */
-  private async mutateRequestOnce(input: unknown, trustedParsed:boolean): Promise<Receipt> {
+  private async mutateRequestOnce(input: unknown, trustedParsed:boolean, receiptDomain:'standalone'|'batch'='standalone'): Promise<Receipt> {
     if (this.#scope.capability !== 'records:write') throw new AuthorityError('FORBIDDEN');
     if ((!trustedParsed && !acceptsInProcessObjects) || !input || typeof input!=='object' ||
       (!trustedParsed && acceptsInProcessObjects && isInProcessProxy(input)) || Array.isArray(input) ||
@@ -1303,7 +1326,7 @@ export class AuthorityTransaction {
     const work=(async()=>{
       await tail;
       this.assertCommittable();
-      return this.mutateOnce(fixed,(version,base)=>this.prepareMutation(fields,operation,version,base),preparePayload);
+      return this.mutateOnce(fixed,(version,base)=>this.prepareMutation(fields,operation,version,base),preparePayload,receiptDomain);
     })().catch(error=>{this.mutationFailed=true;this.mutationError=error;throw error;});
     this.mutationTail=work.then(()=>{},()=>{});
     this.trackOperation(work);
@@ -1366,15 +1389,15 @@ export class AuthorityTransaction {
   }
 
   /** Uncommitted unique rows provide Hyperdrive-compatible, scoped try-locks. */
-  private async reserveIdentity(change: Readonly<RecordChange>, identity: string): Promise<void> {
+  private async reserveIdentity(change: Readonly<RecordChange>, identity: string, receiptOperation: ReceiptOperation): Promise<void> {
     if (mapHas(this.reservedIdentities,identity)) return;
     for (let attempt = 0; attempt < 2; attempt++) {
       const result = await this.query(`SELECT reservation_state,original_collection_id FROM stateplane_try_reserve_receipt($1,$2,$3,$4,$5,$6)`,
         [this.#scope.spaceId,this.#scope.collectionId,this.#scope.credentialId,this.#scope.principalId,
-          change.operation,change.idempotencyKey]);
+          receiptOperation,change.idempotencyKey]);
       const row = result.rows[0];
       if (row?.reservation_state === 'reserved') {
-        mapSet(this.reservedIdentities,identity,{operation:change.operation,key:change.idempotencyKey});
+        mapSet(this.reservedIdentities,identity,{operation:receiptOperation,key:change.idempotencyKey});
         return;
       }
       if (row?.reservation_state === 'pending' && scalarString(row.original_collection_id)) {
@@ -1391,7 +1414,7 @@ export class AuthorityTransaction {
   }
 
   /** Return a still-authorized receipt replay or reserve the fresh identity. */
-  private async lookupReplay(change: RecordChange, identity: string,
+  private async lookupReplay(change: RecordChange, identity: string, receiptOperation: ReceiptOperation,
     preparePayload?: () => Readonly<RecordChange>): Promise<{ replay: Receipt | null; change: RecordChange }> {
     const scope = this.#scope;
     const validated=():RecordChange=>{
@@ -1413,8 +1436,8 @@ export class AuthorityTransaction {
       if (joinedReplay.digest !== actual.requestDigest) throw new AuthorityError('IDEMPOTENCY_MISMATCH');
       return {replay:copyReceipt(joinedReplay.response, true),change:actual};
     }
-    await this.reserveIdentity(change,identity);
-    const previous = await this.findReceipt(change.operation, change.idempotencyKey);
+    await this.reserveIdentity(change,identity,receiptOperation);
+    const previous = await this.findReceipt(receiptOperation, change.idempotencyKey);
     if (previous) {
       await this.authorizeOriginal(previous.collectionId);
       const actual=validated();
@@ -1424,7 +1447,7 @@ export class AuthorityTransaction {
     }
     await this.query(`DELETE FROM idempotency_receipts WHERE space_id=$1 AND credential_id=$2
       AND operation=$3 AND idempotency_key=$4 AND expires_at<=clock_timestamp()`,
-    [scope.spaceId,scope.credentialId,change.operation,change.idempotencyKey]);
+    [scope.spaceId,scope.credentialId,receiptOperation,change.idempotencyKey]);
     if (preparePayload) {
       const lifecycle=(await this.query('SELECT lifecycle FROM spaces WHERE space_id=$1',[scope.spaceId])).rows[0]?.lifecycle;
       if (lifecycle==='readOnly') throw new AuthorityError('SPACE_UNAVAILABLE');
@@ -1579,7 +1602,7 @@ export class AuthorityTransaction {
   }
 
   /** Add the event, outbox entry, and pending receipt for a written revision. */
-  private async appendFacts(change: RecordChange, identity: string, version: { schemaVersion: number; generation: number },
+  private async appendFacts(change: RecordChange, identity: string, receiptOperation: ReceiptOperation, version: { schemaVersion: number; generation: number },
     written: { recordId: string; beforeRevision: number | null; revision: number }): Promise<Receipt> {
     const scope = this.#scope;
     const { recordId, beforeRevision, revision } = written;
@@ -1595,18 +1618,19 @@ export class AuthorityTransaction {
     const exposure: ReceiptExposure = { committedAt:'', expiresAt:'' };
     const returned = pendingReceiptWithExposure(response, exposure);
     mapSet(this.pendingReceipts,identity, { response, exposure, retentionSeconds:this.retentionSeconds,
-      digest:change.requestDigest, collectionId:scope.collectionId, key:change.idempotencyKey });
+      digest:change.requestDigest, collectionId:scope.collectionId, key:change.idempotencyKey, receiptOperation });
     return returned;
   }
 
   /** Apply one revision-safe record change and its receipt, event and projections. */
   private async mutateOnce(change: RecordChange,
     prepare?: (version: { schemaVersion:number;generation:number;definition:string },base:RecordChange)=>Promise<RecordChange>,
-    preparePayload?: () => Readonly<RecordChange>): Promise<Receipt> {
+    preparePayload?: () => Readonly<RecordChange>,receiptDomain:'standalone'|'batch'='standalone'): Promise<Receipt> {
     const scope = this.#scope;
     if (scope.capability !== 'records:write') throw new AuthorityError('FORBIDDEN');
-    const identity = JSON.stringify([scope.spaceId,scope.credentialId,change.operation,change.idempotencyKey]);
-    const lookup = await this.lookupReplay(change, identity, preparePayload);
+    const receiptOperation:ReceiptOperation=receiptDomain==='batch' ? `batch:${change.operation}` : change.operation;
+    const identity = JSON.stringify([scope.spaceId,scope.credentialId,receiptOperation,change.idempotencyKey]);
+    const lookup = await this.lookupReplay(change, identity, receiptOperation, preparePayload);
     if (lookup.replay) return lookup.replay;
     change=lookup.change;
     const slot=await this.query(`SELECT slot FROM collection_write_slots
@@ -1618,7 +1642,7 @@ export class AuthorityTransaction {
     try {
       const written = await this.writeRecord(change, version.schemaVersion);
       await this.writeValues(change, written.recordId);
-      return await this.appendFacts(change, identity, version, written);
+      return await this.appendFacts(change, identity, receiptOperation, version, written);
     } catch (error) {
       if ((error as { code?: string }).code === '23505') {
         const constraint = (error as { constraint?: string }).constraint;

@@ -84,8 +84,8 @@ try {
       if (recorded.get(name) !== sha256) throw new Error(`Migration drift: ${name}`);
       continue;
     }
-    if (name === '033_validate_batch_attempts.sql') {
-      // The 032 ADD CONSTRAINT lock must be released before the populated
+    if (name === '033_validate_batch_attempts.sql' || name === '035_validate_batch_receipt_domain.sql') {
+      // Release the preceding ADD CONSTRAINT schema lock before a populated
       // validation scan. The session advisory lock keeps concurrent migrators
       // serialized through this intentional, retry-safe transaction boundary.
       await client.query('COMMIT');
@@ -93,7 +93,16 @@ try {
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
       transactionOpen = true;
     }
-    await client.query(sql);
+    const receiptDomainCutover = name === '034_batch_receipt_domain.sql' || name === '035_validate_batch_receipt_domain.sql';
+    const priorLockTimeout = receiptDomainCutover ? (await client.query('SHOW lock_timeout')).rows[0].lock_timeout : null;
+    if (receiptDomainCutover) await client.query("SET LOCAL lock_timeout = '5s'");
+    try { await client.query(sql); }
+    catch (error) {
+      if (receiptDomainCutover && error?.code === '55P03')
+        throw new Error('Batch receipt domain upgrade requires drained traffic; stop record writers and retry', { cause:error });
+      throw error;
+    }
+    if (receiptDomainCutover) await client.query('SELECT set_config($1,$2,true)', ['lock_timeout',priorLockTimeout]);
     await client.query('INSERT INTO stateplane_migrations (name, sha256) VALUES ($1, $2)', [name, sha256]);
     process.stdout.write(`Applied ${name}\n`);
   }

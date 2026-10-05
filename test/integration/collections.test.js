@@ -1786,6 +1786,10 @@ test('populated 031 upgrade requires a drained gate before its projection sweep'
       SELECT 'sta8-drain','entries','rec-'||g,1,1,'generated','rec-'||g,payload::text,payload
       FROM generate_series(1,2000) g CROSS JOIN LATERAL
         (SELECT jsonb_build_object('label','row-'||g,'score',g) AS payload) p`);
+    await upgrade.query(`INSERT INTO idempotency_receipts(receipt_id,space_id,collection_id,credential_id,
+      operation,idempotency_key,request_digest,record_id,response,committed_at,expires_at)
+      VALUES('legacy-receipt','sta8-drain','entries','agent','create','legacy-key',$1,
+        'rec-1','{}'::jsonb,clock_timestamp(),clock_timestamp()+interval '1 hour')`,['a'.repeat(64)]);
     await upgrade.query(`INSERT INTO batch_operations(space_id,collection_id,credential_id,operation_key,manifest_digest,item_count)
       VALUES('sta8-drain','entries','agent','legacy-attempt','digest',1)`);
     await upgrade.query(`INSERT INTO batch_items(space_id,collection_id,credential_id,operation_key,ordinal,request_text,attempts)
@@ -1863,6 +1867,12 @@ test('populated 031 upgrade requires a drained gate before its projection sweep'
     const attemptsGuard=(await upgrade.query(`SELECT convalidated FROM pg_constraint
       WHERE conrelid='public.batch_items'::regclass AND conname='batch_items_attempts_nonnegative'`)).rows[0];
     assert.equal(attemptsGuard?.convalidated,true,'staged batch guard validates in the later migration transaction');
+    assert.deepEqual((await upgrade.query(`SELECT operation,idempotency_key FROM idempotency_receipts
+      WHERE receipt_id='legacy-receipt'`)).rows,[{operation:'create',idempotency_key:'legacy-key'}]);
+    for (const table of ['idempotency_receipts','receipt_reservations','receipt_reservation_scopes']) {
+      assert.equal((await upgrade.query(`SELECT convalidated FROM pg_constraint WHERE conrelid=$1::regclass
+        AND conname=$2`,[`public.${table}`,`${table}_operation_check`])).rows[0]?.convalidated,true);
+    }
     assert.ok(elapsed<5000,`local 2000-row drained upgrade plus batch validation retry took ${elapsed.toFixed(0)}ms`);
   } finally {
     await upgrade?.end();
@@ -1971,6 +1981,55 @@ test('durable batch checkpoint resumes partial success, rejects changed retries 
   await pool.query('SELECT stateplane_purge_space($1)',[writer.spaceId]);
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM batch_operations WHERE space_id=$1',[writer.spaceId])).rows[0].n,0);
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM collection_write_slots WHERE space_id=$1',[writer.spaceId])).rows[0].n,0);
+});
+
+test('caller-selected keys cannot preseed batch item receipts or block their retries',async()=>{
+  for (const matching of [true,false]) {
+    const {writer}=await fixture();
+    const operationKey=`receipt-domain-${randomUUID()}`;
+    const itemKey=`b_${createHash('sha256').update(JSON.stringify([
+      writer.spaceId,writer.collectionId,writer.credentialId,operationKey])).update(':0').digest('hex')}`;
+    const batchLabel=`batch-${randomUUID()}`;
+    const standalone=await authority.mutateRequest(writer,{operation:'create',idempotencyKey:itemKey,
+      data:{label:matching ? batchLabel : `standalone-${randomUUID()}`}});
+    const manifest=[JSON.stringify({operation:'create',data:{label:batchLabel}})];
+    const progress=await authority.ingestBatch(writer,operationKey,manifest);
+    assert.equal(progress.items[0].state,matching ? 'failed' : 'succeeded');
+    assert.equal(progress.items[0].failureCode,matching ? 'UNIQUE_CONFLICT' : null);
+    assert.notEqual(progress.items[0].receipt?.receiptId,standalone.receiptId);
+    const replay=await authority.ingestBatch(writer,operationKey,manifest,true);
+    assert.equal(replay.items[0].state,progress.items[0].state);
+    assert.equal(replay.items[0].receipt?.receiptId,progress.items[0].receipt?.receiptId);
+    const stored=(await pool.query(`SELECT operation,receipt_id FROM idempotency_receipts
+      WHERE space_id=$1 AND credential_id=$2 AND idempotency_key=$3 ORDER BY operation`,
+      [writer.spaceId,writer.credentialId,itemKey])).rows;
+    assert.deepEqual(stored.map(row=>row.operation),matching ? ['create'] : ['batch:create','create']);
+    assert.equal(stored.find(row=>row.operation==='create')?.receipt_id,standalone.receiptId);
+    assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),matching ? 1 : 2);
+  }
+});
+
+test('same credential and operation key keep sibling collection batch ledgers separate',async()=>{
+  const {owner,writer}=await fixture();
+  const siblingCollection=`sibling_${randomUUID()}`;
+  await registry.define({...owner,collectionId:siblingCollection},definition(siblingCollection));
+  await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
+    VALUES($1,$2,$3,ARRAY['records:read','records:write'])`,
+    [writer.spaceId,siblingCollection,writer.credentialId]);
+  const sibling={...writer,collectionId:siblingCollection};
+  const operationKey=`shared-${randomUUID()}`;
+  const manifest=[JSON.stringify({operation:'create',data:{label:'same item'}})];
+  const first=await authority.ingestBatch(writer,operationKey,manifest);
+  const second=await authority.ingestBatch(sibling,operationKey,manifest);
+  assert.equal(first.items[0].state,'succeeded');
+  assert.equal(second.items[0].state,'succeeded');
+  assert.notEqual(first.items[0].receipt.receiptId,second.items[0].receipt.receiptId);
+  assert.equal((await authority.ingestBatch(writer,operationKey,manifest)).items[0].receipt.receiptId,
+    first.items[0].receipt.receiptId);
+  assert.equal((await authority.ingestBatch(sibling,operationKey,manifest)).items[0].receipt.receiptId,
+    second.items[0].receipt.receiptId);
+  assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),1);
+  assert.equal(await authority.transaction(read(sibling),tx=>tx.countRecords([])),1);
 });
 
 test('batch ingress owns its scope across manifest, item, failure, progress and serialized preflight',async()=>{
