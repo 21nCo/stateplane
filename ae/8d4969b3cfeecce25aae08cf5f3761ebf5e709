@@ -1,0 +1,24 @@
+docs/exact-queries-bulk.md
+  h_a39f9495f9ec1d 9,17-18
+migrations/034_batch_receipt_domain.sql
+  h_a39f9495f9ec1d 1-23
+migrations/035_validate_batch_receipt_domain.sql
+  h_a39f9495f9ec1d 1-4
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 13,216,563,565,578-579,808,826,849,854,869,916,941,949,954,963,988,1013,1032,1142,1177,1279-1288,1295,1300,1329,1392,1397,1400,1417,1439-1440,1450,1605,1621,1628,1631-1633,1645
+scripts/migrate.mjs
+  h_a39f9495f9ec1d 87-88,96-105
+test/integration/collections.test.js
+  h_a39f9495f9ec1d 1789-1792,1870-1875,1986-2034
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ae8d4969b3cfeecce25aae08cf5f3761ebf5e709",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
