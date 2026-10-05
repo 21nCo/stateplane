@@ -195,11 +195,18 @@ export class CollectionRegistry {
       if (!prior) throw new AuthorityError('SCHEMA_CONFLICT','Current collection definition is unavailable');
       const previous=validateParsedDefinition(JSON.parse(prior.canonical_definition),true,Infinity);
       compatibleParsed(previous,next);
-      const uniqueFields=previous.unique.flatMap(item=>item.paths);
+      const uniqueFields:string[]=[];
+      for (let i=0;i<previous.unique.length;i++) { // NOSONAR -- own-slot scan avoids replaced array methods
+        const paths=previous.unique[i].paths;
+        for (let j=0;j<paths.length;j++) append(uniqueFields,paths[j]);
+      }
       const oldFields=declaredFields(uniqueFields,declaredFields(previous.filterable,previous.sortable));
       const nextFields=declaredFields(uniqueFields,declaredFields(next.filterable,next.sortable));
-      if (nextFields.length>16 && nextFields.some(field=>!has(oldFields,field)))
-        throw new AuthorityError('SCHEMA_UNSUPPORTED','Indexed field limit exceeded');
+      if (nextFields.length>16) {
+        for (let i=0;i<nextFields.length;i++) { // NOSONAR -- own-slot scan avoids replaced array methods
+          if (!has(oldFields,nextFields[i])) throw new AuthorityError('SCHEMA_UNSUPPORTED','Indexed field limit exceeded');
+        }
+      }
       await client.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition)
         VALUES($1,$2,$3,$4)`,[scope.spaceId,next.slug,next.version,canonical(next as unknown as Json)]);
       await this.insertDeclarations(client,scope,next,previous);

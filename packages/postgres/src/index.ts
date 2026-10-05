@@ -1030,6 +1030,7 @@ export class AuthorityTransaction {
           WHERE b.space_id=$1 AND b.collection_id=$2 AND b.credential_id=$3 AND b.operation_key=$4
             AND i.ordinal=$5`,[...key,ordinal])).rows[0];
         if (state?.batch_state==='cancelled') throw new AuthorityError('BATCH_CANCELLED');
+        if (!state) throw new AuthorityError('NOT_FOUND');
         if (state?.batch_state==='active' && state.item_state==='succeeded') return;
         throw new AuthorityError('BACKPRESSURE','Batch item state changed; retry the same operation');
       }

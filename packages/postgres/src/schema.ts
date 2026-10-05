@@ -371,7 +371,7 @@ export function validateParsedDefinition(input: unknown, trustedParsed = true, m
   if (!scalarString(definition.slug) || !definition.slug || !withinBytes(definition.slug,MAX_INDEX_PART_BYTES) || !isSafeInteger(definition.version) || definition.version<1) fail('SCHEMA_UNSUPPORTED');
   validateNode(definition.schema,true,0,{count:0});
   if (!own(definition,'unique') || !own(definition,'filterable') || !own(definition,'sortable')) fail('SCHEMA_UNSUPPORTED');
-  validateUniqueDeclarations(definition);
+  validateUniqueDeclarations(definition,maxIndexedFields);
   validateScalarDeclarations(definition,maxIndexedFields);
   if (own(definition,'lifecycle')) validateLifecycle(definition);
   const encoded=canonical(definition as unknown as Json);
@@ -379,9 +379,9 @@ export function validateParsedDefinition(input: unknown, trustedParsed = true, m
   return JSON.parse(encoded) as CollectionDefinition;
 }
 /** Check immutable unique names and paths against scalar root fields. */
-function validateUniqueDeclarations(definition:CollectionDefinition):void {
+function validateUniqueDeclarations(definition:CollectionDefinition,maxIndexedFields:number):void {
   const uniques=list(definition.unique,'SCHEMA_UNSUPPORTED');
-  if (uniques.length>16) fail('SCHEMA_UNSUPPORTED','Unique reservation limit exceeded');
+  if (uniques.length>maxIndexedFields) fail('SCHEMA_UNSUPPORTED','Unique reservation limit exceeded');
   const names:string[]=[];
   for (let i=0;i<uniques.length;i++) {
     const entry=Object.getOwnPropertyDescriptor(uniques,i)!.value;

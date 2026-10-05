@@ -99,7 +99,8 @@ test('a legacy collection above the new index cap can revise without adding path
   const fields=Array.from({length:17},(_,index)=>`field${index}`);
   const legacySchema={...schema,properties:{...schema.properties,
     ...Object.fromEntries(fields.map(field=>[field,{type:'string'}]))}};
-  const previous=definition(collectionId,{schema:legacySchema,unique:[],filterable:fields,sortable:[]});
+  const previous=definition(collectionId,{schema:legacySchema,
+    unique:fields.map((field,i)=>({name:`u${i}`,paths:[field]})),filterable:fields,sortable:[]});
   const owner={spaceId,collectionId,principalId:'owner',credentialId:'owner-session',capability:'schema:write',
     policyVersion:1,placementGeneration:1};
   await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
@@ -118,10 +119,23 @@ test('a legacy collection above the new index cap can revise without adding path
     VALUES($1,$2,$3,'string',TRUE,FALSE,TRUE,1)`,[spaceId,collectionId,field]);
   const revised={...previous,version:2};
   assert.equal((await registry.revise(owner,1,revised)).version,2);
+  const withNote={...revised,version:3,
+    schema:{...legacySchema,properties:{...legacySchema.properties,note:{type:'string'}}}};
+  assert.equal((await registry.reviseSerialized(owner,2,JSON.stringify(withNote))).version,3);
   const extra='newField';
-  await assert.rejects(registry.revise(owner,2,{...revised,version:3,
-    schema:{...legacySchema,properties:{...legacySchema.properties,[extra]:{type:'string'}}},
-    filterable:[...fields,extra]}),{code:'SCHEMA_UNSUPPORTED'});
+  const attempted={...withNote,version:4,
+    schema:{...withNote.schema,properties:{...withNote.schema.properties,[extra]:{type:'string'}}},
+    filterable:[...fields,extra]};
+  const originalFlatMap=Array.prototype.flatMap,originalSome=Array.prototype.some;
+  try {
+    Array.prototype.flatMap=function(){ return []; };
+    Array.prototype.some=function(){ return false; };
+    await assert.rejects(registry.revise(owner,3,attempted),{code:'SCHEMA_UNSUPPORTED'});
+  } finally {
+    Array.prototype.flatMap=originalFlatMap;
+    Array.prototype.some=originalSome;
+  }
+  await assert.rejects(registry.reviseSerialized(owner,3,JSON.stringify(attempted)),{code:'SCHEMA_UNSUPPORTED'});
 });
 
 test('unindexed Unicode NUL survives writes and replay while indexed siblings fail explicitly',async()=>{
@@ -1772,6 +1786,10 @@ test('populated 031 upgrade requires a drained gate before its projection sweep'
       SELECT 'sta8-drain','entries','rec-'||g,1,1,'generated','rec-'||g,payload::text,payload
       FROM generate_series(1,2000) g CROSS JOIN LATERAL
         (SELECT jsonb_build_object('label','row-'||g,'score',g) AS payload) p`);
+    await upgrade.query(`INSERT INTO batch_operations(space_id,collection_id,credential_id,operation_key,manifest_digest,item_count)
+      VALUES('sta8-drain','entries','agent','legacy-attempt','digest',1)`);
+    await upgrade.query(`INSERT INTO batch_items(space_id,collection_id,credential_id,operation_key,ordinal,request_text,attempts)
+      VALUES('sta8-drain','entries','agent','legacy-attempt',0,'{}',-1)`);
     const env={...process.env,DATABASE_URL:location.href};
     const cwd=fileURLToPath(new URL('../..',import.meta.url));
     let failure;
@@ -1780,6 +1798,22 @@ test('populated 031 upgrade requires a drained gate before its projection sweep'
     assert.match(String(failure?.stderr),/Populated projection upgrade requires drained traffic/);
     assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name LIKE '031_%'"))
       .rows[0].n,0,'refused migration leaves no partial ledger entry');
+    const activeWriter=new pg.Client({connectionString:location.href});
+    await activeWriter.connect();
+    try {
+      await activeWriter.query('BEGIN');
+      await activeWriter.query("UPDATE records SET data=data WHERE space_id='sta8-drain' AND record_id='rec-1'");
+      let contention;
+      try { execFileSync(process.execPath,['scripts/migrate.mjs'],{cwd,
+        env:{...env,STATEPLANE_POPULATED_INDEX_UPGRADE:'drained'},encoding:'utf8'}); }
+      catch(error) { contention=error; }
+      assert.match(String(contention?.stderr),/Projection upgrade requires drained traffic/);
+      assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name LIKE '031_%'"))
+        .rows[0].n,0,'contention refusal leaves no partial projection migration');
+    } finally {
+      await activeWriter.query('ROLLBACK').catch(()=>{});
+      await activeWriter.end();
+    }
     const blocker=new pg.Client({connectionString:location.href});
     await blocker.connect();
     const migrate=promisify(execFile);
@@ -1811,13 +1845,25 @@ test('populated 031 upgrade requires a drained gate before its projection sweep'
       await blocker.end();
     }
     const started=performance.now();
-    await migrating;
+    await assert.rejects(migrating,'legacy negative attempts are found during the separate validation stage');
+    assert.deepEqual((await upgrade.query(`SELECT name FROM stateplane_migrations WHERE name LIKE '03%'
+      ORDER BY name`)).rows.map(row=>row.name),
+    ['030_batch_ingestion.sql','031_index_missing_projection.sql','032_batch_slot_hardening.sql'],
+    'the staged constraint and prior migrations remain committed for a safe retry');
+    await assert.rejects(upgrade.query(`UPDATE batch_items SET attempts=-2 WHERE operation_key='legacy-attempt'`),
+      {code:'23514'},'new writes obey the staged CHECK before validation');
+    await upgrade.query(`UPDATE batch_items SET attempts=0 WHERE operation_key='legacy-attempt'`);
+    execFileSync(process.execPath,['scripts/migrate.mjs'],{cwd,
+      env:{...env,STATEPLANE_POPULATED_INDEX_UPGRADE:'drained'},encoding:'utf8'});
     const elapsed=performance.now()-started;
     assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name LIKE '031_%'"))
       .rows[0].n,1);
     assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM records WHERE space_id='sta8-drain'"))
       .rows[0].n,2000);
-    assert.ok(elapsed<5000,`local 2000-row drained upgrade took ${elapsed.toFixed(0)}ms`);
+    const attemptsGuard=(await upgrade.query(`SELECT convalidated FROM pg_constraint
+      WHERE conrelid='public.batch_items'::regclass AND conname='batch_items_attempts_nonnegative'`)).rows[0];
+    assert.equal(attemptsGuard?.convalidated,true,'staged batch guard validates in the later migration transaction');
+    assert.ok(elapsed<5000,`local 2000-row drained upgrade plus batch validation retry took ${elapsed.toFixed(0)}ms`);
   } finally {
     await upgrade?.end();
     await admin.query(`DROP DATABASE IF EXISTS ${database} WITH (FORCE)`);
@@ -2087,6 +2133,55 @@ test('batch attempts and slot seeding keep their database-level bounds',async()=
   const fn=(await pool.query(`SELECT proconfig FROM pg_proc WHERE oid='public.stateplane_seed_write_slots()'::regprocedure`))
     .rows[0].proconfig;
   assert.ok(fn.includes('search_path=pg_catalog, public, pg_temp'));
+});
+
+test('populated batch validation permits writes while its validation lock waits',async()=>{
+  const {writer}=await fixture();
+  const key=`batch-validate-${randomUUID()}`;
+  await authority.transaction(writer,tx=>tx.startBatch(key,'d'.repeat(64),['{}']));
+  await pool.query('ALTER TABLE batch_items DROP CONSTRAINT batch_items_attempts_nonnegative');
+  await pool.query('ALTER TABLE batch_items ADD CONSTRAINT batch_items_attempts_nonnegative CHECK (attempts >= 0) NOT VALID');
+  const blocker=await pool.connect(),validator=await pool.connect(),updater=await pool.connect();
+  let validation;
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query('LOCK TABLE batch_items IN SHARE UPDATE EXCLUSIVE MODE');
+    validation=validator.query(await readFile(new URL('../../migrations/033_validate_batch_attempts.sql',import.meta.url),'utf8'));
+    validation.catch(()=>{});
+    let waiting=false;
+    for (let attempt=0;attempt<100;attempt++) {
+      const row=(await pool.query(`SELECT wait_event_type FROM pg_stat_activity
+        WHERE pid=$1`,[validator.processID])).rows[0];
+      if (row?.wait_event_type==='Lock') { waiting=true; break; }
+      await new Promise(resolve=>setTimeout(resolve,10));
+    }
+    assert.equal(waiting,true,'PostgreSQL reports validation waiting on the independent DDL lock');
+    await updater.query("SET statement_timeout = '1500ms'");
+    const updated=await updater.query(`UPDATE batch_items SET attempts=attempts+1
+      WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 AND operation_key=$4 AND ordinal=0`,
+      [writer.spaceId,writer.collectionId,writer.credentialId,key]);
+    assert.equal(updated.rowCount,1,'the validation lock does not block batch progress');
+    await blocker.query('COMMIT');
+    await validation;
+    assert.equal((await pool.query(`SELECT convalidated FROM pg_constraint WHERE conrelid='public.batch_items'::regclass
+      AND conname='batch_items_attempts_nonnegative'`)).rows[0].convalidated,true);
+  } finally {
+    await blocker.query('ROLLBACK').catch(()=>{});
+    if (validation) await validation.catch(()=>{});
+    blocker.release(); validator.release(); updater.release();
+  }
+});
+
+test('failing an absent batch operation or item reports NOT_FOUND without changing pending items',async()=>{
+  const {writer}=await fixture();
+  const missing=`missing-${randomUUID()}`;
+  await assert.rejects(authority.transaction(writer,tx=>tx.failBatchItem(missing,0,'SCHEMA_INVALID')),
+    {code:'NOT_FOUND'});
+  const key=`batch-missing-item-${randomUUID()}`;
+  await authority.transaction(writer,tx=>tx.startBatch(key,'d'.repeat(64),['{}']));
+  await assert.rejects(authority.transaction(writer,tx=>tx.failBatchItem(key,1,'SCHEMA_INVALID')),
+    {code:'NOT_FOUND'});
+  assert.equal((await authority.batchProgress(writer,key)).items[0].state,'pending');
 });
 
 test('a 20-item indexed batch bounds timeout-setting round trips',async()=>{

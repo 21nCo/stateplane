@@ -701,7 +701,6 @@ test('authority commit separates confirmed cancellation from a late ambiguous ac
   await pool.query(`CREATE FUNCTION ${probe}_sleep() RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN
       IF NEW.id=1 THEN RAISE SQLSTATE '57014' USING MESSAGE='confirmed commit cancellation'; END IF;
-      PERFORM pg_sleep(1);
       RETURN NEW;
     END $$`);
   await pool.query(`CREATE CONSTRAINT TRIGGER ${probe}_delay AFTER INSERT ON ${probe}
@@ -712,6 +711,8 @@ test('authority commit separates confirmed cancellation from a late ambiguous ac
     return {query:async(...args)=>{
       const result=await client.query(...args);
       if (args[0]==='BEGIN') await client.query(`INSERT INTO ${probe}(id) VALUES($1)`,[probeId]);
+      if (args[0]==='COMMIT' && probeId===2)
+        await new Promise(resolve=>setTimeout(resolve,1100)); // successful commit, lost deadline-bound acknowledgement
       return result;
     },release:discard=>client.release(discard)};
   }};
@@ -727,7 +728,10 @@ test('authority commit separates confirmed cancellation from a late ambiguous ac
     probeId=2;
     const late=change('create',`commit-late-${randomUUID()}`,'{"label":"commit-late"}');
     await assert.rejects(bounded.mutate(scope,late),error=>error instanceof CommitOutcomeUnknownError);
-    await new Promise(resolve=>setTimeout(resolve,1100));
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${probe}`)).rows[0].n,1,
+      'the delayed acknowledgement follows a successful COMMIT');
+    assert.equal((await counts(scope.spaceId)).records,2,
+      'ambiguous response cannot be treated as a confirmed rollback');
     const settled=await authority.mutate(scope,late);
     assert.ok(settled.receiptId);
     assert.equal((await counts(scope.spaceId)).records,2,'same-key retry resolves one committed outcome');

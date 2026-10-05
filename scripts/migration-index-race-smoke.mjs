@@ -162,15 +162,17 @@ async function assertOutcome({ action, prefix, result, client, writer, name, bef
     assert.equal((await migrationLedger(client)).length, completeMigrationCount);
   } else {
     if (action === 'rollback' || action === 'empty') {
-      assert.equal(result.code, 0, JSON.stringify(result));
-      assert.equal(afterLedger.length, completeMigrationCount);
-    } else {
-      assert.deepEqual(afterLedger, beforeLedger);
-      const retry = startMigrator(databaseUrl(name, 'sta5_race_retry'));
-      assert.equal((await boundedResult(retry)).code, 0);
-      assert.equal((await migrationLedger(client)).length, completeMigrationCount);
+      // The outbox preflight passed after the writer rolled back (or with an
+      // empty outbox). The later 031 preflight independently requires drained
+      // traffic while the seeded records remain populated.
+      assert.equal(result.code, 1, JSON.stringify(result));
+      assert.match(result.stderr, /Populated projection upgrade requires drained traffic/);
     }
+    assert.deepEqual(afterLedger, beforeLedger);
     assert.equal(after.outbox, 0);
+    const retry = startMigrator(databaseUrl(name, 'sta5_race_retry'), true);
+    assert.equal((await boundedResult(retry)).code, 0);
+    assert.equal((await migrationLedger(client)).length, completeMigrationCount);
   }
   assert.match(await claimIndex(client), /\(space_id, collection_id, available_at, event_id\)/);
   const migrations = action === 'commit' ? `${prefix} then ${completeMigrationCount}` : String(completeMigrationCount);
