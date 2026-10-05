@@ -1,0 +1,46 @@
+migrations/033_validate_batch_attempts.sql
+  h_a39f9495f9ec1d 1-4
+packages/postgres/src/schema.ts
+  h_a39f9495f9ec1d 374,382,384
+docs/exact-queries-bulk.md
+  h_a39f9495f9ec1d 15-16
+scripts/migrate.mjs
+  s_ad500513bc9987::t_db1c30ef639695 47
+  h_a39f9495f9ec1d 11,14-20,68-72,87-95,107
+  s_ad500513bc9987::t_888da0ebf523d3 44-46
+  s_ad500513bc9987::t_5615f24a08fbb2 48-49
+  h_a39f9495f9ec1d 35-43
+test/integration/postgres-authority.test.js
+  h_a39f9495f9ec1d 714-715,731-734
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 1033
+migrations/032_batch_slot_hardening.sql
+  h_a39f9495f9ec1d 3-5
+packages/postgres/src/collections.ts
+  h_a39f9495f9ec1d 198-202,205-209
+test/integration/collections.test.js
+  h_a39f9495f9ec1d 102-103,122-124,126-138,1789-1792,1801-1816,1848-1857,1863-1866,2138-2186
+scripts/migration-index-race-smoke.mjs
+  h_a39f9495f9ec1d 165-169,171,173-175
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fc03c73a9f1660909cfaa9da6d95662f417758ad",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_ad500513bc9987": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0f222-fb22-76a5-a77e-b7c92826db44",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
