@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { parseRevision } from '@stateplane/contracts';
 import type { Capability, CollectionId, RecordRef, Revision, SpaceId } from '@stateplane/contracts';
-import { acceptsInProcessObjects, canonical, derivedValues, externalKey, fingerprint, isInProcessProxy, MAX_INDEX_PART_BYTES, MAX_INDEX_VALUE_BYTES, plainJson, scalarString as unicodeString, validateValue } from './schema.js';
+import { acceptsInProcessObjects, canonical, derivedParsedValues, externalKey, fingerprint, isInProcessProxy, MAX_INDEX_PART_BYTES, MAX_INDEX_VALUE_BYTES, plainJson, scalarString as unicodeString, validateParsedValue } from './schema.js';
 import type { CollectionDefinition, Json } from './schema.js';
 export { CollectionRegistry } from './collections.js';
 export { externalKey, validateDefinition, validateValue, compatible, derivedValues } from './schema.js';
@@ -279,9 +279,9 @@ function snapshotEnvelopeMember(input:object,fixed:Record<string,unknown>,key:Pr
   const descriptor=Object.getOwnPropertyDescriptor(input,key);
   if (typeof key!=='string' || !descriptor?.enumerable || !Object.hasOwn(descriptor,'value')) return false;
   const value=descriptor.value;
-  const detached=key==='data' || key==='set' || key==='unset'
-    ? snapshotPayload(value,key,trustedParsed)
-    : value !== null && typeof value==='object' ? undefined : value;
+  let detached:unknown=value;
+  if (key==='data' || key==='set' || key==='unset') detached=snapshotPayload(value,key,trustedParsed);
+  else if (value !== null && typeof value==='object') detached=undefined;
   Object.defineProperty(fixed,key,{value:detached,enumerable:true});
   return true;
 }
@@ -825,11 +825,11 @@ export class AuthorityTransaction {
     if (operation==='create' || operation==='replace') data=fields.data as Record<string,Json>;
     if (operation==='patch') data=this.patchRecord(previous!,fields,definition);
     if (!data) return base;
-    validateValue(data as Json,definition.schema);
+    validateParsedValue(data as Json,definition.schema);
     const canonicalData=canonical(data);
     if (Buffer.byteLength(canonicalData,'utf8')>MAX_JSON_BYTES) throw new AuthorityError('SCHEMA_INVALID','Record exceeds canonical byte limit');
     this.checkLifecycle(data,previous,operation,definition);
-    return {...base,canonicalData,...derivedValues(data,definition)};
+    return {...base,canonicalData,...derivedParsedValues(data,definition)};
   }
 
   /** Lock the current record and expose the safe revision on a stale write. */
@@ -955,22 +955,32 @@ export class AuthorityTransaction {
 
   /** Apply a generated create or exact-revision update under one transaction. */
   private async writeRecord(change: RecordChange, schemaVersion: number): Promise<{ recordId: string; beforeRevision: number | null; revision: number }> {
+    if (change.operation === 'create') return this.createRecord(change,schemaVersion);
+    return this.updateRecord(change,schemaVersion);
+  }
+
+  /** Reserve a historical external alias before creating its first revision. */
+  private async createRecord(change:RecordChange,schemaVersion:number):Promise<{recordId:string;beforeRevision:null;revision:1}> {
     const scope = this.#scope;
-    const recordId = change.operation === 'create' ? `rec_${randomUUID()}` : change.recordId!;
-    if (change.operation === 'create') {
-      const mode = change.normalizedExternalKey === undefined ? 'generated' : 'external';
-      if (change.normalizedExternalKey !== undefined) {
-        // The ordinary unique constraint also fences concurrent new writes;
-        // this indexed probe reserves historical raw and tombstone aliases.
-        const held=await this.query(`SELECT 1 FROM records WHERE space_id=$1 AND collection_id=$2
-          AND key_mode='external' AND public.stateplane_external_key_identity(normalized_key)=$3 LIMIT 1`,
-          [...scopeIds(scope),change.normalizedExternalKey]);
-        if (held.rowCount) throw new AuthorityError('KEY_RESERVED');
-      }
-      await this.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
-        VALUES($1,$2,$3,1,$4,$5,$6,$7::text,$8::jsonb)`, [...scopeIds(scope),recordId,schemaVersion,mode,change.normalizedExternalKey ?? recordId,change.canonicalData,jsonbProjection(change.canonicalData!)]);
-      return { recordId, beforeRevision:null, revision:1 };
+    const recordId = `rec_${randomUUID()}`;
+    const mode = change.normalizedExternalKey === undefined ? 'generated' : 'external';
+    if (change.normalizedExternalKey !== undefined) {
+      // The ordinary unique constraint also fences concurrent new writes;
+      // this indexed probe reserves historical raw and tombstone aliases.
+      const held=await this.query(`SELECT 1 FROM records WHERE space_id=$1 AND collection_id=$2
+        AND key_mode='external' AND public.stateplane_external_key_identity(normalized_key)=$3 LIMIT 1`,
+        [...scopeIds(scope),change.normalizedExternalKey]);
+      if (held.rowCount) throw new AuthorityError('KEY_RESERVED');
     }
+    await this.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+      VALUES($1,$2,$3,1,$4,$5,$6,$7::text,$8::jsonb)`, [...scopeIds(scope),recordId,schemaVersion,mode,change.normalizedExternalKey ?? recordId,change.canonicalData,jsonbProjection(change.canonicalData!)]);
+    return { recordId, beforeRevision:null, revision:1 };
+  }
+
+  /** Update one live revision, preserving its key reservation on deletion. */
+  private async updateRecord(change:RecordChange,schemaVersion:number):Promise<{recordId:string;beforeRevision:number;revision:number}> {
+    const scope = this.#scope;
+    const recordId = change.recordId!;
     const updated = await this.query(`UPDATE records SET revision=revision+1,schema_version=$5,
       canonical_data=CASE WHEN $6::boolean THEN canonical_data ELSE $7::text END,
       data=CASE WHEN $6::boolean THEN data ELSE $8::jsonb END,
@@ -978,22 +988,24 @@ export class AuthorityTransaction {
       WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 AND revision=$4 AND NOT tombstone RETURNING revision`,
     [...scopeIds(scope),recordId,change.expectedRevision,schemaVersion,change.operation === 'delete',change.canonicalData ?? null,
       change.operation==='delete' ? null : jsonbProjection(change.canonicalData!)]);
-    if (!updated.rowCount) {
-      const exists = await this.query('SELECT revision FROM records WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 AND NOT tombstone',
-        [...scopeIds(scope),recordId]);
-      throw new AuthorityError(exists.rowCount ? 'REVISION_CONFLICT' : 'NOT_FOUND',exists.rowCount ? 'Record revision changed' : 'NOT_FOUND',
-        exists.rowCount ? Number(exists.rows[0].revision) : undefined);
-    }
+    if (!updated.rowCount) await this.throwCurrentRevision(recordId);
     const revision = Number(updated.rows[0].revision);
     if (change.operation === 'delete') {
       await this.query('INSERT INTO record_tombstones(space_id,collection_id,record_id,revision) VALUES($1,$2,$3,$4)', [...scopeIds(scope),recordId,revision]);
-      await this.query('DELETE FROM record_index_values WHERE space_id=$1 AND collection_id=$2 AND record_id=$3', [...scopeIds(scope),recordId]);
     } else {
       // Historical reservations remain on tombstones. Updates may release only live tuples.
       await this.query('DELETE FROM record_unique_keys WHERE space_id=$1 AND collection_id=$2 AND record_id=$3', [...scopeIds(scope),recordId]);
-      await this.query('DELETE FROM record_index_values WHERE space_id=$1 AND collection_id=$2 AND record_id=$3', [...scopeIds(scope),recordId]);
     }
+    await this.query('DELETE FROM record_index_values WHERE space_id=$1 AND collection_id=$2 AND record_id=$3', [...scopeIds(scope),recordId]);
     return { recordId, beforeRevision:change.expectedRevision!, revision };
+  }
+
+  /** Report the committed live revision after a failed compare-and-swap. */
+  private async throwCurrentRevision(recordId:string):Promise<never> {
+    const exists = await this.query('SELECT revision FROM records WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 AND NOT tombstone',
+      [...scopeIds(this.#scope),recordId]);
+    if (!exists.rowCount) throw new AuthorityError('NOT_FOUND');
+    throw new AuthorityError('REVISION_CONFLICT','Record revision changed',Number(exists.rows[0].revision));
   }
 
   /** Reserve one normalized tuple, distinguishing live and tombstone holders. */

@@ -1,7 +1,7 @@
 import type pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { AuthorityError, type AuthorityScope } from './index.js';
-import { canonical, compatible, derivedIndexValue, MAX_INDEX_PART_BYTES, plainJson, scalarString, validateDefinition } from './schema.js';
+import { canonical, compatibleParsed, derivedIndexValue, MAX_INDEX_PART_BYTES, plainJson, scalarString, validateParsedDefinition } from './schema.js';
 import type { CollectionDefinition, Json } from './schema.js';
 
 type PoolLike = Pick<pg.Pool,'connect'>;
@@ -138,11 +138,11 @@ export class CollectionRegistry {
   /** Create the first version of an owner-controlled collection from an object. */
   async define(scope:AuthorityScope,input:unknown):Promise<CollectionDefinition> {
     const snapshot=snapshotDefinition(input);
-    return this.defineUsing(scope,()=>validateDefinition(snapshot(),true));
+    return this.defineUsing(scope,()=>validateParsedDefinition(snapshot()));
   }
   /** Create the first version from serialized JSON for runtimes without proxy detection. */
   async defineSerialized(scope:AuthorityScope,serialized:string):Promise<CollectionDefinition> {
-    return this.defineUsing(scope,()=>validateDefinition(this.parseDefinition(serialized),true));
+    return this.defineUsing(scope,()=>validateParsedDefinition(this.parseDefinition(serialized)));
   }
   /** Bound and parse a serialized schema after its caller is authorized. */
   private parseDefinition(serialized:string):unknown {
@@ -172,11 +172,11 @@ export class CollectionRegistry {
   /** Accept a compatible object revision at an exact expected version. */
   async revise(scope:AuthorityScope,expectedVersion:number,input:unknown):Promise<CollectionDefinition> {
     const snapshot=snapshotDefinition(input);
-    return this.reviseUsing(scope,expectedVersion,()=>validateDefinition(snapshot(),true));
+    return this.reviseUsing(scope,expectedVersion,()=>validateParsedDefinition(snapshot()));
   }
   /** Accept a compatible serialized revision at an exact expected version. */
   async reviseSerialized(scope:AuthorityScope,expectedVersion:number,serialized:string):Promise<CollectionDefinition> {
-    return this.reviseUsing(scope,expectedVersion,()=>validateDefinition(this.parseDefinition(serialized),true));
+    return this.reviseUsing(scope,expectedVersion,()=>validateParsedDefinition(this.parseDefinition(serialized)));
   }
   /** Serialize version changes with record writes and fence grant expiry at commit. */
   private async reviseUsing(scope:AuthorityScope,expectedVersion:number,load:()=>CollectionDefinition):Promise<CollectionDefinition> {
@@ -193,8 +193,8 @@ export class CollectionRegistry {
       const prior=(await client.query(`SELECT canonical_definition FROM collection_versions
         WHERE space_id=$1 AND collection_id=$2 AND version=$3`,[scope.spaceId,next.slug,row.schema_version])).rows[0];
       if (!prior) throw new AuthorityError('SCHEMA_CONFLICT','Current collection definition is unavailable');
-      const previous=validateDefinition(JSON.parse(prior.canonical_definition),true);
-      compatible(previous,next);
+      const previous=validateParsedDefinition(JSON.parse(prior.canonical_definition));
+      compatibleParsed(previous,next);
       await client.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition)
         VALUES($1,$2,$3,$4)`,[scope.spaceId,next.slug,next.version,canonical(next as unknown as Json)]);
       await this.insertDeclarations(client,scope,next,previous);

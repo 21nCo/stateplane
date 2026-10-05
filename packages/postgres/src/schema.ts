@@ -282,7 +282,7 @@ function validateNodeEnum(node:SchemaNode,depth:number):void {
   if (!distinct(canonicalMembers)) fail('SCHEMA_UNSUPPORTED');
   for (let i=0;i<members.length;i++) {
     const member=Object.getOwnPropertyDescriptor(members,i)!.value;
-    try { validateValue(member as Json,{...node,enum:undefined},depth); }
+    try { validateParsedValue(member as Json,{...node,enum:undefined},depth); }
     catch { fail('SCHEMA_UNSUPPORTED','Invalid enum member'); }
   }
 }
@@ -305,8 +305,14 @@ export function utcInstant(value: string): string {
   const suffix=fraction ? '.'+fraction : '';
   return `${checkedMatch[1]}${suffix}Z`;
 }
-/** Validate a canonical record or enum member against an accepted schema node. */
-export function validateValue(value: Json, node: SchemaNode, depth=0): void {
+/** Validate caller-owned JSON and schema without trusting a serialized provenance claim. */
+export function validateValue(value: Json, node: SchemaNode): void {
+  plainJson(value);
+  plainJson(node);
+  validateParsedValue(value,node);
+}
+/** Validate JSON admitted by the parser or a checked in-process snapshot. */
+export function validateParsedValue(value: Json, node: SchemaNode, depth=0): void {
   if (depth > maxDepth) fail('SCHEMA_INVALID');
   node=Object.assign(Object.create(null),node) as SchemaNode;
   const kind=typeOf(node);
@@ -326,7 +332,7 @@ function validateObjectValue(value:Json,node:SchemaNode,depth:number):void {
     const pair=Object.getOwnPropertyDescriptor(entries,i)!.value as [string,Json];
     const key=pair[0],item=pair[1];
     if (!own(props(node),key)) fail('SCHEMA_INVALID');
-    validateValue(item,props(node)[key],depth+1);
+    validateParsedValue(item,props(node)[key],depth+1);
   }
   const required=node.required??[];
   for (let i=0;i<required.length;i++) if (!own(value as object,Object.getOwnPropertyDescriptor(required,i)!.value)) fail('SCHEMA_INVALID');
@@ -335,7 +341,7 @@ function validateObjectValue(value:Json,node:SchemaNode,depth:number):void {
 function validateArrayValue(value:Json,node:SchemaNode,depth:number):void {
   if (!Array.isArray(value) || (node.minItems!==undefined && value.length<node.minItems) || (node.maxItems!==undefined && value.length>node.maxItems)) fail('SCHEMA_INVALID');
   const members=value as Json[];
-  for (let i=0;i<members.length;i++) validateValue(members[i],node.items!,depth+1); // NOSONAR -- own-slot scan avoids replaced array iterators
+  for (let i=0;i<members.length;i++) validateParsedValue(members[i],node.items!,depth+1); // NOSONAR -- own-slot scan avoids replaced array iterators
 }
 /** Enforce Unicode scalar length and the declared UTC format. */
 function validateStringValue(value:Json,node:SchemaNode):void {
@@ -352,8 +358,12 @@ function validateNumberValue(value:Json,node:SchemaNode,kind:string):void {
 }
 const scalarField = (schema: SchemaNode, path: unknown): path is string => typeof path==='string' && path.length>0 && scalarString(path) &&
   own(props(schema),path) && includes(['string','number','integer','boolean'],typeOf(props(schema)[path]));
-/** Admit only the bounded schema subset and declarations shared by every collection. */
-export function validateDefinition(input: unknown, trustedParsed = false): CollectionDefinition {
+/** Admit caller-owned definitions without exposing a trusted-parser switch. */
+export function validateDefinition(input: unknown): CollectionDefinition {
+  return validateParsedDefinition(input,false);
+}
+/** Admit a definition already parsed from serialized JSON or a checked snapshot. */
+export function validateParsedDefinition(input: unknown, trustedParsed = true): CollectionDefinition {
   plainJson(input,'SCHEMA_UNSUPPORTED',0,new Set<object>(),trustedParsed);
   if (!ordinary(input) || any(Object.keys(input),key=>!includes(['slug','version','schema','unique','filterable','sortable','lifecycle'],key))) fail('SCHEMA_UNSUPPORTED');
   const definition=input as unknown as CollectionDefinition;
@@ -431,8 +441,14 @@ function withoutAnnotations(node: SchemaNode): Json {
   }
   return clone;
 }
-/** Permit additive optional fields, descriptions and index declarations only. */
+/** Check caller-owned definitions before comparing their compatibility. */
 export function compatible(old: CollectionDefinition, next: CollectionDefinition): void {
+  plainJson(old,'SCHEMA_UNSUPPORTED');
+  plainJson(next,'SCHEMA_UNSUPPORTED');
+  compatibleParsed(old,next);
+}
+/** Compare definitions returned by the trusted definition parser. */
+export function compatibleParsed(old: CollectionDefinition, next: CollectionDefinition): void {
   if (old.slug!==next.slug || next.version!==old.version+1 || canonical(old.unique as unknown as Json)!==canonical(next.unique as unknown as Json) ||
     canonical((own(old,'lifecycle') ? old.lifecycle! : null) as Json)!==canonical((own(next,'lifecycle') ? next.lifecycle! : null) as Json)) fail('SCHEMA_BREAKING','Slug, uniqueness or lifecycle change requires migration');
   compatibleFields(old,next);
@@ -473,8 +489,14 @@ export function externalKey(value: unknown): string {
   if (!result || !withinBytes(result,MAX_INDEX_PART_BYTES)) fail('INVALID_ARGUMENT','External key exceeds indexed byte limit');
   return result;
 }
-/** Derive atomic unique reservations and typed index values from accepted data. */
+/** Derive values only after admitting caller-owned data and definition objects. */
 export function derivedValues(data: Record<string,Json>, definition: CollectionDefinition): {unique: UniqueValue[]; indexes: IndexValue[]} {
+  plainJson(data);
+  plainJson(definition);
+  return derivedParsedValues(data,definition);
+}
+/** Derive atomic facts from parsed or previously admitted JSON. */
+export function derivedParsedValues(data: Record<string,Json>, definition: CollectionDefinition): {unique: UniqueValue[]; indexes: IndexValue[]} {
   const unique=derivedUniqueValues(data,definition);
   const indexes:IndexValue[]=[];
   const fields:string[]=[];

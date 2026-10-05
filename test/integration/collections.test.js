@@ -1408,3 +1408,38 @@ test('a runtime without trap-free proxy detection fails closed for in-process pr
     process.stdout.write('closed');`;
   assert.equal(execFileSync(process.execPath,['--input-type=module','-e',script],{encoding:'utf8'}),'closed');
 });
+
+test('public schema helpers reject proxies without detection while serialized writes remain usable',async()=>{
+  const {owner,writer}=await fixture();
+  const next=definition(owner.collectionId,{version:2,schema:{...schema,properties:{...schema.properties,note:{type:'string'}}}});
+  const script=`import assert from 'node:assert/strict';
+    import {types} from 'node:util';
+    import pg from 'pg';
+    types.isProxy=undefined;
+    const {PostgresAuthority,CollectionRegistry,validateDefinition,validateValue,derivedValues,compatible}=await import('./packages/postgres/dist/index.js');
+    const {url,owner,writer,next}=JSON.parse(process.env.STA7_TEST_CONTEXT);
+    let traps=0;
+    const proxy=new Proxy({label:'fabricated'}, {
+      get(target,key,receiver){traps++;return Reflect.get(target,key,receiver)},
+      getPrototypeOf(target){traps++;return Reflect.getPrototypeOf(target)},
+      ownKeys(target){traps++;return Reflect.ownKeys(target)},
+      getOwnPropertyDescriptor(target,key){traps++;return Reflect.getOwnPropertyDescriptor(target,key)}
+    });
+    assert.throws(()=>validateValue(proxy,next.schema),{code:'SCHEMA_INVALID'});
+    assert.throws(()=>derivedValues(proxy,next),{code:'SCHEMA_INVALID'});
+    assert.throws(()=>compatible(proxy,next),{code:'SCHEMA_UNSUPPORTED'});
+    assert.throws(()=>validateDefinition(proxy,true),{code:'SCHEMA_UNSUPPORTED'});
+    assert.equal(traps,0);
+    const pool=new pg.Pool({connectionString:url});
+    try {
+      const registry=new CollectionRegistry(pool), authority=new PostgresAuthority(pool,3600);
+      assert.equal((await registry.reviseSerialized(owner,1,JSON.stringify(next))).version,2);
+      const receipt=await authority.mutateSerializedRequest(writer,JSON.stringify({operation:'create',idempotencyKey:'no-detector',data:{label:'parsed'}}));
+      assert.equal(receipt.revision,1);
+    } finally { await pool.end(); }
+    process.stdout.write('closed');`;
+  assert.equal(execFileSync(process.execPath,['--input-type=module','-e',script],{
+    cwd:fileURLToPath(new URL('../..',import.meta.url)),encoding:'utf8',
+    env:{...process.env,STA7_TEST_CONTEXT:JSON.stringify({url,owner,writer,next})}
+  }),'closed');
+});
