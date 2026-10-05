@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { types } from 'node:util';
 import { execFileSync } from 'node:child_process';
@@ -934,9 +934,16 @@ test('external keys keep one normalized identity across low-level writes and his
   const collidingId=`rec_${randomUUID()}`;
   const collidingData=JSON.stringify({label:'historical-collision'});
   // Emulate an already populated database that predates normalized writes.
-  await pool.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
-    SELECT space_id,collection_id,$2,1,schema_version,'external',$3,$4::text,$4::jsonb FROM records WHERE record_id=$1`,
-  [created.ref.id,collidingId,'é',collidingData]);
+  const historical=await pool.connect();
+  try {
+    await historical.query('BEGIN');
+    await historical.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+      SELECT space_id,collection_id,$2,1,schema_version,'external',$3,$4::text,$4::jsonb FROM records WHERE record_id=$1`,
+    [created.ref.id,collidingId,'é',collidingData]);
+    await historical.query(`INSERT INTO record_index_values(space_id,collection_id,record_id,field_name,value_kind)
+      VALUES($1,$2,$3,'score','missing')`,[writer.spaceId,writer.collectionId,collidingId]);
+    await historical.query('COMMIT');
+  } finally { historical.release(); }
   await assert.rejects(authority.transaction(read(writer),tx=>tx.getByKey('external',raw)),{code:'SCHEMA_CONFLICT'});
   await assert.rejects(authority.transaction(read(writer),tx=>tx.getByKey('external','é')),{code:'SCHEMA_CONFLICT'});
   assert.equal((await authority.transaction(read(writer),tx=>tx.getRecord(created.ref.id))).ref.id,created.ref.id);
@@ -1542,6 +1549,157 @@ test('explicit sort pages preserve missing, null and value ranks in both directi
   }
 });
 
+test('low-level mutations fill declared sort rows and a cutover writer cannot commit a gap',async()=>{
+  const {owner,writer}=await fixture();
+  await registry.revise(owner,1,definition(owner.collectionId,{version:2,sortable:['score']}));
+  await registry.backfill(owner,'score');
+  const low={operation:'create',idempotencyKey:'low-index-create',requestDigest:'a'.repeat(64),
+    canonicalData:'{"label":"low","score":7}',unique:[],indexes:[]};
+  const created=await authority.mutate(writer,low);
+  assert.equal((await authority.mutate(writer,low)).receiptId,created.receiptId);
+  await assert.rejects(authority.mutate(writer,{...low,idempotencyKey:'wrong-index',requestDigest:'c'.repeat(64),
+    indexes:[{field:'score',kind:'number',value:8}]}),{code:'SCHEMA_CONFLICT'});
+  const replaced=await authority.mutate(writer,{operation:'replace',idempotencyKey:'low-index-replace',
+    requestDigest:'b'.repeat(64),recordId:created.ref.id,expectedRevision:1,
+    canonicalData:'{"label":"low"}',unique:[],indexes:[]});
+  assert.equal(replaced.revision,2);
+  await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'typed-neighbor',data:{label:'neighbor',score:2}});
+  const reader=read(writer);
+  const paged=new PostgresAuthority(pool,3600,randomBytes(32));
+  const count=await authority.transaction(reader,tx=>tx.countRecords([]));
+  assert.equal(count,2);
+  for (const direction of ['asc','desc']) {
+    const seen=[];
+    let cursor;
+    do {
+      const page=await paged.transaction(reader,tx=>tx.queryPage([],1,{field:'score',direction},cursor));
+      seen.push(...page.records.map(record=>record.ref.id));
+      cursor=page.nextCursor;
+    } while (cursor);
+    assert.equal(seen.length,count);
+    assert.equal(new Set(seen).size,count);
+    assert.ok(seen.includes(created.ref.id));
+  }
+  const stored=await pool.query(`SELECT value_kind FROM record_index_values
+    WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 AND field_name='score'`,
+  [owner.spaceId,owner.collectionId,created.ref.id]);
+  assert.deepEqual(stored.rows.map(row=>row.value_kind),['missing']);
+  const old=await pool.connect();
+  try {
+    await old.query('BEGIN');
+    await old.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+      VALUES($1,$2,'old-writer',1,2,'generated','old-writer','{"label":"old","score":9}','{"label":"old","score":9}'::jsonb)`,
+    [owner.spaceId,owner.collectionId]);
+    await assert.rejects(old.query('COMMIT'),{code:'PZ003'});
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM records
+      WHERE space_id=$1 AND collection_id=$2 AND record_id='old-writer'`,[owner.spaceId,owner.collectionId])).rows[0].n,0);
+    await old.query('BEGIN');
+    await old.query(`UPDATE records SET revision=revision+1,canonical_data='{"label":"low","score":10}',
+      data='{"label":"low","score":10}'::jsonb WHERE space_id=$1 AND collection_id=$2 AND record_id=$3`,
+    [owner.spaceId,owner.collectionId,created.ref.id]);
+    await old.query(`DELETE FROM record_index_values WHERE space_id=$1 AND collection_id=$2 AND record_id=$3`,
+    [owner.spaceId,owner.collectionId,created.ref.id]);
+    await assert.rejects(old.query('COMMIT'),{code:'PZ003'});
+    assert.equal((await authority.transaction(reader,tx=>tx.getRecord(created.ref.id))).revision,2);
+    assert.equal(await authority.transaction(reader,tx=>tx.countRecords([])),count);
+  } finally { old.release(); }
+});
+
+test('031 restarts a pre-upgrade partial backfill before publishing sorted pages',async()=>{
+  const database=`stateplane_sta8_upgrade_${randomUUID().replaceAll('-','')}`;
+  const location=new URL(baseUrl);
+  location.pathname=`/${database}`;
+  const admin=new pg.Client({connectionString:baseUrl});
+  await admin.connect();
+  let upgraded;
+  let upgradePool;
+  try {
+    await admin.query(`CREATE DATABASE ${database}`);
+    upgraded=new pg.Client({connectionString:location.href});
+    await upgraded.connect();
+    const files=(await readdir(new URL('../../migrations/',import.meta.url))).filter(name=>/^\d{3}_.*\.sql$/.test(name)).sort();
+    for (const file of files.filter(name=>name<'031_'))
+      await upgraded.query(await readFile(new URL(`../../migrations/${file}`,import.meta.url),'utf8'));
+    const scope={spaceId:'sp_partial_upgrade',collectionId:'entries',principalId:'owner',credentialId:'owner-session',
+      capability:'schema:write',policyVersion:1,placementGeneration:1};
+    const accepted=definition('entries',{unique:[],sortable:['score','label']});
+    await upgraded.query('BEGIN');
+    await upgraded.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+      VALUES($1,'owner','cell-a','cell-a','target-a')`,[scope.spaceId]);
+    await upgraded.query(`INSERT INTO collections(space_id,collection_id) VALUES($1,$2)`,[scope.spaceId,scope.collectionId]);
+    await upgraded.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition)
+      VALUES($1,$2,1,$3)`,[scope.spaceId,scope.collectionId,JSON.stringify(accepted)]);
+    await upgraded.query(`INSERT INTO collection_index_declarations
+      (space_id,collection_id,field_name,value_kind,filterable,sortable,ready,accepted_version,backfill_after)
+      VALUES($1,$2,'score','number',TRUE,TRUE,FALSE,1,'rec_100')`,[scope.spaceId,scope.collectionId]);
+    await upgraded.query(`INSERT INTO collection_index_declarations
+      (space_id,collection_id,field_name,value_kind,filterable,sortable,ready,accepted_version)
+      VALUES($1,$2,'label','string',FALSE,TRUE,TRUE,1)`,[scope.spaceId,scope.collectionId]);
+    await upgraded.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+      SELECT $1,$2,'rec_'||lpad(g::text,3,'0'),1,1,'generated','rec_'||lpad(g::text,3,'0'),payload::text,payload
+      FROM generate_series(1,101) g CROSS JOIN LATERAL
+        (SELECT CASE WHEN g%2=0 THEN jsonb_build_object('label','row-'||g,'score',g)
+          ELSE jsonb_build_object('label','row-'||g) END AS payload) p`,[scope.spaceId,scope.collectionId]);
+    await upgraded.query(`INSERT INTO record_index_values
+      (space_id,collection_id,record_id,field_name,value_kind,number_value)
+      SELECT $1,$2,'rec_'||lpad(g::text,3,'0'),'score','number',g
+      FROM generate_series(1,100) g WHERE g%2=0`,[scope.spaceId,scope.collectionId]);
+    await upgraded.query('COMMIT');
+    const oldWriter=new pg.Client({connectionString:location.href});
+    await oldWriter.connect();
+    let migrating;
+    try {
+      await oldWriter.query('BEGIN');
+      await oldWriter.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+        VALUES($1,$2,'rec_102',1,1,'generated','rec_102','{"label":"late"}','{"label":"late"}'::jsonb)`,
+      [scope.spaceId,scope.collectionId]);
+      let settled=false;
+      migrating=upgraded.query(await readFile(new URL('../../migrations/031_index_missing_projection.sql',import.meta.url),'utf8'))
+        .finally(()=>{ settled=true; });
+      await new Promise(resolve=>setTimeout(resolve,50));
+      assert.equal(settled,false,'migration waits for the old record writer');
+      await oldWriter.query('COMMIT');
+    } finally {
+      await oldWriter.query('ROLLBACK').catch(()=>{});
+      await oldWriter.end();
+    }
+    await migrating;
+    assert.deepEqual((await upgraded.query(`SELECT ready,backfill_after FROM collection_index_declarations
+      WHERE space_id=$1 AND collection_id=$2 AND field_name='score'`,[scope.spaceId,scope.collectionId])).rows[0],
+    {ready:false,backfill_after:null});
+    assert.equal((await upgraded.query(`SELECT ready FROM collection_index_declarations
+      WHERE space_id=$1 AND collection_id=$2 AND field_name='label'`,[scope.spaceId,scope.collectionId])).rows[0].ready,false);
+    upgradePool=new pg.Pool({connectionString:location.href,max:4});
+    const upgrading=new CollectionRegistry(upgradePool);
+    assert.deepEqual(await upgrading.backfill(scope,'score'),{processed:100,ready:false});
+    assert.deepEqual(await upgrading.backfill(scope,'score'),{processed:2,ready:true});
+    assert.deepEqual(await upgrading.backfill(scope,'label'),{processed:100,ready:false});
+    assert.deepEqual(await upgrading.backfill(scope,'label'),{processed:2,ready:true});
+    const reader={...scope,capability:'records:read'};
+    const querying=new PostgresAuthority(upgradePool,3600,randomBytes(32));
+    assert.equal(await querying.transaction(reader,tx=>tx.countRecords([])),102);
+    for (const direction of ['asc','desc']) {
+      for (const field of ['score','label']) {
+        const seen=new Set();
+        let cursor;
+        do {
+          const page=await querying.transaction(reader,tx=>tx.queryPage([],25,{field,direction},cursor));
+          for (const row of page.records) seen.add(row.ref.id);
+          cursor=page.nextCursor;
+        } while (cursor);
+        assert.equal(seen.size,102);
+      }
+    }
+    assert.equal((await upgraded.query(`SELECT count(*)::int AS n FROM record_index_values
+      WHERE space_id=$1 AND collection_id=$2 AND field_name='score'`,[scope.spaceId,scope.collectionId])).rows[0].n,102);
+  } finally {
+    await upgradePool?.end();
+    await upgraded?.end();
+    await admin.query(`DROP DATABASE IF EXISTS ${database} WITH (FORCE)`);
+    await admin.end();
+  }
+});
+
 test('string, boolean and full-precision instant sorts page through null and missing ranks',async()=>{
   const {owner,writer}=await fixture();
   const expanded={...schema,properties:{...schema.properties,s:{type:['string','null']},
@@ -1574,9 +1732,7 @@ test('cursor rejects noncanonical base64url and expiry without losing authorizat
   const reader=read(writer),first=await paged.transaction(reader,tx=>tx.queryPage([],1));
   const token=first.nextCursor;
   assert.ok(token);
-  const alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
-  const last=alphabet.indexOf(token.at(-1)),unused=token.length%4===2 ? 4 : 2;
-  const alias=token.slice(0,-1)+alphabet[(last & ~((1<<unused)-1)) | ((last+1)&((1<<unused)-1))];
+  const alias=`${token}=`;
   assert.ok(Buffer.from(token,'base64url').equals(Buffer.from(alias,'base64url')));
   await assert.rejects(paged.transaction(reader,tx=>tx.queryPage([],1,undefined,alias)),{code:'CURSOR_INVALID'});
   const now=Date.now;
@@ -1812,13 +1968,18 @@ test('paged reads cap payload bytes and a 5000-row selective typed query uses th
   assert.equal(second.records.length,2);
   assert.equal(second.nextCursor,null);
 
-  await pool.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+  const volume=await pool.connect();
+  try {
+    await volume.query('BEGIN');
+    await volume.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
     SELECT $1,$2,'volume-'||g,1,2,'generated','volume-'||g,
       ('{"label":"volume-'||g||'","score":'||g||'}'),
       jsonb_build_object('label','volume-'||g,'score',g)
     FROM generate_series(1,5000) AS g`,[owner.spaceId,owner.collectionId]);
-  await pool.query(`INSERT INTO record_index_values(space_id,collection_id,record_id,field_name,value_kind,number_value)
+    await volume.query(`INSERT INTO record_index_values(space_id,collection_id,record_id,field_name,value_kind,number_value)
     SELECT $1,$2,'volume-'||g,'score','number',g FROM generate_series(1,5000) AS g`,[owner.spaceId,owner.collectionId]);
+    await volume.query('COMMIT');
+  } finally { volume.release(); }
   await pool.query('ANALYZE records');
   await pool.query('ANALYZE record_index_values');
   let plan;
@@ -1850,13 +2011,16 @@ test('5000-row sort-only pages use indexed presence and typed order in both dire
   await registry.revise(owner,1,definition(owner.collectionId,{version:2,schema:expanded,
     sortable:['score','label','flag','instant']}));
   for (const field of ['score','label','flag','instant']) await registry.backfill(owner,field);
-  await pool.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+  const volume=await pool.connect();
+  try {
+    await volume.query('BEGIN');
+    await volume.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
     SELECT $1,$2,'plan-'||g,1,2,'generated','plan-'||g,payload::text,payload
     FROM generate_series(1,5000) AS g
     CROSS JOIN LATERAL (SELECT jsonb_build_object('label','plan-'||g,'score',g,'flag',g%2=0,
       'instant','2026-01-01T00:00:'||lpad(((g-1)%60)::text,2,'0')||'Z') AS payload) p`,
   [owner.spaceId,owner.collectionId]);
-  await pool.query(`INSERT INTO record_index_values
+    await volume.query(`INSERT INTO record_index_values
     (space_id,collection_id,record_id,field_name,value_kind,string_value,number_value,boolean_value,time_value)
     SELECT $1,$2,'plan-'||g,'score','number',NULL,g,NULL::boolean,NULL FROM generate_series(1,5000) AS g
     UNION ALL SELECT $1,$2,'plan-'||g,'label','string','plan-'||g,NULL,NULL,NULL FROM generate_series(1,5000) AS g
@@ -1864,6 +2028,8 @@ test('5000-row sort-only pages use indexed presence and typed order in both dire
     UNION ALL SELECT $1,$2,'plan-'||g,'instant','date-time',NULL,NULL,NULL,
       '2026-01-01T00:00:'||lpad(((g-1)%60)::text,2,'0')||'Z' FROM generate_series(1,5000) AS g`,
   [owner.spaceId,owner.collectionId]);
+    await volume.query('COMMIT');
+  } finally { volume.release(); }
   await pool.query('ANALYZE records');
   await pool.query('ANALYZE record_index_values');
   let plan;

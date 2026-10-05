@@ -320,7 +320,11 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       await this.fenceCommit(bounded,claims,joinedReceipts,receiptRemaining,receiptFenceStarted);
       this.remaining(deadline);
       try { await client.query('COMMIT'); begun = false; }
-      catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
+      catch (error) {
+        discard = true;
+        if ((error as {code?:string}).code==='PZ003') throw new AuthorityError('SCHEMA_CONFLICT','Record index projection incomplete');
+        throw new CommitOutcomeUnknownError(error);
+      }
       for (const entry of joined) entry.expose();
       return result;
     } catch (error) {

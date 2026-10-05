@@ -551,7 +551,11 @@ export class PostgresAuthority {
       await tx.checkReplayScopes();
       await tx.ensureReceiptsCurrent();
       try { await client.query('COMMIT'); begun = false; }
-      catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
+      catch (error) {
+        discard = true;
+        if ((error as {code?:string}).code==='PZ003') throw new AuthorityError('SCHEMA_CONFLICT','Record index projection incomplete');
+        throw new CommitOutcomeUnknownError(error);
+      }
       tx.exposeReceipts();
       return result;
     } catch (error) {
@@ -1357,6 +1361,37 @@ export class AuthorityTransaction {
     for (let i = 0; i < indexValues.length; i++) await this.writeIndex(indexValues[i], recordId);
   }
 
+  /** A low-level caller may omit projections. Complete them from the canonical
+   * record under the same collection-version lock as the record write. */
+  private async completeIndexValues(change: RecordChange): Promise<RecordChange> {
+    if (change.operation === 'delete') return change;
+    const declarations = await this.query(`SELECT field_name,value_kind FROM collection_index_declarations
+      WHERE space_id=$1 AND collection_id=$2 ORDER BY field_name`,scopeIds(this.#scope));
+    if (!declarations.rows.length) return change;
+    const data=JSON.parse(change.canonicalData!) as Record<string,Json>;
+    const indexes:IndexValue[]=[...(change.indexes ?? [])];
+    for (const row of declarations.rows) {
+      const field=row.field_name as string;
+      const declaredKind=row.value_kind as 'string'|'number'|'boolean'|'date-time';
+      const value=Object.hasOwn(data,field) ? data[field] : undefined;
+      let expected:IndexValue;
+      if (value===undefined) expected={field,kind:'missing'};
+      else if (value===null) expected={field,kind:'null'};
+      else if (declaredKind==='string' && typeof value==='string') expected={field,kind:'string',value};
+      else if (declaredKind==='date-time' && typeof value==='string') expected={field,kind:'date-time',value:utcInstant(value)};
+      else if (declaredKind==='number' && typeof value==='number' && isFiniteNumber(value)) expected={field,kind:'number',value};
+      else if (declaredKind==='boolean' && typeof value==='boolean') expected={field,kind:'boolean',value};
+      else throw new AuthorityError('SCHEMA_INVALID','Indexed value does not match its declaration');
+      validateIndexValue(expected);
+      let supplied:IndexValue|undefined;
+      for (let i=0;i<indexes.length;i++) if (indexes[i].field===field) { supplied=indexes[i]; break; }
+      if (!supplied) append(indexes,expected);
+      else if (supplied.kind!==expected.kind || ('value' in supplied && 'value' in expected && supplied.value!==expected.value))
+        throw new AuthorityError('SCHEMA_CONFLICT','Supplied index disagrees with canonical record');
+    }
+    return {...change,indexes};
+  }
+
   /** Add the event, outbox entry, and pending receipt for a written revision. */
   private async appendFacts(change: RecordChange, identity: string, version: { schemaVersion: number; generation: number },
     written: { recordId: string; beforeRevision: number | null; revision: number }): Promise<Receipt> {
@@ -1394,6 +1429,7 @@ export class AuthorityTransaction {
     if (!slot.rowCount) throw new AuthorityError('BACKPRESSURE','Collection write concurrency limit reached');
     const version = await this.currentVersion(change);
     if (prepare) change=await prepare(version,change);
+    change=await this.completeIndexValues(change);
     try {
       const written = await this.writeRecord(change, version.schemaVersion);
       await this.writeValues(change, written.recordId);

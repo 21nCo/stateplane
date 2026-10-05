@@ -99,8 +99,9 @@ async function pendingResponseBudget() {
   }
   roundTrips.sort((a,b) => a-b);
   // The budget allows ten measured network round trips plus two 50 ms lock
-  // probes. It still rejects the old remote path's 17 serial statements.
-  return Math.max(250,Math.ceil(roundTrips[2] * 10 + 100));
+  // probes and local scheduler jitter observed above 350 ms under this
+  // workload. It still rejects the old remote 17-statement path (~1.5 s).
+  return Math.max(600,Math.ceil(roundTrips[2] * 10 + 100));
 }
 
 async function scheduleGrantExpiry(scope, collectionId) {
@@ -245,7 +246,7 @@ test('an in-flight receipt returns pending before commit, then replays one effec
   const receipt = await first;
   assert.equal((await authority.mutate(scope,request)).receiptId,receipt.receiptId);
   assert.deepEqual(await counts(scope.spaceId),{
-    records:1,record_unique_keys:0,record_index_values:0,record_events:1,
+    records:1,record_unique_keys:0,record_index_values:1,record_events:1,
     idempotency_receipts:1,record_tombstones:0,projection_outbox:1
   });
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM receipt_reservations WHERE space_id=$1',[scope.spaceId])).rows[0].n,0);
@@ -306,7 +307,7 @@ test('a cross-collection retry with both grants gets pending, then the original 
   assert.equal(replay.receiptId,original.receiptId);
   assert.equal(replay.replayed,true);
   assert.deepEqual(await counts(scope.spaceId),{
-    records:1,record_unique_keys:0,record_index_values:0,record_events:1,
+    records:1,record_unique_keys:0,record_index_values:1,record_events:1,
     idempotency_receipts:1,record_tombstones:0,projection_outbox:1
   });
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM receipt_reservation_scopes WHERE space_id=$1',[scope.spaceId])).rows[0].n,0);
@@ -365,7 +366,8 @@ for (const operation of ['create','replace','patch','delete']) for (const outcom
       assert.equal(fresh.replayed,false);
     }
     assert.deepEqual(await counts(scope.spaceId),{
-      records:1,record_unique_keys:0,record_index_values:0,record_events:initial ? 2 : 1,
+      records:1,record_unique_keys:0,record_index_values:outcome==='rollback' && operation==='create' ? 1 : 0,
+      record_events:initial ? 2 : 1,
       idempotency_receipts:initial ? 2 : 1,record_tombstones:operation==='delete' ? 1 : 0,
       projection_outbox:initial ? 2 : 1
     });
@@ -615,7 +617,7 @@ test('receipt reservation is scoped by identity and rolls back cleanly', async (
   const replacement=await authority.mutate(scope,firstRequest);
   assert.equal(replacement.replayed,false);
   assert.deepEqual(await counts(scope.spaceId),{
-    records:2,record_unique_keys:0,record_index_values:0,record_events:2,
+    records:2,record_unique_keys:0,record_index_values:2,record_events:2,
     idempotency_receipts:2,record_tombstones:0,projection_outbox:2
   });
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM receipt_reservations WHERE space_id=$1',[scope.spaceId])).rows[0].n,0);
@@ -870,7 +872,7 @@ test('concurrent external and composite conflicts leave only winning rows', asyn
   assert.equal(composite.filter(result => result.status === 'fulfilled').length,1);
   assert.equal(composite.find(result => result.status === 'rejected').reason.code,'UNIQUE_CONFLICT');
   assert.deepEqual(await counts(scope.spaceId),{
-    records:2,record_unique_keys:1,record_index_values:0,record_events:2,
+    records:2,record_unique_keys:1,record_index_values:2,record_events:2,
     idempotency_receipts:2,record_tombstones:0,projection_outbox:2 });
 });
 
@@ -1021,7 +1023,7 @@ test('overlapping same-key calls inside one transaction reserve one effect and m
   assert.equal(second.receiptId,first.receiptId);
   assert.equal(second.replayed,true);
   assert.deepEqual(await counts(scope.spaceId),{
-    records:1,record_unique_keys:0,record_index_values:0,record_events:1,idempotency_receipts:1,record_tombstones:0,projection_outbox:1
+    records:1,record_unique_keys:0,record_index_values:1,record_events:1,idempotency_receipts:1,record_tombstones:0,projection_outbox:1
   });
   await assert.rejects(authority.transaction(scope,async tx => {
     const results=await Promise.allSettled([
@@ -1129,7 +1131,7 @@ test('empty indexed strings work and malformed null values and outbox booleans f
   await pool.query(`INSERT INTO collection_index_declarations(space_id,collection_id,field_name,value_kind,filterable,sortable,ready,accepted_version)
     VALUES($1,$2,'text','string',TRUE,TRUE,TRUE,1),($1,$2,'nothing','string',TRUE,FALSE,TRUE,1)`,
   [scope.spaceId,scope.collectionId]);
-  const saved=await authority.mutate(scope,change('create','empty-string','{"text":""}',{
+  const saved=await authority.mutate(scope,change('create','empty-string','{"nothing":null,"text":""}',{
     indexes:[{field:'text',kind:'string',value:''},{field:'nothing',kind:'null'}]
   }));
   const read={...scope,capability:'records:read'};
