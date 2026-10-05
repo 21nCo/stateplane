@@ -1,0 +1,27 @@
+docs/exact-queries-bulk.md
+  s_ad500513bc9987::t_ec2be7c58b7c59 5,9,11,13
+packages/postgres/src/collections.ts
+  s_ad500513bc9987::t_78021088a411f9 175,179,196,198-202
+packages/postgres/src/schema.ts
+  s_ad500513bc9987::t_fccd6bf68e5389 366,375,396,413
+scripts/migrate.mjs
+  s_ad500513bc9987::t_db1c30ef639695 29-55
+test/integration/postgres-authority.test.js
+  s_ad500513bc9987::t_dbbcba3b1e34d0 697-739
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "87ec96ffda525795e86fa6724c9e24e112189965",
+  "prompts": {},
+  "sessions": {
+    "s_ad500513bc9987": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0f222-fb22-76a5-a77e-b7c92826db44",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
