@@ -83,6 +83,8 @@ The reference cursor checks canonical wire bytes and binding, then validates a f
 
 - Unique constraint names are distinct per collection; duplicates fail schema definition. Named reservations remain independent.
 - Patch `unset` accepts distinct declared optional top-level fields; absent optional fields are valid no-ops. External keys, schema names/annotations and record strings must contain Unicode scalar values; unpaired surrogates fail before effects with input-specific codes.
+- U+0000 is a valid JSON scalar in unindexed record strings. PostgreSQL `jsonb` cannot represent it, so `records.canonical_data` stays authoritative and the optional `records.data` projection is NULL for affected records. Indexed and unique text components fail with `SCHEMA_INVALID` before record writes; authorization, receipt lookup and schema version queries may run first. Identifiers keep their input-specific rejection. Migration 027 makes only that projection nullable. Reads, replay and backfill parse canonical text; a later replacement without U+0000 restores the projection.
+- A lifecycle declaration requires its enum field in the root schema's own `required` list. This makes the declared initial-state rule enforceable on every create and prevents an optional omitted state from becoming an undefined transition origin. Existing declarations keep the same rule across compatible revisions.
 - Collection enum-transition enforcement remains normative, outside the STA-2 in-memory oracle.
 - Proof: STA-7 schema, mutation and lifecycle adapter fixtures.
 

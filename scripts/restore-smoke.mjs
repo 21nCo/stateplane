@@ -35,7 +35,7 @@ const tables = ['stateplane_migrations','space_directory','space_provisioning_au
   'collections','collection_versions','collection_unique_declarations',
   'collection_index_declarations','collection_grants','records',
   'record_unique_keys','record_index_values','record_events','idempotency_receipts','receipt_reservations',
-  'receipt_reservation_scopes',
+  'receipt_reservation_scopes','schema_commit_fences',
   'record_tombstones','projection_outbox','entity_refs'];
 async function snapshot(pool) {
   const entries = await Promise.all(tables.map(async table => {

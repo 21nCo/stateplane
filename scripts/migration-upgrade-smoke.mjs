@@ -141,6 +141,10 @@ try {
     assert.match(output,/Applied 020_immutable_space_audits.sql/);
     assert.match(output,/Applied 023_agent_key_completion_fence.sql/);
     assert.match(output,/Applied 025_space_directory_home_cell.sql/);
+    assert.match(output,/Applied 026_collection_backfill.sql/);
+    assert.match(output,/Applied 027_nul_canonical_records.sql/);
+    assert.match(output,/Applied 028_schema_commit_fence.sql/);
+    assert.match(output,/Applied 029_external_key_identity.sql/);
     assert.deepEqual(await facts(upgraded),before);
     const actor={kind:'session',userPrincipalId:'owner',credentialId:'upgrade-session'};
     const pool=new pg.Pool({connectionString:url(names[0])});
@@ -161,6 +165,7 @@ try {
     } finally { await pool.end(); }
     assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM receipt_reservations')).rows[0].n,0);
     assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM receipt_reservation_scopes')).rows[0].n,0);
+    assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM schema_commit_fences')).rows[0].n,0);
     assert.match(await index(upgraded),/\(space_id, collection_id, available_at, event_id\)/);
     await upgraded.query('SET enable_seqscan=off');
     const plan=(await upgraded.query(`EXPLAIN SELECT event_id FROM projection_outbox
@@ -308,9 +313,10 @@ try {
         .rows[0].home_cell_id,null);
     } finally { await Promise.all([splitCellPool.end(),splitControlPool.end()]); }
     await enforceUniqueRecord(upgraded);
-    assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,25);
+    const migrationCount=(await readdir(new URL('../migrations/',import.meta.url))).filter(name=>/^\d+_.*\.sql$/.test(name)).length;
+    assert.equal((await upgraded.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,migrationCount);
     assert.equal(runMigrator(names[0]),'');
-    console.log(`Upgrade smoke passed: 2000 record/event/receipt/outbox rows and upgraded owner route preserved; final index matches fresh install; 005 build ${build005Ms}ms, 006-025 migrator ${buildRemainingMs}ms`);
+    console.log(`Upgrade smoke passed: 2000 record/event/receipt/outbox rows and upgraded owner route preserved; final index matches fresh install; 005 build ${build005Ms}ms, 006-${String(migrationCount).padStart(3,'0')} migrator ${buildRemainingMs}ms`);
   } finally { await Promise.allSettled([upgraded.end(),fresh.end()]); }
 } finally {
   created.reverse();
