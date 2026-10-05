@@ -363,7 +363,7 @@ export function validateDefinition(input: unknown): CollectionDefinition {
   return validateParsedDefinition(input,false);
 }
 /** Admit a definition already parsed from serialized JSON or a checked snapshot. */
-export function validateParsedDefinition(input: unknown, trustedParsed = true): CollectionDefinition {
+export function validateParsedDefinition(input: unknown, trustedParsed = true, maxIndexedFields = 16): CollectionDefinition {
   plainJson(input,'SCHEMA_UNSUPPORTED',0,new Set<object>(),trustedParsed);
   if (!ordinary(input) || any(Object.keys(input),key=>!includes(['slug','version','schema','unique','filterable','sortable','lifecycle'],key))) fail('SCHEMA_UNSUPPORTED');
   const definition=input as unknown as CollectionDefinition;
@@ -372,7 +372,7 @@ export function validateParsedDefinition(input: unknown, trustedParsed = true): 
   validateNode(definition.schema,true,0,{count:0});
   if (!own(definition,'unique') || !own(definition,'filterable') || !own(definition,'sortable')) fail('SCHEMA_UNSUPPORTED');
   validateUniqueDeclarations(definition);
-  validateScalarDeclarations(definition);
+  validateScalarDeclarations(definition,maxIndexedFields);
   if (own(definition,'lifecycle')) validateLifecycle(definition);
   const encoded=canonical(definition as unknown as Json);
   if (Buffer.byteLength(encoded)>maxBytes) fail('SCHEMA_UNSUPPORTED','Definition exceeds byte budget');
@@ -393,7 +393,7 @@ function validateUniqueDeclarations(definition:CollectionDefinition):void {
   }
 }
 /** Check declared filter and sort paths without admitting duplicates. */
-function validateScalarDeclarations(definition:CollectionDefinition):void {
+function validateScalarDeclarations(definition:CollectionDefinition,maxIndexedFields:number):void {
   const declarations=['filterable','sortable'] as const;
   const combined:string[]=[];
   const uniques=list(definition.unique,'SCHEMA_UNSUPPORTED');
@@ -410,7 +410,7 @@ function validateScalarDeclarations(definition:CollectionDefinition):void {
     if (!distinct(paths) || any(paths,path=>!scalarField(definition.schema,path))) fail('SCHEMA_UNSUPPORTED');
     for (let j=0;j<paths.length;j++) if (!includes(combined,paths[j])) append(combined,paths[j]);
   }
-  if (combined.length>16) fail('SCHEMA_UNSUPPORTED','Indexed field limit exceeded');
+  if (combined.length>maxIndexedFields) fail('SCHEMA_UNSUPPORTED','Indexed field limit exceeded');
 }
 /** Restrict lifecycle data to a required enum field and declared transitions. */
 function validateLifecycle(definition:CollectionDefinition):void {

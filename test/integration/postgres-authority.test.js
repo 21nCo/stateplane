@@ -694,6 +694,49 @@ test('a failed transaction cannot leak state into the next borrower of one poole
   } finally { await single.end(); }
 });
 
+test('authority commit separates confirmed cancellation from a late ambiguous acknowledgement', async()=>{
+  const {scope}=await fixture();
+  const probe=`sta8_commit_${randomUUID().replaceAll('-','')}`;
+  await pool.query(`CREATE TABLE ${probe}(id integer NOT NULL)`);
+  await pool.query(`CREATE FUNCTION ${probe}_sleep() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.id=1 THEN RAISE SQLSTATE '57014' USING MESSAGE='confirmed commit cancellation'; END IF;
+      PERFORM pg_sleep(1);
+      RETURN NEW;
+    END $$`);
+  await pool.query(`CREATE CONSTRAINT TRIGGER ${probe}_delay AFTER INSERT ON ${probe}
+    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ${probe}_sleep()`);
+  let probeId=1;
+  const delayed={connect:async()=>{
+    const client=await pool.connect();
+    return {query:async(...args)=>{
+      const result=await client.query(...args);
+      if (args[0]==='BEGIN') await client.query(`INSERT INTO ${probe}(id) VALUES($1)`,[probeId]);
+      return result;
+    },release:discard=>client.release(discard)};
+  }};
+  try {
+    const bounded=new PostgresAuthority(delayed,3600,undefined,500);
+    const request=change('create',`commit-cancel-${randomUUID()}`,'{"label":"commit-cancel"}');
+    await assert.rejects(bounded.mutate(scope,request),{code:'RATE_LIMITED'});
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${probe}`)).rows[0].n,0);
+    assert.equal((await counts(scope.spaceId)).records,0);
+    assert.equal((await counts(scope.spaceId)).idempotency_receipts,0);
+    const receipt=await authority.mutate(scope,request);
+    assert.equal(receipt.replayed,false);
+    probeId=2;
+    const late=change('create',`commit-late-${randomUUID()}`,'{"label":"commit-late"}');
+    await assert.rejects(bounded.mutate(scope,late),error=>error instanceof CommitOutcomeUnknownError);
+    await new Promise(resolve=>setTimeout(resolve,1100));
+    const settled=await authority.mutate(scope,late);
+    assert.ok(settled.receiptId);
+    assert.equal((await counts(scope.spaceId)).records,2,'same-key retry resolves one committed outcome');
+  } finally {
+    await pool.query(`DROP TABLE ${probe}`);
+    await pool.query(`DROP FUNCTION ${probe}_sleep()`);
+  }
+});
+
 test('receipt retention starts at the database precommit clock, even after a held write and app clock skew', async () => {
   const { scope } = await fixture();
   const short = new PostgresAuthority(pool,1);

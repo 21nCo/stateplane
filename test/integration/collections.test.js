@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { types } from 'node:util';
-import { execFileSync } from 'node:child_process';
+import { types, promisify } from 'node:util';
+import { execFile, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { PostgresAuthority, CollectionRegistry, validateDefinition, validateValue, compatible, externalKey, derivedValues } from '../../packages/postgres/dist/index.js';
@@ -92,6 +92,36 @@ test('definition subset, additive revisions and normalization have explicit fail
   assert.doesNotThrow(()=>compatible(d,next));
   assert.throws(()=>compatible(d,{...next,schema:{...next.schema,required:['label','note']}}),{code:'SCHEMA_BREAKING'});
   assert.throws(()=>compatible(d,{...next,unique:[{name:'new',paths:['label']}]}),{code:'SCHEMA_BREAKING'});
+});
+
+test('a legacy collection above the new index cap can revise without adding paths',async()=>{
+  const spaceId=`sp_${randomUUID()}`,collectionId=`legacy_${randomUUID()}`;
+  const fields=Array.from({length:17},(_,index)=>`field${index}`);
+  const legacySchema={...schema,properties:{...schema.properties,
+    ...Object.fromEntries(fields.map(field=>[field,{type:'string'}]))}};
+  const previous=definition(collectionId,{schema:legacySchema,unique:[],filterable:fields,sortable:[]});
+  const owner={spaceId,collectionId,principalId:'owner',credentialId:'owner-session',capability:'schema:write',
+    policyVersion:1,placementGeneration:1};
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
+  const seed=await pool.connect();
+  try {
+    await seed.query('BEGIN');
+    await seed.query('INSERT INTO collections(space_id,collection_id) VALUES($1,$2)',[spaceId,collectionId]);
+    await seed.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition)
+      VALUES($1,$2,1,$3)`,[spaceId,collectionId,JSON.stringify(previous)]);
+    await seed.query('COMMIT');
+  } catch(error) { await seed.query('ROLLBACK'); throw error; }
+  finally { seed.release(); }
+  for (const field of fields) await pool.query(`INSERT INTO collection_index_declarations
+    (space_id,collection_id,field_name,value_kind,filterable,sortable,ready,accepted_version)
+    VALUES($1,$2,$3,'string',TRUE,FALSE,TRUE,1)`,[spaceId,collectionId,field]);
+  const revised={...previous,version:2};
+  assert.equal((await registry.revise(owner,1,revised)).version,2);
+  const extra='newField';
+  await assert.rejects(registry.revise(owner,2,{...revised,version:3,
+    schema:{...legacySchema,properties:{...legacySchema.properties,[extra]:{type:'string'}}},
+    filterable:[...fields,extra]}),{code:'SCHEMA_UNSUPPORTED'});
 });
 
 test('unindexed Unicode NUL survives writes and replay while indexed siblings fail explicitly',async()=>{
@@ -1654,10 +1684,18 @@ test('031 restarts a pre-upgrade partial backfill before publishing sorted pages
         VALUES($1,$2,'rec_102',1,1,'generated','rec_102','{"label":"late"}','{"label":"late"}'::jsonb)`,
       [scope.spaceId,scope.collectionId]);
       let settled=false;
+      const migratingPid=(await upgraded.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+      const oldWriterPid=(await oldWriter.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
       migrating=upgraded.query(await readFile(new URL('../../migrations/031_index_missing_projection.sql',import.meta.url),'utf8'))
         .finally(()=>{ settled=true; });
-      await new Promise(resolve=>setTimeout(resolve,50));
-      assert.equal(settled,false,'migration waits for the old record writer');
+      let observed=false;
+      for (let attempt=0;attempt<100;attempt++) {
+        const blockers=(await admin.query('SELECT pg_blocking_pids($1) AS pids',[migratingPid])).rows[0].pids;
+        if (blockers.includes(oldWriterPid)) { observed=true; break; }
+        if (settled) break;
+        await new Promise(resolve=>setTimeout(resolve,20));
+      }
+      assert.equal(observed,true,'PostgreSQL reports the old writer blocking migration cutover');
       await oldWriter.query('COMMIT');
     } finally {
       await oldWriter.query('ROLLBACK').catch(()=>{});
@@ -1695,6 +1733,93 @@ test('031 restarts a pre-upgrade partial backfill before publishing sorted pages
   } finally {
     await upgradePool?.end();
     await upgraded?.end();
+    await admin.query(`DROP DATABASE IF EXISTS ${database} WITH (FORCE)`);
+    await admin.end();
+  }
+});
+
+test('populated 031 upgrade requires a drained gate before its projection sweep',async()=>{
+  const database=`stateplane_sta8_drain_${randomUUID().replaceAll('-','')}`;
+  const location=new URL(baseUrl); location.pathname=`/${database}`;
+  const admin=new pg.Client({connectionString:baseUrl});
+  await admin.connect();
+  let upgrade;
+  try {
+    await admin.query(`CREATE DATABASE ${database}`);
+    upgrade=new pg.Client({connectionString:location.href});
+    await upgrade.connect();
+    await upgrade.query(`CREATE TABLE stateplane_migrations(name text PRIMARY KEY,sha256 text NOT NULL,
+      applied_at timestamptz NOT NULL DEFAULT now())`);
+    const files=(await readdir(new URL('../../migrations/',import.meta.url))).filter(name=>/^\d{3}_.*\.sql$/.test(name)).sort();
+    for (const file of files.filter(name=>name<'031_')) {
+      const sql=await readFile(new URL(`../../migrations/${file}`,import.meta.url),'utf8');
+      await upgrade.query(sql);
+      await upgrade.query('INSERT INTO stateplane_migrations(name,sha256) VALUES($1,$2)',
+        [file,createHash('sha256').update(sql).digest('hex')]);
+    }
+    await upgrade.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+      VALUES('sta8-drain','owner','cell-a','cell-a','target-a')`);
+    await upgrade.query('BEGIN');
+    await upgrade.query("INSERT INTO collections(space_id,collection_id) VALUES('sta8-drain','entries')");
+    await upgrade.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition)
+      VALUES('sta8-drain','entries',1,$1)`,[JSON.stringify(definition('entries',{unique:[],sortable:['score']}))]);
+    await upgrade.query('COMMIT');
+    await upgrade.query(`INSERT INTO collection_index_declarations
+      (space_id,collection_id,field_name,value_kind,filterable,sortable,ready,accepted_version)
+      VALUES('sta8-drain','entries','score','number',TRUE,TRUE,FALSE,1)`);
+    await upgrade.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,
+      key_mode,normalized_key,canonical_data,data)
+      SELECT 'sta8-drain','entries','rec-'||g,1,1,'generated','rec-'||g,payload::text,payload
+      FROM generate_series(1,2000) g CROSS JOIN LATERAL
+        (SELECT jsonb_build_object('label','row-'||g,'score',g) AS payload) p`);
+    const env={...process.env,DATABASE_URL:location.href};
+    const cwd=fileURLToPath(new URL('../..',import.meta.url));
+    let failure;
+    try { execFileSync(process.execPath,['scripts/migrate.mjs'],{cwd,env,encoding:'utf8'}); }
+    catch(error) { failure=error; }
+    assert.match(String(failure?.stderr),/Populated projection upgrade requires drained traffic/);
+    assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name LIKE '031_%'"))
+      .rows[0].n,0,'refused migration leaves no partial ledger entry');
+    const blocker=new pg.Client({connectionString:location.href});
+    await blocker.connect();
+    const migrate=promisify(execFile);
+    let migrating;
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query(`SELECT 1 FROM collection_index_declarations
+        WHERE space_id='sta8-drain' AND collection_id='entries' AND field_name='score' FOR NO KEY UPDATE`);
+      const blockerPid=(await blocker.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+      migrating=migrate(process.execPath,['scripts/migrate.mjs'],{cwd,
+        env:{...env,STATEPLANE_POPULATED_INDEX_UPGRADE:'drained'},encoding:'utf8'});
+      migrating.catch(()=>{});
+      let observed=false;
+      for (let attempt=0;attempt<100;attempt++) {
+        const activity=(await upgrade.query(`SELECT pid,wait_event_type,query FROM pg_stat_activity
+          WHERE datname=$1 AND query LIKE 'SELECT count(*)::bigint FROM (%'`,[database])).rows[0];
+        if (activity?.wait_event_type==='Lock' &&
+          (await upgrade.query('SELECT pg_blocking_pids($1) AS pids',[activity.pid])).rows[0].pids.includes(blockerPid))
+        { observed=true; break; }
+        await new Promise(resolve=>setTimeout(resolve,20));
+      }
+      assert.equal(observed,true,'PostgreSQL reports the migrator waiting for the backfill declaration lock');
+      await blocker.query(`INSERT INTO record_index_values
+        (space_id,collection_id,record_id,field_name,value_kind,number_value)
+        VALUES('sta8-drain','entries','rec-1','score','number',1)`);
+      await blocker.query('COMMIT');
+    } finally {
+      await blocker.query('ROLLBACK').catch(()=>{});
+      await blocker.end();
+    }
+    const started=performance.now();
+    await migrating;
+    const elapsed=performance.now()-started;
+    assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name LIKE '031_%'"))
+      .rows[0].n,1);
+    assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM records WHERE space_id='sta8-drain'"))
+      .rows[0].n,2000);
+    assert.ok(elapsed<5000,`local 2000-row drained upgrade took ${elapsed.toFixed(0)}ms`);
+  } finally {
+    await upgrade?.end();
     await admin.query(`DROP DATABASE IF EXISTS ${database} WITH (FORCE)`);
     await admin.end();
   }
@@ -1928,27 +2053,60 @@ test('read and serialized batch budgets cover authorization lock waits',async()=
     [writer.spaceId])).rows[0].n,0);
 });
 
-test('expired ingest response is recoverable through durable progress polling',async()=>{
+test('a late clock tick after the last item reports complete durable progress',async()=>{
   const {writer}=await fixture();
-  let commits=0;
-  const delayedPool={connect:async()=>{
-    const client=await pool.connect();
-    return {query:async(...args)=>{
-      const result=await client.query(...args);
-      if (args[0]==='COMMIT' && ++commits===2)
-        await new Promise(resolve=>setTimeout(resolve,650));
-      return result;
-    },release:discard=>client.release(discard)};
-  }};
-  const bounded=new PostgresAuthority(delayedPool,3600,undefined,500);
+  const bounded=new PostgresAuthority(pool,3600,undefined,1500);
+  const processOrdinal=bounded.processBatchOrdinal.bind(bounded);
+  bounded.processBatchOrdinal=async (...args)=>{
+    const result=await processOrdinal(...args);
+    await new Promise(resolve=>setTimeout(resolve,1800));
+    return result;
+  };
   const key='expired-progress',requests=[JSON.stringify({operation:'create',data:{label:'expired-progress'}})];
-  await assert.rejects(bounded.ingestBatch(writer,key,requests),{code:'RATE_LIMITED'});
+  const completed=await bounded.ingestBatch(writer,key,requests);
+  assert.equal(completed.items[0].state,'succeeded');
   const progress=await authority.batchProgress(writer,key);
   assert.equal(progress.items[0].state,'succeeded');
   assert.ok(progress.items[0].receipt?.receiptId);
+  assert.equal(completed.items[0].receipt.receiptId,progress.items[0].receipt.receiptId);
   const replay=await authority.ingestBatch(writer,key,requests);
   assert.equal(replay.items[0].receipt.receiptId,progress.items[0].receipt.receiptId);
   assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),1);
+});
+
+test('batch attempts and slot seeding keep their database-level bounds',async()=>{
+  const {writer}=await fixture();
+  const key=`batch-domain-${randomUUID()}`;
+  await authority.transaction(writer,tx=>tx.startBatch(key,'d'.repeat(64),['{}']));
+  await assert.rejects(pool.query(`UPDATE batch_items SET attempts=-1 WHERE space_id=$1 AND collection_id=$2
+    AND credential_id=$3 AND operation_key=$4`,[writer.spaceId,writer.collectionId,writer.credentialId,key]),
+  {code:'23514'});
+  const slots=await pool.query('SELECT count(*)::int AS n FROM collection_write_slots WHERE space_id=$1 AND collection_id=$2',
+    [writer.spaceId,writer.collectionId]);
+  assert.equal(slots.rows[0].n,8);
+  const fn=(await pool.query(`SELECT proconfig FROM pg_proc WHERE oid='public.stateplane_seed_write_slots()'::regprocedure`))
+    .rows[0].proconfig;
+  assert.ok(fn.includes('search_path=pg_catalog, public, pg_temp'));
+});
+
+test('a 20-item indexed batch bounds timeout-setting round trips',async()=>{
+  const {writer}=await fixture();
+  let timeoutSets=0;
+  const measured={connect:async()=>{
+    const client=await pool.connect();
+    return {query:(...args)=>{
+      if (String(args[0]).startsWith('SET LOCAL statement_timeout')) timeoutSets++;
+      return client.query(...args);
+    },release:discard=>client.release(discard)};
+  }};
+  const batch=new PostgresAuthority(measured,3600);
+  const requests=Array.from({length:20},(_,i)=>JSON.stringify({operation:'create',data:{label:`volume-${i}`,score:i}}));
+  const result=await batch.ingestBatch(writer,`volume-${randomUUID()}`,requests);
+  assert.equal(result.items.length,20);
+  assert.ok(result.items.every(item=>item.state==='succeeded' && item.receipt?.receiptId));
+  assert.ok(timeoutSets<=100,`20 items required ${timeoutSets} timeout-setting round trips`);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM record_index_values WHERE space_id=$1',
+    [writer.spaceId])).rows[0].n,20);
 });
 
 test('paged reads cap payload bytes and a 5000-row selective typed query uses the declared index',async()=>{
@@ -2069,7 +2227,8 @@ test('serialized exact reads work without an in-process proxy detector',async()=
     const {url,reader,writer}=JSON.parse(process.env.STA8_TEST_CONTEXT);
     const pool=new pg.Pool({connectionString:url});
     try {
-      const authority=new PostgresAuthority(pool,3600,Buffer.alloc(32,7));
+      const {randomBytes}=await import('node:crypto');
+      const authority=new PostgresAuthority(pool,3600,randomBytes(32));
       const filters=JSON.stringify([{field:'score',kind:'number',operator:'eq',value:7}]);
       assert.equal(await authority.transaction(reader,tx=>tx.countSerializedRecords(filters)),1);
       assert.equal(await authority.transaction(reader,tx=>tx.existsSerializedRecord(filters)),true);

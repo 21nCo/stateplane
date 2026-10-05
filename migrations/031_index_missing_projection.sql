@@ -27,7 +27,8 @@ UPDATE collection_index_declarations d SET
       AND NOT r.tombstone AND NOT EXISTS (
         SELECT 1 FROM record_index_values v WHERE v.space_id=r.space_id AND v.collection_id=r.collection_id
           AND v.record_id=r.record_id AND v.field_name=d.field_name)),
-  backfill_after = NULL;
+  backfill_after = NULL
+WHERE d.ready OR d.backfill_after IS NOT NULL;
 
 -- A writer from before this migration can still run during a rolling cutover.
 -- Reject its transaction at COMMIT if it omitted any declared projection.
@@ -68,6 +69,8 @@ REVOKE ALL ON FUNCTION stateplane_check_index_projection() FROM PUBLIC;
 CREATE CONSTRAINT TRIGGER record_index_projection_write
   AFTER INSERT OR UPDATE OF canonical_data,tombstone ON records DEFERRABLE INITIALLY DEFERRED
   FOR EACH ROW EXECUTE FUNCTION stateplane_check_index_projection();
+-- An UPDATE to a projection key can remove a required row too. Checking one
+-- changed row is sufficient: the deferred query checks every declared field.
 CREATE CONSTRAINT TRIGGER record_index_projection_delete
-  AFTER DELETE ON record_index_values DEFERRABLE INITIALLY DEFERRED
+  AFTER DELETE OR UPDATE OF space_id,collection_id,record_id,field_name ON record_index_values DEFERRABLE INITIALLY DEFERRED
   FOR EACH ROW EXECUTE FUNCTION stateplane_check_index_projection();

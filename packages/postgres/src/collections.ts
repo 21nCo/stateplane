@@ -172,11 +172,11 @@ export class CollectionRegistry {
   /** Accept a compatible object revision at an exact expected version. */
   async revise(scope:AuthorityScope,expectedVersion:number,input:unknown):Promise<CollectionDefinition> {
     const snapshot=snapshotDefinition(input);
-    return this.reviseUsing(scope,expectedVersion,()=>validateParsedDefinition(snapshot()));
+    return this.reviseUsing(scope,expectedVersion,()=>validateParsedDefinition(snapshot(),true,Infinity));
   }
   /** Accept a compatible serialized revision at an exact expected version. */
   async reviseSerialized(scope:AuthorityScope,expectedVersion:number,serialized:string):Promise<CollectionDefinition> {
-    return this.reviseUsing(scope,expectedVersion,()=>validateParsedDefinition(this.parseDefinition(serialized)));
+    return this.reviseUsing(scope,expectedVersion,()=>validateParsedDefinition(this.parseDefinition(serialized),true,Infinity));
   }
   /** Serialize version changes with record writes and fence grant expiry at commit. */
   private async reviseUsing(scope:AuthorityScope,expectedVersion:number,load:()=>CollectionDefinition):Promise<CollectionDefinition> {
@@ -193,8 +193,13 @@ export class CollectionRegistry {
       const prior=(await client.query(`SELECT canonical_definition FROM collection_versions
         WHERE space_id=$1 AND collection_id=$2 AND version=$3`,[scope.spaceId,next.slug,row.schema_version])).rows[0];
       if (!prior) throw new AuthorityError('SCHEMA_CONFLICT','Current collection definition is unavailable');
-      const previous=validateParsedDefinition(JSON.parse(prior.canonical_definition));
+      const previous=validateParsedDefinition(JSON.parse(prior.canonical_definition),true,Infinity);
       compatibleParsed(previous,next);
+      const uniqueFields=previous.unique.flatMap(item=>item.paths);
+      const oldFields=declaredFields(uniqueFields,declaredFields(previous.filterable,previous.sortable));
+      const nextFields=declaredFields(uniqueFields,declaredFields(next.filterable,next.sortable));
+      if (nextFields.length>16 && nextFields.some(field=>!has(oldFields,field)))
+        throw new AuthorityError('SCHEMA_UNSUPPORTED','Indexed field limit exceeded');
       await client.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition)
         VALUES($1,$2,$3,$4)`,[scope.spaceId,next.slug,next.version,canonical(next as unknown as Json)]);
       await this.insertDeclarations(client,scope,next,previous);

@@ -84,6 +84,7 @@ try {
   const claimed=await authority.transaction(worker,tx=>tx.claimOutbox(1,30));
   await authority.transaction(worker,tx=>tx.finishOutbox(claimed[0],true));
   const expected = await snapshot(base);
+  assert.equal(expected.collection_write_slots.length,8,'restore seed must create all eight write slots');
   assert.ok(expected.records.length && expected.record_events.length && expected.projection_outbox.length &&
     expected.space_directory.length && expected.agent_key_issuances.length &&
     expected.space_credentials.length && expected.collection_grants.length && expected.batch_items.length &&
