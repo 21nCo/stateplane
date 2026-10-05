@@ -783,21 +783,23 @@ export class PostgresAuthority {
 
   /** A bounded manifest is durable before individual item transactions begin. */
   async ingestBatch(scope:AuthorityScope,operationKey:string,requests:readonly string[],retryFailed=false):Promise<BatchProgress> {
+    const fixedScope=Object.freeze({...scope});
     const deadline=Date.now()+this.requestTimeoutMs;
     if (!acceptsInProcessObjects || isInProcessProxy(requests)) throw new AuthorityError('INVALID_ARGUMENT');
-    return this.ingestBatchUsing(scope,operationKey,requests,retryFailed,deadline);
+    return this.ingestBatchUsing(fixedScope,operationKey,requests,retryFailed,deadline);
   }
 
   /** Cloudflare-safe batch boundary: parse manifest bytes only after scope authorization. */
   async ingestSerializedBatch(scope:AuthorityScope,operationKey:string,serialized:string,retryFailed=false):Promise<BatchProgress> {
+    const fixedScope=Object.freeze({...scope});
     const deadline=Date.now()+this.requestTimeoutMs;
-    const requests=await this.transaction(scope,tx=>{
+    const requests=await this.transaction(fixedScope,tx=>{
       if (tx.scope.capability!=='records:write') throw new AuthorityError('FORBIDDEN');
       if (typeof serialized!=='string' || Buffer.byteLength(serialized)>3_145_728) throw new AuthorityError('RATE_LIMITED');
       try { return JSON.parse(serialized) as string[]; }
       catch { throw new AuthorityError('INVALID_ARGUMENT'); }
     },deadline);
-    return this.ingestBatchUsing(scope,operationKey,requests,retryFailed,deadline);
+    return this.ingestBatchUsing(fixedScope,operationKey,requests,retryFailed,deadline);
   }
 
   private async ingestBatchUsing(scope:AuthorityScope,operationKey:string,requests:readonly string[],retryFailed:boolean,deadline:number):Promise<BatchProgress> {

@@ -1973,6 +1973,38 @@ test('durable batch checkpoint resumes partial success, rejects changed retries 
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM collection_write_slots WHERE space_id=$1',[writer.spaceId])).rows[0].n,0);
 });
 
+test('batch ingress owns its scope across manifest, item, failure, progress and serialized preflight',async()=>{
+  const valid=JSON.stringify({operation:'create',data:{label:'scope-owned'}});
+  const invalid=JSON.stringify({operation:'create',data:{label:'scope-invalid',extra:'unsupported'}});
+  for (const [boundary,serialized,requests,expected] of [
+    [1,false,[valid],['succeeded']], // manifest admission
+    [2,false,[valid],['succeeded']], // item commit before progress
+    [2,false,[invalid,valid],['failed','succeeded']], // item failure before failure receipt
+    [3,false,[invalid,valid],['failed','succeeded']], // failure receipt before next item
+    [1,true,[valid],['succeeded']] // serialized authorization preflight
+  ]) {
+    const {writer}=await fixture(),{writer:sibling}=await fixture();
+    const target={...writer},key=`scope-${randomUUID()}`;
+    const digest=createHash('sha256').update(JSON.stringify(requests)).digest('hex');
+    await authority.transaction(sibling,tx=>tx.startBatch(key,digest,requests));
+    const ingest=new PostgresAuthority(pool,3600);
+    const transaction=ingest.transaction.bind(ingest);
+    let completed=0;
+    ingest.transaction=async (...args)=>{
+      try { return await transaction(...args); }
+      finally { if (++completed===boundary) Object.assign(writer,sibling); }
+    };
+    const progress=serialized
+      ? await ingest.ingestSerializedBatch(writer,key,JSON.stringify(requests))
+      : await ingest.ingestBatch(writer,key,requests);
+    assert.deepEqual(progress.items.map(item=>item.state),expected);
+    assert.deepEqual((await authority.batchProgress(target,key)).items.map(item=>item.state),expected);
+    assert.deepEqual((await authority.batchProgress(sibling,key)).items.map(item=>item.state),
+      requests.map(()=> 'pending'));
+    assert.ok(progress.items.find(item=>item.state==='succeeded')?.receipt?.receiptId);
+  }
+});
+
 test('in-flight batch cancellation backs off, then preserves the committed item receipt',async()=>{
   const {writer}=await fixture();
   const key='cancel-in-flight',requests=[JSON.stringify({operation:'create',data:{label:'cancel-in-flight'}})];
@@ -2156,16 +2188,19 @@ test('populated batch validation permits writes while its validation lock waits'
       await new Promise(resolve=>setTimeout(resolve,10));
     }
     assert.equal(waiting,true,'PostgreSQL reports validation waiting on the independent DDL lock');
-    await updater.query("SET statement_timeout = '1500ms'");
+    await updater.query('BEGIN');
+    await updater.query("SET LOCAL statement_timeout = '1500ms'");
     const updated=await updater.query(`UPDATE batch_items SET attempts=attempts+1
       WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 AND operation_key=$4 AND ordinal=0`,
       [writer.spaceId,writer.collectionId,writer.credentialId,key]);
     assert.equal(updated.rowCount,1,'the validation lock does not block batch progress');
+    await updater.query('COMMIT');
     await blocker.query('COMMIT');
     await validation;
     assert.equal((await pool.query(`SELECT convalidated FROM pg_constraint WHERE conrelid='public.batch_items'::regclass
       AND conname='batch_items_attempts_nonnegative'`)).rows[0].convalidated,true);
   } finally {
+    await updater.query('ROLLBACK').catch(()=>{});
     await blocker.query('ROLLBACK').catch(()=>{});
     if (validation) await validation.catch(()=>{});
     blocker.release(); validator.release(); updater.release();
