@@ -6,6 +6,7 @@ import { AuthorityError, CommitOutcomeUnknownError, PostgresAuthority } from './
 import type { AuthorityScope, AuthorityTransaction, JoinedReceiptState } from './index.js';
 
 type PoolLike = Pick<pg.Pool, 'connect'>;
+const CELL_REQUEST_TIMEOUT_MS = 30_000;
 const recordsCallback = new AsyncLocalStorage<symbol>();
 type JoinedAuthority = { finish: () => Promise<void>; verify: () => Promise<void>; ensureCurrent: () => Promise<number>;
   expose: () => void; close: () => void };
@@ -23,23 +24,72 @@ export interface AuthorizedCellContext {
 /** The cell never accepts a bearer credential or requested principal directly. */
 export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
   constructor(private readonly pool: PoolLike, private readonly cellId: string,
-    private readonly credentials: CurrentCredential, private readonly clock: () => number = () => Date.now()) {}
+    private readonly credentials: CurrentCredential, private readonly clock: () => number = () => Date.now(),
+    private readonly requestTimeoutMs = CELL_REQUEST_TIMEOUT_MS) {
+    if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > CELL_REQUEST_TIMEOUT_MS)
+      throw new RangeError('Invalid cell request time budget');
+  }
+
+  private remaining(deadline: number): number {
+    const left = deadline - Date.now();
+    if (left <= 0) throw new AuthorityError('RATE_LIMITED', 'Cell request time budget exceeded');
+    return Math.max(1, Math.trunc(left));
+  }
+
+  private async connect(deadline: number): Promise<pg.PoolClient> {
+    const remaining = this.remaining(deadline);
+    return new Promise((resolve, reject) => {
+      let expired = false;
+      const timer = setTimeout(() => {
+        expired = true;
+        reject(new AuthorityError('RATE_LIMITED', 'Cell request time budget exceeded'));
+      }, remaining);
+      this.pool.connect().then(client => {
+        clearTimeout(timer);
+        if (expired) client.release();
+        else resolve(client);
+      }, error => { clearTimeout(timer); if (!expired) reject(error); });
+    });
+  }
+
+  /** Provider authorization is read-only; a late result cannot reopen admission. */
+  private async authorizeWithin<T>(work: () => Promise<T>, deadline: number): Promise<T> {
+    const remaining = this.remaining(deadline);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new AuthorityError('RATE_LIMITED', 'Cell request time budget exceeded')), remaining);
+      try { work().then(value => { clearTimeout(timer); resolve(value); }, error => { clearTimeout(timer); reject(error); }); }
+      catch (error) { clearTimeout(timer); reject(error); }
+    });
+  }
+
+  /** Reset the server-side bound before every statement so earlier work cannot extend the request. */
+  private boundedClient(client: pg.PoolClient, deadline: number): pg.PoolClient {
+    return { query: async (sql: string, values?: unknown[]) => {
+      await client.query(`SET LOCAL statement_timeout = '${this.remaining(deadline)}ms'`);
+      const result = await client.query(sql, values);
+      this.remaining(deadline);
+      return result;
+    } } as pg.PoolClient;
+  }
 
   private checkAssertionTime(claims: RouteClaims): void {
     if (claims.expiresAt * 1000 <= this.clock()) throw new AuthorityError('FORBIDDEN', 'Routing assertion expired');
   }
 
-  /** Autocommit on a separate connection keeps replay denied even if the effect rolls back. */
-  private async consume(claims: RouteClaims): Promise<void> {
-    const client = await this.pool.connect();
+  /** A separately committed nonce keeps replay denied even if the effect rolls back. */
+  private async consume(claims: RouteClaims, deadline: number): Promise<void> {
+    const client = await this.connect(deadline);
     let discard = false;
+    let begun = false;
     try {
+      await client.query('BEGIN'); begun = true;
+      const bounded = this.boundedClient(client, deadline);
       this.checkAssertionTime(claims);
       // Bound maintenance to each admission so idle Workers do not need a timer.
       // The same database clock governs pruning and insertion; Worker clock skew
       // cannot make a pruned assertion admissible again.
-      await this.prune(client);
-      const nonce = await client.query(`WITH eligible AS MATERIALIZED (
+      await this.prune(bounded);
+      const nonce = await bounded.query(`WITH eligible AS MATERIALIZED (
           SELECT 1 FROM spaces s WHERE s.space_id=$1 AND s.cell_id=$4
             AND s.policy_version=$5 AND s.placement_generation=$6
             AND s.lifecycle IN ('active','readOnly') FOR SHARE OF s
@@ -47,18 +97,25 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
         SELECT $1,$2,to_timestamp($3) FROM eligible WHERE to_timestamp($3)>clock_timestamp()
         ON CONFLICT DO NOTHING RETURNING nonce`,
       [claims.spaceId,claims.nonce,claims.expiresAt,claims.cellId,claims.policyVersion,claims.placementGeneration]);
+      let admissionError: AuthorityError | undefined;
       if (nonce.rowCount !== 1) {
-        const state = await client.query(`SELECT lifecycle,cell_id,policy_version,placement_generation
+        const state = await bounded.query(`SELECT lifecycle,cell_id,policy_version,placement_generation
           FROM spaces WHERE space_id=$1`,[claims.spaceId]);
         const row = state.rows[0];
-        if (!row || row.lifecycle === 'deleted') throw new AuthorityError('NOT_FOUND');
-        if (row.cell_id !== claims.cellId || Number(row.policy_version) !== claims.policyVersion ||
-          Number(row.placement_generation) !== claims.placementGeneration) throw new AuthorityError('STALE_PLACEMENT');
-        if (row.lifecycle !== 'active' && row.lifecycle !== 'readOnly') throw new AuthorityError('SPACE_UNAVAILABLE');
-        throw new AuthorityError('FORBIDDEN', 'Routing assertion already consumed');
+        if (!row || row.lifecycle === 'deleted') admissionError = new AuthorityError('NOT_FOUND');
+        else if (row.cell_id !== claims.cellId || Number(row.policy_version) !== claims.policyVersion ||
+          Number(row.placement_generation) !== claims.placementGeneration) admissionError = new AuthorityError('STALE_PLACEMENT');
+        else if (row.lifecycle !== 'active' && row.lifecycle !== 'readOnly') admissionError = new AuthorityError('SPACE_UNAVAILABLE');
+        else admissionError = new AuthorityError('FORBIDDEN', 'Routing assertion already consumed');
       }
+      this.remaining(deadline);
+      try { await client.query('COMMIT'); begun = false; }
+      catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
+      if (admissionError) throw admissionError;
     } catch (error) {
+      if (begun) { try { await client.query('ROLLBACK'); } catch { discard = true; } }
       if (!(error instanceof AuthorityError)) { discard = true; }
+      if ((error as {code?:string}).code === '57014') throw new AuthorityError('RATE_LIMITED', 'Database statement time limit exceeded');
       throw error;
     }
     finally { client.release(discard); }
@@ -90,7 +147,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     finally { result.release(); }
   }
 
-  private async check(client: pg.PoolClient, claims: RouteClaims, requireActiveSpace = false): Promise<string> {
+  private async check(client: pg.PoolClient, claims: RouteClaims, deadline: number, requireActiveSpace = false): Promise<string> {
     const checkStarted = performance.now();
     const result = await client.query(`SELECT s.owner_principal_id,s.lifecycle,s.cell_id,s.policy_version,s.placement_generation,
       c.lifecycle AS collection_lifecycle, sc.principal_id AS key_principal_id,
@@ -119,7 +176,8 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     const mutates = claims.capability.endsWith(':write') || claims.capability === 'claims:review';
     if (row.collection_lifecycle === 'readOnly' && mutates) throw new AuthorityError('SPACE_UNAVAILABLE');
     if (row.lifecycle === 'readOnly' && mutates && claims.capability !== 'records:write') throw new AuthorityError('SPACE_UNAVAILABLE');
-    if (!await this.credentials.current(claims,row.owner_principal_id)) throw new AuthorityError('FORBIDDEN');
+    if (!await this.authorizeWithin(() => this.credentials.current(claims,row.owner_principal_id),deadline))
+      throw new AuthorityError('FORBIDDEN');
     // The provider call is outside PostgreSQL. Reject if its latency crossed
     // any deadline observed by the database query before that call.
     const validityMs = Number(row.validity_ms);
@@ -157,10 +215,12 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
   }
 
   async run<T>(claims: RouteClaims, effect: (principalId: string, context: AuthorizedCellContext) => Promise<T>): Promise<T> {
+    const deadline = Date.now() + this.requestTimeoutMs;
     claims = Object.freeze({ ...claims });
     this.checkAssertionTime(claims);
-    await this.consume(claims);
-    const client = await this.pool.connect();
+    await this.consume(claims, deadline);
+    const client = await this.connect(deadline);
+    const bounded = this.boundedClient(client, deadline);
     let begun = false;
     let beginAttempted = false;
     let discard = false;
@@ -168,12 +228,12 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     const joinedReceipts: JoinedReceiptState = {pending:new Map(),replayed:new Map(),ready:[]};
     try {
       this.checkAssertionTime(claims);
-      await this.checkDatabaseTime(client,claims);
       beginAttempted = true;
       await client.query('BEGIN'); begun = true;
       this.checkAssertionTime(claims);
-      await this.checkDatabaseTime(client,claims);
-      const principalId = await this.check(client, claims);
+      await this.checkDatabaseTime(bounded,claims);
+      const principalId = await this.check(bounded, claims, deadline);
+      this.remaining(deadline);
       const scope: Readonly<AuthorityScope> = Object.freeze({ spaceId:claims.spaceId as SpaceId,collectionId:claims.collectionId as CollectionId,
         principalId,credentialId:claims.credentialId,capability:claims.capability,
         policyVersion:claims.policyVersion,placementGeneration:claims.placementGeneration });
@@ -188,14 +248,14 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
         const running = (async () => {
           if (previous) await previous;
           this.checkAssertionTime(claims);
-          await this.check(client,claims,requireActiveSpace);
-          await this.checkDatabaseTime(client,claims);
+          await this.check(bounded,claims,deadline,requireActiveSpace);
+          await this.checkDatabaseTime(bounded,claims);
           if (!accepting) throw new AuthorityError('FORBIDDEN', 'Cell effect context ended');
           const value = await work();
           if (!accepting) throw new AuthorityError('FORBIDDEN', 'Cell effect context ended');
           this.checkAssertionTime(claims);
-          await this.check(client,claims,requireActiveSpace);
-          await this.checkDatabaseTime(client,claims);
+          await this.check(bounded,claims,deadline,requireActiveSpace);
+          await this.checkDatabaseTime(bounded,claims);
           if (!accepting) throw new AuthorityError('FORBIDDEN', 'Cell effect context ended');
           return value;
         })();
@@ -223,7 +283,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
           const running = admit(async () => {
             return authority.transactionOnClient(client,scope,
               tx => recordsCallback.run(callbackToken, () => fn(tx)),
-              (finish,verify,ensureCurrent,expose,close) => { joined.push({finish,verify,ensureCurrent,expose,close}); },joinedReceipts);
+              (finish,verify,ensureCurrent,expose,close) => { joined.push({finish,verify,ensureCurrent,expose,close}); },joinedReceipts,deadline);
           }, false, previous);
           recordsTail = running.then(() => {}, () => {});
           return running;
@@ -236,28 +296,29 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       }
       if (operationError) throw operationError;
       // Clock-based expiry can occur while locks are held. Recheck immediately before commit.
-      await this.check(client, claims);
+      await this.check(bounded, claims, deadline);
       this.checkAssertionTime(claims);
-      await this.checkDatabaseTime(client,claims);
+      await this.checkDatabaseTime(bounded,claims);
       // Check provider freshness before starting the receipt retry window.
       // Joined record work remains live until the enclosing cell commit.
       for (const entry of joined) await entry.finish();
       this.checkAssertionTime(claims);
-      await this.check(client,claims);
-      await this.checkDatabaseTime(client,claims);
+      await this.check(bounded,claims,deadline);
+      await this.checkDatabaseTime(bounded,claims);
       for (const entry of joined) await entry.verify();
       // Finalization may wait on SQL. Every joined call, including a replay of
       // an original collection, must still be authorized after that wait.
       for (const entry of joined) await entry.finish();
-      await this.check(client,claims);
+      await this.check(bounded,claims,deadline);
       this.checkAssertionTime(claims);
-      await this.checkDatabaseTime(client,claims);
+      await this.checkDatabaseTime(bounded,claims);
       // The final provider lookup follows all joined SQL work. A slow lookup
       // must not consume the retry window stamped by the database clock.
       const receiptFenceStarted = performance.now();
       const receiptRemaining = joined.length ? await joined[0].ensureCurrent() : Infinity;
-      await this.check(client,claims);
-      await this.fenceCommit(client,claims,joinedReceipts,receiptRemaining,receiptFenceStarted);
+      await this.check(bounded,claims,deadline);
+      await this.fenceCommit(bounded,claims,joinedReceipts,receiptRemaining,receiptFenceStarted);
+      this.remaining(deadline);
       try { await client.query('COMMIT'); begun = false; }
       catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
       for (const entry of joined) entry.expose();
@@ -265,6 +326,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     } catch (error) {
       if (begun) { try { await client.query('ROLLBACK'); } catch { discard = true; } }
       else if (beginAttempted) discard = true;
+      if ((error as {code?:string}).code === '57014') throw new AuthorityError('RATE_LIMITED', 'Database statement time limit exceeded');
       throw error;
     } finally {
       for (const entry of joined) entry.close();

@@ -568,8 +568,8 @@ export class PostgresAuthority {
   async transactionOnClient<T>(client: Client, scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T>,
     deferUntilCommit: (finish: () => Promise<void>, verify: () => Promise<void>, ensureCurrent: () => Promise<number>, expose: () => void,
       close: () => void) => void,
-    joinedReceipts?: JoinedReceiptState): Promise<T> {
-    const deadline=Date.now()+this.requestTimeoutMs;
+    joinedReceipts?: JoinedReceiptState, cellDeadlineMs?: number): Promise<T> {
+    const deadline=Math.min(Date.now()+this.requestTimeoutMs,cellDeadlineMs ?? Infinity);
     const fixedScope = Object.freeze({ ...scope });
     if (!validScope(fixedScope)) throw new AuthorityError('INVALID_ARGUMENT');
     const tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds, joinedReceipts, this.cursorSecret, deadline);

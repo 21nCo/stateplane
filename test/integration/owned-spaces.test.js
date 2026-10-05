@@ -733,17 +733,18 @@ test('database expiry denies later record and external effects and prevents comm
     kind:'session',userPrincipalId:'owner',cellId:'cell-a',policyVersion:1,placementGeneration:1,
     audience:'stateplane-cell:cell-a',issuedAt:1,expiresAt:30,nonce:'expired-at-boundary'};
   let databaseCurrent = true;
-  let commits = 0;
+  let connections = 0;
+  let effectCommits = 0;
   let recordEffects = 0;
   let externalEffects = 0;
   const client = {query:async sql => {
     if (sql.includes('AS assertion_current')) return {rows:[{assertion_current:databaseCurrent}]};
     if (sql.includes('SELECT s.owner_principal_id')) return {rows:[{owner_principal_id:'owner',lifecycle:'active',
       cell_id:'cell-a',policy_version:1,placement_generation:1,collection_lifecycle:'active'}]};
-    if (sql === 'COMMIT') commits++;
+    if (sql === 'COMMIT' && connections % 2 === 0) effectCommits++;
     return {rowCount:1};
   },release:() => {}};
-  const policy = new PostgresCellPolicy({connect:async () => client},'cell-a',
+  const policy = new PostgresCellPolicy({connect:async () => {connections++;return client;}},'cell-a',
     {current:async () => true},() => 1000);
   await assert.rejects(policy.run(claims,async (_principal,context) => {
     databaseCurrent = false;
@@ -761,7 +762,7 @@ test('database expiry denies later record and external effects and prevents comm
   await assert.rejects(policy.run({...claims,nonce:'commit-boundary'},async () => {
     databaseCurrent = false;
   }),denied('FORBIDDEN'));
-  assert.equal(commits,0);
+  assert.equal(effectCommits,0);
 });
 
 test('owner audit reads use bounded stable pages and reject cross-space cursors', async () => {
@@ -2855,6 +2856,95 @@ test('joined record receipt starts its retry window at cell commit', async () =>
     [first.receiptId])).rows[0];
   assert.equal(first.committedAt,stored.committed_at.toISOString());
   assert.equal(first.expiresAt,stored.expires_at.toISOString());
+});
+
+test('regional cell deadline bounds nonce and effect pool admission, releasing late clients', async () => {
+  const collectionId=`entries_${crypto.randomUUID()}`;
+  const spaceId=await cellSpace(collectionId);
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const authority=new PostgresAuthority(pool,60);
+  for (const delayedConnection of [1,2]) {
+    let connections=0;
+    let releaseLate;
+    let lateReleases=0;
+    let effects=0;
+    const delayedPool={connect:async()=>{
+      if (++connections!==delayedConnection) return pool.connect();
+      await new Promise(resolve=>{releaseLate=resolve;});
+      const client=await pool.connect();
+      return {query:(...args)=>client.query(...args),release:discard=>{lateReleases++;client.release(discard);}};
+    }};
+    const cell=new RegionalCell('cell-a',signer,
+      new PostgresCellPolicy(delayedPool,'cell-a',{current:async()=>true},undefined,120));
+    const token=await signRecordRoute(signer,spaceId,collectionId);
+    await assert.rejects(cell.execute(token,(_principal,context)=>{
+      effects++;
+      return context.records(authority,tx=>tx.countRecords([]));
+    }),denied('RATE_LIMITED'));
+    assert.equal(effects,0);
+    releaseLate();
+    for (let i=0;i<20 && lateReleases===0;i++) await pause(10);
+    assert.equal(lateReleases,1,'an expired admission releases its late client');
+    assert.equal(connections,delayedConnection);
+  }
+});
+
+test('regional cell policy-lock wait consumes the same request budget', async () => {
+  const collectionId=`entries_${crypto.randomUUID()}`;
+  const spaceId=await cellSpace(collectionId);
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const cell=new RegionalCell('cell-a',signer,
+    new PostgresCellPolicy(pool,'cell-a',{current:async()=>true},undefined,200));
+  const locker=await pool.connect();
+  let effects=0;
+  try {
+    await locker.query('BEGIN');
+    await locker.query("UPDATE collections SET lifecycle='active' WHERE space_id=$1 AND collection_id=$2",[spaceId,collectionId]);
+    const started=Date.now();
+    await assert.rejects(cell.execute(await signRecordRoute(signer,spaceId,collectionId),async()=>{effects++;}),
+      denied('RATE_LIMITED'));
+    assert.ok(Date.now()-started<2000,'policy lock wait must have a server-side bound');
+    assert.equal(effects,0);
+  } finally { await locker.query('ROLLBACK'); locker.release(); }
+});
+
+test('regional cell deadline rejects a pending provider authorization before any effect', {timeout:3000}, async () => {
+  const collectionId=`entries_${crypto.randomUUID()}`;
+  const spaceId=await cellSpace(collectionId);
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  let finishLookup;
+  let lookupStarted;
+  const started=new Promise(resolve=>{lookupStarted=resolve;});
+  const provider={current:async()=>{lookupStarted();await new Promise(resolve=>{finishLookup=resolve;});return true;}};
+  const cell=new RegionalCell('cell-a',signer,new PostgresCellPolicy(pool,'cell-a',provider,undefined,180));
+  let effects=0;
+  const pending=cell.execute(await signRecordRoute(signer,spaceId,collectionId),async()=>{effects++;});
+  await Promise.race([started,pause(2000).then(()=>{throw new Error('Provider authorization was not reached');})]);
+  await assert.rejects(pending,denied('RATE_LIMITED'));
+  assert.equal(effects,0);
+  finishLookup();
+});
+
+test('sequential joined calls share the cell deadline and hide a rolled-back receipt', async () => {
+  const collectionId=`entries_${crypto.randomUUID()}`;
+  const spaceId=await cellSpace(collectionId);
+  const signer=await RoutingKeys.create([{id:'v1',secret:crypto.getRandomValues(new Uint8Array(32))}],'v1');
+  const cell=new RegionalCell('cell-a',signer,
+    new PostgresCellPolicy(pool,'cell-a',{current:async()=>true},undefined,1000));
+  const authority=new PostgresAuthority(pool,60);
+  const change={operation:'create',idempotencyKey:`deadline-${crypto.randomUUID()}`,
+    requestDigest:'a'.repeat(64),canonicalData:'{}'};
+  let pending;
+  await assert.rejects(cell.execute(await signRecordRoute(signer,spaceId,collectionId),async (_principal,context)=>{
+    pending=await context.records(authority,tx=>tx.mutate(change));
+    await pause(1100);
+    await context.records(authority,tx=>tx.countRecords([]));
+    return pending;
+  }),denied('RATE_LIMITED'));
+  assert.ok(pending,'the first joined mutation reached its pending receipt');
+  assert.throws(()=>({...pending}),denied('RECEIPT_PENDING'));
+  for (const table of ['records','record_events','idempotency_receipts','projection_outbox'])
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[spaceId])).rows[0].n,0,table);
 });
 
 test('a final cell check that outlasts receipt retention rolls the joined write back', async () => {
