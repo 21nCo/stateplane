@@ -1,0 +1,20 @@
+docs/exact-queries-bulk.md
+  h_a39f9495f9ec1d 5
+packages/postgres/src/cell-policy.ts
+  h_a39f9495f9ec1d 9,27-73,79-81,83,85-86,91-92,100,102,105-109,111-114,116,118,150,179-180,218,221-223,234-236,251-252,257-258,286,299,301,306-307,312,314,319-321,329
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 571-572
+test/integration/owned-spaces.test.js
+  h_a39f9495f9ec1d 736-737,744,747,765,2861-2949
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f4d5bcda28fb8fda2156530dc4b51ed78540eaec",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
