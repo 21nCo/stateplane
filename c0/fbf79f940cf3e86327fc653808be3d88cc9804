@@ -1,0 +1,22 @@
+docs/exact-queries-bulk.md
+  h_a39f9495f9ec1d 5,9,11,13
+migrations/031_index_missing_projection.sql
+  h_a39f9495f9ec1d 1-26
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 13,274-275,686-687,855-863,1546-1555,1558,1560,1565,1567,1573-1575
+packages/postgres/src/schema.ts
+  h_a39f9495f9ec1d 559-560
+test/integration/collections.test.js
+  h_a39f9495f9ec1d 73,1485-1488,1673-1710,1846-1893
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c0fbf79f940cf3e86327fc653808be3d88cc9804",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
