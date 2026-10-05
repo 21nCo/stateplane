@@ -1,0 +1,20 @@
+docs/exact-queries-bulk.md
+  h_a39f9495f9ec1d 5,7,9
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 49-50,57-58,64-72,75,82-91,437-449,466-471,487,490,497-498,501,514,518-527,535,666,668-670,674,681,706,712,714,743,745-749,753-759,771,789,792,794,832,845-852,859,1482-1484,1493,1497-1510,1512-1513,1519-1520,1522,1527-1533,1535-1536,1540-1541,1544-1545,1547,1554-1555,1561,1563,1571-1572
+packages/postgres/src/schema.ts
+  h_a39f9495f9ec1d 384,399-406
+test/integration/collections.test.js
+  h_a39f9495f9ec1d 82-90,1473-1478,1480,1484-1485,1489-1491,1494,1496,1500-1601,1645-1693
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b2e4233735ac4b896021bf474ef142633eb165c4",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
