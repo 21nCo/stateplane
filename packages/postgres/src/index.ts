@@ -119,12 +119,12 @@ function containsNul(value: Json): boolean {
   if (typeof value==='string') return Reflect.apply(nativeStringIncludes,value,['\0']) as boolean;
   if (value===null || typeof value!=='object') return false;
   const keys=Object.keys(value);
-  for (let i=0;i<keys.length;i++) if (containsNul((value as Record<string,Json>)[keys[i]])) return true;
+  for (let i=0;i<keys.length;i++) if (containsNul((value as Record<string,Json>)[keys[i]])) return true; // NOSONAR -- own-slot scan avoids replaced array iterators
   return false;
 }
 /** PostgreSQL jsonb cannot represent U+0000. The canonical text remains the authority. */
 function jsonbProjection(canonicalData:string):string|null {
-  return Reflect.apply(nativeStringIncludes,canonicalData,['\\u0000']) && containsNul(JSON.parse(canonicalData) as Json) ? null : canonicalData;
+  return Reflect.apply(nativeStringIncludes,canonicalData,[String.raw`\u0000`]) && containsNul(JSON.parse(canonicalData) as Json) ? null : canonicalData;
 }
 const validScope=(scope:AuthorityScope):boolean =>
   scalarString(scope.spaceId) && Buffer.byteLength(scope.spaceId)<=MAX_SCOPE_ID_BYTES &&
@@ -260,6 +260,31 @@ function snapshotChange(source: RecordChange): Readonly<RecordChange> {
   return Object.freeze(change);
 }
 
+/** Detach a payload member while deferring invalid JSON until after authorization. */
+function snapshotPayload(value:unknown,key:string,trustedParsed:boolean):unknown {
+  try {
+    plainJson(value,'SCHEMA_INVALID',0,new Set<object>(),trustedParsed);
+    return JSON.parse(canonical(value as Json));
+  } catch {
+    // Keep an invalid object-shaped patch as invalid JSON so payload
+    // validation, after authorization and replay lookup, reports
+    // SCHEMA_INVALID. Preserve a non-object set for shape validation.
+    return key==='set' && value !== null && typeof value==='object' && !Array.isArray(value)
+      ? Object.defineProperty(Object.create(null),'invalid',{value:undefined,enumerable:true})
+      : undefined;
+  }
+}
+/** Copy an own data member without retaining caller-owned objects or accessors. */
+function snapshotEnvelopeMember(input:object,fixed:Record<string,unknown>,key:PropertyKey,trustedParsed:boolean):boolean {
+  const descriptor=Object.getOwnPropertyDescriptor(input,key);
+  if (typeof key!=='string' || !descriptor?.enumerable || !Object.hasOwn(descriptor,'value')) return false;
+  const value=descriptor.value;
+  const detached=key==='data' || key==='set' || key==='unset'
+    ? snapshotPayload(value,key,trustedParsed)
+    : value !== null && typeof value==='object' ? undefined : value;
+  Object.defineProperty(fixed,key,{value:detached,enumerable:true});
+  return true;
+}
 /** Detach the requested envelope before a transaction can await authorization. */
 function snapshotRequest(input: unknown, trustedParsed = false): unknown {
   if (input === null || typeof input !== 'object') return input;
@@ -271,23 +296,7 @@ function snapshotRequest(input: unknown, trustedParsed = false): unknown {
   const keys=Reflect.ownKeys(input);
   for (let i=0;i<keys.length;i++) {
     const key=Object.getOwnPropertyDescriptor(keys,i)!.value as PropertyKey;
-    const descriptor=Object.getOwnPropertyDescriptor(input,key);
-    if (typeof key!=='string' || !descriptor?.enumerable || !Object.hasOwn(descriptor,'value')) { malformed=true; continue; }
-    const value=descriptor.value;
-    if (key==='data' || key==='set' || key==='unset') {
-      try {
-        plainJson(value,'SCHEMA_INVALID',0,new Set<object>(),trustedParsed);
-        Object.defineProperty(fixed,key,{value:JSON.parse(canonical(value as Json)),enumerable:true});
-      } catch {
-        // Keep an invalid object-shaped patch as invalid JSON so payload
-        // validation, after authorization and replay lookup, reports
-        // SCHEMA_INVALID. Preserve a non-object set for shape validation.
-        const deferred = key==='set' && value !== null && typeof value==='object' && !Array.isArray(value)
-          ? Object.defineProperty(Object.create(null),'invalid',{value:undefined,enumerable:true})
-          : undefined;
-        Object.defineProperty(fixed,key,{value:deferred,enumerable:true});
-      }
-    } else Object.defineProperty(fixed,key,{value:value !== null && typeof value==='object' ? undefined : value,enumerable:true});
+    if (!snapshotEnvelopeMember(input,fixed,key,trustedParsed)) malformed=true;
   }
   if (malformed) Object.defineProperty(fixed,Symbol('malformed envelope'),{value:true,enumerable:true});
   return fixed;
@@ -353,7 +362,7 @@ function validateUnsetPaths(unset:unknown[],set:object):void {
 function requestFingerprintFields(fields:Record<string,unknown>,normalized:string|undefined,scope:AuthorityScope):Record<string,Json> {
   const payload: Record<string,Json>=Object.create(null);
   const fingerprintFields=['operation','id','externalKey','data','set','unset','expectedRevision','expectedSchemaVersion'];
-  for (let i=0;i<fingerprintFields.length;i++) {
+  for (let i=0;i<fingerprintFields.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
     const key=fingerprintFields[i];
     if (Object.hasOwn(fields,key)) payload[key]=key==='externalKey' ? normalized! : fields[key] as Json;
   }
@@ -385,7 +394,7 @@ function snapshotPredicate(item:unknown):ScalarPredicate {
   const accepted=kind==='null' ? ['field','kind','operator'] : ['field','kind','operator','value'];
   const keys=Reflect.ownKeys(item);
   if (keys.length!==accepted.length) throw new AuthorityError('INVALID_ARGUMENT');
-  for (let j=0;j<keys.length;j++) {
+  for (let j=0;j<keys.length;j++) { // NOSONAR -- own-slot scan avoids replaced array iterators
     const key=keys[j],descriptor=Object.getOwnPropertyDescriptor(item,key);
     if (typeof key!=='string' || !arrayHas(accepted,key) || !descriptor?.enumerable || !Object.hasOwn(descriptor,'value'))
       throw new AuthorityError('INVALID_ARGUMENT');
@@ -499,7 +508,7 @@ export class PostgresAuthority {
     const fixedScope=Object.freeze({...scope});
     const fixedRequest=snapshotRequest(request);
     for (let attempt=0;attempt<3;attempt++) {
-      try { return await this.transaction(fixedScope,tx=>tx.mutateRequest(fixedRequest)); }
+      try { return await this.transaction(fixedScope,tx=>tx.mutateRequest(fixedRequest)); } // NOSONAR -- SQL operations must remain serial in this transaction
       catch (error) { if (!setHas(retryCodes,(error as {code?:string}).code ?? '') || attempt===2) throw error; }
     }
     throw new Error('unreachable');
@@ -509,7 +518,7 @@ export class PostgresAuthority {
   async mutateSerializedRequest(scope:AuthorityScope,serialized:string):Promise<Receipt> {
     const fixedScope=Object.freeze({...scope});
     for (let attempt=0;attempt<3;attempt++) {
-      try { return await this.transaction(fixedScope,tx=>tx.mutateSerializedRequest(serialized)); }
+      try { return await this.transaction(fixedScope,tx=>tx.mutateSerializedRequest(serialized)); } // NOSONAR -- SQL operations must remain serial in this transaction
       catch (error) { if (!setHas(retryCodes,(error as {code?:string}).code ?? '') || attempt===2) throw error; }
     }
     throw new Error('unreachable');
@@ -611,17 +620,17 @@ export class AuthorityTransaction {
     return row ? { ref: this.ref(row.record_id), revision: Number(row.revision), schemaVersion: Number(row.schema_version),
       canonicalData: row.canonical_data, keyMode: row.key_mode, normalizedKey: row.normalized_key, tombstone: row.tombstone } : null;
   }
-  /** Resolve a live key, retaining exact lookup for historical unnormalized external keys. */
+  /** Resolve a live key by its v1 identity, including historical raw spellings. */
   getByKey(mode: 'generated' | 'external', key: string): Promise<AuthorityRecord | null> {
     return this.admitOperation(async () => {
     if (this.#scope.capability !== 'records:read') throw new AuthorityError('FORBIDDEN');
     if (!arrayHas(['generated','external'],mode) || !scalarString(key)) throw new AuthorityError('INVALID_ARGUMENT');
     const normalized=mode==='external' ? externalKey(key) : key;
-    // Exact raw matches preserve pre-normalization rows when both spellings exist.
+    const identity=mode==='external' ? 'public.stateplane_external_key_identity(normalized_key)' : 'normalized_key';
     const result = await this.query(`SELECT record_id FROM records WHERE space_id=$1 AND collection_id=$2
-      AND key_mode=$3 AND normalized_key IN ($4,$5) AND NOT tombstone
-      ORDER BY CASE WHEN normalized_key=$5 THEN 0 ELSE 1 END LIMIT 1`,
-      [...scopeIds(this.#scope), mode, normalized, key]);
+      AND key_mode=$3 AND ${identity}=$4 AND NOT tombstone LIMIT 2`,
+      [...scopeIds(this.#scope), mode, normalized]);
+    if (result.rows.length>1) throw new AuthorityError('SCHEMA_CONFLICT','External key has multiple historical records; use a record ID');
     return result.rows[0] ? this.readRecord(result.rows[0].record_id) : null;
     });
   }
@@ -641,7 +650,7 @@ export class AuthorityTransaction {
       ORDER BY position`, [retentions]);
     if (clock.rows.length !== retentions.length) throw new Error('Receipt clock row count mismatch');
     const times:Array<{committedAt:string;expiresAt:string}>=[];
-    for (let i=0;i<clock.rows.length;i++) {
+    for (let i=0;i<clock.rows.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
       const row=clock.rows[i];
       append(times,{committedAt:(row.committed_at as Date).toISOString(),expiresAt:(row.expires_at as Date).toISOString()});
     }
@@ -652,7 +661,7 @@ export class AuthorityTransaction {
     const pendingReceipts = mapValues(this.pendingReceipts);
     if (pendingReceipts.length) {
       const retentions:number[]=[];
-      for (let i=0;i<pendingReceipts.length;i++) append(retentions,pendingReceipts[i].retentionSeconds);
+      for (let i=0;i<pendingReceipts.length;i++) append(retentions,pendingReceipts[i].retentionSeconds); // NOSONAR -- own-slot scan avoids replaced array iterators
       const times = await this.receiptTimes(retentions);
       for (let index=0;index<pendingReceipts.length;index++) {
         const pending=pendingReceipts[index];
@@ -668,7 +677,7 @@ export class AuthorityTransaction {
       mapClear(this.pendingReceipts);
     }
     const reserved=mapValues(this.reservedIdentities);
-    for (let i=0;i<reserved.length;i++) {
+    for (let i=0;i<reserved.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
       const { operation, key }=reserved[i];
       await this.query(`WITH identity AS (DELETE FROM receipt_reservations
           WHERE space_id=$1 AND credential_id=$3 AND operation=$4 AND idempotency_key=$5 RETURNING 1)
@@ -684,9 +693,9 @@ export class AuthorityTransaction {
     const ids:string[]=[];
     const seen=new Set<string>();
     const addId=(id:string)=>{ if (!setHas(seen,id)) { setAdd(seen,id); append(ids,id); } };
-    for (let i=0;i<this.readyReceipts.length;i++) addId(this.readyReceipts[i].receiptId);
+    for (let i=0;i<this.readyReceipts.length;i++) addId(this.readyReceipts[i].receiptId); // NOSONAR -- own-slot scan avoids replaced array iterators
     const replays=mapValues(this.joinedReplays);
-    for (let i=0;i<replays.length;i++) addId(replays[i].response.receiptId);
+    for (let i=0;i<replays.length;i++) addId(replays[i].response.receiptId); // NOSONAR -- own-slot scan avoids replaced array iterators
     if (!ids.length) return Infinity;
     const result=await this.query(`WITH stamp AS MATERIALIZED (SELECT clock_timestamp() AS at)
       SELECT count(r.receipt_id)::int AS found,
@@ -703,7 +712,7 @@ export class AuthorityTransaction {
   }
   /** Publish committed receipt timestamps after successful COMMIT only. */
   exposeReceipts(): void {
-    for (let i=0;i<this.readyReceipts.length;i++) {
+    for (let i=0;i<this.readyReceipts.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
       const ready=this.readyReceipts[i];
       ready.exposure.committedAt = ready.committedAt;
       ready.exposure.expiresAt = ready.expiresAt;
@@ -720,7 +729,7 @@ export class AuthorityTransaction {
   /** Recheck every replayed collection before the transaction commits. */
   async checkReplayScopes(): Promise<void> {
     const collections=setValues(this.replayCollections);
-    for (let i=0;i<collections.length;i++) {
+    for (let i=0;i<collections.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
       const collectionId=collections[i];
       await new AuthorityTransaction(this.client, { ...this.#scope, collectionId }, this.retentionSeconds).checkScope();
     }
@@ -837,7 +846,7 @@ export class AuthorityTransaction {
   private patchRecord(previous:Record<string,Json>,fields:Record<string,unknown>,definition:CollectionDefinition):Record<string,Json> {
     const data={...previous,...fields.set as Record<string,Json>};
     const unset=fields.unset as string[];
-    for (let i=0;i<unset.length;i++) {
+    for (let i=0;i<unset.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
       const path=unset[i];
       if (!Object.hasOwn(definition.schema,'properties') || !Object.hasOwn(definition.schema.properties!,path) ||
         arrayHas(Object.hasOwn(definition.schema,'required') ? definition.schema.required! : [],path))
@@ -854,8 +863,11 @@ export class AuthorityTransaction {
     const {field,transitions}=definition.lifecycle;
     const to=Object.hasOwn(data,field) ? data[field] : undefined;
     const from=previous && Object.hasOwn(previous,field) ? previous[field] : undefined;
-    if (operation==='create' ? !arrayHas(definition.lifecycle.initial,to) :
-      from!==to && (!Object.hasOwn(transitions,String(from)) || !arrayHas(transitions[String(from)],to)))
+    const changed=from!==to;
+    const transition=typeof from==='string' && Object.hasOwn(transitions,from) ? transitions[from] : undefined;
+    const invalid=operation==='create' ? !arrayHas(definition.lifecycle.initial,to) :
+      changed && (!transition || !arrayHas(transition,to));
+    if (invalid)
       throw new AuthorityError('SCHEMA_INVALID','Lifecycle transition is not declared');
   }
 
@@ -947,6 +959,14 @@ export class AuthorityTransaction {
     const recordId = change.operation === 'create' ? `rec_${randomUUID()}` : change.recordId!;
     if (change.operation === 'create') {
       const mode = change.normalizedExternalKey === undefined ? 'generated' : 'external';
+      if (change.normalizedExternalKey !== undefined) {
+        // The ordinary unique constraint also fences concurrent new writes;
+        // this indexed probe reserves historical raw and tombstone aliases.
+        const held=await this.query(`SELECT 1 FROM records WHERE space_id=$1 AND collection_id=$2
+          AND key_mode='external' AND public.stateplane_external_key_identity(normalized_key)=$3 LIMIT 1`,
+          [...scopeIds(scope),change.normalizedExternalKey]);
+        if (held.rowCount) throw new AuthorityError('KEY_RESERVED');
+      }
       await this.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
         VALUES($1,$2,$3,1,$4,$5,$6,$7::text,$8::jsonb)`, [...scopeIds(scope),recordId,schemaVersion,mode,change.normalizedExternalKey ?? recordId,change.canonicalData,jsonbProjection(change.canonicalData!)]);
       return { recordId, beforeRevision:null, revision:1 };
@@ -1096,7 +1116,7 @@ export class AuthorityTransaction {
     for (let i=0;i<predicates.length;i++) {
       const predicate=Object.getOwnPropertyDescriptor(predicates,i)!.value as ScalarPredicate;
       const declared=findDeclaration(result.rows,predicate.field);
-      if (!declared || declared.ready!==true || declared.filterable!==true ||
+      if (declared?.ready!==true || declared.filterable!==true ||
         (predicate.kind!=='null' && declared.value_kind!==predicate.kind))
         throw new AuthorityError('SCHEMA_CONFLICT','Filter index is not ready');
     }

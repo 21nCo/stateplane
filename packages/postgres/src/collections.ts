@@ -9,14 +9,19 @@ type Client = pg.PoolClient;
 const isSafeInteger=Number.isSafeInteger;
 const validVersion=(n:unknown)=>isSafeInteger(n) && (n as number)>0;
 /** Test own array slots without calling a caller-replaced includes method. */
-const has=(values:readonly string[],value:string)=>{ for (let i=0;i<values.length;i++) if (Object.getOwnPropertyDescriptor(values,i)?.value===value) return true; return false; };
+const has=(values:readonly string[],value:string)=>{
+  for (let i=0;i<values.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
+    if (Object.getOwnPropertyDescriptor(values,i)?.value===value) return true;
+  }
+  return false;
+};
 /** Append to trusted arrays without invoking a replaced push method. */
 const append=<T>(values:T[],value:T)=>{ Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
 /** Merge declared paths without trusting a replaced Set or array method. */
 const declaredFields=(first:readonly string[],second:readonly string[]):string[]=>{
   const fields:string[]=[];
-  for (let i=0;i<first.length;i++) if (!has(fields,first[i])) append(fields,first[i]);
-  for (let i=0;i<second.length;i++) if (!has(fields,second[i])) append(fields,second[i]);
+  for (let i=0;i<first.length;i++) if (!has(fields,first[i])) append(fields,first[i]); // NOSONAR -- own-slot scan avoids replaced array iterators
+  for (let i=0;i<second.length;i++) if (!has(fields,second[i])) append(fields,second[i]); // NOSONAR -- own-slot scan avoids replaced array iterators
   return fields;
 };
 /** Snapshot a schema scope; discovery accepts a space scope without a collection ID. */
@@ -94,17 +99,18 @@ export class CollectionRegistry {
     if (!previous) await this.insertUniqueDeclarations(client,scope,definition);
     const old=declaredFields(previous?.filterable??[],previous?.sortable??[]);
     const fields=declaredFields(definition.filterable,definition.sortable);
-    for (let i=0;i<fields.length;i++) {
-      await this.upsertIndexDeclaration(client,scope,definition,fields[i],has(old,fields[i]));
+    for (let i=0;i<fields.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
+      await this.upsertIndexDeclaration(client,scope,definition,fields[i],has(old,fields[i])); // NOSONAR -- SQL operations must remain serial in this transaction
     }
   }
   /** Insert immutable uniqueness declarations for the first version. */
   private async insertUniqueDeclarations(client:Client,scope:AuthorityScope,definition:CollectionDefinition):Promise<void> {
-    for (let i=0;i<definition.unique.length;i++) {
+    const insertUniqueSql=`INSERT INTO collection_unique_declarations
+        (space_id,collection_id,constraint_name,paths,accepted_version) VALUES($1,$2,$3,$4,$5)`;
+    for (let i=0;i<definition.unique.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
       const item=definition.unique[i];
-      await client.query(`INSERT INTO collection_unique_declarations
-        (space_id,collection_id,constraint_name,paths,accepted_version) VALUES($1,$2,$3,$4,$5)`,
-      [scope.spaceId,definition.slug,item.name,item.paths,definition.version]);
+      await client.query(insertUniqueSql, // NOSONAR -- SQL operations must remain serial in this transaction
+        [scope.spaceId,definition.slug,item.name,item.paths,definition.version]);
     }
   }
   /** Activate added filter/sort flags or stage a new typed index for backfill. */
@@ -118,7 +124,9 @@ export class CollectionRegistry {
       return;
     }
     const node=definition.schema.properties![field];
-    const type=Array.isArray(node.type) ? (node.type[0]==='null' ? node.type[1] : node.type[0]) : node.type;
+    let type:string;
+    if (Array.isArray(node.type)) type=node.type[0]==='null' ? node.type[1] : node.type[0];
+    else type=node.type;
     let kind=type;
     if (Object.hasOwn(node,'format') && node.format==='date-time') kind='date-time';
     else if (type==='integer') kind='number';
@@ -215,7 +223,7 @@ export class CollectionRegistry {
       const collections:Array<{definition:CollectionDefinition;ready:string[];pending:string[]}>=[];
       let lastId:string|undefined;
       let entry:typeof collections[number]|undefined;
-      for (let i=0;i<result.rows.length;i++) {
+      for (let i=0;i<result.rows.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
         const item=result.rows[i];
         if (space.owner_principal_id!==scope.principalId && (!item.grant_current || !has(item.capabilities??[],scope.capability))) continue;
         if (lastId!==item.collection_id) {
@@ -263,15 +271,16 @@ export class CollectionRegistry {
     after:string):Promise<number> {
     const rows=await client.query(`SELECT record_id,canonical_data FROM records WHERE space_id=$1 AND collection_id=$2
       AND NOT tombstone AND record_id>$3 ORDER BY record_id LIMIT 100 FOR UPDATE`,[scope.spaceId,scope.collectionId,after]);
-    for (let i=0;i<rows.rows.length;i++) {
+    const insertIndexSql=`INSERT INTO record_index_values
+        (space_id,collection_id,record_id,field_name,value_kind,string_value,number_value,boolean_value,time_value)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (space_id,collection_id,record_id,field_name) DO NOTHING`;
+    for (let i=0;i<rows.rows.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
       const row=rows.rows[i];
       const data=JSON.parse(row.canonical_data) as Record<string,Json>;
       const index=derivedIndexValue(data,definition,field);
       if (!index) continue;
       const value='value' in index ? index.value : null;
-      await client.query(`INSERT INTO record_index_values
-        (space_id,collection_id,record_id,field_name,value_kind,string_value,number_value,boolean_value,time_value)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (space_id,collection_id,record_id,field_name) DO NOTHING`,
+      await client.query(insertIndexSql, // NOSONAR -- SQL operations must remain serial in this transaction
         [scope.spaceId,scope.collectionId,row.record_id,field,index.kind,index.kind==='string'?value:null,
           index.kind==='number'?value:null,index.kind==='boolean'?value:null,index.kind==='date-time'?value:null]);
     }

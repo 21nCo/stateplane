@@ -144,6 +144,7 @@ try {
     assert.match(output,/Applied 026_collection_backfill.sql/);
     assert.match(output,/Applied 027_nul_canonical_records.sql/);
     assert.match(output,/Applied 028_schema_commit_fence.sql/);
+    assert.match(output,/Applied 029_external_key_identity.sql/);
     assert.deepEqual(await facts(upgraded),before);
     const actor={kind:'session',userPrincipalId:'owner',credentialId:'upgrade-session'};
     const pool=new pg.Pool({connectionString:url(names[0])});

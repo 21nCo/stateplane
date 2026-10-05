@@ -85,7 +85,7 @@ const scalarLength=(value:string):number=>{
   return count;
 };
 const ordinary = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' &&
-  (!proxyDetector || !proxyDetector(value)) && !Array.isArray(value) &&
+  !proxyDetector?.(value) && !Array.isArray(value) &&
   (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 const fail = (code: string, message?: string): never => { throw new AuthorityError(code,message); };
 
@@ -104,12 +104,19 @@ export function scalarString(value: unknown, allowNul = false): value is string 
 }
 /** Admit bounded ordinary JSON without invoking accessors or proxy traps. */
 export function plainJson(value: unknown, code = 'SCHEMA_INVALID', depth = 0, seen = new Set<object>(), trustedParsed = false,
-  budget = { nodes:0, bytes:0 }): asserts value is Json {
+  budget?: { nodes:number; bytes:number }): asserts value is Json {
+  budget ??= { nodes:0, bytes:0 };
   chargeJsonBudget(value,code,budget);
   if ((!trustedParsed && (!proxyDetector || proxyDetector(value))) || depth > maxCanonicalDepth) fail(code);
   if (value === null || typeof value === 'boolean') return;
-  if (typeof value === 'string') { if (!scalarString(value,true)) fail(code); return; }
-  if (typeof value === 'number') { if (!isFiniteNumber(value)) fail(code); return; }
+  if (typeof value === 'string') {
+    if (!scalarString(value,true)) fail(code);
+    return;
+  }
+  if (typeof value === 'number') {
+    if (!isFiniteNumber(value)) fail(code);
+    return;
+  }
   if (!ordinary(value) && !Array.isArray(value)) fail(code);
   const object = value as object;
   if (setHas(seen,object)) fail(code);
@@ -169,7 +176,11 @@ export function canonical(value: Json): string {
 }
 /** Hash the canonical representation used by receipt replay. */
 export function fingerprint(value: Json): string { return createHash('sha256').update(canonical(value)).digest('hex'); }
-const typeOf = (node: SchemaNode) => Array.isArray(node.type) ? (node.type[0]==='null' ? node.type[1] : node.type[0]) : node.type;
+/** Resolve the declared scalar kind, including a null-first union. */
+const typeOf = (node: SchemaNode) => {
+  if (!Array.isArray(node.type)) return node.type;
+  return node.type[0]==='null' ? node.type[1] : node.type[0];
+};
 const nullable = (node: SchemaNode) => Array.isArray(node.type);
 const props = (node: SchemaNode) => own(node,'properties') ? node.properties! : Object.create(null) as Record<string,SchemaNode>;
 const list = (value: unknown, code: string): unknown[] => {
@@ -208,7 +219,10 @@ function validateNodeEnvelope(node:SchemaNode,root:boolean,depth:number,counter:
 function validateChildNodes(node:SchemaNode,kind:string,depth:number,counter:{count:number}):void {
   if (kind === 'object') validateObjectNode(node,depth,counter);
   else if (own(node,'properties') || own(node,'required') || own(node,'additionalProperties')) fail('SCHEMA_UNSUPPORTED');
-  if (kind === 'array') { if (!own(node,'items')) fail('SCHEMA_UNSUPPORTED'); validateNode(node.items!,false,depth+1,counter); }
+  if (kind === 'array') {
+    if (!own(node,'items')) fail('SCHEMA_UNSUPPORTED');
+    validateNode(node.items!,false,depth+1,counter);
+  }
   else if (own(node,'items') || own(node,'minItems') || own(node,'maxItems')) fail('SCHEMA_UNSUPPORTED');
 }
 /** Admit only scalar nullable unions and the closed set of schema types. */
@@ -264,7 +278,7 @@ function validateNodeEnum(node:SchemaNode,depth:number):void {
   const members = list(node.enum,'SCHEMA_UNSUPPORTED');
   if (!members.length) fail('SCHEMA_UNSUPPORTED');
   const canonicalMembers:string[]=[];
-  for (let i=0;i<members.length;i++) append(canonicalMembers,canonical(members[i] as Json));
+  for (let i=0;i<members.length;i++) append(canonicalMembers,canonical(members[i] as Json)); // NOSONAR -- own-slot scan avoids replaced array iterators
   if (!distinct(canonicalMembers)) fail('SCHEMA_UNSUPPORTED');
   for (let i=0;i<members.length;i++) {
     const member=Object.getOwnPropertyDescriptor(members,i)!.value;
@@ -288,7 +302,8 @@ export function utcInstant(value: string): string {
   let fraction=checkedMatch[2]??'';
   while (fraction.length && Reflect.apply(codeUnit,fraction,[fraction.length-1])===48)
     fraction=Reflect.apply(slice,fraction,[0,-1]) as string;
-  return `${checkedMatch[1]}${fraction ? `.${fraction}` : ''}Z`;
+  const suffix=fraction ? '.'+fraction : '';
+  return `${checkedMatch[1]}${suffix}Z`;
 }
 /** Validate a canonical record or enum member against an accepted schema node. */
 export function validateValue(value: Json, node: SchemaNode, depth=0): void {
@@ -320,7 +335,7 @@ function validateObjectValue(value:Json,node:SchemaNode,depth:number):void {
 function validateArrayValue(value:Json,node:SchemaNode,depth:number):void {
   if (!Array.isArray(value) || (node.minItems!==undefined && value.length<node.minItems) || (node.maxItems!==undefined && value.length>node.maxItems)) fail('SCHEMA_INVALID');
   const members=value as Json[];
-  for (let i=0;i<members.length;i++) validateValue(members[i],node.items!,depth+1);
+  for (let i=0;i<members.length;i++) validateValue(members[i],node.items!,depth+1); // NOSONAR -- own-slot scan avoids replaced array iterators
 }
 /** Enforce Unicode scalar length and the declared UTC format. */
 function validateStringValue(value:Json,node:SchemaNode):void {
@@ -369,7 +384,7 @@ function validateUniqueDeclarations(definition:CollectionDefinition):void {
 /** Check declared filter and sort paths without admitting duplicates. */
 function validateScalarDeclarations(definition:CollectionDefinition):void {
   const declarations=['filterable','sortable'] as const;
-  for (let i=0;i<declarations.length;i++) {
+  for (let i=0;i<declarations.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
     const key=declarations[i];
     const paths=list(definition[key],'SCHEMA_UNSUPPORTED');
     if (!distinct(paths) || any(paths,path=>!scalarField(definition.schema,path))) fail('SCHEMA_UNSUPPORTED');
@@ -395,13 +410,13 @@ function validateLifecycle(definition:CollectionDefinition):void {
 function withoutAnnotations(node: SchemaNode): Json {
   const clone:Record<string,Json>=Object.create(null);
   const keys=Object.keys(node) as Array<keyof SchemaNode>;
-  for (let i=0;i<keys.length;i++) {
+  for (let i=0;i<keys.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
     const key=keys[i];
     if (key==='description') continue;
     if (key==='properties') {
       const children:Record<string,Json>=Object.create(null);
       const names=Object.keys(props(node));
-      for (let j=0;j<names.length;j++) {
+      for (let j=0;j<names.length;j++) { // NOSONAR -- own-slot scan avoids replaced array iterators
         const name=names[j];
         Object.defineProperty(children,name,{value:withoutAnnotations(props(node)[name]),enumerable:true,writable:true,configurable:true});
       }
@@ -422,7 +437,7 @@ export function compatible(old: CollectionDefinition, next: CollectionDefinition
     canonical((own(old,'lifecycle') ? old.lifecycle! : null) as Json)!==canonical((own(next,'lifecycle') ? next.lifecycle! : null) as Json)) fail('SCHEMA_BREAKING','Slug, uniqueness or lifecycle change requires migration');
   compatibleFields(old,next);
   const compatibleDeclarations=['filterable','sortable'] as const;
-  for (let i=0;i<compatibleDeclarations.length;i++) {
+  for (let i=0;i<compatibleDeclarations.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
     const key=compatibleDeclarations[i];
     if (any(old[key],name=>!includes(next[key],name))) fail('SCHEMA_BREAKING',`${key} cannot be removed`);
   }
@@ -431,14 +446,14 @@ export function compatible(old: CollectionDefinition, next: CollectionDefinition
 function compatibleFields(old:CollectionDefinition,next:CollectionDefinition):void {
   const oldProps=props(old.schema), nextProps=props(next.schema);
   const names=Object.keys(oldProps);
-  for (let i=0;i<names.length;i++) {
+  for (let i=0;i<names.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
     const name=names[i],oldNode=oldProps[name];
     if (!own(nextProps,name) || canonical(withoutAnnotations(oldNode))!==canonical(withoutAnnotations(nextProps[name]))) fail('SCHEMA_BREAKING',`Existing field ${name} changed`);
   }
   const a={...old.schema,properties:{}} as SchemaNode,b={...next.schema,properties:{}} as SchemaNode;
   if (canonical(withoutAnnotations(a))!==canonical(withoutAnnotations(b))) fail('SCHEMA_BREAKING','Root constraints changed');
   const nextNames=Object.keys(nextProps);
-  for (let i=0;i<nextNames.length;i++) {
+  for (let i=0;i<nextNames.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
     const name=nextNames[i];
     if (!own(oldProps,name) && includes(own(next.schema,'required') ? next.schema.required! : [],name))
       fail('SCHEMA_BREAKING',`New field ${name} must be optional`);
@@ -464,11 +479,11 @@ export function derivedValues(data: Record<string,Json>, definition: CollectionD
   const indexes:IndexValue[]=[];
   const fields:string[]=[];
   const pathLists=[definition.filterable,definition.sortable];
-  for (let j=0;j<pathLists.length;j++) {
+  for (let j=0;j<pathLists.length;j++) { // NOSONAR -- own-slot scan avoids replaced array iterators
     const paths=pathLists[j];
-    for (let i=0;i<paths.length;i++) if (!includes(fields,paths[i])) append(fields,paths[i]);
+    for (let i=0;i<paths.length;i++) if (!includes(fields,paths[i])) append(fields,paths[i]); // NOSONAR -- own-slot scan avoids replaced array iterators
   }
-  for (let i=0;i<fields.length;i++) {
+  for (let i=0;i<fields.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
     const field=fields[i];
     const index=derivedIndexValue(data,definition,field);
     if (index) append(indexes,index);
@@ -478,7 +493,7 @@ export function derivedValues(data: Record<string,Json>, definition: CollectionD
 /** Encode present, non-null unique tuples with stable type and byte lengths. */
 function derivedUniqueValues(data:Record<string,Json>,definition:CollectionDefinition):UniqueValue[] {
   const unique:UniqueValue[]=[];
-  for (let i=0;i<definition.unique.length;i++) {
+  for (let i=0;i<definition.unique.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
     const item=definition.unique[i];
     const encodedValue=encodeUniqueTuple(data,definition,item.paths);
     if (encodedValue!==undefined) append(unique,{name:item.name,encodedValue});
@@ -488,14 +503,17 @@ function derivedUniqueValues(data:Record<string,Json>,definition:CollectionDefin
 /** Missing or null tuple members release the corresponding unique reservation. */
 function encodeUniqueTuple(data:Record<string,Json>,definition:CollectionDefinition,paths:readonly string[]):string|undefined {
   const parts:string[]=[];
-  for (let j=0;j<paths.length;j++) {
+  for (let j=0;j<paths.length;j++) { // NOSONAR -- own-slot scan avoids replaced array iterators
     const path=paths[j];
     if (!own(data,path) || data[path]===null) return undefined;
     const value=data[path];
     if (typeof value==='string' && !scalarString(value)) fail('SCHEMA_INVALID','Unique value contains a database-unsupported character');
     const field=props(definition.schema)[path];
-    const tag=typeOf(field); const normalized=typeof value==='string' ?
-      (own(field,'format') && field.format==='date-time' ? utcInstant(value) : Reflect.apply(normalize,value,['NFC']) as string) : canonical(value);
+    const tag=typeOf(field);
+    let normalized:string;
+    if (typeof value!=='string') normalized=canonical(value);
+    else if (own(field,'format') && field.format==='date-time') normalized=utcInstant(value);
+    else normalized=Reflect.apply(normalize,value,['NFC']) as string;
     append(parts,`${tag}:${Buffer.byteLength(normalized)}:${normalized}`);
   }
   const encodedValue=joined(parts,'');

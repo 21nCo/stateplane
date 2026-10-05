@@ -900,7 +900,7 @@ test('generated and external keys are distinct, revoked retries disclose no rece
   await assert.rejects(authority.mutateRequest({...writer,policyVersion:2},{operation:'create',idempotencyKey:'external',externalKey:generated.ref.id,data:{label:'external'}}),{code:'FORBIDDEN'});
 });
 
-test('external keys normalize on low-level writes and historical raw keys remain readable',async()=>{
+test('external keys keep one normalized identity across low-level writes and historical raw rows',async()=>{
   const {writer}=await fixture();
   const data={label:'low-level'};
   const values=derivedValues(data,definition(writer.collectionId));
@@ -914,9 +914,27 @@ test('external keys normalize on low-level writes and historical raw keys remain
   assert.equal((await authority.transaction(read(writer),tx=>tx.getByKey('external',raw))).ref.id,created.ref.id);
   await pool.query('UPDATE records SET normalized_key=$2 WHERE record_id=$1',[created.ref.id,raw]);
   assert.equal((await authority.transaction(read(writer),tx=>tx.getByKey('external',raw))).ref.id,created.ref.id);
-  const normalized=await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'normalized-key',externalKey:'é',data:{label:'normalized-key'}});
-  assert.equal((await authority.transaction(read(writer),tx=>tx.getByKey('external',raw))).ref.id,created.ref.id);
-  assert.equal((await authority.transaction(read(writer),tx=>tx.getByKey('external','é'))).ref.id,normalized.ref.id);
+  assert.equal((await authority.transaction(read(writer),tx=>tx.getByKey('external','é'))).ref.id,created.ref.id);
+  await assert.rejects(authority.mutateRequest(writer,{operation:'create',idempotencyKey:'normalized-key',externalKey:'é',data:{label:'normalized-key'}}),
+    {code:'KEY_RESERVED'});
+  const collidingId=`rec_${randomUUID()}`;
+  const collidingData=JSON.stringify({label:'historical-collision'});
+  // Emulate an already populated database that predates normalized writes.
+  await pool.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+    SELECT space_id,collection_id,$2,1,schema_version,'external',$3,$4::text,$4::jsonb FROM records WHERE record_id=$1`,
+  [created.ref.id,collidingId,'é',collidingData]);
+  await assert.rejects(authority.transaction(read(writer),tx=>tx.getByKey('external',raw)),{code:'SCHEMA_CONFLICT'});
+  await assert.rejects(authority.transaction(read(writer),tx=>tx.getByKey('external','é')),{code:'SCHEMA_CONFLICT'});
+  assert.equal((await authority.transaction(read(writer),tx=>tx.getRecord(created.ref.id))).ref.id,created.ref.id);
+  assert.equal((await authority.transaction(read(writer),tx=>tx.getRecord(collidingId))).ref.id,collidingId);
+});
+
+test('database external-key identity matches the fixed Unicode trim and NFC rule',async()=>{
+  const whitespace=[9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288];
+  const raw=whitespace.map(code=>`${String.fromCodePoint(code)}e\u0301${String.fromCodePoint(code)}`);
+  const rows=await pool.query('SELECT public.stateplane_external_key_identity(value) AS identity FROM unnest($1::text[]) AS value',[raw]);
+  assert.deepEqual(rows.rows.map(row=>row.identity),raw.map(externalKey));
+  assert.equal((await pool.query('SELECT public.stateplane_external_key_identity($1) AS identity',['\ufeffé\ufeff'])).rows[0].identity,'\ufeffé\ufeff');
 });
 
 test('patch unset ignores inherited properties and rejects invalid requests without effects',async()=>{
