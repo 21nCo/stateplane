@@ -105,6 +105,7 @@ const MAX_SCOPE_ID_BYTES = 512;
 const MAX_PAGE = 100;
 const MAX_PAGE_BYTES = 2_097_152;
 const QUERY_TIMEOUT_MS = 5_000;
+const REQUEST_TIMEOUT_MS = 30_000;
 const retryCodes = new Set(['40P01', '40001']);
 const validDigest = /^[0-9a-f]{64}$/;
 const serializedMarker=Symbol('stateplane parsed JSON');
@@ -504,14 +505,19 @@ function decodeCursor(token:string, secret:Uint8Array):PageCursor {
 export class PostgresAuthority {
   /** Configure the receipt window used by new authority transactions. */
   constructor(private readonly pool: PoolLike, private readonly receiptRetentionSeconds: number,
-    private readonly cursorSecret?: Uint8Array) {
+    private readonly cursorSecret?: Uint8Array, private readonly requestTimeoutMs = REQUEST_TIMEOUT_MS) {
     if (!isSafeInteger(receiptRetentionSeconds) || receiptRetentionSeconds < 1) throw new RangeError('Invalid receipt retention');
     if (cursorSecret && cursorSecret.byteLength < 32) throw new RangeError('Cursor secret must contain at least 32 bytes');
+    if (!isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > REQUEST_TIMEOUT_MS)
+      throw new RangeError('Invalid request time budget');
     if (cursorSecret) this.cursorSecret=Buffer.from(cursorSecret);
   }
 
   /** Callback side effects are never retried. A COMMIT failure is deliberately ambiguous. */
   async transaction<T>(scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T>, deadlineMs?: number): Promise<T> {
+    const requestDeadline=Date.now()+this.requestTimeoutMs;
+    if (deadlineMs!==undefined && !isSafeInteger(deadlineMs)) throw new AuthorityError('INVALID_ARGUMENT');
+    deadlineMs=deadlineMs===undefined ? requestDeadline : Math.min(deadlineMs,requestDeadline);
     // Capture the authenticated identity before waiting for a pooled connection.
     const fixedScope = Object.freeze({ ...scope });
     if (!validScope(fixedScope)) throw new AuthorityError('INVALID_ARGUMENT');
@@ -563,9 +569,10 @@ export class PostgresAuthority {
     deferUntilCommit: (finish: () => Promise<void>, verify: () => Promise<void>, ensureCurrent: () => Promise<number>, expose: () => void,
       close: () => void) => void,
     joinedReceipts?: JoinedReceiptState): Promise<T> {
+    const deadline=Date.now()+this.requestTimeoutMs;
     const fixedScope = Object.freeze({ ...scope });
     if (!validScope(fixedScope)) throw new AuthorityError('INVALID_ARGUMENT');
-    const tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds, joinedReceipts, this.cursorSecret);
+    const tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds, joinedReceipts, this.cursorSecret, deadline);
     let deferred = false;
     try {
       await tx.checkScope();
@@ -632,21 +639,23 @@ export class PostgresAuthority {
 
   /** A bounded manifest is durable before individual item transactions begin. */
   async ingestBatch(scope:AuthorityScope,operationKey:string,requests:readonly string[],retryFailed=false):Promise<BatchProgress> {
+    const deadline=Date.now()+this.requestTimeoutMs;
     if (!acceptsInProcessObjects || isInProcessProxy(requests)) throw new AuthorityError('INVALID_ARGUMENT');
-    return this.ingestBatchUsing(scope,operationKey,requests,retryFailed);
+    return this.ingestBatchUsing(scope,operationKey,requests,retryFailed,deadline);
   }
 
   /** Cloudflare-safe batch boundary: parse manifest bytes only after scope authorization. */
   async ingestSerializedBatch(scope:AuthorityScope,operationKey:string,serialized:string,retryFailed=false):Promise<BatchProgress> {
+    const deadline=Date.now()+this.requestTimeoutMs;
     const requests=await this.transaction(scope,async tx=>{
       if (tx.scope.capability!=='records:write') throw new AuthorityError('FORBIDDEN');
       if (typeof serialized!=='string' || Buffer.byteLength(serialized)>3_145_728) throw new AuthorityError('RATE_LIMITED');
       try { return JSON.parse(serialized) as string[]; } catch { throw new AuthorityError('INVALID_ARGUMENT'); }
-    });
-    return this.ingestBatchUsing(scope,operationKey,requests,retryFailed);
+    },deadline);
+    return this.ingestBatchUsing(scope,operationKey,requests,retryFailed,deadline);
   }
 
-  private async ingestBatchUsing(scope:AuthorityScope,operationKey:string,requests:readonly string[],retryFailed:boolean):Promise<BatchProgress> {
+  private async ingestBatchUsing(scope:AuthorityScope,operationKey:string,requests:readonly string[],retryFailed:boolean,deadline:number):Promise<BatchProgress> {
     if (!Array.isArray(requests) || Object.getPrototypeOf(requests)!==Array.prototype ||
       requests.length<1 || requests.length>20 || Reflect.ownKeys(requests).length!==requests.length+1 ||
       typeof operationKey!=='string' || !unicodeString(operationKey) || !operationKey ||
@@ -662,7 +671,6 @@ export class PostgresAuthority {
       append(fixed,item);
     }
     const digest=createHash('sha256').update(JSON.stringify(fixed)).digest('hex');
-    const deadline=Date.now()+30_000;
     await this.transaction(scope,tx=>tx.startBatch(operationKey,digest,fixed),deadline);
     for (let ordinal=0;ordinal<fixed.length;ordinal++) {
       const remaining=deadline-Date.now();
@@ -678,6 +686,8 @@ export class PostgresAuthority {
         throw error;
       }
     }
+    if (Date.now()>=deadline)
+      throw new AuthorityError('RATE_LIMITED','Batch request time budget exceeded; poll batchProgress with the operation key');
     return this.transaction(scope,tx=>tx.batchProgress(operationKey),deadline);
   }
 
@@ -704,6 +714,7 @@ export class AuthorityTransaction {
   private readonly replayCollections = new Set<CollectionId>();
   private readonly batchReceiptIds = new Set<string>();
   private requestDeadlineMs: number | undefined;
+  private statementTimeoutMs = 15_000;
   readonly #scope: Readonly<AuthorityScope>;
   /** Expose the frozen scope used by every operation in this transaction. */
   get scope(): Readonly<AuthorityScope> { return this.#scope; }
@@ -745,7 +756,7 @@ export class AuthorityTransaction {
     if (this.requestDeadlineMs!==undefined) {
       const remaining=this.requestDeadlineMs-Date.now();
       if (remaining<=0) throw new AuthorityError('RATE_LIMITED','Request time budget exceeded');
-      await this.client.query(`SET LOCAL statement_timeout = '${Math.max(1,Math.min(15_000,Math.trunc(remaining)))}ms'`);
+      await this.client.query(`SET LOCAL statement_timeout = '${Math.max(1,Math.min(this.statementTimeoutMs,Math.trunc(remaining)))}ms'`);
     }
     return this.client.query(sql, values);
   }
@@ -755,6 +766,10 @@ export class AuthorityTransaction {
       throw new AuthorityError('INVALID_ARGUMENT');
     const until=Date.now()+milliseconds;
     this.requestDeadlineMs=this.requestDeadlineMs===undefined ? until : Math.min(this.requestDeadlineMs,until);
+  }
+
+  private limitStatementTime(milliseconds:number):void {
+    this.statementTimeoutMs=Math.min(this.statementTimeoutMs,milliseconds);
   }
 
   private batchKey(operationKey:string,allowRead=false):unknown[] {
@@ -1468,6 +1483,7 @@ export class AuthorityTransaction {
       if (!this.cursorSecret) throw new AuthorityError('INVALID_ARGUMENT','Cursor secret is not configured');
       if (!isSafeInteger(limit) || limit<1 || limit>MAX_PAGE) throw new AuthorityError('INVALID_ARGUMENT');
       const {params,where}=this.compilePredicates(fixed);
+      this.limitStatementTime(QUERY_TIMEOUT_MS);
       await this.requireReadyIndexes(fixed);
       const kind=fixedSort ? await this.readySort(fixedSort.field) : undefined;
       const versionResult=await this.query(`SELECT schema_version FROM collections WHERE space_id=$1 AND collection_id=$2`,scopeIds(this.#scope));
@@ -1513,7 +1529,6 @@ export class AuthorityTransaction {
           after=` AND (${expr}>${valueParam} OR (${expr}=${valueParam} AND r.record_id>${idParam}))`;
         }
       }
-      await this.query(`SET LOCAL statement_timeout = '${QUERY_TIMEOUT_MS}ms'`);
       params.push(limit+1,limit,MAX_PAGE_BYTES);
       const candidateLimit=`$${params.length-2}`,pageLimit=`$${params.length-1}`,byteLimit=`$${params.length}`;
       const sortedOrder=`sort_rank ${direction},sort_value ${direction} NULLS LAST,record_id ASC`;
@@ -1581,8 +1596,8 @@ export class AuthorityTransaction {
     return this.admitOperation(async () => {
     if (!isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE) throw new AuthorityError('INVALID_ARGUMENT');
     const { params, where } = this.compilePredicates(fixed);
+    this.limitStatementTime(QUERY_TIMEOUT_MS);
     await this.requireReadyIndexes(fixed);
-    await this.query(`SET LOCAL statement_timeout = '${QUERY_TIMEOUT_MS}ms'`);
     params.push(limit,MAX_PAGE_BYTES);
     const result = await this.query(`WITH candidates AS MATERIALIZED (
         SELECT r.record_id,r.created_at,octet_length(r.canonical_data) AS bytes FROM records r
@@ -1613,8 +1628,8 @@ export class AuthorityTransaction {
   private countUsing(fixed:readonly ScalarPredicate[]):Promise<number> {
     return this.admitOperation(async () => {
     const { params, where } = this.compilePredicates(fixed);
+    this.limitStatementTime(QUERY_TIMEOUT_MS);
     await this.requireReadyIndexes(fixed);
-    await this.query(`SET LOCAL statement_timeout = '${QUERY_TIMEOUT_MS}ms'`);
     const result = await this.query(`SELECT count(*)::bigint AS total FROM records r WHERE ${where}`,params);
     const count = Number(result.rows[0].total);
     if (!isSafeInteger(count)) throw new RangeError('Count exceeds JavaScript safe integer range');
@@ -1637,8 +1652,8 @@ export class AuthorityTransaction {
   private existsUsing(fixed:readonly ScalarPredicate[]):Promise<boolean> {
     return this.admitOperation(async () => {
     const { params, where } = this.compilePredicates(fixed);
+    this.limitStatementTime(QUERY_TIMEOUT_MS);
     await this.requireReadyIndexes(fixed);
-    await this.query(`SET LOCAL statement_timeout = '${QUERY_TIMEOUT_MS}ms'`);
     const result = await this.query(`SELECT EXISTS(SELECT 1 FROM records r WHERE ${where}) AS found`,params);
     return result.rows[0].found;
     });

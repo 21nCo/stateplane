@@ -1691,6 +1691,68 @@ test('batch transaction budget also bounds pool admission and releases a late co
   assert.equal(releaseCount,1);
 });
 
+test('standalone exact reads and batch preflight bound pool admission before authorization',async()=>{
+  const {writer}=await fixture();
+  const pending=[];
+  let released=0;
+  const delayed=new PostgresAuthority({connect:()=>new Promise(resolve=>pending.push(resolve))},
+    3600,randomBytes(32),30);
+  const reader=read(writer);
+  const requests=[
+    delayed.transaction(reader,tx=>tx.queryPage([],1)),
+    delayed.transaction(reader,tx=>tx.queryRecords([],1)),
+    delayed.transaction(reader,tx=>tx.countRecords([])),
+    delayed.transaction(reader,tx=>tx.existsRecord([])),
+    delayed.transaction(reader,tx=>tx.countRecords([]),Date.now()+60_000),
+    delayed.ingestSerializedBatch(writer,'pool-preflight',JSON.stringify(['{}'])),
+    delayed.batchProgress(reader,'pool-preflight'),
+    delayed.cancelBatch(writer,'pool-preflight')
+  ];
+  await Promise.all(requests.map(request=>assert.rejects(request,{code:'RATE_LIMITED'})));
+  assert.equal(pending.length,requests.length);
+  for (const connect of pending) connect({release:()=>{released++;}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(released,requests.length);
+});
+
+test('read and serialized batch budgets cover authorization lock waits',async()=>{
+  const {writer}=await fixture();
+  const blocker=await pool.connect();
+  const bounded=new PostgresAuthority(pool,3600,randomBytes(32),120);
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query('UPDATE spaces SET policy_version=policy_version WHERE space_id=$1',[writer.spaceId]);
+    await assert.rejects(bounded.transaction(read(writer),tx=>tx.countRecords([])),{code:'RATE_LIMITED'});
+    await assert.rejects(bounded.ingestSerializedBatch(writer,'locked-preflight',JSON.stringify(['{}'])),
+      {code:'RATE_LIMITED'});
+  } finally { await blocker.query('ROLLBACK'); blocker.release(); }
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM batch_operations WHERE space_id=$1',
+    [writer.spaceId])).rows[0].n,0);
+});
+
+test('expired ingest response is recoverable through durable progress polling',async()=>{
+  const {writer}=await fixture();
+  let commits=0;
+  const delayedPool={connect:async()=>{
+    const client=await pool.connect();
+    return {query:async(...args)=>{
+      const result=await client.query(...args);
+      if (args[0]==='COMMIT' && ++commits===2)
+        await new Promise(resolve=>setTimeout(resolve,650));
+      return result;
+    },release:discard=>client.release(discard)};
+  }};
+  const bounded=new PostgresAuthority(delayedPool,3600,undefined,500);
+  const key='expired-progress',requests=[JSON.stringify({operation:'create',data:{label:'expired-progress'}})];
+  await assert.rejects(bounded.ingestBatch(writer,key,requests),{code:'RATE_LIMITED'});
+  const progress=await authority.batchProgress(writer,key);
+  assert.equal(progress.items[0].state,'succeeded');
+  assert.ok(progress.items[0].receipt?.receiptId);
+  const replay=await authority.ingestBatch(writer,key,requests);
+  assert.equal(replay.items[0].receipt.receiptId,progress.items[0].receipt.receiptId);
+  assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),1);
+});
+
 test('paged reads cap payload bytes and a 5000-row selective typed query uses the declared index',async()=>{
   const {owner,writer}=await fixture();
   const expanded={...schema,properties:{...schema.properties,note:{type:'string'}}};
