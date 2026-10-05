@@ -1,0 +1,30 @@
+docs/exact-queries-bulk.md
+  h_a39f9495f9ec1d 15-16
+migrations/032_batch_slot_hardening.sql
+  h_a39f9495f9ec1d 3-5
+migrations/033_validate_batch_attempts.sql
+  h_a39f9495f9ec1d 1-4
+packages/postgres/src/collections.ts
+  h_a39f9495f9ec1d 198-202,205-209
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 1033
+packages/postgres/src/schema.ts
+  h_a39f9495f9ec1d 374,382,384
+scripts/migrate.mjs
+  h_a39f9495f9ec1d 11,14-20,53-57,87-95,107
+test/integration/collections.test.js
+  h_a39f9495f9ec1d 102-103,122-124,126-138,1789-1792,1801-1816,1848-1857,1863-1866,2138-2186
+test/integration/postgres-authority.test.js
+  h_a39f9495f9ec1d 714-715,731-734
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9c738dede2f00aedff5a38c6ea65bc2c0e6632c7",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
