@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { types } from 'node:util';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -74,6 +74,11 @@ test('definition subset, additive revisions and normalization have explicit fail
   assert.equal(derivedValues({label:'x',score:null},d).indexes[0].kind,'null');
   assert.throws(()=>validateDefinition(definition('bad',{schema:{...schema,patternProperties:{}}})),{code:'SCHEMA_UNSUPPORTED'});
   assert.throws(()=>validateDefinition(definition('bad',{unique:[{name:'dup',paths:['label']},{name:'dup',paths:['score']}]})),{code:'SCHEMA_UNSUPPORTED'});
+  const indexed=Object.fromEntries(Array.from({length:17},(_,i)=>[`field${i}`,{type:'string'}]));
+  assert.throws(()=>validateDefinition(definition('too-many-indexes',{
+    schema:{...schema,properties:{...schema.properties,...indexed}},
+    filterable:Object.keys(indexed)
+  })),{code:'SCHEMA_UNSUPPORTED'});
   const next=definition('generic',{version:2,schema:{...schema,properties:{...schema.properties,note:{type:'string',description:'optional'}}}});
   assert.doesNotThrow(()=>compatible(d,next));
   assert.throws(()=>compatible(d,{...next,schema:{...next.schema,required:['label','note']}}),{code:'SCHEMA_BREAKING'});
@@ -1442,4 +1447,192 @@ test('public schema helpers reject proxies without detection while serialized wr
     cwd:fileURLToPath(new URL('../..',import.meta.url)),encoding:'utf8',
     env:{...process.env,STA7_TEST_CONTEXT:JSON.stringify({url,owner,writer,next})}
   }),'closed');
+});
+
+test('signed pages bind scope, query and schema; mutable sorts expose live traversal',async()=>{
+  const {owner,writer}=await fixture();
+  const key=randomBytes(32);
+  const paged=new PostgresAuthority(pool,3600,key);
+  await assert.rejects(paged.transaction(read(writer),tx=>tx.queryPage([],1,{field:'score',direction:'asc'})),{code:'SCHEMA_CONFLICT'});
+  await registry.revise(owner,1,definition(owner.collectionId,{version:2,sortable:['score']}));
+  await registry.backfill(owner,'score');
+  const created=[];
+  for (const [i,score] of [1,2,3].entries())
+    created.push(await authority.mutateRequest(writer,{operation:'create',idempotencyKey:`page-${i}`,data:{label:`page-${i}`,score}}));
+  await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'page-missing',data:{label:'page-missing'}});
+  const reader=read(writer),sort={field:'score',direction:'asc'};
+  const descending=await paged.transaction(reader,tx=>tx.queryPage([],3,{field:'score',direction:'desc'}));
+  assert.deepEqual(descending.records.map(row=>JSON.parse(row.canonicalData).score),[3,2,1]);
+  const first=await paged.transaction(reader,tx=>tx.queryPage([],1,sort));
+  assert.equal(first.records.length,1);
+  assert.equal(JSON.parse(first.records[0].canonicalData).score,1);
+  assert.ok(first.nextCursor);
+  await assert.rejects(paged.transaction(read(owner),tx=>tx.queryPage([],1,sort,first.nextCursor)),{code:'INVALID_CURSOR'});
+  await assert.rejects(paged.transaction({...reader,spaceId:'another-space'},tx=>tx.queryPage([],1,sort,first.nextCursor)),{code:'NOT_FOUND'});
+  const other=await fixture();
+  await registry.revise(other.owner,1,definition(other.owner.collectionId,{version:2,sortable:['score']}));
+  await registry.backfill(other.owner,'score');
+  await assert.rejects(paged.transaction(read(other.writer),tx=>tx.queryPage([],1,sort,first.nextCursor)),{code:'INVALID_CURSOR'});
+  await assert.rejects(paged.transaction(reader,tx=>tx.queryPage([{field:'score',kind:'number',operator:'gt',value:0}],1,sort,first.nextCursor)),{code:'INVALID_CURSOR'});
+  await assert.rejects(paged.transaction(reader,tx=>tx.queryPage([],1,sort,`${first.nextCursor[0]==='A' ? 'B' : 'A'}${first.nextCursor.slice(1)}`)),{code:'INVALID_CURSOR'});
+  await authority.mutateRequest(writer,{operation:'replace',idempotencyKey:'move-before',id:created[1].ref.id,
+    expectedRevision:1,data:{label:'page-1',score:0}});
+  const second=await paged.transaction(reader,tx=>tx.queryPage([],1,sort,first.nextCursor));
+  assert.equal(JSON.parse(second.records[0].canonicalData).score,3);
+  const last=await paged.transaction(reader,tx=>tx.queryPage([],1,sort,second.nextCursor));
+  assert.equal(JSON.parse(last.records[0].canonicalData).label,'page-missing');
+  assert.equal(last.nextCursor,null);
+  assert.equal(await paged.transaction(reader,tx=>tx.countRecords([])),4);
+  assert.equal(await paged.transaction(reader,tx=>tx.existsRecord([{field:'score',kind:'number',operator:'eq',value:0}])),true);
+  await registry.revise(owner,2,definition(owner.collectionId,{version:3,sortable:['score']}));
+  await assert.rejects(paged.transaction(reader,tx=>tx.queryPage([],1,sort,first.nextCursor)),{code:'INVALID_CURSOR'});
+});
+
+test('durable batch checkpoint resumes partial success, rejects changed retries and permits failed-item retry',async()=>{
+  const {owner,writer}=await fixture();
+  const requests=[
+    JSON.stringify({operation:'create',data:{label:'bulk-a',score:1}}),
+    JSON.stringify({operation:'create',data:{label:'bulk-b',extra:'later'}}),
+    JSON.stringify({operation:'create',data:{label:'bulk-c',score:3}})
+  ];
+  const key='bulk-operation';
+  const digest=createHash('sha256').update(JSON.stringify(requests)).digest('hex');
+  await authority.transaction(writer,tx=>tx.startBatch(key,digest,requests));
+  await authority.transaction(writer,tx=>tx.processBatchItem(key,0,false));
+  let progress=await authority.batchProgress(writer,key);
+  assert.deepEqual(progress.items.map(item=>item.state),['succeeded','pending','pending']);
+  const firstReceipt=progress.items[0].receipt;
+  assert.ok(firstReceipt?.committedAt);
+  progress=await authority.ingestBatch(writer,key,requests);
+  assert.deepEqual(progress.items.map(item=>item.state),['succeeded','failed','succeeded']);
+  assert.equal(progress.items[1].failureCode,'SCHEMA_INVALID');
+  assert.equal(progress.items[0].receipt.receiptId,firstReceipt.receiptId);
+  assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),2);
+  await assert.rejects(authority.ingestBatch(writer,key,[requests[0],requests[1],requests[2]+' ']),{code:'BATCH_CONFLICT'});
+  const expanded={...schema,properties:{...schema.properties,extra:{type:'string'}}};
+  await registry.revise(owner,1,definition(owner.collectionId,{version:2,schema:expanded}));
+  progress=await authority.ingestBatch(writer,key,requests,true);
+  assert.deepEqual(progress.items.map(item=>item.state),['succeeded','succeeded','succeeded']);
+  assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),3);
+  assert.equal((await authority.ingestBatch(writer,key,requests)).items[0].receipt.receiptId,firstReceipt.receiptId);
+  const cancelled=await authority.cancelBatch(writer,key);
+  assert.equal(cancelled.state,'cancelled');
+  await assert.rejects(authority.ingestBatch(writer,key,requests),{code:'BATCH_CANCELLED'});
+  const pendingKey='cancel-pending';
+  await authority.transaction(writer,tx=>tx.startBatch(pendingKey,digest,requests));
+  await authority.cancelBatch(writer,pendingKey);
+  await assert.rejects(authority.transaction(writer,tx=>tx.processBatchItem(pendingKey,0,false)),{code:'BATCH_CANCELLED'});
+  assert.deepEqual((await authority.batchProgress(writer,pendingKey)).items.map(item=>item.state),['pending','pending','pending']);
+  await pool.query("UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1",[writer.spaceId]);
+  await pool.query('SELECT stateplane_purge_space($1)',[writer.spaceId]);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM batch_operations WHERE space_id=$1',[writer.spaceId])).rows[0].n,0);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM collection_write_slots WHERE space_id=$1',[writer.spaceId])).rows[0].n,0);
+});
+
+test('paged reads cap payload bytes and a 5000-row selective typed query uses the declared index',async()=>{
+  const {owner,writer}=await fixture();
+  const expanded={...schema,properties:{...schema.properties,note:{type:'string'}}};
+  await registry.revise(owner,1,definition(owner.collectionId,{version:2,schema:expanded,sortable:['score']}));
+  await registry.backfill(owner,'score');
+  const large='x'.repeat(750_000);
+  for (let i=0;i<4;i++) await authority.mutateRequest(writer,{operation:'create',idempotencyKey:`wide-${i}`,
+    data:{label:`wide-${i}`,score:i,note:large}});
+  const paged=new PostgresAuthority(pool,3600,randomBytes(32));
+  const first=await paged.transaction(read(writer),tx=>tx.queryPage([],100));
+  assert.equal(first.records.length,2);
+  assert.ok(first.records.reduce((n,r)=>n+Buffer.byteLength(r.canonicalData),0)<=2_097_152);
+  assert.ok(first.nextCursor);
+  const second=await paged.transaction(read(writer),tx=>tx.queryPage([],100,undefined,first.nextCursor));
+  assert.equal(second.records.length,2);
+  assert.equal(second.nextCursor,null);
+
+  await pool.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+    SELECT $1,$2,'volume-'||g,1,2,'generated','volume-'||g,
+      ('{"label":"volume-'||g||'","score":'||g||'}'),
+      jsonb_build_object('label','volume-'||g,'score',g)
+    FROM generate_series(1,5000) AS g`,[owner.spaceId,owner.collectionId]);
+  await pool.query(`INSERT INTO record_index_values(space_id,collection_id,record_id,field_name,value_kind,number_value)
+    SELECT $1,$2,'volume-'||g,'score','number',g FROM generate_series(1,5000) AS g`,[owner.spaceId,owner.collectionId]);
+  await pool.query('ANALYZE records');
+  await pool.query('ANALYZE record_index_values');
+  let plan;
+  const observed=new PostgresAuthority({connect:async()=>{
+    const client=await pool.connect();
+    return {query:async(sql,...args)=>{
+      if (String(sql).includes('ranked AS MATERIALIZED')) {
+        const explained=await client.query(`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) ${sql}`,...args);
+        plan=explained.rows[0]['QUERY PLAN'][0];
+      }
+      return client.query(sql,...args);
+    },release:discard=>client.release(discard)};
+  }},3600,randomBytes(32));
+  const result=await observed.transaction(read(writer),tx=>tx.queryPage(
+    [{field:'score',kind:'number',operator:'gte',value:4900}],25,{field:'score',direction:'asc'}));
+  assert.equal(result.records.length,25);
+  assert.equal(JSON.parse(result.records[0].canonicalData).score,4900);
+  assert.ok(JSON.stringify(plan.Plan).includes('record_index_number'),JSON.stringify(plan.Plan));
+  const sortOnly=await observed.transaction(read(writer),tx=>tx.queryPage([],25,{field:'score',direction:'desc'}));
+  assert.equal(sortOnly.records.length,25);
+  assert.equal(JSON.parse(sortOnly.records[0].canonicalData).score,5000);
+  assert.ok(JSON.stringify(plan.Plan).includes('record_index_number'),JSON.stringify(plan.Plan));
+});
+
+test('serialized exact reads work without an in-process proxy detector',async()=>{
+  const {owner,writer}=await fixture();
+  await registry.backfill(owner,'score');
+  await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'serialized-exact',data:{label:'serialized-exact',score:7}});
+  const script=`import assert from 'node:assert/strict';
+    import {types} from 'node:util';
+    import pg from 'pg';
+    types.isProxy=undefined;
+    const {PostgresAuthority}=await import('./packages/postgres/dist/index.js');
+    const {url,reader,writer}=JSON.parse(process.env.STA8_TEST_CONTEXT);
+    const pool=new pg.Pool({connectionString:url});
+    try {
+      const authority=new PostgresAuthority(pool,3600,Buffer.alloc(32,7));
+      const filters=JSON.stringify([{field:'score',kind:'number',operator:'eq',value:7}]);
+      assert.equal(await authority.transaction(reader,tx=>tx.countSerializedRecords(filters)),1);
+      assert.equal(await authority.transaction(reader,tx=>tx.existsSerializedRecord(filters)),true);
+      const page=await authority.transaction(reader,tx=>tx.querySerializedPage(JSON.stringify({predicates:JSON.parse(filters),limit:1})));
+      assert.equal(page.records.length,1);
+      await assert.rejects(authority.transaction(reader,tx=>tx.queryPage([],1)),{code:'INVALID_ARGUMENT'});
+      const bulk=await authority.ingestSerializedBatch(writer,'worker-bulk',JSON.stringify([
+        JSON.stringify({operation:'create',data:{label:'worker-bulk',score:8}})
+      ]));
+      assert.equal(bulk.items[0].state,'succeeded');
+      await assert.rejects(authority.ingestBatch(writer,'direct-bulk',['{}']),{code:'INVALID_ARGUMENT'});
+    } finally { await pool.end(); }
+    process.stdout.write('closed');`;
+  assert.equal(execFileSync(process.execPath,['--input-type=module','-e',script],{
+    cwd:fileURLToPath(new URL('../..',import.meta.url)),encoding:'utf8',
+    env:{...process.env,STA8_TEST_CONTEXT:JSON.stringify({url,reader:read(writer),writer})}
+  }),'closed');
+});
+
+test('ninth concurrent collection write reports backpressure and succeeds after a slot is released',async()=>{
+  const {writer}=await fixture();
+  const writerPool=new pg.Pool({connectionString:url,max:12});
+  const bounded=new PostgresAuthority(writerPool,3600);
+  let release;
+  const hold=new Promise(resolve=>{release=resolve;});
+  const entered=[];
+  const active=[];
+  try {
+    for (let i=0;i<8;i++) {
+      let signal;
+      entered.push(new Promise(resolve=>{signal=resolve;}));
+      active.push(bounded.transaction(writer,async tx=>{
+        await tx.mutateRequest({operation:'create',idempotencyKey:`slot-${i}`,data:{label:`slot-${i}`}});
+        signal();
+        await hold;
+      }));
+    }
+    await Promise.all(entered);
+    const ninth={operation:'create',idempotencyKey:'slot-ninth',data:{label:'slot-ninth'}};
+    await assert.rejects(bounded.mutateRequest(writer,ninth),{code:'BACKPRESSURE'});
+    release();
+    await Promise.all(active);
+    assert.equal((await bounded.mutateRequest(writer,ninth)).revision,1);
+    assert.equal(await bounded.transaction(read(writer),tx=>tx.countRecords([])),9);
+  } finally { release?.(); await Promise.allSettled(active); await writerPool.end(); }
 });

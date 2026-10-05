@@ -35,7 +35,7 @@ const tables = ['stateplane_migrations','space_directory','space_provisioning_au
   'collections','collection_versions','collection_unique_declarations',
   'collection_index_declarations','collection_grants','records',
   'record_unique_keys','record_index_values','record_events','idempotency_receipts','receipt_reservations',
-  'receipt_reservation_scopes','schema_commit_fences',
+  'receipt_reservation_scopes','schema_commit_fences','collection_write_slots','batch_operations','batch_items',
   'record_tombstones','projection_outbox','entity_refs'];
 async function snapshot(pool) {
   const entries = await Promise.all(tables.map(async table => {
@@ -76,13 +76,17 @@ try {
   await authority.mutate(scope,{operation:'create',idempotencyKey:'second',requestDigest:'b'.repeat(64),canonicalData:'{"label":"two","score":2}',
     unique:[{name:'label',encodedValue:'s:3:two'}],indexes:[{field:'score',kind:'number',value:2}]});
   await authority.mutate(scope,{operation:'delete',idempotencyKey:'delete',requestDigest:'c'.repeat(64),recordId:first.ref.id,expectedRevision:1});
+  await base.query(`INSERT INTO batch_operations(space_id,collection_id,credential_id,operation_key,manifest_digest,item_count)
+    VALUES($1,$2,'restore','checkpoint',$3,1)`,[spaceId,collectionId,'d'.repeat(64)]);
+  await base.query(`INSERT INTO batch_items(space_id,collection_id,credential_id,operation_key,ordinal,request_text,state,receipt_id,receipt)
+    VALUES($1,$2,'restore','checkpoint',0,'{}','succeeded',$3,$4::jsonb)`,[spaceId,collectionId,first.receiptId,JSON.stringify(first)]);
   const worker={...scope,principalId:'system:projection',credentialId:'system:projection',capability:'outbox:worker'};
   const claimed=await authority.transaction(worker,tx=>tx.claimOutbox(1,30));
   await authority.transaction(worker,tx=>tx.finishOutbox(claimed[0],true));
   const expected = await snapshot(base);
   assert.ok(expected.records.length && expected.record_events.length && expected.projection_outbox.length &&
     expected.space_directory.length && expected.agent_key_issuances.length &&
-    expected.space_credentials.length && expected.collection_grants.length &&
+    expected.space_credentials.length && expected.collection_grants.length && expected.batch_items.length &&
     expected.routing_nonces.length && expected.space_audit.length && expected.space_provisioning_audit.length,
   'expected this restore smoke seed to populate records, outbox, and owned-space authority');
   const archive = docker(['pg_dump','-U','stateplane','-Fc',sourceName]);

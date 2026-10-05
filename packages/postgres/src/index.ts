@@ -1,8 +1,8 @@
-import { randomUUID } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { parseRevision } from '@stateplane/contracts';
 import type { Capability, CollectionId, RecordRef, Revision, SpaceId } from '@stateplane/contracts';
-import { acceptsInProcessObjects, canonical, derivedParsedValues, externalKey, fingerprint, isInProcessProxy, MAX_INDEX_PART_BYTES, MAX_INDEX_VALUE_BYTES, plainJson, scalarString as unicodeString, validateParsedValue } from './schema.js';
+import { acceptsInProcessObjects, canonical, derivedParsedValues, externalKey, fingerprint, isInProcessProxy, MAX_INDEX_PART_BYTES, MAX_INDEX_VALUE_BYTES, plainJson, scalarString as unicodeString, utcInstant, validateParsedValue } from './schema.js';
 import type { CollectionDefinition, Json } from './schema.js';
 export { CollectionRegistry } from './collections.js';
 export { externalKey, validateDefinition, validateValue, compatible, derivedValues } from './schema.js';
@@ -47,6 +47,15 @@ export interface OutboxDelivery {
 export type ScalarPredicate =
   | { field: string; kind: 'null'; operator: 'isNull' }
   | { field: string; kind: 'string' | 'date-time' | 'number' | 'boolean'; operator: 'eq' | 'lt' | 'lte' | 'gt' | 'gte'; value: string | number | boolean };
+export interface RecordSort { field: string; direction: 'asc' | 'desc' }
+export interface RecordPage { records: AuthorityRecord[]; nextCursor: string | null; schemaVersion: number }
+export interface BatchItemStatus { ordinal:number; state:'pending'|'failed'|'succeeded'; attempts:number; receipt:Receipt|null; failureCode:string|null }
+export interface BatchProgress { operationKey:string; state:'active'|'cancelled'; items:BatchItemStatus[] }
+interface PageCursor {
+  space: string; collection: string; principal: string; credential: string;
+  policy: number; placement: number; schema: number; query: string;
+  id: string; value: string | number | boolean | null;
+}
 
 /** Compile one typed comparison after checking its scalar parameter. */
 function comparison(predicate: Exclude<ScalarPredicate, { kind: 'null' }>, alias: string, params: unknown[]): string {
@@ -55,8 +64,11 @@ function comparison(predicate: Exclude<ScalarPredicate, { kind: 'null' }>, alias
   if (!operator) throw new AuthorityError('INVALID_ARGUMENT');
   if ((predicate.kind === 'number' && (typeof predicate.value !== 'number' || !isFiniteNumber(predicate.value)))
     || (predicate.kind === 'boolean' && typeof predicate.value !== 'boolean')
-    || (predicate.kind === 'string' && !valueString(predicate.value))
-    || (predicate.kind === 'date-time' && !scalarString(predicate.value))) throw new AuthorityError('INVALID_ARGUMENT');
+    || (predicate.kind === 'string' && (!valueString(predicate.value) || Buffer.byteLength(predicate.value)>MAX_INDEX_VALUE_BYTES))
+    || (predicate.kind === 'date-time' && (!scalarString(predicate.value) || Buffer.byteLength(predicate.value)>MAX_INDEX_VALUE_BYTES))) throw new AuthorityError('INVALID_ARGUMENT');
+  if (predicate.kind==='date-time') {
+    try { utcInstant(predicate.value as string); } catch { throw new AuthorityError('INVALID_ARGUMENT'); }
+  }
   params.push(predicate.value);
   if (predicate.kind === 'date-time') {
     return ` AND stateplane_instant_sort_key(${alias}.${column}) COLLATE "C" ${operator} stateplane_instant_sort_key($${params.length}::text) COLLATE "C"`;
@@ -68,6 +80,7 @@ export class AuthorityError extends Error {
   /** Carry a safe current revision for caller-visible conflicts. */
   constructor(public readonly code: string, message = code, public readonly currentRevision?: number) { super(message); this.name = 'AuthorityError'; }
 }
+class BatchItemFailure extends AuthorityError {}
 export class CommitOutcomeUnknownError extends Error {
   /** Require an idempotent retry when COMMIT acknowledgement is ambiguous. */
   constructor(cause: unknown) { super('Commit outcome unknown; retry with the same idempotency key', { cause }); }
@@ -76,6 +89,8 @@ export class CommitOutcomeUnknownError extends Error {
 const MAX_JSON_BYTES = 1_048_576;
 const MAX_SCOPE_ID_BYTES = 512;
 const MAX_PAGE = 100;
+const MAX_PAGE_BYTES = 2_097_152;
+const QUERY_TIMEOUT_MS = 5_000;
 const retryCodes = new Set(['40P01', '40001']);
 const validDigest = /^[0-9a-f]{64}$/;
 const serializedMarker=Symbol('stateplane parsed JSON');
@@ -372,20 +387,25 @@ function requestFingerprintFields(fields:Record<string,unknown>,normalized:strin
 }
 
 /** Reject decorated predicates and retain stable own values for query admission. */
-function snapshotPredicates(source: readonly ScalarPredicate[]): readonly ScalarPredicate[] {
-  if (!acceptsInProcessObjects || isInProcessProxy(source) || !Array.isArray(source) ||
+function snapshotPredicates(source: readonly ScalarPredicate[], trustedParsed=false): readonly ScalarPredicate[] {
+  if ((!trustedParsed && !acceptsInProcessObjects) || (!trustedParsed && isInProcessProxy(source)) || !Array.isArray(source) ||
     Object.getPrototypeOf(source)!==Array.prototype || source.length > 16 || Reflect.ownKeys(source).length!==source.length+1)
     throw new AuthorityError('INVALID_ARGUMENT');
   const result: ScalarPredicate[]=[];
   for (let i=0;i<source.length;i++) {
     const item=Object.getOwnPropertyDescriptor(source,i)?.value;
-    append(result,snapshotPredicate(item));
+    append(result,snapshotPredicate(item,trustedParsed));
   }
   return Object.freeze(result);
 }
+function parseSerializedPredicates(serialized:string):readonly ScalarPredicate[] {
+  if (typeof serialized!=='string' || Buffer.byteLength(serialized)>32_768) throw new AuthorityError('INVALID_ARGUMENT');
+  try { return snapshotPredicates(JSON.parse(serialized),true); }
+  catch { throw new AuthorityError('INVALID_ARGUMENT'); }
+}
 /** Retain a predicate's own data properties and reject decorated objects. */
-function snapshotPredicate(item:unknown):ScalarPredicate {
-  if (!item || typeof item!=='object' || isInProcessProxy(item) ||
+function snapshotPredicate(item:unknown,trustedParsed=false):ScalarPredicate {
+  if (!item || typeof item!=='object' || (!trustedParsed && isInProcessProxy(item)) ||
     (Object.getPrototypeOf(item)!==Object.prototype && Object.getPrototypeOf(item)!==null)) throw new AuthorityError('INVALID_ARGUMENT');
   const field=Object.getOwnPropertyDescriptor(item,'field')?.value;
   const kind=Object.getOwnPropertyDescriptor(item,'kind')?.value;
@@ -410,11 +430,51 @@ function findDeclaration(rows:readonly Record<string,unknown>[],field:string):Re
   }
   return undefined;
 }
+function snapshotSort(input: RecordSort | undefined,trustedParsed=false): RecordSort | undefined {
+  if (input===undefined) return undefined;
+  if (!input || typeof input!=='object' || (!trustedParsed && isInProcessProxy(input)) ||
+    (Object.getPrototypeOf(input)!==Object.prototype && Object.getPrototypeOf(input)!==null) ||
+    Reflect.ownKeys(input).length!==2 || !Object.hasOwn(input,'field') || !Object.hasOwn(input,'direction'))
+    throw new AuthorityError('INVALID_ARGUMENT');
+  const field=Object.getOwnPropertyDescriptor(input,'field')?.value;
+  const direction=Object.getOwnPropertyDescriptor(input,'direction')?.value;
+  if (!scalarString(field) || !field || Buffer.byteLength(field)>MAX_INDEX_PART_BYTES ||
+    !arrayHas(['asc','desc'],direction)) throw new AuthorityError('INVALID_ARGUMENT');
+  return Object.freeze({field,direction});
+}
+function digestQuery(predicates:readonly ScalarPredicate[], sort:RecordSort|undefined, limit:number):string {
+  return createHash('sha256').update(JSON.stringify({predicates,sort:sort??null,limit})).digest('hex');
+}
+function signCursor(cursor:PageCursor, secret:Uint8Array):string {
+  const iv=randomBytes(12);
+  const cipher=createCipheriv('aes-256-gcm',createHash('sha256').update(secret).digest(),iv);
+  const encrypted=Buffer.concat([cipher.update(JSON.stringify(cursor),'utf8'),cipher.final()]);
+  return Buffer.concat([iv,encrypted,cipher.getAuthTag()]).toString('base64url');
+}
+function decodeCursor(token:string, secret:Uint8Array):PageCursor {
+  if (typeof token!=='string' || token.length>4096 || !/^[A-Za-z0-9_-]+$/.test(token))
+    throw new AuthorityError('INVALID_CURSOR');
+  try {
+    const bytes=Buffer.from(token,'base64url');
+    if (bytes.length<29) throw new Error('size');
+    const decipher=createDecipheriv('aes-256-gcm',createHash('sha256').update(secret).digest(),bytes.subarray(0,12));
+    decipher.setAuthTag(bytes.subarray(bytes.length-16));
+    const plain=Buffer.concat([decipher.update(bytes.subarray(12,bytes.length-16)),decipher.final()]);
+    const cursor=JSON.parse(plain.toString('utf8')) as PageCursor;
+    if (!cursor || typeof cursor!=='object' || typeof cursor.id!=='string' || !cursor.id ||
+      typeof cursor.query!=='string' || !/^[0-9a-f]{64}$/.test(cursor.query) ||
+      !(cursor.value===null || ['string','number','boolean'].includes(typeof cursor.value))) throw new Error('shape');
+    return cursor;
+  } catch { throw new AuthorityError('INVALID_CURSOR'); }
+}
 
 export class PostgresAuthority {
   /** Configure the receipt window used by new authority transactions. */
-  constructor(private readonly pool: PoolLike, private readonly receiptRetentionSeconds: number) {
+  constructor(private readonly pool: PoolLike, private readonly receiptRetentionSeconds: number,
+    private readonly cursorSecret?: Uint8Array) {
     if (!isSafeInteger(receiptRetentionSeconds) || receiptRetentionSeconds < 1) throw new RangeError('Invalid receipt retention');
+    if (cursorSecret && cursorSecret.byteLength < 32) throw new RangeError('Cursor secret must contain at least 32 bytes');
+    if (cursorSecret) this.cursorSecret=Buffer.from(cursorSecret);
   }
 
   /** Callback side effects are never retried. A COMMIT failure is deliberately ambiguous. */
@@ -430,7 +490,7 @@ export class PostgresAuthority {
     try {
       beginAttempted = true;
       await client.query('BEGIN'); begun = true;
-      tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds);
+      tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds, undefined, this.cursorSecret);
       await tx.checkScope();
       const result = await fn(tx);
       tx.sealMutations();
@@ -450,6 +510,8 @@ export class PostgresAuthority {
       if (tx) { tx.sealMutations(); await tx.settleMutations(); }
       if (begun) { try { await client.query('ROLLBACK'); } catch { discard = true; } }
       else if (beginAttempted) discard = true;
+      if ((error as {code?:string}).code==='57014') throw new AuthorityError('RATE_LIMITED','Database statement time limit exceeded');
+      if ((error as {code?:string}).code==='55P03') throw new AuthorityError('BACKPRESSURE','Database lock budget exceeded');
       throw error;
     } finally { tx?.close(); client.release(discard); }
   }
@@ -461,7 +523,7 @@ export class PostgresAuthority {
     joinedReceipts?: JoinedReceiptState): Promise<T> {
     const fixedScope = Object.freeze({ ...scope });
     if (!validScope(fixedScope)) throw new AuthorityError('INVALID_ARGUMENT');
-    const tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds, joinedReceipts);
+    const tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds, joinedReceipts, this.cursorSecret);
     let deferred = false;
     try {
       await tx.checkScope();
@@ -486,6 +548,8 @@ export class PostgresAuthority {
     } catch (error) {
       tx.sealMutations();
       await tx.settleMutations();
+      if ((error as {code?:string}).code==='57014') throw new AuthorityError('RATE_LIMITED','Database statement time limit exceeded');
+      if ((error as {code?:string}).code==='55P03') throw new AuthorityError('BACKPRESSURE','Database lock budget exceeded');
       throw error;
     } finally { if (!deferred) tx.close(); }
   }
@@ -523,6 +587,64 @@ export class PostgresAuthority {
     }
     throw new Error('unreachable');
   }
+
+  /** A bounded manifest is durable before individual item transactions begin. */
+  async ingestBatch(scope:AuthorityScope,operationKey:string,requests:readonly string[],retryFailed=false):Promise<BatchProgress> {
+    if (!acceptsInProcessObjects || isInProcessProxy(requests)) throw new AuthorityError('INVALID_ARGUMENT');
+    return this.ingestBatchUsing(scope,operationKey,requests,retryFailed);
+  }
+
+  /** Cloudflare-safe batch boundary: parse manifest bytes only after scope authorization. */
+  async ingestSerializedBatch(scope:AuthorityScope,operationKey:string,serialized:string,retryFailed=false):Promise<BatchProgress> {
+    const requests=await this.transaction(scope,async tx=>{
+      if (tx.scope.capability!=='records:write') throw new AuthorityError('FORBIDDEN');
+      if (typeof serialized!=='string' || Buffer.byteLength(serialized)>3_145_728) throw new AuthorityError('RATE_LIMITED');
+      try { return JSON.parse(serialized) as string[]; } catch { throw new AuthorityError('INVALID_ARGUMENT'); }
+    });
+    return this.ingestBatchUsing(scope,operationKey,requests,retryFailed);
+  }
+
+  private async ingestBatchUsing(scope:AuthorityScope,operationKey:string,requests:readonly string[],retryFailed:boolean):Promise<BatchProgress> {
+    if (!Array.isArray(requests) || Object.getPrototypeOf(requests)!==Array.prototype ||
+      requests.length<1 || requests.length>20 || Reflect.ownKeys(requests).length!==requests.length+1 ||
+      typeof operationKey!=='string' || !unicodeString(operationKey) || !operationKey ||
+      Buffer.byteLength(operationKey)>MAX_INDEX_PART_BYTES || typeof retryFailed!=='boolean')
+      throw new AuthorityError('INVALID_ARGUMENT');
+    const fixed:string[]=[];
+    let total=0;
+    for (let i=0;i<requests.length;i++) {
+      const item=Object.getOwnPropertyDescriptor(requests,i)?.value;
+      if (!unicodeString(item)) throw new AuthorityError('INVALID_ARGUMENT');
+      total+=Buffer.byteLength(item);
+      if (total>MAX_PAGE_BYTES || Buffer.byteLength(item)>MAX_JSON_BYTES) throw new AuthorityError('RATE_LIMITED','Batch byte budget exceeded');
+      append(fixed,item);
+    }
+    const digest=createHash('sha256').update(JSON.stringify(fixed)).digest('hex');
+    await this.transaction(scope,tx=>tx.startBatch(operationKey,digest,fixed));
+    const deadline=Date.now()+30_000;
+    for (let ordinal=0;ordinal<fixed.length;ordinal++) {
+      if (Date.now()>=deadline) break;
+      try { await this.transaction(scope,tx=>tx.processBatchItem(operationKey,ordinal,retryFailed)); }
+      catch (error) {
+        if (error instanceof AuthorityError && error.code==='BATCH_CANCELLED') break;
+        if (error instanceof BatchItemFailure) {
+          try { await this.transaction(scope,tx=>tx.failBatchItem(operationKey,ordinal,error.code)); }
+          catch (failure) { if (failure instanceof AuthorityError && failure.code==='BATCH_CANCELLED') break; throw failure; }
+          continue;
+        }
+        throw error;
+      }
+    }
+    return this.batchProgress(scope,operationKey);
+  }
+
+  batchProgress(scope:AuthorityScope,operationKey:string):Promise<BatchProgress> {
+    return this.transaction(scope,tx=>tx.batchProgress(operationKey));
+  }
+
+  cancelBatch(scope:AuthorityScope,operationKey:string):Promise<BatchProgress> {
+    return this.transaction(scope,async tx=>{ await tx.cancelBatch(operationKey); return tx.batchProgress(operationKey); });
+  }
 }
 
 export class AuthorityTransaction {
@@ -537,12 +659,13 @@ export class AuthorityTransaction {
   private readonly reservedIdentities = new Map<string, { operation: RecordMutation; key: string }>();
   private admittingMutations = true;
   private readonly replayCollections = new Set<CollectionId>();
+  private readonly batchReceiptIds = new Set<string>();
   readonly #scope: Readonly<AuthorityScope>;
   /** Expose the frozen scope used by every operation in this transaction. */
   get scope(): Readonly<AuthorityScope> { return this.#scope; }
   /** Join an authorized client and optionally share pending receipt state. */
   constructor(private readonly client: Client, scope: AuthorityScope, private readonly retentionSeconds: number,
-    joinedReceipts?: JoinedReceiptState) {
+    joinedReceipts?: JoinedReceiptState, private readonly cursorSecret?: Uint8Array) {
     this.#scope = Object.freeze({ ...scope });
     this.pendingReceipts = joinedReceipts?.pending ?? new Map();
     this.joinedReplays = joinedReceipts?.replayed ?? new Map();
@@ -575,6 +698,106 @@ export class AuthorityTransaction {
   private query(sql: string, values: unknown[] = []) {
     if (!this.active) throw new AuthorityError('INVALID_ARGUMENT', 'Transaction ended');
     return this.client.query(sql, values);
+  }
+
+  private batchKey(operationKey:string,allowRead=false):unknown[] {
+    if (this.#scope.capability!=='records:write' && !(allowRead && this.#scope.capability==='records:read'))
+      throw new AuthorityError('FORBIDDEN');
+    if (!unicodeString(operationKey) || !operationKey || Buffer.byteLength(operationKey)>MAX_INDEX_PART_BYTES)
+      throw new AuthorityError('INVALID_ARGUMENT');
+    return [...scopeIds(this.#scope),this.#scope.credentialId,operationKey];
+  }
+
+  startBatch(operationKey:string,digest:string,requests:readonly string[]):Promise<void> {
+    return this.admitOperation(async()=>{
+      const key=this.batchKey(operationKey);
+      await this.query("SET LOCAL lock_timeout = '100ms'");
+      await this.query("SET LOCAL statement_timeout = '15000ms'");
+      try {
+        await this.query(`INSERT INTO batch_operations(space_id,collection_id,credential_id,operation_key,manifest_digest,item_count)
+          VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`,[...key,digest,requests.length]);
+        const row=(await this.query(`SELECT manifest_digest,item_count,state FROM batch_operations
+          WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 AND operation_key=$4 FOR UPDATE`,key)).rows[0];
+        if (!row || row.manifest_digest!==digest || Number(row.item_count)!==requests.length)
+          throw new AuthorityError('BATCH_CONFLICT','Operation key has a different manifest');
+        if (row.state==='cancelled') throw new AuthorityError('BATCH_CANCELLED');
+        for (let ordinal=0;ordinal<requests.length;ordinal++)
+          await this.query(`INSERT INTO batch_items(space_id,collection_id,credential_id,operation_key,ordinal,request_text)
+            VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`,[...key,ordinal,requests[ordinal]]);
+      } catch(error) { if ((error as {code?:string}).code==='55P03') throw new AuthorityError('BACKPRESSURE'); throw error; }
+    },true);
+  }
+
+  processBatchItem(operationKey:string,ordinal:number,retryFailed:boolean):Promise<void> {
+    return this.admitOperation(async()=>{
+      const key=this.batchKey(operationKey);
+      await this.query("SET LOCAL lock_timeout = '100ms'");
+      await this.query("SET LOCAL statement_timeout = '15000ms'");
+      try {
+        const batch=(await this.query(`SELECT state FROM batch_operations WHERE space_id=$1 AND collection_id=$2
+          AND credential_id=$3 AND operation_key=$4 FOR UPDATE`,key)).rows[0];
+        if (!batch) throw new AuthorityError('NOT_FOUND');
+        if (batch.state==='cancelled') throw new AuthorityError('BATCH_CANCELLED');
+        const item=(await this.query(`SELECT state,request_text FROM batch_items WHERE space_id=$1 AND collection_id=$2
+          AND credential_id=$3 AND operation_key=$4 AND ordinal=$5 FOR UPDATE`,[...key,ordinal])).rows[0];
+        if (!item) throw new AuthorityError('NOT_FOUND');
+        if (item.state==='succeeded' || (item.state==='failed' && !retryFailed)) return;
+        let request:Record<string,unknown>;
+        try {
+          const parsed=JSON.parse(item.request_text);
+          if (!parsed || typeof parsed!=='object' || Array.isArray(parsed) || Object.hasOwn(parsed,'idempotencyKey'))
+            throw new Error('invalid batch item');
+          request=parsed;
+        } catch { throw new BatchItemFailure('INVALID_ARGUMENT','Malformed batch item'); }
+        const itemKey=`b_${createHash('sha256').update(JSON.stringify(key)).update(`:${ordinal}`).digest('hex')}`;
+        let receipt:Receipt;
+        try { receipt=await this.mutateSerializedRequest(JSON.stringify({...request,idempotencyKey:itemKey})); }
+        catch (error) {
+          if (error instanceof AuthorityError && arrayHas(['INVALID_ARGUMENT','SCHEMA_INVALID','SCHEMA_CONFLICT',
+            'REVISION_CONFLICT','UNIQUE_CONFLICT','KEY_RESERVED','NOT_FOUND'],error.code))
+            throw new BatchItemFailure(error.code);
+          throw error;
+        }
+        await this.query(`UPDATE batch_items SET state='succeeded',failure_code=NULL,receipt_id=$6,
+          receipt=COALESCE(receipt,$7::jsonb),attempts=attempts+1
+          WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 AND operation_key=$4 AND ordinal=$5`,
+        [...key,ordinal,receipt.receiptId,receipt.replayed ? JSON.stringify(receipt) : null]);
+        if (!receipt.replayed) setAdd(this.batchReceiptIds,receipt.receiptId);
+      } catch(error) { if ((error as {code?:string}).code==='55P03') throw new AuthorityError('BACKPRESSURE'); throw error; }
+    },true);
+  }
+
+  failBatchItem(operationKey:string,ordinal:number,code:string):Promise<void> {
+    return this.admitOperation(async()=>{
+      const key=this.batchKey(operationKey);
+      const result=await this.query(`UPDATE batch_items SET state='failed',failure_code=$6,attempts=attempts+1
+        WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 AND operation_key=$4 AND ordinal=$5
+          AND state<>'succeeded' AND EXISTS (SELECT 1 FROM batch_operations b
+            WHERE b.space_id=$1 AND b.collection_id=$2 AND b.credential_id=$3 AND b.operation_key=$4 AND b.state='active')`,
+      [...key,ordinal,code]);
+      if (!result.rowCount) throw new AuthorityError('BATCH_CANCELLED');
+    },true);
+  }
+
+  cancelBatch(operationKey:string):Promise<void> {
+    return this.admitOperation(async()=>{
+      const key=this.batchKey(operationKey);
+      const result=await this.query(`UPDATE batch_operations SET state='cancelled'
+        WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 AND operation_key=$4`,key);
+      if (!result.rowCount) throw new AuthorityError('NOT_FOUND');
+    },true);
+  }
+
+  batchProgress(operationKey:string):Promise<BatchProgress> {
+    return this.admitOperation(async()=>{
+      const key=this.batchKey(operationKey,true);
+      const rows=await this.query(`SELECT b.state AS batch_state,i.ordinal,i.state,i.attempts,i.failure_code,i.receipt
+        FROM batch_operations b JOIN batch_items i USING(space_id,collection_id,credential_id,operation_key)
+        WHERE b.space_id=$1 AND b.collection_id=$2 AND b.credential_id=$3 AND b.operation_key=$4 ORDER BY i.ordinal`,key);
+      if (!rows.rows.length) throw new AuthorityError('NOT_FOUND');
+      return {operationKey,state:rows.rows[0].batch_state,items:rows.rows.map(row=>({ordinal:row.ordinal,state:row.state,
+        attempts:row.attempts,failureCode:row.failure_code,receipt:row.receipt}))};
+    });
   }
 
   /** Hold shared policy/placement/collection locks through commit. Application policy remains explicit. */
@@ -672,6 +895,9 @@ export class AuthorityTransaction {
           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)`, [pending.response.receiptId,this.#scope.spaceId,pending.collectionId,
           this.#scope.credentialId,pending.response.operation,pending.key,pending.digest,pending.response.ref.id,
           JSON.stringify(pending.response),committedAt,expiresAt]);
+        if (setHas(this.batchReceiptIds,pending.response.receiptId))
+          await this.query(`UPDATE batch_items SET receipt=$2::jsonb WHERE receipt_id=$1`,
+            [pending.response.receiptId,JSON.stringify(pending.response)]);
         append(this.readyReceipts,{receiptId:pending.response.receiptId,exposure:pending.exposure,committedAt,expiresAt});
       }
       mapClear(this.pendingReceipts);
@@ -1071,6 +1297,10 @@ export class AuthorityTransaction {
     const lookup = await this.lookupReplay(change, identity, preparePayload);
     if (lookup.replay) return lookup.replay;
     change=lookup.change;
+    await this.query("SET LOCAL statement_timeout = '15000ms'");
+    const slot=await this.query(`SELECT slot FROM collection_write_slots
+      WHERE space_id=$1 AND collection_id=$2 ORDER BY slot FOR UPDATE SKIP LOCKED LIMIT 1`,scopeIds(scope));
+    if (!slot.rowCount) throw new AuthorityError('BACKPRESSURE','Collection write concurrency limit reached');
     const version = await this.currentVersion(change);
     if (prepare) change=await prepare(version,change);
     try {
@@ -1134,7 +1364,133 @@ export class AuthorityTransaction {
     }
   }
 
-  /** Declaration allowlists, signed cursors and public sort behavior belong to STA-8. */
+  private async readySort(field:string):Promise<'string'|'number'|'boolean'|'date-time'> {
+    const result=await this.query(`SELECT value_kind,ready,sortable FROM collection_index_declarations
+      WHERE space_id=$1 AND collection_id=$2 AND field_name=$3`,[...scopeIds(this.#scope),field]);
+    const row=result.rows[0];
+    if (!row || row.ready!==true || row.sortable!==true || !arrayHas(['string','number','boolean','date-time'],row.value_kind))
+      throw new AuthorityError('SCHEMA_CONFLICT','Sort index is not ready');
+    return row.value_kind;
+  }
+
+  /** Live keyset traversal. Each page is authoritative at its own statement, not a snapshot of later pages. */
+  queryPage(predicates:readonly ScalarPredicate[], limit:number, sort?:RecordSort, cursor?:string):Promise<RecordPage> {
+    let fixed:readonly ScalarPredicate[],fixedSort:RecordSort|undefined;
+    try { fixed=snapshotPredicates(predicates); fixedSort=snapshotSort(sort); }
+    catch (error) { return Promise.reject(error); }
+    return this.queryPageUsing(fixed,limit,fixedSort,cursor);
+  }
+
+  /** Worker boundary: parse primitive bytes after transaction scope admission. */
+  querySerializedPage(serialized:string):Promise<RecordPage> {
+    return this.admitOperation(async()=>{
+      if (this.#scope.capability!=='records:read') throw new AuthorityError('FORBIDDEN');
+      if (typeof serialized!=='string' || Buffer.byteLength(serialized)>32_768) throw new AuthorityError('INVALID_ARGUMENT');
+      let request:Record<string,unknown>;
+      try { request=JSON.parse(serialized); } catch { throw new AuthorityError('INVALID_ARGUMENT'); }
+      if (!request || typeof request!=='object' || Array.isArray(request) ||
+        Object.keys(request).some(key=>!arrayHas(['predicates','limit','sort','cursor'],key)) ||
+        !Object.hasOwn(request,'predicates') || !Object.hasOwn(request,'limit')) throw new AuthorityError('INVALID_ARGUMENT');
+      const fixed=snapshotPredicates(request.predicates as ScalarPredicate[],true);
+      const fixedSort=snapshotSort(request.sort as RecordSort|undefined,true);
+      return this.queryPageUsing(fixed,request.limit as number,fixedSort,request.cursor as string|undefined);
+    });
+  }
+
+  private queryPageUsing(fixed:readonly ScalarPredicate[],limit:number,fixedSort?:RecordSort,cursor?:string):Promise<RecordPage> {
+    return this.admitOperation(async()=>{
+      if (!this.cursorSecret) throw new AuthorityError('INVALID_ARGUMENT','Cursor secret is not configured');
+      if (!isSafeInteger(limit) || limit<1 || limit>MAX_PAGE) throw new AuthorityError('INVALID_ARGUMENT');
+      const {params,where}=this.compilePredicates(fixed);
+      await this.requireReadyIndexes(fixed);
+      const kind=fixedSort ? await this.readySort(fixedSort.field) : undefined;
+      const versionResult=await this.query(`SELECT schema_version FROM collections WHERE space_id=$1 AND collection_id=$2`,scopeIds(this.#scope));
+      const schemaVersion=Number(versionResult.rows[0]?.schema_version);
+      if (!isSafeInteger(schemaVersion)) throw new AuthorityError('SCHEMA_CONFLICT');
+      const query=digestQuery(fixed,fixedSort,limit);
+      const scope=this.#scope;
+      const parsed=cursor===undefined ? undefined : decodeCursor(cursor,this.cursorSecret);
+      if (parsed && (parsed.space!==scope.spaceId || parsed.collection!==scope.collectionId ||
+        parsed.principal!==scope.principalId || parsed.credential!==scope.credentialId ||
+        parsed.policy!==scope.policyVersion || parsed.placement!==scope.placementGeneration ||
+        parsed.schema!==schemaVersion || parsed.query!==query)) throw new AuthorityError('INVALID_CURSOR');
+      let expr='r.created_at',sortFieldParam='';
+      const direction=fixedSort?.direction==='desc' ? 'DESC' : 'ASC';
+      if (fixedSort) {
+        params.push(fixedSort.field);
+        sortFieldParam=`$${params.length}`;
+        expr=kind==='date-time' ? 'stateplane_instant_sort_key(sv.time_value) COLLATE "C"' :
+          `sv.${{string:'string_value',number:'number_value',boolean:'boolean_value'}[kind!]}`;
+      }
+      let after='',presentAfter='',missingAfter='';
+      if (parsed) {
+        params.push(parsed.id);
+        const idParam=`$${params.length}`;
+        if (parsed.value===null) {
+          after=` AND ${expr} IS NULL AND r.record_id>${idParam}`;
+          presentAfter=' AND FALSE';
+          missingAfter=` AND r.record_id>${idParam}`;
+        }
+        else {
+          params.push(parsed.value);
+          const valueParam=`$${params.length}${fixedSort ? (kind==='number' ? '::numeric' : kind==='boolean' ? '::boolean' : '::text') : '::timestamptz'}`;
+          const operator=direction==='ASC' ? '>' : '<';
+          after=` AND (${expr} ${operator} ${valueParam} OR (${expr}=${valueParam} AND r.record_id>${idParam})${fixedSort ? ` OR ${expr} IS NULL` : ''})`;
+          presentAfter=` AND (${expr} ${operator} ${valueParam} OR (${expr}=${valueParam} AND r.record_id>${idParam}))`;
+        }
+      }
+      await this.query(`SET LOCAL statement_timeout = '${QUERY_TIMEOUT_MS}ms'`);
+      params.push(limit+1,limit,MAX_PAGE_BYTES);
+      const candidateLimit=`$${params.length-2}`,pageLimit=`$${params.length-1}`,byteLimit=`$${params.length}`;
+      const candidates=fixedSort ? `WITH present AS MATERIALIZED (
+          SELECT r.record_id,${expr} AS sort_value,${expr} AS sort_cursor,octet_length(r.canonical_data) AS bytes
+          FROM record_index_values sv JOIN records r ON r.space_id=sv.space_id AND r.collection_id=sv.collection_id
+            AND r.record_id=sv.record_id
+          WHERE ${where} AND sv.field_name=${sortFieldParam} AND sv.value_kind='${kind}'${presentAfter}
+          ORDER BY ${expr} ${direction},r.record_id LIMIT ${candidateLimit}
+        ), missing AS MATERIALIZED (
+          SELECT r.record_id,NULL::${kind==='number' ? 'numeric' : kind==='boolean' ? 'boolean' : 'text'} AS sort_value,
+            NULL::${kind==='number' ? 'numeric' : kind==='boolean' ? 'boolean' : 'text'} AS sort_cursor,
+            octet_length(r.canonical_data) AS bytes
+          FROM records r WHERE ${where} AND NOT EXISTS (
+            SELECT 1 FROM record_index_values sv2 WHERE sv2.space_id=r.space_id AND sv2.collection_id=r.collection_id
+              AND sv2.record_id=r.record_id AND sv2.field_name=${sortFieldParam} AND sv2.value_kind='${kind}'
+          )${missingAfter} AND (SELECT count(*) FROM present)<${candidateLimit}
+          ORDER BY r.record_id LIMIT ${candidateLimit}
+        ), candidates AS MATERIALIZED (
+          SELECT * FROM present UNION ALL SELECT * FROM missing
+          ORDER BY sort_value ${direction} NULLS LAST,record_id LIMIT ${candidateLimit}
+        )` : `WITH candidates AS MATERIALIZED (
+          SELECT r.record_id,${expr} AS sort_value,
+            r.created_at::text AS sort_cursor,
+            octet_length(r.canonical_data) AS bytes
+          FROM records r WHERE ${where}${after}
+          ORDER BY ${expr} ${direction} NULLS LAST,r.record_id ASC LIMIT ${candidateLimit}
+        )`;
+      const result=await this.query(`${candidates}, ranked AS MATERIALIZED (
+          SELECT c.*,row_number() OVER (ORDER BY c.sort_value ${direction} NULLS LAST,c.record_id) AS position,
+            sum(c.bytes) OVER (ORDER BY c.sort_value ${direction} NULLS LAST,c.record_id) AS consumed
+          FROM candidates c
+        ), chosen AS MATERIALIZED (
+          SELECT * FROM ranked WHERE position<=${pageLimit} AND consumed<=${byteLimit}
+        )
+        SELECT r.record_id,r.revision,r.schema_version,r.canonical_data,r.key_mode,r.normalized_key,r.tombstone,
+          c.sort_value,c.sort_cursor,(SELECT EXISTS(SELECT 1 FROM ranked k WHERE k.position>${pageLimit} OR k.consumed>${byteLimit})) AS more
+        FROM chosen c JOIN records r ON r.space_id=$1 AND r.collection_id=$2 AND r.record_id=c.record_id
+        ORDER BY c.sort_value ${direction} NULLS LAST,c.record_id`,params);
+      const records:AuthorityRecord[]=result.rows.map(row=>({ref:this.ref(row.record_id),revision:Number(row.revision),
+        schemaVersion:Number(row.schema_version),canonicalData:row.canonical_data,keyMode:row.key_mode,
+        normalizedKey:row.normalized_key,tombstone:row.tombstone}));
+      const last=result.rows.at(-1);
+      const more=Boolean(last?.more);
+      return {records,schemaVersion,nextCursor:more && last ? signCursor({space:scope.spaceId,collection:scope.collectionId,
+        principal:scope.principalId,credential:scope.credentialId,policy:scope.policyVersion,
+        placement:scope.placementGeneration,schema:schemaVersion,query,id:last.record_id,
+        value:last.sort_cursor},this.cursorSecret) : null};
+    });
+  }
+
+  /** Legacy bounded read hook; new callers use queryPage for continuation. */
   queryRecords(predicates: readonly ScalarPredicate[], limit: number): Promise<AuthorityRecord[]> {
     let fixed:readonly ScalarPredicate[];
     try { fixed=snapshotPredicates(predicates); } catch (error) { return Promise.reject(error); }
@@ -1142,10 +1498,17 @@ export class AuthorityTransaction {
     if (!isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE) throw new AuthorityError('INVALID_ARGUMENT');
     const { params, where } = this.compilePredicates(fixed);
     await this.requireReadyIndexes(fixed);
-    params.push(limit);
-    const result = await this.query(`SELECT record_id,revision,schema_version,canonical_data,key_mode,normalized_key,tombstone FROM records r
-      WHERE ${where}
-      ORDER BY r.created_at,r.record_id LIMIT $${params.length}`, params);
+    await this.query(`SET LOCAL statement_timeout = '${QUERY_TIMEOUT_MS}ms'`);
+    params.push(limit,MAX_PAGE_BYTES);
+    const result = await this.query(`WITH candidates AS MATERIALIZED (
+        SELECT r.record_id,r.created_at,octet_length(r.canonical_data) AS bytes FROM records r
+        WHERE ${where} ORDER BY r.created_at,r.record_id LIMIT $${params.length-1}
+      ), ranked AS MATERIALIZED (
+        SELECT c.*,sum(c.bytes) OVER (ORDER BY c.created_at,c.record_id) AS consumed FROM candidates c
+      )
+      SELECT r.record_id,r.revision,r.schema_version,r.canonical_data,r.key_mode,r.normalized_key,r.tombstone
+      FROM ranked c JOIN records r ON r.space_id=$1 AND r.collection_id=$2 AND r.record_id=c.record_id
+      WHERE c.consumed<=$${params.length} ORDER BY c.created_at,c.record_id`, params);
     return result.rows.map(row => ({ ref:this.ref(row.record_id),revision:Number(row.revision),schemaVersion:Number(row.schema_version),
       canonicalData:row.canonical_data,keyMode:row.key_mode,normalizedKey:row.normalized_key,tombstone:row.tombstone }));
     });
@@ -1155,9 +1518,19 @@ export class AuthorityTransaction {
   countRecords(predicates: readonly ScalarPredicate[]): Promise<number> {
     let fixed:readonly ScalarPredicate[];
     try { fixed=snapshotPredicates(predicates); } catch (error) { return Promise.reject(error); }
+    return this.countUsing(fixed);
+  }
+  countSerializedRecords(serialized:string):Promise<number> {
+    return this.admitOperation(()=>{
+      if (this.#scope.capability!=='records:read') throw new AuthorityError('FORBIDDEN');
+      return this.countUsing(parseSerializedPredicates(serialized));
+    });
+  }
+  private countUsing(fixed:readonly ScalarPredicate[]):Promise<number> {
     return this.admitOperation(async () => {
     const { params, where } = this.compilePredicates(fixed);
     await this.requireReadyIndexes(fixed);
+    await this.query(`SET LOCAL statement_timeout = '${QUERY_TIMEOUT_MS}ms'`);
     const result = await this.query(`SELECT count(*)::bigint AS total FROM records r WHERE ${where}`,params);
     const count = Number(result.rows[0].total);
     if (!isSafeInteger(count)) throw new RangeError('Count exceeds JavaScript safe integer range');
@@ -1169,9 +1542,19 @@ export class AuthorityTransaction {
   existsRecord(predicates: readonly ScalarPredicate[]): Promise<boolean> {
     let fixed:readonly ScalarPredicate[];
     try { fixed=snapshotPredicates(predicates); } catch (error) { return Promise.reject(error); }
+    return this.existsUsing(fixed);
+  }
+  existsSerializedRecord(serialized:string):Promise<boolean> {
+    return this.admitOperation(()=>{
+      if (this.#scope.capability!=='records:read') throw new AuthorityError('FORBIDDEN');
+      return this.existsUsing(parseSerializedPredicates(serialized));
+    });
+  }
+  private existsUsing(fixed:readonly ScalarPredicate[]):Promise<boolean> {
     return this.admitOperation(async () => {
     const { params, where } = this.compilePredicates(fixed);
     await this.requireReadyIndexes(fixed);
+    await this.query(`SET LOCAL statement_timeout = '${QUERY_TIMEOUT_MS}ms'`);
     const result = await this.query(`SELECT EXISTS(SELECT 1 FROM records r WHERE ${where}) AS found`,params);
     return result.rows[0].found;
     });

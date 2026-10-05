@@ -394,11 +394,14 @@ function validateUniqueDeclarations(definition:CollectionDefinition):void {
 /** Check declared filter and sort paths without admitting duplicates. */
 function validateScalarDeclarations(definition:CollectionDefinition):void {
   const declarations=['filterable','sortable'] as const;
+  const combined:string[]=[];
   for (let i=0;i<declarations.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
     const key=declarations[i];
     const paths=list(definition[key],'SCHEMA_UNSUPPORTED');
     if (!distinct(paths) || any(paths,path=>!scalarField(definition.schema,path))) fail('SCHEMA_UNSUPPORTED');
+    for (let j=0;j<paths.length;j++) if (!includes(combined,paths[j])) append(combined,paths[j]);
   }
+  if (combined.length>16) fail('SCHEMA_UNSUPPORTED','Indexed field limit exceeded');
 }
 /** Restrict lifecycle data to a required enum field and declared transitions. */
 function validateLifecycle(definition:CollectionDefinition):void {
