@@ -1,0 +1,39 @@
+docs/exact-queries-bulk.md
+  s_ad500513bc9987::t_03322c0e41f0f3 5,9
+packages/postgres/src/index.ts
+  s_28d4128c7417df::t_ab8f31bc8c5155 108,508,511-512,518-520,572,575,642,644,649,654-655,658,689-690,717,759,771-774,1486,1599,1631,1655
+test/integration/collections.test.js
+  s_5010dd07a305d3::t_1cda58970426d3 1694-1755
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d674a8a81a592a56721d88a84606fca125607c89",
+  "prompts": {},
+  "sessions": {
+    "s_28d4128c7417df": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1c1c580e-3b46-4699-b932-7f146605890c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_5010dd07a305d3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a10c28-4f7f-7513-9260-2a1162cb4752",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_ad500513bc9987": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0f222-fb22-76a5-a77e-b7c92826db44",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
