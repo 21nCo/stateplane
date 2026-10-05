@@ -70,7 +70,7 @@ test('definition subset, additive revisions and normalization have explicit fail
     assert.equal(derivedValues({label:decomposed},d).unique[0].encodedValue,
       derivedValues({label:composed},d).unique[0].encodedValue);
   }
-  assert.equal(derivedValues({label:'x'},d).indexes.length,0);
+  assert.deepEqual(derivedValues({label:'x'},d).indexes,[{field:'score',kind:'missing'}]);
   assert.equal(derivedValues({label:'x',score:null},d).indexes[0].kind,'null');
   assert.throws(()=>validateDefinition(definition('bad',{schema:{...schema,patternProperties:{}}})),{code:'SCHEMA_UNSUPPORTED'});
   assert.throws(()=>validateDefinition(definition('bad',{unique:[{name:'dup',paths:['label']},{name:'dup',paths:['score']}]})),{code:'SCHEMA_UNSUPPORTED'});
@@ -1482,6 +1482,10 @@ test('signed pages bind scope, query and schema; mutable sorts expose live trave
   assert.equal(JSON.parse(first.records[0].canonicalData).score,1);
   assert.ok(first.nextCursor);
   await assert.rejects(paged.transaction(read(owner),tx=>tx.queryPage(positive,1,sort,first.nextCursor)),{code:'CURSOR_INVALID'});
+  await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
+    VALUES($1,$2,'other-agent',ARRAY['records:read'])`,[owner.spaceId,owner.collectionId]);
+  await assert.rejects(paged.transaction({...reader,credentialId:'other-agent'},tx=>
+    tx.queryPage(positive,1,sort,first.nextCursor)),{code:'CURSOR_INVALID'});
   await assert.rejects(paged.transaction({...reader,spaceId:'another-space'},tx=>tx.queryPage(positive,1,sort,first.nextCursor)),{code:'NOT_FOUND'});
   const other=await fixture();
   await registry.revise(other.owner,1,definition(other.owner.collectionId,{version:2,sortable:['score']}));
@@ -1666,6 +1670,44 @@ test('in-flight batch cancellation backs off, then preserves the committed item 
   assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),1);
 });
 
+test('rolled-back batch item reports stable backpressure and resumes its unchanged manifest',async()=>{
+  const {writer}=await fixture();
+  const key='transient-item',requests=[JSON.stringify({operation:'create',data:{label:'transient-item'}})];
+  let interrupted=false;
+  const flaky=new PostgresAuthority({connect:async()=>{
+    const client=await pool.connect();
+    return {query:(sql,...args)=>{
+      if (!interrupted && String(sql).includes('SELECT state FROM batch_operations')) {
+        interrupted=true;
+        throw Object.assign(new Error('forced serialization rollback'),{code:'40001'});
+      }
+      return client.query(sql,...args);
+    },release:discard=>client.release(discard)};
+  }},3600);
+  await assert.rejects(flaky.ingestBatch(writer,key,requests),{code:'BACKPRESSURE'});
+  assert.equal(interrupted,true);
+  assert.deepEqual((await authority.batchProgress(writer,key)).items.map(item=>item.state),['pending']);
+  const resumed=await authority.ingestBatch(writer,key,requests);
+  assert.equal(resumed.items[0].state,'succeeded');
+  assert.equal((await authority.ingestBatch(writer,key,requests)).items[0].receipt.receiptId,
+    resumed.items[0].receipt.receiptId);
+  assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),1);
+});
+
+test('a concurrently completed batch item does not cancel later ordinals',async()=>{
+  const {writer}=await fixture();
+  const key='terminal-item',requests=[0,1].map(i=>JSON.stringify({operation:'create',data:{label:`terminal-${i}`}}));
+  const digest=createHash('sha256').update(JSON.stringify(requests)).digest('hex');
+  await authority.transaction(writer,tx=>tx.startBatch(key,digest,requests));
+  await authority.transaction(writer,tx=>tx.processBatchItem(key,0,false));
+  await authority.transaction(writer,tx=>tx.failBatchItem(key,0,'SCHEMA_INVALID'));
+  await authority.transaction(writer,tx=>tx.processBatchItem(key,1,false));
+  const progress=await authority.batchProgress(writer,key);
+  assert.equal(progress.state,'active');
+  assert.deepEqual(progress.items.map(item=>item.state),['succeeded','succeeded']);
+  assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),2);
+});
+
 test('batch item lock wait respects the remaining request budget',async()=>{
   const {writer}=await fixture();
   const key='budget-locked',requests=[JSON.stringify({operation:'create',data:{label:'budget-locked'}})];
@@ -1799,6 +1841,54 @@ test('paged reads cap payload bytes and a 5000-row selective typed query uses th
   assert.equal(sortOnly.records.length,25);
   assert.equal(JSON.parse(sortOnly.records[0].canonicalData).score,5000);
   assert.ok(JSON.stringify(plan.Plan).includes('record_index_number'),JSON.stringify(plan.Plan));
+});
+
+test('5000-row sort-only pages use indexed presence and typed order in both directions',async()=>{
+  const {owner}=await fixture();
+  const fields={...schema.properties,flag:{type:'boolean'},instant:{type:'string',format:'date-time'}};
+  const expanded={...schema,properties:fields};
+  await registry.revise(owner,1,definition(owner.collectionId,{version:2,schema:expanded,
+    sortable:['score','label','flag','instant']}));
+  for (const field of ['score','label','flag','instant']) await registry.backfill(owner,field);
+  await pool.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+    SELECT $1,$2,'plan-'||g,1,2,'generated','plan-'||g,payload::text,payload
+    FROM generate_series(1,5000) AS g
+    CROSS JOIN LATERAL (SELECT jsonb_build_object('label','plan-'||g,'score',g,'flag',g%2=0,
+      'instant','2026-01-01T00:00:'||lpad(((g-1)%60)::text,2,'0')||'Z') AS payload) p`,
+  [owner.spaceId,owner.collectionId]);
+  await pool.query(`INSERT INTO record_index_values
+    (space_id,collection_id,record_id,field_name,value_kind,string_value,number_value,boolean_value,time_value)
+    SELECT $1,$2,'plan-'||g,'score','number',NULL,g,NULL::boolean,NULL FROM generate_series(1,5000) AS g
+    UNION ALL SELECT $1,$2,'plan-'||g,'label','string','plan-'||g,NULL,NULL,NULL FROM generate_series(1,5000) AS g
+    UNION ALL SELECT $1,$2,'plan-'||g,'flag','boolean',NULL,NULL,g%2=0,NULL FROM generate_series(1,5000) AS g
+    UNION ALL SELECT $1,$2,'plan-'||g,'instant','date-time',NULL,NULL,NULL,
+      '2026-01-01T00:00:'||lpad(((g-1)%60)::text,2,'0')||'Z' FROM generate_series(1,5000) AS g`,
+  [owner.spaceId,owner.collectionId]);
+  await pool.query('ANALYZE records');
+  await pool.query('ANALYZE record_index_values');
+  let plan;
+  const observed=new PostgresAuthority({connect:async()=>{
+    const client=await pool.connect();
+    return {query:async(sql,...args)=>{
+      if (String(sql).includes('ranked AS MATERIALIZED'))
+        plan=(await client.query(`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) ${sql}`,...args)).rows[0]['QUERY PLAN'][0];
+      return client.query(sql,...args);
+    },release:discard=>client.release(discard)};
+  }},3600,randomBytes(32));
+  const names=node=>[node['Index Name'],...(node.Plans??[]).flatMap(names)].filter(Boolean);
+  const scans=node=>[node,...(node.Plans??[]).flatMap(scans)].filter(part=>part['Node Type']==='Seq Scan' &&
+    ['records','record_index_values'].includes(part['Relation Name']));
+  for (const [field,index] of [['score','record_index_number'],['label','record_index_string'],
+    ['flag','record_index_boolean'],['instant','record_index_instant_order']]) {
+    for (const direction of ['asc','desc']) {
+      const page=await observed.transaction(read(owner),tx=>tx.queryPage([],25,{field,direction}));
+      assert.equal(page.records.length,25);
+      assert.equal(scans(plan.Plan).length,0,JSON.stringify(plan.Plan));
+      assert.ok(names(plan.Plan).includes('record_index_missing'),JSON.stringify(plan.Plan));
+      assert.ok(names(plan.Plan).includes(index),JSON.stringify(plan.Plan));
+      assert.ok(plan.Plan['Shared Hit Blocks']<2000,JSON.stringify(plan.Plan));
+    }
+  }
 });
 
 test('serialized exact reads work without an in-process proxy detector',async()=>{

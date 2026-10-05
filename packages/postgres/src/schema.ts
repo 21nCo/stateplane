@@ -556,8 +556,8 @@ function encodeUniqueTuple(data:Record<string,Json>,definition:CollectionDefinit
 }
 
 /** Derive one declared typed value for a bounded backfill batch. */
-export function derivedIndexValue(data: Record<string,Json>, definition: CollectionDefinition, field:string): IndexValue|undefined {
-  if (!own(data,field)) return undefined;
+export function derivedIndexValue(data: Record<string,Json>, definition: CollectionDefinition, field:string): IndexValue {
+  if (!own(data,field)) return {field,kind:'missing'};
   const value=data[field];
   if (value===null) return {field,kind:'null'};
   if (typeof value==='string') {

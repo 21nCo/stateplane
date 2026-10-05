@@ -278,7 +278,6 @@ export class CollectionRegistry {
       const row=rows.rows[i];
       const data=JSON.parse(row.canonical_data) as Record<string,Json>;
       const index=derivedIndexValue(data,definition,field);
-      if (!index) continue;
       const value='value' in index ? index.value : null;
       await client.query(insertIndexSql, // NOSONAR -- SQL operations must remain serial in this transaction
         [scope.spaceId,scope.collectionId,row.record_id,field,index.kind,index.kind==='string'?value:null,

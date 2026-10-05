@@ -10,7 +10,7 @@ export type { CollectionDefinition } from './schema.js';
 
 export type RecordMutation = 'create' | 'replace' | 'patch' | 'delete';
 export type IndexValue =
-  | { field: string; kind: 'null' }
+  | { field: string; kind: 'null' | 'missing' }
   | { field: string; kind: 'string' | 'date-time'; value: string }
   | { field: string; kind: 'number'; value: number }
   | { field: string; kind: 'boolean'; value: boolean };
@@ -271,8 +271,8 @@ function validateIndexValue(entry:IndexValue):void {
     || (entry.kind === 'string' && (!valueString(value) || Buffer.byteLength(value)>MAX_INDEX_VALUE_BYTES))
     || (entry.kind === 'date-time' && (!scalarString(value) || Buffer.byteLength(value)>MAX_INDEX_VALUE_BYTES))
     || (entry.kind === 'boolean' && typeof value !== 'boolean')
-    || (entry.kind === 'null' && value !== null && value !== undefined)
-    || !arrayHas(['null','string','date-time','number','boolean'],entry.kind)) throw new AuthorityError('INVALID_ARGUMENT');
+    || (arrayHas(['null','missing'],entry.kind) && value !== null && value !== undefined)
+    || !arrayHas(['missing','null','string','date-time','number','boolean'],entry.kind)) throw new AuthorityError('INVALID_ARGUMENT');
 }
 
 /** Detach caller-owned fields before any await, including the first retry attempt. */
@@ -683,6 +683,8 @@ export class PostgresAuthority {
           catch (failure) { if (failure instanceof AuthorityError && failure.code==='BATCH_CANCELLED') break; throw failure; }
           continue;
         }
+        if (setHas(retryCodes,(error as {code?:string}).code ?? ''))
+          throw new AuthorityError('BACKPRESSURE','Batch item rolled back; retry the same operation and manifest');
         throw error;
       }
     }
@@ -850,7 +852,15 @@ export class AuthorityTransaction {
           AND state<>'succeeded' AND EXISTS (SELECT 1 FROM batch_operations b
             WHERE b.space_id=$1 AND b.collection_id=$2 AND b.credential_id=$3 AND b.operation_key=$4 AND b.state='active')`,
       [...key,ordinal,code]);
-      if (!result.rowCount) throw new AuthorityError('BATCH_CANCELLED');
+      if (!result.rowCount) {
+        const state=(await this.query(`SELECT b.state AS batch_state,i.state AS item_state FROM batch_operations b
+          JOIN batch_items i USING(space_id,collection_id,credential_id,operation_key)
+          WHERE b.space_id=$1 AND b.collection_id=$2 AND b.credential_id=$3 AND b.operation_key=$4
+            AND i.ordinal=$5`,[...key,ordinal])).rows[0];
+        if (state?.batch_state==='cancelled') throw new AuthorityError('BATCH_CANCELLED');
+        if (state?.batch_state==='active' && state.item_state==='succeeded') return;
+        throw new AuthorityError('BACKPRESSURE','Batch item state changed; retry the same operation');
+      }
     },true);
   }
 
@@ -1533,27 +1543,36 @@ export class AuthorityTransaction {
       const candidateLimit=`$${params.length-2}`,pageLimit=`$${params.length-1}`,byteLimit=`$${params.length}`;
       const sortedOrder=`sort_rank ${direction},sort_value ${direction} NULLS LAST,record_id ASC`;
       const nullValueType=kind==='number' ? 'numeric' : kind==='boolean' ? 'boolean' : 'text';
+      // For a sort-only page, take bounded keys directly from each typed index
+      // before fetching record bytes. Joining records ahead of LIMIT lets the
+      // planner scan and hash the whole collection for low-cardinality sorts.
+      const sortSource=(valueKind:string,order:string,continuation:string):string=> fixed.length===0
+        ? `(SELECT * FROM record_index_values sv WHERE sv.space_id=$1 AND sv.collection_id=$2
+            AND sv.field_name=${sortFieldParam} AND sv.value_kind='${valueKind}'
+            ${continuation.replaceAll('r.record_id','sv.record_id')}
+            ORDER BY ${order},sv.record_id LIMIT ${candidateLimit}) sv`
+        : 'record_index_values sv';
+      const outerAfter=(value:string):string=>fixed.length===0 ? '' : value;
       const candidates=fixedSort ? `WITH present AS MATERIALIZED (
           SELECT r.record_id,2 AS sort_rank,${expr} AS sort_value,${expr} AS sort_cursor,octet_length(r.canonical_data) AS bytes
-          FROM record_index_values sv JOIN records r ON r.space_id=sv.space_id AND r.collection_id=sv.collection_id
+          FROM ${sortSource(kind!,`${expr} ${direction}`,presentAfter)} JOIN records r ON r.space_id=sv.space_id AND r.collection_id=sv.collection_id
             AND r.record_id=sv.record_id
-          WHERE ${where} AND sv.field_name=${sortFieldParam} AND sv.value_kind='${kind}'${presentAfter}
+          WHERE ${where} AND sv.field_name=${sortFieldParam} AND sv.value_kind='${kind}'${outerAfter(presentAfter)}
           ORDER BY ${expr} ${direction},r.record_id LIMIT ${candidateLimit}
         ), explicit_null AS MATERIALIZED (
           SELECT r.record_id,1 AS sort_rank,NULL::${nullValueType} AS sort_value,NULL::${nullValueType} AS sort_cursor,
             octet_length(r.canonical_data) AS bytes
-          FROM record_index_values sv JOIN records r ON r.space_id=sv.space_id AND r.collection_id=sv.collection_id
+          FROM ${sortSource('null','sv.record_id',nullAfter)} JOIN records r ON r.space_id=sv.space_id AND r.collection_id=sv.collection_id
             AND r.record_id=sv.record_id
-          WHERE ${where} AND sv.field_name=${sortFieldParam} AND sv.value_kind='null'${nullAfter}
+          WHERE ${where} AND sv.field_name=${sortFieldParam} AND sv.value_kind='null'${outerAfter(nullAfter)}
           ORDER BY r.record_id LIMIT ${candidateLimit}
         ), missing AS MATERIALIZED (
           SELECT r.record_id,0 AS sort_rank,NULL::${nullValueType} AS sort_value,
             NULL::${nullValueType} AS sort_cursor,
             octet_length(r.canonical_data) AS bytes
-          FROM records r WHERE ${where} AND NOT EXISTS (
-            SELECT 1 FROM record_index_values sv2 WHERE sv2.space_id=r.space_id AND sv2.collection_id=r.collection_id
-              AND sv2.record_id=r.record_id AND sv2.field_name=${sortFieldParam}
-          )${missingAfter}
+          FROM ${sortSource('missing','sv.record_id',missingAfter)} JOIN records r ON r.space_id=sv.space_id AND r.collection_id=sv.collection_id
+            AND r.record_id=sv.record_id
+          WHERE ${where} AND sv.field_name=${sortFieldParam} AND sv.value_kind='missing'${outerAfter(missingAfter)}
           ORDER BY r.record_id LIMIT ${candidateLimit}
         ), candidates AS MATERIALIZED (
           SELECT * FROM present UNION ALL SELECT * FROM explicit_null UNION ALL SELECT * FROM missing
