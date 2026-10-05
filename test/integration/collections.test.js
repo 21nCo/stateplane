@@ -1217,19 +1217,21 @@ test('schema revision and backfill reject natural grant expiry after their last 
     const {owner,writer}=await fixture();
     const grantee={...writer,capability:'schema:write'};
     if (operation==='backfill-ready') await registry.backfill(owner,'score');
-    await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '2 seconds'
-      WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[owner.spaceId,owner.collectionId,grantee.credentialId]);
     let reachedCommit=false;
     const delayed=new CollectionRegistry({connect:async()=>{
       const client=await pool.connect();
       return {query:async(sql,...args)=>{
         if (sql==='COMMIT') {
           reachedCommit=true;
-          // The database clock, not the process clock, crosses the grant deadline
-          // after the registry's final authorization query.
-          await client.query(`SELECT pg_sleep(GREATEST(0, EXTRACT(EPOCH FROM
-            ((SELECT expires_at FROM collection_grants WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3)
-             - clock_timestamp())) + 0.05))`,[owner.spaceId,owner.collectionId,grantee.credentialId]);
+          // Begin the grant deadline only after the final application check,
+          // then let the database clock cross it before COMMIT's deferred fence.
+          const expiry=await client.query(`UPDATE collection_grants
+            SET expires_at=clock_timestamp()+interval '200 milliseconds'
+            WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3
+            AND (expires_at IS NULL OR expires_at>clock_timestamp()) RETURNING expires_at`,
+          [owner.spaceId,owner.collectionId,grantee.credentialId]);
+          assert.equal(expiry.rowCount,1,'the grant must still be live after the final check');
+          await client.query('SELECT pg_sleep(0.25)');
         }
         return client.query(sql,...args);
       },release:discard=>client.release(discard)};

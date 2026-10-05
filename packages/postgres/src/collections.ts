@@ -45,6 +45,7 @@ const snapshotDefinition=(input:unknown):(()=>unknown)=>{
 
 /** Schema administration and explicit index activation in the regional authority. */
 export class CollectionRegistry {
+  /** Use the regional pool for schema and backfill transactions. */
   constructor(private readonly pool: PoolLike) {}
   /** Roll back failed schema work and discard clients with ambiguous boundaries. */
   private async transaction<T>(fn:(client:Client)=>Promise<T>):Promise<T> {
@@ -251,27 +252,33 @@ export class CollectionRegistry {
         WHERE space_id=$1 AND collection_id=$2 AND version=$3`,[scope.spaceId,scope.collectionId,collection.schema_version])).rows[0];
       if (!version) throw new AuthorityError('SCHEMA_CONFLICT','Current collection definition is unavailable');
       const definition=JSON.parse(version.canonical_definition) as CollectionDefinition;
-      const rows=await client.query(`SELECT record_id,canonical_data FROM records WHERE space_id=$1 AND collection_id=$2
-        AND NOT tombstone AND record_id>$3 ORDER BY record_id LIMIT 100 FOR UPDATE`,[scope.spaceId,scope.collectionId,declaration.backfill_after??'']);
-      for (let i=0;i<rows.rows.length;i++) {
-        const row=rows.rows[i];
-        const data=JSON.parse(row.canonical_data) as Record<string,Json>;
-        const index=derivedIndexValue(data,definition,field);
-        if (!index) continue;
-        const value='value' in index ? index.value : null;
-        await client.query(`INSERT INTO record_index_values
-          (space_id,collection_id,record_id,field_name,value_kind,string_value,number_value,boolean_value,time_value)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (space_id,collection_id,record_id,field_name) DO NOTHING`,
-          [scope.spaceId,scope.collectionId,row.record_id,field,index.kind,index.kind==='string'?value:null,
-            index.kind==='number'?value:null,index.kind==='boolean'?value:null,index.kind==='date-time'?value:null]);
-      }
-      if (rows.rows.length) await client.query(`UPDATE collection_index_declarations SET backfill_after=$4
-        WHERE space_id=$1 AND collection_id=$2 AND field_name=$3`,[scope.spaceId,scope.collectionId,field,rows.rows[rows.rows.length-1].record_id]);
-      if (rows.rows.length<100) await client.query(`UPDATE collection_index_declarations SET ready=TRUE
-        WHERE space_id=$1 AND collection_id=$2 AND field_name=$3`,[scope.spaceId,scope.collectionId,field]);
+      const processed=await this.backfillBatch(client,scope,field,definition,declaration.backfill_after??'');
       await this.authorize(client,scope,scope.collectionId);
       await this.fenceCommit(client,scope);
-      return {processed:rows.rows.length,ready:rows.rows.length<100};
+      return {processed,ready:processed<100};
     });
+  }
+  /** Store one cursor-bounded batch and mark readiness only after the last row. */
+  private async backfillBatch(client:Client,scope:AuthorityScope,field:string,definition:CollectionDefinition,
+    after:string):Promise<number> {
+    const rows=await client.query(`SELECT record_id,canonical_data FROM records WHERE space_id=$1 AND collection_id=$2
+      AND NOT tombstone AND record_id>$3 ORDER BY record_id LIMIT 100 FOR UPDATE`,[scope.spaceId,scope.collectionId,after]);
+    for (let i=0;i<rows.rows.length;i++) {
+      const row=rows.rows[i];
+      const data=JSON.parse(row.canonical_data) as Record<string,Json>;
+      const index=derivedIndexValue(data,definition,field);
+      if (!index) continue;
+      const value='value' in index ? index.value : null;
+      await client.query(`INSERT INTO record_index_values
+        (space_id,collection_id,record_id,field_name,value_kind,string_value,number_value,boolean_value,time_value)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (space_id,collection_id,record_id,field_name) DO NOTHING`,
+        [scope.spaceId,scope.collectionId,row.record_id,field,index.kind,index.kind==='string'?value:null,
+          index.kind==='number'?value:null,index.kind==='boolean'?value:null,index.kind==='date-time'?value:null]);
+    }
+    if (rows.rows.length) await client.query(`UPDATE collection_index_declarations SET backfill_after=$4
+      WHERE space_id=$1 AND collection_id=$2 AND field_name=$3`,[scope.spaceId,scope.collectionId,field,rows.rows[rows.rows.length-1].record_id]);
+    if (rows.rows.length<100) await client.query(`UPDATE collection_index_declarations SET ready=TRUE
+      WHERE space_id=$1 AND collection_id=$2 AND field_name=$3`,[scope.spaceId,scope.collectionId,field]);
+    return rows.rows.length;
   }
 }

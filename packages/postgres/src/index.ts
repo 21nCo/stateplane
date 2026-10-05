@@ -48,6 +48,7 @@ export type ScalarPredicate =
   | { field: string; kind: 'null'; operator: 'isNull' }
   | { field: string; kind: 'string' | 'date-time' | 'number' | 'boolean'; operator: 'eq' | 'lt' | 'lte' | 'gt' | 'gte'; value: string | number | boolean };
 
+/** Compile one typed comparison after checking its scalar parameter. */
 function comparison(predicate: Exclude<ScalarPredicate, { kind: 'null' }>, alias: string, params: unknown[]): string {
   const column = { string:'string_value','date-time':'time_value',number:'number_value',boolean:'boolean_value' }[predicate.kind];
   const operator = { eq:'=',lt:'<',lte:'<=',gt:'>',gte:'>=' }[predicate.operator];
@@ -64,9 +65,11 @@ function comparison(predicate: Exclude<ScalarPredicate, { kind: 'null' }>, alias
 }
 
 export class AuthorityError extends Error {
+  /** Carry a safe current revision for caller-visible conflicts. */
   constructor(public readonly code: string, message = code, public readonly currentRevision?: number) { super(message); this.name = 'AuthorityError'; }
 }
 export class CommitOutcomeUnknownError extends Error {
+  /** Require an idempotent retry when COMMIT acknowledgement is ambiguous. */
   constructor(cause: unknown) { super('Commit outcome unknown; retry with the same idempotency key', { cause }); }
 }
 
@@ -130,13 +133,16 @@ const validScope=(scope:AuthorityScope):boolean =>
   scalarString(scope.credentialId) && Buffer.byteLength(scope.credentialId)<=MAX_SCOPE_ID_BYTES &&
   isSafeInteger(scope.policyVersion) && scope.policyVersion>0 &&
   isSafeInteger(scope.placementGeneration) && scope.placementGeneration>0;
+/** Detach nested receipt fields before exposing them to callers. */
 function copyReceipt(receipt: Receipt, replayed = receipt.replayed): Receipt {
   return { ...receipt, ref: { ...receipt.ref }, projection: { ...receipt.projection }, replayed };
 }
+/** Delay receipt timestamps until the surrounding transaction commits. */
 function pendingReceiptWithExposure(receipt: Receipt, exposure: ReceiptExposure, replayed = receipt.replayed): Receipt {
   const result = copyReceipt(receipt, replayed);
   for (const field of ['committedAt', 'expiresAt'] as const) {
     Object.defineProperty(result, field, { enumerable: true,
+      /** Refuse to expose receipt timestamps until COMMIT succeeds. */
       get() {
         if (!exposure.committedAt) throw new AuthorityError('RECEIPT_PENDING', 'Receipt has not committed');
         return exposure[field];
@@ -144,12 +150,15 @@ function pendingReceiptWithExposure(receipt: Receipt, exposure: ReceiptExposure,
   }
   return result;
 }
+/** Reject malformed Unicode before key and predicate admission. */
 function validUnicode(value: string): boolean {
   return unicodeString(value);
 }
+/** Require a nonempty well-formed string for scoped identifiers. */
 function scalarString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && validUnicode(value);
 }
+/** Allow empty but well-formed indexed string values. */
 function valueString(value: unknown): value is string {
   return typeof value === 'string' && validUnicode(value);
 }
@@ -179,6 +188,7 @@ export interface JoinedReceiptState {
 }
 const scopeIds = (scope: AuthorityScope) => [scope.spaceId, scope.collectionId];
 
+/** Check low-level operation shape before a transaction can write records. */
 function validateChangeShape(change: RecordChange): void {
   if (!arrayHas(['create','replace','patch','delete'],change.operation) || !scalarString(change.idempotencyKey) || Buffer.byteLength(change.idempotencyKey)>MAX_INDEX_PART_BYTES
     || typeof change.requestDigest !== 'string' || !validDigest.test(change.requestDigest)) throw new AuthorityError('INVALID_ARGUMENT');
@@ -192,6 +202,7 @@ function validateChangeShape(change: RecordChange): void {
   if ((change.operation === 'replace' || change.operation === 'patch') && (!change.unique || !change.indexes)) throw new AuthorityError('INVALID_ARGUMENT');
 }
 
+/** Copy and bound low-level unique reservations before the first await. */
 function snapshotUnique(source: readonly UniqueValue[] | undefined): readonly UniqueValue[] | undefined {
   if (source === undefined) return undefined;
   if (!Array.isArray(source)) throw new AuthorityError('INVALID_ARGUMENT');
@@ -208,6 +219,7 @@ function snapshotUnique(source: readonly UniqueValue[] | undefined): readonly Un
   return Object.freeze(values);
 }
 
+/** Copy typed index values before any caller-owned object can change. */
 function snapshotIndexes(source: readonly IndexValue[] | undefined): readonly IndexValue[] | undefined {
   if (source === undefined) return undefined;
   if (!Array.isArray(source)) throw new AuthorityError('INVALID_ARGUMENT');
@@ -217,16 +229,20 @@ function snapshotIndexes(source: readonly IndexValue[] | undefined): readonly In
     const entry = source[i];
     if (!entry || !scalarString(entry.field) || Buffer.byteLength(entry.field)>MAX_INDEX_PART_BYTES || setHas(seen,entry.field)) throw new AuthorityError('INVALID_ARGUMENT');
     setAdd(seen,entry.field);
-    const value = 'value' in entry ? entry.value : null;
-    if ((entry.kind === 'number' && (typeof value !== 'number' || !isFiniteNumber(value)))
-      || (entry.kind === 'string' && (!valueString(value) || Buffer.byteLength(value)>MAX_INDEX_VALUE_BYTES))
-      || (entry.kind === 'date-time' && (!scalarString(value) || Buffer.byteLength(value)>MAX_INDEX_VALUE_BYTES))
-      || (entry.kind === 'boolean' && typeof value !== 'boolean')
-      || (entry.kind === 'null' && value !== null && value !== undefined)
-      || !arrayHas(['null','string','date-time','number','boolean'],entry.kind)) throw new AuthorityError('INVALID_ARGUMENT');
+    validateIndexValue(entry);
     append(values,Object.freeze({ ...entry }));
   }
   return Object.freeze(values);
+}
+/** Enforce the bounded scalar representation for each stored index kind. */
+function validateIndexValue(entry:IndexValue):void {
+  const value = 'value' in entry ? entry.value : null;
+  if ((entry.kind === 'number' && (typeof value !== 'number' || !isFiniteNumber(value)))
+    || (entry.kind === 'string' && (!valueString(value) || Buffer.byteLength(value)>MAX_INDEX_VALUE_BYTES))
+    || (entry.kind === 'date-time' && (!scalarString(value) || Buffer.byteLength(value)>MAX_INDEX_VALUE_BYTES))
+    || (entry.kind === 'boolean' && typeof value !== 'boolean')
+    || (entry.kind === 'null' && value !== null && value !== undefined)
+    || !arrayHas(['null','string','date-time','number','boolean'],entry.kind)) throw new AuthorityError('INVALID_ARGUMENT');
 }
 
 /** Detach caller-owned fields before any await, including the first retry attempt. */
@@ -302,7 +318,16 @@ function requestOperation(fields:Record<string,unknown>):RecordMutation {
 /** Canonicalize an authorized payload and bind its digest to the requested scope. */
 function prepareRecordPayload(fields:Record<string,unknown>,operation:RecordMutation,fixed:Readonly<RecordChange>,
   normalized:string|undefined,scope:AuthorityScope,trustedParsed:boolean):Readonly<RecordChange> {
-  const has=(key:string)=>Object.hasOwn(fields,key);
+  prepareCanonicalFields(fields,operation,trustedParsed);
+  const payload=requestFingerprintFields(fields,normalized,scope);
+  let canonicalData: string|undefined;
+  if (operation==='create' || operation==='replace') canonicalData=canonical(fields.data as Json);
+  else if (operation==='patch') canonicalData=canonical(fields.set as Json);
+  return snapshotChange({...fixed,requestDigest:fingerprint(payload),
+    ...(canonicalData===undefined ? {} : {canonicalData})});
+}
+/** Canonicalize payload members after authorization and replay admission. */
+function prepareCanonicalFields(fields:Record<string,unknown>,operation:RecordMutation,trustedParsed:boolean):void {
   if (operation==='create' || operation==='replace') {
     plainJson(fields.data,'SCHEMA_INVALID',0,new Set<object>(),trustedParsed);
     fields.data=JSON.parse(canonical(fields.data as Json));
@@ -311,28 +336,30 @@ function prepareRecordPayload(fields:Record<string,unknown>,operation:RecordMuta
     if (!fields.set || typeof fields.set!=='object' || Array.isArray(fields.set) || !Array.isArray(fields.unset)) throw new AuthorityError('INVALID_ARGUMENT');
     plainJson(fields.set,'SCHEMA_INVALID',0,new Set<object>(),trustedParsed);
     plainJson(fields.unset,'INVALID_ARGUMENT',0,new Set<object>(),trustedParsed);
-    const unset=fields.unset as unknown[];
-    for (let i=0;i<unset.length;i++) {
-      const path=Object.getOwnPropertyDescriptor(unset,i)!.value;
-      if (!unicodeString(path) || !path || Object.hasOwn(fields.set as object,path)) throw new AuthorityError('INVALID_ARGUMENT');
-      for (let j=0;j<i;j++) if (Object.getOwnPropertyDescriptor(unset,j)!.value===path) throw new AuthorityError('INVALID_ARGUMENT');
-    }
+    validateUnsetPaths(fields.unset as unknown[],fields.set as object);
     fields.set=JSON.parse(canonical(fields.set as Json));
     fields.unset=JSON.parse(canonical(fields.unset as Json));
   }
+}
+/** Reject repeated, nonstring, or set-and-unset patch paths. */
+function validateUnsetPaths(unset:unknown[],set:object):void {
+  for (let i=0;i<unset.length;i++) {
+    const path=Object.getOwnPropertyDescriptor(unset,i)!.value;
+    if (!unicodeString(path) || !path || Object.hasOwn(set,path)) throw new AuthorityError('INVALID_ARGUMENT');
+    for (let j=0;j<i;j++) if (Object.getOwnPropertyDescriptor(unset,j)!.value===path) throw new AuthorityError('INVALID_ARGUMENT');
+  }
+}
+/** Bind the canonical request digest to collection and credential scope. */
+function requestFingerprintFields(fields:Record<string,unknown>,normalized:string|undefined,scope:AuthorityScope):Record<string,Json> {
   const payload: Record<string,Json>=Object.create(null);
   const fingerprintFields=['operation','id','externalKey','data','set','unset','expectedRevision','expectedSchemaVersion'];
   for (let i=0;i<fingerprintFields.length;i++) {
     const key=fingerprintFields[i];
-    if (has(key)) payload[key]=key==='externalKey' ? normalized! : fields[key] as Json;
+    if (Object.hasOwn(fields,key)) payload[key]=key==='externalKey' ? normalized! : fields[key] as Json;
   }
   payload.collection=scope.collectionId;
   payload.credential=scope.credentialId;
-  let canonicalData: string|undefined;
-  if (operation==='create' || operation==='replace') canonicalData=canonical(fields.data as Json);
-  else if (operation==='patch') canonicalData=canonical(fields.set as Json);
-  return snapshotChange({...fixed,requestDigest:fingerprint(payload),
-    ...(canonicalData===undefined ? {} : {canonicalData})});
+  return payload;
 }
 
 /** Reject decorated predicates and retain stable own values for query admission. */
@@ -343,24 +370,28 @@ function snapshotPredicates(source: readonly ScalarPredicate[]): readonly Scalar
   const result: ScalarPredicate[]=[];
   for (let i=0;i<source.length;i++) {
     const item=Object.getOwnPropertyDescriptor(source,i)?.value;
-    if (!item || typeof item!=='object' || isInProcessProxy(item) ||
-      (Object.getPrototypeOf(item)!==Object.prototype && Object.getPrototypeOf(item)!==null)) throw new AuthorityError('INVALID_ARGUMENT');
-    const field=Object.getOwnPropertyDescriptor(item,'field')?.value;
-    const kind=Object.getOwnPropertyDescriptor(item,'kind')?.value;
-    const operator=Object.getOwnPropertyDescriptor(item,'operator')?.value;
-    const value=Object.getOwnPropertyDescriptor(item,'value')?.value;
-    const accepted=kind==='null' ? ['field','kind','operator'] : ['field','kind','operator','value'];
-    const keys=Reflect.ownKeys(item);
-    if (keys.length!==accepted.length) throw new AuthorityError('INVALID_ARGUMENT');
-    for (let j=0;j<keys.length;j++) {
-      const key=keys[j],descriptor=Object.getOwnPropertyDescriptor(item,key);
-      if (typeof key!=='string' || !arrayHas(accepted,key) || !descriptor?.enumerable || !Object.hasOwn(descriptor,'value'))
-        throw new AuthorityError('INVALID_ARGUMENT');
-    }
-    if (kind==='null') append(result,Object.freeze({field,kind,operator}) as ScalarPredicate);
-    else append(result,Object.freeze({field,kind,operator,value}) as ScalarPredicate);
+    append(result,snapshotPredicate(item));
   }
   return Object.freeze(result);
+}
+/** Retain a predicate's own data properties and reject decorated objects. */
+function snapshotPredicate(item:unknown):ScalarPredicate {
+  if (!item || typeof item!=='object' || isInProcessProxy(item) ||
+    (Object.getPrototypeOf(item)!==Object.prototype && Object.getPrototypeOf(item)!==null)) throw new AuthorityError('INVALID_ARGUMENT');
+  const field=Object.getOwnPropertyDescriptor(item,'field')?.value;
+  const kind=Object.getOwnPropertyDescriptor(item,'kind')?.value;
+  const operator=Object.getOwnPropertyDescriptor(item,'operator')?.value;
+  const value=Object.getOwnPropertyDescriptor(item,'value')?.value;
+  const accepted=kind==='null' ? ['field','kind','operator'] : ['field','kind','operator','value'];
+  const keys=Reflect.ownKeys(item);
+  if (keys.length!==accepted.length) throw new AuthorityError('INVALID_ARGUMENT');
+  for (let j=0;j<keys.length;j++) {
+    const key=keys[j],descriptor=Object.getOwnPropertyDescriptor(item,key);
+    if (typeof key!=='string' || !arrayHas(accepted,key) || !descriptor?.enumerable || !Object.hasOwn(descriptor,'value'))
+      throw new AuthorityError('INVALID_ARGUMENT');
+  }
+  if (kind==='null') return Object.freeze({field,kind,operator}) as ScalarPredicate;
+  return Object.freeze({field,kind,operator,value}) as ScalarPredicate;
 }
 /** Match a declared index using only trusted own result-array slots. */
 function findDeclaration(rows:readonly Record<string,unknown>[],field:string):Record<string,unknown>|undefined {
@@ -372,6 +403,7 @@ function findDeclaration(rows:readonly Record<string,unknown>[],field:string):Re
 }
 
 export class PostgresAuthority {
+  /** Configure the receipt window used by new authority transactions. */
   constructor(private readonly pool: PoolLike, private readonly receiptRetentionSeconds: number) {
     if (!isSafeInteger(receiptRetentionSeconds) || receiptRetentionSeconds < 1) throw new RangeError('Invalid receipt retention');
   }
@@ -497,7 +529,9 @@ export class AuthorityTransaction {
   private admittingMutations = true;
   private readonly replayCollections = new Set<CollectionId>();
   readonly #scope: Readonly<AuthorityScope>;
+  /** Expose the frozen scope used by every operation in this transaction. */
   get scope(): Readonly<AuthorityScope> { return this.#scope; }
+  /** Join an authorized client and optionally share pending receipt state. */
   constructor(private readonly client: Client, scope: AuthorityScope, private readonly retentionSeconds: number,
     joinedReceipts?: JoinedReceiptState) {
     this.#scope = Object.freeze({ ...scope });
@@ -511,6 +545,7 @@ export class AuthorityTransaction {
   assertCommittable() {
     if (this.mutationFailed) throw this.mutationError;
   }
+  /** Stop admission before final policy, receipt, and COMMIT checks. */
   sealMutations() { this.admittingMutations = false; }
   /** Drain admitted operations before the final authorization and commit. */
   async settleMutations() { await this.activeOperationTail; await this.mutationTail; }
@@ -519,6 +554,7 @@ export class AuthorityTransaction {
     const settled=work.then(()=>{},()=>{});
     this.activeOperationTail=this.activeOperationTail.then(()=>settled);
   }
+  /** Track admitted operations so callback return cannot bypass their completion. */
   private admitOperation<T>(work: () => Promise<T>, rollbackOnError = false): Promise<T> {
     if (!this.admittingMutations || !this.active) return Promise.reject(new AuthorityError('INVALID_ARGUMENT', 'Transaction admission ended'));
     const running = Promise.resolve().then(() => { this.assertCommittable(); return work(); })
@@ -526,6 +562,7 @@ export class AuthorityTransaction {
     this.trackOperation(running);
     return running;
   }
+  /** Deny SQL after transaction-local authority state has closed. */
   private query(sql: string, values: unknown[] = []) {
     if (!this.active) throw new AuthorityError('INVALID_ARGUMENT', 'Transaction ended');
     return this.client.query(sql, values);
@@ -558,10 +595,13 @@ export class AuthorityTransaction {
     if (row.collection_lifecycle === 'readOnly' && (capability === 'records:write' || capability === 'claims:review')) throw new AuthorityError('SPACE_UNAVAILABLE');
   }
 
+  /** Scope a stored record ID to this transaction's collection. */
   private ref(id: string): RecordRef { return { spaceId: this.#scope.spaceId, collectionId: this.#scope.collectionId, id }; }
+  /** Read a record through the admitted operation queue. */
   getRecord(recordId: string, includeTombstone = false): Promise<AuthorityRecord | null> {
     return this.admitOperation(() => this.readRecord(recordId,includeTombstone));
   }
+  /** Apply read authorization and tombstone visibility to a record lookup. */
   private async readRecord(recordId: string, includeTombstone = false): Promise<AuthorityRecord | null> {
     if (this.#scope.capability !== 'records:read') throw new AuthorityError('FORBIDDEN');
     if (!scalarString(recordId)) throw new AuthorityError('INVALID_ARGUMENT');
@@ -585,6 +625,7 @@ export class AuthorityTransaction {
     return result.rows[0] ? this.readRecord(result.rows[0].record_id) : null;
     });
   }
+  /** Look up a committed receipt before admitting a new mutation effect. */
   private async findReceipt(operation: RecordMutation, key: string): Promise<{ collectionId: CollectionId; requestDigest: string; response: Receipt } | null> {
     const result = await this.query(`SELECT collection_id,request_digest,response FROM idempotency_receipts
       WHERE space_id=$1 AND credential_id=$2 AND operation=$3 AND idempotency_key=$4 AND expires_at>clock_timestamp()`,
@@ -592,6 +633,7 @@ export class AuthorityTransaction {
     const row = result.rows[0];
     return row ? { collectionId: row.collection_id, requestDigest: row.request_digest, response: row.response } : null;
   }
+  /** Compute receipt windows from one database-clock statement. */
   private async receiptTimes(retentions: number[]): Promise<Array<{ committedAt: string; expiresAt: string }>> {
     const clock = await this.query(`WITH stamp AS MATERIALIZED (SELECT clock_timestamp() AS at)
       SELECT at AS committed_at, at + (retention * interval '1 second') AS expires_at
@@ -659,6 +701,7 @@ export class AuthorityTransaction {
       throw new AuthorityError('RECEIPT_EXPIRED','Receipt expired before commit');
     return remainingMs;
   }
+  /** Publish committed receipt timestamps after successful COMMIT only. */
   exposeReceipts(): void {
     for (let i=0;i<this.readyReceipts.length;i++) {
       const ready=this.readyReceipts[i];
@@ -667,12 +710,14 @@ export class AuthorityTransaction {
     }
     this.readyReceipts.length = 0;
   }
+  /** Recheck the original collection before returning a cross-collection replay. */
   private async authorizeOriginal(collectionId: CollectionId): Promise<void> {
     if (collectionId === this.#scope.collectionId) return;
     await new AuthorityTransaction(this.client, { ...this.#scope, collectionId }, this.retentionSeconds).checkScope();
     setAdd(this.replayCollections,collectionId);
   }
 
+  /** Recheck every replayed collection before the transaction commits. */
   async checkReplayScopes(): Promise<void> {
     const collections=setValues(this.replayCollections);
     for (let i=0;i<collections.length;i++) {
@@ -681,6 +726,7 @@ export class AuthorityTransaction {
     }
   }
 
+  /** Queue one low-level change and poison the transaction on failure. */
   async mutate(change: RecordChange): Promise<Receipt> {
     try {
       if (!this.admittingMutations || !this.active) throw new AuthorityError('INVALID_ARGUMENT', 'Transaction mutation admission ended');
@@ -754,50 +800,63 @@ export class AuthorityTransaction {
     const work=(async()=>{
       await tail;
       this.assertCommittable();
-      return this.mutateOnce(fixed,async (version,base)=>{
-        const definition=JSON.parse(version.definition) as CollectionDefinition;
-        let data: Record<string,Json> | undefined;
-        let previous: Record<string,Json> | undefined;
-        if (operation==='replace' || operation==='patch' || operation==='delete') {
-          const row=(await this.query(`SELECT revision,canonical_data FROM records WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 AND NOT tombstone FOR UPDATE`,
-            [...scopeIds(this.#scope),fields.id])).rows[0];
-          if (!row) throw new AuthorityError('NOT_FOUND');
-          if (Number(row.revision)!==fields.expectedRevision) throw new AuthorityError('REVISION_CONFLICT','Record revision changed',Number(row.revision));
-          previous=JSON.parse(row.canonical_data) as Record<string,Json>;
-        }
-        if (operation==='create' || operation==='replace') data=fields.data as Record<string,Json>;
-        if (operation==='patch') {
-          data={...previous,...fields.set as Record<string,Json>};
-          const unset=fields.unset as string[];
-          for (let i=0;i<unset.length;i++) {
-            const path=unset[i];
-            if (!Object.hasOwn(definition.schema,'properties') || !Object.hasOwn(definition.schema.properties!,path) ||
-              arrayHas(Object.hasOwn(definition.schema,'required') ? definition.schema.required! : [],path))
-              throw new AuthorityError('INVALID_ARGUMENT','Unset requires a declared optional field');
-            delete data[path];
-          }
-        }
-        if (data) {
-          validateValue(data as Json,definition.schema);
-          const canonicalData=canonical(data);
-          if (Buffer.byteLength(canonicalData,'utf8')>MAX_JSON_BYTES) throw new AuthorityError('SCHEMA_INVALID','Record exceeds canonical byte limit');
-          if (Object.hasOwn(definition,'lifecycle') && definition.lifecycle) {
-            const {field,transitions}=definition.lifecycle;
-            const to=Object.hasOwn(data,field) ? data[field] : undefined;
-            const from=previous && Object.hasOwn(previous,field) ? previous[field] : undefined;
-            if (operation==='create' ? !arrayHas(definition.lifecycle.initial,to) :
-              from!==to && (!Object.hasOwn(transitions,String(from)) || !arrayHas(transitions[String(from)],to)))
-              throw new AuthorityError('SCHEMA_INVALID','Lifecycle transition is not declared');
-          }
-          const values=derivedValues(data,definition);
-          return {...base,canonicalData,...values};
-        }
-        return base;
-      },preparePayload);
+      return this.mutateOnce(fixed,(version,base)=>this.prepareMutation(fields,operation,version,base),preparePayload);
     })().catch(error=>{this.mutationFailed=true;this.mutationError=error;throw error;});
     this.mutationTail=work.then(()=>{},()=>{});
     this.trackOperation(work);
     return await work;
+  }
+
+  /** Derive a validated change under the collection version and record locks. */
+  private async prepareMutation(fields:Record<string,unknown>,operation:RecordMutation,
+    version:{definition:string},base:RecordChange):Promise<RecordChange> {
+    const definition=JSON.parse(version.definition) as CollectionDefinition;
+    const previous=await this.previousRecord(fields,operation);
+    let data:Record<string,Json>|undefined;
+    if (operation==='create' || operation==='replace') data=fields.data as Record<string,Json>;
+    if (operation==='patch') data=this.patchRecord(previous!,fields,definition);
+    if (!data) return base;
+    validateValue(data as Json,definition.schema);
+    const canonicalData=canonical(data);
+    if (Buffer.byteLength(canonicalData,'utf8')>MAX_JSON_BYTES) throw new AuthorityError('SCHEMA_INVALID','Record exceeds canonical byte limit');
+    this.checkLifecycle(data,previous,operation,definition);
+    return {...base,canonicalData,...derivedValues(data,definition)};
+  }
+
+  /** Lock the current record and expose the safe revision on a stale write. */
+  private async previousRecord(fields:Record<string,unknown>,operation:RecordMutation):Promise<Record<string,Json>|undefined> {
+    if (operation==='create') return undefined;
+    const row=(await this.query(`SELECT revision,canonical_data FROM records WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 AND NOT tombstone FOR UPDATE`,
+      [...scopeIds(this.#scope),fields.id])).rows[0];
+    if (!row) throw new AuthorityError('NOT_FOUND');
+    if (Number(row.revision)!==fields.expectedRevision) throw new AuthorityError('REVISION_CONFLICT','Record revision changed',Number(row.revision));
+    return JSON.parse(row.canonical_data) as Record<string,Json>;
+  }
+
+  /** Apply only declared optional unsets to the prior canonical record. */
+  private patchRecord(previous:Record<string,Json>,fields:Record<string,unknown>,definition:CollectionDefinition):Record<string,Json> {
+    const data={...previous,...fields.set as Record<string,Json>};
+    const unset=fields.unset as string[];
+    for (let i=0;i<unset.length;i++) {
+      const path=unset[i];
+      if (!Object.hasOwn(definition.schema,'properties') || !Object.hasOwn(definition.schema.properties!,path) ||
+        arrayHas(Object.hasOwn(definition.schema,'required') ? definition.schema.required! : [],path))
+        throw new AuthorityError('INVALID_ARGUMENT','Unset requires a declared optional field');
+      delete data[path];
+    }
+    return data;
+  }
+
+  /** Check declared lifecycle transitions after the record has been validated. */
+  private checkLifecycle(data:Record<string,Json>,previous:Record<string,Json>|undefined,
+    operation:RecordMutation,definition:CollectionDefinition):void {
+    if (!Object.hasOwn(definition,'lifecycle') || !definition.lifecycle) return;
+    const {field,transitions}=definition.lifecycle;
+    const to=Object.hasOwn(data,field) ? data[field] : undefined;
+    const from=previous && Object.hasOwn(previous,field) ? previous[field] : undefined;
+    if (operation==='create' ? !arrayHas(definition.lifecycle.initial,to) :
+      from!==to && (!Object.hasOwn(transitions,String(from)) || !arrayHas(transitions[String(from)],to)))
+      throw new AuthorityError('SCHEMA_INVALID','Lifecycle transition is not declared');
   }
 
   /** Uncommitted unique rows provide Hyperdrive-compatible, scoped try-locks. */
@@ -882,6 +941,7 @@ export class AuthorityTransaction {
     return { schemaVersion:Number(version.schema_version), generation:Number(version.placement_generation),definition:version.canonical_definition };
   }
 
+  /** Apply a generated create or exact-revision update under one transaction. */
   private async writeRecord(change: RecordChange, schemaVersion: number): Promise<{ recordId: string; beforeRevision: number | null; revision: number }> {
     const scope = this.#scope;
     const recordId = change.operation === 'create' ? `rec_${randomUUID()}` : change.recordId!;
@@ -916,6 +976,7 @@ export class AuthorityTransaction {
     return { recordId, beforeRevision:change.expectedRevision!, revision };
   }
 
+  /** Reserve one normalized tuple, distinguishing live and tombstone holders. */
   private async reserveUnique(unique: UniqueValue, recordId: string): Promise<void> {
     const scope = this.#scope;
     const inserted = await this.query(`INSERT INTO record_unique_keys(space_id,collection_id,constraint_name,encoded_value,record_id)
@@ -929,6 +990,7 @@ export class AuthorityTransaction {
     throw new AuthorityError(holder.rows[0]?.tombstone ? 'KEY_RESERVED' : 'UNIQUE_CONFLICT');
   }
 
+  /** Persist one typed index value alongside the canonical record. */
   private async writeIndex(field: IndexValue, recordId: string): Promise<void> {
     const value = 'value' in field ? field.value : null;
     await this.query(`INSERT INTO record_index_values(space_id,collection_id,record_id,field_name,value_kind,string_value,number_value,boolean_value,time_value)
@@ -937,6 +999,7 @@ export class AuthorityTransaction {
       field.kind === 'boolean' ? value : null,field.kind === 'date-time' ? value : null]);
   }
 
+  /** Write all unique reservations and indexes inside the record transaction. */
   private async writeValues(change: RecordChange, recordId: string): Promise<void> {
     if (change.operation === 'delete') return;
     const uniqueValues = change.unique ?? [];
@@ -945,6 +1008,7 @@ export class AuthorityTransaction {
     for (let i = 0; i < indexValues.length; i++) await this.writeIndex(indexValues[i], recordId);
   }
 
+  /** Add the event, outbox entry, and pending receipt for a written revision. */
   private async appendFacts(change: RecordChange, identity: string, version: { schemaVersion: number; generation: number },
     written: { recordId: string; beforeRevision: number | null; revision: number }): Promise<Receipt> {
     const scope = this.#scope;
@@ -1055,6 +1119,7 @@ export class AuthorityTransaction {
     });
   }
 
+  /** Count records only through ready declared filter indexes. */
   countRecords(predicates: readonly ScalarPredicate[]): Promise<number> {
     let fixed:readonly ScalarPredicate[];
     try { fixed=snapshotPredicates(predicates); } catch (error) { return Promise.reject(error); }
@@ -1068,6 +1133,7 @@ export class AuthorityTransaction {
     });
   }
 
+  /** Test record existence with the same indexed predicate contract as count. */
   existsRecord(predicates: readonly ScalarPredicate[]): Promise<boolean> {
     let fixed:readonly ScalarPredicate[];
     try { fixed=snapshotPredicates(predicates); } catch (error) { return Promise.reject(error); }
@@ -1096,6 +1162,7 @@ export class AuthorityTransaction {
     },true);
   }
 
+  /** Finish only the still-current leased outbox attempt. */
   finishOutbox(delivery: OutboxDelivery, success: boolean, error?: string): Promise<boolean> {
     return this.admitOperation(async () => {
     if (this.#scope.capability !== 'outbox:worker') throw new AuthorityError('FORBIDDEN');

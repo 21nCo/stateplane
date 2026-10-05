@@ -105,12 +105,7 @@ export function scalarString(value: unknown, allowNul = false): value is string 
 /** Admit bounded ordinary JSON without invoking accessors or proxy traps. */
 export function plainJson(value: unknown, code = 'SCHEMA_INVALID', depth = 0, seen = new Set<object>(), trustedParsed = false,
   budget = { nodes:0, bytes:0 }): asserts value is Json {
-  // Shared-reference DAGs are legal in-process input. Charge each occurrence,
-  // not each distinct object, before canonical expansion can multiply it.
-  if (++budget.nodes > maxBytes) fail(code,'JSON exceeds node budget');
-  budget.bytes += value === null || typeof value === 'boolean' || typeof value === 'number' || typeof value === 'string'
-    ? Buffer.byteLength(JSON.stringify(value)) : 2;
-  if (budget.bytes > maxBytes) fail(code,'JSON exceeds byte budget');
+  chargeJsonBudget(value,code,budget);
   if ((!trustedParsed && (!proxyDetector || proxyDetector(value))) || depth > maxCanonicalDepth) fail(code);
   if (value === null || typeof value === 'boolean') return;
   if (typeof value === 'string') { if (!scalarString(value,true)) fail(code); return; }
@@ -119,26 +114,42 @@ export function plainJson(value: unknown, code = 'SCHEMA_INVALID', depth = 0, se
   const object = value as object;
   if (setHas(seen,object)) fail(code);
   setAdd(seen,object);
-  if (Array.isArray(value)) {
-    if (Object.getPrototypeOf(value) !== Array.prototype || Reflect.ownKeys(value).length !== value.length+1) fail(code);
-    for (let i=0;i<value.length;i++) {
-      const descriptor = Object.getOwnPropertyDescriptor(value,i);
-      if (!descriptor?.enumerable || !own(descriptor,'value')) fail(code);
-      if (i) budget.bytes++;
-      plainJson(descriptor!.value,code,depth+1,seen,trustedParsed,budget);
-    }
-  } else {
-    const keys=Reflect.ownKeys(object);
-    for (let i=0;i<keys.length;i++) {
-      const key=Object.getOwnPropertyDescriptor(keys,i)!.value as PropertyKey;
-      const descriptor = Object.getOwnPropertyDescriptor(object,key);
-      if (typeof key !== 'string' || !scalarString(key) || !descriptor?.enumerable || !own(descriptor,'value')) fail(code);
-      budget.bytes += Buffer.byteLength(JSON.stringify(key))+1+(i ? 1 : 0);
-      if (budget.bytes > maxBytes) fail(code,'JSON exceeds byte budget');
-      plainJson(descriptor!.value,code,depth+1,seen,trustedParsed,budget);
-    }
-  }
+  if (Array.isArray(value)) validateJsonArray(value,code,depth,seen,trustedParsed,budget);
+  else validateJsonObject(object,code,depth,seen,trustedParsed,budget);
   setDelete(seen,object);
+}
+/** Charge each JSON occurrence before traversing shared in-process references. */
+function chargeJsonBudget(value:unknown,code:string,budget:{nodes:number;bytes:number}):void {
+  // Shared-reference DAGs are legal in-process input. Charge each occurrence,
+  // not each distinct object, before canonical expansion can multiply it.
+  if (++budget.nodes > maxBytes) fail(code,'JSON exceeds node budget');
+  budget.bytes += value === null || typeof value === 'boolean' || typeof value === 'number' || typeof value === 'string'
+    ? Buffer.byteLength(JSON.stringify(value)) : 2;
+  if (budget.bytes > maxBytes) fail(code,'JSON exceeds byte budget');
+}
+/** Inspect every array slot as an own data property without invoking getters. */
+function validateJsonArray(value:unknown[],code:string,depth:number,seen:Set<object>,trustedParsed:boolean,
+  budget:{nodes:number;bytes:number}):void {
+  if (Object.getPrototypeOf(value) !== Array.prototype || Reflect.ownKeys(value).length !== value.length+1) fail(code);
+  for (let i=0;i<value.length;i++) {
+    const descriptor = Object.getOwnPropertyDescriptor(value,i);
+    if (!descriptor?.enumerable || !own(descriptor,'value')) fail(code);
+    if (i) budget.bytes++;
+    plainJson(descriptor!.value,code,depth+1,seen,trustedParsed,budget);
+  }
+}
+/** Inspect object keys and values without trusting the object's prototype. */
+function validateJsonObject(object:object,code:string,depth:number,seen:Set<object>,trustedParsed:boolean,
+  budget:{nodes:number;bytes:number}):void {
+  const keys=Reflect.ownKeys(object);
+  for (let i=0;i<keys.length;i++) {
+    const key=Object.getOwnPropertyDescriptor(keys,i)!.value as PropertyKey;
+    const descriptor = Object.getOwnPropertyDescriptor(object,key);
+    if (typeof key !== 'string' || !scalarString(key) || !descriptor?.enumerable || !own(descriptor,'value')) fail(code);
+    budget.bytes += Buffer.byteLength(JSON.stringify(key))+1+(i ? 1 : 0);
+    if (budget.bytes > maxBytes) fail(code,'JSON exceeds byte budget');
+    plainJson(descriptor!.value,code,depth+1,seen,trustedParsed,budget);
+  }
 }
 /** Serialize already admitted JSON in stable UTF-8 key order. */
 export function canonical(value: Json): string {
@@ -173,6 +184,16 @@ const list = (value: unknown, code: string): unknown[] => {
 };
 /** Validate one node of the closed schema subset within shared depth and node budgets. */
 function validateNode(node: SchemaNode, root: boolean, depth: number, counter: { count: number }): void {
+  node=validateNodeEnvelope(node,root,depth,counter);
+  const kind=schemaKind(node.type);
+  if (root && kind !== 'object') fail('SCHEMA_UNSUPPORTED');
+  if (own(node,'description') && (typeof node.description !== 'string' || !scalarString(node.description,true))) fail('SCHEMA_UNSUPPORTED');
+  validateNodeBounds(node,kind);
+  validateChildNodes(node,kind,depth,counter);
+  if (own(node,'enum')) validateNodeEnum(node,depth);
+}
+/** Snapshot a schema node and reject unsupported keywords before inspecting values. */
+function validateNodeEnvelope(node:SchemaNode,root:boolean,depth:number,counter:{count:number}):SchemaNode {
   if (!ordinary(node) || depth > maxDepth || ++counter.count > maxFields) fail('SCHEMA_UNSUPPORTED','Schema exceeds node/depth budget');
   node=Object.assign(Object.create(null),node) as SchemaNode;
   const nodeKeys=Object.keys(node);
@@ -181,60 +202,74 @@ function validateNode(node: SchemaNode, root: boolean, depth: number, counter: {
     if (!setHas(allowed,key)) fail('SCHEMA_UNSUPPORTED',`Unsupported keyword: ${key}`);
   }
   if (!own(node,'type') || (root ? !own(node,'$schema') || node.$schema !== 'https://json-schema.org/draft/2020-12/schema' : own(node,'$schema'))) fail('SCHEMA_UNSUPPORTED');
-  const spec = node.type;
-  let kind='';
-  if (typeof spec === 'string' && setHas(typesAllowed,spec)) kind=spec;
-  else if (Array.isArray(spec) && list(spec,'SCHEMA_UNSUPPORTED').length === 2 &&
+  return node;
+}
+/** Recurse only through children declared for the admitted node kind. */
+function validateChildNodes(node:SchemaNode,kind:string,depth:number,counter:{count:number}):void {
+  if (kind === 'object') validateObjectNode(node,depth,counter);
+  else if (own(node,'properties') || own(node,'required') || own(node,'additionalProperties')) fail('SCHEMA_UNSUPPORTED');
+  if (kind === 'array') { if (!own(node,'items')) fail('SCHEMA_UNSUPPORTED'); validateNode(node.items!,false,depth+1,counter); }
+  else if (own(node,'items') || own(node,'minItems') || own(node,'maxItems')) fail('SCHEMA_UNSUPPORTED');
+}
+/** Admit only scalar nullable unions and the closed set of schema types. */
+function schemaKind(spec:SchemaNode['type']):string {
+  if (typeof spec === 'string' && setHas(typesAllowed,spec)) return spec;
+  if (Array.isArray(spec) && list(spec,'SCHEMA_UNSUPPORTED').length === 2 &&
     ((spec[1] === 'null' && includes(['string','integer','number','boolean'],spec[0])) ||
-      (spec[0] === 'null' && includes(['string','integer','number','boolean'],spec[1])))) kind=spec[0]==='null' ? spec[1] : spec[0];
-  else fail('SCHEMA_UNSUPPORTED','Unsupported type');
-  if (root && kind !== 'object') fail('SCHEMA_UNSUPPORTED');
-  if (own(node,'description') && (typeof node.description !== 'string' || !scalarString(node.description,true))) fail('SCHEMA_UNSUPPORTED');
-  const sizeBounds=[['minLength','maxLength','string'],['minItems','maxItems','array']] as const;
-  for (let i=0;i<sizeBounds.length;i++) {
-    const bound=sizeBounds[i],min=bound[0],max=bound[1],expected=bound[2];
-    if (own(node,min) || own(node,max)) {
-      if (kind !== expected) fail('SCHEMA_UNSUPPORTED');
-      if (own(node,min) && (!isIntegerNumber(node[min]) || (node[min] as number)<0)) fail('SCHEMA_UNSUPPORTED');
-      if (own(node,max) && (!isIntegerNumber(node[max]) || (node[max] as number)<0)) fail('SCHEMA_UNSUPPORTED');
-      if (own(node,min) && own(node,max) && (node[min] as number)>(node[max] as number)) fail('SCHEMA_UNSUPPORTED');
-    }
-  }
+      (spec[0] === 'null' && includes(['string','integer','number','boolean'],spec[1])))) return spec[0]==='null' ? spec[1] : spec[0];
+  return fail('SCHEMA_UNSUPPORTED','Unsupported type');
+}
+/** Check type-specific limits before validating child schema nodes. */
+function validateNodeBounds(node:SchemaNode,kind:string):void {
+  validateSizeBounds(node,kind,'minLength','maxLength','string');
+  validateSizeBounds(node,kind,'minItems','maxItems','array');
+  validateNumericBounds(node,kind);
+  if (own(node,'format') && (kind !== 'string' || node.format !== 'date-time')) fail('SCHEMA_UNSUPPORTED');
+}
+/** Admit nonnegative integral size bounds only for their matching type. */
+function validateSizeBounds(node:SchemaNode,kind:string,min:'minLength'|'minItems',max:'maxLength'|'maxItems',expected:string):void {
+  if (!own(node,min) && !own(node,max)) return;
+  if (kind !== expected) fail('SCHEMA_UNSUPPORTED');
+  if (own(node,min) && (!isIntegerNumber(node[min]) || (node[min] as number)<0)) fail('SCHEMA_UNSUPPORTED');
+  if (own(node,max) && (!isIntegerNumber(node[max]) || (node[max] as number)<0)) fail('SCHEMA_UNSUPPORTED');
+  if (own(node,min) && own(node,max) && (node[min] as number)>(node[max] as number)) fail('SCHEMA_UNSUPPORTED');
+}
+/** Admit finite numeric bounds only for number and integer nodes. */
+function validateNumericBounds(node:SchemaNode,kind:string):void {
   if (own(node,'minimum') || own(node,'maximum')) {
     if (kind !== 'number' && kind !== 'integer') fail('SCHEMA_UNSUPPORTED');
     if (own(node,'minimum') && (typeof node.minimum !== 'number' || !isFiniteNumber(node.minimum))) fail('SCHEMA_UNSUPPORTED');
     if (own(node,'maximum') && (typeof node.maximum !== 'number' || !isFiniteNumber(node.maximum))) fail('SCHEMA_UNSUPPORTED');
     if (own(node,'minimum') && own(node,'maximum') && node.minimum!>node.maximum!) fail('SCHEMA_UNSUPPORTED');
   }
-  if (own(node,'format') && (kind !== 'string' || node.format !== 'date-time')) fail('SCHEMA_UNSUPPORTED');
-  if (kind === 'object') {
-    if (!own(node,'additionalProperties') || node.additionalProperties !== false || own(node,'items') || own(node,'minItems') || own(node,'maxItems')) fail('SCHEMA_UNSUPPORTED');
-    if (own(node,'properties') && !ordinary(node.properties)) fail('SCHEMA_UNSUPPORTED');
-    const entries = Object.entries(props(node));
-    for (let i=0;i<entries.length;i++) {
-      const pair=Object.getOwnPropertyDescriptor(entries,i)!.value as [string,SchemaNode];
-      const key=pair[0],child=pair[1];
-      if (!scalarString(key) || !withinBytes(key,MAX_INDEX_PART_BYTES)) fail('SCHEMA_UNSUPPORTED','Field name exceeds indexed byte limit');
-      validateNode(child,false,depth+1,counter);
-    }
-    if (own(node,'required')) {
-      const required = list(node.required,'SCHEMA_UNSUPPORTED');
+}
+/** Validate declared fields and required names without inherited-key admission. */
+function validateObjectNode(node:SchemaNode,depth:number,counter:{count:number}):void {
+  if (!own(node,'additionalProperties') || node.additionalProperties !== false || own(node,'items') || own(node,'minItems') || own(node,'maxItems')) fail('SCHEMA_UNSUPPORTED');
+  if (own(node,'properties') && !ordinary(node.properties)) fail('SCHEMA_UNSUPPORTED');
+  const entries = Object.entries(props(node));
+  for (let i=0;i<entries.length;i++) {
+    const pair=Object.getOwnPropertyDescriptor(entries,i)!.value as [string,SchemaNode];
+    const key=pair[0],child=pair[1];
+    if (!scalarString(key) || !withinBytes(key,MAX_INDEX_PART_BYTES)) fail('SCHEMA_UNSUPPORTED','Field name exceeds indexed byte limit');
+    validateNode(child,false,depth+1,counter);
+  }
+  if (own(node,'required')) {
+    const required = list(node.required,'SCHEMA_UNSUPPORTED');
     if (!distinct(required) || any(required,key=>typeof key !== 'string' || !own(props(node),key))) fail('SCHEMA_UNSUPPORTED');
-    }
-  } else if (own(node,'properties') || own(node,'required') || own(node,'additionalProperties')) fail('SCHEMA_UNSUPPORTED');
-  if (kind === 'array') { if (!own(node,'items')) fail('SCHEMA_UNSUPPORTED'); validateNode(node.items!,false,depth+1,counter); }
-  else if (own(node,'items') || own(node,'minItems') || own(node,'maxItems')) fail('SCHEMA_UNSUPPORTED');
-  if (own(node,'enum')) {
-    const members = list(node.enum,'SCHEMA_UNSUPPORTED');
-    if (!members.length) fail('SCHEMA_UNSUPPORTED');
-    const canonicalMembers:string[]=[];
-    for (let i=0;i<members.length;i++) append(canonicalMembers,canonical(members[i] as Json));
-    if (!distinct(canonicalMembers)) fail('SCHEMA_UNSUPPORTED');
-    for (let i=0;i<members.length;i++) {
-      const member=Object.getOwnPropertyDescriptor(members,i)!.value;
-      try { validateValue(member as Json,{...node,enum:undefined},depth); }
-      catch { fail('SCHEMA_UNSUPPORTED','Invalid enum member'); }
-    }
+  }
+}
+/** Validate enum members against the same node without the enum recursion. */
+function validateNodeEnum(node:SchemaNode,depth:number):void {
+  const members = list(node.enum,'SCHEMA_UNSUPPORTED');
+  if (!members.length) fail('SCHEMA_UNSUPPORTED');
+  const canonicalMembers:string[]=[];
+  for (let i=0;i<members.length;i++) append(canonicalMembers,canonical(members[i] as Json));
+  if (!distinct(canonicalMembers)) fail('SCHEMA_UNSUPPORTED');
+  for (let i=0;i<members.length;i++) {
+    const member=Object.getOwnPropertyDescriptor(members,i)!.value;
+    try { validateValue(member as Json,{...node,enum:undefined},depth); }
+    catch { fail('SCHEMA_UNSUPPORTED','Invalid enum member'); }
   }
 }
 const leapDays = new Set(['1972-06-30','1972-12-31','1973-12-31','1974-12-31','1975-12-31','1976-12-31','1977-12-31','1978-12-31','1979-12-31','1981-06-30','1982-06-30','1983-06-30','1985-06-30','1987-12-31','1989-12-31','1990-12-31','1992-06-30','1993-06-30','1994-06-30','1995-12-31','1997-06-30','1998-12-31','2005-12-31','2008-12-31','2012-06-30','2015-06-30','2016-12-31']);
@@ -261,32 +296,44 @@ export function validateValue(value: Json, node: SchemaNode, depth=0): void {
   node=Object.assign(Object.create(null),node) as SchemaNode;
   const kind=typeOf(node);
   if (value === null) { if (!nullable(node)) fail('SCHEMA_INVALID'); }
-  else if (kind==='object') {
-    if (!ordinary(value)) fail('SCHEMA_INVALID');
-    const entries=Object.entries(value as Record<string,Json>);
-    for (let i=0;i<entries.length;i++) {
-      const pair=Object.getOwnPropertyDescriptor(entries,i)!.value as [string,Json];
-      const key=pair[0],item=pair[1];
-      if (!own(props(node),key)) fail('SCHEMA_INVALID');
-      validateValue(item,props(node)[key],depth+1);
-    }
-    const required=node.required??[];
-    for (let i=0;i<required.length;i++) if (!own(value as object,Object.getOwnPropertyDescriptor(required,i)!.value)) fail('SCHEMA_INVALID');
-  } else if (kind==='array') {
-    if (!Array.isArray(value) || (node.minItems!==undefined && value.length<node.minItems) || (node.maxItems!==undefined && value.length>node.maxItems)) fail('SCHEMA_INVALID');
-    const members=value as Json[];
-    for (let i=0;i<members.length;i++) validateValue(members[i],node.items!,depth+1);
-  } else if (kind==='string') {
-    if (typeof value!=='string' || !scalarString(value,true)) fail('SCHEMA_INVALID');
-    const length=scalarLength(value as string);
-    if ((node.minLength!==undefined && length<node.minLength) || (node.maxLength!==undefined && length>node.maxLength)) fail('SCHEMA_INVALID');
-    if (node.format==='date-time') utcInstant(value as string);
-  } else if (kind==='boolean') { if (typeof value!=='boolean') fail('SCHEMA_INVALID'); }
-  else {
-    if (typeof value!=='number' || !isFiniteNumber(value) || (kind==='integer' && !isSafeInteger(value)) ||
-      (node.minimum!==undefined && value<node.minimum) || (node.maximum!==undefined && value>node.maximum)) fail('SCHEMA_INVALID');
-  }
+  else if (kind==='object') validateObjectValue(value,node,depth);
+  else if (kind==='array') validateArrayValue(value,node,depth);
+  else if (kind==='string') validateStringValue(value,node);
+  else if (kind==='boolean') { if (typeof value!=='boolean') fail('SCHEMA_INVALID'); }
+  else validateNumberValue(value,node,kind);
   if (node.enum && !any(node.enum,member=>canonical(member)===canonical(value))) fail('SCHEMA_INVALID');
+}
+/** Validate declared object members and required own fields. */
+function validateObjectValue(value:Json,node:SchemaNode,depth:number):void {
+  if (!ordinary(value)) fail('SCHEMA_INVALID');
+  const entries=Object.entries(value as Record<string,Json>);
+  for (let i=0;i<entries.length;i++) {
+    const pair=Object.getOwnPropertyDescriptor(entries,i)!.value as [string,Json];
+    const key=pair[0],item=pair[1];
+    if (!own(props(node),key)) fail('SCHEMA_INVALID');
+    validateValue(item,props(node)[key],depth+1);
+  }
+  const required=node.required??[];
+  for (let i=0;i<required.length;i++) if (!own(value as object,Object.getOwnPropertyDescriptor(required,i)!.value)) fail('SCHEMA_INVALID');
+}
+/** Validate array length before walking its already admitted members. */
+function validateArrayValue(value:Json,node:SchemaNode,depth:number):void {
+  if (!Array.isArray(value) || (node.minItems!==undefined && value.length<node.minItems) || (node.maxItems!==undefined && value.length>node.maxItems)) fail('SCHEMA_INVALID');
+  const members=value as Json[];
+  for (let i=0;i<members.length;i++) validateValue(members[i],node.items!,depth+1);
+}
+/** Enforce Unicode scalar length and the declared UTC format. */
+function validateStringValue(value:Json,node:SchemaNode):void {
+  if (typeof value!=='string' || !scalarString(value,true)) fail('SCHEMA_INVALID');
+  const text=value as string;
+  const length=scalarLength(text);
+  if ((node.minLength!==undefined && length<node.minLength) || (node.maxLength!==undefined && length>node.maxLength)) fail('SCHEMA_INVALID');
+  if (node.format==='date-time') utcInstant(text);
+}
+/** Enforce finite numeric bounds and safe integer representation. */
+function validateNumberValue(value:Json,node:SchemaNode,kind:string):void {
+  if (typeof value!=='number' || !isFiniteNumber(value) || (kind==='integer' && !isSafeInteger(value)) ||
+    (node.minimum!==undefined && value<node.minimum) || (node.maximum!==undefined && value>node.maximum)) fail('SCHEMA_INVALID');
 }
 const scalarField = (schema: SchemaNode, path: unknown): path is string => typeof path==='string' && path.length>0 && scalarString(path) &&
   own(props(schema),path) && includes(['string','number','integer','boolean'],typeOf(props(schema)[path]));
@@ -299,6 +346,15 @@ export function validateDefinition(input: unknown, trustedParsed = false): Colle
   if (!scalarString(definition.slug) || !definition.slug || !withinBytes(definition.slug,MAX_INDEX_PART_BYTES) || !isSafeInteger(definition.version) || definition.version<1) fail('SCHEMA_UNSUPPORTED');
   validateNode(definition.schema,true,0,{count:0});
   if (!own(definition,'unique') || !own(definition,'filterable') || !own(definition,'sortable')) fail('SCHEMA_UNSUPPORTED');
+  validateUniqueDeclarations(definition);
+  validateScalarDeclarations(definition);
+  if (own(definition,'lifecycle')) validateLifecycle(definition);
+  const encoded=canonical(definition as unknown as Json);
+  if (Buffer.byteLength(encoded)>maxBytes) fail('SCHEMA_UNSUPPORTED','Definition exceeds byte budget');
+  return JSON.parse(encoded) as CollectionDefinition;
+}
+/** Check immutable unique names and paths against scalar root fields. */
+function validateUniqueDeclarations(definition:CollectionDefinition):void {
   const uniques=list(definition.unique,'SCHEMA_UNSUPPORTED');
   const names:string[]=[];
   for (let i=0;i<uniques.length;i++) {
@@ -309,30 +365,31 @@ export function validateDefinition(input: unknown, trustedParsed = false): Colle
     if (!scalarString(item.name) || !item.name || !withinBytes(item.name,MAX_INDEX_PART_BYTES) || includes(names,item.name) || !paths.length || !distinct(paths) || any(paths,path=>!scalarField(definition.schema,path))) fail('SCHEMA_UNSUPPORTED');
     append(names,item.name as string);
   }
+}
+/** Check declared filter and sort paths without admitting duplicates. */
+function validateScalarDeclarations(definition:CollectionDefinition):void {
   const declarations=['filterable','sortable'] as const;
   for (let i=0;i<declarations.length;i++) {
     const key=declarations[i];
     const paths=list(definition[key],'SCHEMA_UNSUPPORTED');
     if (!distinct(paths) || any(paths,path=>!scalarField(definition.schema,path))) fail('SCHEMA_UNSUPPORTED');
   }
-  if (own(definition,'lifecycle')) {
-    const rule=definition.lifecycle;
-    if (!ordinary(rule) || joined(sorted(Object.keys(rule),compare),',')!=='field,initial,transitions' || !scalarField(definition.schema,rule.field) ||
-      typeOf(props(definition.schema)[rule.field])!=='string' || nullable(props(definition.schema)[rule.field]) ||
-      !includes(own(definition.schema,'required') ? definition.schema.required! : [],rule.field) || !ordinary(rule.transitions) ||
-      !own(props(definition.schema)[rule.field],'enum')) fail('SCHEMA_UNSUPPORTED');
-    if (any(list(rule!.initial,'SCHEMA_UNSUPPORTED'),value=>!includes(props(definition.schema)[rule!.field].enum!,value as Json))) fail('SCHEMA_UNSUPPORTED');
-    const transitions=Object.entries(rule!.transitions);
-    for (let i=0;i<transitions.length;i++) {
-      const pair=Object.getOwnPropertyDescriptor(transitions,i)!.value as [string,string[]];
-      const from=pair[0],tos=pair[1];
-      if (!includes(props(definition.schema)[rule!.field].enum!,from) ||
-        any(list(tos,'SCHEMA_UNSUPPORTED'),to=>!includes(props(definition.schema)[rule!.field].enum!,to as Json))) fail('SCHEMA_UNSUPPORTED');
-    }
+}
+/** Restrict lifecycle data to a required enum field and declared transitions. */
+function validateLifecycle(definition:CollectionDefinition):void {
+  const rule=definition.lifecycle;
+  if (!ordinary(rule) || joined(sorted(Object.keys(rule),compare),',')!=='field,initial,transitions' || !scalarField(definition.schema,rule.field) ||
+    typeOf(props(definition.schema)[rule.field])!=='string' || nullable(props(definition.schema)[rule.field]) ||
+    !includes(own(definition.schema,'required') ? definition.schema.required! : [],rule.field) || !ordinary(rule.transitions) ||
+    !own(props(definition.schema)[rule.field],'enum')) fail('SCHEMA_UNSUPPORTED');
+  if (any(list(rule!.initial,'SCHEMA_UNSUPPORTED'),value=>!includes(props(definition.schema)[rule!.field].enum!,value as Json))) fail('SCHEMA_UNSUPPORTED');
+  const transitions=Object.entries(rule!.transitions);
+  for (let i=0;i<transitions.length;i++) {
+    const pair=Object.getOwnPropertyDescriptor(transitions,i)!.value as [string,string[]];
+    const from=pair[0],tos=pair[1];
+    if (!includes(props(definition.schema)[rule!.field].enum!,from) ||
+      any(list(tos,'SCHEMA_UNSUPPORTED'),to=>!includes(props(definition.schema)[rule!.field].enum!,to as Json))) fail('SCHEMA_UNSUPPORTED');
   }
-  const encoded=canonical(definition as unknown as Json);
-  if (Buffer.byteLength(encoded)>maxBytes) fail('SCHEMA_UNSUPPORTED','Definition exceeds byte budget');
-  return JSON.parse(encoded) as CollectionDefinition;
 }
 /** Remove only descriptions when comparing immutable constraints. */
 function withoutAnnotations(node: SchemaNode): Json {
@@ -363,6 +420,15 @@ function withoutAnnotations(node: SchemaNode): Json {
 export function compatible(old: CollectionDefinition, next: CollectionDefinition): void {
   if (old.slug!==next.slug || next.version!==old.version+1 || canonical(old.unique as unknown as Json)!==canonical(next.unique as unknown as Json) ||
     canonical((own(old,'lifecycle') ? old.lifecycle! : null) as Json)!==canonical((own(next,'lifecycle') ? next.lifecycle! : null) as Json)) fail('SCHEMA_BREAKING','Slug, uniqueness or lifecycle change requires migration');
+  compatibleFields(old,next);
+  const compatibleDeclarations=['filterable','sortable'] as const;
+  for (let i=0;i<compatibleDeclarations.length;i++) {
+    const key=compatibleDeclarations[i];
+    if (any(old[key],name=>!includes(next[key],name))) fail('SCHEMA_BREAKING',`${key} cannot be removed`);
+  }
+}
+/** Reject changed or newly required fields while allowing additive optional fields. */
+function compatibleFields(old:CollectionDefinition,next:CollectionDefinition):void {
   const oldProps=props(old.schema), nextProps=props(next.schema);
   const names=Object.keys(oldProps);
   for (let i=0;i<names.length;i++) {
@@ -376,11 +442,6 @@ export function compatible(old: CollectionDefinition, next: CollectionDefinition
     const name=nextNames[i];
     if (!own(oldProps,name) && includes(own(next.schema,'required') ? next.schema.required! : [],name))
       fail('SCHEMA_BREAKING',`New field ${name} must be optional`);
-  }
-  const compatibleDeclarations=['filterable','sortable'] as const;
-  for (let i=0;i<compatibleDeclarations.length;i++) {
-    const key=compatibleDeclarations[i];
-    if (any(old[key],name=>!includes(next[key],name))) fail('SCHEMA_BREAKING',`${key} cannot be removed`);
   }
 }
 const whites = new Set([0x20,0x85,0xa0,0x1680,0x2028,0x2029,0x202f,0x205f,0x3000]);
@@ -399,27 +460,8 @@ export function externalKey(value: unknown): string {
 }
 /** Derive atomic unique reservations and typed index values from accepted data. */
 export function derivedValues(data: Record<string,Json>, definition: CollectionDefinition): {unique: UniqueValue[]; indexes: IndexValue[]} {
-  const unique: UniqueValue[]=[]; const indexes: IndexValue[]=[];
-  for (let i=0;i<definition.unique.length;i++) {
-    const item=definition.unique[i];
-    const parts: string[]=[]; let skip=false;
-    for (let j=0;j<item.paths.length;j++) {
-      const path=item.paths[j];
-      if (!own(data,path)) { skip=true; break; }
-      const value=data[path];
-      if (value===null) { skip=true; break; }
-      if (typeof value==='string' && !scalarString(value)) fail('SCHEMA_INVALID','Unique value contains a database-unsupported character');
-      const field=props(definition.schema)[path];
-      const tag=typeOf(field); const normalized=typeof value==='string' ?
-        (own(field,'format') && field.format==='date-time' ? utcInstant(value) : Reflect.apply(normalize,value,['NFC']) as string) : canonical(value);
-      append(parts,`${tag}:${Buffer.byteLength(normalized)}:${normalized}`);
-    }
-    if (!skip) {
-      const encodedValue=joined(parts,'');
-      if (!withinBytes(encodedValue,MAX_INDEX_VALUE_BYTES)) fail('SCHEMA_INVALID','Unique value exceeds indexed byte limit');
-      append(unique,{name:item.name,encodedValue});
-    }
-  }
+  const unique=derivedUniqueValues(data,definition);
+  const indexes:IndexValue[]=[];
   const fields:string[]=[];
   const pathLists=[definition.filterable,definition.sortable];
   for (let j=0;j<pathLists.length;j++) {
@@ -432,6 +474,33 @@ export function derivedValues(data: Record<string,Json>, definition: CollectionD
     if (index) append(indexes,index);
   }
   return {unique,indexes};
+}
+/** Encode present, non-null unique tuples with stable type and byte lengths. */
+function derivedUniqueValues(data:Record<string,Json>,definition:CollectionDefinition):UniqueValue[] {
+  const unique:UniqueValue[]=[];
+  for (let i=0;i<definition.unique.length;i++) {
+    const item=definition.unique[i];
+    const encodedValue=encodeUniqueTuple(data,definition,item.paths);
+    if (encodedValue!==undefined) append(unique,{name:item.name,encodedValue});
+  }
+  return unique;
+}
+/** Missing or null tuple members release the corresponding unique reservation. */
+function encodeUniqueTuple(data:Record<string,Json>,definition:CollectionDefinition,paths:readonly string[]):string|undefined {
+  const parts:string[]=[];
+  for (let j=0;j<paths.length;j++) {
+    const path=paths[j];
+    if (!own(data,path) || data[path]===null) return undefined;
+    const value=data[path];
+    if (typeof value==='string' && !scalarString(value)) fail('SCHEMA_INVALID','Unique value contains a database-unsupported character');
+    const field=props(definition.schema)[path];
+    const tag=typeOf(field); const normalized=typeof value==='string' ?
+      (own(field,'format') && field.format==='date-time' ? utcInstant(value) : Reflect.apply(normalize,value,['NFC']) as string) : canonical(value);
+    append(parts,`${tag}:${Buffer.byteLength(normalized)}:${normalized}`);
+  }
+  const encodedValue=joined(parts,'');
+  if (!withinBytes(encodedValue,MAX_INDEX_VALUE_BYTES)) fail('SCHEMA_INVALID','Unique value exceeds indexed byte limit');
+  return encodedValue;
 }
 
 /** Derive one declared typed value for a bounded backfill batch. */
