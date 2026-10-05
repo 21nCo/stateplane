@@ -1,0 +1,19 @@
+packages/postgres/src/index.ts
+  s_02c7861f1c7d32::t_1e73a72242268e 554-558,1364-1394,1432
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e959a0e3712f73109607744d03bd959ef1c5086a",
+  "prompts": {},
+  "sessions": {
+    "s_02c7861f1c7d32": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "f2eea76f-e8e1-4db0-b64f-4196a2db787a",
+        "model": "grok-4.7"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
