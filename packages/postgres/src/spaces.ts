@@ -508,6 +508,9 @@ export class PostgresSpaces {
     const observed = await this.owned(actor,spaceId);
     const space = await this.publicationForRetry(actor,observed);
     const prior = space.lifecycle;
+    // The regional read (or reconciliation) can await while the provider
+    // revokes this owner. A no-op must still authorize the returned metadata.
+    await this.current(actor);
     if (prior === lifecycle) return space;
     if (prior === 'deleting' || prior === 'deleted') throw new AuthorityError('SPACE_UNAVAILABLE');
     if (lifecycle === 'deleting' && prior !== 'readOnly' && prior !== 'suspended') throw new AuthorityError('INVALID_ARGUMENT', 'Archive or suspend before deletion');
@@ -524,13 +527,16 @@ export class PostgresSpaces {
       await this.current(actor);
       return Number(changed.rows[0].policy_version);
     });
+    await this.current(actor);
+    let published: SpaceInfo;
     try {
-      await this.current(actor);
-      return await this.publish(space,version,next);
+      published = await this.publish(space,version,next);
     } catch (error) {
       if (error instanceof CommitOutcomeUnknownError) throw error;
       throw new CommitOutcomeUnknownError(error);
     }
+    await this.current(actor);
+    return published;
   }
   archive(actor: VerifiedCredential, spaceId: string): Promise<SpaceInfo> { return this.changeLifecycle(actor,spaceId,'readOnly'); }
   restore(actor: VerifiedCredential, spaceId: string): Promise<SpaceInfo> { return this.changeLifecycle(actor,spaceId,'active'); }
@@ -548,11 +554,13 @@ export class PostgresSpaces {
     const observed = await this.owned(actor,spaceId,true);
     if (observed.lifecycle === 'deleted') {
       await this.publishDeletedRetry(observed);
+      await this.current(actor);
       return;
     }
     const current = await this.publicationForRetry(actor,observed);
     if (current.lifecycle === 'deleted') {
       await this.publishDeletedRetry(current);
+      await this.current(actor);
       return;
     }
     if (current.lifecycle !== 'deleting') await this.changeLifecycle(actor,spaceId,'deleting');
@@ -586,6 +594,7 @@ export class PostgresSpaces {
     if (!await this.erased(cell.pool,spaceId)) throw new AuthorityError('STALE_PLACEMENT');
     await this.current(actor);
     await this.publish(space,Number(deleted.rows[0].policy_version),'deleted');
+    await this.current(actor);
   }
   /** Explicit owner recovery for an inconsistent deleted cell tombstone. No directory publication occurs here. */
   async repairDeletedErasure(actor: VerifiedCredential, spaceId: string): Promise<void> {

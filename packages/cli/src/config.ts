@@ -5,7 +5,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { StateplaneCliError } from './transport.js';
 
-export interface CliConfig { endpoint?:string; space?:string; tokenStore?:'keychain'|'file' }
+type TokenStore = 'keychain'|'file';
+export interface CliConfig { endpoint?:string; space?:string; tokenStore?:TokenStore; tokenLocations?:TokenStore[] }
 export function configDir():string {
   return process.env.STATEPLANE_CONFIG_DIR || join(process.env.XDG_CONFIG_HOME || join(homedir(),'.config'),'stateplane');
 }
@@ -33,10 +34,15 @@ export async function readConfig():Promise<CliConfig> {
   try {
     const value=JSON.parse(await readFile(configPath(),'utf8')) as CliConfig;
     if (!value || typeof value!=='object' || Array.isArray(value) ||
-      Object.keys(value).some(key=>!['endpoint','space','tokenStore'].includes(key)) ||
+      Object.keys(value).some(key=>!['endpoint','space','tokenStore','tokenLocations'].includes(key)) ||
       (value.endpoint!==undefined && typeof value.endpoint!=='string') ||
       (value.space!==undefined && typeof value.space!=='string') ||
-      (value.tokenStore!==undefined && !['file','keychain'].includes(value.tokenStore)))
+      (value.tokenStore!==undefined && !['file','keychain'].includes(value.tokenStore)) ||
+      (value.tokenLocations!==undefined && (!value.endpoint || !Array.isArray(value.tokenLocations) ||
+        value.tokenLocations.length<1 || value.tokenLocations.length>2 ||
+        new Set(value.tokenLocations).size!==value.tokenLocations.length ||
+        value.tokenLocations.some(store=>store!=='file' && store!=='keychain') ||
+        (value.tokenStore!==undefined && !value.tokenLocations.includes(value.tokenStore)))))
       throw new Error('invalid');
     return value;
   } catch { throw new StateplaneCliError('INVALID_CONFIGURATION'); }
@@ -141,4 +147,28 @@ export async function removeToken(config:CliConfig):Promise<void> {
       : platform()==='linux' ? await command('secret-tool',['clear',...keyArgs(config.endpoint)]) : {ok:false};
     if (!result.ok) throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
   }
+}
+
+type TokenPersistence = {saveConfig:typeof saveConfig; saveToken:typeof saveToken; removeToken:typeof removeToken};
+const persistence:TokenPersistence={saveConfig,saveToken,removeToken};
+
+/** Keep both possible locations discoverable until the old secret is gone.
+ * Each persisted step can be retried or cleaned up after process interruption. */
+export async function configureToken(config:CliConfig,token:string,store:'keychain'|'file',
+  io:TokenPersistence=persistence):Promise<void> {
+  if (!config.endpoint) throw new StateplaneCliError('INVALID_CONFIGURATION');
+  const locations=[...new Set([...(config.tokenLocations??[]),...(config.tokenStore?[config.tokenStore]:[]),store])];
+  await io.saveConfig({...config,tokenLocations:locations});
+  await io.saveToken(config.endpoint,token,store);
+  await io.saveConfig({...config,tokenStore:store,tokenLocations:locations});
+  for (const previous of locations) if (previous!==store)
+    await io.removeToken({...config,tokenStore:previous});
+  await io.saveConfig({...config,tokenStore:store,tokenLocations:undefined});
+}
+
+/** Logout and endpoint changes also clean a transition interrupted at any step. */
+export async function removeTrackedTokens(config:CliConfig,
+  io:Pick<TokenPersistence,'removeToken'>=persistence):Promise<void> {
+  const locations=new Set([...(config.tokenLocations??[]),...(config.tokenStore?[config.tokenStore]:[])]);
+  for (const store of locations) await io.removeToken({...config,tokenStore:store});
 }

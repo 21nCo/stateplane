@@ -11,7 +11,8 @@ import { platform } from 'node:os';
 import { createHttpHandler } from '../packages/api/dist/index.js';
 import { PostgresSpaces, AuthorityTransaction } from '../packages/postgres/dist/index.js';
 import { StateplaneHttpClient, StateplaneCliError } from '../packages/cli/dist/index.js';
-import { saveToken, loadToken, removeToken, storeSecretServiceToken, loadSecretServiceToken,
+import { saveToken, loadToken, removeToken, configureToken, removeTrackedTokens,
+  storeSecretServiceToken, loadSecretServiceToken,
   loadOsSecretToken } from '../packages/cli/dist/config.js';
 
 function fixture() {
@@ -716,6 +717,162 @@ test('macOS Keychain reports a missing item as unauthenticated',
     await assert.rejects(loadToken({endpoint:`https://missing-${randomUUID()}.example.invalid/`,
       tokenStore:'keychain'}),{code:'UNAUTHENTICATED'});
   });
+
+test('interrupted credential store switches and logout remove both tracked secrets',async()=>{
+  let initial={endpoint:'https://store-transition.example.invalid/'};
+  await assert.rejects(configureToken(initial,'new-secret','file',{
+    saveConfig:async value=>{initial=structuredClone(value);},
+    saveToken:async()=>{throw new Error('interrupted');},
+    removeToken:async()=>{throw new Error('unexpected cleanup');}
+  }),/interrupted/);
+  const initialCleanup=[];
+  await removeTrackedTokens(initial,{removeToken:async config=>{initialCleanup.push(config.tokenStore);}});
+  assert.deepEqual(initialCleanup,['file'],'first file login never probes an unavailable OS store');
+
+  for (const from of ['file','keychain']) for (const failAt of [1,2,3,4,5]) {
+    const to=from==='file'?'keychain':'file';
+    const endpoint='https://store-transition.example.invalid/';
+    let saved={endpoint,tokenStore:from};
+    const secrets=new Map([[from,'old-secret']]);
+    let step=0;
+    const fail=()=>{ if (++step===failAt) throw new Error('interrupted'); };
+    const io={
+      saveConfig:async value=>{fail();saved=structuredClone(value);},
+      saveToken:async (_endpoint,token,store)=>{fail();secrets.set(store,token);},
+      removeToken:async config=>{fail();secrets.delete(config.tokenStore);}
+    };
+    await assert.rejects(configureToken(saved,'new-secret',to,io),/interrupted/);
+    assert.ok(secrets.size>0 || failAt===5);
+    const removed=[];
+    const cleanup={removeToken:async config=>{
+      removed.push(config.tokenStore);
+      secrets.delete(config.tokenStore);
+    }};
+    await removeTrackedTokens(saved,cleanup);
+    assert.equal(secrets.size,0,`${from} to ${to}, interruption ${failAt}`);
+    assert.deepEqual(new Set(removed),new Set(saved.tokenLocations??[saved.tokenStore]));
+  }
+
+  // A failed old-store removal leaves the transition marker persisted. A
+  // subsequent logout must retry both stores without printing either secret.
+  let saved={endpoint:'https://store-transition.example.invalid/',tokenStore:'file'};
+  const secrets=new Map([['file','old-secret']]);
+  const io={
+    saveConfig:async value=>{saved=structuredClone(value);},
+    saveToken:async (_endpoint,token,store)=>{secrets.set(store,token);},
+    removeToken:async config=>{if (config.tokenStore==='file') throw new Error('store unavailable');
+      secrets.delete(config.tokenStore);}
+  };
+  await assert.rejects(configureToken(saved,'new-secret','keychain',io),/store unavailable/);
+  assert.equal(saved.tokenStore,'keychain');
+  assert.deepEqual(new Set(saved.tokenLocations),new Set(['file','keychain']));
+  assert.equal(secrets.get('file'),'old-secret');
+  assert.equal(secrets.get('keychain'),'new-secret');
+  await removeTrackedTokens(saved,{removeToken:async config=>{secrets.delete(config.tokenStore);}});
+  assert.equal(secrets.size,0);
+});
+
+test('installed CLI switches file and macOS Keychain stores and cleans an interrupted switch',
+  {skip:platform()!=='darwin'},async()=>{
+    const root=await mkdtemp(join(tmpdir(),'stateplane-cli-switch-'));
+    const endpoint=`https://switch-${randomUUID()}.example.invalid/`;
+    const token=`secret-${randomUUID()}`;
+    try {
+      const cli=(args,input)=>cliProcess(root,args,input);
+      assert.equal((await cli(['config','endpoint','--url',endpoint])).status,0);
+      for (const store of ['file','keychain','file']) {
+        const result=await cli(['auth','import','--token-stdin','--store',store],token+'\n');
+        assert.equal(result.status,0,result.stderr);
+        assert.equal((result.stdout+result.stderr).includes(token),false);
+        assert.equal(store==='file'?await readFile(join(root,'token'),'utf8'):
+          await loadToken({endpoint,tokenStore:store}),token);
+      }
+      await assert.rejects(loadToken({endpoint,tokenStore:'keychain'}),{code:'UNAUTHENTICATED'});
+      // Simulate a process stopping after the new Keychain item is written.
+      await writeFile(join(root,'config.json'),JSON.stringify({endpoint,tokenStore:'file',
+        tokenLocations:['file','keychain']}),{mode:0o600});
+      await saveToken(endpoint,token,'keychain');
+      const logout=await cli(['auth','logout']);
+      assert.equal(logout.status,0,logout.stderr);
+      assert.equal((logout.stdout+logout.stderr).includes(token),false);
+      await assert.rejects(readFile(join(root,'token'),'utf8'),{code:'ENOENT'});
+      await assert.rejects(loadToken({endpoint,tokenStore:'keychain'}),{code:'UNAUTHENTICATED'});
+    } finally {
+      await removeToken({endpoint,tokenStore:'keychain'});
+      await rm(root,{recursive:true,force:true});
+    }
+  });
+
+test('HTTP and CLI no-op space updates deny metadata after owner revocation during regional read',async t=>{
+  const spaceId='sp_a';
+  const row={space_id:spaceId,owner_principal_id:'owner',home_cell_id:'cell-a',cell_id:'cell-a',
+    storage_target_id:'target-a',lifecycle:'active',policy_version:1,placement_generation:1,
+    created_at:new Date(),updated_at:new Date()};
+  let current=true;let providerDown=false;let gate;
+  const control={query:async()=>({rows:[row]})};
+  const regional={query:async()=>{
+    gate.enter();
+    await gate.wait;
+    return {rows:[{home_cell_id:'cell-a',lifecycle:'active',policy_version:1,placement_generation:1}]};
+  }};
+  const spaces=new PostgresSpaces(control,new Map([['cell-a',{pool:regional,storageTargetId:'target-a'}]]),
+    'cell-a',{}, {current:async()=>{
+      if (providerDown) throw new Error('private provider failure');
+      return current;
+    }});
+  const state=fixture();state.services.spaces.update=(...args)=>spaces.update(...args);
+  const {server,endpoint}=await serve(createHttpHandler(state));
+  t.after(()=>server.close());
+  const newGate=()=>{
+    let enter,release;
+    const entered=new Promise(resolve=>{enter=resolve;});
+    const wait=new Promise(resolve=>{release=resolve;});
+    return {enter,entered,wait,release};
+  };
+  const headers={Authorization:'Bearer secret-test-token','Content-Type':'application/json'};
+  gate=newGate();
+  const directPending=fetch(new URL('v1/spaces/sp_a',endpoint),{
+    method:'PATCH',headers,body:JSON.stringify({lifecycle:'active'})});
+  await gate.entered;
+  current=false;gate.release();
+  const directResponse=await directPending;
+  assert.equal(directResponse.status,403);
+  const direct=await directResponse.json();
+  assert.equal(direct.error.code,'FORBIDDEN');
+
+  const root=await mkdtemp(join(tmpdir(),'stateplane-cli-lifecycle-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  await writeFile(join(root,'config.json'),JSON.stringify({endpoint,tokenStore:'file'}),{mode:0o600});
+  await writeFile(join(root,'token'),'secret-test-token',{mode:0o600});
+  current=true;gate=newGate();
+  const cliPending=cliProcess(root,['spaces','update','--space',spaceId,'--lifecycle','active']);
+  await gate.entered;
+  current=false;gate.release();
+  assertErrorParity(direct,await cliPending);
+
+  current=true;providerDown=false;gate=newGate();
+  const unavailablePending=fetch(new URL('v1/spaces/sp_a',endpoint),{
+    method:'PATCH',headers,body:JSON.stringify({lifecycle:'active'})});
+  await gate.entered;
+  providerDown=true;gate.release();
+  const unavailableResponse=await unavailablePending;
+  assert.equal(unavailableResponse.status,503);
+  const unavailable=await unavailableResponse.json();
+  assert.equal(unavailable.error.code,'PROVIDER_UNAVAILABLE');
+  assert.doesNotMatch(JSON.stringify(unavailable),/private provider failure/);
+  providerDown=false;gate=newGate();
+  const cliUnavailable=cliProcess(root,['spaces','update','--space',spaceId,'--lifecycle','active']);
+  await gate.entered;
+  providerDown=true;gate.release();
+  assertErrorParity(unavailable,await cliUnavailable);
+
+  providerDown=false;gate=newGate();
+  const recovered=fetch(new URL('v1/spaces/sp_a',endpoint),{
+    method:'PATCH',headers,body:JSON.stringify({lifecycle:'active'})});
+  await gate.entered;
+  gate.release();
+  assert.equal((await (await recovered).json()).lifecycle,'active');
+});
 
 test('HTTP and CLI selected-space retries deny metadata when owner access is revoked during the directory lock wait',async t=>{
   const spaceId=`sp_${randomUUID()}`;

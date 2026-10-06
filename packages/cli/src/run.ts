@@ -1,5 +1,5 @@
 import { createReadStream } from 'node:fs';
-import { readConfig, saveConfig, saveToken, loadToken, removeToken } from './config.js';
+import { readConfig, saveConfig, configureToken, loadToken, removeTrackedTokens } from './config.js';
 import { StateplaneCliError, StateplaneHttpClient } from './transport.js';
 
 type Flags=Record<string,string|boolean>;
@@ -127,10 +127,11 @@ export async function runCli(argv:string[]):Promise<number> {
     if (resource==='config' && action==='endpoint') {
       const value=endpoint(required(flags,'url'));
       const changed=config.endpoint!==value;
-      if (config.endpoint && changed && config.tokenStore) await removeToken(config);
+      if (config.endpoint && changed) await removeTrackedTokens(config);
       await saveConfig({...config,endpoint:value,
         space:changed?undefined:config.space,
-        tokenStore:changed?undefined:config.tokenStore});
+        tokenStore:changed?undefined:config.tokenStore,
+        tokenLocations:changed?undefined:config.tokenLocations});
       output({endpoint:value,space:changed?null:config.space??null}); return 0;
     }
     if (resource==='config' && action==='show') {
@@ -143,12 +144,12 @@ export async function runCli(argv:string[]):Promise<number> {
       const token=(await input('-',4096)).replace(/\r?\n$/,'');
       if (action==='login') await new StateplaneHttpClient({endpoint:config.endpoint,token,
         timeoutMs:flags.timeout ? integer(required(flags,'timeout')) : undefined}).request('GET','/v1/auth/session');
-      await saveToken(config.endpoint,token,store);
-      if (config.tokenStore && config.tokenStore!==store) await removeToken(config);
-      await saveConfig({...config,tokenStore:store}); output({configured:true,store}); return 0;
+      await configureToken(config,token,store); output({configured:true,store}); return 0;
     }
     if (resource==='auth' && action==='logout') {
-      await removeToken(config); await saveConfig({...config,tokenStore:undefined}); output({configured:false}); return 0;
+      await removeTrackedTokens(config);
+      await saveConfig({...config,tokenStore:undefined,tokenLocations:undefined});
+      output({configured:false}); return 0;
     }
     if (resource==='spaces' && action==='select') {
       const space=required(flags,'space');
