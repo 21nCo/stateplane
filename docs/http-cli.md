@@ -89,7 +89,13 @@ credential.
 Every `spaces create` request supplies a caller-generated `sp_<UUID>` ID.
 Retain it before sending the request. If the response is lost, repeat the
 same create request and cell selection or use `spaces get --space <ID>`;
-pending provisioning returns `RECEIPT_PENDING`. For schema define/revise
+an explicit same-ID create retry locks and inspects pending provisioning,
+then publishes a verified committed cell or completes an absent cell. A live
+creator holding the reservation lock finishes first. If lease-expiry recovery
+has already retired an absent cell, the retry returns `UNIQUE_CONFLICT` and
+the client must choose a new ID; the retired ID is never reused. If recovery
+cannot verify the cell, the retry fails closed and may be repeated after the
+cell is available. For schema define/revise
 and lifecycle changes, `COMMIT_OUTCOME_UNKNOWN` means read back the selected
 space or collection before deciding whether another change is needed.
 Unknown or misplaced CLI flags are rejected before a saved space can be used

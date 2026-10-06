@@ -1130,6 +1130,83 @@ test('provisioning recovery waits for its database claim and retires only after 
     [spaceId])).rows[0].n,1);
 });
 
+test('selected space create retries recover failed cell insert and lost cell acknowledgement', async () => {
+  const actor={kind:'session',credentialId:'session',userPrincipalId:`retry-owner-${crypto.randomUUID()}`};
+  const provider={create:async () => { throw new Error('unexpected key'); },revoke:async () => {}};
+  let granted=true;
+  const credentials={current:async () => granted};
+  let failInsert=true;
+  let loseCommit=false;
+  const unreliableCell={storageTargetId:'target-a',pool:{query:(...args)=>pool.query(...args),connect:async()=>{
+    const client=await pool.connect();
+    return {query:async (sql,...args)=>{
+      if (typeof sql==='string' && sql.includes('INSERT INTO spaces(') && failInsert) {
+        failInsert=false;
+        throw new Error('cell insert offline');
+      }
+      const result=await client.query(sql,...args);
+      if (sql==='COMMIT' && loseCommit) {
+        loseCommit=false;
+        throw new Error('cell commit acknowledgement lost');
+      }
+      return result;
+    },release:discard=>client.release(discard)};
+  }}};
+  const cells=new Map([['cell-a',unreliableCell],['cell-b',{pool:cellBPool,storageTargetId:'target-b'}]]);
+  const spaces=new PostgresSpaces(controlPool,cells,'cell-a',provider,credentials);
+  const first=`sp_${crypto.randomUUID()}`;
+  await assert.rejects(spaces.create(actor,'cell-a',first),denied('RECEIPT_PENDING'));
+  assert.equal((await controlPool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1',[first])).rows[0].lifecycle,'provisioning');
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM spaces WHERE space_id=$1',[first])).rows[0].n,0);
+  await assert.rejects(spaces.get(actor,first),denied('NOT_FOUND'));
+  assert.equal((await spaces.list(actor)).some(space=>space.spaceId===first),false);
+  await assert.rejects(spaces.create({...actor,userPrincipalId:'other-owner'},'cell-a',first),denied('UNIQUE_CONFLICT'));
+  await assert.rejects(spaces.create(actor,'cell-b',first),denied('UNIQUE_CONFLICT'));
+  granted=false;
+  await assert.rejects(spaces.create(actor,'cell-a',first),denied('FORBIDDEN'));
+  granted=true;
+  assert.equal((await spaces.create(actor,'cell-a',first)).lifecycle,'active');
+  assert.equal((await spaces.create(actor,'cell-a',first)).spaceId,first);
+  assert.equal((await pool.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:create'",[first])).rows[0].n,1);
+
+  const second=`sp_${crypto.randomUUID()}`;
+  loseCommit=true;
+  await assert.rejects(spaces.create(actor,'cell-a',second),denied('RECEIPT_PENDING'));
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM spaces WHERE space_id=$1',[second])).rows[0].n,1);
+  assert.equal((await spaces.create(actor,'cell-a',second)).lifecycle,'active');
+  assert.equal((await pool.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:create'",[second])).rows[0].n,1);
+});
+
+test('selected retry races lease recovery under one directory lock', async () => {
+  const actor={kind:'session',credentialId:'session',userPrincipalId:`lease-owner-${crypto.randomUUID()}`};
+  const cells=new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
+  const spaces=new PostgresSpaces(controlPool,cells,'cell-a',
+    {create:async () => { throw new Error('unexpected key'); },revoke:async () => {}},{current:async () => true});
+  const absent=`sp_${crypto.randomUUID()}`;
+  const committed=`sp_${crypto.randomUUID()}`;
+  const retired=`sp_${crypto.randomUUID()}`;
+  const malformed=`sp_${crypto.randomUUID()}`;
+  for (const id of [absent,committed,retired,malformed]) await controlPool.query(`INSERT INTO space_directory
+    (space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,lifecycle,provisioning_lease_until)
+    VALUES($1,$2,'cell-a','cell-a','target-a','provisioning',clock_timestamp()-interval '1 second')`,[id,actor.userPrincipalId]);
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,$2,'cell-a','cell-a','target-a')`,[committed,actor.userPrincipalId]);
+  await pool.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
+    VALUES($1,$2,$3,$4,'space:create',1,1)`,[`aud_${crypto.randomUUID()}`,committed,actor.userPrincipalId,actor.credentialId]);
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,$2,'cell-a','cell-a','target-a')`,[malformed,actor.userPrincipalId]);
+  await assert.rejects(spaces.create(actor,'cell-a',malformed),denied('STALE_PLACEMENT'));
+  assert.equal((await controlPool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1',[malformed])).rows[0].lifecycle,'provisioning');
+  assert.equal((await spaces.create(actor,'cell-a',committed)).lifecycle,'active');
+  const [one,two]=await Promise.all([spaces.create(actor,'cell-a',absent),spaces.create(actor,'cell-a',absent)]);
+  assert.equal(one.spaceId,absent);
+  assert.equal(two.spaceId,absent);
+  assert.equal((await pool.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:create'",[absent])).rows[0].n,1);
+  assert.equal((await spaces.list(actor)).some(space=>space.spaceId===retired),false);
+  await assert.rejects(spaces.create(actor,'cell-a',retired),denied('UNIQUE_CONFLICT'));
+  assert.equal((await controlPool.query('SELECT count(*)::int AS n FROM space_provisioning_audit WHERE space_id=$1',[retired])).rows[0].n,1);
+});
+
 test('shared single-connection pool creates, issues, rotates and reconciles without waiting for itself', {timeout:10_000}, async () => {
   const single=new pg.Pool({connectionString:url,max:1});
   const actor={kind:'session',credentialId:'session',userPrincipalId:'single-pool-owner'};

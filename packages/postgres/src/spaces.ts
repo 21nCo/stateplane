@@ -281,6 +281,44 @@ export class PostgresSpaces {
       throw error;
     } finally { directory.release(discard); }
   }
+  /** An explicit retry of a selected ID may finish a reservation left by an
+   * interrupted creator. The directory lock serializes it with that creator
+   * and with lease-expiry reconciliation. */
+  private async resumeCreatedCell(actor: VerifiedCredential, spaceId: string,
+    cellId: string, cell: CellDatabase): Promise<SpaceInfo> {
+    return transaction(this.control, async directory => {
+      await this.current(actor);
+      const row = (await directory.query(`SELECT * FROM space_directory WHERE space_id=$1 FOR UPDATE`,[spaceId])).rows[0];
+      if (!row || row.owner_principal_id !== owner(actor) || row.cell_id !== cellId ||
+        row.storage_target_id !== cell.storageTargetId ||
+        (row.home_cell_id !== null && row.home_cell_id !== cellId) || row.lifecycle === 'deleted')
+        throw new AuthorityError('UNIQUE_CONFLICT');
+      if (row.lifecycle !== 'provisioning') return info(row);
+      const db = cell.pool === this.control ? directory : cell.pool;
+      const local = (await db.query(`SELECT s.owner_principal_id,s.home_cell_id,s.cell_id,s.storage_target_id,s.lifecycle,
+        s.policy_version,s.placement_generation,
+        EXISTS (SELECT 1 FROM space_audit a WHERE a.space_id=s.space_id AND a.actor_principal_id=s.owner_principal_id
+          AND a.action='space:create' AND a.policy_version=1 AND a.placement_generation=1) AS created
+        FROM spaces s WHERE s.space_id=$1`,[spaceId])).rows[0];
+      if (local) {
+        if (local.owner_principal_id !== owner(actor) || local.home_cell_id !== cellId ||
+          local.cell_id !== cellId || local.storage_target_id !== cell.storageTargetId ||
+          local.lifecycle !== 'active' || safeVersion(local.policy_version) !== 1 ||
+          safeVersion(local.placement_generation) !== 1 || local.created !== true)
+          throw new AuthorityError('STALE_PLACEMENT');
+      } else if (cell.pool === this.control) {
+        await this.insertCreatedCell(actor,directory,spaceId,cellId,cell.storageTargetId);
+      } else {
+        await transaction(cell.pool,client => this.insertCreatedCell(actor,client,spaceId,cellId,cell.storageTargetId));
+      }
+      await this.current(actor);
+      const published = await directory.query(`UPDATE space_directory SET home_cell_id=COALESCE(home_cell_id,$2),
+        lifecycle='active',provisioning_lease_until=NULL,updated_at=clock_timestamp()
+        WHERE space_id=$1 AND lifecycle='provisioning' RETURNING *`,[spaceId,cellId]);
+      if (!published.rows[0]) throw new AuthorityError('STALE_PLACEMENT');
+      return info(published.rows[0]);
+    });
+  }
   async create(actor: VerifiedCredential, requestedCellId?: string, requestedSpaceId?: string): Promise<SpaceInfo> {
     actor = snapshotOwner(actor);
     const principal = owner(actor);
@@ -290,18 +328,21 @@ export class PostgresSpaces {
       throw new AuthorityError('INVALID_ARGUMENT');
     const spaceId = requestedSpaceId ?? `sp_${randomUUID()}`;
     await this.current(actor);
-    const recoverSelected = async (): Promise<SpaceInfo | null> => {
+    const recoverSelected = async (resume = false): Promise<SpaceInfo | null> => {
       if (!requestedSpaceId) return null;
       const existing=(await this.control.query('SELECT * FROM space_directory WHERE space_id=$1',[spaceId])).rows[0];
       if (!existing) return null;
       if (existing.owner_principal_id!==principal || existing.cell_id!==cellId ||
           existing.storage_target_id!==cell.storageTargetId) throw new AuthorityError('UNIQUE_CONFLICT');
-      if (existing.lifecycle==='provisioning') throw new AuthorityError('RECEIPT_PENDING');
+      if (existing.lifecycle==='provisioning') {
+        if (resume) return this.resumeCreatedCell(actor,spaceId,cellId,cell);
+        throw new AuthorityError('RECEIPT_PENDING');
+      }
       if (existing.lifecycle==='deleted') throw new AuthorityError('UNIQUE_CONFLICT');
       await this.current(actor);
       return info(existing);
     };
-    const previous=await recoverSelected();
+    const previous=await recoverSelected(true);
     if (previous) return previous;
     let publicationAttempted = false;
     try {
