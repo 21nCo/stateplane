@@ -92,11 +92,13 @@ space-scoped command. Setting the same endpoint again retains the selection.
 During a store switch, private config tracks both locations until the old
 credential is removed. Logout and endpoint changes clean both locations after
 an interrupted switch; repeat either command after a temporary store failure.
-Config and secret changes are serialized across CLI processes. A command that
-cannot acquire the local lock within 120 seconds returns `CONFIGURATION_BUSY`
-without changing credentials; repeat it after the other command finishes.
-The 120-second bound matches the maximum configured HTTP timeout, while a
-dead process's lock is reclaimed after a two-second initialization grace.
+Config and secret changes are serialized across CLI processes by a private
+SQLite transaction lock. A command that cannot acquire it within 120 seconds
+returns `CONFIGURATION_BUSY` without changing credentials; repeat it after the
+other command finishes. The 120-second bound matches the maximum configured
+HTTP timeout. The OS releases the transaction if a process exits unexpectedly.
+Version, revision, limit, and timeout arguments use positive decimal digits
+without signs, leading zeros, spaces, hexadecimal, or exponent notation.
 
 Every `spaces create` request supplies a caller-generated `sp_<UUID>` ID.
 Retain it before sending the request. If the response is lost, repeat the

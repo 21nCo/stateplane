@@ -19,41 +19,60 @@ const configPath=()=>join(configDir(),'config.json');
 const tokenPath=()=>join(configDir(),'token');
 /** Serialize config and secret-location changes across CLI processes. The
  * durable journal remains the recovery source if a process exits mid-switch. */
-export async function withConfigMutation<T>(change:(current:CliConfig)=>Promise<T>):Promise<T> {
-  await secureDirectory();
-  const path=join(configDir(),'config.lock');
-  const deadline=Date.now()+120_000;
-  let handle;
-  while (!handle) {
-    try {
-      handle=await open(path,'wx',0o600);
-      try { await handle.writeFile(String(process.pid)); }
-      catch(error) { await handle.close(); await rm(path,{force:true}); throw error; }
-    } catch(error) {
-      if ((error as NodeJS.ErrnoException).code!=='EEXIST') throw error;
-      const lock=await lstat(path).catch(cause=>{
-        if ((cause as NodeJS.ErrnoException).code==='ENOENT') return undefined;
-        throw cause;
-      });
-      if (lock && (!lock.isFile() || (lock.mode&0o077)!==0))
-        throw new StateplaneCliError('INSECURE_CONFIGURATION');
-      if (lock && Date.now()-lock.mtimeMs>2000) {
-        const pid=Number((await readFile(path,'utf8').catch(()=>'')).trim());
-        if (!Number.isSafeInteger(pid) || pid<=0) await rm(path,{force:true});
-        else {
-          let alive=true;
-          try { process.kill(pid,0); } catch(cause) {
-            if ((cause as NodeJS.ErrnoException).code==='ESRCH') alive=false;
-          }
-          if (!alive) await rm(path,{force:true});
-        }
-      }
-      if (Date.now()>deadline) throw new StateplaneCliError('CONFIGURATION_BUSY',undefined,undefined,true);
-      await new Promise(resolve=>setTimeout(resolve,50));
-    }
+let mutationTail:Promise<void>=Promise.resolve();
+let sqliteModule:Promise<typeof import('node:sqlite')>|undefined;
+function sqlite():Promise<typeof import('node:sqlite')> {
+  if (!sqliteModule) {
+    const emitWarning=process.emitWarning;
+    // Node 22 emits this warning while importing its built-in SQLite module.
+    // Keep all other diagnostics, including credential-store failures, intact.
+    process.emitWarning=function(warning:string|Error,...args:unknown[]) {
+      if (String(warning)==='SQLite is an experimental feature and might change at any time') return;
+      return Reflect.apply(emitWarning,process,[warning,...args]);
+    } as typeof process.emitWarning;
+    sqliteModule=import('node:sqlite').finally(()=>{ process.emitWarning=emitWarning; });
   }
-  try { return await change(await readConfig()); }
-  finally { await handle.close(); await rm(path,{force:true}); }
+  return sqliteModule;
+}
+export async function withConfigMutation<T>(change:(current:CliConfig)=>Promise<T>):Promise<T> {
+  // SQLite owns the cross-process lock. Its transaction is released by the OS
+  // on process death, so no contender ever unlinks another contender's lock.
+  // Queue this process too: DatabaseSync's busy wait would otherwise block a
+  // callback holding the lock in the same event loop.
+  const previous=mutationTail;
+  let release!:()=>void;
+  mutationTail=new Promise<void>(resolve=>{ release=resolve; });
+  await previous;
+  let database:import('node:sqlite').DatabaseSync|undefined;
+  try {
+    await secureDirectory();
+    const path=join(configDir(),'config.lock.sqlite');
+    try { const file=await open(path,'wx',0o600); await file.close(); }
+    catch(error) { if ((error as NodeJS.ErrnoException).code!=='EEXIST') throw error; }
+    await privateFile(path);
+    const {DatabaseSync}=await sqlite();
+    database=new DatabaseSync(path);
+    // PRAGMA works on the earliest supported Node 22.13 runtime; the
+    // DatabaseSync constructor's timeout option arrived in Node 22.16.
+    database.exec('PRAGMA busy_timeout = 120000');
+    try { database.exec('BEGIN IMMEDIATE'); }
+    catch(error) {
+      if (String(error).includes('database is locked'))
+        throw new StateplaneCliError('CONFIGURATION_BUSY',undefined,undefined,true);
+      throw error;
+    }
+    try {
+      const result=await change(await readConfig());
+      database.exec('COMMIT');
+      return result;
+    } catch(error) {
+      database.exec('ROLLBACK');
+      throw error;
+    }
+  } finally {
+    database?.close();
+    release();
+  }
 }
 async function privateFile(path:string):Promise<boolean> {
   try {

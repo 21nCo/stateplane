@@ -248,6 +248,80 @@ test('concurrent selection reloads the endpoint after another process changes it
     {endpoint:after,space:'selected',tokenStore:null});
 });
 
+test('a killed config writer releases its lock and concurrent clients serialize mutations',async t=>{
+  const root=await mkdtemp(join(tmpdir(),'stateplane-cli-lock-recovery-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  await saveConfigWithRoot(root,{endpoint:'https://original.example.invalid/'});
+  const moduleUrl=new URL('../packages/cli/dist/config.js',import.meta.url).href;
+  const holder=spawn(process.execPath,['--input-type=module','-e',
+    `import {withConfigMutation} from ${JSON.stringify(moduleUrl)};
+     await withConfigMutation(async()=>{process.stdout.write('locked\\n');await new Promise(()=>{});});`],
+  {env:{...process.env,STATEPLANE_CONFIG_DIR:root},stdio:['ignore','pipe','pipe']});
+  await new Promise((resolve,reject)=>{
+    holder.stdout.once('data',resolve);
+    holder.once('error',reject);
+    holder.once('exit',()=>reject(new Error('lock holder exited before acquisition')));
+  });
+  holder.kill('SIGKILL');
+  await once(holder,'exit');
+  const journal=join(root,'intervals');
+  const worker=`import {withConfigMutation,saveConfig} from ${JSON.stringify(moduleUrl)};
+    import {appendFile} from 'node:fs/promises';
+    await withConfigMutation(async current=>{
+      await appendFile(${JSON.stringify(journal)},'start\\n');
+      await new Promise(resolve=>setTimeout(resolve,40));
+      await saveConfig({...current,space:'selected'});
+      await appendFile(${JSON.stringify(journal)},'end\\n');
+    });`;
+  const clients=await Promise.all(Array.from({length:8},()=>new Promise((resolve,reject)=>{
+    const child=spawn(process.execPath,['--input-type=module','-e',worker],
+      {env:{...process.env,STATEPLANE_CONFIG_DIR:root},stdio:['ignore','pipe','pipe']});
+    let diagnostics='';
+    child.stderr.on('data',chunk=>{diagnostics+=chunk;});
+    child.once('error',reject);
+    child.once('exit',code=>code===0?resolve(code):reject(new Error(diagnostics)));
+  })));
+  assert.equal(clients.length,8);
+  assert.deepEqual((await readFile(journal,'utf8')).trim().split('\n'),
+    Array.from({length:8},()=>['start','end']).flat());
+  assert.equal(JSON.parse(await readFile(join(root,'config.json'),'utf8')).space,'selected');
+  assert.equal((await stat(join(root,'config.lock.sqlite'))).mode&0o077,0);
+});
+
+test('HTTP and CLI reject noncanonical integer spellings before schema revision',async t=>{
+  const state=fixture();let revisions=0;
+  state.services.collections.revise=async()=>{revisions++;return {schemaVersion:2};};
+  const {server,endpoint}=await serve(createHttpHandler(state));
+  t.after(()=>server.close());
+  const root=await mkdtemp(join(tmpdir(),'stateplane-cli-numeric-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  assert.equal((await cliProcess(root,['config','endpoint','--url',endpoint])).status,0);
+  assert.equal((await cliProcess(root,['auth','import','--token-stdin','--store','file'],
+    'secret-test-token\n')).status,0);
+  const route=new URL('v1/spaces/sp_a/collections/entries',endpoint);
+  for (const value of ['1e2','0x10','01','+1','1.0']) {
+    const response=await fetch(route,{method:'PATCH',headers:{Authorization:'Bearer secret-test-token',
+      'Content-Type':'application/json','If-Match':value},body:'{}'});
+    assert.equal(response.status,400,value);
+    assert.equal((await response.json()).error.code,'INVALID_ARGUMENT');
+    const cli=await cliProcess(root,['collections','revise','--space','sp_a','--collection','entries',
+      '--version',value,'--data','{}']);
+    assert.equal(cli.status,1,value);
+    assert.equal(JSON.parse(cli.stderr).error.code,'INVALID_ARGUMENT');
+  }
+  const spaced=await cliProcess(root,['collections','revise','--space','sp_a','--collection','entries',
+    '--version',' 1 ','--data','{}']);
+  assert.equal(spaced.status,1);
+  assert.equal(JSON.parse(spaced.stderr).error.code,'INVALID_ARGUMENT');
+  assert.equal(revisions,0);
+  const response=await fetch(route,{method:'PATCH',headers:{Authorization:'Bearer secret-test-token',
+    'Content-Type':'application/json','If-Match':'1'},body:'{}'});
+  assert.equal(response.status,200);
+  assert.equal((await cliProcess(root,['collections','revise','--space','sp_a','--collection','entries',
+    '--version','1','--data','{}'])).status,0);
+  assert.equal(revisions,2);
+});
+
 test('HTTP and CLI address encoded collection, record, batch and external-key selectors',async t=>{
   const state=fixture();const {server,endpoint}=await serve(createHttpHandler(state));
   t.after(()=>server.close());

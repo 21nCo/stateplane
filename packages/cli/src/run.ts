@@ -62,6 +62,7 @@ function cursor(flags:Flags):string {
   return value;
 }
 function integer(value:string):number {
+  if (!/^[1-9][0-9]*$/.test(value)) throw new StateplaneCliError('INVALID_ARGUMENT');
   const number=Number(value);
   if (!Number.isSafeInteger(number) || number<1) throw new StateplaneCliError('INVALID_ARGUMENT');
   return number;

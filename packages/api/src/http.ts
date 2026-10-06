@@ -120,7 +120,9 @@ export function createHttpHandler({services,identity}:{services:StateplaneServic
         if (method==='GET') return json(await services.collections.list(actor,space,collection));
         if (method==='PUT') return json(await services.collections.define(actor,space,collection,await body(request,1_048_576)),201);
         if (method==='PATCH') {
-          const version=Number(request.headers.get('if-match'));
+          const rawVersion=request.headers.get('if-match');
+          if (!rawVersion || !/^[1-9][0-9]*$/.test(rawVersion)) fail('INVALID_ARGUMENT');
+          const version=Number(rawVersion);
           if (!Number.isSafeInteger(version) || version<1) fail('INVALID_ARGUMENT');
           return json(await services.collections.revise(actor,space,collection,version,await body(request,1_048_576)));
         }
