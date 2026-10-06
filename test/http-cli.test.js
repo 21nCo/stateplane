@@ -296,6 +296,94 @@ test('CLI rejects a batch whose escaped HTTP envelope exceeds the server budget'
   assert.equal(ingests,1);
 });
 
+test('CLI checks complete record and query bodies at the HTTP byte boundary',async t=>{
+  const state=fixture();let mutations=0,queries=0,counts=0;
+  state.services.records.mutate=async()=>{mutations++;return {ok:true};};
+  state.services.records.query=async()=>{queries++;return {records:[],nextCursor:null};};
+  state.services.records.count=async()=>{counts++;return 0;};
+  const {server,endpoint}=await serve(createHttpHandler(state));
+  t.after(()=>server.close());
+  const root=await mkdtemp(join(tmpdir(),'stateplane-cli-wire-budget-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  const file=join(root,'payload.json');
+  const cli=argv=>cliProcess(root,argv);
+  assert.equal((await cli(['config','endpoint','--url',endpoint])).status,0);
+  assert.equal((await cliProcess(root,['auth','import','--token-stdin','--store','file'],
+    'secret-test-token\n')).status,0);
+  assert.equal((await cli(['spaces','select','--space','sp_a'])).status,0);
+
+  const cases=[
+    {name:'create',limit:1_048_576,wire:value=>({operation:'create',idempotencyKey:'budget',data:{label:value}}),
+      args:()=>['records','create','--idempotency-key','budget','--file',file]},
+    {name:'replace',limit:1_048_576,wire:value=>({operation:'replace',idempotencyKey:'budget',
+      id:'rec_1',expectedRevision:1,data:{label:value}}),
+      args:()=>['records','replace','--idempotency-key','budget','--id','rec_1',
+        '--expected-revision','1','--file',file]},
+    {name:'patch',limit:1_048_576,wire:value=>({operation:'patch',idempotencyKey:'budget',
+      id:'rec_1',expectedRevision:1,set:{label:value},unset:[]}),
+      args:()=>['records','patch','--idempotency-key','budget','--id','rec_1',
+        '--expected-revision','1','--file',file]},
+    {name:'query',limit:32_768,wire:value=>({predicates:[value],limit:1}),
+      args:value=>['records','query','--predicates',JSON.stringify([value]),'--limit','1']},
+    {name:'count',limit:32_768,wire:value=>[value],
+      args:value=>['records','count','--predicates',JSON.stringify([value])]}
+  ];
+  for (const entry of cases) {
+    const length=entry.limit-Buffer.byteLength(JSON.stringify(entry.wire('')));
+    for (const [excess,expectedStatus] of [[0,0],[1,1]]) {
+      const value='x'.repeat(length+excess);
+      assert.equal(Buffer.byteLength(JSON.stringify(entry.wire(value))),entry.limit+excess);
+      if (['create','replace','patch'].includes(entry.name)) {
+        const data=entry.name==='patch'?{set:{label:value},unset:[]}:{label:value};
+        await writeFile(file,JSON.stringify(data));
+      }
+      const result=await cli([...entry.args(value),'--collection','entries']);
+      assert.equal(result.status,expectedStatus,`${entry.name}: ${result.stderr}`);
+      if (excess) assert.deepEqual(JSON.parse(result.stderr).error,
+        {code:'RATE_LIMITED',message:'RATE_LIMITED',retryable:false,requestId:null});
+    }
+  }
+  assert.deepEqual([mutations,queries,counts],[3,1,1]);
+});
+
+test('empty CLI cursors fail before fetching; event polling preserves supplied cursor',async t=>{
+  const state=fixture();const seen={queries:[],events:[]};
+  state.services.records.query=async(_actor,_space,_collection,serialized)=>{
+    seen.queries.push(JSON.parse(serialized).cursor);
+    return {records:[],nextCursor:'query-next'};
+  };
+  state.services.events.list=async(_actor,_space,_collection,cursor)=>{
+    seen.events.push(cursor);return {events:[],nextCursor:cursor??null};
+  };
+  const {server,endpoint}=await serve(createHttpHandler(state));
+  t.after(()=>server.close());
+  const root=await mkdtemp(join(tmpdir(),'stateplane-cli-cursors-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  const cli=argv=>cliProcess(root,argv);
+  assert.equal((await cli(['config','endpoint','--url',endpoint])).status,0);
+  assert.equal((await cliProcess(root,['auth','import','--token-stdin','--store','file'],
+    'secret-test-token\n')).status,0);
+  assert.equal((await cli(['spaces','select','--space','sp_a'])).status,0);
+  for (const args of [
+    ['records','query','--limit','1','--cursor',''],
+    ['events','list','--cursor','']
+  ]) {
+    const rejected=await cli([...args,'--collection','entries']);
+    assert.equal(rejected.status,1);
+    assert.deepEqual(JSON.parse(rejected.stderr).error,
+      {code:'INVALID_ARGUMENT',message:'INVALID_ARGUMENT',retryable:false,requestId:null});
+  }
+  assert.deepEqual(seen,{queries:[],events:[]});
+  assert.equal((await cli(['records','query','--collection','entries','--limit','1',
+    '--cursor','query-page-2'])).status,0);
+  const first=await cli(['events','list','--collection','entries']);
+  const next=await cli(['events','list','--collection','entries','--cursor','event-page-2']);
+  assert.equal(first.status,0,first.stderr);
+  assert.equal(next.status,0,next.stderr);
+  assert.equal(JSON.parse(next.stdout).nextCursor,'event-page-2');
+  assert.deepEqual(seen,{queries:['query-page-2'],events:[undefined,'event-page-2']});
+});
+
 test('GET honors Retry-After; writes never auto-retry after an uncertain outcome',async()=>{
   let calls=0;const client=new StateplaneHttpClient({endpoint:'http://127.0.0.1/',token:'secret',
     fetch:async()=>{calls++;if(calls===1)return Response.json({error:{code:'BACKPRESSURE',requestId:'r1'}},

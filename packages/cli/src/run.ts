@@ -87,6 +87,14 @@ async function payload(flags:Flags):Promise<unknown> {
   if (Buffer.byteLength(text)>1_048_576) throw new StateplaneCliError('RATE_LIMITED',undefined,undefined,false);
   return parsed(text);
 }
+function withinWireBudget<T>(value:T,maxBytes:number):T {
+  // Match StateplaneHttpClient's body serialization, including raw strings.
+  const serialized=typeof value==='string'?value:JSON.stringify(value);
+  if (serialized===undefined) throw new StateplaneCliError('INVALID_ARGUMENT');
+  if (Buffer.byteLength(serialized)>maxBytes)
+    throw new StateplaneCliError('RATE_LIMITED',undefined,undefined,false);
+  return value;
+}
 function endpoint(value:string):string {
   let url:URL;
   try { url=new URL(value); } catch { throw new StateplaneCliError('INVALID_ARGUMENT'); }
@@ -147,9 +155,10 @@ export async function runCli(argv:string[]):Promise<number> {
     if (resource==='spaces') {
       if (action==='list') output(await client.request('GET','/v1/spaces'));
       else if (action==='create') output(await client.request('POST','/v1/spaces',
-        {spaceId:required(flags,'space'),...(flags.cell ? {cellId:flags.cell}:{})}));
+        withinWireBudget({spaceId:required(flags,'space'),...(flags.cell ? {cellId:flags.cell}:{})},4096)));
       else if (action==='get' && spacePath) output(await client.request('GET',spacePath));
-      else if (action==='update' && spacePath) output(await client.request('PATCH',spacePath,{lifecycle:required(flags,'lifecycle')}));
+      else if (action==='update' && spacePath) output(await client.request('PATCH',spacePath,
+        withinWireBudget({lifecycle:required(flags,'lifecycle')},4096)));
       else if (action==='delete' && spacePath) output(await client.request('DELETE',spacePath));
       else throw new StateplaneCliError('INVALID_ARGUMENT');
       return 0;
@@ -160,8 +169,10 @@ export async function runCli(argv:string[]):Promise<number> {
     if (resource==='collections') {
       if (action==='list') output(await client.request('GET',`${spacePath}/collections`));
       else if (action==='get' && collectionPath) output(await client.request('GET',collectionPath));
-      else if (action==='define' && collectionPath) output(await client.request('PUT',collectionPath,await payload(flags)));
-      else if (action==='revise' && collectionPath) output(await client.request('PATCH',collectionPath,await payload(flags),
+      else if (action==='define' && collectionPath) output(await client.request('PUT',collectionPath,
+        withinWireBudget(await payload(flags),1_048_576)));
+      else if (action==='revise' && collectionPath) output(await client.request('PATCH',collectionPath,
+        withinWireBudget(await payload(flags),1_048_576),
         {'If-Match':String(integer(required(flags,'version')))}));
       else throw new StateplaneCliError('INVALID_ARGUMENT');
       return 0;
@@ -172,13 +183,13 @@ export async function runCli(argv:string[]):Promise<number> {
       if (action==='get') output(await client.request('GET',`${recordPath}/${encoded(required(flags,'id'))}`));
       else if (action==='key') output(await client.request('GET',`${recordPath}/by-key/${encoded(required(flags,'key'))}?mode=${encoded(required(flags,'mode'))}`));
       else if (action==='projection') output(await client.request('GET',`${recordPath}/${encoded(required(flags,'id'))}/projection`));
-      else if (action==='query') output(await client.request('POST',`${recordPath}/query`,{
+      else if (action==='query') output(await client.request('POST',`${recordPath}/query`,withinWireBudget({
         predicates:parsed(typeof flags.predicates==='string'?flags.predicates:'[]'),
         limit:integer(required(flags,'limit')),
         ...(flags.sort ? {sort:parsed(required(flags,'sort'))}:{}),
-        ...(flags.cursor!==undefined ? {cursor:required(flags,'cursor')}:{} )}));
+        ...(flags.cursor!==undefined ? {cursor:required(flags,'cursor')}:{} )},32_768)));
       else if (action==='count') output(await client.request('POST',`${recordPath}/count`,
-        parsed(typeof flags.predicates==='string'?flags.predicates:'[]')));
+        withinWireBudget(parsed(typeof flags.predicates==='string'?flags.predicates:'[]'),32_768)));
       else if (['create','replace','patch','delete'].includes(action??'')) {
         const request:Record<string,unknown>={operation:action,idempotencyKey:required(flags,'idempotency-key')};
         if (flags['expected-schema-version']!==undefined)
@@ -198,7 +209,7 @@ export async function runCli(argv:string[]):Promise<number> {
             request.set=patch.set; request.unset=patch.unset;
           }
         }
-        output(await client.request('POST',recordPath,request));
+        output(await client.request('POST',recordPath,withinWireBudget(request,1_048_576)));
       } else throw new StateplaneCliError('INVALID_ARGUMENT');
       return 0;
     }
@@ -211,17 +222,17 @@ export async function runCli(argv:string[]):Promise<number> {
         const manifest=lines.map(line=>JSON.stringify(parsed(line)));
         const itemBytes=manifest.map(item=>Buffer.byteLength(item));
         if (itemBytes.some(size=>size>1_048_576) ||
-          itemBytes.reduce((sum,size)=>sum+size,0)>2_097_152 ||
-          Buffer.byteLength(JSON.stringify(manifest))>3_145_728)
+          itemBytes.reduce((sum,size)=>sum+size,0)>2_097_152)
           throw new StateplaneCliError('RATE_LIMITED',undefined,undefined,false);
-        output(await client.request('PUT',url+(flags['retry-failed']?'?retryFailed=true':''),manifest));
+        output(await client.request('PUT',url+(flags['retry-failed']?'?retryFailed=true':''),
+          withinWireBudget(manifest,3_145_728)));
       } else if (action==='status') output(await client.request('GET',url));
       else if (action==='cancel') output(await client.request('DELETE',url));
       else throw new StateplaneCliError('INVALID_ARGUMENT');
       return 0;
     }
     if (resource==='events' && action==='list') {
-      output(await client.request('GET',`${collectionPath}/events${flags.cursor?`?cursor=${encoded(required(flags,'cursor'))}`:''}`));
+      output(await client.request('GET',`${collectionPath}/events${flags.cursor!==undefined?`?cursor=${encoded(required(flags,'cursor'))}`:''}`));
       return 0;
     }
     throw new StateplaneCliError('INVALID_ARGUMENT');

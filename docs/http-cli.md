@@ -126,7 +126,10 @@ not a fixed export snapshot.
 The API applies the authority's existing 30-second transaction budget,
 32 KiB query envelope, 1 MiB record/schema body and 3 MiB batch envelope.
 Those are protective implementation limits from STA-8, not measured remote
-throughput. The CLI timeout defaults to 30 seconds and can be set with
+throughput. The CLI checks the complete serialized HTTP body against each
+endpoint's limit before sending; oversized local input returns a nonretryable
+`RATE_LIMITED` error. An explicitly empty query or event cursor is invalid;
+omit `--cursor` to request the first page. The CLI timeout defaults to 30 seconds and can be set with
 `--timeout` in milliseconds up to 120 seconds. Keep the CLI timeout above the
 server budget when possible; a client timeout on a write is still ambiguous.
 The event feed returns at most 100 immutable metadata entries per page and
