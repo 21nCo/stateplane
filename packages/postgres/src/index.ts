@@ -281,7 +281,7 @@ function validateIndexValue(entry:IndexValue):void {
 
 /** Reconstruct a declared projection from canonical bytes, including absence. */
 function indexForDeclaration(data:Record<string,Json>,field:string,
-  kind:'string'|'number'|'boolean'|'date-time'):IndexValue {
+  kind:SortValueKind):IndexValue {
   const value=Object.hasOwn(data,field) ? data[field] : undefined;
   if (value===undefined) return {field,kind:'missing'};
   if (value===null) return {field,kind:'null'};
@@ -594,10 +594,14 @@ function pageContinuation(params:unknown[],cursor:PageCursor|undefined,sort:Reco
   return {after,presentAfter,nullAfter,missingAfter};
 }
 
+interface PageCandidateOptions {
+  where:string; sort:RecordSort|undefined; kind:SortValueKind|undefined; expr:string;
+  direction:'ASC'|'DESC'; fieldParam:string; candidateLimit:string; filtered:boolean;
+  continuation:PageContinuation;
+}
 /** Limit each typed branch before fetching record bytes from a sort-only page. */
-function pageCandidateSql(where:string,sort:RecordSort|undefined,kind:string|undefined,expr:string,
-  direction:'ASC'|'DESC',fieldParam:string,candidateLimit:string,filtered:boolean,
-  continuation:PageContinuation):string {
+function pageCandidateSql(options:PageCandidateOptions):string {
+  const {where,sort,kind,expr,direction,fieldParam,candidateLimit,filtered,continuation}=options;
   if (!sort) return `WITH candidates AS MATERIALIZED (
     SELECT r.record_id,2 AS sort_rank,${expr} AS sort_value,
       r.created_at::text AS sort_cursor,octet_length(r.canonical_data) AS bytes
@@ -971,7 +975,7 @@ export class AuthorityTransaction {
           VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`,[...key,digest,requests.length]);
         const row=(await this.query(`SELECT manifest_digest,item_count,state FROM batch_operations
           WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 AND operation_key=$4 FOR UPDATE`,key)).rows[0];
-        if (!row || row.manifest_digest!==digest || Number(row.item_count)!==requests.length)
+        if (row?.manifest_digest!==digest || Number(row.item_count)!==requests.length)
           throw new AuthorityError('BATCH_CONFLICT','Operation key has a different manifest');
         if (row.state==='cancelled') throw new AuthorityError('BATCH_CANCELLED');
         await this.query(`INSERT INTO batch_items(space_id,collection_id,credential_id,operation_key,ordinal,request_text)
@@ -1052,6 +1056,7 @@ export class AuthorityTransaction {
     },true);
   }
 
+  /** Stop new item starts under the operation lock; committed item receipts remain durable. */
   cancelBatch(operationKey:string):Promise<void> {
     return this.admitOperation(async()=>{
       const key=this.batchKey(operationKey);
@@ -1700,11 +1705,12 @@ export class AuthorityTransaction {
     }
   }
 
-  private async readySort(field:string):Promise<'string'|'number'|'boolean'|'date-time'> {
+  /** Reject undeclared or pending sort projections before constructing indexed page SQL. */
+  private async readySort(field:string):Promise<SortValueKind> {
     const result=await this.query(`SELECT value_kind,ready,sortable FROM collection_index_declarations
       WHERE space_id=$1 AND collection_id=$2 AND field_name=$3`,[...scopeIds(this.#scope),field]);
     const row=result.rows[0];
-    if (!row || row.ready!==true || row.sortable!==true || !arrayHas(['string','number','boolean','date-time'],row.value_kind))
+    if (row?.ready!==true || row.sortable!==true || !arrayHas(['string','number','boolean','date-time'],row.value_kind))
       throw new AuthorityError('SCHEMA_CONFLICT','Sort index is not ready');
     return row.value_kind;
   }
@@ -1733,6 +1739,7 @@ export class AuthorityTransaction {
     });
   }
 
+  /** Bind a cursor to current scope and schema, then fetch one statement-local bounded page. */
   private queryPageUsing(fixed:readonly ScalarPredicate[],limit:number,fixedSort?:RecordSort,cursor?:string):Promise<RecordPage> {
     return this.admitOperation(async()=>{
       if (!this.cursorSecret) throw new AuthorityError('INVALID_ARGUMENT','Cursor secret is not configured');
@@ -1764,8 +1771,8 @@ export class AuthorityTransaction {
       const continuation=pageContinuation(params,parsed,fixedSort,kind,expr,direction);
       params.push(limit+1,limit,MAX_PAGE_BYTES);
       const candidateLimit=`$${params.length-2}`,pageLimit=`$${params.length-1}`,byteLimit=`$${params.length}`;
-      const candidates=pageCandidateSql(where,fixedSort,kind,expr,direction,sortFieldParam,
-        candidateLimit,fixed.length>0,continuation);
+      const candidates=pageCandidateSql({where,sort:fixedSort,kind,expr,direction,fieldParam:sortFieldParam,
+        candidateLimit,filtered:fixed.length>0,continuation});
       const result=await this.query(`${candidates}, ranked AS MATERIALIZED (
           SELECT c.*,row_number() OVER (ORDER BY c.sort_rank ${direction},c.sort_value ${direction} NULLS LAST,c.record_id) AS position,
             sum(c.bytes) OVER (ORDER BY c.sort_rank ${direction},c.sort_value ${direction} NULLS LAST,c.record_id) AS consumed
@@ -1820,12 +1827,14 @@ export class AuthorityTransaction {
     try { fixed=snapshotPredicates(predicates); } catch (error) { return Promise.reject(error); }
     return this.countUsing(fixed);
   }
+  /** Parse a Worker-safe predicate envelope only after read authorization. */
   countSerializedRecords(serialized:string):Promise<number> {
     return this.admitOperation(()=>{
       if (this.#scope.capability!=='records:read') throw new AuthorityError('FORBIDDEN');
       return this.countUsing(parseSerializedPredicates(serialized));
     });
   }
+  /** Count authoritative scoped rows after every referenced projection is ready. */
   private countUsing(fixed:readonly ScalarPredicate[]):Promise<number> {
     return this.admitOperation(async () => {
     const { params, where } = this.compilePredicates(fixed);
@@ -1844,12 +1853,14 @@ export class AuthorityTransaction {
     try { fixed=snapshotPredicates(predicates); } catch (error) { return Promise.reject(error); }
     return this.existsUsing(fixed);
   }
+  /** Parse a Worker-safe existence predicate only after read authorization. */
   existsSerializedRecord(serialized:string):Promise<boolean> {
     return this.admitOperation(()=>{
       if (this.#scope.capability!=='records:read') throw new AuthorityError('FORBIDDEN');
       return this.existsUsing(parseSerializedPredicates(serialized));
     });
   }
+  /** Use SQL existence over the same scoped, ready-index predicate as count. */
   private existsUsing(fixed:readonly ScalarPredicate[]):Promise<boolean> {
     return this.admitOperation(async () => {
     const { params, where } = this.compilePredicates(fixed);

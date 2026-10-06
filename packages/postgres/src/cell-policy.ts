@@ -188,6 +188,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     finally { result.release(); }
   }
 
+  /** Recheck regional policy and provider credential freshness within one cell deadline. */
   private async check(client: pg.PoolClient, claims: RouteClaims, deadline: number, requireActiveSpace = false): Promise<string> {
     const checkStarted = performance.now();
     const result = await client.query(`SELECT s.owner_principal_id,s.lifecycle,s.cell_id,s.policy_version,s.placement_generation,
@@ -269,6 +270,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
     this.remaining(deadline);
   }
 
+  /** Consume the nonce separately, then commit joined records only after effect and policy fences settle. */
   async run<T>(claims: RouteClaims, effect: (principalId: string, context: AuthorizedCellContext) => Promise<T>): Promise<T> {
     const deadline = Date.now() + this.requestTimeoutMs;
     claims = Object.freeze({ ...claims });
