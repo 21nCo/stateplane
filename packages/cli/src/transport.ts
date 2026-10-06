@@ -41,7 +41,7 @@ export class StateplaneHttpClient {
         response=await this.fetcher(url,{method,redirect:'error',signal:AbortSignal.timeout(this.timeoutMs),
           headers:{Authorization:`Bearer ${this.options.token}`,Accept:'application/json',
             ...(body===undefined?{}:{'Content-Type':'application/json'}),...extraHeaders},
-          body:body===undefined?undefined:typeof body==='string'?body:JSON.stringify(body)});
+          body:body===undefined?undefined:JSON.stringify(body)});
       } catch {
         if (safeRead && attempt<2) { await this.sleep(250*(attempt+1)); continue; }
         throw new StateplaneCliError(safeRead?'PROVIDER_UNAVAILABLE':'OUTCOME_UNKNOWN');

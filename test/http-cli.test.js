@@ -194,6 +194,78 @@ test('HTTP and installed CLI observe the same receipt; revocation and cursor err
   await assert.rejects(readFile(join(cliRoot,'token'),'utf8'),{code:'ENOENT'});
 });
 
+test('CLI preserves JSON string types and rejects empty optional selectors before HTTP effects',async t=>{
+  const state=fixture();
+  const observed={define:0,revise:0,count:0,create:0,query:0};
+  const schema=async(kind,_actor,_space,_collection,...args)=>{
+    observed[kind]++;
+    const value=JSON.parse(args.at(-1));
+    if (!value || typeof value!=='object' || Array.isArray(value))
+      throw Object.assign(new Error('invalid schema'),{code:'SCHEMA_UNSUPPORTED'});
+    return {slug:'entries',version:1};
+  };
+  state.services.collections.define=(...args)=>schema('define',...args);
+  state.services.collections.revise=(...args)=>schema('revise',...args);
+  state.services.records.count=async(_actor,_space,_collection,body)=>{
+    observed.count++;
+    if (!Array.isArray(JSON.parse(body)))
+      throw Object.assign(new Error('invalid predicates'),{code:'INVALID_ARGUMENT'});
+    return 0;
+  };
+  state.services.spaces.create=async()=>{observed.create++;return {spaceId:'sp_created'};};
+  state.services.records.query=async()=>{observed.query++;return {records:[],nextCursor:null};};
+  const {server,endpoint}=await serve(createHttpHandler(state));
+  t.after(()=>server.close());
+  const root=await mkdtemp(join(tmpdir(),'stateplane-cli-json-types-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  const cli=argv=>cliProcess(root,argv);
+  assert.equal((await cli(['config','endpoint','--url',endpoint])).status,0);
+  assert.equal((await cliProcess(root,['auth','import','--token-stdin','--store','file'],
+    'secret-test-token\n')).status,0);
+  const collection='/v1/spaces/sp_a/collections/entries';
+  const headers={Authorization:'Bearer secret-test-token','Content-Type':'application/json'};
+  const direct=async(method,path,body,extraHeaders={})=>
+    (await fetch(new URL(path,endpoint),{method,headers:{...headers,...extraHeaders},body:JSON.stringify(body)})).json();
+  const quotedSchema=JSON.stringify('{}');
+  const schemaFile=join(root,'quoted-schema.json');
+  await writeFile(schemaFile,quotedSchema);
+  for (const [action,method,args] of [
+    ['define','PUT',['--data',quotedSchema]],
+    ['define','PUT',['--file',schemaFile]],
+    ['revise','PATCH',['--data',quotedSchema,'--version','1']],
+    ['revise','PATCH',['--file',schemaFile,'--version','1']]
+  ]) {
+    const http=await direct(method,collection,'{}',action==='revise'?{'If-Match':'1'}:{});
+    const result=await cli(['collections',action,'--space','sp_a','--collection','entries',...args]);
+    assertErrorParity(http,result);
+  }
+  const quotedPredicates=JSON.stringify('[]');
+  assertErrorParity(await direct('POST',collection+'/records/count','[]'),
+    await cli(['records','count','--space','sp_a','--collection','entries',
+      '--predicates',quotedPredicates]));
+  assert.equal(observed.define,4);
+  assert.equal(observed.revise,4);
+  assert.equal(observed.count,2);
+  const goodSchema=await cli(['collections','define','--space','sp_a','--collection','entries',
+    '--data','{}']);
+  assert.equal(goodSchema.status,0,goodSchema.stderr);
+  const goodCount=await cli(['records','count','--space','sp_a','--collection','entries',
+    '--predicates','[]']);
+  assert.equal(goodCount.status,0,goodCount.stderr);
+  assert.equal(JSON.parse(goodCount.stdout),0);
+  const emptyCell=await cli(['spaces','create','--space','sp_12345678-1234-1234-1234-123456789abc',
+    '--cell','']);
+  const emptySort=await cli(['records','query','--space','sp_a','--collection','entries',
+    '--limit','1','--sort','']);
+  for (const result of [emptyCell,emptySort]) {
+    assert.equal(result.status,1);
+    assert.equal(JSON.parse(result.stderr).error.code,'INVALID_ARGUMENT');
+    assert.doesNotMatch(result.stdout+result.stderr,/secret-test-token/);
+  }
+  assert.equal(observed.create,0);
+  assert.equal(observed.query,0);
+});
+
 test('endpoint changes clear saved space while same-endpoint configuration retains it',async t=>{
   const {server,endpoint}=await serve(createHttpHandler(fixture()));
   t.after(()=>server.close());

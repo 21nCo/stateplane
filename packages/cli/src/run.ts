@@ -49,6 +49,7 @@ function validateFlags(resource:string,action:string|undefined,flags:Flags):void
   const usesHttp=resource!=='config' && resource!=='auth' && !(resource==='spaces' && action==='select');
   const accepted=new Set([...command,...common,...(usesHttp?['timeout']:[])]);
   if (Object.keys(flags).some(key=>!accepted.has(key))) throw new StateplaneCliError('INVALID_ARGUMENT');
+  if (flags.cell==='' || flags.sort==='') throw new StateplaneCliError('INVALID_ARGUMENT');
   if (flags.timeout!==undefined) integer(required(flags,'timeout'));
 }
 function required(flags:Flags,key:string):string {
@@ -94,8 +95,8 @@ async function payload(flags:Flags):Promise<unknown> {
   return parsed(text);
 }
 function withinWireBudget<T>(value:T,maxBytes:number):T {
-  // Match StateplaneHttpClient's body serialization, including raw strings.
-  const serialized=typeof value==='string'?value:JSON.stringify(value);
+  // Match StateplaneHttpClient's JSON serialization for every JSON value.
+  const serialized=JSON.stringify(value);
   if (serialized===undefined) throw new StateplaneCliError('INVALID_ARGUMENT');
   if (Buffer.byteLength(serialized)>maxBytes)
     throw new StateplaneCliError('RATE_LIMITED',undefined,undefined,false);
