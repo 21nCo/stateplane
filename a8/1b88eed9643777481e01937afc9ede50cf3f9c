@@ -1,0 +1,24 @@
+contracts/openapi.yaml
+  h_a39f9495f9ec1d 58,75,80,155-225,305-309,312
+docs/http-cli.md
+  h_a39f9495f9ec1d 68-69,96-99,114-116
+packages/cli/src/run.ts
+  h_a39f9495f9ec1d 9,24,37-40,184-185,212-216
+packages/postgres/src/services.ts
+  h_a39f9495f9ec1d 68-85
+test/http-cli.test.js
+  h_a39f9495f9ec1d 5,120-124,227-298
+test/integration/http-services.test.js
+  h_a39f9495f9ec1d 118-135
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a81b88eed9643777481e01937afc9ede50cf3f9c",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
