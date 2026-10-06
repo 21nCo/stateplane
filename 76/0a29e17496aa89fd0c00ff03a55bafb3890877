@@ -1,0 +1,18 @@
+docs/exact-queries-bulk.md
+  h_a39f9495f9ec1d 9
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 298,302
+test/integration/collections.test.js
+  h_a39f9495f9ec1d 2301-2341
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "760a29e17496aa89fd0c00ff03a55bafb3890877",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
