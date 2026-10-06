@@ -26,8 +26,9 @@ if operation == "store" {
   request[kSecReturnData as String] = true
   request[kSecMatchLimit as String] = kSecMatchLimitOne
   var result: CFTypeRef?
-  guard SecItemCopyMatching(request as CFDictionary, &result) == errSecSuccess,
-    let token = result as? Data else { exit(1) }
+  let status = SecItemCopyMatching(request as CFDictionary, &result)
+  guard status != errSecItemNotFound else { exit(2) }
+  guard status == errSecSuccess, let token = result as? Data else { exit(1) }
   FileHandle.standardOutput.write(token)
 } else if operation == "remove" {
   let status = SecItemDelete(query as CFDictionary)

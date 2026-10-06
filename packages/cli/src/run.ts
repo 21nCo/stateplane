@@ -226,7 +226,9 @@ export async function runCli(argv:string[]):Promise<number> {
       if (action==='ingest') {
         const lines=(await input(required(flags,'file'),3_145_728)).split(/\r?\n/).filter(Boolean);
         if (!lines.length || lines.length>20) throw new StateplaneCliError('INVALID_ARGUMENT');
-        const manifest=lines.map(line=>JSON.stringify(parsed(line)));
+        // Batch identity hashes each item string, so preserve the validated
+        // NDJSON bytes across an HTTP-to-CLI recovery attempt.
+        const manifest=lines.map(line=>{ parsed(line); return line; });
         const itemBytes=manifest.map(item=>Buffer.byteLength(item));
         if (itemBytes.some(size=>size>1_048_576) ||
           itemBytes.reduce((sum,size)=>sum+size,0)>2_097_152)

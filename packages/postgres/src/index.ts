@@ -1187,7 +1187,7 @@ export class AuthorityTransaction {
       const rows=await this.query(`SELECT r.revision,o.generation,o.delivery_state FROM records r
         JOIN projection_outbox o ON o.space_id=r.space_id AND o.collection_id=r.collection_id
           AND o.record_id=r.record_id AND o.revision=r.revision
-        WHERE r.space_id=$1 AND r.collection_id=$2 AND r.record_id=$3 AND NOT r.tombstone`,
+        WHERE r.space_id=$1 AND r.collection_id=$2 AND r.record_id=$3`,
         [...scopeIds(this.#scope),recordId]);
       const row=rows.rows[0];
       if (!row) throw new AuthorityError('NOT_FOUND');

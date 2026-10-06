@@ -71,6 +71,8 @@ stateplane records create --collection entries --key ' item-1 ' \
 
 `keychain` is the default. On macOS, it uses Keychain; on Linux, it uses Secret
 Service through `secret-tool`. If OS storage is unavailable, explicitly select `--store file`.
+An absent stored item returns `UNAUTHENTICATED`; an unavailable OS store returns
+`KEYCHAIN_UNAVAILABLE`. Neither error prints backend diagnostics or a token.
 The macOS path requires the system `swift` command (install Apple Command Line
 Tools with `xcode-select --install` if it is absent). It sends the token to a
 small bundled Keychain helper over stdin, then reads the item back before
@@ -120,6 +122,9 @@ stateplane batches status --collection entries --operation-key import-1
 
 An ingestion file or `--file -` stream is NDJSON with one record request per
 line, omitting `idempotencyKey`; the authority derives stable item keys. The
+CLI preserves each valid line's exact JSON text in the manifest. Keep the
+original file bytes for same-key recovery; reformatting an item changes batch
+identity even when its parsed JSON value is equivalent. The
 manifest is limited to 20 items and 2 MiB of serialized item bytes by the
 authority. The HTTP JSON string-array envelope must also fit 3 MiB after
 escaping; the CLI checks both byte budgets before sending and reports an

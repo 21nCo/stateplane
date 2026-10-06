@@ -813,6 +813,30 @@ test('caller changes to create, replace and delete receipts cannot alter saved f
     idempotency_receipts:3,record_tombstones:1,projection_outbox:3 });
 });
 
+test('projection status follows a deleted revision without exposing content or bypassing read grant', async () => {
+  const {scope}=await fixture();
+  const created=await authority.mutate(scope,change('create','projection-create','{"label":"one"}'));
+  const reader={...scope,capability:'records:read'};
+  const status=()=>authority.transaction(reader,tx=>tx.projection(created.ref.id));
+  assert.deepEqual(await status(),{state:'pending',generation:1,revision:1});
+  const deleted=await authority.mutate(scope,change('delete','projection-delete',undefined,
+    {recordId:created.ref.id,expectedRevision:1}));
+  assert.equal(deleted.revision,2);
+  assert.equal(await authority.transaction(reader,tx=>tx.getRecord(created.ref.id)),null);
+  assert.deepEqual(await status(),{state:'pending',generation:1,revision:2});
+  await pool.query(`UPDATE projection_outbox SET delivery_state='delivered'
+    WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 AND revision=2`,
+  [scope.spaceId,scope.collectionId,created.ref.id]);
+  assert.deepEqual(await status(),{state:'current',generation:1,revision:2});
+  await pool.query(`UPDATE projection_outbox SET delivery_state='degraded'
+    WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 AND revision=2`,
+  [scope.spaceId,scope.collectionId,created.ref.id]);
+  assert.deepEqual(await status(),{state:'degraded',generation:1,revision:2});
+  await pool.query(`DELETE FROM collection_grants WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,
+    [scope.spaceId,scope.collectionId,scope.credentialId]);
+  await assert.rejects(status(),{code:'FORBIDDEN'});
+});
+
 test('date-time filters compare full UTC instants across query, count and exists', async () => {
   const { scope } = await fixture();
   await pool.query(`INSERT INTO collection_index_declarations(space_id,collection_id,field_name,value_kind,filterable,sortable,ready,accepted_version)

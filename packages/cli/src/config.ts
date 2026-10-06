@@ -51,21 +51,44 @@ export async function saveConfig(value:CliConfig):Promise<void> {
 }
 function keyArgs(endpoint:string):string[] { return ['service','stateplane','endpoint',endpoint]; }
 const macKeychainScript=join(dirname(fileURLToPath(import.meta.url)),'../bin/keychain.swift');
-function macKeychain(operation:'store'|'load'|'remove',endpoint:string,stdin?:string) {
-  return command('/usr/bin/swift',[macKeychainScript,operation,`stateplane:${endpoint}`],stdin);
+function macKeychain(operation:'store'|'load'|'remove',endpoint:string,stdin?:string,
+  run:typeof command=command) {
+  return run('/usr/bin/swift',[macKeychainScript,operation,`stateplane:${endpoint}`],stdin);
 }
-function command(program:string,args:string[],stdin?:string):Promise<{ok:boolean;output:string}> {
+interface CommandResult { ok:boolean; output:string; missing?:boolean }
+function command(program:string,args:string[],stdin?:string):Promise<CommandResult> {
   return new Promise(resolve=>{
-    const child=spawn(program,args,{stdio:['pipe','pipe','ignore']});
+    const child=spawn(program,args,{stdio:['pipe','pipe','pipe']});
     const timer=setTimeout(()=>child.kill(),30_000);
-    let output='';
+    let output=''; let diagnostic=false;
     child.stdout.setEncoding('utf8');
     child.stdout.on('data',chunk=>{ if (output.length<16_384) output+=chunk; });
+    child.stderr.on('data',()=>{ diagnostic=true; });
     child.stdin.on('error',()=>{});
     child.on('error',()=>{clearTimeout(timer);resolve({ok:false,output:''});});
-    child.on('close',code=>{clearTimeout(timer);resolve({ok:code===0,output});});
+    child.on('close',code=>{clearTimeout(timer);resolve({ok:code===0,output,
+      missing:program==='/usr/bin/swift' ? code===2 : program==='secret-tool' && code===1 && !diagnostic});});
     child.stdin.end(stdin);
   });
+}
+export async function loadSecretServiceToken(endpoint:string,
+  run:typeof command=command):Promise<string> {
+  // An absent Secret Service item exits 1 without diagnostics. Backend
+  // failures produce diagnostics, which are observed but never printed.
+  const result=await run('secret-tool',['lookup',...keyArgs(endpoint)]);
+  if (!result.ok) throw new StateplaneCliError(result.missing?'UNAUTHENTICATED':'KEYCHAIN_UNAVAILABLE');
+  const token=result.output.replace(/\n$/,'');
+  if (!token) throw new StateplaneCliError('UNAUTHENTICATED');
+  return token;
+}
+export async function loadOsSecretToken(endpoint:string,os=platform(),
+  run:typeof command=command):Promise<string> {
+  if (os==='linux') return loadSecretServiceToken(endpoint,run);
+  if (os!=='darwin') throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
+  const result=await macKeychain('load',endpoint,undefined,run);
+  if (!result.ok) throw new StateplaneCliError(result.missing?'UNAUTHENTICATED':'KEYCHAIN_UNAVAILABLE');
+  if (!result.output) throw new StateplaneCliError('UNAUTHENTICATED');
+  return result.output;
 }
 export async function storeSecretServiceToken(endpoint:string,token:string,
   run:typeof command=command):Promise<void> {
@@ -106,14 +129,7 @@ export async function loadToken(config:CliConfig):Promise<string> {
     return token;
   }
   if (config.tokenStore==='keychain') {
-    const result=platform()==='darwin'
-      ? await macKeychain('load',config.endpoint)
-      : platform()==='linux'
-        ? await command('secret-tool',['lookup',...keyArgs(config.endpoint)])
-        : {ok:false,output:''};
-    const token=platform()==='darwin' ? result.output : result.output.replace(/\n$/,'');
-    if (!result.ok || !token) throw new StateplaneCliError('UNAUTHENTICATED');
-    return token;
+    return loadOsSecretToken(config.endpoint);
   }
   throw new StateplaneCliError('UNAUTHENTICATED');
 }

@@ -9,9 +9,10 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { platform } from 'node:os';
 import { createHttpHandler } from '../packages/api/dist/index.js';
-import { PostgresSpaces } from '../packages/postgres/dist/index.js';
+import { PostgresSpaces, AuthorityTransaction } from '../packages/postgres/dist/index.js';
 import { StateplaneHttpClient, StateplaneCliError } from '../packages/cli/dist/index.js';
-import { saveToken, loadToken, removeToken, storeSecretServiceToken } from '../packages/cli/dist/config.js';
+import { saveToken, loadToken, removeToken, storeSecretServiceToken, loadSecretServiceToken,
+  loadOsSecretToken } from '../packages/cli/dist/config.js';
 
 function fixture() {
   let granted=true; let providerDown=false; let commitUnknown=false; let calls=0; let deletes=0;
@@ -556,6 +557,91 @@ test('Secret Service verification failure clears a stored token',async()=>{
   assert.equal(stored,undefined);
 });
 
+test('Secret Service load separates an absent item from a failed backend without exposing diagnostics',async()=>{
+  const endpoint='https://secret-test.example.invalid/';
+  for (const [result,code] of [
+    [{ok:false,output:'',missing:true},'UNAUTHENTICATED'],
+    [{ok:false,output:'private provider diagnostic',missing:false},'KEYCHAIN_UNAVAILABLE'],
+    [{ok:true,output:''},'UNAUTHENTICATED']
+  ]) {
+    const run=async(program,args)=>{
+      assert.equal(program,'secret-tool');
+      assert.deepEqual(args,['lookup','service','stateplane','endpoint',endpoint]);
+      return result;
+    };
+    await assert.rejects(loadSecretServiceToken(endpoint,run),{code});
+  }
+  assert.equal(await loadSecretServiceToken(endpoint,async()=>({ok:true,output:'token\n'})),'token');
+});
+
+test('OS secret load reports backend failure consistently and missing macOS items as unauthenticated',async()=>{
+  const endpoint='https://secret-test.example.invalid/';
+  await assert.rejects(loadOsSecretToken(endpoint,'win32',async()=>{
+    throw new Error('unsupported OS invoked a store');
+  }),{code:'KEYCHAIN_UNAVAILABLE'});
+  for (const [result,code] of [
+    [{ok:false,output:'',missing:false},'KEYCHAIN_UNAVAILABLE'],
+    [{ok:false,output:'',missing:true},'UNAUTHENTICATED']
+  ]) await assert.rejects(loadOsSecretToken(endpoint,'darwin',async(program,args)=>{
+    assert.equal(program,'/usr/bin/swift');
+    assert.deepEqual(args.slice(-2),['load',`stateplane:${endpoint}`]);
+    return result;
+  }),{code});
+});
+
+test('projection polling returns a deleted revision while record content remains hidden',async()=>{
+  const scope={spaceId:'sp_a',collectionId:'entries',principalId:'owner',credentialId:'writer',
+    capability:'records:read',policyVersion:1,placementGeneration:1};
+  const client={query:async sql=>{
+    if (sql.includes('JOIN projection_outbox')) return {rows:sql.includes('NOT r.tombstone')?[]:[
+      {revision:2,generation:1,delivery_state:'pending'}]};
+    if (sql.includes('FROM records')) return {rows:[]};
+    throw new Error('unexpected SQL');
+  }};
+  const transaction=new AuthorityTransaction(client,scope,3600);
+  assert.equal(await transaction.getRecord('deleted'),null);
+  assert.deepEqual(await transaction.projection('deleted'),{state:'pending',generation:1,revision:2});
+  const denied=new AuthorityTransaction(client,{...scope,capability:'records:write'},3600);
+  await assert.rejects(denied.projection('deleted'),{code:'FORBIDDEN'});
+});
+
+test('CLI batch recovery preserves whitespace-bearing HTTP manifest item bytes',async t=>{
+  const state=fixture();
+  const item=' { "operation" : "create", "data": {"label":"one"} } ';
+  const manifest=[item];
+  let accepted;
+  state.services.batches.ingest=async(_actor,_space,_collection,operationKey,serialized)=>{
+    const items=JSON.parse(serialized);
+    const digest=JSON.stringify(items);
+    if (accepted && accepted!==digest) throw Object.assign(new Error('different manifest'),{code:'BATCH_CONFLICT'});
+    const replayed=accepted!==undefined;
+    accepted=digest;
+    return {operationKey,state:'active',items:[],replayed};
+  };
+  const {server,endpoint}=await serve(createHttpHandler(state));
+  t.after(()=>server.close());
+  const root=await mkdtemp(join(tmpdir(),'stateplane-cli-batch-replay-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  const file=join(root,'items.ndjson');
+  await writeFile(file,`${item}\n`);
+  const direct=await fetch(`${endpoint}v1/spaces/sp_a/collections/entries/batches/recover`,{
+    method:'PUT',headers:{Authorization:'Bearer secret-test-token','Content-Type':'application/json'},
+    body:JSON.stringify(manifest)});
+  assert.equal(direct.status,200);
+  assert.equal((await cliProcess(root,['config','endpoint','--url',endpoint])).status,0);
+  assert.equal((await cliProcess(root,['auth','import','--token-stdin','--store','file'],
+    'secret-test-token\n')).status,0);
+  const retry=await cliProcess(root,['batches','ingest','--space','sp_a','--collection','entries',
+    '--operation-key','recover','--file',file]);
+  assert.equal(retry.status,0,retry.stderr);
+  assert.equal(accepted,JSON.stringify(manifest));
+  await writeFile(file,' {bad json}\n');
+  const malformed=await cliProcess(root,['batches','ingest','--space','sp_a','--collection','entries',
+    '--operation-key','recover','--file',file]);
+  assert.equal(JSON.parse(malformed.stderr).error.code,'INVALID_ARGUMENT');
+  assert.equal(accepted,JSON.stringify(manifest));
+});
+
 test('GET honors Retry-After; writes never auto-retry after an uncertain outcome',async()=>{
   let calls=0;const client=new StateplaneHttpClient({endpoint:'http://127.0.0.1/',token:'secret',
     fetch:async()=>{calls++;if(calls===1)return Response.json({error:{code:'BACKPRESSURE',requestId:'r1'}},
@@ -623,6 +709,12 @@ test('macOS Keychain stores and reloads a token without passing it as a process 
       await removeToken({endpoint,tokenStore:'keychain'});
       await rm(root,{recursive:true,force:true});
     }
+  });
+
+test('macOS Keychain reports a missing item as unauthenticated',
+  {skip:platform()!=='darwin'},async()=>{
+    await assert.rejects(loadToken({endpoint:`https://missing-${randomUUID()}.example.invalid/`,
+      tokenStore:'keychain'}),{code:'UNAUTHENTICATED'});
   });
 
 test('HTTP and CLI selected-space retries deny metadata when owner access is revoked during the directory lock wait',async t=>{
