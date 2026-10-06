@@ -1,0 +1,22 @@
+docs/http-cli.md
+  h_a39f9495f9ec1d 156-163
+packages/cli/src/config.ts
+  h_a39f9495f9ec1d 173-181
+scripts/migrate.mjs
+  h_a39f9495f9ec1d 35-36,82-102
+test/http-cli.test.js
+  h_a39f9495f9ec1d 5,773-797,825-839
+test/integration/event-feed-upgrade.test.js
+  h_a39f9495f9ec1d 1-79
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "eb5c6ddbdad4d47434ac9d95254086d38a00a317",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
