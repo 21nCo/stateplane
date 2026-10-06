@@ -84,7 +84,11 @@ directory. A process-only alternative is `STATEPLANE_TOKEN`; it overrides the
 stored credential and is never written to the config. Avoid putting secrets
 in command arguments. `stateplane config show` exports only endpoint, selected
 space and storage kind. `stateplane auth logout` removes the selected stored
-credential.
+credential. Changing the configured endpoint clears the selected space and
+stored credential; select a space for the new endpoint before issuing a
+space-scoped command. Setting the same endpoint again retains the selection.
+Logout can be retried after an interrupted cleanup when a Keychain item is
+already absent.
 
 Every `spaces create` request supplies a caller-generated `sp_<UUID>` ID.
 Retain it before sending the request. If the response is lost, repeat the

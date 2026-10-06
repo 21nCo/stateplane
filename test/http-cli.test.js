@@ -166,14 +166,41 @@ test('HTTP and installed CLI observe the same receipt; revocation and cursor err
   state.recoverProvider();
   const changed=await cli(['config','endpoint','--url','http://127.0.0.1:43210/']);
   assert.equal(changed.status,0);
+  assert.equal(JSON.parse(changed.stdout).space,null);
   await assert.rejects(readFile(join(cliRoot,'token'),'utf8'),{code:'ENOENT'});
-  assert.equal(JSON.parse((await cli(['config','show'])).stdout).tokenStore,null);
+  assert.deepEqual(JSON.parse((await cli(['config','show'])).stdout),
+    {endpoint:'http://127.0.0.1:43210/',space:null,tokenStore:null});
   assert.equal((await cli(['config','endpoint','--url',endpoint])).status,0);
   const invalid=await cliProcess(cliRoot,['auth','login','--token-stdin','--store','file'],'bad-secret\n');
   const invalidHttp=await fetch(endpoint+'v1/auth/session',{headers:{Authorization:'Bearer bad-secret'}});
   assertErrorParity(await invalidHttp.json(),invalid);
   assert.doesNotMatch(invalid.stderr,/bad-secret/);
   await assert.rejects(readFile(join(cliRoot,'token'),'utf8'),{code:'ENOENT'});
+});
+
+test('endpoint changes clear saved space while same-endpoint configuration retains it',async t=>{
+  const {server,endpoint}=await serve(createHttpHandler(fixture()));
+  t.after(()=>server.close());
+  const other=await serve(createHttpHandler(fixture()));
+  t.after(()=>other.server.close());
+  const root=await mkdtemp(join(tmpdir(),'stateplane-cli-endpoint-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  const cli=argv=>cliProcess(root,argv);
+  assert.equal((await cli(['config','endpoint','--url',endpoint])).status,0);
+  assert.equal((await cli(['spaces','select','--space','sp_old'])).status,0);
+  assert.equal(JSON.parse((await cli(['config','endpoint','--url',endpoint])).stdout).space,'sp_old');
+  const switched=await cli(['config','endpoint','--url',other.endpoint]);
+  assert.equal(switched.status,0,switched.stderr);
+  assert.deepEqual(JSON.parse((await cli(['config','show'])).stdout),
+    {endpoint:other.endpoint,space:null,tokenStore:null});
+  const login=await cliProcess(root,['auth','login','--token-stdin','--store','file'],'secret-test-token\n');
+  assert.equal(login.status,0,login.stderr);
+  const withoutSpace=await cli(['records','get','--collection','entries','--id','rec_1']);
+  assert.equal(JSON.parse(withoutSpace.stderr).error.code,'INVALID_ARGUMENT');
+  const explicit=await cli(['records','get','--space','sp_new','--collection','entries','--id','rec_1']);
+  assert.equal(explicit.status,0,explicit.stderr);
+  assert.equal(JSON.parse(explicit.stdout).ref.id,'rec_1');
+  assert.equal(JSON.parse((await cli(['config','show'])).stdout).space,null);
 });
 
 test('HTTP and CLI address encoded collection, record, batch and external-key selectors',async t=>{
@@ -579,8 +606,20 @@ test('macOS Keychain stores and reloads a token without passing it as a process 
   {skip:platform()!=='darwin'},async()=>{
     const endpoint=`https://keychain-${randomUUID()}.example.invalid/`;
     const token=`token-${randomUUID()}`;
+    const root=await mkdtemp(join(tmpdir(),'stateplane-cli-keychain-'));
     try {
       await saveToken(endpoint,token,'keychain');
       assert.equal(await loadToken({endpoint,tokenStore:'keychain'}),token);
-    } finally { await removeToken({endpoint,tokenStore:'keychain'}); }
+      await removeToken({endpoint,tokenStore:'keychain'});
+      await removeToken({endpoint,tokenStore:'keychain'});
+      // Simulate a config save failure after the first deletion, then retry logout.
+      await writeFile(join(root,'config.json'),JSON.stringify({endpoint,tokenStore:'keychain'}),{mode:0o600});
+      const logout=await cliProcess(root,['auth','logout']);
+      assert.equal(logout.status,0,logout.stderr);
+      assert.deepEqual(JSON.parse(logout.stdout),{configured:false});
+      assert.equal(JSON.parse(await readFile(join(root,'config.json'),'utf8')).tokenStore,undefined);
+    } finally {
+      await removeToken({endpoint,tokenStore:'keychain'});
+      await rm(root,{recursive:true,force:true});
+    }
   });

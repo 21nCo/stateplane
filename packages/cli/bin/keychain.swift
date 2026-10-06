@@ -30,5 +30,6 @@ if operation == "store" {
     let token = result as? Data else { exit(1) }
   FileHandle.standardOutput.write(token)
 } else if operation == "remove" {
-  guard SecItemDelete(query as CFDictionary) == errSecSuccess else { exit(1) }
+  let status = SecItemDelete(query as CFDictionary)
+  guard status == errSecSuccess || status == errSecItemNotFound else { exit(1) }
 } else { exit(1) }

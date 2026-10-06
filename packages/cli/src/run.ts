@@ -126,10 +126,12 @@ export async function runCli(argv:string[]):Promise<number> {
     const config=await readConfig();
     if (resource==='config' && action==='endpoint') {
       const value=endpoint(required(flags,'url'));
-      if (config.endpoint && config.endpoint!==value && config.tokenStore) await removeToken(config);
+      const changed=config.endpoint!==value;
+      if (config.endpoint && changed && config.tokenStore) await removeToken(config);
       await saveConfig({...config,endpoint:value,
-        tokenStore:config.endpoint===value?config.tokenStore:undefined});
-      output({endpoint:value,space:config.space??null}); return 0;
+        space:changed?undefined:config.space,
+        tokenStore:changed?undefined:config.tokenStore});
+      output({endpoint:value,space:changed?null:config.space??null}); return 0;
     }
     if (resource==='config' && action==='show') {
       output({endpoint:config.endpoint??null,space:config.space??null,tokenStore:config.tokenStore??null}); return 0;
