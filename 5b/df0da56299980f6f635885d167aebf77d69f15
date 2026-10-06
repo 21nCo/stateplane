@@ -1,0 +1,19 @@
+docs/exact-queries-bulk.md
+  h_a39f9495f9ec1d 9
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 284,597-601,603-604,978,1709,1713,1774-1775
+  h_a39f9495f9ec1d 1059,1708,1742,1830,1837,1856,1863
+packages/postgres/src/cell-policy.ts
+  h_a39f9495f9ec1d 191,273
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5bdf0da56299980f6f635885d167aebf77d69f15",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
