@@ -13,7 +13,7 @@
     "test": "pnpm test:contracts && pnpm test:qualification",
     "topology:validate": "node scripts/topology.mjs validate",
     "topology:dry-run": "node scripts/topology-dry-run.mjs",
-    "test:contracts": "node --test test/*.test.js",
+    "test:contracts": "pnpm --filter @stateplane/postgres... build && node --test test/*.test.js",
     "test:provider": "node --test test/connected/*.test.js",
     "test:qualification": "pnpm --filter @stateplane/contracts build && pnpm --filter @stateplane/read-model build && vitest run test/qualification.test.ts test/qualification-worker.test.ts test/qualification-worker-postgres.test.ts test/operational-worker.test.ts && node scripts/qualify-exports.mjs",
     "test:consumer": "node scripts/test-consumer.mjs",
