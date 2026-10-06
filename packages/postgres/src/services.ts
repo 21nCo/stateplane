@@ -65,8 +65,24 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
     batches: {
       ingest:(actor,spaceId,collectionId,key,serialized,retryFailed)=>admitted(actor,spaceId,collectionId,'records:write',
         (cell,scope,recheck)=>authority(cell,recheck).ingestSerializedBatch(scope,key,serialized,retryFailed)),
-      progress:(actor,spaceId,collectionId,key)=>admitted(actor,spaceId,collectionId,'records:read',
-        (cell,scope,recheck)=>authority(cell,recheck).batchProgress(scope,key)),
+      progress:async(actor,spaceId,collectionId,key)=>{
+        // Progress is also the recovery path for a write-only ingester. Try
+        // each admitted capability through its own transaction and final
+        // credential check; never turn a provider failure into a fallback.
+        let reachedFinalCheck=false;
+        try {
+          return await admitted(actor,spaceId,collectionId,'records:read',
+            (cell,scope,recheck)=>authority(cell,async(db,result)=>{
+              reachedFinalCheck=true;
+              await recheck(db,result);
+            }).batchProgress(scope,key));
+        } catch(error) {
+          if (actor.kind!=='api-key' || reachedFinalCheck ||
+            !(error instanceof AuthorityError) || error.code!=='FORBIDDEN') throw error;
+          return admitted(actor,spaceId,collectionId,'records:write',
+            (cell,scope,recheck)=>authority(cell,recheck).batchProgress(scope,key));
+        }
+      },
       cancel:(actor,spaceId,collectionId,key)=>admitted(actor,spaceId,collectionId,'records:write',
         (cell,scope,recheck)=>authority(cell,recheck).cancelBatch(scope,key))
     },

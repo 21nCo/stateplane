@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { mkdtemp, rm, readFile, stat } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -117,6 +117,11 @@ test('HTTP and installed CLI observe the same receipt; revocation and cursor err
   assert.equal(state.calls,1);
   const mistyped=await cli(['spaces','delete','--spcae','sp_intended']);
   assert.equal(JSON.parse(mistyped.stderr).error.code,'INVALID_ARGUMENT');
+  for (const flag of ['--verbose','--debug']) {
+    const rejected=await cli(['spaces','delete',flag]);
+    assert.equal(JSON.parse(rejected.stderr).error.code,'INVALID_ARGUMENT');
+    assert.doesNotMatch(rejected.stderr,/secret-test-token/);
+  }
   assert.equal(state.deletes,0);
   const result=await cli(['records','create','--collection','entries','--data','{"label":"A"}',
     '--idempotency-key','req-a']);
@@ -217,6 +222,78 @@ test('HTTP and CLI address encoded collection, record, batch and external-key se
     assert.equal(result.status,0,result.stderr);
     assert.deepEqual(JSON.parse(result.stdout),expected,args.join(' '));
   }
+});
+
+test('CLI sends schema preconditions on every record mutation',async t=>{
+  const state=fixture();let effects=0;
+  state.services.records.mutate=async(_actor,_space,_collection,serialized)=>{
+    const request=JSON.parse(serialized);
+    if (request.expectedSchemaVersion!==2)
+      throw Object.assign(new Error('schema changed'),{code:'SCHEMA_CONFLICT'});
+    effects++;
+    return {schemaVersion:2,operation:request.operation};
+  };
+  const {server,endpoint}=await serve(createHttpHandler(state));
+  t.after(()=>server.close());
+  const root=await mkdtemp(join(tmpdir(),'stateplane-cli-schema-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  const cli=argv=>cliProcess(root,argv);
+  assert.equal((await cli(['config','endpoint','--url',endpoint])).status,0);
+  assert.equal((await cliProcess(root,['auth','import','--token-stdin','--store','file'],
+    'secret-test-token\n')).status,0);
+  assert.equal((await cli(['spaces','select','--space','sp_a'])).status,0);
+  const route='/v1/spaces/sp_a/collections/entries/records';
+  for (const [operation,args,fields] of [
+    ['create',['--data','{"label":"A"}'],{data:{label:'A'}}],
+    ['replace',['--id','rec_1','--expected-revision','1','--data','{"label":"B"}'],
+      {id:'rec_1',expectedRevision:1,data:{label:'B'}}],
+    ['patch',['--id','rec_1','--expected-revision','1','--data','{"set":{"label":"B"},"unset":[]}'],
+      {id:'rec_1',expectedRevision:1,set:{label:'B'},unset:[]}],
+    ['delete',['--id','rec_1','--expected-revision','1'],{id:'rec_1',expectedRevision:1}]
+  ]) {
+    const key=`schema-${operation}`;
+    const request={operation,idempotencyKey:key,expectedSchemaVersion:1,...fields};
+    const http=await fetch(new URL(route,endpoint),{method:'POST',
+      headers:{Authorization:'Bearer secret-test-token','Content-Type':'application/json'},body:JSON.stringify(request)});
+    const stale=await cli(['records',operation,'--collection','entries','--idempotency-key',key,
+      '--expected-schema-version','1',...args]);
+    assertErrorParity(await http.json(),stale);
+    assert.equal(JSON.parse(stale.stderr).error.code,'SCHEMA_CONFLICT');
+    const fresh=await cli(['records',operation,'--collection','entries','--idempotency-key',key,
+      '--expected-schema-version','2',...args]);
+    assert.equal(fresh.status,0,fresh.stderr);
+    assert.deepEqual(JSON.parse(fresh.stdout),{schemaVersion:2,operation});
+  }
+  assert.equal(effects,4);
+});
+
+test('CLI rejects a batch whose escaped HTTP envelope exceeds the server budget',async t=>{
+  const state=fixture();let ingests=0;
+  state.services.batches.ingest=async()=>{ingests++;return {state:'active',items:[]};};
+  const {server,endpoint}=await serve(createHttpHandler(state));
+  t.after(()=>server.close());
+  const root=await mkdtemp(join(tmpdir(),'stateplane-cli-envelope-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  const file=join(root,'items.ndjson');
+  const item=JSON.stringify({operation:'create',data:{label:'"'.repeat(500_000)}});
+  await writeFile(file,`${item}\n${item}\n`);
+  assert.ok(Buffer.byteLength(item)<1_048_576);
+  assert.ok(Buffer.byteLength(JSON.stringify([item,item]))>3_145_728);
+  const cli=argv=>cliProcess(root,argv);
+  assert.equal((await cli(['config','endpoint','--url',endpoint])).status,0);
+  assert.equal((await cliProcess(root,['auth','import','--token-stdin','--store','file'],
+    'secret-test-token\n')).status,0);
+  assert.equal((await cli(['spaces','select','--space','sp_a'])).status,0);
+  const oversized=await cli(['batches','ingest','--collection','entries','--operation-key','dense',
+    '--file',file]);
+  assert.equal(oversized.status,1);
+  assert.deepEqual(JSON.parse(oversized.stderr).error,
+    {code:'RATE_LIMITED',message:'RATE_LIMITED',retryable:false,requestId:null});
+  assert.equal(ingests,0);
+  await writeFile(file,'{"operation":"create","data":{"label":"small"}}\n');
+  assert.equal((await cli(['batches','ingest','--collection','entries','--operation-key','small',
+    '--file',file])).status,0);
+  assert.equal(ingests,1);
 });
 
 test('GET honors Retry-After; writes never auto-retry after an uncertain outcome',async()=>{

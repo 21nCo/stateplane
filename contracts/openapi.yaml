@@ -55,7 +55,7 @@ paths:
       responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
     patch:
       operationId: updateSpaceLifecycle
-      requestBody: { $ref: '#/components/requestBodies/Json' }
+      requestBody: { $ref: '#/components/requestBodies/SpaceLifecycle' }
       responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
     delete:
       operationId: deleteSpace
@@ -72,12 +72,12 @@ paths:
       responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
     put:
       operationId: defineCollection
-      requestBody: { $ref: '#/components/requestBodies/Json' }
+      requestBody: { $ref: '#/components/requestBodies/CollectionDefinition' }
       responses: { '201': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
     patch:
       operationId: reviseCollection
       parameters: [ { name: If-Match, in: header, required: true, schema: { type: integer, minimum: 1 } } ]
-      requestBody: { $ref: '#/components/requestBodies/Json' }
+      requestBody: { $ref: '#/components/requestBodies/CollectionDefinition' }
       responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
   /v1/spaces/{spaceId}/collections/{collectionId}/records:
     parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
@@ -152,6 +152,77 @@ paths:
       responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
 components:
   schemas:
+    SpaceLifecycle:
+      type: object
+      required: [lifecycle]
+      additionalProperties: false
+      properties:
+        lifecycle: { enum: [active, readOnly, suspended] }
+    SchemaNode:
+      type: object
+      required: [type]
+      additionalProperties: false
+      properties:
+        $schema: { type: string }
+        type:
+          oneOf:
+            - { enum: [string, integer, number, boolean, object, array] }
+            - { type: array, minItems: 2, maxItems: 2, items: { enum: [string, integer, number, boolean, 'null'] } }
+        properties: { type: object, additionalProperties: { $ref: '#/components/schemas/SchemaNode' } }
+        required: { type: array, items: { type: string } }
+        additionalProperties: { const: false }
+        items: { $ref: '#/components/schemas/SchemaNode' }
+        minItems: { type: integer, minimum: 0 }
+        maxItems: { type: integer, minimum: 0 }
+        minLength: { type: integer, minimum: 0 }
+        maxLength: { type: integer, minimum: 0 }
+        minimum: { type: number }
+        maximum: { type: number }
+        enum: { type: array, minItems: 1 }
+        format: { const: date-time }
+        description: { type: string }
+      description: >-
+        The authority further checks node-kind restrictions, nullable scalar
+        unions, depth, field count, bounds, and enum members.
+    SchemaRoot:
+      allOf:
+        - { $ref: '#/components/schemas/SchemaNode' }
+        - type: object
+          required: [$schema, type, additionalProperties]
+          properties:
+            $schema: { const: 'https://json-schema.org/draft/2020-12/schema' }
+            type: { const: object }
+            additionalProperties: { const: false }
+    CollectionDefinition:
+      type: object
+      required: [slug, version, schema, unique, filterable, sortable]
+      additionalProperties: false
+      properties:
+        slug: { type: string, minLength: 1 }
+        version: { type: integer, minimum: 1 }
+        schema: { $ref: '#/components/schemas/SchemaRoot' }
+        unique:
+          type: array
+          items:
+            type: object
+            required: [name, paths]
+            additionalProperties: false
+            properties:
+              name: { type: string, minLength: 1 }
+              paths: { type: array, minItems: 1, items: { type: string } }
+        filterable: { type: array, items: { type: string } }
+        sortable: { type: array, items: { type: string } }
+        lifecycle:
+          type: object
+          required: [field, initial, transitions]
+          additionalProperties: false
+          properties:
+            field: { type: string }
+            initial: { type: array, items: { type: string } }
+            transitions: { type: object, additionalProperties: { type: array, items: { type: string } } }
+      description: >-
+        Define requires version 1 and a slug matching the path. Revise requires
+        the next compatible version and the current version in If-Match.
     RecordMutation:
       type: object
       required: [operation, idempotencyKey]
@@ -231,10 +302,14 @@ components:
     collectionId: { name: collectionId, in: path, required: true, schema: { type: string } }
     recordId: { name: recordId, in: path, required: true, schema: { type: string } }
   requestBodies:
-    Json:
+    SpaceLifecycle:
       required: true
       content:
-        application/json: { schema: {} }
+        application/json: { schema: { $ref: '#/components/schemas/SpaceLifecycle' } }
+    CollectionDefinition:
+      required: true
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/CollectionDefinition' } }
   responses:
     Receipt:
       description: Canonical committed or replayed authority receipt

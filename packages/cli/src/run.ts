@@ -6,7 +6,7 @@ type Flags=Record<string,string|boolean>;
 const encoded=(value:string)=>value==='.' || value==='..' ? `;${value}` : encodeURIComponent(value);
 function parse(argv:string[]):{words:string[];flags:Flags} {
   const words:string[]=[]; const flags:Flags={};
-  const switches=new Set(['retry-failed','json','token-stdin','help','verbose','debug']);
+  const switches=new Set(['retry-failed','json','token-stdin','help']);
   for (let i=0;i<argv.length;i++) {
     const item=argv[i];
     if (!item.startsWith('--')) { words.push(item); continue; }
@@ -21,7 +21,7 @@ function parse(argv:string[]):{words:string[];flags:Flags} {
   }
   return {words,flags};
 }
-const common=['json','verbose','debug'];
+const common=['json'];
 const allowed:Record<string,readonly string[]>={
   'config endpoint':['url'], 'config show':[],
   'auth login':['token-stdin','store','timeout'], 'auth import':['token-stdin','store'], 'auth logout':[],
@@ -34,10 +34,10 @@ const allowed:Record<string,readonly string[]>={
   'records projection':['space','collection','id'],
   'records query':['space','collection','predicates','limit','sort','cursor'],
   'records count':['space','collection','predicates'],
-  'records create':['space','collection','idempotency-key','data','file','key'],
-  'records replace':['space','collection','idempotency-key','id','expected-revision','data','file'],
-  'records patch':['space','collection','idempotency-key','id','expected-revision','data','file'],
-  'records delete':['space','collection','idempotency-key','id','expected-revision'],
+  'records create':['space','collection','idempotency-key','expected-schema-version','data','file','key'],
+  'records replace':['space','collection','idempotency-key','id','expected-revision','expected-schema-version','data','file'],
+  'records patch':['space','collection','idempotency-key','id','expected-revision','expected-schema-version','data','file'],
+  'records delete':['space','collection','idempotency-key','id','expected-revision','expected-schema-version'],
   'batches ingest':['space','collection','operation-key','file','retry-failed'],
   'batches status':['space','collection','operation-key'],
   'batches cancel':['space','collection','operation-key'],
@@ -181,6 +181,8 @@ export async function runCli(argv:string[]):Promise<number> {
         parsed(typeof flags.predicates==='string'?flags.predicates:'[]')));
       else if (['create','replace','patch','delete'].includes(action??'')) {
         const request:Record<string,unknown>={operation:action,idempotencyKey:required(flags,'idempotency-key')};
+        if (flags['expected-schema-version']!==undefined)
+          request.expectedSchemaVersion=integer(required(flags,'expected-schema-version'));
         if (action==='create') {
           request.data=await payload(flags);
           if (flags.key) request.externalKey=required(flags,'key');
@@ -207,6 +209,11 @@ export async function runCli(argv:string[]):Promise<number> {
         const lines=(await input(required(flags,'file'),3_145_728)).split(/\r?\n/).filter(Boolean);
         if (!lines.length || lines.length>20) throw new StateplaneCliError('INVALID_ARGUMENT');
         const manifest=lines.map(line=>JSON.stringify(parsed(line)));
+        const itemBytes=manifest.map(item=>Buffer.byteLength(item));
+        if (itemBytes.some(size=>size>1_048_576) ||
+          itemBytes.reduce((sum,size)=>sum+size,0)>2_097_152 ||
+          Buffer.byteLength(JSON.stringify(manifest))>3_145_728)
+          throw new StateplaneCliError('RATE_LIMITED',undefined,undefined,false);
         output(await client.request('PUT',url+(flags['retry-failed']?'?retryFailed=true':''),manifest));
       } else if (action==='status') output(await client.request('GET',url));
       else if (action==='cancel') output(await client.request('DELETE',url));

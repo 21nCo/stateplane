@@ -65,7 +65,8 @@ stateplane spaces create --space sp_123e4567-e89b-42d3-a456-426614174000
 stateplane spaces select --space sp_123e4567-e89b-42d3-a456-426614174000
 stateplane collections list
 stateplane records create --collection entries --key ' item-1 ' \
-  --data '{"label":"Item 1","state":"open"}' --idempotency-key req-a
+  --data '{"label":"Item 1","state":"open"}' --idempotency-key req-a \
+  --expected-schema-version 1
 ```
 
 `keychain` is the default. On macOS, it uses Keychain; on Linux, it uses Secret
@@ -92,7 +93,10 @@ pending provisioning returns `RECEIPT_PENDING`. For schema define/revise
 and lifecycle changes, `COMMIT_OUTCOME_UNKNOWN` means read back the selected
 space or collection before deciding whether another change is needed.
 Unknown or misplaced CLI flags are rejected before a saved space can be used
-for an effect.
+for an effect. `--expected-schema-version` is available on create, replace,
+patch and delete; use it to reject a write after an incompatible schema
+revision. The CLI accepts `--json` for scripts and always emits JSON. It does
+not accept `--verbose` or `--debug`, so those flags cannot expose credentials.
 
 ## Queries, ingestion and recovery
 
@@ -107,7 +111,9 @@ stateplane batches status --collection entries --operation-key import-1
 An ingestion file or `--file -` stream is NDJSON with one record request per
 line, omitting `idempotencyKey`; the authority derives stable item keys. The
 manifest is limited to 20 items and 2 MiB of serialized item bytes by the
-authority. Retry the unchanged file and operation key to resume pending
+authority. The HTTP JSON string-array envelope must also fit 3 MiB after
+escaping; the CLI checks both byte budgets before sending and reports an
+oversize input as a nonretryable `RATE_LIMITED` error. Retry the unchanged file and operation key to resume pending
 items; use `--retry-failed` only when intentionally retrying failed items.
 After a timeout or `OUTCOME_UNKNOWN`, first read batch status. A standalone
 write is never retried automatically. Resubmit the **identical** record body

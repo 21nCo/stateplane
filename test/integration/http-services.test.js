@@ -115,6 +115,24 @@ test('real Postgres HTTP operations preserve receipts, grant checks, events and 
   assert.equal((await route('POST',`${base}/records`,keyWrite,'fixture-agent-key')).status,200);
   assert.equal((await route('PUT',`${base}/batches/agent-import`,
     [JSON.stringify({operation:'create',data:{label:'Agent batch'}})],'fixture-agent-key')).status,200);
+  const writeOnlyManifest=[JSON.stringify({operation:'create',data:{label:'Write only batch'}})];
+  await pool.query(`UPDATE collection_grants SET capabilities=ARRAY['records:write']::text[]
+    WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[space.spaceId,collection,agent.credentialId]);
+  assert.equal((await route('PUT',`${base}/batches/write-only`,writeOnlyManifest,'fixture-agent-key')).status,200);
+  const writeOnlyProgress=await route('GET',`${base}/batches/write-only`,undefined,'fixture-agent-key');
+  assert.equal(writeOnlyProgress.status,200);
+  assert.equal((await writeOnlyProgress.json()).items[0].state,'succeeded');
+  await pool.query(`UPDATE collection_grants SET capabilities=ARRAY[]::text[]
+    WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[space.spaceId,collection,agent.credentialId]);
+  assert.equal((await route('GET',`${base}/batches/write-only`,undefined,'fixture-agent-key')).status,403);
+  await pool.query(`UPDATE collection_grants SET capabilities=ARRAY['records:write']::text[]
+    WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[space.spaceId,collection,agent.credentialId]);
+  const recovered=await route('PUT',`${base}/batches/write-only`,writeOnlyManifest,'fixture-agent-key');
+  assert.equal(recovered.status,200);
+  assert.equal((await recovered.json()).items[0].receipt.receiptId,
+    (await (await route('GET',`${base}/batches/write-only`,undefined,'fixture-agent-key')).json()).items[0].receipt.receiptId);
+  await pool.query(`UPDATE collection_grants SET capabilities=ARRAY['schema:write','records:read','records:write','events:read','space:admin']::text[]
+    WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[space.spaceId,collection,agent.credentialId]);
   for (const [method,path,body] of [
     ['GET',`/v1/spaces/${space.spaceId}`,undefined],['GET',base,undefined],
     ['GET',`${base}/records/${id}`,undefined],['GET',`${base}/batches/agent-import`,undefined],
