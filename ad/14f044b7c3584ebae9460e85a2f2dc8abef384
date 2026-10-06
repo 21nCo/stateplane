@@ -1,0 +1,16 @@
+package.json
+  h_a39f9495f9ec1d 16
+test/batch-resume.test.js
+  h_a39f9495f9ec1d 11-42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ad14f044b7c3584ebae9460e85a2f2dc8abef384",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
