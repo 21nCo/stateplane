@@ -1983,6 +1983,37 @@ test('durable batch checkpoint resumes partial success, rejects changed retries 
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM collection_write_slots WHERE space_id=$1',[writer.spaceId])).rows[0].n,0);
 });
 
+test('batch retries advance past a settled prefix under a bounded request budget',async()=>{
+  for (const serialized of [false,true]) {
+    const {writer}=await fixture();
+    const key=`prefix-${randomUUID()}`;
+    const requests=Array.from({length:4},(_,i)=>JSON.stringify({operation:'create',data:{label:`prefix-${key}-${i}`}}));
+    const digest=createHash('sha256').update(JSON.stringify(requests)).digest('hex');
+    await authority.transaction(writer,tx=>tx.startBatch(key,digest,requests));
+    for (let ordinal=0;ordinal<3;ordinal++)
+      await authority.transaction(writer,tx=>tx.processBatchItem(key,ordinal,false));
+    const before=await authority.batchProgress(writer,key);
+    const ingest=new PostgresAuthority(pool,3600,undefined,1200);
+    const transaction=ingest.transaction.bind(ingest);
+    ingest.transaction=(scope,callback,deadline)=>transaction(scope,tx=>{
+      const process=tx.processBatchItem.bind(tx);
+      tx.processBatchItem=async (...args)=>{
+        if (args[1]<3) await new Promise(resolve=>setTimeout(resolve,500));
+        return process(...args);
+      };
+      return callback(tx);
+    },deadline);
+    const progress=serialized
+      ? await ingest.ingestSerializedBatch(writer,key,JSON.stringify(requests))
+      : await ingest.ingestBatch(writer,key,requests);
+    assert.deepEqual(progress.items.map(item=>item.state),Array(4).fill('succeeded'));
+    assert.deepEqual(progress.items.slice(0,3).map(item=>item.receipt.receiptId),
+      before.items.slice(0,3).map(item=>item.receipt.receiptId));
+    assert.deepEqual(progress.items.map(item=>item.attempts),Array(4).fill(1));
+    assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),4);
+  }
+});
+
 test('caller-selected keys cannot preseed batch item receipts or block their retries',async()=>{
   for (const matching of [true,false]) {
     const {writer}=await fixture();

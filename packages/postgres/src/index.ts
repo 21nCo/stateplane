@@ -815,9 +815,11 @@ export class PostgresAuthority {
   private async ingestBatchUsing(scope:AuthorityScope,operationKey:string,requests:readonly string[],retryFailed:boolean,deadline:number):Promise<BatchProgress> {
     const fixed=snapshotBatchManifest(operationKey,requests,retryFailed);
     const digest=createHash('sha256').update(JSON.stringify(fixed)).digest('hex');
-    await this.transaction(scope,tx=>tx.startBatch(operationKey,digest,fixed),deadline);
+    // A retry must spend its request budget on durable eligible items, not on
+    // one transaction per already settled item in the manifest prefix.
+    const eligible=await this.transaction(scope,tx=>tx.startBatch(operationKey,digest,fixed,retryFailed),deadline);
     let stoppedForDeadline=false;
-    for (let ordinal=0;ordinal<fixed.length;ordinal++) {
+    for (const ordinal of eligible) {
       const remaining=deadline-Date.now();
       if (remaining<=0) { stoppedForDeadline=true; break; }
       if (await this.processBatchOrdinal(scope,operationKey,ordinal,retryFailed,remaining,deadline)==='cancelled') break;
@@ -975,7 +977,7 @@ export class AuthorityTransaction {
   }
 
   /** Commit the manifest before item work; reject reuse with different bytes. */
-  startBatch(operationKey:string,digest:string,requests:readonly string[]):Promise<void> {
+  startBatch(operationKey:string,digest:string,requests:readonly string[],retryFailed=false):Promise<number[]> {
     return this.admitOperation(async()=>{
       const key=this.batchKey(operationKey);
       this.limitBatchTime(15_000);
@@ -992,6 +994,10 @@ export class AuthorityTransaction {
           SELECT $1,$2,$3,$4,item.ordinal-1,item.request_text
           FROM unnest($5::text[]) WITH ORDINALITY AS item(request_text,ordinal)
           ON CONFLICT DO NOTHING`,[...key,requests]);
+        const eligible=await this.query(`SELECT ordinal FROM batch_items
+          WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 AND operation_key=$4
+            AND (state='pending' OR ($5::boolean AND state='failed')) ORDER BY ordinal`,[...key,retryFailed]);
+        return eligible.rows.map(item=>Number(item.ordinal));
       } catch(error) {
         if ((error as {code?:string}).code==='55P03') throw new AuthorityError('BACKPRESSURE');
         throw error;
