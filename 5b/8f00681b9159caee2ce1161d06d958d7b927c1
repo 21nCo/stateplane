@@ -1,0 +1,32 @@
+app/src/routes/v1/[...path]/+server.ts
+  h_a39f9495f9ec1d 8,14-18,25,27,54-69
+docs/http-cli.md
+  h_a39f9495f9ec1d 95-99
+packages/cli/src/config.ts
+  h_a39f9495f9ec1d 2,20-57
+packages/cli/src/run.ts
+  h_a39f9495f9ec1d 2,129-138,150-154,157-160,165-166
+packages/postgres/src/collections.ts
+  h_a39f9495f9ec1d 69-72
+scripts/migrate.mjs
+  h_a39f9495f9ec1d 82,102,119-125
+test/http-cli.test.js
+  h_a39f9495f9ec1d 15,83-94,222-250,959-1004
+test/integration/event-feed-upgrade.test.js
+  h_a39f9495f9ec1d 4-5,20,30,58-92,109-114
+test/integration/http-host-pool.test.js
+  h_a39f9495f9ec1d 1-73
+test/integration/http-services.test.js
+  h_a39f9495f9ec1d 174
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5b8f00681b9159caee2ce1161d06d958d7b927c1",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
