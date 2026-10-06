@@ -1,0 +1,22 @@
+docs/http-cli.md
+  h_a39f9495f9ec1d 88,92-94
+packages/cli/src/config.ts
+  h_a39f9495f9ec1d 8-9,37,40-45,151-174
+packages/cli/src/run.ts
+  h_a39f9495f9ec1d 2,130,133-134,147,150-152
+packages/postgres/src/spaces.ts
+  h_a39f9495f9ec1d 511-513,530-531,533,538-539,557,563,597
+test/http-cli.test.js
+  h_a39f9495f9ec1d 14-15,721-876
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "be884c3a7dfb21651e71bc38669e7ab29e1b7509",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
