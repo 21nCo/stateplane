@@ -31,7 +31,18 @@ paths:
       responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
     post:
       operationId: createSpace
-      requestBody: { $ref: '#/components/requestBodies/Json' }
+      description: Caller supplies a stable sp_ UUID for recovery after a lost response; repeat the same ID and cell selection.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [spaceId]
+              properties:
+                spaceId: { type: string, pattern: '^sp_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' }
+                cellId: { type: string }
       responses: { '201': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
   /v1/spaces/{spaceId}:
     parameters: [ { $ref: '#/components/parameters/spaceId' } ]
@@ -132,6 +143,7 @@ paths:
     parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
     get:
       operationId: listEvents
+      description: Feed positions are assigned after writer commit. Poll nextCursor even after a short or empty page to observe later commits.
       parameters: [ { name: cursor, in: query, schema: { type: string } } ]
       responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
 components:

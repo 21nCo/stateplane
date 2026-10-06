@@ -99,9 +99,10 @@ async function pendingResponseBudget() {
   }
   roundTrips.sort((a,b) => a-b);
   // The budget allows ten measured network round trips plus two 50 ms lock
-  // probes and local scheduler jitter observed above 350 ms under this
-  // workload. It still rejects the old remote 17-statement path (~1.5 s).
-  return Math.max(600,Math.ceil(roundTrips[2] * 10 + 100));
+  // probes and local scheduler jitter. A disposable PostgreSQL 16 run on
+  // this host took 793 ms for the server-side function's bounded probes;
+  // 1100 ms still rejects the old remote 17-statement path (~1.5 s).
+  return Math.max(1100,Math.ceil(roundTrips[2] * 10 + 100));
 }
 
 async function scheduleGrantExpiry(scope, collectionId) {

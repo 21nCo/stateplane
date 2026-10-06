@@ -21,6 +21,36 @@ function parse(argv:string[]):{words:string[];flags:Flags} {
   }
   return {words,flags};
 }
+const common=['json','verbose','debug'];
+const allowed:Record<string,readonly string[]>={
+  'config endpoint':['url'], 'config show':[],
+  'auth login':['token-stdin','store','timeout'], 'auth import':['token-stdin','store'], 'auth logout':[],
+  'spaces select':['space'], 'spaces list':[], 'spaces create':['cell','space'],
+  'spaces get':['space'], 'spaces update':['space','lifecycle'], 'spaces delete':['space'],
+  'collections list':['space'], 'collections get':['space','collection'],
+  'collections define':['space','collection','data','file'],
+  'collections revise':['space','collection','data','file','version'],
+  'records get':['space','collection','id'], 'records key':['space','collection','key','mode'],
+  'records projection':['space','collection','id'],
+  'records query':['space','collection','predicates','limit','sort','cursor'],
+  'records count':['space','collection','predicates'],
+  'records create':['space','collection','idempotency-key','data','file','key'],
+  'records replace':['space','collection','idempotency-key','id','expected-revision','data','file'],
+  'records patch':['space','collection','idempotency-key','id','expected-revision','data','file'],
+  'records delete':['space','collection','idempotency-key','id','expected-revision'],
+  'batches ingest':['space','collection','operation-key','file','retry-failed'],
+  'batches status':['space','collection','operation-key'],
+  'batches cancel':['space','collection','operation-key'],
+  'events list':['space','collection','cursor']
+};
+function validateFlags(resource:string,action:string|undefined,flags:Flags):void {
+  const command=allowed[`${resource} ${action??''}`];
+  if (!command) throw new StateplaneCliError('INVALID_ARGUMENT');
+  const usesHttp=resource!=='config' && resource!=='auth' && !(resource==='spaces' && action==='select');
+  const accepted=new Set([...command,...common,...(usesHttp?['timeout']:[])]);
+  if (Object.keys(flags).some(key=>!accepted.has(key))) throw new StateplaneCliError('INVALID_ARGUMENT');
+  if (flags.timeout!==undefined) integer(required(flags,'timeout'));
+}
 function required(flags:Flags,key:string):string {
   const value=flags[key];
   if (typeof value!=='string' || !value) throw new StateplaneCliError('INVALID_ARGUMENT');
@@ -74,6 +104,7 @@ export async function runCli(argv:string[]):Promise<number> {
     const [resource,action,...rest]=words;
     if (!resource || resource==='help' || flags.help) { help(); return 0; }
     if (rest.length) throw new StateplaneCliError('INVALID_ARGUMENT');
+    validateFlags(resource,action,flags);
     const config=await readConfig();
     if (resource==='config' && action==='endpoint') {
       const value=endpoint(required(flags,'url'));
@@ -90,7 +121,8 @@ export async function runCli(argv:string[]):Promise<number> {
       const store=typeof flags.store==='string'?flags.store:'keychain';
       if (store!=='file' && store!=='keychain') throw new StateplaneCliError('INVALID_ARGUMENT');
       const token=(await input('-',4096)).replace(/\r?\n$/,'');
-      if (action==='login') await new StateplaneHttpClient({endpoint:config.endpoint,token}).request('GET','/v1/auth/session');
+      if (action==='login') await new StateplaneHttpClient({endpoint:config.endpoint,token,
+        timeoutMs:flags.timeout ? integer(required(flags,'timeout')) : undefined}).request('GET','/v1/auth/session');
       await saveToken(config.endpoint,token,store);
       if (config.tokenStore && config.tokenStore!==store) await removeToken(config);
       await saveConfig({...config,tokenStore:store}); output({configured:true,store}); return 0;
@@ -109,7 +141,8 @@ export async function runCli(argv:string[]):Promise<number> {
     const spacePath=space ? `/v1/spaces/${encoded(space)}` : '';
     if (resource==='spaces') {
       if (action==='list') output(await client.request('GET','/v1/spaces'));
-      else if (action==='create') output(await client.request('POST','/v1/spaces',flags.cell ? {cellId:flags.cell}:{}));
+      else if (action==='create') output(await client.request('POST','/v1/spaces',
+        {spaceId:required(flags,'space'),...(flags.cell ? {cellId:flags.cell}:{})}));
       else if (action==='get' && spacePath) output(await client.request('GET',spacePath));
       else if (action==='update' && spacePath) output(await client.request('PATCH',spacePath,{lifecycle:required(flags,'lifecycle')}));
       else if (action==='delete' && spacePath) output(await client.request('DELETE',spacePath));

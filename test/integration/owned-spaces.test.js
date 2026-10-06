@@ -828,7 +828,7 @@ test('interrupted lifecycle publication reconciles and deleted publication retri
     }
     return original(sql,...args);
   };
-  try { await assert.rejects(spaces.archive(actor,created.spaceId),/directory offline/); }
+  try { await assert.rejects(spaces.archive(actor,created.spaceId),{name:'CommitOutcomeUnknownError'}); }
   finally { controlPool.query = original; }
   assert.equal((await spaces.get(actor,created.spaceId)).lifecycle,'active');
   assert.equal((await pool.query('SELECT lifecycle FROM spaces WHERE space_id=$1',[created.spaceId])).rows[0].lifecycle,'readOnly');
@@ -843,7 +843,7 @@ test('interrupted lifecycle publication reconciles and deleted publication retri
     }
     return original(sql,...args);
   };
-  try { await assert.rejects(spaces.update(actor,created.spaceId,'suspended'),/directory offline/); }
+  try { await assert.rejects(spaces.update(actor,created.spaceId,'suspended'),{name:'CommitOutcomeUnknownError'}); }
   finally { controlPool.query = original; }
   await spaces.update(actor,created.spaceId,'suspended');
   assert.equal((await spaces.get(actor,created.spaceId)).lifecycle,'suspended');
@@ -1592,7 +1592,7 @@ test('reconcile preserves confirmed agent grants across interrupted archive publ
   const issued=await spaces.issueAgentKey(actor,spaceId,new Date(Date.now()+3_600_000),
     [{collectionId,capabilities:['records:read']}]);
   publicationOffline=true;
-  await assert.rejects(spaces.archive(actor,spaceId),/publication offline/);
+  await assert.rejects(spaces.archive(actor,spaceId),{name:'CommitOutcomeUnknownError'});
   publicationOffline=false;
   assert.equal((await spaces.reconcile(spaceId)).lifecycle,'readOnly');
   assert.equal(revocations,0);

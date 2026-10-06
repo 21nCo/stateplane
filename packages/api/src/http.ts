@@ -83,9 +83,10 @@ export function createHttpHandler({services,identity}:{services:StateplaneServic
         if (method==='GET') return json(await services.spaces.list(actor));
         if (method==='POST') {
           const value=object(await body(request,4096));
-          if (Object.keys(value).some(k=>k!=='cellId') ||
-            (value.cellId!==undefined && typeof value.cellId!=='string')) fail('INVALID_ARGUMENT');
-          return json(await services.spaces.create(actor,value.cellId as string|undefined),201);
+          if (Object.keys(value).some(k=>!['cellId','spaceId'].includes(k)) ||
+            (value.cellId!==undefined && typeof value.cellId!=='string') ||
+            typeof value.spaceId!=='string' || !/^sp_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value.spaceId)) fail('INVALID_ARGUMENT');
+          return json(await services.spaces.create(actor,value.cellId as string|undefined,value.spaceId as string),201);
         }
       }
       const space=p[1];
@@ -125,7 +126,7 @@ export function createHttpHandler({services,identity}:{services:StateplaneServic
           if (!result) fail('NOT_FOUND');
           return json(result);
         }
-        if (p.length===6 && method==='GET') {
+        if (p.length===6 && method==='GET' && !['query','count','by-key'].includes(p[5])) {
           const result=await services.records.get(...prefix,p[5]);
           if (!result) fail('NOT_FOUND');
           return json(result);

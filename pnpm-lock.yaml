@@ -101,6 +101,12 @@ importers:
       '@stateplane/contracts':
         specifier: workspace:*
         version: link:../packages/contracts
+      '@stateplane/postgres':
+        specifier: workspace:*
+        version: link:../packages/postgres
+      pg:
+        specifier: 8.22.0
+        version: 8.22.0
     devDependencies:
       '@cloudflare/workers-types':
         specifier: 5.20260918.1

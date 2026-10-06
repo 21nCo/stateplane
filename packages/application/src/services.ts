@@ -5,7 +5,7 @@ import type { VerifiedCredential } from '@stateplane/contracts';
 export interface StateplaneServices {
   spaces: {
     list(actor: VerifiedCredential): Promise<unknown>;
-    create(actor: VerifiedCredential, cellId?: string): Promise<unknown>;
+    create(actor: VerifiedCredential, cellId?: string, spaceId?: string): Promise<unknown>;
     get(actor: VerifiedCredential, spaceId: string): Promise<unknown>;
     update(actor: VerifiedCredential, spaceId: string, lifecycle: 'active' | 'readOnly' | 'suspended'): Promise<unknown>;
     delete(actor: VerifiedCredential, spaceId: string): Promise<unknown>;

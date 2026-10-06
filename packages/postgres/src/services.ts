@@ -12,58 +12,59 @@ export interface ServiceCell { pool: Pick<pg.Pool,'connect'>; cursorSecret: Uint
 export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<string,ServiceCell>,
   receiptRetentionSeconds: number): StateplaneServices {
   async function admitted<T>(actor:VerifiedCredential,spaceId:string,collectionId:string|undefined,
-    capability:Capability,run:(pool:ServiceCell,scope:AuthorityScope)=>Promise<T>):Promise<T> {
+    capability:Capability,run:(pool:ServiceCell,scope:AuthorityScope,recheck:()=>Promise<void>)=>Promise<T>):Promise<T> {
     const admitted=await spaces.scope(actor,spaceId,collectionId,capability);
     const cell=cells.get(admitted.cellId);
     if (!cell) throw new AuthorityError('STALE_PLACEMENT');
-    return run(cell,admitted.scope);
+    return run(cell,admitted.scope,()=>spaces.assertCurrent(actor,admitted.ownerPrincipalId));
   }
-  const authority=(cell:ServiceCell)=>new PostgresAuthority(cell.pool,receiptRetentionSeconds,cell.cursorSecret);
+  const authority=(cell:ServiceCell,recheck:()=>Promise<void>)=>
+    new PostgresAuthority(cell.pool,receiptRetentionSeconds,cell.cursorSecret,30_000,recheck);
   return {
     spaces: {
-      list:actor=>spaces.list(actor), create:(actor,cellId)=>spaces.create(actor,cellId),
+      list:actor=>spaces.list(actor), create:(actor,cellId,spaceId)=>spaces.create(actor,cellId,spaceId),
       get:(actor,id)=>spaces.get(actor,id),
-      update:async(actor,id,lifecycle)=>{ await spaces.update(actor,id,lifecycle); return spaces.get(actor,id); },
+      update:(actor,id,lifecycle)=>spaces.update(actor,id,lifecycle),
       delete:async(actor,id)=>{ await spaces.delete(actor,id); return {spaceId:id,deleted:true}; }
     },
     collections: {
-      list:(actor,spaceId,collectionId)=>admitted(actor,spaceId,undefined,'records:read',async(cell,scope)=>{
-        const entries=await new CollectionRegistry(cell.pool).discover(scope);
+      list:(actor,spaceId,collectionId)=>admitted(actor,spaceId,undefined,'records:read',async(cell,scope,recheck)=>{
+        const entries=await new CollectionRegistry(cell.pool,recheck).discover(scope);
         if (collectionId===undefined) return entries;
         const found=entries.find(item=>item.definition.slug===collectionId);
         if (!found) throw new AuthorityError('NOT_FOUND');
         return found;
       }),
       define:(actor,spaceId,collectionId,serialized)=>admitted(actor,spaceId,collectionId,'schema:write',
-        (cell,scope)=>new CollectionRegistry(cell.pool).defineSerialized(scope,serialized)),
+        (cell,scope,recheck)=>new CollectionRegistry(cell.pool,recheck).defineSerialized(scope,serialized)),
       revise:(actor,spaceId,collectionId,version,serialized)=>admitted(actor,spaceId,collectionId,'schema:write',
-        (cell,scope)=>new CollectionRegistry(cell.pool).reviseSerialized(scope,version,serialized))
+        (cell,scope,recheck)=>new CollectionRegistry(cell.pool,recheck).reviseSerialized(scope,version,serialized))
     },
     records: {
       get:(actor,spaceId,collectionId,id)=>admitted(actor,spaceId,collectionId,'records:read',
-        (cell,scope)=>authority(cell).transaction(scope,tx=>tx.getRecord(id))),
+        (cell,scope,recheck)=>authority(cell,recheck).transaction(scope,tx=>tx.getRecord(id))),
       byKey:(actor,spaceId,collectionId,mode,key)=>admitted(actor,spaceId,collectionId,'records:read',
-        (cell,scope)=>authority(cell).transaction(scope,tx=>tx.getByKey(mode,key))),
+        (cell,scope,recheck)=>authority(cell,recheck).transaction(scope,tx=>tx.getByKey(mode,key))),
       mutate:(actor,spaceId,collectionId,serialized)=>admitted(actor,spaceId,collectionId,'records:write',
-        (cell,scope)=>authority(cell).mutateSerializedRequest(scope,serialized)),
+        (cell,scope,recheck)=>authority(cell,recheck).mutateSerializedRequest(scope,serialized)),
       query:(actor,spaceId,collectionId,serialized)=>admitted(actor,spaceId,collectionId,'records:read',
-        (cell,scope)=>authority(cell).transaction(scope,tx=>tx.querySerializedPage(serialized))),
+        (cell,scope,recheck)=>authority(cell,recheck).transaction(scope,tx=>tx.querySerializedPage(serialized))),
       count:(actor,spaceId,collectionId,serialized)=>admitted(actor,spaceId,collectionId,'records:read',
-        (cell,scope)=>authority(cell).transaction(scope,tx=>tx.countSerializedRecords(serialized)))
+        (cell,scope,recheck)=>authority(cell,recheck).transaction(scope,tx=>tx.countSerializedRecords(serialized)))
     },
     batches: {
       ingest:(actor,spaceId,collectionId,key,serialized,retryFailed)=>admitted(actor,spaceId,collectionId,'records:write',
-        (cell,scope)=>authority(cell).ingestSerializedBatch(scope,key,serialized,retryFailed)),
+        (cell,scope,recheck)=>authority(cell,recheck).ingestSerializedBatch(scope,key,serialized,retryFailed)),
       progress:(actor,spaceId,collectionId,key)=>admitted(actor,spaceId,collectionId,'records:read',
-        (cell,scope)=>authority(cell).batchProgress(scope,key)),
+        (cell,scope,recheck)=>authority(cell,recheck).batchProgress(scope,key)),
       cancel:(actor,spaceId,collectionId,key)=>admitted(actor,spaceId,collectionId,'records:write',
-        (cell,scope)=>authority(cell).cancelBatch(scope,key))
+        (cell,scope,recheck)=>authority(cell,recheck).cancelBatch(scope,key))
     },
     events: {
       list:(actor,spaceId,collectionId,cursor)=>admitted(actor,spaceId,collectionId,'events:read',
-        (cell,scope)=>authority(cell).transaction(scope,tx=>tx.events(cursor))),
+        (cell,scope,recheck)=>authority(cell,recheck).transaction(scope,tx=>tx.events(cursor))),
       projection:(actor,spaceId,collectionId,id)=>admitted(actor,spaceId,collectionId,'records:read',
-        (cell,scope)=>authority(cell).transaction(scope,tx=>tx.projection(id)))
+        (cell,scope,recheck)=>authority(cell,recheck).transaction(scope,tx=>tx.projection(id)))
     }
   };
 }

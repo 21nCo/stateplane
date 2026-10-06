@@ -101,8 +101,11 @@ export class AuthorityError extends Error {
 }
 class BatchItemFailure extends AuthorityError {}
 export class CommitOutcomeUnknownError extends Error {
-  /** Require an idempotent retry when COMMIT acknowledgement is ambiguous. */
-  constructor(cause: unknown) { super('Commit outcome unknown; retry with the same idempotency key', { cause }); }
+  /** A missing commit acknowledgement requires operation-specific recovery. */
+  constructor(cause: unknown) {
+    super('Commit outcome unknown; inspect authoritative state before retrying', { cause });
+    this.name='CommitOutcomeUnknownError';
+  }
 }
 
 const MAX_JSON_BYTES = 1_048_576;
@@ -653,7 +656,8 @@ function pageCandidateSql(options:PageCandidateOptions):string {
 export class PostgresAuthority {
   /** Configure the receipt window used by new authority transactions. */
   constructor(private readonly pool: PoolLike, private readonly receiptRetentionSeconds: number,
-    private readonly cursorSecret?: Uint8Array, private readonly requestTimeoutMs = REQUEST_TIMEOUT_MS) {
+    private readonly cursorSecret?: Uint8Array, private readonly requestTimeoutMs = REQUEST_TIMEOUT_MS,
+    private readonly recheckCredential?: () => Promise<void>) {
     if (!isSafeInteger(receiptRetentionSeconds) || receiptRetentionSeconds < 1) throw new RangeError('Invalid receipt retention');
     if (cursorSecret && cursorSecret.byteLength < 32) throw new RangeError('Cursor secret must contain at least 32 bytes');
     if (!isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > REQUEST_TIMEOUT_MS)
@@ -690,6 +694,7 @@ export class PostgresAuthority {
       await tx.checkScope();
       await tx.checkReplayScopes();
       await tx.ensureReceiptsCurrent();
+      await this.recheckCredential?.();
       // A failure while setting the final timeout is before COMMIT dispatch.
       // Only a missing COMMIT acknowledgement has an ambiguous outcome.
       await client.query(`SET LOCAL statement_timeout = '${Math.max(1,deadlineMs-Date.now())}ms'`);
@@ -1146,20 +1151,32 @@ export class AuthorityTransaction {
     return this.admitOperation(async()=>{
       if (this.#scope.capability!=='events:read') throw new AuthorityError('FORBIDDEN');
       if (cursor!==undefined && (!/^evt_[0-9a-f-]{36}$/.test(cursor))) throw new AuthorityError('CURSOR_INVALID');
-      const rows=await this.query(`SELECT event_id,record_id,revision,operation,schema_version,committed_at
-        FROM record_events WHERE space_id=$1 AND collection_id=$2
-          AND ($3::text IS NULL OR (committed_at,event_id)>(
-            SELECT committed_at,event_id FROM record_events WHERE event_id=$3 AND space_id=$1 AND collection_id=$2))
-        ORDER BY committed_at,event_id LIMIT 101`,[...scopeIds(this.#scope),cursor??null]);
+      // Assign positions after record writers commit. A slow earlier writer
+      // can then appear after a cursor issued for a faster later writer.
+      await this.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 1))',
+        [JSON.stringify(scopeIds(this.#scope))]);
+      await this.query(`INSERT INTO record_event_feed(event_id,space_id,collection_id)
+        SELECT e.event_id,e.space_id,e.collection_id FROM record_events e
+        LEFT JOIN record_event_feed f ON f.event_id=e.event_id
+        WHERE e.space_id=$1 AND e.collection_id=$2 AND f.event_id IS NULL
+        ORDER BY e.committed_at,e.event_id LIMIT 101 ON CONFLICT DO NOTHING`,scopeIds(this.#scope));
+      const rows=await this.query(`SELECT e.event_id,e.record_id,e.revision,e.operation,e.schema_version,e.committed_at
+        FROM record_event_feed f JOIN record_events e ON e.event_id=f.event_id
+        WHERE f.space_id=$1 AND f.collection_id=$2
+          AND ($3::text IS NULL OR f.position>(
+            SELECT position FROM record_event_feed WHERE event_id=$3 AND space_id=$1 AND collection_id=$2))
+        ORDER BY f.position LIMIT 101`,[...scopeIds(this.#scope),cursor??null]);
       if (cursor && !rows.rows.length) {
-        const found=await this.query('SELECT 1 FROM record_events WHERE event_id=$1 AND space_id=$2 AND collection_id=$3',
+        const found=await this.query('SELECT 1 FROM record_event_feed WHERE event_id=$1 AND space_id=$2 AND collection_id=$3',
           [cursor,...scopeIds(this.#scope)]);
         if (!found.rows.length) throw new AuthorityError('CURSOR_INVALID');
       }
       const page=rows.rows.slice(0,100);
       return {events:page.map(row=>({eventId:row.event_id,recordId:row.record_id,revision:Number(row.revision),
         operation:row.operation,schemaVersion:Number(row.schema_version),committedAt:new Date(row.committed_at).toISOString()})),
-        nextCursor:rows.rows.length>100 ? page.at(-1).event_id : null};
+        // A quiet tail is still resumable: clients poll the returned cursor
+        // after an empty page and stop only when they choose to stop polling.
+        nextCursor:page.at(-1)?.event_id ?? cursor ?? null};
     });
   }
   /** Report the latest authoritative revision's projection state. */

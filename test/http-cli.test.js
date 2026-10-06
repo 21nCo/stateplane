@@ -10,12 +10,12 @@ import { createHttpHandler } from '../packages/api/dist/index.js';
 import { StateplaneHttpClient, StateplaneCliError } from '../packages/cli/dist/index.js';
 
 function fixture() {
-  let granted=true; let providerDown=false; let commitUnknown=false; let calls=0;
+  let granted=true; let providerDown=false; let commitUnknown=false; let calls=0; let deletes=0;
   const saved=new Map();
   const denied=()=>{ if (!granted) throw Object.assign(new Error('private data'),{code:'NOT_FOUND'}); };
   const services={
     spaces:{list:async()=>[],create:async()=>({spaceId:'sp_a'}),get:async()=>{denied();return {spaceId:'sp_a'};},
-      update:async()=>({spaceId:'sp_a'}),delete:async()=>({deleted:true})},
+      update:async()=>({spaceId:'sp_a'}),delete:async()=>{deletes++;return {deleted:true};}},
     collections:{list:async()=>{denied();return [];},define:async()=>({slug:'entries'}),revise:async()=>({slug:'entries'})},
     records:{
       get:async(_actor,_space,_collection,id)=>{denied();return {ref:{id},revision:1};},
@@ -47,7 +47,7 @@ function fixture() {
   }};
   return {services,identity,revoke:()=>{granted=false;},failProvider:()=>{providerDown=true;},
     recoverProvider:()=>{providerDown=false;},
-    unknownCommit:()=>{commitUnknown=true;},get calls(){return calls;}};
+    unknownCommit:()=>{commitUnknown=true;},get calls(){return calls;},get deletes(){return deletes;}};
 }
 
 async function serve(handler) {
@@ -91,6 +91,9 @@ test('HTTP and installed CLI observe the same receipt; revocation and cursor err
   assert.equal((await stat(join(cliRoot,'token'))).mode&0o077,0);
   const selected=await cli(['spaces','select','--space','sp_a']);
   assert.equal(selected.status,0,selected.stderr);
+  const mistyped=await cli(['spaces','delete','--spcae','sp_intended']);
+  assert.equal(JSON.parse(mistyped.stderr).error.code,'INVALID_ARGUMENT');
+  assert.equal(state.deletes,0);
   const result=await cli(['records','create','--collection','entries','--data','{"label":"A"}',
     '--idempotency-key','req-a']);
   assert.equal(result.status,0,result.stderr);
@@ -104,6 +107,12 @@ test('HTTP and installed CLI observe the same receipt; revocation and cursor err
   assert.doesNotMatch(uncertain.stderr,/secret commit cause|secret-test-token/);
   const page=await cli(['records','query','--collection','entries','--predicates','[]','--limit','1']);
   assert.equal(JSON.parse(page.stdout).nextCursor,'cursor-next');
+  for (const reserved of ['query','count','by-key']) {
+    const wrongMethod=await fetch(endpoint+`v1/spaces/sp_a/collections/entries/records/${reserved}`,
+      {headers:{Authorization:'Bearer secret-test-token'}});
+    assert.equal(wrongMethod.status,404);
+    assert.equal((await wrongMethod.json()).error.code,'NOT_FOUND');
+  }
   await assert.rejects(client.request('POST',route+'/query',{predicates:[],limit:1,cursor:'bad'}),
     {code:'CURSOR_INVALID'});
   state.revoke();
@@ -143,6 +152,18 @@ test('GET honors Retry-After; writes never auto-retry after an uncertain outcome
   const lost=new StateplaneHttpClient({endpoint:'http://127.0.0.1/',token:'secret',
     fetch:async()=>{calls++;throw new Error('token secret');},sleep:async()=>{}});
   await assert.rejects(lost.request('POST','/v1/spaces',{}),error=>error instanceof StateplaneCliError && error.code==='OUTCOME_UNKNOWN');
+  assert.equal(calls,1);
+  calls=0;
+  assert.deepEqual(await client.request('POST','/v1/spaces/sp_a/collections/entries/records/query',
+    {predicates:[],limit:1}),{ok:true});
+  assert.equal(calls,2);
+  calls=0;
+  await assert.rejects(lost.request('POST','/v1/spaces/sp_a/collections/entries/records/count',[]),
+    {code:'PROVIDER_UNAVAILABLE'});
+  assert.equal(calls,3);
+  calls=0;
+  await assert.rejects(lost.request('POST','/v1/spaces/sp_a/collections/entries/records',{operation:'create'}),
+    {code:'OUTCOME_UNKNOWN'});
   assert.equal(calls,1);
   calls=0;
   const rejected=new StateplaneHttpClient({endpoint:'http://127.0.0.1/',token:'secret',

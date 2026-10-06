@@ -10,7 +10,9 @@
   },
   "dependencies": {
     "@stateplane/api": "workspace:*",
-    "@stateplane/contracts": "workspace:*"
+    "@stateplane/contracts": "workspace:*",
+    "@stateplane/postgres": "workspace:*",
+    "pg": "8.22.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20260918.1",

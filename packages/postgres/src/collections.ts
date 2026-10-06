@@ -1,6 +1,6 @@
 import type pg from 'pg';
 import { randomUUID } from 'node:crypto';
-import { AuthorityError, type AuthorityScope } from './index.js';
+import { AuthorityError, CommitOutcomeUnknownError, type AuthorityScope } from './index.js';
 import { canonical, compatibleParsed, derivedIndexValue, MAX_INDEX_PART_BYTES, plainJson, scalarString, validateParsedDefinition } from './schema.js';
 import type { CollectionDefinition, Json } from './schema.js';
 
@@ -51,7 +51,7 @@ const snapshotDefinition=(input:unknown):(()=>unknown)=>{
 /** Schema administration and explicit index activation in the regional authority. */
 export class CollectionRegistry {
   /** Use the regional pool for schema and backfill transactions. */
-  constructor(private readonly pool: PoolLike) {}
+  constructor(private readonly pool: PoolLike, private readonly recheckCredential?: () => Promise<void>) {}
   /** Roll back failed schema work and discard clients with ambiguous boundaries. */
   private async transaction<T>(fn:(client:Client)=>Promise<T>):Promise<T> {
     const client=await this.pool.connect();
@@ -60,8 +60,15 @@ export class CollectionRegistry {
       beginAttempted=true;
       await client.query('BEGIN'); begun=true;
       const result=await fn(client);
+      await this.recheckCredential?.();
       try { await client.query('COMMIT'); begun=false; }
-      catch (error) { discard=true; throw error; }
+      catch (error) {
+        discard=true;
+        // A PostgreSQL SQLSTATE confirms that COMMIT was rejected. A broken
+        // transport without a SQLSTATE leaves the commit outcome unknown.
+        if (/^[0-9A-Z]{5}$/.test(String((error as {code?:unknown}).code??''))) throw error;
+        throw new CommitOutcomeUnknownError(error);
+      }
       return result;
     } catch (error) {
       if (begun) try { await client.query('ROLLBACK'); } catch { discard=true; }

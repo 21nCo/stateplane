@@ -10,6 +10,20 @@ cell. The HTTP host owns the AuthFn config, control/cell database bindings,
 and `IdentityVerifier`; it must not expose a direct database endpoint to CLI
 clients. The OpenAPI surface is [openapi.yaml](../contracts/openapi.yaml).
 
+The app mounts `/v1/*` through a deliberately opt-in nonproduction host. For
+local or isolated Preview smoke, set `STATEPLANE_ENV=local` or `preview`,
+`STATEPLANE_TEST_HTTP=1`, a private 32-character or longer
+`STATEPLANE_TEST_TOKEN`, `STATEPLANE_TEST_OWNER`,
+`STATEPLANE_TEST_CREDENTIAL`, and a private hex-encoded 32-byte
+`STATEPLANE_TEST_CURSOR_SECRET`. Supply either
+`STATEPLANE_TEST_DATABASE_URL` for local PostgreSQL or the `AUTHORITY`
+Hyperdrive binding for Preview. The optional cell and storage target IDs
+default to `cell-a` and `target-a`. This fixture host uses one configured
+bearer and does not establish connected AuthFn provider acceptance. Without
+all opt-in bindings, `/v1/*` fails closed with a structured 503. Keep these
+secrets outside tracked configuration and never use the fixture host for a
+shared or production environment.
+
 Every selected-space call takes a fresh provider credential and placement
 snapshot. Collection effects additionally check live policy, grant and
 placement in their database transaction. Space administration uses
@@ -42,7 +56,8 @@ development. Supply a bearer session token or API key through stdin:
 stateplane config endpoint --url https://stateplane.example.invalid/
 stateplane auth login --token-stdin --store keychain < /private/path/token
 stateplane spaces list
-stateplane spaces select --space sp_alpha
+stateplane spaces create --space sp_123e4567-e89b-42d3-a456-426614174000
+stateplane spaces select --space sp_123e4567-e89b-42d3-a456-426614174000
 stateplane collections list
 stateplane records create --collection entries --key ' item-1 ' \
   --data '{"label":"Item 1","state":"open"}' --idempotency-key req-a
@@ -60,6 +75,15 @@ stored credential and is never written to the config. Avoid putting secrets
 in command arguments. `stateplane config show` exports only endpoint, selected
 space and storage kind. `stateplane auth logout` removes the selected stored
 credential.
+
+Every `spaces create` request supplies a caller-generated `sp_<UUID>` ID.
+Retain it before sending the request. If the response is lost, repeat the
+same create request and cell selection or use `spaces get --space <ID>`;
+pending provisioning returns `RECEIPT_PENDING`. For schema define/revise
+and lifecycle changes, `COMMIT_OUTCOME_UNKNOWN` means read back the selected
+space or collection before deciding whether another change is needed.
+Unknown or misplaced CLI flags are rejected before a saved space can be used
+for an effect.
 
 ## Queries, ingestion and recovery
 
@@ -79,7 +103,8 @@ items; use `--retry-failed` only when intentionally retrying failed items.
 After a timeout or `OUTCOME_UNKNOWN`, first read batch status. A standalone
 write is never retried automatically. Resubmit the **identical** record body
 with the **same idempotency key** to recover its receipt. `Retry-After` controls
-bounded automatic retries for GET requests only. Query `nextCursor` is opaque
+bounded automatic retries for GET and read-only query/count POST requests.
+Writes are never retried automatically. Query `nextCursor` is opaque
 and bound to the same credential, space, collection and query; live pages are
 not a fixed export snapshot.
 
@@ -90,10 +115,11 @@ throughput. The CLI timeout defaults to 30 seconds and can be set with
 `--timeout` in milliseconds up to 120 seconds. Keep the CLI timeout above the
 server budget when possible; a client timeout on a write is still ambiguous.
 The event feed returns at most 100 immutable metadata entries per page and
-uses migration 036's scoped cursor index. Apply that migration with record
-writers drained on a populated database; measure the index build lock and
+uses migration 037's commit-safe feed position index. Apply that migration with
+record writers drained on a populated database; measure the index build lock and
 feed plans on disposable Railway before increasing the limit. Event cursors
-are page positions, not export snapshots.
+are page positions, not export snapshots. The event `nextCursor` is the last
+observed event even on a short page; an empty poll retains the input cursor.
 
 ## Acceptance boundaries
 
