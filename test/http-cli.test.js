@@ -6,8 +6,11 @@ import { mkdtemp, rm, readFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { platform } from 'node:os';
 import { createHttpHandler } from '../packages/api/dist/index.js';
 import { StateplaneHttpClient, StateplaneCliError } from '../packages/cli/dist/index.js';
+import { saveToken, loadToken, removeToken } from '../packages/cli/dist/config.js';
 
 function fixture() {
   let granted=true; let providerDown=false; let commitUnknown=false; let calls=0; let deletes=0;
@@ -100,6 +103,18 @@ test('HTTP and installed CLI observe the same receipt; revocation and cursor err
   assert.equal((await stat(join(cliRoot,'token'))).mode&0o077,0);
   const selected=await cli(['spaces','select','--space','sp_a']);
   assert.equal(selected.status,0,selected.stderr);
+  for (const args of [
+    ['records','patch','--collection','entries','--id','rec_1','--expected-revision','1',
+      '--idempotency-key','bad-patch','--data','null'],
+    ['records','create','--collection','entries','--idempotency-key','missing-file',
+      '--file',join(cliRoot,'missing.json')]
+  ]) {
+    const invalid=await cli(args);
+    assert.equal(invalid.status,1);
+    assert.deepEqual(JSON.parse(invalid.stderr).error,
+      {code:'INVALID_ARGUMENT',message:'INVALID_ARGUMENT',retryable:false,requestId:null});
+  }
+  assert.equal(state.calls,1);
   const mistyped=await cli(['spaces','delete','--spcae','sp_intended']);
   assert.equal(JSON.parse(mistyped.stderr).error.code,'INVALID_ARGUMENT');
   assert.equal(state.deletes,0);
@@ -232,4 +247,31 @@ test('GET honors Retry-After; writes never auto-retry after an uncertain outcome
       {status:503,headers:{'Retry-After':'0'}});},sleep:async()=>{}});
   await assert.rejects(rejected.request('POST','/v1/spaces',{}),{code:'BACKPRESSURE'});
   assert.equal(calls,1);
+  calls=0;
+  const nonJson=new StateplaneHttpClient({endpoint:'http://127.0.0.1/',token:'secret',
+    fetch:async()=>{calls++;return calls===1
+      ? new Response('upstream unavailable',{status:503,headers:{'Retry-After':'0'}})
+      : Response.json({ok:true});},sleep:async()=>{}});
+  assert.deepEqual(await nonJson.request('GET','/v1/spaces'),{ok:true});
+  assert.equal(calls,2);
+  calls=0;
+  const alwaysNonJson=new StateplaneHttpClient({endpoint:'http://127.0.0.1/',token:'secret',
+    fetch:async()=>{calls++;return new Response('upstream unavailable',
+      {status:503,headers:{'Retry-After':'0'}});},sleep:async()=>{}});
+  await assert.rejects(alwaysNonJson.request('GET','/v1/spaces'),
+    {code:'PROVIDER_UNAVAILABLE',retryable:true});
+  assert.equal(calls,3);
+  calls=0;
+  await assert.rejects(alwaysNonJson.request('POST','/v1/spaces',{}),{code:'OUTCOME_UNKNOWN'});
+  assert.equal(calls,1);
 });
+
+test('macOS Keychain stores and reloads a token without passing it as a process argument',
+  {skip:platform()!=='darwin'},async()=>{
+    const endpoint=`https://keychain-${randomUUID()}.example.invalid/`;
+    const token=`token-${randomUUID()}`;
+    try {
+      await saveToken(endpoint,token,'keychain');
+      assert.equal(await loadToken({endpoint,tokenStore:'keychain'}),token);
+    } finally { await removeToken({endpoint,tokenStore:'keychain'}); }
+  });

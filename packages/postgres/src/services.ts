@@ -12,13 +12,23 @@ export interface ServiceCell { pool: Pick<pg.Pool,'connect'>; cursorSecret: Uint
 export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<string,ServiceCell>,
   receiptRetentionSeconds: number): StateplaneServices {
   async function admitted<T>(actor:VerifiedCredential,spaceId:string,collectionId:string|undefined,
-    capability:Capability,run:(pool:ServiceCell,scope:AuthorityScope,recheck:()=>Promise<void>)=>Promise<T>):Promise<T> {
+    capability:Capability,run:(pool:ServiceCell,scope:AuthorityScope,recheck:(db:pg.PoolClient,result?:unknown)=>Promise<void>)=>Promise<T>,
+    discoveryCollectionId?:string):Promise<T> {
     const admitted=await spaces.scope(actor,spaceId,collectionId,capability);
     const cell=cells.get(admitted.cellId);
     if (!cell) throw new AuthorityError('STALE_PLACEMENT');
-    return run(cell,admitted.scope,()=>spaces.assertCurrent(actor,admitted.ownerPrincipalId));
+    return run(cell,admitted.scope,async(db,result)=>{
+      const discovery=collectionId===undefined && capability==='records:read';
+      const grants:Capability[]=discovery ? ['records:read','schema:write'] : [capability];
+      await spaces.assertScopeCurrent(actor,admitted.ownerPrincipalId,admitted.scope,db,
+        discoveryCollectionId??collectionId,grants);
+      if (discovery && Array.isArray(result)) for (const entry of result) {
+        await spaces.assertScopeCurrent(actor,admitted.ownerPrincipalId,admitted.scope,db,
+          entry.definition.slug,grants);
+      }
+    });
   }
-  const authority=(cell:ServiceCell,recheck:()=>Promise<void>)=>
+  const authority=(cell:ServiceCell,recheck:(db:pg.PoolClient,result?:unknown)=>Promise<void>)=>
     new PostgresAuthority(cell.pool,receiptRetentionSeconds,cell.cursorSecret,30_000,recheck);
   return {
     spaces: {
@@ -34,7 +44,7 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
         const found=entries.find(item=>item.definition.slug===collectionId);
         if (!found) throw new AuthorityError('NOT_FOUND');
         return found;
-      }),
+      },collectionId),
       define:(actor,spaceId,collectionId,serialized)=>admitted(actor,spaceId,collectionId,'schema:write',
         (cell,scope,recheck)=>new CollectionRegistry(cell.pool,recheck).defineSerialized(scope,serialized)),
       revise:(actor,spaceId,collectionId,version,serialized)=>admitted(actor,spaceId,collectionId,'schema:write',

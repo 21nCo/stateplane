@@ -46,6 +46,12 @@ export class StateplaneHttpClient {
         if (safeRead && attempt<2) { await this.sleep(250*(attempt+1)); continue; }
         throw new StateplaneCliError(safeRead?'PROVIDER_UNAVAILABLE':'OUTCOME_UNKNOWN');
       }
+      const retryAfterHeader=response.headers.get('retry-after');
+      const retryAfter=retryAfterHeader && /^\d+$/.test(retryAfterHeader) ? Math.min(5,Number(retryAfterHeader)) : undefined;
+      if (safeRead && attempt<2 && [429,503].includes(response.status) && retryAfter!==undefined) {
+        await response.body?.cancel().catch(()=>{});
+        await this.sleep(retryAfter*1000); continue;
+      }
       let value:unknown;
       try { value=await response.json(); }
       catch { throw new StateplaneCliError(safeRead?'PROVIDER_UNAVAILABLE':'OUTCOME_UNKNOWN'); }
@@ -55,11 +61,6 @@ export class StateplaneHttpClient {
         ? envelope.error.code : 'PROVIDER_UNAVAILABLE';
       const requestId=typeof envelope?.error?.requestId==='string' && /^[a-zA-Z0-9_-]{1,80}$/.test(envelope.error.requestId)
         ? envelope.error.requestId : undefined;
-      const retryAfterHeader=response.headers.get('retry-after');
-      const retryAfter=retryAfterHeader && /^\d+$/.test(retryAfterHeader) ? Math.min(5,Number(retryAfterHeader)) : undefined;
-      if (safeRead && attempt<2 && [429,503].includes(response.status) && retryAfter!==undefined) {
-        await this.sleep(retryAfter*1000); continue;
-      }
       throw new StateplaneCliError(code,requestId,retryAfter,
         typeof envelope?.error?.retryable==='boolean' ? envelope.error.retryable : undefined);
     }

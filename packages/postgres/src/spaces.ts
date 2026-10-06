@@ -186,6 +186,24 @@ export class PostgresSpaces {
   async assertCurrent(actor:VerifiedCredential,ownerPrincipalId:string):Promise<void> {
     await this.current(actor,ownerPrincipalId);
   }
+  /** Check the regional key and grant after the final provider await. The
+   * caller supplies its transaction client so a one-connection pool works. */
+  async assertScopeCurrent(actor:VerifiedCredential,ownerPrincipalId:string,scope:AuthorityScope,
+    db:Pick<pg.PoolClient,'query'>,collectionId:string|undefined,
+    capabilities:readonly Capability[]):Promise<void> {
+    await this.current(actor,ownerPrincipalId);
+    if (actor.kind!=='api-key') return;
+    const live=await db.query(`SELECT 1 FROM space_credentials sc
+      JOIN collection_grants g ON g.space_id=sc.space_id AND g.credential_id=sc.credential_id
+      JOIN collections c ON c.space_id=g.space_id AND c.collection_id=g.collection_id
+      WHERE sc.space_id=$1 AND sc.credential_id=$2 AND sc.owner_principal_id=$3
+        AND ($4::text IS NULL OR g.collection_id=$4) AND g.capabilities && $5::text[]
+        AND c.lifecycle<>'deleted' AND sc.activated_at IS NOT NULL AND sc.confirmed_at IS NOT NULL
+        AND sc.revoked_at IS NULL AND sc.expires_at>clock_timestamp()
+        AND (g.expires_at IS NULL OR g.expires_at>clock_timestamp()) LIMIT 1`,
+    [scope.spaceId,actor.credentialId,ownerPrincipalId,collectionId??null,capabilities]);
+    if (!live.rows.length) throw new AuthorityError('FORBIDDEN');
+  }
   /** Snapshot placement and provider identity for one request. The collection
    * transaction subsequently fences policy, placement, grant and lifecycle. */
   async scope(actor: VerifiedCredential, spaceId: string, collectionId: string | undefined,
@@ -383,7 +401,7 @@ export class PostgresSpaces {
     if (!await this.credentials.current({kind:'api-key',credentialId},row.owner_principal_id))
       throw new AuthorityError('NOT_FOUND');
     if (!this.cells.has(row.cell_id)) throw new AuthorityError('NOT_FOUND');
-    const cell = await this.cell(row.cell_id).pool.query(`SELECT s.policy_version,s.placement_generation,s.home_cell_id,s.cell_id
+    const regional = () => this.cell(row.cell_id).pool.query(`SELECT s.policy_version,s.placement_generation,s.home_cell_id,s.cell_id
       FROM spaces s JOIN space_credentials sc ON sc.space_id=s.space_id AND sc.credential_id=$2
       JOIN collection_grants g ON g.space_id=s.space_id AND g.credential_id=sc.credential_id
       JOIN collections c ON c.space_id=g.space_id AND c.collection_id=g.collection_id
@@ -392,12 +410,14 @@ export class PostgresSpaces {
         AND sc.activated_at IS NOT NULL AND sc.confirmed_at IS NOT NULL AND sc.revoked_at IS NULL AND sc.expires_at>clock_timestamp()
         AND (g.expires_at IS NULL OR g.expires_at>clock_timestamp())
         AND g.capabilities @> ARRAY['space:admin']::text[] LIMIT 1`,[spaceId,credentialId]);
+    const cell = await regional();
     const local = cell.rows[0];
     if (!local) throw new AuthorityError('NOT_FOUND');
     if (local.home_cell_id !== row.home_cell_id || local.cell_id !== row.cell_id ||
       safeVersion(local.policy_version) !== safeVersion(row.policy_version) ||
       safeVersion(local.placement_generation) !== safeVersion(row.placement_generation)) throw new AuthorityError('STALE_PLACEMENT');
     await this.current({kind:'api-key',credentialId},row.owner_principal_id);
+    if (!(await regional()).rows[0]) throw new AuthorityError('NOT_FOUND');
     return info(row);
   }
 

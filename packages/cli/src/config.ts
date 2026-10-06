@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process';
 import { mkdir, readFile, rename, rm, lstat, writeFile } from 'node:fs/promises';
 import { homedir, platform } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { StateplaneCliError } from './transport.js';
 
 export interface CliConfig { endpoint?:string; space?:string; tokenStore?:'keychain'|'file' }
@@ -49,6 +50,10 @@ export async function saveConfig(value:CliConfig):Promise<void> {
   } finally { await rm(temp,{force:true}); }
 }
 function keyArgs(endpoint:string):string[] { return ['service','stateplane','endpoint',endpoint]; }
+const macKeychainScript=join(dirname(fileURLToPath(import.meta.url)),'../bin/keychain.swift');
+function macKeychain(operation:'store'|'load'|'remove',endpoint:string,stdin?:string) {
+  return command('/usr/bin/swift',[macKeychainScript,operation,`stateplane:${endpoint}`],stdin);
+}
 function command(program:string,args:string[],stdin?:string):Promise<{ok:boolean;output:string}> {
   return new Promise(resolve=>{
     const child=spawn(program,args,{stdio:['pipe','pipe','ignore']});
@@ -72,11 +77,17 @@ export async function saveToken(endpoint:string,token:string,store:'keychain'|'f
     return;
   }
   const result=platform()==='darwin'
-    ? await command('security',['add-generic-password','-a','default','-s',`stateplane:${endpoint}`,'-U','-w'],token+'\n')
+    ? await macKeychain('store',endpoint,token)
     : platform()==='linux'
       ? await command('secret-tool',['store','--label=Stateplane API key',...keyArgs(endpoint)],token)
       : {ok:false};
   if (!result.ok) throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
+  const checked=platform()==='darwin' ? await macKeychain('load',endpoint)
+    : await command('secret-tool',['lookup',...keyArgs(endpoint)]);
+  if (!checked.ok || checked.output.replace(/\n$/,'')!==token) {
+    if (platform()==='darwin') await macKeychain('remove',endpoint);
+    throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
+  }
 }
 export async function loadToken(config:CliConfig):Promise<string> {
   if (process.env.STATEPLANE_TOKEN) return process.env.STATEPLANE_TOKEN;
@@ -89,12 +100,13 @@ export async function loadToken(config:CliConfig):Promise<string> {
   }
   if (config.tokenStore==='keychain') {
     const result=platform()==='darwin'
-      ? await command('security',['find-generic-password','-a','default','-s',`stateplane:${config.endpoint}`,'-w'])
+      ? await macKeychain('load',config.endpoint)
       : platform()==='linux'
         ? await command('secret-tool',['lookup',...keyArgs(config.endpoint)])
         : {ok:false,output:''};
-    if (!result.ok || !result.output.trim()) throw new StateplaneCliError('UNAUTHENTICATED');
-    return result.output.trimEnd();
+    const token=platform()==='darwin' ? result.output : result.output.replace(/\n$/,'');
+    if (!result.ok || !token) throw new StateplaneCliError('UNAUTHENTICATED');
+    return token;
   }
   throw new StateplaneCliError('UNAUTHENTICATED');
 }
@@ -102,7 +114,7 @@ export async function removeToken(config:CliConfig):Promise<void> {
   if (config.tokenStore==='file') await rm(tokenPath(),{force:true});
   else if (config.tokenStore==='keychain' && config.endpoint) {
     const result=platform()==='darwin'
-      ? await command('security',['delete-generic-password','-a','default','-s',`stateplane:${config.endpoint}`])
+      ? await macKeychain('remove',config.endpoint)
       : platform()==='linux' ? await command('secret-tool',['clear',...keyArgs(config.endpoint)]) : {ok:false};
     if (!result.ok) throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
   }

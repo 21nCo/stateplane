@@ -657,7 +657,7 @@ export class PostgresAuthority {
   /** Configure the receipt window used by new authority transactions. */
   constructor(private readonly pool: PoolLike, private readonly receiptRetentionSeconds: number,
     private readonly cursorSecret?: Uint8Array, private readonly requestTimeoutMs = REQUEST_TIMEOUT_MS,
-    private readonly recheckCredential?: () => Promise<void>) {
+    private readonly recheckCredential?: (client: pg.PoolClient) => Promise<void>) {
     if (!isSafeInteger(receiptRetentionSeconds) || receiptRetentionSeconds < 1) throw new RangeError('Invalid receipt retention');
     if (cursorSecret && cursorSecret.byteLength < 32) throw new RangeError('Cursor secret must contain at least 32 bytes');
     if (!isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > REQUEST_TIMEOUT_MS)
@@ -694,7 +694,7 @@ export class PostgresAuthority {
       await tx.checkScope();
       await tx.checkReplayScopes();
       await tx.ensureReceiptsCurrent();
-      await this.recheckCredential?.();
+      await this.recheckCredential?.(client);
       // A failure while setting the final timeout is before COMMIT dispatch.
       // Only a missing COMMIT acknowledgement has an ambiguous outcome.
       await client.query(`SET LOCAL statement_timeout = '${Math.max(1,deadlineMs-Date.now())}ms'`);

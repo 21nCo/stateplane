@@ -67,11 +67,16 @@ function parsed(value:string):unknown {
 async function input(path:string,maxBytes:number):Promise<string> {
   const source=path==='-'?process.stdin:createReadStream(path);
   const chunks:Buffer[]=[];let size=0;
-  for await (const chunk of source) {
-    const bytes=Buffer.isBuffer(chunk)?chunk:Buffer.from(chunk);
-    size+=bytes.length;
-    if (size>maxBytes) throw new StateplaneCliError('RATE_LIMITED');
-    chunks.push(bytes);
+  try {
+    for await (const chunk of source) {
+      const bytes=Buffer.isBuffer(chunk)?chunk:Buffer.from(chunk);
+      size+=bytes.length;
+      if (size>maxBytes) throw new StateplaneCliError('RATE_LIMITED',undefined,undefined,false);
+      chunks.push(bytes);
+    }
+  } catch(error) {
+    if (error instanceof StateplaneCliError) throw error;
+    throw new StateplaneCliError('INVALID_ARGUMENT');
   }
   try { return new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(chunks)); }
   catch { throw new StateplaneCliError('INVALID_ARGUMENT'); }
@@ -79,7 +84,7 @@ async function input(path:string,maxBytes:number):Promise<string> {
 async function payload(flags:Flags):Promise<unknown> {
   if (flags.data && flags.file) throw new StateplaneCliError('INVALID_ARGUMENT');
   const text=flags.file ? await input(required(flags,'file'),1_048_576) : required(flags,'data');
-  if (Buffer.byteLength(text)>1_048_576) throw new StateplaneCliError('RATE_LIMITED');
+  if (Buffer.byteLength(text)>1_048_576) throw new StateplaneCliError('RATE_LIMITED',undefined,undefined,false);
   return parsed(text);
 }
 function endpoint(value:string):string {
@@ -183,7 +188,11 @@ export async function runCli(argv:string[]):Promise<number> {
           request.id=required(flags,'id'); request.expectedRevision=integer(required(flags,'expected-revision'));
           if (action==='replace') request.data=await payload(flags);
           if (action==='patch') {
-            const patch=await payload(flags) as {set?:unknown;unset?:unknown};
+            const patch=await payload(flags) as {set?:unknown;unset?:unknown}|null;
+            if (!patch || typeof patch!=='object' || Array.isArray(patch) ||
+              !patch.set || typeof patch.set!=='object' || Array.isArray(patch.set) ||
+              !Array.isArray(patch.unset) || patch.unset.some(value=>typeof value!=='string'))
+              throw new StateplaneCliError('INVALID_ARGUMENT');
             request.set=patch.set; request.unset=patch.unset;
           }
         }
@@ -210,7 +219,10 @@ export async function runCli(argv:string[]):Promise<number> {
     }
     throw new StateplaneCliError('INVALID_ARGUMENT');
   } catch(error) {
-    const failure=error instanceof StateplaneCliError?error:new StateplaneCliError('PROVIDER_UNAVAILABLE');
+    const localCode=(error as NodeJS.ErrnoException)?.code;
+    const failure=error instanceof StateplaneCliError?error:
+      typeof localCode==='string' && ['EACCES','EPERM','ENOENT','ENOTDIR','EISDIR','EROFS','ENOSPC'].includes(localCode)
+        ? new StateplaneCliError('INVALID_CONFIGURATION') : new StateplaneCliError('PROVIDER_UNAVAILABLE');
     process.stderr.write(JSON.stringify({contractVersion:'1',error:{code:failure.code,message:failure.code,
       retryable:failure.retryable,requestId:failure.requestId??null}})+'\n');
     return 1;

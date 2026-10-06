@@ -109,6 +109,30 @@ test('real Postgres HTTP operations preserve receipts, grant checks, events and 
   await pool.query(`UPDATE collection_grants SET capabilities=ARRAY['schema:write','records:read']::text[]
     WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[space.spaceId,collection,agent.credentialId]);
   assert.equal((await route('GET',`${base}/records/${id}`,undefined,'fixture-agent-key')).status,200);
+  await pool.query(`UPDATE collection_grants SET capabilities=ARRAY['schema:write','records:read','records:write','events:read','space:admin']::text[]
+    WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[space.spaceId,collection,agent.credentialId]);
+  const keyWrite={operation:'create',idempotencyKey:'agent-replay',data:{label:'Agent'}};
+  assert.equal((await route('POST',`${base}/records`,keyWrite,'fixture-agent-key')).status,200);
+  assert.equal((await route('PUT',`${base}/batches/agent-import`,
+    [JSON.stringify({operation:'create',data:{label:'Agent batch'}})],'fixture-agent-key')).status,200);
+  for (const [method,path,body] of [
+    ['GET',`/v1/spaces/${space.spaceId}`,undefined],['GET',base,undefined],
+    ['GET',`${base}/records/${id}`,undefined],['GET',`${base}/batches/agent-import`,undefined],
+    ['GET',`${base}/events`,undefined],['POST',`${base}/records`,keyWrite]
+  ]) {
+    await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '800 milliseconds'
+      WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[space.spaceId,collection,agent.credentialId]);
+    let probes=0;
+    currentProbe=async()=>{
+      if (++probes===(path.includes('/collections/')?2:3))
+        await new Promise(resolve=>setTimeout(resolve,1000));
+      return true;
+    };
+    const expired=await route(method,path,body,'fixture-agent-key');
+    assert.equal(expired.status,path.includes('/collections/')?403:404,path);
+    assert.equal(probes,path.includes('/collections/')?2:3,path);
+  }
+  currentProbe=()=>current;
   await pool.query('UPDATE space_credentials SET revoked_at=clock_timestamp() WHERE space_id=$1 AND credential_id=$2',
     [space.spaceId,agent.credentialId]);
   assert.equal((await route('GET',`${base}/records/${id}`,undefined,'fixture-agent-key')).status,404);

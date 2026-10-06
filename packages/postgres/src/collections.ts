@@ -51,7 +51,7 @@ const snapshotDefinition=(input:unknown):(()=>unknown)=>{
 /** Schema administration and explicit index activation in the regional authority. */
 export class CollectionRegistry {
   /** Use the regional pool for schema and backfill transactions. */
-  constructor(private readonly pool: PoolLike, private readonly recheckCredential?: () => Promise<void>) {}
+  constructor(private readonly pool: PoolLike, private readonly recheckCredential?: (client:Client,result?:unknown) => Promise<void>) {}
   /** Roll back failed schema work and discard clients with ambiguous boundaries. */
   private async transaction<T>(fn:(client:Client)=>Promise<T>):Promise<T> {
     const client=await this.pool.connect();
@@ -60,7 +60,7 @@ export class CollectionRegistry {
       beginAttempted=true;
       await client.query('BEGIN'); begun=true;
       const result=await fn(client);
-      await this.recheckCredential?.();
+      await this.recheckCredential?.(client,result);
       try { await client.query('COMMIT'); begun=false; }
       catch (error) {
         discard=true;
