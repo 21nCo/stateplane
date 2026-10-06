@@ -286,14 +286,17 @@ export class PostgresSpaces {
    * and with lease-expiry reconciliation. */
   private async resumeCreatedCell(actor: VerifiedCredential, spaceId: string,
     cellId: string, cell: CellDatabase): Promise<SpaceInfo> {
-    return transaction(this.control, async directory => {
+    const resumed = await transaction(this.control, async directory => {
       await this.current(actor);
       const row = (await directory.query(`SELECT * FROM space_directory WHERE space_id=$1 FOR UPDATE`,[spaceId])).rows[0];
       if (!row || row.owner_principal_id !== owner(actor) || row.cell_id !== cellId ||
         row.storage_target_id !== cell.storageTargetId ||
         (row.home_cell_id !== null && row.home_cell_id !== cellId) || row.lifecycle === 'deleted')
         throw new AuthorityError('UNIQUE_CONFLICT');
-      if (row.lifecycle !== 'provisioning') return info(row);
+      if (row.lifecycle !== 'provisioning') {
+        await this.current(actor);
+        return info(row);
+      }
       const db = cell.pool === this.control ? directory : cell.pool;
       const local = (await db.query(`SELECT s.owner_principal_id,s.home_cell_id,s.cell_id,s.storage_target_id,s.lifecycle,
         s.policy_version,s.placement_generation,
@@ -316,8 +319,11 @@ export class PostgresSpaces {
         lifecycle='active',provisioning_lease_until=NULL,updated_at=clock_timestamp()
         WHERE space_id=$1 AND lifecycle='provisioning' RETURNING *`,[spaceId,cellId]);
       if (!published.rows[0]) throw new AuthorityError('STALE_PLACEMENT');
+      await this.current(actor);
       return info(published.rows[0]);
     });
+    await this.current(actor);
+    return resumed;
   }
   async create(actor: VerifiedCredential, requestedCellId?: string, requestedSpaceId?: string): Promise<SpaceInfo> {
     actor = snapshotOwner(actor);
@@ -352,12 +358,13 @@ export class PostgresSpaces {
       const published = await this.control.query(`UPDATE space_directory SET lifecycle='active',provisioning_lease_until=NULL,updated_at=clock_timestamp()
         WHERE space_id=$1 AND lifecycle='provisioning' RETURNING *`,[spaceId]);
       if (!published.rows[0]) throw new Error('Space publication was interrupted');
+      await this.current(actor);
       return info(published.rows[0]);
     } catch (error) {
       if (requestedSpaceId) {
         const selected=await recoverSelected().catch(recoveryError=>{
           if (recoveryError instanceof AuthorityError &&
-              ['RECEIPT_PENDING','UNIQUE_CONFLICT'].includes(recoveryError.code)) throw recoveryError;
+              ['RECEIPT_PENDING','UNIQUE_CONFLICT','FORBIDDEN'].includes(recoveryError.code)) throw recoveryError;
           return null;
         });
         if (selected) return selected;
@@ -370,7 +377,10 @@ export class PostgresSpaces {
         if (!observed) throw requestedSpaceId ? new CommitOutcomeUnknownError(error) : error;
         const row = observed.rows[0];
         if (row?.lifecycle === 'active' && row.owner_principal_id === principal && row.home_cell_id === cellId && row.cell_id === cellId &&
-          row.storage_target_id === cell.storageTargetId) return info(row);
+          row.storage_target_id === cell.storageTargetId) {
+          await this.current(actor);
+          return info(row);
+        }
         if (row?.lifecycle !== 'provisioning') throw error;
       }
       // The cell commit may have succeeded even when its acknowledgement was

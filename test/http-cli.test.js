@@ -9,6 +9,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { platform } from 'node:os';
 import { createHttpHandler } from '../packages/api/dist/index.js';
+import { PostgresSpaces } from '../packages/postgres/dist/index.js';
 import { StateplaneHttpClient, StateplaneCliError } from '../packages/cli/dist/index.js';
 import { saveToken, loadToken, removeToken, storeSecretServiceToken } from '../packages/cli/dist/config.js';
 
@@ -623,3 +624,62 @@ test('macOS Keychain stores and reloads a token without passing it as a process 
       await rm(root,{recursive:true,force:true});
     }
   });
+
+test('HTTP and CLI selected-space retries deny metadata when owner access is revoked during the directory lock wait',async t=>{
+  const spaceId=`sp_${randomUUID()}`;
+  const owner='owner';
+  const row={space_id:spaceId,owner_principal_id:owner,home_cell_id:'cell-a',cell_id:'cell-a',
+    storage_target_id:'target-a',lifecycle:'provisioning',policy_version:1,placement_generation:1,
+    created_at:new Date(),updated_at:new Date()};
+  let granted=true;
+  let gate;
+  const control={
+    query:async()=>({rows:[row]}),
+    connect:async()=>({
+      query:async sql=>{
+        if (sql.includes('FOR UPDATE')) {
+          gate.enter();
+          await gate.wait;
+          return {rows:[{...row,lifecycle:'active'}]};
+        }
+        return {rows:[]};
+      },
+      release:()=>{}
+    })
+  };
+  const spaces=new PostgresSpaces(control,new Map([['cell-a',{pool:{},storageTargetId:'target-a'}]]),
+    'cell-a',{}, {current:async()=>granted});
+  const state=fixture();
+  state.services.spaces.create=(...args)=>spaces.create(...args);
+  const {server,endpoint}=await serve(createHttpHandler(state));
+  t.after(()=>server.close());
+  const retryBody=JSON.stringify({spaceId});
+  const newGate=()=>{
+    let enter,release;
+    const entered=new Promise(resolve=>{enter=resolve;});
+    const wait=new Promise(resolve=>{release=resolve;});
+    return {enter,entered,wait,release};
+  };
+  const headers={Authorization:'Bearer secret-test-token','Content-Type':'application/json'};
+  gate=newGate();
+  const directPending=fetch(new URL('v1/spaces',endpoint),{method:'POST',headers,body:retryBody});
+  await gate.entered;
+  granted=false;
+  gate.release();
+  const directResponse=await directPending;
+  assert.equal(directResponse.status,403);
+  const direct=await directResponse.json();
+  assert.equal(direct.error.code,'FORBIDDEN');
+
+  const cliRoot=await mkdtemp(join(tmpdir(),'stateplane-cli-revoked-'));
+  t.after(()=>rm(cliRoot,{recursive:true,force:true}));
+  await writeFile(join(cliRoot,'config.json'),JSON.stringify({endpoint,tokenStore:'file'}),{mode:0o600});
+  await writeFile(join(cliRoot,'token'),'secret-test-token',{mode:0o600});
+  granted=true;
+  gate=newGate();
+  const cliPending=cliProcess(cliRoot,['spaces','create','--space',spaceId]);
+  await gate.entered;
+  granted=false;
+  gate.release();
+  assertErrorParity(direct,await cliPending);
+});
