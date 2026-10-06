@@ -99,7 +99,8 @@ export function createHttpHandler({services,identity}:{services:StateplaneServic
         if (method==='PATCH') {
           await services.spaces.get(actor,space);
           const value=object(await body(request,4096));
-          if (Object.keys(value).length!==1 || !['active','readOnly','suspended'].includes(String(value.lifecycle))) fail('INVALID_ARGUMENT');
+          if (Object.keys(value).length!==1 || typeof value.lifecycle!=='string' ||
+            !['active','readOnly','suspended'].includes(value.lifecycle)) fail('INVALID_ARGUMENT');
           return json(await services.spaces.update(actor,space,value.lifecycle as 'active'|'readOnly'|'suspended'));
         }
         if (method==='DELETE') return json(await services.spaces.delete(actor,space));

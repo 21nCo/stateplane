@@ -10,7 +10,7 @@ import { randomUUID } from 'node:crypto';
 import { platform } from 'node:os';
 import { createHttpHandler } from '../packages/api/dist/index.js';
 import { StateplaneHttpClient, StateplaneCliError } from '../packages/cli/dist/index.js';
-import { saveToken, loadToken, removeToken } from '../packages/cli/dist/config.js';
+import { saveToken, loadToken, removeToken, storeSecretServiceToken } from '../packages/cli/dist/config.js';
 
 function fixture() {
   let granted=true; let providerDown=false; let commitUnknown=false; let calls=0; let deletes=0;
@@ -349,10 +349,13 @@ test('CLI checks complete record and query bodies at the HTTP byte boundary',asy
 test('empty CLI cursors fail before fetching; event polling preserves supplied cursor',async t=>{
   const state=fixture();const seen={queries:[],events:[]};
   state.services.records.query=async(_actor,_space,_collection,serialized)=>{
-    seen.queries.push(JSON.parse(serialized).cursor);
+    const cursor=JSON.parse(serialized).cursor;
+    if (cursor==='') throw Object.assign(new Error('invalid cursor'),{code:'CURSOR_INVALID'});
+    seen.queries.push(cursor);
     return {records:[],nextCursor:'query-next'};
   };
   state.services.events.list=async(_actor,_space,_collection,cursor)=>{
+    if (cursor==='') throw Object.assign(new Error('invalid cursor'),{code:'CURSOR_INVALID'});
     seen.events.push(cursor);return {events:[],nextCursor:cursor??null};
   };
   const {server,endpoint}=await serve(createHttpHandler(state));
@@ -364,14 +367,21 @@ test('empty CLI cursors fail before fetching; event polling preserves supplied c
   assert.equal((await cliProcess(root,['auth','import','--token-stdin','--store','file'],
     'secret-test-token\n')).status,0);
   assert.equal((await cli(['spaces','select','--space','sp_a'])).status,0);
-  for (const args of [
-    ['records','query','--limit','1','--cursor',''],
-    ['events','list','--cursor','']
+  const route=`${endpoint}v1/spaces/sp_a/collections/entries`;
+  for (const [args,direct] of [
+    [['records','query','--limit','1','--cursor',''],
+      fetch(`${route}/records/query`,{method:'POST',headers:{Authorization:'Bearer secret-test-token',
+        'Content-Type':'application/json'},body:JSON.stringify({predicates:[],limit:1,cursor:''})})],
+    [['events','list','--cursor',''],
+      fetch(`${route}/events?cursor=`,{headers:{Authorization:'Bearer secret-test-token'}})]
   ]) {
+    const response=await direct;
+    assert.equal(response.status,400);
+    assert.equal((await response.json()).error.code,'CURSOR_INVALID');
     const rejected=await cli([...args,'--collection','entries']);
     assert.equal(rejected.status,1);
     assert.deepEqual(JSON.parse(rejected.stderr).error,
-      {code:'INVALID_ARGUMENT',message:'INVALID_ARGUMENT',retryable:false,requestId:null});
+      {code:'CURSOR_INVALID',message:'CURSOR_INVALID',retryable:false,requestId:null});
   }
   assert.deepEqual(seen,{queries:[],events:[]});
   assert.equal((await cli(['records','query','--collection','entries','--limit','1',
@@ -382,6 +392,46 @@ test('empty CLI cursors fail before fetching; event polling preserves supplied c
   assert.equal(next.status,0,next.stderr);
   assert.equal(JSON.parse(next.stdout).nextCursor,'event-page-2');
   assert.deepEqual(seen,{queries:['query-page-2'],events:[undefined,'event-page-2']});
+});
+
+test('malformed lifecycle PATCH returns an input error without invoking the transition',async t=>{
+  const state=fixture();let updates=0;
+  state.services.spaces.update=async()=>{updates++;return {lifecycle:'readOnly'};};
+  const {server,endpoint}=await serve(createHttpHandler(state));
+  t.after(()=>server.close());
+  for (const lifecycle of [{toString:null},null,2,[]]) {
+    const response=await fetch(`${endpoint}v1/spaces/sp_a`,{method:'PATCH',
+      headers:{Authorization:'Bearer secret-test-token','Content-Type':'application/json'},
+      body:JSON.stringify({lifecycle})});
+    assert.equal(response.status,400);
+    assert.equal((await response.json()).error.code,'INVALID_ARGUMENT');
+  }
+  assert.equal(updates,0);
+  const valid=await fetch(`${endpoint}v1/spaces/sp_a`,{method:'PATCH',
+    headers:{Authorization:'Bearer secret-test-token','Content-Type':'application/json'},
+    body:JSON.stringify({lifecycle:'readOnly'})});
+  assert.equal(valid.status,200);
+  assert.equal(updates,1);
+});
+
+test('Secret Service verification failure clears a stored token',async()=>{
+  const endpoint='https://secret-test.example.invalid/';
+  const token='private-test-token';
+  let stored;
+  const calls=[];
+  const run=async(program,args,stdin)=>{
+    assert.equal(program,'secret-tool');
+    assert.deepEqual(args.slice(-4),['service','stateplane','endpoint',endpoint]);
+    assert.ok(!args.includes(token));
+    const action=args[0];calls.push(action);
+    if (action==='store') { stored=stdin;return {ok:true,output:''}; }
+    if (action==='lookup') return {ok:true,output:'wrong-token\n'};
+    if (action==='clear') { stored=undefined;return {ok:true,output:''}; }
+    throw new Error('unexpected secret-tool action');
+  };
+  await assert.rejects(storeSecretServiceToken(endpoint,token,run),{code:'KEYCHAIN_UNAVAILABLE'});
+  assert.deepEqual(calls,['store','lookup','clear']);
+  assert.equal(stored,undefined);
 });
 
 test('GET honors Retry-After; writes never auto-retry after an uncertain outcome',async()=>{

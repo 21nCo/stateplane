@@ -67,6 +67,17 @@ function command(program:string,args:string[],stdin?:string):Promise<{ok:boolean
     child.stdin.end(stdin);
   });
 }
+export async function storeSecretServiceToken(endpoint:string,token:string,
+  run:typeof command=command):Promise<void> {
+  const args=keyArgs(endpoint);
+  const stored=await run('secret-tool',['store','--label=Stateplane API key',...args],token);
+  if (!stored.ok) throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
+  const checked=await run('secret-tool',['lookup',...args]);
+  if (!checked.ok || checked.output.replace(/\n$/,'')!==token) {
+    await run('secret-tool',['clear',...args]);
+    throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
+  }
+}
 export async function saveToken(endpoint:string,token:string,store:'keychain'|'file'):Promise<void> {
   if (!token || /[\r\n\0]/.test(token)) throw new StateplaneCliError('INVALID_ARGUMENT');
   if (store==='file') {
@@ -76,16 +87,12 @@ export async function saveToken(endpoint:string,token:string,store:'keychain'|'f
     finally { await rm(temp,{force:true}); }
     return;
   }
-  const result=platform()==='darwin'
-    ? await macKeychain('store',endpoint,token)
-    : platform()==='linux'
-      ? await command('secret-tool',['store','--label=Stateplane API key',...keyArgs(endpoint)],token)
-      : {ok:false};
+  if (platform()==='linux') return storeSecretServiceToken(endpoint,token);
+  const result=platform()==='darwin' ? await macKeychain('store',endpoint,token) : {ok:false};
   if (!result.ok) throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
-  const checked=platform()==='darwin' ? await macKeychain('load',endpoint)
-    : await command('secret-tool',['lookup',...keyArgs(endpoint)]);
-  if (!checked.ok || checked.output.replace(/\n$/,'')!==token) {
-    if (platform()==='darwin') await macKeychain('remove',endpoint);
+  const checked=await macKeychain('load',endpoint);
+  if (!checked.ok || checked.output!==token) {
+    await macKeychain('remove',endpoint);
     throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
   }
 }

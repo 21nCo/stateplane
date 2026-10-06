@@ -56,6 +56,11 @@ function required(flags:Flags,key:string):string {
   if (typeof value!=='string' || !value) throw new StateplaneCliError('INVALID_ARGUMENT');
   return value;
 }
+function cursor(flags:Flags):string {
+  const value=flags.cursor;
+  if (typeof value!=='string' || !value) throw new StateplaneCliError('CURSOR_INVALID');
+  return value;
+}
 function integer(value:string):number {
   const number=Number(value);
   if (!Number.isSafeInteger(number) || number<1) throw new StateplaneCliError('INVALID_ARGUMENT');
@@ -187,7 +192,7 @@ export async function runCli(argv:string[]):Promise<number> {
         predicates:parsed(typeof flags.predicates==='string'?flags.predicates:'[]'),
         limit:integer(required(flags,'limit')),
         ...(flags.sort ? {sort:parsed(required(flags,'sort'))}:{}),
-        ...(flags.cursor!==undefined ? {cursor:required(flags,'cursor')}:{} )},32_768)));
+        ...(flags.cursor!==undefined ? {cursor:cursor(flags)}:{} )},32_768)));
       else if (action==='count') output(await client.request('POST',`${recordPath}/count`,
         withinWireBudget(parsed(typeof flags.predicates==='string'?flags.predicates:'[]'),32_768)));
       else if (['create','replace','patch','delete'].includes(action??'')) {
@@ -232,7 +237,7 @@ export async function runCli(argv:string[]):Promise<number> {
       return 0;
     }
     if (resource==='events' && action==='list') {
-      output(await client.request('GET',`${collectionPath}/events${flags.cursor!==undefined?`?cursor=${encoded(required(flags,'cursor'))}`:''}`));
+      output(await client.request('GET',`${collectionPath}/events${flags.cursor!==undefined?`?cursor=${encoded(cursor(flags))}`:''}`));
       return 0;
     }
     throw new StateplaneCliError('INVALID_ARGUMENT');
