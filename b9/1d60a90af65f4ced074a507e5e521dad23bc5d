@@ -1,0 +1,18 @@
+docs/http-cli.md
+  h_a39f9495f9ec1d 129-132
+packages/cli/src/run.ts
+  h_a39f9495f9ec1d 90-96,157,159-160,171-174,185,189,191,211,224,226-227,234
+test/http-cli.test.js
+  h_a39f9495f9ec1d 299-386
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b91d60a90af65f4ced074a507e5e521dad23bc5d",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
