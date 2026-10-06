@@ -1,0 +1,18 @@
+packages/cli/src/run.ts
+  h_a39f9495f9ec1d 52,98-99
+packages/cli/src/transport.ts
+  h_a39f9495f9ec1d 44
+test/http-cli.test.js
+  h_a39f9495f9ec1d 197-268
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fc561a1ea144a999be0eec233ad3f90c9a66a89b",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
