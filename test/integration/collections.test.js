@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
-import { randomBytes, randomUUID } from 'node:crypto';
-import { types } from 'node:util';
-import { execFileSync } from 'node:child_process';
+import { readFile, readdir } from 'node:fs/promises';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { types, promisify } from 'node:util';
+import { execFile, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { PostgresAuthority, CollectionRegistry, validateDefinition, validateValue, compatible, externalKey, derivedValues } from '../../packages/postgres/dist/index.js';
@@ -70,14 +70,72 @@ test('definition subset, additive revisions and normalization have explicit fail
     assert.equal(derivedValues({label:decomposed},d).unique[0].encodedValue,
       derivedValues({label:composed},d).unique[0].encodedValue);
   }
-  assert.equal(derivedValues({label:'x'},d).indexes.length,0);
+  assert.deepEqual(derivedValues({label:'x'},d).indexes,[{field:'score',kind:'missing'}]);
   assert.equal(derivedValues({label:'x',score:null},d).indexes[0].kind,'null');
   assert.throws(()=>validateDefinition(definition('bad',{schema:{...schema,patternProperties:{}}})),{code:'SCHEMA_UNSUPPORTED'});
   assert.throws(()=>validateDefinition(definition('bad',{unique:[{name:'dup',paths:['label']},{name:'dup',paths:['score']}]})),{code:'SCHEMA_UNSUPPORTED'});
+  const indexed=Object.fromEntries(Array.from({length:17},(_,i)=>[`field${i}`,{type:'string'}]));
+  assert.throws(()=>validateDefinition(definition('too-many-indexes',{
+    schema:{...schema,properties:{...schema.properties,...indexed}},
+    filterable:Object.keys(indexed)
+  })),{code:'SCHEMA_UNSUPPORTED'});
+  const uniqueFields=Object.fromEntries(Array.from({length:17},(_,i)=>[`unique${i}`,{type:'string'}]));
+  assert.throws(()=>validateDefinition(definition('too-many-unique-fields',{
+    schema:{...schema,properties:{...schema.properties,...uniqueFields}},
+    unique:Object.keys(uniqueFields).map((field,i)=>({name:`u${i}`,paths:[field]})),filterable:[]
+  })),{code:'SCHEMA_UNSUPPORTED'});
+  assert.throws(()=>validateDefinition(definition('too-many-total-indexed-fields',{
+    schema:{...schema,properties:{...schema.properties,...uniqueFields}},
+    unique:[{name:'one',paths:['unique0']}],filterable:Object.keys(uniqueFields).slice(1)
+  })),{code:'SCHEMA_UNSUPPORTED'});
   const next=definition('generic',{version:2,schema:{...schema,properties:{...schema.properties,note:{type:'string',description:'optional'}}}});
   assert.doesNotThrow(()=>compatible(d,next));
   assert.throws(()=>compatible(d,{...next,schema:{...next.schema,required:['label','note']}}),{code:'SCHEMA_BREAKING'});
   assert.throws(()=>compatible(d,{...next,unique:[{name:'new',paths:['label']}]}),{code:'SCHEMA_BREAKING'});
+});
+
+test('a legacy collection above the new index cap can revise without adding paths',async()=>{
+  const spaceId=`sp_${randomUUID()}`,collectionId=`legacy_${randomUUID()}`;
+  const fields=Array.from({length:17},(_,index)=>`field${index}`);
+  const legacySchema={...schema,properties:{...schema.properties,
+    ...Object.fromEntries(fields.map(field=>[field,{type:'string'}]))}};
+  const previous=definition(collectionId,{schema:legacySchema,
+    unique:fields.map((field,i)=>({name:`u${i}`,paths:[field]})),filterable:fields,sortable:[]});
+  const owner={spaceId,collectionId,principalId:'owner',credentialId:'owner-session',capability:'schema:write',
+    policyVersion:1,placementGeneration:1};
+  await pool.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+    VALUES($1,'owner','cell-a','cell-a','target-a')`,[spaceId]);
+  const seed=await pool.connect();
+  try {
+    await seed.query('BEGIN');
+    await seed.query('INSERT INTO collections(space_id,collection_id) VALUES($1,$2)',[spaceId,collectionId]);
+    await seed.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition)
+      VALUES($1,$2,1,$3)`,[spaceId,collectionId,JSON.stringify(previous)]);
+    await seed.query('COMMIT');
+  } catch(error) { await seed.query('ROLLBACK'); throw error; }
+  finally { seed.release(); }
+  for (const field of fields) await pool.query(`INSERT INTO collection_index_declarations
+    (space_id,collection_id,field_name,value_kind,filterable,sortable,ready,accepted_version)
+    VALUES($1,$2,$3,'string',TRUE,FALSE,TRUE,1)`,[spaceId,collectionId,field]);
+  const revised={...previous,version:2};
+  assert.equal((await registry.revise(owner,1,revised)).version,2);
+  const withNote={...revised,version:3,
+    schema:{...legacySchema,properties:{...legacySchema.properties,note:{type:'string'}}}};
+  assert.equal((await registry.reviseSerialized(owner,2,JSON.stringify(withNote))).version,3);
+  const extra='newField';
+  const attempted={...withNote,version:4,
+    schema:{...withNote.schema,properties:{...withNote.schema.properties,[extra]:{type:'string'}}},
+    filterable:[...fields,extra]};
+  const originalFlatMap=Array.prototype.flatMap,originalSome=Array.prototype.some;
+  try {
+    Array.prototype.flatMap=function(){ return []; };
+    Array.prototype.some=function(){ return false; };
+    await assert.rejects(registry.revise(owner,3,attempted),{code:'SCHEMA_UNSUPPORTED'});
+  } finally {
+    Array.prototype.flatMap=originalFlatMap;
+    Array.prototype.some=originalSome;
+  }
+  await assert.rejects(registry.reviseSerialized(owner,3,JSON.stringify(attempted)),{code:'SCHEMA_UNSUPPORTED'});
 });
 
 test('unindexed Unicode NUL survives writes and replay while indexed siblings fail explicitly',async()=>{
@@ -920,9 +978,16 @@ test('external keys keep one normalized identity across low-level writes and his
   const collidingId=`rec_${randomUUID()}`;
   const collidingData=JSON.stringify({label:'historical-collision'});
   // Emulate an already populated database that predates normalized writes.
-  await pool.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
-    SELECT space_id,collection_id,$2,1,schema_version,'external',$3,$4::text,$4::jsonb FROM records WHERE record_id=$1`,
-  [created.ref.id,collidingId,'é',collidingData]);
+  const historical=await pool.connect();
+  try {
+    await historical.query('BEGIN');
+    await historical.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+      SELECT space_id,collection_id,$2,1,schema_version,'external',$3,$4::text,$4::jsonb FROM records WHERE record_id=$1`,
+    [created.ref.id,collidingId,'é',collidingData]);
+    await historical.query(`INSERT INTO record_index_values(space_id,collection_id,record_id,field_name,value_kind)
+      VALUES($1,$2,$3,'score','missing')`,[writer.spaceId,writer.collectionId,collidingId]);
+    await historical.query('COMMIT');
+  } finally { historical.release(); }
   await assert.rejects(authority.transaction(read(writer),tx=>tx.getByKey('external',raw)),{code:'SCHEMA_CONFLICT'});
   await assert.rejects(authority.transaction(read(writer),tx=>tx.getByKey('external','é')),{code:'SCHEMA_CONFLICT'});
   assert.equal((await authority.transaction(read(writer),tx=>tx.getRecord(created.ref.id))).ref.id,created.ref.id);
@@ -1442,4 +1507,1052 @@ test('public schema helpers reject proxies without detection while serialized wr
     cwd:fileURLToPath(new URL('../..',import.meta.url)),encoding:'utf8',
     env:{...process.env,STA7_TEST_CONTEXT:JSON.stringify({url,owner,writer,next})}
   }),'closed');
+});
+
+test('signed pages bind scope, query and schema; mutable sorts expose live traversal',async()=>{
+  const {owner,writer}=await fixture();
+  const key=randomBytes(32);
+  const paged=new PostgresAuthority(pool,3600,key);
+  await assert.rejects(paged.transaction(read(writer),tx=>tx.queryPage([],1,{field:'score',direction:'asc'})),{code:'SCHEMA_CONFLICT'});
+  await registry.revise(owner,1,definition(owner.collectionId,{version:2,sortable:['score']}));
+  await registry.backfill(owner,'score');
+  const created=[];
+  for (const [i,score] of [1,2,3].entries())
+    created.push(await authority.mutateRequest(writer,{operation:'create',idempotencyKey:`page-${i}`,data:{label:`page-${i}`,score}}));
+  await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'page-missing',data:{label:'page-missing'}});
+  const reader=read(writer),sort={field:'score',direction:'asc'};
+  for (const malformed of [
+    Object.defineProperty({direction:'asc'},'field',{value:'score',enumerable:false}),
+    Object.defineProperty({field:'score'},'direction',{value:'asc',enumerable:false})
+  ]) await assert.rejects(paged.transaction(reader,tx=>tx.queryPage([],1,malformed)),{code:'INVALID_ARGUMENT'});
+  const positive=[{field:'score',kind:'number',operator:'gte',value:0}];
+  const descending=await paged.transaction(reader,tx=>tx.queryPage(positive,3,{field:'score',direction:'desc'}));
+  assert.deepEqual(descending.records.map(row=>JSON.parse(row.canonicalData).score),[3,2,1]);
+  const first=await paged.transaction(reader,tx=>tx.queryPage(positive,1,sort));
+  assert.equal(first.records.length,1);
+  assert.equal(JSON.parse(first.records[0].canonicalData).score,1);
+  assert.ok(first.nextCursor);
+  await assert.rejects(paged.transaction(read(owner),tx=>tx.queryPage(positive,1,sort,first.nextCursor)),{code:'CURSOR_INVALID'});
+  await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
+    VALUES($1,$2,'other-agent',ARRAY['records:read'])`,[owner.spaceId,owner.collectionId]);
+  await assert.rejects(paged.transaction({...reader,credentialId:'other-agent'},tx=>
+    tx.queryPage(positive,1,sort,first.nextCursor)),{code:'CURSOR_INVALID'});
+  await assert.rejects(paged.transaction({...reader,spaceId:'another-space'},tx=>tx.queryPage(positive,1,sort,first.nextCursor)),{code:'NOT_FOUND'});
+  const other=await fixture();
+  await registry.revise(other.owner,1,definition(other.owner.collectionId,{version:2,sortable:['score']}));
+  await registry.backfill(other.owner,'score');
+  await assert.rejects(paged.transaction(read(other.writer),tx=>tx.queryPage(positive,1,sort,first.nextCursor)),{code:'CURSOR_INVALID'});
+  await assert.rejects(paged.transaction(reader,tx=>tx.queryPage([{field:'score',kind:'number',operator:'gt',value:0}],1,sort,first.nextCursor)),{code:'CURSOR_INVALID'});
+  await assert.rejects(paged.transaction(reader,tx=>tx.queryPage(positive,1,sort,`${first.nextCursor[0]==='A' ? 'B' : 'A'}${first.nextCursor.slice(1)}`)),{code:'CURSOR_INVALID'});
+  await authority.mutateRequest(writer,{operation:'replace',idempotencyKey:'move-before',id:created[1].ref.id,
+    expectedRevision:1,data:{label:'page-1',score:0}});
+  const second=await paged.transaction(reader,tx=>tx.queryPage(positive,1,sort,first.nextCursor));
+  assert.equal(JSON.parse(second.records[0].canonicalData).score,3);
+  assert.equal(second.nextCursor,null);
+  assert.equal(await paged.transaction(reader,tx=>tx.countRecords([])),4);
+  assert.equal(await paged.transaction(reader,tx=>tx.existsRecord([{field:'score',kind:'number',operator:'eq',value:0}])),true);
+  await registry.revise(owner,2,definition(owner.collectionId,{version:3,sortable:['score']}));
+  await assert.rejects(paged.transaction(reader,tx=>tx.queryPage(positive,1,sort,first.nextCursor)),{code:'CURSOR_INVALID'});
+  await pool.query('UPDATE spaces SET policy_version=2 WHERE space_id=$1',[owner.spaceId]);
+  const afterPolicy={...reader,policyVersion:2};
+  await assert.rejects(paged.transaction(afterPolicy,tx=>tx.queryPage(positive,1,sort,first.nextCursor)),{code:'CURSOR_INVALID'});
+  const fresh=await paged.transaction(afterPolicy,tx=>tx.queryPage(positive,1,sort));
+  assert.ok(fresh.nextCursor);
+  await pool.query('UPDATE spaces SET placement_generation=2 WHERE space_id=$1',[owner.spaceId]);
+  await assert.rejects(paged.transaction({...afterPolicy,placementGeneration:2},tx=>
+    tx.queryPage(positive,1,sort,fresh.nextCursor)),{code:'CURSOR_INVALID'});
+});
+
+test('explicit sort pages preserve missing, null and value ranks in both directions',async()=>{
+  const {owner,writer}=await fixture();
+  await registry.revise(owner,1,definition(owner.collectionId,{version:2,sortable:['score']}));
+  await registry.backfill(owner,'score');
+  const values=[undefined,null,2,1,null,undefined,1];
+  const ids=[];
+  for (let i=0;i<values.length;i++) ids.push((await authority.mutateRequest(writer,{operation:'create',
+    idempotencyKey:`rank-${i}`,data:{label:`rank-${i}`,...(values[i]===undefined ? {} : {score:values[i]})}})).ref.id);
+  const paged=new PostgresAuthority(pool,3600,randomBytes(32)),reader=read(writer);
+  for (const direction of ['asc','desc']) {
+    const seen=[];
+    let cursor;
+    do {
+      const page=await paged.transaction(reader,tx=>tx.queryPage([],1,{field:'score',direction},cursor));
+      assert.equal(page.records.length,1);
+      seen.push(JSON.parse(page.records[0].canonicalData).label);
+      cursor=page.nextCursor;
+    } while(cursor);
+    const expected=direction==='asc'
+      ? [['rank-0','rank-5'],['rank-1','rank-4'],['rank-3','rank-6'],['rank-2']]
+      : [['rank-2'],['rank-3','rank-6'],['rank-1','rank-4'],['rank-0','rank-5']];
+    assert.deepEqual(seen.map(label=>expected.findIndex(group=>group.includes(label))),
+      expected.flatMap((group,rank)=>group.map(()=>rank)));
+    for (const group of expected) {
+      assert.deepEqual(seen.filter(label=>group.includes(label)),[...group].sort((a,b)=>
+        ids[Number(a.slice(5))].localeCompare(ids[Number(b.slice(5))])));
+    }
+  }
+});
+
+test('low-level mutations fill declared sort rows and a cutover writer cannot commit a gap',async()=>{
+  const {owner,writer}=await fixture();
+  await registry.revise(owner,1,definition(owner.collectionId,{version:2,sortable:['score']}));
+  await registry.backfill(owner,'score');
+  const low={operation:'create',idempotencyKey:'low-index-create',requestDigest:'a'.repeat(64),
+    canonicalData:'{"label":"low","score":7}',unique:[],indexes:[]};
+  const created=await authority.mutate(writer,low);
+  assert.equal((await authority.mutate(writer,low)).receiptId,created.receiptId);
+  await assert.rejects(authority.mutate(writer,{...low,idempotencyKey:'wrong-index',requestDigest:'c'.repeat(64),
+    indexes:[{field:'score',kind:'number',value:8}]}),{code:'SCHEMA_CONFLICT'});
+  const replaced=await authority.mutate(writer,{operation:'replace',idempotencyKey:'low-index-replace',
+    requestDigest:'b'.repeat(64),recordId:created.ref.id,expectedRevision:1,
+    canonicalData:'{"label":"low"}',unique:[],indexes:[]});
+  assert.equal(replaced.revision,2);
+  await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'typed-neighbor',data:{label:'neighbor',score:2}});
+  const reader=read(writer);
+  const paged=new PostgresAuthority(pool,3600,randomBytes(32));
+  const count=await authority.transaction(reader,tx=>tx.countRecords([]));
+  assert.equal(count,2);
+  for (const direction of ['asc','desc']) {
+    const seen=[];
+    let cursor;
+    do {
+      const page=await paged.transaction(reader,tx=>tx.queryPage([],1,{field:'score',direction},cursor));
+      seen.push(...page.records.map(record=>record.ref.id));
+      cursor=page.nextCursor;
+    } while (cursor);
+    assert.equal(seen.length,count);
+    assert.equal(new Set(seen).size,count);
+    assert.ok(seen.includes(created.ref.id));
+  }
+  const stored=await pool.query(`SELECT value_kind FROM record_index_values
+    WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 AND field_name='score'`,
+  [owner.spaceId,owner.collectionId,created.ref.id]);
+  assert.deepEqual(stored.rows.map(row=>row.value_kind),['missing']);
+  const old=await pool.connect();
+  try {
+    await old.query('BEGIN');
+    await old.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+      VALUES($1,$2,'old-writer',1,2,'generated','old-writer','{"label":"old","score":9}','{"label":"old","score":9}'::jsonb)`,
+    [owner.spaceId,owner.collectionId]);
+    await assert.rejects(old.query('COMMIT'),{code:'PZ003'});
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM records
+      WHERE space_id=$1 AND collection_id=$2 AND record_id='old-writer'`,[owner.spaceId,owner.collectionId])).rows[0].n,0);
+    await old.query('BEGIN');
+    await old.query(`UPDATE records SET revision=revision+1,canonical_data='{"label":"low","score":10}',
+      data='{"label":"low","score":10}'::jsonb WHERE space_id=$1 AND collection_id=$2 AND record_id=$3`,
+    [owner.spaceId,owner.collectionId,created.ref.id]);
+    await old.query(`DELETE FROM record_index_values WHERE space_id=$1 AND collection_id=$2 AND record_id=$3`,
+    [owner.spaceId,owner.collectionId,created.ref.id]);
+    await assert.rejects(old.query('COMMIT'),{code:'PZ003'});
+    assert.equal((await authority.transaction(reader,tx=>tx.getRecord(created.ref.id))).revision,2);
+    assert.equal(await authority.transaction(reader,tx=>tx.countRecords([])),count);
+  } finally { old.release(); }
+});
+
+test('031 restarts a pre-upgrade partial backfill before publishing sorted pages',async()=>{
+  const database=`stateplane_sta8_upgrade_${randomUUID().replaceAll('-','')}`;
+  const location=new URL(baseUrl);
+  location.pathname=`/${database}`;
+  const admin=new pg.Client({connectionString:baseUrl});
+  await admin.connect();
+  let upgraded;
+  let upgradePool;
+  try {
+    await admin.query(`CREATE DATABASE ${database}`);
+    upgraded=new pg.Client({connectionString:location.href});
+    await upgraded.connect();
+    const files=(await readdir(new URL('../../migrations/',import.meta.url))).filter(name=>/^\d{3}_.*\.sql$/.test(name)).sort();
+    for (const file of files.filter(name=>name<'031_'))
+      await upgraded.query(await readFile(new URL(`../../migrations/${file}`,import.meta.url),'utf8'));
+    const scope={spaceId:'sp_partial_upgrade',collectionId:'entries',principalId:'owner',credentialId:'owner-session',
+      capability:'schema:write',policyVersion:1,placementGeneration:1};
+    const accepted=definition('entries',{unique:[],sortable:['score','label']});
+    await upgraded.query('BEGIN');
+    await upgraded.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+      VALUES($1,'owner','cell-a','cell-a','target-a')`,[scope.spaceId]);
+    await upgraded.query(`INSERT INTO collections(space_id,collection_id) VALUES($1,$2)`,[scope.spaceId,scope.collectionId]);
+    await upgraded.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition)
+      VALUES($1,$2,1,$3)`,[scope.spaceId,scope.collectionId,JSON.stringify(accepted)]);
+    await upgraded.query(`INSERT INTO collection_index_declarations
+      (space_id,collection_id,field_name,value_kind,filterable,sortable,ready,accepted_version,backfill_after)
+      VALUES($1,$2,'score','number',TRUE,TRUE,FALSE,1,'rec_100')`,[scope.spaceId,scope.collectionId]);
+    await upgraded.query(`INSERT INTO collection_index_declarations
+      (space_id,collection_id,field_name,value_kind,filterable,sortable,ready,accepted_version)
+      VALUES($1,$2,'label','string',FALSE,TRUE,TRUE,1)`,[scope.spaceId,scope.collectionId]);
+    await upgraded.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+      SELECT $1,$2,'rec_'||lpad(g::text,3,'0'),1,1,'generated','rec_'||lpad(g::text,3,'0'),payload::text,payload
+      FROM generate_series(1,101) g CROSS JOIN LATERAL
+        (SELECT CASE WHEN g%2=0 THEN jsonb_build_object('label','row-'||g,'score',g)
+          ELSE jsonb_build_object('label','row-'||g) END AS payload) p`,[scope.spaceId,scope.collectionId]);
+    await upgraded.query(`INSERT INTO record_index_values
+      (space_id,collection_id,record_id,field_name,value_kind,number_value)
+      SELECT $1,$2,'rec_'||lpad(g::text,3,'0'),'score','number',g
+      FROM generate_series(1,100) g WHERE g%2=0`,[scope.spaceId,scope.collectionId]);
+    await upgraded.query('COMMIT');
+    const oldWriter=new pg.Client({connectionString:location.href});
+    await oldWriter.connect();
+    let migrating;
+    try {
+      await oldWriter.query('BEGIN');
+      await oldWriter.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+        VALUES($1,$2,'rec_102',1,1,'generated','rec_102','{"label":"late"}','{"label":"late"}'::jsonb)`,
+      [scope.spaceId,scope.collectionId]);
+      let settled=false;
+      const migratingPid=(await upgraded.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+      const oldWriterPid=(await oldWriter.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+      migrating=upgraded.query(await readFile(new URL('../../migrations/031_index_missing_projection.sql',import.meta.url),'utf8'))
+        .finally(()=>{ settled=true; });
+      let observed=false;
+      for (let attempt=0;attempt<100;attempt++) {
+        const blockers=(await admin.query('SELECT pg_blocking_pids($1) AS pids',[migratingPid])).rows[0].pids;
+        if (blockers.includes(oldWriterPid)) { observed=true; break; }
+        if (settled) break;
+        await new Promise(resolve=>setTimeout(resolve,20));
+      }
+      assert.equal(observed,true,'PostgreSQL reports the old writer blocking migration cutover');
+      await oldWriter.query('COMMIT');
+    } finally {
+      await oldWriter.query('ROLLBACK').catch(()=>{});
+      await oldWriter.end();
+    }
+    await migrating;
+    assert.deepEqual((await upgraded.query(`SELECT ready,backfill_after FROM collection_index_declarations
+      WHERE space_id=$1 AND collection_id=$2 AND field_name='score'`,[scope.spaceId,scope.collectionId])).rows[0],
+    {ready:false,backfill_after:null});
+    assert.equal((await upgraded.query(`SELECT ready FROM collection_index_declarations
+      WHERE space_id=$1 AND collection_id=$2 AND field_name='label'`,[scope.spaceId,scope.collectionId])).rows[0].ready,false);
+    upgradePool=new pg.Pool({connectionString:location.href,max:4});
+    const upgrading=new CollectionRegistry(upgradePool);
+    assert.deepEqual(await upgrading.backfill(scope,'score'),{processed:100,ready:false});
+    assert.deepEqual(await upgrading.backfill(scope,'score'),{processed:2,ready:true});
+    assert.deepEqual(await upgrading.backfill(scope,'label'),{processed:100,ready:false});
+    assert.deepEqual(await upgrading.backfill(scope,'label'),{processed:2,ready:true});
+    const reader={...scope,capability:'records:read'};
+    const querying=new PostgresAuthority(upgradePool,3600,randomBytes(32));
+    assert.equal(await querying.transaction(reader,tx=>tx.countRecords([])),102);
+    for (const direction of ['asc','desc']) {
+      for (const field of ['score','label']) {
+        const seen=new Set();
+        let cursor;
+        do {
+          const page=await querying.transaction(reader,tx=>tx.queryPage([],25,{field,direction},cursor));
+          for (const row of page.records) seen.add(row.ref.id);
+          cursor=page.nextCursor;
+        } while (cursor);
+        assert.equal(seen.size,102);
+      }
+    }
+    assert.equal((await upgraded.query(`SELECT count(*)::int AS n FROM record_index_values
+      WHERE space_id=$1 AND collection_id=$2 AND field_name='score'`,[scope.spaceId,scope.collectionId])).rows[0].n,102);
+  } finally {
+    await upgradePool?.end();
+    await upgraded?.end();
+    await admin.query(`DROP DATABASE IF EXISTS ${database} WITH (FORCE)`);
+    await admin.end();
+  }
+});
+
+test('populated 031 upgrade requires a drained gate before its projection sweep',async()=>{
+  const database=`stateplane_sta8_drain_${randomUUID().replaceAll('-','')}`;
+  const location=new URL(baseUrl); location.pathname=`/${database}`;
+  const admin=new pg.Client({connectionString:baseUrl});
+  await admin.connect();
+  let upgrade;
+  try {
+    await admin.query(`CREATE DATABASE ${database}`);
+    upgrade=new pg.Client({connectionString:location.href});
+    await upgrade.connect();
+    await upgrade.query(`CREATE TABLE stateplane_migrations(name text PRIMARY KEY,sha256 text NOT NULL,
+      applied_at timestamptz NOT NULL DEFAULT now())`);
+    const files=(await readdir(new URL('../../migrations/',import.meta.url))).filter(name=>/^\d{3}_.*\.sql$/.test(name)).sort();
+    for (const file of files.filter(name=>name<'031_')) {
+      const sql=await readFile(new URL(`../../migrations/${file}`,import.meta.url),'utf8');
+      await upgrade.query(sql);
+      await upgrade.query('INSERT INTO stateplane_migrations(name,sha256) VALUES($1,$2)',
+        [file,createHash('sha256').update(sql).digest('hex')]);
+    }
+    await upgrade.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+      VALUES('sta8-drain','owner','cell-a','cell-a','target-a')`);
+    await upgrade.query('BEGIN');
+    await upgrade.query("INSERT INTO collections(space_id,collection_id) VALUES('sta8-drain','entries')");
+    await upgrade.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition)
+      VALUES('sta8-drain','entries',1,$1)`,[JSON.stringify(definition('entries',{unique:[],sortable:['score']}))]);
+    await upgrade.query('COMMIT');
+    await upgrade.query(`INSERT INTO collection_index_declarations
+      (space_id,collection_id,field_name,value_kind,filterable,sortable,ready,accepted_version)
+      VALUES('sta8-drain','entries','score','number',TRUE,TRUE,FALSE,1)`);
+    await upgrade.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,
+      key_mode,normalized_key,canonical_data,data)
+      SELECT 'sta8-drain','entries','rec-'||g,1,1,'generated','rec-'||g,payload::text,payload
+      FROM generate_series(1,2000) g CROSS JOIN LATERAL
+        (SELECT jsonb_build_object('label','row-'||g,'score',g) AS payload) p`);
+    await upgrade.query(`INSERT INTO idempotency_receipts(receipt_id,space_id,collection_id,credential_id,
+      operation,idempotency_key,request_digest,record_id,response,committed_at,expires_at)
+      VALUES('legacy-receipt','sta8-drain','entries','agent','create','legacy-key',$1,
+        'rec-1','{}'::jsonb,clock_timestamp(),clock_timestamp()+interval '1 hour')`,['a'.repeat(64)]);
+    await upgrade.query(`INSERT INTO batch_operations(space_id,collection_id,credential_id,operation_key,manifest_digest,item_count)
+      VALUES('sta8-drain','entries','agent','legacy-attempt','digest',1)`);
+    await upgrade.query(`INSERT INTO batch_items(space_id,collection_id,credential_id,operation_key,ordinal,request_text,attempts)
+      VALUES('sta8-drain','entries','agent','legacy-attempt',0,'{}',-1)`);
+    const env={...process.env,DATABASE_URL:location.href};
+    const cwd=fileURLToPath(new URL('../..',import.meta.url));
+    let failure;
+    try { execFileSync(process.execPath,['scripts/migrate.mjs'],{cwd,env,encoding:'utf8'}); }
+    catch(error) { failure=error; }
+    assert.match(String(failure?.stderr),/Populated projection upgrade requires drained traffic/);
+    assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name LIKE '031_%'"))
+      .rows[0].n,0,'refused migration leaves no partial ledger entry');
+    const activeWriter=new pg.Client({connectionString:location.href});
+    await activeWriter.connect();
+    try {
+      await activeWriter.query('BEGIN');
+      await activeWriter.query("UPDATE records SET data=data WHERE space_id='sta8-drain' AND record_id='rec-1'");
+      let contention;
+      try { execFileSync(process.execPath,['scripts/migrate.mjs'],{cwd,
+        env:{...env,STATEPLANE_POPULATED_INDEX_UPGRADE:'drained'},encoding:'utf8'}); }
+      catch(error) { contention=error; }
+      assert.match(String(contention?.stderr),/Projection upgrade requires drained traffic/);
+      assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name LIKE '031_%'"))
+        .rows[0].n,0,'contention refusal leaves no partial projection migration');
+    } finally {
+      await activeWriter.query('ROLLBACK').catch(()=>{});
+      await activeWriter.end();
+    }
+    const blocker=new pg.Client({connectionString:location.href});
+    await blocker.connect();
+    const migrate=promisify(execFile);
+    let migrating;
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query(`SELECT 1 FROM collection_index_declarations
+        WHERE space_id='sta8-drain' AND collection_id='entries' AND field_name='score' FOR NO KEY UPDATE`);
+      const blockerPid=(await blocker.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+      migrating=migrate(process.execPath,['scripts/migrate.mjs'],{cwd,
+        env:{...env,STATEPLANE_POPULATED_INDEX_UPGRADE:'drained'},encoding:'utf8'});
+      migrating.catch(()=>{});
+      let observed=false;
+      for (let attempt=0;attempt<100;attempt++) {
+        const activity=(await upgrade.query(`SELECT pid,wait_event_type,query FROM pg_stat_activity
+          WHERE datname=$1 AND query LIKE 'SELECT count(*)::bigint FROM (%'`,[database])).rows[0];
+        if (activity?.wait_event_type==='Lock' &&
+          (await upgrade.query('SELECT pg_blocking_pids($1) AS pids',[activity.pid])).rows[0].pids.includes(blockerPid))
+        { observed=true; break; }
+        await new Promise(resolve=>setTimeout(resolve,20));
+      }
+      assert.equal(observed,true,'PostgreSQL reports the migrator waiting for the backfill declaration lock');
+      await blocker.query(`INSERT INTO record_index_values
+        (space_id,collection_id,record_id,field_name,value_kind,number_value)
+        VALUES('sta8-drain','entries','rec-1','score','number',1)`);
+      await blocker.query('COMMIT');
+    } finally {
+      await blocker.query('ROLLBACK').catch(()=>{});
+      await blocker.end();
+    }
+    const started=performance.now();
+    await assert.rejects(migrating,'legacy negative attempts are found during the separate validation stage');
+    assert.deepEqual((await upgrade.query(`SELECT name FROM stateplane_migrations WHERE name LIKE '03%'
+      ORDER BY name`)).rows.map(row=>row.name),
+    ['030_batch_ingestion.sql','031_index_missing_projection.sql','032_batch_slot_hardening.sql'],
+    'the staged constraint and prior migrations remain committed for a safe retry');
+    await assert.rejects(upgrade.query(`UPDATE batch_items SET attempts=-2 WHERE operation_key='legacy-attempt'`),
+      {code:'23514'},'new writes obey the staged CHECK before validation');
+    await upgrade.query(`UPDATE batch_items SET attempts=0 WHERE operation_key='legacy-attempt'`);
+    execFileSync(process.execPath,['scripts/migrate.mjs'],{cwd,
+      env:{...env,STATEPLANE_POPULATED_INDEX_UPGRADE:'drained'},encoding:'utf8'});
+    const elapsed=performance.now()-started;
+    assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name LIKE '031_%'"))
+      .rows[0].n,1);
+    assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM records WHERE space_id='sta8-drain'"))
+      .rows[0].n,2000);
+    const attemptsGuard=(await upgrade.query(`SELECT convalidated FROM pg_constraint
+      WHERE conrelid='public.batch_items'::regclass AND conname='batch_items_attempts_nonnegative'`)).rows[0];
+    assert.equal(attemptsGuard?.convalidated,true,'staged batch guard validates in the later migration transaction');
+    assert.deepEqual((await upgrade.query(`SELECT operation,idempotency_key FROM idempotency_receipts
+      WHERE receipt_id='legacy-receipt'`)).rows,[{operation:'create',idempotency_key:'legacy-key'}]);
+    for (const table of ['idempotency_receipts','receipt_reservations','receipt_reservation_scopes']) {
+      assert.equal((await upgrade.query(`SELECT convalidated FROM pg_constraint WHERE conrelid=$1::regclass
+        AND conname=$2`,[`public.${table}`,`${table}_operation_check`])).rows[0]?.convalidated,true);
+    }
+    assert.ok(elapsed<5000,`local 2000-row drained upgrade plus batch validation retry took ${elapsed.toFixed(0)}ms`);
+  } finally {
+    await upgrade?.end();
+    await admin.query(`DROP DATABASE IF EXISTS ${database} WITH (FORCE)`);
+    await admin.end();
+  }
+});
+
+test('string, boolean and full-precision instant sorts page through null and missing ranks',async()=>{
+  const {owner,writer}=await fixture();
+  const expanded={...schema,properties:{...schema.properties,s:{type:['string','null']},
+    b:{type:['boolean','null']},t:{type:['string','null'],format:'date-time'}}};
+  await registry.revise(owner,1,definition(owner.collectionId,{version:2,schema:expanded,sortable:['s','b','t']}));
+  for (const field of ['s','b','t']) await registry.backfill(owner,field);
+  const cases=[
+    {label:'missing'},
+    {label:'null',s:null,b:null,t:null},
+    {label:'high',s:'é',b:true,t:'2026-01-01T00:00:00.1Z'},
+    {label:'low',s:'a',b:false,t:'2026-01-01T00:00:00.01Z'}
+  ];
+  for (const data of cases) await authority.mutateRequest(writer,{operation:'create',idempotencyKey:`typed-sort-${data.label}`,data});
+  const paged=new PostgresAuthority(pool,3600,randomBytes(32));
+  for (const field of ['s','b','t']) for (const direction of ['asc','desc']) {
+    let cursor,labels=[];
+    do {
+      const page=await paged.transaction(read(writer),tx=>tx.queryPage([],1,{field,direction},cursor));
+      labels.push(JSON.parse(page.records[0].canonicalData).label);
+      cursor=page.nextCursor;
+    } while(cursor);
+    assert.deepEqual(labels,direction==='asc' ? ['missing','null','low','high'] : ['high','low','null','missing']);
+  }
+});
+
+test('cursor rejects noncanonical base64url and expiry without losing authorization order',async()=>{
+  const {writer}=await fixture();
+  const paged=new PostgresAuthority(pool,3600,randomBytes(32));
+  for(let i=0;i<3;i++) await authority.mutateRequest(writer,{operation:'create',idempotencyKey:`cursor-${i}`,data:{label:`cursor-${i}`}});
+  const reader=read(writer),first=await paged.transaction(reader,tx=>tx.queryPage([],1));
+  const token=first.nextCursor;
+  assert.ok(token);
+  const alias=`${token}=`;
+  assert.ok(Buffer.from(token,'base64url').equals(Buffer.from(alias,'base64url')));
+  await assert.rejects(paged.transaction(reader,tx=>tx.queryPage([],1,undefined,alias)),{code:'CURSOR_INVALID'});
+  const now=Date.now;
+  try {
+    Date.now=()=>now()+16*60_000;
+    await assert.rejects(paged.transaction(reader,tx=>tx.queryPage([],1,undefined,token)),{code:'CURSOR_INVALID'});
+  } finally { Date.now=now; }
+});
+
+test('typed IN uses authoritative indexes and rejects malformed or oversized lists',async()=>{
+  const {owner,writer}=await fixture();
+  const expanded={...schema,properties:{...schema.properties,active:{type:'boolean'},at:{type:'string',format:'date-time'}}};
+  await registry.revise(owner,1,definition(owner.collectionId,{version:2,schema:expanded,filterable:['score','label','active','at']}));
+  for (const field of ['score','label','active','at']) await registry.backfill(owner,field);
+  for (const [i,score,active,at] of [[0,1,true,'2026-01-01T00:00:00Z'],[1,2,false,'2026-01-02T00:00:00Z'],
+    [2,3,true,'2026-01-03T00:00:00Z']].values()) await authority.mutateRequest(writer,{operation:'create',
+      idempotencyKey:`in-${i}`,data:{label:`in-${i}`,score,active,at}});
+  const reader=read(writer);
+  for (const [field,kind,values] of [['score','number',[1,3]],['label','string',['in-0','in-2']],
+    ['active','boolean',[true]],['at','date-time',['2026-01-01T00:00:00.000Z','2026-01-03T00:00:00Z']]]) {
+    const predicate=[{field,kind,operator:'in',value:values}];
+    assert.equal(await authority.transaction(reader,tx=>tx.countRecords(predicate)),2);
+    assert.equal(await authority.transaction(reader,tx=>tx.existsRecord(predicate)),true);
+  }
+  for (const value of [[],Array(17).fill(1),[1,'2'],[NaN]])
+    await assert.rejects(authority.transaction(reader,tx=>tx.countRecords([{field:'score',kind:'number',operator:'in',value}])),{code:'INVALID_ARGUMENT'});
+});
+
+test('durable batch checkpoint resumes partial success, rejects changed retries and permits failed-item retry',async()=>{
+  const {owner,writer}=await fixture();
+  const requests=[
+    JSON.stringify({operation:'create',data:{label:'bulk-a',score:1}}),
+    JSON.stringify({operation:'create',data:{label:'bulk-b',extra:'later'}}),
+    JSON.stringify({operation:'create',data:{label:'bulk-c',score:3}})
+  ];
+  const key='bulk-operation';
+  const digest=createHash('sha256').update(JSON.stringify(requests)).digest('hex');
+  await authority.transaction(writer,tx=>tx.startBatch(key,digest,requests));
+  await authority.transaction(writer,tx=>tx.processBatchItem(key,0,false));
+  let progress=await authority.batchProgress(writer,key);
+  assert.deepEqual(progress.items.map(item=>item.state),['succeeded','pending','pending']);
+  const firstReceipt=progress.items[0].receipt;
+  assert.ok(firstReceipt?.committedAt);
+  progress=await authority.ingestBatch(writer,key,requests);
+  assert.deepEqual(progress.items.map(item=>item.state),['succeeded','failed','succeeded']);
+  assert.equal(progress.items[1].failureCode,'SCHEMA_INVALID');
+  assert.equal(progress.items[0].receipt.receiptId,firstReceipt.receiptId);
+  assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),2);
+  await assert.rejects(authority.ingestBatch(writer,key,[requests[0],requests[1],requests[2]+' ']),{code:'BATCH_CONFLICT'});
+  const expanded={...schema,properties:{...schema.properties,extra:{type:'string'}}};
+  await registry.revise(owner,1,definition(owner.collectionId,{version:2,schema:expanded}));
+  progress=await authority.ingestBatch(writer,key,requests,true);
+  assert.deepEqual(progress.items.map(item=>item.state),['succeeded','succeeded','succeeded']);
+  assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),3);
+  assert.equal((await authority.ingestBatch(writer,key,requests)).items[0].receipt.receiptId,firstReceipt.receiptId);
+  const cancelled=await authority.cancelBatch(writer,key);
+  assert.equal(cancelled.state,'cancelled');
+  await assert.rejects(authority.ingestBatch(writer,key,requests),{code:'BATCH_CANCELLED'});
+  const pendingKey='cancel-pending';
+  await authority.transaction(writer,tx=>tx.startBatch(pendingKey,digest,requests));
+  await authority.cancelBatch(writer,pendingKey);
+  await assert.rejects(authority.transaction(writer,tx=>tx.processBatchItem(pendingKey,0,false)),{code:'BATCH_CANCELLED'});
+  assert.deepEqual((await authority.batchProgress(writer,pendingKey)).items.map(item=>item.state),['pending','pending','pending']);
+  await pool.query("UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1",[writer.spaceId]);
+  await pool.query('SELECT stateplane_purge_space($1)',[writer.spaceId]);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM batch_operations WHERE space_id=$1',[writer.spaceId])).rows[0].n,0);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM collection_write_slots WHERE space_id=$1',[writer.spaceId])).rows[0].n,0);
+});
+
+test('batch retries advance past a settled prefix under a bounded request budget',async()=>{
+  for (const serialized of [false,true]) {
+    const {writer}=await fixture();
+    const key=`prefix-${randomUUID()}`;
+    const requests=Array.from({length:4},(_,i)=>JSON.stringify({operation:'create',data:{label:`prefix-${key}-${i}`}}));
+    const digest=createHash('sha256').update(JSON.stringify(requests)).digest('hex');
+    await authority.transaction(writer,tx=>tx.startBatch(key,digest,requests));
+    for (let ordinal=0;ordinal<3;ordinal++)
+      await authority.transaction(writer,tx=>tx.processBatchItem(key,ordinal,false));
+    const before=await authority.batchProgress(writer,key);
+    const ingest=new PostgresAuthority(pool,3600,undefined,1200);
+    const transaction=ingest.transaction.bind(ingest);
+    ingest.transaction=(scope,callback,deadline)=>transaction(scope,tx=>{
+      const process=tx.processBatchItem.bind(tx);
+      tx.processBatchItem=async (...args)=>{
+        if (args[1]<3) await new Promise(resolve=>setTimeout(resolve,500));
+        return process(...args);
+      };
+      return callback(tx);
+    },deadline);
+    const progress=serialized
+      ? await ingest.ingestSerializedBatch(writer,key,JSON.stringify(requests))
+      : await ingest.ingestBatch(writer,key,requests);
+    assert.deepEqual(progress.items.map(item=>item.state),Array(4).fill('succeeded'));
+    assert.deepEqual(progress.items.slice(0,3).map(item=>item.receipt.receiptId),
+      before.items.slice(0,3).map(item=>item.receipt.receiptId));
+    assert.deepEqual(progress.items.map(item=>item.attempts),Array(4).fill(1));
+    assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),4);
+  }
+});
+
+test('caller-selected keys cannot preseed batch item receipts or block their retries',async()=>{
+  for (const matching of [true,false]) {
+    const {writer}=await fixture();
+    const operationKey=`receipt-domain-${randomUUID()}`;
+    const itemKey=`b_${createHash('sha256').update(JSON.stringify([
+      writer.spaceId,writer.collectionId,writer.credentialId,operationKey])).update(':0').digest('hex')}`;
+    const batchLabel=`batch-${randomUUID()}`;
+    const standalone=await authority.mutateRequest(writer,{operation:'create',idempotencyKey:itemKey,
+      data:{label:matching ? batchLabel : `standalone-${randomUUID()}`}});
+    const manifest=[JSON.stringify({operation:'create',data:{label:batchLabel}})];
+    const progress=await authority.ingestBatch(writer,operationKey,manifest);
+    assert.equal(progress.items[0].state,matching ? 'failed' : 'succeeded');
+    assert.equal(progress.items[0].failureCode,matching ? 'UNIQUE_CONFLICT' : null);
+    assert.notEqual(progress.items[0].receipt?.receiptId,standalone.receiptId);
+    const replay=await authority.ingestBatch(writer,operationKey,manifest,true);
+    assert.equal(replay.items[0].state,progress.items[0].state);
+    assert.equal(replay.items[0].receipt?.receiptId,progress.items[0].receipt?.receiptId);
+    const stored=(await pool.query(`SELECT operation,receipt_id FROM idempotency_receipts
+      WHERE space_id=$1 AND credential_id=$2 AND idempotency_key=$3 ORDER BY operation`,
+      [writer.spaceId,writer.credentialId,itemKey])).rows;
+    assert.deepEqual(stored.map(row=>row.operation),matching ? ['create'] : ['batch:create','create']);
+    assert.equal(stored.find(row=>row.operation==='create')?.receipt_id,standalone.receiptId);
+    assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),matching ? 1 : 2);
+  }
+});
+
+test('same credential and operation key keep sibling collection batch ledgers separate',async()=>{
+  const {owner,writer}=await fixture();
+  const siblingCollection=`sibling_${randomUUID()}`;
+  await registry.define({...owner,collectionId:siblingCollection},definition(siblingCollection));
+  await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
+    VALUES($1,$2,$3,ARRAY['records:read','records:write'])`,
+    [writer.spaceId,siblingCollection,writer.credentialId]);
+  const sibling={...writer,collectionId:siblingCollection};
+  const operationKey=`shared-${randomUUID()}`;
+  const manifest=[JSON.stringify({operation:'create',data:{label:'same item'}})];
+  const first=await authority.ingestBatch(writer,operationKey,manifest);
+  const second=await authority.ingestBatch(sibling,operationKey,manifest);
+  assert.equal(first.items[0].state,'succeeded');
+  assert.equal(second.items[0].state,'succeeded');
+  assert.notEqual(first.items[0].receipt.receiptId,second.items[0].receipt.receiptId);
+  assert.equal((await authority.ingestBatch(writer,operationKey,manifest)).items[0].receipt.receiptId,
+    first.items[0].receipt.receiptId);
+  assert.equal((await authority.ingestBatch(sibling,operationKey,manifest)).items[0].receipt.receiptId,
+    second.items[0].receipt.receiptId);
+  assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),1);
+  assert.equal(await authority.transaction(read(sibling),tx=>tx.countRecords([])),1);
+});
+
+test('batch ingress owns its scope across manifest, item, failure, progress and serialized preflight',async()=>{
+  const valid=JSON.stringify({operation:'create',data:{label:'scope-owned'}});
+  const invalid=JSON.stringify({operation:'create',data:{label:'scope-invalid',extra:'unsupported'}});
+  for (const [boundary,serialized,requests,expected] of [
+    [1,false,[valid],['succeeded']], // manifest admission
+    [2,false,[valid],['succeeded']], // item commit before progress
+    [2,false,[invalid,valid],['failed','succeeded']], // item failure before failure receipt
+    [3,false,[invalid,valid],['failed','succeeded']], // failure receipt before next item
+    [1,true,[valid],['succeeded']] // serialized authorization preflight
+  ]) {
+    const {writer}=await fixture(),{writer:sibling}=await fixture();
+    const target={...writer},key=`scope-${randomUUID()}`;
+    const digest=createHash('sha256').update(JSON.stringify(requests)).digest('hex');
+    await authority.transaction(sibling,tx=>tx.startBatch(key,digest,requests));
+    const ingest=new PostgresAuthority(pool,3600);
+    const transaction=ingest.transaction.bind(ingest);
+    let completed=0;
+    ingest.transaction=async (...args)=>{
+      try { return await transaction(...args); }
+      finally { if (++completed===boundary) Object.assign(writer,sibling); }
+    };
+    const progress=serialized
+      ? await ingest.ingestSerializedBatch(writer,key,JSON.stringify(requests))
+      : await ingest.ingestBatch(writer,key,requests);
+    assert.deepEqual(progress.items.map(item=>item.state),expected);
+    assert.deepEqual((await authority.batchProgress(target,key)).items.map(item=>item.state),expected);
+    assert.deepEqual((await authority.batchProgress(sibling,key)).items.map(item=>item.state),
+      requests.map(()=> 'pending'));
+    assert.ok(progress.items.find(item=>item.state==='succeeded')?.receipt?.receiptId);
+  }
+});
+
+test('in-flight batch cancellation backs off, then preserves the committed item receipt',async()=>{
+  const {writer}=await fixture();
+  const key='cancel-in-flight',requests=[JSON.stringify({operation:'create',data:{label:'cancel-in-flight'}})];
+  const digest=createHash('sha256').update(JSON.stringify(requests)).digest('hex');
+  await authority.transaction(writer,tx=>tx.startBatch(key,digest,requests));
+  let entered,release;
+  const processing=new Promise(resolve=>{entered=resolve;});
+  const held=new Promise(resolve=>{release=resolve;});
+  const item=authority.transaction(writer,async tx=>{
+    await tx.processBatchItem(key,0,false);
+    entered();
+    await held;
+  });
+  try {
+    await processing;
+    await assert.rejects(authority.cancelBatch(writer,key),{code:'BACKPRESSURE'});
+  } finally { release(); await item; }
+  const receipt=(await authority.batchProgress(writer,key)).items[0].receipt;
+  assert.ok(receipt?.receiptId);
+  assert.equal((await authority.cancelBatch(writer,key)).state,'cancelled');
+  assert.equal((await authority.batchProgress(writer,key)).items[0].receipt.receiptId,receipt.receiptId);
+  assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),1);
+});
+
+test('rolled-back batch item reports stable backpressure and resumes its unchanged manifest',async()=>{
+  const {writer}=await fixture();
+  const key='transient-item',requests=[JSON.stringify({operation:'create',data:{label:'transient-item'}})];
+  let interrupted=false;
+  const flaky=new PostgresAuthority({connect:async()=>{
+    const client=await pool.connect();
+    return {query:(sql,...args)=>{
+      if (!interrupted && String(sql).includes('SELECT state FROM batch_operations')) {
+        interrupted=true;
+        throw Object.assign(new Error('forced serialization rollback'),{code:'40001'});
+      }
+      return client.query(sql,...args);
+    },release:discard=>client.release(discard)};
+  }},3600);
+  await assert.rejects(flaky.ingestBatch(writer,key,requests),{code:'BACKPRESSURE'});
+  assert.equal(interrupted,true);
+  assert.deepEqual((await authority.batchProgress(writer,key)).items.map(item=>item.state),['pending']);
+  const resumed=await authority.ingestBatch(writer,key,requests);
+  assert.equal(resumed.items[0].state,'succeeded');
+  assert.equal((await authority.ingestBatch(writer,key,requests)).items[0].receipt.receiptId,
+    resumed.items[0].receipt.receiptId);
+  assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),1);
+});
+
+test('a concurrently completed batch item does not cancel later ordinals',async()=>{
+  const {writer}=await fixture();
+  const key='terminal-item',requests=[0,1].map(i=>JSON.stringify({operation:'create',data:{label:`terminal-${i}`}}));
+  const digest=createHash('sha256').update(JSON.stringify(requests)).digest('hex');
+  await authority.transaction(writer,tx=>tx.startBatch(key,digest,requests));
+  await authority.transaction(writer,tx=>tx.processBatchItem(key,0,false));
+  await authority.transaction(writer,tx=>tx.failBatchItem(key,0,'SCHEMA_INVALID'));
+  await authority.transaction(writer,tx=>tx.processBatchItem(key,1,false));
+  const progress=await authority.batchProgress(writer,key);
+  assert.equal(progress.state,'active');
+  assert.deepEqual(progress.items.map(item=>item.state),['succeeded','succeeded']);
+  assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),2);
+});
+
+test('batch item lock wait respects the remaining request budget',async()=>{
+  const {writer}=await fixture();
+  const key='budget-locked',requests=[JSON.stringify({operation:'create',data:{label:'budget-locked'}})];
+  const digest=createHash('sha256').update(JSON.stringify(requests)).digest('hex');
+  await authority.transaction(writer,tx=>tx.startBatch(key,digest,requests));
+  const blocker=await pool.connect();
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query(`SELECT 1 FROM batch_operations WHERE space_id=$1 AND collection_id=$2
+      AND credential_id=$3 AND operation_key=$4 FOR UPDATE`,[writer.spaceId,writer.collectionId,writer.credentialId,key]);
+    await assert.rejects(authority.transaction(writer,tx=>tx.processBatchItem(key,0,false,25)),{code:'RATE_LIMITED'});
+  } finally { await blocker.query('ROLLBACK'); blocker.release(); }
+  assert.deepEqual((await authority.batchProgress(writer,key)).items.map(item=>item.state),['pending']);
+});
+
+test('batch transaction budget also bounds pool admission and releases a late connection',async()=>{
+  const {writer}=await fixture();
+  let connect,releaseCount=0;
+  const delayed=new PostgresAuthority({connect:()=>new Promise(resolve=>{connect=resolve;})},3600);
+  await assert.rejects(delayed.transaction(writer,async()=>{},Date.now()+20),{code:'RATE_LIMITED'});
+  connect({release:()=>{releaseCount++;}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(releaseCount,1);
+});
+
+test('standalone exact reads and batch preflight bound pool admission before authorization',async()=>{
+  const {writer}=await fixture();
+  const pending=[];
+  let released=0;
+  const delayed=new PostgresAuthority({connect:()=>new Promise(resolve=>pending.push(resolve))},
+    3600,randomBytes(32),30);
+  const reader=read(writer);
+  const requests=[
+    delayed.transaction(reader,tx=>tx.queryPage([],1)),
+    delayed.transaction(reader,tx=>tx.queryRecords([],1)),
+    delayed.transaction(reader,tx=>tx.countRecords([])),
+    delayed.transaction(reader,tx=>tx.existsRecord([])),
+    delayed.transaction(reader,tx=>tx.countRecords([]),Date.now()+60_000),
+    delayed.ingestSerializedBatch(writer,'pool-preflight',JSON.stringify(['{}'])),
+    delayed.batchProgress(reader,'pool-preflight'),
+    delayed.cancelBatch(writer,'pool-preflight')
+  ];
+  await Promise.all(requests.map(request=>assert.rejects(request,{code:'RATE_LIMITED'})));
+  assert.equal(pending.length,requests.length);
+  for (const connect of pending) connect({release:()=>{released++;}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(released,requests.length);
+});
+
+test('read and serialized batch budgets cover authorization lock waits',async()=>{
+  const {writer}=await fixture();
+  const blocker=await pool.connect();
+  const bounded=new PostgresAuthority(pool,3600,randomBytes(32),120);
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query('UPDATE spaces SET policy_version=policy_version WHERE space_id=$1',[writer.spaceId]);
+    await assert.rejects(bounded.transaction(read(writer),tx=>tx.countRecords([])),{code:'RATE_LIMITED'});
+    await assert.rejects(bounded.ingestSerializedBatch(writer,'locked-preflight',JSON.stringify(['{}'])),
+      {code:'RATE_LIMITED'});
+  } finally { await blocker.query('ROLLBACK'); blocker.release(); }
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM batch_operations WHERE space_id=$1',
+    [writer.spaceId])).rows[0].n,0);
+});
+
+test('a late clock tick after the last item reports complete durable progress',async()=>{
+  const {writer}=await fixture();
+  const bounded=new PostgresAuthority(pool,3600,undefined,1500);
+  const processOrdinal=bounded.processBatchOrdinal.bind(bounded);
+  bounded.processBatchOrdinal=async (...args)=>{
+    const result=await processOrdinal(...args);
+    await new Promise(resolve=>setTimeout(resolve,1800));
+    return result;
+  };
+  const key='expired-progress',requests=[JSON.stringify({operation:'create',data:{label:'expired-progress'}})];
+  const completed=await bounded.ingestBatch(writer,key,requests);
+  assert.equal(completed.items[0].state,'succeeded');
+  const progress=await authority.batchProgress(writer,key);
+  assert.equal(progress.items[0].state,'succeeded');
+  assert.ok(progress.items[0].receipt?.receiptId);
+  assert.equal(completed.items[0].receipt.receiptId,progress.items[0].receipt.receiptId);
+  const replay=await authority.ingestBatch(writer,key,requests);
+  assert.equal(replay.items[0].receipt.receiptId,progress.items[0].receipt.receiptId);
+  assert.equal(await authority.transaction(read(writer),tx=>tx.countRecords([])),1);
+});
+
+test('batch attempts and slot seeding keep their database-level bounds',async()=>{
+  const {writer}=await fixture();
+  const key=`batch-domain-${randomUUID()}`;
+  await authority.transaction(writer,tx=>tx.startBatch(key,'d'.repeat(64),['{}']));
+  await assert.rejects(pool.query(`UPDATE batch_items SET attempts=-1 WHERE space_id=$1 AND collection_id=$2
+    AND credential_id=$3 AND operation_key=$4`,[writer.spaceId,writer.collectionId,writer.credentialId,key]),
+  {code:'23514'});
+  const slots=await pool.query('SELECT count(*)::int AS n FROM collection_write_slots WHERE space_id=$1 AND collection_id=$2',
+    [writer.spaceId,writer.collectionId]);
+  assert.equal(slots.rows[0].n,8);
+  const fn=(await pool.query(`SELECT proconfig FROM pg_proc WHERE oid='public.stateplane_seed_write_slots()'::regprocedure`))
+    .rows[0].proconfig;
+  assert.ok(fn.includes('search_path=pg_catalog, public, pg_temp'));
+});
+
+test('populated batch validation permits writes while its validation lock waits',async()=>{
+  const {writer}=await fixture();
+  const key=`batch-validate-${randomUUID()}`;
+  await authority.transaction(writer,tx=>tx.startBatch(key,'d'.repeat(64),['{}']));
+  await pool.query('ALTER TABLE batch_items DROP CONSTRAINT batch_items_attempts_nonnegative');
+  await pool.query('ALTER TABLE batch_items ADD CONSTRAINT batch_items_attempts_nonnegative CHECK (attempts >= 0) NOT VALID');
+  const blocker=await pool.connect(),validator=await pool.connect(),updater=await pool.connect();
+  let validation;
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query('LOCK TABLE batch_items IN SHARE UPDATE EXCLUSIVE MODE');
+    validation=validator.query(await readFile(new URL('../../migrations/033_validate_batch_attempts.sql',import.meta.url),'utf8'));
+    validation.catch(()=>{});
+    let waiting=false;
+    for (let attempt=0;attempt<100;attempt++) {
+      const row=(await pool.query(`SELECT wait_event_type FROM pg_stat_activity
+        WHERE pid=$1`,[validator.processID])).rows[0];
+      if (row?.wait_event_type==='Lock') { waiting=true; break; }
+      await new Promise(resolve=>setTimeout(resolve,10));
+    }
+    assert.equal(waiting,true,'PostgreSQL reports validation waiting on the independent DDL lock');
+    await updater.query('BEGIN');
+    await updater.query("SET LOCAL statement_timeout = '1500ms'");
+    const updated=await updater.query(`UPDATE batch_items SET attempts=attempts+1
+      WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 AND operation_key=$4 AND ordinal=0`,
+      [writer.spaceId,writer.collectionId,writer.credentialId,key]);
+    assert.equal(updated.rowCount,1,'the validation lock does not block batch progress');
+    await updater.query('COMMIT');
+    await blocker.query('COMMIT');
+    await validation;
+    assert.equal((await pool.query(`SELECT convalidated FROM pg_constraint WHERE conrelid='public.batch_items'::regclass
+      AND conname='batch_items_attempts_nonnegative'`)).rows[0].convalidated,true);
+  } finally {
+    await updater.query('ROLLBACK').catch(()=>{});
+    await blocker.query('ROLLBACK').catch(()=>{});
+    if (validation) await validation.catch(()=>{});
+    blocker.release(); validator.release(); updater.release();
+  }
+});
+
+test('failing an absent batch operation or item reports NOT_FOUND without changing pending items',async()=>{
+  const {writer}=await fixture();
+  const missing=`missing-${randomUUID()}`;
+  await assert.rejects(authority.transaction(writer,tx=>tx.failBatchItem(missing,0,'SCHEMA_INVALID')),
+    {code:'NOT_FOUND'});
+  const key=`batch-missing-item-${randomUUID()}`;
+  await authority.transaction(writer,tx=>tx.startBatch(key,'d'.repeat(64),['{}']));
+  await assert.rejects(authority.transaction(writer,tx=>tx.failBatchItem(key,1,'SCHEMA_INVALID')),
+    {code:'NOT_FOUND'});
+  assert.equal((await authority.batchProgress(writer,key)).items[0].state,'pending');
+});
+
+test('a 20-item indexed batch bounds timeout-setting round trips',async()=>{
+  const {writer}=await fixture();
+  let timeoutSets=0;
+  const measured={connect:async()=>{
+    const client=await pool.connect();
+    return {query:(...args)=>{
+      if (String(args[0]).startsWith('SET LOCAL statement_timeout')) timeoutSets++;
+      return client.query(...args);
+    },release:discard=>client.release(discard)};
+  }};
+  const batch=new PostgresAuthority(measured,3600);
+  const requests=Array.from({length:20},(_,i)=>JSON.stringify({operation:'create',data:{label:`volume-${i}`,score:i}}));
+  const result=await batch.ingestBatch(writer,`volume-${randomUUID()}`,requests);
+  assert.equal(result.items.length,20);
+  assert.ok(result.items.every(item=>item.state==='succeeded' && item.receipt?.receiptId));
+  assert.ok(timeoutSets<=100,`20 items required ${timeoutSets} timeout-setting round trips`);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM record_index_values WHERE space_id=$1',
+    [writer.spaceId])).rows[0].n,20);
+});
+
+test('batch admission distinguishes count quotas from malformed manifests before durable writes',async()=>{
+  const {writer}=await fixture();
+  const valid=Array.from({length:20},(_,i)=>JSON.stringify({operation:'create',data:{label:`count-${randomUUID()}-${i}`,score:i}}));
+  const readCounts=async()=>{
+    const rows=await Promise.all(['batch_operations','batch_items','idempotency_receipts'].map(table=>
+      pool.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[writer.spaceId])));
+    return rows.map(row=>row.rows[0].n);
+  };
+  const malformed=new Array(2); malformed[0]=valid[0];
+  const custom=[valid[0]]; custom.extra='unexpected';
+  const inherited=Object.setPrototypeOf([valid[0]],Object.create(Array.prototype));
+  for (const serialized of [false,true]) {
+    const ingest=(key,items)=>serialized
+      ? authority.ingestSerializedBatch(writer,key,JSON.stringify(items))
+      : authority.ingestBatch(writer,key,items);
+    const prefix=serialized?'serialized':'direct';
+    assert.deepEqual(await readCounts(),[0,0,0]);
+    await assert.rejects(ingest(`${prefix}-zero`,[]),{code:'INVALID_ARGUMENT'});
+    await assert.rejects(ingest(`${prefix}-too-many`,[...valid,valid[0]]),{code:'RATE_LIMITED'});
+    if (!serialized) {
+      await assert.rejects(ingest(`${prefix}-sparse`,malformed),{code:'INVALID_ARGUMENT'});
+      await assert.rejects(ingest(`${prefix}-custom`,custom),{code:'INVALID_ARGUMENT'});
+      await assert.rejects(ingest(`${prefix}-inherited`,inherited),{code:'INVALID_ARGUMENT'});
+    }
+    else await assert.rejects(authority.ingestSerializedBatch(writer,`${prefix}-malformed`,'{"bad":true}'),{code:'INVALID_ARGUMENT'});
+    await assert.rejects(ingest(`${prefix}-item-byte`,['x'.repeat(1_048_577)]),{code:'RATE_LIMITED'});
+    await assert.rejects(ingest(`${prefix}-aggregate-byte`,Array(3).fill('x'.repeat(700_000))),{code:'RATE_LIMITED'});
+    assert.deepEqual(await readCounts(),[0,0,0]);
+  }
+  const million=Array(1_000_000).fill('');
+  const wire=JSON.stringify(million);
+  assert.equal(Buffer.byteLength(wire),3_000_001);
+  const ownKeys=Reflect.ownKeys;
+  let enumerated=false;
+  Reflect.ownKeys=value=>{
+    if (value===million) enumerated=true;
+    return ownKeys(value);
+  };
+  try { await assert.rejects(authority.ingestBatch(writer,'direct-million',million),{code:'RATE_LIMITED'}); }
+  finally { Reflect.ownKeys=ownKeys; }
+  assert.equal(enumerated,false,'over-count direct admission must not enumerate array keys');
+  await assert.rejects(authority.ingestSerializedBatch(writer,'serialized-million',wire),{code:'RATE_LIMITED'});
+  assert.deepEqual(await readCounts(),[0,0,0]);
+  for (const serialized of [false,true]) {
+    const key=serialized?'serialized-twenty':'direct-twenty';
+    const accepted=serialized
+      ? Array.from({length:20},(_,i)=>JSON.stringify({operation:'create',data:{label:`serialized-${randomUUID()}-${i}`,score:i}}))
+      : valid;
+    const ingest=()=>serialized
+      ? authority.ingestSerializedBatch(writer,key,JSON.stringify(accepted),true)
+      : authority.ingestBatch(writer,key,accepted,true);
+    const first=await ingest();
+    assert.equal(first.items.length,20);
+    assert.ok(first.items.every(item=>item.state==='succeeded' && item.receipt));
+    const beforeReplay=await readCounts();
+    const replay=await ingest();
+    assert.deepEqual(replay.items.map(item=>item.receipt?.receiptId),first.items.map(item=>item.receipt?.receiptId));
+    assert.deepEqual(await readCounts(),beforeReplay);
+  }
+});
+
+test('paged reads cap payload bytes and a 5000-row selective typed query uses the declared index',async()=>{
+  const {owner,writer}=await fixture();
+  const expanded={...schema,properties:{...schema.properties,note:{type:'string'}}};
+  await registry.revise(owner,1,definition(owner.collectionId,{version:2,schema:expanded,sortable:['score']}));
+  await registry.backfill(owner,'score');
+  const large='x'.repeat(750_000);
+  for (let i=0;i<4;i++) await authority.mutateRequest(writer,{operation:'create',idempotencyKey:`wide-${i}`,
+    data:{label:`wide-${i}`,score:i,note:large}});
+  const paged=new PostgresAuthority(pool,3600,randomBytes(32));
+  const first=await paged.transaction(read(writer),tx=>tx.queryPage([],100));
+  assert.equal(first.records.length,2);
+  assert.ok(first.records.reduce((n,r)=>n+Buffer.byteLength(r.canonicalData),0)<=2_097_152);
+  assert.ok(first.nextCursor);
+  const second=await paged.transaction(read(writer),tx=>tx.queryPage([],100,undefined,first.nextCursor));
+  assert.equal(second.records.length,2);
+  assert.equal(second.nextCursor,null);
+
+  const volume=await pool.connect();
+  try {
+    await volume.query('BEGIN');
+    await volume.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+    SELECT $1,$2,'volume-'||g,1,2,'generated','volume-'||g,
+      ('{"label":"volume-'||g||'","score":'||g||'}'),
+      jsonb_build_object('label','volume-'||g,'score',g)
+    FROM generate_series(1,5000) AS g`,[owner.spaceId,owner.collectionId]);
+    await volume.query(`INSERT INTO record_index_values(space_id,collection_id,record_id,field_name,value_kind,number_value)
+    SELECT $1,$2,'volume-'||g,'score','number',g FROM generate_series(1,5000) AS g`,[owner.spaceId,owner.collectionId]);
+    await volume.query('COMMIT');
+  } finally { volume.release(); }
+  await pool.query('ANALYZE records');
+  await pool.query('ANALYZE record_index_values');
+  let plan;
+  const observed=new PostgresAuthority({connect:async()=>{
+    const client=await pool.connect();
+    return {query:async(sql,...args)=>{
+      if (String(sql).includes('ranked AS MATERIALIZED')) {
+        const explained=await client.query(`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) ${sql}`,...args);
+        plan=explained.rows[0]['QUERY PLAN'][0];
+      }
+      return client.query(sql,...args);
+    },release:discard=>client.release(discard)};
+  }},3600,randomBytes(32));
+  const result=await observed.transaction(read(writer),tx=>tx.queryPage(
+    [{field:'score',kind:'number',operator:'gte',value:4900}],25,{field:'score',direction:'asc'}));
+  assert.equal(result.records.length,25);
+  assert.equal(JSON.parse(result.records[0].canonicalData).score,4900);
+  assert.ok(JSON.stringify(plan.Plan).includes('record_index_number'),JSON.stringify(plan.Plan));
+  const sortOnly=await observed.transaction(read(writer),tx=>tx.queryPage([],25,{field:'score',direction:'desc'}));
+  assert.equal(sortOnly.records.length,25);
+  assert.equal(JSON.parse(sortOnly.records[0].canonicalData).score,5000);
+  assert.ok(JSON.stringify(plan.Plan).includes('record_index_number'),JSON.stringify(plan.Plan));
+});
+
+test('5000-row sort-only pages use indexed presence and typed order in both directions',async()=>{
+  const {owner}=await fixture();
+  const fields={...schema.properties,flag:{type:'boolean'},instant:{type:'string',format:'date-time'}};
+  const expanded={...schema,properties:fields};
+  await registry.revise(owner,1,definition(owner.collectionId,{version:2,schema:expanded,
+    sortable:['score','label','flag','instant']}));
+  for (const field of ['score','label','flag','instant']) await registry.backfill(owner,field);
+  const volume=await pool.connect();
+  try {
+    await volume.query('BEGIN');
+    await volume.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+    SELECT $1,$2,'plan-'||g,1,2,'generated','plan-'||g,payload::text,payload
+    FROM generate_series(1,5000) AS g
+    CROSS JOIN LATERAL (SELECT jsonb_build_object('label','plan-'||g,'score',g,'flag',g%2=0,
+      'instant','2026-01-01T00:00:'||lpad(((g-1)%60)::text,2,'0')||'Z') AS payload) p`,
+  [owner.spaceId,owner.collectionId]);
+    await volume.query(`INSERT INTO record_index_values
+    (space_id,collection_id,record_id,field_name,value_kind,string_value,number_value,boolean_value,time_value)
+    SELECT $1,$2,'plan-'||g,'score','number',NULL,g,NULL::boolean,NULL FROM generate_series(1,5000) AS g
+    UNION ALL SELECT $1,$2,'plan-'||g,'label','string','plan-'||g,NULL,NULL,NULL FROM generate_series(1,5000) AS g
+    UNION ALL SELECT $1,$2,'plan-'||g,'flag','boolean',NULL,NULL,g%2=0,NULL FROM generate_series(1,5000) AS g
+    UNION ALL SELECT $1,$2,'plan-'||g,'instant','date-time',NULL,NULL,NULL,
+      '2026-01-01T00:00:'||lpad(((g-1)%60)::text,2,'0')||'Z' FROM generate_series(1,5000) AS g`,
+  [owner.spaceId,owner.collectionId]);
+    await volume.query('COMMIT');
+  } finally { volume.release(); }
+  await pool.query('ANALYZE records');
+  await pool.query('ANALYZE record_index_values');
+  let plan;
+  const observed=new PostgresAuthority({connect:async()=>{
+    const client=await pool.connect();
+    return {query:async(sql,...args)=>{
+      if (String(sql).includes('ranked AS MATERIALIZED'))
+        plan=(await client.query(`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) ${sql}`,...args)).rows[0]['QUERY PLAN'][0];
+      return client.query(sql,...args);
+    },release:discard=>client.release(discard)};
+  }},3600,randomBytes(32));
+  const names=node=>[node['Index Name'],...(node.Plans??[]).flatMap(names)].filter(Boolean);
+  const scans=node=>[node,...(node.Plans??[]).flatMap(scans)].filter(part=>part['Node Type']==='Seq Scan' &&
+    ['records','record_index_values'].includes(part['Relation Name']));
+  for (const [field,index] of [['score','record_index_number'],['label','record_index_string'],
+    ['flag','record_index_boolean'],['instant','record_index_instant_order']]) {
+    for (const direction of ['asc','desc']) {
+      const page=await observed.transaction(read(owner),tx=>tx.queryPage([],25,{field,direction}));
+      assert.equal(page.records.length,25);
+      assert.equal(scans(plan.Plan).length,0,JSON.stringify(plan.Plan));
+      assert.ok(names(plan.Plan).includes('record_index_missing'),JSON.stringify(plan.Plan));
+      assert.ok(names(plan.Plan).includes(index),JSON.stringify(plan.Plan));
+      assert.ok(plan.Plan['Shared Hit Blocks']<2000,JSON.stringify(plan.Plan));
+    }
+  }
+});
+
+test('serialized exact reads work without an in-process proxy detector',async()=>{
+  const {owner,writer}=await fixture();
+  await registry.backfill(owner,'score');
+  await authority.mutateRequest(writer,{operation:'create',idempotencyKey:'serialized-exact',data:{label:'serialized-exact',score:7}});
+  const script=`import assert from 'node:assert/strict';
+    import {types} from 'node:util';
+    import pg from 'pg';
+    types.isProxy=undefined;
+    const {PostgresAuthority}=await import('./packages/postgres/dist/index.js');
+    const {url,reader,writer}=JSON.parse(process.env.STA8_TEST_CONTEXT);
+    const pool=new pg.Pool({connectionString:url});
+    try {
+      const {randomBytes}=await import('node:crypto');
+      const authority=new PostgresAuthority(pool,3600,randomBytes(32));
+      const filters=JSON.stringify([{field:'score',kind:'number',operator:'eq',value:7}]);
+      assert.equal(await authority.transaction(reader,tx=>tx.countSerializedRecords(filters)),1);
+      assert.equal(await authority.transaction(reader,tx=>tx.existsSerializedRecord(filters)),true);
+      const page=await authority.transaction(reader,tx=>tx.querySerializedPage(JSON.stringify({predicates:JSON.parse(filters),limit:1})));
+      assert.equal(page.records.length,1);
+      await assert.rejects(authority.transaction(reader,tx=>tx.queryPage([],1)),{code:'INVALID_ARGUMENT'});
+      const bulk=await authority.ingestSerializedBatch(writer,'worker-bulk',JSON.stringify([
+        JSON.stringify({operation:'create',data:{label:'worker-bulk',score:8}})
+      ]));
+      assert.equal(bulk.items[0].state,'succeeded');
+      await assert.rejects(authority.ingestBatch(writer,'direct-bulk',['{}']),{code:'INVALID_ARGUMENT'});
+    } finally { await pool.end(); }
+    process.stdout.write('closed');`;
+  assert.equal(execFileSync(process.execPath,['--input-type=module','-e',script],{
+    cwd:fileURLToPath(new URL('../..',import.meta.url)),encoding:'utf8',
+    env:{...process.env,STA8_TEST_CONTEXT:JSON.stringify({url,reader:read(writer),writer})}
+  }),'closed');
+});
+
+test('ninth concurrent collection write reports backpressure and succeeds after a slot is released',async()=>{
+  const {writer}=await fixture();
+  const writerPool=new pg.Pool({connectionString:url,max:12});
+  const bounded=new PostgresAuthority(writerPool,3600);
+  let release;
+  const hold=new Promise(resolve=>{release=resolve;});
+  const entered=[];
+  const active=[];
+  try {
+    for (let i=0;i<8;i++) {
+      let signal;
+      entered.push(new Promise(resolve=>{signal=resolve;}));
+      active.push(bounded.transaction(writer,async tx=>{
+        await tx.mutateRequest({operation:'create',idempotencyKey:`slot-${i}`,data:{label:`slot-${i}`}});
+        signal();
+        await hold;
+      }));
+    }
+    await Promise.all(entered);
+    const ninth={operation:'create',idempotencyKey:'slot-ninth',data:{label:'slot-ninth'}};
+    await assert.rejects(bounded.mutateRequest(writer,ninth),{code:'BACKPRESSURE'});
+    release();
+    await Promise.all(active);
+    assert.equal((await bounded.mutateRequest(writer,ninth)).revision,1);
+    assert.equal(await bounded.transaction(read(writer),tx=>tx.countRecords([])),9);
+  } finally { release?.(); await Promise.allSettled(active); await writerPool.end(); }
 });

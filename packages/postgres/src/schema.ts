@@ -363,7 +363,7 @@ export function validateDefinition(input: unknown): CollectionDefinition {
   return validateParsedDefinition(input,false);
 }
 /** Admit a definition already parsed from serialized JSON or a checked snapshot. */
-export function validateParsedDefinition(input: unknown, trustedParsed = true): CollectionDefinition {
+export function validateParsedDefinition(input: unknown, trustedParsed = true, maxIndexedFields = 16): CollectionDefinition {
   plainJson(input,'SCHEMA_UNSUPPORTED',0,new Set<object>(),trustedParsed);
   if (!ordinary(input) || any(Object.keys(input),key=>!includes(['slug','version','schema','unique','filterable','sortable','lifecycle'],key))) fail('SCHEMA_UNSUPPORTED');
   const definition=input as unknown as CollectionDefinition;
@@ -371,16 +371,17 @@ export function validateParsedDefinition(input: unknown, trustedParsed = true): 
   if (!scalarString(definition.slug) || !definition.slug || !withinBytes(definition.slug,MAX_INDEX_PART_BYTES) || !isSafeInteger(definition.version) || definition.version<1) fail('SCHEMA_UNSUPPORTED');
   validateNode(definition.schema,true,0,{count:0});
   if (!own(definition,'unique') || !own(definition,'filterable') || !own(definition,'sortable')) fail('SCHEMA_UNSUPPORTED');
-  validateUniqueDeclarations(definition);
-  validateScalarDeclarations(definition);
+  validateUniqueDeclarations(definition,maxIndexedFields);
+  validateScalarDeclarations(definition,maxIndexedFields);
   if (own(definition,'lifecycle')) validateLifecycle(definition);
   const encoded=canonical(definition as unknown as Json);
   if (Buffer.byteLength(encoded)>maxBytes) fail('SCHEMA_UNSUPPORTED','Definition exceeds byte budget');
   return JSON.parse(encoded) as CollectionDefinition;
 }
 /** Check immutable unique names and paths against scalar root fields. */
-function validateUniqueDeclarations(definition:CollectionDefinition):void {
+function validateUniqueDeclarations(definition:CollectionDefinition,maxIndexedFields:number):void {
   const uniques=list(definition.unique,'SCHEMA_UNSUPPORTED');
+  if (uniques.length>maxIndexedFields) fail('SCHEMA_UNSUPPORTED','Unique reservation limit exceeded');
   const names:string[]=[];
   for (let i=0;i<uniques.length;i++) {
     const entry=Object.getOwnPropertyDescriptor(uniques,i)!.value;
@@ -392,13 +393,24 @@ function validateUniqueDeclarations(definition:CollectionDefinition):void {
   }
 }
 /** Check declared filter and sort paths without admitting duplicates. */
-function validateScalarDeclarations(definition:CollectionDefinition):void {
+function validateScalarDeclarations(definition:CollectionDefinition,maxIndexedFields:number):void {
   const declarations=['filterable','sortable'] as const;
+  const combined:string[]=[];
+  const uniques=list(definition.unique,'SCHEMA_UNSUPPORTED');
+  for (let i=0;i<uniques.length;i++) {
+    const paths=list((Object.getOwnPropertyDescriptor(uniques,i)!.value as {paths:unknown}).paths,'SCHEMA_UNSUPPORTED');
+    for (let j=0;j<paths.length;j++) {
+      const path=Object.getOwnPropertyDescriptor(paths,j)!.value as string;
+      if (!includes(combined,path)) append(combined,path);
+    }
+  }
   for (let i=0;i<declarations.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
     const key=declarations[i];
     const paths=list(definition[key],'SCHEMA_UNSUPPORTED');
     if (!distinct(paths) || any(paths,path=>!scalarField(definition.schema,path))) fail('SCHEMA_UNSUPPORTED');
+    for (let j=0;j<paths.length;j++) if (!includes(combined,paths[j])) append(combined,paths[j]);
   }
+  if (combined.length>maxIndexedFields) fail('SCHEMA_UNSUPPORTED','Indexed field limit exceeded');
 }
 /** Restrict lifecycle data to a required enum field and declared transitions. */
 function validateLifecycle(definition:CollectionDefinition):void {
@@ -544,8 +556,8 @@ function encodeUniqueTuple(data:Record<string,Json>,definition:CollectionDefinit
 }
 
 /** Derive one declared typed value for a bounded backfill batch. */
-export function derivedIndexValue(data: Record<string,Json>, definition: CollectionDefinition, field:string): IndexValue|undefined {
-  if (!own(data,field)) return undefined;
+export function derivedIndexValue(data: Record<string,Json>, definition: CollectionDefinition, field:string): IndexValue {
+  if (!own(data,field)) return {field,kind:'missing'};
   const value=data[field];
   if (value===null) return {field,kind:'null'};
   if (typeof value==='string') {

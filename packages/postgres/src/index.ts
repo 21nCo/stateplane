@@ -1,16 +1,18 @@
-import { randomUUID } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
 import pg from 'pg';
+import { commitBeforeDeadline, CommitNotSentDeadlineExceeded } from './commit-deadline.js';
 import { parseRevision } from '@stateplane/contracts';
 import type { Capability, CollectionId, RecordRef, Revision, SpaceId } from '@stateplane/contracts';
-import { acceptsInProcessObjects, canonical, derivedParsedValues, externalKey, fingerprint, isInProcessProxy, MAX_INDEX_PART_BYTES, MAX_INDEX_VALUE_BYTES, plainJson, scalarString as unicodeString, validateParsedValue } from './schema.js';
+import { acceptsInProcessObjects, canonical, derivedParsedValues, externalKey, fingerprint, isInProcessProxy, MAX_INDEX_PART_BYTES, MAX_INDEX_VALUE_BYTES, plainJson, scalarString as unicodeString, utcInstant, validateParsedValue } from './schema.js';
 import type { CollectionDefinition, Json } from './schema.js';
 export { CollectionRegistry } from './collections.js';
 export { externalKey, validateDefinition, validateValue, compatible, derivedValues } from './schema.js';
 export type { CollectionDefinition } from './schema.js';
 
 export type RecordMutation = 'create' | 'replace' | 'patch' | 'delete';
+type ReceiptOperation = RecordMutation | `batch:${RecordMutation}`;
 export type IndexValue =
-  | { field: string; kind: 'null' }
+  | { field: string; kind: 'null' | 'missing' }
   | { field: string; kind: 'string' | 'date-time'; value: string }
   | { field: string; kind: 'number'; value: number }
   | { field: string; kind: 'boolean'; value: boolean };
@@ -46,28 +48,57 @@ export interface OutboxDelivery {
 }
 export type ScalarPredicate =
   | { field: string; kind: 'null'; operator: 'isNull' }
-  | { field: string; kind: 'string' | 'date-time' | 'number' | 'boolean'; operator: 'eq' | 'lt' | 'lte' | 'gt' | 'gte'; value: string | number | boolean };
+  | { field: string; kind: 'string' | 'date-time' | 'number' | 'boolean'; operator: 'eq' | 'lt' | 'lte' | 'gt' | 'gte'; value: string | number | boolean }
+  | { field: string; kind: 'string' | 'date-time' | 'number' | 'boolean'; operator: 'in'; value: readonly (string | number | boolean)[] };
+export interface RecordSort { field: string; direction: 'asc' | 'desc' }
+export interface RecordPage { records: AuthorityRecord[]; nextCursor: string | null; schemaVersion: number }
+export interface BatchItemStatus { ordinal:number; state:'pending'|'failed'|'succeeded'; attempts:number; receipt:Receipt|null; failureCode:string|null }
+export interface BatchProgress { operationKey:string; state:'active'|'cancelled'; items:BatchItemStatus[] }
+interface PageCursor {
+  space: string; collection: string; principal: string; credential: string;
+  policy: number; placement: number; schema: number; query: string; expiresAt: number;
+  id: string; rank: 0 | 1 | 2; value: string | number | boolean | null;
+}
 
 /** Compile one typed comparison after checking its scalar parameter. */
 function comparison(predicate: Exclude<ScalarPredicate, { kind: 'null' }>, alias: string, params: unknown[]): string {
   const column = { string:'string_value','date-time':'time_value',number:'number_value',boolean:'boolean_value' }[predicate.kind];
+  if (predicate.operator==='in') {
+    if (!Array.isArray(predicate.value) || predicate.value.length<1 || predicate.value.length>16 ||
+      predicate.value.some(value=>!validPredicateValue(predicate.kind,value))) throw new AuthorityError('INVALID_ARGUMENT');
+    params.push(predicate.value);
+    let arrayType='text';
+    if (predicate.kind==='number') arrayType='numeric';
+    else if (predicate.kind==='boolean') arrayType='boolean';
+    if (predicate.kind==='date-time') return ` AND EXISTS (SELECT 1 FROM unnest($${params.length}::text[]) AS choice(value)
+      WHERE stateplane_instant_sort_key(${alias}.${column}) COLLATE "C" = stateplane_instant_sort_key(choice.value) COLLATE "C")`;
+    return ` AND ${alias}.${column} = ANY($${params.length}::${arrayType}[])`;
+  }
   const operator = { eq:'=',lt:'<',lte:'<=',gt:'>',gte:'>=' }[predicate.operator];
   if (!operator) throw new AuthorityError('INVALID_ARGUMENT');
-  if ((predicate.kind === 'number' && (typeof predicate.value !== 'number' || !isFiniteNumber(predicate.value)))
-    || (predicate.kind === 'boolean' && typeof predicate.value !== 'boolean')
-    || (predicate.kind === 'string' && !valueString(predicate.value))
-    || (predicate.kind === 'date-time' && !scalarString(predicate.value))) throw new AuthorityError('INVALID_ARGUMENT');
+  if (!validPredicateValue(predicate.kind,predicate.value)) throw new AuthorityError('INVALID_ARGUMENT');
   params.push(predicate.value);
   if (predicate.kind === 'date-time') {
     return ` AND stateplane_instant_sort_key(${alias}.${column}) COLLATE "C" ${operator} stateplane_instant_sort_key($${params.length}::text) COLLATE "C"`;
   }
   return ` AND ${alias}.${column} ${operator} $${params.length}`;
 }
+function validPredicateValue(kind:string,value:unknown):boolean {
+  if (kind==='number') return typeof value==='number' && isFiniteNumber(value);
+  if (kind==='boolean') return typeof value==='boolean';
+  if (kind==='string') return valueString(value) && Buffer.byteLength(value)<=MAX_INDEX_VALUE_BYTES;
+  if (kind==='date-time') {
+    if (!scalarString(value) || Buffer.byteLength(value)>MAX_INDEX_VALUE_BYTES) return false;
+    try { utcInstant(value); return true; } catch { return false; }
+  }
+  return false;
+}
 
 export class AuthorityError extends Error {
   /** Carry a safe current revision for caller-visible conflicts. */
   constructor(public readonly code: string, message = code, public readonly currentRevision?: number) { super(message); this.name = 'AuthorityError'; }
 }
+class BatchItemFailure extends AuthorityError {}
 export class CommitOutcomeUnknownError extends Error {
   /** Require an idempotent retry when COMMIT acknowledgement is ambiguous. */
   constructor(cause: unknown) { super('Commit outcome unknown; retry with the same idempotency key', { cause }); }
@@ -76,6 +107,9 @@ export class CommitOutcomeUnknownError extends Error {
 const MAX_JSON_BYTES = 1_048_576;
 const MAX_SCOPE_ID_BYTES = 512;
 const MAX_PAGE = 100;
+const MAX_PAGE_BYTES = 2_097_152;
+const QUERY_TIMEOUT_MS = 5_000;
+const REQUEST_TIMEOUT_MS = 30_000;
 const retryCodes = new Set(['40P01', '40001']);
 const validDigest = /^[0-9a-f]{64}$/;
 const serializedMarker=Symbol('stateplane parsed JSON');
@@ -179,7 +213,7 @@ type PoolLike = Pick<pg.Pool, 'connect'>;
 type Client = pg.PoolClient;
 type ReceiptExposure = { committedAt: string; expiresAt: string };
 type PendingReceipt = { response: Receipt; exposure: ReceiptExposure; retentionSeconds: number;
-  digest: string; collectionId: CollectionId; key: string };
+  digest: string; collectionId: CollectionId; key: string; receiptOperation: ReceiptOperation };
 type ReadyReceipt = { receiptId: string; exposure: ReceiptExposure; committedAt: string; expiresAt: string };
 export interface JoinedReceiptState {
   pending: Map<string, PendingReceipt>;
@@ -241,8 +275,57 @@ function validateIndexValue(entry:IndexValue):void {
     || (entry.kind === 'string' && (!valueString(value) || Buffer.byteLength(value)>MAX_INDEX_VALUE_BYTES))
     || (entry.kind === 'date-time' && (!scalarString(value) || Buffer.byteLength(value)>MAX_INDEX_VALUE_BYTES))
     || (entry.kind === 'boolean' && typeof value !== 'boolean')
-    || (entry.kind === 'null' && value !== null && value !== undefined)
-    || !arrayHas(['null','string','date-time','number','boolean'],entry.kind)) throw new AuthorityError('INVALID_ARGUMENT');
+    || (arrayHas(['null','missing'],entry.kind) && value !== null && value !== undefined)
+    || !arrayHas(['missing','null','string','date-time','number','boolean'],entry.kind)) throw new AuthorityError('INVALID_ARGUMENT');
+}
+
+/** Reconstruct a declared projection from canonical bytes, including absence. */
+function indexForDeclaration(data:Record<string,Json>,field:string,
+  kind:SortValueKind):IndexValue {
+  const value=Object.hasOwn(data,field) ? data[field] : undefined;
+  if (value===undefined) return {field,kind:'missing'};
+  if (value===null) return {field,kind:'null'};
+  if (kind==='string' && typeof value==='string') return {field,kind,value};
+  if (kind==='date-time' && typeof value==='string') return {field,kind,value:utcInstant(value)};
+  if (kind==='number' && typeof value==='number' && isFiniteNumber(value)) return {field,kind,value};
+  if (kind==='boolean' && typeof value==='boolean') return {field,kind,value};
+  throw new AuthorityError('SCHEMA_INVALID','Indexed value does not match its declaration');
+}
+
+/** Freeze a bounded batch manifest before the first asynchronous admission. */
+function snapshotBatchManifest(operationKey:string,requests:readonly string[],retryFailed:boolean):string[] {
+  if (!Array.isArray(requests) || Object.getPrototypeOf(requests)!==Array.prototype ||
+    requests.length<1 ||
+    typeof operationKey!=='string' || !unicodeString(operationKey) || !operationKey ||
+    Buffer.byteLength(operationKey)>MAX_INDEX_PART_BYTES || typeof retryFailed!=='boolean')
+    throw new AuthorityError('INVALID_ARGUMENT');
+  if (requests.length>20) throw new AuthorityError('RATE_LIMITED','Batch item count limit exceeded');
+  if (Reflect.ownKeys(requests).length!==requests.length+1) throw new AuthorityError('INVALID_ARGUMENT');
+  const fixed:string[]=[];
+  let total=0;
+  for (let i=0;i<requests.length;i++) {
+    const item=Object.getOwnPropertyDescriptor(requests,i)?.value;
+    if (!unicodeString(item)) throw new AuthorityError('INVALID_ARGUMENT');
+    total+=Buffer.byteLength(item);
+    if (total>MAX_PAGE_BYTES || Buffer.byteLength(item)>MAX_JSON_BYTES)
+      throw new AuthorityError('RATE_LIMITED','Batch byte budget exceeded');
+    append(fixed,item);
+  }
+  return fixed;
+}
+
+/** Bound pool admission before a transaction owns a client. */
+function connectWithin(pool:PoolLike,deadline:number):Promise<Client> {
+  const remaining=deadline-Date.now();
+  if (remaining<=0) return Promise.reject(new AuthorityError('RATE_LIMITED','Request time budget exceeded'));
+  return new Promise((resolve,reject)=>{
+    let expired=false;
+    const timer=setTimeout(()=>{ expired=true; reject(new AuthorityError('RATE_LIMITED','Request time budget exceeded')); },remaining);
+    pool.connect().then(connected=>{
+      clearTimeout(timer);
+      if (expired) connected.release(); else resolve(connected);
+    },error=>{ clearTimeout(timer); if (!expired) reject(error); });
+  });
 }
 
 /** Detach caller-owned fields before any await, including the first retry attempt. */
@@ -372,25 +455,24 @@ function requestFingerprintFields(fields:Record<string,unknown>,normalized:strin
 }
 
 /** Reject decorated predicates and retain stable own values for query admission. */
-function snapshotPredicates(source: readonly ScalarPredicate[]): readonly ScalarPredicate[] {
-  if (!acceptsInProcessObjects || isInProcessProxy(source) || !Array.isArray(source) ||
+function snapshotPredicates(source: readonly ScalarPredicate[], trustedParsed=false): readonly ScalarPredicate[] {
+  if ((!trustedParsed && !acceptsInProcessObjects) || (!trustedParsed && isInProcessProxy(source)) || !Array.isArray(source) ||
     Object.getPrototypeOf(source)!==Array.prototype || source.length > 16 || Reflect.ownKeys(source).length!==source.length+1)
     throw new AuthorityError('INVALID_ARGUMENT');
   const result: ScalarPredicate[]=[];
   for (let i=0;i<source.length;i++) {
     const item=Object.getOwnPropertyDescriptor(source,i)?.value;
-    append(result,snapshotPredicate(item));
+    append(result,snapshotPredicate(item,trustedParsed));
   }
   return Object.freeze(result);
 }
+function parseSerializedPredicates(serialized:string):readonly ScalarPredicate[] {
+  if (typeof serialized!=='string' || Buffer.byteLength(serialized)>32_768) throw new AuthorityError('INVALID_ARGUMENT');
+  try { return snapshotPredicates(JSON.parse(serialized),true); }
+  catch { throw new AuthorityError('INVALID_ARGUMENT'); }
+}
 /** Retain a predicate's own data properties and reject decorated objects. */
-function snapshotPredicate(item:unknown):ScalarPredicate {
-  if (!item || typeof item!=='object' || isInProcessProxy(item) ||
-    (Object.getPrototypeOf(item)!==Object.prototype && Object.getPrototypeOf(item)!==null)) throw new AuthorityError('INVALID_ARGUMENT');
-  const field=Object.getOwnPropertyDescriptor(item,'field')?.value;
-  const kind=Object.getOwnPropertyDescriptor(item,'kind')?.value;
-  const operator=Object.getOwnPropertyDescriptor(item,'operator')?.value;
-  const value=Object.getOwnPropertyDescriptor(item,'value')?.value;
+function predicateDataKeys(item:object,kind:unknown):void {
   const accepted=kind==='null' ? ['field','kind','operator'] : ['field','kind','operator','value'];
   const keys=Reflect.ownKeys(item);
   if (keys.length!==accepted.length) throw new AuthorityError('INVALID_ARGUMENT');
@@ -399,7 +481,32 @@ function snapshotPredicate(item:unknown):ScalarPredicate {
     if (typeof key!=='string' || !arrayHas(accepted,key) || !descriptor?.enumerable || !Object.hasOwn(descriptor,'value'))
       throw new AuthorityError('INVALID_ARGUMENT');
   }
+}
+function snapshotInValues(value:unknown,kind:string,trustedParsed:boolean):readonly (string|number|boolean)[] {
+  if (!Array.isArray(value) || (!trustedParsed && isInProcessProxy(value)) ||
+    Object.getPrototypeOf(value)!==Array.prototype || value.length<1 || value.length>16 ||
+    Reflect.ownKeys(value).length!==value.length+1) throw new AuthorityError('INVALID_ARGUMENT');
+  const values:(string|number|boolean)[]=[];
+  for (let i=0;i<value.length;i++) {
+    const descriptor=Object.getOwnPropertyDescriptor(value,i);
+    if (!descriptor?.enumerable || !Object.hasOwn(descriptor,'value') || !validPredicateValue(kind,descriptor.value))
+      throw new AuthorityError('INVALID_ARGUMENT');
+    append(values,descriptor.value);
+  }
+  return Object.freeze(values);
+}
+function snapshotPredicate(item:unknown,trustedParsed=false):ScalarPredicate {
+  if (!item || typeof item!=='object' || (!trustedParsed && isInProcessProxy(item)) ||
+    (Object.getPrototypeOf(item)!==Object.prototype && Object.getPrototypeOf(item)!==null)) throw new AuthorityError('INVALID_ARGUMENT');
+  const field=Object.getOwnPropertyDescriptor(item,'field')?.value;
+  const kind=Object.getOwnPropertyDescriptor(item,'kind')?.value;
+  const operator=Object.getOwnPropertyDescriptor(item,'operator')?.value;
+  const value=Object.getOwnPropertyDescriptor(item,'value')?.value;
+  predicateDataKeys(item,kind);
   if (kind==='null') return Object.freeze({field,kind,operator}) as ScalarPredicate;
+  if (operator==='in') {
+    return Object.freeze({field,kind,operator,value:snapshotInValues(value,kind,trustedParsed)}) as ScalarPredicate;
+  }
   return Object.freeze({field,kind,operator,value}) as ScalarPredicate;
 }
 /** Match a declared index using only trusted own result-array slots. */
@@ -410,27 +517,167 @@ function findDeclaration(rows:readonly Record<string,unknown>[],field:string):Re
   }
   return undefined;
 }
+function snapshotSort(input: RecordSort | undefined,trustedParsed=false): RecordSort | undefined {
+  if (input===undefined) return undefined;
+  if (!input || typeof input!=='object' || (!trustedParsed && isInProcessProxy(input)) ||
+    (Object.getPrototypeOf(input)!==Object.prototype && Object.getPrototypeOf(input)!==null) ||
+    Reflect.ownKeys(input).length!==2 || !Object.hasOwn(input,'field') || !Object.hasOwn(input,'direction'))
+    throw new AuthorityError('INVALID_ARGUMENT');
+  const fieldDescriptor=Object.getOwnPropertyDescriptor(input,'field');
+  const directionDescriptor=Object.getOwnPropertyDescriptor(input,'direction');
+  if (!fieldDescriptor?.enumerable || !Object.hasOwn(fieldDescriptor,'value') ||
+    !directionDescriptor?.enumerable || !Object.hasOwn(directionDescriptor,'value')) throw new AuthorityError('INVALID_ARGUMENT');
+  const field=fieldDescriptor.value;
+  const direction=directionDescriptor.value;
+  if (!scalarString(field) || !field || Buffer.byteLength(field)>MAX_INDEX_PART_BYTES ||
+    !arrayHas(['asc','desc'],direction)) throw new AuthorityError('INVALID_ARGUMENT');
+  return Object.freeze({field,direction});
+}
+function digestQuery(predicates:readonly ScalarPredicate[], sort:RecordSort|undefined, limit:number):string {
+  return createHash('sha256').update(JSON.stringify({predicates,sort:sort??null,limit})).digest('hex');
+}
+function signCursor(cursor:PageCursor, secret:Uint8Array):string {
+  const iv=randomBytes(12);
+  const cipher=createCipheriv('aes-256-gcm',createHash('sha256').update(secret).digest(),iv);
+  const encrypted=Buffer.concat([cipher.update(JSON.stringify(cursor),'utf8'),cipher.final()]);
+  return Buffer.concat([iv,encrypted,cipher.getAuthTag()]).toString('base64url');
+}
+function decodeCursor(token:string, secret:Uint8Array):PageCursor {
+  if (typeof token!=='string' || token.length>4096 || !/^[A-Za-z0-9_-]+$/.test(token))
+    throw new AuthorityError('CURSOR_INVALID');
+  try {
+    const bytes=Buffer.from(token,'base64url');
+    if (bytes.length<29 || bytes.toString('base64url')!==token) throw new Error('wire');
+    const decipher=createDecipheriv('aes-256-gcm',createHash('sha256').update(secret).digest(),bytes.subarray(0,12));
+    decipher.setAuthTag(bytes.subarray(-16));
+    const plain=Buffer.concat([decipher.update(bytes.subarray(12,-16)),decipher.final()]);
+    const cursor=JSON.parse(plain.toString('utf8')) as PageCursor;
+    if (!cursor || typeof cursor!=='object' || typeof cursor.id!=='string' || !cursor.id ||
+      typeof cursor.query!=='string' || !/^[0-9a-f]{64}$/.test(cursor.query) ||
+      !Number.isSafeInteger(cursor.expiresAt) || cursor.expiresAt<=Date.now() ||
+      !arrayHas([0,1,2],cursor.rank) ||
+      !(cursor.value===null || ['string','number','boolean'].includes(typeof cursor.value))) throw new Error('shape');
+    return cursor;
+  } catch { throw new AuthorityError('CURSOR_INVALID'); }
+}
+
+type PageContinuation={after:string;presentAfter:string;nullAfter:string;missingAfter:string};
+type SortValueKind='string'|'number'|'boolean'|'date-time';
+function pageContinuation(params:unknown[],cursor:PageCursor|undefined,sort:RecordSort|undefined,
+  kind:SortValueKind|undefined,expr:string,direction:'ASC'|'DESC'):PageContinuation {
+  let after='',presentAfter='',nullAfter='',missingAfter='';
+  if (!cursor) return {after,presentAfter,nullAfter,missingAfter};
+  params.push(cursor.id);
+  const idParam=`$${params.length}`;
+  if (!sort) {
+    params.push(cursor.value);
+    const valueParam=`$${params.length}::timestamptz`;
+    after=` AND (${expr}>${valueParam} OR (${expr}=${valueParam} AND r.record_id>${idParam}))`;
+    return {after,presentAfter,nullAfter,missingAfter};
+  }
+  const afterRank=(rank:0|1|2):string=>{
+    if (rank===cursor.rank) return ` AND r.record_id>${idParam}`;
+    const follows=direction==='ASC' ? rank>cursor.rank : rank<cursor.rank;
+    return follows ? '' : ' AND FALSE';
+  };
+  missingAfter=afterRank(0);
+  nullAfter=afterRank(1);
+  if (cursor.rank!==2) {
+    presentAfter=afterRank(2);
+    return {after,presentAfter,nullAfter,missingAfter};
+  }
+  params.push(cursor.value);
+  let valueType='::text';
+  if (kind==='number') valueType='::numeric';
+  else if (kind==='boolean') valueType='::boolean';
+  const valueParam=`$${params.length}${valueType}`;
+  const operator=direction==='ASC' ? '>' : '<';
+  presentAfter=` AND (${expr} ${operator} ${valueParam} OR (${expr}=${valueParam} AND r.record_id>${idParam}))`;
+  return {after,presentAfter,nullAfter,missingAfter};
+}
+
+interface PageCandidateOptions {
+  where:string; sort:RecordSort|undefined; kind:SortValueKind|undefined; expr:string;
+  direction:'ASC'|'DESC'; fieldParam:string; candidateLimit:string; filtered:boolean;
+  continuation:PageContinuation;
+}
+/** Limit each typed branch before fetching record bytes from a sort-only page. */
+function pageCandidateSql(options:PageCandidateOptions):string {
+  const {where,sort,kind,expr,direction,fieldParam,candidateLimit,filtered,continuation}=options;
+  if (!sort) return `WITH candidates AS MATERIALIZED (
+    SELECT r.record_id,2 AS sort_rank,${expr} AS sort_value,
+      r.created_at::text AS sort_cursor,octet_length(r.canonical_data) AS bytes
+    FROM records r WHERE ${where}${continuation.after}
+    ORDER BY ${expr} ${direction} NULLS LAST,r.record_id ASC LIMIT ${candidateLimit}
+  )`;
+  let nullValueType='text';
+  if (kind==='number') nullValueType='numeric';
+  else if (kind==='boolean') nullValueType='boolean';
+  const sortSource=(valueKind:string,order:string,position:string):string=>{
+    if (filtered) return 'record_index_values sv';
+    return `(SELECT * FROM record_index_values sv WHERE sv.space_id=$1 AND sv.collection_id=$2
+      AND sv.field_name=${fieldParam} AND sv.value_kind='${valueKind}'
+      ${position.replaceAll('r.record_id','sv.record_id')}
+      ORDER BY ${order},sv.record_id LIMIT ${candidateLimit}) sv`;
+  };
+  const outerAfter=(value:string):string=>filtered ? value : '';
+  const presentOrder=`${expr} ${direction}`;
+  const sortedOrder=`sort_rank ${direction},sort_value ${direction} NULLS LAST,record_id ASC`;
+  return `WITH present AS MATERIALIZED (
+    SELECT r.record_id,2 AS sort_rank,${expr} AS sort_value,${expr} AS sort_cursor,octet_length(r.canonical_data) AS bytes
+    FROM ${sortSource(kind!,presentOrder,continuation.presentAfter)} JOIN records r ON r.space_id=sv.space_id AND r.collection_id=sv.collection_id
+      AND r.record_id=sv.record_id
+    WHERE ${where} AND sv.field_name=${fieldParam} AND sv.value_kind='${kind}'${outerAfter(continuation.presentAfter)}
+    ORDER BY ${expr} ${direction},r.record_id LIMIT ${candidateLimit}
+  ), explicit_null AS MATERIALIZED (
+    SELECT r.record_id,1 AS sort_rank,NULL::${nullValueType} AS sort_value,NULL::${nullValueType} AS sort_cursor,
+      octet_length(r.canonical_data) AS bytes
+    FROM ${sortSource('null','sv.record_id',continuation.nullAfter)} JOIN records r ON r.space_id=sv.space_id AND r.collection_id=sv.collection_id
+      AND r.record_id=sv.record_id
+    WHERE ${where} AND sv.field_name=${fieldParam} AND sv.value_kind='null'${outerAfter(continuation.nullAfter)}
+    ORDER BY r.record_id LIMIT ${candidateLimit}
+  ), missing AS MATERIALIZED (
+    SELECT r.record_id,0 AS sort_rank,NULL::${nullValueType} AS sort_value,
+      NULL::${nullValueType} AS sort_cursor,octet_length(r.canonical_data) AS bytes
+    FROM ${sortSource('missing','sv.record_id',continuation.missingAfter)} JOIN records r ON r.space_id=sv.space_id AND r.collection_id=sv.collection_id
+      AND r.record_id=sv.record_id
+    WHERE ${where} AND sv.field_name=${fieldParam} AND sv.value_kind='missing'${outerAfter(continuation.missingAfter)}
+    ORDER BY r.record_id LIMIT ${candidateLimit}
+  ), candidates AS MATERIALIZED (
+    SELECT * FROM present UNION ALL SELECT * FROM explicit_null UNION ALL SELECT * FROM missing
+    ORDER BY ${sortedOrder} LIMIT ${candidateLimit}
+  )`;
+}
 
 export class PostgresAuthority {
   /** Configure the receipt window used by new authority transactions. */
-  constructor(private readonly pool: PoolLike, private readonly receiptRetentionSeconds: number) {
+  constructor(private readonly pool: PoolLike, private readonly receiptRetentionSeconds: number,
+    private readonly cursorSecret?: Uint8Array, private readonly requestTimeoutMs = REQUEST_TIMEOUT_MS) {
     if (!isSafeInteger(receiptRetentionSeconds) || receiptRetentionSeconds < 1) throw new RangeError('Invalid receipt retention');
+    if (cursorSecret && cursorSecret.byteLength < 32) throw new RangeError('Cursor secret must contain at least 32 bytes');
+    if (!isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > REQUEST_TIMEOUT_MS)
+      throw new RangeError('Invalid request time budget');
+    if (cursorSecret) this.cursorSecret=Buffer.from(cursorSecret);
   }
 
   /** Callback side effects are never retried. A COMMIT failure is deliberately ambiguous. */
-  async transaction<T>(scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T>): Promise<T> {
+  async transaction<T>(scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T> | T, deadlineMs?: number): Promise<T> {
+    const requestDeadline=Date.now()+this.requestTimeoutMs;
+    if (deadlineMs!==undefined && !isSafeInteger(deadlineMs)) throw new AuthorityError('INVALID_ARGUMENT');
+    deadlineMs=deadlineMs===undefined ? requestDeadline : Math.min(deadlineMs,requestDeadline);
     // Capture the authenticated identity before waiting for a pooled connection.
     const fixedScope = Object.freeze({ ...scope });
     if (!validScope(fixedScope)) throw new AuthorityError('INVALID_ARGUMENT');
-    const client = await this.pool.connect();
+    const client = await connectWithin(this.pool,deadlineMs);
     let begun = false;
     let beginAttempted = false;
     let discard = false;
+    let commitAmbiguous = false;
     let tx: AuthorityTransaction | undefined;
     try {
       beginAttempted = true;
       await client.query('BEGIN'); begun = true;
-      tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds);
+      tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds, undefined, this.cursorSecret, deadlineMs);
       await tx.checkScope();
       const result = await fn(tx);
       tx.sealMutations();
@@ -442,14 +689,30 @@ export class PostgresAuthority {
       await tx.checkScope();
       await tx.checkReplayScopes();
       await tx.ensureReceiptsCurrent();
-      try { await client.query('COMMIT'); begun = false; }
-      catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
+      // A failure while setting the final timeout is before COMMIT dispatch.
+      // Only a missing COMMIT acknowledgement has an ambiguous outcome.
+      await client.query(`SET LOCAL statement_timeout = '${Math.max(1,deadlineMs-Date.now())}ms'`);
+      if (Date.now()>=deadlineMs) throw new AuthorityError('RATE_LIMITED','Request time budget exceeded');
+      try {
+        await commitBeforeDeadline(client,deadlineMs); begun = false;
+      }
+      catch (error) {
+        discard = true;
+        if ((error as {code?:string}).code==='PZ003') throw new AuthorityError('SCHEMA_CONFLICT','Record index projection incomplete');
+        if ((error as {code?:string}).code==='57014') throw new AuthorityError('RATE_LIMITED','Database commit time limit exceeded');
+        if (error instanceof CommitNotSentDeadlineExceeded) throw new AuthorityError('RATE_LIMITED','Request time budget exceeded');
+        if (error instanceof AuthorityError) throw error;
+        commitAmbiguous = true;
+        throw new CommitOutcomeUnknownError(error);
+      }
       tx.exposeReceipts();
       return result;
     } catch (error) {
       if (tx) { tx.sealMutations(); await tx.settleMutations(); }
-      if (begun) { try { await client.query('ROLLBACK'); } catch { discard = true; } }
+      if (begun && !commitAmbiguous) { try { await client.query('ROLLBACK'); } catch { discard = true; } }
       else if (beginAttempted) discard = true;
+      if ((error as {code?:string}).code==='57014') throw new AuthorityError('RATE_LIMITED','Database statement time limit exceeded');
+      if ((error as {code?:string}).code==='55P03') throw new AuthorityError('BACKPRESSURE','Database lock budget exceeded');
       throw error;
     } finally { tx?.close(); client.release(discard); }
   }
@@ -458,10 +721,11 @@ export class PostgresAuthority {
   async transactionOnClient<T>(client: Client, scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T>,
     deferUntilCommit: (finish: () => Promise<void>, verify: () => Promise<void>, ensureCurrent: () => Promise<number>, expose: () => void,
       close: () => void) => void,
-    joinedReceipts?: JoinedReceiptState): Promise<T> {
+    joinedReceipts?: JoinedReceiptState, cellDeadlineMs?: number, signal?: AbortSignal): Promise<T> {
+    const deadline=Math.min(Date.now()+this.requestTimeoutMs,cellDeadlineMs ?? Infinity);
     const fixedScope = Object.freeze({ ...scope });
     if (!validScope(fixedScope)) throw new AuthorityError('INVALID_ARGUMENT');
-    const tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds, joinedReceipts);
+    const tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds, joinedReceipts, this.cursorSecret, deadline, signal);
     let deferred = false;
     try {
       await tx.checkScope();
@@ -486,6 +750,8 @@ export class PostgresAuthority {
     } catch (error) {
       tx.sealMutations();
       await tx.settleMutations();
+      if ((error as {code?:string}).code==='57014') throw new AuthorityError('RATE_LIMITED','Database statement time limit exceeded');
+      if ((error as {code?:string}).code==='55P03') throw new AuthorityError('BACKPRESSURE','Database lock budget exceeded');
       throw error;
     } finally { if (!deferred) tx.close(); }
   }
@@ -523,6 +789,85 @@ export class PostgresAuthority {
     }
     throw new Error('unreachable');
   }
+
+  /** A bounded manifest is durable before individual item transactions begin. */
+  async ingestBatch(scope:AuthorityScope,operationKey:string,requests:readonly string[],retryFailed=false):Promise<BatchProgress> {
+    const fixedScope=Object.freeze({...scope});
+    const deadline=Date.now()+this.requestTimeoutMs;
+    if (!acceptsInProcessObjects || isInProcessProxy(requests)) throw new AuthorityError('INVALID_ARGUMENT');
+    return this.ingestBatchUsing(fixedScope,operationKey,requests,retryFailed,deadline);
+  }
+
+  /** Cloudflare-safe batch boundary: parse manifest bytes only after scope authorization. */
+  async ingestSerializedBatch(scope:AuthorityScope,operationKey:string,serialized:string,retryFailed=false):Promise<BatchProgress> {
+    const fixedScope=Object.freeze({...scope});
+    const deadline=Date.now()+this.requestTimeoutMs;
+    const requests=await this.transaction(fixedScope,tx=>{
+      if (tx.scope.capability!=='records:write') throw new AuthorityError('FORBIDDEN');
+      if (typeof serialized!=='string' || Buffer.byteLength(serialized)>3_145_728) throw new AuthorityError('RATE_LIMITED');
+      try { return JSON.parse(serialized) as string[]; }
+      catch { throw new AuthorityError('INVALID_ARGUMENT'); }
+    },deadline);
+    return this.ingestBatchUsing(fixedScope,operationKey,requests,retryFailed,deadline);
+  }
+
+  /** Persist one immutable manifest, then settle items in separate transactions. */
+  private async ingestBatchUsing(scope:AuthorityScope,operationKey:string,requests:readonly string[],retryFailed:boolean,deadline:number):Promise<BatchProgress> {
+    const fixed=snapshotBatchManifest(operationKey,requests,retryFailed);
+    const digest=createHash('sha256').update(JSON.stringify(fixed)).digest('hex');
+    // A retry must spend its request budget on durable eligible items, not on
+    // one transaction per already settled item in the manifest prefix.
+    const eligible=await this.transaction(scope,tx=>tx.startBatch(operationKey,digest,fixed,retryFailed),deadline);
+    let stoppedForDeadline=false;
+    for (const ordinal of eligible) {
+      const remaining=deadline-Date.now();
+      if (remaining<=0) { stoppedForDeadline=true; break; }
+      if (await this.processBatchOrdinal(scope,operationKey,ordinal,retryFailed,remaining,deadline)==='cancelled') break;
+    }
+    if (stoppedForDeadline)
+      throw new AuthorityError('RATE_LIMITED','Batch request time budget exceeded; poll batchProgress with the operation key');
+    // All item transactions settled. Reading their committed status may need a
+    // new bounded read budget; an expired ingestion clock cannot undo them.
+    return this.transaction(scope,tx=>tx.batchProgress(operationKey),Date.now()>=deadline ? undefined : deadline);
+  }
+
+  /** Record only a confirmed item failure; leave a rolled-back item pending. */
+  private async processBatchOrdinal(scope:AuthorityScope,operationKey:string,ordinal:number,retryFailed:boolean,
+    remaining:number,deadline:number):Promise<'continued'|'cancelled'> {
+    try {
+      await this.transaction(scope,tx=>tx.processBatchItem(operationKey,ordinal,retryFailed,remaining),deadline);
+      return 'continued';
+    } catch (error) {
+      if (error instanceof AuthorityError && error.code==='BATCH_CANCELLED') return 'cancelled';
+      if (error instanceof BatchItemFailure)
+        return this.recordBatchItemFailure(scope,operationKey,ordinal,error.code,deadline);
+      if (setHas(retryCodes,(error as {code?:string}).code ?? '')) {
+        throw new AuthorityError('BACKPRESSURE','Batch item rolled back; retry the same operation and manifest');
+      }
+      throw error;
+    }
+  }
+
+  /** Persist a confirmed item failure without masking concurrent cancellation. */
+  private async recordBatchItemFailure(scope:AuthorityScope,operationKey:string,ordinal:number,
+    code:string,deadline:number):Promise<'continued'|'cancelled'> {
+    try { await this.transaction(scope,tx=>tx.failBatchItem(operationKey,ordinal,code),deadline); }
+    catch (error) {
+      if (error instanceof AuthorityError && error.code==='BATCH_CANCELLED') return 'cancelled';
+      throw error;
+    }
+    return 'continued';
+  }
+
+  /** Read the committed ledger for this credential and collection. */
+  batchProgress(scope:AuthorityScope,operationKey:string):Promise<BatchProgress> {
+    return this.transaction(scope,tx=>tx.batchProgress(operationKey));
+  }
+
+  /** Fence future item starts while preserving receipts already committed. */
+  cancelBatch(scope:AuthorityScope,operationKey:string):Promise<BatchProgress> {
+    return this.transaction(scope,async tx=>{ await tx.cancelBatch(operationKey); return tx.batchProgress(operationKey); });
+  }
 }
 
 export class AuthorityTransaction {
@@ -534,16 +879,26 @@ export class AuthorityTransaction {
   private readonly readyReceipts: JoinedReceiptState['ready'];
   private activeOperationTail: Promise<void> = Promise.resolve();
   private mutationTail: Promise<void> = Promise.resolve();
-  private readonly reservedIdentities = new Map<string, { operation: RecordMutation; key: string }>();
+  private readonly reservedIdentities = new Map<string, { operation: ReceiptOperation; key: string }>();
   private admittingMutations = true;
   private readonly replayCollections = new Set<CollectionId>();
+  private readonly batchReceiptIds = new Set<string>();
+  private requestDeadlineMs: number | undefined;
+  private statementTimeoutMs = 15_000;
+  private configuredStatementTimeoutMs: number | undefined;
+  private readonly cacheStatementTimeout: boolean;
   readonly #scope: Readonly<AuthorityScope>;
   /** Expose the frozen scope used by every operation in this transaction. */
   get scope(): Readonly<AuthorityScope> { return this.#scope; }
   /** Join an authorized client and optionally share pending receipt state. */
   constructor(private readonly client: Client, scope: AuthorityScope, private readonly retentionSeconds: number,
-    joinedReceipts?: JoinedReceiptState) {
+    joinedReceipts?: JoinedReceiptState, private readonly cursorSecret?: Uint8Array, deadlineMs?: number,
+    private readonly signal?: AbortSignal) {
     this.#scope = Object.freeze({ ...scope });
+    this.requestDeadlineMs = deadlineMs;
+    // Joined cell policy SQL uses the same client and can change SET LOCAL.
+    // Standalone transactions own their setting and may safely cache it.
+    this.cacheStatementTimeout = joinedReceipts===undefined && signal===undefined;
     this.pendingReceipts = joinedReceipts?.pending ?? new Map();
     this.joinedReplays = joinedReceipts?.replayed ?? new Map();
     this.readyReceipts = joinedReceipts?.ready ?? [];
@@ -565,16 +920,191 @@ export class AuthorityTransaction {
   }
   /** Track admitted operations so callback return cannot bypass their completion. */
   private admitOperation<T>(work: () => Promise<T>, rollbackOnError = false): Promise<T> {
-    if (!this.admittingMutations || !this.active) return Promise.reject(new AuthorityError('INVALID_ARGUMENT', 'Transaction admission ended'));
+    if (!this.admittingMutations || !this.active || this.signal?.aborted) return Promise.reject(new AuthorityError('INVALID_ARGUMENT', 'Transaction admission ended'));
     const running = Promise.resolve().then(() => { this.assertCommittable(); return work(); })
       .catch(error => { if (rollbackOnError) { this.mutationFailed = true; this.mutationError = error; } throw error; });
     this.trackOperation(running);
     return running;
   }
-  /** Deny SQL after transaction-local authority state has closed. */
-  private query(sql: string, values: unknown[] = []) {
+  /** Deny SQL after closure and bound each statement by the remaining request budget. */
+  private async query(sql: string, values: unknown[] = []) {
     if (!this.active) throw new AuthorityError('INVALID_ARGUMENT', 'Transaction ended');
+    if (this.signal?.aborted) throw new AuthorityError('RATE_LIMITED', 'Transaction time budget exceeded');
+    if (this.requestDeadlineMs!==undefined) await this.applyStatementTimeout(this.requestDeadlineMs);
     return this.client.query(sql, values);
+  }
+
+  /** Refresh the transaction-local SQL budget without extending its prior bound. */
+  private async applyStatementTimeout(deadline:number):Promise<void> {
+    let remaining=deadline-Date.now();
+    if (remaining<=0) throw new AuthorityError('RATE_LIMITED','Request time budget exceeded');
+    let bound=Math.max(1,Math.min(this.statementTimeoutMs,Math.trunc(remaining)));
+    while (!this.cacheStatementTimeout || this.configuredStatementTimeoutMs===undefined ||
+      this.configuredStatementTimeoutMs>bound) {
+      // Reserve time for subsequent statements. Until the setting needs a
+      // refresh it is always no larger than the current remaining budget.
+      const slack=this.cacheStatementTimeout ? Math.min(1000,Math.floor(bound/4)) : 0;
+      const configured=Math.max(1,bound-slack);
+      await this.client.query(`SET LOCAL statement_timeout = '${configured}ms'`);
+      this.configuredStatementTimeoutMs=configured;
+      remaining=deadline-Date.now();
+      if (remaining<=0) throw new AuthorityError('RATE_LIMITED','Request time budget exceeded');
+      bound=Math.max(1,Math.min(this.statementTimeoutMs,Math.trunc(remaining)));
+      if (!this.cacheStatementTimeout) break;
+    }
+  }
+
+  /** Narrow an existing deadline for one bounded batch transaction. */
+  private limitBatchTime(milliseconds:number):void {
+    if (!Number.isSafeInteger(milliseconds) || milliseconds<1 || milliseconds>30_000)
+      throw new AuthorityError('INVALID_ARGUMENT');
+    const until=Date.now()+milliseconds;
+    this.requestDeadlineMs=this.requestDeadlineMs===undefined ? until : Math.min(this.requestDeadlineMs,until);
+  }
+
+  /** Bound subsequent statements without extending an earlier limit. */
+  private limitStatementTime(milliseconds:number):void {
+    this.statementTimeoutMs=Math.min(this.statementTimeoutMs,milliseconds);
+  }
+
+  /** Validate the operation key and bind it to the authenticated ledger scope. */
+  private batchKey(operationKey:string,allowRead=false):unknown[] {
+    if (this.#scope.capability!=='records:write' && !(allowRead && this.#scope.capability==='records:read'))
+      throw new AuthorityError('FORBIDDEN');
+    if (!unicodeString(operationKey) || !operationKey || Buffer.byteLength(operationKey)>MAX_INDEX_PART_BYTES)
+      throw new AuthorityError('INVALID_ARGUMENT');
+    return [...scopeIds(this.#scope),this.#scope.credentialId,operationKey];
+  }
+
+  /** Commit the manifest before item work; reject reuse with different bytes. */
+  startBatch(operationKey:string,digest:string,requests:readonly string[],retryFailed=false):Promise<number[]> {
+    return this.admitOperation(async()=>{
+      const key=this.batchKey(operationKey);
+      this.limitBatchTime(15_000);
+      await this.query("SET LOCAL lock_timeout = '100ms'");
+      try {
+        await this.query(`INSERT INTO batch_operations(space_id,collection_id,credential_id,operation_key,manifest_digest,item_count)
+          VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`,[...key,digest,requests.length]);
+        const row=(await this.query(`SELECT manifest_digest,item_count,state FROM batch_operations
+          WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 AND operation_key=$4 FOR UPDATE`,key)).rows[0];
+        if (row?.manifest_digest!==digest || Number(row.item_count)!==requests.length)
+          throw new AuthorityError('BATCH_CONFLICT','Operation key has a different manifest');
+        if (row.state==='cancelled') throw new AuthorityError('BATCH_CANCELLED');
+        await this.query(`INSERT INTO batch_items(space_id,collection_id,credential_id,operation_key,ordinal,request_text)
+          SELECT $1,$2,$3,$4,item.ordinal-1,item.request_text
+          FROM unnest($5::text[]) WITH ORDINALITY AS item(request_text,ordinal)
+          ON CONFLICT DO NOTHING`,[...key,requests]);
+        const eligible=await this.query(`SELECT ordinal FROM batch_items
+          WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 AND operation_key=$4
+            AND (state='pending' OR ($5::boolean AND state='failed')) ORDER BY ordinal`,[...key,retryFailed]);
+        return eligible.rows.map(item=>Number(item.ordinal));
+      } catch(error) {
+        if ((error as {code?:string}).code==='55P03') throw new AuthorityError('BACKPRESSURE');
+        throw error;
+      }
+    },true);
+  }
+
+  /** Lock one item and write its record, receipt and success status atomically. */
+  processBatchItem(operationKey:string,ordinal:number,retryFailed:boolean,remainingMs=15_000):Promise<void> {
+    return this.admitOperation(async()=>{
+      const key=this.batchKey(operationKey);
+      this.limitBatchTime(Math.min(15_000,remainingMs));
+      await this.query("SET LOCAL lock_timeout = '100ms'");
+      try {
+        const batch=(await this.query(`SELECT state FROM batch_operations WHERE space_id=$1 AND collection_id=$2
+          AND credential_id=$3 AND operation_key=$4 FOR UPDATE`,key)).rows[0];
+        if (!batch) throw new AuthorityError('NOT_FOUND');
+        if (batch.state==='cancelled') throw new AuthorityError('BATCH_CANCELLED');
+        const item=(await this.query(`SELECT state,request_text FROM batch_items WHERE space_id=$1 AND collection_id=$2
+          AND credential_id=$3 AND operation_key=$4 AND ordinal=$5 FOR UPDATE`,[...key,ordinal])).rows[0];
+        if (!item) throw new AuthorityError('NOT_FOUND');
+        if (item.state==='succeeded' || (item.state==='failed' && !retryFailed)) return;
+        const request=this.batchItemRequest(item.request_text,key,ordinal);
+        let receipt:Receipt;
+        try { receipt=await this.mutateBatchSerializedRequest(request); }
+        catch (error) {
+          if (error instanceof AuthorityError && arrayHas(['INVALID_ARGUMENT','SCHEMA_INVALID','SCHEMA_CONFLICT',
+            'REVISION_CONFLICT','UNIQUE_CONFLICT','KEY_RESERVED','NOT_FOUND'],error.code))
+            throw new BatchItemFailure(error.code);
+          throw error;
+        }
+        await this.query(`UPDATE batch_items SET state='succeeded',failure_code=NULL,receipt_id=$6,
+          receipt=COALESCE(receipt,$7::jsonb),attempts=attempts+1
+          WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 AND operation_key=$4 AND ordinal=$5`,
+        [...key,ordinal,receipt.receiptId,receipt.replayed ? JSON.stringify(receipt) : null]);
+        if (!receipt.replayed) setAdd(this.batchReceiptIds,receipt.receiptId);
+      } catch(error) {
+        if ((error as {code?:string}).code==='55P03') throw new AuthorityError('BACKPRESSURE');
+        throw error;
+      }
+    },true);
+  }
+
+  /** Derive a batch-only receipt key from a stored item and its ledger identity. */
+  private batchItemRequest(text:string,key:unknown[],ordinal:number):string {
+    let request:Record<string,unknown>;
+    try {
+      const parsed=JSON.parse(text);
+      if (!parsed || typeof parsed!=='object' || Array.isArray(parsed) || Object.hasOwn(parsed,'idempotencyKey'))
+        throw new Error('invalid batch item');
+      request=parsed;
+    } catch { throw new BatchItemFailure('INVALID_ARGUMENT','Malformed batch item'); }
+    const itemDigest=createHash('sha256').update(JSON.stringify(key)).update(`:${ordinal}`).digest('hex');
+    return JSON.stringify({...request,idempotencyKey:`b_${itemDigest}`});
+  }
+
+  /** Persist a confirmed item error without overwriting a concurrent success. */
+  failBatchItem(operationKey:string,ordinal:number,code:string):Promise<void> {
+    return this.admitOperation(async()=>{
+      const key=this.batchKey(operationKey);
+      this.limitBatchTime(5_000);
+      const result=await this.query(`UPDATE batch_items SET state='failed',failure_code=$6,attempts=attempts+1
+        WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 AND operation_key=$4 AND ordinal=$5
+          AND state<>'succeeded' AND EXISTS (SELECT 1 FROM batch_operations b
+            WHERE b.space_id=$1 AND b.collection_id=$2 AND b.credential_id=$3 AND b.operation_key=$4 AND b.state='active')`,
+      [...key,ordinal,code]);
+      if (!result.rowCount) {
+        const state=(await this.query(`SELECT b.state AS batch_state,i.state AS item_state FROM batch_operations b
+          JOIN batch_items i USING(space_id,collection_id,credential_id,operation_key)
+          WHERE b.space_id=$1 AND b.collection_id=$2 AND b.credential_id=$3 AND b.operation_key=$4
+            AND i.ordinal=$5`,[...key,ordinal])).rows[0];
+        if (state?.batch_state==='cancelled') throw new AuthorityError('BATCH_CANCELLED');
+        if (!state) throw new AuthorityError('NOT_FOUND');
+        if (state?.batch_state==='active' && state.item_state==='succeeded') return;
+        throw new AuthorityError('BACKPRESSURE','Batch item state changed; retry the same operation');
+      }
+    },true);
+  }
+
+  /** Stop new item starts under the operation lock; committed item receipts remain durable. */
+  cancelBatch(operationKey:string):Promise<void> {
+    return this.admitOperation(async()=>{
+      const key=this.batchKey(operationKey);
+      this.limitBatchTime(5_000);
+      await this.query("SET LOCAL lock_timeout = '100ms'");
+      try {
+        const result=await this.query(`UPDATE batch_operations SET state='cancelled'
+          WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3 AND operation_key=$4`,key);
+        if (!result.rowCount) throw new AuthorityError('NOT_FOUND');
+      } catch(error) {
+        if ((error as {code?:string}).code==='55P03') throw new AuthorityError('BACKPRESSURE');
+        throw error;
+      }
+    },true);
+  }
+
+  batchProgress(operationKey:string):Promise<BatchProgress> {
+    return this.admitOperation(async()=>{
+      const key=this.batchKey(operationKey,true);
+      this.limitBatchTime(5_000);
+      const rows=await this.query(`SELECT b.state AS batch_state,i.ordinal,i.state,i.attempts,i.failure_code,i.receipt
+        FROM batch_operations b JOIN batch_items i USING(space_id,collection_id,credential_id,operation_key)
+        WHERE b.space_id=$1 AND b.collection_id=$2 AND b.credential_id=$3 AND b.operation_key=$4 ORDER BY i.ordinal`,key);
+      if (!rows.rows.length) throw new AuthorityError('NOT_FOUND');
+      return {operationKey,state:rows.rows[0].batch_state,items:rows.rows.map(row=>({ordinal:row.ordinal,state:row.state,
+        attempts:row.attempts,failureCode:row.failure_code,receipt:row.receipt}))};
+    });
   }
 
   /** Hold shared policy/placement/collection locks through commit. Application policy remains explicit. */
@@ -635,7 +1165,7 @@ export class AuthorityTransaction {
     });
   }
   /** Look up a committed receipt before admitting a new mutation effect. */
-  private async findReceipt(operation: RecordMutation, key: string): Promise<{ collectionId: CollectionId; requestDigest: string; response: Receipt } | null> {
+  private async findReceipt(operation: ReceiptOperation, key: string): Promise<{ collectionId: CollectionId; requestDigest: string; response: Receipt } | null> {
     const result = await this.query(`SELECT collection_id,request_digest,response FROM idempotency_receipts
       WHERE space_id=$1 AND credential_id=$2 AND operation=$3 AND idempotency_key=$4 AND expires_at>clock_timestamp()`,
     [this.#scope.spaceId, this.#scope.credentialId, operation, key]);
@@ -670,8 +1200,11 @@ export class AuthorityTransaction {
         pending.response.expiresAt = expiresAt;
         await this.query(`INSERT INTO idempotency_receipts(receipt_id,space_id,collection_id,credential_id,operation,idempotency_key,request_digest,record_id,response,committed_at,expires_at)
           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)`, [pending.response.receiptId,this.#scope.spaceId,pending.collectionId,
-          this.#scope.credentialId,pending.response.operation,pending.key,pending.digest,pending.response.ref.id,
+          this.#scope.credentialId,pending.receiptOperation,pending.key,pending.digest,pending.response.ref.id,
           JSON.stringify(pending.response),committedAt,expiresAt]);
+        if (setHas(this.batchReceiptIds,pending.response.receiptId))
+          await this.query(`UPDATE batch_items SET receipt=$2::jsonb WHERE receipt_id=$1`,
+            [pending.response.receiptId,JSON.stringify(pending.response)]);
         append(this.readyReceipts,{receiptId:pending.response.receiptId,exposure:pending.exposure,committedAt,expiresAt});
       }
       mapClear(this.pendingReceipts);
@@ -769,18 +1302,28 @@ export class AuthorityTransaction {
 
   /** Use inside a joined regional cell transaction to retain its credential fence. */
   async mutateSerializedRequest(serialized:string):Promise<Receipt> {
+    return this.mutateSerializedUsing(serialized,'standalone');
+  }
+
+  /** Keep batch receipts in a database identity domain unavailable to standalone requests. */
+  private async mutateBatchSerializedRequest(serialized:string):Promise<Receipt> {
+    return this.mutateSerializedUsing(serialized,'batch');
+  }
+
+  /** Parse serialized bytes once and preserve the normal mutation admission queue. */
+  private async mutateSerializedUsing(serialized:string,receiptDomain:'standalone'|'batch'):Promise<Receipt> {
     try {
       if (!this.admittingMutations || !this.active) throw new AuthorityError('INVALID_ARGUMENT','Transaction mutation admission ended');
       this.assertCommittable();
       if (typeof serialized!=='string' || Buffer.byteLength(serialized)>MAX_JSON_BYTES) throw new AuthorityError('INVALID_ARGUMENT');
       let input:unknown;
       try { input=JSON.parse(serialized); } catch { throw new AuthorityError('INVALID_ARGUMENT'); }
-      return await this.mutateRequest(input,serializedMarker);
+      return await this.mutateRequestOnce(snapshotRequest(input,true),true,receiptDomain);
     } catch (error) { this.mutationFailed=true; this.mutationError=error; throw error; }
   }
 
   /** Validate one envelope and derive its canonical effect inside the collection lock. */
-  private async mutateRequestOnce(input: unknown, trustedParsed:boolean): Promise<Receipt> {
+  private async mutateRequestOnce(input: unknown, trustedParsed:boolean, receiptDomain:'standalone'|'batch'='standalone'): Promise<Receipt> {
     if (this.#scope.capability !== 'records:write') throw new AuthorityError('FORBIDDEN');
     if ((!trustedParsed && !acceptsInProcessObjects) || !input || typeof input!=='object' ||
       (!trustedParsed && acceptsInProcessObjects && isInProcessProxy(input)) || Array.isArray(input) ||
@@ -809,7 +1352,7 @@ export class AuthorityTransaction {
     const work=(async()=>{
       await tail;
       this.assertCommittable();
-      return this.mutateOnce(fixed,(version,base)=>this.prepareMutation(fields,operation,version,base),preparePayload);
+      return this.mutateOnce(fixed,(version,base)=>this.prepareMutation(fields,operation,version,base),preparePayload,receiptDomain);
     })().catch(error=>{this.mutationFailed=true;this.mutationError=error;throw error;});
     this.mutationTail=work.then(()=>{},()=>{});
     this.trackOperation(work);
@@ -872,15 +1415,15 @@ export class AuthorityTransaction {
   }
 
   /** Uncommitted unique rows provide Hyperdrive-compatible, scoped try-locks. */
-  private async reserveIdentity(change: Readonly<RecordChange>, identity: string): Promise<void> {
+  private async reserveIdentity(change: Readonly<RecordChange>, identity: string, receiptOperation: ReceiptOperation): Promise<void> {
     if (mapHas(this.reservedIdentities,identity)) return;
     for (let attempt = 0; attempt < 2; attempt++) {
       const result = await this.query(`SELECT reservation_state,original_collection_id FROM stateplane_try_reserve_receipt($1,$2,$3,$4,$5,$6)`,
         [this.#scope.spaceId,this.#scope.collectionId,this.#scope.credentialId,this.#scope.principalId,
-          change.operation,change.idempotencyKey]);
+          receiptOperation,change.idempotencyKey]);
       const row = result.rows[0];
       if (row?.reservation_state === 'reserved') {
-        mapSet(this.reservedIdentities,identity,{operation:change.operation,key:change.idempotencyKey});
+        mapSet(this.reservedIdentities,identity,{operation:receiptOperation,key:change.idempotencyKey});
         return;
       }
       if (row?.reservation_state === 'pending' && scalarString(row.original_collection_id)) {
@@ -897,7 +1440,7 @@ export class AuthorityTransaction {
   }
 
   /** Return a still-authorized receipt replay or reserve the fresh identity. */
-  private async lookupReplay(change: RecordChange, identity: string,
+  private async lookupReplay(change: RecordChange, identity: string, receiptOperation: ReceiptOperation,
     preparePayload?: () => Readonly<RecordChange>): Promise<{ replay: Receipt | null; change: RecordChange }> {
     const scope = this.#scope;
     const validated=():RecordChange=>{
@@ -919,8 +1462,8 @@ export class AuthorityTransaction {
       if (joinedReplay.digest !== actual.requestDigest) throw new AuthorityError('IDEMPOTENCY_MISMATCH');
       return {replay:copyReceipt(joinedReplay.response, true),change:actual};
     }
-    await this.reserveIdentity(change,identity);
-    const previous = await this.findReceipt(change.operation, change.idempotencyKey);
+    await this.reserveIdentity(change,identity,receiptOperation);
+    const previous = await this.findReceipt(receiptOperation, change.idempotencyKey);
     if (previous) {
       await this.authorizeOriginal(previous.collectionId);
       const actual=validated();
@@ -930,7 +1473,7 @@ export class AuthorityTransaction {
     }
     await this.query(`DELETE FROM idempotency_receipts WHERE space_id=$1 AND credential_id=$2
       AND operation=$3 AND idempotency_key=$4 AND expires_at<=clock_timestamp()`,
-    [scope.spaceId,scope.credentialId,change.operation,change.idempotencyKey]);
+    [scope.spaceId,scope.credentialId,receiptOperation,change.idempotencyKey]);
     if (preparePayload) {
       const lifecycle=(await this.query('SELECT lifecycle FROM spaces WHERE space_id=$1',[scope.spaceId])).rows[0]?.lifecycle;
       if (lifecycle==='readOnly') throw new AuthorityError('SPACE_UNAVAILABLE');
@@ -996,7 +1539,8 @@ export class AuthorityTransaction {
       // Historical reservations remain on tombstones. Updates may release only live tuples.
       await this.query('DELETE FROM record_unique_keys WHERE space_id=$1 AND collection_id=$2 AND record_id=$3', [...scopeIds(scope),recordId]);
     }
-    await this.query('DELETE FROM record_index_values WHERE space_id=$1 AND collection_id=$2 AND record_id=$3', [...scopeIds(scope),recordId]);
+    if (change.operation === 'delete')
+      await this.query('DELETE FROM record_index_values WHERE space_id=$1 AND collection_id=$2 AND record_id=$3', [...scopeIds(scope),recordId]);
     return { recordId, beforeRevision:change.expectedRevision!, revision };
   }
 
@@ -1022,13 +1566,30 @@ export class AuthorityTransaction {
     throw new AuthorityError(holder.rows[0]?.tombstone ? 'KEY_RESERVED' : 'UNIQUE_CONFLICT');
   }
 
-  /** Persist one typed index value alongside the canonical record. */
-  private async writeIndex(field: IndexValue, recordId: string): Promise<void> {
-    const value = 'value' in field ? field.value : null;
-    await this.query(`INSERT INTO record_index_values(space_id,collection_id,record_id,field_name,value_kind,string_value,number_value,boolean_value,time_value)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [...scopeIds(this.#scope),recordId,field.field,field.kind,
-      field.kind === 'string' ? value : null,field.kind === 'number' ? value : null,
-      field.kind === 'boolean' ? value : null,field.kind === 'date-time' ? value : null]);
+  /** Persist all typed projections in one scoped statement. */
+  private async writeIndexes(indexes: readonly IndexValue[], recordId: string): Promise<string[]> {
+    const names:string[]=[],kinds:string[]=[],strings:(string|null)[]=[],numbers:(number|null)[]=[],
+      booleans:(boolean|null)[]=[],times:(string|null)[]=[];
+    for (let i=0;i<indexes.length;i++) {
+      const field=indexes[i];
+      const value='value' in field ? field.value : null;
+      append(names,field.field); append(kinds,field.kind);
+      append(strings,field.kind==='string' ? value as string : null);
+      append(numbers,field.kind==='number' ? value as number : null);
+      append(booleans,field.kind==='boolean' ? value as boolean : null);
+      append(times,field.kind==='date-time' ? value as string : null);
+    }
+    if (indexes.length) await this.query(`INSERT INTO record_index_values
+      (space_id,collection_id,record_id,field_name,value_kind,string_value,number_value,boolean_value,time_value)
+      SELECT $1,$2,$3,fields.field_name,fields.value_kind,fields.string_value,
+        fields.number_value,fields.boolean_value,fields.time_value
+      FROM unnest($4::text[],$5::text[],$6::text[],$7::numeric[],$8::boolean[],$9::text[])
+        AS fields(field_name,value_kind,string_value,number_value,boolean_value,time_value)
+      ON CONFLICT (space_id,collection_id,record_id,field_name) DO UPDATE SET
+        value_kind=EXCLUDED.value_kind,string_value=EXCLUDED.string_value,number_value=EXCLUDED.number_value,
+        boolean_value=EXCLUDED.boolean_value,time_value=EXCLUDED.time_value`,
+      [...scopeIds(this.#scope),recordId,names,kinds,strings,numbers,booleans,times]);
+    return names;
   }
 
   /** Write all unique reservations and indexes inside the record transaction. */
@@ -1037,11 +1598,37 @@ export class AuthorityTransaction {
     const uniqueValues = change.unique ?? [];
     for (let i = 0; i < uniqueValues.length; i++) await this.reserveUnique(uniqueValues[i], recordId);
     const indexValues = change.indexes ?? [];
-    for (let i = 0; i < indexValues.length; i++) await this.writeIndex(indexValues[i], recordId);
+    const names=await this.writeIndexes(indexValues,recordId);
+    if (change.operation !== 'create')
+      await this.query(`DELETE FROM record_index_values WHERE space_id=$1 AND collection_id=$2 AND record_id=$3
+        AND field_name <> ALL($4::text[])`,[...scopeIds(this.#scope),recordId,names]);
+  }
+
+  /** A low-level caller may omit projections. Complete them from the canonical
+   * record under the same collection-version lock as the record write. */
+  private async completeIndexValues(change: RecordChange): Promise<RecordChange> {
+    if (change.operation === 'delete') return change;
+    const declarations = await this.query(`SELECT field_name,value_kind FROM collection_index_declarations
+      WHERE space_id=$1 AND collection_id=$2 ORDER BY field_name`,scopeIds(this.#scope));
+    if (!declarations.rows.length) return change;
+    const data=JSON.parse(change.canonicalData!) as Record<string,Json>;
+    const indexes:IndexValue[]=[...(change.indexes ?? [])];
+    for (const row of declarations.rows) {
+      const field=row.field_name as string;
+      const declaredKind=row.value_kind as 'string'|'number'|'boolean'|'date-time';
+      const expected=indexForDeclaration(data,field,declaredKind);
+      validateIndexValue(expected);
+      let supplied:IndexValue|undefined;
+      for (let i=0;i<indexes.length;i++) if (indexes[i].field===field) { supplied=indexes[i]; break; }
+      if (!supplied) append(indexes,expected);
+      else if (supplied.kind!==expected.kind || ('value' in supplied && 'value' in expected && supplied.value!==expected.value))
+        throw new AuthorityError('SCHEMA_CONFLICT','Supplied index disagrees with canonical record');
+    }
+    return {...change,indexes};
   }
 
   /** Add the event, outbox entry, and pending receipt for a written revision. */
-  private async appendFacts(change: RecordChange, identity: string, version: { schemaVersion: number; generation: number },
+  private async appendFacts(change: RecordChange, identity: string, receiptOperation: ReceiptOperation, version: { schemaVersion: number; generation: number },
     written: { recordId: string; beforeRevision: number | null; revision: number }): Promise<Receipt> {
     const scope = this.#scope;
     const { recordId, beforeRevision, revision } = written;
@@ -1057,26 +1644,31 @@ export class AuthorityTransaction {
     const exposure: ReceiptExposure = { committedAt:'', expiresAt:'' };
     const returned = pendingReceiptWithExposure(response, exposure);
     mapSet(this.pendingReceipts,identity, { response, exposure, retentionSeconds:this.retentionSeconds,
-      digest:change.requestDigest, collectionId:scope.collectionId, key:change.idempotencyKey });
+      digest:change.requestDigest, collectionId:scope.collectionId, key:change.idempotencyKey, receiptOperation });
     return returned;
   }
 
   /** Apply one revision-safe record change and its receipt, event and projections. */
   private async mutateOnce(change: RecordChange,
     prepare?: (version: { schemaVersion:number;generation:number;definition:string },base:RecordChange)=>Promise<RecordChange>,
-    preparePayload?: () => Readonly<RecordChange>): Promise<Receipt> {
+    preparePayload?: () => Readonly<RecordChange>,receiptDomain:'standalone'|'batch'='standalone'): Promise<Receipt> {
     const scope = this.#scope;
     if (scope.capability !== 'records:write') throw new AuthorityError('FORBIDDEN');
-    const identity = JSON.stringify([scope.spaceId,scope.credentialId,change.operation,change.idempotencyKey]);
-    const lookup = await this.lookupReplay(change, identity, preparePayload);
+    const receiptOperation:ReceiptOperation=receiptDomain==='batch' ? `batch:${change.operation}` : change.operation;
+    const identity = JSON.stringify([scope.spaceId,scope.credentialId,receiptOperation,change.idempotencyKey]);
+    const lookup = await this.lookupReplay(change, identity, receiptOperation, preparePayload);
     if (lookup.replay) return lookup.replay;
     change=lookup.change;
+    const slot=await this.query(`SELECT slot FROM collection_write_slots
+      WHERE space_id=$1 AND collection_id=$2 ORDER BY slot FOR UPDATE SKIP LOCKED LIMIT 1`,scopeIds(scope));
+    if (!slot.rowCount) throw new AuthorityError('BACKPRESSURE','Collection write concurrency limit reached');
     const version = await this.currentVersion(change);
     if (prepare) change=await prepare(version,change);
+    change=await this.completeIndexValues(change);
     try {
       const written = await this.writeRecord(change, version.schemaVersion);
       await this.writeValues(change, written.recordId);
-      return await this.appendFacts(change, identity, version, written);
+      return await this.appendFacts(change, identity, receiptOperation, version, written);
     } catch (error) {
       if ((error as { code?: string }).code === '23505') {
         const constraint = (error as { constraint?: string }).constraint;
@@ -1134,18 +1726,117 @@ export class AuthorityTransaction {
     }
   }
 
-  /** Declaration allowlists, signed cursors and public sort behavior belong to STA-8. */
+  /** Reject undeclared or pending sort projections before constructing indexed page SQL. */
+  private async readySort(field:string):Promise<SortValueKind> {
+    const result=await this.query(`SELECT value_kind,ready,sortable FROM collection_index_declarations
+      WHERE space_id=$1 AND collection_id=$2 AND field_name=$3`,[...scopeIds(this.#scope),field]);
+    const row=result.rows[0];
+    if (row?.ready!==true || row.sortable!==true || !arrayHas(['string','number','boolean','date-time'],row.value_kind))
+      throw new AuthorityError('SCHEMA_CONFLICT','Sort index is not ready');
+    return row.value_kind;
+  }
+
+  /** Live keyset traversal. Each page is authoritative at its own statement, not a snapshot of later pages. */
+  queryPage(predicates:readonly ScalarPredicate[], limit:number, sort?:RecordSort, cursor?:string):Promise<RecordPage> {
+    let fixed:readonly ScalarPredicate[],fixedSort:RecordSort|undefined;
+    try { fixed=snapshotPredicates(predicates); fixedSort=snapshotSort(sort); }
+    catch (error) { return Promise.reject(error); }
+    return this.queryPageUsing(fixed,limit,fixedSort,cursor);
+  }
+
+  /** Worker boundary: parse primitive bytes after transaction scope admission. */
+  querySerializedPage(serialized:string):Promise<RecordPage> {
+    return this.admitOperation(async()=>{
+      if (this.#scope.capability!=='records:read') throw new AuthorityError('FORBIDDEN');
+      if (typeof serialized!=='string' || Buffer.byteLength(serialized)>32_768) throw new AuthorityError('INVALID_ARGUMENT');
+      let request:Record<string,unknown>;
+      try { request=JSON.parse(serialized); } catch { throw new AuthorityError('INVALID_ARGUMENT'); }
+      if (!request || typeof request!=='object' || Array.isArray(request) ||
+        Object.keys(request).some(key=>!arrayHas(['predicates','limit','sort','cursor'],key)) ||
+        !Object.hasOwn(request,'predicates') || !Object.hasOwn(request,'limit')) throw new AuthorityError('INVALID_ARGUMENT');
+      const fixed=snapshotPredicates(request.predicates as ScalarPredicate[],true);
+      const fixedSort=snapshotSort(request.sort as RecordSort|undefined,true);
+      return this.queryPageUsing(fixed,request.limit as number,fixedSort,request.cursor as string|undefined);
+    });
+  }
+
+  /** Bind a cursor to current scope and schema, then fetch one statement-local bounded page. */
+  private queryPageUsing(fixed:readonly ScalarPredicate[],limit:number,fixedSort?:RecordSort,cursor?:string):Promise<RecordPage> {
+    return this.admitOperation(async()=>{
+      if (!this.cursorSecret) throw new AuthorityError('INVALID_ARGUMENT','Cursor secret is not configured');
+      if (!isSafeInteger(limit) || limit<1 || limit>MAX_PAGE) throw new AuthorityError('INVALID_ARGUMENT');
+      const {params,where}=this.compilePredicates(fixed);
+      this.limitStatementTime(QUERY_TIMEOUT_MS);
+      await this.requireReadyIndexes(fixed);
+      const kind=fixedSort ? await this.readySort(fixedSort.field) : undefined;
+      const versionResult=await this.query(`SELECT schema_version FROM collections WHERE space_id=$1 AND collection_id=$2`,scopeIds(this.#scope));
+      const schemaVersion=Number(versionResult.rows[0]?.schema_version);
+      if (!isSafeInteger(schemaVersion)) throw new AuthorityError('SCHEMA_CONFLICT');
+      const query=digestQuery(fixed,fixedSort,limit);
+      const scope=this.#scope;
+      const parsed=cursor===undefined ? undefined : decodeCursor(cursor,this.cursorSecret);
+      if (parsed && (parsed.space!==scope.spaceId || parsed.collection!==scope.collectionId ||
+        parsed.principal!==scope.principalId || parsed.credential!==scope.credentialId ||
+        parsed.policy!==scope.policyVersion || parsed.placement!==scope.placementGeneration ||
+        parsed.schema!==schemaVersion || parsed.query!==query ||
+        (!fixedSort && parsed.rank!==2) ||
+        (parsed.rank===2 ? parsed.value===null : parsed.value!==null))) throw new AuthorityError('CURSOR_INVALID');
+      let expr='r.created_at',sortFieldParam='';
+      const direction: 'ASC'|'DESC'=fixedSort?.direction==='desc' ? 'DESC' : 'ASC';
+      if (fixedSort) {
+        params.push(fixedSort.field);
+        sortFieldParam=`$${params.length}`;
+        expr=kind==='date-time' ? 'stateplane_instant_sort_key(sv.time_value) COLLATE "C"' :
+          `sv.${{string:'string_value',number:'number_value',boolean:'boolean_value'}[kind!]}`;
+      }
+      const continuation=pageContinuation(params,parsed,fixedSort,kind,expr,direction);
+      params.push(limit+1,limit,MAX_PAGE_BYTES);
+      const candidateLimit=`$${params.length-2}`,pageLimit=`$${params.length-1}`,byteLimit=`$${params.length}`;
+      const candidates=pageCandidateSql({where,sort:fixedSort,kind,expr,direction,fieldParam:sortFieldParam,
+        candidateLimit,filtered:fixed.length>0,continuation});
+      const result=await this.query(`${candidates}, ranked AS MATERIALIZED (
+          SELECT c.*,row_number() OVER (ORDER BY c.sort_rank ${direction},c.sort_value ${direction} NULLS LAST,c.record_id) AS position,
+            sum(c.bytes) OVER (ORDER BY c.sort_rank ${direction},c.sort_value ${direction} NULLS LAST,c.record_id) AS consumed
+          FROM candidates c
+        ), chosen AS MATERIALIZED (
+          SELECT * FROM ranked WHERE position<=${pageLimit} AND consumed<=${byteLimit}
+        )
+        SELECT r.record_id,r.revision,r.schema_version,r.canonical_data,r.key_mode,r.normalized_key,r.tombstone,
+          c.sort_rank,c.sort_value,c.sort_cursor,(SELECT EXISTS(SELECT 1 FROM ranked k WHERE k.position>${pageLimit} OR k.consumed>${byteLimit})) AS more
+        FROM chosen c JOIN records r ON r.space_id=$1 AND r.collection_id=$2 AND r.record_id=c.record_id
+        ORDER BY c.sort_rank ${direction},c.sort_value ${direction} NULLS LAST,c.record_id`,params);
+      const records:AuthorityRecord[]=result.rows.map(row=>({ref:this.ref(row.record_id),revision:Number(row.revision),
+        schemaVersion:Number(row.schema_version),canonicalData:row.canonical_data,keyMode:row.key_mode,
+        normalizedKey:row.normalized_key,tombstone:row.tombstone}));
+      const last=result.rows.at(-1);
+      const more=Boolean(last?.more);
+      return {records,schemaVersion,nextCursor:more && last ? signCursor({space:scope.spaceId,collection:scope.collectionId,
+        principal:scope.principalId,credential:scope.credentialId,policy:scope.policyVersion,
+        placement:scope.placementGeneration,schema:schemaVersion,query,expiresAt:Date.now()+15*60_000,
+        id:last.record_id,rank:last.sort_rank,
+        value:last.sort_cursor},this.cursorSecret) : null};
+    });
+  }
+
+  /** Legacy bounded read hook; new callers use queryPage for continuation. */
   queryRecords(predicates: readonly ScalarPredicate[], limit: number): Promise<AuthorityRecord[]> {
     let fixed:readonly ScalarPredicate[];
     try { fixed=snapshotPredicates(predicates); } catch (error) { return Promise.reject(error); }
     return this.admitOperation(async () => {
     if (!isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE) throw new AuthorityError('INVALID_ARGUMENT');
     const { params, where } = this.compilePredicates(fixed);
+    this.limitStatementTime(QUERY_TIMEOUT_MS);
     await this.requireReadyIndexes(fixed);
-    params.push(limit);
-    const result = await this.query(`SELECT record_id,revision,schema_version,canonical_data,key_mode,normalized_key,tombstone FROM records r
-      WHERE ${where}
-      ORDER BY r.created_at,r.record_id LIMIT $${params.length}`, params);
+    params.push(limit,MAX_PAGE_BYTES);
+    const result = await this.query(`WITH candidates AS MATERIALIZED (
+        SELECT r.record_id,r.created_at,octet_length(r.canonical_data) AS bytes FROM records r
+        WHERE ${where} ORDER BY r.created_at,r.record_id LIMIT $${params.length-1}
+      ), ranked AS MATERIALIZED (
+        SELECT c.*,sum(c.bytes) OVER (ORDER BY c.created_at,c.record_id) AS consumed FROM candidates c
+      )
+      SELECT r.record_id,r.revision,r.schema_version,r.canonical_data,r.key_mode,r.normalized_key,r.tombstone
+      FROM ranked c JOIN records r ON r.space_id=$1 AND r.collection_id=$2 AND r.record_id=c.record_id
+      WHERE c.consumed<=$${params.length} ORDER BY c.created_at,c.record_id`, params);
     return result.rows.map(row => ({ ref:this.ref(row.record_id),revision:Number(row.revision),schemaVersion:Number(row.schema_version),
       canonicalData:row.canonical_data,keyMode:row.key_mode,normalizedKey:row.normalized_key,tombstone:row.tombstone }));
     });
@@ -1155,8 +1846,20 @@ export class AuthorityTransaction {
   countRecords(predicates: readonly ScalarPredicate[]): Promise<number> {
     let fixed:readonly ScalarPredicate[];
     try { fixed=snapshotPredicates(predicates); } catch (error) { return Promise.reject(error); }
+    return this.countUsing(fixed);
+  }
+  /** Parse a Worker-safe predicate envelope only after read authorization. */
+  countSerializedRecords(serialized:string):Promise<number> {
+    return this.admitOperation(()=>{
+      if (this.#scope.capability!=='records:read') throw new AuthorityError('FORBIDDEN');
+      return this.countUsing(parseSerializedPredicates(serialized));
+    });
+  }
+  /** Count authoritative scoped rows after every referenced projection is ready. */
+  private countUsing(fixed:readonly ScalarPredicate[]):Promise<number> {
     return this.admitOperation(async () => {
     const { params, where } = this.compilePredicates(fixed);
+    this.limitStatementTime(QUERY_TIMEOUT_MS);
     await this.requireReadyIndexes(fixed);
     const result = await this.query(`SELECT count(*)::bigint AS total FROM records r WHERE ${where}`,params);
     const count = Number(result.rows[0].total);
@@ -1169,8 +1872,20 @@ export class AuthorityTransaction {
   existsRecord(predicates: readonly ScalarPredicate[]): Promise<boolean> {
     let fixed:readonly ScalarPredicate[];
     try { fixed=snapshotPredicates(predicates); } catch (error) { return Promise.reject(error); }
+    return this.existsUsing(fixed);
+  }
+  /** Parse a Worker-safe existence predicate only after read authorization. */
+  existsSerializedRecord(serialized:string):Promise<boolean> {
+    return this.admitOperation(()=>{
+      if (this.#scope.capability!=='records:read') throw new AuthorityError('FORBIDDEN');
+      return this.existsUsing(parseSerializedPredicates(serialized));
+    });
+  }
+  /** Use SQL existence over the same scoped, ready-index predicate as count. */
+  private existsUsing(fixed:readonly ScalarPredicate[]):Promise<boolean> {
     return this.admitOperation(async () => {
     const { params, where } = this.compilePredicates(fixed);
+    this.limitStatementTime(QUERY_TIMEOUT_MS);
     await this.requireReadyIndexes(fixed);
     const result = await this.query(`SELECT EXISTS(SELECT 1 FROM records r WHERE ${where}) AS found`,params);
     return result.rows[0].found;

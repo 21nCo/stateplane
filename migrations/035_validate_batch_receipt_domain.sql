@@ -1,0 +1,4 @@
+-- Validate populated receipts after the short schema cutover commits.
+ALTER TABLE public.idempotency_receipts VALIDATE CONSTRAINT idempotency_receipts_operation_check;
+ALTER TABLE public.receipt_reservations VALIDATE CONSTRAINT receipt_reservations_operation_check;
+ALTER TABLE public.receipt_reservation_scopes VALIDATE CONSTRAINT receipt_reservation_scopes_operation_check;
