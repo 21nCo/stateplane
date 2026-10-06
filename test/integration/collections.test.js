@@ -2298,6 +2298,47 @@ test('a 20-item indexed batch bounds timeout-setting round trips',async()=>{
     [writer.spaceId])).rows[0].n,20);
 });
 
+test('batch admission distinguishes count quotas from malformed manifests before durable writes',async()=>{
+  const {writer}=await fixture();
+  const valid=Array.from({length:20},(_,i)=>JSON.stringify({operation:'create',data:{label:`count-${randomUUID()}-${i}`,score:i}}));
+  const readCounts=async()=>{
+    const rows=await Promise.all(['batch_operations','batch_items','idempotency_receipts'].map(table=>
+      pool.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[writer.spaceId])));
+    return rows.map(row=>row.rows[0].n);
+  };
+  const malformed=new Array(2); malformed[0]=valid[0];
+  for (const serialized of [false,true]) {
+    const ingest=(key,items)=>serialized
+      ? authority.ingestSerializedBatch(writer,key,JSON.stringify(items))
+      : authority.ingestBatch(writer,key,items);
+    const prefix=serialized?'serialized':'direct';
+    assert.deepEqual(await readCounts(),[0,0,0]);
+    await assert.rejects(ingest(`${prefix}-zero`,[]),{code:'INVALID_ARGUMENT'});
+    await assert.rejects(ingest(`${prefix}-too-many`,[...valid,valid[0]]),{code:'RATE_LIMITED'});
+    if (!serialized) await assert.rejects(ingest(`${prefix}-sparse`,malformed),{code:'INVALID_ARGUMENT'});
+    else await assert.rejects(authority.ingestSerializedBatch(writer,`${prefix}-malformed`,'{"bad":true}'),{code:'INVALID_ARGUMENT'});
+    await assert.rejects(ingest(`${prefix}-item-byte`,['x'.repeat(1_048_577)]),{code:'RATE_LIMITED'});
+    await assert.rejects(ingest(`${prefix}-aggregate-byte`,Array(3).fill('x'.repeat(700_000))),{code:'RATE_LIMITED'});
+    assert.deepEqual(await readCounts(),[0,0,0]);
+  }
+  for (const serialized of [false,true]) {
+    const key=serialized?'serialized-twenty':'direct-twenty';
+    const accepted=serialized
+      ? Array.from({length:20},(_,i)=>JSON.stringify({operation:'create',data:{label:`serialized-${randomUUID()}-${i}`,score:i}}))
+      : valid;
+    const ingest=()=>serialized
+      ? authority.ingestSerializedBatch(writer,key,JSON.stringify(accepted),true)
+      : authority.ingestBatch(writer,key,accepted,true);
+    const first=await ingest();
+    assert.equal(first.items.length,20);
+    assert.ok(first.items.every(item=>item.state==='succeeded' && item.receipt));
+    const beforeReplay=await readCounts();
+    const replay=await ingest();
+    assert.deepEqual(replay.items.map(item=>item.receipt?.receiptId),first.items.map(item=>item.receipt?.receiptId));
+    assert.deepEqual(await readCounts(),beforeReplay);
+  }
+});
+
 test('paged reads cap payload bytes and a 5000-row selective typed query uses the declared index',async()=>{
   const {owner,writer}=await fixture();
   const expanded={...schema,properties:{...schema.properties,note:{type:'string'}}};

@@ -295,10 +295,11 @@ function indexForDeclaration(data:Record<string,Json>,field:string,
 /** Freeze a bounded batch manifest before the first asynchronous admission. */
 function snapshotBatchManifest(operationKey:string,requests:readonly string[],retryFailed:boolean):string[] {
   if (!Array.isArray(requests) || Object.getPrototypeOf(requests)!==Array.prototype ||
-    requests.length<1 || requests.length>20 || Reflect.ownKeys(requests).length!==requests.length+1 ||
+    requests.length<1 || Reflect.ownKeys(requests).length!==requests.length+1 ||
     typeof operationKey!=='string' || !unicodeString(operationKey) || !operationKey ||
     Buffer.byteLength(operationKey)>MAX_INDEX_PART_BYTES || typeof retryFailed!=='boolean')
     throw new AuthorityError('INVALID_ARGUMENT');
+  if (requests.length>20) throw new AuthorityError('RATE_LIMITED','Batch item count limit exceeded');
   const fixed:string[]=[];
   let total=0;
   for (let i=0;i<requests.length;i++) {
