@@ -1,0 +1,54 @@
+app/package.json
+  h_a39f9495f9ec1d 13-15
+app/src/app.d.ts
+  h_a39f9495f9ec1d 7-15
+app/src/routes/v1/[...path]/+server.ts
+  h_a39f9495f9ec1d 1-61
+contracts/openapi.yaml
+  h_a39f9495f9ec1d 34-45,146
+docs/http-cli.md
+  h_a39f9495f9ec1d 13-26,59-60,79-87,106-107,118-119,121-122
+migrations/037_commit_safe_event_feed.sql
+  h_a39f9495f9ec1d 1-16
+package.json
+  h_a39f9495f9ec1d 20-21
+packages/api/src/http.ts
+  h_a39f9495f9ec1d 86-89,129
+packages/application/src/services.ts
+  h_a39f9495f9ec1d 8
+packages/cli/src/run.ts
+  h_a39f9495f9ec1d 24-53,107,124-125,144-145
+packages/cli/src/transport.ts
+  h_a39f9495f9ec1d 35-36,44-45,49,58
+packages/postgres/src/collections.ts
+  h_a39f9495f9ec1d 3,54,63,65-71
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 104-108,659-660,697,1154-1168,1170,1177-1179
+packages/postgres/src/services.ts
+  h_a39f9495f9ec1d 15,19,21-22,25,27,31-32,39,41,45,47,49,51,53,57,59,61,65,67
+packages/postgres/src/spaces.ts
+  h_a39f9495f9ec1d 185-188,192,198-200,213,266,271-273,275-287,298-305,311,319,405,408,411,417,435,440,456-462,464-466,566
+pnpm-lock.yaml
+  h_a39f9495f9ec1d 104-109
+scripts/test-http-host.mjs
+  h_a39f9495f9ec1d 1-105
+test/http-cli.test.js
+  h_a39f9495f9ec1d 13,18,50,94-96,110-115,157-168
+test/integration/http-services.test.js
+  h_a39f9495f9ec1d 7,15,19,30,33-35,66,76-92,116-218
+test/integration/owned-spaces.test.js
+  h_a39f9495f9ec1d 831,846,1595
+test/integration/postgres-authority.test.js
+  h_a39f9495f9ec1d 102-105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "99cd268aa06174b80f0102685455af24beef3f97",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
