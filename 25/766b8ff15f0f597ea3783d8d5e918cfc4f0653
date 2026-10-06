@@ -1,0 +1,26 @@
+docs/http-cli.md
+  h_a39f9495f9ec1d 74-75,125-127
+packages/cli/bin/keychain.swift
+  h_a39f9495f9ec1d 29-31
+packages/cli/src/config.ts
+  h_a39f9495f9ec1d 54-56,58-59,61,63,66,69-70,74-92,132
+packages/cli/src/run.ts
+  h_a39f9495f9ec1d 229-231
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 1190
+test/http-cli.test.js
+  h_a39f9495f9ec1d 12,14-15,560-644,714-719
+test/integration/postgres-authority.test.js
+  h_a39f9495f9ec1d 816-839
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "25766b8ff15f0f597ea3783d8d5e918cfc4f0653",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
