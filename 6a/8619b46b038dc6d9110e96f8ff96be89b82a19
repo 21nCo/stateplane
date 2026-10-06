@@ -1,0 +1,20 @@
+docs/http-cli.md
+  h_a39f9495f9ec1d 87-91
+packages/cli/bin/keychain.swift
+  h_a39f9495f9ec1d 33-34
+packages/cli/src/run.ts
+  h_a39f9495f9ec1d 129-130,132-134
+test/http-cli.test.js
+  h_a39f9495f9ec1d 169,171-172,181-205,609,613-624
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6a8619b46b038dc6d9110e96f8ff96be89b82a19",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
