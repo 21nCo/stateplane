@@ -2307,6 +2307,8 @@ test('batch admission distinguishes count quotas from malformed manifests before
     return rows.map(row=>row.rows[0].n);
   };
   const malformed=new Array(2); malformed[0]=valid[0];
+  const custom=[valid[0]]; custom.extra='unexpected';
+  const inherited=Object.setPrototypeOf([valid[0]],Object.create(Array.prototype));
   for (const serialized of [false,true]) {
     const ingest=(key,items)=>serialized
       ? authority.ingestSerializedBatch(writer,key,JSON.stringify(items))
@@ -2315,12 +2317,30 @@ test('batch admission distinguishes count quotas from malformed manifests before
     assert.deepEqual(await readCounts(),[0,0,0]);
     await assert.rejects(ingest(`${prefix}-zero`,[]),{code:'INVALID_ARGUMENT'});
     await assert.rejects(ingest(`${prefix}-too-many`,[...valid,valid[0]]),{code:'RATE_LIMITED'});
-    if (!serialized) await assert.rejects(ingest(`${prefix}-sparse`,malformed),{code:'INVALID_ARGUMENT'});
+    if (!serialized) {
+      await assert.rejects(ingest(`${prefix}-sparse`,malformed),{code:'INVALID_ARGUMENT'});
+      await assert.rejects(ingest(`${prefix}-custom`,custom),{code:'INVALID_ARGUMENT'});
+      await assert.rejects(ingest(`${prefix}-inherited`,inherited),{code:'INVALID_ARGUMENT'});
+    }
     else await assert.rejects(authority.ingestSerializedBatch(writer,`${prefix}-malformed`,'{"bad":true}'),{code:'INVALID_ARGUMENT'});
     await assert.rejects(ingest(`${prefix}-item-byte`,['x'.repeat(1_048_577)]),{code:'RATE_LIMITED'});
     await assert.rejects(ingest(`${prefix}-aggregate-byte`,Array(3).fill('x'.repeat(700_000))),{code:'RATE_LIMITED'});
     assert.deepEqual(await readCounts(),[0,0,0]);
   }
+  const million=Array(1_000_000).fill('');
+  const wire=JSON.stringify(million);
+  assert.equal(Buffer.byteLength(wire),3_000_001);
+  const ownKeys=Reflect.ownKeys;
+  let enumerated=false;
+  Reflect.ownKeys=value=>{
+    if (value===million) enumerated=true;
+    return ownKeys(value);
+  };
+  try { await assert.rejects(authority.ingestBatch(writer,'direct-million',million),{code:'RATE_LIMITED'}); }
+  finally { Reflect.ownKeys=ownKeys; }
+  assert.equal(enumerated,false,'over-count direct admission must not enumerate array keys');
+  await assert.rejects(authority.ingestSerializedBatch(writer,'serialized-million',wire),{code:'RATE_LIMITED'});
+  assert.deepEqual(await readCounts(),[0,0,0]);
   for (const serialized of [false,true]) {
     const key=serialized?'serialized-twenty':'direct-twenty';
     const accepted=serialized
