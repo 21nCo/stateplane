@@ -153,9 +153,14 @@ omit `--cursor` to request the first page. The CLI timeout defaults to 30 second
 `--timeout` in milliseconds up to 120 seconds. Keep the CLI timeout above the
 server budget when possible; a client timeout on a write is still ambiguous.
 The event feed returns at most 100 immutable metadata entries per page and
-uses migration 037's commit-safe feed position index. Apply that migration with
-record writers drained on a populated database; measure the index build lock and
-feed plans on disposable Railway before increasing the limit. Event cursors
+uses migration 037's commit-safe feed position index. On an existing database
+with events, the migrator refuses pending 036 or 037 unless record writers are
+stopped and `STATEPLANE_POPULATED_INDEX_UPGRADE=drained` is set. Its preflight
+takes writer-excluding record and event locks without waiting behind active
+writers, then holds them through migration commit. The flag does not drain
+traffic itself. Keep writers stopped until commit, verify the migration ledger
+and feed row count, and measure the index build lock and feed plans on
+disposable Railway before increasing the page limit. Event cursors
 are page positions, not export snapshots. The event `nextCursor` is the last
 observed event even on a short page; an empty poll retains the input cursor.
 

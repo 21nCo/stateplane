@@ -32,6 +32,8 @@ try {
   const pendingOutboxIndexBuild = files.some(name =>
     (name === '005_scoped_query_indexes.sql' || name === '006_outbox_due_order.sql') && !recorded.has(name));
   const pendingProjectionUpgrade = files.includes('031_index_missing_projection.sql') && !recorded.has('031_index_missing_projection.sql');
+  const pendingEventFeedUpgrade = ['036_event_cursor.sql','037_commit_safe_event_feed.sql']
+    .some(name => files.includes(name) && !recorded.has(name));
   if (pendingOutboxIndexBuild && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained') {
     const relation = await client.query("SELECT to_regclass('public.projection_outbox') AS name");
     if (relation.rows[0].name !== null) {
@@ -75,6 +77,27 @@ try {
       if (populated.rows[0].present && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained') {
         throw new Error('Populated projection upgrade requires drained traffic; set STATEPLANE_POPULATED_INDEX_UPGRADE=drained only after stopping record writers and backfill workers');
       }
+    }
+  }
+  if (pendingEventFeedUpgrade) {
+    const relations = await client.query(`SELECT to_regclass('public.records') AS records,
+      to_regclass('public.record_events') AS events`);
+    if (relations.rows[0].events) {
+      // A record writer can touch records before it inserts an event. Lock in
+      // that order and refuse contention instead of waiting behind a writer
+      // while holding a lock it needs to finish. Keep both locks until commit
+      // so the emptiness check and historical feed backfill cannot race writes.
+      try {
+        if (relations.rows[0].records) await client.query('LOCK TABLE public.records IN SHARE MODE NOWAIT');
+        await client.query('LOCK TABLE public.record_events IN SHARE MODE NOWAIT');
+      } catch(error) {
+        if (error?.code === '55P03')
+          throw new Error('Event feed upgrade requires drained traffic; stop active record writers before retrying', {cause:error});
+        throw error;
+      }
+      const populated = await client.query('SELECT EXISTS (SELECT 1 FROM public.record_events) AS present');
+      if (populated.rows[0].present && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained')
+        throw new Error('Populated event feed upgrade requires drained traffic; set STATEPLANE_POPULATED_INDEX_UPGRADE=drained only after stopping record writers');
     }
   }
   for (const name of files) {

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { mkdtemp, rm, readFile, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -770,6 +770,31 @@ test('interrupted credential store switches and logout remove both tracked secre
   assert.equal(secrets.get('keychain'),'new-secret');
   await removeTrackedTokens(saved,{removeToken:async config=>{secrets.delete(config.tokenStore);}});
   assert.equal(secrets.size,0);
+
+  for (const from of ['file','keychain']) {
+    const to=from==='file'?'keychain':'file';
+    let journal={endpoint:'https://store-transition.example.invalid/',tokenStore:from};
+    const credentials=new Map([[from,'old-secret']]);
+    await assert.rejects(configureToken(journal,'new-secret',to,{
+      saveConfig:async value=>{journal=structuredClone(value);},
+      saveToken:async (_endpoint,token,store)=>{credentials.set(store,token);},
+      removeToken:async config=>{if (config.tokenStore===from) throw new Error('old store failed');
+        credentials.delete(config.tokenStore);}
+    }),/old store failed/);
+    const attempted=[];
+    await assert.rejects(removeTrackedTokens(journal,{removeToken:async config=>{
+      attempted.push(config.tokenStore);
+      if (config.tokenStore===from) throw new Error('old store failed');
+      credentials.delete(config.tokenStore);
+    }}),/old store failed/);
+    assert.deepEqual(attempted,[from,to]);
+    assert.deepEqual([...credentials.keys()],[from],
+      'logout removes the active credential even if obsolete storage fails');
+    assert.deepEqual(journal.tokenLocations,[from,to],
+      'failed cleanup retains both locations for retry');
+    await removeTrackedTokens(journal,{removeToken:async config=>{credentials.delete(config.tokenStore);}});
+    assert.equal(credentials.size,0);
+  }
 });
 
 test('installed CLI switches file and macOS Keychain stores and cleans an interrupted switch',
@@ -797,6 +822,21 @@ test('installed CLI switches file and macOS Keychain stores and cleans an interr
       assert.equal((logout.stdout+logout.stderr).includes(token),false);
       await assert.rejects(readFile(join(root,'token'),'utf8'),{code:'ENOENT'});
       await assert.rejects(loadToken({endpoint,tokenStore:'keychain'}),{code:'UNAUTHENTICATED'});
+      // An obsolete file location fails cleanup, but the active Keychain
+      // credential must still be removed and the journal kept for retry.
+      await mkdir(join(root,'token'));
+      await saveToken(endpoint,token,'keychain');
+      await writeFile(join(root,'config.json'),JSON.stringify({endpoint,tokenStore:'keychain',
+        tokenLocations:['file','keychain']}),{mode:0o600});
+      const interrupted=await cli(['auth','logout']);
+      assert.equal(interrupted.status,1);
+      assert.equal((interrupted.stdout+interrupted.stderr).includes(token),false);
+      assert.equal(JSON.parse((await readFile(join(root,'config.json'),'utf8')).trim()).tokenStore,'keychain');
+      await assert.rejects(loadToken({endpoint,tokenStore:'keychain'}),{code:'UNAUTHENTICATED'});
+      await rm(join(root,'token'),{recursive:true});
+      const retry=await cli(['auth','logout']);
+      assert.equal(retry.status,0,retry.stderr);
+      assert.equal((retry.stdout+retry.stderr).includes(token),false);
     } finally {
       await removeToken({endpoint,tokenStore:'keychain'});
       await rm(root,{recursive:true,force:true});

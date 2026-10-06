@@ -170,5 +170,13 @@ export async function configureToken(config:CliConfig,token:string,store:'keycha
 export async function removeTrackedTokens(config:CliConfig,
   io:Pick<TokenPersistence,'removeToken'>=persistence):Promise<void> {
   const locations=new Set([...(config.tokenLocations??[]),...(config.tokenStore?[config.tokenStore]:[])]);
-  for (const store of locations) await io.removeToken({...config,tokenStore:store});
+  let failure:unknown;
+  for (const store of locations) {
+    try { await io.removeToken({...config,tokenStore:store}); }
+    catch(error) { failure??=error; }
+  }
+  // Leave the persisted location journal intact on any failure. A later
+  // logout or endpoint change can retry every location, including one whose
+  // removal already succeeded (both backends treat absence as success).
+  if (failure) throw failure;
 }
