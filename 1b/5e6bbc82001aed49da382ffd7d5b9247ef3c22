@@ -1,0 +1,73 @@
+README.md
+  s_b1f0c7747df33a::t_e8db4ce0b74006 5,43
+contracts/openapi.yaml
+  s_b1f0c7747df33a::t_34aebe99181721 1-239
+migrations/036_event_cursor.sql
+  s_b1f0c7747df33a::t_7d4458622ad74a 1-4
+package.json
+  s_b1f0c7747df33a::t_6342231ce42daa 16
+packages/api/package.json
+  s_b1f0c7747df33a::t_1e75abb9d6e8d9 23-24
+packages/api/src/http.ts
+  s_b1f0c7747df33a::t_471226bcb52a86 1-148
+packages/api/src/index.ts
+  s_28d4128c7417df::t_95045307710771 1,3,6
+packages/application/src/services.ts
+  s_28d4128c7417df::t_051de970087c8e 1-34
+packages/cli/bin/stateplane.js
+  s_b1f0c7747df33a::t_5a27ee705b090f 1-4
+packages/cli/package.json
+  s_b1f0c7747df33a::t_6a0ed5e02c4fb8 3,14-15,17-19
+packages/cli/src/config.ts
+  s_b1f0c7747df33a::t_3cfd5e23f72418 1-109
+packages/cli/src/index.ts
+  s_b1f0c7747df33a::t_21283332a71a02 1-2
+packages/cli/src/run.ts
+  s_b1f0c7747df33a::t_dd06d8578c4253 1-183
+packages/cli/src/transport.ts
+  s_b1f0c7747df33a::t_2bcf85068ddbd3 1-64
+packages/postgres/src/collections.ts
+  s_b1f0c7747df33a::t_931c07a3d89a2c 240-241
+packages/postgres/src/index.ts
+  s_28d4128c7417df::t_9a16404fd75179 57,1144-1180,1972
+packages/postgres/src/services.ts
+  s_b1f0c7747df33a::t_902f698fb3704a 1-69
+packages/postgres/src/spaces.ts
+  s_b1f0c7747df33a::t_8365bdc482d5f5 5,7,185-211
+pnpm-lock.yaml
+  s_b1f0c7747df33a::t_7a783f456959c4 141-143,160
+scripts/check-boundaries.mjs
+  s_b1f0c7747df33a::t_78494bea74e0c7 13-14
+scripts/test-consumer.mjs
+  s_b1f0c7747df33a::t_b0d9e77aa6b031 15,37-50,53,72-73
+test/foundation-boundaries.test.js
+  s_b1f0c7747df33a::t_05e78b8efe49a1 30-31
+test/http-cli.test.js
+  s_b1f0c7747df33a::t_685ed05b14f2f1 1-145
+test/integration/http-services.test.js
+  s_b1f0c7747df33a::t_6797fd6e6241ce 1-93
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1b5e6bbc82001aed49da382ffd7d5b9247ef3c22",
+  "prompts": {},
+  "sessions": {
+    "s_28d4128c7417df": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1c1c580e-3b46-4699-b932-7f146605890c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_b1f0c7747df33a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a11165-dda9-7623-a887-ac162d273227",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
