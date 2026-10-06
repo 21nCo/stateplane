@@ -1,0 +1,24 @@
+contracts/openapi.yaml
+  h_a39f9495f9ec1d 14-27
+docs/http-cli.md
+  h_a39f9495f9ec1d 53-56
+packages/api/src/http.ts
+  h_a39f9495f9ec1d 79-80
+packages/cli/src/run.ts
+  h_a39f9495f9ec1d 88,93
+scripts/test-consumer.mjs
+  h_a39f9495f9ec1d 44
+test/http-cli.test.js
+  h_a39f9495f9ec1d 49,124,129-134
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "16fc229c23f5bc74413e83f2a9dc61651a41ac2d",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
