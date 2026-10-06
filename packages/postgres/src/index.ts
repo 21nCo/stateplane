@@ -835,19 +835,24 @@ export class PostgresAuthority {
       return 'continued';
     } catch (error) {
       if (error instanceof AuthorityError && error.code==='BATCH_CANCELLED') return 'cancelled';
-      if (error instanceof BatchItemFailure) {
-        try { await this.transaction(scope,tx=>tx.failBatchItem(operationKey,ordinal,error.code),deadline); }
-        catch (error_) {
-          if (error_ instanceof AuthorityError && error_.code==='BATCH_CANCELLED') return 'cancelled';
-          throw error_;
-        }
-        return 'continued';
-      }
+      if (error instanceof BatchItemFailure)
+        return this.recordBatchItemFailure(scope,operationKey,ordinal,error.code,deadline);
       if (setHas(retryCodes,(error as {code?:string}).code ?? '')) {
         throw new AuthorityError('BACKPRESSURE','Batch item rolled back; retry the same operation and manifest');
       }
       throw error;
     }
+  }
+
+  /** Persist a confirmed item failure without masking concurrent cancellation. */
+  private async recordBatchItemFailure(scope:AuthorityScope,operationKey:string,ordinal:number,
+    code:string,deadline:number):Promise<'continued'|'cancelled'> {
+    try { await this.transaction(scope,tx=>tx.failBatchItem(operationKey,ordinal,code),deadline); }
+    catch (error) {
+      if (error instanceof AuthorityError && error.code==='BATCH_CANCELLED') return 'cancelled';
+      throw error;
+    }
+    return 'continued';
   }
 
   /** Read the committed ledger for this credential and collection. */
@@ -921,25 +926,28 @@ export class AuthorityTransaction {
   private async query(sql: string, values: unknown[] = []) {
     if (!this.active) throw new AuthorityError('INVALID_ARGUMENT', 'Transaction ended');
     if (this.signal?.aborted) throw new AuthorityError('RATE_LIMITED', 'Transaction time budget exceeded');
-    if (this.requestDeadlineMs!==undefined) {
-      let remaining=this.requestDeadlineMs-Date.now();
-      if (remaining<=0) throw new AuthorityError('RATE_LIMITED','Request time budget exceeded');
-      let bound=Math.max(1,Math.min(this.statementTimeoutMs,Math.trunc(remaining)));
-      while (!this.cacheStatementTimeout || this.configuredStatementTimeoutMs===undefined ||
-        this.configuredStatementTimeoutMs>bound) {
-        // Reserve time for subsequent statements. Until the setting needs a
-        // refresh it is always no larger than the current remaining budget.
-        const slack=this.cacheStatementTimeout ? Math.min(1000,Math.floor(bound/4)) : 0;
-        const configured=Math.max(1,bound-slack);
-        await this.client.query(`SET LOCAL statement_timeout = '${configured}ms'`);
-        this.configuredStatementTimeoutMs=configured;
-        remaining=this.requestDeadlineMs-Date.now();
-        if (remaining<=0) throw new AuthorityError('RATE_LIMITED','Request time budget exceeded');
-        bound=Math.max(1,Math.min(this.statementTimeoutMs,Math.trunc(remaining)));
-        if (!this.cacheStatementTimeout) break;
-      }
-    }
+    if (this.requestDeadlineMs!==undefined) await this.applyStatementTimeout(this.requestDeadlineMs);
     return this.client.query(sql, values);
+  }
+
+  /** Refresh the transaction-local SQL budget without extending its prior bound. */
+  private async applyStatementTimeout(deadline:number):Promise<void> {
+    let remaining=deadline-Date.now();
+    if (remaining<=0) throw new AuthorityError('RATE_LIMITED','Request time budget exceeded');
+    let bound=Math.max(1,Math.min(this.statementTimeoutMs,Math.trunc(remaining)));
+    while (!this.cacheStatementTimeout || this.configuredStatementTimeoutMs===undefined ||
+      this.configuredStatementTimeoutMs>bound) {
+      // Reserve time for subsequent statements. Until the setting needs a
+      // refresh it is always no larger than the current remaining budget.
+      const slack=this.cacheStatementTimeout ? Math.min(1000,Math.floor(bound/4)) : 0;
+      const configured=Math.max(1,bound-slack);
+      await this.client.query(`SET LOCAL statement_timeout = '${configured}ms'`);
+      this.configuredStatementTimeoutMs=configured;
+      remaining=deadline-Date.now();
+      if (remaining<=0) throw new AuthorityError('RATE_LIMITED','Request time budget exceeded');
+      bound=Math.max(1,Math.min(this.statementTimeoutMs,Math.trunc(remaining)));
+      if (!this.cacheStatementTimeout) break;
+    }
   }
 
   /** Narrow an existing deadline for one bounded batch transaction. */
@@ -1004,17 +1012,9 @@ export class AuthorityTransaction {
           AND credential_id=$3 AND operation_key=$4 AND ordinal=$5 FOR UPDATE`,[...key,ordinal])).rows[0];
         if (!item) throw new AuthorityError('NOT_FOUND');
         if (item.state==='succeeded' || (item.state==='failed' && !retryFailed)) return;
-        let request:Record<string,unknown>;
-        try {
-          const parsed=JSON.parse(item.request_text);
-          if (!parsed || typeof parsed!=='object' || Array.isArray(parsed) || Object.hasOwn(parsed,'idempotencyKey'))
-            throw new Error('invalid batch item');
-          request=parsed;
-        } catch { throw new BatchItemFailure('INVALID_ARGUMENT','Malformed batch item'); }
-        const itemDigest=createHash('sha256').update(JSON.stringify(key)).update(`:${ordinal}`).digest('hex');
-        const itemKey=`b_${itemDigest}`;
+        const request=this.batchItemRequest(item.request_text,key,ordinal);
         let receipt:Receipt;
-        try { receipt=await this.mutateBatchSerializedRequest(JSON.stringify({...request,idempotencyKey:itemKey})); }
+        try { receipt=await this.mutateBatchSerializedRequest(request); }
         catch (error) {
           if (error instanceof AuthorityError && arrayHas(['INVALID_ARGUMENT','SCHEMA_INVALID','SCHEMA_CONFLICT',
             'REVISION_CONFLICT','UNIQUE_CONFLICT','KEY_RESERVED','NOT_FOUND'],error.code))
@@ -1031,6 +1031,19 @@ export class AuthorityTransaction {
         throw error;
       }
     },true);
+  }
+
+  /** Derive a batch-only receipt key from a stored item and its ledger identity. */
+  private batchItemRequest(text:string,key:unknown[],ordinal:number):string {
+    let request:Record<string,unknown>;
+    try {
+      const parsed=JSON.parse(text);
+      if (!parsed || typeof parsed!=='object' || Array.isArray(parsed) || Object.hasOwn(parsed,'idempotencyKey'))
+        throw new Error('invalid batch item');
+      request=parsed;
+    } catch { throw new BatchItemFailure('INVALID_ARGUMENT','Malformed batch item'); }
+    const itemDigest=createHash('sha256').update(JSON.stringify(key)).update(`:${ordinal}`).digest('hex');
+    return JSON.stringify({...request,idempotencyKey:`b_${itemDigest}`});
   }
 
   /** Persist a confirmed item error without overwriting a concurrent success. */
