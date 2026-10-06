@@ -85,11 +85,12 @@ export async function runCli(argv:string[]):Promise<number> {
     if (resource==='config' && action==='show') {
       output({endpoint:config.endpoint??null,space:config.space??null,tokenStore:config.tokenStore??null}); return 0;
     }
-    if (resource==='auth' && action==='login') {
+    if (resource==='auth' && (action==='login' || action==='import')) {
       if (!config.endpoint || flags['token-stdin']!==true) throw new StateplaneCliError('INVALID_ARGUMENT');
       const store=typeof flags.store==='string'?flags.store:'keychain';
       if (store!=='file' && store!=='keychain') throw new StateplaneCliError('INVALID_ARGUMENT');
       const token=(await input('-',4096)).replace(/\r?\n$/,'');
+      if (action==='login') await new StateplaneHttpClient({endpoint:config.endpoint,token}).request('GET','/v1/auth/session');
       await saveToken(config.endpoint,token,store);
       if (config.tokenStore && config.tokenStore!==store) await removeToken(config);
       await saveConfig({...config,tokenStore:store}); output({configured:true,store}); return 0;

@@ -76,6 +76,8 @@ export function createHttpHandler({services,identity}:{services:StateplaneServic
       const actor:VerifiedCredential|null=await identity.verify(request);
       if (!actor) return fail('UNAUTHENTICATED');
       const method=request.method;
+      if (p.length===2 && p[0]==='auth' && p[1]==='session' && method==='GET')
+        return json({contractVersion:'1',kind:actor.kind});
       if (p[0]!=='spaces') fail('NOT_FOUND');
       if (p.length===1) {
         if (method==='GET') return json(await services.spaces.list(actor));

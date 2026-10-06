@@ -50,6 +50,10 @@ stateplane records create --collection entries --key ' item-1 ' \
 
 `keychain` is the default. On macOS, it uses Keychain; on Linux, it uses Secret
 Service through `secret-tool`. If OS storage is unavailable, explicitly select `--store file`.
+`auth login` validates the bearer with `GET /v1/auth/session` before saving it.
+For offline bootstrap, `auth import --token-stdin --store file` stores a
+credential without validation; the next API call checks it. Invalid tokens
+and provider failures produce structured errors without echoing the input.
 That stores the token in a mode-0600 file in the mode-0700 Stateplane config
 directory. A process-only alternative is `STATEPLANE_TOKEN`; it overrides the
 stored credential and is never written to the config. Avoid putting secrets

@@ -41,7 +41,7 @@ if (canonicalJsonObject('{"answer":42}') !== '{"answer":42}') throw Error('Postg
   const setup = spawnSync(installedCli, ['config', 'endpoint', '--url', 'http://127.0.0.1:43210/'],
     { cwd: temp, env: cliEnv, encoding: 'utf8' });
   if (setup.status !== 0) throw Error(`Installed CLI configuration failed: ${setup.stderr}`);
-  const login = spawnSync(installedCli, ['auth', 'login', '--token-stdin', '--store', 'file'],
+  const login = spawnSync(installedCli, ['auth', 'import', '--token-stdin', '--store', 'file'],
     { cwd: temp, env: cliEnv, encoding: 'utf8', input: 'generic-consumer-token\n' });
   if (login.status !== 0 || (login.stdout + login.stderr).includes('generic-consumer-token'))
     throw Error('Installed CLI secure bootstrap failed');

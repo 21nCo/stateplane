@@ -11,6 +11,20 @@ servers:
 security:
   - bearer: []
 paths:
+  /v1/auth/session:
+    get:
+      operationId: verifyCredential
+      description: Verify a bearer session or API key without selecting a space; returns kind only.
+      responses:
+        '200':
+          description: Credential is valid at verification time
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [contractVersion, kind]
+                properties: { contractVersion: { const: '1' }, kind: { enum: [session, api-key] } }
+        default: { $ref: '#/components/responses/Error' }
   /v1/spaces:
     get:
       operationId: listSpaces

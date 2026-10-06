@@ -46,6 +46,7 @@ function fixture() {
       ? {kind:'session',userPrincipalId:'owner',credentialId:'session-1'} : null;
   }};
   return {services,identity,revoke:()=>{granted=false;},failProvider:()=>{providerDown=true;},
+    recoverProvider:()=>{providerDown=false;},
     unknownCommit:()=>{commitUnknown=true;},get calls(){return calls;}};
 }
 
@@ -120,10 +121,17 @@ test('HTTP and installed CLI observe the same receipt; revocation and cursor err
   const badAuth=await fetch(endpoint+'v1/spaces',{headers:{Authorization:'Bearer bad-secret'}});
   assert.equal(badAuth.status,503);
   assert.doesNotMatch(await badAuth.text(),/provider failure|bad-secret/);
+  state.recoverProvider();
   const changed=await cli(['config','endpoint','--url','http://127.0.0.1:43210/']);
   assert.equal(changed.status,0);
   await assert.rejects(readFile(join(cliRoot,'token'),'utf8'),{code:'ENOENT'});
   assert.equal(JSON.parse((await cli(['config','show'])).stdout).tokenStore,null);
+  assert.equal((await cli(['config','endpoint','--url',endpoint])).status,0);
+  const invalid=await cliProcess(cliRoot,['auth','login','--token-stdin','--store','file'],'bad-secret\n');
+  assert.equal(invalid.status,1);
+  assert.equal(JSON.parse(invalid.stderr).error.code,'UNAUTHENTICATED');
+  assert.doesNotMatch(invalid.stderr,/bad-secret/);
+  await assert.rejects(readFile(join(cliRoot,'token'),'utf8'),{code:'ENOENT'});
 });
 
 test('GET honors Retry-After; writes never auto-retry after an uncertain outcome',async()=>{
