@@ -12,8 +12,10 @@ const status:Record<string,number> = {
   COMMIT_OUTCOME_UNKNOWN:503,STALE_PLACEMENT:503
 };
 const retryable = new Set(['RECEIPT_PENDING','PROVIDER_UNAVAILABLE','BACKPRESSURE','RATE_LIMITED','STALE_PLACEMENT']);
-class HttpFailure extends Error { constructor(readonly code:string) { super(code); } }
-const fail=(code:string):never=>{ throw new HttpFailure(code); };
+class HttpFailure extends Error {
+  constructor(readonly code:string,readonly retryableOverride?:boolean) { super(code); }
+}
+const fail=(code:string,retryableOverride?:boolean):never=>{ throw new HttpFailure(code,retryableOverride); };
 const json=(value:unknown,code=200)=>Response.json(value,{status:code,headers});
 function path(value:string):string[] {
   const parts=value.split('/').slice(1);
@@ -32,7 +34,7 @@ function path(value:string):string[] {
 }
 async function body(request:Request,limit=3_145_728):Promise<string> {
   const declared=request.headers.get('content-length');
-  if (declared && Number(declared)>limit) fail('RATE_LIMITED');
+  if (declared && Number(declared)>limit) fail('RATE_LIMITED',false);
   if (!/^application\/json(?:\s*;|$)/i.test(request.headers.get('content-type')??'')) fail('INVALID_ARGUMENT');
   if (!request.body) return fail('INVALID_ARGUMENT');
   const reader=request.body.getReader();
@@ -43,7 +45,10 @@ async function body(request:Request,limit=3_145_728):Promise<string> {
       const next=await reader.read();
       if (next.done) break;
       size+=next.value.byteLength;
-      if (size>limit) { await reader.cancel(); fail('RATE_LIMITED'); }
+      if (size>limit) {
+        try { await reader.cancel(); } catch { /* The size error still owns this response. */ }
+        fail('RATE_LIMITED',false);
+      }
       chunks.push(next.value);
     }
   } finally { reader.releaseLock(); }
@@ -64,8 +69,10 @@ function errorResponse(error:unknown,requestId:string):Response {
   const raw=(error as {code?:unknown})?.code;
   const code=name==='CommitOutcomeUnknownError' ? 'COMMIT_OUTCOME_UNKNOWN' :
     typeof raw==='string' && Object.hasOwn(status,raw) ? raw : error instanceof HttpFailure ? error.code : 'PROVIDER_UNAVAILABLE';
-  const response=json({contractVersion:'1',error:{code,message:code,retryable:retryable.has(code),requestId}},status[code]??503);
-  if (retryable.has(code)) response.headers.set('Retry-After','1');
+  const canRetry=error instanceof HttpFailure && error.retryableOverride!==undefined
+    ? error.retryableOverride : retryable.has(code);
+  const response=json({contractVersion:'1',error:{code,message:code,retryable:canRetry,requestId}},status[code]??503);
+  if (canRetry) response.headers.set('Retry-After','1');
   return response;
 }
 /** All v1 endpoints use the same services as other transports. No error includes

@@ -128,7 +128,11 @@ The API applies the authority's existing 30-second transaction budget,
 Those are protective implementation limits from STA-8, not measured remote
 throughput. The CLI checks the complete serialized HTTP body against each
 endpoint's limit before sending; oversized local input returns a nonretryable
-`RATE_LIMITED` error. An explicitly empty query or event cursor is invalid;
+`RATE_LIMITED` error. HTTP rejects a body beyond the same limit with
+`RATE_LIMITED`, `retryable: false`, and no `Retry-After` header, including
+requests without `Content-Length`. A service time or capacity limit can also
+return `RATE_LIMITED`; that response remains retryable and carries
+`Retry-After`. An explicitly empty query or event cursor is invalid;
 omit `--cursor` to request the first page. The CLI timeout defaults to 30 seconds and can be set with
 `--timeout` in milliseconds up to 120 seconds. Keep the CLI timeout above the
 server budget when possible; a client timeout on a write is still ambiguous.

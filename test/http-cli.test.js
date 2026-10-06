@@ -346,6 +346,100 @@ test('CLI checks complete record and query bodies at the HTTP byte boundary',asy
   assert.deepEqual([mutations,queries,counts],[3,1,1]);
 });
 
+test('HTTP body caps match CLI nonretryable errors while service throttles retain Retry-After',async t=>{
+  const state=fixture();let effects=0;
+  for (const [owner,method] of [
+    [state.services.spaces,'create'],[state.services.collections,'define'],
+    [state.services.records,'mutate'],[state.services.records,'query'],
+    [state.services.records,'count'],[state.services.batches,'ingest']
+  ]) owner[method]=async()=>{effects++;return {ok:true};};
+  const handler=createHttpHandler(state);
+  const {server,endpoint}=await serve(handler);
+  t.after(()=>server.close());
+  const root=await mkdtemp(join(tmpdir(),'stateplane-http-budgets-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  const cli=argv=>cliProcess(root,argv);
+  assert.equal((await cli(['config','endpoint','--url',endpoint])).status,0);
+  assert.equal((await cliProcess(root,['auth','import','--token-stdin','--store','file'],
+    'secret-test-token\n')).status,0);
+  assert.equal((await cli(['spaces','select','--space','sp_a'])).status,0);
+
+  const spaceId='sp_00000000-0000-0000-0000-000000000001';
+  const collection='/v1/spaces/sp_a/collections/entries';
+  const oversized=(limit,make)=>{
+    const length=limit-Buffer.byteLength(JSON.stringify(make('')))+1;
+    const value='x'.repeat(length);
+    const serialized=JSON.stringify(make(value));
+    assert.equal(Buffer.byteLength(serialized),limit+1);
+    return {value,serialized};
+  };
+  const space=oversized(4096,value=>({spaceId,cellId:value}));
+  const schema=oversized(1_048_576,value=>({label:value}));
+  const record=oversized(1_048_576,value=>({operation:'create',idempotencyKey:'budget',data:{label:value}}));
+  const query=oversized(32_768,value=>({predicates:[value],limit:1}));
+  const count=oversized(32_768,value=>[value]);
+  const schemaFile=join(root,'schema.json');
+  const recordFile=join(root,'record.json');
+  await writeFile(schemaFile,schema.serialized);
+  await writeFile(recordFile,JSON.stringify({label:record.value}));
+  const batchFile=join(root,'items.ndjson');
+  const item=JSON.stringify({operation:'create',data:{label:'"'.repeat(500_000)}});
+  await writeFile(batchFile,`${item}\n${item}\n`);
+  const batch=JSON.stringify([item,item]);
+  assert.ok(Buffer.byteLength(batch)>3_145_728);
+  const cases=[
+    {name:'space',method:'POST',route:'/v1/spaces',body:space.serialized,
+      args:['spaces','create','--space',spaceId,'--cell',space.value]},
+    {name:'collection',method:'PUT',route:collection,body:schema.serialized,
+      args:['collections','define','--collection','entries','--file',schemaFile]},
+    {name:'record',method:'POST',route:`${collection}/records`,body:record.serialized,
+      args:['records','create','--collection','entries','--idempotency-key','budget',
+        '--file',recordFile]},
+    {name:'query',method:'POST',route:`${collection}/records/query`,body:query.serialized,
+      args:['records','query','--collection','entries','--predicates',JSON.stringify([query.value]),'--limit','1']},
+    {name:'count',method:'POST',route:`${collection}/records/count`,body:count.serialized,
+      args:['records','count','--collection','entries','--predicates',count.serialized]},
+    {name:'batch',method:'PUT',route:`${collection}/batches/budget`,body:batch,
+      args:['batches','ingest','--collection','entries','--operation-key','budget','--file',batchFile]}
+  ];
+  for (const entry of cases) {
+    const response=await fetch(new URL(entry.route,endpoint),{method:entry.method,
+      headers:{Authorization:'Bearer secret-test-token','Content-Type':'application/json'},body:entry.body});
+    assert.equal(response.status,429,entry.name);
+    assert.equal(response.headers.get('Retry-After'),null,entry.name);
+    const error=(await response.json()).error;
+    assert.deepEqual({code:error.code,message:error.message,retryable:error.retryable},
+      {code:'RATE_LIMITED',message:'RATE_LIMITED',retryable:false},entry.name);
+    const command=await cli(entry.args);
+    assert.equal(command.status,1,entry.name);
+    assert.deepEqual(JSON.parse(command.stderr).error,
+      {code:'RATE_LIMITED',message:'RATE_LIMITED',retryable:false,requestId:null},entry.name);
+  }
+  assert.equal(effects,0);
+
+  const stream=new ReadableStream({start(controller){
+    controller.enqueue(new TextEncoder().encode('x'.repeat(32_769)));
+    controller.close();
+  }});
+  const streamed=new Request(new URL(`${collection}/records/query`,endpoint),{method:'POST',
+    headers:{Authorization:'Bearer secret-test-token','Content-Type':'application/json'},
+    body:stream,duplex:'half'});
+  assert.equal(streamed.headers.get('Content-Length'),null);
+  const streamResponse=await handler(streamed);
+  assert.equal(streamResponse.status,429);
+  assert.equal(streamResponse.headers.get('Retry-After'),null);
+  assert.equal((await streamResponse.json()).error.retryable,false);
+  assert.equal(effects,0);
+
+  state.services.records.query=async()=>{throw Object.assign(new Error('busy'),{code:'RATE_LIMITED'});};
+  const throttle=await fetch(new URL(`${collection}/records/query`,endpoint),{method:'POST',
+    headers:{Authorization:'Bearer secret-test-token','Content-Type':'application/json'},
+    body:JSON.stringify({predicates:[],limit:1})});
+  assert.equal(throttle.status,429);
+  assert.equal(throttle.headers.get('Retry-After'),'1');
+  assert.equal((await throttle.json()).error.retryable,true);
+});
+
 test('empty CLI cursors fail before fetching; event polling preserves supplied cursor',async t=>{
   const state=fixture();const seen={queries:[],events:[]};
   state.services.records.query=async(_actor,_space,_collection,serialized)=>{
