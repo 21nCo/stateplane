@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, rename, rm, lstat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, lstat, writeFile, open } from 'node:fs/promises';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,6 +17,44 @@ async function secureDirectory():Promise<void> {
 }
 const configPath=()=>join(configDir(),'config.json');
 const tokenPath=()=>join(configDir(),'token');
+/** Serialize config and secret-location changes across CLI processes. The
+ * durable journal remains the recovery source if a process exits mid-switch. */
+export async function withConfigMutation<T>(change:(current:CliConfig)=>Promise<T>):Promise<T> {
+  await secureDirectory();
+  const path=join(configDir(),'config.lock');
+  const deadline=Date.now()+120_000;
+  let handle;
+  while (!handle) {
+    try {
+      handle=await open(path,'wx',0o600);
+      try { await handle.writeFile(String(process.pid)); }
+      catch(error) { await handle.close(); await rm(path,{force:true}); throw error; }
+    } catch(error) {
+      if ((error as NodeJS.ErrnoException).code!=='EEXIST') throw error;
+      const lock=await lstat(path).catch(cause=>{
+        if ((cause as NodeJS.ErrnoException).code==='ENOENT') return undefined;
+        throw cause;
+      });
+      if (lock && (!lock.isFile() || (lock.mode&0o077)!==0))
+        throw new StateplaneCliError('INSECURE_CONFIGURATION');
+      if (lock && Date.now()-lock.mtimeMs>2000) {
+        const pid=Number((await readFile(path,'utf8').catch(()=>'')).trim());
+        if (!Number.isSafeInteger(pid) || pid<=0) await rm(path,{force:true});
+        else {
+          let alive=true;
+          try { process.kill(pid,0); } catch(cause) {
+            if ((cause as NodeJS.ErrnoException).code==='ESRCH') alive=false;
+          }
+          if (!alive) await rm(path,{force:true});
+        }
+      }
+      if (Date.now()>deadline) throw new StateplaneCliError('CONFIGURATION_BUSY',undefined,undefined,true);
+      await new Promise(resolve=>setTimeout(resolve,50));
+    }
+  }
+  try { return await change(await readConfig()); }
+  finally { await handle.close(); await rm(path,{force:true}); }
+}
 async function privateFile(path:string):Promise<boolean> {
   try {
     const stat=await lstat(path);

@@ -66,7 +66,10 @@ export class CollectionRegistry {
         discard=true;
         // A PostgreSQL SQLSTATE confirms that COMMIT was rejected. A broken
         // transport without a SQLSTATE leaves the commit outcome unknown.
-        if (/^[0-9A-Z]{5}$/.test(String((error as {code?:unknown}).code??''))) throw error;
+        // PostgreSQL SQLSTATEs contain a digit; Node transport errno names
+        // such as EPIPE and EBUSY can also have five uppercase characters.
+        const code=String((error as {code?:unknown}).code??'');
+        if (/^[0-9A-Z]{5}$/.test(code) && /[0-9]/.test(code)) throw error;
         throw new CommitOutcomeUnknownError(error);
       }
       return result;

@@ -12,6 +12,7 @@ import { createHttpHandler } from '../packages/api/dist/index.js';
 import { PostgresSpaces, AuthorityTransaction } from '../packages/postgres/dist/index.js';
 import { StateplaneHttpClient, StateplaneCliError } from '../packages/cli/dist/index.js';
 import { saveToken, loadToken, removeToken, configureToken, removeTrackedTokens,
+  saveConfig, withConfigMutation,
   storeSecretServiceToken, loadSecretServiceToken,
   loadOsSecretToken } from '../packages/cli/dist/config.js';
 
@@ -78,6 +79,18 @@ async function cliProcess(root,argv,input='') {
   child.stdin.end(input);
   const [status]=await once(child,'close');
   return {status,stdout,stderr};
+}
+async function withConfigMutationInRoot(root,change) {
+  const previous=process.env.STATEPLANE_CONFIG_DIR;
+  process.env.STATEPLANE_CONFIG_DIR=root;
+  try { return await withConfigMutation(change); }
+  finally {
+    if (previous===undefined) delete process.env.STATEPLANE_CONFIG_DIR;
+    else process.env.STATEPLANE_CONFIG_DIR=previous;
+  }
+}
+async function saveConfigWithRoot(root,value) {
+  return withConfigMutationInRoot(root,async()=>saveConfig(value));
 }
 function assertErrorParity(http,cli) {
   assert.equal(cli.status,1);
@@ -204,6 +217,35 @@ test('endpoint changes clear saved space while same-endpoint configuration retai
   assert.equal(explicit.status,0,explicit.stderr);
   assert.equal(JSON.parse(explicit.stdout).ref.id,'rec_1');
   assert.equal(JSON.parse((await cli(['config','show'])).stdout).space,null);
+});
+
+test('concurrent selection reloads the endpoint after another process changes it',async t=>{
+  const root=await mkdtemp(join(tmpdir(),'stateplane-cli-race-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  const before='https://old.example.invalid/';
+  const after='https://new.example.invalid/';
+  await saveConfigWithRoot(root,{endpoint:before});
+  let release;
+  let entered;
+  const locked=new Promise(resolve=>{entered=resolve;});
+  const gate=new Promise(resolve=>{release=resolve;});
+  const change=withConfigMutationInRoot(root,async current=>{
+    entered();
+    await gate;
+    await saveConfig({...current,endpoint:after,space:undefined});
+  });
+  await locked;
+  const selection=cliProcess(root,['spaces','select','--space','selected']);
+  let settled=false;
+  selection.then(()=>{settled=true;});
+  try {
+    await new Promise(resolve=>setTimeout(resolve,200));
+    assert.equal(settled,false,'selection waits for the cross-process config lock');
+  } finally { release(); }
+  await change;
+  assert.equal((await selection).status,0);
+  assert.deepEqual(JSON.parse((await cliProcess(root,['config','show'])).stdout),
+    {endpoint:after,space:'selected',tokenStore:null});
 });
 
 test('HTTP and CLI address encoded collection, record, batch and external-key selectors',async t=>{
@@ -913,6 +955,52 @@ test('HTTP and CLI no-op space updates deny metadata after owner revocation duri
   gate.release();
   assert.equal((await (await recovered).json()).lifecycle,'active');
 });
+
+test('concurrent logout and endpoint changes clean both secret stores after a switch',
+  {skip:platform()!=='darwin'},async()=>{
+    for (const from of ['file','keychain']) for (const action of ['logout','endpoint']) {
+      const to=from==='file'?'keychain':'file';
+      const root=await mkdtemp(join(tmpdir(),'stateplane-cli-race-secret-'));
+      const endpoint=`https://race-${randomUUID()}.example.invalid/`;
+      const token=`secret-${randomUUID()}`;
+      let release;
+      try {
+        assert.equal((await cliProcess(root,['config','endpoint','--url',endpoint])).status,0);
+        assert.equal((await cliProcess(root,['auth','import','--token-stdin','--store',from],token+'\n')).status,0);
+        let entered;
+        const locked=new Promise(resolve=>{entered=resolve;});
+        const gate=new Promise(resolve=>{release=resolve;});
+        const switchStore=withConfigMutationInRoot(root,async current=>{
+          entered();
+          await gate;
+          await configureToken(current,token,to);
+        });
+        await locked;
+        const args=action==='logout'?['auth','logout']:
+          ['config','endpoint','--url',`https://next-${randomUUID()}.example.invalid/`];
+        const cleanup=cliProcess(root,args);
+        let settled=false;
+        cleanup.then(()=>{settled=true;});
+        await new Promise(resolve=>setTimeout(resolve,200));
+        assert.equal(settled,false,'cleanup waits for the in-progress store switch');
+        release();release=undefined;
+        await switchStore;
+        const result=await cleanup;
+        assert.equal(result.status,0,result.stderr);
+        assert.equal((result.stdout+result.stderr).includes(token),false);
+        await assert.rejects(readFile(join(root,'token'),'utf8'),{code:'ENOENT'});
+        await assert.rejects(loadToken({endpoint,tokenStore:'keychain'}),{code:'UNAUTHENTICATED'});
+        const saved=JSON.parse(await readFile(join(root,'config.json'),'utf8'));
+        assert.equal(saved.tokenStore,undefined);
+        assert.equal(saved.tokenLocations,undefined);
+        if (action==='endpoint') assert.notEqual(saved.endpoint,endpoint);
+      } finally {
+        release?.();
+        await removeToken({endpoint,tokenStore:'keychain'}).catch(()=>{});
+        await rm(root,{recursive:true,force:true});
+      }
+    }
+  });
 
 test('HTTP and CLI selected-space retries deny metadata when owner access is revoked during the directory lock wait',async t=>{
   const spaceId=`sp_${randomUUID()}`;

@@ -171,7 +171,7 @@ test('schema lost COMMIT is uncertain and lifecycle returns its own transition',
     const client=await pool.connect();
     return {query:async(sql,values)=>{
       const result=await client.query(sql,values);
-      if (sql==='COMMIT') throw new Error('lost schema acknowledgement');
+      if (sql==='COMMIT') throw Object.assign(new Error('lost schema acknowledgement'),{code:'EPIPE'});
       return result;
     },release:discard=>client.release(discard)};
   }};

@@ -79,7 +79,7 @@ try {
       }
     }
   }
-  if (pendingEventFeedUpgrade) {
+  const preflightEventFeed = async () => {
     const relations = await client.query(`SELECT to_regclass('public.records') AS records,
       to_regclass('public.record_events') AS events`);
     if (relations.rows[0].events) {
@@ -99,7 +99,7 @@ try {
       if (populated.rows[0].present && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained')
         throw new Error('Populated event feed upgrade requires drained traffic; set STATEPLANE_POPULATED_INDEX_UPGRADE=drained only after stopping record writers');
     }
-  }
+  };
   for (const name of files) {
     const sql = await readFile(resolve(directory, name), 'utf8');
     const sha256 = createHash('sha256').update(sql).digest('hex');
@@ -116,6 +116,13 @@ try {
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
       transactionOpen = true;
     }
+    // The 033/035 validation boundaries commit their preceding transaction.
+    // Recheck and retain the event writer locks in the transaction that will
+    // actually build 036/037, including upgrades from older ledger prefixes.
+    if (pendingEventFeedUpgrade &&
+      (name === '036_event_cursor.sql' || name === '037_commit_safe_event_feed.sql') &&
+      (name === '036_event_cursor.sql' || recorded.has('036_event_cursor.sql')))
+      await preflightEventFeed();
     const receiptDomainCutover = name === '034_batch_receipt_domain.sql' || name === '035_validate_batch_receipt_domain.sql';
     const priorLockTimeout = receiptDomainCutover ? (await client.query('SHOW lock_timeout')).rows[0].lock_timeout : null;
     if (receiptDomainCutover) await client.query("SET LOCAL lock_timeout = '5s'");

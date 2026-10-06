@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { readFile, readdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
@@ -16,7 +17,7 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
   const name=`stateplane_sta9_event_${randomUUID().replaceAll('-','')}`;
   const url=new URL(baseUrl); url.pathname=`/${name}`;
   const admin=new pg.Client({connectionString:baseUrl});
-  let upgrade;let writer;
+  let upgrade;let writer;let blocker;let migration;
   await admin.connect();
   try {
     await admin.query(`CREATE DATABASE ${name}`);
@@ -26,7 +27,7 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
       applied_at timestamptz NOT NULL DEFAULT now())`);
     const files=(await readdir(new URL('../../migrations/',import.meta.url)))
       .filter(file=>/^\d{3}_.*\.sql$/.test(file)).sort();
-    for (const file of files.filter(file=>file<'036_')) {
+    for (const file of files.filter(file=>file<'033_')) {
       const sql=await readFile(new URL(`../../migrations/${file}`,import.meta.url),'utf8');
       await upgrade.query(sql);
       await upgrade.query('INSERT INTO stateplane_migrations(name,sha256) VALUES($1,$2)',
@@ -54,6 +55,41 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     assert.match(String(refused?.stderr),/Populated event feed upgrade requires drained traffic/);
     assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name>='036_'")).rows[0].n,0);
 
+    // Revisit the older ledger prefix and pause at 033, after its transaction
+    // split. A writer starting now must be rejected by the 036 preflight.
+    await upgrade.query("DELETE FROM stateplane_migrations WHERE name>='033_'");
+    blocker=new pg.Client({connectionString:url.href});
+    await blocker.connect();
+    await blocker.query('BEGIN');
+    await blocker.query('LOCK TABLE batch_items IN ACCESS EXCLUSIVE MODE');
+    migration=spawn(process.execPath,['scripts/migrate.mjs'],{cwd,
+      env:{...env,STATEPLANE_POPULATED_INDEX_UPGRADE:'drained'},stdio:['ignore','pipe','pipe']});
+    let migrationError='';
+    migration.stderr.setEncoding('utf8');
+    migration.stderr.on('data',chunk=>{migrationError+=chunk;});
+    let reachedSplit=false;
+    for (let attempt=0;attempt<100;attempt++) {
+      const waiting=await upgrade.query(`SELECT 1 FROM pg_stat_activity WHERE pid<>pg_backend_pid()
+        AND wait_event_type='Lock' AND query LIKE '%VALIDATE CONSTRAINT batch_items_attempts_nonnegative%'`);
+      if (waiting.rowCount) {reachedSplit=true;break;}
+      if (migration.exitCode!==null) break;
+      await new Promise(resolve=>setTimeout(resolve,50));
+    }
+    assert.equal(reachedSplit,true,'migrator reached 033 after releasing its previous transaction');
+    writer=new pg.Client({connectionString:url.href});
+    await writer.connect();
+    await writer.query('BEGIN');
+    await writer.query("UPDATE records SET data=data WHERE space_id='sta9-event' AND record_id='record-1'");
+    await blocker.query('ROLLBACK');
+    const [splitStatus]=await once(migration,'close');
+    migration=undefined;
+    assert.equal(splitStatus,1);
+    assert.match(migrationError,/Event feed upgrade requires drained traffic/);
+    assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name>='036_'")).rows[0].n,0);
+    await writer.query('ROLLBACK');
+    await writer.end();
+    writer=undefined;
+
     writer=new pg.Client({connectionString:url.href});
     await writer.connect();
     await writer.query('BEGIN');
@@ -70,6 +106,12 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name>='036_'")).rows[0].n,2);
     migrate(false);
   } finally {
+    if (migration) {
+      migration.kill('SIGTERM');
+      await once(migration,'close').catch(()=>{});
+    }
+    await blocker?.query('ROLLBACK').catch(()=>{});
+    await blocker?.end().catch(()=>{});
     await writer?.query('ROLLBACK').catch(()=>{});
     await writer?.end().catch(()=>{});
     await upgrade?.end().catch(()=>{});

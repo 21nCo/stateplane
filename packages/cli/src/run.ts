@@ -1,5 +1,5 @@
 import { createReadStream } from 'node:fs';
-import { readConfig, saveConfig, configureToken, loadToken, removeTrackedTokens } from './config.js';
+import { readConfig, saveConfig, configureToken, loadToken, removeTrackedTokens, withConfigMutation } from './config.js';
 import { StateplaneCliError, StateplaneHttpClient } from './transport.js';
 
 type Flags=Record<string,string|boolean>;
@@ -126,13 +126,16 @@ export async function runCli(argv:string[]):Promise<number> {
     const config=await readConfig();
     if (resource==='config' && action==='endpoint') {
       const value=endpoint(required(flags,'url'));
-      const changed=config.endpoint!==value;
-      if (config.endpoint && changed) await removeTrackedTokens(config);
-      await saveConfig({...config,endpoint:value,
-        space:changed?undefined:config.space,
-        tokenStore:changed?undefined:config.tokenStore,
-        tokenLocations:changed?undefined:config.tokenLocations});
-      output({endpoint:value,space:changed?null:config.space??null}); return 0;
+      const result=await withConfigMutation(async current=>{
+        const changed=current.endpoint!==value;
+        if (current.endpoint && changed) await removeTrackedTokens(current);
+        await saveConfig({...current,endpoint:value,
+          space:changed?undefined:current.space,
+          tokenStore:changed?undefined:current.tokenStore,
+          tokenLocations:changed?undefined:current.tokenLocations});
+        return {endpoint:value,space:changed?null:current.space??null};
+      });
+      output(result); return 0;
     }
     if (resource==='config' && action==='show') {
       output({endpoint:config.endpoint??null,space:config.space??null,tokenStore:config.tokenStore??null}); return 0;
@@ -144,16 +147,23 @@ export async function runCli(argv:string[]):Promise<number> {
       const token=(await input('-',4096)).replace(/\r?\n$/,'');
       if (action==='login') await new StateplaneHttpClient({endpoint:config.endpoint,token,
         timeoutMs:flags.timeout ? integer(required(flags,'timeout')) : undefined}).request('GET','/v1/auth/session');
-      await configureToken(config,token,store); output({configured:true,store}); return 0;
+      await withConfigMutation(async current=>{
+        if (current.endpoint!==config.endpoint) throw new StateplaneCliError('INVALID_CONFIGURATION');
+        await configureToken(current,token,store);
+      });
+      output({configured:true,store}); return 0;
     }
     if (resource==='auth' && action==='logout') {
-      await removeTrackedTokens(config);
-      await saveConfig({...config,tokenStore:undefined,tokenLocations:undefined});
+      await withConfigMutation(async current=>{
+        await removeTrackedTokens(current);
+        await saveConfig({...current,tokenStore:undefined,tokenLocations:undefined});
+      });
       output({configured:false}); return 0;
     }
     if (resource==='spaces' && action==='select') {
       const space=required(flags,'space');
-      await saveConfig({...config,space}); output({space}); return 0;
+      await withConfigMutation(async current=>{await saveConfig({...current,space});});
+      output({space}); return 0;
     }
     if (!config.endpoint) throw new StateplaneCliError('INVALID_CONFIGURATION');
     const client=new StateplaneHttpClient({endpoint:config.endpoint,token:await loadToken(config),
