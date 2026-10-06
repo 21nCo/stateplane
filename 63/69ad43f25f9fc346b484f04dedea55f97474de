@@ -1,0 +1,25 @@
+docs/http-cli.md
+  s_8476f5b8554e5b::t_e7b7f11d4c35ad 73-76
+packages/cli/src/config.ts
+  s_8476f5b8554e5b::t_a9ac42e6435b21 4-5,53-56,80,85-90,103,107-109,117
+packages/cli/src/run.ts
+  s_8476f5b8554e5b::t_056af522ec2b49 70-79,87,191-195,222-225
+test/integration/http-services.test.js
+  s_8476f5b8554e5b::t_5609afc8da4552 112-135
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6369ad43f25f9fc346b484f04dedea55f97474de",
+  "prompts": {},
+  "sessions": {
+    "s_8476f5b8554e5b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a111ea-ef61-7a43-91e0-428764c7041f",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
