@@ -3,7 +3,7 @@ import { readConfig, saveConfig, saveToken, loadToken, removeToken } from './con
 import { StateplaneCliError, StateplaneHttpClient } from './transport.js';
 
 type Flags=Record<string,string|boolean>;
-const encoded=(value:string)=>encodeURIComponent(value);
+const encoded=(value:string)=>value==='.' || value==='..' ? `;${value}` : encodeURIComponent(value);
 function parse(argv:string[]):{words:string[];flags:Flags} {
   const words:string[]=[]; const flags:Flags={};
   const switches=new Set(['retry-failed','json','token-stdin','help','verbose','debug']);
@@ -96,8 +96,8 @@ function help():void {
     docs:'See docs/http-cli.md for examples and recovery rules.'});
 }
 
-/** One command produces one JSON value. Errors contain only stable code and
- * request ID; no token, provider response body, or input payload is printed. */
+/** One command produces one JSON value. Errors contain only stable fields;
+ * no token, provider response body, or input payload is printed. */
 export async function runCli(argv:string[]):Promise<number> {
   try {
     const {words,flags}=parse(argv);
@@ -211,7 +211,8 @@ export async function runCli(argv:string[]):Promise<number> {
     throw new StateplaneCliError('INVALID_ARGUMENT');
   } catch(error) {
     const failure=error instanceof StateplaneCliError?error:new StateplaneCliError('PROVIDER_UNAVAILABLE');
-    process.stderr.write(JSON.stringify({contractVersion:'1',error:{code:failure.code,requestId:failure.requestId??null}})+'\n');
+    process.stderr.write(JSON.stringify({contractVersion:'1',error:{code:failure.code,message:failure.code,
+      retryable:failure.retryable,requestId:failure.requestId??null}})+'\n');
     return 1;
   }
 }

@@ -31,6 +31,11 @@ placement in their database transaction. Space administration uses
 Errors have `contractVersion`, stable `error.code`, `message`, `retryable` and
 `requestId`, without provider messages or credential values. A write with an
 unacknowledged commit reports `COMMIT_OUTCOME_UNKNOWN`; its result is unknown.
+CLI errors use the same fields on stderr; locally detected failures have a null
+request ID. Both clients percent-encode each path selector as one component,
+including `/` and `\\`. URL parsers remove dot-only path segments, so a selector
+whose entire value is `.` or `..` is sent as `;.` or `;..` respectively. A literal
+leading semicolon is encoded as `%3B`, keeping it distinct from that marker.
 
 ## Install the CLI on a clean machine
 

@@ -16,10 +16,11 @@ function fixture() {
   const services={
     spaces:{list:async()=>[],create:async()=>({spaceId:'sp_a'}),get:async()=>{denied();return {spaceId:'sp_a'};},
       update:async()=>({spaceId:'sp_a'}),delete:async()=>{deletes++;return {deleted:true};}},
-    collections:{list:async()=>{denied();return [];},define:async()=>({slug:'entries'}),revise:async()=>({slug:'entries'})},
+    collections:{list:async(_actor,_space,collection)=>{denied();return collection?{slug:collection}:[];},
+      define:async()=>({slug:'entries'}),revise:async()=>({slug:'entries'})},
     records:{
-      get:async(_actor,_space,_collection,id)=>{denied();return {ref:{id},revision:1};},
-      byKey:async()=>null,
+      get:async(_actor,_space,collection,id)=>{denied();return {collection,ref:{id},revision:1};},
+      byKey:async(_actor,_space,collection,mode,key)=>{denied();return {collection,mode,key};},
       mutate:async(_actor,space,collection,body)=>{
         denied();calls++;
         if (commitUnknown) throw Object.assign(new Error('secret commit cause'),{name:'CommitOutcomeUnknownError'});
@@ -35,10 +36,10 @@ function fixture() {
       count:async()=>{denied();return 1;}
     },
     batches:{ingest:async()=>({operationKey:'batch-1',state:'active',items:[]}),
-      progress:async()=>{denied();return {operationKey:'batch-1',state:'active',items:[]};},
+      progress:async(_actor,_space,collection,operationKey)=>{denied();return {collection,operationKey,state:'active',items:[]};},
       cancel:async()=>({operationKey:'batch-1',state:'cancelled',items:[]})},
-    events:{list:async()=>{denied();return {events:[],nextCursor:null};},
-      projection:async()=>{denied();return {state:'pending',generation:1,revision:1};}}
+    events:{list:async(_actor,_space,collection)=>{denied();return {collection,events:[],nextCursor:null};},
+      projection:async(_actor,_space,collection,id)=>{denied();return {collection,id,state:'pending',generation:1,revision:1};}}
   };
   const identity={verify:async request=>{
     if (providerDown) throw new Error(`provider failure ${request.headers.get('authorization')}`);
@@ -72,6 +73,14 @@ async function cliProcess(root,argv,input='') {
   const [status]=await once(child,'close');
   return {status,stdout,stderr};
 }
+function assertErrorParity(http,cli) {
+  assert.equal(cli.status,1);
+  const direct=http.error,fromCli=JSON.parse(cli.stderr).error;
+  assert.deepEqual({code:fromCli.code,message:fromCli.message,retryable:fromCli.retryable},
+    {code:direct.code,message:direct.message,retryable:direct.retryable});
+  assert.match(direct.requestId,/^[a-zA-Z0-9_-]{1,80}$/);
+  assert.match(fromCli.requestId,/^[a-zA-Z0-9_-]{1,80}$/);
+}
 
 test('HTTP and installed CLI observe the same receipt; revocation and cursor errors stay structured',async t=>{
   const state=fixture();const handler=createHttpHandler(state);const {server,endpoint}=await serve(handler);
@@ -102,8 +111,9 @@ test('HTTP and installed CLI observe the same receipt; revocation and cursor err
   state.unknownCommit();
   const uncertain=await cli(['records','create','--collection','entries','--data','{"label":"B"}',
     '--idempotency-key','req-b']);
-  assert.equal(uncertain.status,1);
-  assert.equal(JSON.parse(uncertain.stderr).error.code,'COMMIT_OUTCOME_UNKNOWN');
+  const uncertainHttp=await fetch(new URL(route,endpoint),{method:'POST',headers:{Authorization:'Bearer secret-test-token',
+    'Content-Type':'application/json'},body:JSON.stringify({operation:'create',idempotencyKey:'req-c',data:{label:'C'}})});
+  assertErrorParity(await uncertainHttp.json(),uncertain);
   assert.doesNotMatch(uncertain.stderr,/secret commit cause|secret-test-token/);
   const page=await cli(['records','query','--collection','entries','--predicates','[]','--limit','1']);
   assert.equal(JSON.parse(page.stdout).nextCursor,'cursor-next');
@@ -113,8 +123,10 @@ test('HTTP and installed CLI observe the same receipt; revocation and cursor err
     assert.equal(wrongMethod.status,404);
     assert.equal((await wrongMethod.json()).error.code,'NOT_FOUND');
   }
-  await assert.rejects(client.request('POST',route+'/query',{predicates:[],limit:1,cursor:'bad'}),
-    {code:'CURSOR_INVALID'});
+  const cursorHttp=await fetch(new URL(route+'/query',endpoint),{method:'POST',headers:{Authorization:'Bearer secret-test-token',
+    'Content-Type':'application/json'},body:JSON.stringify({predicates:[],limit:1,cursor:'bad'})});
+  assertErrorParity(await cursorHttp.json(),await cli(['records','query','--collection','entries',
+    '--predicates','[]','--limit','1','--cursor','bad']));
   state.revoke();
   const denied=await cli(['records','get','--collection','entries','--id','rec_1']);
   assert.equal(denied.status,1);
@@ -125,7 +137,8 @@ test('HTTP and installed CLI observe the same receipt; revocation and cursor err
   assert.doesNotMatch(await invalidToken.text(),/bad-secret/);
   state.failProvider();
   const failed=await cli(['records','get','--collection','entries','--id','rec_1']);
-  assert.equal(failed.status,1);
+  const failedHttp=await fetch(new URL(route+'/rec_1',endpoint),{headers:{Authorization:'Bearer secret-test-token'}});
+  assertErrorParity(await failedHttp.json(),failed);
   assert.doesNotMatch(failed.stderr,/provider failure|secret-test-token/);
   const badAuth=await fetch(endpoint+'v1/spaces',{headers:{Authorization:'Bearer bad-secret'}});
   assert.equal(badAuth.status,503);
@@ -137,10 +150,58 @@ test('HTTP and installed CLI observe the same receipt; revocation and cursor err
   assert.equal(JSON.parse((await cli(['config','show'])).stdout).tokenStore,null);
   assert.equal((await cli(['config','endpoint','--url',endpoint])).status,0);
   const invalid=await cliProcess(cliRoot,['auth','login','--token-stdin','--store','file'],'bad-secret\n');
-  assert.equal(invalid.status,1);
-  assert.equal(JSON.parse(invalid.stderr).error.code,'UNAUTHENTICATED');
+  const invalidHttp=await fetch(endpoint+'v1/auth/session',{headers:{Authorization:'Bearer bad-secret'}});
+  assertErrorParity(await invalidHttp.json(),invalid);
   assert.doesNotMatch(invalid.stderr,/bad-secret/);
   await assert.rejects(readFile(join(cliRoot,'token'),'utf8'),{code:'ENOENT'});
+});
+
+test('HTTP and CLI address encoded collection, record, batch and external-key selectors',async t=>{
+  const state=fixture();const {server,endpoint}=await serve(createHttpHandler(state));
+  t.after(()=>server.close());
+  const cliRoot=await mkdtemp(join(tmpdir(),'stateplane-cli-paths-'));
+  t.after(()=>rm(cliRoot,{recursive:true,force:true}));
+  const cli=argv=>cliProcess(cliRoot,argv);
+  assert.equal((await cli(['config','endpoint','--url',endpoint])).status,0);
+  assert.equal((await cliProcess(cliRoot,['auth','login','--token-stdin','--store','file'],
+    'secret-test-token\n')).status,0);
+  assert.equal((await cli(['spaces','select','--space','sp_a'])).status,0);
+  const cases=[
+    ['/collections/a%2Fb',['collections','get','--collection','a/b'],{slug:'a/b'}],
+    ['/collections/a%5Cb',['collections','get','--collection','a\\b'],{slug:'a\\b'}],
+    ['/collections/;.',['collections','get','--collection','.'],{slug:'.'}],
+    ['/collections/;..',['collections','get','--collection','..'],{slug:'..'}],
+    ['/collections/%3B.',['collections','get','--collection',';.'],{slug:';.'}],
+    ['/collections/a%2Fb/records/by-key/k%2Fv?mode=external',
+      ['records','key','--collection','a/b','--key','k/v','--mode','external'],
+      {collection:'a/b',mode:'external',key:'k/v'}],
+    ['/collections/entries/records/by-key/;.?mode=external',
+      ['records','key','--collection','entries','--key','.','--mode','external'],
+      {collection:'entries',mode:'external',key:'.'}],
+    ['/collections/entries/records/by-key/%3B.?mode=external',
+      ['records','key','--collection','entries','--key',';.','--mode','external'],
+      {collection:'entries',mode:'external',key:';.'}],
+    ['/collections/entries/records/a%2Fb',
+      ['records','get','--collection','entries','--id','a/b'],
+      {collection:'entries',ref:{id:'a/b'},revision:1}],
+    ['/collections/entries/batches/a%2Fb',
+      ['batches','status','--collection','entries','--operation-key','a/b'],
+      {collection:'entries',operationKey:'a/b',state:'active',items:[]}],
+    ['/collections/a%2Fb/events',['events','list','--collection','a/b'],
+      {collection:'a/b',events:[],nextCursor:null}],
+    ['/collections/entries/records/a%2Fb/projection',
+      ['records','projection','--collection','entries','--id','a/b'],
+      {collection:'entries',id:'a/b',state:'pending',generation:1,revision:1}]
+  ];
+  for (const [suffix,args,expected] of cases) {
+    const response=await fetch(endpoint+`v1/spaces/sp_a${suffix}`,
+      {headers:{Authorization:'Bearer secret-test-token'}});
+    assert.equal(response.status,200,suffix);
+    assert.deepEqual(await response.json(),expected,suffix);
+    const result=await cli(args);
+    assert.equal(result.status,0,result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout),expected,args.join(' '));
+  }
 });
 
 test('GET honors Retry-After; writes never auto-retry after an uncertain outcome',async()=>{

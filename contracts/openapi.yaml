@@ -6,6 +6,10 @@ info:
     Version 1 authority operations. All content operations reauthorize the current
     credential, space placement, collection grant and lifecycle. Mutations retain
     caller idempotency keys. Query cursors traverse live pages, not snapshots.
+    Encode each path selector as one URI component. Encoded slashes (%2F) and
+    backslashes (%5C) remain part of the selector. Because URL parsers remove
+    dot-only segments, send a selector of "." as ";." and ".." as ";..";
+    a literal semicolon is percent-encoded (%3B), so these forms are distinct.
 servers:
   - url: https://stateplane.example.invalid
 security:

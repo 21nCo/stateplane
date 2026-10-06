@@ -18,7 +18,8 @@ reservation.close(); await once(reservation,'close');
 const endpoint=`http://127.0.0.1:${port}/`;
 const token=randomBytes(32).toString('hex');
 const spaceId=`sp_${randomUUID()}`;
-const collectionId='entries';
+const collectionId='entries/path';
+const externalKey='key/part';
 const temp=await mkdtemp(join(tmpdir(),'stateplane-host-consumer-'));
 const appEnv={...process.env,STATEPLANE_ENV:'local',STATEPLANE_TEST_HTTP:'1',
   STATEPLANE_TEST_DATABASE_URL:databaseUrl,STATEPLANE_TEST_TOKEN:token,
@@ -72,17 +73,22 @@ try {
     unique:[],filterable:[],sortable:[]};
   await writeFile(join(temp,'schema.json'),JSON.stringify(definition));
   run(cli,['collections','define','--collection',collectionId,'--file',join(temp,'schema.json')],{env:cliEnv});
-  const discovered=await request('GET',`v1/spaces/${spaceId}/collections/${collectionId}`);
+  const discovered=await request('GET',`v1/spaces/${spaceId}/collections/${encodeURIComponent(collectionId)}`);
   assert(discovered.definition.slug===collectionId,'CLI schema is visible through HTTP');
-  const path=`v1/spaces/${spaceId}/collections/${collectionId}/records`;
-  const mutation={operation:'create',idempotencyKey:'consumer-record',data:{label:'A'}};
+  const path=`v1/spaces/${spaceId}/collections/${encodeURIComponent(collectionId)}/records`;
+  const mutation={operation:'create',idempotencyKey:'consumer-record',externalKey,data:{label:'A'}};
   const receipt=await request('POST',path,mutation);
   const replay=run(cli,['records','create','--collection',collectionId,'--data','{"label":"A"}',
-    '--idempotency-key','consumer-record'],{env:cliEnv});
+    '--idempotency-key','consumer-record','--key',externalKey],{env:cliEnv});
   assert(replay.receiptId===receipt.receiptId && replay.replayed===true,'CLI receipt replay parity');
   const record=run(cli,['records','get','--collection',collectionId,'--id',receipt.ref.id],{env:cliEnv});
   const direct=await request('GET',`${path}/${receipt.ref.id}`);
   assert(JSON.stringify(record)===JSON.stringify(direct),'CLI and HTTP canonical record parity');
+  const keyPath=`${path}/by-key/${encodeURIComponent(externalKey)}?mode=external`;
+  const directByKey=await request('GET',keyPath);
+  const cliByKey=run(cli,['records','key','--collection',collectionId,'--key',externalKey,
+    '--mode','external'],{env:cliEnv});
+  assert(JSON.stringify(cliByKey)===JSON.stringify(directByKey),'CLI and HTTP encoded-key parity');
   // Report success after the disposable space and processes are gone.
 } catch(error) {
   testError=error;

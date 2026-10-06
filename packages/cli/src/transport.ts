@@ -1,6 +1,8 @@
 export class StateplaneCliError extends Error {
-  constructor(readonly code:string,readonly requestId?:string,readonly retryAfter?:number) {
+  readonly retryable:boolean;
+  constructor(readonly code:string,readonly requestId?:string,readonly retryAfter?:number,retryable?:boolean) {
     super(code); this.name='StateplaneCliError';
+    this.retryable=retryable??['RECEIPT_PENDING','PROVIDER_UNAVAILABLE','BACKPRESSURE','RATE_LIMITED','STALE_PLACEMENT'].includes(code);
   }
 }
 
@@ -48,7 +50,7 @@ export class StateplaneHttpClient {
       try { value=await response.json(); }
       catch { throw new StateplaneCliError(safeRead?'PROVIDER_UNAVAILABLE':'OUTCOME_UNKNOWN'); }
       if (response.ok) return value;
-      const envelope=value as {error?:{code?:unknown;requestId?:unknown}};
+      const envelope=value as {error?:{code?:unknown;retryable?:unknown;requestId?:unknown}};
       const code=typeof envelope?.error?.code==='string' && /^[A-Z_]{1,64}$/.test(envelope.error.code)
         ? envelope.error.code : 'PROVIDER_UNAVAILABLE';
       const requestId=typeof envelope?.error?.requestId==='string' && /^[a-zA-Z0-9_-]{1,80}$/.test(envelope.error.requestId)
@@ -58,7 +60,8 @@ export class StateplaneHttpClient {
       if (safeRead && attempt<2 && [429,503].includes(response.status) && retryAfter!==undefined) {
         await this.sleep(retryAfter*1000); continue;
       }
-      throw new StateplaneCliError(code,requestId,retryAfter);
+      throw new StateplaneCliError(code,requestId,retryAfter,
+        typeof envelope?.error?.retryable==='boolean' ? envelope.error.retryable : undefined);
     }
     throw new StateplaneCliError('PROVIDER_UNAVAILABLE');
   }

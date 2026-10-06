@@ -20,9 +20,12 @@ function path(value:string):string[] {
   if (parts[0]!=='v1') fail('NOT_FOUND');
   return parts.slice(1).map(part=>{
     try {
+      // URL parsers remove dot-only segments before a Request reaches us.
+      // Semicolons are escaped by encodeURIComponent, so these two raw forms
+      // cannot collide with a literal caller identifier.
+      if (part===';.' || part===';..') return part.slice(1);
       const decoded=decodeURIComponent(part);
-      if (!decoded || decoded==='.' || decoded==='..' || decoded.includes('/') || decoded.includes('\\') ||
-          decoded.includes('\0') || decoded.length>512) fail('NOT_FOUND');
+      if (!decoded || decoded==='.' || decoded==='..' || decoded.includes('\0') || decoded.length>512) fail('NOT_FOUND');
       return decoded;
     } catch { return fail('NOT_FOUND'); }
   });
