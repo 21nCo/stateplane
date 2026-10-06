@@ -54,6 +54,7 @@ export interface RecordSort { field: string; direction: 'asc' | 'desc' }
 export interface RecordPage { records: AuthorityRecord[]; nextCursor: string | null; schemaVersion: number }
 export interface BatchItemStatus { ordinal:number; state:'pending'|'failed'|'succeeded'; attempts:number; receipt:Receipt|null; failureCode:string|null }
 export interface BatchProgress { operationKey:string; state:'active'|'cancelled'; items:BatchItemStatus[] }
+export interface EventPage { events: Array<{eventId:string;recordId:string;revision:number;operation:RecordMutation;schemaVersion:number;committedAt:string}>; nextCursor:string|null }
 interface PageCursor {
   space: string; collection: string; principal: string; credential: string;
   policy: number; placement: number; schema: number; query: string; expiresAt: number;
@@ -1140,6 +1141,43 @@ export class AuthorityTransaction {
   getRecord(recordId: string, includeTombstone = false): Promise<AuthorityRecord | null> {
     return this.admitOperation(() => this.readRecord(recordId,includeTombstone));
   }
+  /** Read only immutable event metadata; content remains subject to record access. */
+  events(cursor?:string):Promise<EventPage> {
+    return this.admitOperation(async()=>{
+      if (this.#scope.capability!=='events:read') throw new AuthorityError('FORBIDDEN');
+      if (cursor!==undefined && (!/^evt_[0-9a-f-]{36}$/.test(cursor))) throw new AuthorityError('CURSOR_INVALID');
+      const rows=await this.query(`SELECT event_id,record_id,revision,operation,schema_version,committed_at
+        FROM record_events WHERE space_id=$1 AND collection_id=$2
+          AND ($3::text IS NULL OR (committed_at,event_id)>(
+            SELECT committed_at,event_id FROM record_events WHERE event_id=$3 AND space_id=$1 AND collection_id=$2))
+        ORDER BY committed_at,event_id LIMIT 101`,[...scopeIds(this.#scope),cursor??null]);
+      if (cursor && !rows.rows.length) {
+        const found=await this.query('SELECT 1 FROM record_events WHERE event_id=$1 AND space_id=$2 AND collection_id=$3',
+          [cursor,...scopeIds(this.#scope)]);
+        if (!found.rows.length) throw new AuthorityError('CURSOR_INVALID');
+      }
+      const page=rows.rows.slice(0,100);
+      return {events:page.map(row=>({eventId:row.event_id,recordId:row.record_id,revision:Number(row.revision),
+        operation:row.operation,schemaVersion:Number(row.schema_version),committedAt:new Date(row.committed_at).toISOString()})),
+        nextCursor:rows.rows.length>100 ? page.at(-1).event_id : null};
+    });
+  }
+  /** Report the latest authoritative revision's projection state. */
+  projection(recordId:string):Promise<{state:'pending'|'current'|'degraded';generation:number;revision:number}> {
+    return this.admitOperation(async()=>{
+      if (this.#scope.capability!=='records:read') throw new AuthorityError('FORBIDDEN');
+      if (!scalarString(recordId)) throw new AuthorityError('INVALID_ARGUMENT');
+      const rows=await this.query(`SELECT r.revision,o.generation,o.delivery_state FROM records r
+        JOIN projection_outbox o ON o.space_id=r.space_id AND o.collection_id=r.collection_id
+          AND o.record_id=r.record_id AND o.revision=r.revision
+        WHERE r.space_id=$1 AND r.collection_id=$2 AND r.record_id=$3 AND NOT r.tombstone`,
+        [...scopeIds(this.#scope),recordId]);
+      const row=rows.rows[0];
+      if (!row) throw new AuthorityError('NOT_FOUND');
+      return {state:row.delivery_state==='delivered'?'current':row.delivery_state==='degraded'?'degraded':'pending',
+        generation:Number(row.generation),revision:Number(row.revision)};
+    });
+  }
   /** Apply read authorization and tombstone visibility to a record lookup. */
   private async readRecord(recordId: string, includeTombstone = false): Promise<AuthorityRecord | null> {
     if (this.#scope.capability !== 'records:read') throw new AuthorityError('FORBIDDEN');
@@ -1931,3 +1969,4 @@ export class AuthorityTransaction {
 
 export * from './spaces.js';
 export * from './cell-policy.js';
+export * from './services.js';

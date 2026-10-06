@@ -237,7 +237,8 @@ export class CollectionRegistry {
       let entry:typeof collections[number]|undefined;
       for (let i=0;i<result.rows.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
         const item=result.rows[i];
-        if (space.owner_principal_id!==scope.principalId && (!item.grant_current || !has(item.capabilities??[],scope.capability))) continue;
+        if (space.owner_principal_id!==scope.principalId && (!item.grant_current ||
+          (!has(item.capabilities??[],scope.capability) && !has(item.capabilities??[],'schema:write')))) continue;
         if (lastId!==item.collection_id) {
           entry={definition:JSON.parse(item.canonical_definition),ready:[],pending:[]};
           append(collections,entry);

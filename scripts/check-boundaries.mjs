@@ -10,8 +10,8 @@ const { parse: parseSvelte } = requireFromApp('svelte/compiler');
 const roles = new Map([
   ['contracts', []], ['application', ['contracts']], ['postgres', ['contracts', 'application']],
   ['auth', ['contracts']], ['storage', ['contracts']], ['retrieval', ['contracts']],
-  ['workers', ['application', 'contracts']], ['api', ['application', 'auth']],
-  ['mcp', ['application', 'auth']], ['cli', ['contracts']], ['testing', ['contracts']],
+  ['workers', ['application', 'contracts']], ['api', ['application', 'auth', 'contracts']],
+  ['mcp', ['application', 'auth']], ['cli', []], ['testing', ['contracts']],
   ['read-model', []]
 ]);
 

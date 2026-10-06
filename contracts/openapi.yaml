@@ -1,0 +1,239 @@
+openapi: 3.1.0
+info:
+  title: Stateplane HTTP contract
+  version: 1.0.0
+  description: >-
+    Version 1 authority operations. All content operations reauthorize the current
+    credential, space placement, collection grant and lifecycle. Mutations retain
+    caller idempotency keys. Query cursors traverse live pages, not snapshots.
+servers:
+  - url: https://stateplane.example.invalid
+security:
+  - bearer: []
+paths:
+  /v1/spaces:
+    get:
+      operationId: listSpaces
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+    post:
+      operationId: createSpace
+      requestBody: { $ref: '#/components/requestBodies/Json' }
+      responses: { '201': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}:
+    parameters: [ { $ref: '#/components/parameters/spaceId' } ]
+    get:
+      operationId: getSpace
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+    patch:
+      operationId: updateSpaceLifecycle
+      requestBody: { $ref: '#/components/requestBodies/Json' }
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+    delete:
+      operationId: deleteSpace
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections:
+    parameters: [ { $ref: '#/components/parameters/spaceId' } ]
+    get:
+      operationId: discoverCollections
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
+    get:
+      operationId: getCollectionDefinition
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+    put:
+      operationId: defineCollection
+      requestBody: { $ref: '#/components/requestBodies/Json' }
+      responses: { '201': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+    patch:
+      operationId: reviseCollection
+      parameters: [ { name: If-Match, in: header, required: true, schema: { type: integer, minimum: 1 } } ]
+      requestBody: { $ref: '#/components/requestBodies/Json' }
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/records:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
+    post:
+      operationId: mutateRecord
+      description: Create, replace, patch or delete; body includes operation and idempotencyKey.
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/RecordMutation' } }
+      responses: { '200': { $ref: '#/components/responses/Receipt' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/records/{recordId}:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { $ref: '#/components/parameters/recordId' } ]
+    get:
+      operationId: getRecord
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/records/by-key/{key}:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { name: key, in: path, required: true, schema: { type: string } }, { name: mode, in: query, required: true, schema: { enum: [generated, external] } } ]
+    get:
+      operationId: getRecordByKey
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/records/query:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
+    post:
+      operationId: queryRecords
+      description: Body has predicates, limit, optional sort and optional opaque cursor.
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/RecordQuery' } }
+      responses: { '200': { $ref: '#/components/responses/RecordPage' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/records/count:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
+    post:
+      operationId: countRecords
+      description: Body is a JSON array of typed predicates.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: array, items: { $ref: '#/components/schemas/Predicate' }, maxItems: 16 }
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/records/{recordId}/projection:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { $ref: '#/components/parameters/recordId' } ]
+    get:
+      operationId: getProjectionStatus
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/batches/{operationKey}:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { name: operationKey, in: path, required: true, schema: { type: string } } ]
+    put:
+      operationId: ingestBatch
+      description: Immutable operation key and JSON array of serialized record requests; retryFailed=true resumes failed items.
+      parameters: [ { name: retryFailed, in: query, schema: { type: boolean } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: array, minItems: 1, maxItems: 20, items: { type: string, description: Serialized record mutation without idempotencyKey } }
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+    get:
+      operationId: getBatchProgress
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+    delete:
+      operationId: cancelBatch
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/events:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
+    get:
+      operationId: listEvents
+      parameters: [ { name: cursor, in: query, schema: { type: string } } ]
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+components:
+  schemas:
+    RecordMutation:
+      type: object
+      required: [operation, idempotencyKey]
+      properties:
+        operation: { enum: [create, replace, patch, delete] }
+        idempotencyKey: { type: string, minLength: 1 }
+        id: { type: string }
+        expectedRevision: { type: integer, minimum: 1 }
+        expectedSchemaVersion: { type: integer, minimum: 1 }
+        externalKey: { type: string }
+        data: { type: object }
+        set: { type: object }
+        unset: { type: array, items: { type: string } }
+      additionalProperties: false
+      description: >-
+        Create requires data and excludes id/expectedRevision. Replace requires
+        id, expectedRevision and data. Patch requires id, expectedRevision,
+        set and unset. Delete requires id and expectedRevision. Retry unchanged
+        input with the same idempotency key after an uncertain commit.
+    Predicate:
+      type: object
+      required: [field, kind, operator]
+      properties:
+        field: { type: string }
+        kind: { enum: [null, string, number, boolean, date-time] }
+        operator: { enum: [isNull, eq, lt, lte, gt, gte, in] }
+        value: {}
+      additionalProperties: false
+    RecordQuery:
+      type: object
+      required: [predicates, limit]
+      properties:
+        predicates: { type: array, items: { $ref: '#/components/schemas/Predicate' }, maxItems: 16 }
+        limit: { type: integer, minimum: 1, maximum: 100 }
+        sort:
+          type: object
+          required: [field, direction]
+          properties:
+            field: { type: string }
+            direction: { enum: [asc, desc] }
+          additionalProperties: false
+        cursor: { type: string, minLength: 1 }
+      additionalProperties: false
+    Receipt:
+      type: object
+      required: [contractVersion, receiptId, spaceId, ref, operation, beforeRevision, revision, schemaVersion, committedAt, expiresAt, projection, replayed]
+      properties:
+        contractVersion: { const: '1' }
+        receiptId: { type: string }
+        spaceId: { type: string }
+        ref:
+          type: object
+          required: [kind, id]
+          properties: { kind: { const: record }, id: { type: string } }
+        operation: { enum: [create, replace, patch, delete] }
+        beforeRevision: { type: [integer, 'null'] }
+        revision: { type: integer, minimum: 1 }
+        schemaVersion: { type: integer, minimum: 1 }
+        committedAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        projection:
+          type: object
+          required: [generation, state]
+          properties: { generation: { type: integer }, state: { const: pending } }
+        replayed: { type: boolean }
+    RecordPage:
+      type: object
+      required: [records, nextCursor, schemaVersion]
+      properties:
+        records: { type: array, items: { type: object } }
+        nextCursor: { type: [string, 'null'] }
+        schemaVersion: { type: integer }
+  securitySchemes:
+    bearer: { type: http, scheme: bearer }
+  parameters:
+    spaceId: { name: spaceId, in: path, required: true, schema: { type: string } }
+    collectionId: { name: collectionId, in: path, required: true, schema: { type: string } }
+    recordId: { name: recordId, in: path, required: true, schema: { type: string } }
+  requestBodies:
+    Json:
+      required: true
+      content:
+        application/json: { schema: {} }
+  responses:
+    Receipt:
+      description: Canonical committed or replayed authority receipt
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/Receipt' } }
+    RecordPage:
+      description: Exact live page; nextCursor is null at end
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/RecordPage' } }
+    Json:
+      description: Canonical application result or receipt
+      content:
+        application/json: { schema: {} }
+    Error:
+      description: Stable structured error; Retry-After is supplied for bounded retryable conditions
+      headers:
+        Retry-After: { schema: { type: integer, minimum: 0 } }
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [contractVersion, error]
+            properties:
+              contractVersion: { const: '1' }
+              error:
+                type: object
+                required: [code, message, retryable, requestId]
+                properties:
+                  code: { type: string }
+                  message: { type: string }
+                  retryable: { type: boolean }
+                  requestId: { type: string }

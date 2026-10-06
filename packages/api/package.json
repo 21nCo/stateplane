@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@stateplane/application": "workspace:*",
-    "@stateplane/auth": "workspace:*"
+    "@stateplane/auth": "workspace:*",
+    "@stateplane/contracts": "workspace:*"
   }
 }

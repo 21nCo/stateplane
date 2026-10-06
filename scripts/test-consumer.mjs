@@ -12,7 +12,7 @@ function run(command, args, cwd) {
   return result.stdout.trim();
 }
 try {
-  const names = ['contracts', 'application', 'auth', 'api', 'read-model', 'postgres', 'workers'];
+  const names = ['contracts', 'application', 'auth', 'api', 'cli', 'read-model', 'postgres', 'workers'];
   const tarballs = [];
   for (const name of names) {
     const tarball = join(temp, `${name}.tgz`);
@@ -34,8 +34,23 @@ if (parseRevision(1) !== 1) throw Error('revision export failed');
 if (canonicalJsonObject('{"answer":42}') !== '{"answer":42}') throw Error('Postgres export failed');
 `);
   run('node', ['consumer.mjs'], temp);
+  const cliHelp = run(join(temp, 'node_modules/.bin/stateplane'), ['help'], temp);
+  if (JSON.parse(cliHelp).usage?.startsWith('stateplane ') !== true) throw Error('Installed CLI executable failed');
+  const cliEnv = { ...process.env, STATEPLANE_CONFIG_DIR: join(temp, 'cli-config') };
+  const installedCli = join(temp, 'node_modules/.bin/stateplane');
+  const setup = spawnSync(installedCli, ['config', 'endpoint', '--url', 'http://127.0.0.1:43210/'],
+    { cwd: temp, env: cliEnv, encoding: 'utf8' });
+  if (setup.status !== 0) throw Error(`Installed CLI configuration failed: ${setup.stderr}`);
+  const login = spawnSync(installedCli, ['auth', 'login', '--token-stdin', '--store', 'file'],
+    { cwd: temp, env: cliEnv, encoding: 'utf8', input: 'generic-consumer-token\n' });
+  if (login.status !== 0 || (login.stdout + login.stderr).includes('generic-consumer-token'))
+    throw Error('Installed CLI secure bootstrap failed');
+  const shown = spawnSync(installedCli, ['config', 'show'], { cwd: temp, env: cliEnv, encoding: 'utf8' });
+  if (shown.status !== 0 || shown.stdout.includes('generic-consumer-token') ||
+      JSON.parse(shown.stdout).endpoint !== 'http://127.0.0.1:43210/') throw Error('Installed CLI exported a secret or lost endpoint');
   await writeFile(join(temp, 'consumer.ts'), `import { parseRevision, type RecordRef, type Revision, type CollectionId, type SpaceId } from '@stateplane/contracts';
 import type { HttpDependencies } from '@stateplane/api';
+import type { StateplaneHttpClient } from '@stateplane/cli';
 import type { AuthorityScope, AuthorityTransaction, RecordChange, PostgresAuthority, Receipt } from '@stateplane/postgres';
 import type { ProjectionJob } from '@stateplane/workers';
 const ref: RecordRef | undefined = undefined;
@@ -54,7 +69,8 @@ const change: RecordChange = { operation: 'create', idempotencyKey: 'retry', req
 const receipt: Receipt = await repository.mutate(scope, change);
 // @ts-expect-error An authority mutation must include a request fingerprint.
 const unsafe: RecordChange = { operation: 'create', idempotencyKey: 'retry', canonicalData: '{}' };
-void tx; void receipt; void unsafe; void ref; void deps; void revision; void invalid;
+declare const cli: StateplaneHttpClient;
+void tx; void receipt; void unsafe; void ref; void deps; void revision; void invalid; void cli;
 `);
   await writeFile(join(temp, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'NodeNext', moduleResolution: 'NodeNext', target: 'ES2022', strict: true, skipLibCheck: true, noEmit: true }, files: ['consumer.ts'] }));
   run(process.execPath, [join(root, 'node_modules/typescript/bin/tsc'), '-p', 'tsconfig.json'], temp);

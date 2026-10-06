@@ -1,0 +1,69 @@
+import type pg from 'pg';
+import type { StateplaneServices } from '@stateplane/application';
+import type { Capability, VerifiedCredential } from '@stateplane/contracts';
+import { AuthorityError, PostgresAuthority } from './index.js';
+import type { AuthorityScope } from './index.js';
+import { CollectionRegistry } from './collections.js';
+import { PostgresSpaces } from './spaces.js';
+
+export interface ServiceCell { pool: Pick<pg.Pool,'connect'>; cursorSecret: Uint8Array }
+
+/** Composition of the existing authoritative services for HTTP consumers. */
+export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<string,ServiceCell>,
+  receiptRetentionSeconds: number): StateplaneServices {
+  async function admitted<T>(actor:VerifiedCredential,spaceId:string,collectionId:string|undefined,
+    capability:Capability,run:(pool:ServiceCell,scope:AuthorityScope)=>Promise<T>):Promise<T> {
+    const admitted=await spaces.scope(actor,spaceId,collectionId,capability);
+    const cell=cells.get(admitted.cellId);
+    if (!cell) throw new AuthorityError('STALE_PLACEMENT');
+    return run(cell,admitted.scope);
+  }
+  const authority=(cell:ServiceCell)=>new PostgresAuthority(cell.pool,receiptRetentionSeconds,cell.cursorSecret);
+  return {
+    spaces: {
+      list:actor=>spaces.list(actor), create:(actor,cellId)=>spaces.create(actor,cellId),
+      get:(actor,id)=>spaces.get(actor,id),
+      update:async(actor,id,lifecycle)=>{ await spaces.update(actor,id,lifecycle); return spaces.get(actor,id); },
+      delete:async(actor,id)=>{ await spaces.delete(actor,id); return {spaceId:id,deleted:true}; }
+    },
+    collections: {
+      list:(actor,spaceId,collectionId)=>admitted(actor,spaceId,undefined,'records:read',async(cell,scope)=>{
+        const entries=await new CollectionRegistry(cell.pool).discover(scope);
+        if (collectionId===undefined) return entries;
+        const found=entries.find(item=>item.definition.slug===collectionId);
+        if (!found) throw new AuthorityError('NOT_FOUND');
+        return found;
+      }),
+      define:(actor,spaceId,collectionId,serialized)=>admitted(actor,spaceId,collectionId,'schema:write',
+        (cell,scope)=>new CollectionRegistry(cell.pool).defineSerialized(scope,serialized)),
+      revise:(actor,spaceId,collectionId,version,serialized)=>admitted(actor,spaceId,collectionId,'schema:write',
+        (cell,scope)=>new CollectionRegistry(cell.pool).reviseSerialized(scope,version,serialized))
+    },
+    records: {
+      get:(actor,spaceId,collectionId,id)=>admitted(actor,spaceId,collectionId,'records:read',
+        (cell,scope)=>authority(cell).transaction(scope,tx=>tx.getRecord(id))),
+      byKey:(actor,spaceId,collectionId,mode,key)=>admitted(actor,spaceId,collectionId,'records:read',
+        (cell,scope)=>authority(cell).transaction(scope,tx=>tx.getByKey(mode,key))),
+      mutate:(actor,spaceId,collectionId,serialized)=>admitted(actor,spaceId,collectionId,'records:write',
+        (cell,scope)=>authority(cell).mutateSerializedRequest(scope,serialized)),
+      query:(actor,spaceId,collectionId,serialized)=>admitted(actor,spaceId,collectionId,'records:read',
+        (cell,scope)=>authority(cell).transaction(scope,tx=>tx.querySerializedPage(serialized))),
+      count:(actor,spaceId,collectionId,serialized)=>admitted(actor,spaceId,collectionId,'records:read',
+        (cell,scope)=>authority(cell).transaction(scope,tx=>tx.countSerializedRecords(serialized)))
+    },
+    batches: {
+      ingest:(actor,spaceId,collectionId,key,serialized,retryFailed)=>admitted(actor,spaceId,collectionId,'records:write',
+        (cell,scope)=>authority(cell).ingestSerializedBatch(scope,key,serialized,retryFailed)),
+      progress:(actor,spaceId,collectionId,key)=>admitted(actor,spaceId,collectionId,'records:read',
+        (cell,scope)=>authority(cell).batchProgress(scope,key)),
+      cancel:(actor,spaceId,collectionId,key)=>admitted(actor,spaceId,collectionId,'records:write',
+        (cell,scope)=>authority(cell).cancelBatch(scope,key))
+    },
+    events: {
+      list:(actor,spaceId,collectionId,cursor)=>admitted(actor,spaceId,collectionId,'events:read',
+        (cell,scope)=>authority(cell).transaction(scope,tx=>tx.events(cursor))),
+      projection:(actor,spaceId,collectionId,id)=>admitted(actor,spaceId,collectionId,'records:read',
+        (cell,scope)=>authority(cell).transaction(scope,tx=>tx.projection(id)))
+    }
+  };
+}

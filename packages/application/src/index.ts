@@ -5,3 +5,4 @@ export interface ApplicationPorts { authorizer: Authorizer; unitOfWork: UnitOfWo
 /** Bind the scaffold application to its supplied service ports. */
 export function createApplication(ports: ApplicationPorts): ApplicationPorts { return ports; }
 export * from './routing.js';
+export type { StateplaneServices } from './services.js';

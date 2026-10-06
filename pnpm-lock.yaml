@@ -138,6 +138,9 @@ importers:
       '@stateplane/auth':
         specifier: workspace:*
         version: link:../auth
+      '@stateplane/contracts':
+        specifier: workspace:*
+        version: link:../contracts
 
   packages/application:
     dependencies:
@@ -154,11 +157,7 @@ importers:
         specifier: workspace:*
         version: link:../contracts
 
-  packages/cli:
-    dependencies:
-      '@stateplane/contracts':
-        specifier: workspace:*
-        version: link:../contracts
+  packages/cli: {}
 
   packages/contracts: {}
 

@@ -27,7 +27,8 @@ test('package and CLI checks reject forbidden imports with extra call arguments'
   try {
     await mkdir(join(directory, 'packages/api/src'), { recursive: true });
     await mkdir(join(directory, 'app/src'), { recursive: true });
-    await writeFile(join(directory, 'packages/api/package.json'), JSON.stringify({ dependencies: { '@stateplane/auth': 'workspace:*', '@stateplane/application': 'workspace:*' } }));
+    await writeFile(join(directory, 'packages/api/package.json'), JSON.stringify({ dependencies: {
+      '@stateplane/auth': 'workspace:*', '@stateplane/contracts': 'workspace:*', '@stateplane/application': 'workspace:*' } }));
     await writeFile(join(directory, 'packages/api/src/index.ts'), `require('@stateplane/postgres', ignored);`);
     assert.ok((await checkBoundaries(directory)).some(problem => problem.includes('forbidden dependency')));
   } finally {

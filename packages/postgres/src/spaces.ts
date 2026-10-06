@@ -2,8 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { types } from 'node:util';
 import type pg from 'pg';
 import type { DirectoryPlacement, RoutingDirectory } from '@stateplane/application';
-import type { Capability, VerifiedCredential } from '@stateplane/contracts';
+import type { Capability, CollectionId, SpaceId, VerifiedCredential } from '@stateplane/contracts';
 import { AuthorityError, CommitOutcomeUnknownError } from './index.js';
+import type { AuthorityScope } from './index.js';
 import type { CurrentCredential } from './cell-policy.js';
 
 type PoolLike = Pick<pg.Pool, 'connect' | 'query'>;
@@ -180,6 +181,33 @@ export class PostgresSpaces {
   }
   private async current(actor: VerifiedCredential, ownerPrincipalId: string = owner(actor)): Promise<void> {
     if (!await this.credentials.current(actor,ownerPrincipalId)) throw new AuthorityError('FORBIDDEN');
+  }
+  /** Snapshot placement and provider identity for one request. The collection
+   * transaction subsequently fences policy, placement, grant and lifecycle. */
+  async scope(actor: VerifiedCredential, spaceId: string, collectionId: string | undefined,
+    capability: Capability): Promise<{cellId:string; scope:AuthorityScope}> {
+    if (!validId(spaceId) || (collectionId !== undefined && !validId(collectionId))) throw new AuthorityError('NOT_FOUND');
+    const row=(await this.control.query(`SELECT owner_principal_id,cell_id,lifecycle,policy_version,placement_generation
+      FROM space_directory WHERE space_id=$1`,[spaceId])).rows[0];
+    if (!row || row.lifecycle==='deleted' || row.lifecycle==='provisioning') throw new AuthorityError('NOT_FOUND');
+    if (actor.kind==='session' && actor.userPrincipalId!==row.owner_principal_id) throw new AuthorityError('NOT_FOUND');
+    await this.current(actor,row.owner_principal_id);
+    if (!this.cells.has(row.cell_id)) throw new AuthorityError('STALE_PLACEMENT');
+    let principalId:string=row.owner_principal_id;
+    if (actor.kind==='api-key') {
+      const active=await this.cell(row.cell_id).pool.query(`SELECT principal_id FROM space_credentials
+        WHERE space_id=$1 AND credential_id=$2 AND owner_principal_id=$3
+          AND activated_at IS NOT NULL AND confirmed_at IS NOT NULL
+          AND revoked_at IS NULL AND expires_at>clock_timestamp()`,
+        [spaceId,actor.credentialId,row.owner_principal_id]);
+      if (!active.rows.length) throw new AuthorityError('NOT_FOUND');
+      principalId=active.rows[0].principal_id;
+      if (!validId(principalId) || principalId===row.owner_principal_id) throw new AuthorityError('FORBIDDEN');
+    }
+    return {cellId:row.cell_id,scope:{spaceId:spaceId as SpaceId,
+      collectionId:collectionId as CollectionId,principalId,
+      credentialId:actor.credentialId,capability,policyVersion:safeVersion(row.policy_version),
+      placementGeneration:safeVersion(row.placement_generation)}};
   }
   private async owned(actor: VerifiedCredential, spaceId: string, includeDeleted = false,
     control: Pick<pg.Pool, 'query'> = this.control): Promise<SpaceInfo> {
