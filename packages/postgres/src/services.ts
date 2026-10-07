@@ -4,7 +4,7 @@ import type { StateplaneServices } from '@stateplane/application';
 import type { Capability, VerifiedCredential } from '@stateplane/contracts';
 import { AuthorityError, PostgresAuthority } from './index.js';
 import type { AuthorityScope } from './index.js';
-import { CollectionRegistry } from './collections.js';
+import { CollectionRegistry, discoveryGrants } from './collections.js';
 import { PostgresSpaces } from './spaces.js';
 
 export interface ServiceCell { pool: Pick<pg.Pool,'connect'>; cursorSecret: Uint8Array }
@@ -40,7 +40,7 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
     if (!cell) throw new AuthorityError('STALE_PLACEMENT');
     return run(cell,admitted.scope,async(db,result)=>{
       const discovery=collectionId===undefined && capability==='records:read';
-      const grants:Capability[]=discovery ? ['records:read','schema:write'] : [capability];
+      const grants:readonly Capability[]=discovery ? discoveryGrants(capability) : [capability];
       const discovered=result && typeof result==='object' && 'items' in result ? result.items : result;
       if (discovery && Array.isArray(discovered)) {
         await spaces.assertDiscoveryCurrent(actor,admitted.ownerPrincipalId,admitted.scope,db,

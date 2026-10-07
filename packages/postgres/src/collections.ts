@@ -1,5 +1,6 @@
 import type pg from 'pg';
 import { randomUUID } from 'node:crypto';
+import type { Capability } from '@stateplane/contracts';
 import { AuthorityError, CommitOutcomeUnknownError, type AuthorityScope } from './index.js';
 import { canonical, compatibleParsed, derivedIndexValue, MAX_INDEX_PART_BYTES, plainJson, scalarString, validateParsedDefinition } from './schema.js';
 import type { CollectionDefinition, Json } from './schema.js';
@@ -17,6 +18,13 @@ const has=(values:readonly string[],value:string)=>{
 };
 /** Append to trusted arrays without invoking a replaced push method. */
 const append=<T>(values:T[],value:T)=>{ Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
+/** Definition discovery is available to keys that can read, write or define
+ * records; other direct registry scopes retain their own grant plus schema. */
+export function discoveryGrants(capability:AuthorityScope['capability']):readonly Capability[] {
+  if (capability==='outbox:worker') return [];
+  if (capability==='records:read') return ['records:read','records:write','schema:write'];
+  return [capability,'schema:write'];
+}
 /** Merge declared paths without trusting a replaced Set or array method. */
 const declaredFields=(first:readonly string[],second:readonly string[]):string[]=>{
   const fields:string[]=[];
@@ -24,10 +32,13 @@ const declaredFields=(first:readonly string[],second:readonly string[]):string[]
   for (let i=0;i<second.length;i++) if (!has(fields,second[i])) append(fields,second[i]); // NOSONAR -- own-slot scan avoids replaced array iterators
   return fields;
 };
-const visibleDiscoveryRow=(item:pg.QueryResultRow,space:pg.QueryResultRow,scope:AuthorityScope):boolean=>
-  space.owner_principal_id===scope.principalId ||
-    (item.grant_current &&
-      (has(item.capabilities??[],scope.capability) || has(item.capabilities??[],'schema:write')));
+const visibleDiscoveryRow=(item:pg.QueryResultRow,space:pg.QueryResultRow,scope:AuthorityScope):boolean=>{
+  if (space.owner_principal_id===scope.principalId) return true;
+  if (!item.grant_current) return false;
+  for (const capability of discoveryGrants(scope.capability))
+    if (has(item.capabilities??[],capability)) return true;
+  return false;
+};
 /** Assemble only authorized definitions after the scoped SQL read completes. */
 function discoveredDefinitions(rows:pg.QueryResultRow[],space:pg.QueryResultRow,scope:AuthorityScope):
   Array<{definition:CollectionDefinition;ready:string[];pending:string[]}> {
@@ -265,8 +276,7 @@ export class CollectionRegistry {
         WHERE c.space_id=$1 AND c.lifecycle<>'deleted' AND c.collection_id>$3
           AND (c.space_id=$1 AND ($4::boolean OR (grant_check.expires_at IS NULL OR
             grant_check.expires_at>clock_timestamp()) AND
-            (grant_check.capabilities @> ARRAY[$5::text] OR
-             grant_check.capabilities @> ARRAY['schema:write']::text[])))
+            grant_check.capabilities && $5::text[]))
         ORDER BY c.collection_id LIMIT 9)
         SELECT c.collection_id,v.canonical_definition,ix.ready_fields,ix.pending_fields,
           g.capabilities,(g.expires_at IS NULL OR g.expires_at>clock_timestamp()) AS grant_current
@@ -288,7 +298,7 @@ export class CollectionRegistry {
         WHERE c.space_id=$1 AND c.lifecycle<>'deleted' AND c.collection_id=$3 ORDER BY c.collection_id`;
       const result=await client.query(page,
       requestedCollection===undefined ? [scope.spaceId,scope.credentialId,after,
-        space.owner_principal_id===scope.principalId,scope.capability] :
+        space.owner_principal_id===scope.principalId,discoveryGrants(scope.capability)] :
         [scope.spaceId,scope.credentialId,requestedCollection]);
       return discoveredDefinitions(result.rows,space,scope as AuthorityScope);
     });

@@ -23,27 +23,37 @@ function host(env:Bindings):((request:Request)=>Promise<Response>) | undefined {
       !env.STATEPLANE_TEST_TOKEN || env.STATEPLANE_TEST_TOKEN.length<32 ||
       !env.STATEPLANE_TEST_OWNER || !env.STATEPLANE_TEST_CREDENTIAL ||
       !env.STATEPLANE_TEST_CURSOR_SECRET || !/^[0-9a-fA-F]{64,}$/.test(env.STATEPLANE_TEST_CURSOR_SECRET)) return clearHost();
+  if ((env.STATEPLANE_TEST_AGENT_TOKEN || env.STATEPLANE_TEST_AGENT_CREDENTIAL) &&
+      (!env.STATEPLANE_TEST_AGENT_TOKEN || env.STATEPLANE_TEST_AGENT_TOKEN.length<32 ||
+       !env.STATEPLANE_TEST_AGENT_CREDENTIAL)) return clearHost();
   const connectionString=env.AUTHORITY?.connectionString ?? env.STATEPLANE_TEST_DATABASE_URL;
   if (!connectionString) return clearHost();
   const cellId=env.STATEPLANE_TEST_CELL_ID??'cell-a';
   const storageTargetId=env.STATEPLANE_TEST_STORAGE_TARGET??'target-a';
   const key=createHash('sha256').update(JSON.stringify([connectionString,cellId,storageTargetId,
     env.STATEPLANE_TEST_TOKEN,env.STATEPLANE_TEST_OWNER,env.STATEPLANE_TEST_CREDENTIAL,
-    env.STATEPLANE_TEST_CURSOR_SECRET])).digest('hex');
+    env.STATEPLANE_TEST_CURSOR_SECRET,env.STATEPLANE_TEST_AGENT_TOKEN,
+    env.STATEPLANE_TEST_AGENT_CREDENTIAL])).digest('hex');
   if (!env.AUTHORITY && cached?.key===key) return cached.handler;
   const pool=new pg.Pool({connectionString,max:4});
   const tokenDigest=createHash('sha256').update(env.STATEPLANE_TEST_TOKEN).digest();
+  const agentDigest=env.STATEPLANE_TEST_AGENT_TOKEN ?
+    createHash('sha256').update(env.STATEPLANE_TEST_AGENT_TOKEN).digest() : null;
   const actor={kind:'session' as const,userPrincipalId:env.STATEPLANE_TEST_OWNER,
     credentialId:env.STATEPLANE_TEST_CREDENTIAL};
+  const agent=env.STATEPLANE_TEST_AGENT_CREDENTIAL ?
+    {kind:'api-key' as const,credentialId:env.STATEPLANE_TEST_AGENT_CREDENTIAL} : null;
   const identity={
     verify:(request:Request)=>{
       const bearer=request.headers.get('authorization');
       if (!bearer?.startsWith('Bearer ')) return Promise.resolve(null);
       const candidate=createHash('sha256').update(bearer.slice(7)).digest();
-      return Promise.resolve(timingSafeEqual(candidate,tokenDigest) ? actor : null);
+      if (timingSafeEqual(candidate,tokenDigest)) return Promise.resolve(actor);
+      return Promise.resolve(agent && agentDigest && timingSafeEqual(candidate,agentDigest) ? agent : null);
     },
     current:(claims:{credentialId:string},owner?:string)=>
-      Promise.resolve(claims.credentialId===actor.credentialId && (owner===undefined || owner===actor.userPrincipalId))
+      Promise.resolve((claims.credentialId===actor.credentialId ||
+        claims.credentialId===agent?.credentialId) && (owner===undefined || owner===actor.userPrincipalId))
   };
   const cells=new Map([[cellId,{pool,storageTargetId}]]);
   const spaces=new PostgresSpaces(pool,cells,cellId,{

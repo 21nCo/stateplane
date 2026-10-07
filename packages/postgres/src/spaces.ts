@@ -43,6 +43,8 @@ export interface SpaceAuditPage { entries: ReadonlyArray<Record<string, unknown>
 export interface SpacePage { items: ReadonlyArray<SpaceInfo>; cursor: string | null }
 const spacePageSize = 8;
 const spaceCursorLifetimeMs = 15 * 60_000;
+// Allow a bounded issuing-node clock lead during cross-instance pagination.
+const spaceCursorFutureSkewMs = 60_000;
 /** A fixed cap bounds one owner audit read even when audit history is retained after deletion. */
 const auditPageSize = 100;
 const capabilities = new Set<Capability>(['schema:write','records:read','records:write','sources:read','sources:write','claims:read','claims:write','claims:review','events:read','export:read','space:admin']);
@@ -200,11 +202,13 @@ export class PostgresSpaces {
       const expected=this.spaceCursorMac(envelope[0],secret);
       if (!timingSafeEqual(expected,Buffer.from(envelope[1],'hex'))) throw new Error('Invalid signature');
       const value:unknown=JSON.parse(envelope[0]);
+      const now=Date.now();
       if (!Array.isArray(value) || value.length!==5 || value[0]!==owner(actor) ||
         value[1]!==actor.credentialId || typeof value[2]!=='string' ||
         !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/.test(value[2]) ||
         !validId(value[3]) || typeof value[4]!=='number' || !Number.isSafeInteger(value[4]) ||
-        value[4]>Date.now() || Date.now()-value[4]>spaceCursorLifetimeMs) throw new Error('Invalid scope or age');
+        value[4]>now+spaceCursorFutureSkewMs || now-value[4]>spaceCursorLifetimeMs)
+        throw new Error('Invalid scope or age');
       return {time:value[2],id:value[3],issued:value[4]};
     } catch { throw new AuthorityError('CURSOR_INVALID'); }
   }

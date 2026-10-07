@@ -8,6 +8,8 @@ declare global {
         STATEPLANE_TEST_TOKEN?: string;
         STATEPLANE_TEST_OWNER?: string;
         STATEPLANE_TEST_CREDENTIAL?: string;
+        STATEPLANE_TEST_AGENT_TOKEN?: string;
+        STATEPLANE_TEST_AGENT_CREDENTIAL?: string;
         STATEPLANE_TEST_DATABASE_URL?: string;
         STATEPLANE_TEST_CURSOR_SECRET?: string;
         STATEPLANE_TEST_CELL_ID?: string;

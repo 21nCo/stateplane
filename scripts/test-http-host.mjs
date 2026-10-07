@@ -6,6 +6,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { existsSync } from 'node:fs';
+import pg from 'pg';
 
 const root=resolve(import.meta.dirname,'..');
 const pnpmCli=process.env.npm_execpath;
@@ -24,6 +25,8 @@ const port=reservation.address().port;
 reservation.close(); await once(reservation,'close');
 const endpoint=`http://127.0.0.1:${port}/`;
 const token=randomBytes(32).toString('hex');
+const agentToken=randomBytes(32).toString('hex');
+const agentCredential=`agent-${randomUUID()}`;
 const spaceId=`sp_${randomUUID()}`;
 const collectionId='entries/path';
 const externalKey='key/part';
@@ -31,19 +34,21 @@ const temp=await mkdtemp(join(tmpdir(),'stateplane-host-consumer-'));
 const appEnv={...process.env,STATEPLANE_ENV:'local',STATEPLANE_TEST_HTTP:'1',
   STATEPLANE_TEST_DATABASE_URL:databaseUrl,STATEPLANE_TEST_TOKEN:token,
   STATEPLANE_TEST_OWNER:`owner-${randomUUID()}`,STATEPLANE_TEST_CREDENTIAL:`session-${randomUUID()}`,
+  STATEPLANE_TEST_AGENT_TOKEN:agentToken,STATEPLANE_TEST_AGENT_CREDENTIAL:agentCredential,
   STATEPLANE_TEST_CURSOR_SECRET:randomBytes(32).toString('hex')};
 const app=spawn(process.execPath,[join(root,'app/node_modules/vite/bin/vite.js'),'dev','--host','127.0.0.1',
   '--port',String(port),'--strictPort'],{cwd:join(root,'app'),env:appEnv,stdio:'ignore'});
 const cliEnv={...process.env,STATEPLANE_CONFIG_DIR:join(temp,'config')};
 let cleanupError;
 let testError;
+let fixturePool;
 function run(command,args,options={}) {
   const result=spawnSync(command,args,{cwd:temp,encoding:'utf8',...options});
   if (result.status!==0) throw new Error(`${command} failed: ${result.stderr}`);
   return JSON.parse(result.stdout);
 }
-async function request(method,path,body) {
-  const response=await fetch(endpoint+path,{method,headers:{Authorization:`Bearer ${token}`,
+async function request(method,path,body,credential=token) {
+  const response=await fetch(endpoint+path,{method,headers:{Authorization:`Bearer ${credential}`,
     ...(body===undefined?{}:{'Content-Type':'application/json'})},
     body:body===undefined?undefined:JSON.stringify(body)});
   const value=await response.json();
@@ -95,10 +100,55 @@ try {
   const cliByKey=runCli(['records','key','--collection',collectionId,'--key',externalKey,
     '--mode','external'],{env:cliEnv});
   assert(JSON.stringify(cliByKey)===JSON.stringify(directByKey),'CLI and HTTP encoded-key parity');
+  for (let index=0;index<9;index++) {
+    const slug=`entries_${String(index).padStart(2,'0')}`;
+    await request('PUT',`v1/spaces/${spaceId}/collections/${slug}`,{...definition,slug});
+  }
+  fixturePool=new pg.Pool({connectionString:databaseUrl,max:1});
+  await fixturePool.query(`INSERT INTO space_credentials(space_id,credential_id,principal_id,owner_principal_id,
+    expires_at,activated_at,confirmed_at)
+    VALUES($1,$2,$3,$4,clock_timestamp()+interval '1 hour',clock_timestamp(),clock_timestamp())`,
+  [spaceId,agentCredential,`agent-principal-${randomUUID()}`,appEnv.STATEPLANE_TEST_OWNER]);
+  for (const slug of [collectionId,...Array.from({length:9},(_,index)=>`entries_${String(index).padStart(2,'0')}`)])
+    await fixturePool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
+      VALUES($1,$2,$3,ARRAY['records:write']::text[])`,[spaceId,slug,agentCredential]);
+  runCli(['auth','login','--token-stdin','--store','file'],{env:cliEnv,input:`${agentToken}\n`});
+  const agentFirst=await request('GET',`v1/spaces/${spaceId}/collections`,undefined,agentToken);
+  assert(JSON.stringify(runCli(['collections','list'],{env:cliEnv}))===JSON.stringify(agentFirst),
+    'installed CLI write-only discovery matches HTTP first page');
+  assert(agentFirst.items.length===8 && typeof agentFirst.cursor==='string','write-only page bound');
+  const agentNext=await request('GET',
+    `v1/spaces/${spaceId}/collections?cursor=${encodeURIComponent(agentFirst.cursor)}`,undefined,agentToken);
+  assert(JSON.stringify(runCli(['collections','list','--cursor',agentFirst.cursor],{env:cliEnv}))===JSON.stringify(agentNext),
+    'installed CLI write-only continuation matches HTTP');
+  const agentSelected=await request('GET',
+    `v1/spaces/${spaceId}/collections/${encodeURIComponent(collectionId)}`,undefined,agentToken);
+  assert(JSON.stringify(runCli(['collections','get','--collection',collectionId],{env:cliEnv}))===
+    JSON.stringify(agentSelected),'installed CLI write-only selected definition matches HTTP');
+  const deniedRead=spawnSync(process.execPath,[cli,'records','get','--collection',collectionId,
+    '--id',receipt.ref.id],{cwd:temp,env:cliEnv,encoding:'utf8'});
+  assert(deniedRead.status!==0 && `${deniedRead.stdout}${deniedRead.stderr}`.includes('FORBIDDEN'),
+    'write-only CLI cannot read records');
+  await fixturePool.query(`UPDATE space_credentials SET revoked_at=clock_timestamp()
+    WHERE space_id=$1 AND credential_id=$2`,[spaceId,agentCredential]);
+  const deniedPage=spawnSync(process.execPath,[cli,'collections','list','--cursor',agentFirst.cursor],
+    {cwd:temp,env:cliEnv,encoding:'utf8'});
+  assert(deniedPage.status!==0 && !`${deniedPage.stdout}${deniedPage.stderr}`.includes(agentToken),
+    'revoked write-only CLI continuation is denied without exposing its token');
   // Report success after the disposable space and processes are gone.
 } catch(error) {
   testError=error;
 } finally {
+  // This synthetic agent key has no provider backing; remove it before the
+  // real space erasure flow asks the provider to revoke remaining keys.
+  try {
+    if (fixturePool) {
+      await fixturePool.query('DELETE FROM collection_grants WHERE space_id=$1 AND credential_id=$2',
+        [spaceId,agentCredential]);
+      await fixturePool.query('DELETE FROM space_credentials WHERE space_id=$1 AND credential_id=$2',
+        [spaceId,agentCredential]);
+    }
+  } catch(error) { cleanupError=error; }
   // The create response can be lost after COMMIT. Reconcile the selected ID
   // before cleanup, including when the command failed before seeing a receipt.
   try {
@@ -111,6 +161,7 @@ try {
       cleanupError=new Error(`HTTP cleanup lookup failed: ${lookup.status}`);
     }
   } catch(error) { cleanupError=error; }
+  try { await fixturePool?.end(); } catch(error) { cleanupError ??= error; }
   app.kill('SIGTERM');
   await Promise.race([once(app,'close'),new Promise(resolve=>setTimeout(resolve,3000))]);
   if (app.exitCode===null) app.kill('SIGKILL');

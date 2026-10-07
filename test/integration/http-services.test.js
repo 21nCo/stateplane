@@ -76,6 +76,17 @@ test('space discovery pages bound directory work and reauthorize each continuati
     find:async()=>null,revoke:async()=>{}},verifier,secret);
   assert.equal((await sibling.listPage(owner,page1.cursor)).items.length,8,
     'a continuation must work on another instance using the shared key');
+  try {
+    Date.now=()=>actualNow()+30_000;
+    assert.equal((await sibling.listPage(owner,page1.cursor)).items.length,8,
+      'a faster receiving instance retains the cursor within its age limit');
+    Date.now=()=>actualNow()-30_000;
+    assert.equal((await sibling.listPage(owner,page1.cursor)).items.length,8,
+      'a slower instance must accept a fresh cursor from a faster issuer');
+    Date.now=()=>actualNow()-61_000;
+    await assert.rejects(sibling.listPage(owner,page1.cursor),{code:'CURSOR_INVALID'},
+      'a cursor too far in the future remains invalid');
+  } finally { Date.now=actualNow; }
   const unconfigured=new PostgresSpaces(pool,cells,'cell-a',{create:async()=>{throw Error('unused');},
     find:async()=>null,revoke:async()=>{}},verifier);
   await assert.rejects(unconfigured.listPage(owner),/Shared space cursor secret/);
@@ -387,6 +398,37 @@ test('collection discovery checks one provider snapshot and set of grants',async
   assert.equal(selected.status,200);
   assert.equal((await selected.json()).definition.slug,names[0]);
   assert.equal(definitionRows,1,'one-collection HTTP lookup fetches only its definition');
+  await pool.query(`UPDATE collection_grants SET capabilities=ARRAY['records:write']::text[]
+    WHERE space_id=$1 AND credential_id=$2`,[spaceId,agent.credentialId]);
+  const writeFirst=await route('GET',`/v1/spaces/${spaceId}/collections`,undefined,'fixture-agent-key');
+  assert.equal(writeFirst.status,200);
+  const writePage=await writeFirst.json();
+  assert.deepEqual(writePage.items.map(item=>item.definition.slug),names.slice(0,8));
+  const writeNext=await route('GET',
+    `/v1/spaces/${spaceId}/collections?cursor=${encodeURIComponent(writePage.cursor)}`,
+    undefined,'fixture-agent-key');
+  assert.equal(writeNext.status,200);
+  assert.deepEqual((await writeNext.json()).items.map(item=>item.definition.slug),[names[8],names[9],names[11]]);
+  assert.equal((await route('GET',`/v1/spaces/${spaceId}/collections/${names[0]}`,
+    undefined,'fixture-agent-key')).status,200);
+  assert.equal((await route('GET',`/v1/spaces/${spaceId}/collections/${names[0]}/records/missing`,
+    undefined,'fixture-agent-key')).status,403,'discovery does not authorize record reads');
+  await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '800 milliseconds'
+    WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[spaceId,names[0],agent.credentialId]);
+  let finalChecks=0;
+  currentProbe=async()=>{
+    if (++finalChecks===2) await new Promise(resolve=>setTimeout(resolve,1000));
+    return true;
+  };
+  assert.equal((await route('GET',`/v1/spaces/${spaceId}/collections/${names[0]}`,
+    undefined,'fixture-agent-key')).status,403,'write-only grant expiry is checked before response');
+  assert.equal(finalChecks,2);
+  currentProbe=()=>current;
+  await pool.query(`UPDATE space_credentials SET revoked_at=clock_timestamp()
+    WHERE space_id=$1 AND credential_id=$2`,[spaceId,agent.credentialId]);
+  assert.notEqual((await route('GET',
+    `/v1/spaces/${spaceId}/collections?cursor=${encodeURIComponent(writePage.cursor)}`,
+    undefined,'fixture-agent-key')).status,200,'revoked key cannot continue discovery');
 });
 
 test('event continuation survives two writers whose transactions finish in opposite order',async t=>{

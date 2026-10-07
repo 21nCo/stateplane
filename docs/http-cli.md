@@ -129,6 +129,10 @@ page with a non-null cursor; continue rather than treating that page as the end.
 Cursors are bound to the owner and credential, expire after 15 minutes, and
 traverse live directory state rather than a snapshot. An invalid, expired or
 cross-credential cursor returns `CURSOR_INVALID`; restart from the first page.
+Receiving instances allow up to 60 seconds of issuing-node clock lead. The
+15-minute age check still uses the signed issue time; node clocks need
+synchronization within this allowance. This is a protective operational choice,
+not a measured Cloudflare clock-skew guarantee.
 The eight-item cap matches collection discovery and limits a request to nine
 ordered directory candidates and at most eight provisioning recovery attempts.
 All HTTP instances serving one control directory must use the same private
@@ -215,6 +219,8 @@ non-null cursor to the next `collections list --cursor` call. An empty or
 malformed supplied cursor returns `CURSOR_INVALID`; omitting `--cursor`
 requests the first page. Each page checks current space and
 collection grants, so a revoked collection cannot appear on a later page.
+Read, write and schema grants each permit definition discovery; a write-only
+grant does not permit reading records.
 The eight-definition cap bounds a page to roughly eight 1 MiB definitions,
 plus metadata, and is a protective limit rather than measured Worker capacity.
 Keep the CLI timeout above the
