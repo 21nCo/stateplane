@@ -1074,7 +1074,7 @@ test('owner recovery waits for a live create and cannot retire its reserved dire
     },release:discard => client.release(discard)};
   },query:async (sql,...args) => {
     const result=await controlPool.query(sql,...args);
-    if (typeof sql === 'string' && sql.includes("lifecycle='provisioning' ORDER BY")) sawPending();
+    if (typeof sql === 'string' && sql.includes("owner_principal_id=$1 AND lifecycle<>'deleted'")) sawPending();
     return result;
   }};
   const gatedCell={storageTargetId:'target-a',pool:{query:(...args) => pool.query(...args),
@@ -1203,7 +1203,7 @@ test('selected retry races lease recovery under one directory lock', async () =>
   const proceed=new Promise(resolve=>{release=resolve;});
   const racingControl={connect:()=>controlPool.connect(),query:async(sql,...args)=>{
     const result=await controlPool.query(sql,...args);
-    if (String(sql).includes("lifecycle='provisioning' ORDER BY created_at")) {
+    if (String(sql).includes("owner_principal_id=$1 AND lifecycle<>'deleted'")) {
       signal();await proceed;
     }
     return result;

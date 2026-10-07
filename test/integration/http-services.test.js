@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { createHttpHandler } from '../../packages/api/dist/index.js';
 import { PostgresAuthority, CollectionRegistry, PostgresSpaces, postgresServices } from '../../packages/postgres/dist/index.js';
@@ -25,6 +25,69 @@ const handler=createHttpHandler({services,identity});
 const route=async(method,path,body,token='fixture-token')=>handler(new Request(`https://stateplane.example.invalid${path}`,{
   method,headers:{Authorization:`Bearer ${token}`,...(body===undefined?{}:{'Content-Type':'application/json'})},
   body:body===undefined?undefined:JSON.stringify(body)}));
+
+test('space discovery pages bound directory work and reauthorize each continuation',async t=>{
+  const prefix=`sta9-page-${randomUUID()}`;
+  const owner={kind:'session',userPrincipalId:`owner-${randomUUID()}`,credentialId:`session-${randomUUID()}`};
+  const secret=randomBytes(32);
+  let live=true;
+  const verifier={verify:async()=>owner,current:async()=>live};
+  const listing=new PostgresSpaces(pool,cells,'cell-a',{create:async()=>{throw Error('unused');},
+    find:async()=>null,revoke:async()=>{}},verifier,secret);
+  const endpoint=createHttpHandler({services:postgresServices(listing,new Map(),3600),identity:verifier});
+  const get=cursor=>endpoint(new Request(`https://stateplane.example.invalid/v1/spaces${cursor===undefined?'':`?cursor=${encodeURIComponent(cursor)}`}`));
+  t.after(async()=>{
+    live=true;
+    await pool.query('DELETE FROM space_directory WHERE space_id LIKE $1',[`${prefix}%`]);
+  });
+  await pool.query(`INSERT INTO space_directory(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,lifecycle,created_at)
+    SELECT $1 || '-' || lpad(n::text,3,'0'),$2,'cell-a','cell-a','target-a','active',
+      '2026-01-01T00:00:00Z'::timestamptz+n*interval '2 microseconds' FROM generate_series(0,54) n`,
+  [prefix,owner.userPrincipalId]);
+  await pool.query(`INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,lifecycle,created_at,provisioning_lease_until)
+    VALUES($1,$2,'cell-a','target-a','provisioning','2026-01-01T00:00:00Z'::timestamptz+interval '5 microseconds',clock_timestamp()+interval '1 hour')`,
+  [`${prefix}-pending`,owner.userPrincipalId]);
+  await pool.query(`INSERT INTO space_directory(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,lifecycle,created_at)
+    VALUES($1,'foreign-owner','cell-a','cell-a','target-a','active','2026-01-01T00:00:00Z')`,[`${prefix}-foreign`]);
+  const first=await get();
+  assert.equal(first.status,200);
+  const page1=await first.json();
+  assert.equal(page1.items.length,7,'one pending reservation consumes one bounded scan slot');
+  assert.equal(typeof page1.cursor,'string');
+  assert.ok(page1.items.every(item=>item.ownerPrincipalId===owner.userPrincipalId));
+  assert.equal((await pool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1',
+    [`${prefix}-pending`])).rows[0].lifecycle,'provisioning');
+  await pool.query('UPDATE space_directory SET owner_principal_id=$2 WHERE space_id=$1',
+    [`${prefix}-054`,'changed-owner']);
+  const listed=[...page1.items];
+  let next=page1.cursor;
+  let pages=1;
+  while (next) {
+    const response=await get(next);
+    assert.equal(response.status,200);
+    const page=await response.json();
+    assert.ok(page.items.length<=8);
+    listed.push(...page.items);
+    next=page.cursor;
+    pages++;
+    assert.ok(pages<=8,'continuation must advance through 56 candidates');
+  }
+  assert.equal(new Set(listed.map(item=>item.spaceId)).size,54);
+  for (const bad of ['!',page1.cursor+'x']) {
+    const response=await get(bad);
+    assert.equal(response.status,400);
+    assert.equal((await response.json()).error.code,'CURSOR_INVALID');
+  }
+  await assert.rejects(listing.listPage({...owner,credentialId:'other-credential'},page1.cursor),{code:'CURSOR_INVALID'});
+  await assert.rejects(listing.listPage({...owner,userPrincipalId:'other-owner'},page1.cursor),{code:'CURSOR_INVALID'});
+  const [body]=JSON.parse(Buffer.from(page1.cursor,'base64url').toString('utf8'));
+  const old=JSON.parse(body);old[4]=Date.now()-16*60_000;
+  const expiredBody=JSON.stringify(old);
+  const expired=Buffer.from(JSON.stringify([expiredBody,createHmac('sha256',secret).update(expiredBody).digest('hex')])).toString('base64url');
+  assert.equal((await (await get(expired)).json()).error.code,'CURSOR_INVALID');
+  live=false;
+  assert.equal((await (await get(page1.cursor)).json()).error.code,'FORBIDDEN');
+});
 
 test('real Postgres HTTP operations preserve receipts, grant checks, events and batch progress',async t=>{
   const created=await route('POST','/v1/spaces',{spaceId:`sp_${randomUUID()}`});

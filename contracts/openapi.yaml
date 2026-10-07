@@ -32,7 +32,20 @@ paths:
   /v1/spaces:
     get:
       operationId: listSpaces
-      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+      description: Returns at most eight owner spaces per page. Each page rechecks the current credential; pending provisioning rows may yield a short or empty page with a continuation. Cursors are scoped to the owner and credential and expire after 15 minutes.
+      parameters: [ { name: cursor, in: query, schema: { type: string }, description: Opaque continuation from the prior page } ]
+      responses:
+        '200':
+          description: Bounded owner space page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, cursor]
+                properties:
+                  items: { type: array, maxItems: 8, items: { type: object } }
+                  cursor: { type: [string, 'null'] }
+        default: { $ref: '#/components/responses/Error' }
     post:
       operationId: createSpace
       description: Caller supplies a stable sp_ UUID for recovery after a lost response; repeat the same ID and cell selection.

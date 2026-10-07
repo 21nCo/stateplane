@@ -55,7 +55,7 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
     new PostgresAuthority(cell.pool,receiptRetentionSeconds,cell.cursorSecret,30_000,recheck);
   return {
     spaces: {
-      list:actor=>spaces.list(actor), create:(actor,cellId,spaceId)=>spaces.create(actor,cellId,spaceId),
+      list:(actor,cursor)=>spaces.listPage(actor,cursor), create:(actor,cellId,spaceId)=>spaces.create(actor,cellId,spaceId),
       get:(actor,id)=>spaces.get(actor,id),
       update:(actor,id,lifecycle)=>spaces.update(actor,id,lifecycle),
       delete:async(actor,id)=>{ await spaces.delete(actor,id); return {spaceId:id,deleted:true}; }

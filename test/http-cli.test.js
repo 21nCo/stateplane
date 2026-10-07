@@ -119,6 +119,15 @@ test('HTTP and installed CLI observe the same receipt; revocation and cursor err
   assert.equal((await stat(join(cliRoot,'token'))).mode&0o077,0);
   const selected=await cli(['spaces','select','--space','sp_a']);
   assert.equal(selected.status,0,selected.stderr);
+  state.services.spaces.list=async(_actor,cursor)=>({items:[{spaceId:cursor?'sp_next':'sp_first'}],
+    cursor:cursor?null:'space-next'});
+  const httpSpaces=await (await fetch(new URL('v1/spaces?cursor=space-next',endpoint),{
+    headers:{Authorization:'Bearer secret-test-token'}})).json();
+  const cliSpaces=await cli(['spaces','list','--cursor','space-next']);
+  assert.equal(cliSpaces.status,0,cliSpaces.stderr);
+  assert.deepEqual(JSON.parse(cliSpaces.stdout),httpSpaces);
+  const emptySpaceCursor=await cli(['spaces','list','--cursor','']);
+  assert.equal(JSON.parse(emptySpaceCursor.stderr).error.code,'CURSOR_INVALID');
   state.services.collections.list=async(_actor,space,collection,cursor)=>{
     assert.equal(space,'sp_a');
     assert.equal(collection,undefined);

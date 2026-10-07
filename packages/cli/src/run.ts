@@ -37,7 +37,7 @@ const common=['json'];
 const allowed:Record<string,readonly string[]>={
   'config endpoint':['url'], 'config show':[],
   'auth login':['token-stdin','store','timeout'], 'auth import':['token-stdin','store'], 'auth logout':[],
-  'spaces select':['space'], 'spaces list':[], 'spaces create':['cell','space'],
+  'spaces select':['space'], 'spaces list':['cursor'], 'spaces create':['cell','space'],
   'spaces get':['space'], 'spaces update':['space','lifecycle'], 'spaces delete':['space'],
   'collections list':['space','cursor'], 'collections get':['space','collection'],
   'collections define':['space','collection','data','file'],
@@ -164,7 +164,7 @@ async function runAuth(action:string|undefined,flags:Flags,config:CliConfig):Pro
 }
 
 async function runSpaces(client:StateplaneHttpClient,action:string|undefined,flags:Flags,spacePath:string):Promise<unknown> {
-  if (action==='list') return client.request('GET','/v1/spaces');
+  if (action==='list') return client.request('GET',`/v1/spaces${flags.cursor!==undefined ? `?cursor=${encoded(cursor(flags))}` : ''}`);
   if (action==='create') return client.request('POST','/v1/spaces',
     withinWireBudget({spaceId:required(flags,'space'),...(flags.cell ? {cellId:flags.cell}:{})},4096));
   if (action==='get' && spacePath) return client.request('GET',spacePath);

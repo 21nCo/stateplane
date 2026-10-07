@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { types } from 'node:util';
 import type pg from 'pg';
 import type { DirectoryPlacement, RoutingDirectory } from '@stateplane/application';
@@ -40,6 +40,9 @@ class CompletionOutcomeUnknownError extends Error {
   constructor(cause: unknown) { super('Journal completion outcome unknown',{cause}); }
 }
 export interface SpaceAuditPage { entries: ReadonlyArray<Record<string, unknown>>; nextCursor: string | null }
+export interface SpacePage { items: ReadonlyArray<SpaceInfo>; cursor: string | null }
+const spacePageSize = 8;
+const spaceCursorLifetimeMs = 15 * 60_000;
 /** A fixed cap bounds one owner audit read even when audit history is retained after deletion. */
 const auditPageSize = 100;
 const capabilities = new Set<Capability>(['schema:write','records:read','records:write','sources:read','sources:write','claims:read','claims:write','claims:review','events:read','export:read','space:admin']);
@@ -171,8 +174,37 @@ export class PostgresRoutingDirectory implements RoutingDirectory {
 export class PostgresSpaces {
   constructor(private readonly control: PoolLike, private readonly cells: ReadonlyMap<string, CellDatabase>,
     private readonly defaultCellId: string, private readonly keys: AgentKeyProvider,
-    private readonly credentials: CurrentCredential) {
+    private readonly credentials: CurrentCredential,
+    private readonly cursorSecret: Uint8Array = randomBytes(32)) {
     if (!cells.has(defaultCellId)) throw new Error('Default cell is not configured');
+    if (cursorSecret.byteLength < 32) throw new Error('Space cursor secret must have at least 32 bytes');
+  }
+  private spaceCursorMac(value: string): Buffer {
+    return createHmac('sha256',this.cursorSecret).update(value).digest();
+  }
+  private spaceCursor(actor: VerifiedCredential, time: string, id: string, issued: number): string {
+    const body=JSON.stringify([owner(actor),actor.credentialId,time,id,issued]);
+    return Buffer.from(JSON.stringify([body,this.spaceCursorMac(body).toString('hex')])).toString('base64url');
+  }
+  private spaceAfter(actor: VerifiedCredential, cursor?: string): {time:string;id:string;issued:number}|null {
+    if (cursor===undefined) return null;
+    if (!/^[A-Za-z0-9_-]{1,16384}$/.test(cursor)) throw new AuthorityError('CURSOR_INVALID');
+    try {
+      const decoded=Buffer.from(cursor,'base64url').toString('utf8');
+      if (Buffer.from(decoded).toString('base64url')!==cursor) throw new Error('Noncanonical cursor');
+      const envelope:unknown=JSON.parse(decoded);
+      if (!Array.isArray(envelope) || envelope.length!==2 || typeof envelope[0]!=='string' ||
+        typeof envelope[1]!=='string' || !/^[0-9a-f]{64}$/.test(envelope[1])) throw new Error('Invalid cursor');
+      const expected=this.spaceCursorMac(envelope[0]);
+      if (!timingSafeEqual(expected,Buffer.from(envelope[1],'hex'))) throw new Error('Invalid signature');
+      const value:unknown=JSON.parse(envelope[0]);
+      if (!Array.isArray(value) || value.length!==5 || value[0]!==owner(actor) ||
+        value[1]!==actor.credentialId || typeof value[2]!=='string' ||
+        !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/.test(value[2]) ||
+        !validId(value[3]) || typeof value[4]!=='number' || !Number.isSafeInteger(value[4]) ||
+        value[4]>Date.now() || Date.now()-value[4]>spaceCursorLifetimeMs) throw new Error('Invalid scope or age');
+      return {time:value[2],id:value[3],issued:value[4]};
+    } catch { throw new AuthorityError('CURSOR_INVALID'); }
   }
   private cell(id: string): CellDatabase {
     const cell = this.cells.get(id);
@@ -454,22 +486,38 @@ export class PostgresSpaces {
         WHERE space_id=$1 AND lifecycle='provisioning'`,[spaceId,existing.home_cell_id]);
     });
   }
+  /** Legacy direct-call shape is bounded to the first page; transports use listPage. */
   async list(actor: VerifiedCredential): Promise<SpaceInfo[]> {
+    return (await this.listPage(actor)).items.slice();
+  }
+  async listPage(actor: VerifiedCredential, cursor?: string): Promise<SpacePage> {
     actor = snapshotOwner(actor);
+    const after=this.spaceAfter(actor,cursor);
     await this.current(actor);
-    const pending = await this.control.query(`SELECT space_id FROM space_directory
-      WHERE owner_principal_id=$1 AND lifecycle='provisioning' ORDER BY created_at,space_id`,[owner(actor)]);
-    for (const row of pending.rows) {
-      await this.current(actor);
+    const candidates = await this.control.query(`SELECT space_id,lifecycle,
+      to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_time
+      FROM space_directory WHERE owner_principal_id=$1 AND lifecycle<>'deleted'
+        AND ($2::timestamptz IS NULL OR (created_at,space_id)>($2::timestamptz,$3::text))
+      ORDER BY created_at,space_id LIMIT $4`,
+    [owner(actor),after?.time??null,after?.id??null,spacePageSize+1]);
+    const page=candidates.rows.slice(0,spacePageSize);
+    for (const row of page) {
+      if (row.lifecycle!=='provisioning') continue;
+      await this.current(actor); // NOSONAR -- reauthorize before each bounded recovery
       // A pending cell can be offline while the owner's other spaces remain
       // available. Its directory row stays unrouteable until a later retry.
-      try { await this.recoverProvisioning(row.space_id,owner(actor)); }
+      try { await this.recoverProvisioning(row.space_id,owner(actor)); } // NOSONAR -- recovery is ordered and capped by the page
       catch { /* Keep this reservation pending and continue with healthy cells. */ }
     }
-    const rows = await this.control.query(`SELECT * FROM space_directory WHERE owner_principal_id=$1 AND lifecycle NOT IN ('provisioning','deleted')
-      ORDER BY created_at,space_id`,[owner(actor)]);
+    const rows = page.length ? await this.control.query(`SELECT * FROM space_directory
+      WHERE owner_principal_id=$1 AND space_id=ANY($2::text[]) AND lifecycle NOT IN ('provisioning','deleted') LIMIT $3`,
+    [owner(actor),page.map(row=>row.space_id),spacePageSize]) : {rows:[]};
     await this.current(actor);
-    return rows.rows.map(info);
+    const byId=new Map(rows.rows.map(row=>[row.space_id,info(row)]));
+    const last=page.at(-1);
+    return {items:page.flatMap(row=>byId.has(row.space_id)?[byId.get(row.space_id)!]:[]),
+      cursor:candidates.rows.length>spacePageSize && last ?
+        this.spaceCursor(actor,last.cursor_time,last.space_id,after?.issued??Date.now()) : null};
   }
   async get(actor: VerifiedCredential, spaceId: string): Promise<SpaceInfo> {
     if (!actor || types.isProxy(actor) || !validId(spaceId)) throw new AuthorityError('NOT_FOUND');

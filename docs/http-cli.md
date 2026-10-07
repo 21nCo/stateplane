@@ -66,6 +66,7 @@ development. Supply a bearer session token or API key through stdin:
 stateplane config endpoint --url https://stateplane.example.invalid/
 stateplane auth login --token-stdin --store file < /private/path/token
 stateplane spaces list
+stateplane spaces list --cursor '<nextCursor>'
 stateplane spaces create --space sp_123e4567-e89b-42d3-a456-426614174000
 stateplane spaces select --space sp_123e4567-e89b-42d3-a456-426614174000
 stateplane collections list
@@ -121,6 +122,19 @@ Each HTTP command captures the endpoint, selected space, storage kind and
 credential under that same lock before sending a request.
 Version, revision, limit, and timeout arguments use positive decimal digits
 without signs, leading zeros, spaces, hexadecimal, or exponent notation.
+`spaces list` returns `{items,cursor}` with at most eight spaces per page. Pass the
+opaque cursor to the next call until it is `null`. Each page rechecks the
+current session and owner. Pending provisioning can produce a short or empty
+page with a non-null cursor; continue rather than treating that page as the end.
+Cursors are bound to the owner and credential, expire after 15 minutes, and
+traverse live directory state rather than a snapshot. An invalid, expired or
+cross-credential cursor returns `CURSOR_INVALID`; restart from the first page.
+The eight-item cap matches collection discovery and limits a request to nine
+ordered directory candidates and at most eight provisioning recovery attempts.
+The local PostgreSQL page test uses 55 active spaces and one pending
+reservation to verify a short first page, continuation and a changed owner
+before its later page. These are local
+bounds, not a regional latency target.
 
 Every `spaces create` request supplies a caller-generated `sp_<UUID>` ID.
 Retain it before sending the request. If the response is lost, repeat the

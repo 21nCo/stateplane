@@ -4,7 +4,7 @@ import type { VerifiedCredential } from '@stateplane/contracts';
  * the credential and the selected space at every call, including replay reads. */
 export interface StateplaneServices {
   spaces: {
-    list(actor: VerifiedCredential): Promise<unknown>;
+    list(actor: VerifiedCredential, cursor?: string): Promise<unknown>;
     create(actor: VerifiedCredential, cellId?: string, spaceId?: string): Promise<unknown>;
     get(actor: VerifiedCredential, spaceId: string): Promise<unknown>;
     update(actor: VerifiedCredential, spaceId: string, lifecycle: 'active' | 'readOnly' | 'suspended'): Promise<unknown>;

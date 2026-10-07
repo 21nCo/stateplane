@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import pg from 'pg';
+import { fileURLToPath } from 'node:url';
 
 const password=process.env.DATABASE_URL?null:
   (await readFile(new URL('../../.data/local-db-password',import.meta.url),'utf8')).trim();
@@ -10,7 +11,7 @@ const databaseUrl=process.env.DATABASE_URL??
 
 test('rotating the opt-in HTTP fixture ends retired pools after in-flight requests',async()=>{
   const previous=process.cwd();
-  process.chdir(new URL('../../app/',import.meta.url).pathname);
+  process.chdir(fileURLToPath(new URL('../../app/',import.meta.url)));
   const {createServer}=await import('../../app/node_modules/vite/dist/node/index.js');
   const vite=await createServer({server:{middlewareMode:true},appType:'custom'});
   const admin=new pg.Client({connectionString:databaseUrl});

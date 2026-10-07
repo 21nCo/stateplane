@@ -49,7 +49,7 @@ function host(env:Bindings):((request:Request)=>Promise<Response>) | undefined {
   const spaces=new PostgresSpaces(pool,cells,cellId,{
     create:()=>Promise.reject(new Error('Agent issuance is not configured')),
     find:()=>Promise.resolve(null),revoke:()=>Promise.reject(new Error('Agent revocation is not configured'))
-  },identity);
+  },identity,Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex'));
   const services=postgresServices(spaces,new Map([[cellId,{pool,cursorSecret:Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex')}]]),3600);
   const serve=createHttpHandler({services,identity});
   if (env.AUTHORITY) {

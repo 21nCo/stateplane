@@ -80,8 +80,11 @@ function errorResponse(error:unknown,requestId:string,request:Request):Response 
   return response;
 }
 
-async function rootSpaces(services:StateplaneServices,actor:VerifiedCredential,request:Request):Promise<Response> {
-  if (request.method==='GET') return json(await services.spaces.list(actor));
+async function rootSpaces(services:StateplaneServices,actor:VerifiedCredential,request:Request,url:URL):Promise<Response> {
+  if (request.method==='GET') {
+    if (url.searchParams.getAll('cursor').length>1) fail('CURSOR_INVALID');
+    return json(await services.spaces.list(actor,url.searchParams.get('cursor')??undefined));
+  }
   if (request.method!=='POST') return fail('NOT_FOUND');
   const value=object(await body(request,4096));
   if (Object.keys(value).some(k=>!['cellId','spaceId'].includes(k)) ||
@@ -163,7 +166,7 @@ async function dispatch(services:StateplaneServices,actor:VerifiedCredential,req
   if (p.length===2 && p[0]==='auth' && p[1]==='session' && request.method==='GET')
     return json({contractVersion:'1',kind:actor.kind});
   if (p[0]!=='spaces') return fail('NOT_FOUND');
-  if (p.length===1) return rootSpaces(services,actor,request);
+  if (p.length===1) return rootSpaces(services,actor,request,url);
   const space=p[1];
   if (!space) return fail('NOT_FOUND');
   if (p.length===2) return selectedSpace(services,actor,space,request);
