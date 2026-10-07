@@ -266,6 +266,53 @@ test('CLI preserves JSON string types and rejects empty optional selectors befor
   assert.equal(observed.query,0);
 });
 
+test('CLI rejects empty record selectors and conflicting payload sources before writes',async t=>{
+  const state=fixture();
+  let schemas=0;
+  state.services.collections.define=async()=>{schemas++;return {slug:'entries'};};
+  const {server,endpoint}=await serve(createHttpHandler(state));
+  t.after(()=>server.close());
+  const root=await mkdtemp(join(tmpdir(),'stateplane-cli-empty-input-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  const file=join(root,'record.json');
+  await writeFile(file,'{"label":"from file"}');
+  const cli=argv=>cliProcess(root,argv);
+  assert.equal((await cli(['config','endpoint','--url',endpoint])).status,0);
+  assert.equal((await cliProcess(root,['auth','import','--token-stdin','--store','file'],
+    'secret-test-token\n')).status,0);
+  assert.equal((await cli(['spaces','select','--space','sp_a'])).status,0);
+
+  const create=['records','create','--collection','entries','--idempotency-key','invalid',
+    '--data','{"label":"from data"}'];
+  for (const args of [
+    [...create,'--key',''],
+    [...create,'--space',''],
+    [...create,'--file',''],
+    ['records','create','--collection','entries','--idempotency-key','invalid',
+      '--data','','--file',file],
+    ['collections','define','--collection','entries','--data','{}','--file','']
+  ]) {
+    const result=await cli(args);
+    assert.equal(result.status,1,args.join(' '));
+    assert.deepEqual(JSON.parse(result.stderr).error,
+      {code:'INVALID_ARGUMENT',message:'INVALID_ARGUMENT',retryable:false,requestId:null});
+    assert.doesNotMatch(result.stdout+result.stderr,/secret-test-token/);
+    assert.equal(state.calls,0,'malformed record input reached HTTP');
+    assert.equal(schemas,0,'malformed schema input reached HTTP');
+  }
+
+  for (const [source,args] of [
+    ['data',['--data','{"label":"from data"}']],
+    ['file',['--file',file]]
+  ]) {
+    const result=await cli(['records','create','--collection','entries',
+      '--idempotency-key',source,'--key',source,...args]);
+    assert.equal(result.status,0,result.stderr);
+    assert.equal(JSON.parse(result.stdout).operation,'create');
+  }
+  assert.equal(state.calls,2);
+});
+
 test('endpoint changes clear saved space while same-endpoint configuration retains it',async t=>{
   const {server,endpoint}=await serve(createHttpHandler(fixture()));
   t.after(()=>server.close());

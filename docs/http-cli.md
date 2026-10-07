@@ -117,6 +117,9 @@ for an effect. `--expected-schema-version` is available on create, replace,
 patch and delete; use it to reject a write after an incompatible schema
 revision. The CLI accepts `--json` for scripts and always emits JSON. It does
 not accept `--verbose` or `--debug`, so those flags cannot expose credentials.
+Explicitly empty space, cell, sort, and external-key selectors are rejected.
+Commands that accept a JSON payload require exactly one of `--data` and
+`--file`; supplying both is an error even if one value is empty.
 
 ## Queries, ingestion and recovery
 

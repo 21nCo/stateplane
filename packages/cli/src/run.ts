@@ -49,7 +49,8 @@ function validateFlags(resource:string,action:string|undefined,flags:Flags):void
   const usesHttp=resource!=='config' && resource!=='auth' && !(resource==='spaces' && action==='select');
   const accepted=new Set([...command,...common,...(usesHttp?['timeout']:[])]);
   if (Object.keys(flags).some(key=>!accepted.has(key))) throw new StateplaneCliError('INVALID_ARGUMENT');
-  if (flags.cell==='' || flags.sort==='') throw new StateplaneCliError('INVALID_ARGUMENT');
+  if (flags.space==='' || flags.cell==='' || flags.sort==='' || flags.key==='')
+    throw new StateplaneCliError('INVALID_ARGUMENT');
   if (flags.timeout!==undefined) integer(required(flags,'timeout'));
 }
 function required(flags:Flags,key:string):string {
@@ -89,8 +90,8 @@ async function input(path:string,maxBytes:number):Promise<string> {
   catch { throw new StateplaneCliError('INVALID_ARGUMENT'); }
 }
 async function payload(flags:Flags):Promise<unknown> {
-  if (flags.data && flags.file) throw new StateplaneCliError('INVALID_ARGUMENT');
-  const text=flags.file ? await input(required(flags,'file'),1_048_576) : required(flags,'data');
+  if (flags.data!==undefined && flags.file!==undefined) throw new StateplaneCliError('INVALID_ARGUMENT');
+  const text=flags.file!==undefined ? await input(required(flags,'file'),1_048_576) : required(flags,'data');
   if (Buffer.byteLength(text)>1_048_576) throw new StateplaneCliError('RATE_LIMITED',undefined,undefined,false);
   return parsed(text);
 }
@@ -216,7 +217,7 @@ export async function runCli(argv:string[]):Promise<number> {
           request.expectedSchemaVersion=integer(required(flags,'expected-schema-version'));
         if (action==='create') {
           request.data=await payload(flags);
-          if (flags.key) request.externalKey=required(flags,'key');
+          if (flags.key!==undefined) request.externalKey=required(flags,'key');
         } else {
           request.id=required(flags,'id'); request.expectedRevision=integer(required(flags,'expected-revision'));
           if (action==='replace') request.data=await payload(flags);

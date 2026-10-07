@@ -48,6 +48,19 @@ if (canonicalJsonObject('{"answer":42}') !== '{"answer":42}') throw Error('Postg
   const shown = spawnSync(installedCli, ['config', 'show'], { cwd: temp, env: cliEnv, encoding: 'utf8' });
   if (shown.status !== 0 || shown.stdout.includes('generic-consumer-token') ||
       JSON.parse(shown.stdout).endpoint !== 'http://127.0.0.1:43210/') throw Error('Installed CLI exported a secret or lost endpoint');
+  const record = ['records', 'create', '--space', 'sp_a', '--collection', 'entries',
+    '--idempotency-key', 'invalid', '--data', '{}'];
+  for (const args of [
+    [...record, '--key', ''],
+    [...record, '--file', ''],
+    ['records', 'create', '--space', 'sp_a', '--collection', 'entries',
+      '--idempotency-key', 'invalid', '--data', '', '--file', 'record.json']
+  ]) {
+    const rejected = spawnSync(installedCli, args, { cwd: temp, env: cliEnv, encoding: 'utf8' });
+    if (rejected.status !== 1 || JSON.parse(rejected.stderr).error.code !== 'INVALID_ARGUMENT' ||
+        (rejected.stdout + rejected.stderr).includes('generic-consumer-token'))
+      throw Error('Installed CLI accepted malformed record input or exposed a token');
+  }
   await writeFile(join(temp, 'consumer.ts'), `import { parseRevision, type RecordRef, type Revision, type CollectionId, type SpaceId } from '@stateplane/contracts';
 import type { HttpDependencies } from '@stateplane/api';
 import type { StateplaneHttpClient } from '@stateplane/cli';
