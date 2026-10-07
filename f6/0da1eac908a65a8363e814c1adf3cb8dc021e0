@@ -1,0 +1,36 @@
+docs/http-cli.md
+  h_a39f9495f9ec1d 74-79,86-88
+packages/api/src/http.ts
+  h_a39f9495f9ec1d 4,22,57-58,69-72
+packages/cli/bin/keychain.swift
+  h_a39f9495f9ec1d 18-19,21,27,29
+packages/cli/bin/secure-acl.ps1
+  h_a39f9495f9ec1d 9-13,16-17,40-41,54-55
+packages/cli/package.json
+  h_a39f9495f9ec1d 20-22
+packages/cli/src/config.ts
+  h_a39f9495f9ec1d 17
+packages/cli/src/transport.ts
+  h_a39f9495f9ec1d 1-2,87-88,93-107,116
+packages/contracts/src/index.ts
+  h_a39f9495f9ec1d 21-45
+pnpm-lock.yaml
+  h_a39f9495f9ec1d 166-170
+scripts/check-boundaries.mjs
+  h_a39f9495f9ec1d 14
+scripts/test-consumer.mjs
+  h_a39f9495f9ec1d 66-67
+test/http-cli.test.js
+  h_a39f9495f9ec1d 8,984-1028,1103,1136-1160,1241,1358
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f60da1eac908a65a8363e814c1adf3cb8dc021e0",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
