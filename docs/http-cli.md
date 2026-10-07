@@ -44,6 +44,7 @@ leading semicolon is encoded as `%3B`, keeping it distinct from that marker.
 Use Node 22.13+ and a tarball built from this checkout:
 
 ```sh
+pnpm --filter @stateplane/contracts build
 pnpm --filter @stateplane/cli build
 cd packages/cli
 pnpm pack --pack-destination /tmp
@@ -51,7 +52,9 @@ npm install --global /tmp/stateplane-cli-0.1.0.tgz
 stateplane help
 ```
 
-The package has no workspace runtime dependencies. `stateplane` emits one JSON
+The CLI build bundles its shared route helpers from `@stateplane/contracts`
+into the tarball; installation needs only the CLI tarball. The package has no
+workspace runtime dependencies. `stateplane` emits one JSON
 value to stdout on success. On failure it emits one JSON error to stderr and
 exits nonzero. It never prints a bearer token, request body or provider error.
 `--json` is accepted for scripts; JSON is always the output format.
@@ -86,6 +89,10 @@ reporting `configured:true`; the token never appears in a process argument.
 The helper applies a Keychain access list with no silently trusted application,
 including when replacing an older item. Approve the macOS Keychain prompt for
 each token read or update. Use the protected file store for unattended jobs.
+Apple's [SecAccessCreate documentation](https://developer.apple.com/documentation/security/secaccesscreate%28_%3A_%3A_%3A%29)
+specifies that an empty trusted-app list requires confirmation for restricted
+operations. This is an interactive login Keychain policy; a locked or headless
+Keychain cannot satisfy the prompt and yields `KEYCHAIN_UNAVAILABLE`.
 `auth login` validates the bearer with `GET /v1/auth/session` before saving it.
 For offline bootstrap, `auth import --token-stdin --store file` stores a
 credential without validation; the next API call checks it. Invalid tokens

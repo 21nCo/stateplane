@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { existsSync } from 'node:fs';
@@ -30,6 +30,47 @@ try {
     run('pnpm', ['pack', '--out', tarball], join(root, 'packages', name));
     tarballs.push(tarball);
   }
+  // The documented install names only the CLI tarball. Verify it without the
+  // contracts tarball that the larger cross-package consumer installs below.
+  const standalone=join(temp,'standalone');
+  await mkdir(standalone);
+  await writeFile(join(standalone,'package.json'),JSON.stringify({name:'stateplane-cli-only',private:true}));
+  run('npm',['install','--offline','--no-audit','--no-fund',tarballs[names.indexOf('cli')]],standalone);
+  const standaloneCli=join(standalone,'node_modules/@stateplane/cli/bin/stateplane.js');
+  if (JSON.parse(run(process.execPath,[standaloneCli,'help'],standalone)).usage?.startsWith('stateplane ')!==true)
+    throw new Error('CLI-only tarball did not launch');
+  if (existsSync(join(standalone,'node_modules/@stateplane/contracts')))
+    throw new Error('CLI-only install unexpectedly included private contracts');
+  const standaloneEnv={...process.env,STATEPLANE_CONFIG_DIR:join(standalone,'config')};
+  const endpoint=spawnSync(process.execPath,[standaloneCli,'config','endpoint','--url','http://127.0.0.1:43210/'],
+    {cwd:standalone,env:standaloneEnv,encoding:'utf8'});
+  if (endpoint.status!==0) {
+    let diagnostic='';
+    if (process.platform==='win32') {
+      const powershell=join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe');
+      const script=join(standalone,'node_modules','@stateplane','cli','bin','secure-acl.ps1');
+      const caller=spawnSync('whoami',['/user'],{encoding:'utf8'});
+      const probe=spawnSync(powershell,['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+        '-File',script,'-TargetPath',standaloneEnv.STATEPLANE_CONFIG_DIR,'-Action','diagnose'],
+      {encoding:'utf8'});
+      diagnostic=`caller=${caller.stdout.trim()} helper=${probe.status} `+
+        `acl=${probe.stdout.trim()} helperError=${probe.stderr.trim()}`;
+    }
+    throw new Error(`CLI-only endpoint bootstrap failed: status=${endpoint.status} ${endpoint.stderr} ${diagnostic}`);
+  }
+  const imported=spawnSync(process.execPath,[standaloneCli,'auth','import','--token-stdin','--store','file'],
+    {cwd:standalone,env:standaloneEnv,encoding:'utf8',input:'standalone-disposable-token\n'});
+  if (imported.status!==0 || (imported.stdout+imported.stderr).includes('standalone-disposable-token'))
+    throw new Error('CLI-only credential import failed or exposed a secret');
+  const standaloneShown=spawnSync(process.execPath,[standaloneCli,'config','show'],
+    {cwd:standalone,env:standaloneEnv,encoding:'utf8'});
+  if (standaloneShown.status!==0 || JSON.parse(standaloneShown.stdout).endpoint!=='http://127.0.0.1:43210/' ||
+      (standaloneShown.stdout+standaloneShown.stderr).includes('standalone-disposable-token'))
+    throw new Error('CLI-only configuration read failed or exposed a secret');
+  const signedOut=spawnSync(process.execPath,[standaloneCli,'auth','logout'],
+    {cwd:standalone,env:standaloneEnv,encoding:'utf8'});
+  if (signedOut.status!==0 || existsSync(join(standalone,'config','token')))
+    throw new Error('CLI-only logout left a credential');
   await writeFile(join(temp, 'package.json'), JSON.stringify({ name: 'stateplane-external-consumer', private: true, type: 'module' }));
   run('npm', ['install', '--no-audit', '--no-fund', ...tarballs], temp);
   await writeFile(join(temp, 'consumer.mjs'), `
@@ -56,6 +97,12 @@ if (canonicalJsonObject('{"answer":42}') !== '{"answer":42}') throw new Error('P
     if (process.platform==='win32') {
       const powershell=join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe');
       const script=join(temp,'node_modules','@stateplane','cli','bin','secure-acl.ps1');
+      const runner=spawnSync('whoami',['/user'],{cwd:temp,encoding:'utf8'});
+      const moduleProbe=spawnSync(powershell,['-NoProfile','-NonInteractive','-Command',
+        '$PSVersionTable.PSVersion.ToString(); try { Import-Module Microsoft.PowerShell.Security -ErrorAction Stop; "module=loaded" } catch { "module=" + $_.Exception.GetType().FullName + ":" + $_.Exception.Message }'],
+      {cwd:temp,encoding:'utf8'});
+      aclDiagnostic+=`runner=${runner.stdout.trim()} node=${process.execPath} powershell=${powershell} `+
+        `module=${moduleProbe.stdout.trim()} moduleError=${moduleProbe.stderr.trim()}; `;
       for (const name of ['cli-config','cli-config/config.lock.sqlite','cli-config/config.json']) {
         const target=join(temp,name);
         if (!existsSync(target)) { aclDiagnostic+=`${name}: absent; `; continue; }
@@ -63,8 +110,11 @@ if (canonicalJsonObject('{"answer":42}') !== '{"answer":42}') throw new Error('P
           '-File',script,'-TargetPath',target,'-Action','verify'],{cwd:temp,encoding:'utf8'});
         const details=spawnSync(powershell,['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
           '-File',script,'-TargetPath',target,'-Action','diagnose'],{cwd:temp,encoding:'utf8'});
+        const rawAcl=spawnSync(join(process.env.SystemRoot,'System32','icacls.exe'),[target],
+          {cwd:temp,encoding:'utf8'});
         aclDiagnostic+=`${name}: verify=${check.status} signal=${check.signal} verifyError=${check.stderr.trim()} `+
-          `diagnose=${details.status} acl=${details.stdout.trim()} diagnoseError=${details.stderr.trim()}; `;
+          `diagnose=${details.status} acl=${details.stdout.trim()} diagnoseError=${details.stderr.trim()} `+
+          `icacls=${rawAcl.stdout.trim()} icaclsError=${rawAcl.stderr.trim()}; `;
       }
     }
     throw new Error(`Installed CLI configuration failed: status=${setup.status} signal=${setup.signal} error=${setup.error?.code??'none'} ${setup.stderr} ${aclDiagnostic}`);

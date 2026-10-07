@@ -29,16 +29,21 @@ async function body(request:Request,limit=3_145_728):Promise<string> {
   const reader=request.body.getReader();
   const chunks:Uint8Array[]=[];
   let size=0;
+  let oversized=false;
   try {
     while (true) {
       const next=await reader.read(); // NOSONAR -- a stream reader advances sequentially
       if (next.done) break;
       size+=next.value.byteLength;
       if (size>limit) {
-        try { await reader.cancel(); } catch { /* The size error still owns this response. */ }
-        fail('RATE_LIMITED',false);
+        oversized=true;
+        break;
       }
       chunks.push(next.value);
+    }
+    if (oversized) {
+      try { await reader.cancel(); } catch { /* The size error still owns this response. */ }
+      fail('RATE_LIMITED',false);
     }
   } finally { reader.releaseLock(); }
   const bytes=new Uint8Array(size);

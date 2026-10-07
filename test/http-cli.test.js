@@ -16,6 +16,11 @@ import { saveToken, loadToken, removeToken, configureToken, removeTrackedTokens,
   storeSecretServiceToken, loadSecretServiceToken,
   loadOsSecretToken } from '../packages/cli/dist/config.js';
 
+// The interactive macOS cases require an unlocked login Keychain. A headless
+// runner can compile Swift but receives authorization error -60008 on access.
+const macKeychainAvailable=platform()==='darwin' &&
+  spawnSync('/usr/bin/security',['show-keychain-info'],{stdio:'ignore'}).status===0;
+
 function fixture() {
   let granted=true; let providerDown=false; let commitUnknown=false; let calls=0; let deletes=0;
   const saved=new Map();
@@ -1128,13 +1133,13 @@ test('macOS Keychain stores and reloads a token without passing it as a process 
   });
 
 test('macOS Keychain reports a missing item as unauthenticated',
-  {skip:platform()!=='darwin'},async()=>{
+  {skip:!macKeychainAvailable},async()=>{
     await assert.rejects(loadToken({endpoint:`https://missing-${randomUUID()}.example.invalid/`,
       tokenStore:'keychain'}),{code:'UNAUTHENTICATED'});
   });
 
 test('macOS Keychain does not silently trust a second Swift script',
-  {skip:platform()!=='darwin'},async()=>{
+  {skip:!macKeychainAvailable || process.env.STATEPLANE_KEYCHAIN_INTERACTIVE_TESTS!=='1'},async()=>{
     const endpoint=`https://caller-${randomUUID()}.example.invalid/`;
     const service=`stateplane:${endpoint}`;
     const token=`disposable-${randomUUID()}`;
@@ -1143,14 +1148,21 @@ test('macOS Keychain does not silently trust a second Swift script',
     const helper='packages/cli/bin/keychain.swift';
     const swift=(script,operation,input='')=>spawnSync('/usr/bin/xcrun',
       ['--sdk','macosx','swift',script,operation,service],
-      {encoding:'utf8',input,timeout:5000});
+      {encoding:'utf8',input,timeout:30000});
     try {
-      await writeFile(probe,`import Foundation\nimport Security\nlet query:[String:Any]=[kSecClass as String:kSecClassGenericPassword,\n  kSecAttrAccount as String:"default",kSecAttrService as String:CommandLine.arguments[2],\n  kSecReturnData as String:true,kSecMatchLimit as String:kSecMatchLimitOne]\nvar result:CFTypeRef?\nlet status=SecItemCopyMatching(query as CFDictionary,&result)\nif status == errSecSuccess, let data=result as? Data { FileHandle.standardOutput.write(data) }\nelse { exit(1) }\n`);
+      await writeFile(probe,`import Foundation\nimport Security\nlet query:[String:Any]=[kSecClass as String:kSecClassGenericPassword,\n  kSecAttrAccount as String:"default",kSecAttrService as String:CommandLine.arguments[2],\n  kSecReturnData as String:true,kSecMatchLimit as String:kSecMatchLimitOne]\nvar result:CFTypeRef?\nfputs("KEYCHAIN_PROBE_ENTER\\n",stderr)\nlet status=SecItemCopyMatching(query as CFDictionary,&result)\nfputs("KEYCHAIN_PROBE_RETURN=\\(status)\\n",stderr)\nif status == errSecSuccess, let data=result as? Data { FileHandle.standardOutput.write(data) }\nelse { exit(3) }\n`);
       const stored=swift(helper,'store',token);
       assert.equal(stored.status,0,'disposable Keychain item must be created');
+      const updated=swift(helper,'store',token);
+      assert.equal(updated.status,0,`duplicate item must update its access policy: ${updated.error?.code??updated.stderr}`);
+      const own=swift(helper,'load');
+      assert.ok(own.status===0 && own.stdout===token,'the owning CLI must still load the token');
       const other=swift(probe,'load');
-      assert.notEqual(other.stdout,token,'another Swift script must not decrypt silently');
-      assert.ok(other.status!==0 || other.error?.code==='ETIMEDOUT');
+      assert.equal(other.error,undefined,`alternate probe must launch: ${other.stderr}`);
+      assert.match(other.stderr,/KEYCHAIN_PROBE_RETURN=-?\d+/,
+        'alternate probe must reach SecItemCopyMatching and report its result');
+      assert.ok(other.stdout!==token,'another Swift script must not decrypt silently');
+      assert.equal(other.status,3,'Keychain must deny the alternate caller');
     } finally {
       const removed=swift(helper,'remove');
       assert.equal(removed.status,0,'disposable Keychain item must be removed');

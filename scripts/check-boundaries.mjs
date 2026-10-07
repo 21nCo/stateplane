@@ -146,7 +146,13 @@ export async function checkBoundaries(base = root) {
     const role = entry.name;
     if (!roles.has(role)) { problems.push(`packages/${role}: unknown package role`); continue; }
     const pkg = JSON.parse(await readFile(join(base, 'packages', role, 'package.json'), 'utf8'));
-    const declared = Object.keys(pkg.dependencies ?? {}).filter(name => name.startsWith('@stateplane/')).map(name => name.split('/')[1]);
+    const runtime = Object.keys(pkg.dependencies ?? {}).filter(name => name.startsWith('@stateplane/'));
+    // The distributable CLI compiles against contracts but bundles its only
+    // workspace dependency, so npm consumers must not resolve it at runtime.
+    if (role === 'cli' && runtime.length > 0)
+      problems.push('cli: private workspace dependency in distributable runtime');
+    const names = role === 'cli' ? [...runtime,...Object.keys(pkg.devDependencies ?? {})] : runtime;
+    const declared = names.filter(name => name.startsWith('@stateplane/')).map(name => name.split('/')[1]);
     const allowed = roles.get(role);
     if (declared.length !== allowed.length || declared.some(name => !allowed.includes(name))) {
       problems.push(`${role}: dependency declaration differs from allowed graph`);
