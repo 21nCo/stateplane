@@ -51,7 +51,23 @@ if (canonicalJsonObject('{"answer":42}') !== '{"answer":42}') throw new Error('P
   const cliEnv = { ...process.env, STATEPLANE_CONFIG_DIR: join(temp, 'cli-config') };
   const setup = spawnSync(process.execPath, [installedCli, 'config', 'endpoint', '--url', 'http://127.0.0.1:43210/'],
     { cwd: temp, env: cliEnv, encoding: 'utf8' });
-  if (setup.status !== 0) throw new Error(`Installed CLI configuration failed: ${setup.stderr}`);
+  if (setup.status !== 0) {
+    let aclDiagnostic='';
+    if (process.platform==='win32') {
+      const powershell=join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe');
+      const script=join(temp,'node_modules','@stateplane','cli','bin','secure-acl.ps1');
+      for (const name of ['cli-config','cli-config/config.lock.sqlite','cli-config/config.json']) {
+        const target=join(temp,name);
+        if (!existsSync(target)) { aclDiagnostic+=`${name}: absent; `; continue; }
+        const check=spawnSync(powershell,['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+          '-File',script,'-TargetPath',target,'-Action','verify'],{cwd:temp,encoding:'utf8'});
+        const details=spawnSync(powershell,['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+          '-File',script,'-TargetPath',target,'-Action','diagnose'],{cwd:temp,encoding:'utf8'});
+        aclDiagnostic+=`${name}: verify=${check.status} signal=${check.signal} acl=${details.stdout.trim()}; `;
+      }
+    }
+    throw new Error(`Installed CLI configuration failed: status=${setup.status} signal=${setup.signal} error=${setup.error?.code??'none'} ${setup.stderr} ${aclDiagnostic}`);
+  }
   const login = spawnSync(process.execPath, [installedCli, 'auth', 'import', '--token-stdin', '--store', 'file'],
     { cwd: temp, env: cliEnv, encoding: 'utf8', input: 'generic-consumer-token\n' });
   if (login.status !== 0 || (login.stdout + login.stderr).includes('generic-consumer-token'))
@@ -59,16 +75,6 @@ if (canonicalJsonObject('{"answer":42}') !== '{"answer":42}') throw new Error('P
   const shown = spawnSync(process.execPath, [installedCli, 'config', 'show'], { cwd: temp, env: cliEnv, encoding: 'utf8' });
   if (shown.status !== 0 || shown.stdout.includes('generic-consumer-token') ||
       JSON.parse(shown.stdout).endpoint !== 'http://127.0.0.1:43210/') throw new Error('Installed CLI exported a secret or lost endpoint');
-  if (process.platform==='win32') {
-    const tokenFile=join(temp,'cli-config','token');
-    const opened=spawnSync('icacls.exe',[tokenFile,'/grant','*S-1-1-0:R'],{cwd:temp,encoding:'utf8'});
-    if (opened.status!==0) throw new Error(`Windows ACL probe failed: ${opened.stderr}`);
-    const rejected=spawnSync(process.execPath,[installedCli,'spaces','list'],
-      {cwd:temp,env:cliEnv,encoding:'utf8'});
-    if (rejected.status!==1 || JSON.parse(rejected.stderr).error.code!=='INSECURE_CONFIGURATION' ||
-        (rejected.stdout+rejected.stderr).includes('generic-consumer-token'))
-      throw new Error('Installed CLI accepted a token readable by another Windows principal');
-  }
   const record = ['records', 'create', '--space', 'sp_a', '--collection', 'entries',
     '--idempotency-key', 'invalid', '--data', '{}'];
   for (const args of [
@@ -81,6 +87,24 @@ if (canonicalJsonObject('{"answer":42}') !== '{"answer":42}') throw new Error('P
     if (rejected.status !== 1 || JSON.parse(rejected.stderr).error.code !== 'INVALID_ARGUMENT' ||
         (rejected.stdout + rejected.stderr).includes('generic-consumer-token'))
       throw new Error('Installed CLI accepted malformed record input or exposed a token');
+  }
+  if (process.platform==='win32') {
+    const tokenFile=join(temp,'cli-config','token');
+    const icacls=join(process.env.SystemRoot,'System32','icacls.exe');
+    const opened=spawnSync(icacls,[tokenFile,'/grant','*S-1-1-0:R'],{cwd:temp,encoding:'utf8'});
+    if (opened.status!==0) throw new Error(`Windows ACL probe failed: ${opened.stderr}`);
+    const rejected=spawnSync(process.execPath,[installedCli,'spaces','list'],
+      {cwd:temp,env:cliEnv,encoding:'utf8'});
+    if (rejected.status!==1 || JSON.parse(rejected.stderr).error.code!=='INSECURE_CONFIGURATION' ||
+        (rejected.stdout+rejected.stderr).includes('generic-consumer-token'))
+      throw new Error('Installed CLI accepted a token readable by another Windows principal');
+    const powershell=join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe');
+    const script=join(temp,'node_modules','@stateplane','cli','bin','secure-acl.ps1');
+    const restored=spawnSync(powershell,['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+      '-File',script,'-TargetPath',tokenFile,'-Action','harden'],{cwd:temp,encoding:'utf8'});
+    if (restored.status!==0) throw new Error(`Windows ACL restoration failed: ${restored.stderr}`);
+    const logout=spawnSync(process.execPath,[installedCli,'auth','logout'],{cwd:temp,env:cliEnv,encoding:'utf8'});
+    if (logout.status!==0 || existsSync(tokenFile)) throw new Error('Installed CLI failed to remove the Windows token');
   }
   await writeFile(join(temp, 'consumer.ts'), `import { parseRevision, type RecordRef, type Revision, type CollectionId, type SpaceId } from '@stateplane/contracts';
 import type { HttpDependencies } from '@stateplane/api';

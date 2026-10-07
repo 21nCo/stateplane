@@ -25,10 +25,11 @@ function parseOption(argv:string[],index:number,flags:Flags):number {
 /** Keep explicit flag presence and JSON value spelling through dispatch. */
 function parse(argv:string[]):{words:string[];flags:Flags} {
   const words:string[]=[]; const flags:Flags={};
-  for (let i=0;i<argv.length;i++) {
+  let i=0;
+  while (i<argv.length) {
     const item=argv[i];
-    if (!item.startsWith('--')) { words.push(item); continue; }
-    i=parseOption(argv,i,flags);
+    if (!item.startsWith('--')) { words.push(item); i++; continue; }
+    i=parseOption(argv,i,flags)+1;
   }
   return {words,flags};
 }

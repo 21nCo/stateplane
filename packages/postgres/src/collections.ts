@@ -28,6 +28,24 @@ const visibleDiscoveryRow=(item:pg.QueryResultRow,space:pg.QueryResultRow,scope:
   space.owner_principal_id===scope.principalId ||
     (item.grant_current &&
       (has(item.capabilities??[],scope.capability) || has(item.capabilities??[],'schema:write')));
+/** Assemble only authorized definitions after the scoped SQL read completes. */
+function discoveredDefinitions(rows:pg.QueryResultRow[],space:pg.QueryResultRow,scope:AuthorityScope):
+  Array<{definition:CollectionDefinition;ready:string[];pending:string[]}> {
+  const collections:Array<{definition:CollectionDefinition;ready:string[];pending:string[]}>=[];
+  let lastId:string|undefined;
+  let entry:typeof collections[number]|undefined;
+  for (let i=0;i<rows.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
+    const item=rows[i];
+    if (!visibleDiscoveryRow(item,space,scope)) continue;
+    if (lastId!==item.collection_id) {
+      entry={definition:JSON.parse(item.canonical_definition),ready:[],pending:[]};
+      append(collections,entry);
+      lastId=item.collection_id;
+    }
+    if (item.field_name) append(item.ready ? entry!.ready : entry!.pending,item.field_name);
+  }
+  return collections;
+}
 /** Snapshot a schema scope; discovery accepts a space scope without a collection ID. */
 const snapshotScope=(scope:AuthorityScope,collectionRequired=true):AuthorityScope=>{
   const fixed=Object.freeze({...scope});
@@ -255,20 +273,7 @@ export class CollectionRegistry {
         WHERE c.space_id=$1 AND c.lifecycle<>'deleted'${selected} ORDER BY c.collection_id,i.field_name`,
       requestedCollection===undefined ? [scope.spaceId,scope.credentialId] :
         [scope.spaceId,scope.credentialId,requestedCollection]);
-      const collections:Array<{definition:CollectionDefinition;ready:string[];pending:string[]}>=[];
-      let lastId:string|undefined;
-      let entry:typeof collections[number]|undefined;
-      for (let i=0;i<result.rows.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
-        const item=result.rows[i];
-        if (!visibleDiscoveryRow(item,space,scope as AuthorityScope)) continue;
-        if (lastId!==item.collection_id) {
-          entry={definition:JSON.parse(item.canonical_definition),ready:[],pending:[]};
-          append(collections,entry);
-          lastId=item.collection_id;
-        }
-        if (item.field_name) append(item.ready ? entry!.ready : entry!.pending,item.field_name);
-      }
-      return collections;
+      return discoveredDefinitions(result.rows,space,scope as AuthorityScope);
     });
   }
   /** One committed batch; repeat until ready. Cursor and values commit together. */

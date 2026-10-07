@@ -42,7 +42,7 @@ async function body(request:Request,limit=3_145_728):Promise<string> {
   let size=0;
   try {
     while (true) {
-      const next=await reader.read();
+      const next=await reader.read(); // NOSONAR -- a stream reader advances sequentially
       if (next.done) break;
       size+=next.value.byteLength;
       if (size>limit) {
@@ -64,7 +64,13 @@ function object(serialized:string):Record<string,unknown> {
   if (!parsed || typeof parsed!=='object' || Array.isArray(parsed)) fail('INVALID_ARGUMENT');
   return parsed as Record<string,unknown>;
 }
-function errorResponse(error:unknown,requestId:string):Response {
+function safeRead(request:Request):boolean {
+  if (request.method==='GET') return true;
+  if (request.method!=='POST') return false;
+  try { return /^\/v1\/spaces\/[^/]+\/collections\/[^/]+\/records\/(?:query|count)$/.test(new URL(request.url).pathname); }
+  catch { return false; }
+}
+function errorResponse(error:unknown,requestId:string,request:Request):Response {
   const name=error instanceof Error ? error.name : '';
   const raw=(error as {code?:unknown})?.code;
   let code:string;
@@ -73,7 +79,7 @@ function errorResponse(error:unknown,requestId:string):Response {
   else if (error instanceof HttpFailure) code=error.code;
   else code='PROVIDER_UNAVAILABLE';
   const canRetry=error instanceof HttpFailure && error.retryableOverride!==undefined
-    ? error.retryableOverride : retryable.has(code);
+    ? error.retryableOverride : code==='COMMIT_OUTCOME_UNKNOWN' ? safeRead(request) : retryable.has(code);
   const response=json({contractVersion:'1',error:{code,message:code,retryable:canRetry,requestId}},status[code]??503);
   if (canRetry) response.headers.set('Retry-After','1');
   return response;
@@ -189,6 +195,6 @@ export function createHttpHandler({services,identity}:{services:StateplaneServic
       const actor:VerifiedCredential|null=await identity.verify(request);
       if (!actor) return fail('UNAUTHENTICATED');
       return await dispatch(services,actor,request,url,p);
-    } catch(error) { return errorResponse(error,requestId); }
+    } catch(error) { return errorResponse(error,requestId,request); }
   };
 }

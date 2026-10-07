@@ -29,7 +29,7 @@ if operation == "store" {
   item[kSecAttrAccess as String] = access
   let added = SecItemAdd(item as CFDictionary, nil) // NOSONAR -- kSecAttrAccess restricts decryption to this caller
   let status = added == errSecDuplicateItem
-    ? SecItemUpdate(query as CFDictionary, [
+    ? SecItemUpdate(query as CFDictionary, [ // NOSONAR -- classic login Keychain unlock plus caller ACL; user-presence storage requires an unavailable CLI entitlement
         kSecValueData as String: token,
         kSecAttrAccess as String: access
       ] as CFDictionary)

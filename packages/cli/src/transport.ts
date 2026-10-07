@@ -64,6 +64,25 @@ export class StateplaneHttpClient {
       throw new StateplaneCliError('INVALID_CONFIGURATION');
     this.sleep=options.sleep??(ms=>new Promise(resolve=>setTimeout(resolve,ms)));
   }
+  /** One wire attempt; only an explicit safe-read response can request a repeat. */
+  private async exchange(method:string,url:URL,serialized:string|undefined,
+    extraHeaders:Record<string,string>|undefined,safeRead:boolean,attempt:number):
+    Promise<{retry:true}|{retry:false;value:unknown}> {
+    const response=await wireFetch(this.fetcher,url,{method,redirect:'error',signal:AbortSignal.timeout(this.timeoutMs),
+      headers:{Authorization:`Bearer ${this.options.token}`,Accept:'application/json',
+        ...(serialized===undefined?{}:{'Content-Type':'application/json'}),...extraHeaders},
+      body:serialized});
+    const after=retryAfter(response);
+    if (safeRead && attempt<2 && [429,503].includes(response.status) && after!==undefined) {
+      await response.body?.cancel().catch(()=>{});
+      await this.sleep(after*1000);
+      return {retry:true};
+    }
+    const value=await wireJson(response);
+    if (!response.ok) throw serverError(value,after);
+    return {retry:false,value};
+  }
+  /** Validate the route once, then bound retries to read-only operations. */
   async request(method:'GET'|'POST'|'PUT'|'PATCH'|'DELETE',path:string,body?:unknown,
     extraHeaders?:Record<string,string>):Promise<unknown> {
     if (!path.startsWith('/v1/') || path.startsWith('//')) throw new StateplaneCliError('INVALID_ARGUMENT');
@@ -75,21 +94,12 @@ export class StateplaneHttpClient {
     const serialized=serializeBody(body);
     for (let attempt=0;attempt<(safeRead?3:1);attempt++) {
       try {
-        const response=await wireFetch(this.fetcher,url,{method,redirect:'error',signal:AbortSignal.timeout(this.timeoutMs),
-          headers:{Authorization:`Bearer ${this.options.token}`,Accept:'application/json',
-            ...(body===undefined?{}:{'Content-Type':'application/json'}),...extraHeaders},
-          body:serialized});
-        const after=retryAfter(response);
-        if (safeRead && attempt<2 && [429,503].includes(response.status) && after!==undefined) {
-          await response.body?.cancel().catch(()=>{});
-          await this.sleep(after*1000); continue;
-        }
-        const value=await wireJson(response);
-        if (response.ok) return value;
-        throw serverError(value,after);
+        const result=await this.exchange(method,url,serialized,extraHeaders,safeRead,attempt); // NOSONAR -- each retry depends on the preceding response
+        if (result.retry) continue;
+        return result.value;
       } catch(error) {
         if (!(error instanceof WireFailure)) throw error;
-        if (safeRead && attempt<2) { await this.sleep(250*(attempt+1)); continue; }
+        if (safeRead && attempt<2) { await this.sleep(250*(attempt+1)); continue; } // NOSONAR -- bounded read retries must remain sequential
         throw new StateplaneCliError(safeRead?'PROVIDER_UNAVAILABLE':'OUTCOME_UNKNOWN');
       }
     }

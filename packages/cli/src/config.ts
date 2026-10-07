@@ -14,7 +14,8 @@ const windowsAclScript=join(dirname(fileURLToPath(import.meta.url)),'../bin/secu
 /** fs.Stats.mode does not expose Windows ACLs. Keep only the current user,
  * SYSTEM and Administrators on configuration and file-secret paths. */
 async function windowsAcl(path:string,action:'harden'|'verify'):Promise<void> {
-  const result=await command('powershell.exe',['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+  const powershell=join(process.env.SystemRoot??'C:\\Windows','System32','WindowsPowerShell','v1.0','powershell.exe');
+  const result=await command(powershell,['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
     '-File',windowsAclScript,'-TargetPath',path,'-Action',action]);
   if (!result.ok) throw new StateplaneCliError('INSECURE_CONFIGURATION');
 }
@@ -130,7 +131,9 @@ function keyArgs(endpoint:string):string[] { return ['service','stateplane','end
 const macKeychainScript=join(dirname(fileURLToPath(import.meta.url)),'../bin/keychain.swift');
 function macKeychain(operation:'store'|'load'|'remove',endpoint:string,stdin?:string,
   run:typeof command=command) {
-  return run('/usr/bin/swift',[macKeychainScript,operation,`stateplane:${endpoint}`],stdin);
+  // xcrun selects a matching Swift toolchain and SDK. Direct /usr/bin/swift
+  // can bind to an older CLT compiler with a newer active Xcode SDK.
+  return run('/usr/bin/xcrun',['--sdk','macosx','swift',macKeychainScript,operation,`stateplane:${endpoint}`],stdin);
 }
 interface CommandResult { ok:boolean; output:string; missing?:boolean }
 function command(program:string,args:string[],stdin?:string):Promise<CommandResult> {
@@ -144,7 +147,7 @@ function command(program:string,args:string[],stdin?:string):Promise<CommandResu
     child.stdin.on('error',()=>{});
     child.on('error',()=>{clearTimeout(timer);resolve({ok:false,output:''});});
     child.on('close',code=>{clearTimeout(timer);resolve({ok:code===0,output,
-      missing:program==='/usr/bin/swift' ? code===2 : program==='secret-tool' && code===1 && !diagnostic});});
+      missing:program==='/usr/bin/xcrun' ? code===2 : program==='secret-tool' && code===1 && !diagnostic});});
     child.stdin.end(stdin);
   });
 }

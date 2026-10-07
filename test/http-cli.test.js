@@ -819,7 +819,8 @@ test('OS secret load reports backend failure consistently and missing macOS item
     [{ok:false,output:'',missing:false},'KEYCHAIN_UNAVAILABLE'],
     [{ok:false,output:'',missing:true},'UNAUTHENTICATED']
   ]) await assert.rejects(loadOsSecretToken(endpoint,'darwin',async(program,args)=>{
-    assert.equal(program,'/usr/bin/swift');
+    assert.equal(program,'/usr/bin/xcrun');
+    assert.deepEqual(args.slice(0,3),['--sdk','macosx','swift']);
     assert.deepEqual(args.slice(-2),['load',`stateplane:${endpoint}`]);
     return result;
   }),{code});
@@ -943,6 +944,41 @@ test('GET honors Retry-After; writes never auto-retry after an uncertain outcome
   const circular={};circular.self=circular;
   await assert.rejects(presend.request('POST','/v1/spaces',circular),{code:'INVALID_ARGUMENT'});
   assert.equal(sent,0);
+});
+
+test('unknown COMMIT on a read retries safely while a write remains outcome-unknown',async()=>{
+  const state=fixture();
+  let readCalls=0,writeCalls=0;
+  state.services.records.count=async()=>{
+    readCalls++;
+    if (readCalls===1) throw Object.assign(new Error('private commit cause'),{name:'CommitOutcomeUnknownError'});
+    return 1;
+  };
+  state.services.records.mutate=async()=>{
+    writeCalls++;
+    throw Object.assign(new Error('private commit cause'),{name:'CommitOutcomeUnknownError'});
+  };
+  const handler=createHttpHandler(state);
+  const readPath='/v1/spaces/sp_a/collections/entries/records/count';
+  const writePath='/v1/spaces/sp_a/collections/entries/records';
+  const request=(path,body)=>new Request(`http://127.0.0.1${path}`,{method:'POST',
+    headers:{Authorization:'Bearer secret-test-token','Content-Type':'application/json'},body:JSON.stringify(body)});
+  const first=await handler(request(readPath,[]));
+  assert.equal(first.status,503);
+  assert.equal(first.headers.get('Retry-After'),'1');
+  assert.deepEqual((await first.json()).error.code,'COMMIT_OUTCOME_UNKNOWN');
+  readCalls=0;
+  const client=new StateplaneHttpClient({endpoint:'http://127.0.0.1/',token:'secret-test-token',
+    fetch:(url,options)=>handler(new Request(url,options)),sleep:async()=>{}});
+  assert.equal(await client.request('POST',readPath,[]),1);
+  assert.equal(readCalls,2);
+  const write=await handler(request(writePath,{operation:'create'}));
+  assert.equal(write.status,503);
+  assert.equal(write.headers.get('Retry-After'),null);
+  assert.equal((await write.json()).error.retryable,false);
+  await assert.rejects(client.request('POST',writePath,{operation:'create'}),
+    {code:'COMMIT_OUTCOME_UNKNOWN',retryable:false});
+  assert.equal(writeCalls,2);
 });
 
 test('a concurrent endpoint and token switch cannot mix credentials or selected spaces',async t=>{

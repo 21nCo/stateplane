@@ -30,7 +30,9 @@ placement in their database transaction. Space administration uses
 `PostgresSpaces` owner checks. A wrong-space selector can return `NOT_FOUND`.
 Errors have `contractVersion`, stable `error.code`, `message`, `retryable` and
 `requestId`, without provider messages or credential values. A write with an
-unacknowledged commit reports `COMMIT_OUTCOME_UNKNOWN`; its result is unknown.
+unacknowledged commit reports `COMMIT_OUTCOME_UNKNOWN`; writes retain an unknown
+result and require readback. GET and exact query/count operations can retry that
+response with `Retry-After` because repeating those reads is safe.
 CLI errors use the same fields on stderr; locally detected failures have a null
 request ID. Both clients percent-encode each path selector as one component,
 including `/` and `\\`. URL parsers remove dot-only path segments, so a selector
@@ -73,8 +75,8 @@ stateplane records create --collection entries --key ' item-1 ' \
 Service through `secret-tool`. If OS storage is unavailable, explicitly select `--store file`.
 An absent stored item returns `UNAUTHENTICATED`; an unavailable OS store returns
 `KEYCHAIN_UNAVAILABLE`. Neither error prints backend diagnostics or a token.
-The macOS path requires the system `swift` command (install Apple Command Line
-Tools with `xcode-select --install` if it is absent). It sends the token to a
+The macOS path requires `xcrun` and its selected Swift toolchain (install Apple
+Command Line Tools with `xcode-select --install` if they are absent). It sends the token to a
 small bundled Keychain helper over stdin, then reads the item back before
 reporting `configured:true`; the token never appears in a process argument.
 The helper applies a Keychain access list restricted to the calling application,
