@@ -1,0 +1,14 @@
+scripts/migration-upgrade-smoke.mjs
+  h_a39f9495f9ec1d 12-16,162,257,269,285,288
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "54b5d1f0d323797af8ea1dc16aaff30c7f457f11",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
