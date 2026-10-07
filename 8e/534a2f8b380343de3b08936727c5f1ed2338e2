@@ -1,0 +1,28 @@
+app/src/app.d.ts
+  h_a39f9495f9ec1d 11-12
+app/src/routes/v1/[...path]/+server.ts
+  h_a39f9495f9ec1d 26-28,35-36,40-41,44-45,51-52,55-56
+docs/http-cli.md
+  h_a39f9495f9ec1d 132-135,222-223
+packages/postgres/src/collections.ts
+  h_a39f9495f9ec1d 3,21-27,35-41,279,301
+packages/postgres/src/services.ts
+  h_a39f9495f9ec1d 7,43
+packages/postgres/src/spaces.ts
+  h_a39f9495f9ec1d 46-47,205,210-211
+scripts/test-http-host.mjs
+  h_a39f9495f9ec1d 9,28-29,37,44,50-51,103-137,142-151,164
+test/integration/http-services.test.js
+  h_a39f9495f9ec1d 79-89,401-431
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8e534a2f8b380343de3b08936727c5f1ed2338e2",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
