@@ -1,0 +1,21 @@
+packages/cli/src/run.ts
+  s_f35acf97713caf::t_394a3166155e67 52-53,93-94,220
+test/http-cli.test.js
+  s_f35acf97713caf::t_51694d30ec6d74 269-315
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "268b473a91ec044fd93639df8bd72685aaec6b9e",
+  "prompts": {},
+  "sessions": {
+    "s_f35acf97713caf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0fc84-64a0-7e21-abe8-470ad56e7650",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
