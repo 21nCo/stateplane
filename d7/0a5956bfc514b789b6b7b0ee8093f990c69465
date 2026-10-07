@@ -1,0 +1,31 @@
+packages/cli/src/config.ts
+  s_45ec3de0b74902::t_2367a0eddcd32e 184-194,236
+scripts/test-consumer.mjs
+  s_45ec3de0b74902::t_0e598248521d3e 1,3,13-17,24-27,34-50
+test/http-cli.test.js
+  s_c1093e7194f7e3::t_90c9548504ff2d 16,22-25,821-860,1196,1207
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d70a5956bfc514b789b6b7b0ee8093f990c69465",
+  "prompts": {},
+  "sessions": {
+    "s_45ec3de0b74902": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca4da5b6-68d7-4518-94db-7cdaaabdab88",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_c1093e7194f7e3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "203316bd-9c88-41f4-b037-58d76f8b6cd9",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
