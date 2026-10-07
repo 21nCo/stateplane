@@ -55,6 +55,15 @@ test('space discovery pages bound directory work and reauthorize each continuati
   assert.equal(page1.items.length,7,'one pending reservation consumes one bounded scan slot');
   assert.equal(typeof page1.cursor,'string');
   assert.ok(page1.items.every(item=>item.ownerPrincipalId===owner.userPrincipalId));
+  assert.equal((await listing.list(owner)).length,55,
+    'direct callers must find every active space after the first bounded page');
+  const sibling=new PostgresSpaces(pool,cells,'cell-a',{create:async()=>{throw Error('unused');},
+    find:async()=>null,revoke:async()=>{}},verifier,secret);
+  assert.equal((await sibling.listPage(owner,page1.cursor)).items.length,8,
+    'a continuation must work on another instance using the shared key');
+  const unconfigured=new PostgresSpaces(pool,cells,'cell-a',{create:async()=>{throw Error('unused');},
+    find:async()=>null,revoke:async()=>{}},verifier);
+  await assert.rejects(unconfigured.listPage(owner),/Shared space cursor secret/);
   assert.equal((await pool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1',
     [`${prefix}-pending`])).rows[0].lifecycle,'provisioning');
   await pool.query('UPDATE space_directory SET owner_principal_id=$2 WHERE space_id=$1',
@@ -87,6 +96,23 @@ test('space discovery pages bound directory work and reauthorize each continuati
   assert.equal((await (await get(expired)).json()).error.code,'CURSOR_INVALID');
   live=false;
   assert.equal((await (await get(page1.cursor)).json()).error.code,'FORBIDDEN');
+});
+
+test('direct space enumeration advances past a full page of pending reservations',async t=>{
+  const prefix=`sta9-pending-${randomUUID()}`;
+  const localActor={kind:'session',userPrincipalId:`owner-${randomUUID()}`,credentialId:`session-${randomUUID()}`};
+  const verifier={current:async()=>true};
+  const listing=new PostgresSpaces(pool,cells,'cell-a',{create:async()=>{throw Error('unused');},
+    find:async()=>null,revoke:async()=>{}},verifier);
+  t.after(()=>pool.query('DELETE FROM space_directory WHERE space_id LIKE $1',[`${prefix}%`]));
+  await pool.query(`INSERT INTO space_directory(space_id,owner_principal_id,cell_id,storage_target_id,lifecycle,created_at,provisioning_lease_until)
+    SELECT $1 || '-pending-' || n,$2,'cell-a','target-a','provisioning',
+      '2026-01-01T00:00:00Z'::timestamptz+n*interval '1 microsecond',clock_timestamp()+interval '1 hour'
+    FROM generate_series(0,7) n`,[prefix,localActor.userPrincipalId]);
+  await pool.query(`INSERT INTO space_directory(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,lifecycle,created_at)
+    VALUES($1,$2,'cell-a','cell-a','target-a','active','2026-01-01T00:00:01Z')`,
+  [`${prefix}-active`,localActor.userPrincipalId]);
+  assert.deepEqual((await listing.list(localActor)).map(row=>row.spaceId),[`${prefix}-active`]);
 });
 
 test('real Postgres HTTP operations preserve receipts, grant checks, events and batch progress',async t=>{

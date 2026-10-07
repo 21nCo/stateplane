@@ -126,7 +126,7 @@ try {
       await preflightEventFeed(); // NOSONAR -- preflight locks must precede this migration step
     const receiptDomainCutover = name === '034_batch_receipt_domain.sql' || name === '035_validate_batch_receipt_domain.sql';
     const boundedDdl = receiptDomainCutover || name === '038_drop_superseded_event_cursor.sql';
-    const priorLockTimeout = boundedDdl ? (await client.query('SHOW lock_timeout')).rows[0].lock_timeout : null; // NOSONAR -- each migration uses the preceding step's committed schema
+    const priorLockTimeout = boundedDdl ? (await client.query('SHOW lock_timeout')).rows[0].lock_timeout : null; // NOSONAR -- migrations run in order within the current transaction
     if (boundedDdl) await client.query("SET LOCAL lock_timeout = '5s'"); // NOSONAR -- set before this step's DDL, never concurrently
     try { await client.query(sql); } // NOSONAR -- ordered DDL and ledger writes form one migration transaction
     catch (error) {

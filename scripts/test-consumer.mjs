@@ -106,6 +106,12 @@ try {
     }
     throw new Error(`CLI-only endpoint bootstrap failed: status=${endpoint.status} ${endpoint.stderr} ${diagnostic}`);
   }
+  const invalidBearer=spawnSync(process.execPath,[standaloneCli,'spaces','create',
+    '--space','sp_00000000-0000-4000-8000-000000000001'],{
+    cwd:standalone,env:{...standaloneEnv,STATEPLANE_TOKEN:'malformed\nbearer'},encoding:'utf8'});
+  if (invalidBearer.status!==1 || JSON.parse(invalidBearer.stderr).error.code!=='INVALID_CONFIGURATION' ||
+      (invalidBearer.stdout+invalidBearer.stderr).includes('malformed'))
+    throw new Error('CLI-only install misclassified or disclosed a malformed bearer');
   const imported=spawnSync(process.execPath,[standaloneCli,'auth','import','--token-stdin','--store','file'],
     {cwd:standalone,env:standaloneEnv,encoding:'utf8',input:'standalone-disposable-token\n'});
   if (imported.status!==0 || (imported.stdout+imported.stderr).includes('standalone-disposable-token'))

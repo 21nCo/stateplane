@@ -2390,6 +2390,9 @@ test('batch admission rejects fixed limits as invalid input before durable write
   finally { Reflect.ownKeys=ownKeys; }
   assert.equal(enumerated,false,'over-count direct admission must not enumerate array keys');
   await assert.rejects(authority.ingestSerializedBatch(writer,'serialized-million',wire),{code:'INVALID_ARGUMENT'});
+  const oversizedEnvelope=JSON.stringify(['x'.repeat(3_145_728)]);
+  await assert.rejects(authority.ingestSerializedBatch(writer,'serialized-envelope',oversizedEnvelope),
+    {code:'RATE_LIMITED',retryable:false});
   assert.deepEqual(await readCounts(),[0,0,0]);
   for (const serialized of [false,true]) {
     const key=serialized?'serialized-twenty':'direct-twenty';

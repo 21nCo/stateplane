@@ -131,6 +131,10 @@ traverse live directory state rather than a snapshot. An invalid, expired or
 cross-credential cursor returns `CURSOR_INVALID`; restart from the first page.
 The eight-item cap matches collection discovery and limits a request to nine
 ordered directory candidates and at most eight provisioning recovery attempts.
+All HTTP instances serving one control directory must use the same private
+cursor secret; an instance without that configured secret refuses space pages.
+Rotating it invalidates outstanding cursors. Direct `PostgresSpaces.list()`
+callers enumerate all pages, including pages containing only pending spaces.
 The local PostgreSQL page test uses 55 active spaces and one pending
 reservation to verify a short first page, continuation and a changed owner
 before its later page. These are local

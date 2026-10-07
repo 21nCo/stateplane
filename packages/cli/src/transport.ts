@@ -60,7 +60,8 @@ export class StateplaneHttpClient {
     if (!['https:','http:'].includes(this.endpoint.protocol) ||
         (this.endpoint.protocol==='http:' && !['localhost','127.0.0.1','[::1]'].includes(this.endpoint.hostname)) ||
         this.endpoint.username || this.endpoint.password ||
-        this.endpoint.search || this.endpoint.hash || this.endpoint.pathname!=='/' || !token)
+        this.endpoint.search || this.endpoint.hash || this.endpoint.pathname!=='/' ||
+        typeof token!=='string' || !token || /[\r\n\0]/.test(token))
       throw new StateplaneCliError('INVALID_CONFIGURATION');
     this.token=token;
     this.fetcher=options.fetch??fetch;

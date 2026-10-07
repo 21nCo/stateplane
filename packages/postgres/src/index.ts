@@ -97,7 +97,8 @@ function validPredicateValue(kind:string,value:unknown):boolean {
 
 export class AuthorityError extends Error {
   /** Carry a safe current revision for caller-visible conflicts. */
-  constructor(public readonly code: string, message = code, public readonly currentRevision?: number) { super(message); this.name = 'AuthorityError'; }
+  constructor(public readonly code: string, message = code, public readonly currentRevision?: number,
+    public readonly retryable?: boolean) { super(message); this.name = 'AuthorityError'; }
 }
 class BatchItemFailure extends AuthorityError {}
 export class CommitOutcomeUnknownError extends Error {
@@ -810,7 +811,9 @@ export class PostgresAuthority {
     const deadline=Date.now()+this.requestTimeoutMs;
     const requests=await this.transaction(fixedScope,tx=>{
       if (tx.scope.capability!=='records:write') throw new AuthorityError('FORBIDDEN');
-      if (typeof serialized!=='string' || Buffer.byteLength(serialized)>3_145_728) throw new AuthorityError('INVALID_ARGUMENT');
+      if (typeof serialized!=='string') throw new AuthorityError('INVALID_ARGUMENT');
+      if (Buffer.byteLength(serialized)>3_145_728)
+        throw new AuthorityError('RATE_LIMITED','Batch envelope byte budget exceeded',undefined,false);
       try { return JSON.parse(serialized) as string[]; }
       catch { throw new AuthorityError('INVALID_ARGUMENT'); }
     },deadline);

@@ -75,6 +75,8 @@ function errorResponse(error:unknown,requestId:string,request:Request):Response 
   if (code==='COMMIT_OUTCOME_UNKNOWN') canRetry=safeRead(request);
   if (error instanceof HttpFailure && error.retryableOverride!==undefined)
     canRetry=error.retryableOverride;
+  else if (typeof (error as {retryable?:unknown})?.retryable==='boolean')
+    canRetry=(error as {retryable:boolean}).retryable;
   const response=json({contractVersion:'1',error:{code,message:code,retryable:canRetry,requestId}},status[code]??503);
   if (canRetry) response.headers.set('Retry-After','1');
   return response;

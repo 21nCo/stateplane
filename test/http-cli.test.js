@@ -9,7 +9,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { platform } from 'node:os';
 import { createHttpHandler } from '../packages/api/dist/index.js';
-import { PostgresSpaces, AuthorityTransaction } from '../packages/postgres/dist/index.js';
+import { PostgresSpaces, AuthorityError, AuthorityTransaction } from '../packages/postgres/dist/index.js';
 import { StateplaneHttpClient, StateplaneCliError } from '../packages/cli/dist/index.js';
 import { saveToken, loadToken, removeToken, configureToken, removeTrackedTokens,
   saveConfig, withConfigMutation, logoutConfig,
@@ -70,9 +70,9 @@ async function serve(handler) {
   server.listen(0,'127.0.0.1'); await once(server,'listening');
   return {server,endpoint:`http://127.0.0.1:${server.address().port}/`};
 }
-async function cliProcess(root,argv,input='',nodeArgs=[]) {
+async function cliProcess(root,argv,input='',nodeArgs=[],extraEnv={}) {
   const child=spawn(process.execPath,[...nodeArgs,'packages/cli/bin/stateplane.js',...argv],{
-    cwd:process.cwd(),env:{...process.env,STATEPLANE_CONFIG_DIR:root},stdio:['pipe','pipe','pipe']});
+    cwd:process.cwd(),env:{...process.env,STATEPLANE_CONFIG_DIR:root,...extraEnv},stdio:['pipe','pipe','pipe']});
   let stdout='',stderr='';
   child.stdout.setEncoding('utf8');child.stderr.setEncoding('utf8');
   child.stdout.on('data',chunk=>{stdout+=chunk;});child.stderr.on('data',chunk=>{stderr+=chunk;});
@@ -723,6 +723,14 @@ test('HTTP body caps match CLI nonretryable errors while service throttles retai
   assert.equal(throttle.status,429);
   assert.equal(throttle.headers.get('Retry-After'),'1');
   assert.equal((await throttle.json()).error.retryable,true);
+  state.services.batches.ingest=async()=>{
+    throw new AuthorityError('RATE_LIMITED','Batch envelope byte budget exceeded',undefined,false);
+  };
+  const authorityLimit=await fetch(new URL(`${collection}/batches/budget`,endpoint),{method:'PUT',
+    headers:{Authorization:'Bearer secret-test-token','Content-Type':'application/json'},body:'["{}"]'});
+  assert.equal(authorityLimit.status,429);
+  assert.equal(authorityLimit.headers.get('Retry-After'),null);
+  assert.equal((await authorityLimit.json()).error.retryable,false);
 });
 
 test('empty CLI cursors fail before fetching; event polling preserves supplied cursor',async t=>{
@@ -898,6 +906,29 @@ test('HTTP client keeps its bearer paired with its endpoint across response retr
   assert.deepEqual(observed,[
     {url:'https://cell-a.example.invalid/v1/spaces',authorization:'Bearer cell-a-token'},
     {url:'https://cell-a.example.invalid/v1/spaces',authorization:'Bearer cell-a-token'}]);
+});
+
+test('malformed bearer values are rejected before a write reaches Fetch or HTTP',async t=>{
+  let sent=0;
+  for (const token of ['bad\nsecret','bad\rsecret','bad\0secret']) {
+    assert.throws(()=>new StateplaneHttpClient({endpoint:'https://stateplane.example.invalid/',token,
+      fetch:async()=>{sent++;return Response.json({});}}),{code:'INVALID_CONFIGURATION'});
+  }
+  assert.equal(sent,0);
+  const {server,endpoint}=await serve(async()=>{sent++;return Response.json({});});
+  t.after(()=>server.close());
+  const root=await mkdtemp(join(tmpdir(),'stateplane-invalid-bearer-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  await saveConfigWithRoot(root,{endpoint,tokenStore:'file'});
+  const args=['spaces','create','--space',`sp_${randomUUID()}`];
+  const fromEnv=await cliProcess(root,args,'',[],{STATEPLANE_TOKEN:'bad\nsecret'});
+  assert.equal(JSON.parse(fromEnv.stderr).error.code,'INVALID_CONFIGURATION');
+  assert.doesNotMatch(fromEnv.stderr,/bad|secret/);
+  await writeFile(join(root,'token'),'bad\0secret',{mode:0o600});
+  const fromFile=await cliProcess(root,args,'',[],{STATEPLANE_TOKEN:''});
+  assert.equal(JSON.parse(fromFile.stderr).error.code,'INVALID_CONFIGURATION');
+  assert.doesNotMatch(fromFile.stderr,/bad|secret/);
+  assert.equal(sent,0);
 });
 
 test('projection polling returns a deleted revision while record content remains hidden',async()=>{

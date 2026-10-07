@@ -164,7 +164,10 @@ async function runAuth(action:string|undefined,flags:Flags,config:CliConfig):Pro
 }
 
 async function runSpaces(client:StateplaneHttpClient,action:string|undefined,flags:Flags,spacePath:string):Promise<unknown> {
-  if (action==='list') return client.request('GET',`/v1/spaces${flags.cursor!==undefined ? `?cursor=${encoded(cursor(flags))}` : ''}`);
+  if (action==='list') {
+    const suffix=flags.cursor===undefined ? '' : `?cursor=${encoded(cursor(flags))}`;
+    return client.request('GET',`/v1/spaces${suffix}`);
+  }
   if (action==='create') return client.request('POST','/v1/spaces',
     withinWireBudget({spaceId:required(flags,'space'),...(flags.cell ? {cellId:flags.cell}:{})},4096));
   if (action==='get' && spacePath) return client.request('GET',spacePath);

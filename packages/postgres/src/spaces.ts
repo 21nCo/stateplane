@@ -175,18 +175,20 @@ export class PostgresSpaces {
   constructor(private readonly control: PoolLike, private readonly cells: ReadonlyMap<string, CellDatabase>,
     private readonly defaultCellId: string, private readonly keys: AgentKeyProvider,
     private readonly credentials: CurrentCredential,
-    private readonly cursorSecret: Uint8Array = randomBytes(32)) {
+    cursorSecret?: Uint8Array) {
     if (!cells.has(defaultCellId)) throw new Error('Default cell is not configured');
-    if (cursorSecret.byteLength < 32) throw new Error('Space cursor secret must have at least 32 bytes');
+    if (cursorSecret && cursorSecret.byteLength < 32) throw new Error('Space cursor secret must have at least 32 bytes');
+    this.cursorSecret = cursorSecret ? Buffer.from(cursorSecret) : undefined;
   }
-  private spaceCursorMac(value: string): Buffer {
-    return createHmac('sha256',this.cursorSecret).update(value).digest();
+  private readonly cursorSecret?: Uint8Array;
+  private spaceCursorMac(value: string, secret:Uint8Array): Buffer {
+    return createHmac('sha256',secret).update(value).digest();
   }
-  private spaceCursor(actor: VerifiedCredential, time: string, id: string, issued: number): string {
+  private spaceCursor(actor: VerifiedCredential, time: string, id: string, issued: number, secret:Uint8Array): string {
     const body=JSON.stringify([owner(actor),actor.credentialId,time,id,issued]);
-    return Buffer.from(JSON.stringify([body,this.spaceCursorMac(body).toString('hex')])).toString('base64url');
+    return Buffer.from(JSON.stringify([body,this.spaceCursorMac(body,secret).toString('hex')])).toString('base64url');
   }
-  private spaceAfter(actor: VerifiedCredential, cursor?: string): {time:string;id:string;issued:number}|null {
+  private spaceAfter(actor: VerifiedCredential, cursor:string|undefined, secret:Uint8Array): {time:string;id:string;issued:number}|null {
     if (cursor===undefined) return null;
     if (!/^[A-Za-z0-9_-]{1,16384}$/.test(cursor)) throw new AuthorityError('CURSOR_INVALID');
     try {
@@ -195,7 +197,7 @@ export class PostgresSpaces {
       const envelope:unknown=JSON.parse(decoded);
       if (!Array.isArray(envelope) || envelope.length!==2 || typeof envelope[0]!=='string' ||
         typeof envelope[1]!=='string' || !/^[0-9a-f]{64}$/.test(envelope[1])) throw new Error('Invalid cursor');
-      const expected=this.spaceCursorMac(envelope[0]);
+      const expected=this.spaceCursorMac(envelope[0],secret);
       if (!timingSafeEqual(expected,Buffer.from(envelope[1],'hex'))) throw new Error('Invalid signature');
       const value:unknown=JSON.parse(envelope[0]);
       if (!Array.isArray(value) || value.length!==5 || value[0]!==owner(actor) ||
@@ -486,13 +488,25 @@ export class PostgresSpaces {
         WHERE space_id=$1 AND lifecycle='provisioning'`,[spaceId,existing.home_cell_id]);
     });
   }
-  /** Legacy direct-call shape is bounded to the first page; transports use listPage. */
+  /** Direct callers retain complete enumeration; transports use bounded listPage. */
   async list(actor: VerifiedCredential): Promise<SpaceInfo[]> {
-    return (await this.listPage(actor)).items.slice();
+    const items:SpaceInfo[]=[];
+    const secret=this.cursorSecret??randomBytes(32);
+    let cursor:string|undefined;
+    do {
+      const page=await this.page(actor,cursor,secret);
+      items.push(...page.items);
+      cursor=page.cursor??undefined;
+    } while (cursor!==undefined);
+    return items;
   }
   async listPage(actor: VerifiedCredential, cursor?: string): Promise<SpacePage> {
+    if (!this.cursorSecret) throw new Error('Shared space cursor secret is required for HTTP pagination');
+    return this.page(actor,cursor,this.cursorSecret);
+  }
+  private async page(actor: VerifiedCredential, cursor:string|undefined, secret:Uint8Array): Promise<SpacePage> {
     actor = snapshotOwner(actor);
-    const after=this.spaceAfter(actor,cursor);
+    const after=this.spaceAfter(actor,cursor,secret);
     await this.current(actor);
     const candidates = await this.control.query(`SELECT space_id,lifecycle,
       to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_time
@@ -517,7 +531,7 @@ export class PostgresSpaces {
     const last=page.at(-1);
     return {items:page.flatMap(row=>byId.has(row.space_id)?[byId.get(row.space_id)!]:[]),
       cursor:candidates.rows.length>spacePageSize && last ?
-        this.spaceCursor(actor,last.cursor_time,last.space_id,after?.issued??Date.now()) : null};
+        this.spaceCursor(actor,last.cursor_time,last.space_id,after?.issued??Date.now(),secret) : null};
   }
   async get(actor: VerifiedCredential, spaceId: string): Promise<SpaceInfo> {
     if (!actor || types.isProxy(actor) || !validId(spaceId)) throw new AuthorityError('NOT_FOUND');
