@@ -1,0 +1,36 @@
+docs/exact-queries-bulk.md
+  h_a39f9495f9ec1d 9
+docs/http-cli.md
+  h_a39f9495f9ec1d 134-137
+packages/api/src/http.ts
+  h_a39f9495f9ec1d 78-79
+packages/cli/src/run.ts
+  h_a39f9495f9ec1d 167-170
+packages/cli/src/transport.ts
+  h_a39f9495f9ec1d 63-64
+packages/postgres/src/index.ts
+  h_a39f9495f9ec1d 100-101,814-816
+packages/postgres/src/spaces.ts
+  h_a39f9495f9ec1d 178,180-181,183-185,187,189,191,200,491,493-501,504-507,509,534
+scripts/migrate.mjs
+  h_a39f9495f9ec1d 129
+scripts/test-consumer.mjs
+  h_a39f9495f9ec1d 109-114
+test/http-cli.test.js
+  h_a39f9495f9ec1d 12,73,75,726-733,911-933
+test/integration/collections.test.js
+  h_a39f9495f9ec1d 2393-2395
+test/integration/http-services.test.js
+  h_a39f9495f9ec1d 58-66,101-117
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cb7312eee2506b0198965b78342179b86a8b39e2",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
