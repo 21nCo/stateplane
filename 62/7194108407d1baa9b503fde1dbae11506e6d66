@@ -1,0 +1,33 @@
+docs/http-cli.md
+  s_28d4128c7417df::t_fa61c3667a305f 69,125-137
+packages/postgres/src/spaces.ts
+  s_28d4128c7417df::t_158380885b25b4 1,43-45,177-178,180-207,489,491-493,495,497-506,509,512-514,516-520
+test/http-cli.test.js
+  s_7baedd1a23974d::t_7d4f4e8a91795f 122-130
+test/integration/http-services.test.js
+  s_7baedd1a23974d::t_9b8a44ccc037d0 4,29-91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "627194108407d1baa9b503fde1dbae11506e6d66",
+  "prompts": {},
+  "sessions": {
+    "s_28d4128c7417df": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1c1c580e-3b46-4699-b932-7f146605890c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_7baedd1a23974d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5cffedd7-506e-4b28-96b0-50a923a66ab2",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
