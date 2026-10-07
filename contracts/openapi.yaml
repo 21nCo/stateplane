@@ -277,14 +277,22 @@ components:
         set and unset. Delete requires id and expectedRevision. Retry unchanged
         input with the same idempotency key after an uncertain commit.
     Predicate:
-      type: object
-      required: [field, kind, operator]
-      properties:
-        field: { type: string }
-        kind: { enum: ['null', string, number, boolean, date-time] }
-        operator: { enum: [isNull, eq, lt, lte, gt, gte, in] }
-        value: {}
-      additionalProperties: false
+      oneOf:
+        - type: object
+          required: [field, kind, operator]
+          properties:
+            field: { type: string }
+            kind: { const: 'null' }
+            operator: { const: isNull }
+          additionalProperties: false
+        - type: object
+          required: [field, kind, operator, value]
+          properties:
+            field: { type: string }
+            kind: { enum: [string, number, boolean, date-time] }
+            operator: { enum: [eq, lt, lte, gt, gte, in] }
+            value: {}
+          additionalProperties: false
     RecordQuery:
       type: object
       required: [predicates, limit]

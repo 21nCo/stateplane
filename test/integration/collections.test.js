@@ -63,6 +63,27 @@ test('write-only grants remain discoverable across bounded registry pages',async
   assert.equal(new Set([...first,...second].map(item=>item.definition.slug)).size,10);
 });
 
+test('a replaced array iterator cannot inject a discovery capability',async()=>{
+  const {owner,writer}=await fixture();
+  await pool.query(`UPDATE collection_grants SET capabilities=ARRAY['events:read']::text[]
+    WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,
+  [owner.spaceId,owner.collectionId,writer.credentialId]);
+  const original=Array.prototype[Symbol.iterator];
+  try {
+    Array.prototype[Symbol.iterator]=function*(){
+      if (this.length===3 && this[0]==='records:read' && this[1]==='records:write') {
+        yield 'events:read';
+        return;
+      }
+      yield* Reflect.apply(original,this,[]);
+    };
+    assert.deepEqual(await registry.discover(read(writer),owner.collectionId),[],
+      'selected lookup must not expose a definition through an injected grant');
+    assert.deepEqual(await registry.discover(read(writer)),[],
+      'paged lookup must not expose a definition through an injected grant');
+  } finally { Array.prototype[Symbol.iterator]=original; }
+});
+
 function observedRegistry(matches) {
   let signal;
   const attempted=new Promise(resolve=>{signal=resolve;});

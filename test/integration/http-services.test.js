@@ -413,11 +413,19 @@ test('collection discovery checks one provider snapshot and set of grants',async
     undefined,'fixture-agent-key')).status,200);
   assert.equal((await route('GET',`/v1/spaces/${spaceId}/collections/${names[0]}/records/missing`,
     undefined,'fixture-agent-key')).status,403,'discovery does not authorize record reads');
-  await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '800 milliseconds'
+  await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '5 minutes'
     WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,[spaceId,names[0],agent.credentialId]);
   let finalChecks=0;
   currentProbe=async()=>{
-    if (++finalChecks===2) await new Promise(resolve=>setTimeout(resolve,1000));
+    if (++finalChecks===2) {
+      const live=await pool.query(`SELECT expires_at>clock_timestamp() AS live FROM collection_grants
+        WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,
+      [spaceId,names[0],agent.credentialId]);
+      assert.equal(live.rows[0]?.live,true,'grant was live after the initial discovery query');
+      await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()-interval '1 second'
+        WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,
+      [spaceId,names[0],agent.credentialId]);
+    }
     return true;
   };
   assert.equal((await route('GET',`/v1/spaces/${spaceId}/collections/${names[0]}`,

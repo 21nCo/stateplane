@@ -35,8 +35,10 @@ const declaredFields=(first:readonly string[],second:readonly string[]):string[]
 const visibleDiscoveryRow=(item:pg.QueryResultRow,space:pg.QueryResultRow,scope:AuthorityScope):boolean=>{
   if (space.owner_principal_id===scope.principalId) return true;
   if (!item.grant_current) return false;
-  for (const capability of discoveryGrants(scope.capability))
-    if (has(item.capabilities??[],capability)) return true;
+  const grants=discoveryGrants(scope.capability);
+  for (let i=0;i<grants.length;i++) { // NOSONAR -- do not trust a replaced array iterator at this grant boundary
+    if (has(item.capabilities??[],Object.getOwnPropertyDescriptor(grants,i)!.value)) return true;
+  }
   return false;
 };
 /** Assemble only authorized definitions after the scoped SQL read completes. */

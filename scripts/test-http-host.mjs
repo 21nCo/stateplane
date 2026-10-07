@@ -95,6 +95,15 @@ try {
   const record=runCli(['records','get','--collection',collectionId,'--id',receipt.ref.id],{env:cliEnv});
   const direct=await request('GET',`${path}/${receipt.ref.id}`);
   assert(JSON.stringify(record)===JSON.stringify(direct),'CLI and HTTP canonical record parity');
+  const invalidPredicate=[{field:'label',kind:'string',operator:'eq'}];
+  const invalidQuery=await fetch(endpoint+`${path}/query`,{method:'POST',headers:{Authorization:`Bearer ${token}`,
+    'Content-Type':'application/json'},body:JSON.stringify({predicates:invalidPredicate,limit:1})});
+  assert(invalidQuery.status===400 && (await invalidQuery.json()).error.code==='INVALID_ARGUMENT',
+    'HTTP rejects a missing non-null predicate value');
+  const invalidCli=spawnSync(process.execPath,[cli,'records','query','--collection',collectionId,
+    '--predicates',JSON.stringify(invalidPredicate),'--limit','1'],{cwd:temp,env:cliEnv,encoding:'utf8'});
+  assert(invalidCli.status!==0 && JSON.parse(invalidCli.stderr).error.code==='INVALID_ARGUMENT',
+    'installed CLI matches HTTP for a missing predicate value');
   const keyPath=`${path}/by-key/${encodeURIComponent(externalKey)}?mode=external`;
   const directByKey=await request('GET',keyPath);
   const cliByKey=runCli(['records','key','--collection',collectionId,'--key',externalKey,
@@ -102,7 +111,7 @@ try {
   assert(JSON.stringify(cliByKey)===JSON.stringify(directByKey),'CLI and HTTP encoded-key parity');
   for (let index=0;index<9;index++) {
     const slug=`entries_${String(index).padStart(2,'0')}`;
-    await request('PUT',`v1/spaces/${spaceId}/collections/${slug}`,{...definition,slug});
+    await request('PUT',`v1/spaces/${spaceId}/collections/${slug}`,{...definition,slug}); // NOSONAR -- definitions must exist before granting the agent access
   }
   fixturePool=new pg.Pool({connectionString:databaseUrl,max:1});
   await fixturePool.query(`INSERT INTO space_credentials(space_id,credential_id,principal_id,owner_principal_id,
@@ -110,7 +119,8 @@ try {
     VALUES($1,$2,$3,$4,clock_timestamp()+interval '1 hour',clock_timestamp(),clock_timestamp())`,
   [spaceId,agentCredential,`agent-principal-${randomUUID()}`,appEnv.STATEPLANE_TEST_OWNER]);
   for (const slug of [collectionId,...Array.from({length:9},(_,index)=>`entries_${String(index).padStart(2,'0')}`)])
-    await fixturePool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
+    await fixturePool.query(/* NOSONAR -- each grant follows its committed collection definition */
+      `INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
       VALUES($1,$2,$3,ARRAY['records:write']::text[])`,[spaceId,slug,agentCredential]);
   runCli(['auth','login','--token-stdin','--store','file'],{env:cliEnv,input:`${agentToken}\n`});
   const agentFirst=await request('GET',`v1/spaces/${spaceId}/collections`,undefined,agentToken);
