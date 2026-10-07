@@ -40,7 +40,7 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
     },
     collections: {
       list:(actor,spaceId,collectionId)=>admitted(actor,spaceId,undefined,'records:read',async(cell,scope,recheck)=>{
-        const entries=await new CollectionRegistry(cell.pool,recheck).discover(scope);
+        const entries=await new CollectionRegistry(cell.pool,recheck).discover(scope,collectionId);
         if (collectionId===undefined) return entries;
         const found=entries.find(item=>item.definition.slug===collectionId);
         if (!found) throw new AuthorityError('NOT_FOUND');

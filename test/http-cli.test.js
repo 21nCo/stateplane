@@ -70,8 +70,8 @@ async function serve(handler) {
   server.listen(0,'127.0.0.1'); await once(server,'listening');
   return {server,endpoint:`http://127.0.0.1:${server.address().port}/`};
 }
-async function cliProcess(root,argv,input='') {
-  const child=spawn(process.execPath,['packages/cli/bin/stateplane.js',...argv],{
+async function cliProcess(root,argv,input='',nodeArgs=[]) {
+  const child=spawn(process.execPath,[...nodeArgs,'packages/cli/bin/stateplane.js',...argv],{
     cwd:process.cwd(),env:{...process.env,STATEPLANE_CONFIG_DIR:root},stdio:['pipe','pipe','pipe']});
   let stdout='',stderr='';
   child.stdout.setEncoding('utf8');child.stderr.setEncoding('utf8');
@@ -961,13 +961,30 @@ test('a concurrent endpoint and token switch cannot mix credentials or selected 
   const endpointB=`http://127.0.0.1:${b.address().port}/`;
   await saveConfigWithRoot(root,{endpoint:endpointA,space:'sp_old',tokenStore:'file'});
   await writeFile(join(root,'token'),'old-secret',{mode:0o600});
+  const attempted=join(root,'lock-attempted');
+  const preload=join(root,'observe-lock.mjs');
+  await writeFile(preload,`import { DatabaseSync } from 'node:sqlite';
+import { writeFileSync } from 'node:fs';
+const original=DatabaseSync.prototype.exec;
+DatabaseSync.prototype.exec=function(sql) {
+  if (sql==='BEGIN IMMEDIATE') writeFileSync(${JSON.stringify(attempted)},'ready');
+  return original.call(this,sql);
+};`);
   let command;
   await withConfigMutationInRoot(root,async()=>{
     await writeFile(join(root,'token'),'new-secret',{mode:0o600});
-    command=cliProcess(root,['collections','list']);
-    // The old implementation completed through A with B's token while this
-    // mutation lock was held. A correct command waits for the matched state.
-    await new Promise(resolve=>setTimeout(resolve,500));
+    command=cliProcess(root,['collections','list'],'',['--import',preload]);
+    // Observe the child's BEGIN attempt while this process holds the lock.
+    // A fixed delay could pass without exercising the cross-process race.
+    let ready=false;
+    for (let i=0;i<200;i++) {
+      try { ready=(await stat(attempted)).isFile(); } catch(error) {
+        if (error.code!=='ENOENT') throw error;
+      }
+      if (ready) break;
+      await new Promise(resolve=>setTimeout(resolve,25));
+    }
+    assert.equal(ready,true,'child attempted the configuration lock');
     await saveConfig({endpoint:endpointB,space:'sp_new',tokenStore:'file'});
   });
   const result=await command;

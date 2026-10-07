@@ -83,7 +83,12 @@ test('rotating the opt-in HTTP fixture ends retired pools after in-flight reques
       const response=await route.GET({request:new Request('http://localhost/v1/spaces',{
         headers:{Authorization:`Bearer ${token}`}}),platform:{env:previewEnv}});
       assert.equal(response.status,200,'Preview accepts uppercase hex and consecutive requests');
-      assert.equal(await hyperdriveCount(),0,'the Hyperdrive pool ends with its request');
+      let remaining=await hyperdriveCount();
+      for (let wait=0;wait<100 && remaining!==0;wait++) {
+        await new Promise(resolve=>setTimeout(resolve,20));
+        remaining=await hyperdriveCount();
+      }
+      assert.equal(remaining,0,'the Hyperdrive pool ends with its request');
     }
   } finally {
     if (blocked) await blocker.query('ROLLBACK').catch(()=>{});

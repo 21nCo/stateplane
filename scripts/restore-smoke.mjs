@@ -34,7 +34,8 @@ const restored = new pg.Pool({ connectionString:targetUrl });
 const tables = ['stateplane_migrations','space_directory','space_provisioning_audit','agent_key_issuances','spaces','space_credentials','routing_nonces','space_audit',
   'collections','collection_versions','collection_unique_declarations',
   'collection_index_declarations','collection_grants','records',
-  'record_unique_keys','record_index_values','record_events','idempotency_receipts','receipt_reservations',
+  'record_unique_keys','record_index_values','record_events','record_event_feed','record_event_pending',
+  'idempotency_receipts','receipt_reservations',
   'receipt_reservation_scopes','schema_commit_fences','collection_write_slots','batch_operations','batch_items',
   'record_tombstones','projection_outbox','entity_refs'];
 async function snapshot(pool) {
@@ -83,9 +84,15 @@ try {
   const worker={...scope,principalId:'system:projection',credentialId:'system:projection',capability:'outbox:worker'};
   const claimed=await authority.transaction(worker,tx=>tx.claimOutbox(1,30));
   await authority.transaction(worker,tx=>tx.finishOutbox(claimed[0],true));
+  const feedSeed=(await base.query(`SELECT event_id FROM record_events WHERE space_id=$1
+    ORDER BY committed_at,event_id LIMIT 1`,[spaceId])).rows[0].event_id;
+  await base.query(`INSERT INTO record_event_feed(event_id,space_id,collection_id)
+    VALUES($1,$2,$3)`,[feedSeed,spaceId,collectionId]);
+  await base.query('DELETE FROM record_event_pending WHERE event_id=$1',[feedSeed]);
   const expected = await snapshot(base);
   assert.equal(expected.collection_write_slots.length,8,'restore seed must create all eight write slots');
-  assert.ok(expected.records.length && expected.record_events.length && expected.projection_outbox.length &&
+  assert.ok(expected.records.length && expected.record_events.length && expected.record_event_feed.length===1 &&
+    expected.record_event_pending.length>=1 && expected.projection_outbox.length &&
     expected.space_directory.length && expected.agent_key_issuances.length &&
     expected.space_credentials.length && expected.collection_grants.length && expected.batch_items.length &&
     expected.routing_nonces.length && expected.space_audit.length && expected.space_provisioning_audit.length,
@@ -95,6 +102,12 @@ try {
   execFileSync(dockerExecutable, ['compose','exec','-T','postgres','pg_restore','-U','stateplane','-d',name],
     { cwd:root, input:archive, maxBuffer:64 * 1024 * 1024 });
   assert.deepEqual(await snapshot(restored),expected);
+  const restoredAuthority=new PostgresAuthority(restored,3600);
+  const resumed=await restoredAuthority.transaction({...scope,capability:'events:read'},tx=>tx.events(feedSeed));
+  assert.equal(resumed.events.length,expected.record_event_pending.length,
+    'restored pending events follow the previously issued feed cursor');
+  assert.ok(resumed.events.every(event=>event.eventId!==feedSeed));
+  assert.equal((await restored.query('SELECT count(*)::int AS n FROM record_event_pending')).rows[0].n,0);
   const journalRole=`sta6_restore_${randomBytes(8).toString('hex')}`;
   await restored.query(`CREATE ROLE ${journalRole} LOGIN`);
   try {

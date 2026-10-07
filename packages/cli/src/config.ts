@@ -10,10 +10,20 @@ export interface CliConfig { endpoint?:string; space?:string; tokenStore?:TokenS
 export function configDir():string {
   return process.env.STATEPLANE_CONFIG_DIR || join(process.env.XDG_CONFIG_HOME || join(homedir(),'.config'),'stateplane');
 }
+const windowsAclScript=join(dirname(fileURLToPath(import.meta.url)),'../bin/secure-acl.ps1');
+/** fs.Stats.mode does not expose Windows ACLs. Keep only the current user,
+ * SYSTEM and Administrators on configuration and file-secret paths. */
+async function windowsAcl(path:string,action:'harden'|'verify'):Promise<void> {
+  const result=await command('powershell.exe',['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+    '-File',windowsAclScript,'-TargetPath',path,'-Action',action]);
+  if (!result.ok) throw new StateplaneCliError('INSECURE_CONFIGURATION');
+}
 async function secureDirectory():Promise<void> {
   await mkdir(configDir(),{recursive:true,mode:0o700});
   const stat=await lstat(configDir());
-  if (!stat.isDirectory() || (stat.mode&0o077)!==0) throw new StateplaneCliError('INSECURE_CONFIGURATION');
+  if (!stat.isDirectory()) throw new StateplaneCliError('INSECURE_CONFIGURATION');
+  if (platform()==='win32') await windowsAcl(configDir(),'harden');
+  else if ((stat.mode&0o077)!==0) throw new StateplaneCliError('INSECURE_CONFIGURATION');
 }
 const configPath=()=>join(configDir(),'config.json');
 const tokenPath=()=>join(configDir(),'token');
@@ -49,6 +59,7 @@ export async function withConfigMutation<T>(change:(current:CliConfig)=>Promise<
     const path=join(configDir(),'config.lock.sqlite');
     try { const file=await open(path,'wx',0o600); await file.close(); }
     catch(error) { if ((error as NodeJS.ErrnoException).code!=='EEXIST') throw error; }
+    if (platform()==='win32') await windowsAcl(path,'harden');
     await privateFile(path);
     const {DatabaseSync}=await sqlite();
     database=new DatabaseSync(path);
@@ -77,7 +88,9 @@ export async function withConfigMutation<T>(change:(current:CliConfig)=>Promise<
 async function privateFile(path:string):Promise<boolean> {
   try {
     const stat=await lstat(path);
-    if (!stat.isFile() || (stat.mode&0o077)!==0) throw new StateplaneCliError('INSECURE_CONFIGURATION');
+    if (!stat.isFile()) throw new StateplaneCliError('INSECURE_CONFIGURATION');
+    if (platform()==='win32') await windowsAcl(path,'verify');
+    else if ((stat.mode&0o077)!==0) throw new StateplaneCliError('INSECURE_CONFIGURATION');
     return true;
   } catch(error) {
     if ((error as NodeJS.ErrnoException).code==='ENOENT') return false;
@@ -109,6 +122,7 @@ export async function saveConfig(value:CliConfig):Promise<void> {
   const temp=join(configDir(),`.config-${process.pid}-${crypto.randomUUID()}`);
   try {
     await writeFile(temp,JSON.stringify(value)+'\n',{mode:0o600,flag:'wx'});
+    if (platform()==='win32') await windowsAcl(temp,'harden');
     await rename(temp,configPath());
   } finally { await rm(temp,{force:true}); }
 }
@@ -169,7 +183,11 @@ export async function saveToken(endpoint:string,token:string,store:'keychain'|'f
   if (store==='file') {
     await secureDirectory();
     const temp=join(configDir(),`.token-${process.pid}-${crypto.randomUUID()}`);
-    try { await writeFile(temp,token,{mode:0o600,flag:'wx'}); await rename(temp,tokenPath()); }
+    try {
+      await writeFile(temp,token,{mode:0o600,flag:'wx'});
+      if (platform()==='win32') await windowsAcl(temp,'harden');
+      await rename(temp,tokenPath());
+    }
     finally { await rm(temp,{force:true}); }
     return;
   }
@@ -213,14 +231,14 @@ const persistence:TokenPersistence={saveConfig,saveToken,removeToken};
 /** Keep both possible locations discoverable until the old secret is gone.
  * Each persisted step can be retried or cleaned up after process interruption. */
 export async function configureToken(config:CliConfig,token:string,store:'keychain'|'file',
-  io:TokenPersistence=persistence):Promise<void> {
+  io:TokenPersistence=persistence):Promise<void> { // NOSONAR -- shared immutable adapter, not a per-call object
   if (!config.endpoint) throw new StateplaneCliError('INVALID_CONFIGURATION');
   const locations=[...new Set([...(config.tokenLocations??[]),...(config.tokenStore?[config.tokenStore]:[]),store])];
   await io.saveConfig({...config,tokenLocations:locations});
   await io.saveToken(config.endpoint,token,store);
   await io.saveConfig({...config,tokenStore:store,tokenLocations:locations});
   for (const previous of locations) if (previous!==store)
-    await io.removeToken({...config,tokenStore:previous});
+    await io.removeToken({...config,tokenStore:previous}); // NOSONAR -- locations must settle serially before the journal clears
   await io.saveConfig({...config,tokenStore:store,tokenLocations:undefined});
 }
 
@@ -230,7 +248,7 @@ export async function removeTrackedTokens(config:CliConfig,
   const locations=new Set([...(config.tokenLocations??[]),...(config.tokenStore?[config.tokenStore]:[])]);
   let failure:unknown;
   for (const store of locations) {
-    try { await io.removeToken({...config,tokenStore:store}); }
+    try { await io.removeToken({...config,tokenStore:store}); } // NOSONAR -- preserve ordered cleanup and first failure
     catch(error) { failure??=error; }
   }
   // Leave the persisted location journal intact on any failure. A later
@@ -241,9 +259,9 @@ export async function removeTrackedTokens(config:CliConfig,
 
 /** A completed logout clears the durable secret-location journal only after
  * every tracked backend has confirmed removal. */
+const logoutPersistence={removeTrackedTokens,saveConfig};
 export async function logoutConfig(config:CliConfig,
-  io:{removeTrackedTokens:typeof removeTrackedTokens;saveConfig:typeof saveConfig}=
-    {removeTrackedTokens,saveConfig}):Promise<void> {
+  io:{removeTrackedTokens:typeof removeTrackedTokens;saveConfig:typeof saveConfig}=logoutPersistence):Promise<void> {
   await io.removeTrackedTokens(config);
   await io.saveConfig({...config,tokenStore:undefined,tokenLocations:undefined});
 }

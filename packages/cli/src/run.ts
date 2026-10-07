@@ -5,24 +5,30 @@ import { StateplaneCliError, StateplaneHttpClient } from './transport.js';
 
 type Flags=Record<string,string|boolean>;
 const encoded=(value:string)=>value==='.' || value==='..' ? `;${value}` : encodeURIComponent(value);
+const switches=new Set(['retry-failed','json','token-stdin','help']);
+/** Consume one option and return the next unread argv position. */
+function parseOption(argv:string[],index:number,flags:Flags):number {
+  const item=argv[index];
+  const equals=item.indexOf('=');
+  const key=item.slice(2,equals<0?undefined:equals);
+  if (!/^[a-z][a-z-]*$/.test(key) || Object.hasOwn(flags,key)) throw new StateplaneCliError('INVALID_ARGUMENT');
+  if (switches.has(key)) {
+    if (equals>=0) throw new StateplaneCliError('INVALID_ARGUMENT');
+    flags[key]=true;
+    return index;
+  }
+  const value=equals>=0 ? item.slice(equals+1) : argv[++index];
+  if (value===undefined || (equals<0 && value.startsWith('--'))) throw new StateplaneCliError('INVALID_ARGUMENT');
+  flags[key]=value;
+  return index;
+}
+/** Keep explicit flag presence and JSON value spelling through dispatch. */
 function parse(argv:string[]):{words:string[];flags:Flags} {
   const words:string[]=[]; const flags:Flags={};
-  const switches=new Set(['retry-failed','json','token-stdin','help']);
   for (let i=0;i<argv.length;i++) {
     const item=argv[i];
     if (!item.startsWith('--')) { words.push(item); continue; }
-    const equals=item.indexOf('=');
-    const key=item.slice(2,equals<0?undefined:equals);
-    if (!/^[a-z][a-z-]*$/.test(key) || Object.hasOwn(flags,key)) throw new StateplaneCliError('INVALID_ARGUMENT');
-    if (switches.has(key)) {
-      if (equals>=0) throw new StateplaneCliError('INVALID_ARGUMENT');
-      flags[key]=true;
-    }
-    else {
-      const value=equals>=0 ? item.slice(equals+1) : argv[++i];
-      if (value===undefined || (equals<0 && value.startsWith('--'))) throw new StateplaneCliError('INVALID_ARGUMENT');
-      flags[key]=value;
-    }
+    i=parseOption(argv,i,flags);
   }
   return {words,flags};
 }
@@ -237,17 +243,9 @@ async function runBatches(client:StateplaneHttpClient,action:string|undefined,fl
     withinWireBudget(manifest,3_145_728));
 }
 
-async function runHttpCommand(resource:string,action:string|undefined,flags:Flags):Promise<unknown> {
-  // File credentials have one path across endpoints. Capture the endpoint,
-  // selected space, store and token under the mutation lock before I/O.
-  const snapshot=await withConfigMutation(async current=>({config:current,token:await loadToken(current)}));
-  if (!snapshot.config.endpoint) throw new StateplaneCliError('INVALID_CONFIGURATION');
-  const client=new StateplaneHttpClient({endpoint:snapshot.config.endpoint,token:snapshot.token,
-    timeoutMs:flags.timeout ? integer(required(flags,'timeout')) : undefined});
-  const space=typeof flags.space==='string' ? flags.space : snapshot.config.space;
-  const spacePath=space ? `/v1/spaces/${encoded(space)}` : '';
-  if (resource==='spaces') return runSpaces(client,action,flags,spacePath);
-  if (!spacePath) throw new StateplaneCliError('INVALID_ARGUMENT');
+/** Route a selected collection without reading credentials again. */
+async function runCollectionResource(client:StateplaneHttpClient,resource:string,action:string|undefined,
+  flags:Flags,spacePath:string):Promise<unknown> {
   const collection=typeof flags.collection==='string' ? flags.collection : undefined;
   const collectionPath=collection ? `${spacePath}/collections/${encoded(collection)}` : '';
   if (resource==='collections') return runCollections(client,action,flags,spacePath,collectionPath);
@@ -259,6 +257,19 @@ async function runHttpCommand(resource:string,action:string|undefined,flags:Flag
     return client.request('GET',`${collectionPath}/events${suffix}`);
   }
   throw new StateplaneCliError('INVALID_ARGUMENT');
+}
+
+/** Capture endpoint, selected space and token as one cross-process snapshot. */
+async function runHttpCommand(resource:string,action:string|undefined,flags:Flags):Promise<unknown> {
+  const snapshot=await withConfigMutation(async current=>({config:current,token:await loadToken(current)}));
+  if (!snapshot.config.endpoint) throw new StateplaneCliError('INVALID_CONFIGURATION');
+  const client=new StateplaneHttpClient({endpoint:snapshot.config.endpoint,token:snapshot.token,
+    timeoutMs:flags.timeout ? integer(required(flags,'timeout')) : undefined});
+  const space=typeof flags.space==='string' ? flags.space : snapshot.config.space;
+  const spacePath=space ? `/v1/spaces/${encoded(space)}` : '';
+  if (resource==='spaces') return runSpaces(client,action,flags,spacePath);
+  if (!spacePath) throw new StateplaneCliError('INVALID_ARGUMENT');
+  return runCollectionResource(client,resource,action,flags,spacePath);
 }
 
 /** One command produces one JSON value. Errors contain only stable fields;

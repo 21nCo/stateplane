@@ -232,8 +232,11 @@ export class CollectionRegistry {
     });
   }
   /** A result includes only indexes proven ready; clients must not infer readiness from declaration. */
-  async discover(scope:Omit<AuthorityScope,'collectionId'> & {collectionId?:string}):Promise<Array<{definition:CollectionDefinition;ready:string[];pending:string[]}>> {
+  async discover(scope:Omit<AuthorityScope,'collectionId'> & {collectionId?:string},
+    requestedCollection?:string):Promise<Array<{definition:CollectionDefinition;ready:string[];pending:string[]}>> {
     scope=snapshotScope(scope as AuthorityScope,false);
+    if (requestedCollection!==undefined && (!scalarString(requestedCollection) || !requestedCollection ||
+      Buffer.byteLength(requestedCollection)>MAX_INDEX_PART_BYTES)) throw new AuthorityError('NOT_FOUND');
     return this.transaction(async client=>{
       const row=await client.query(`SELECT s.owner_principal_id,s.lifecycle,s.policy_version,s.placement_generation
         FROM spaces s WHERE s.space_id=$1 FOR SHARE OF s`,[scope.spaceId]);
@@ -241,12 +244,17 @@ export class CollectionRegistry {
       if (!space) throw new AuthorityError('NOT_FOUND');
       if (Number(space.policy_version)!==scope.policyVersion || Number(space.placement_generation)!==scope.placementGeneration) throw new AuthorityError('FORBIDDEN');
       if (space.lifecycle!=='active' && space.lifecycle!=='readOnly') throw new AuthorityError('SPACE_UNAVAILABLE');
+      // Keep the single-collection route bounded by its key before loading or
+      // parsing definitions; list discovery still scans all visible rows.
+      const selected=requestedCollection===undefined ? '' : ' AND c.collection_id=$3';
       const result=await client.query(`SELECT c.collection_id,v.canonical_definition,i.field_name,i.ready,
         g.capabilities,(g.expires_at IS NULL OR g.expires_at>clock_timestamp()) AS grant_current
         FROM collections c JOIN collection_versions v ON v.space_id=c.space_id AND v.collection_id=c.collection_id AND v.version=c.schema_version
         LEFT JOIN collection_index_declarations i ON i.space_id=c.space_id AND i.collection_id=c.collection_id
         LEFT JOIN collection_grants g ON g.space_id=c.space_id AND g.collection_id=c.collection_id AND g.credential_id=$2
-        WHERE c.space_id=$1 AND c.lifecycle<>'deleted' ORDER BY c.collection_id,i.field_name`,[scope.spaceId,scope.credentialId]);
+        WHERE c.space_id=$1 AND c.lifecycle<>'deleted'${selected} ORDER BY c.collection_id,i.field_name`,
+      requestedCollection===undefined ? [scope.spaceId,scope.credentialId] :
+        [scope.spaceId,scope.credentialId,requestedCollection]);
       const collections:Array<{definition:CollectionDefinition;ready:string[];pending:string[]}>=[];
       let lastId:string|undefined;
       let entry:typeof collections[number]|undefined;

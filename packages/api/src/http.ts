@@ -114,6 +114,27 @@ async function selectedCollection(services:StateplaneServices,actor:VerifiedCred
   return json(await services.collections.revise(actor,space,collection,version,await body(request,1_048_576)));
 }
 
+/** Resolve the three read selectors without broadening path authorization. */
+async function recordReadRoute(services:StateplaneServices,p:string[],url:URL,
+  prefix:readonly [VerifiedCredential,string,string]):Promise<Response> {
+  if (p.length===7 && p[5]==='by-key') {
+    const mode=url.searchParams.get('mode');
+    if (mode!=='generated' && mode!=='external') return fail('INVALID_ARGUMENT');
+    const result=await services.records.byKey(...prefix,mode,p[6]);
+    if (!result) fail('NOT_FOUND');
+    return json(result);
+  }
+  if (p.length===6 && !['query','count','by-key'].includes(p[5])) {
+    const result=await services.records.get(...prefix,p[5]);
+    if (!result) fail('NOT_FOUND');
+    return json(result);
+  }
+  if (p.length===7 && p[6]==='projection')
+    return json(await services.events.projection(...prefix,p[5]));
+  return fail('NOT_FOUND');
+}
+
+/** Dispatch record mutations and exact reads under the same admitted scope. */
 async function recordsRoute(services:StateplaneServices,p:string[],request:Request,url:URL,
   prefix:readonly [VerifiedCredential,string,string]):Promise<Response> {
   if (p.length===5 && request.method==='POST')
@@ -122,20 +143,7 @@ async function recordsRoute(services:StateplaneServices,p:string[],request:Reque
     return json(await services.records.query(...prefix,await body(request,32_768)));
   if (p.length===6 && p[5]==='count' && request.method==='POST')
     return json(await services.records.count(...prefix,await body(request,32_768)));
-  if (p.length===7 && p[5]==='by-key' && request.method==='GET') {
-    const mode=url.searchParams.get('mode');
-    if (mode!=='generated' && mode!=='external') return fail('INVALID_ARGUMENT');
-    const result=await services.records.byKey(...prefix,mode,p[6]);
-    if (!result) fail('NOT_FOUND');
-    return json(result);
-  }
-  if (p.length===6 && request.method==='GET' && !['query','count','by-key'].includes(p[5])) {
-    const result=await services.records.get(...prefix,p[5]);
-    if (!result) fail('NOT_FOUND');
-    return json(result);
-  }
-  if (p.length===7 && p[6]==='projection' && request.method==='GET')
-    return json(await services.events.projection(...prefix,p[5]));
+  if (request.method==='GET') return recordReadRoute(services,p,url,prefix);
   return fail('NOT_FOUND');
 }
 

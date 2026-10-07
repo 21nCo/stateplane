@@ -41,4 +41,4 @@ REVOKE ALL ON FUNCTION stateplane_queue_record_event() FROM PUBLIC;
 -- historic timestamps supply a stable initial order only.
 INSERT INTO record_event_feed(event_id,space_id,collection_id)
   SELECT event_id,space_id,collection_id FROM record_events
-  ORDER BY committed_at,event_id;
+  ORDER BY committed_at ASC,event_id ASC;

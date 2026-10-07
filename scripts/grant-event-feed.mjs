@@ -1,4 +1,5 @@
 import pg from 'pg';
+import { connectionOptions } from './db-connection.mjs';
 
 // Run after migration or restore through a protected cell administration
 // connection. The role is supplied by the protected deployment inventory.
@@ -7,7 +8,7 @@ const role=process.env.STATEPLANE_CELL_ROLE;
 if (!url || !role || !/^(?!pg_)[a-z][a-z0-9_]{0,62}$/.test(role))
   throw new Error('Set STATEPLANE_CELL_ADMIN_URL and a valid STATEPLANE_CELL_ROLE');
 
-const client=new pg.Client({connectionString:url});
+const client=new pg.Client(connectionOptions(url));
 await client.connect();
 try {
   const found=await client.query('SELECT 1 FROM pg_roles WHERE rolname=$1',[role]);

@@ -10,17 +10,19 @@ const pnpmCli=process.env.npm_execpath;
 const npmCandidates=[join(dirname(process.execPath),'node_modules/npm/bin/npm-cli.js'),
   join(dirname(process.execPath),'../lib/node_modules/npm/bin/npm-cli.js')];
 const npmCli=npmCandidates.find(existsSync);
-if (!pnpmCli || !isAbsolute(pnpmCli) || !existsSync(pnpmCli) || !npmCli || !isAbsolute(npmCli))
-  throw new Error('Trusted pnpm/npm CLI paths are unavailable');
 /** Run a package command inside the isolated external consumer. */
 function run(command, args, cwd) {
-  const executable=command==='pnpm'?process.execPath:command==='npm'?process.execPath:command;
-  const parameters=command==='pnpm'?[pnpmCli,...args]:command==='npm'?[npmCli,...args]:args;
+  const executable=['pnpm','npm'].includes(command) ? process.execPath : command;
+  let parameters=args;
+  if (command==='pnpm') parameters=[pnpmCli,...args];
+  else if (command==='npm') parameters=[npmCli,...args];
   const result = spawnSync(executable, parameters, { cwd, encoding: 'utf8', stdio: 'pipe', env: process.env });
   if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed\n${result.stdout}\n${result.stderr}`);
   return result.stdout.trim();
 }
 try {
+  if (!pnpmCli || !isAbsolute(pnpmCli) || !existsSync(pnpmCli) || !npmCli || !isAbsolute(npmCli))
+    throw new Error('Trusted pnpm/npm CLI paths are unavailable');
   const names = ['contracts', 'application', 'auth', 'api', 'cli', 'read-model', 'postgres', 'workers'];
   const tarballs = [];
   for (const name of names) {
@@ -57,6 +59,16 @@ if (canonicalJsonObject('{"answer":42}') !== '{"answer":42}') throw new Error('P
   const shown = spawnSync(process.execPath, [installedCli, 'config', 'show'], { cwd: temp, env: cliEnv, encoding: 'utf8' });
   if (shown.status !== 0 || shown.stdout.includes('generic-consumer-token') ||
       JSON.parse(shown.stdout).endpoint !== 'http://127.0.0.1:43210/') throw new Error('Installed CLI exported a secret or lost endpoint');
+  if (process.platform==='win32') {
+    const tokenFile=join(temp,'cli-config','token');
+    const opened=spawnSync('icacls.exe',[tokenFile,'/grant','*S-1-1-0:R'],{cwd:temp,encoding:'utf8'});
+    if (opened.status!==0) throw new Error(`Windows ACL probe failed: ${opened.stderr}`);
+    const rejected=spawnSync(process.execPath,[installedCli,'spaces','list'],
+      {cwd:temp,env:cliEnv,encoding:'utf8'});
+    if (rejected.status!==1 || JSON.parse(rejected.stderr).error.code!=='INSECURE_CONFIGURATION' ||
+        (rejected.stdout+rejected.stderr).includes('generic-consumer-token'))
+      throw new Error('Installed CLI accepted a token readable by another Windows principal');
+  }
   const record = ['records', 'create', '--space', 'sp_a', '--collection', 'entries',
     '--idempotency-key', 'invalid', '--data', '{}'];
   for (const args of [

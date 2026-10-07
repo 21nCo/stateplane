@@ -311,7 +311,8 @@ export class PostgresSpaces {
     const resumed = await transaction(this.control, async directory => {
       await this.current(actor);
       const row = (await directory.query(`SELECT * FROM space_directory WHERE space_id=$1 FOR UPDATE`,[spaceId])).rows[0];
-      if (!row || row.owner_principal_id !== owner(actor) || row.cell_id !== cellId ||
+      if (!row) throw new AuthorityError('UNIQUE_CONFLICT');
+      if (row.owner_principal_id !== owner(actor) || row.cell_id !== cellId ||
         row.storage_target_id !== cell.storageTargetId ||
         (row.home_cell_id !== null && row.home_cell_id !== cellId) || row.lifecycle === 'deleted')
         throw new AuthorityError('UNIQUE_CONFLICT');
@@ -362,6 +363,21 @@ export class PostgresSpaces {
     await this.current(actor);
     return info(existing);
   }
+  /** Reconcile a lost directory publication acknowledgement against owner facts. */
+  private async reconcilePublishedCreate(actor:VerifiedCredential,spaceId:string,cellId:string,
+    cell:CellDatabase,selected:boolean,error:unknown):Promise<SpaceInfo|null> {
+    const observed=await this.control.query('SELECT * FROM space_directory WHERE space_id=$1',[spaceId]).catch(()=>null);
+    if (!observed) throw selected ? new CommitOutcomeUnknownError(error) : error;
+    const row=observed.rows[0];
+    if (row?.lifecycle==='active' && row.owner_principal_id===owner(actor) &&
+        row.home_cell_id===cellId && row.cell_id===cellId && row.storage_target_id===cell.storageTargetId) {
+      await this.current(actor);
+      return info(row);
+    }
+    if (row?.lifecycle!=='provisioning') throw error;
+    return null;
+  }
+  /** Preserve the reservation until an owner retry can determine its outcome. */
   private async recoverFailedCreate(actor:VerifiedCredential,spaceId:string,cellId:string,
     cell:CellDatabase,selected:boolean,publicationAttempted:boolean,error:unknown):Promise<SpaceInfo> {
     if (selected) {
@@ -373,17 +389,8 @@ export class PostgresSpaces {
       if (recovered) return recovered;
     }
     if (publicationAttempted) {
-      // A missing acknowledgement may follow a committed control write. An
-      // unavailable readback leaves owner reconciliation possible.
-      const observed=await this.control.query('SELECT * FROM space_directory WHERE space_id=$1',[spaceId]).catch(()=>null);
-      if (!observed) throw selected ? new CommitOutcomeUnknownError(error) : error;
-      const row=observed.rows[0];
-      if (row?.lifecycle==='active' && row.owner_principal_id===owner(actor) &&
-          row.home_cell_id===cellId && row.cell_id===cellId && row.storage_target_id===cell.storageTargetId) {
-        await this.current(actor);
-        return info(row);
-      }
-      if (row?.lifecycle!=='provisioning') throw error;
+      const published=await this.reconcilePublishedCreate(actor,spaceId,cellId,cell,selected,error);
+      if (published) return published;
     }
     // The cell COMMIT may have succeeded even when its acknowledgement was
     // lost. Leave its reservation for a selected owner retry.

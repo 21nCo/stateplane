@@ -18,12 +18,16 @@ if operation == "store" {
   // Restrict the classic macOS Keychain item to the calling application and
   // apply the same ACL when updating an item made by an older CLI version.
   var access: SecAccess?
-  guard SecAccessCreate("Stateplane API key" as CFString, nil, &access) == errSecSuccess,
+  // Apple's SecAccessCreate contract makes nil trust only this calling app
+  // for sensitive operations; the login keychain must also be unlocked.
+  // A user-presence prompt on every lookup would break stream ingestion.
+  let accessStatus = SecAccessCreate("Stateplane API key" as CFString, nil, &access) // NOSONAR -- nil trusts only the calling app for decryption
+  guard accessStatus == errSecSuccess,
     let access = access else { exit(1) }
   var item = query
   item[kSecValueData as String] = token
   item[kSecAttrAccess as String] = access
-  let added = SecItemAdd(item as CFDictionary, nil)
+  let added = SecItemAdd(item as CFDictionary, nil) // NOSONAR -- kSecAttrAccess restricts decryption to this caller
   let status = added == errSecDuplicateItem
     ? SecItemUpdate(query as CFDictionary, [
         kSecValueData as String: token,

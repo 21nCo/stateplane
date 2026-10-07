@@ -250,6 +250,23 @@ test('collection discovery checks one provider snapshot and set of grants',async
   assert.equal((await response.json()).length,5);
   assert.equal(checks,2,'one admission and one final credential recheck regardless of collection count');
   currentProbe=()=>current;
+  let definitionRows=0;
+  const tracked={connect:async()=>{
+    const client=await pool.connect();
+    return {query:async(...args)=>{
+      const result=await client.query(...args);
+      if (String(args[0]).includes('FROM collections c JOIN collection_versions'))
+        definitionRows+=result.rows.length;
+      return result;
+    },release:discard=>client.release(discard)};
+  }};
+  const selectedHandler=createHttpHandler({services:postgresServices(spaces,new Map([['cell-a',
+    {pool:tracked,cursorSecret:randomBytes(32)}]]),3600),identity});
+  const selected=await selectedHandler(new Request(`https://stateplane.example.invalid/v1/spaces/${spaceId}/collections/${names[0]}`,
+    {headers:{Authorization:'Bearer fixture-agent-key'}}));
+  assert.equal(selected.status,200);
+  assert.equal((await selected.json()).definition.slug,names[0]);
+  assert.equal(definitionRows,1,'one-collection HTTP lookup fetches only its definition');
 });
 
 test('event continuation survives two writers whose transactions finish in opposite order',async t=>{

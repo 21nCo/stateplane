@@ -122,7 +122,7 @@ try {
     if (pendingEventFeedUpgrade &&
       (name === '036_event_cursor.sql' || name === '037_commit_safe_event_feed.sql') &&
       (name === '036_event_cursor.sql' || recorded.has('036_event_cursor.sql')))
-      await preflightEventFeed();
+      await preflightEventFeed(); // NOSONAR -- preflight locks must precede this migration step
     const receiptDomainCutover = name === '034_batch_receipt_domain.sql' || name === '035_validate_batch_receipt_domain.sql';
     const priorLockTimeout = receiptDomainCutover ? (await client.query('SHOW lock_timeout')).rows[0].lock_timeout : null;
     if (receiptDomainCutover) await client.query("SET LOCAL lock_timeout = '5s'");

@@ -85,7 +85,13 @@ For offline bootstrap, `auth import --token-stdin --store file` stores a
 credential without validation; the next API call checks it. Invalid tokens
 and provider failures produce structured errors without echoing the input.
 That stores the token in a mode-0600 file in the mode-0700 Stateplane config
-directory. A process-only alternative is `STATEPLANE_TOKEN`; it overrides the
+directory on Unix. On Windows, the CLI uses the bundled PowerShell helper to
+remove inherited file ACLs and grant access only to the current user, SYSTEM
+and Administrators. It verifies the ACL when reading a stored token or config;
+if ACL enforcement is unavailable, configuration fails closed with
+`INSECURE_CONFIGURATION`. Windows users must select `--store file` or supply
+`STATEPLANE_TOKEN`, because the Keychain and Secret Service adapters are not
+available there. A process-only alternative is `STATEPLANE_TOKEN`; it overrides the
 stored credential and is never written to the config. Avoid putting secrets
 in command arguments. `stateplane config show` exports only endpoint, selected
 space and storage kind. `stateplane auth logout` removes every stored

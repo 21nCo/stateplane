@@ -16,6 +16,9 @@ function scannedRows(plan,relation) {
   return (plan['Relation Name']===relation ? plan['Actual Rows']*plan['Actual Loops'] : 0)+
     (plan.Plans??[]).reduce((sum,child)=>sum+scannedRows(child,relation),0);
 }
+function usesIndex(plan,index) {
+  return plan['Index Name']===index || (plan.Plans??[]).some(child=>usesIndex(child,index));
+}
 
 test('quiet event tails use bounded pending discovery and a separate runtime role can publish',async()=>{
   const suffix=randomUUID().replaceAll('-','');
@@ -49,17 +52,34 @@ test('quiet event tails use bounded pending discovery and a separate runtime rol
     assert.equal((await db.query('SELECT count(*)::int AS n FROM record_event_pending')).rows[0].n,2000);
     await db.query(`INSERT INTO record_event_feed(event_id,space_id,collection_id)
       SELECT event_id,space_id,collection_id FROM record_events ORDER BY committed_at,event_id`);
-    await db.query('DELETE FROM record_event_pending');
+    // Keep the relation populated with real events from another collection.
+    // An empty table lets a sequential scan appear cheap.
+    await db.query("DELETE FROM record_event_pending WHERE collection_id='entries'");
+    await db.query('BEGIN');
+    await db.query("INSERT INTO collections(space_id,collection_id) VALUES('sp_event','other')");
+    await db.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition)
+      VALUES('sp_event','other',1,'{}')`);
+    await db.query('COMMIT');
+    await db.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,
+      key_mode,normalized_key,canonical_data,data)
+      VALUES('sp_event','other','rec-other',1,1,'generated','rec-other','{}','{}'::jsonb)`);
+    await db.query(`INSERT INTO record_events(event_id,space_id,collection_id,record_id,revision,
+      operation,credential_id,schema_version,canonical_data)
+      SELECT 'evt-other-'||n,'sp_event','other','rec-other',n,'create','writer',1,'{}'
+      FROM generate_series(1,2000) n`);
+    await db.query('ANALYZE record_event_pending');
     const oldPlan=(await db.query(`EXPLAIN (ANALYZE, FORMAT JSON)
       SELECT e.event_id FROM record_events e LEFT JOIN record_event_feed f ON f.event_id=e.event_id
       WHERE e.space_id='sp_event' AND e.collection_id='entries' AND f.event_id IS NULL
       ORDER BY e.committed_at,e.event_id LIMIT 101`)).rows[0]['QUERY PLAN'][0].Plan;
-    const newPlan=(await db.query(`EXPLAIN (ANALYZE, FORMAT JSON)
+    const newPlan=(await db.query(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
       SELECT event_id FROM record_event_pending WHERE space_id='sp_event' AND collection_id='entries'
       ORDER BY committed_at,event_id LIMIT 101`)).rows[0]['QUERY PLAN'][0].Plan;
     assert.ok(scannedRows(oldPlan,'record_events')>=2000,'old quiet poll inspected retained history');
     assert.equal(scannedRows(newPlan,'record_events'),0);
     assert.equal(scannedRows(newPlan,'record_event_pending'),0,'caught-up index reads no pending rows');
+    assert.ok(usesIndex(newPlan,'record_event_pending_scoped_order'),
+      'quiet polling must use the scoped pending index while other scopes retain rows');
 
     await db.query(`GRANT USAGE ON SCHEMA public TO ${role}`);
     await db.query(`GRANT SELECT, INSERT ON TABLE record_events TO ${role}`);

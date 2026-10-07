@@ -56,7 +56,7 @@ try {
     if (app.exitCode!==null) throw new Error('app dev host exited before readiness');
     try { const health=await fetch(endpoint+'api/health'); if (health.ok) {ready=true;break;} }
     catch { /* The development host may still be starting. */ }
-    await new Promise(resolve=>setTimeout(resolve,100));
+    await new Promise(resolve=>setTimeout(resolve,100)); // NOSONAR -- poll the child readiness in order
   }
   if (!ready) throw new Error('app dev host did not become ready');
   const tarball=join(temp,'stateplane-cli.tgz');
