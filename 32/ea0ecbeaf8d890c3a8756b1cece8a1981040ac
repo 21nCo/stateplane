@@ -1,0 +1,24 @@
+contracts/openapi.yaml
+  h_a39f9495f9ec1d 145-153
+docs/exact-queries-bulk.md
+  h_a39f9495f9ec1d 9,19-20
+docs/http-cli.md
+  h_a39f9495f9ec1d 166-170
+packages/cli/src/run.ts
+  h_a39f9495f9ec1d 154
+scripts/migrate.mjs
+  h_a39f9495f9ec1d 128-130,135-136,139
+test/integration/event-feed-upgrade.test.js
+  h_a39f9495f9ec1d 33,126-162,173-174
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "32ea0ecbeaf8d890c3a8756b1cece8a1981040ac",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
