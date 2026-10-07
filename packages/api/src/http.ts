@@ -168,7 +168,10 @@ async function dispatch(services:StateplaneServices,actor:VerifiedCredential,req
   if (!space) return fail('NOT_FOUND');
   if (p.length===2) return selectedSpace(services,actor,space,request);
   if (p[2]!=='collections') return fail('NOT_FOUND');
-  if (p.length===3 && request.method==='GET') return json(await services.collections.list(actor,space));
+  if (p.length===3 && request.method==='GET') {
+    if (url.searchParams.getAll('cursor').length>1) fail('CURSOR_INVALID');
+    return json(await services.collections.list(actor,space,undefined,url.searchParams.get('cursor')??undefined));
+  }
   const collection=p[3];
   if (!collection) return fail('NOT_FOUND');
   if (p.length===4) return selectedCollection(services,actor,space,collection,request);

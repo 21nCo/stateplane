@@ -32,17 +32,11 @@ const visibleDiscoveryRow=(item:pg.QueryResultRow,space:pg.QueryResultRow,scope:
 function discoveredDefinitions(rows:pg.QueryResultRow[],space:pg.QueryResultRow,scope:AuthorityScope):
   Array<{definition:CollectionDefinition;ready:string[];pending:string[]}> {
   const collections:Array<{definition:CollectionDefinition;ready:string[];pending:string[]}>=[];
-  let lastId:string|undefined;
-  let entry:typeof collections[number]|undefined;
   for (let i=0;i<rows.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
     const item=rows[i];
     if (!visibleDiscoveryRow(item,space,scope)) continue;
-    if (lastId!==item.collection_id) {
-      entry={definition:JSON.parse(item.canonical_definition),ready:[],pending:[]};
-      append(collections,entry);
-      lastId=item.collection_id;
-    }
-    if (item.field_name) append(item.ready ? entry!.ready : entry!.pending,item.field_name);
+    append(collections,{definition:JSON.parse(item.canonical_definition),
+      ready:item.ready_fields??[],pending:item.pending_fields??[]});
   }
   return collections;
 }
@@ -251,7 +245,7 @@ export class CollectionRegistry {
   }
   /** A result includes only indexes proven ready; clients must not infer readiness from declaration. */
   async discover(scope:Omit<AuthorityScope,'collectionId'> & {collectionId?:string},
-    requestedCollection?:string):Promise<Array<{definition:CollectionDefinition;ready:string[];pending:string[]}>> {
+    requestedCollection?:string,after=''):Promise<Array<{definition:CollectionDefinition;ready:string[];pending:string[]}>> {
     scope=snapshotScope(scope as AuthorityScope,false);
     if (requestedCollection!==undefined && (!scalarString(requestedCollection) || !requestedCollection ||
       Buffer.byteLength(requestedCollection)>MAX_INDEX_PART_BYTES)) throw new AuthorityError('NOT_FOUND');
@@ -262,16 +256,39 @@ export class CollectionRegistry {
       if (!space) throw new AuthorityError('NOT_FOUND');
       if (Number(space.policy_version)!==scope.policyVersion || Number(space.placement_generation)!==scope.placementGeneration) throw new AuthorityError('FORBIDDEN');
       if (space.lifecycle!=='active' && space.lifecycle!=='readOnly') throw new AuthorityError('SPACE_UNAVAILABLE');
-      // Keep the single-collection route bounded by its key before loading or
-      // parsing definitions; list discovery still scans all visible rows.
-      const selected=requestedCollection===undefined ? '' : ' AND c.collection_id=$3';
-      const result=await client.query(`SELECT c.collection_id,v.canonical_definition,i.field_name,i.ready,
+      // Choose at most nine visible IDs before joining potentially large
+      // canonical definitions. The ninth ID only signals continuation.
+      const page=requestedCollection===undefined ? `WITH page AS (
+        SELECT c.collection_id FROM collections c
+        LEFT JOIN collection_grants grant_check ON grant_check.space_id=c.space_id
+          AND grant_check.collection_id=c.collection_id AND grant_check.credential_id=$2
+        WHERE c.space_id=$1 AND c.lifecycle<>'deleted' AND c.collection_id>$3
+          AND (c.space_id=$1 AND ($4::boolean OR (grant_check.expires_at IS NULL OR
+            grant_check.expires_at>clock_timestamp()) AND
+            (grant_check.capabilities @> ARRAY['records:read']::text[] OR
+             grant_check.capabilities @> ARRAY['schema:write']::text[])))
+        ORDER BY c.collection_id LIMIT 9)
+        SELECT c.collection_id,v.canonical_definition,ix.ready_fields,ix.pending_fields,
+          g.capabilities,(g.expires_at IS NULL OR g.expires_at>clock_timestamp()) AS grant_current
+        FROM page p JOIN collections c ON c.space_id=$1 AND c.collection_id=p.collection_id
+        JOIN collection_versions v ON v.space_id=c.space_id AND v.collection_id=c.collection_id AND v.version=c.schema_version
+        LEFT JOIN LATERAL (SELECT
+          array_agg(i.field_name ORDER BY i.field_name) FILTER (WHERE i.ready) AS ready_fields,
+          array_agg(i.field_name ORDER BY i.field_name) FILTER (WHERE NOT i.ready) AS pending_fields
+          FROM collection_index_declarations i WHERE i.space_id=c.space_id AND i.collection_id=c.collection_id) ix ON TRUE
+        LEFT JOIN collection_grants g ON g.space_id=c.space_id AND g.collection_id=c.collection_id AND g.credential_id=$2
+        ORDER BY c.collection_id` : `SELECT c.collection_id,v.canonical_definition,ix.ready_fields,ix.pending_fields,
         g.capabilities,(g.expires_at IS NULL OR g.expires_at>clock_timestamp()) AS grant_current
         FROM collections c JOIN collection_versions v ON v.space_id=c.space_id AND v.collection_id=c.collection_id AND v.version=c.schema_version
-        LEFT JOIN collection_index_declarations i ON i.space_id=c.space_id AND i.collection_id=c.collection_id
+        LEFT JOIN LATERAL (SELECT
+          array_agg(i.field_name ORDER BY i.field_name) FILTER (WHERE i.ready) AS ready_fields,
+          array_agg(i.field_name ORDER BY i.field_name) FILTER (WHERE NOT i.ready) AS pending_fields
+          FROM collection_index_declarations i WHERE i.space_id=c.space_id AND i.collection_id=c.collection_id) ix ON TRUE
         LEFT JOIN collection_grants g ON g.space_id=c.space_id AND g.collection_id=c.collection_id AND g.credential_id=$2
-        WHERE c.space_id=$1 AND c.lifecycle<>'deleted'${selected} ORDER BY c.collection_id,i.field_name`,
-      requestedCollection===undefined ? [scope.spaceId,scope.credentialId] :
+        WHERE c.space_id=$1 AND c.lifecycle<>'deleted' AND c.collection_id=$3 ORDER BY c.collection_id`;
+      const result=await client.query(page,
+      requestedCollection===undefined ? [scope.spaceId,scope.credentialId,after,
+        space.owner_principal_id===scope.principalId] :
         [scope.spaceId,scope.credentialId,requestedCollection]);
       return discoveredDefinitions(result.rows,space,scope as AuthorityScope);
     });

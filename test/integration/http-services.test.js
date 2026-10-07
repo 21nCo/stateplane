@@ -230,7 +230,7 @@ test('collection discovery checks one provider snapshot and set of grants',async
     currentProbe=()=>current;
     try { await spaces.update(actor,spaceId,'readOnly'); await spaces.delete(actor,spaceId); } catch {}
   });
-  const names=Array.from({length:5},(_,index)=>`collection_${index}`);
+  const names=Array.from({length:12},(_,index)=>`collection_${String(index).padStart(2,'0')}`);
   for (const slug of names) {
     const definition={slug,version:1,schema:{$schema:'https://json-schema.org/draft/2020-12/schema',
       type:'object',properties:{label:{type:'string'}},additionalProperties:false},
@@ -247,8 +247,21 @@ test('collection discovery checks one provider snapshot and set of grants',async
   currentProbe=()=>{checks++;return true;};
   const response=await route('GET',`/v1/spaces/${spaceId}/collections`,undefined,'fixture-agent-key');
   assert.equal(response.status,200);
-  assert.equal((await response.json()).length,5);
+  const first=await response.json();
+  assert.deepEqual(first.items.map(item=>item.definition.slug),names.slice(0,8));
+  assert.equal(typeof first.cursor,'string');
   assert.equal(checks,2,'one admission and one final credential recheck regardless of collection count');
+  await pool.query(`DELETE FROM collection_grants WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,
+    [spaceId,names[10],agent.credentialId]);
+  const second=await route('GET',`/v1/spaces/${spaceId}/collections?cursor=${encodeURIComponent(first.cursor)}`,
+    undefined,'fixture-agent-key');
+  assert.equal(second.status,200);
+  assert.deepEqual((await second.json()).items.map(item=>item.definition.slug),[names[8],names[9],names[11]]);
+  assert.equal(checks,4,'every page rechecks the provider credential');
+  const invalid=await route('GET',`/v1/spaces/${spaceId}/collections?cursor=invalid!`,
+    undefined,'fixture-agent-key');
+  assert.equal(invalid.status,400);
+  assert.equal((await invalid.json()).error.code,'CURSOR_INVALID');
   currentProbe=()=>current;
   let definitionRows=0;
   const tracked={connect:async()=>{

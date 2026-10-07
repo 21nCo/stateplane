@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { existsSync } from 'node:fs';
@@ -14,7 +14,30 @@ const systemPaths=process.platform==='win32'
   ? [join(process.env.SystemRoot??String.raw`C:\Windows`,'System32'),
     process.env.SystemRoot??String.raw`C:\Windows`]
   : ['/usr/bin','/bin'];
-const trustedPath=[dirname(process.execPath),...systemPaths].join(delimiter);
+// Never search the Node installation directory: a user-managed installation
+// can be writable even when process.execPath itself is a trusted executable.
+const nodeBin=join(temp,'node-bin');
+let windowsShimSid;
+let cleanupFailure;
+await mkdir(nodeBin,{mode:0o700});
+if (process.platform==='win32') await copyFile(process.execPath,join(nodeBin,'node.exe'));
+else {
+  await symlink(process.execPath,join(nodeBin,'node'));
+  await chmod(nodeBin,0o500);
+}
+if (process.platform==='win32') {
+  const system32=systemPaths[0];
+  const identity=spawnSync(join(system32,'whoami.exe'),['/user','/fo','csv','/nh'],{encoding:'utf8'});
+  const sid=identity.status===0 ? identity.stdout.match(/S-1-\d+(?:-\d+)+/)?.[0] : undefined;
+  if (!sid) throw new Error('Consumer Node shim identity unavailable');
+  windowsShimSid=sid;
+  const icacls=join(system32,'icacls.exe');
+  for (const [target,rights] of [[nodeBin,'(OI)(CI)RX'],[join(nodeBin,'node.exe'),'RX']]) {
+    const locked=spawnSync(icacls,[target,'/inheritance:r','/grant:r',`*${sid}:${rights}`],{encoding:'utf8'});
+    if (locked.status!==0) throw new Error('Consumer Node shim ACL unavailable');
+  }
+}
+const trustedPath=[nodeBin,...systemPaths].join(delimiter);
 /** Run a package command inside the isolated external consumer. */
 function run(command, args, cwd) {
   const executable=['pnpm','npm'].includes(command) ? process.execPath : command;
@@ -23,7 +46,7 @@ function run(command, args, cwd) {
   else if (command==='npm') parameters=[npmCli,...args];
   const env={...process.env};
   for (const key of Object.keys(env)) if (key.toLowerCase()==='path') delete env[key];
-  env.PATH=trustedPath;
+  env.PATH=trustedPath; // NOSONAR -- only the locked Node shim and fixed OS directories are searched
   const result = spawnSync(executable, parameters, { cwd, encoding: 'utf8', stdio: 'pipe', env });
   if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed\n${result.stdout}\n${result.stderr}`);
   return result.stdout.trim();
@@ -210,5 +233,14 @@ void tx; void receipt; void unsafe; void ref; void deps; void revision; void inv
   run(process.execPath, [join(root, 'node_modules/typescript/bin/tsc'), '-p', 'tsconfig.json'], temp);
   console.log('Packed Stateplane packages import and typecheck in an isolated npm consumer');
 } finally {
+  if (process.platform!=='win32') await chmod(nodeBin,0o700);
+  else if (windowsShimSid) {
+    const icacls=join(systemPaths[0],'icacls.exe');
+    for (const target of [nodeBin,join(nodeBin,'node.exe')]) {
+      const unlocked=spawnSync(icacls,[target,'/grant:r',`*${windowsShimSid}:F`],{encoding:'utf8'});
+      if (unlocked.status!==0) cleanupFailure=new Error('Consumer Node shim ACL cleanup failed');
+    }
+  }
   await rm(temp, { recursive: true, force: true });
 }
+if (cleanupFailure) throw cleanupFailure;

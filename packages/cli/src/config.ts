@@ -129,7 +129,7 @@ export async function saveConfig(value:CliConfig):Promise<void> {
 }
 function keyArgs(endpoint:string):string[] { return ['service','stateplane','endpoint',endpoint]; }
 const macKeychainScript=join(dirname(fileURLToPath(import.meta.url)),'../bin/keychain.swift');
-function macKeychain(operation:'store'|'load'|'remove',endpoint:string,stdin?:string,
+function macKeychain(operation:'remove',endpoint:string,stdin?:string,
   run:typeof command=command) {
   // xcrun selects a matching Swift toolchain and SDK. Direct /usr/bin/swift
   // can bind to an older CLT compiler with a newer active Xcode SDK.
@@ -164,11 +164,10 @@ export async function loadSecretServiceToken(endpoint:string,
 export async function loadOsSecretToken(endpoint:string,os=platform(),
   run:typeof command=command):Promise<string> {
   if (os==='linux') return loadSecretServiceToken(endpoint,run);
-  if (os!=='darwin') throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
-  const result=await macKeychain('load',endpoint,undefined,run);
-  if (!result.ok) throw new StateplaneCliError(result.missing?'UNAUTHENTICATED':'KEYCHAIN_UNAVAILABLE');
-  if (!result.output) throw new StateplaneCliError('UNAUTHENTICATED');
-  return result.output;
+  // Interpreted Swift callers cannot provide a verifiable application identity.
+  // The legacy login Keychain allowed another same-account process to decrypt
+  // with interaction disabled. Retain only removal for existing stored items.
+  throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
 }
 export async function storeSecretServiceToken(endpoint:string,token:string,
   run:typeof command=command):Promise<void> {
@@ -206,13 +205,7 @@ export async function saveToken(endpoint:string,token:string,store:'keychain'|'f
     return;
   }
   if (platform()==='linux') return storeSecretServiceToken(endpoint,token);
-  const result=platform()==='darwin' ? await macKeychain('store',endpoint,token) : {ok:false};
-  if (!result.ok) throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
-  const checked=await macKeychain('load',endpoint);
-  if (!checked.ok || checked.output!==token) {
-    await macKeychain('remove',endpoint);
-    throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
-  }
+  throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
 }
 export async function loadToken(config:CliConfig):Promise<string> {
   if (process.env.STATEPLANE_TOKEN) return process.env.STATEPLANE_TOKEN;

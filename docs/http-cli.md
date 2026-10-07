@@ -64,36 +64,33 @@ development. Supply a bearer session token or API key through stdin:
 
 ```sh
 stateplane config endpoint --url https://stateplane.example.invalid/
-stateplane auth login --token-stdin --store keychain < /private/path/token
+stateplane auth login --token-stdin --store file < /private/path/token
 stateplane spaces list
 stateplane spaces create --space sp_123e4567-e89b-42d3-a456-426614174000
 stateplane spaces select --space sp_123e4567-e89b-42d3-a456-426614174000
 stateplane collections list
+stateplane collections list --cursor '<nextCursor>'
 stateplane records create --collection entries --key ' item-1 ' \
   --data '{"label":"Item 1","state":"open"}' --idempotency-key req-a \
   --expected-schema-version 1
 ```
 
-`keychain` is the default. On macOS, it uses the legacy login Keychain. A
-disposable native test on macOS found that a second Swift process could read
-the item with Keychain interaction disabled, despite the helper's restricted
-access list. This mode does not establish isolation from other processes in
-the same OS account. For unattended ingestion on macOS, choose `--store file` and protect the user's
-private configuration directory. On Linux, it uses Secret Service through
-`secret-tool`. If OS storage is unavailable, explicitly select `--store file`.
+On Linux, `keychain` is the default and uses Secret Service through
+`secret-tool`. On macOS and Windows, the default is the protected file store.
+The macOS legacy login Keychain path is disabled for new writes and reads: a
+native probe observed that an unrelated same-account Swift process could read
+a disposable token with interaction disabled. Selecting `--store keychain` on
+macOS fails with `KEYCHAIN_UNAVAILABLE` before saving a token. Existing
+Keychain items can still be removed by `auth logout` or an endpoint change.
+Use `--store file` explicitly for unattended jobs or supply `STATEPLANE_TOKEN`
+only in the process environment. On Linux, select `--store file` if Secret
+Service is unavailable.
 An absent stored item returns `UNAUTHENTICATED`; an unavailable OS store returns
 `KEYCHAIN_UNAVAILABLE`. Neither error prints backend diagnostics or a token.
-The macOS path requires `xcrun` and its selected Swift toolchain (install Apple
-Command Line Tools with `xcode-select --install` if they are absent). It sends the token to a
-small bundled Keychain helper over stdin, then reads the item back before
-reporting `configured:true`; the token never appears in a process argument.
-The helper requests a Keychain access list with no silently trusted application,
-including when replacing an older item, but the observed macOS behavior does
-not satisfy that caller policy. Use the protected file store for unattended jobs.
-Apple's [SecAccessCreate documentation](https://developer.apple.com/documentation/security/secaccesscreate%28_%3A_%3A_%3A%29)
-specifies that an empty trusted-app list requires confirmation for restricted
-operations. The observed behavior did not enforce that expectation. A locked
-or headless Keychain can yield `KEYCHAIN_UNAVAILABLE`.
+Removing a legacy macOS Keychain item requires `xcrun` and its selected Swift
+toolchain. If that cleanup fails, the credential-location journal stays in
+place for a later logout or endpoint change. A locked or headless Keychain can
+yield `KEYCHAIN_UNAVAILABLE`.
 `auth login` validates the bearer with `GET /v1/auth/session` before saving it.
 For offline bootstrap, `auth import --token-stdin --store file` stores a
 credential without validation; the next API call checks it. Invalid tokens
@@ -189,7 +186,14 @@ requests without `Content-Length`. A service time or capacity limit can also
 return `RATE_LIMITED`; that response remains retryable and carries
 `Retry-After`. An explicitly empty query or event cursor is invalid;
 omit `--cursor` to request the first page. The CLI timeout defaults to 30 seconds and can be set with
-`--timeout` in milliseconds up to 120 seconds. Keep the CLI timeout above the
+`--timeout` in milliseconds up to 120 seconds. Collection discovery returns
+`{items,cursor}` with at most eight canonical definitions per page. Pass its
+non-null cursor to the next `collections list --cursor` call; a missing or
+malformed cursor returns `CURSOR_INVALID`. Each page checks current space and
+collection grants, so a revoked collection cannot appear on a later page.
+The eight-definition cap bounds a page to roughly eight 1 MiB definitions,
+plus metadata, and is a protective limit rather than measured Worker capacity.
+Keep the CLI timeout above the
 server budget when possible; a client timeout on a write is still ambiguous.
 The event feed returns at most 100 immutable metadata entries per page and
 uses migration 037's commit-safe feed position index. A trigger writes pending

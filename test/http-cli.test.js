@@ -16,14 +16,6 @@ import { saveToken, loadToken, removeToken, configureToken, removeTrackedTokens,
   storeSecretServiceToken, loadSecretServiceToken, removeSecretServiceToken,
   loadOsSecretToken } from '../packages/cli/dist/config.js';
 
-// The interactive macOS cases require an unlocked login Keychain. A headless
-// runner can compile Swift but receives authorization error -60008 on access.
-const macKeychainAvailable=platform()==='darwin' &&
-  spawnSync('/usr/bin/xcrun',['--sdk','macosx','swift',
-    join(import.meta.dirname,'../packages/cli/bin/keychain.swift'),'load',
-    `stateplane:https://readiness-${randomUUID()}.example.invalid/`],
-  {encoding:'utf8',timeout:30000}).status===2;
-
 function fixture() {
   let granted=true; let providerDown=false; let commitUnknown=false; let calls=0; let deletes=0;
   const saved=new Map();
@@ -127,6 +119,17 @@ test('HTTP and installed CLI observe the same receipt; revocation and cursor err
   assert.equal((await stat(join(cliRoot,'token'))).mode&0o077,0);
   const selected=await cli(['spaces','select','--space','sp_a']);
   assert.equal(selected.status,0,selected.stderr);
+  state.services.collections.list=async(_actor,space,collection,cursor)=>{
+    assert.equal(space,'sp_a');
+    assert.equal(collection,undefined);
+    return {items:[{definition:{slug:cursor?'next':'first'}}],cursor:cursor?null:'opaque-next'};
+  };
+  const discoveryPath='v1/spaces/sp_a/collections?cursor=opaque-next';
+  const httpDiscovery=await (await fetch(new URL(discoveryPath,endpoint),{
+    headers:{Authorization:'Bearer secret-test-token'}})).json();
+  const cliDiscovery=await cli(['collections','list','--cursor','opaque-next']);
+  assert.equal(cliDiscovery.status,0,cliDiscovery.stderr);
+  assert.deepEqual(JSON.parse(cliDiscovery.stdout),httpDiscovery);
   for (const args of [
     ['records','patch','--collection','entries','--id','rec_1','--expected-revision','1',
       '--idempotency-key','bad-patch','--data','null'],
@@ -858,20 +861,14 @@ test('Secret Service cleanup accepts verified absence and preserves the journal 
   assert.equal(journal.tokenLocations,undefined);
 });
 
-test('OS secret load reports backend failure consistently and missing macOS items as unauthenticated',async()=>{
+test('OS secret load fails closed on macOS and reports Linux backend failure',async()=>{
   const endpoint='https://secret-test.example.invalid/';
   await assert.rejects(loadOsSecretToken(endpoint,'win32',async()=>{
     throw new Error('unsupported OS invoked a store');
   }),{code:'KEYCHAIN_UNAVAILABLE'});
-  for (const [result,code] of [
-    [{ok:false,output:'',missing:false},'KEYCHAIN_UNAVAILABLE'],
-    [{ok:false,output:'',missing:true},'UNAUTHENTICATED']
-  ]) await assert.rejects(loadOsSecretToken(endpoint,'darwin',async(program,args)=>{
-    assert.equal(program,'/usr/bin/xcrun');
-    assert.deepEqual(args.slice(0,3),['--sdk','macosx','swift']);
-    assert.deepEqual(args.slice(-2),['load',`stateplane:${endpoint}`]);
-    return result;
-  }),{code});
+  await assert.rejects(loadOsSecretToken(endpoint,'darwin',async()=>{
+    throw new Error('macOS Keychain must not be read');
+  }),{code:'KEYCHAIN_UNAVAILABLE'});
 });
 
 test('projection polling returns a deleted revision while record content remains hidden',async()=>{
@@ -1147,70 +1144,30 @@ test('equals-form flags preserve identifiers beginning with option syntax',async
   assert.doesNotMatch(created.stdout+created.stderr,/secret-test-token/);
 });
 
-test('macOS Keychain stores and reloads a token without passing it as a process argument',
-  {skip:platform()!=='darwin' || process.env.STATEPLANE_KEYCHAIN_INTERACTIVE_TESTS!=='1'},async()=>{
+test('macOS rejects unsafe Keychain writes and reads before a token can be stored',
+  {skip:platform()!=='darwin'},async()=>{
     const endpoint=`https://keychain-${randomUUID()}.example.invalid/`;
     const token=`token-${randomUUID()}`;
+    await assert.rejects(saveToken(endpoint,token,'keychain'),{code:'KEYCHAIN_UNAVAILABLE'});
+    await assert.rejects(loadToken({endpoint,tokenStore:'keychain'}),{code:'KEYCHAIN_UNAVAILABLE'});
     const root=await mkdtemp(join(tmpdir(),'stateplane-cli-keychain-'));
     try {
-      await saveToken(endpoint,token,'keychain');
-      assert.equal(await loadToken({endpoint,tokenStore:'keychain'}),token);
-      await removeToken({endpoint,tokenStore:'keychain'});
-      await removeToken({endpoint,tokenStore:'keychain'});
-      await writeFile(join(root,'config.json'),JSON.stringify({endpoint,tokenStore:'keychain'}),{mode:0o600});
-      await saveToken(endpoint,token,'keychain');
-      await assert.rejects(withConfigMutationInRoot(root,current=>logoutConfig(current,{
-        removeTrackedTokens,
-        saveConfig:async()=>{throw new Error('interrupted after keychain deletion');}
-      })),/interrupted after keychain deletion/);
-      await assert.rejects(loadToken({endpoint,tokenStore:'keychain'}),{code:'UNAUTHENTICATED'});
-      assert.equal(JSON.parse(await readFile(join(root,'config.json'),'utf8')).tokenStore,'keychain');
-      const logout=await cliProcess(root,['auth','logout']);
-      assert.equal(logout.status,0,logout.stderr);
-      assert.deepEqual(JSON.parse(logout.stdout),{configured:false});
-      assert.equal(JSON.parse(await readFile(join(root,'config.json'),'utf8')).tokenStore,undefined);
-    } finally {
-      await removeToken({endpoint,tokenStore:'keychain'});
-      await rm(root,{recursive:true,force:true});
-    }
-  });
-
-test('macOS Keychain reports a missing item as unauthenticated',
-  {skip:!macKeychainAvailable},async()=>{
-    await assert.rejects(loadToken({endpoint:`https://missing-${randomUUID()}.example.invalid/`,
-      tokenStore:'keychain'}),{code:'UNAUTHENTICATED'});
-  });
-
-test('macOS Keychain does not silently trust a second Swift script',
-  {skip:!macKeychainAvailable || process.env.STATEPLANE_KEYCHAIN_INTERACTIVE_TESTS!=='1'},async()=>{
-    const endpoint=`https://caller-${randomUUID()}.example.invalid/`;
-    const service=`stateplane:${endpoint}`;
-    const token=`disposable-${randomUUID()}`;
-    const root=await mkdtemp(join(tmpdir(),'stateplane-keychain-caller-'));
-    const probe=join(root,'alternate.swift');
-    const helper='packages/cli/bin/keychain.swift';
-    const swift=(script,operation,input='')=>spawnSync('/usr/bin/xcrun',
-      ['--sdk','macosx','swift',script,operation,service],
-      {encoding:'utf8',input,timeout:30000});
-    try {
-      await writeFile(probe,`import Foundation\nimport Security\nlet query:[String:Any]=[kSecClass as String:kSecClassGenericPassword,\n  kSecAttrAccount as String:"default",kSecAttrService as String:CommandLine.arguments[2],\n  kSecReturnData as String:true,kSecMatchLimit as String:kSecMatchLimitOne,\n  kSecUseAuthenticationUI as String:kSecUseAuthenticationUIFail]\nvar result:CFTypeRef?\nfputs("KEYCHAIN_PROBE_ENTER\\n",stderr)\nlet interaction=SecKeychainSetUserInteractionAllowed(false)\nfputs("KEYCHAIN_PROBE_INTERACTION=\\(interaction)\\n",stderr)\nlet status=SecItemCopyMatching(query as CFDictionary,&result)\nfputs("KEYCHAIN_PROBE_RETURN=\\(status)\\n",stderr)\nif status == errSecSuccess, let data=result as? Data { FileHandle.standardOutput.write(data) }\nelse { exit(3) }\n`);
-      const stored=swift(helper,'store',token);
-      assert.equal(stored.status,0,'disposable Keychain item must be created');
-      const updated=swift(helper,'store',token);
-      assert.equal(updated.status,0,`duplicate item must update its access policy: ${updated.error?.code??updated.stderr}`);
-      const own=swift(helper,'load');
-      assert.ok(own.status===0 && own.stdout===token,'the owning CLI must still load the token');
-      const other=swift(probe,'load');
-      assert.equal(other.error,undefined,`alternate probe must launch: ${other.stderr}`);
-      assert.match(other.stderr,/KEYCHAIN_PROBE_RETURN=-?\d+/,
-        'alternate probe must reach SecItemCopyMatching and report its result');
-      assert.ok(other.stdout!==token,`another Swift script must not decrypt silently: ${other.stderr}`);
-      assert.equal(other.status,3,'Keychain must deny the alternate caller');
-    } finally {
-      const removed=swift(helper,'remove');
-      assert.equal(removed.status,0,'disposable Keychain item must be removed');
-      await rm(root,{recursive:true,force:true});
-    }
+      assert.equal((await cliProcess(root,['config','endpoint','--url',endpoint])).status,0);
+      const rejected=await cliProcess(root,['auth','import','--token-stdin','--store','keychain'],token+'\n');
+      assert.equal(rejected.status,1);
+      assert.equal(JSON.parse(rejected.stderr).error.code,'KEYCHAIN_UNAVAILABLE');
+      assert.doesNotMatch(rejected.stdout+rejected.stderr,new RegExp(token));
+      const saved=JSON.parse(await readFile(join(root,'config.json'),'utf8'));
+      assert.equal(saved.tokenStore,undefined);
+      // A failed import may leave a recovery journal, but logout must clear it.
+      assert.equal((await cliProcess(root,['auth','logout'])).status,0);
+      assert.equal(JSON.parse(await readFile(join(root,'config.json'),'utf8')).tokenLocations,undefined);
+      const imported=await cliProcess(root,['auth','import','--token-stdin'],token+'\n');
+      assert.equal(imported.status,0,imported.stderr);
+      assert.deepEqual(JSON.parse(imported.stdout),{configured:true,store:'file'});
+      assert.equal(await readFile(join(root,'token'),'utf8'),token);
+      assert.equal((await cliProcess(root,['auth','logout'])).status,0);
+    } finally { await rm(root,{recursive:true,force:true}); }
   });
 
 test('interrupted credential store switches and logout remove both tracked secrets',async()=>{
@@ -1292,52 +1249,6 @@ test('interrupted credential store switches and logout remove both tracked secre
   }
 });
 
-test('installed CLI switches file and macOS Keychain stores and cleans an interrupted switch',
-  {skip:platform()!=='darwin' || process.env.STATEPLANE_KEYCHAIN_INTERACTIVE_TESTS!=='1'},async()=>{
-    const root=await mkdtemp(join(tmpdir(),'stateplane-cli-switch-'));
-    const endpoint=`https://switch-${randomUUID()}.example.invalid/`;
-    const token=`secret-${randomUUID()}`;
-    try {
-      const cli=(args,input)=>cliProcess(root,args,input);
-      assert.equal((await cli(['config','endpoint','--url',endpoint])).status,0);
-      for (const store of ['file','keychain','file']) {
-        const result=await cli(['auth','import','--token-stdin','--store',store],token+'\n');
-        assert.equal(result.status,0,result.stderr);
-        assert.equal((result.stdout+result.stderr).includes(token),false);
-        assert.equal(store==='file'?await readFile(join(root,'token'),'utf8'):
-          await loadToken({endpoint,tokenStore:store}),token);
-      }
-      await assert.rejects(loadToken({endpoint,tokenStore:'keychain'}),{code:'UNAUTHENTICATED'});
-      // Simulate a process stopping after the new Keychain item is written.
-      await writeFile(join(root,'config.json'),JSON.stringify({endpoint,tokenStore:'file',
-        tokenLocations:['file','keychain']}),{mode:0o600});
-      await saveToken(endpoint,token,'keychain');
-      const logout=await cli(['auth','logout']);
-      assert.equal(logout.status,0,logout.stderr);
-      assert.equal((logout.stdout+logout.stderr).includes(token),false);
-      await assert.rejects(readFile(join(root,'token'),'utf8'),{code:'ENOENT'});
-      await assert.rejects(loadToken({endpoint,tokenStore:'keychain'}),{code:'UNAUTHENTICATED'});
-      // An obsolete file location fails cleanup, but the active Keychain
-      // credential must still be removed and the journal kept for retry.
-      await mkdir(join(root,'token'));
-      await saveToken(endpoint,token,'keychain');
-      await writeFile(join(root,'config.json'),JSON.stringify({endpoint,tokenStore:'keychain',
-        tokenLocations:['file','keychain']}),{mode:0o600});
-      const interrupted=await cli(['auth','logout']);
-      assert.equal(interrupted.status,1);
-      assert.equal((interrupted.stdout+interrupted.stderr).includes(token),false);
-      assert.equal(JSON.parse((await readFile(join(root,'config.json'),'utf8')).trim()).tokenStore,'keychain');
-      await assert.rejects(loadToken({endpoint,tokenStore:'keychain'}),{code:'UNAUTHENTICATED'});
-      await rm(join(root,'token'),{recursive:true});
-      const retry=await cli(['auth','logout']);
-      assert.equal(retry.status,0,retry.stderr);
-      assert.equal((retry.stdout+retry.stderr).includes(token),false);
-    } finally {
-      await removeToken({endpoint,tokenStore:'keychain'});
-      await rm(root,{recursive:true,force:true});
-    }
-  });
-
 test('HTTP and CLI no-op space updates deny metadata after owner revocation during regional read',async t=>{
   const spaceId='sp_a';
   const row={space_id:spaceId,owner_principal_id:'owner',home_cell_id:'cell-a',cell_id:'cell-a',
@@ -1408,52 +1319,6 @@ test('HTTP and CLI no-op space updates deny metadata after owner revocation duri
   gate.release();
   assert.equal((await (await recovered).json()).lifecycle,'active');
 });
-
-test('concurrent logout and endpoint changes clean both secret stores after a switch',
-  {skip:platform()!=='darwin' || process.env.STATEPLANE_KEYCHAIN_INTERACTIVE_TESTS!=='1'},async()=>{
-    for (const from of ['file','keychain']) for (const action of ['logout','endpoint']) {
-      const to=from==='file'?'keychain':'file';
-      const root=await mkdtemp(join(tmpdir(),'stateplane-cli-race-secret-'));
-      const endpoint=`https://race-${randomUUID()}.example.invalid/`;
-      const token=`secret-${randomUUID()}`;
-      let release;
-      try {
-        assert.equal((await cliProcess(root,['config','endpoint','--url',endpoint])).status,0);
-        assert.equal((await cliProcess(root,['auth','import','--token-stdin','--store',from],token+'\n')).status,0);
-        let entered;
-        const locked=new Promise(resolve=>{entered=resolve;});
-        const gate=new Promise(resolve=>{release=resolve;});
-        const switchStore=withConfigMutationInRoot(root,async current=>{
-          entered();
-          await gate;
-          await configureToken(current,token,to);
-        });
-        await locked;
-        const args=action==='logout'?['auth','logout']:
-          ['config','endpoint','--url',`https://next-${randomUUID()}.example.invalid/`];
-        const cleanup=cliProcess(root,args);
-        let settled=false;
-        cleanup.then(()=>{settled=true;});
-        await new Promise(resolve=>setTimeout(resolve,200));
-        assert.equal(settled,false,'cleanup waits for the in-progress store switch');
-        release();release=undefined;
-        await switchStore;
-        const result=await cleanup;
-        assert.equal(result.status,0,result.stderr);
-        assert.equal((result.stdout+result.stderr).includes(token),false);
-        await assert.rejects(readFile(join(root,'token'),'utf8'),{code:'ENOENT'});
-        await assert.rejects(loadToken({endpoint,tokenStore:'keychain'}),{code:'UNAUTHENTICATED'});
-        const saved=JSON.parse(await readFile(join(root,'config.json'),'utf8'));
-        assert.equal(saved.tokenStore,undefined);
-        assert.equal(saved.tokenLocations,undefined);
-        if (action==='endpoint') assert.notEqual(saved.endpoint,endpoint);
-      } finally {
-        release?.();
-        await removeToken({endpoint,tokenStore:'keychain'}).catch(()=>{});
-        await rm(root,{recursive:true,force:true});
-      }
-    }
-  });
 
 test('HTTP and CLI selected-space retries deny metadata when owner access is revoked during the directory lock wait',async t=>{
   const spaceId=`sp_${randomUUID()}`;

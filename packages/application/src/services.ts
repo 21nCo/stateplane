@@ -11,7 +11,7 @@ export interface StateplaneServices {
     delete(actor: VerifiedCredential, spaceId: string): Promise<unknown>;
   };
   collections: {
-    list(actor: VerifiedCredential, spaceId: string, collectionId?: string): Promise<unknown>;
+    list(actor: VerifiedCredential, spaceId: string, collectionId?: string, cursor?: string): Promise<unknown>;
     define(actor: VerifiedCredential, spaceId: string, collectionId: string, serialized: string): Promise<unknown>;
     revise(actor: VerifiedCredential, spaceId: string, collectionId: string, version: number, serialized: string): Promise<unknown>;
   };

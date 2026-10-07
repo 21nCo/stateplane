@@ -64,7 +64,20 @@ paths:
     parameters: [ { $ref: '#/components/parameters/spaceId' } ]
     get:
       operationId: discoverCollections
-      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+      description: Returns at most eight canonical definitions per page. Every page rechecks the caller's current space and collection grants.
+      parameters: [ { name: cursor, in: query, schema: { type: string }, description: Opaque continuation from the prior page } ]
+      responses:
+        '200':
+          description: Bounded collection discovery page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, cursor]
+                properties:
+                  items: { type: array, maxItems: 8, items: { type: object } }
+                  cursor: { type: [string, 'null'] }
+        default: { $ref: '#/components/responses/Error' }
   /v1/spaces/{spaceId}/collections/{collectionId}:
     parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
     get:
