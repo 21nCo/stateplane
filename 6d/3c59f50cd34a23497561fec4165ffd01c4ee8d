@@ -1,0 +1,28 @@
+contracts/openapi.yaml
+  h_a39f9495f9ec1d 280-295
+package.json
+  h_a39f9495f9ec1d 42,58,67-68
+packages/postgres/src/collections.ts
+  h_a39f9495f9ec1d 38-41
+pnpm-lock.yaml
+  h_a39f9495f9ec1d 68-70,97-100,122,125,128,131,140,2681-2685,3624,3627,3631,3635,3647,3653,3659-3660,3723,3728,3880,3886,4952,4964,4966,4968,4970,4973,4990,5045-5046
+scripts/test-http-host.mjs
+  h_a39f9495f9ec1d 98-106,114,122-123
+test/integration/collections.test.js
+  h_a39f9495f9ec1d 66-86
+test/integration/http-services.test.js
+  h_a39f9495f9ec1d 416,420-428
+test/openapi-contract.test.js
+  h_a39f9495f9ec1d 1-18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6d3c59f50cd34a23497561fec4165ffd01c4ee8d",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
