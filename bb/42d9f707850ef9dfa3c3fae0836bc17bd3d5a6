@@ -1,0 +1,28 @@
+docs/http-cli.md
+  h_a39f9495f9ec1d 47,55-57,92-95
+packages/api/src/http.ts
+  h_a39f9495f9ec1d 32,39-40,44-47
+packages/cli/bin/secure-acl.ps1
+  h_a39f9495f9ec1d 8-19,31,39-40,49,56
+packages/cli/package.json
+  h_a39f9495f9ec1d 20-22,25
+pnpm-lock.yaml
+  h_a39f9495f9ec1d 167,171-173
+scripts/check-boundaries.mjs
+  h_a39f9495f9ec1d 149-155
+scripts/test-consumer.mjs
+  h_a39f9495f9ec1d 1,33-73,100-105,113-114,116-117
+test/http-cli.test.js
+  h_a39f9495f9ec1d 19-23,1136,1142,1151,1153,1156-1159,1161-1165
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bb42d9f707850ef9dfa3c3fae0836bc17bd3d5a6",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
