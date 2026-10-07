@@ -1,0 +1,38 @@
+docs/http-cli.md
+  h_a39f9495f9ec1d 191-193
+migrations/038_drop_superseded_event_cursor.sql
+  h_a39f9495f9ec1d 1-3
+packages/api/src/http.ts
+  h_a39f9495f9ec1d 171,182-185
+packages/cli/src/config.ts
+  h_a39f9495f9ec1d 243-246
+packages/cli/src/run.ts
+  h_a39f9495f9ec1d 154-155,180-183
+packages/cli/src/transport.ts
+  h_a39f9495f9ec1d 52,56-57,63,65,77
+packages/postgres/src/collections.ts
+  h_a39f9495f9ec1d 268,291
+packages/postgres/src/services.ts
+  h_a39f9495f9ec1d 70
+scripts/migrate.mjs
+  h_a39f9495f9ec1d 35-36,122,124
+scripts/test-consumer.mjs
+  h_a39f9495f9ec1d 100,148
+test/http-cli.test.js
+  h_a39f9495f9ec1d 872-891,1167-1168,1175-1176,1183,1188-1191,1209,1234-1250,1254
+test/integration/collections.test.js
+  h_a39f9495f9ec1d 47-65
+test/integration/event-feed-upgrade.test.js
+  h_a39f9495f9ec1d 123-124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9cfa4d21f226c1d2e7a0824c090ac2e2c024e919",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
