@@ -30,7 +30,7 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
   const name=`stateplane_sta9_event_${randomUUID().replaceAll('-','')}`;
   const url=new URL(baseUrl); url.pathname=`/${name}`;
   const admin=new pg.Client({connectionString:baseUrl});
-  let upgrade;let writer;let blocker;let migration;
+  let upgrade;let writer;let blocker;let reader;let migration;
   await admin.connect();
   try {
     await admin.query(`CREATE DATABASE ${name}`);
@@ -123,6 +123,43 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name>='036_'")).rows[0].n,3);
     assert.equal((await upgrade.query("SELECT to_regclass('public.record_events_scoped_cursor') AS name")).rows[0].name,null);
     migrate(false);
+
+    // Recreate only the unapplied drop step to exercise a long-lived reader.
+    // The old migrator waited indefinitely at DROP INDEX while this lock lived.
+    await upgrade.query("DELETE FROM stateplane_migrations WHERE name='038_drop_superseded_event_cursor.sql'");
+    await upgrade.query(`CREATE INDEX record_events_scoped_cursor
+      ON record_events(space_id,collection_id,committed_at,event_id)`);
+    reader=new pg.Client({connectionString:url.href});
+    await reader.connect();
+    await reader.query('BEGIN');
+    await reader.query('LOCK TABLE record_events IN ACCESS SHARE MODE');
+    migration=spawn(process.execPath,['scripts/migrate.mjs'],{cwd,
+      env:{...env,STATEPLANE_POPULATED_INDEX_UPGRADE:'drained'},stdio:['ignore','pipe','pipe']});
+    const dropClosed=once(migration,'close');
+    let dropError='';
+    migration.stderr.setEncoding('utf8');
+    migration.stderr.on('data',chunk=>{dropError+=chunk;});
+    let waitingOnDrop=false;
+    for (let attempt=0;attempt<100;attempt++) {
+      const waiting=await upgrade.query(`SELECT 1 FROM pg_stat_activity WHERE pid<>pg_backend_pid()
+        AND wait_event_type='Lock' AND query LIKE '%DROP INDEX IF EXISTS record_events_scoped_cursor%'`);
+      if (waiting.rowCount) {waitingOnDrop=true;break;}
+      if (migration.exitCode!==null) break;
+      await new Promise(resolve=>setTimeout(resolve,50));
+    }
+    assert.equal(waitingOnDrop,true,'index removal waits behind the active reader');
+    assert.deepEqual((await upgrade.query('SELECT event_id FROM record_event_feed')).rows,[{event_id:'event-1'}]);
+    const [dropStatus]=await dropClosed;
+    migration=undefined;
+    assert.equal(dropStatus,1);
+    assert.match(dropError,/Event cursor index removal requires drained readers/);
+    assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name='038_drop_superseded_event_cursor.sql'")).rows[0].n,0);
+    assert.notEqual((await upgrade.query("SELECT to_regclass('public.record_events_scoped_cursor') AS name")).rows[0].name,null);
+    await reader.query('ROLLBACK');
+    await reader.end();
+    reader=undefined;
+    migrate(true);
+    assert.equal((await upgrade.query("SELECT to_regclass('public.record_events_scoped_cursor') AS name")).rows[0].name,null);
   } finally {
     if (migration) {
       migration.kill('SIGTERM');
@@ -133,6 +170,8 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     await blocker?.end().catch(()=>{});
     await writer?.query('ROLLBACK').catch(()=>{});
     await writer?.end().catch(()=>{});
+    await reader?.query('ROLLBACK').catch(()=>{});
+    await reader?.end().catch(()=>{});
     await upgrade?.end().catch(()=>{});
     await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
     await admin.end();

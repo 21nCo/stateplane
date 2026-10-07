@@ -125,15 +125,18 @@ try {
       (name === '036_event_cursor.sql' || recorded.has('036_event_cursor.sql')))
       await preflightEventFeed(); // NOSONAR -- preflight locks must precede this migration step
     const receiptDomainCutover = name === '034_batch_receipt_domain.sql' || name === '035_validate_batch_receipt_domain.sql';
-    const priorLockTimeout = receiptDomainCutover ? (await client.query('SHOW lock_timeout')).rows[0].lock_timeout : null;
-    if (receiptDomainCutover) await client.query("SET LOCAL lock_timeout = '5s'");
+    const boundedDdl = receiptDomainCutover || name === '038_drop_superseded_event_cursor.sql';
+    const priorLockTimeout = boundedDdl ? (await client.query('SHOW lock_timeout')).rows[0].lock_timeout : null;
+    if (boundedDdl) await client.query("SET LOCAL lock_timeout = '5s'");
     try { await client.query(sql); }
     catch (error) {
       if (receiptDomainCutover && error?.code === '55P03')
         throw new Error('Batch receipt domain upgrade requires drained traffic; stop record writers and retry', { cause:error });
+      if (name === '038_drop_superseded_event_cursor.sql' && error?.code === '55P03')
+        throw new Error('Event cursor index removal requires drained readers; stop long readers and retry', { cause:error });
       throw error;
     }
-    if (receiptDomainCutover) await client.query('SELECT set_config($1,$2,true)', ['lock_timeout',priorLockTimeout]);
+    if (boundedDdl) await client.query('SELECT set_config($1,$2,true)', ['lock_timeout',priorLockTimeout]);
     await client.query('INSERT INTO stateplane_migrations (name, sha256) VALUES ($1, $2)', [name, sha256]);
     process.stdout.write(`Applied ${name}\n`);
   }

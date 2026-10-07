@@ -163,10 +163,11 @@ identity even when its parsed JSON value is equivalent. The
 manifest is limited to 20 items and 2 MiB of serialized item bytes by the
 authority. The HTTP JSON string-array envelope must also fit 3 MiB after
 escaping; the CLI checks both byte budgets before sending. Permanent item
-count and item-byte violations return nonretryable `INVALID_ARGUMENT`;
-an oversized HTTP envelope returns nonretryable `RATE_LIMITED`. Retry the
-unchanged file and operation key to resume pending
-items; use `--retry-failed` only when intentionally retrying failed items.
+count, item-byte and aggregate-byte violations return nonretryable `INVALID_ARGUMENT`;
+an oversized HTTP envelope returns nonretryable `RATE_LIMITED`. Correct fixed
+limit violations before submitting again. After an interrupted or uncertain
+ingest, retry the unchanged file and operation key to resume pending items;
+use `--retry-failed` only when intentionally retrying failed items.
 After a timeout or `OUTCOME_UNKNOWN`, first read batch status. A standalone
 write is never retried automatically. Resubmit the **identical** record body
 with the **same idempotency key** to recover its receipt. `Retry-After` controls

@@ -142,7 +142,15 @@ paths:
     parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { name: operationKey, in: path, required: true, schema: { type: string } } ]
     put:
       operationId: ingestBatch
-      description: Immutable operation key and JSON array of serialized record requests; retryFailed=true resumes failed items.
+      description: >-
+        Immutable operation key and JSON array of serialized record requests;
+        retryFailed=true resumes failed items. One to 20 items, at most 1,048,576
+        UTF-8 bytes per item and 2,097,152 combined item bytes are accepted.
+        Fixed item count or byte violations return 400 INVALID_ARGUMENT with
+        retryable false before writes. A body over 3,145,728 bytes returns 429
+        RATE_LIMITED with retryable false and no Retry-After. Transient time or
+        capacity RATE_LIMITED remains retryable with Retry-After; clients must
+        inspect retryable and recover an uncertain write by its operation key.
       parameters: [ { name: retryFailed, in: query, schema: { type: boolean } } ]
       requestBody:
         required: true

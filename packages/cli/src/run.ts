@@ -151,8 +151,7 @@ async function runAuth(action:string|undefined,flags:Flags,config:CliConfig):Pro
   }
   if (action!=='login' && action!=='import') throw new StateplaneCliError('INVALID_ARGUMENT');
   if (!config.endpoint || flags['token-stdin']!==true) throw new StateplaneCliError('INVALID_ARGUMENT');
-  let store=flags.store;
-  if (store===undefined) store=process.platform==='linux'?'keychain':'file';
+  const store=flags.store ?? (process.platform==='linux'?'keychain':'file');
   if (store!=='file' && store!=='keychain') throw new StateplaneCliError('INVALID_ARGUMENT');
   const token=(await input('-',4096)).replace(/\r?\n$/,'');
   if (action==='login') await new StateplaneHttpClient({endpoint:config.endpoint,token,
