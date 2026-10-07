@@ -9,6 +9,34 @@ CREATE TABLE record_event_feed (
 CREATE INDEX record_event_feed_scoped_position
   ON record_event_feed(space_id,collection_id,position);
 
+-- A writer records its event and pending marker in the same transaction. A
+-- reader sees only committed markers, so a slower writer cannot be skipped by
+-- a cursor issued after a faster writer. The pending index makes empty polls
+-- independent of retained event history.
+CREATE TABLE record_event_pending (
+  event_id text PRIMARY KEY REFERENCES record_events(event_id) ON DELETE CASCADE,
+  space_id text NOT NULL,
+  collection_id text NOT NULL,
+  committed_at timestamptz NOT NULL
+);
+CREATE INDEX record_event_pending_scoped_order
+  ON record_event_pending(space_id ASC,collection_id ASC,committed_at ASC,event_id ASC);
+CREATE FUNCTION stateplane_queue_record_event() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER
+SET search_path = pg_catalog, public, pg_temp
+AS $$
+BEGIN
+  INSERT INTO public.record_event_pending(event_id,space_id,collection_id,committed_at)
+    VALUES(NEW.event_id,NEW.space_id,NEW.collection_id,NEW.committed_at);
+  RETURN NEW;
+END $$;
+CREATE TRIGGER record_event_pending_insert AFTER INSERT ON record_events
+  FOR EACH ROW EXECUTE FUNCTION stateplane_queue_record_event();
+REVOKE ALL ON TABLE record_event_pending FROM PUBLIC;
+REVOKE ALL ON TABLE record_event_feed FROM PUBLIC;
+REVOKE ALL ON SEQUENCE record_event_feed_position_seq FROM PUBLIC;
+REVOKE ALL ON FUNCTION stateplane_queue_record_event() FROM PUBLIC;
+
 -- Older events are all committed before this migration completes. Their
 -- historic timestamps supply a stable initial order only.
 INSERT INTO record_event_feed(event_id,space_id,collection_id)

@@ -1,13 +1,22 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 
 const root = resolve(import.meta.dirname, '..');
 const temp = await mkdtemp(join(tmpdir(), 'stateplane-consumer-'));
+const pnpmCli=process.env.npm_execpath;
+const npmCandidates=[join(dirname(process.execPath),'node_modules/npm/bin/npm-cli.js'),
+  join(dirname(process.execPath),'../lib/node_modules/npm/bin/npm-cli.js')];
+const npmCli=npmCandidates.find(existsSync);
+if (!pnpmCli || !isAbsolute(pnpmCli) || !existsSync(pnpmCli) || !npmCli || !isAbsolute(npmCli))
+  throw new Error('Trusted pnpm/npm CLI paths are unavailable');
 /** Run a package command inside the isolated external consumer. */
 function run(command, args, cwd) {
-  const result = spawnSync(command, args, { cwd, encoding: 'utf8', stdio: 'pipe', env: process.env, shell: process.platform === 'win32' && ['pnpm', 'npm'].includes(command) });
+  const executable=command==='pnpm'?process.execPath:command==='npm'?process.execPath:command;
+  const parameters=command==='pnpm'?[pnpmCli,...args]:command==='npm'?[npmCli,...args]:args;
+  const result = spawnSync(executable, parameters, { cwd, encoding: 'utf8', stdio: 'pipe', env: process.env });
   if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed\n${result.stdout}\n${result.stderr}`);
   return result.stdout.trim();
 }
@@ -27,27 +36,27 @@ import { readModelSchema } from '@stateplane/read-model';
 import { parseRevision } from '@stateplane/contracts';
 import { canonicalJsonObject } from '@stateplane/postgres';
 import { validateSchema } from '@datafn/core';
-if ((await healthResponse().json()).status !== 'scaffold') throw Error('API export failed');
-if (readModelSchema.resources[0].name !== 'spacePlacements') throw Error('fixed schema export failed');
-if (!validateSchema(readModelSchema)) throw Error('DataFn schema rejected');
-if (parseRevision(1) !== 1) throw Error('revision export failed');
-if (canonicalJsonObject('{"answer":42}') !== '{"answer":42}') throw Error('Postgres export failed');
+if ((await healthResponse().json()).status !== 'scaffold') throw new Error('API export failed');
+if (readModelSchema.resources[0].name !== 'spacePlacements') throw new Error('fixed schema export failed');
+if (!validateSchema(readModelSchema)) throw new Error('DataFn schema rejected');
+if (parseRevision(1) !== 1) throw new Error('revision export failed');
+if (canonicalJsonObject('{"answer":42}') !== '{"answer":42}') throw new Error('Postgres export failed');
 `);
   run('node', ['consumer.mjs'], temp);
-  const cliHelp = run(join(temp, 'node_modules/.bin/stateplane'), ['help'], temp);
-  if (JSON.parse(cliHelp).usage?.startsWith('stateplane ') !== true) throw Error('Installed CLI executable failed');
+  const installedCli = join(temp, 'node_modules/@stateplane/cli/bin/stateplane.js');
+  const cliHelp = run(process.execPath, [installedCli, 'help'], temp);
+  if (JSON.parse(cliHelp).usage?.startsWith('stateplane ') !== true) throw new Error('Installed CLI executable failed');
   const cliEnv = { ...process.env, STATEPLANE_CONFIG_DIR: join(temp, 'cli-config') };
-  const installedCli = join(temp, 'node_modules/.bin/stateplane');
-  const setup = spawnSync(installedCli, ['config', 'endpoint', '--url', 'http://127.0.0.1:43210/'],
+  const setup = spawnSync(process.execPath, [installedCli, 'config', 'endpoint', '--url', 'http://127.0.0.1:43210/'],
     { cwd: temp, env: cliEnv, encoding: 'utf8' });
-  if (setup.status !== 0) throw Error(`Installed CLI configuration failed: ${setup.stderr}`);
-  const login = spawnSync(installedCli, ['auth', 'import', '--token-stdin', '--store', 'file'],
+  if (setup.status !== 0) throw new Error(`Installed CLI configuration failed: ${setup.stderr}`);
+  const login = spawnSync(process.execPath, [installedCli, 'auth', 'import', '--token-stdin', '--store', 'file'],
     { cwd: temp, env: cliEnv, encoding: 'utf8', input: 'generic-consumer-token\n' });
   if (login.status !== 0 || (login.stdout + login.stderr).includes('generic-consumer-token'))
-    throw Error('Installed CLI secure bootstrap failed');
-  const shown = spawnSync(installedCli, ['config', 'show'], { cwd: temp, env: cliEnv, encoding: 'utf8' });
+    throw new Error('Installed CLI secure bootstrap failed');
+  const shown = spawnSync(process.execPath, [installedCli, 'config', 'show'], { cwd: temp, env: cliEnv, encoding: 'utf8' });
   if (shown.status !== 0 || shown.stdout.includes('generic-consumer-token') ||
-      JSON.parse(shown.stdout).endpoint !== 'http://127.0.0.1:43210/') throw Error('Installed CLI exported a secret or lost endpoint');
+      JSON.parse(shown.stdout).endpoint !== 'http://127.0.0.1:43210/') throw new Error('Installed CLI exported a secret or lost endpoint');
   const record = ['records', 'create', '--space', 'sp_a', '--collection', 'entries',
     '--idempotency-key', 'invalid', '--data', '{}'];
   for (const args of [
@@ -56,10 +65,10 @@ if (canonicalJsonObject('{"answer":42}') !== '{"answer":42}') throw Error('Postg
     ['records', 'create', '--space', 'sp_a', '--collection', 'entries',
       '--idempotency-key', 'invalid', '--data', '', '--file', 'record.json']
   ]) {
-    const rejected = spawnSync(installedCli, args, { cwd: temp, env: cliEnv, encoding: 'utf8' });
+    const rejected = spawnSync(process.execPath, [installedCli, ...args], { cwd: temp, env: cliEnv, encoding: 'utf8' });
     if (rejected.status !== 1 || JSON.parse(rejected.stderr).error.code !== 'INVALID_ARGUMENT' ||
         (rejected.stdout + rejected.stderr).includes('generic-consumer-token'))
-      throw Error('Installed CLI accepted malformed record input or exposed a token');
+      throw new Error('Installed CLI accepted malformed record input or exposed a token');
   }
   await writeFile(join(temp, 'consumer.ts'), `import { parseRevision, type RecordRef, type Revision, type CollectionId, type SpaceId } from '@stateplane/contracts';
 import type { HttpDependencies } from '@stateplane/api';

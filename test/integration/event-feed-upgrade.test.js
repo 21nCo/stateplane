@@ -13,6 +13,19 @@ const password=process.env.DATABASE_URL ? null :
 const baseUrl=process.env.DATABASE_URL ??
   `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT??'55432'}/stateplane`;
 
+async function applyFixtureMigration(client,file,sql) {
+  await client.query('BEGIN');
+  try {
+    await client.query(sql);
+    await client.query('INSERT INTO stateplane_migrations(name,sha256) VALUES($1,$2)',
+      [file,createHash('sha256').update(sql).digest('hex')]);
+    await client.query('COMMIT');
+  } catch(error) {
+    await client.query('ROLLBACK');
+    throw error;
+  }
+}
+
 test('populated event-feed upgrade refuses live traffic and replays after a drained window',async()=>{
   const name=`stateplane_sta9_event_${randomUUID().replaceAll('-','')}`;
   const url=new URL(baseUrl); url.pathname=`/${name}`;
@@ -29,10 +42,13 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
       .filter(file=>/^\d{3}_.*\.sql$/.test(file)).sort();
     for (const file of files.filter(file=>file<'033_')) {
       const sql=await readFile(new URL(`../../migrations/${file}`,import.meta.url),'utf8');
-      await upgrade.query(sql);
-      await upgrade.query('INSERT INTO stateplane_migrations(name,sha256) VALUES($1,$2)',
-        [file,createHash('sha256').update(sql).digest('hex')]);
+      await applyFixtureMigration(upgrade,file,sql);
     }
+    await upgrade.query("INSERT INTO stateplane_migrations(name,sha256) VALUES('fixture_failure.sql','prior')");
+    await assert.rejects(applyFixtureMigration(upgrade,'fixture_failure.sql',
+      'CREATE TABLE sta9_ledger_failure_probe(id integer)'),{code:'23505'});
+    assert.equal((await upgrade.query("SELECT to_regclass('public.sta9_ledger_failure_probe') AS relation")).rows[0].relation,null);
+    await upgrade.query("DELETE FROM stateplane_migrations WHERE name='fixture_failure.sql'");
     await upgrade.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
       VALUES('sta9-event','owner','cell-a','cell-a','target-a')`);
     await upgrade.query('BEGIN');
@@ -48,7 +64,7 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
       operation,credential_id,schema_version,canonical_data)
       VALUES('event-1','sta9-event','entries','record-1',1,'create','agent',1,'{}')`);
     const env={...process.env,DATABASE_URL:url.href};
-    const migrate=(drained)=>execFileSync(process.execPath,['scripts/migrate.mjs'],{cwd,encoding:'utf8',
+    const migrate=(drained)=>execFileSync(process.execPath,['scripts/migrate.mjs'],{cwd,encoding:'utf8',timeout:15_000,
       env:{...env,STATEPLANE_POPULATED_INDEX_UPGRADE:drained?'drained':''}});
     let refused;
     try { migrate(false); } catch(error) { refused=error; }
@@ -64,6 +80,7 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     await blocker.query('LOCK TABLE batch_items IN ACCESS EXCLUSIVE MODE');
     migration=spawn(process.execPath,['scripts/migrate.mjs'],{cwd,
       env:{...env,STATEPLANE_POPULATED_INDEX_UPGRADE:'drained'},stdio:['ignore','pipe','pipe']});
+    const migrationClosed=once(migration,'close');
     let migrationError='';
     migration.stderr.setEncoding('utf8');
     migration.stderr.on('data',chunk=>{migrationError+=chunk;});
@@ -81,7 +98,7 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     await writer.query('BEGIN');
     await writer.query("UPDATE records SET data=data WHERE space_id='sta9-event' AND record_id='record-1'");
     await blocker.query('ROLLBACK');
-    const [splitStatus]=await once(migration,'close');
+    const [splitStatus]=await migrationClosed;
     migration=undefined;
     assert.equal(splitStatus,1);
     assert.match(migrationError,/Event feed upgrade requires drained traffic/);
@@ -108,7 +125,8 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
   } finally {
     if (migration) {
       migration.kill('SIGTERM');
-      await once(migration,'close').catch(()=>{});
+      if (migration.exitCode===null && migration.signalCode===null)
+        await once(migration,'close').catch(()=>{});
     }
     await blocker?.query('ROLLBACK').catch(()=>{});
     await blocker?.end().catch(()=>{});

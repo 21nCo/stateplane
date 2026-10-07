@@ -77,6 +77,9 @@ The macOS path requires the system `swift` command (install Apple Command Line
 Tools with `xcode-select --install` if it is absent). It sends the token to a
 small bundled Keychain helper over stdin, then reads the item back before
 reporting `configured:true`; the token never appears in a process argument.
+The helper applies a Keychain access list restricted to the calling application,
+including when replacing an older item. It supports CLI use after the login
+Keychain is unlocked without a per-command user-presence prompt.
 `auth login` validates the bearer with `GET /v1/auth/session` before saving it.
 For offline bootstrap, `auth import --token-stdin --store file` stores a
 credential without validation; the next API call checks it. Invalid tokens
@@ -97,6 +100,8 @@ SQLite transaction lock. A command that cannot acquire it within 120 seconds
 returns `CONFIGURATION_BUSY` without changing credentials; repeat it after the
 other command finishes. The 120-second bound matches the maximum configured
 HTTP timeout. The OS releases the transaction if a process exits unexpectedly.
+Each HTTP command captures the endpoint, selected space, storage kind and
+credential under that same lock before sending a request.
 Version, revision, limit, and timeout arguments use positive decimal digits
 without signs, leading zeros, spaces, hexadecimal, or exponent notation.
 
@@ -118,6 +123,8 @@ patch and delete; use it to reject a write after an incompatible schema
 revision. The CLI accepts `--json` for scripts and always emits JSON. It does
 not accept `--verbose` or `--debug`, so those flags cannot expose credentials.
 Explicitly empty space, cell, sort, and external-key selectors are rejected.
+Use `--name=--literal-value` when an identifier starts with `--`; the equals
+form distinguishes that value from another option name.
 Commands that accept a JSON payload require exactly one of `--data` and
 `--file`; supplying both is an error even if one value is empty.
 
@@ -138,8 +145,10 @@ original file bytes for same-key recovery; reformatting an item changes batch
 identity even when its parsed JSON value is equivalent. The
 manifest is limited to 20 items and 2 MiB of serialized item bytes by the
 authority. The HTTP JSON string-array envelope must also fit 3 MiB after
-escaping; the CLI checks both byte budgets before sending and reports an
-oversize input as a nonretryable `RATE_LIMITED` error. Retry the unchanged file and operation key to resume pending
+escaping; the CLI checks both byte budgets before sending. Permanent item
+count and item-byte violations return nonretryable `INVALID_ARGUMENT`;
+an oversized HTTP envelope returns nonretryable `RATE_LIMITED`. Retry the
+unchanged file and operation key to resume pending
 items; use `--retry-failed` only when intentionally retrying failed items.
 After a timeout or `OUTCOME_UNKNOWN`, first read batch status. A standalone
 write is never retried automatically. Resubmit the **identical** record body
@@ -163,7 +172,11 @@ omit `--cursor` to request the first page. The CLI timeout defaults to 30 second
 `--timeout` in milliseconds up to 120 seconds. Keep the CLI timeout above the
 server budget when possible; a client timeout on a write is still ambiguous.
 The event feed returns at most 100 immutable metadata entries per page and
-uses migration 037's commit-safe feed position index. On an existing database
+uses migration 037's commit-safe feed position index. A trigger writes pending
+markers in the record writer transaction; polling publishes at most 101
+committed markers without scanning retained event history. Grant the separate
+cell runtime role the feed, pending table and sequence privileges after each
+migration or restore as described in [owned spaces](owned-spaces.md). On an existing database
 with events, the migrator refuses pending 036 or 037 unless record writers are
 stopped and `STATEPLANE_POPULATED_INDEX_UPGRADE=drained` is set. Its preflight
 takes writer-excluding record and event locks without waiting behind active

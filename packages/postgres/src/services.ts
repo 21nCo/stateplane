@@ -20,11 +20,12 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
     return run(cell,admitted.scope,async(db,result)=>{
       const discovery=collectionId===undefined && capability==='records:read';
       const grants:Capability[]=discovery ? ['records:read','schema:write'] : [capability];
-      await spaces.assertScopeCurrent(actor,admitted.ownerPrincipalId,admitted.scope,db,
-        discoveryCollectionId??collectionId,grants);
-      if (discovery && Array.isArray(result)) for (const entry of result) {
+      if (discovery && Array.isArray(result)) {
+        await spaces.assertDiscoveryCurrent(actor,admitted.ownerPrincipalId,admitted.scope,db,
+          result.map(entry=>entry.definition.slug),grants);
+      } else {
         await spaces.assertScopeCurrent(actor,admitted.ownerPrincipalId,admitted.scope,db,
-          entry.definition.slug,grants);
+          discoveryCollectionId??collectionId,grants);
       }
     });
   }

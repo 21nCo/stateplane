@@ -22,7 +22,7 @@ function host(env:Bindings):((request:Request)=>Promise<Response>) | undefined {
   if (!['local','preview'].includes(env.STATEPLANE_ENV) || env.STATEPLANE_TEST_HTTP!=='1' ||
       !env.STATEPLANE_TEST_TOKEN || env.STATEPLANE_TEST_TOKEN.length<32 ||
       !env.STATEPLANE_TEST_OWNER || !env.STATEPLANE_TEST_CREDENTIAL ||
-      !env.STATEPLANE_TEST_CURSOR_SECRET || !/^[0-9a-f]{64,}$/.test(env.STATEPLANE_TEST_CURSOR_SECRET)) return clearHost();
+      !env.STATEPLANE_TEST_CURSOR_SECRET || !/^[0-9a-fA-F]{64,}$/.test(env.STATEPLANE_TEST_CURSOR_SECRET)) return clearHost();
   const connectionString=env.AUTHORITY?.connectionString ?? env.STATEPLANE_TEST_DATABASE_URL;
   if (!connectionString) return clearHost();
   const cellId=env.STATEPLANE_TEST_CELL_ID??'cell-a';
@@ -30,28 +30,35 @@ function host(env:Bindings):((request:Request)=>Promise<Response>) | undefined {
   const key=createHash('sha256').update(JSON.stringify([connectionString,cellId,storageTargetId,
     env.STATEPLANE_TEST_TOKEN,env.STATEPLANE_TEST_OWNER,env.STATEPLANE_TEST_CREDENTIAL,
     env.STATEPLANE_TEST_CURSOR_SECRET])).digest('hex');
-  if (cached?.key===key) return cached.handler;
+  if (!env.AUTHORITY && cached?.key===key) return cached.handler;
   const pool=new pg.Pool({connectionString,max:4});
   const tokenDigest=createHash('sha256').update(env.STATEPLANE_TEST_TOKEN).digest();
   const actor={kind:'session' as const,userPrincipalId:env.STATEPLANE_TEST_OWNER,
     credentialId:env.STATEPLANE_TEST_CREDENTIAL};
   const identity={
-    verify:async(request:Request)=>{
+    verify:(request:Request)=>{
       const bearer=request.headers.get('authorization');
-      if (!bearer?.startsWith('Bearer ')) return null;
+      if (!bearer?.startsWith('Bearer ')) return Promise.resolve(null);
       const candidate=createHash('sha256').update(bearer.slice(7)).digest();
-      return timingSafeEqual(candidate,tokenDigest) ? actor : null;
+      return Promise.resolve(timingSafeEqual(candidate,tokenDigest) ? actor : null);
     },
-    current:async(claims:{credentialId:string},owner?:string)=>
-      claims.credentialId===actor.credentialId && (owner===undefined || owner===actor.userPrincipalId)
+    current:(claims:{credentialId:string},owner?:string)=>
+      Promise.resolve(claims.credentialId===actor.credentialId && (owner===undefined || owner===actor.userPrincipalId))
   };
   const cells=new Map([[cellId,{pool,storageTargetId}]]);
   const spaces=new PostgresSpaces(pool,cells,cellId,{
-    create:async()=>{ throw new Error('Agent issuance is not configured'); },
-    find:async()=>null,revoke:async()=>{ throw new Error('Agent revocation is not configured'); }
+    create:()=>Promise.reject(new Error('Agent issuance is not configured')),
+    find:()=>Promise.resolve(null),revoke:()=>Promise.reject(new Error('Agent revocation is not configured'))
   },identity);
   const services=postgresServices(spaces,new Map([[cellId,{pool,cursorSecret:Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex')}]]),3600);
   const serve=createHttpHandler({services,identity});
+  if (env.AUTHORITY) {
+    clearHost();
+    return async request=>{
+      try { return await serve(request); }
+      finally { await pool.end(); }
+    };
+  }
   let active=0;let retired=false;
   const retire=()=>{
     retired=true;

@@ -1198,10 +1198,35 @@ test('selected retry races lease recovery under one directory lock', async () =>
   await assert.rejects(spaces.create(actor,'cell-a',malformed),denied('STALE_PLACEMENT'));
   assert.equal((await controlPool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1',[malformed])).rows[0].lifecycle,'provisioning');
   assert.equal((await spaces.create(actor,'cell-a',committed)).lifecycle,'active');
-  const [one,two]=await Promise.all([spaces.create(actor,'cell-a',absent),spaces.create(actor,'cell-a',absent)]);
-  assert.equal(one.spaceId,absent);
-  assert.equal(two.spaceId,absent);
-  assert.equal((await pool.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:create'",[absent])).rows[0].n,1);
+  let signal,release;
+  const selected=new Promise(resolve=>{signal=resolve;});
+  const proceed=new Promise(resolve=>{release=resolve;});
+  const racingControl={connect:()=>controlPool.connect(),query:async(sql,...args)=>{
+    const result=await controlPool.query(sql,...args);
+    if (String(sql).includes("lifecycle='provisioning' ORDER BY created_at")) {
+      signal();await proceed;
+    }
+    return result;
+  }};
+  const racing=new PostgresSpaces(racingControl,cells,'cell-a',
+    {create:async()=>{throw new Error('unexpected key');},revoke:async()=>{}},{current:async()=>true});
+  const listing=racing.list(actor);
+  await selected;
+  const creating=racing.create(actor,'cell-a',absent);
+  release();
+  const [creation,list]=await Promise.allSettled([creating,listing]);
+  assert.equal(list.status,'fulfilled');
+  const lifecycle=(await controlPool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1',[absent])).rows[0].lifecycle;
+  assert.ok(['active','deleted'].includes(lifecycle));
+  if (lifecycle==='active') {
+    assert.equal(creation.status,'fulfilled');
+    assert.equal(creation.value.spaceId,absent);
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:create'",[absent])).rows[0].n,1);
+  } else {
+    assert.equal(creation.status,'rejected');
+    assert.equal(creation.reason.code,'UNIQUE_CONFLICT');
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM spaces WHERE space_id=$1',[absent])).rows[0].n,0);
+  }
   assert.equal((await spaces.list(actor)).some(space=>space.spaceId===retired),false);
   await assert.rejects(spaces.create(actor,'cell-a',retired),denied('UNIQUE_CONFLICT'));
   assert.equal((await controlPool.query('SELECT count(*)::int AS n FROM space_provisioning_audit WHERE space_id=$1',[retired])).rows[0].n,1);

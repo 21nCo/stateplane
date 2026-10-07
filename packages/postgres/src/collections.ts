@@ -24,6 +24,10 @@ const declaredFields=(first:readonly string[],second:readonly string[]):string[]
   for (let i=0;i<second.length;i++) if (!has(fields,second[i])) append(fields,second[i]); // NOSONAR -- own-slot scan avoids replaced array iterators
   return fields;
 };
+const visibleDiscoveryRow=(item:pg.QueryResultRow,space:pg.QueryResultRow,scope:AuthorityScope):boolean=>
+  space.owner_principal_id===scope.principalId ||
+    (item.grant_current &&
+      (has(item.capabilities??[],scope.capability) || has(item.capabilities??[],'schema:write')));
 /** Snapshot a schema scope; discovery accepts a space scope without a collection ID. */
 const snapshotScope=(scope:AuthorityScope,collectionRequired=true):AuthorityScope=>{
   const fixed=Object.freeze({...scope});
@@ -66,10 +70,11 @@ export class CollectionRegistry {
         discard=true;
         // A PostgreSQL SQLSTATE confirms that COMMIT was rejected. A broken
         // transport without a SQLSTATE leaves the commit outcome unknown.
-        // PostgreSQL SQLSTATEs contain a digit; Node transport errno names
-        // such as EPIPE and EBUSY can also have five uppercase characters.
-        const code=String((error as {code?:unknown}).code??'');
-        if (/^[0-9A-Z]{5}$/.test(code) && /[0-9]/.test(code)) throw error;
+        // Driver server errors carry SQLSTATE and server fields. An errno can
+        // also have five uppercase letters, so code shape alone is unsafe.
+        const server=error as {code?:unknown;severity?:unknown;routine?:unknown};
+        if (typeof server.code==='string' && /^[0-9A-Z]{5}$/.test(server.code) &&
+          typeof server.severity==='string' && typeof server.routine==='string') throw error;
         throw new CommitOutcomeUnknownError(error);
       }
       return result;
@@ -247,8 +252,7 @@ export class CollectionRegistry {
       let entry:typeof collections[number]|undefined;
       for (let i=0;i<result.rows.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
         const item=result.rows[i];
-        if (space.owner_principal_id!==scope.principalId && (!item.grant_current ||
-          (!has(item.capabilities??[],scope.capability) && !has(item.capabilities??[],'schema:write')))) continue;
+        if (!visibleDiscoveryRow(item,space,scope as AuthorityScope)) continue;
         if (lastId!==item.collection_id) {
           entry={definition:JSON.parse(item.canonical_definition),ready:[],pending:[]};
           append(collections,entry);

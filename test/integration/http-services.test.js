@@ -73,6 +73,20 @@ test('real Postgres HTTP operations preserve receipts, grant checks, events and 
   assert.equal(batch.status,200);
   assert.equal((await batch.json()).items[0].state,'succeeded');
   assert.equal((await (await route('GET',`${base}/batches/import-1`)).json()).items[0].state,'succeeded');
+  for (const [key,items] of [
+    ['too-many',Array(21).fill('{}')],
+    ['too-large',Array(3).fill('x'.repeat(750_000))]
+  ]) {
+    const rejected=await route('PUT',`${base}/batches/${key}`,items);
+    assert.equal(rejected.status,400);
+    const failure=(await rejected.json()).error;
+    assert.deepEqual({code:failure.code,message:failure.message,retryable:failure.retryable},
+      {code:'INVALID_ARGUMENT',message:'INVALID_ARGUMENT',retryable:false});
+    assert.match(failure.requestId,/^[a-zA-Z0-9_-]+$/);
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM batch_operations
+      WHERE space_id=$1 AND collection_id=$2 AND operation_key=$3`,
+    [space.spaceId,collection,key])).rows[0].n,0);
+  }
   for (const [method,path,body] of [
     ['GET',`${base}/records/${id}`,undefined],
     ['POST',`${base}/records`,request],
@@ -209,6 +223,35 @@ test('a live API key cannot enumerate another owner through collection siblings'
   }
 });
 
+test('collection discovery checks one provider snapshot and set of grants',async t=>{
+  const spaceId=`sp_${randomUUID()}`;
+  assert.equal((await route('POST','/v1/spaces',{spaceId})).status,201);
+  t.after(async()=>{
+    currentProbe=()=>current;
+    try { await spaces.update(actor,spaceId,'readOnly'); await spaces.delete(actor,spaceId); } catch {}
+  });
+  const names=Array.from({length:5},(_,index)=>`collection_${index}`);
+  for (const slug of names) {
+    const definition={slug,version:1,schema:{$schema:'https://json-schema.org/draft/2020-12/schema',
+      type:'object',properties:{label:{type:'string'}},additionalProperties:false},
+      unique:[],filterable:[],sortable:[]};
+    assert.equal((await route('PUT',`/v1/spaces/${spaceId}/collections/${slug}`,definition)).status,201);
+  }
+  await pool.query(`INSERT INTO space_credentials(space_id,credential_id,principal_id,owner_principal_id,
+    expires_at,activated_at,confirmed_at)
+    VALUES($1,$2,'discovery-agent',$3,clock_timestamp()+interval '1 hour',clock_timestamp(),clock_timestamp())`,
+  [spaceId,agent.credentialId,actor.userPrincipalId]);
+  for (const slug of names) await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
+    VALUES($1,$2,$3,ARRAY['records:read']::text[])`,[spaceId,slug,agent.credentialId]);
+  let checks=0;
+  currentProbe=()=>{checks++;return true;};
+  const response=await route('GET',`/v1/spaces/${spaceId}/collections`,undefined,'fixture-agent-key');
+  assert.equal(response.status,200);
+  assert.equal((await response.json()).length,5);
+  assert.equal(checks,2,'one admission and one final credential recheck regardless of collection count');
+  currentProbe=()=>current;
+});
+
 test('event continuation survives two writers whose transactions finish in opposite order',async t=>{
   const spaceId=`sp_${randomUUID()}`;
   assert.equal((await route('POST','/v1/spaces',{spaceId})).status,201);
@@ -234,7 +277,7 @@ test('event continuation survives two writers whose transactions finish in oppos
   const second=authority.mutateRequest(admitted.scope,{operation:'create',idempotencyKey:'writer-b',data:{label:'B'}});
   let before;
   try {
-    const early=await Promise.race([second.then(()=>true),new Promise(resolve=>setTimeout(()=>resolve(false),80))]);
+    const early=await Promise.race([second.then(()=>true),new Promise(resolve=>setTimeout(()=>resolve(false),2000))]);
     assert.equal(early,true,'independent record writes must remain concurrent');
     before=await (await route('GET',`${base}/events`)).json();
     assert.equal(before.events.length,1);

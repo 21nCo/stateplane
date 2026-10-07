@@ -67,13 +67,108 @@ function object(serialized:string):Record<string,unknown> {
 function errorResponse(error:unknown,requestId:string):Response {
   const name=error instanceof Error ? error.name : '';
   const raw=(error as {code?:unknown})?.code;
-  const code=name==='CommitOutcomeUnknownError' ? 'COMMIT_OUTCOME_UNKNOWN' :
-    typeof raw==='string' && Object.hasOwn(status,raw) ? raw : error instanceof HttpFailure ? error.code : 'PROVIDER_UNAVAILABLE';
+  let code:string;
+  if (name==='CommitOutcomeUnknownError') code='COMMIT_OUTCOME_UNKNOWN';
+  else if (typeof raw==='string' && Object.hasOwn(status,raw)) code=raw;
+  else if (error instanceof HttpFailure) code=error.code;
+  else code='PROVIDER_UNAVAILABLE';
   const canRetry=error instanceof HttpFailure && error.retryableOverride!==undefined
     ? error.retryableOverride : retryable.has(code);
   const response=json({contractVersion:'1',error:{code,message:code,retryable:canRetry,requestId}},status[code]??503);
   if (canRetry) response.headers.set('Retry-After','1');
   return response;
+}
+
+async function rootSpaces(services:StateplaneServices,actor:VerifiedCredential,request:Request):Promise<Response> {
+  if (request.method==='GET') return json(await services.spaces.list(actor));
+  if (request.method!=='POST') return fail('NOT_FOUND');
+  const value=object(await body(request,4096));
+  if (Object.keys(value).some(k=>!['cellId','spaceId'].includes(k)) ||
+    (value.cellId!==undefined && typeof value.cellId!=='string') ||
+    typeof value.spaceId!=='string' || !/^sp_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value.spaceId)) fail('INVALID_ARGUMENT');
+  return json(await services.spaces.create(actor,value.cellId as string|undefined,value.spaceId as string),201);
+}
+
+async function selectedSpace(services:StateplaneServices,actor:VerifiedCredential,space:string,
+  request:Request):Promise<Response> {
+  if (request.method==='GET') return json(await services.spaces.get(actor,space));
+  if (request.method==='DELETE') return json(await services.spaces.delete(actor,space));
+  if (request.method!=='PATCH') return fail('NOT_FOUND');
+  await services.spaces.get(actor,space);
+  const value=object(await body(request,4096));
+  if (Object.keys(value).length!==1 || typeof value.lifecycle!=='string' ||
+    !['active','readOnly','suspended'].includes(value.lifecycle)) fail('INVALID_ARGUMENT');
+  return json(await services.spaces.update(actor,space,value.lifecycle as 'active'|'readOnly'|'suspended'));
+}
+
+async function selectedCollection(services:StateplaneServices,actor:VerifiedCredential,space:string,
+  collection:string,request:Request):Promise<Response> {
+  if (request.method==='GET') return json(await services.collections.list(actor,space,collection));
+  if (request.method==='PUT') return json(await services.collections.define(actor,space,collection,
+    await body(request,1_048_576)),201);
+  if (request.method!=='PATCH') return fail('NOT_FOUND');
+  const rawVersion=request.headers.get('if-match');
+  if (!rawVersion || !/^[1-9]\d*$/.test(rawVersion)) fail('INVALID_ARGUMENT');
+  const version=Number(rawVersion);
+  if (!Number.isSafeInteger(version) || version<1) fail('INVALID_ARGUMENT');
+  return json(await services.collections.revise(actor,space,collection,version,await body(request,1_048_576)));
+}
+
+async function recordsRoute(services:StateplaneServices,p:string[],request:Request,url:URL,
+  prefix:readonly [VerifiedCredential,string,string]):Promise<Response> {
+  if (p.length===5 && request.method==='POST')
+    return json(await services.records.mutate(...prefix,await body(request,1_048_576)));
+  if (p.length===6 && p[5]==='query' && request.method==='POST')
+    return json(await services.records.query(...prefix,await body(request,32_768)));
+  if (p.length===6 && p[5]==='count' && request.method==='POST')
+    return json(await services.records.count(...prefix,await body(request,32_768)));
+  if (p.length===7 && p[5]==='by-key' && request.method==='GET') {
+    const mode=url.searchParams.get('mode');
+    if (mode!=='generated' && mode!=='external') return fail('INVALID_ARGUMENT');
+    const result=await services.records.byKey(...prefix,mode,p[6]);
+    if (!result) fail('NOT_FOUND');
+    return json(result);
+  }
+  if (p.length===6 && request.method==='GET' && !['query','count','by-key'].includes(p[5])) {
+    const result=await services.records.get(...prefix,p[5]);
+    if (!result) fail('NOT_FOUND');
+    return json(result);
+  }
+  if (p.length===7 && p[6]==='projection' && request.method==='GET')
+    return json(await services.events.projection(...prefix,p[5]));
+  return fail('NOT_FOUND');
+}
+
+async function batchesRoute(services:StateplaneServices,p:string[],request:Request,url:URL,
+  prefix:readonly [VerifiedCredential,string,string]):Promise<Response> {
+  if (p.length!==6 || !p[5]) return fail('NOT_FOUND');
+  if (request.method==='GET') return json(await services.batches.progress(...prefix,p[5]));
+  if (request.method==='DELETE') return json(await services.batches.cancel(...prefix,p[5]));
+  if (request.method!=='PUT') return fail('NOT_FOUND');
+  const retry=url.searchParams.get('retryFailed');
+  if (retry!==null && retry!=='true' && retry!=='false') fail('INVALID_ARGUMENT');
+  return json(await services.batches.ingest(...prefix,p[5],await body(request),retry==='true'));
+}
+
+async function dispatch(services:StateplaneServices,actor:VerifiedCredential,request:Request,url:URL,p:string[]):Promise<Response> {
+  if (p.length===2 && p[0]==='auth' && p[1]==='session' && request.method==='GET')
+    return json({contractVersion:'1',kind:actor.kind});
+  if (p[0]!=='spaces') return fail('NOT_FOUND');
+  if (p.length===1) return rootSpaces(services,actor,request);
+  const space=p[1];
+  if (!space) return fail('NOT_FOUND');
+  if (p.length===2) return selectedSpace(services,actor,space,request);
+  if (p[2]!=='collections') return fail('NOT_FOUND');
+  if (p.length===3 && request.method==='GET') return json(await services.collections.list(actor,space));
+  const collection=p[3];
+  if (!collection) return fail('NOT_FOUND');
+  if (p.length===4) return selectedCollection(services,actor,space,collection,request);
+  const prefix=[actor,space,collection] as const;
+  if (p[4]==='records') return recordsRoute(services,p,request,url,prefix);
+  if (p[4]==='batches') return batchesRoute(services,p,request,url,prefix);
+  if (p[4]==='events' && p.length===5 && request.method==='GET')
+    return json(await services.events.list(...prefix,url.searchParams.get('cursor')??undefined));
+  return fail('NOT_FOUND');
 }
 /** All v1 endpoints use the same services as other transports. No error includes
  * the provider exception, bearer value, body, or URL query string. */
@@ -85,80 +180,7 @@ export function createHttpHandler({services,identity}:{services:StateplaneServic
       const p=path(url.pathname);
       const actor:VerifiedCredential|null=await identity.verify(request);
       if (!actor) return fail('UNAUTHENTICATED');
-      const method=request.method;
-      if (p.length===2 && p[0]==='auth' && p[1]==='session' && method==='GET')
-        return json({contractVersion:'1',kind:actor.kind});
-      if (p[0]!=='spaces') fail('NOT_FOUND');
-      if (p.length===1) {
-        if (method==='GET') return json(await services.spaces.list(actor));
-        if (method==='POST') {
-          const value=object(await body(request,4096));
-          if (Object.keys(value).some(k=>!['cellId','spaceId'].includes(k)) ||
-            (value.cellId!==undefined && typeof value.cellId!=='string') ||
-            typeof value.spaceId!=='string' || !/^sp_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value.spaceId)) fail('INVALID_ARGUMENT');
-          return json(await services.spaces.create(actor,value.cellId as string|undefined,value.spaceId as string),201);
-        }
-      }
-      const space=p[1];
-      if (!space) fail('NOT_FOUND');
-      if (p.length===2) {
-        if (method==='GET') return json(await services.spaces.get(actor,space));
-        if (method==='PATCH') {
-          await services.spaces.get(actor,space);
-          const value=object(await body(request,4096));
-          if (Object.keys(value).length!==1 || typeof value.lifecycle!=='string' ||
-            !['active','readOnly','suspended'].includes(value.lifecycle)) fail('INVALID_ARGUMENT');
-          return json(await services.spaces.update(actor,space,value.lifecycle as 'active'|'readOnly'|'suspended'));
-        }
-        if (method==='DELETE') return json(await services.spaces.delete(actor,space));
-      }
-      if (p[2]!=='collections') fail('NOT_FOUND');
-      const collection=p[3];
-      if (p.length===3 && method==='GET') return json(await services.collections.list(actor,space));
-      if (!collection) fail('NOT_FOUND');
-      if (p.length===4) {
-        if (method==='GET') return json(await services.collections.list(actor,space,collection));
-        if (method==='PUT') return json(await services.collections.define(actor,space,collection,await body(request,1_048_576)),201);
-        if (method==='PATCH') {
-          const rawVersion=request.headers.get('if-match');
-          if (!rawVersion || !/^[1-9][0-9]*$/.test(rawVersion)) fail('INVALID_ARGUMENT');
-          const version=Number(rawVersion);
-          if (!Number.isSafeInteger(version) || version<1) fail('INVALID_ARGUMENT');
-          return json(await services.collections.revise(actor,space,collection,version,await body(request,1_048_576)));
-        }
-      }
-      const prefix=[actor,space,collection] as const;
-      if (p[4]==='records') {
-        if (p.length===5 && method==='POST') return json(await services.records.mutate(...prefix,await body(request,1_048_576)));
-        if (p.length===6 && p[5]==='query' && method==='POST') return json(await services.records.query(...prefix,await body(request,32_768)));
-        if (p.length===6 && p[5]==='count' && method==='POST') return json(await services.records.count(...prefix,await body(request,32_768)));
-        if (p.length===7 && p[5]==='by-key' && method==='GET') {
-          const mode=url.searchParams.get('mode');
-          if (mode!=='generated' && mode!=='external') return fail('INVALID_ARGUMENT');
-          const result=await services.records.byKey(...prefix,mode,p[6]);
-          if (!result) fail('NOT_FOUND');
-          return json(result);
-        }
-        if (p.length===6 && method==='GET' && !['query','count','by-key'].includes(p[5])) {
-          const result=await services.records.get(...prefix,p[5]);
-          if (!result) fail('NOT_FOUND');
-          return json(result);
-        }
-        if (p.length===7 && p[6]==='projection' && method==='GET')
-          return json(await services.events.projection(...prefix,p[5]));
-      }
-      if (p[4]==='batches' && p[5]) {
-        if (p.length===6 && method==='PUT') {
-          const retry=url.searchParams.get('retryFailed');
-          if (retry!==null && retry!=='true' && retry!=='false') fail('INVALID_ARGUMENT');
-          return json(await services.batches.ingest(...prefix,p[5],await body(request),retry==='true'));
-        }
-        if (p.length===6 && method==='GET') return json(await services.batches.progress(...prefix,p[5]));
-        if (p.length===6 && method==='DELETE') return json(await services.batches.cancel(...prefix,p[5]));
-      }
-      if (p[4]==='events' && p.length===5 && method==='GET')
-        return json(await services.events.list(...prefix,url.searchParams.get('cursor')??undefined));
-      return fail('NOT_FOUND');
+      return await dispatch(services,actor,request,url,p);
     } catch(error) { return errorResponse(error,requestId); }
   };
 }

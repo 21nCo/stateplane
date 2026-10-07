@@ -199,9 +199,10 @@ export async function loadToken(config:CliConfig):Promise<string> {
 export async function removeToken(config:CliConfig):Promise<void> {
   if (config.tokenStore==='file') await rm(tokenPath(),{force:true});
   else if (config.tokenStore==='keychain' && config.endpoint) {
-    const result=platform()==='darwin'
-      ? await macKeychain('remove',config.endpoint)
-      : platform()==='linux' ? await command('secret-tool',['clear',...keyArgs(config.endpoint)]) : {ok:false};
+    let result:CommandResult;
+    if (platform()==='darwin') result=await macKeychain('remove',config.endpoint);
+    else if (platform()==='linux') result=await command('secret-tool',['clear',...keyArgs(config.endpoint)]);
+    else result={ok:false,output:''};
     if (!result.ok) throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
   }
 }
@@ -236,4 +237,13 @@ export async function removeTrackedTokens(config:CliConfig,
   // logout or endpoint change can retry every location, including one whose
   // removal already succeeded (both backends treat absence as success).
   if (failure) throw failure;
+}
+
+/** A completed logout clears the durable secret-location journal only after
+ * every tracked backend has confirmed removal. */
+export async function logoutConfig(config:CliConfig,
+  io:{removeTrackedTokens:typeof removeTrackedTokens;saveConfig:typeof saveConfig}=
+    {removeTrackedTokens,saveConfig}):Promise<void> {
+  await io.removeTrackedTokens(config);
+  await io.saveConfig({...config,tokenStore:undefined,tokenLocations:undefined});
 }

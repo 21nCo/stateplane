@@ -10,6 +10,30 @@ export interface ClientOptions {
   endpoint:string; token:string; fetch?:typeof fetch; timeoutMs?:number; sleep?:(ms:number)=>Promise<void>;
 }
 
+function serializeBody(body:unknown):string|undefined {
+  if (body===undefined) return undefined;
+  let serialized:string|undefined;
+  try { serialized=JSON.stringify(body); }
+  catch { throw new StateplaneCliError('INVALID_ARGUMENT'); }
+  if (serialized===undefined) throw new StateplaneCliError('INVALID_ARGUMENT');
+  return serialized;
+}
+
+function retryAfter(response:Response):number|undefined {
+  const header=response.headers.get('retry-after');
+  return header && /^\d+$/.test(header) ? Math.min(5,Number(header)) : undefined;
+}
+
+function serverError(value:unknown,after:number|undefined):StateplaneCliError {
+  const envelope=value as {error?:{code?:unknown;retryable?:unknown;requestId?:unknown}};
+  const code=typeof envelope?.error?.code==='string' && /^[A-Z_]{1,64}$/.test(envelope.error.code)
+    ? envelope.error.code : 'PROVIDER_UNAVAILABLE';
+  const requestId=typeof envelope?.error?.requestId==='string' && /^[a-zA-Z0-9_-]{1,80}$/.test(envelope.error.requestId)
+    ? envelope.error.requestId : undefined;
+  return new StateplaneCliError(code,requestId,after,
+    typeof envelope?.error?.retryable==='boolean' ? envelope.error.retryable : undefined);
+}
+
 /** A thin HTTP client. Only read requests may be repeated automatically. */
 export class StateplaneHttpClient {
   private readonly endpoint:URL;
@@ -17,7 +41,8 @@ export class StateplaneHttpClient {
   private readonly timeoutMs:number;
   private readonly sleep:(ms:number)=>Promise<void>;
   constructor(private readonly options:ClientOptions) {
-    this.endpoint=new URL(options.endpoint);
+    try { this.endpoint=new URL(options.endpoint); }
+    catch { throw new StateplaneCliError('INVALID_CONFIGURATION'); }
     if (!['https:','http:'].includes(this.endpoint.protocol) ||
         (this.endpoint.protocol==='http:' && !['localhost','127.0.0.1','[::1]'].includes(this.endpoint.hostname)) ||
         this.endpoint.username || this.endpoint.password ||
@@ -32,37 +57,36 @@ export class StateplaneHttpClient {
   async request(method:'GET'|'POST'|'PUT'|'PATCH'|'DELETE',path:string,body?:unknown,
     extraHeaders?:Record<string,string>):Promise<unknown> {
     if (!path.startsWith('/v1/') || path.startsWith('//')) throw new StateplaneCliError('INVALID_ARGUMENT');
-    const url=new URL(path,this.endpoint);
+    let url:URL;
+    try { url=new URL(path,this.endpoint); }
+    catch { throw new StateplaneCliError('INVALID_ARGUMENT'); }
     if (url.origin!==this.endpoint.origin) throw new StateplaneCliError('INVALID_ARGUMENT');
-    const safeRead=method==='GET' || (method==='POST' && /\/records\/(?:query|count)$/.test(new URL(path,this.endpoint).pathname));
+    const safeRead=method==='GET' || (method==='POST' && /\/records\/(?:query|count)$/.test(url.pathname));
+    const serialized=serializeBody(body);
     for (let attempt=0;attempt<(safeRead?3:1);attempt++) {
       let response:Response;
       try {
         response=await this.fetcher(url,{method,redirect:'error',signal:AbortSignal.timeout(this.timeoutMs),
           headers:{Authorization:`Bearer ${this.options.token}`,Accept:'application/json',
             ...(body===undefined?{}:{'Content-Type':'application/json'}),...extraHeaders},
-          body:body===undefined?undefined:JSON.stringify(body)});
+          body:serialized});
       } catch {
         if (safeRead && attempt<2) { await this.sleep(250*(attempt+1)); continue; }
         throw new StateplaneCliError(safeRead?'PROVIDER_UNAVAILABLE':'OUTCOME_UNKNOWN');
       }
-      const retryAfterHeader=response.headers.get('retry-after');
-      const retryAfter=retryAfterHeader && /^\d+$/.test(retryAfterHeader) ? Math.min(5,Number(retryAfterHeader)) : undefined;
-      if (safeRead && attempt<2 && [429,503].includes(response.status) && retryAfter!==undefined) {
+      const after=retryAfter(response);
+      if (safeRead && attempt<2 && [429,503].includes(response.status) && after!==undefined) {
         await response.body?.cancel().catch(()=>{});
-        await this.sleep(retryAfter*1000); continue;
+        await this.sleep(after*1000); continue;
       }
       let value:unknown;
       try { value=await response.json(); }
-      catch { throw new StateplaneCliError(safeRead?'PROVIDER_UNAVAILABLE':'OUTCOME_UNKNOWN'); }
+      catch {
+        if (safeRead && attempt<2) { await this.sleep(250*(attempt+1)); continue; }
+        throw new StateplaneCliError(safeRead?'PROVIDER_UNAVAILABLE':'OUTCOME_UNKNOWN');
+      }
       if (response.ok) return value;
-      const envelope=value as {error?:{code?:unknown;retryable?:unknown;requestId?:unknown}};
-      const code=typeof envelope?.error?.code==='string' && /^[A-Z_]{1,64}$/.test(envelope.error.code)
-        ? envelope.error.code : 'PROVIDER_UNAVAILABLE';
-      const requestId=typeof envelope?.error?.requestId==='string' && /^[a-zA-Z0-9_-]{1,80}$/.test(envelope.error.requestId)
-        ? envelope.error.requestId : undefined;
-      throw new StateplaneCliError(code,requestId,retryAfter,
-        typeof envelope?.error?.retryable==='boolean' ? envelope.error.retryable : undefined);
+      throw serverError(value,after);
     }
     throw new StateplaneCliError('PROVIDER_UNAVAILABLE');
   }

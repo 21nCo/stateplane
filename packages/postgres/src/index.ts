@@ -303,7 +303,7 @@ function snapshotBatchManifest(operationKey:string,requests:readonly string[],re
     typeof operationKey!=='string' || !unicodeString(operationKey) || !operationKey ||
     Buffer.byteLength(operationKey)>MAX_INDEX_PART_BYTES || typeof retryFailed!=='boolean')
     throw new AuthorityError('INVALID_ARGUMENT');
-  if (requests.length>20) throw new AuthorityError('RATE_LIMITED','Batch item count limit exceeded');
+  if (requests.length>20) throw new AuthorityError('INVALID_ARGUMENT','Batch item count limit exceeded');
   if (Reflect.ownKeys(requests).length!==requests.length+1) throw new AuthorityError('INVALID_ARGUMENT');
   const fixed:string[]=[];
   let total=0;
@@ -312,7 +312,7 @@ function snapshotBatchManifest(operationKey:string,requests:readonly string[],re
     if (!unicodeString(item)) throw new AuthorityError('INVALID_ARGUMENT');
     total+=Buffer.byteLength(item);
     if (total>MAX_PAGE_BYTES || Buffer.byteLength(item)>MAX_JSON_BYTES)
-      throw new AuthorityError('RATE_LIMITED','Batch byte budget exceeded');
+      throw new AuthorityError('INVALID_ARGUMENT','Batch byte budget exceeded');
     append(fixed,item);
   }
   return fixed;
@@ -810,7 +810,7 @@ export class PostgresAuthority {
     const deadline=Date.now()+this.requestTimeoutMs;
     const requests=await this.transaction(fixedScope,tx=>{
       if (tx.scope.capability!=='records:write') throw new AuthorityError('FORBIDDEN');
-      if (typeof serialized!=='string' || Buffer.byteLength(serialized)>3_145_728) throw new AuthorityError('RATE_LIMITED');
+      if (typeof serialized!=='string' || Buffer.byteLength(serialized)>3_145_728) throw new AuthorityError('INVALID_ARGUMENT');
       try { return JSON.parse(serialized) as string[]; }
       catch { throw new AuthorityError('INVALID_ARGUMENT'); }
     },deadline);
@@ -1155,11 +1155,17 @@ export class AuthorityTransaction {
       // can then appear after a cursor issued for a faster later writer.
       await this.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 1))',
         [JSON.stringify(scopeIds(this.#scope))]);
-      await this.query(`INSERT INTO record_event_feed(event_id,space_id,collection_id)
-        SELECT e.event_id,e.space_id,e.collection_id FROM record_events e
-        LEFT JOIN record_event_feed f ON f.event_id=e.event_id
-        WHERE e.space_id=$1 AND e.collection_id=$2 AND f.event_id IS NULL
-        ORDER BY e.committed_at,e.event_id LIMIT 101 ON CONFLICT DO NOTHING`,scopeIds(this.#scope));
+      await this.query(`WITH next AS (
+          SELECT event_id,space_id,collection_id FROM record_event_pending
+          WHERE space_id=$1 AND collection_id=$2
+          ORDER BY committed_at,event_id LIMIT 101
+        ), published AS (
+          INSERT INTO record_event_feed(event_id,space_id,collection_id)
+          SELECT event_id,space_id,collection_id FROM next
+          ON CONFLICT DO NOTHING RETURNING event_id
+        )
+        DELETE FROM record_event_pending p USING published f
+        WHERE p.event_id=f.event_id`,scopeIds(this.#scope));
       const rows=await this.query(`SELECT e.event_id,e.record_id,e.revision,e.operation,e.schema_version,e.committed_at
         FROM record_event_feed f JOIN record_events e ON e.event_id=f.event_id
         WHERE f.space_id=$1 AND f.collection_id=$2
@@ -1191,7 +1197,10 @@ export class AuthorityTransaction {
         [...scopeIds(this.#scope),recordId]);
       const row=rows.rows[0];
       if (!row) throw new AuthorityError('NOT_FOUND');
-      return {state:row.delivery_state==='delivered'?'current':row.delivery_state==='degraded'?'degraded':'pending',
+      let state:'current'|'degraded'|'pending'='pending';
+      if (row.delivery_state==='delivered') state='current';
+      else if (row.delivery_state==='degraded') state='degraded';
+      return {state,
         generation:Number(row.generation),revision:Number(row.revision)};
     });
   }

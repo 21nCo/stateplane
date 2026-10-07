@@ -27,6 +27,7 @@
     "db:upgrade-smoke": "node scripts/migration-upgrade-smoke.mjs",
     "db:backfill-directory": "node scripts/backfill-space-directory.mjs",
     "db:grant-control-journal": "node scripts/grant-control-journal.mjs",
+    "db:grant-event-feed": "node scripts/grant-event-feed.mjs",
     "db:index-race-smoke": "node scripts/migration-index-race-smoke.mjs",
     "dev:worker": "pnpm --filter @stateplane/app dev:worker",
     "worker:dry-run": "pnpm --filter @stateplane/app exec wrangler deploy --dry-run --outdir ../.data/worker-dry-run",

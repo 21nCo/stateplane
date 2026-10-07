@@ -247,7 +247,7 @@ components:
       required: [field, kind, operator]
       properties:
         field: { type: string }
-        kind: { enum: [null, string, number, boolean, date-time] }
+        kind: { enum: ['null', string, number, boolean, date-time] }
         operator: { enum: [isNull, eq, lt, lte, gt, gte, in] }
         value: {}
       additionalProperties: false

@@ -1,5 +1,6 @@
 import { createReadStream } from 'node:fs';
-import { readConfig, saveConfig, configureToken, loadToken, removeTrackedTokens, withConfigMutation } from './config.js';
+import { readConfig, saveConfig, configureToken, loadToken, logoutConfig, removeTrackedTokens, withConfigMutation } from './config.js';
+import type { CliConfig } from './config.js';
 import { StateplaneCliError, StateplaneHttpClient } from './transport.js';
 
 type Flags=Record<string,string|boolean>;
@@ -10,12 +11,16 @@ function parse(argv:string[]):{words:string[];flags:Flags} {
   for (let i=0;i<argv.length;i++) {
     const item=argv[i];
     if (!item.startsWith('--')) { words.push(item); continue; }
-    const key=item.slice(2);
+    const equals=item.indexOf('=');
+    const key=item.slice(2,equals<0?undefined:equals);
     if (!/^[a-z][a-z-]*$/.test(key) || Object.hasOwn(flags,key)) throw new StateplaneCliError('INVALID_ARGUMENT');
-    if (switches.has(key)) flags[key]=true;
+    if (switches.has(key)) {
+      if (equals>=0) throw new StateplaneCliError('INVALID_ARGUMENT');
+      flags[key]=true;
+    }
     else {
-      const value=argv[++i];
-      if (value===undefined || value.startsWith('--')) throw new StateplaneCliError('INVALID_ARGUMENT');
+      const value=equals>=0 ? item.slice(equals+1) : argv[++i];
+      if (value===undefined || (equals<0 && value.startsWith('--'))) throw new StateplaneCliError('INVALID_ARGUMENT');
       flags[key]=value;
     }
   }
@@ -64,7 +69,7 @@ function cursor(flags:Flags):string {
   return value;
 }
 function integer(value:string):number {
-  if (!/^[1-9][0-9]*$/.test(value)) throw new StateplaneCliError('INVALID_ARGUMENT');
+  if (!/^[1-9]\d*$/.test(value)) throw new StateplaneCliError('INVALID_ARGUMENT');
   const number=Number(value);
   if (!Number.isSafeInteger(number) || number<1) throw new StateplaneCliError('INVALID_ARGUMENT');
   return number;
@@ -117,6 +122,145 @@ function help():void {
     docs:'See docs/http-cli.md for examples and recovery rules.'});
 }
 
+async function runConfig(action:string|undefined,flags:Flags,config:CliConfig):Promise<unknown> {
+  if (action==='show') return {endpoint:config.endpoint??null,space:config.space??null,tokenStore:config.tokenStore??null};
+  if (action!=='endpoint') throw new StateplaneCliError('INVALID_ARGUMENT');
+  const value=endpoint(required(flags,'url'));
+  return withConfigMutation(async current=>{
+    const changed=current.endpoint!==value;
+    if (current.endpoint && changed) await removeTrackedTokens(current);
+    await saveConfig({...current,endpoint:value,
+      space:changed?undefined:current.space,
+      tokenStore:changed?undefined:current.tokenStore,
+      tokenLocations:changed?undefined:current.tokenLocations});
+    return {endpoint:value,space:changed?null:current.space??null};
+  });
+}
+
+async function runAuth(action:string|undefined,flags:Flags,config:CliConfig):Promise<unknown> {
+  if (action==='logout') {
+    await withConfigMutation(current=>logoutConfig(current));
+    return {configured:false};
+  }
+  if (action!=='login' && action!=='import') throw new StateplaneCliError('INVALID_ARGUMENT');
+  if (!config.endpoint || flags['token-stdin']!==true) throw new StateplaneCliError('INVALID_ARGUMENT');
+  const store=typeof flags.store==='string'?flags.store:'keychain';
+  if (store!=='file' && store!=='keychain') throw new StateplaneCliError('INVALID_ARGUMENT');
+  const token=(await input('-',4096)).replace(/\r?\n$/,'');
+  if (action==='login') await new StateplaneHttpClient({endpoint:config.endpoint,token,
+    timeoutMs:flags.timeout ? integer(required(flags,'timeout')) : undefined}).request('GET','/v1/auth/session');
+  await withConfigMutation(async current=>{
+    if (current.endpoint!==config.endpoint) throw new StateplaneCliError('INVALID_CONFIGURATION');
+    await configureToken(current,token,store);
+  });
+  return {configured:true,store};
+}
+
+async function runSpaces(client:StateplaneHttpClient,action:string|undefined,flags:Flags,spacePath:string):Promise<unknown> {
+  if (action==='list') return client.request('GET','/v1/spaces');
+  if (action==='create') return client.request('POST','/v1/spaces',
+    withinWireBudget({spaceId:required(flags,'space'),...(flags.cell ? {cellId:flags.cell}:{})},4096));
+  if (action==='get' && spacePath) return client.request('GET',spacePath);
+  if (action==='update' && spacePath) return client.request('PATCH',spacePath,
+    withinWireBudget({lifecycle:required(flags,'lifecycle')},4096));
+  if (action==='delete' && spacePath) return client.request('DELETE',spacePath);
+  throw new StateplaneCliError('INVALID_ARGUMENT');
+}
+
+async function runCollections(client:StateplaneHttpClient,action:string|undefined,flags:Flags,
+  spacePath:string,collectionPath:string):Promise<unknown> {
+  if (action==='list') return client.request('GET',`${spacePath}/collections`);
+  if (action==='get' && collectionPath) return client.request('GET',collectionPath);
+  if (action==='define' && collectionPath) return client.request('PUT',collectionPath,
+    withinWireBudget(await payload(flags),1_048_576));
+  if (action==='revise' && collectionPath) return client.request('PATCH',collectionPath,
+    withinWireBudget(await payload(flags),1_048_576),
+    {'If-Match':String(integer(required(flags,'version')))});
+  throw new StateplaneCliError('INVALID_ARGUMENT');
+}
+
+async function mutationRequest(action:string,flags:Flags):Promise<Record<string,unknown>> {
+  const request:Record<string,unknown>={operation:action,idempotencyKey:required(flags,'idempotency-key')};
+  if (flags['expected-schema-version']!==undefined)
+    request.expectedSchemaVersion=integer(required(flags,'expected-schema-version'));
+  if (action==='create') {
+    request.data=await payload(flags);
+    if (flags.key!==undefined) request.externalKey=required(flags,'key');
+    return request;
+  }
+  request.id=required(flags,'id');
+  request.expectedRevision=integer(required(flags,'expected-revision'));
+  if (action==='replace') request.data=await payload(flags);
+  if (action==='patch') {
+    const patch=await payload(flags) as {set?:unknown;unset?:unknown}|null;
+    if (!patch || typeof patch!=='object' || Array.isArray(patch) ||
+      !patch.set || typeof patch.set!=='object' || Array.isArray(patch.set) ||
+      !Array.isArray(patch.unset) || patch.unset.some(value=>typeof value!=='string'))
+      throw new StateplaneCliError('INVALID_ARGUMENT');
+    request.set=patch.set;
+    request.unset=patch.unset;
+  }
+  return request;
+}
+
+async function runRecords(client:StateplaneHttpClient,action:string|undefined,flags:Flags,recordPath:string):Promise<unknown> {
+  if (action==='get') return client.request('GET',`${recordPath}/${encoded(required(flags,'id'))}`);
+  if (action==='key') return client.request('GET',`${recordPath}/by-key/${encoded(required(flags,'key'))}?mode=${encoded(required(flags,'mode'))}`);
+  if (action==='projection') return client.request('GET',`${recordPath}/${encoded(required(flags,'id'))}/projection`);
+  if (action==='query') return client.request('POST',`${recordPath}/query`,withinWireBudget({
+    predicates:parsed(typeof flags.predicates==='string'?flags.predicates:'[]'),
+    limit:integer(required(flags,'limit')),
+    ...(flags.sort ? {sort:parsed(required(flags,'sort'))}:{}),
+    ...(flags.cursor!==undefined ? {cursor:cursor(flags)}:{} )},32_768));
+  if (action==='count') return client.request('POST',`${recordPath}/count`,
+    withinWireBudget(parsed(typeof flags.predicates==='string'?flags.predicates:'[]'),32_768));
+  if (action && ['create','replace','patch','delete'].includes(action))
+    return client.request('POST',recordPath,withinWireBudget(await mutationRequest(action,flags),1_048_576));
+  throw new StateplaneCliError('INVALID_ARGUMENT');
+}
+
+async function runBatches(client:StateplaneHttpClient,action:string|undefined,flags:Flags,collectionPath:string):Promise<unknown> {
+  const operation=required(flags,'operation-key');
+  const url=`${collectionPath}/batches/${encoded(operation)}`;
+  if (action==='status') return client.request('GET',url);
+  if (action==='cancel') return client.request('DELETE',url);
+  if (action!=='ingest') throw new StateplaneCliError('INVALID_ARGUMENT');
+  const lines=(await input(required(flags,'file'),3_145_728)).split(/\r?\n/).filter(Boolean);
+  if (!lines.length || lines.length>20) throw new StateplaneCliError('INVALID_ARGUMENT');
+  // Preserve each item string for HTTP-to-CLI same-key recovery.
+  const manifest=lines.map(line=>{ parsed(line); return line; });
+  const itemBytes=manifest.map(item=>Buffer.byteLength(item));
+  if (itemBytes.some(size=>size>1_048_576) ||
+    itemBytes.reduce((sum,size)=>sum+size,0)>2_097_152)
+    throw new StateplaneCliError('INVALID_ARGUMENT');
+  return client.request('PUT',url+(flags['retry-failed']?'?retryFailed=true':''),
+    withinWireBudget(manifest,3_145_728));
+}
+
+async function runHttpCommand(resource:string,action:string|undefined,flags:Flags):Promise<unknown> {
+  // File credentials have one path across endpoints. Capture the endpoint,
+  // selected space, store and token under the mutation lock before I/O.
+  const snapshot=await withConfigMutation(async current=>({config:current,token:await loadToken(current)}));
+  if (!snapshot.config.endpoint) throw new StateplaneCliError('INVALID_CONFIGURATION');
+  const client=new StateplaneHttpClient({endpoint:snapshot.config.endpoint,token:snapshot.token,
+    timeoutMs:flags.timeout ? integer(required(flags,'timeout')) : undefined});
+  const space=typeof flags.space==='string' ? flags.space : snapshot.config.space;
+  const spacePath=space ? `/v1/spaces/${encoded(space)}` : '';
+  if (resource==='spaces') return runSpaces(client,action,flags,spacePath);
+  if (!spacePath) throw new StateplaneCliError('INVALID_ARGUMENT');
+  const collection=typeof flags.collection==='string' ? flags.collection : undefined;
+  const collectionPath=collection ? `${spacePath}/collections/${encoded(collection)}` : '';
+  if (resource==='collections') return runCollections(client,action,flags,spacePath,collectionPath);
+  if (!collectionPath) throw new StateplaneCliError('INVALID_ARGUMENT');
+  if (resource==='records') return runRecords(client,action,flags,`${collectionPath}/records`);
+  if (resource==='batches') return runBatches(client,action,flags,collectionPath);
+  if (resource==='events' && action==='list') {
+    const suffix=flags.cursor!==undefined ? `?cursor=${encoded(cursor(flags))}` : '';
+    return client.request('GET',`${collectionPath}/events${suffix}`);
+  }
+  throw new StateplaneCliError('INVALID_ARGUMENT');
+}
+
 /** One command produces one JSON value. Errors contain only stable fields;
  * no token, provider response body, or input payload is printed. */
 export async function runCli(argv:string[]):Promise<number> {
@@ -127,143 +271,22 @@ export async function runCli(argv:string[]):Promise<number> {
     if (rest.length) throw new StateplaneCliError('INVALID_ARGUMENT');
     validateFlags(resource,action,flags);
     const config=await readConfig();
-    if (resource==='config' && action==='endpoint') {
-      const value=endpoint(required(flags,'url'));
-      const result=await withConfigMutation(async current=>{
-        const changed=current.endpoint!==value;
-        if (current.endpoint && changed) await removeTrackedTokens(current);
-        await saveConfig({...current,endpoint:value,
-          space:changed?undefined:current.space,
-          tokenStore:changed?undefined:current.tokenStore,
-          tokenLocations:changed?undefined:current.tokenLocations});
-        return {endpoint:value,space:changed?null:current.space??null};
-      });
-      output(result); return 0;
-    }
-    if (resource==='config' && action==='show') {
-      output({endpoint:config.endpoint??null,space:config.space??null,tokenStore:config.tokenStore??null}); return 0;
-    }
-    if (resource==='auth' && (action==='login' || action==='import')) {
-      if (!config.endpoint || flags['token-stdin']!==true) throw new StateplaneCliError('INVALID_ARGUMENT');
-      const store=typeof flags.store==='string'?flags.store:'keychain';
-      if (store!=='file' && store!=='keychain') throw new StateplaneCliError('INVALID_ARGUMENT');
-      const token=(await input('-',4096)).replace(/\r?\n$/,'');
-      if (action==='login') await new StateplaneHttpClient({endpoint:config.endpoint,token,
-        timeoutMs:flags.timeout ? integer(required(flags,'timeout')) : undefined}).request('GET','/v1/auth/session');
-      await withConfigMutation(async current=>{
-        if (current.endpoint!==config.endpoint) throw new StateplaneCliError('INVALID_CONFIGURATION');
-        await configureToken(current,token,store);
-      });
-      output({configured:true,store}); return 0;
-    }
-    if (resource==='auth' && action==='logout') {
-      await withConfigMutation(async current=>{
-        await removeTrackedTokens(current);
-        await saveConfig({...current,tokenStore:undefined,tokenLocations:undefined});
-      });
-      output({configured:false}); return 0;
-    }
-    if (resource==='spaces' && action==='select') {
+    if (resource==='config') output(await runConfig(action,flags,config));
+    else if (resource==='auth') output(await runAuth(action,flags,config));
+    else if (resource==='spaces' && action==='select') {
       const space=required(flags,'space');
       await withConfigMutation(async current=>{await saveConfig({...current,space});});
-      output({space}); return 0;
-    }
-    if (!config.endpoint) throw new StateplaneCliError('INVALID_CONFIGURATION');
-    const client=new StateplaneHttpClient({endpoint:config.endpoint,token:await loadToken(config),
-      timeoutMs:flags.timeout ? integer(required(flags,'timeout')) : undefined});
-    const space=typeof flags.space==='string' ? flags.space : config.space;
-    const spacePath=space ? `/v1/spaces/${encoded(space)}` : '';
-    if (resource==='spaces') {
-      if (action==='list') output(await client.request('GET','/v1/spaces'));
-      else if (action==='create') output(await client.request('POST','/v1/spaces',
-        withinWireBudget({spaceId:required(flags,'space'),...(flags.cell ? {cellId:flags.cell}:{})},4096)));
-      else if (action==='get' && spacePath) output(await client.request('GET',spacePath));
-      else if (action==='update' && spacePath) output(await client.request('PATCH',spacePath,
-        withinWireBudget({lifecycle:required(flags,'lifecycle')},4096)));
-      else if (action==='delete' && spacePath) output(await client.request('DELETE',spacePath));
-      else throw new StateplaneCliError('INVALID_ARGUMENT');
-      return 0;
-    }
-    if (!spacePath) throw new StateplaneCliError('INVALID_ARGUMENT');
-    const collection=typeof flags.collection==='string' ? flags.collection : undefined;
-    const collectionPath=collection ? `${spacePath}/collections/${encoded(collection)}` : '';
-    if (resource==='collections') {
-      if (action==='list') output(await client.request('GET',`${spacePath}/collections`));
-      else if (action==='get' && collectionPath) output(await client.request('GET',collectionPath));
-      else if (action==='define' && collectionPath) output(await client.request('PUT',collectionPath,
-        withinWireBudget(await payload(flags),1_048_576)));
-      else if (action==='revise' && collectionPath) output(await client.request('PATCH',collectionPath,
-        withinWireBudget(await payload(flags),1_048_576),
-        {'If-Match':String(integer(required(flags,'version')))}));
-      else throw new StateplaneCliError('INVALID_ARGUMENT');
-      return 0;
-    }
-    if (!collectionPath) throw new StateplaneCliError('INVALID_ARGUMENT');
-    const recordPath=`${collectionPath}/records`;
-    if (resource==='records') {
-      if (action==='get') output(await client.request('GET',`${recordPath}/${encoded(required(flags,'id'))}`));
-      else if (action==='key') output(await client.request('GET',`${recordPath}/by-key/${encoded(required(flags,'key'))}?mode=${encoded(required(flags,'mode'))}`));
-      else if (action==='projection') output(await client.request('GET',`${recordPath}/${encoded(required(flags,'id'))}/projection`));
-      else if (action==='query') output(await client.request('POST',`${recordPath}/query`,withinWireBudget({
-        predicates:parsed(typeof flags.predicates==='string'?flags.predicates:'[]'),
-        limit:integer(required(flags,'limit')),
-        ...(flags.sort ? {sort:parsed(required(flags,'sort'))}:{}),
-        ...(flags.cursor!==undefined ? {cursor:cursor(flags)}:{} )},32_768)));
-      else if (action==='count') output(await client.request('POST',`${recordPath}/count`,
-        withinWireBudget(parsed(typeof flags.predicates==='string'?flags.predicates:'[]'),32_768)));
-      else if (['create','replace','patch','delete'].includes(action??'')) {
-        const request:Record<string,unknown>={operation:action,idempotencyKey:required(flags,'idempotency-key')};
-        if (flags['expected-schema-version']!==undefined)
-          request.expectedSchemaVersion=integer(required(flags,'expected-schema-version'));
-        if (action==='create') {
-          request.data=await payload(flags);
-          if (flags.key!==undefined) request.externalKey=required(flags,'key');
-        } else {
-          request.id=required(flags,'id'); request.expectedRevision=integer(required(flags,'expected-revision'));
-          if (action==='replace') request.data=await payload(flags);
-          if (action==='patch') {
-            const patch=await payload(flags) as {set?:unknown;unset?:unknown}|null;
-            if (!patch || typeof patch!=='object' || Array.isArray(patch) ||
-              !patch.set || typeof patch.set!=='object' || Array.isArray(patch.set) ||
-              !Array.isArray(patch.unset) || patch.unset.some(value=>typeof value!=='string'))
-              throw new StateplaneCliError('INVALID_ARGUMENT');
-            request.set=patch.set; request.unset=patch.unset;
-          }
-        }
-        output(await client.request('POST',recordPath,withinWireBudget(request,1_048_576)));
-      } else throw new StateplaneCliError('INVALID_ARGUMENT');
-      return 0;
-    }
-    if (resource==='batches') {
-      const operation=required(flags,'operation-key');
-      const url=`${collectionPath}/batches/${encoded(operation)}`;
-      if (action==='ingest') {
-        const lines=(await input(required(flags,'file'),3_145_728)).split(/\r?\n/).filter(Boolean);
-        if (!lines.length || lines.length>20) throw new StateplaneCliError('INVALID_ARGUMENT');
-        // Batch identity hashes each item string, so preserve the validated
-        // NDJSON bytes across an HTTP-to-CLI recovery attempt.
-        const manifest=lines.map(line=>{ parsed(line); return line; });
-        const itemBytes=manifest.map(item=>Buffer.byteLength(item));
-        if (itemBytes.some(size=>size>1_048_576) ||
-          itemBytes.reduce((sum,size)=>sum+size,0)>2_097_152)
-          throw new StateplaneCliError('RATE_LIMITED',undefined,undefined,false);
-        output(await client.request('PUT',url+(flags['retry-failed']?'?retryFailed=true':''),
-          withinWireBudget(manifest,3_145_728)));
-      } else if (action==='status') output(await client.request('GET',url));
-      else if (action==='cancel') output(await client.request('DELETE',url));
-      else throw new StateplaneCliError('INVALID_ARGUMENT');
-      return 0;
-    }
-    if (resource==='events' && action==='list') {
-      output(await client.request('GET',`${collectionPath}/events${flags.cursor!==undefined?`?cursor=${encoded(cursor(flags))}`:''}`));
-      return 0;
-    }
-    throw new StateplaneCliError('INVALID_ARGUMENT');
+      output({space});
+    } else output(await runHttpCommand(resource,action,flags));
+    return 0;
   } catch(error) {
     const localCode=(error as NodeJS.ErrnoException)?.code;
-    const failure=error instanceof StateplaneCliError?error:
-      typeof localCode==='string' && ['EACCES','EPERM','ENOENT','ENOTDIR','EISDIR','EROFS','ENOSPC'].includes(localCode)
-        ? new StateplaneCliError('INVALID_CONFIGURATION') : new StateplaneCliError('PROVIDER_UNAVAILABLE');
+    let failure:StateplaneCliError;
+    if (error instanceof StateplaneCliError) failure=error;
+    else if (typeof localCode==='string' &&
+      ['EACCES','EPERM','ENOENT','ENOTDIR','EISDIR','EROFS','ENOSPC'].includes(localCode))
+      failure=new StateplaneCliError('INVALID_CONFIGURATION');
+    else failure=new StateplaneCliError('PROVIDER_UNAVAILABLE');
     process.stderr.write(JSON.stringify({contractVersion:'1',error:{code:failure.code,message:failure.code,
       retryable:failure.retryable,requestId:failure.requestId??null}})+'\n');
     return 1;

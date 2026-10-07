@@ -12,7 +12,7 @@ import { createHttpHandler } from '../packages/api/dist/index.js';
 import { PostgresSpaces, AuthorityTransaction } from '../packages/postgres/dist/index.js';
 import { StateplaneHttpClient, StateplaneCliError } from '../packages/cli/dist/index.js';
 import { saveToken, loadToken, removeToken, configureToken, removeTrackedTokens,
-  saveConfig, withConfigMutation,
+  saveConfig, withConfigMutation, logoutConfig,
   storeSecretServiceToken, loadSecretServiceToken,
   loadOsSecretToken } from '../packages/cli/dist/config.js';
 
@@ -923,6 +923,82 @@ test('GET honors Retry-After; writes never auto-retry after an uncertain outcome
   calls=0;
   await assert.rejects(alwaysNonJson.request('POST','/v1/spaces',{}),{code:'OUTCOME_UNKNOWN'});
   assert.equal(calls,1);
+  let reads=0;
+  const partial=new StateplaneHttpClient({endpoint:'http://127.0.0.1/',token:'secret',
+    fetch:async()=>{
+      reads++;
+      return reads===1 ? new Response(new ReadableStream({pull(controller){controller.error(new Error('broken body'));}}))
+        : Response.json({ok:true});
+    },sleep:async()=>{}});
+  assert.deepEqual(await partial.request('GET','/v1/spaces'),{ok:true});
+  assert.equal(reads,2);
+  reads=0;
+  await assert.rejects(partial.request('POST','/v1/spaces',{}),{code:'OUTCOME_UNKNOWN'});
+  assert.equal(reads,1);
+  assert.throws(()=>new StateplaneHttpClient({endpoint:'not a URL',token:'secret'}),
+    {code:'INVALID_CONFIGURATION'});
+  let sent=0;
+  const presend=new StateplaneHttpClient({endpoint:'http://127.0.0.1/',token:'secret',
+    fetch:async()=>{sent++;return Response.json({ok:true});}});
+  const circular={};circular.self=circular;
+  await assert.rejects(presend.request('POST','/v1/spaces',circular),{code:'INVALID_ARGUMENT'});
+  assert.equal(sent,0);
+});
+
+test('a concurrent endpoint and token switch cannot mix credentials or selected spaces',async t=>{
+  const receivedA=[],receivedB=[];
+  const listener=requests=>createServer((req,res)=>{
+    requests.push({path:req.url,authorization:req.headers.authorization});
+    res.writeHead(200,{'Content-Type':'application/json'});res.end('[]');
+  });
+  const a=listener(receivedA),b=listener(receivedB);
+  a.listen(0,'127.0.0.1');b.listen(0,'127.0.0.1');
+  await Promise.all([once(a,'listening'),once(b,'listening')]);
+  t.after(()=>{a.close();b.close();});
+  const root=await mkdtemp(join(tmpdir(),'stateplane-cli-snapshot-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  const endpointA=`http://127.0.0.1:${a.address().port}/`;
+  const endpointB=`http://127.0.0.1:${b.address().port}/`;
+  await saveConfigWithRoot(root,{endpoint:endpointA,space:'sp_old',tokenStore:'file'});
+  await writeFile(join(root,'token'),'old-secret',{mode:0o600});
+  let command;
+  await withConfigMutationInRoot(root,async()=>{
+    await writeFile(join(root,'token'),'new-secret',{mode:0o600});
+    command=cliProcess(root,['collections','list']);
+    // The old implementation completed through A with B's token while this
+    // mutation lock was held. A correct command waits for the matched state.
+    await new Promise(resolve=>setTimeout(resolve,500));
+    await saveConfig({endpoint:endpointB,space:'sp_new',tokenStore:'file'});
+  });
+  const result=await command;
+  assert.equal(result.status,0,result.stderr);
+  assert.deepEqual(receivedA,[]);
+  assert.deepEqual(receivedB,[{path:'/v1/spaces/sp_new/collections',authorization:'Bearer new-secret'}]);
+  assert.doesNotMatch(result.stdout+result.stderr,/old-secret|new-secret/);
+});
+
+test('equals-form flags preserve identifiers beginning with option syntax',async t=>{
+  const state=fixture();
+  const {server,endpoint}=await serve(createHttpHandler(state));
+  t.after(()=>server.close());
+  const root=await mkdtemp(join(tmpdir(),'stateplane-cli-flags-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  await saveConfigWithRoot(root,{endpoint,space:'sp_a',tokenStore:'file'});
+  await writeFile(join(root,'token'),'secret-test-token',{mode:0o600});
+  const byKey=await cliProcess(root,['records','key','--collection','entries','--mode','external',
+    '--key=--special']);
+  assert.equal(byKey.status,0,byKey.stderr);
+  assert.equal(JSON.parse(byKey.stdout).key,'--special');
+  const byId=await cliProcess(root,['records','get','--collection','entries','--id=--special']);
+  assert.equal(byId.status,0,byId.stderr);
+  assert.equal(JSON.parse(byId.stdout).ref.id,'--special');
+  const created=await cliProcess(root,['records','create','--collection','entries',
+    '--idempotency-key=--special','--data','{}']);
+  assert.equal(created.status,0,created.stderr);
+  assert.equal(state.calls,1);
+  const ambiguous=await cliProcess(root,['records','get','--collection','entries','--id','--special']);
+  assert.equal(JSON.parse(ambiguous.stderr).error.code,'INVALID_ARGUMENT');
+  assert.doesNotMatch(created.stdout+created.stderr,/secret-test-token/);
 });
 
 test('macOS Keychain stores and reloads a token without passing it as a process argument',
@@ -935,8 +1011,14 @@ test('macOS Keychain stores and reloads a token without passing it as a process 
       assert.equal(await loadToken({endpoint,tokenStore:'keychain'}),token);
       await removeToken({endpoint,tokenStore:'keychain'});
       await removeToken({endpoint,tokenStore:'keychain'});
-      // Simulate a config save failure after the first deletion, then retry logout.
       await writeFile(join(root,'config.json'),JSON.stringify({endpoint,tokenStore:'keychain'}),{mode:0o600});
+      await saveToken(endpoint,token,'keychain');
+      await assert.rejects(withConfigMutationInRoot(root,current=>logoutConfig(current,{
+        removeTrackedTokens,
+        saveConfig:async()=>{throw new Error('interrupted after keychain deletion');}
+      })),/interrupted after keychain deletion/);
+      await assert.rejects(loadToken({endpoint,tokenStore:'keychain'}),{code:'UNAUTHENTICATED'});
+      assert.equal(JSON.parse(await readFile(join(root,'config.json'),'utf8')).tokenStore,'keychain');
       const logout=await cliProcess(root,['auth','logout']);
       assert.equal(logout.status,0,logout.stderr);
       assert.deepEqual(JSON.parse(logout.stdout),{configured:false});

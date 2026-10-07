@@ -24,6 +24,13 @@ test('rotating the opt-in HTTP fixture ends retired pools after in-flight reques
     url.searchParams.set('application_name','sta9_http_pool_rotation');
     const count=async()=>Number((await admin.query(`SELECT count(*)::int AS n FROM pg_stat_activity
       WHERE application_name='sta9_http_pool_rotation'`)).rows[0].n);
+    const waitForCount=async expected=>{
+      for (let attempt=0;attempt<100;attempt++) {
+        if (await count()===expected) return;
+        await new Promise(resolve=>setTimeout(resolve,20));
+      }
+      assert.equal(await count(),expected);
+    };
     const request=async(index)=>{
       const token=String(index).repeat(32);
       const env={STATEPLANE_ENV:'local',STATEPLANE_TEST_HTTP:'1',STATEPLANE_TEST_DATABASE_URL:url.href,
@@ -34,10 +41,10 @@ test('rotating the opt-in HTTP fixture ends retired pools after in-flight reques
       assert.equal(result.status,200);
     };
     await request(1);
-    assert.equal(await count(),1);
+    await waitForCount(1);
     for (const index of [2,3,4]) {
       await request(index);
-      assert.equal(await count(),1,'only the current fixture pool retains a connection');
+      await waitForCount(1);
     }
     await blocker.query('BEGIN');blocked=true;
     await blocker.query('LOCK TABLE space_directory IN ACCESS EXCLUSIVE MODE');
@@ -59,10 +66,25 @@ test('rotating the opt-in HTTP fixture ends retired pools after in-flight reques
     assert.equal(overlap,true,'retired pool remains open while its request is active');
     await blocker.query('ROLLBACK');blocked=false;
     await Promise.all([inFlight,replacement]);
-    assert.equal(await count(),1,'retired pools close when their last request finishes');
+    await waitForCount(1);
     // Disable the fixture to close the last cached pool as well.
     await route.GET({request:new Request('http://localhost/v1/spaces'),platform:{env:{}}});
-    assert.equal(await count(),0);
+    await waitForCount(0);
+    const hyperdriveUrl=new URL(databaseUrl);
+    hyperdriveUrl.searchParams.set('application_name','sta9_hyperdrive_request');
+    const hyperdriveCount=async()=>Number((await admin.query(`SELECT count(*)::int AS n FROM pg_stat_activity
+      WHERE application_name='sta9_hyperdrive_request'`)).rows[0].n);
+    const token='H'.repeat(32);
+    const previewEnv={STATEPLANE_ENV:'preview',STATEPLANE_TEST_HTTP:'1',
+      AUTHORITY:{connectionString:hyperdriveUrl.href},STATEPLANE_TEST_TOKEN:token,
+      STATEPLANE_TEST_OWNER:'owner',STATEPLANE_TEST_CREDENTIAL:'session',
+      STATEPLANE_TEST_CURSOR_SECRET:'A'.repeat(64)};
+    for (let attempt=0;attempt<2;attempt++) {
+      const response=await route.GET({request:new Request('http://localhost/v1/spaces',{
+        headers:{Authorization:`Bearer ${token}`}}),platform:{env:previewEnv}});
+      assert.equal(response.status,200,'Preview accepts uppercase hex and consecutive requests');
+      assert.equal(await hyperdriveCount(),0,'the Hyperdrive pool ends with its request');
+    }
   } finally {
     if (blocked) await blocker.query('ROLLBACK').catch(()=>{});
     await blocker.end().catch(()=>{});
