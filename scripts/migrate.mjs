@@ -32,7 +32,8 @@ try {
   const pendingOutboxIndexBuild = files.some(name =>
     (name === '005_scoped_query_indexes.sql' || name === '006_outbox_due_order.sql') && !recorded.has(name));
   const pendingProjectionUpgrade = files.includes('031_index_missing_projection.sql') && !recorded.has('031_index_missing_projection.sql');
-  const pendingEventFeedUpgrade = ['036_event_cursor.sql','037_commit_safe_event_feed.sql']
+  const pendingEventFeedUpgrade = ['036_event_cursor.sql','037_commit_safe_event_feed.sql',
+    '038_drop_superseded_event_cursor.sql']
     .some(name => files.includes(name) && !recorded.has(name));
   if (pendingOutboxIndexBuild && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained') {
     const relation = await client.query("SELECT to_regclass('public.projection_outbox') AS name");
@@ -118,9 +119,9 @@ try {
     }
     // The 033/035 validation boundaries commit their preceding transaction.
     // Recheck and retain the event writer locks in the transaction that will
-    // actually build 036/037, including upgrades from older ledger prefixes.
+    // actually change the event indexes/feed, including upgrades from older ledger prefixes.
     if (pendingEventFeedUpgrade &&
-      (name === '036_event_cursor.sql' || name === '037_commit_safe_event_feed.sql') &&
+      ['036_event_cursor.sql','037_commit_safe_event_feed.sql','038_drop_superseded_event_cursor.sql'].includes(name) &&
       (name === '036_event_cursor.sql' || recorded.has('036_event_cursor.sql')))
       await preflightEventFeed(); // NOSONAR -- preflight locks must precede this migration step
     const receiptDomainCutover = name === '034_batch_receipt_domain.sql' || name === '035_validate_batch_receipt_domain.sql';

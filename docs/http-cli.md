@@ -188,8 +188,9 @@ return `RATE_LIMITED`; that response remains retryable and carries
 omit `--cursor` to request the first page. The CLI timeout defaults to 30 seconds and can be set with
 `--timeout` in milliseconds up to 120 seconds. Collection discovery returns
 `{items,cursor}` with at most eight canonical definitions per page. Pass its
-non-null cursor to the next `collections list --cursor` call; a missing or
-malformed cursor returns `CURSOR_INVALID`. Each page checks current space and
+non-null cursor to the next `collections list --cursor` call. An empty or
+malformed supplied cursor returns `CURSOR_INVALID`; omitting `--cursor`
+requests the first page. Each page checks current space and
 collection grants, so a revoked collection cannot appear on a later page.
 The eight-definition cap bounds a page to roughly eight 1 MiB definitions,
 plus metadata, and is a protective limit rather than measured Worker capacity.

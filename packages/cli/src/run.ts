@@ -151,7 +151,8 @@ async function runAuth(action:string|undefined,flags:Flags,config:CliConfig):Pro
   }
   if (action!=='login' && action!=='import') throw new StateplaneCliError('INVALID_ARGUMENT');
   if (!config.endpoint || flags['token-stdin']!==true) throw new StateplaneCliError('INVALID_ARGUMENT');
-  const store=typeof flags.store==='string'?flags.store:(process.platform==='linux'?'keychain':'file');
+  let store=flags.store;
+  if (store===undefined) store=process.platform==='linux'?'keychain':'file';
   if (store!=='file' && store!=='keychain') throw new StateplaneCliError('INVALID_ARGUMENT');
   const token=(await input('-',4096)).replace(/\r?\n$/,'');
   if (action==='login') await new StateplaneHttpClient({endpoint:config.endpoint,token,
@@ -176,8 +177,10 @@ async function runSpaces(client:StateplaneHttpClient,action:string|undefined,fla
 
 async function runCollections(client:StateplaneHttpClient,action:string|undefined,flags:Flags,
   spacePath:string,collectionPath:string):Promise<unknown> {
-  if (action==='list') return client.request('GET',`${spacePath}/collections${
-    flags.cursor!==undefined ? `?cursor=${encoded(cursor(flags))}` : ''}`);
+  if (action==='list') {
+    const suffix=flags.cursor!==undefined ? `?cursor=${encoded(cursor(flags))}` : '';
+    return client.request('GET',`${spacePath}/collections${suffix}`);
+  }
   if (action==='get' && collectionPath) return client.request('GET',collectionPath);
   if (action==='define' && collectionPath) return client.request('PUT',collectionPath,
     withinWireBudget(await payload(flags),1_048_576));

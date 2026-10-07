@@ -67,7 +67,7 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
         if (collectionId===undefined) {
           const items=entries.slice(0,collectionPageSize);
           return {items,cursor:entries.length>collectionPageSize ?
-            discoveryCursor(spaceId,actor.credentialId,items[items.length-1].definition.slug,cell.cursorSecret) : null};
+            discoveryCursor(spaceId,actor.credentialId,items.at(-1)!.definition.slug,cell.cursorSecret) : null};
         }
         const found=entries.find(item=>item.definition.slug===collectionId);
         if (!found) throw new AuthorityError('NOT_FOUND');

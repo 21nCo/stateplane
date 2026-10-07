@@ -97,7 +97,7 @@ try {
     if (process.platform==='win32') {
       const powershell=join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe');
       const script=join(standalone,'node_modules','@stateplane','cli','bin','secure-acl.ps1');
-      const caller=spawnSync('whoami',['/user'],{encoding:'utf8'});
+      const caller=spawnSync(join(systemPaths[0],'whoami.exe'),['/user'],{encoding:'utf8'});
       const probe=spawnSync(powershell,['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
         '-File',script,'-TargetPath',standaloneEnv.STATEPLANE_CONFIG_DIR,'-Action','diagnose'],
       {encoding:'utf8'});
@@ -145,7 +145,7 @@ if (canonicalJsonObject('{"answer":42}') !== '{"answer":42}') throw new Error('P
     if (process.platform==='win32') {
       const powershell=join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe');
       const script=join(temp,'node_modules','@stateplane','cli','bin','secure-acl.ps1');
-      const runner=spawnSync('whoami',['/user'],{cwd:temp,encoding:'utf8'});
+      const runner=spawnSync(join(systemPaths[0],'whoami.exe'),['/user'],{cwd:temp,encoding:'utf8'});
       const moduleProbe=spawnSync(powershell,['-NoProfile','-NonInteractive','-Command',
         '$PSVersionTable.PSVersion.ToString(); try { Import-Module Microsoft.PowerShell.Security -ErrorAction Stop; "module=loaded" } catch { "module=" + $_.Exception.GetType().FullName + ":" + $_.Exception.Message }'],
       {cwd:temp,encoding:'utf8'});

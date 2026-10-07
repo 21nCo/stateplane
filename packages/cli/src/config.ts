@@ -240,6 +240,10 @@ const persistence:TokenPersistence={saveConfig,saveToken,removeToken};
 export async function configureToken(config:CliConfig,token:string,store:'keychain'|'file',
   io:TokenPersistence=persistence):Promise<void> { // NOSONAR -- shared immutable adapter, not a per-call object
   if (!config.endpoint) throw new StateplaneCliError('INVALID_CONFIGURATION');
+  // Only Linux supports new OS-store tokens. Reject unsupported platforms before the durable
+  // journal records a cleanup obligation. Existing legacy locations below
+  // remain journaled and must still be removed during a switch or logout.
+  if (store==='keychain' && platform()!=='linux') throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
   const locations=[...new Set([...(config.tokenLocations??[]),...(config.tokenStore?[config.tokenStore]:[]),store])];
   await io.saveConfig({...config,tokenLocations:locations});
   await io.saveToken(config.endpoint,token,store);

@@ -869,6 +869,26 @@ test('OS secret load fails closed on macOS and reports Linux backend failure',as
   await assert.rejects(loadOsSecretToken(endpoint,'darwin',async()=>{
     throw new Error('macOS Keychain must not be read');
   }),{code:'KEYCHAIN_UNAVAILABLE'});
+  await assert.rejects(loadOsSecretToken(endpoint,'linux',async()=>({ok:false,output:'',missing:false})),
+    {code:'KEYCHAIN_UNAVAILABLE'});
+});
+
+test('HTTP client keeps its bearer paired with its endpoint across response retries',async()=>{
+  const observed=[];
+  const options={endpoint:'https://cell-a.example.invalid/',token:'cell-a-token',
+    sleep:async()=>{},fetch:async(url,init)=>{
+      observed.push({url:String(url),authorization:init.headers.Authorization});
+      return observed.length===1
+        ? new Response('{}',{status:503,headers:{'Retry-After':'0'}})
+        : Response.json({ok:true});
+    }};
+  const client=new StateplaneHttpClient(options);
+  options.endpoint='https://cell-b.example.invalid/';
+  options.token='cell-b-token';
+  assert.deepEqual(await client.request('GET','/v1/spaces'),{ok:true});
+  assert.deepEqual(observed,[
+    {url:'https://cell-a.example.invalid/v1/spaces',authorization:'Bearer cell-a-token'},
+    {url:'https://cell-a.example.invalid/v1/spaces',authorization:'Bearer cell-a-token'}]);
 });
 
 test('projection polling returns a deleted revision while record content remains hidden',async()=>{
@@ -1144,28 +1164,31 @@ test('equals-form flags preserve identifiers beginning with option syntax',async
   assert.doesNotMatch(created.stdout+created.stderr,/secret-test-token/);
 });
 
-test('macOS rejects unsafe Keychain writes and reads before a token can be stored',
-  {skip:platform()!=='darwin'},async()=>{
+test('unsupported OS rejects new Keychain writes before journaling a token',
+  {skip:platform()==='linux'},async()=>{
     const endpoint=`https://keychain-${randomUUID()}.example.invalid/`;
     const token=`token-${randomUUID()}`;
     await assert.rejects(saveToken(endpoint,token,'keychain'),{code:'KEYCHAIN_UNAVAILABLE'});
     await assert.rejects(loadToken({endpoint,tokenStore:'keychain'}),{code:'KEYCHAIN_UNAVAILABLE'});
     const root=await mkdtemp(join(tmpdir(),'stateplane-cli-keychain-'));
     try {
-      assert.equal((await cliProcess(root,['config','endpoint','--url',endpoint])).status,0);
+      const configured=await cliProcess(root,['config','endpoint','--url',endpoint]);
+      assert.equal(configured.status,0,configured.stderr);
       const rejected=await cliProcess(root,['auth','import','--token-stdin','--store','keychain'],token+'\n');
       assert.equal(rejected.status,1);
       assert.equal(JSON.parse(rejected.stderr).error.code,'KEYCHAIN_UNAVAILABLE');
       assert.doesNotMatch(rejected.stdout+rejected.stderr,new RegExp(token));
       const saved=JSON.parse(await readFile(join(root,'config.json'),'utf8'));
       assert.equal(saved.tokenStore,undefined);
-      // A failed import may leave a recovery journal, but logout must clear it.
-      assert.equal((await cliProcess(root,['auth','logout'])).status,0);
-      assert.equal(JSON.parse(await readFile(join(root,'config.json'),'utf8')).tokenLocations,undefined);
+      assert.equal(saved.tokenLocations,undefined);
       const imported=await cliProcess(root,['auth','import','--token-stdin'],token+'\n');
       assert.equal(imported.status,0,imported.stderr);
       assert.deepEqual(JSON.parse(imported.stdout),{configured:true,store:'file'});
       assert.equal(await readFile(join(root,'token'),'utf8'),token);
+      const replacement=`https://keychain-${randomUUID()}.example.invalid/`;
+      assert.equal((await cliProcess(root,['config','endpoint','--url',replacement])).status,0);
+      assert.equal(JSON.parse(await readFile(join(root,'config.json'),'utf8')).tokenLocations,undefined);
+      assert.equal((await cliProcess(root,['auth','import','--token-stdin'],token+'\n')).status,0);
       assert.equal((await cliProcess(root,['auth','logout'])).status,0);
     } finally { await rm(root,{recursive:true,force:true}); }
   });
@@ -1183,6 +1206,7 @@ test('interrupted credential store switches and logout remove both tracked secre
 
   for (const from of ['file','keychain']) for (const failAt of [1,2,3,4,5]) {
     const to=from==='file'?'keychain':'file';
+    if (to==='keychain' && platform()!=='linux') continue;
     const endpoint='https://store-transition.example.invalid/';
     let saved={endpoint,tokenStore:from};
     const secrets=new Map([[from,'old-secret']]);
@@ -1207,24 +1231,27 @@ test('interrupted credential store switches and logout remove both tracked secre
 
   // A failed old-store removal leaves the transition marker persisted. A
   // subsequent logout must retry both stores without printing either secret.
-  let saved={endpoint:'https://store-transition.example.invalid/',tokenStore:'file'};
-  const secrets=new Map([['file','old-secret']]);
-  const io={
-    saveConfig:async value=>{saved=structuredClone(value);},
-    saveToken:async (_endpoint,token,store)=>{secrets.set(store,token);},
-    removeToken:async config=>{if (config.tokenStore==='file') throw new Error('store unavailable');
-      secrets.delete(config.tokenStore);}
-  };
-  await assert.rejects(configureToken(saved,'new-secret','keychain',io),/store unavailable/);
-  assert.equal(saved.tokenStore,'keychain');
-  assert.deepEqual(new Set(saved.tokenLocations),new Set(['file','keychain']));
-  assert.equal(secrets.get('file'),'old-secret');
-  assert.equal(secrets.get('keychain'),'new-secret');
-  await removeTrackedTokens(saved,{removeToken:async config=>{secrets.delete(config.tokenStore);}});
-  assert.equal(secrets.size,0);
+  if (platform()==='linux') {
+    let saved={endpoint:'https://store-transition.example.invalid/',tokenStore:'file'};
+    const secrets=new Map([['file','old-secret']]);
+    const io={
+      saveConfig:async value=>{saved=structuredClone(value);},
+      saveToken:async (_endpoint,token,store)=>{secrets.set(store,token);},
+      removeToken:async config=>{if (config.tokenStore==='file') throw new Error('store unavailable');
+        secrets.delete(config.tokenStore);}
+    };
+    await assert.rejects(configureToken(saved,'new-secret','keychain',io),/store unavailable/);
+    assert.equal(saved.tokenStore,'keychain');
+    assert.deepEqual(new Set(saved.tokenLocations),new Set(['file','keychain']));
+    assert.equal(secrets.get('file'),'old-secret');
+    assert.equal(secrets.get('keychain'),'new-secret');
+    await removeTrackedTokens(saved,{removeToken:async config=>{secrets.delete(config.tokenStore);}});
+    assert.equal(secrets.size,0);
+  }
 
   for (const from of ['file','keychain']) {
     const to=from==='file'?'keychain':'file';
+    if (to==='keychain' && platform()!=='linux') continue;
     let journal={endpoint:'https://store-transition.example.invalid/',tokenStore:from};
     const credentials=new Map([[from,'old-secret']]);
     await assert.rejects(configureToken(journal,'new-secret',to,{

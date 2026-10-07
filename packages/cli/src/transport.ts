@@ -49,17 +49,20 @@ async function wireJson(response:Response):Promise<unknown> {
 /** A thin HTTP client. Only read requests may be repeated automatically. */
 export class StateplaneHttpClient {
   private readonly endpoint:URL;
+  private readonly token:string;
   private readonly fetcher:typeof fetch;
   private readonly timeoutMs:number;
   private readonly sleep:(ms:number)=>Promise<void>;
-  constructor(private readonly options:ClientOptions) {
+  constructor(options:ClientOptions) {
+    const token=options.token;
     try { this.endpoint=new URL(options.endpoint); }
     catch { throw new StateplaneCliError('INVALID_CONFIGURATION'); }
     if (!['https:','http:'].includes(this.endpoint.protocol) ||
         (this.endpoint.protocol==='http:' && !['localhost','127.0.0.1','[::1]'].includes(this.endpoint.hostname)) ||
         this.endpoint.username || this.endpoint.password ||
-        this.endpoint.search || this.endpoint.hash || this.endpoint.pathname!=='/' || !options.token)
+        this.endpoint.search || this.endpoint.hash || this.endpoint.pathname!=='/' || !token)
       throw new StateplaneCliError('INVALID_CONFIGURATION');
+    this.token=token;
     this.fetcher=options.fetch??fetch;
     this.timeoutMs=options.timeoutMs??30_000;
     if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs<1 || this.timeoutMs>120_000)
@@ -71,7 +74,7 @@ export class StateplaneHttpClient {
     extraHeaders:Record<string,string>|undefined,safeRead:boolean,attempt:number):
     Promise<{retry:true}|{retry:false;value:unknown}> {
     const response=await wireFetch(this.fetcher,url,{method,redirect:'error',signal:AbortSignal.timeout(this.timeoutMs),
-      headers:{Authorization:`Bearer ${this.options.token}`,Accept:'application/json',
+      headers:{Authorization:`Bearer ${this.token}`,Accept:'application/json',
         ...(serialized===undefined?{}:{'Content-Type':'application/json'}),...extraHeaders},
       body:serialized});
     const after=retryAfter(response);

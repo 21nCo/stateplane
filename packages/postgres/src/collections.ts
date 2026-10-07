@@ -265,7 +265,7 @@ export class CollectionRegistry {
         WHERE c.space_id=$1 AND c.lifecycle<>'deleted' AND c.collection_id>$3
           AND (c.space_id=$1 AND ($4::boolean OR (grant_check.expires_at IS NULL OR
             grant_check.expires_at>clock_timestamp()) AND
-            (grant_check.capabilities @> ARRAY['records:read']::text[] OR
+            (grant_check.capabilities @> ARRAY[$5::text] OR
              grant_check.capabilities @> ARRAY['schema:write']::text[])))
         ORDER BY c.collection_id LIMIT 9)
         SELECT c.collection_id,v.canonical_definition,ix.ready_fields,ix.pending_fields,
@@ -288,7 +288,7 @@ export class CollectionRegistry {
         WHERE c.space_id=$1 AND c.lifecycle<>'deleted' AND c.collection_id=$3 ORDER BY c.collection_id`;
       const result=await client.query(page,
       requestedCollection===undefined ? [scope.spaceId,scope.credentialId,after,
-        space.owner_principal_id===scope.principalId] :
+        space.owner_principal_id===scope.principalId,scope.capability] :
         [scope.spaceId,scope.credentialId,requestedCollection]);
       return discoveredDefinitions(result.rows,space,scope as AuthorityScope);
     });

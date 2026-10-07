@@ -168,10 +168,7 @@ async function dispatch(services:StateplaneServices,actor:VerifiedCredential,req
   if (!space) return fail('NOT_FOUND');
   if (p.length===2) return selectedSpace(services,actor,space,request);
   if (p[2]!=='collections') return fail('NOT_FOUND');
-  if (p.length===3 && request.method==='GET') {
-    if (url.searchParams.getAll('cursor').length>1) fail('CURSOR_INVALID');
-    return json(await services.collections.list(actor,space,undefined,url.searchParams.get('cursor')??undefined));
-  }
+  if (p.length===3 && request.method==='GET') return collectionDiscovery(services,actor,space,url);
   const collection=p[3];
   if (!collection) return fail('NOT_FOUND');
   if (p.length===4) return selectedCollection(services,actor,space,collection,request);
@@ -181,6 +178,10 @@ async function dispatch(services:StateplaneServices,actor:VerifiedCredential,req
   if (p[4]==='events' && p.length===5 && request.method==='GET')
     return json(await services.events.list(...prefix,url.searchParams.get('cursor')??undefined));
   return fail('NOT_FOUND');
+}
+async function collectionDiscovery(services:StateplaneServices,actor:VerifiedCredential,space:string,url:URL):Promise<Response> {
+  if (url.searchParams.getAll('cursor').length>1) fail('CURSOR_INVALID');
+  return json(await services.collections.list(actor,space,undefined,url.searchParams.get('cursor')??undefined));
 }
 /** All v1 endpoints use the same services as other transports. No error includes
  * the provider exception, bearer value, body, or URL query string. */

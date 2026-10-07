@@ -120,7 +120,8 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     migrate(true);
     assert.deepEqual((await upgrade.query(`SELECT event_id FROM record_event_feed`)).rows,
       [{event_id:'event-1'}]);
-    assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name>='036_'")).rows[0].n,2);
+    assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name>='036_'")).rows[0].n,3);
+    assert.equal((await upgrade.query("SELECT to_regclass('public.record_events_scoped_cursor') AS name")).rows[0].name,null);
     migrate(false);
   } finally {
     if (migration) {

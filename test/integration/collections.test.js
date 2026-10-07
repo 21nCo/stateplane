@@ -44,6 +44,25 @@ async function fixture() {
   return {owner,writer};
 }
 const read=scope=>({...scope,capability:'records:read'});
+
+test('write-only grants remain discoverable across bounded registry pages',async()=>{
+  const {owner,writer}=await fixture();
+  await pool.query(`UPDATE collection_grants SET capabilities=ARRAY['records:write']::text[]
+    WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,
+    [owner.spaceId,owner.collectionId,writer.credentialId]);
+  for (let i=0;i<9;i++) {
+    const slug=`entries_${i}`;
+    await registry.define({...owner,collectionId:slug},definition(slug));
+    await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
+      VALUES($1,$2,$3,ARRAY['records:write']::text[])`,[owner.spaceId,slug,writer.credentialId]);
+  }
+  const first=await registry.discover(writer);
+  assert.equal(first.length,9);
+  const second=await registry.discover(writer,undefined,first.at(-1).definition.slug);
+  assert.equal(second.length,1);
+  assert.equal(new Set([...first,...second].map(item=>item.definition.slug)).size,10);
+});
+
 function observedRegistry(matches) {
   let signal;
   const attempted=new Promise(resolve=>{signal=resolve;});
