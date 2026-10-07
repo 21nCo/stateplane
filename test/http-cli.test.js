@@ -13,13 +13,16 @@ import { PostgresSpaces, AuthorityTransaction } from '../packages/postgres/dist/
 import { StateplaneHttpClient, StateplaneCliError } from '../packages/cli/dist/index.js';
 import { saveToken, loadToken, removeToken, configureToken, removeTrackedTokens,
   saveConfig, withConfigMutation, logoutConfig,
-  storeSecretServiceToken, loadSecretServiceToken,
+  storeSecretServiceToken, loadSecretServiceToken, removeSecretServiceToken,
   loadOsSecretToken } from '../packages/cli/dist/config.js';
 
 // The interactive macOS cases require an unlocked login Keychain. A headless
 // runner can compile Swift but receives authorization error -60008 on access.
 const macKeychainAvailable=platform()==='darwin' &&
-  spawnSync('/usr/bin/security',['show-keychain-info'],{stdio:'ignore'}).status===0;
+  spawnSync('/usr/bin/xcrun',['--sdk','macosx','swift',
+    join(import.meta.dirname,'../packages/cli/bin/keychain.swift'),'load',
+    `stateplane:https://readiness-${randomUUID()}.example.invalid/`],
+  {encoding:'utf8',timeout:30000}).status===2;
 
 function fixture() {
   let granted=true; let providerDown=false; let commitUnknown=false; let calls=0; let deletes=0;
@@ -815,6 +818,46 @@ test('Secret Service load separates an absent item from a failed backend without
   assert.equal(await loadSecretServiceToken(endpoint,async()=>({ok:true,output:'token\n'})),'token');
 });
 
+test('Secret Service cleanup accepts verified absence and preserves the journal on backend failure',async()=>{
+  const endpoint='https://secret-cleanup.example.invalid/';
+  let token='private-test-token';
+  let backendFailure=false;
+  const calls=[];
+  const run=async(program,args)=>{
+    assert.equal(program,'secret-tool');
+    assert.deepEqual(args.slice(1),['service','stateplane','endpoint',endpoint]);
+    const action=args[0];calls.push(action);
+    if (backendFailure) return {ok:false,output:'',missing:false};
+    if (action==='clear') {
+      if (!token) return {ok:false,output:'',missing:true};
+      token=undefined;return {ok:true,output:''};
+    }
+    if (action==='lookup') return token?{ok:true,output:token+'\n'}:{ok:false,output:'',missing:true};
+    throw new Error('unexpected secret-tool action');
+  };
+  await removeSecretServiceToken(endpoint,run);
+  await removeSecretServiceToken(endpoint,run);
+  assert.deepEqual(calls,['clear','clear','lookup']);
+  let journal={endpoint,tokenStore:'keychain',tokenLocations:['file','keychain']};
+  const cleanup=async()=>logoutConfig(journal,{
+    removeTrackedTokens:config=>removeTrackedTokens(config,{removeToken:async current=>{
+      if (current.tokenStore==='keychain') await removeSecretServiceToken(endpoint,run);
+    }}),
+    saveConfig:async value=>{journal=value;}
+  });
+  await cleanup();
+  assert.equal(journal.tokenStore,undefined);
+  assert.equal(journal.tokenLocations,undefined);
+  journal={endpoint,tokenStore:'keychain',tokenLocations:['keychain']};
+  backendFailure=true;
+  await assert.rejects(cleanup(),{code:'KEYCHAIN_UNAVAILABLE'});
+  assert.deepEqual(journal.tokenLocations,['keychain']);
+  assert.doesNotMatch(JSON.stringify(journal),/private-test-token/);
+  backendFailure=false;
+  await cleanup();
+  assert.equal(journal.tokenLocations,undefined);
+});
+
 test('OS secret load reports backend failure consistently and missing macOS items as unauthenticated',async()=>{
   const endpoint='https://secret-test.example.invalid/';
   await assert.rejects(loadOsSecretToken(endpoint,'win32',async()=>{
@@ -1150,7 +1193,7 @@ test('macOS Keychain does not silently trust a second Swift script',
       ['--sdk','macosx','swift',script,operation,service],
       {encoding:'utf8',input,timeout:30000});
     try {
-      await writeFile(probe,`import Foundation\nimport Security\nlet query:[String:Any]=[kSecClass as String:kSecClassGenericPassword,\n  kSecAttrAccount as String:"default",kSecAttrService as String:CommandLine.arguments[2],\n  kSecReturnData as String:true,kSecMatchLimit as String:kSecMatchLimitOne]\nvar result:CFTypeRef?\nfputs("KEYCHAIN_PROBE_ENTER\\n",stderr)\nlet status=SecItemCopyMatching(query as CFDictionary,&result)\nfputs("KEYCHAIN_PROBE_RETURN=\\(status)\\n",stderr)\nif status == errSecSuccess, let data=result as? Data { FileHandle.standardOutput.write(data) }\nelse { exit(3) }\n`);
+      await writeFile(probe,`import Foundation\nimport Security\nlet query:[String:Any]=[kSecClass as String:kSecClassGenericPassword,\n  kSecAttrAccount as String:"default",kSecAttrService as String:CommandLine.arguments[2],\n  kSecReturnData as String:true,kSecMatchLimit as String:kSecMatchLimitOne,\n  kSecUseAuthenticationUI as String:kSecUseAuthenticationUIFail]\nvar result:CFTypeRef?\nfputs("KEYCHAIN_PROBE_ENTER\\n",stderr)\nlet interaction=SecKeychainSetUserInteractionAllowed(false)\nfputs("KEYCHAIN_PROBE_INTERACTION=\\(interaction)\\n",stderr)\nlet status=SecItemCopyMatching(query as CFDictionary,&result)\nfputs("KEYCHAIN_PROBE_RETURN=\\(status)\\n",stderr)\nif status == errSecSuccess, let data=result as? Data { FileHandle.standardOutput.write(data) }\nelse { exit(3) }\n`);
       const stored=swift(helper,'store',token);
       assert.equal(stored.status,0,'disposable Keychain item must be created');
       const updated=swift(helper,'store',token);
@@ -1161,7 +1204,7 @@ test('macOS Keychain does not silently trust a second Swift script',
       assert.equal(other.error,undefined,`alternate probe must launch: ${other.stderr}`);
       assert.match(other.stderr,/KEYCHAIN_PROBE_RETURN=-?\d+/,
         'alternate probe must reach SecItemCopyMatching and report its result');
-      assert.ok(other.stdout!==token,'another Swift script must not decrypt silently');
+      assert.ok(other.stdout!==token,`another Swift script must not decrypt silently: ${other.stderr}`);
       assert.equal(other.status,3,'Keychain must deny the alternate caller');
     } finally {
       const removed=swift(helper,'remove');

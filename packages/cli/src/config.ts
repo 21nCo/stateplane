@@ -181,6 +181,17 @@ export async function storeSecretServiceToken(endpoint:string,token:string,
     throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
   }
 }
+/** secret-tool clear exits 1 when there was no item to remove. Confirm that
+ * absence with a lookup before treating it as successful cleanup. */
+export async function removeSecretServiceToken(endpoint:string,
+  run:typeof command=command):Promise<void> {
+  const args=keyArgs(endpoint);
+  const cleared=await run('secret-tool',['clear',...args]);
+  if (cleared.ok) return;
+  if (!cleared.missing) throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
+  const remaining=await run('secret-tool',['lookup',...args]);
+  if (!remaining.missing) throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
+}
 export async function saveToken(endpoint:string,token:string,store:'keychain'|'file'):Promise<void> {
   if (!token || /[\r\n\0]/.test(token)) throw new StateplaneCliError('INVALID_ARGUMENT');
   if (store==='file') {
@@ -222,7 +233,7 @@ export async function removeToken(config:CliConfig):Promise<void> {
   else if (config.tokenStore==='keychain' && config.endpoint) {
     let result:CommandResult;
     if (platform()==='darwin') result=await macKeychain('remove',config.endpoint);
-    else if (platform()==='linux') result=await command('secret-tool',['clear',...keyArgs(config.endpoint)]);
+    else if (platform()==='linux') return removeSecretServiceToken(config.endpoint);
     else result={ok:false,output:''};
     if (!result.ok) throw new StateplaneCliError('KEYCHAIN_UNAVAILABLE');
   }

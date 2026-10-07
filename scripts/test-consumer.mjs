@@ -1,6 +1,6 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 
@@ -10,19 +10,44 @@ const pnpmCli=process.env.npm_execpath;
 const npmCandidates=[join(dirname(process.execPath),'node_modules/npm/bin/npm-cli.js'),
   join(dirname(process.execPath),'../lib/node_modules/npm/bin/npm-cli.js')];
 const npmCli=npmCandidates.find(existsSync);
+const systemPaths=process.platform==='win32'
+  ? [join(process.env.SystemRoot??String.raw`C:\Windows`,'System32'),
+    process.env.SystemRoot??String.raw`C:\Windows`]
+  : ['/usr/bin','/bin'];
+const trustedPath=[dirname(process.execPath),...systemPaths].join(delimiter);
 /** Run a package command inside the isolated external consumer. */
 function run(command, args, cwd) {
   const executable=['pnpm','npm'].includes(command) ? process.execPath : command;
   let parameters=args;
   if (command==='pnpm') parameters=[pnpmCli,...args];
   else if (command==='npm') parameters=[npmCli,...args];
-  const result = spawnSync(executable, parameters, { cwd, encoding: 'utf8', stdio: 'pipe', env: process.env });
+  const env={...process.env};
+  for (const key of Object.keys(env)) if (key.toLowerCase()==='path') delete env[key];
+  env.PATH=trustedPath;
+  const result = spawnSync(executable, parameters, { cwd, encoding: 'utf8', stdio: 'pipe', env });
   if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed\n${result.stdout}\n${result.stderr}`);
   return result.stdout.trim();
 }
 try {
   if (!pnpmCli || !isAbsolute(pnpmCli) || !existsSync(pnpmCli) || !npmCli || !isAbsolute(npmCli))
     throw new Error('Trusted pnpm/npm CLI paths are unavailable');
+  // npm lifecycle scripts must not resolve a command from a writable caller PATH.
+  const pathProbe=join(temp,'path-probe');
+  const writablePath=join(pathProbe,'writable');
+  await mkdir(writablePath,{recursive:true});
+  await writeFile(join(pathProbe,'package.json'),JSON.stringify({name:'stateplane-path-probe',
+    private:true,scripts:{probe:'node --version'}}));
+  const fakeNode=join(writablePath,process.platform==='win32'?'node.cmd':'node');
+  await writeFile(fakeNode,process.platform==='win32'?'@exit /b 73\r\n':'#!/bin/sh\nexit 73\n');
+  if (process.platform!=='win32') await chmod(fakeNode,0o755);
+  const callerPath=process.env.PATH;
+  try {
+    process.env.PATH=[writablePath,callerPath].filter(Boolean).join(delimiter);
+    run('npm',['run','probe'],pathProbe);
+  } finally {
+    if (callerPath===undefined) delete process.env.PATH;
+    else process.env.PATH=callerPath;
+  }
   const names = ['contracts', 'application', 'auth', 'api', 'cli', 'read-model', 'postgres', 'workers'];
   const tarballs = [];
   for (const name of names) {

@@ -74,10 +74,11 @@ stateplane records create --collection entries --key ' item-1 ' \
   --expected-schema-version 1
 ```
 
-`keychain` is the default. On macOS, it uses Keychain and asks for approval
-when the token is read; the Swift interpreter is not silently trusted. Choose
-`Allow` for each prompt, since `Always Allow` would trust the interpreter. For
-unattended ingestion on macOS, choose `--store file` and protect the user's
+`keychain` is the default. On macOS, it uses the legacy login Keychain. A
+disposable native test on macOS found that a second Swift process could read
+the item with Keychain interaction disabled, despite the helper's restricted
+access list. This mode does not establish isolation from other processes in
+the same OS account. For unattended ingestion on macOS, choose `--store file` and protect the user's
 private configuration directory. On Linux, it uses Secret Service through
 `secret-tool`. If OS storage is unavailable, explicitly select `--store file`.
 An absent stored item returns `UNAUTHENTICATED`; an unavailable OS store returns
@@ -86,13 +87,13 @@ The macOS path requires `xcrun` and its selected Swift toolchain (install Apple
 Command Line Tools with `xcode-select --install` if they are absent). It sends the token to a
 small bundled Keychain helper over stdin, then reads the item back before
 reporting `configured:true`; the token never appears in a process argument.
-The helper applies a Keychain access list with no silently trusted application,
-including when replacing an older item. Approve the macOS Keychain prompt for
-each token read or update. Use the protected file store for unattended jobs.
+The helper requests a Keychain access list with no silently trusted application,
+including when replacing an older item, but the observed macOS behavior does
+not satisfy that caller policy. Use the protected file store for unattended jobs.
 Apple's [SecAccessCreate documentation](https://developer.apple.com/documentation/security/secaccesscreate%28_%3A_%3A_%3A%29)
 specifies that an empty trusted-app list requires confirmation for restricted
-operations. This is an interactive login Keychain policy; a locked or headless
-Keychain cannot satisfy the prompt and yields `KEYCHAIN_UNAVAILABLE`.
+operations. The observed behavior did not enforce that expectation. A locked
+or headless Keychain can yield `KEYCHAIN_UNAVAILABLE`.
 `auth login` validates the bearer with `GET /v1/auth/session` before saving it.
 For offline bootstrap, `auth import --token-stdin --store file` stores a
 credential without validation; the next API call checks it. Invalid tokens
