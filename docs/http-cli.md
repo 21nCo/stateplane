@@ -134,7 +134,11 @@ ordered directory candidates and at most eight provisioning recovery attempts.
 All HTTP instances serving one control directory must use the same private
 cursor secret; an instance without that configured secret refuses space pages.
 Rotating it invalidates outstanding cursors. Direct `PostgresSpaces.list()`
-callers enumerate all pages, including pages containing only pending spaces.
+returns an async iterator of spaces. Consume it with `for await`; it scans one
+bounded page at a time, including pages containing only pending reservations,
+and rechecks the session on every page. Its internal continuation does not use
+the 15-minute HTTP cursor lifetime. An iterator is a live traversal, not a
+snapshot; callers that collect all items still own the resulting memory cost.
 The local PostgreSQL page test uses 55 active spaces and one pending
 reservation to verify a short first page, continuation and a changed owner
 before its later page. These are local

@@ -36,6 +36,23 @@ function serverError(value:unknown,after:number|undefined):StateplaneCliError {
     typeof envelope?.error?.retryable==='boolean' ? envelope.error.retryable : undefined);
 }
 class WireFailure extends Error {}
+const protectedHeaders=new Set(['authorization','proxy-authorization','cookie','host','accept','content-type',
+  'content-length','transfer-encoding','origin','referer']);
+function requestHeaders(token:string,serialized:string|undefined,extraHeaders:Record<string,string>|undefined):
+  Readonly<Record<string,string>> {
+  const headers:Record<string,string>={Authorization:`Bearer ${token}`,Accept:'application/json',
+    ...(serialized===undefined?{}:{'Content-Type':'application/json'})};
+  if (extraHeaders===undefined) return Object.freeze(headers);
+  try {
+    for (const [name,value] of Object.entries(extraHeaders)) {
+      if (typeof value!=='string' || protectedHeaders.has(name.toLowerCase()))
+        throw new StateplaneCliError('INVALID_ARGUMENT');
+      new Headers([[name,value]]); // validate before a write can reach the transport
+      headers[name.toLowerCase()]=value;
+    }
+  } catch { throw new StateplaneCliError('INVALID_ARGUMENT'); }
+  return Object.freeze(headers);
+}
 /** Keep provider exceptions out of CLI output, including verbose paths. */
 async function wireFetch(fetcher:typeof fetch,url:URL,options:RequestInit):Promise<Response> {
   try { return await fetcher(url,options); }
@@ -72,11 +89,10 @@ export class StateplaneHttpClient {
   }
   /** One wire attempt; only an explicit safe-read response can request a repeat. */
   private async exchange(method:string,url:URL,serialized:string|undefined,
-    extraHeaders:Record<string,string>|undefined,safeRead:boolean,attempt:number):
+    headers:Readonly<Record<string,string>>,safeRead:boolean,attempt:number):
     Promise<{retry:true}|{retry:false;value:unknown}> {
     const response=await wireFetch(this.fetcher,url,{method,redirect:'error',signal:AbortSignal.timeout(this.timeoutMs),
-      headers:{Authorization:`Bearer ${this.token}`,Accept:'application/json',
-        ...(serialized===undefined?{}:{'Content-Type':'application/json'}),...extraHeaders},
+      headers,
       body:serialized});
     const after=retryAfter(response);
     if (safeRead && attempt<2 && [429,503].includes(response.status) && after!==undefined) {
@@ -110,9 +126,10 @@ export class StateplaneHttpClient {
     const {url,segments}=this.route(path);
     const safeRead=isSafeHttpRead(method,segments);
     const serialized=serializeBody(body);
+    const headers=requestHeaders(this.token,serialized,extraHeaders);
     for (let attempt=0;attempt<(safeRead?3:1);attempt++) {
       try {
-        const result=await this.exchange(method,url,serialized,extraHeaders,safeRead,attempt); // NOSONAR -- each retry depends on the preceding response
+        const result=await this.exchange(method,url,serialized,headers,safeRead,attempt); // NOSONAR -- each retry depends on the preceding response
         if (result.retry) continue;
         return result.value;
       } catch(error) {

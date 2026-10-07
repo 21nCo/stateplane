@@ -908,6 +908,35 @@ test('HTTP client keeps its bearer paired with its endpoint across response retr
     {url:'https://cell-a.example.invalid/v1/spaces',authorization:'Bearer cell-a-token'}]);
 });
 
+test('HTTP client rejects protected header overrides and snapshots permitted retry headers',async()=>{
+  const sent=[];
+  const extra={'X-Trace':'first'};
+  const client=new StateplaneHttpClient({endpoint:'https://cell-a.example.invalid/',token:'cell-a-token',
+    sleep:async()=>{extra['X-Trace']='second';extra.Authorization='cell-b-token';},
+    fetch:async(url,init)=>{
+      sent.push({url:String(url),headers:{...init.headers}});
+      return sent.length===1 ? new Response('{}',{status:503,headers:{'Retry-After':'0'}})
+        : Response.json({ok:true});
+    }});
+  assert.deepEqual(await client.request('GET','/v1/spaces',undefined,extra),{ok:true});
+  assert.equal(sent.length,2);
+  for (const request of sent) {
+    assert.equal(request.url,'https://cell-a.example.invalid/v1/spaces');
+    assert.equal(request.headers.Authorization,'Bearer cell-a-token');
+    assert.equal(request.headers['x-trace'],'first');
+    assert.equal(request.headers['Content-Type'],undefined);
+  }
+  const before=sent.length;
+  for (const name of ['Authorization','authorization','ACCEPT','Content-Type','Content-Length',
+    'Transfer-Encoding','Proxy-Authorization','Cookie','Host','Origin']) {
+    await assert.rejects(client.request('POST','/v1/spaces',{}, {[name]:'cell-b-token'}),
+      {code:'INVALID_ARGUMENT'});
+  }
+  await assert.rejects(client.request('POST','/v1/spaces',{}, {'X-Trace':'bad\nsecret'}),
+    {code:'INVALID_ARGUMENT'});
+  assert.equal(sent.length,before,'invalid write headers must be rejected before Fetch');
+});
+
 test('malformed bearer values are rejected before a write reaches Fetch or HTTP',async t=>{
   let sent=0;
   for (const token of ['bad\nsecret','bad\rsecret','bad\0secret']) {

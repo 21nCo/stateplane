@@ -136,7 +136,7 @@ try {
         throw new Error('Event cursor index removal requires drained readers; stop long readers and retry', { cause:error });
       throw error;
     }
-    if (boundedDdl) await client.query('SELECT set_config($1,$2,true)', ['lock_timeout',priorLockTimeout]);
+    if (boundedDdl) await client.query('SELECT set_config($1,$2,true)', ['lock_timeout',priorLockTimeout]); // NOSONAR -- restore this step's transaction-local timeout before the ledger write
     await client.query('INSERT INTO stateplane_migrations (name, sha256) VALUES ($1, $2)', [name, sha256]);
     process.stdout.write(`Applied ${name}\n`);
   }

@@ -154,7 +154,8 @@ try {
         {create:async () => { throw new Error('unexpected provider create'); },
           find:async () => null,revoke:async () => {}},{current:async () => true});
       const directory=new PostgresRoutingDirectory(pool,cells);
-      const listed=await spaces.list(actor);
+      const listed=[];
+      for await (const space of spaces.list(actor)) listed.push(space);
       assert.deepEqual(listed.map(space=>space.spaceId),['sp_upgrade']);
       assert.equal(listed[0].homeCellId,'cell-origin');
       assert.equal(listed[0].cellId,'cell-a');

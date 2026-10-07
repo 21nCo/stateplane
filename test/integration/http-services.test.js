@@ -26,6 +26,12 @@ const route=async(method,path,body,token='fixture-token')=>handler(new Request(`
   method,headers:{Authorization:`Bearer ${token}`,...(body===undefined?{}:{'Content-Type':'application/json'})},
   body:body===undefined?undefined:JSON.stringify(body)}));
 
+async function collectSpaces(spaces,actor) {
+  const items=[];
+  for await (const item of spaces.list(actor)) items.push(item);
+  return items;
+}
+
 test('space discovery pages bound directory work and reauthorize each continuation',async t=>{
   const prefix=`sta9-page-${randomUUID()}`;
   const owner={kind:'session',userPrincipalId:`owner-${randomUUID()}`,credentialId:`session-${randomUUID()}`};
@@ -55,8 +61,17 @@ test('space discovery pages bound directory work and reauthorize each continuati
   assert.equal(page1.items.length,7,'one pending reservation consumes one bounded scan slot');
   assert.equal(typeof page1.cursor,'string');
   assert.ok(page1.items.every(item=>item.ownerPrincipalId===owner.userPrincipalId));
-  assert.equal((await listing.list(owner)).length,55,
-    'direct callers must find every active space after the first bounded page');
+  const direct=listing.list(owner);
+  assert.equal(typeof direct[Symbol.asyncIterator],'function','direct discovery must stream bounded pages');
+  const directItems=[];
+  for (let index=0;index<page1.items.length;index++) directItems.push((await direct.next()).value);
+  const actualNow=Date.now;
+  try {
+    Date.now=()=>actualNow()+16*60_000;
+    for await (const item of direct) directItems.push(item);
+  } finally { Date.now=actualNow; }
+  assert.equal(directItems.length,55,'direct traversal stays complete past external cursor expiry');
+  assert.equal(new Set(directItems.map(item=>item.spaceId)).size,55);
   const sibling=new PostgresSpaces(pool,cells,'cell-a',{create:async()=>{throw Error('unused');},
     find:async()=>null,revoke:async()=>{}},verifier,secret);
   assert.equal((await sibling.listPage(owner,page1.cursor)).items.length,8,
@@ -94,7 +109,10 @@ test('space discovery pages bound directory work and reauthorize each continuati
   const expiredBody=JSON.stringify(old);
   const expired=Buffer.from(JSON.stringify([expiredBody,createHmac('sha256',secret).update(expiredBody).digest('hex')])).toString('base64url');
   assert.equal((await (await get(expired)).json()).error.code,'CURSOR_INVALID');
+  const directRevoked=listing.list(owner);
+  for (let index=0;index<page1.items.length;index++) await directRevoked.next();
   live=false;
+  await assert.rejects(directRevoked.next(),{code:'FORBIDDEN'});
   assert.equal((await (await get(page1.cursor)).json()).error.code,'FORBIDDEN');
 });
 
@@ -112,7 +130,7 @@ test('direct space enumeration advances past a full page of pending reservations
   await pool.query(`INSERT INTO space_directory(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,lifecycle,created_at)
     VALUES($1,$2,'cell-a','cell-a','target-a','active','2026-01-01T00:00:01Z')`,
   [`${prefix}-active`,localActor.userPrincipalId]);
-  assert.deepEqual((await listing.list(localActor)).map(row=>row.spaceId),[`${prefix}-active`]);
+  assert.deepEqual((await collectSpaces(listing,localActor)).map(row=>row.spaceId),[`${prefix}-active`]);
 });
 
 test('real Postgres HTTP operations preserve receipts, grant checks, events and batch progress',async t=>{

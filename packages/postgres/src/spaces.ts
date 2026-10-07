@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { types } from 'node:util';
 import type pg from 'pg';
 import type { DirectoryPlacement, RoutingDirectory } from '@stateplane/application';
@@ -488,25 +488,26 @@ export class PostgresSpaces {
         WHERE space_id=$1 AND lifecycle='provisioning'`,[spaceId,existing.home_cell_id]);
     });
   }
-  /** Direct callers retain complete enumeration; transports use bounded listPage. */
-  async list(actor: VerifiedCredential): Promise<SpaceInfo[]> {
-    const items:SpaceInfo[]=[];
-    const secret=this.cursorSecret??randomBytes(32);
-    let cursor:string|undefined;
+  /** Direct callers consume one bounded page at a time without an expiring wire cursor. */
+  async *list(actor: VerifiedCredential): AsyncGenerator<SpaceInfo> {
+    const selected=snapshotOwner(actor);
+    let after:{time:string;id:string}|null=null;
     do {
-      const page=await this.page(actor,cursor,secret);
-      items.push(...page.items);
-      cursor=page.cursor??undefined;
-    } while (cursor!==undefined);
-    return items;
+      const page=await this.scanPage(selected,after); // NOSONAR -- the next key depends on the previous page
+      for (const item of page.items) yield item;
+      after=page.next;
+    } while (after);
   }
   async listPage(actor: VerifiedCredential, cursor?: string): Promise<SpacePage> {
     if (!this.cursorSecret) throw new Error('Shared space cursor secret is required for HTTP pagination');
-    return this.page(actor,cursor,this.cursorSecret);
+    const selected=snapshotOwner(actor);
+    const after=this.spaceAfter(selected,cursor,this.cursorSecret);
+    const page=await this.scanPage(selected,after);
+    return {items:page.items,cursor:page.next ? this.spaceCursor(selected,page.next.time,page.next.id,
+      after?.issued??Date.now(),this.cursorSecret) : null};
   }
-  private async page(actor: VerifiedCredential, cursor:string|undefined, secret:Uint8Array): Promise<SpacePage> {
-    actor = snapshotOwner(actor);
-    const after=this.spaceAfter(actor,cursor,secret);
+  private async scanPage(actor: VerifiedCredential, after:{time:string;id:string}|null):
+    Promise<{items:ReadonlyArray<SpaceInfo>;next:{time:string;id:string}|null}> {
     await this.current(actor);
     const candidates = await this.control.query(`SELECT space_id,lifecycle,
       to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_time
@@ -530,8 +531,7 @@ export class PostgresSpaces {
     const byId=new Map(rows.rows.map(row=>[row.space_id,info(row)]));
     const last=page.at(-1);
     return {items:page.flatMap(row=>byId.has(row.space_id)?[byId.get(row.space_id)!]:[]),
-      cursor:candidates.rows.length>spacePageSize && last ?
-        this.spaceCursor(actor,last.cursor_time,last.space_id,after?.issued??Date.now(),secret) : null};
+      next:candidates.rows.length>spacePageSize && last ? {time:last.cursor_time,id:last.space_id} : null};
   }
   async get(actor: VerifiedCredential, spaceId: string): Promise<SpaceInfo> {
     if (!actor || types.isProxy(actor) || !validId(spaceId)) throw new AuthorityError('NOT_FOUND');
