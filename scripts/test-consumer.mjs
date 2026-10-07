@@ -63,7 +63,8 @@ if (canonicalJsonObject('{"answer":42}') !== '{"answer":42}') throw new Error('P
           '-File',script,'-TargetPath',target,'-Action','verify'],{cwd:temp,encoding:'utf8'});
         const details=spawnSync(powershell,['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
           '-File',script,'-TargetPath',target,'-Action','diagnose'],{cwd:temp,encoding:'utf8'});
-        aclDiagnostic+=`${name}: verify=${check.status} signal=${check.signal} acl=${details.stdout.trim()}; `;
+        aclDiagnostic+=`${name}: verify=${check.status} signal=${check.signal} verifyError=${check.stderr.trim()} `+
+          `diagnose=${details.status} acl=${details.stdout.trim()} diagnoseError=${details.stderr.trim()}; `;
       }
     }
     throw new Error(`Installed CLI configuration failed: status=${setup.status} signal=${setup.signal} error=${setup.error?.code??'none'} ${setup.stderr} ${aclDiagnostic}`);

@@ -1,6 +1,7 @@
 import type { StateplaneServices } from '@stateplane/application';
 import type { IdentityVerifier } from '@stateplane/auth';
 import type { VerifiedCredential } from '@stateplane/contracts';
+import { isSafeHttpRead, parseV1Path } from '@stateplane/contracts';
 
 const headers = { 'Cache-Control':'no-store', 'Content-Type':'application/json; charset=utf-8' };
 const status:Record<string,number> = {
@@ -18,19 +19,7 @@ class HttpFailure extends Error {
 const fail=(code:string,retryableOverride?:boolean):never=>{ throw new HttpFailure(code,retryableOverride); };
 const json=(value:unknown,code=200)=>Response.json(value,{status:code,headers});
 function path(value:string):string[] {
-  const parts=value.split('/').slice(1);
-  if (parts[0]!=='v1') fail('NOT_FOUND');
-  return parts.slice(1).map(part=>{
-    try {
-      // URL parsers remove dot-only segments before a Request reaches us.
-      // Semicolons are escaped by encodeURIComponent, so these two raw forms
-      // cannot collide with a literal caller identifier.
-      if (part===';.' || part===';..') return part.slice(1);
-      const decoded=decodeURIComponent(part);
-      if (!decoded || decoded==='.' || decoded==='..' || decoded.includes('\0') || decoded.length>512) fail('NOT_FOUND');
-      return decoded;
-    } catch { return fail('NOT_FOUND'); }
-  });
+  return parseV1Path(value)??fail('NOT_FOUND');
 }
 async function body(request:Request,limit=3_145_728):Promise<string> {
   const declared=request.headers.get('content-length');
@@ -65,9 +54,8 @@ function object(serialized:string):Record<string,unknown> {
   return parsed as Record<string,unknown>;
 }
 function safeRead(request:Request):boolean {
-  if (request.method==='GET') return true;
-  if (request.method!=='POST') return false;
-  try { return /^\/v1\/spaces\/[^/]+\/collections\/[^/]+\/records\/(?:query|count)$/.test(new URL(request.url).pathname); }
+  try { const route=parseV1Path(new URL(request.url).pathname);
+    return route!==null && isSafeHttpRead(request.method,route); }
   catch { return false; }
 }
 function errorResponse(error:unknown,requestId:string,request:Request):Response {
@@ -78,8 +66,10 @@ function errorResponse(error:unknown,requestId:string,request:Request):Response 
   else if (typeof raw==='string' && Object.hasOwn(status,raw)) code=raw;
   else if (error instanceof HttpFailure) code=error.code;
   else code='PROVIDER_UNAVAILABLE';
-  const canRetry=error instanceof HttpFailure && error.retryableOverride!==undefined
-    ? error.retryableOverride : code==='COMMIT_OUTCOME_UNKNOWN' ? safeRead(request) : retryable.has(code);
+  let canRetry=retryable.has(code);
+  if (code==='COMMIT_OUTCOME_UNKNOWN') canRetry=safeRead(request);
+  if (error instanceof HttpFailure && error.retryableOverride!==undefined)
+    canRetry=error.retryableOverride;
   const response=json({contractVersion:'1',error:{code,message:code,retryable:canRetry,requestId}},status[code]??503);
   if (canRetry) response.headers.set('Retry-After','1');
   return response;

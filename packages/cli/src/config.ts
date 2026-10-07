@@ -14,7 +14,7 @@ const windowsAclScript=join(dirname(fileURLToPath(import.meta.url)),'../bin/secu
 /** fs.Stats.mode does not expose Windows ACLs. Keep only the current user,
  * SYSTEM and Administrators on configuration and file-secret paths. */
 async function windowsAcl(path:string,action:'harden'|'verify'):Promise<void> {
-  const powershell=join(process.env.SystemRoot??'C:\\Windows','System32','WindowsPowerShell','v1.0','powershell.exe');
+  const powershell=join(process.env.SystemRoot??String.raw`C:\Windows`,'System32','WindowsPowerShell','v1.0','powershell.exe');
   const result=await command(powershell,['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
     '-File',windowsAclScript,'-TargetPath',path,'-Action',action]);
   if (!result.ok) throw new StateplaneCliError('INSECURE_CONFIGURATION');

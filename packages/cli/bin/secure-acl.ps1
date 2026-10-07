@@ -6,10 +6,15 @@ $ErrorActionPreference='Stop'
 $identity=[System.Security.Principal.WindowsIdentity]::GetCurrent().User
 $allowed=@($identity.Value,'S-1-5-18','S-1-5-32-544')
 $acl=Get-Acl -LiteralPath $TargetPath
+function RulesBySid($security) {
+  # Get-Acl.Access can hold NTAccount names that no longer translate on a
+  # runner. Asking the ACL for SIDs also makes the allowlist comparison exact.
+  return @($security.GetAccessRules($true,$false,[System.Security.Principal.SecurityIdentifier]))
+}
 if ($Action -eq 'diagnose') {
   $owner=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
-  $rules=@($acl.Access | ForEach-Object {
-    $sid=$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+  $rules=@(RulesBySid $acl | ForEach-Object {
+    $sid=$_.IdentityReference.Value
     "$sid/$($_.AccessControlType)/$($_.IsInherited)"
   }) -join ','
   Write-Output "caller=$($identity.Value) owner=$owner protected=$($acl.AreAccessRulesProtected) rules=$rules"
@@ -32,8 +37,8 @@ if ($Action -eq 'harden') {
   & $icacls $TargetPath '/inheritance:r' | Out-Null
   if ($LASTEXITCODE -ne 0) { exit 12 }
   $acl=Get-Acl -LiteralPath $TargetPath
-  foreach ($rule in @($acl.Access)) {
-    $sid=$rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+  foreach ($rule in @(RulesBySid $acl)) {
+    $sid=$rule.IdentityReference.Value
     if ($allowed -contains $sid) { continue }
     & $icacls $TargetPath '/remove' "*$sid" | Out-Null
     if ($LASTEXITCODE -ne 0) { exit 13 }
@@ -46,8 +51,8 @@ try { $owner=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
 catch { exit 2 }
 if ($allowed -notcontains $owner) { exit 2 }
 $hasUser=$false
-foreach ($rule in $acl.Access) {
-  $sid=$rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+foreach ($rule in @(RulesBySid $acl)) {
+  $sid=$rule.IdentityReference.Value
   if ($allowed -notcontains $sid -or $rule.AccessControlType -ne 'Allow') { exit 1 }
   if ($sid -eq $identity.Value) { $hasUser=$true }
 }

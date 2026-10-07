@@ -15,21 +15,18 @@ if operation == "store" {
   let token = FileHandle.standardInput.readDataToEndOfFile()
   guard !token.isEmpty else { exit(1) }
   // A Swift CLI has no Data Protection Keychain entitlement on this host.
-  // Restrict the classic macOS Keychain item to the calling application and
-  // apply the same ACL when updating an item made by an older CLI version.
+  // An interpreter cannot be trusted as the calling application: any other
+  // Swift script would inherit its trust. Require a Keychain prompt instead.
   var access: SecAccess?
-  // Apple's SecAccessCreate contract makes nil trust only this calling app
-  // for sensitive operations; the login keychain must also be unlocked.
-  // A user-presence prompt on every lookup would break stream ingestion.
-  let accessStatus = SecAccessCreate("Stateplane API key" as CFString, nil, &access) // NOSONAR -- nil trusts only the calling app for decryption
+  let accessStatus = SecAccessCreate("Stateplane API key" as CFString, [] as CFArray, &access)
   guard accessStatus == errSecSuccess,
     let access = access else { exit(1) }
   var item = query
   item[kSecValueData as String] = token
   item[kSecAttrAccess as String] = access
-  let added = SecItemAdd(item as CFDictionary, nil) // NOSONAR -- kSecAttrAccess restricts decryption to this caller
+  let added = SecItemAdd(item as CFDictionary, nil) // NOSONAR -- empty trusted-app ACL requires confirmation for decryption
   let status = added == errSecDuplicateItem
-    ? SecItemUpdate(query as CFDictionary, [ // NOSONAR -- classic login Keychain unlock plus caller ACL; user-presence storage requires an unavailable CLI entitlement
+    ? SecItemUpdate(query as CFDictionary, [ // NOSONAR -- update replaces legacy caller trust with the prompt-only ACL
         kSecValueData as String: token,
         kSecAttrAccess as String: access
       ] as CFDictionary)

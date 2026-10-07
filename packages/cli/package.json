@@ -17,6 +17,9 @@
   "bin": {
     "stateplane": "./bin/stateplane.js"
   },
+  "dependencies": {
+    "@stateplane/contracts": "workspace:*"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"

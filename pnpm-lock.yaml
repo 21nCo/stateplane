@@ -163,7 +163,11 @@ importers:
         specifier: workspace:*
         version: link:../contracts
 
-  packages/cli: {}
+  packages/cli:
+    dependencies:
+      '@stateplane/contracts':
+        specifier: workspace:*
+        version: link:../contracts
 
   packages/contracts: {}
 

@@ -1,3 +1,5 @@
+import { isSafeHttpRead, parseV1Path } from '@stateplane/contracts';
+
 export class StateplaneCliError extends Error {
   readonly retryable:boolean;
   constructor(readonly code:string,readonly requestId?:string,readonly retryAfter?:number,retryable?:boolean) {
@@ -82,15 +84,27 @@ export class StateplaneHttpClient {
     if (!response.ok) throw serverError(value,after);
     return {retry:false,value};
   }
-  /** Validate the route once, then bound retries to read-only operations. */
-  async request(method:'GET'|'POST'|'PUT'|'PATCH'|'DELETE',path:string,body?:unknown,
-    extraHeaders?:Record<string,string>):Promise<unknown> {
+  /** Resolve the route before any bearer token is attached to a request. */
+  private route(path:string):{url:URL;segments:string[]} {
     if (!path.startsWith('/v1/') || path.startsWith('//')) throw new StateplaneCliError('INVALID_ARGUMENT');
     let url:URL;
     try { url=new URL(path,this.endpoint); }
     catch { throw new StateplaneCliError('INVALID_ARGUMENT'); }
-    if (url.origin!==this.endpoint.origin) throw new StateplaneCliError('INVALID_ARGUMENT');
-    const safeRead=method==='GET' || (method==='POST' && /\/records\/(?:query|count)$/.test(url.pathname));
+    const segments=parseV1Path(url.pathname);
+    if (url.origin!==this.endpoint.origin || !segments) throw new StateplaneCliError('INVALID_ARGUMENT');
+    return {url,segments};
+  }
+  /** A wire failure is ambiguous for writes, but a read can be repeated twice. */
+  private async recoverWireFailure(safeRead:boolean,attempt:number):Promise<void> {
+    if (!safeRead) throw new StateplaneCliError('OUTCOME_UNKNOWN');
+    if (attempt>=2) throw new StateplaneCliError('PROVIDER_UNAVAILABLE');
+    await this.sleep(250*(attempt+1));
+  }
+  /** Validate the route once, then bound retries to read-only operations. */
+  async request(method:'GET'|'POST'|'PUT'|'PATCH'|'DELETE',path:string,body?:unknown,
+    extraHeaders?:Record<string,string>):Promise<unknown> {
+    const {url,segments}=this.route(path);
+    const safeRead=isSafeHttpRead(method,segments);
     const serialized=serializeBody(body);
     for (let attempt=0;attempt<(safeRead?3:1);attempt++) {
       try {
@@ -99,8 +113,7 @@ export class StateplaneHttpClient {
         return result.value;
       } catch(error) {
         if (!(error instanceof WireFailure)) throw error;
-        if (safeRead && attempt<2) { await this.sleep(250*(attempt+1)); continue; } // NOSONAR -- bounded read retries must remain sequential
-        throw new StateplaneCliError(safeRead?'PROVIDER_UNAVAILABLE':'OUTCOME_UNKNOWN');
+        await this.recoverWireFailure(safeRead,attempt); // NOSONAR -- bounded read retries must remain sequential
       }
     }
     throw new StateplaneCliError('PROVIDER_UNAVAILABLE');

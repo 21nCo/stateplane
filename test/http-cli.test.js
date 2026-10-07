@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { mkdir, mkdtemp, rm, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { platform } from 'node:os';
 import { createHttpHandler } from '../packages/api/dist/index.js';
@@ -981,6 +981,51 @@ test('unknown COMMIT on a read retries safely while a write remains outcome-unkn
   assert.equal(writeCalls,2);
 });
 
+test('decoded read routes retain safe retry and normalized paths cannot carry credentials elsewhere',async()=>{
+  const state=fixture();
+  let readCalls=0,writeCalls=0;
+  state.services.records.query=async()=>{
+    readCalls++;
+    if (readCalls%2===1) throw Object.assign(new Error('private commit cause'),{name:'CommitOutcomeUnknownError'});
+    return {records:[],nextCursor:null};
+  };
+  state.services.records.count=async()=>{
+    readCalls++;
+    if (readCalls%2===1) throw Object.assign(new Error('private commit cause'),{name:'CommitOutcomeUnknownError'});
+    return 1;
+  };
+  state.services.records.mutate=async()=>{
+    writeCalls++;
+    throw Object.assign(new Error('private commit cause'),{name:'CommitOutcomeUnknownError'});
+  };
+  const handler=createHttpHandler(state);
+  const client=new StateplaneHttpClient({endpoint:'http://127.0.0.1/',token:'secret-test-token',
+    fetch:(url,options)=>handler(new Request(url,options)),sleep:async()=>{}});
+  const base='/v1/spaces/sp_a/collections/entries/records';
+  for (const action of ['%71uery','%63ount']) {
+    const path=`${base}/${action}`;
+    const first=await handler(new Request(`http://127.0.0.1${path}`,{method:'POST',
+      headers:{Authorization:'Bearer secret-test-token','Content-Type':'application/json'},body:'[]'}));
+    assert.equal((await first.json()).error.retryable,true);
+    assert.equal(first.headers.get('Retry-After'),'1');
+    readCalls=0;
+    assert.deepEqual(await client.request('POST',path,[]),
+      action==='%71uery'?{records:[],nextCursor:null}:1);
+    assert.equal(readCalls,2);
+    readCalls=0;
+  }
+  await assert.rejects(client.request('POST',base,{operation:'create'}),
+    {code:'COMMIT_OUTCOME_UNKNOWN',retryable:false});
+  assert.equal(writeCalls,1);
+  let sent=0;
+  const scoped=new StateplaneHttpClient({endpoint:'http://127.0.0.1/',token:'secret-test-token',
+    fetch:async()=>{sent++;return Response.json({ok:true});}});
+  for (const route of ['/v1/../api/health','/v1/%2e%2e/api/health',
+    '/v1/spaces/sp_a/../../../api/health'])
+    await assert.rejects(scoped.request('GET',route),{code:'INVALID_ARGUMENT'});
+  assert.equal(sent,0);
+});
+
 test('a concurrent endpoint and token switch cannot mix credentials or selected spaces',async t=>{
   const receivedA=[],receivedB=[];
   const listener=requests=>createServer((req,res)=>{
@@ -1055,7 +1100,7 @@ test('equals-form flags preserve identifiers beginning with option syntax',async
 });
 
 test('macOS Keychain stores and reloads a token without passing it as a process argument',
-  {skip:platform()!=='darwin'},async()=>{
+  {skip:platform()!=='darwin' || process.env.STATEPLANE_KEYCHAIN_INTERACTIVE_TESTS!=='1'},async()=>{
     const endpoint=`https://keychain-${randomUUID()}.example.invalid/`;
     const token=`token-${randomUUID()}`;
     const root=await mkdtemp(join(tmpdir(),'stateplane-cli-keychain-'));
@@ -1086,6 +1131,31 @@ test('macOS Keychain reports a missing item as unauthenticated',
   {skip:platform()!=='darwin'},async()=>{
     await assert.rejects(loadToken({endpoint:`https://missing-${randomUUID()}.example.invalid/`,
       tokenStore:'keychain'}),{code:'UNAUTHENTICATED'});
+  });
+
+test('macOS Keychain does not silently trust a second Swift script',
+  {skip:platform()!=='darwin'},async()=>{
+    const endpoint=`https://caller-${randomUUID()}.example.invalid/`;
+    const service=`stateplane:${endpoint}`;
+    const token=`disposable-${randomUUID()}`;
+    const root=await mkdtemp(join(tmpdir(),'stateplane-keychain-caller-'));
+    const probe=join(root,'alternate.swift');
+    const helper='packages/cli/bin/keychain.swift';
+    const swift=(script,operation,input='')=>spawnSync('/usr/bin/xcrun',
+      ['--sdk','macosx','swift',script,operation,service],
+      {encoding:'utf8',input,timeout:5000});
+    try {
+      await writeFile(probe,`import Foundation\nimport Security\nlet query:[String:Any]=[kSecClass as String:kSecClassGenericPassword,\n  kSecAttrAccount as String:"default",kSecAttrService as String:CommandLine.arguments[2],\n  kSecReturnData as String:true,kSecMatchLimit as String:kSecMatchLimitOne]\nvar result:CFTypeRef?\nlet status=SecItemCopyMatching(query as CFDictionary,&result)\nif status == errSecSuccess, let data=result as? Data { FileHandle.standardOutput.write(data) }\nelse { exit(1) }\n`);
+      const stored=swift(helper,'store',token);
+      assert.equal(stored.status,0,'disposable Keychain item must be created');
+      const other=swift(probe,'load');
+      assert.notEqual(other.stdout,token,'another Swift script must not decrypt silently');
+      assert.ok(other.status!==0 || other.error?.code==='ETIMEDOUT');
+    } finally {
+      const removed=swift(helper,'remove');
+      assert.equal(removed.status,0,'disposable Keychain item must be removed');
+      await rm(root,{recursive:true,force:true});
+    }
   });
 
 test('interrupted credential store switches and logout remove both tracked secrets',async()=>{
@@ -1168,7 +1238,7 @@ test('interrupted credential store switches and logout remove both tracked secre
 });
 
 test('installed CLI switches file and macOS Keychain stores and cleans an interrupted switch',
-  {skip:platform()!=='darwin'},async()=>{
+  {skip:platform()!=='darwin' || process.env.STATEPLANE_KEYCHAIN_INTERACTIVE_TESTS!=='1'},async()=>{
     const root=await mkdtemp(join(tmpdir(),'stateplane-cli-switch-'));
     const endpoint=`https://switch-${randomUUID()}.example.invalid/`;
     const token=`secret-${randomUUID()}`;
@@ -1285,7 +1355,7 @@ test('HTTP and CLI no-op space updates deny metadata after owner revocation duri
 });
 
 test('concurrent logout and endpoint changes clean both secret stores after a switch',
-  {skip:platform()!=='darwin'},async()=>{
+  {skip:platform()!=='darwin' || process.env.STATEPLANE_KEYCHAIN_INTERACTIVE_TESTS!=='1'},async()=>{
     for (const from of ['file','keychain']) for (const action of ['logout','endpoint']) {
       const to=from==='file'?'keychain':'file';
       const root=await mkdtemp(join(tmpdir(),'stateplane-cli-race-secret-'));
