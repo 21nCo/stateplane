@@ -1,15 +1,30 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
+import type { Socket } from 'node:net';
 import pg from 'pg';
 import { createHttpHandler } from '@stateplane/api';
+import { isSafeHttpRead, parseV1Path } from '@stateplane/contracts';
 import { PostgresSpaces, postgresServices } from '@stateplane/postgres';
 import type { RequestHandler } from './$types';
 
 type Bindings = App.Platform['env'];
 let cached: { key:string; handler:(request:Request)=>Promise<Response>; retire:()=>void } | undefined;
+const providerTimeoutMs=5_000;
+const requestTimeoutMs=12_000;
+class HostProviderTimeoutError extends Error {
+  constructor() { super('Provider socket timeout'); this.name='HostProviderTimeoutError'; }
+}
 
-function unavailable():Response {
-  return Response.json({contractVersion:'1',error:{code:'PROVIDER_UNAVAILABLE',message:'PROVIDER_UNAVAILABLE',
-    retryable:true,requestId:crypto.randomUUID()}},{status:503,headers:{'Cache-Control':'no-store','Retry-After':'1'}});
+function safeRead(request:Request):boolean {
+  const route=parseV1Path(new URL(request.url).pathname);
+  return route!==null && isSafeHttpRead(request.method,route);
+}
+
+function unavailable(request?:Request):Response {
+  const retryable=!request || safeRead(request);
+  const code=retryable?'PROVIDER_UNAVAILABLE':'COMMIT_OUTCOME_UNKNOWN';
+  return Response.json({contractVersion:'1',error:{code,message:code,
+    retryable,requestId:crypto.randomUUID()}},{status:503,
+    headers:{'Cache-Control':'no-store',...(retryable?{'Retry-After':'1'}:{})}});
 }
 function clearHost():undefined {
   cached?.retire();
@@ -38,7 +53,16 @@ function host(env:Bindings):((request:Request)=>Promise<Response>) | undefined {
   // pg-pool applies this limit both to new connections and to clients queued
   // behind the four active connections. Without it a provider outage can leave
   // an authenticated HTTP request pending indefinitely.
-  const pool=new pg.Pool({connectionString,max:4,connectionTimeoutMillis:5_000});
+  const pool=new pg.Pool({connectionString,max:4,connectionTimeoutMillis:providerTimeoutMs,
+    query_timeout:providerTimeoutMs+1_000,statement_timeout:providerTimeoutMs});
+  // pg's query_timeout rejects the caller but leaves a silent socket in the
+  // pool. Destroy that socket first, so a stalled query cannot poison reuse.
+  pool.on('connect',client=>{
+    const stream=(client as pg.PoolClient & {connection:{stream:Socket}}).connection.stream;
+    stream.setTimeout(providerTimeoutMs,()=>{
+      stream.destroy(new HostProviderTimeoutError());
+    });
+  });
   // An idle connection can fail after a successful request when the provider
   // goes away. The pool removes that client; consume the event without logging
   // provider diagnostics or allowing an unhandled error to kill the host.
@@ -69,11 +93,19 @@ function host(env:Bindings):((request:Request)=>Promise<Response>) | undefined {
   },identity,Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex'));
   const services=postgresServices(spaces,new Map([[cellId,{pool,cursorSecret:Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex')}]]),3600);
   const serve=createHttpHandler({services,identity});
+  const boundedServe=async(request:Request):Promise<Response>=>{
+    let timer:ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([serve(request),new Promise<Response>(resolve=>{
+        timer=setTimeout(()=>resolve(unavailable(request)),requestTimeoutMs);
+      })]);
+    } finally { if (timer) clearTimeout(timer); }
+  };
   if (env.AUTHORITY) {
     clearHost();
     return async request=>{
-      try { return await serve(request); }
-      finally { await pool.end(); }
+      try { return await boundedServe(request); }
+      finally { void pool.end().catch(()=>{}); }
     };
   }
   let active=0;let retired=false;
@@ -84,7 +116,7 @@ function host(env:Bindings):((request:Request)=>Promise<Response>) | undefined {
   const previous=cached;
   cached={key,retire,handler:async request=>{
     active++;
-    try { return await serve(request); }
+    try { return await boundedServe(request); }
     finally {
       active--;
       if (retired && active===0) void pool.end().catch(()=>{});

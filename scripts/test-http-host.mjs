@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { existsSync } from 'node:fs';
 import pg from 'pg';
-import { CollectionRegistry } from '../packages/postgres/dist/index.js';
+import { CollectionRegistry, PostgresSpaces } from '../packages/postgres/dist/index.js';
 
 const root=resolve(import.meta.dirname,'..');
 const pnpmCli=process.env.npm_execpath;
@@ -36,26 +36,49 @@ const temp=await mkdtemp(join(tmpdir(),'stateplane-host-consumer-'));
 // PostgreSQL handshakes after a successful connection, then resume without
 // changing the HTTP host's configuration or its cached pool.
 const databaseAddress=new URL(databaseUrl);
-const provider=fork(join(root,'scripts/http-provider-relay.mjs'),
-  [databaseAddress.hostname,databaseAddress.port || '5432'],{stdio:['ignore','ignore','ignore','ipc']});
-const [{port:providerPort}]=await once(provider,'message');
-async function providerMode(mode) {
-  const reply=once(provider,'message');
-  provider.send(mode);
-  await reply;
+let provider;
+let app;
+let appEnv;
+function relayReply(expected,command) {
+  return new Promise((resolve,reject)=>{
+    if (!provider || provider.exitCode!==null || provider.signalCode!==null) {
+      reject(new Error(`relay exited before ${expected}`));
+      return;
+    }
+    let settled=false;
+    const timeout=setTimeout(()=>finish(new Error(`relay ${expected} timed out`)),7_000);
+    function finish(error,value) {
+      if (settled) return;
+      settled=true;
+      clearTimeout(timeout);
+      provider.off('message',message);
+      provider.off('exit',exit);
+      provider.off('error',exit);
+      if (error) reject(error); else resolve(value);
+    }
+    function message(value) {
+      if (expected==='ready' ? Number.isSafeInteger(value?.port) : value?.state===expected)
+        finish(null,value);
+    }
+    function exit() { finish(new Error(`relay exited before ${expected}`)); }
+    provider.on('message',message);
+    provider.once('exit',exit);
+    provider.once('error',exit);
+    if (command) provider.send(command,error=>{ if (error) finish(error); });
+  });
 }
-const hostDatabaseUrl=new URL(databaseUrl);
-hostDatabaseUrl.hostname='127.0.0.1';
-hostDatabaseUrl.port=String(providerPort);
-const appEnv={...process.env,STATEPLANE_ENV:'local',STATEPLANE_TEST_HTTP:'1',
-  STATEPLANE_TEST_DATABASE_URL:hostDatabaseUrl.toString(),STATEPLANE_TEST_TOKEN:token,
-  STATEPLANE_TEST_OWNER:`owner-${randomUUID()}`,STATEPLANE_TEST_CREDENTIAL:`session-${randomUUID()}`,
-  STATEPLANE_TEST_AGENT_TOKEN:agentToken,STATEPLANE_TEST_AGENT_CREDENTIAL:agentCredential,
-  STATEPLANE_TEST_CURSOR_SECRET:randomBytes(32).toString('hex')};
-const app=spawn(process.execPath,[join(root,'app/node_modules/vite/bin/vite.js'),'dev','--host','127.0.0.1',
-  '--port',String(port),'--strictPort'],{cwd:join(root,'app'),env:appEnv,stdio:'ignore'});
+async function providerMode(mode) { await relayReply(mode==='stall'?'stalled':mode==='silent'?'silent':'forwarding',mode); }
+async function waitClosed(child,timeoutMs) {
+  if (!child || child.exitCode!==null || child.signalCode!==null) return;
+  let timer;
+  try {
+    await Promise.race([once(child,'close'),new Promise((_,reject)=>{
+      timer=setTimeout(()=>reject(new Error('child exit timed out')),timeoutMs);
+    })]);
+  } finally { clearTimeout(timer); }
+}
 const cliEnv={...process.env,STATEPLANE_CONFIG_DIR:join(temp,'config')};
-let cleanupError;
+const cleanupErrors=[];
 let testError;
 let fixturePool;
 function run(command,args,options={}) {
@@ -72,6 +95,20 @@ async function request(method,path,body,credential=token) {
   return value;
 }
 try {
+  provider=fork(join(root,'scripts/http-provider-relay.mjs'),
+    [databaseAddress.hostname,databaseAddress.port || '5432'],{stdio:['ignore','ignore','ignore','ipc']});
+  provider.on('error',()=>{});
+  const {port:providerPort}=await relayReply('ready');
+  const hostDatabaseUrl=new URL(databaseUrl);
+  hostDatabaseUrl.hostname='127.0.0.1';
+  hostDatabaseUrl.port=String(providerPort);
+  appEnv={...process.env,STATEPLANE_ENV:'local',STATEPLANE_TEST_HTTP:'1',
+    STATEPLANE_TEST_DATABASE_URL:hostDatabaseUrl.toString(),STATEPLANE_TEST_TOKEN:token,
+    STATEPLANE_TEST_OWNER:`owner-${randomUUID()}`,STATEPLANE_TEST_CREDENTIAL:`session-${randomUUID()}`,
+    STATEPLANE_TEST_AGENT_TOKEN:agentToken,STATEPLANE_TEST_AGENT_CREDENTIAL:agentCredential,
+    STATEPLANE_TEST_CURSOR_SECRET:randomBytes(32).toString('hex')};
+  app=spawn(process.execPath,[join(root,'app/node_modules/vite/bin/vite.js'),'dev','--host','127.0.0.1',
+    '--port',String(port),'--strictPort'],{cwd:join(root,'app'),env:appEnv,stdio:'ignore'});
   let ready=false;
   for (let attempt=0;attempt<100;attempt++) {
     if (app.exitCode!==null) throw new Error('app dev host exited before readiness');
@@ -371,8 +408,8 @@ try {
       body:body===undefined?undefined:JSON.stringify(body)});
     const result=await response.json();
     assert(Date.now()-started<8_000 && response.status===503 &&
-      result.error?.code==='PROVIDER_UNAVAILABLE' && result.error.retryable===true &&
-      response.headers.get('Retry-After')==='1' &&
+      result.error?.code==='PROVIDER_UNAVAILABLE' &&
+      result.error.retryable===true && response.headers.get('Retry-After')==='1' &&
       !JSON.stringify(result).includes(token) && !JSON.stringify(result).includes(databaseUrl),
     `bounded redacted provider failure for ${method} ${outagePath}`);
   }));
@@ -390,44 +427,116 @@ try {
     'outage requests have no record, event or receipt effects');
   assert((await request('GET',`v1/spaces/${spaceId}`)).spaceId===spaceId,
     'the cached host pool recovers after the provider returns');
+  const silentRequests=[
+    {method:'GET',path:`v1/spaces/${spaceId}`},
+    {method:'POST',path:`${path}/query`,body:{predicates:[],limit:1}},
+    {method:'POST',path:`${path}/count`,body:[]},
+    {method:'POST',path,body:{operation:'create',idempotencyKey:'silent-create',data}},
+    {method:'POST',path,body:{operation:'replace',idempotencyKey:'silent-replace',
+      id:receipt.ref.id,expectedRevision:1,data:{...data,label:'Silent replace'}}},
+    {method:'POST',path,body:{operation:'patch',idempotencyKey:'silent-patch',
+      id:receipt.ref.id,expectedRevision:2,set:{label:'Silent patch'},unset:[]}},
+    {method:'POST',path,body:{operation:'delete',idempotencyKey:'silent-delete',
+      id:receipt.ref.id,expectedRevision:3}}
+  ];
+  for (const item of silentRequests) {
+    await request('GET',`v1/spaces/${spaceId}`); // NOSONAR -- warm the cached connection before the silent query
+    await providerMode('silent');
+    const started=Date.now();
+    const response=await fetch(endpoint+item.path,{method:item.method,signal:AbortSignal.timeout(8_000),
+      headers:{Authorization:`Bearer ${token}`,...(item.body===undefined?{}:{'Content-Type':'application/json'})},
+      body:item.body===undefined?undefined:JSON.stringify(item.body)});
+    const result=await response.json();
+    const safe=item.method==='GET' || item.path.endsWith('/query') || item.path.endsWith('/count');
+    assert(Date.now()-started<8_000 && response.status===503 &&
+      result.error?.code===(safe?'PROVIDER_UNAVAILABLE':'COMMIT_OUTCOME_UNKNOWN') &&
+      result.error.retryable===safe && response.headers.get('Retry-After')===(safe?'1':null) &&
+      !JSON.stringify(result).includes(token) && !JSON.stringify(result).includes(databaseUrl),
+    `bounded established-query failure for ${item.method} ${item.path}`);
+    await providerMode('forward');
+    if (!safe) {
+      const first=await request('POST',path,item.body);
+      const counts=await effects();
+      const replay=await request('POST',path,item.body);
+      assert(replay.replayed && replay.receiptId===first.receiptId &&
+        JSON.stringify(await effects())===JSON.stringify(counts),
+      `explicit original-credential ${item.body.operation} recovery has no duplicate effect`);
+    }
+  }
   // Report success after the disposable space and processes are gone.
 } catch(error) {
   testError=error;
 } finally {
-  await providerMode('forward');
+  async function cleanupStep(action) {
+    try { await action(); } catch(error) { cleanupErrors.push(error); }
+  }
+  if (provider && provider.exitCode===null && provider.signalCode===null)
+    await cleanupStep(()=>providerMode('forward'));
   // This synthetic agent key has no provider backing; remove it before the
   // real space erasure flow asks the provider to revoke remaining keys.
-  try {
-    if (fixturePool) {
-      await fixturePool.query('DELETE FROM collection_grants WHERE space_id=$1 AND credential_id=$2',
-        [spaceId,agentCredential]);
-      await fixturePool.query('DELETE FROM space_credentials WHERE space_id=$1 AND credential_id=$2',
-        [spaceId,agentCredential]);
-    }
-  } catch(error) { cleanupError=error; }
+  await cleanupStep(()=>fixturePool?.query('DELETE FROM collection_grants WHERE space_id=$1 AND credential_id=$2',
+    [spaceId,agentCredential]));
+  await cleanupStep(()=>fixturePool?.query('DELETE FROM space_credentials WHERE space_id=$1 AND credential_id=$2',
+    [spaceId,agentCredential]));
   // The create response can be lost after COMMIT. Reconcile the selected ID
   // before cleanup, including when the command failed before seeing a receipt.
-  try {
-    const lookup=await fetch(endpoint+`v1/spaces/${spaceId}`,{
-      headers:{Authorization:`Bearer ${token}`}});
-    if (lookup.ok) {
-      await request('PATCH',`v1/spaces/${spaceId}`,{lifecycle:'readOnly'});
-      await request('DELETE',`v1/spaces/${spaceId}`);
-    } else if (lookup.status!==404) {
-      cleanupError=new Error(`HTTP cleanup lookup failed: ${lookup.status}`);
+  await cleanupStep(async()=>{
+    try {
+      if (!app) throw new Error('HTTP host unavailable during cleanup');
+      const lookup=await fetch(endpoint+`v1/spaces/${spaceId}`,{
+        headers:{Authorization:`Bearer ${token}`},signal:AbortSignal.timeout(15_000)});
+      if (lookup.ok) {
+        await request('PATCH',`v1/spaces/${spaceId}`,{lifecycle:'readOnly'});
+        await request('DELETE',`v1/spaces/${spaceId}`);
+      } else if (lookup.status!==404) {
+        throw new Error(`HTTP cleanup lookup failed: ${lookup.status}`);
+      }
+    } catch(httpError) {
+      if (!appEnv) return;
+      // The relay itself may be dead. Reconcile by the known space ID through
+      // the same service against the direct disposable database.
+      fixturePool ??= new pg.Pool({connectionString:databaseUrl,connectionTimeoutMillis:5_000,query_timeout:5_000});
+      const actor={kind:'session',userPrincipalId:appEnv?.STATEPLANE_TEST_OWNER,
+        credentialId:appEnv?.STATEPLANE_TEST_CREDENTIAL};
+      const spaces=new PostgresSpaces(fixturePool,new Map([['cell-a',{pool:fixturePool,storageTargetId:'target-a'}]]),
+        'cell-a',{create:()=>Promise.reject(new Error('not configured')),
+          find:()=>Promise.resolve(null),revoke:()=>Promise.reject(new Error('not configured'))},
+        {current:()=>Promise.resolve(true)},Buffer.from(appEnv?.STATEPLANE_TEST_CURSOR_SECRET??'00'.repeat(32),'hex'));
+      try {
+        const space=await spaces.get(actor,spaceId);
+        if (space.lifecycle==='active') await spaces.archive(actor,spaceId);
+        await spaces.delete(actor,spaceId);
+      } catch(directError) {
+        if (directError?.code!=='NOT_FOUND')
+          throw new AggregateError([httpError,directError],'HTTP and direct space cleanup failed',
+            {cause:directError});
+      }
     }
-  } catch(error) { cleanupError=error; }
-  try { await fixturePool?.end(); } catch(error) { cleanupError ??= error; }
-  app.kill('SIGTERM');
-  await Promise.race([once(app,'close'),new Promise(resolve=>setTimeout(resolve,3000))]);
-  if (app.exitCode===null) app.kill('SIGKILL');
-  provider.send('close');
-  await once(provider,'close');
-  await rm(temp,{recursive:true,force:true});
+  });
+  await cleanupStep(()=>fixturePool?.end());
+  await cleanupStep(async()=>{
+    if (!app) return;
+    if (app.exitCode===null && app.signalCode===null) app.kill('SIGTERM');
+    try { await waitClosed(app,3_000); }
+    catch {
+      app.kill('SIGKILL');
+      await waitClosed(app,3_000);
+    }
+  });
+  await cleanupStep(async()=>{
+    if (!provider || provider.exitCode!==null || provider.signalCode!==null) return;
+    provider.send('close');
+    try { await waitClosed(provider,3_000); }
+    catch {
+      provider.kill('SIGKILL');
+      await waitClosed(provider,3_000);
+    }
+  });
+  await cleanupStep(()=>rm(temp,{recursive:true,force:true}));
 }
-if (testError && cleanupError) throw new AggregateError([testError,cleanupError],
+if (testError && cleanupErrors.length) throw new AggregateError([testError,...cleanupErrors],
   'HTTP host smoke and cleanup both failed');
-if (cleanupError) throw cleanupError;
+if (cleanupErrors.length) throw new AggregateError(cleanupErrors,'HTTP host smoke cleanup failed');
 if (testError) throw testError;
 console.log('Installed CLI and independent HTTP client reached the live /v1 host with matching state and receipt');
 
