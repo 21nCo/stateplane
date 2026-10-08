@@ -245,14 +245,15 @@ try {
   assert(normalizedReplay.receiptId===normalized.receiptId && normalizedReplay.replayed,
     'installed CLI and HTTP replay one canonical NFC key');
   const beforeMismatch=await effects();
-  await Promise.all([{externalKey:'é',data:{...data,label:'Changed'}},
-    {externalKey:'é',data,expectedSchemaVersion:2}].map(async changed=>{
+  async function expectFingerprintMismatch(changed) {
     const mismatch=await fetch(endpoint+path,{method:'POST',headers:{Authorization:`Bearer ${token}`,
       'Content-Type':'application/json'},body:JSON.stringify({operation:'create',
       idempotencyKey:'normalized-key',...changed})});
     assert(mismatch.status===409 && (await mismatch.json()).error.code==='IDEMPOTENCY_MISMATCH',
       'changed canonical fingerprint cannot replay the normalized key');
-  }));
+  }
+  await expectFingerprintMismatch({externalKey:'é',data:{...data,label:'Changed'}});
+  await expectFingerprintMismatch({externalKey:'é',data,expectedSchemaVersion:2});
   const cliMismatch=spawnSync(process.execPath,[cli,'records','create','--collection',collectionId,
     '--idempotency-key','normalized-key','--key','é','--data',JSON.stringify({...data,label:'Changed'})],
     {cwd:temp,env:cliEnv,encoding:'utf8'});
@@ -288,8 +289,12 @@ try {
   const beforeCredentialSwitch=await effects();
   const switched=await fetch(endpoint+path,{method:'POST',headers:{Authorization:`Bearer ${agentToken}`,
     'Content-Type':'application/json'},body:JSON.stringify(mutation)});
-  assert(!switched.ok && (await switched.json()).receiptId!==receipt.receiptId,
-    'a new credential cannot recover the original create receipt');
+  const switchedBody=await switched.json();
+  assert(switched.status===409 && switchedBody.error?.code==='KEY_RESERVED' &&
+    !JSON.stringify(switchedBody).includes(receipt.receiptId) &&
+    !JSON.stringify(switchedBody).includes(token) &&
+    !JSON.stringify(switchedBody).includes(agentToken),
+  'a new authorized credential receives KEY_RESERVED without recovering the original receipt or a token');
   assert(JSON.stringify(await effects())===JSON.stringify(beforeCredentialSwitch),
     'credential switch with the same reserved external key has no record, event or receipt effect');
   const ownerReplay=await request('POST',path,mutation);
@@ -299,9 +304,12 @@ try {
   const switchedCli=spawnSync(process.execPath,[cli,'records','create','--collection',collectionId,
     '--idempotency-key',mutation.idempotencyKey,'--key',externalKey,'--data',JSON.stringify(data)],
     {cwd:temp,env:cliEnv,encoding:'utf8'});
-  assert(switchedCli.status===1 && !`${switchedCli.stdout}${switchedCli.stderr}`.includes(receipt.receiptId) &&
+  const switchedCliError=switchedCli.stderr ? JSON.parse(switchedCli.stderr).error : null;
+  assert(switchedCli.status===1 && switchedCliError?.code==='KEY_RESERVED' &&
+    !`${switchedCli.stdout}${switchedCli.stderr}`.includes(receipt.receiptId) &&
+    !`${switchedCli.stdout}${switchedCli.stderr}`.includes(token) &&
     !`${switchedCli.stdout}${switchedCli.stderr}`.includes(agentToken),
-  'installed CLI with a different credential cannot recover or expose the original receipt');
+  'installed CLI with a different authorized credential receives KEY_RESERVED without exposing the original receipt or a token');
   assert(JSON.stringify(await effects())===JSON.stringify(beforeCredentialSwitch),
     'CLI credential switch also has no record, event or receipt effect');
   const agentFirst=await request('GET',`v1/spaces/${spaceId}/collections`,undefined,agentToken);
