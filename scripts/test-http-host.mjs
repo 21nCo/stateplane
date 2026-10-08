@@ -106,10 +106,10 @@ try {
     policyVersion:Number(placement.policy_version),placementGeneration:Number(placement.placement_generation)};
   const registry=new CollectionRegistry(fixturePool);
   for (const field of definition.filterable) {
-    const result=await registry.backfill(schemaScope,field);
+    const result=await registry.backfill(schemaScope,field); // NOSONAR -- each index must be ready before the read matrix starts
     assert(result.ready,`index for ${field} is ready before querying`);
   }
-  for (const predicate of [
+  await Promise.all([
     {field:'label',kind:'string',operator:'eq',value:'A'},
     {field:'score',kind:'number',operator:'gte',value:2},
     {field:'active',kind:'boolean',operator:'eq',value:true},
@@ -117,9 +117,10 @@ try {
     {field:'note',kind:'null',operator:'isNull'},
     {field:'label',kind:'string',operator:'in',value:['A']},
     {field:'score',kind:'number',operator:'in',value:[2]},
+    {field:'score',kind:'number',operator:'in',value:new Array(16).fill(2)},
     {field:'active',kind:'boolean',operator:'in',value:[true]},
     {field:'at',kind:'date-time',operator:'in',value:['2024-02-29T23:59:59Z']}
-  ]) for (const action of ['query','count']) {
+  ].flatMap(predicate=>['query','count'].map(async action=>{
     const predicates=[predicate];
     const body=action==='query'?{predicates,limit:1}:predicates;
     const directResult=await request('POST',`${path}/${action}`,body);
@@ -128,31 +129,48 @@ try {
     const cliResult=runCli(args,{env:cliEnv});
     assert(JSON.stringify(cliResult)===JSON.stringify(directResult),`installed CLI ${action} matches HTTP`);
     assert(action==='query'?directResult.records.length===1:directResult===1,`typed ${action} finds the record`);
-  }
+  })));
   const beforeEvents=await request('GET',`v1/spaces/${spaceId}/collections/${encodeURIComponent(collectionId)}/events`);
-  for (const predicate of [
+  async function expectPredicateError(predicate,code) {
+    await Promise.all(['query','count'].map(async action=>{
+      const predicates=[predicate];
+      const body=action==='query'?{predicates,limit:1}:predicates;
+      const response=await fetch(endpoint+`${path}/${action}`,{method:'POST',
+        headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const error=(await response.json()).error;
+      assert(response.status===(code==='SCHEMA_CONFLICT'?409:400) && error.code===code,
+        `HTTP ${action} rejects ${JSON.stringify(predicate)} with ${code}`);
+      const args=['records',action,'--collection',collectionId,'--predicates',JSON.stringify(predicates)];
+      if (action==='query') args.push('--limit','1');
+      const installedCli=spawnSync(process.execPath,[cli,...args],{cwd:temp,env:cliEnv,encoding:'utf8'});
+      assert(installedCli.status!==0 && JSON.parse(installedCli.stderr).error.code===code,
+        `installed CLI ${action} matches HTTP for ${code}`);
+    }));
+  }
+  await Promise.all([
     {field:'label',kind:'string',operator:'eq'},
     {field:'label',kind:'number',operator:'eq',value:'oops'},
     {field:'label',kind:'number',operator:'in',value:7},
     {field:'label',kind:'number',operator:'in',value:[]},
-    {field:'label',kind:'number',operator:'in',value:Array(17).fill(1)},
+    {field:'score',kind:'number',operator:'in',value:new Array(17).fill(2)},
     {field:'label',kind:'string',operator:'eq',value:'😀'.repeat(129)},
     {field:'label',kind:'date-time',operator:'eq',value:'2026-02-30T00:00:00Z'}
-  ]) for (const action of ['query','count']) {
-    const predicates=[predicate];
-    const body=action==='query'?{predicates,limit:1}:predicates;
-    const response=await fetch(endpoint+`${path}/${action}`,{method:'POST',
-      headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify(body)});
-    assert(response.status===400 && (await response.json()).error.code==='INVALID_ARGUMENT',
-      `HTTP ${action} rejects malformed predicate`);
-    const args=['records',action,'--collection',collectionId,'--predicates',JSON.stringify(predicates)];
-    if (action==='query') args.push('--limit','1');
-    const installedCli=spawnSync(process.execPath,[cli,...args],{cwd:temp,env:cliEnv,encoding:'utf8'});
-    assert(installedCli.status!==0 && JSON.parse(installedCli.stderr).error.code==='INVALID_ARGUMENT',
-      `installed CLI ${action} matches HTTP for malformed predicate`);
+  ].map(predicate=>expectPredicateError(predicate,'INVALID_ARGUMENT')));
+  await expectPredicateError({field:'absent',kind:'string',operator:'eq',value:'A'},'SCHEMA_CONFLICT');
+  async function expectUnavailableIndex(column) {
+    await fixturePool.query(`UPDATE collection_index_declarations SET ${column}=FALSE
+      WHERE space_id=$1 AND collection_id=$2 AND field_name='label'`,[spaceId,collectionId]);
+    try {
+      await expectPredicateError({field:'label',kind:'string',operator:'eq',value:'A'},'SCHEMA_CONFLICT');
+    } finally {
+      await fixturePool.query(`UPDATE collection_index_declarations SET ${column}=TRUE
+        WHERE space_id=$1 AND collection_id=$2 AND field_name='label'`,[spaceId,collectionId]);
+    }
   }
+  await expectUnavailableIndex('filterable');
+  await expectUnavailableIndex('ready');
   assert(JSON.stringify(await request('GET',`v1/spaces/${spaceId}/collections/${encodeURIComponent(collectionId)}/events`))===
-    JSON.stringify(beforeEvents),'malformed read requests cause no record events');
+    JSON.stringify(beforeEvents),'rejected read requests cause no record events');
   const keyPath=`${path}/by-key/${encodeURIComponent(externalKey)}?mode=external`;
   const directByKey=await request('GET',keyPath);
   const cliByKey=runCli(['records','key','--collection',collectionId,'--key',externalKey,

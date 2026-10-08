@@ -188,7 +188,9 @@ has `field`, `kind`, and `operator`; every non-null kind also requires `value`.
 or `in` with 1–16 values of that kind. Date-time values are valid UTC `Z`
 instants; the authority checks the calendar and known leap-second dates.
 String and date-time values must fit 512 UTF-8 bytes, including multibyte
-characters. An invalid predicate returns `INVALID_ARGUMENT` before query SQL.
+characters. Malformed predicates return `INVALID_ARGUMENT` before the record
+query. Undeclared, non-filterable, or unready fields return `SCHEMA_CONFLICT`
+after the filter index lookup. HTTP and CLI report the same error code.
 
 An ingestion file or `--file -` stream is NDJSON with one record request per
 line, omitting `idempotencyKey`; the authority derives stable item keys. The
