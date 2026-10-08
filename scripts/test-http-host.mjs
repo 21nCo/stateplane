@@ -112,8 +112,8 @@ try {
   }));
   assert(JSON.stringify(await effects())===JSON.stringify({records:0,events:0,receipts:0}),
     'invalid keys have no durable effect');
-  for (const operation of ['create','replace','patch','delete']) {
-    for (const key of ['', 'a'.repeat(257), 'é'.repeat(129), '\ud800']) {
+  await Promise.all(['create','replace','patch','delete'].flatMap(operation=>
+    ['', 'a'.repeat(257), 'é'.repeat(129), '\ud800'].map(async key=>{
       const envelope={operation,idempotencyKey:key,
         ...(operation==='create'?{data}:{id:'missing',expectedRevision:1}),
         ...(operation==='replace'?{data}:{}),
@@ -123,7 +123,7 @@ try {
       assert(denied.status===400 && (await denied.json()).error.code==='INVALID_ARGUMENT',
         `HTTP rejects invalid ${operation} idempotency key`);
       // Process argv converts an unpaired surrogate to U+FFFD before the CLI can receive it.
-      if (key==='\ud800') continue;
+      if (key==='\ud800') return;
       const args=['records',operation,'--collection',collectionId,'--idempotency-key',key];
       if (operation==='create' || operation==='replace') args.push('--data',JSON.stringify(data));
       if (operation!=='create') args.push('--id','missing','--expected-revision','1');
@@ -132,8 +132,7 @@ try {
       const cliError=cliDenied.stderr ? JSON.parse(cliDenied.stderr).error.code : null;
       assert(cliDenied.status===1 && cliError==='INVALID_ARGUMENT',
         `installed CLI rejects invalid ${operation} idempotency key (${Buffer.byteLength(key)} bytes/${cliDenied.status}/${cliError})`);
-    }
-  }
+    })));
   assert(JSON.stringify(await effects())===JSON.stringify({records:0,events:0,receipts:0}),
     'invalid idempotency keys have no durable record, event or receipt');
   const mutation={operation:'create',idempotencyKey:'consumer-record',externalKey,data};
@@ -157,7 +156,7 @@ try {
     {operation:'delete',idempotencyKey:'z'.repeat(256),id,expectedRevision:3}
   ];
   for (const envelope of variants) {
-    const httpReceipt=await request('POST',path,envelope);
+    const httpReceipt=await request('POST',path,envelope); // NOSONAR -- each revision requires the previous mutation to commit
     const args=['records',envelope.operation,'--collection',collectionId,
       '--idempotency-key',envelope.idempotencyKey,'--id',id,
       '--expected-revision',String(envelope.expectedRevision)];
@@ -246,14 +245,14 @@ try {
   assert(normalizedReplay.receiptId===normalized.receiptId && normalizedReplay.replayed,
     'installed CLI and HTTP replay one canonical NFC key');
   const beforeMismatch=await effects();
-  for (const changed of [{externalKey:'é',data:{...data,label:'Changed'}},
-    {externalKey:'é',data,expectedSchemaVersion:2}]) {
+  await Promise.all([{externalKey:'é',data:{...data,label:'Changed'}},
+    {externalKey:'é',data,expectedSchemaVersion:2}].map(async changed=>{
     const mismatch=await fetch(endpoint+path,{method:'POST',headers:{Authorization:`Bearer ${token}`,
       'Content-Type':'application/json'},body:JSON.stringify({operation:'create',
       idempotencyKey:'normalized-key',...changed})});
     assert(mismatch.status===409 && (await mismatch.json()).error.code==='IDEMPOTENCY_MISMATCH',
       'changed canonical fingerprint cannot replay the normalized key');
-  }
+  }));
   const cliMismatch=spawnSync(process.execPath,[cli,'records','create','--collection',collectionId,
     '--idempotency-key','normalized-key','--key','é','--data',JSON.stringify({...data,label:'Changed'})],
     {cwd:temp,env:cliEnv,encoding:'utf8'});
@@ -286,7 +285,25 @@ try {
     await fixturePool.query(/* NOSONAR -- each grant follows its committed collection definition */
       `INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
       VALUES($1,$2,$3,ARRAY['records:write']::text[])`,[spaceId,slug,agentCredential]);
+  const beforeCredentialSwitch=await effects();
+  const switched=await fetch(endpoint+path,{method:'POST',headers:{Authorization:`Bearer ${agentToken}`,
+    'Content-Type':'application/json'},body:JSON.stringify(mutation)});
+  assert(!switched.ok && (await switched.json()).receiptId!==receipt.receiptId,
+    'a new credential cannot recover the original create receipt');
+  assert(JSON.stringify(await effects())===JSON.stringify(beforeCredentialSwitch),
+    'credential switch with the same reserved external key has no record, event or receipt effect');
+  const ownerReplay=await request('POST',path,mutation);
+  assert(ownerReplay.receiptId===receipt.receiptId && ownerReplay.replayed,
+    'original credential still recovers the original receipt after a credential switch');
   runCli(['auth','login','--token-stdin','--store','file'],{env:cliEnv,input:`${agentToken}\n`});
+  const switchedCli=spawnSync(process.execPath,[cli,'records','create','--collection',collectionId,
+    '--idempotency-key',mutation.idempotencyKey,'--key',externalKey,'--data',JSON.stringify(data)],
+    {cwd:temp,env:cliEnv,encoding:'utf8'});
+  assert(switchedCli.status===1 && !`${switchedCli.stdout}${switchedCli.stderr}`.includes(receipt.receiptId) &&
+    !`${switchedCli.stdout}${switchedCli.stderr}`.includes(agentToken),
+  'installed CLI with a different credential cannot recover or expose the original receipt');
+  assert(JSON.stringify(await effects())===JSON.stringify(beforeCredentialSwitch),
+    'CLI credential switch also has no record, event or receipt effect');
   const agentFirst=await request('GET',`v1/spaces/${spaceId}/collections`,undefined,agentToken);
   assert(JSON.stringify(runCli(['collections','list'],{env:cliEnv}))===JSON.stringify(agentFirst),
     'installed CLI write-only discovery matches HTTP first page');

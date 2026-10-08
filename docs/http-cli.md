@@ -88,7 +88,9 @@ create with the same idempotency key and equivalent normalized external key
 returns the original receipt only when the rest of the canonical request
 fingerprint also matches. Changed data or expected schema version returns
 `IDEMPOTENCY_MISMATCH` without a new record, event or receipt. After an unknown
-commit, retry the unchanged request with its original key to recover the receipt.
+commit, use the original credential and retry the identical canonical request
+with its original idempotency key to recover that credential's receipt. A new
+credential cannot recover the old receipt and may submit a separate write.
 
 On Linux, `keychain` is the default and uses Secret Service through
 `secret-tool`. On macOS and Windows, the default is the protected file store.
@@ -217,11 +219,16 @@ escaping; the CLI checks both byte budgets before sending. Permanent item
 count, item-byte and aggregate-byte violations return nonretryable `INVALID_ARGUMENT`;
 an oversized HTTP envelope returns nonretryable `RATE_LIMITED`. Correct fixed
 limit violations before submitting again. After an interrupted or uncertain
-ingest, retry the unchanged file and operation key to resume pending items;
+ingest, use the original credential to read batch status, then retry the
+unchanged file and operation key to resume pending items;
 use `--retry-failed` only when intentionally retrying failed items.
-After a timeout or `OUTCOME_UNKNOWN`, first read batch status. A standalone
-write is never retried automatically. Resubmit the **identical** record body
-with the **same idempotency key** to recover its receipt. `Retry-After` controls
+For a batch timeout or `OUTCOME_UNKNOWN`, read batch status with the original
+credential, space, collection and operation key before resubmitting the
+unchanged manifest. A standalone write is never retried automatically. Use
+the original credential to resubmit the **identical canonical request** with
+the **same idempotency key** to recover its receipt. A changed request returns
+`IDEMPOTENCY_MISMATCH`; changing credentials does not recover the original
+receipt and may create a separate effect. `Retry-After` controls
 bounded automatic retries for GET and read-only query/count POST requests.
 Writes are never retried automatically. Query `nextCursor` is opaque
 and bound to the same credential, space, collection and query; live pages are
