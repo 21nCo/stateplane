@@ -90,6 +90,28 @@ try {
   assert(discovered.definition.slug===collectionId,'CLI schema is visible through HTTP');
   const path=`v1/spaces/${spaceId}/collections/${encodeURIComponent(collectionId)}/records`;
   const data={label:'A',score:2,active:true,at:'2024-02-29T23:59:59Z',note:null};
+  fixturePool=new pg.Pool({connectionString:databaseUrl,max:1});
+  const effects=async()=>{
+    const counts=await fixturePool.query(`SELECT
+      (SELECT count(*)::int FROM records WHERE space_id=$1) AS records,
+      (SELECT count(*)::int FROM record_events WHERE space_id=$1) AS events,
+      (SELECT count(*)::int FROM idempotency_receipts WHERE space_id=$1) AS receipts`,[spaceId]);
+    return counts.rows[0];
+  };
+  await Promise.all(['', '\u0085 \u2003', 'a'.repeat(257), 'é'.repeat(129)].map(async(key,index)=>{
+    const denied=await fetch(endpoint+path,{method:'POST',headers:{Authorization:`Bearer ${token}`,
+      'Content-Type':'application/json'},body:JSON.stringify({operation:'create',
+      idempotencyKey:`invalid-key-${index}`,externalKey:key,data})});
+    assert(denied.status===400 && (await denied.json()).error.code==='INVALID_ARGUMENT',
+      `HTTP rejects invalid key ${index}`);
+    const cliDenied=spawnSync(process.execPath,[cli,'records','create','--collection',collectionId,
+      '--idempotency-key',`invalid-cli-key-${index}`,'--key',key,'--data',JSON.stringify(data)],
+      {cwd:temp,env:cliEnv,encoding:'utf8'});
+    assert(cliDenied.status===1 && JSON.parse(cliDenied.stderr).error.code==='INVALID_ARGUMENT' &&
+      !`${cliDenied.stdout}${cliDenied.stderr}`.includes(token),`installed CLI rejects invalid key ${index}`);
+  }));
+  assert(JSON.stringify(await effects())===JSON.stringify({records:0,events:0,receipts:0}),
+    'invalid keys have no durable effect');
   const mutation={operation:'create',idempotencyKey:'consumer-record',externalKey,data};
   const receipt=await request('POST',path,mutation);
   const replay=runCli(['records','create','--collection',collectionId,'--data',JSON.stringify(data),
@@ -98,7 +120,6 @@ try {
   const record=runCli(['records','get','--collection',collectionId,'--id',receipt.ref.id],{env:cliEnv});
   const direct=await request('GET',`${path}/${receipt.ref.id}`);
   assert(JSON.stringify(record)===JSON.stringify(direct),'CLI and HTTP canonical record parity');
-  fixturePool=new pg.Pool({connectionString:databaseUrl,max:1});
   const placement=(await fixturePool.query('SELECT policy_version,placement_generation FROM spaces WHERE space_id=$1',
     [spaceId])).rows[0];
   const schemaScope={spaceId,collectionId,principalId:appEnv.STATEPLANE_TEST_OWNER,
@@ -171,6 +192,20 @@ try {
   await expectUnavailableIndex('ready');
   assert(JSON.stringify(await request('GET',`v1/spaces/${spaceId}/collections/${encodeURIComponent(collectionId)}/events`))===
     JSON.stringify(beforeEvents),'rejected read requests cause no record events');
+  const normalized=runCli(['records','create','--collection',collectionId,'--data',JSON.stringify(data),
+    '--idempotency-key','normalized-key','--key','\u0085 e\u0301 \u0085'],{env:cliEnv});
+  const normalizedReplay=await request('POST',path,{operation:'create',idempotencyKey:'normalized-key',
+    externalKey:'é',data});
+  assert(normalizedReplay.receiptId===normalized.receiptId && normalizedReplay.replayed,
+    'installed CLI and HTTP replay one canonical NFC key');
+  const normalizedLookup=await request('GET',`${path}/by-key/${encodeURIComponent('é')}?mode=external`);
+  assert(normalizedLookup.ref.id===normalized.ref.id,'normalized key lookup resolves CLI record');
+  await Promise.all(['a'.repeat(256),'é'.repeat(128)].map(async(key,index)=>{
+    const accepted=runCli(['records','create','--collection',collectionId,'--data',JSON.stringify(data),
+      '--idempotency-key',`boundary-key-${index}`,'--key',key],{env:cliEnv});
+    const observed=await request('GET',`${path}/by-key/${encodeURIComponent(key)}?mode=external`);
+    assert(observed.ref.id===accepted.ref.id,`installed CLI and HTTP accept 256-byte key ${index}`);
+  }));
   const keyPath=`${path}/by-key/${encodeURIComponent(externalKey)}?mode=external`;
   const directByKey=await request('GET',keyPath);
   const cliByKey=runCli(['records','key','--collection',collectionId,'--key',externalKey,

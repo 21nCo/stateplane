@@ -76,6 +76,14 @@ stateplane records create --collection entries --key ' item-1 ' \
   --expected-schema-version 1
 ```
 
+For `records create`, an external key is normalized to NFC and trimmed using
+the fixed v1 Unicode whitespace set listed in OpenAPI. The resulting key must
+be nonempty and at most 256 UTF-8 bytes. OpenAPI publishes the byte budget as
+`x-utf8MaxBytes`; generated clients should enforce it after normalization and
+trim. The API returns `INVALID_ARGUMENT` for a rejected key and writes no
+record, event or receipt. Replaying an accepted create with the same
+idempotency key and an equivalent normalized key returns the original receipt.
+
 On Linux, `keychain` is the default and uses Secret Service through
 `secret-tool`. On macOS and Windows, the default is the protected file store.
 The macOS legacy login Keychain path is disabled for new writes and reads: a

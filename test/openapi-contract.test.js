@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import Ajv from 'ajv';
 import YAML from 'yaml';
+import { externalKey } from '../packages/postgres/dist/index.js';
 
 test('generated-client predicates agree with the typed HTTP query and count contract',async()=>{
   const source=await readFile(new URL('../contracts/openapi.yaml',import.meta.url),'utf8');
@@ -95,4 +96,32 @@ test('generated-client record mutations require the runtime operation envelope',
     const wire=JSON.parse(JSON.stringify(envelope));
     assert.equal(validate(wire),false,`${wire.operation} must reject ${JSON.stringify(wire)}`);
   }
+});
+
+test('published create keys match normalized authority admission',async()=>{
+  const document=YAML.parse(await readFile(new URL('../contracts/openapi.yaml',import.meta.url),'utf8'));
+  const schema=document.components.schemas.RecordMutation;
+  const keySchema=schema.oneOf[0].properties.externalKey;
+  assert.equal(keySchema['x-utf8MaxBytes'],256);
+  const trim=/^[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/gu;
+  const ajv=new Ajv({strict:false});
+  ajv.addKeyword({keyword:'x-utf8MaxBytes',schemaType:'number',type:'string',
+    validate:(limit,raw)=>Buffer.byteLength(raw.normalize('NFC').replace(trim,''),'utf8')<=limit});
+  const validate=ajv.compile(schema);
+  const create=externalKey=>({operation:'create',idempotencyKey:'key-contract',externalKey,data:{label:'A'}});
+  const valid=['x','a'.repeat(256),'é'.repeat(128),'😀'.repeat(64),
+    '\u0085 e\u0301 \u0085',`${' '.repeat(300)}x${' '.repeat(300)}`];
+  const invalid=['','\u0085 \u2003','a'.repeat(257),'é'.repeat(129),'😀'.repeat(65),
+    'a\u0000b','\ud800','\udc00'];
+  for (const raw of valid) {
+    assert.equal(validate(create(raw)),true,`published key must accept ${JSON.stringify(raw)}`);
+    assert.equal(typeof externalKey(raw),'string');
+  }
+  for (const raw of invalid) {
+    assert.equal(validate(create(raw)),false,`published key must reject ${JSON.stringify(raw)}`);
+    assert.throws(()=>externalKey(raw),{code:'INVALID_ARGUMENT'});
+  }
+  assert.equal(externalKey(valid[4]),'é','NFC and fixed whitespace trim share one canonical key');
+  assert.equal(validate({...create('x'),operation:'replace',id:'rec_1',expectedRevision:1}),false,
+    'external keys remain create-only');
 });

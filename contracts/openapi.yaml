@@ -265,7 +265,20 @@ components:
             operation: { const: create }
             idempotencyKey: { type: string, minLength: 1 }
             expectedSchemaVersion: { type: integer, minimum: 1 }
-            externalKey: { type: string }
+            externalKey:
+              type: string
+              minLength: 1
+              # The pattern excludes U+0000, lone surrogates and strings made
+              # entirely of the fixed v1 trim set. The byte extension applies
+              # after NFC and that trim; raw input may include padding.
+              pattern: '^(?![\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*$)[^\u0000\ud800-\udfff]+$'
+              x-utf8MaxBytes: 256
+              description: >-
+                Normalize to NFC, then trim U+0009–000D, U+0020, U+0085,
+                U+00A0, U+1680, U+2000–200A, U+2028, U+2029, U+202F,
+                U+205F and U+3000 at both ends. The result must be nonempty
+                and at most 256 UTF-8 bytes. Clients must enforce the byte
+                extension on the normalized result; the server enforces it.
             data: { type: object }
           additionalProperties: false
         - type: object

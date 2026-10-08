@@ -308,15 +308,30 @@ test('HTTP mutation variants reject malformed envelopes before writing',async t=
     const receipts=await pool.query('SELECT count(*)::int AS n FROM idempotency_receipts WHERE space_id=$1',[spaceId]);
     assert.deepEqual([events.rows[0].n,receipts.rows[0].n],[expectedEvents,expectedReceipts]);
   };
+  await Promise.all([
+    '', '\u0085 \u2003', 'a'.repeat(257), 'é'.repeat(129), '\ud800'
+  ].map(async(externalKey,index)=>{
+    const response=await mutate({operation:'create',idempotencyKey:`invalid-key-${index}`,
+      externalKey,data:{label:'A'}});
+    assert.equal(response.status,400,`invalid external key ${index}`);
+    assert.equal((await response.json()).error.code,'INVALID_ARGUMENT');
+  }));
+  await assertNoWrite(0,0);
   const missingData=await mutate({operation:'create',idempotencyKey:'missing-data'});
   assert.equal(missingData.status,400);
   assert.equal((await missingData.json()).error.code,'INVALID_ARGUMENT');
   await assertNoWrite(0,0);
-  const create={operation:'create',idempotencyKey:'create',data:{label:'A'}};
+  const create={operation:'create',idempotencyKey:'create',externalKey:'\u0085 e\u0301 \u0085',data:{label:'A'}};
   const createdResponse=await mutate(create);
   assert.equal(createdResponse.status,200);
   const created=await createdResponse.json();
   const id=created.ref.id;
+  const equivalent=await (await mutate({...create,externalKey:'é'})).json();
+  assert.equal(equivalent.receiptId,created.receiptId);
+  assert.equal(equivalent.replayed,true);
+  const byKey=await route('GET',`${base}/records/by-key/${encodeURIComponent('é')}?mode=external`);
+  assert.equal(byKey.status,200);
+  assert.equal((await byKey.json()).ref.id,id);
   for (const invalid of [
     {operation:'create',idempotencyKey:'forbidden-id',id,data:{label:'B'}},
     {operation:'replace',idempotencyKey:'missing-revision',id,data:{label:'B'}},
