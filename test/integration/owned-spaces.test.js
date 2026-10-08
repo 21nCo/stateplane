@@ -1183,6 +1183,37 @@ test('selected space create retries recover failed cell insert and lost cell ack
   assert.equal((await pool.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:create'",[second])).rows[0].n,1);
 });
 
+test('cross-pool create keeps COMMIT cancellation uncertain and selected recovery publishes one space', async () => {
+  const actor={kind:'session',credentialId:'session',userPrincipalId:`commit-owner-${crypto.randomUUID()}`};
+  const keys={create:async()=>{throw new Error('unexpected key');},revoke:async()=>{}};
+  for (const committed of [false,true]) {
+    let spaceId;
+    let cancel=true;
+    const control={query:(...args)=>controlPool.query(...args),connect:async()=>{
+      const client=await controlPool.connect();
+      return {query:async(sql,...args)=>{
+        if (typeof sql==='string' && sql.includes('INSERT INTO space_directory')) spaceId=args[0][0];
+        if (sql==='COMMIT' && cancel) {
+          cancel=false;
+          if (committed) await client.query(sql);
+          throw Object.assign(new Error('directory commit cancelled'),{code:'57014'});
+        }
+        return client.query(sql,...args);
+      },release:discard=>client.release(discard)};
+    }};
+    const spaces=new PostgresSpaces(control,new Map([['cell-a',{pool,storageTargetId:'target-a'}]]),
+      'cell-a',keys,{current:async()=>true});
+    await assert.rejects(spaces.create(actor),error=>error instanceof CommitOutcomeUnknownError);
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM spaces WHERE space_id=$1',[spaceId])).rows[0].n,1,
+      'the cell transaction committed independently');
+    const recovered=await spaces.create(actor,'cell-a',spaceId);
+    assert.equal(recovered.spaceId,spaceId);
+    assert.equal(recovered.lifecycle,'active');
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:create'",
+      [spaceId])).rows[0].n,1,'reconciliation does not create a second cell effect');
+  }
+});
+
 test('selected retry races lease recovery under one directory lock', async () => {
   const actor={kind:'session',credentialId:'session',userPrincipalId:`lease-owner-${crypto.randomUUID()}`};
   const cells=new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
@@ -3086,7 +3117,7 @@ test('a hung cell effect expires, releases locks and hides its joined receipt', 
   finishEffect();
 });
 
-test('server cancellation at cell commit rolls back a joined write with a retryable limit error', async () => {
+test('server cancellation at cell commit remains uncertain to the caller until receipt readback', async () => {
   const collectionId=`entries_${crypto.randomUUID()}`;
   const spaceId=await cellSpace(collectionId);
   const probe=`sta8_cell_cancel_${crypto.randomUUID().replaceAll('-','')}`;
@@ -3114,7 +3145,7 @@ test('server cancellation at cell commit rolls back a joined write with a retrya
     await assert.rejects(cell.execute(await signRecordRoute(signer,spaceId,collectionId),async (_principal,context)=>{
       pendingReceipt=await context.records(authority,tx=>tx.mutate(change));
       return pendingReceipt;
-    }),denied('RATE_LIMITED'));
+    }),error=>error instanceof CommitOutcomeUnknownError);
     assert.equal(commits,2);
     assert.throws(()=>JSON.stringify(pendingReceipt),denied('RECEIPT_PENDING'));
     for (const table of ['records','record_events','idempotency_receipts','projection_outbox'])

@@ -437,6 +437,31 @@ try {
     'outage requests have no record, event or receipt effects');
   assert((await request('GET',`v1/spaces/${spaceId}`)).spaceId===spaceId,
     'the cached host pool recovers after the provider returns');
+  const blocker=await fixturePool.connect();
+  const cancelledSpace=`sp_${randomUUID()}`;
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query('LOCK TABLE space_directory IN ACCESS EXCLUSIVE MODE');
+    for (const [method,lockedPath,body] of [
+      ['GET',`v1/spaces/${spaceId}`,undefined],
+      ['POST','v1/spaces',{spaceId:cancelledSpace}]
+    ]) {
+      const response=await fetch(endpoint+lockedPath,{method,signal:AbortSignal.timeout(8_000),
+        headers:{Authorization:`Bearer ${token}`,...(body?{'Content-Type':'application/json'}:{})},
+        body:body?JSON.stringify(body):undefined});
+      const value=await response.json();
+      assert(response.status===429 && value.error?.code==='RATE_LIMITED' &&
+        value.error.retryable===true && response.headers.get('Retry-After')==='1',
+      `server cancellation wins over the socket timer for locked ${method}`);
+    }
+  } finally {
+    await blocker.query('ROLLBACK');
+    blocker.release();
+  }
+  assert((await fixturePool.query('SELECT count(*)::int AS n FROM space_directory WHERE space_id=$1',
+    [cancelledSpace])).rows[0].n===0,'cancelled create has no durable space');
+  assert((await request('GET',`v1/spaces/${spaceId}`)).spaceId===spaceId,
+    'the host reuses a healthy client after confirmed cancellation');
   const silentRequests=[
     {method:'GET',path:`v1/spaces/${spaceId}`},
     {method:'POST',path:`${path}/query`,body:{predicates:[],limit:1}},
@@ -551,7 +576,7 @@ try {
     }
   });
   await cleanupStep(async()=>{
-    if (!provider || provider.exitCode!==null || provider.signalCode!==null) return;
+    if (provider?.exitCode!==null || provider?.signalCode!==null) return;
     provider.send('close');
     try { await waitClosed(provider,3_000); }
     catch {

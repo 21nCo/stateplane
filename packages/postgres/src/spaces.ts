@@ -60,6 +60,7 @@ async function transaction<T>(pool: PoolLike, fn: (client: pg.PoolClient) => Pro
   let begun = false;
   let beginAttempted = false;
   let discard = false;
+  let commitAmbiguous = false;
   try {
     beginAttempted = true;
     await client.query('BEGIN'); begun = true;
@@ -67,13 +68,12 @@ async function transaction<T>(pool: PoolLike, fn: (client: pg.PoolClient) => Pro
     try { await client.query('COMMIT'); begun = false; }
     catch (error) {
       discard = true;
-      if ((error as {code?:string}).code==='57014')
-        throw new AuthorityError('RATE_LIMITED','Database commit time limit exceeded');
+      commitAmbiguous = true;
       throw new CommitOutcomeUnknownError(error);
     }
     return result;
   } catch (error) {
-    if (begun) await client.query('ROLLBACK').catch(() => { discard = true; });
+    if (begun && !commitAmbiguous) await client.query('ROLLBACK').catch(() => { discard = true; });
     else if (beginAttempted) discard = true;
     throw error;
   } finally { client.release(discard); }
@@ -324,6 +324,8 @@ export class PostgresSpaces {
     let beginAttempted = false;
     let begun = false;
     let discard = false;
+    let cellPublished = false;
+    let commitAmbiguous = false;
     try {
       await this.current(actor);
       // Recovery may see this committed reservation before the creator can
@@ -337,17 +339,21 @@ export class PostgresSpaces {
         WHERE space_id=$1 AND owner_principal_id=$2 AND lifecycle='provisioning' FOR UPDATE`,[spaceId,owner(actor)]);
       if (!reserved.rows[0]) throw new AuthorityError('STALE_PLACEMENT');
       if (cell.pool === this.control) await this.insertCreatedCell(actor,directory,spaceId,cellId,cell.storageTargetId);
-      else await transaction(cell.pool,db => this.insertCreatedCell(actor,db,spaceId,cellId,cell.storageTargetId));
+      else {
+        await transaction(cell.pool,db => this.insertCreatedCell(actor,db,spaceId,cellId,cell.storageTargetId));
+        cellPublished = true;
+      }
       try { await directory.query('COMMIT'); begun = false; }
       catch (error) {
         discard = true;
-        if ((error as {code?:string}).code==='57014')
-          throw new AuthorityError('RATE_LIMITED','Database commit time limit exceeded');
+        commitAmbiguous = true;
         throw new CommitOutcomeUnknownError(error);
       }
     } catch (error) {
-      if (begun) await directory.query('ROLLBACK').catch(() => { discard = true; });
+      if (begun && !commitAmbiguous) await directory.query('ROLLBACK').catch(() => { discard = true; });
       else if (beginAttempted) discard = true;
+      if (cellPublished && !(error instanceof CommitOutcomeUnknownError))
+        throw new CommitOutcomeUnknownError(error);
       throw error;
     } finally { directory.release(discard); }
   }

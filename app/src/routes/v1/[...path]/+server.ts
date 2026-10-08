@@ -9,6 +9,9 @@ import type { RequestHandler } from './$types';
 type Bindings = App.Platform['env'];
 let cached: { key:string; handler:(request:Request)=>Promise<Response>; retire:()=>void } | undefined;
 const providerTimeoutMs=5_000;
+// Let PostgreSQL's statement cancellation arrive before retiring a silent
+// connection. A client-side query timeout rejects while its SQL may still run.
+const socketTimeoutMs=7_000;
 const requestTimeoutMs=12_000;
 class HostProviderTimeoutError extends Error {
   constructor() { super('Provider socket timeout'); this.name='HostProviderTimeoutError'; }
@@ -54,28 +57,24 @@ function host(env:Bindings):((request:Request)=>Promise<Response>) | undefined {
   // behind the four active connections. Without it a provider outage can leave
   // an authenticated HTTP request pending indefinitely.
   const pool=new pg.Pool({connectionString,max:4,connectionTimeoutMillis:providerTimeoutMs,
-    query_timeout:providerTimeoutMs+1_000,statement_timeout:providerTimeoutMs});
-  // A socket timeout belongs to an executing query, not to a checked-out
+    statement_timeout:providerTimeoutMs});
+  // An absolute query timer belongs to that query, not to a checked-out
   // client or an idle pool entry. A transaction may pause between statements.
   pool.on('connect',client=>{
     // pg-pool only listens for errors while a client is idle. A destroyed
     // checked-out socket can also emit a client error after rejecting query().
     client.on('error',()=>{});
     const stream=(client as pg.PoolClient & {connection:{stream:Socket}}).connection.stream;
-    let pending=0;
-    stream.on('timeout',()=>{
-      if (pending>0) stream.destroy(new HostProviderTimeoutError());
-    });
     const query=client.query.bind(client) as (...args:unknown[])=>unknown;
     client.query=((...args:unknown[])=>{
-      pending++;
-      stream.setTimeout(providerTimeoutMs);
+      // Destroying the stream marks pg's client unqueryable; pg-pool discards
+      // it on release instead of reusing a query that may still be executing.
+      const timer=setTimeout(()=>stream.destroy(new HostProviderTimeoutError()),socketTimeoutMs);
       let finished=false;
       const finish=()=>{
         if (finished) return;
         finished=true;
-        pending--;
-        if (pending===0) stream.setTimeout(0);
+        clearTimeout(timer);
       };
       const last=args.length-1;
       if (typeof args[last]==='function') {
@@ -121,33 +120,41 @@ function host(env:Bindings):((request:Request)=>Promise<Response>) | undefined {
   },identity,Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex'));
   const services=postgresServices(spaces,new Map([[cellId,{pool,cursorSecret:Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex')}]]),3600);
   const serve=createHttpHandler({services,identity});
+  let active=0;let retired=false;let ended=false;
+  const closeIfIdle=()=>{
+    if (retired && active===0 && !ended) {
+      ended=true;
+      void pool.end().catch(()=>{});
+    }
+  };
+  const retire=()=>{
+    retired=true;
+    if (cached?.retire===retire) cached=undefined;
+    closeIfIdle();
+  };
   const boundedServe=async(request:Request):Promise<Response>=>{
     let timer:ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([serve(request),new Promise<Response>(resolve=>{
-        timer=setTimeout(()=>resolve(unavailable(request)),requestTimeoutMs);
+        timer=setTimeout(()=>{retire();resolve(unavailable(request));},requestTimeoutMs);
       })]);
     } finally { if (timer) clearTimeout(timer); }
   };
   if (env.AUTHORITY) {
     clearHost();
     return async request=>{
+      active++;
       try { return await boundedServe(request); }
-      finally { void pool.end().catch(()=>{}); }
+      finally { active--;retire(); }
     };
   }
-  let active=0;let retired=false;
-  const retire=()=>{
-    retired=true;
-    if (active===0) void pool.end().catch(()=>{});
-  };
   const previous=cached;
   cached={key,retire,handler:async request=>{
     active++;
     try { return await boundedServe(request); }
     finally {
       active--;
-      if (retired && active===0) void pool.end().catch(()=>{});
+      closeIfIdle();
     }
   }};
   previous?.retire();

@@ -706,7 +706,6 @@ export class PostgresAuthority {
       catch (error) {
         discard = true;
         if ((error as {code?:string}).code==='PZ003') throw new AuthorityError('SCHEMA_CONFLICT','Record index projection incomplete');
-        if ((error as {code?:string}).code==='57014') throw new AuthorityError('RATE_LIMITED','Database commit time limit exceeded');
         if (error instanceof CommitNotSentDeadlineExceeded) throw new AuthorityError('RATE_LIMITED','Request time budget exceeded');
         if (error instanceof AuthorityError) throw error;
         commitAmbiguous = true;

@@ -695,7 +695,7 @@ test('a failed transaction cannot leak state into the next borrower of one poole
   } finally { await single.end(); }
 });
 
-test('authority commit separates confirmed cancellation from a late ambiguous acknowledgement', async()=>{
+test('authority treats every sent COMMIT cancellation as uncertain and reconciles by receipt', async()=>{
   const {scope}=await fixture();
   const probe=`sta8_commit_${randomUUID().replaceAll('-','')}`;
   await pool.query(`CREATE TABLE ${probe}(id integer NOT NULL)`);
@@ -720,7 +720,7 @@ test('authority commit separates confirmed cancellation from a late ambiguous ac
   try {
     const bounded=new PostgresAuthority(delayed,3600,undefined,500);
     const request=change('create',`commit-cancel-${randomUUID()}`,'{"label":"commit-cancel"}');
-    await assert.rejects(bounded.mutate(scope,request),{code:'RATE_LIMITED'});
+    await assert.rejects(bounded.mutate(scope,request),error=>error instanceof CommitOutcomeUnknownError);
     assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${probe}`)).rows[0].n,0);
     assert.equal((await counts(scope.spaceId)).records,0);
     assert.equal((await counts(scope.spaceId)).idempotency_receipts,0);

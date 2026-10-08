@@ -33,17 +33,21 @@ Errors have `contractVersion`, stable `error.code`, `message`, `retryable` and
 unacknowledged commit reports `COMMIT_OUTCOME_UNKNOWN`; writes retain an unknown
 result and require readback. GET and exact query/count operations can retry that
 response with `Retry-After` because repeating those reads is safe.
-The opt-in local/Preview HTTP host limits PostgreSQL connection acquisition,
-pool queue wait, and silent established queries to five seconds. PostgreSQL
-statement execution has the same limit; the complete HTTP request has a
+The opt-in local/Preview HTTP host limits PostgreSQL connection acquisition and
+pool queue wait to five seconds. The default PostgreSQL statement limit is five
+seconds; transaction code can narrow or extend that server limit within its
+own request budget. A silent established query is retired after seven seconds,
+giving the default server cancellation time to arrive first. The complete HTTP request has a
 12-second fallback deadline. A safe read or failed connection acquisition
 returns redacted `PROVIDER_UNAVAILABLE` with HTTP 503 and `Retry-After: 1`.
 A write may have committed before its response was lost, so an uncertain
 in-flight timeout returns `COMMIT_OUTCOME_UNKNOWN` with `retryable: false` and
 no `Retry-After`.
-PostgreSQL's confirmed statement cancellation returns `RATE_LIMITED` instead;
-the cancelled transaction has rolled back, and the client still leaves write
-retries to the caller.
+PostgreSQL's cancellation before COMMIT returns `RATE_LIMITED` after rollback.
+A cancellation reported for a sent COMMIT remains `COMMIT_OUTCOME_UNKNOWN`, as
+does a space creation after a separate cell commit when directory publication
+fails. Recover with the original credential and operation identity before any
+new write.
 Timed-out sockets are discarded, and later requests can acquire new connections
 after recovery. The CLI automatically retries only safe reads. For a write whose
 outcome is uncertain, use the original credential, canonical request and
