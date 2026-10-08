@@ -1120,7 +1120,8 @@ test('confirmed PostgreSQL cancellation is definite across HTTP and CLI writes',
   let writes=0;
   const cancelled=async()=>{
     writes++;
-    throw Object.assign(new Error('private database detail'),{code:'57014',severity:'ERROR',routine:'ProcessInterrupts'});
+    // The authority has already proved a rollback before exposing this code.
+    throw new AuthorityError('RATE_LIMITED','private database detail');
   };
   state.services.collections.define=cancelled;
   state.services.collections.revise=cancelled;
@@ -1163,6 +1164,40 @@ test('confirmed PostgreSQL cancellation is definite across HTTP and CLI writes',
   assert.equal(JSON.parse(cli.stderr).error.code,'RATE_LIMITED');
   assert.doesNotMatch(cli.stdout+cli.stderr,/private database detail|secret-test-token/);
   assert.equal(writes,before+2,'CLI process does not automatically replay a cancelled write');
+});
+
+test('unclassified PostgreSQL cancellation on a write remains outcome-unknown through HTTP and CLI process',async t=>{
+  const state=fixture();
+  let writes=0;
+  state.services.spaces.create=async()=>{
+    writes++;
+    throw Object.assign(new Error('private database detail'),{code:'57014',severity:'ERROR'});
+  };
+  const handler=createHttpHandler(state);
+  const response=await handler(new Request('http://127.0.0.1/v1/spaces',{method:'POST',
+    headers:{Authorization:'Bearer secret-test-token','Content-Type':'application/json'},
+    body:JSON.stringify({spaceId:`sp_${randomUUID()}`})}));
+  assert.equal(response.status,503);
+  assert.equal(response.headers.get('Retry-After'),null);
+  const error=(await response.json()).error;
+  assert.deepEqual({code:error.code,retryable:error.retryable},
+    {code:'COMMIT_OUTCOME_UNKNOWN',retryable:false});
+  assert.equal(writes,1);
+  const {server,endpoint}=await serve(handler);
+  t.after(()=>server.close());
+  const root=await mkdtemp(join(tmpdir(),'stateplane-uncertain-space-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  assert.equal((await cliProcess(root,['config','endpoint','--url',endpoint])).status,0);
+  assert.equal((await cliProcess(root,['auth','login','--token-stdin','--store','file'],
+    'secret-test-token\n')).status,0);
+  const cli=await cliProcess(root,['spaces','create','--space',`sp_${randomUUID()}`]);
+  assert.equal(cli.status,1);
+  const cliError=JSON.parse(cli.stderr).error;
+  assert.deepEqual({code:cliError.code,message:cliError.message,retryable:cliError.retryable},
+    {code:'COMMIT_OUTCOME_UNKNOWN',message:'COMMIT_OUTCOME_UNKNOWN',retryable:false});
+  assert.match(cliError.requestId,/^[a-zA-Z0-9_-]{1,80}$/);
+  assert.doesNotMatch(cli.stdout+cli.stderr,/private database detail|secret-test-token/);
+  assert.equal(writes,2,'the CLI sends no automatic replay');
 });
 
 test('decoded read routes retain safe retry and normalized paths cannot carry credentials elsewhere',async()=>{

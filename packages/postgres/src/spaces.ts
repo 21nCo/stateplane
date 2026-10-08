@@ -419,21 +419,28 @@ export class PostgresSpaces {
   }
   /** Reconcile a lost directory publication acknowledgement against owner facts. */
   private async reconcilePublishedCreate(actor:VerifiedCredential,spaceId:string,cellId:string,
-    cell:CellDatabase,selected:boolean,error:unknown):Promise<SpaceInfo|null> {
+    cell:CellDatabase,error:unknown):Promise<SpaceInfo|null> {
     const observed=await this.control.query('SELECT * FROM space_directory WHERE space_id=$1',[spaceId]).catch(()=>null);
-    if (!observed) throw selected ? new CommitOutcomeUnknownError(error) : error;
+    if (!observed) throw new CommitOutcomeUnknownError(error);
     const row=observed.rows[0];
     if (row?.lifecycle==='active' && row.owner_principal_id===owner(actor) &&
         row.home_cell_id===cellId && row.cell_id===cellId && row.storage_target_id===cell.storageTargetId) {
       await this.current(actor);
       return info(row);
     }
-    if (row?.lifecycle!=='provisioning') throw error;
+    if (row?.lifecycle!=='provisioning') throw new CommitOutcomeUnknownError(error);
     return null;
   }
   /** Preserve the reservation until an owner retry can determine its outcome. */
   private async recoverFailedCreate(actor:VerifiedCredential,spaceId:string,cellId:string,
     cell:CellDatabase,selected:boolean,publicationAttempted:boolean,error:unknown):Promise<SpaceInfo> {
+    // Once publication is sent, neither a server cancellation nor a missing
+    // readback proves that the independently committed cell was rolled back.
+    if (publicationAttempted) {
+      const published=await this.reconcilePublishedCreate(actor,spaceId,cellId,cell,error);
+      if (published) return published;
+      throw new CommitOutcomeUnknownError(error);
+    }
     if (selected) {
       const recovered=await this.recoverSelectedCreate(actor,spaceId,cellId,cell,true).catch(recoveryError=>{
         if (recoveryError instanceof AuthorityError &&
@@ -441,10 +448,6 @@ export class PostgresSpaces {
         return null;
       });
       if (recovered) return recovered;
-    }
-    if (publicationAttempted) {
-      const published=await this.reconcilePublishedCreate(actor,spaceId,cellId,cell,selected,error);
-      if (published) return published;
     }
     // The cell COMMIT may have succeeded even when its acknowledgement was
     // lost. Leave its reservation for a selected owner retry.

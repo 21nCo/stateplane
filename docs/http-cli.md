@@ -43,11 +43,16 @@ returns redacted `PROVIDER_UNAVAILABLE` with HTTP 503 and `Retry-After: 1`.
 A write may have committed before its response was lost, so an uncertain
 in-flight timeout returns `COMMIT_OUTCOME_UNKNOWN` with `retryable: false` and
 no `Retry-After`.
-PostgreSQL's cancellation before COMMIT returns `RATE_LIMITED` after rollback.
+PostgreSQL cancellation returns `RATE_LIMITED` only when the authority has
+confirmed rollback. A raw cancellation on a write is treated as an unknown
+outcome until its transaction and any separate cell effect are reconciled.
 A cancellation reported for a sent COMMIT remains `COMMIT_OUTCOME_UNKNOWN`, as
 does a space creation after a separate cell commit when directory publication
 fails. Recover with the original credential and operation identity before any
 new write.
+Direct callers that let the service generate a space ID must inspect their
+owner space listing after an unknown result; HTTP and CLI create require a
+client-selected ID so the original request can be reconciled by that ID.
 Timed-out sockets are discarded, and later requests can acquire new connections
 after recovery. The CLI automatically retries only safe reads. For a write whose
 outcome is uncertain, use the original credential, canonical request and

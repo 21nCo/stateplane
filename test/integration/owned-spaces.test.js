@@ -912,7 +912,7 @@ test('lost control publication acknowledgements preserve create and make lifecyc
 
   loseCreateAck = true;
   loseReadback = true;
-  await assert.rejects(spaces.create(actor),/lost create acknowledgement/);
+  await assert.rejects(spaces.create(actor),{name:'CommitOutcomeUnknownError'});
   loseReadback = false;
   assert.equal((await original('SELECT lifecycle FROM space_directory WHERE space_id=$1',[lostSpaceId])).rows[0].lifecycle,'active');
   assert.equal((await pool.query('SELECT lifecycle FROM spaces WHERE space_id=$1',[lostSpaceId])).rows[0].lifecycle,'active',
@@ -1211,6 +1211,50 @@ test('cross-pool create keeps COMMIT cancellation uncertain and selected recover
     assert.equal(recovered.lifecycle,'active');
     assert.equal((await pool.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:create'",
       [spaceId])).rows[0].n,1,'reconciliation does not create a second cell effect');
+  }
+});
+
+test('cross-pool directory publication cancellation never makes generated or selected creates retryable', async () => {
+  const actor={kind:'session',credentialId:'original-session',userPrincipalId:`publication-owner-${crypto.randomUUID()}`};
+  const other={...actor,credentialId:'different-session',userPrincipalId:'different-owner'};
+  for (const selected of [false,true]) {
+    for (const committed of [false,true]) {
+      let spaceId=selected?`sp_${crypto.randomUUID()}`:undefined;
+      let cancelled=false;
+      const control={connect:async()=>{
+        const client=await controlPool.connect();
+        return {query:async(sql,...args)=>{
+          if (typeof sql==='string' && sql.includes('INSERT INTO space_directory')) spaceId=args[0][0];
+          return client.query(sql,...args);
+        },release:discard=>client.release(discard)};
+      },query:async(sql,...args)=>{
+        if (typeof sql==='string' && sql.includes("UPDATE space_directory SET lifecycle='active'") && !cancelled) {
+          cancelled=true;
+          if (committed) await controlPool.query(sql,...args);
+          throw Object.assign(new Error('private publication cancellation'),{code:'57014'});
+        }
+        return controlPool.query(sql,...args);
+      }};
+      // Capture the generated ID at the committed directory reservation.
+      const spaces=new PostgresSpaces(control,new Map([['cell-a',{pool,storageTargetId:'target-a'}]]),
+        'cell-a',{create:async()=>{throw new Error('unexpected key');},revoke:async()=>{}},
+        {current:async()=>true});
+      if (committed) {
+        const result=await spaces.create(actor,'cell-a',selected?spaceId:undefined);
+        assert.equal(result.spaceId,spaceId,'lost response after durable publication is reconciled');
+      } else {
+        await assert.rejects(spaces.create(actor,'cell-a',selected?spaceId:undefined),
+          error=>error instanceof CommitOutcomeUnknownError && error.code===undefined);
+        assert.equal((await controlPool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1',[spaceId])).rows[0].lifecycle,
+          'provisioning');
+      }
+      assert.equal((await pool.query('SELECT count(*)::int AS n FROM spaces WHERE space_id=$1',[spaceId])).rows[0].n,1);
+      await assert.rejects(spaces.create(other,'cell-a',spaceId),denied('UNIQUE_CONFLICT'));
+      const recovered=await spaces.create(actor,'cell-a',spaceId);
+      assert.equal(recovered.lifecycle,'active');
+      assert.equal((await pool.query("SELECT count(*)::int AS n FROM space_audit WHERE space_id=$1 AND action='space:create'",
+        [spaceId])).rows[0].n,1,'recovery creates no second cell effect');
+    }
   }
 });
 

@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readRailwayQualification } from '../scripts/qualification-target.mjs';
-import { assertProcessStopped } from './process-stopped.mjs';
+import { assertProcessStopped, processIdentity } from './process-stopped.mjs';
 
 test('connected Railway readback rejects every GraphQL error', async () => {
   const previous = process.env.STATEPLANE_RAILWAY_ACCOUNT;
@@ -60,11 +60,12 @@ setTimeout(() => process.exit(0), 80);
         catch { await new Promise(resolve => setTimeout(resolve, 25)); }
       }
       assert.ok(pid, 'descendant started before cancellation');
+      const identity=processIdentity(pid);
       const started = Date.now();
       controller.abort();
       await assert.rejects(request, /Connected Railway readback failed/);
       assert.ok(Date.now() - started < 3000, 'real child must settle before watchdog');
-      await assertProcessStopped(pid, 'Railway descendant must stop executing');
+      await assertProcessStopped(pid, `Railway descendant must stop executing; ${identity}; settledAt=${new Date().toISOString()}`);
     } finally {
       controller.abort();
       await request?.catch(() => {});

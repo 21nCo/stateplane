@@ -437,29 +437,42 @@ try {
     'outage requests have no record, event or receipt effects');
   assert((await request('GET',`v1/spaces/${spaceId}`)).spaceId===spaceId,
     'the cached host pool recovers after the provider returns');
+  runCli(['auth','login','--token-stdin','--store','file'],{env:cliEnv,input:`${token}\n`});
   const blocker=await fixturePool.connect();
   const cancelledSpace=`sp_${randomUUID()}`;
+  const cancelledCliSpace=`sp_${randomUUID()}`;
   try {
     await blocker.query('BEGIN');
     await blocker.query('LOCK TABLE space_directory IN ACCESS EXCLUSIVE MODE');
-    for (const [method,lockedPath,body] of [
-      ['GET',`v1/spaces/${spaceId}`,undefined],
-      ['POST','v1/spaces',{spaceId:cancelledSpace}]
-    ]) {
+    async function assertLockedCancellation(method,lockedPath,body) {
       const response=await fetch(endpoint+lockedPath,{method,signal:AbortSignal.timeout(8_000),
         headers:{Authorization:`Bearer ${token}`,...(body?{'Content-Type':'application/json'}:{})},
         body:body?JSON.stringify(body):undefined});
       const value=await response.json();
-      assert(response.status===429 && value.error?.code==='RATE_LIMITED' &&
-        value.error.retryable===true && response.headers.get('Retry-After')==='1',
-      `server cancellation wins over the socket timer for locked ${method}`);
+      const code=method==='GET'?'RATE_LIMITED':'COMMIT_OUTCOME_UNKNOWN';
+      assert(response.status===(method==='GET'?429:503) && value.error?.code===code &&
+        value.error.retryable===(method==='GET') &&
+        response.headers.get('Retry-After')===(method==='GET'?'1':null),
+      'server cancellation wins over the socket timer for a locked request');
     }
+    await assertLockedCancellation('GET',`v1/spaces/${spaceId}`);
+    await assertLockedCancellation('POST','v1/spaces',{spaceId:cancelledSpace});
+    const cliCancellation=spawnSync(process.execPath,[cli,'spaces','create','--space',cancelledCliSpace],
+      {cwd:temp,env:cliEnv,encoding:'utf8',timeout:12_000});
+    const cliError=JSON.parse(cliCancellation.stderr).error;
+    assert(cliCancellation.status===1 && cliError.code==='COMMIT_OUTCOME_UNKNOWN' &&
+      cliError.retryable===false &&
+      !`${cliCancellation.stdout}${cliCancellation.stderr}`.includes(token) &&
+      !`${cliCancellation.stdout}${cliCancellation.stderr}`.includes(databaseUrl),
+    `installed CLI keeps a cancelled space publication nonretryable and redacted: ${JSON.stringify({status:cliCancellation.status,code:cliError.code,retryable:cliError.retryable})}`);
   } finally {
     await blocker.query('ROLLBACK');
     blocker.release();
   }
   assert((await fixturePool.query('SELECT count(*)::int AS n FROM space_directory WHERE space_id=$1',
     [cancelledSpace])).rows[0].n===0,'cancelled create has no durable space');
+  assert((await fixturePool.query('SELECT count(*)::int AS n FROM space_directory WHERE space_id=$1',
+    [cancelledCliSpace])).rows[0].n===0,'cancelled CLI create has no durable space');
   assert((await request('GET',`v1/spaces/${spaceId}`)).spaceId===spaceId,
     'the host reuses a healthy client after confirmed cancellation');
   const silentRequests=[
