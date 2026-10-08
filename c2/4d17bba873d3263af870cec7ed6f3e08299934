@@ -1,0 +1,32 @@
+docs/http-cli.md
+  h_a39f9495f9ec1d 46-48,53-55
+packages/api/src/http.ts
+  h_a39f9495f9ec1d 73-74
+packages/postgres/src/spaces.ts
+  h_a39f9495f9ec1d 422,424,431,437-443
+scripts/test-http-host.mjs
+  h_a39f9495f9ec1d 440,443,447,452-456,458-467,474-475
+test/bounded-command.test.js
+  h_a39f9495f9ec1d 6-7,9-27
+test/http-cli.test.js
+  h_a39f9495f9ec1d 1123-1124,1169-1202
+test/integration/owned-spaces.test.js
+  h_a39f9495f9ec1d 915,1217-1260
+test/operational-railway.test.js
+  h_a39f9495f9ec1d 7,68,73
+test/process-stopped.mjs
+  h_a39f9495f9ec1d 15-22,24,30-33,39,43,76
+test/qualification-provider.test.js
+  h_a39f9495f9ec1d 7,63,68
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c24d17bba873d3263af870cec7ed6f3e08299934",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
