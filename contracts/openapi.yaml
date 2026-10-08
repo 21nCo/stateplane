@@ -258,19 +258,46 @@ components:
         Define requires version 1 and a slug matching the path. Revise requires
         the next compatible version and the current version in If-Match.
     RecordMutation:
-      type: object
-      required: [operation, idempotencyKey]
-      properties:
-        operation: { enum: [create, replace, patch, delete] }
-        idempotencyKey: { type: string, minLength: 1 }
-        id: { type: string }
-        expectedRevision: { type: integer, minimum: 1 }
-        expectedSchemaVersion: { type: integer, minimum: 1 }
-        externalKey: { type: string }
-        data: { type: object }
-        set: { type: object }
-        unset: { type: array, items: { type: string } }
-      additionalProperties: false
+      oneOf:
+        - type: object
+          required: [operation, idempotencyKey, data]
+          properties:
+            operation: { const: create }
+            idempotencyKey: { type: string, minLength: 1 }
+            expectedSchemaVersion: { type: integer, minimum: 1 }
+            externalKey: { type: string }
+            data: { type: object }
+          additionalProperties: false
+        - type: object
+          required: [operation, idempotencyKey, id, expectedRevision, data]
+          properties:
+            operation: { const: replace }
+            idempotencyKey: { type: string, minLength: 1 }
+            id: { type: string, minLength: 1 }
+            expectedRevision: { type: integer, minimum: 1 }
+            expectedSchemaVersion: { type: integer, minimum: 1 }
+            data: { type: object }
+          additionalProperties: false
+        - type: object
+          required: [operation, idempotencyKey, id, expectedRevision, set, unset]
+          properties:
+            operation: { const: patch }
+            idempotencyKey: { type: string, minLength: 1 }
+            id: { type: string, minLength: 1 }
+            expectedRevision: { type: integer, minimum: 1 }
+            expectedSchemaVersion: { type: integer, minimum: 1 }
+            set: { type: object }
+            unset: { type: array, items: { type: string } }
+          additionalProperties: false
+        - type: object
+          required: [operation, idempotencyKey, id, expectedRevision]
+          properties:
+            operation: { const: delete }
+            idempotencyKey: { type: string, minLength: 1 }
+            id: { type: string, minLength: 1 }
+            expectedRevision: { type: integer, minimum: 1 }
+            expectedSchemaVersion: { type: integer, minimum: 1 }
+          additionalProperties: false
       description: >-
         Create requires data and excludes id/expectedRevision. Replace requires
         id, expectedRevision and data. Patch requires id, expectedRevision,

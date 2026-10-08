@@ -288,6 +288,66 @@ test('real Postgres HTTP operations preserve receipts, grant checks, events and 
   assert.equal((await route('GET',`${base}/records/${id}`,undefined,'fixture-agent-key')).status,404);
 });
 
+test('HTTP mutation variants reject malformed envelopes before writing',async t=>{
+  const spaceId=`sp_${randomUUID()}`;
+  assert.equal((await route('POST','/v1/spaces',{spaceId})).status,201);
+  t.after(async()=>{
+    current=true; currentProbe=()=>current;
+    try { await spaces.archive(actor,spaceId); await spaces.delete(actor,spaceId); }
+    catch { /* Keep the disposable database for inspection if cleanup fails. */ }
+  });
+  const collection='entries';
+  const base=`/v1/spaces/${spaceId}/collections/${collection}`;
+  const definition={slug:collection,version:1,schema:{$schema:'https://json-schema.org/draft/2020-12/schema',
+    type:'object',properties:{label:{type:'string'}},required:['label'],additionalProperties:false},
+    unique:[],filterable:[],sortable:[]};
+  assert.equal((await route('PUT',base,definition)).status,201);
+  const mutate=envelope=>route('POST',`${base}/records`,envelope);
+  const assertNoWrite=async(expectedEvents,expectedReceipts)=>{
+    const events=await pool.query('SELECT count(*)::int AS n FROM record_events WHERE space_id=$1',[spaceId]);
+    const receipts=await pool.query('SELECT count(*)::int AS n FROM idempotency_receipts WHERE space_id=$1',[spaceId]);
+    assert.deepEqual([events.rows[0].n,receipts.rows[0].n],[expectedEvents,expectedReceipts]);
+  };
+  const missingData=await mutate({operation:'create',idempotencyKey:'missing-data'});
+  assert.equal(missingData.status,400);
+  assert.equal((await missingData.json()).error.code,'INVALID_ARGUMENT');
+  await assertNoWrite(0,0);
+  const create={operation:'create',idempotencyKey:'create',data:{label:'A'}};
+  const createdResponse=await mutate(create);
+  assert.equal(createdResponse.status,200);
+  const created=await createdResponse.json();
+  const id=created.ref.id;
+  for (const invalid of [
+    {operation:'create',idempotencyKey:'forbidden-id',id,data:{label:'B'}},
+    {operation:'replace',idempotencyKey:'missing-revision',id,data:{label:'B'}},
+    {operation:'replace',idempotencyKey:'forbidden-key',id,expectedRevision:1,data:{label:'B'},externalKey:'b'},
+    {operation:'patch',idempotencyKey:'missing-unset',id,expectedRevision:1,set:{label:'B'}},
+    {operation:'patch',idempotencyKey:'forbidden-data',id,expectedRevision:1,set:{label:'B'},unset:[],data:{}},
+    {operation:'delete',idempotencyKey:'missing-id',expectedRevision:1},
+    {operation:'delete',idempotencyKey:'forbidden-set',id,expectedRevision:1,set:{label:'B'}}
+  ]) {
+    const response=await mutate(invalid);
+    assert.equal(response.status,400,invalid.idempotencyKey);
+    assert.equal((await response.json()).error.code,'INVALID_ARGUMENT');
+  }
+  await assertNoWrite(1,1);
+  const valid=[
+    {operation:'replace',idempotencyKey:'replace',id,expectedRevision:1,data:{label:'B'}},
+    {operation:'patch',idempotencyKey:'patch',id,expectedRevision:2,set:{label:'C'},unset:[]},
+    {operation:'delete',idempotencyKey:'delete',id,expectedRevision:3}
+  ];
+  for (const [index,envelope] of valid.entries()) {
+    const response=await mutate(envelope);
+    assert.equal(response.status,200,envelope.operation);
+    const receipt=await response.json();
+    assert.equal(receipt.revision,index+2);
+    assert.equal(receipt.operation,envelope.operation);
+  }
+  const replay=await (await mutate(valid[2])).json();
+  assert.equal(replay.replayed,true);
+  await assertNoWrite(4,4);
+});
+
 test('schema lost COMMIT is uncertain and lifecycle returns its own transition',async t=>{
   const spaceId=`sp_${randomUUID()}`;
   assert.equal((await route('POST','/v1/spaces',{spaceId})).status,201);
