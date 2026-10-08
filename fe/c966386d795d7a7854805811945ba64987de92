@@ -1,0 +1,21 @@
+app/src/routes/v1/[...path]/+server.ts
+  s_e2bb6d27cfc767::t_023c0e75ea36cd 2,5,11-20,22-27,56-65,96-103,107-108,119
+packages/api/src/http.ts
+  s_e2bb6d27cfc767::t_e74f1f7c7b9cd1 73-74
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fec966386d795d7a7854805811945ba64987de92",
+  "prompts": {},
+  "sessions": {
+    "s_e2bb6d27cfc767": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2f601879-d802-4996-8897-c3ba67d043af",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
