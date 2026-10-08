@@ -43,6 +43,8 @@ test('rotating the opt-in HTTP fixture ends retired pools after in-flight reques
     };
     await request(1);
     await waitForCount(1);
+    await new Promise(resolve=>setTimeout(resolve,5_300));
+    assert.equal(await count(),1,'idle pool connection survives the active-query timeout window');
     for (const index of [2,3,4]) {
       await request(index);
       await waitForCount(1);

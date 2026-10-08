@@ -55,13 +55,41 @@ function host(env:Bindings):((request:Request)=>Promise<Response>) | undefined {
   // an authenticated HTTP request pending indefinitely.
   const pool=new pg.Pool({connectionString,max:4,connectionTimeoutMillis:providerTimeoutMs,
     query_timeout:providerTimeoutMs+1_000,statement_timeout:providerTimeoutMs});
-  // pg's query_timeout rejects the caller but leaves a silent socket in the
-  // pool. Destroy that socket first, so a stalled query cannot poison reuse.
+  // A socket timeout belongs to an executing query, not to a checked-out
+  // client or an idle pool entry. A transaction may pause between statements.
   pool.on('connect',client=>{
+    // pg-pool only listens for errors while a client is idle. A destroyed
+    // checked-out socket can also emit a client error after rejecting query().
+    client.on('error',()=>{});
     const stream=(client as pg.PoolClient & {connection:{stream:Socket}}).connection.stream;
-    stream.setTimeout(providerTimeoutMs,()=>{
-      stream.destroy(new HostProviderTimeoutError());
+    let pending=0;
+    stream.on('timeout',()=>{
+      if (pending>0) stream.destroy(new HostProviderTimeoutError());
     });
+    const query=client.query.bind(client) as (...args:unknown[])=>unknown;
+    client.query=((...args:unknown[])=>{
+      pending++;
+      stream.setTimeout(providerTimeoutMs);
+      let finished=false;
+      const finish=()=>{
+        if (finished) return;
+        finished=true;
+        pending--;
+        if (pending===0) stream.setTimeout(0);
+      };
+      const last=args.length-1;
+      if (typeof args[last]==='function') {
+        const callback=args[last] as (...values:unknown[])=>void;
+        args[last]=(...values:unknown[])=>{ finish(); callback(...values); };
+      }
+      try {
+        const result=query(...args);
+        if (typeof args[last]!=='function' && result &&
+            typeof (result as Promise<unknown>).then==='function')
+          return (result as Promise<unknown>).finally(finish);
+        return result;
+      } catch (error) { finish(); throw error; }
+    }) as typeof client.query;
   });
   // An idle connection can fail after a successful request when the provider
   // goes away. The pool removes that client; consume the event without logging

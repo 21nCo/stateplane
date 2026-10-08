@@ -41,7 +41,7 @@ let app;
 let appEnv;
 function relayReply(expected,command) {
   return new Promise((resolve,reject)=>{
-    if (!provider || provider.exitCode!==null || provider.signalCode!==null) {
+    if (provider?.exitCode!==null || provider.signalCode!==null) {
       reject(new Error(`relay exited before ${expected}`));
       return;
     }
@@ -57,7 +57,9 @@ function relayReply(expected,command) {
       if (error) reject(error); else resolve(value);
     }
     function message(value) {
-      if (expected==='ready' ? Number.isSafeInteger(value?.port) : value?.state===expected)
+      let matches=value?.state===expected;
+      if (expected==='ready') matches=Number.isSafeInteger(value?.port);
+      if (matches)
         finish(null,value);
     }
     function exit() { finish(new Error(`relay exited before ${expected}`)); }
@@ -67,9 +69,12 @@ function relayReply(expected,command) {
     if (command) provider.send(command,error=>{ if (error) finish(error); });
   });
 }
-async function providerMode(mode) { await relayReply(mode==='stall'?'stalled':mode==='silent'?'silent':'forwarding',mode); }
+async function providerMode(mode) {
+  const states={stall:'stalled',silent:'silent',forward:'forwarding'};
+  await relayReply(states[mode],mode);
+}
 async function waitClosed(child,timeoutMs) {
-  if (!child || child.exitCode!==null || child.signalCode!==null) return;
+  if (child?.exitCode!==null || child.signalCode!==null) return;
   let timer;
   try {
     await Promise.race([once(child,'close'),new Promise((_,reject)=>{
@@ -195,6 +200,11 @@ try {
   const record=runCli(['records','get','--collection',collectionId,'--id',receipt.ref.id],{env:cliEnv});
   const direct=await request('GET',`${path}/${receipt.ref.id}`);
   assert(JSON.stringify(record)===JSON.stringify(direct),'CLI and HTTP canonical record parity');
+  if (process.env.STATEPLANE_TEST_RELAY_FAULT==='kill-after-create') {
+    provider.kill('SIGKILL');
+    await waitClosed(provider,3_000);
+    throw new Error('injected relay exit after creating a custom-cell space');
+  }
   const boundaryCreate={operation:'create',idempotencyKey:'a'.repeat(256),data:{...data,label:'Boundary'}};
   const boundary=runCli(['records','create','--collection',collectionId,
     '--idempotency-key',boundaryCreate.idempotencyKey,'--data',JSON.stringify(boundaryCreate.data)],{env:cliEnv});
@@ -439,8 +449,8 @@ try {
     {method:'POST',path,body:{operation:'delete',idempotencyKey:'silent-delete',
       id:receipt.ref.id,expectedRevision:3}}
   ];
-  for (const item of silentRequests) {
-    await request('GET',`v1/spaces/${spaceId}`); // NOSONAR -- warm the cached connection before the silent query
+  async function checkSilentRequest(item) {
+    await request('GET',`v1/spaces/${spaceId}`);
     await providerMode('silent');
     const started=Date.now();
     const response=await fetch(endpoint+item.path,{method:item.method,signal:AbortSignal.timeout(8_000),
@@ -463,6 +473,8 @@ try {
       `explicit original-credential ${item.body.operation} recovery has no duplicate effect`);
     }
   }
+  // Each fault must be restored and its write reconciled before the next one.
+  await silentRequests.reduce((previous,item)=>previous.then(()=>checkSilentRequest(item)),Promise.resolve());
   // Report success after the disposable space and processes are gone.
 } catch(error) {
   testError=error;
@@ -470,7 +482,7 @@ try {
   async function cleanupStep(action) {
     try { await action(); } catch(error) { cleanupErrors.push(error); }
   }
-  if (provider && provider.exitCode===null && provider.signalCode===null)
+  if (provider?.exitCode===null && provider.signalCode===null)
     await cleanupStep(()=>providerMode('forward'));
   // This synthetic agent key has no provider backing; remove it before the
   // real space erasure flow asks the provider to revoke remaining keys.
@@ -498,8 +510,10 @@ try {
       fixturePool ??= new pg.Pool({connectionString:databaseUrl,connectionTimeoutMillis:5_000,query_timeout:5_000});
       const actor={kind:'session',userPrincipalId:appEnv?.STATEPLANE_TEST_OWNER,
         credentialId:appEnv?.STATEPLANE_TEST_CREDENTIAL};
-      const spaces=new PostgresSpaces(fixturePool,new Map([['cell-a',{pool:fixturePool,storageTargetId:'target-a'}]]),
-        'cell-a',{create:()=>Promise.reject(new Error('not configured')),
+      const cellId=appEnv.STATEPLANE_TEST_CELL_ID??'cell-a';
+      const storageTargetId=appEnv.STATEPLANE_TEST_STORAGE_TARGET??'target-a';
+      const spaces=new PostgresSpaces(fixturePool,new Map([[cellId,{pool:fixturePool,storageTargetId}]]),
+        cellId,{create:()=>Promise.reject(new Error('not configured')),
           find:()=>Promise.resolve(null),revoke:()=>Promise.reject(new Error('not configured'))},
         {current:()=>Promise.resolve(true)},Buffer.from(appEnv?.STATEPLANE_TEST_CURSOR_SECRET??'00'.repeat(32),'hex'));
       try {
@@ -513,10 +527,23 @@ try {
       }
     }
   });
+  await cleanupStep(async()=>{
+    if (!appEnv) return;
+    const verifier=new pg.Client({connectionString:databaseUrl,connectionTimeoutMillis:5_000,query_timeout:5_000});
+    try {
+      await verifier.connect();
+      const remaining=await verifier.query(`SELECT
+        (SELECT count(*)::int FROM spaces WHERE space_id=$1 AND lifecycle<>'deleted') AS cells,
+        (SELECT count(*)::int FROM space_directory WHERE space_id=$1 AND lifecycle<>'deleted') AS directory`,
+      [spaceId]);
+      assert(remaining.rows[0].cells===0 && remaining.rows[0].directory===0,
+        'HTTP host smoke leaves no active disposable space after cleanup');
+    } finally { await verifier.end().catch(()=>{}); }
+  });
   await cleanupStep(()=>fixturePool?.end());
   await cleanupStep(async()=>{
     if (!app) return;
-    if (app.exitCode===null && app.signalCode===null) app.kill('SIGTERM');
+    if (app?.exitCode===null && app.signalCode===null) app.kill('SIGTERM');
     try { await waitClosed(app,3_000); }
     catch {
       app.kill('SIGKILL');

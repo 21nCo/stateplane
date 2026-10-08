@@ -65,7 +65,12 @@ async function transaction<T>(pool: PoolLike, fn: (client: pg.PoolClient) => Pro
     await client.query('BEGIN'); begun = true;
     const result = await fn(client);
     try { await client.query('COMMIT'); begun = false; }
-    catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
+    catch (error) {
+      discard = true;
+      if ((error as {code?:string}).code==='57014')
+        throw new AuthorityError('RATE_LIMITED','Database commit time limit exceeded');
+      throw new CommitOutcomeUnknownError(error);
+    }
     return result;
   } catch (error) {
     if (begun) await client.query('ROLLBACK').catch(() => { discard = true; });
@@ -334,7 +339,12 @@ export class PostgresSpaces {
       if (cell.pool === this.control) await this.insertCreatedCell(actor,directory,spaceId,cellId,cell.storageTargetId);
       else await transaction(cell.pool,db => this.insertCreatedCell(actor,db,spaceId,cellId,cell.storageTargetId));
       try { await directory.query('COMMIT'); begun = false; }
-      catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
+      catch (error) {
+        discard = true;
+        if ((error as {code?:string}).code==='57014')
+          throw new AuthorityError('RATE_LIMITED','Database commit time limit exceeded');
+        throw new CommitOutcomeUnknownError(error);
+      }
     } catch (error) {
       if (begun) await directory.query('ROLLBACK').catch(() => { discard = true; });
       else if (beginAttempted) discard = true;

@@ -41,6 +41,9 @@ returns redacted `PROVIDER_UNAVAILABLE` with HTTP 503 and `Retry-After: 1`.
 A write may have committed before its response was lost, so an uncertain
 in-flight timeout returns `COMMIT_OUTCOME_UNKNOWN` with `retryable: false` and
 no `Retry-After`.
+PostgreSQL's confirmed statement cancellation returns `RATE_LIMITED` instead;
+the cancelled transaction has rolled back, and the client still leaves write
+retries to the caller.
 Timed-out sockets are discarded, and later requests can acquire new connections
 after recovery. The CLI automatically retries only safe reads. For a write whose
 outcome is uncertain, use the original credential, canonical request and

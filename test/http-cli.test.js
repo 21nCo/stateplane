@@ -1115,6 +1115,56 @@ test('unknown COMMIT on a read retries safely while a write remains outcome-unkn
   assert.equal(writeCalls,2);
 });
 
+test('confirmed PostgreSQL cancellation is definite across HTTP and CLI writes',async t=>{
+  const state=fixture();
+  let writes=0;
+  const cancelled=async()=>{
+    writes++;
+    throw Object.assign(new Error('private database detail'),{code:'57014',severity:'ERROR',routine:'ProcessInterrupts'});
+  };
+  state.services.collections.define=cancelled;
+  state.services.collections.revise=cancelled;
+  state.services.records.mutate=cancelled;
+  const handler=createHttpHandler(state);
+  const {server,endpoint}=await serve(handler);
+  t.after(()=>server.close());
+  const root=await mkdtemp(join(tmpdir(),'stateplane-cancellation-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  assert.equal((await cliProcess(root,['config','endpoint','--url',endpoint])).status,0);
+  assert.equal((await cliProcess(root,['auth','login','--token-stdin','--store','file'],
+    'secret-test-token\n')).status,0);
+  assert.equal((await cliProcess(root,['spaces','select','--space','sp_a'])).status,0);
+  const client=new StateplaneHttpClient({endpoint,token:'secret-test-token'});
+  const path='/v1/spaces/sp_a/collections/entries/records';
+  const cases=[
+    ['PUT','/v1/spaces/sp_a/collections/entries',{}],
+    ['PATCH','/v1/spaces/sp_a/collections/entries',{}],
+    ...['create','replace','patch','delete'].map(operation=>['POST',path,{operation}])
+  ];
+  await Promise.all(cases.map(async([method,route,body])=>{
+    const response=await fetch(new URL(route,endpoint),{method,
+      headers:{Authorization:'Bearer secret-test-token','Content-Type':'application/json',
+        ...(method==='PATCH'?{'If-Match':'1'}:{})},body:JSON.stringify(body)});
+    assert.equal(response.status,429);
+    const error=(await response.json()).error;
+    assert.deepEqual({code:error.code,message:error.message,retryable:error.retryable},
+      {code:'RATE_LIMITED',message:'RATE_LIMITED',retryable:true});
+    assert.match(error.requestId,/^[a-zA-Z0-9_-]{1,80}$/);
+    assert.equal(response.headers.get('Retry-After'),'1');
+  }));
+  assert.equal(writes,cases.length);
+  const before=writes;
+  await assert.rejects(client.request('POST',path,{operation:'create'}),
+    {code:'RATE_LIMITED',retryable:true});
+  assert.equal(writes,before+1,'client does not automatically replay a cancelled write');
+  const cli=await cliProcess(root,['records','create','--collection','entries',
+    '--idempotency-key','cancelled','--data','{"label":"A"}']);
+  assert.equal(cli.status,1);
+  assert.equal(JSON.parse(cli.stderr).error.code,'RATE_LIMITED');
+  assert.doesNotMatch(cli.stdout+cli.stderr,/private database detail|secret-test-token/);
+  assert.equal(writes,before+2,'CLI process does not automatically replay a cancelled write');
+});
+
 test('decoded read routes retain safe retry and normalized paths cannot carry credentials elsewhere',async()=>{
   const state=fixture();
   let readCalls=0,writeCalls=0;

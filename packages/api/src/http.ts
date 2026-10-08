@@ -70,7 +70,8 @@ function errorResponse(error:unknown,requestId:string,request:Request):Response 
   if (name==='CommitOutcomeUnknownError') code='COMMIT_OUTCOME_UNKNOWN';
   else if (typeof raw==='string' && Object.hasOwn(status,raw)) code=raw;
   else if (error instanceof HttpFailure) code=error.code;
-  else if (!safeRead(request) && (name==='HostProviderTimeoutError' || raw==='57014' ||
+  else if (raw==='57014') code='RATE_LIMITED';
+  else if (!safeRead(request) && (name==='HostProviderTimeoutError' ||
     (error as Error)?.message==='Query read timeout')) code='COMMIT_OUTCOME_UNKNOWN';
   else code='PROVIDER_UNAVAILABLE';
   let canRetry=retryable.has(code);
