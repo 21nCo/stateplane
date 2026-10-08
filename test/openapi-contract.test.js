@@ -96,6 +96,35 @@ test('generated-client record mutations require the runtime operation envelope',
     const wire=JSON.parse(JSON.stringify(envelope));
     assert.equal(validate(wire),false,`${wire.operation} must reject ${JSON.stringify(wire)}`);
   }
+  for (const envelope of Object.values(valid)) {
+    for (const key of ['', 'a'.repeat(257), '\u0000', '\ud800', '\udc00'])
+      assert.equal(validate({...envelope,idempotencyKey:key}),false,
+        `${envelope.operation} rejects malformed or oversized idempotency key`);
+  }
+});
+
+test('all published record mutations enforce the authority idempotency byte budget',async()=>{
+  const document=YAML.parse(await readFile(new URL('../contracts/openapi.yaml',import.meta.url),'utf8'));
+  const variants=document.components.schemas.RecordMutation.oneOf;
+  const ajv=new Ajv({strict:false});
+  ajv.addKeyword({keyword:'x-utf8MaxBytes',schemaType:'number',type:'string',
+    validate:(limit,value)=>Buffer.byteLength(value,'utf8')<=limit});
+  const validate=ajv.compile(document.components.schemas.RecordMutation);
+  const envelopes=[
+    {operation:'create',idempotencyKey:'key',data:{label:'A'}},
+    {operation:'replace',idempotencyKey:'key',id:'rec_1',expectedRevision:1,data:{label:'B'}},
+    {operation:'patch',idempotencyKey:'key',id:'rec_1',expectedRevision:1,set:{label:'C'},unset:[]},
+    {operation:'delete',idempotencyKey:'key',id:'rec_1',expectedRevision:1}
+  ];
+  for (const [index,envelope] of envelopes.entries()) {
+    assert.equal(variants[index].properties.idempotencyKey['x-utf8MaxBytes'],256);
+    for (const key of ['a'.repeat(256),'é'.repeat(128),'😀'.repeat(64)])
+      assert.equal(validate({...envelope,idempotencyKey:key}),true,
+        `${envelope.operation} accepts a 256-byte idempotency key`);
+    for (const key of ['a'.repeat(257),'é'.repeat(129),'😀'.repeat(65),'\ud800'])
+      assert.equal(validate({...envelope,idempotencyKey:key}),false,
+        `${envelope.operation} rejects an invalid idempotency key`);
+  }
 });
 
 test('published create keys match normalized authority admission',async()=>{

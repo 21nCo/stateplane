@@ -81,8 +81,14 @@ the fixed v1 Unicode whitespace set listed in OpenAPI. The resulting key must
 be nonempty and at most 256 UTF-8 bytes. OpenAPI publishes the byte budget as
 `x-utf8MaxBytes`; generated clients should enforce it after normalization and
 trim. The API returns `INVALID_ARGUMENT` for a rejected key and writes no
-record, event or receipt. Replaying an accepted create with the same
-idempotency key and an equivalent normalized key returns the original receipt.
+record, event or receipt. An idempotency key must be a nonempty Unicode-scalar
+string of at most 256 UTF-8 bytes; generated clients should enforce its
+`x-utf8MaxBytes` extension. Replaying an accepted
+create with the same idempotency key and equivalent normalized external key
+returns the original receipt only when the rest of the canonical request
+fingerprint also matches. Changed data or expected schema version returns
+`IDEMPOTENCY_MISMATCH` without a new record, event or receipt. After an unknown
+commit, retry the unchanged request with its original key to recover the receipt.
 
 On Linux, `keychain` is the default and uses Secret Service through
 `secret-tool`. On macOS and Windows, the default is the protected file store.

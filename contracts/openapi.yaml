@@ -263,7 +263,17 @@ components:
           required: [operation, idempotencyKey, data]
           properties:
             operation: { const: create }
-            idempotencyKey: { type: string, minLength: 1 }
+            idempotencyKey: &idempotencyKey
+              type: string
+              minLength: 1
+              maxLength: 256
+              pattern: '^(?:[^\u0000\uD800-\uDFFF]|[\uD800-\uDBFF][\uDC00-\uDFFF])+$'
+              x-utf8MaxBytes: 256
+              description: >-
+                A nonempty Unicode-scalar key of at most 256 UTF-8 bytes.
+                Clients must enforce the byte extension; the server enforces it
+                before any mutation or receipt effect. Reuse the same key only
+                with an identical canonical request fingerprint.
             expectedSchemaVersion: { type: integer, minimum: 1 }
             externalKey:
               type: string
@@ -285,7 +295,7 @@ components:
           required: [operation, idempotencyKey, id, expectedRevision, data]
           properties:
             operation: { const: replace }
-            idempotencyKey: { type: string, minLength: 1 }
+            idempotencyKey: *idempotencyKey
             id: { type: string, minLength: 1 }
             expectedRevision: { type: integer, minimum: 1 }
             expectedSchemaVersion: { type: integer, minimum: 1 }
@@ -295,7 +305,7 @@ components:
           required: [operation, idempotencyKey, id, expectedRevision, set, unset]
           properties:
             operation: { const: patch }
-            idempotencyKey: { type: string, minLength: 1 }
+            idempotencyKey: *idempotencyKey
             id: { type: string, minLength: 1 }
             expectedRevision: { type: integer, minimum: 1 }
             expectedSchemaVersion: { type: integer, minimum: 1 }
@@ -306,7 +316,7 @@ components:
           required: [operation, idempotencyKey, id, expectedRevision]
           properties:
             operation: { const: delete }
-            idempotencyKey: { type: string, minLength: 1 }
+            idempotencyKey: *idempotencyKey
             id: { type: string, minLength: 1 }
             expectedRevision: { type: integer, minimum: 1 }
             expectedSchemaVersion: { type: integer, minimum: 1 }

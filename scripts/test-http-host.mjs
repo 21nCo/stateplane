@@ -112,6 +112,30 @@ try {
   }));
   assert(JSON.stringify(await effects())===JSON.stringify({records:0,events:0,receipts:0}),
     'invalid keys have no durable effect');
+  for (const operation of ['create','replace','patch','delete']) {
+    for (const key of ['', 'a'.repeat(257), 'é'.repeat(129), '\ud800']) {
+      const envelope={operation,idempotencyKey:key,
+        ...(operation==='create'?{data}:{id:'missing',expectedRevision:1}),
+        ...(operation==='replace'?{data}:{}),
+        ...(operation==='patch'?{set:{label:'B'},unset:[]}:{})};
+      const denied=await fetch(endpoint+path,{method:'POST',headers:{Authorization:`Bearer ${token}`,
+        'Content-Type':'application/json'},body:JSON.stringify(envelope)});
+      assert(denied.status===400 && (await denied.json()).error.code==='INVALID_ARGUMENT',
+        `HTTP rejects invalid ${operation} idempotency key`);
+      // Process argv converts an unpaired surrogate to U+FFFD before the CLI can receive it.
+      if (key==='\ud800') continue;
+      const args=['records',operation,'--collection',collectionId,'--idempotency-key',key];
+      if (operation==='create' || operation==='replace') args.push('--data',JSON.stringify(data));
+      if (operation!=='create') args.push('--id','missing','--expected-revision','1');
+      if (operation==='patch') args.push('--data',JSON.stringify({set:{label:'B'},unset:[]}));
+      const cliDenied=spawnSync(process.execPath,[cli,...args],{cwd:temp,env:cliEnv,encoding:'utf8'});
+      const cliError=cliDenied.stderr ? JSON.parse(cliDenied.stderr).error.code : null;
+      assert(cliDenied.status===1 && cliError==='INVALID_ARGUMENT',
+        `installed CLI rejects invalid ${operation} idempotency key (${Buffer.byteLength(key)} bytes/${cliDenied.status}/${cliError})`);
+    }
+  }
+  assert(JSON.stringify(await effects())===JSON.stringify({records:0,events:0,receipts:0}),
+    'invalid idempotency keys have no durable record, event or receipt');
   const mutation={operation:'create',idempotencyKey:'consumer-record',externalKey,data};
   const receipt=await request('POST',path,mutation);
   const replay=runCli(['records','create','--collection',collectionId,'--data',JSON.stringify(data),
@@ -120,6 +144,29 @@ try {
   const record=runCli(['records','get','--collection',collectionId,'--id',receipt.ref.id],{env:cliEnv});
   const direct=await request('GET',`${path}/${receipt.ref.id}`);
   assert(JSON.stringify(record)===JSON.stringify(direct),'CLI and HTTP canonical record parity');
+  const boundaryCreate={operation:'create',idempotencyKey:'a'.repeat(256),data:{...data,label:'Boundary'}};
+  const boundary=runCli(['records','create','--collection',collectionId,
+    '--idempotency-key',boundaryCreate.idempotencyKey,'--data',JSON.stringify(boundaryCreate.data)],{env:cliEnv});
+  const boundaryReplay=await request('POST',path,boundaryCreate);
+  assert(boundaryReplay.receiptId===boundary.receiptId && boundaryReplay.replayed,
+    '256-byte create key replays from HTTP after installed CLI');
+  const id=boundary.ref.id;
+  const variants=[
+    {operation:'replace',idempotencyKey:'é'.repeat(128),id,expectedRevision:1,data:{...data,label:'Replaced'}},
+    {operation:'patch',idempotencyKey:'😀'.repeat(64),id,expectedRevision:2,set:{label:'Patched'},unset:[]},
+    {operation:'delete',idempotencyKey:'z'.repeat(256),id,expectedRevision:3}
+  ];
+  for (const envelope of variants) {
+    const httpReceipt=await request('POST',path,envelope);
+    const args=['records',envelope.operation,'--collection',collectionId,
+      '--idempotency-key',envelope.idempotencyKey,'--id',id,
+      '--expected-revision',String(envelope.expectedRevision)];
+    if (envelope.operation==='replace') args.push('--data',JSON.stringify(envelope.data));
+    if (envelope.operation==='patch') args.push('--data',JSON.stringify({set:envelope.set,unset:envelope.unset}));
+    const cliReplay=runCli(args,{env:cliEnv});
+    assert(cliReplay.receiptId===httpReceipt.receiptId && cliReplay.replayed,
+      `256-byte ${envelope.operation} key replays through installed CLI`);
+  }
   const placement=(await fixturePool.query('SELECT policy_version,placement_generation FROM spaces WHERE space_id=$1',
     [spaceId])).rows[0];
   const schemaScope={spaceId,collectionId,principalId:appEnv.STATEPLANE_TEST_OWNER,
@@ -198,6 +245,22 @@ try {
     externalKey:'é',data});
   assert(normalizedReplay.receiptId===normalized.receiptId && normalizedReplay.replayed,
     'installed CLI and HTTP replay one canonical NFC key');
+  const beforeMismatch=await effects();
+  for (const changed of [{externalKey:'é',data:{...data,label:'Changed'}},
+    {externalKey:'é',data,expectedSchemaVersion:2}]) {
+    const mismatch=await fetch(endpoint+path,{method:'POST',headers:{Authorization:`Bearer ${token}`,
+      'Content-Type':'application/json'},body:JSON.stringify({operation:'create',
+      idempotencyKey:'normalized-key',...changed})});
+    assert(mismatch.status===409 && (await mismatch.json()).error.code==='IDEMPOTENCY_MISMATCH',
+      'changed canonical fingerprint cannot replay the normalized key');
+  }
+  const cliMismatch=spawnSync(process.execPath,[cli,'records','create','--collection',collectionId,
+    '--idempotency-key','normalized-key','--key','é','--data',JSON.stringify({...data,label:'Changed'})],
+    {cwd:temp,env:cliEnv,encoding:'utf8'});
+  assert(cliMismatch.status===1 && JSON.parse(cliMismatch.stderr).error.code==='IDEMPOTENCY_MISMATCH',
+    'installed CLI rejects changed canonical replay');
+  assert(JSON.stringify(await effects())===JSON.stringify(beforeMismatch),
+    'fingerprint mismatch leaves records, events and receipts unchanged');
   const normalizedLookup=await request('GET',`${path}/by-key/${encodeURIComponent('é')}?mode=external`);
   assert(normalizedLookup.ref.id===normalized.ref.id,'normalized key lookup resolves CLI record');
   await Promise.all(['a'.repeat(256),'é'.repeat(128)].map(async(key,index)=>{
