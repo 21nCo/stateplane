@@ -1,0 +1,20 @@
+app/src/routes/v1/[...path]/+server.ts
+  h_a39f9495f9ec1d 38-45
+docs/http-cli.md
+  h_a39f9495f9ec1d 36-44
+scripts/http-provider-relay.mjs
+  h_a39f9495f9ec1d 1-32
+scripts/test-http-host.mjs
+  h_a39f9495f9ec1d 2,35-49,51,352-392,397,424-425,428-429
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2c38d35a1cfc3b47c5a46e84cd2d746e6f79c2ca",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
