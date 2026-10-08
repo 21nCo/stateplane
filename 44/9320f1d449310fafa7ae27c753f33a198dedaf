@@ -1,0 +1,33 @@
+docs/exact-queries-bulk.md
+  s_e41552db7a7823::t_ef4880fa7b7752 9
+docs/http-cli.md
+  s_28d4128c7417df::t_7f2819cdf62778 91-93,222-223,225-231
+docs/owned-spaces.md
+  s_e41552db7a7823::t_634851018dbf47 19
+scripts/test-http-host.mjs
+  s_28d4128c7417df::t_550525fe7933ed 115-116,126,135,159,248-249,255,288-297,299-306
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "449320f1d449310fafa7ae27c753f33a198dedaf",
+  "prompts": {},
+  "sessions": {
+    "s_28d4128c7417df": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1c1c580e-3b46-4699-b932-7f146605890c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_e41552db7a7823": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ccf55d8d-6176-4456-a8a3-555947c35bfe",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
