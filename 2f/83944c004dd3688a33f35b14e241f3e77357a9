@@ -1,0 +1,22 @@
+contracts/openapi.yaml
+  h_a39f9495f9ec1d 261-300
+package.json
+  h_a39f9495f9ec1d 68
+pnpm-lock.yaml
+  h_a39f9495f9ec1d 97,99-100,122,125,128,131,140,2681-2682,3624,3627,3631,3635,3647,3653,3659-3660,3723,3728,3880,3886,4952,4964,4966,4968,4970,4973,4990,5045
+test/integration/http-services.test.js
+  h_a39f9495f9ec1d 291-350
+test/openapi-contract.test.js
+  h_a39f9495f9ec1d 19-49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2f83944c004dd3688a33f35b14e241f3e77357a9",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
