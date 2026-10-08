@@ -1,0 +1,16 @@
+docs/http-cli.md
+  h_a39f9495f9ec1d 191-193
+scripts/test-http-host.mjs
+  h_a39f9495f9ec1d 109,112,120,123,132,134-150,155,158-168,170-171,173
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "705b94b9ed23be216e4d5e4038a71cda36dbb36e",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
