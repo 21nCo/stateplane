@@ -4,17 +4,66 @@ import { readFile } from 'node:fs/promises';
 import Ajv from 'ajv';
 import YAML from 'yaml';
 
-test('generated-client predicate shape matches the HTTP value-presence contract',async()=>{
+test('generated-client predicates agree with the typed HTTP query and count contract',async()=>{
   const source=await readFile(new URL('../contracts/openapi.yaml',import.meta.url),'utf8');
   const document=YAML.parse(source);
   const schema=document.components.schemas.Predicate;
   const validate=new Ajv({strict:false}).compile(schema);
-  assert.equal(validate({field:'score',kind:'number',operator:'eq',value:2}),true);
-  assert.equal(validate({field:'score',kind:'null',operator:'isNull'}),true);
-  assert.equal(validate({field:'score',kind:'number',operator:'eq'}),false,
-    'a generated client must reject a non-null predicate without value');
-  assert.equal(validate({field:'score',kind:'null',operator:'isNull',value:null}),false,
-    'a generated client must reject a value on isNull');
+  assert.equal(document.paths['/v1/spaces/{spaceId}/collections/{collectionId}/records/query'].post
+    .requestBody.content['application/json'].schema.$ref,'#/components/schemas/RecordQuery');
+  assert.equal(document.components.schemas.RecordQuery.properties.predicates.items.$ref,
+    '#/components/schemas/Predicate');
+  assert.equal(document.paths['/v1/spaces/{spaceId}/collections/{collectionId}/records/count'].post
+    .requestBody.content['application/json'].schema.items.$ref,'#/components/schemas/Predicate');
+  const accepted=[
+    {field:'score',kind:'null',operator:'isNull'},
+    ...[['string',''],['number',2],['boolean',false],['date-time','2024-02-29T23:59:59.123Z']]
+      .flatMap(([kind,value])=>['eq','lt','lte','gt','gte'].map(operator=>({field:'score',kind,operator,value}))),
+    ...[['string',['a','b']],['number',[1,2]],['boolean',[true,false]],
+      ['date-time',['2016-12-31T23:59:60Z','2026-01-01T00:00:00Z']]]
+      .map(([kind,value])=>({field:'score',kind,operator:'in',value})),
+    {field:'score',kind:'number',operator:'in',value:Array(16).fill(1)},
+    {field:'score',kind:'string',operator:'eq',value:'a'.repeat(512)},
+    {field:'score',kind:'string',operator:'eq',value:'😀'},
+    {field:'score',kind:'date-time',operator:'eq',value:'2000-02-29T00:00:00Z'}
+  ];
+  const rejected=[
+    {field:'score',kind:'number',operator:'eq'},
+    {field:'score',kind:'null',operator:'isNull',value:null},
+    {field:'score',kind:'null',operator:'eq'},
+    {field:'score',kind:'number',operator:'eq',value:'oops'},
+    {field:'score',kind:'string',operator:'eq',value:3},
+    {field:'score',kind:'boolean',operator:'eq',value:0},
+    {field:'score',kind:'date-time',operator:'eq',value:'2026-13-01T00:00:00Z'},
+    {field:'score',kind:'date-time',operator:'eq',value:'2026-02-30T00:00:00Z'},
+    {field:'score',kind:'date-time',operator:'eq',value:'1900-02-29T00:00:00Z'},
+    {field:'score',kind:'date-time',operator:'eq',value:'2026-12-31T23:59:60Z'},
+    {field:'score',kind:'date-time',operator:'eq',value:'2026-01-01T00:00:00+00:00'},
+    {field:'score',kind:'number',operator:'in',value:7},
+    {field:'score',kind:'number',operator:'in',value:[]},
+    {field:'score',kind:'number',operator:'in',value:Array(17).fill(1)},
+    {field:'score',kind:'number',operator:'in',value:[1,'2']},
+    {field:'score',kind:'string',operator:'in',value:[2]},
+    {field:'score',kind:'boolean',operator:'in',value:[0]},
+    {field:'score',kind:'date-time',operator:'in',value:['not-an-instant']},
+    {field:'score',kind:'string',operator:'eq',value:'a'.repeat(513)},
+    {field:'score',kind:'string',operator:'eq',value:'a\u0000b'},
+    {field:'score',kind:'string',operator:'eq',value:'\uD800'},
+    {field:'score',kind:'number',operator:'in',value:undefined}
+  ];
+  for (const predicate of accepted)
+    assert.equal(validate(predicate),true,`valid ${JSON.stringify(predicate)}`);
+  for (const predicate of rejected)
+    assert.equal(validate(JSON.parse(JSON.stringify(predicate))),false,
+      `invalid ${JSON.stringify(predicate)}`);
+  for (const kind of ['string','date-time']) {
+    const scalar=schema.oneOf.find(variant=>variant.properties.kind.const===kind &&
+      Array.isArray(variant.properties.operator.enum));
+    const list=schema.oneOf.find(variant=>variant.properties.kind.const===kind &&
+      variant.properties.operator.const==='in');
+    assert.equal(scalar.properties.value['x-utf8MaxBytes'],512);
+    assert.equal(list.properties.value.items['x-utf8MaxBytes'],512);
+  }
 });
 
 test('generated-client record mutations require the runtime operation envelope',async()=>{

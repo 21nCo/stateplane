@@ -181,6 +181,15 @@ stateplane batches ingest --collection entries --operation-key import-1 --file .
 stateplane batches status --collection entries --operation-key import-1
 ```
 
+Query and count take the same typed `--predicates` JSON array. Each predicate
+has `field`, `kind`, and `operator`; every non-null kind also requires `value`.
+`null` uses only `isNull` and has no value. `string`, `number`, `boolean`, and
+`date-time` use `eq`, `lt`, `lte`, `gt`, or `gte` with one value of that kind,
+or `in` with 1–16 values of that kind. Date-time values are valid UTC `Z`
+instants; the authority checks the calendar and known leap-second dates.
+String and date-time values must fit 512 UTF-8 bytes, including multibyte
+characters. An invalid predicate returns `INVALID_ARGUMENT` before query SQL.
+
 An ingestion file or `--file -` stream is NDJSON with one record request per
 line, omitting `idempotencyKey`; the authority derives stable item keys. The
 CLI preserves each valid line's exact JSON text in the manifest. Keep the

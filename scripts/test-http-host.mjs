@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { existsSync } from 'node:fs';
 import pg from 'pg';
+import { CollectionRegistry } from '../packages/postgres/dist/index.js';
 
 const root=resolve(import.meta.dirname,'..');
 const pnpmCli=process.env.npm_execpath;
@@ -80,30 +81,78 @@ try {
   assert(JSON.stringify(observed)===JSON.stringify(created),'CLI and HTTP space parity');
   runCli(['spaces','select','--space',spaceId],{env:cliEnv});
   const definition={slug:collectionId,version:1,schema:{$schema:'https://json-schema.org/draft/2020-12/schema',
-    type:'object',properties:{label:{type:'string'}},required:['label'],additionalProperties:false},
-    unique:[],filterable:[],sortable:[]};
+    type:'object',properties:{label:{type:'string'},score:{type:'number'},active:{type:'boolean'},
+      at:{type:'string',format:'date-time'},note:{type:['string','null']}},required:['label'],additionalProperties:false},
+    unique:[],filterable:['label','score','active','at','note'],sortable:[]};
   await writeFile(join(temp,'schema.json'),JSON.stringify(definition));
   runCli(['collections','define','--collection',collectionId,'--file',join(temp,'schema.json')],{env:cliEnv});
   const discovered=await request('GET',`v1/spaces/${spaceId}/collections/${encodeURIComponent(collectionId)}`);
   assert(discovered.definition.slug===collectionId,'CLI schema is visible through HTTP');
   const path=`v1/spaces/${spaceId}/collections/${encodeURIComponent(collectionId)}/records`;
-  const mutation={operation:'create',idempotencyKey:'consumer-record',externalKey,data:{label:'A'}};
+  const data={label:'A',score:2,active:true,at:'2024-02-29T23:59:59Z',note:null};
+  const mutation={operation:'create',idempotencyKey:'consumer-record',externalKey,data};
   const receipt=await request('POST',path,mutation);
-  const replay=runCli(['records','create','--collection',collectionId,'--data','{"label":"A"}',
+  const replay=runCli(['records','create','--collection',collectionId,'--data',JSON.stringify(data),
     '--idempotency-key','consumer-record','--key',externalKey],{env:cliEnv});
   assert(replay.receiptId===receipt.receiptId && replay.replayed===true,'CLI receipt replay parity');
   const record=runCli(['records','get','--collection',collectionId,'--id',receipt.ref.id],{env:cliEnv});
   const direct=await request('GET',`${path}/${receipt.ref.id}`);
   assert(JSON.stringify(record)===JSON.stringify(direct),'CLI and HTTP canonical record parity');
-  const invalidPredicate=[{field:'label',kind:'string',operator:'eq'}];
-  const invalidQuery=await fetch(endpoint+`${path}/query`,{method:'POST',headers:{Authorization:`Bearer ${token}`,
-    'Content-Type':'application/json'},body:JSON.stringify({predicates:invalidPredicate,limit:1})});
-  assert(invalidQuery.status===400 && (await invalidQuery.json()).error.code==='INVALID_ARGUMENT',
-    'HTTP rejects a missing non-null predicate value');
-  const invalidCli=spawnSync(process.execPath,[cli,'records','query','--collection',collectionId,
-    '--predicates',JSON.stringify(invalidPredicate),'--limit','1'],{cwd:temp,env:cliEnv,encoding:'utf8'});
-  assert(invalidCli.status!==0 && JSON.parse(invalidCli.stderr).error.code==='INVALID_ARGUMENT',
-    'installed CLI matches HTTP for a missing predicate value');
+  fixturePool=new pg.Pool({connectionString:databaseUrl,max:1});
+  const placement=(await fixturePool.query('SELECT policy_version,placement_generation FROM spaces WHERE space_id=$1',
+    [spaceId])).rows[0];
+  const schemaScope={spaceId,collectionId,principalId:appEnv.STATEPLANE_TEST_OWNER,
+    credentialId:appEnv.STATEPLANE_TEST_CREDENTIAL,capability:'schema:write',
+    policyVersion:Number(placement.policy_version),placementGeneration:Number(placement.placement_generation)};
+  const registry=new CollectionRegistry(fixturePool);
+  for (const field of definition.filterable) {
+    const result=await registry.backfill(schemaScope,field);
+    assert(result.ready,`index for ${field} is ready before querying`);
+  }
+  for (const predicate of [
+    {field:'label',kind:'string',operator:'eq',value:'A'},
+    {field:'score',kind:'number',operator:'gte',value:2},
+    {field:'active',kind:'boolean',operator:'eq',value:true},
+    {field:'at',kind:'date-time',operator:'lte',value:'2024-02-29T23:59:59.000Z'},
+    {field:'note',kind:'null',operator:'isNull'},
+    {field:'label',kind:'string',operator:'in',value:['A']},
+    {field:'score',kind:'number',operator:'in',value:[2]},
+    {field:'active',kind:'boolean',operator:'in',value:[true]},
+    {field:'at',kind:'date-time',operator:'in',value:['2024-02-29T23:59:59Z']}
+  ]) for (const action of ['query','count']) {
+    const predicates=[predicate];
+    const body=action==='query'?{predicates,limit:1}:predicates;
+    const directResult=await request('POST',`${path}/${action}`,body);
+    const args=['records',action,'--collection',collectionId,'--predicates',JSON.stringify(predicates)];
+    if (action==='query') args.push('--limit','1');
+    const cliResult=runCli(args,{env:cliEnv});
+    assert(JSON.stringify(cliResult)===JSON.stringify(directResult),`installed CLI ${action} matches HTTP`);
+    assert(action==='query'?directResult.records.length===1:directResult===1,`typed ${action} finds the record`);
+  }
+  const beforeEvents=await request('GET',`v1/spaces/${spaceId}/collections/${encodeURIComponent(collectionId)}/events`);
+  for (const predicate of [
+    {field:'label',kind:'string',operator:'eq'},
+    {field:'label',kind:'number',operator:'eq',value:'oops'},
+    {field:'label',kind:'number',operator:'in',value:7},
+    {field:'label',kind:'number',operator:'in',value:[]},
+    {field:'label',kind:'number',operator:'in',value:Array(17).fill(1)},
+    {field:'label',kind:'string',operator:'eq',value:'😀'.repeat(129)},
+    {field:'label',kind:'date-time',operator:'eq',value:'2026-02-30T00:00:00Z'}
+  ]) for (const action of ['query','count']) {
+    const predicates=[predicate];
+    const body=action==='query'?{predicates,limit:1}:predicates;
+    const response=await fetch(endpoint+`${path}/${action}`,{method:'POST',
+      headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify(body)});
+    assert(response.status===400 && (await response.json()).error.code==='INVALID_ARGUMENT',
+      `HTTP ${action} rejects malformed predicate`);
+    const args=['records',action,'--collection',collectionId,'--predicates',JSON.stringify(predicates)];
+    if (action==='query') args.push('--limit','1');
+    const installedCli=spawnSync(process.execPath,[cli,...args],{cwd:temp,env:cliEnv,encoding:'utf8'});
+    assert(installedCli.status!==0 && JSON.parse(installedCli.stderr).error.code==='INVALID_ARGUMENT',
+      `installed CLI ${action} matches HTTP for malformed predicate`);
+  }
+  assert(JSON.stringify(await request('GET',`v1/spaces/${spaceId}/collections/${encodeURIComponent(collectionId)}/events`))===
+    JSON.stringify(beforeEvents),'malformed read requests cause no record events');
   const keyPath=`${path}/by-key/${encodeURIComponent(externalKey)}?mode=external`;
   const directByKey=await request('GET',keyPath);
   const cliByKey=runCli(['records','key','--collection',collectionId,'--key',externalKey,
@@ -113,7 +162,6 @@ try {
     const slug=`entries_${String(index).padStart(2,'0')}`;
     await request('PUT',`v1/spaces/${spaceId}/collections/${slug}`,{...definition,slug}); // NOSONAR -- definitions must exist before granting the agent access
   }
-  fixturePool=new pg.Pool({connectionString:databaseUrl,max:1});
   await fixturePool.query(`INSERT INTO space_credentials(space_id,credential_id,principal_id,owner_principal_id,
     expires_at,activated_at,confirmed_at)
     VALUES($1,$2,$3,$4,clock_timestamp()+interval '1 hour',clock_timestamp(),clock_timestamp())`,

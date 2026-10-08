@@ -308,17 +308,85 @@ components:
         - type: object
           required: [field, kind, operator]
           properties:
-            field: { type: string }
+            field: &predicateField { type: string, minLength: 1, pattern: '^(?:[^\u0000\uD800-\uDFFF]|[\uD800-\uDBFF][\uDC00-\uDFFF])+$' }
             kind: { const: 'null' }
             operator: { const: isNull }
           additionalProperties: false
         - type: object
           required: [field, kind, operator, value]
           properties:
-            field: { type: string }
-            kind: { enum: [string, number, boolean, date-time] }
-            operator: { enum: [eq, lt, lte, gt, gte, in] }
-            value: {}
+            field: *predicateField
+            kind: { const: string }
+            operator: { enum: [eq, lt, lte, gt, gte] }
+            value: &predicateString
+              type: string
+              maxLength: 512
+              pattern: '^(?:[^\u0000\uD800-\uDFFF]|[\uD800-\uDBFF][\uDC00-\uDFFF])*$'
+              x-utf8MaxBytes: 512
+              description: At most 512 UTF-8 bytes; clients must check the byte limit as well as this structural schema.
+          additionalProperties: false
+        - type: object
+          required: [field, kind, operator, value]
+          properties:
+            field: *predicateField
+            kind: { const: string }
+            operator: { const: in }
+            value: { type: array, minItems: 1, maxItems: 16, items: *predicateString }
+          additionalProperties: false
+        - type: object
+          required: [field, kind, operator, value]
+          properties:
+            field: *predicateField
+            kind: { const: number }
+            operator: { enum: [eq, lt, lte, gt, gte] }
+            value: &predicateNumber { type: number, description: A finite JSON number. }
+          additionalProperties: false
+        - type: object
+          required: [field, kind, operator, value]
+          properties:
+            field: *predicateField
+            kind: { const: number }
+            operator: { const: in }
+            value: { type: array, minItems: 1, maxItems: 16, items: *predicateNumber }
+          additionalProperties: false
+        - type: object
+          required: [field, kind, operator, value]
+          properties:
+            field: *predicateField
+            kind: { const: boolean }
+            operator: { enum: [eq, lt, lte, gt, gte] }
+            value: &predicateBoolean { type: boolean }
+          additionalProperties: false
+        - type: object
+          required: [field, kind, operator, value]
+          properties:
+            field: *predicateField
+            kind: { const: boolean }
+            operator: { const: in }
+            value: { type: array, minItems: 1, maxItems: 16, items: *predicateBoolean }
+          additionalProperties: false
+        - type: object
+          required: [field, kind, operator, value]
+          properties:
+            field: *predicateField
+            kind: { const: date-time }
+            operator: { enum: [eq, lt, lte, gt, gte] }
+            value: &predicateInstant
+              type: string
+              maxLength: 512
+              x-utf8MaxBytes: 512
+              description: UTC instant with a valid Gregorian date and optional decimal seconds; at most 512 UTF-8 bytes. Leap seconds are limited to the listed UTC dates.
+              anyOf:
+                - pattern: '^(?:(?!0000)[0-9]{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12][0-9]|3[01])|(?:0[469]|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:(?!0000)(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00))-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\.[0-9]+)?Z$'
+                - pattern: '^(?:1972-(?:06-30|12-31)|1973-12-31|1974-12-31|1975-12-31|1976-12-31|1977-12-31|1978-12-31|1979-12-31|1981-06-30|1982-06-30|1983-06-30|1985-06-30|1987-12-31|1989-12-31|1990-12-31|1992-06-30|1993-06-30|1994-06-30|1995-12-31|1997-06-30|1998-12-31|2005-12-31|2008-12-31|2012-06-30|2015-06-30|2016-12-31)T23:59:60(?:\.[0-9]+)?Z$'
+          additionalProperties: false
+        - type: object
+          required: [field, kind, operator, value]
+          properties:
+            field: *predicateField
+            kind: { const: date-time }
+            operator: { const: in }
+            value: { type: array, minItems: 1, maxItems: 16, items: *predicateInstant }
           additionalProperties: false
     RecordQuery:
       type: object
