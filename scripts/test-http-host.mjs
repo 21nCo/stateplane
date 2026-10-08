@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { spawn, spawnSync } from 'node:child_process';
+import { fork, spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { once } from 'node:events';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -32,8 +32,23 @@ const spaceId=`sp_${randomUUID()}`;
 const collectionId='entries/path';
 const externalKey='key/part';
 const temp=await mkdtemp(join(tmpdir(),'stateplane-host-consumer-'));
+// Route the host through a disposable TCP relay. It can stop answering new
+// PostgreSQL handshakes after a successful connection, then resume without
+// changing the HTTP host's configuration or its cached pool.
+const databaseAddress=new URL(databaseUrl);
+const provider=fork(join(root,'scripts/http-provider-relay.mjs'),
+  [databaseAddress.hostname,databaseAddress.port || '5432'],{stdio:['ignore','ignore','ignore','ipc']});
+const [{port:providerPort}]=await once(provider,'message');
+async function providerMode(mode) {
+  const reply=once(provider,'message');
+  provider.send(mode);
+  await reply;
+}
+const hostDatabaseUrl=new URL(databaseUrl);
+hostDatabaseUrl.hostname='127.0.0.1';
+hostDatabaseUrl.port=String(providerPort);
 const appEnv={...process.env,STATEPLANE_ENV:'local',STATEPLANE_TEST_HTTP:'1',
-  STATEPLANE_TEST_DATABASE_URL:databaseUrl,STATEPLANE_TEST_TOKEN:token,
+  STATEPLANE_TEST_DATABASE_URL:hostDatabaseUrl.toString(),STATEPLANE_TEST_TOKEN:token,
   STATEPLANE_TEST_OWNER:`owner-${randomUUID()}`,STATEPLANE_TEST_CREDENTIAL:`session-${randomUUID()}`,
   STATEPLANE_TEST_AGENT_TOKEN:agentToken,STATEPLANE_TEST_AGENT_CREDENTIAL:agentCredential,
   STATEPLANE_TEST_CURSOR_SECRET:randomBytes(32).toString('hex')};
@@ -334,10 +349,52 @@ try {
     {cwd:temp,env:cliEnv,encoding:'utf8'});
   assert(deniedPage.status!==0 && !`${deniedPage.stdout}${deniedPage.stderr}`.includes(agentToken),
     'revoked write-only CLI continuation is denied without exposing its token');
+  const beforeOutage=await effects();
+  await providerMode('stall');
+  const outageRequests=[
+    ...Array.from({length:6},()=>({method:'GET',path:`v1/spaces/${spaceId}`})),
+    {method:'GET',path:`${path}/${receipt.ref.id}`},
+    ...['query','count'].map(action=>({method:'POST',path:`${path}/${action}`,
+      body:action==='query'?{predicates:[],limit:1}:[]})),
+    {method:'POST',path,body:{operation:'create',idempotencyKey:'outage-create',data}},
+    {method:'POST',path,body:{operation:'replace',idempotencyKey:'outage-replace',
+      id:receipt.ref.id,expectedRevision:1,data}},
+    {method:'POST',path,body:{operation:'patch',idempotencyKey:'outage-patch',
+      id:receipt.ref.id,expectedRevision:1,set:{label:'Outage'},unset:[]}},
+    {method:'POST',path,body:{operation:'delete',idempotencyKey:'outage-delete',
+      id:receipt.ref.id,expectedRevision:1}}
+  ];
+  await Promise.all(outageRequests.map(async({method,path:outagePath,body})=>{
+    const started=Date.now();
+    const response=await fetch(endpoint+outagePath,{method,signal:AbortSignal.timeout(8_000),
+      headers:{Authorization:`Bearer ${token}`,...(body===undefined?{}:{'Content-Type':'application/json'})},
+      body:body===undefined?undefined:JSON.stringify(body)});
+    const result=await response.json();
+    assert(Date.now()-started<8_000 && response.status===503 &&
+      result.error?.code==='PROVIDER_UNAVAILABLE' && result.error.retryable===true &&
+      response.headers.get('Retry-After')==='1' &&
+      !JSON.stringify(result).includes(token) && !JSON.stringify(result).includes(databaseUrl),
+    `bounded redacted provider failure for ${method} ${outagePath}`);
+  }));
+  const cliOutage=spawnSync(process.execPath,[cli,'records','create','--collection',collectionId,
+    '--idempotency-key','outage-cli','--data',JSON.stringify(data)],
+  {cwd:temp,env:cliEnv,encoding:'utf8'});
+  const cliOutageError=JSON.parse(cliOutage.stderr).error;
+  assert(cliOutage.status!==0 && cliOutageError.code==='PROVIDER_UNAVAILABLE' &&
+    cliOutageError.retryable===true &&
+    !`${cliOutage.stdout}${cliOutage.stderr}`.includes(token) &&
+    !`${cliOutage.stdout}${cliOutage.stderr}`.includes(databaseUrl),
+  'installed CLI returns a redacted provider failure without replaying its write');
+  await providerMode('forward');
+  assert(JSON.stringify(await effects())===JSON.stringify(beforeOutage),
+    'outage requests have no record, event or receipt effects');
+  assert((await request('GET',`v1/spaces/${spaceId}`)).spaceId===spaceId,
+    'the cached host pool recovers after the provider returns');
   // Report success after the disposable space and processes are gone.
 } catch(error) {
   testError=error;
 } finally {
+  await providerMode('forward');
   // This synthetic agent key has no provider backing; remove it before the
   // real space erasure flow asks the provider to revoke remaining keys.
   try {
@@ -364,8 +421,12 @@ try {
   app.kill('SIGTERM');
   await Promise.race([once(app,'close'),new Promise(resolve=>setTimeout(resolve,3000))]);
   if (app.exitCode===null) app.kill('SIGKILL');
+  provider.send('close');
+  await once(provider,'close');
   await rm(temp,{recursive:true,force:true});
 }
+if (testError && cleanupError) throw new AggregateError([testError,cleanupError],
+  'HTTP host smoke and cleanup both failed');
 if (cleanupError) throw cleanupError;
 if (testError) throw testError;
 console.log('Installed CLI and independent HTTP client reached the live /v1 host with matching state and receipt');

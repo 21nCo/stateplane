@@ -33,6 +33,15 @@ Errors have `contractVersion`, stable `error.code`, `message`, `retryable` and
 unacknowledged commit reports `COMMIT_OUTCOME_UNKNOWN`; writes retain an unknown
 result and require readback. GET and exact query/count operations can retry that
 response with `Retry-After` because repeating those reads is safe.
+The opt-in local/Preview HTTP host limits PostgreSQL connection acquisition and
+pool queue wait to five seconds, including when a provider accepts TCP but does
+not complete startup. A failed acquisition returns redacted `PROVIDER_UNAVAILABLE`
+with HTTP 503 and `Retry-After: 1`. Existing idle connections are removed when
+the provider closes them, and later requests can acquire new connections after
+recovery. `Retry-After` expresses when to try again; the CLI automatically
+retries only safe reads. For a write whose outcome is uncertain, use the
+original credential, canonical request and idempotency key for explicit receipt
+recovery. Do not submit a changed request or automatically repeat writes.
 CLI errors use the same fields on stderr; locally detected failures have a null
 request ID. Both clients percent-encode each path selector as one component,
 including `/` and `\\`. URL parsers remove dot-only path segments, so a selector

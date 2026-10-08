@@ -35,7 +35,14 @@ function host(env:Bindings):((request:Request)=>Promise<Response>) | undefined {
     env.STATEPLANE_TEST_CURSOR_SECRET,env.STATEPLANE_TEST_AGENT_TOKEN,
     env.STATEPLANE_TEST_AGENT_CREDENTIAL])).digest('hex');
   if (!env.AUTHORITY && cached?.key===key) return cached.handler;
-  const pool=new pg.Pool({connectionString,max:4});
+  // pg-pool applies this limit both to new connections and to clients queued
+  // behind the four active connections. Without it a provider outage can leave
+  // an authenticated HTTP request pending indefinitely.
+  const pool=new pg.Pool({connectionString,max:4,connectionTimeoutMillis:5_000});
+  // An idle connection can fail after a successful request when the provider
+  // goes away. The pool removes that client; consume the event without logging
+  // provider diagnostics or allowing an unhandled error to kill the host.
+  pool.on('error',()=>{});
   const tokenDigest=createHash('sha256').update(env.STATEPLANE_TEST_TOKEN).digest();
   const agentDigest=env.STATEPLANE_TEST_AGENT_TOKEN ?
     createHash('sha256').update(env.STATEPLANE_TEST_AGENT_TOKEN).digest() : null;
