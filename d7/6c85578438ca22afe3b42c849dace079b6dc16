@@ -1,0 +1,14 @@
+packages/api/src/http.ts
+  h_a39f9495f9ec1d 70,73-80,82,87-92
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d76c85578438ca22afe3b42c849dace079b6dc16",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
