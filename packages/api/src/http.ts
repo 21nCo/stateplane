@@ -67,23 +67,29 @@ function hostWriteTimeout(error:unknown):boolean {
   return error instanceof Error && (error.name==='HostProviderTimeoutError' ||
     error.message==='Query read timeout');
 }
-function errorResponse(error:unknown,requestId:string,request:Request):Response {
+function errorCode(error:unknown,read:boolean):string {
   const name=error instanceof Error ? error.name : '';
   const raw=(error as {code?:unknown})?.code;
-  let code:string;
-  if (name==='CommitOutcomeUnknownError') code='COMMIT_OUTCOME_UNKNOWN';
-  else if (typeof raw==='string' && Object.hasOwn(status,raw)) code=raw;
-  else if (error instanceof HttpFailure) code=error.code;
-  else if (raw==='57014' && safeRead(request)) code='RATE_LIMITED';
-  else if (raw==='57014') code='COMMIT_OUTCOME_UNKNOWN';
-  else if (!safeRead(request) && hostWriteTimeout(error)) code='COMMIT_OUTCOME_UNKNOWN';
-  else code='PROVIDER_UNAVAILABLE';
+  if (name==='CommitOutcomeUnknownError') return 'COMMIT_OUTCOME_UNKNOWN';
+  if (typeof raw==='string' && Object.hasOwn(status,raw)) return raw;
+  if (error instanceof HttpFailure) return error.code;
+  if (raw==='57014') return read?'RATE_LIMITED':'COMMIT_OUTCOME_UNKNOWN';
+  if (!read && hostWriteTimeout(error)) return 'COMMIT_OUTCOME_UNKNOWN';
+  return 'PROVIDER_UNAVAILABLE';
+}
+function errorRetryable(error:unknown,code:string,read:boolean):boolean {
   let canRetry=retryable.has(code);
-  if (code==='COMMIT_OUTCOME_UNKNOWN') canRetry=safeRead(request);
+  if (code==='COMMIT_OUTCOME_UNKNOWN') canRetry=read;
   if (error instanceof HttpFailure && error.retryableOverride!==undefined)
     canRetry=error.retryableOverride;
   else if (typeof (error as {retryable?:unknown})?.retryable==='boolean')
     canRetry=(error as {retryable:boolean}).retryable;
+  return canRetry;
+}
+function errorResponse(error:unknown,requestId:string,request:Request):Response {
+  const read=safeRead(request);
+  const code=errorCode(error,read);
+  const canRetry=errorRetryable(error,code,read);
   const response=json({contractVersion:'1',error:{code,message:code,retryable:canRetry,requestId}},status[code]??503);
   if (canRetry) response.headers.set('Retry-After','1');
   return response;
