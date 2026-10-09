@@ -449,10 +449,9 @@ try {
         headers:{Authorization:`Bearer ${token}`,...(body?{'Content-Type':'application/json'}:{})},
         body:body?JSON.stringify(body):undefined});
       const value=await response.json();
-      const code=method==='GET'?'RATE_LIMITED':'COMMIT_OUTCOME_UNKNOWN';
-      assert(response.status===(method==='GET'?429:503) && value.error?.code===code &&
-        value.error.retryable===(method==='GET') &&
-        response.headers.get('Retry-After')===(method==='GET'?'1':null),
+      const code='RATE_LIMITED';
+      assert(response.status===429 && value.error?.code===code &&
+        value.error.retryable===true && response.headers.get('Retry-After')==='1',
       'server cancellation wins over the socket timer for a locked request');
     }
     await assertLockedCancellation('GET',`v1/spaces/${spaceId}`);
@@ -460,11 +459,11 @@ try {
     const cliCancellation=spawnSync(process.execPath,[cli,'spaces','create','--space',cancelledCliSpace],
       {cwd:temp,env:cliEnv,encoding:'utf8',timeout:12_000});
     const cliError=JSON.parse(cliCancellation.stderr).error;
-    assert(cliCancellation.status===1 && cliError.code==='COMMIT_OUTCOME_UNKNOWN' &&
-      cliError.retryable===false &&
+    assert(cliCancellation.status===1 && cliError.code==='RATE_LIMITED' &&
+      cliError.retryable===true &&
       !`${cliCancellation.stdout}${cliCancellation.stderr}`.includes(token) &&
       !`${cliCancellation.stdout}${cliCancellation.stderr}`.includes(databaseUrl),
-    `installed CLI keeps a cancelled space publication nonretryable and redacted: ${JSON.stringify({status:cliCancellation.status,code:cliError.code,retryable:cliError.retryable})}`);
+    `installed CLI reports a proven pre-write cancellation without replay or disclosure: ${JSON.stringify({status:cliCancellation.status,code:cliError.code,retryable:cliError.retryable})}`);
   } finally {
     await blocker.query('ROLLBACK');
     blocker.release();

@@ -13,15 +13,17 @@ test('Linux observer accepts exit between liveness and procfs, but still sees a 
     const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
     await once(child,'spawn');
     try {
-      const live=await processState(child.pid,{readLinuxStat:async()=>{
+      const missingPs=()=>({error:Object.assign(new Error('procps unavailable'),{code:'ENOENT'}),
+        status:null,stdout:''});
+      await assert.rejects(processState(child.pid,{observeProcess:missingPs,readLinuxStat:async()=>{
         throw Object.assign(new Error('procfs entry vanished'),{code:'ESRCH'});
-      }});
-      assert.notEqual(live,'gone','a live child cannot pass an unavailable procfs sample');
+      }}),/OS process-state observer unavailable/,
+      'a live child cannot pass when both procfs and ps are unavailable');
       const stopped=await processState(child.pid,{readLinuxStat:async()=>{
         child.kill('SIGTERM');
         await once(child,'exit');
         throw Object.assign(new Error('procfs entry vanished'),{code:'ESRCH'});
-      }});
+      },observeProcess:missingPs});
       assert.equal(stopped,'gone');
     } finally { if (child.exitCode===null) child.kill('SIGKILL'); }
   });

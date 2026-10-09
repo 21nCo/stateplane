@@ -63,6 +63,10 @@ function safeRead(request:Request):boolean {
     return route!==null && isSafeHttpRead(request.method,route); }
   catch { return false; }
 }
+function hostWriteTimeout(error:unknown):boolean {
+  return error instanceof Error && (error.name==='HostProviderTimeoutError' ||
+    error.message==='Query read timeout');
+}
 function errorResponse(error:unknown,requestId:string,request:Request):Response {
   const name=error instanceof Error ? error.name : '';
   const raw=(error as {code?:unknown})?.code;
@@ -72,8 +76,7 @@ function errorResponse(error:unknown,requestId:string,request:Request):Response 
   else if (error instanceof HttpFailure) code=error.code;
   else if (raw==='57014' && safeRead(request)) code='RATE_LIMITED';
   else if (raw==='57014') code='COMMIT_OUTCOME_UNKNOWN';
-  else if (!safeRead(request) && (name==='HostProviderTimeoutError' ||
-    (error as Error)?.message==='Query read timeout')) code='COMMIT_OUTCOME_UNKNOWN';
+  else if (!safeRead(request) && hostWriteTimeout(error)) code='COMMIT_OUTCOME_UNKNOWN';
   else code='PROVIDER_UNAVAILABLE';
   let canRetry=retryable.has(code);
   if (code==='COMMIT_OUTCOME_UNKNOWN') canRetry=safeRead(request);

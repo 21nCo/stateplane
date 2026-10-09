@@ -1200,6 +1200,46 @@ test('unclassified PostgreSQL cancellation on a write remains outcome-unknown th
   assert.equal(writes,2,'the CLI sends no automatic replay');
 });
 
+test('selected space pre-read cancellation is retryable before any write through direct, HTTP and CLI',async t=>{
+  let reads=0;
+  let writes=0;
+  const control={
+    query:async()=>{
+      reads++;
+      throw Object.assign(new Error('private pre-read cancellation'),{code:'57014'});
+    },
+    connect:async()=>{writes++;throw new Error('pre-read must not reserve a space');}
+  };
+  const spaces=new PostgresSpaces(control,new Map([['cell-a',{pool:{},storageTargetId:'target-a'}]]),
+    'cell-a',{}, {current:async()=>true});
+  const selectedId=`sp_${randomUUID()}`;
+  const actor={kind:'session',credentialId:'session-1',userPrincipalId:'owner'};
+  await assert.rejects(spaces.create(actor,'cell-a',selectedId),
+    {code:'RATE_LIMITED',retryable:true});
+  const state=fixture();
+  state.services.spaces.create=(...args)=>spaces.create(...args);
+  const {server,endpoint}=await serve(createHttpHandler(state));
+  t.after(()=>server.close());
+  const response=await fetch(new URL('v1/spaces',endpoint),{
+    method:'POST',headers:{Authorization:'Bearer secret-test-token','Content-Type':'application/json'},
+    body:JSON.stringify({spaceId:selectedId})});
+  assert.equal(response.status,429);
+  assert.equal(response.headers.get('Retry-After'),'1');
+  assert.deepEqual((await response.json()).error.code,'RATE_LIMITED');
+  const root=await mkdtemp(join(tmpdir(),'stateplane-preread-space-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  assert.equal((await cliProcess(root,['config','endpoint','--url',endpoint])).status,0);
+  assert.equal((await cliProcess(root,['auth','login','--token-stdin','--store','file'],
+    'secret-test-token\n')).status,0);
+  const cli=await cliProcess(root,['spaces','create','--space',selectedId]);
+  assert.equal(cli.status,1);
+  assert.deepEqual({code:JSON.parse(cli.stderr).error.code,retryable:JSON.parse(cli.stderr).error.retryable},
+    {code:'RATE_LIMITED',retryable:true});
+  assert.doesNotMatch(cli.stdout+cli.stderr,/private pre-read cancellation|secret-test-token/);
+  assert.equal(reads,3);
+  assert.equal(writes,0,'no reservation or cell effect is attempted');
+});
+
 test('decoded read routes retain safe retry and normalized paths cannot carry credentials elsewhere',async()=>{
   const state=fixture();
   let readCalls=0,writeCalls=0;

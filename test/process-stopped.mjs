@@ -20,9 +20,9 @@ export function processIdentity(pid) {
   return `pid=${pid}; ps=${observed.stdout?.trim() || observed.error?.code || 'absent'}; observedAt=${new Date().toISOString()}`;
 }
 
-function linuxFallback(pid, error) {
+function linuxFallback(pid, error, observeProcess) {
   if ((error.code === 'ENOENT' || error.code === 'ESRCH') && !exists(pid)) return 'gone';
-  const observed = spawnSync('/bin/ps', ['-o', 'pid=,ppid=,pgid=,stat=,lstart=', '-p', String(pid)],
+  const observed = observeProcess('/bin/ps', ['-o', 'pid=,ppid=,pgid=,stat=,lstart=', '-p', String(pid)],
     { encoding: 'utf8', timeout: 1000, maxBuffer: 4096 });
   const detail = observed.error?.code ?? observed.stdout?.trim() ?? 'empty';
   const psState = new RegExp(String.raw`^${pid}\s+\d+\s+\d+\s+([A-Z])`).exec(detail)?.[1];
@@ -36,13 +36,13 @@ function linuxFallback(pid, error) {
 }
 
 /** Observe execution with a trusted OS source; an unreaped zombie is stopped. */
-export async function processState(pid, { readLinuxStat = readFile } = {}) {
+export async function processState(pid, { readLinuxStat = readFile, observeProcess = spawnSync } = {}) {
   if (!exists(pid)) return 'gone';
   if (process.platform === 'linux') {
     try {
       const stat = await readLinuxStat(`/proc/${pid}/stat`, 'utf8');
       return stat.slice(stat.lastIndexOf(')') + 2, stat.lastIndexOf(')') + 3);
-    } catch (error) { return linuxFallback(pid, error); }
+    } catch (error) { return linuxFallback(pid, error, observeProcess); }
   }
   const observed = spawnSync('/bin/ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' });
   if (observed.error) throw new Error('OS process-state observer unavailable', { cause: observed.error });

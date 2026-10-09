@@ -51,8 +51,14 @@ does a space creation after a separate cell commit when directory publication
 fails. Recover with the original credential and operation identity before any
 new write.
 Direct callers that let the service generate a space ID must inspect their
-owner space listing after an unknown result; HTTP and CLI create require a
-client-selected ID so the original request can be reconciled by that ID.
+owner space listing after an unknown result. A provisioning reservation is
+omitted while its 60-second lease is live, so an immediate empty listing does
+not prove that creation failed. With the original credential, wait until the
+lease has expired, then traverse every owner-list page so pending rows can be
+reconciled and a committed space becomes visible. If the complete delayed
+listing still does not establish the outcome, leave it unknown and investigate
+the directory and cell before making a new create. HTTP and CLI create require
+a client-selected ID so the original request can be reconciled by that ID.
 Timed-out sockets are discarded, and later requests can acquire new connections
 after recovery. The CLI automatically retries only safe reads. For a write whose
 outcome is uncertain, use the original credential, canonical request and

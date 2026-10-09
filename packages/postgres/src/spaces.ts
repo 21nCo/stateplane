@@ -403,9 +403,17 @@ export class PostgresSpaces {
     return resumed;
   }
   private async recoverSelectedCreate(actor:VerifiedCredential,spaceId:string,cellId:string,
-    cell:CellDatabase,selected:boolean,resume=false):Promise<SpaceInfo|null> {
+    cell:CellDatabase,selected:boolean,resume=false,prewrite=false):Promise<SpaceInfo|null> {
     if (!selected) return null;
-    const existing=(await this.control.query('SELECT * FROM space_directory WHERE space_id=$1',[spaceId])).rows[0];
+    let existing;
+    try { existing=(await this.control.query('SELECT * FROM space_directory WHERE space_id=$1',[spaceId])).rows[0]; }
+    catch (error) {
+      // Only the initial lookup is known to precede every create effect. A
+      // recovery lookup can follow a committed cell or directory reservation.
+      if (prewrite && (error as {code?:unknown})?.code==='57014')
+        throw new AuthorityError('RATE_LIMITED','Database statement time limit exceeded',undefined,true);
+      throw error;
+    }
     if (!existing) return null;
     if (existing.owner_principal_id!==owner(actor) || existing.cell_id!==cellId ||
         existing.storage_target_id!==cell.storageTargetId) throw new AuthorityError('UNIQUE_CONFLICT');
@@ -462,7 +470,7 @@ export class PostgresSpaces {
       throw new AuthorityError('INVALID_ARGUMENT');
     const spaceId = requestedSpaceId ?? `sp_${randomUUID()}`;
     await this.current(actor);
-    const previous=await this.recoverSelectedCreate(actor,spaceId,cellId,cell,requestedSpaceId!==undefined,true);
+    const previous=await this.recoverSelectedCreate(actor,spaceId,cellId,cell,requestedSpaceId!==undefined,true,true);
     if (previous) return previous;
     let publicationAttempted = false;
     try {
