@@ -1,0 +1,26 @@
+docs/http-cli.md
+  h_a39f9495f9ec1d 54-61
+packages/api/src/http.ts
+  h_a39f9495f9ec1d 66-69,79
+packages/postgres/src/spaces.ts
+  h_a39f9495f9ec1d 406,408-416,473
+scripts/test-http-host.mjs
+  h_a39f9495f9ec1d 452-454,462-463,466
+test/bounded-command.test.js
+  h_a39f9495f9ec1d 16-18,20-21,26
+test/http-cli.test.js
+  h_a39f9495f9ec1d 1203-1242
+test/process-stopped.mjs
+  h_a39f9495f9ec1d 23,25,39,45
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a15fa7e2e61efd9d9f3c48c60609fe76778b3ec0",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
