@@ -1,0 +1,27 @@
+docs/mcp.md
+  s_1900bb15a7199a::t_7bd2b9d1194873 220,259-261
+scripts/mcp-acceptance-hosts.mjs
+  s_1900bb15a7199a::t_da7f4e4ba11ff7 7,9,109-112,115-117,120-133
+scripts/test-mcp-clients.mjs
+  s_1900bb15a7199a::t_ca7c864ffca9b5 16,20,179
+scripts/test-mcp-conformance.mjs
+  s_1900bb15a7199a::t_b9f29f1cbc12f9 16,30,99
+test/mcp-acceptance-cleanup.test.js
+  s_1900bb15a7199a::t_1ab0ea34b47691 6,9,28-69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c8f1e788dcffbbabef601ac570e38fae49a230c9",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
