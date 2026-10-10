@@ -17,7 +17,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { stateplaneMcpDeclaration } from '../packages/mcp/dist/index.js';
-import { gateMode, runGate, selectBackend, startLineProcess } from './mcp-acceptance-hosts.mjs';
+import { gateMode, loopbackForwarder, runGate, selectBackend, startLineProcess } from './mcp-acceptance-hosts.mjs';
 
 const root=resolve(import.meta.dirname,'..');
 const pythonSdk='mcp==2.3.0';
@@ -83,8 +83,12 @@ async function pythonClient(endpoint,token,label,cleanup) {
 async function scenario(backend,cleanup) {
   const spaceId=await backend.createSpace();
   const collectionId='entries';
-  // Both clients are closed by the gate's cleanup, before the space is erased.
-  const owner=await typeScriptClient(backend.endpoint,backend.ownerToken,'ts-owner',cleanup);
+  // Both clients reach the endpoint through one loopback forwarder, which
+  // observes response statuses and injects one lost response after commit.
+  const gate=await loopbackForwarder(backend.endpoint,{cleanup});
+  evidence.transport='loopback forwarder; one injected lost response';
+  // Both clients are closed by the gate's cleanup, before the forwarder and the space.
+  const owner=await typeScriptClient(gate.url,backend.ownerToken,'ts-owner',cleanup);
   const expected=stateplaneMcpDeclaration().manifest().tools.map(tool=>tool.name).sort();
   const call=async(client,tool,input)=>{
     const result=await client.call(tool,input);
@@ -107,7 +111,7 @@ async function scenario(backend,cleanup) {
       state:{type:'string',enum:['open','closed']},score:{type:'number'}},required:['label'],additionalProperties:false},
     unique:[{name:'by_label',paths:['label']}],filterable:['state'],sortable:[]}});
   const grant=await backend.grantAgent(spaceId,collectionId,['records:read','records:write','events:read']);
-  const agent=await pythonClient(backend.endpoint,grant.token,'py-agent',cleanup);
+  const agent=await pythonClient(gate.url,grant.token,'py-agent',cleanup);
   evidence.toolLists={[owner.label]:await owner.list(),[agent.label]:await agent.list()};
   assert(JSON.stringify(evidence.toolLists[owner.label])===JSON.stringify(expected),'TypeScript client sees the fixed registry');
   assert(JSON.stringify(evidence.toolLists[agent.label])===JSON.stringify(expected),'Python client sees the same fixed registry');
@@ -119,11 +123,18 @@ async function scenario(backend,cleanup) {
   assert(seen.revision===1 && (seen.ref?.id??seen.id)===id1,'owner reads the agent record at revision 1');
   const byKey=await value(owner,'records_get_by_key',{...s,mode:'external',key:'item-1'});
   assert((byKey.ref?.id??byKey.id)===id1,'normalized external key resolves the same record');
-  const second=await value(owner,'records_create',{...s,externalKey:'item-2',idempotencyKey:'owner-create-2',data:{label:'Item 2',state:'open'}});
-  const id2=second.ref.id;
+  // Lost response: the create commits, the forwarder drops its answer, the
+  // other client sees the record, and the identical request recovers the receipt.
+  const createSecond={...s,externalKey:'item-2',idempotencyKey:'owner-create-2',data:{label:'Item 2',state:'open'}};
+  gate.dropNextResponse(message=>message?.params?.name==='records_create' && message.params.arguments?.idempotencyKey==='owner-create-2');
+  const lost=await call(owner,'records_create',createSecond);
+  assert(lost.transportError,'the owner observes the lost response as a transport failure');
   const page=await value(agent,'records_query',{...s,predicates:[],limit:10});
+  const id2=page.records[1]?.ref?.id??page.records[1]?.id;
   assert(JSON.stringify(page.records.map(record=>[record.ref?.id??record.id,record.revision]))===JSON.stringify([[id1,1],[id2,1]]),
-    'both clients observe the same IDs and revisions');
+    'the unanswered create committed, and both clients observe the same IDs and revisions');
+  const recovered=await value(owner,'records_create',createSecond);
+  assert(recovered.replayed===true && recovered.ref.id===id2 && recovered.revision===1,'the identical request recovers the lost receipt');
   const replaced=await value(owner,'records_replace',{...s,id:id1,expectedRevision:1,idempotencyKey:'owner-replace-1',
     data:{label:'Item 1',state:'closed'}});
   assert(replaced.revision===2,'replace advances the revision');
@@ -134,9 +145,9 @@ async function scenario(backend,cleanup) {
   assert(patched.revision===3,'patch at the current revision succeeds');
   await code(owner,'records_create',{...s,externalKey:'item-1',idempotencyKey:'owner-dup-key',data:{label:'Other'}},'KEY_RESERVED');
   await code(owner,'records_create',{...s,externalKey:'item-3',idempotencyKey:'owner-dup-unique',data:{label:'Item 2'}},'UNIQUE_CONFLICT');
-  // A lost response is recovered by the identical request and key on the same credential.
+  // A duplicate delivery of the identical request and key replays on the same credential.
   const replay=await value(agent,'records_create',create);
-  assert(replay.replayed===true && replay.receiptId===first.receiptId && replay.revision===1,'lost-response replay returns the original receipt');
+  assert(replay.replayed===true && replay.receiptId===first.receiptId && replay.revision===1,'a duplicate delivery returns the original receipt');
   await code(agent,'records_create',{...create,data:{label:'Changed'}},'IDEMPOTENCY_MISMATCH');
   await code(owner,'records_create',create,'KEY_RESERVED');
   assert(await backend.backfill(spaceId,collectionId,'state'),'filter index is ready');
@@ -152,9 +163,15 @@ async function scenario(backend,cleanup) {
   assert(events.events.length===5,'five committed changes are visible in the event feed');
   await grant.revoke();
   step('owner','revoke agent credential',{ok:true});
+  const observedBefore=gate.observed.length;
   const denied=await call(agent,'records_count',{...s,predicates:[]});
-  assert(backend.denial==='transport' ? !!denied.transportError : denied.structuredContent?.error?.code==='NOT_FOUND',
-    'the revoked credential is denied');
+  if (backend.denial==='transport') {
+    // AuthFn rejects the revoked key at the transport: 401 with the resource challenge.
+    const challenge=gate.observed.slice(observedBefore).find(item=>item.status===401);
+    assert(denied.transportError && /^Bearer resource_metadata="/.test(challenge?.wwwAuthenticate??''),
+      `the revoked credential is denied with a 401 challenge, got ${JSON.stringify(gate.observed.slice(observedBefore))}`);
+    step('py-agent','revoked transport status',{status:challenge.status,challenge:'Bearer resource_metadata'});
+  } else assert(denied.structuredContent?.error?.code==='NOT_FOUND','the revoked cell credential is denied');
   const after=await value(owner,'records_count',{...s,predicates:[]});
   assert(after.count===1,'the owner continues after revocation');
 }

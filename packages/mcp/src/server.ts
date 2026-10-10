@@ -249,9 +249,13 @@ export function createMcpEndpoint(options: McpEndpointOptions): McpEndpoint {
       resource,
       provider: {
         async authenticateBearer(token: string, request: Request) {
-          // Only the exact Bearer value reaches AuthFn; cookies never authenticate MCP.
+          // AuthFn sees the request's own headers and abort signal, as over HTTP,
+          // with the exact Bearer value. Cookies never authenticate MCP.
+          const headers = new Headers(request.headers);
+          headers.delete('cookie');
+          headers.set('authorization', `Bearer ${token}`);
           const credential = credentialOf(await scope.identity.verify(new Request(request.url,
-            { method: 'POST', headers: { authorization: `Bearer ${token}` } })));
+            { method: request.method, headers, signal: request.signal })));
           if (!credential) return null;
           return { id: credential.credentialId, type: credential.kind,
             subject: { actorId: credential.kind === 'session' ? credential.userPrincipalId : credential.credentialId,

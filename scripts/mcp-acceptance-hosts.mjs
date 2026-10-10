@@ -117,6 +117,48 @@ export async function runGate(record,body) {
   return failure;
 }
 
+const requestHop=new Set(['host','connection','keep-alive','content-length','transfer-encoding','accept-encoding']);
+// fetch has already decoded the body, so its encoding and framing headers no longer apply.
+const responseHop=new Set(['connection','keep-alive','content-length','transfer-encoding','content-encoding']);
+const parsed=body=>{ try { return JSON.parse(body); } catch { return null; } };
+
+/** A loopback forwarder for one fixed upstream path. Only this forwarder's own
+ * origin stands for the upstream origin; any other Origin passes through for
+ * the upstream to judge. It records each upstream status and can drop the
+ * next matching response after the upstream answered: a real lost response. */
+export async function loopbackForwarder(endpoint,{cleanup,timeoutMs=30_000}={}) {
+  const upstream=new URL(endpoint);
+  const observed=[];
+  let own;
+  let drop=null;
+  const server=createServer(async(req,res)=>{
+    // An upstream failure is a 502, never an unhandled rejection that skips cleanup.
+    try {
+      if (new URL(req.url,'http://127.0.0.1').pathname!==upstream.pathname) { res.writeHead(404).end(); return; }
+      const chunks=[];for await(const chunk of req) chunks.push(chunk);
+      const body=chunks.length?Buffer.concat(chunks):undefined;
+      const headers=Object.fromEntries(Object.entries(req.headers).filter(([name])=>!requestHop.has(name)));
+      if (headers.origin===own) headers.origin=upstream.origin;
+      const response=await fetch(upstream,{method:req.method,headers,body,redirect:'manual',signal:AbortSignal.timeout(timeoutMs)});
+      const payload=Buffer.from(await response.arrayBuffer());
+      observed.push({status:response.status,wwwAuthenticate:response.headers.get('www-authenticate')});
+      if (drop?.(parsed(body?.toString('utf8')))) { drop=null; res.destroy(); return; }
+      res.writeHead(response.status,Object.fromEntries([...response.headers].filter(([name])=>!responseHop.has(name))));
+      res.end(payload);
+    } catch {
+      if (!res.headersSent) res.writeHead(502);
+      res.end();
+    }
+  });
+  server.listen(0,'127.0.0.1'); await once(server,'listening');
+  own=`http://127.0.0.1:${server.address().port}`;
+  const close=()=>new Promise(resolve=>{ server.closeAllConnections(); server.close(()=>resolve()); });
+  cleanup?.add(close);
+  return {url:`${own}${upstream.pathname}`,observed,close,
+    /** Drop the response to the next request whose JSON-RPC message matches. */
+    dropNextResponse(match) { drop=match; }};
+}
+
 const modes={'node-in-process':'in-process-authfn','node-vite':'local-app-host',workerd:'local-workerd-host',external:'external-host'};
 /** The evidence mode is the backend that ran, never the environment requested. */
 export function gateMode(endpointInfo) { return modes[endpointInfo.runtime]; }
@@ -148,19 +190,27 @@ export async function inProcessBackend({cleanup}) {
   const spaces=new PostgresSpaces(pool,cells,'cell-a',new AuthFnAgentKeys(config),identity,randomBytes(32));
   const services=postgresServices(spaces,new Map([['cell-a',{pool,cursorSecret:randomBytes(32)}]]),3600);
   const holder={};
+  // Only the fixed MCP and metadata routes reach the handler, at fixed loopback URLs.
+  const routes=new Map();
   const server=createServer(async(req,res)=>{
     // An aborted request is a 500, never an unhandled rejection that skips cleanup.
     try {
+      const target=routes.get(new URL(req.url,'http://127.0.0.1').pathname);
+      if (!target) { res.writeHead(404).end(); return; }
       const chunks=[];for await(const chunk of req) chunks.push(chunk);
-      const response=await holder.handler(new Request(`http://127.0.0.1:${server.address().port}${req.url}`,{
+      const response=await holder.handler(new Request(target,{
         method:req.method,headers:req.headers,body:chunks.length?Buffer.concat(chunks):undefined}));
       res.writeHead(response.status,Object.fromEntries(response.headers));
       res.end(Buffer.from(await response.arrayBuffer()));
-    } catch { if (!res.headersSent) res.writeHead(500); res.end(); }
+    } catch {
+      if (!res.headersSent) res.writeHead(500);
+      res.end();
+    }
   });
   server.listen(0,'127.0.0.1'); await once(server,'listening');
   cleanup.add(()=>new Promise(resolve=>{ server.closeAllConnections(); server.close(()=>resolve()); }));
   const endpoint=`http://127.0.0.1:${server.address().port}/mcp`;
+  for (const path of ['/mcp','/.well-known/oauth-protected-resource/mcp']) routes.set(path,new URL(path,endpoint).href);
   holder.handler=createMcpHandler({services,identity,resource:endpoint,authorizationServers:['http://127.0.0.1:9/'],
     allowInsecureLoopback:true,requestTimeoutMs:12_000});
   const user=await createUser(config,{primaryEmail:`owner-${randomUUID()}@example.invalid`});
@@ -184,8 +234,10 @@ export async function inProcessBackend({cleanup}) {
 }
 
 /** The app's opt-in host with its fixture identity: an external endpoint, or a
- * local vite (Node) or wrangler (workerd) run. */
-export async function hostBackend({workerd=false,cleanup}) {
+ * local vite (Node) or wrangler (workerd) run. Every request to the host and
+ * every fixture query has a deadline, so a stalled host cannot hold cleanup. */
+export async function hostBackend({workerd=false,cleanup,httpTimeoutMs=30_000}) {
+  const deadline=()=>AbortSignal.timeout(httpTimeoutMs);
   const external=process.env.STATEPLANE_MCP_ENDPOINT;
   const databaseUrl=external ? process.env.DATABASE_URL : await loopbackUrl();
   assert(databaseUrl,'DATABASE_URL is required for fixture grants');
@@ -226,21 +278,21 @@ export async function hostBackend({workerd=false,cleanup}) {
     let ready=false;
     for (let attempt=0;attempt<600 && !ready;attempt++) {
       if (app.exitCode!==null) throw new Error('app host exited before readiness');
-      try { ready=(await fetch(new URL('/api/health',endpoint))).ok; } catch { /* still starting */ }
+      try { ready=(await fetch(new URL('/api/health',endpoint),{signal:AbortSignal.timeout(2_000)})).ok; } catch { /* still starting */ }
       if (!ready) await Promise.race([new Promise(resolve=>setTimeout(resolve,100)),started.failed]); // NOSONAR -- readiness polling is sequential
     }
     assert(ready,'app host did not become ready');
   }
   // The advertised resource must be this endpoint; a Preview pins it with STATEPLANE_MCP_RESOURCE.
   const origin=new URL(endpoint);
-  const metadata=await fetch(new URL(`/.well-known/oauth-protected-resource${origin.pathname}`,endpoint));
+  const metadata=await fetch(new URL(`/.well-known/oauth-protected-resource${origin.pathname}`,endpoint),{signal:deadline()});
   assert(metadata.ok,`protected resource metadata returned ${metadata.status}; is STATEPLANE_MCP_RESOURCE set?`);
   const advertised=(await metadata.json()).resource;
   assert(new URL(advertised).href===origin.href,`the endpoint advertises resource ${advertised}, not ${origin.href}`);
-  const pool=new pg.Pool({...connectionOptions(databaseUrl),max:2});
+  const pool=new pg.Pool({...connectionOptions(databaseUrl),max:2,connectionTimeoutMillis:httpTimeoutMs,query_timeout:httpTimeoutMs});
   cleanup.add(()=>pool.end());
   const http=async(method,path,body)=>{
-    const response=await fetch(new URL(`/v1/${path}`,endpoint),{method,headers:{authorization:`Bearer ${env.STATEPLANE_TEST_TOKEN}`,
+    const response=await fetch(new URL(`/v1/${path}`,endpoint),{method,signal:deadline(),headers:{authorization:`Bearer ${env.STATEPLANE_TEST_TOKEN}`,
       ...(body?{'content-type':'application/json'}:{})},body:body?JSON.stringify(body):undefined});
     assert(response.ok,`HTTP ${method} ${path} failed with ${response.status}`);
     return response.json();
@@ -257,8 +309,10 @@ export async function hostBackend({workerd=false,cleanup}) {
       (SELECT count(*)::int FROM space_directory WHERE space_id=$1 AND lifecycle<>'deleted') AS n`,[spaceId])).rows[0].n;
     assert(left===0,'the disposable space is erased');
   }));
+  let runtime='external';
+  if (!external) runtime=workerd?'workerd':'node-vite';
   return {endpoint,ownerToken:env.STATEPLANE_TEST_TOKEN,denial:'service',
-    endpointInfo:{origin:external?origin.origin:'loopback',path:origin.pathname,runtime:external?'external':workerd?'workerd':'node-vite'},
+    endpointInfo:{origin:external?origin.origin:'loopback',path:origin.pathname,runtime},
     async createSpace() { const spaceId=`sp_${randomUUID()}`; spaceIds.push(spaceId); await http('POST','spaces',{spaceId}); return spaceId; },
     async grantAgent(spaceId,collectionId,capabilities) {
       // The fixture host authenticates one configured agent bearer; its cell

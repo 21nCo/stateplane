@@ -4,11 +4,13 @@ import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import YAML from 'yaml';
+import Ajv2020 from 'ajv/dist/2020.js';
 import { McpFnTestClient, authenticatedHttpTarget, assertManifestContract, checkHostCompatibility,
   MCPFN_HOST_PROFILES } from '@mcpfn/testing';
 import { assertAuthRegressionSuite, createFetchAuthTarget, bearerCredential } from '@mcpfn/testing/auth';
 import { diffManifests } from '@mcpfn/core';
 import { createHttpHandler } from '../packages/api/dist/index.js';
+import { TransportFailure } from '../packages/application/dist/index.js';
 import { createMcpEndpoint, createMcpHandler, stateplaneMcpDeclaration, serializeJson, tools, guidance, guidanceUri,
   instructions, maxRequestBytes } from '../packages/mcp/dist/index.js';
 
@@ -233,6 +235,81 @@ test('tool errors keep the HTTP code and retryability without provider details',
   state.fail(null);
   const missing=await mcp.callTool('records_get',{...s,id:'missing'});
   assert.equal(missing.structuredContent.error.code,'NOT_FOUND');
+});
+
+test('no retryable override makes a write with an unknown outcome retryable',async t=>{
+  const state=fixture();
+  const {server,url}=await mcpServer(state);
+  const http=createHttpHandler(state);
+  t.after(()=>server.close());
+  const mcp=await client(url,'owner-token');
+  t.after(()=>mcp.close());
+  const s={spaceId:'sp_a',collectionId:'entries'};
+  const errors=[new TransportFailure('COMMIT_OUTCOME_UNKNOWN',true),
+    Object.assign(new Error('x'),{code:'COMMIT_OUTCOME_UNKNOWN',retryable:true})];
+  for (const error of errors) {
+    state.fail(error);
+    const write=await http(new Request('https://h.invalid/v1/spaces/sp_a/collections/entries/records',{method:'POST',
+      headers:{authorization:'Bearer owner-token','content-type':'application/json'},
+      body:JSON.stringify({operation:'create',idempotencyKey:'k',data:{}})}));
+    assert.deepEqual((await write.json()).error.retryable,false,'HTTP write');
+    const viaMcp=(await mcp.callTool('records_create',{...s,idempotencyKey:'k',data:{}})).structuredContent.error;
+    assert.deepEqual([viaMcp.code,viaMcp.retryable],['COMMIT_OUTCOME_UNKNOWN',false],'MCP write');
+    const read=(await mcp.callTool('records_get',{...s,id:'r'})).structuredContent.error;
+    assert.deepEqual([read.code,read.retryable],['COMMIT_OUTCOME_UNKNOWN',true],'a read stays retryable');
+  }
+});
+
+/** The published schema with its x- extensions applied as a client must. */
+function publishedValidator(schema) {
+  const ajv=new Ajv2020({strict:false,allErrors:true});
+  ajv.addKeyword({keyword:'x-utf8MaxBytes',type:'string',validate:(limit,value)=>Buffer.byteLength(value)<=limit});
+  ajv.addKeyword({keyword:'x-utf16MaxLength',type:'string',validate:(limit,value)=>value.length<=limit});
+  return ajv.compile(schema);
+}
+
+test('a published selector accepts exactly the values the handler accepts',async t=>{
+  const state=fixture();
+  const {server,url}=await mcpServer(state);
+  t.after(()=>server.close());
+  const mcp=await client(url,'owner-token');
+  t.after(()=>mcp.close());
+  const valid=publishedValidator(stateplaneMcpDeclaration().manifest().tools.find(tool=>tool.name==='records_get').inputSchema);
+  // 300 astral characters are 300 code points (within maxLength) but 600 UTF-16 units.
+  for (const id of ['a'.repeat(512),'a'.repeat(513),'\u{1F600}'.repeat(256),'\u{1F600}'.repeat(300),'a\0b']) {
+    const args={spaceId:'sp_a',collectionId:'entries',id};
+    const result=await mcp.callTool('records_get',args);
+    assert.equal(valid(args),result.structuredContent.error?.code!=='INVALID_ARGUMENT',`${id.length} UTF-16 units`);
+  }
+});
+
+test('bearer verification sees the request headers and signal, never a cookie',async()=>{
+  const state=fixture();
+  const seen=[];
+  const verify=state.identity.verify;
+  state.identity.verify=async request=>{ seen.push(request); return verify(request); };
+  const handler=createMcpHandler({services:state.services,identity:state.identity,resource:'https://stateplane.example/mcp',
+    authorizationServers:['https://auth.example']});
+  const controller=new AbortController();
+  const response=await handler(new Request('https://stateplane.example/mcp',{method:'POST',signal:controller.signal,
+    body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'spaces_list',arguments:{}}}),
+    headers:{'content-type':'application/json',accept:'application/json, text/event-stream',authorization:'bearer owner-token',
+      'mcp-protocol-version':'2025-06-18','user-agent':'probe/1','x-forwarded-for':'203.0.113.7',cookie:'authfn_session=owner-token'}}));
+  assert.equal(response.status,200);
+  assert.equal(seen.length,1);
+  const [request]=seen;
+  assert.equal(request.headers.get('authorization'),'Bearer owner-token');
+  assert.equal(request.headers.get('user-agent'),'probe/1');
+  assert.equal(request.headers.get('x-forwarded-for'),'203.0.113.7');
+  assert.equal(request.headers.get('cookie'),null,'cookies never reach the verifier');
+  assert.equal(request.signal.aborted,false);
+  controller.abort();
+  assert.equal(request.signal.aborted,true,'the verifier observes the request signal');
+  seen.length=0;
+  const cookieOnly=await handler(new Request('https://stateplane.example/mcp',{method:'POST',body:'{}',
+    headers:{'content-type':'application/json',accept:'application/json, text/event-stream',cookie:'authfn_session=owner-token'}}));
+  assert.equal(cookieOnly.status,401);
+  assert.deepEqual(seen,[],'a cookie-only request never authenticates');
 });
 
 test('authorization precedes argument shape, and selectors are validated locally',async t=>{

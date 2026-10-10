@@ -5,13 +5,14 @@ import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { randomBytes, randomUUID } from 'node:crypto';
 import pg from 'pg';
+import Ajv2020 from 'ajv/dist/2020.js';
 import { memoryAdapter } from '@superfunctions/db/testing';
 import { createAuthFn, createUser, issueSession } from '@authfn/core';
 import { McpFnTestClient, authenticatedHttpTarget } from '@mcpfn/testing';
 import { AuthFnIdentityVerifier, AuthFnAgentKeys } from '../../packages/auth/dist/index.js';
 import { CollectionRegistry, PostgresSpaces, postgresServices } from '../../packages/postgres/dist/index.js';
 import { createHttpHandler } from '../../packages/api/dist/index.js';
-import { createMcpHandler } from '../../packages/mcp/dist/index.js';
+import { createMcpHandler, stateplaneMcpDeclaration } from '../../packages/mcp/dist/index.js';
 
 const password=process.env.DATABASE_URL?null:(await readFile(new URL('../../.data/local-db-password',import.meta.url),'utf8')).trim();
 const url=process.env.DATABASE_URL??`postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT??'55432'}/stateplane`;
@@ -207,4 +208,48 @@ test('a cell-revoked key whose provider still authenticates is denied by the sha
   await pool.query('UPDATE space_credentials SET revoked_at=clock_timestamp() WHERE space_id=$1 AND credential_id=$2',[spaceId,key.id]);
   assert.equal(await failed(agentClient,'records_count',{spaceId,collectionId:'entries',predicates:[]}),'NOT_FOUND');
   assert.equal(await failed(agentClient,'collections_list',{spaceId}),'NOT_FOUND');
+});
+
+/** The published schema with its x- extensions applied as a client must. */
+function publishedValidator(name) {
+  const ajv=new Ajv2020({strict:false,allErrors:true});
+  ajv.addKeyword({keyword:'x-utf8MaxBytes',type:'string',validate:(limit,value)=>Buffer.byteLength(value)<=limit});
+  ajv.addKeyword({keyword:'x-utf16MaxLength',type:'string',validate:(limit,value)=>value.length<=limit});
+  return ajv.compile(stateplaneMcpDeclaration().manifest().tools.find(tool=>tool.name===name).inputSchema);
+}
+
+test('published key and definition limits accept exactly what the authority accepts',async t=>{
+  const user=await createUser(config,{primaryEmail:`owner-${randomUUID()}@example.invalid`});
+  const session=await issueSession(config,{},{userId:user.id,methods:['password']});
+  const owner=await identity.verify(new Request('https://h.invalid',{headers:{authorization:`Bearer ${session.sessionToken}`}}));
+  const spaceId=`sp_${randomUUID()}`;
+  await spaces.create(owner,'cell-a',spaceId);
+  t.after(async()=>{ await spaces.archive(owner,spaceId); await spaces.delete(owner,spaceId); });
+  const {server,endpoint}=await host();
+  t.after(()=>server.close());
+  const client=await connect(endpoint,session.sessionToken,'owner-client');
+  t.after(()=>client.close());
+  const collectionId='entries';
+  const schema={$schema:'https://json-schema.org/draft/2020-12/schema',type:'object',properties:{label:{type:'string'}},
+    required:['label'],additionalProperties:false};
+  const accepted=async(tool,args)=>{
+    const result=await call(client,tool,args);
+    return !['INVALID_ARGUMENT','SCHEMA_INVALID','SCHEMA_UNSUPPORTED'].includes(result.structuredContent.error?.code);
+  };
+  const cases=[
+    ['collections_define',{spaceId,collectionId:'empty',definition:{slug:'empty',version:1,schema:{},unique:[],filterable:[],sortable:[]}}],
+    ['collections_define',{spaceId,collectionId,definition:{slug:collectionId,version:1,schema,unique:[],filterable:[],sortable:[]}}],
+    // 64 four-byte characters are 256 UTF-8 bytes; 65 are 260 bytes but only 65 code points.
+    ['records_create',{spaceId,collectionId,idempotencyKey:'\u{1F600}'.repeat(64),data:{label:'a'}}],
+    ['records_create',{spaceId,collectionId,idempotencyKey:'\u{1F600}'.repeat(65),data:{label:'b'}}],
+    ['batches_status',{spaceId,collectionId,operationKey:'\u{1F600}'.repeat(65)}],
+    ['batches_ingest',{spaceId,collectionId,operationKey:'\u{1F600}'.repeat(64),items:[JSON.stringify({operation:'create',data:{label:'c'}})]}],
+    ['batches_ingest',{spaceId,collectionId,operationKey:'\u{1F600}'.repeat(65),items:[JSON.stringify({operation:'create',data:{label:'d'}})]}]
+  ];
+  for (const [tool,args] of cases) {
+    const valid=publishedValidator(tool)(args);
+    assert.equal(await accepted(tool,args),valid,`${tool} ${JSON.stringify(args).slice(0,120)}`);
+  }
+  assert.deepEqual(cases.map(([tool,args])=>publishedValidator(tool)(args)),[false,true,true,false,false,true,false],
+    'each boundary is exercised on both sides');
 });

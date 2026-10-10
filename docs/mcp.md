@@ -19,8 +19,13 @@ fixed tools and one guidance resource. Defining a collection inserts registry
 data; it never adds a tool. Every credential sees the same list, and access is
 decided per call by the shared services. The public manifest is committed in
 [contracts/mcp-manifest.json](../contracts/mcp-manifest.json); review a change
-with `node scripts/mcp-manifest.mjs` and record it with `--write`. The contract
-test rejects an unreviewed manifest change.
+with `node scripts/mcp-manifest.mjs`, which builds `@stateplane/mcp` from the
+current source first, and record it with `--write`. The contract test rejects
+an unreviewed manifest change. JSON Schema `maxLength` counts code points, so a
+limit it cannot express is published as an extension that clients must enforce,
+as in the OpenAPI contract: `x-utf8MaxBytes` (256 for `idempotencyKey`,
+`externalKey` and `operationKey`) and `x-utf16MaxLength` (512 for selectors).
+`definition.schema` publishes the closed root that the authority requires.
 
 | Tool | Service | Annotations |
 | --- | --- | --- |
@@ -52,7 +57,8 @@ the JSON an HTTP client receives, in `structuredContent` and as JSON text;
 - Selectors (`spaceId`, `collectionId`, record `id` for reads, `key`,
   `operationKey`) follow the HTTP path-segment rules: a nonempty string of at
   most 512 UTF-16 code units without NUL. A missing or invalid selector returns
-  `INVALID_ARGUMENT` before any service call.
+  `INVALID_ARGUMENT` before any service call. The authority further limits
+  `operationKey` to 256 UTF-8 bytes of Unicode scalars.
 - Record mutations and `records_query` forward every argument except the two
   scope selectors into the serialized authority request, exactly like an HTTP
   body. The authority therefore authorizes the requested collection before it
@@ -99,8 +105,9 @@ The endpoint is an OAuth 2.0 protected resource implemented with
 `@mcpfn/auth`. `GET /.well-known/oauth-protected-resource/mcp` publishes the
 resource and its configured AuthFn authorization servers. Requests without a
 valid `Authorization: Bearer` credential receive `401` with a
-`WWW-Authenticate: Bearer resource_metadata=...` challenge. Only the exact
-bearer reaches `IdentityVerifier`: cookies and `access_token` query parameters
+`WWW-Authenticate: Bearer resource_metadata=...` challenge. `IdentityVerifier`
+receives the request's own headers and abort signal, as over HTTP, with the
+exact bearer and without `Cookie`: cookies and `access_token` query parameters
 never authenticate MCP. A provider failure returns a redacted `503`.
 
 The bearer is an AuthFn session (including an AuthFn OAuth-backed session) or
@@ -201,7 +208,7 @@ transport and belongs to regional acceptance (STA-21).
 | `test/mcp-host.test.ts` (in `pnpm test:qualification`) | The app host builds one MCP endpoint per isolate and resource while each Worker request passes its own services, identity and pool; a Preview without `STATEPLANE_MCP_RESOURCE` and a local non-loopback `Host` with a matching `Origin` fail closed | Node |
 | `node --test test/mcp-acceptance-cleanup.test.js` (in `pnpm test:contracts`) | Gate cleanup: reverse-order finalizers; a client that cannot spawn, stalls before ready or answers not ready fails the gate, is terminated and awaited, and backend cleanup still runs; evidence mode is the backend that ran | Node |
 | `test/integration/mcp-services.test.js` (in `pnpm test:postgres`) | Real AuthFn sessions and keys, Postgres authority: shared IDs and revisions, revision conflict, `KEY_RESERVED` and `UNIQUE_CONFLICT`, MCP↔HTTP receipt replay, idempotency mismatch, `1e400` parity, authorization before shape, AuthFn and cell revocation | Local Postgres |
-| `pnpm test:mcp-clients` | Two distinct SDK clients in one space: official TypeScript SDK 1.29.0 (through `@mcpfn/client`) as owner and official Python SDK 2.3.0 as agent; create, read, query, replace, conflict, patch, both duplicate kinds, lost-response replay, typed filter, count, delete, event feed and revocation | Local Postgres, `uv` |
+| `pnpm test:mcp-clients` | Two distinct SDK clients in one space: official TypeScript SDK 1.29.0 (through `@mcpfn/client`) as owner and official Python SDK 2.3.0 as agent; create, read, query, replace, conflict, patch, both duplicate kinds, a lost response injected after commit and recovered, duplicate-delivery replay, typed filter, count, delete, event feed and revocation (`401` challenge in process) | Local Postgres, `uv` |
 | `pnpm test:mcp-conformance` | McpFn target suite (initialize, inventory against the manifest, guidance resource and semantic scenarios) and the applicable scenarios of the pinned official runner 0.1.16 | Local Postgres, network for `npx` |
 | `pnpm test:mcp-workerd` | The two-client gate through the built app under `wrangler dev`: workerd runtime, Workers `pg` sockets and the `@cfworker/json-schema` validator McpFn selects on Workers | Local Postgres, `uv` |
 
@@ -209,7 +216,15 @@ Both scripts accept `--host`, which runs the app's `/mcp` route under
 `vite dev` (add `--workerd` for `wrangler dev`), or an already running opt-in
 host through `STATEPLANE_MCP_ENDPOINT` with that host's fixture variables and
 `DATABASE_URL`. A non-loopback endpoint is reached through a fixed-path
-loopback forwarder because the official runner accepts only loopback URLs.
+loopback forwarder because the official runner accepts only loopback URLs. The
+forwarder drops encoding and framing headers from the body it has already
+decoded, and it rewrites only its own exact origin, so other loopback and
+foreign origins still reach the endpoint's DNS-rebinding check. In the
+two-client gate both clients use the same forwarder: it drops the response to
+one committed `records_create`, which the owner then recovers by repeating the
+identical request, and it records the `401` challenge for a revoked AuthFn key.
+Every request to a host, and every fixture query, has a 30 s deadline, so a
+stalled host fails the gate instead of holding cleanup.
 Each run writes credential-free evidence under `.data/`; its `mode` and
 `endpoint.runtime` name the backend that actually ran, and setting
 `STATEPLANE_MCP_ENDPOINT` without `--host` fails instead of running in
@@ -221,9 +236,10 @@ resource joins it as soon as it exists: the app process and both client
 processes are registered at spawn or connect (stdin end, then `SIGTERM`, then
 `SIGKILL`, each awaited), a spawn error is a caught failure rather than an
 uncaught event, and the secret file, pools and disposable spaces follow.
-Every step runs even after a failure, `cleanupSteps` counts the client
-terminations, and the evidence records `cleanup: failed` with the reason
-when any step fails. The official runner's
+Every step runs even after a failure, `cleanupSteps` counts every registered
+finalizer (client terminations, forwarder, spaces, pools, server or app
+process and secret directory), and the evidence records `cleanup: failed` with
+the reason when any step fails. The official runner's
 remaining server scenarios call the reference server's fixture tools, prompts,
 logging, completions, sampling and elicitation; a fixed product registry does
 not publish those, so they are recorded as not applicable rather than passed.
@@ -245,10 +261,13 @@ UI/health. Clean up every disposable resource.
 | Shared services | MCP takes a different policy or data path | Service-call matrix; HTTP/MCP code and retryability parity; MCP and HTTP replay the same receipt |
 | Precedence | Malformed writes are rejected before authorization | Hidden and revoked collections return their access code for undeclared fields |
 | Argument fidelity | Parsed values alias on re-encoding and change validation or fingerprints | `1e400`, `-0`, `__proto__` and surrogate cases; Postgres `SCHEMA_INVALID` parity with no effects |
-| OAuth resource | Cookie or query token accepted; missing challenge; provider details leak | Challenge and metadata tests; McpFn API-key regression suite; redacted provider failure |
+| OAuth resource | Cookie or query token accepted; missing challenge; provider details leak; verifier sees different context than HTTP | Challenge and metadata tests; McpFn API-key regression suite; redacted provider failure; recording-verifier headers and signal test |
+| Published schemas | A schema accepts values the handler or authority rejects | Selector, key and definition boundary tests comparing the extended schema with handler and Postgres results |
+| Unknown outcome | An override reports an uncertain write as retryable | Classifier tests through HTTP and MCP envelopes |
 | Transport bounds | Unbounded bodies, batched calls, rebinding, ambiguous write timeouts, stalled admission | 413/400/403 tests; one deadline over verification, body and dispatch with no late service call; read and write classification |
 | Worker cost | Rebuilding the registry and validators on every request | One endpoint per isolate and resource; per-request scope test; recorded before/after cost |
 | Recovery guidance | Agents send idempotency keys that collection and batch tools reject | Per-tool recovery hints checked against each write schema |
 | Two clients | Inconsistent IDs, revisions, conflicts, receipts or revocation across implementations | TypeScript and Python SDK gate in-process and through the app host |
 | Resource origin | A request `Host` becomes the trusted origin, defeating the rebinding check | Configured resource outside local loopback; host fail-closed tests |
-| Gate cleanup | A failed start leaves a credential-bearing client, app process or space behind while evidence reports complete | Spawn-error, stalled-init and not-ready tests; client terminations counted in `cleanupSteps` |
+| Gate cleanup | A failed start leaves a credential-bearing client, app process or space behind while evidence reports complete; a stalled host holds cleanup | Spawn-error, stalled-init, not-ready and stalled-host tests; every finalizer counted in `cleanupSteps` |
+| Forwarder | A compressed or relabelled body, or a masked rebinding origin, on the hosted path | gzip upstream that rejects foreign origins |

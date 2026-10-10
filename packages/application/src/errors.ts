@@ -34,10 +34,11 @@ export function errorCode(error: unknown, read: boolean): string {
   return 'PROVIDER_UNAVAILABLE';
 }
 
-/** Repeating a read is safe; an unknown write outcome needs receipt recovery. */
+/** Repeating a read is safe; an unknown write outcome needs receipt recovery.
+ * No override can make a write whose outcome is unknown retryable. */
 export function errorRetryable(error: unknown, code: string, read: boolean): boolean {
-  let canRetry = retryableCodes.has(code);
-  if (code === 'COMMIT_OUTCOME_UNKNOWN') canRetry = read;
+  if (code === 'COMMIT_OUTCOME_UNKNOWN' && !read) return false;
+  let canRetry = code === 'COMMIT_OUTCOME_UNKNOWN' || retryableCodes.has(code);
   if (error instanceof TransportFailure && error.retryableOverride !== undefined)
     canRetry = error.retryableOverride;
   else if (typeof (error as { retryable?: unknown })?.retryable === 'boolean')

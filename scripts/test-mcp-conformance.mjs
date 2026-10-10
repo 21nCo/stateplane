@@ -7,15 +7,13 @@
 //                                                   and its fixture variables for a running one
 //
 // Reports without credentials are written under .data/mcp-conformance/.
-import { createServer } from 'node:http';
-import { once } from 'node:events';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { authenticatedHttpTarget, createMcpFnTargetSuiteJUnit, disposeMcpFnTargetSuiteReport,
   OFFICIAL_CONFORMANCE_VERSION, runAuthenticatedOfficialConformance, runMcpFnTargetSuite,
   serializeMcpFnTargetSuiteReport } from '@mcpfn/testing';
 import { guidanceUri, stateplaneMcpDeclaration } from '../packages/mcp/dist/index.js';
-import { gateMode, runGate, selectBackend } from './mcp-acceptance-hosts.mjs';
+import { gateMode, loopbackForwarder, runGate, selectBackend } from './mcp-acceptance-hosts.mjs';
 
 const root=resolve(import.meta.dirname,'..');
 const output=join(root,'.data/mcp-conformance');
@@ -25,30 +23,6 @@ const output=join(root,'.data/mcp-conformance');
 // any server run here; the remainder is recorded as not applicable.
 const applicable=['server-initialize','ping','tools-list','resources-list','dns-rebinding-protection'];
 function assert(condition,message) { if (!condition) throw new Error(message); }
-
-/** Official runners require a loopback URL. Forward one fixed path to a deployed endpoint. */
-async function loopbackForwarder(endpoint) {
-  const upstream=new URL(endpoint);
-  const server=createServer(async(req,res)=>{
-    const chunks=[];for await(const chunk of req) chunks.push(chunk);
-    const target=new URL(upstream);
-    if (new URL(req.url,'http://127.0.0.1').pathname!==upstream.pathname) { res.writeHead(404).end(); return; }
-    const headers=Object.fromEntries(Object.entries(req.headers).filter(([name])=>!['host','connection','content-length'].includes(name)));
-    // Loopback tooling origins in front of this forwarder stand for the deployed
-    // origin. A foreign Origin passes through and must be rejected upstream.
-    try {
-      if (headers.origin && ['127.0.0.1','localhost','[::1]'].includes(new URL(headers.origin).hostname)) headers.origin=upstream.origin;
-    } catch { /* A malformed Origin passes through unchanged. */ }
-    // An upstream failure is the runner's 502, never an unhandled rejection that skips cleanup.
-    try {
-      const response=await fetch(target,{method:req.method,headers,body:chunks.length?Buffer.concat(chunks):undefined,redirect:'manual'});
-      res.writeHead(response.status,Object.fromEntries(response.headers));
-      res.end(Buffer.from(await response.arrayBuffer()));
-    } catch { if (!res.headersSent) res.writeHead(502); res.end(); }
-  });
-  server.listen(0,'127.0.0.1'); await once(server,'listening');
-  return {url:`http://127.0.0.1:${server.address().port}${upstream.pathname}`,close:()=>new Promise(r=>server.close(r))};
-}
 
 const summary={formatVersion:1,kind:'stateplane.mcp-conformance',startedAt:new Date().toISOString(),
   officialSuiteVersion:OFFICIAL_CONFORMANCE_VERSION,mode:null,official:[],notApplicable:[]};
@@ -109,9 +83,8 @@ const failure=await runGate(summary,async cleanup=>{
     `McpFn scenarios failed: ${JSON.stringify(summary.mcpfn.failures)}`);
 
   const loopback=/^(?:127\.0\.0\.1|localhost|\[::1\])$/.test(new URL(backend.endpoint).hostname);
-  const forwarder=loopback ? null : await loopbackForwarder(backend.endpoint);
-  if (forwarder) cleanup.add(forwarder.close);
-  const url=forwarder?.url??backend.endpoint;
+  // Official runners require a loopback URL; a deployed endpoint is reached through the forwarder.
+  const url=loopback ? backend.endpoint : (await loopbackForwarder(backend.endpoint,{cleanup})).url;
   for (const scenario of applicable) {
     const result=await runAuthenticatedOfficialConformance({url,scenario,credential,cwd:output});
     summary.official.push({scenario,ok:result.ok,exitCode:result.exitCode,

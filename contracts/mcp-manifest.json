@@ -29,22 +29,25 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units; no NUL."
+            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "collectionId": {
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units; no NUL."
+            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "operationKey": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 512,
-            "pattern": "^[^\\u0000]+$",
-            "description": "Immutable batch operation key. At most 512 UTF-16 code units; no NUL."
+            "maxLength": 256,
+            "x-utf8MaxBytes": 256,
+            "pattern": "^(?:[^\\u0000\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
+            "description": "Immutable batch operation key: a nonempty Unicode-scalar string of at most 256 UTF-8 bytes (x-utf8MaxBytes; clients must enforce it)."
           }
         },
         "required": [
@@ -73,22 +76,25 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units; no NUL."
+            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "collectionId": {
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units; no NUL."
+            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "operationKey": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 512,
-            "pattern": "^[^\\u0000]+$",
-            "description": "Immutable batch operation key. At most 512 UTF-16 code units; no NUL."
+            "maxLength": 256,
+            "x-utf8MaxBytes": 256,
+            "pattern": "^(?:[^\\u0000\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
+            "description": "Immutable batch operation key: a nonempty Unicode-scalar string of at most 256 UTF-8 bytes (x-utf8MaxBytes; clients must enforce it)."
           },
           "items": {
             "type": "array",
@@ -131,22 +137,25 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units; no NUL."
+            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "collectionId": {
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units; no NUL."
+            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "operationKey": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 512,
-            "pattern": "^[^\\u0000]+$",
-            "description": "Immutable batch operation key. At most 512 UTF-16 code units; no NUL."
+            "maxLength": 256,
+            "x-utf8MaxBytes": 256,
+            "pattern": "^(?:[^\\u0000\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
+            "description": "Immutable batch operation key: a nonempty Unicode-scalar string of at most 256 UTF-8 bytes (x-utf8MaxBytes; clients must enforce it)."
           }
         },
         "required": [
@@ -175,15 +184,17 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units; no NUL."
+            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "collectionId": {
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units; no NUL."
+            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "definition": {
             "type": "object",
@@ -210,6 +221,25 @@
               },
               "schema": {
                 "type": "object",
+                "required": [
+                  "$schema",
+                  "type",
+                  "additionalProperties"
+                ],
+                "properties": {
+                  "$schema": {
+                    "const": "https://json-schema.org/draft/2020-12/schema"
+                  },
+                  "type": {
+                    "const": "object"
+                  },
+                  "properties": {
+                    "type": "object"
+                  },
+                  "additionalProperties": {
+                    "const": false
+                  }
+                },
                 "description": "Closed JSON Schema Draft 2020-12 root: $schema \"https://json-schema.org/draft/2020-12/schema\", type \"object\", properties and additionalProperties false at every object node. Only type, properties, required, additionalProperties, items, minItems, maxItems, minLength, maxLength, minimum, maximum, enum, format \"date-time\" and description are supported."
               },
               "unique": {
@@ -306,15 +336,17 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units; no NUL."
+            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "collectionId": {
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units; no NUL."
+            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           }
         },
         "required": [
@@ -342,8 +374,9 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units; no NUL."
+            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "cursor": {
             "type": "string",
@@ -375,15 +408,17 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units; no NUL."
+            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "collectionId": {
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units; no NUL."
+            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "expectedVersion": {
             "type": "integer",
@@ -416,6 +451,25 @@
               },
               "schema": {
                 "type": "object",
+                "required": [
+                  "$schema",
+                  "type",
+                  "additionalProperties"
+                ],
+                "properties": {
+                  "$schema": {
+                    "const": "https://json-schema.org/draft/2020-12/schema"
+                  },
+                  "type": {
+                    "const": "object"
+                  },
+                  "properties": {
+                    "type": "object"
+                  },
+                  "additionalProperties": {
+                    "const": false
+                  }
+                },
                 "description": "Closed JSON Schema Draft 2020-12 root: $schema \"https://json-schema.org/draft/2020-12/schema\", type \"object\", properties and additionalProperties false at every object node. Only type, properties, required, additionalProperties, items, minItems, maxItems, minLength, maxLength, minimum, maximum, enum, format \"date-time\" and description are supported."
               },
               "unique": {
@@ -513,15 +567,17 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units; no NUL."
+            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "collectionId": {
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units; no NUL."
+            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "cursor": {
             "type": "string",
@@ -554,22 +610,25 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units; no NUL."
+            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "collectionId": {
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units; no NUL."
+            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "id": {
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Canonical record ID. At most 512 UTF-16 code units; no NUL."
+            "description": "Canonical record ID. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           }
         },
         "required": [
@@ -598,15 +657,17 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units; no NUL."
+            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "collectionId": {
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units; no NUL."
+            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "predicates": {
             "type": "array",
@@ -947,26 +1008,30 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units; no NUL."
+            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "collectionId": {
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units; no NUL."
+            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "idempotencyKey": {
             "type": "string",
             "minLength": 1,
             "maxLength": 256,
+            "x-utf8MaxBytes": 256,
             "pattern": "^(?:[^\\u0000\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
-            "description": "Nonempty Unicode-scalar key of at most 256 UTF-8 bytes. Reuse it only with an identical request to recover a lost response."
+            "description": "Nonempty Unicode-scalar key of at most 256 UTF-8 bytes (x-utf8MaxBytes; clients must enforce it). Reuse it only with an identical request to recover a lost response."
           },
           "externalKey": {
             "type": "string",
             "minLength": 1,
+            "x-utf8MaxBytes": 256,
             "pattern": "^(?![\\u0009-\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*$)[^\\u0000\\ud800-\\udfff]+$",
             "description": "Optional create-only key. Normalized to NFC, then trimmed of U+0009–000D, U+0020, U+0085, U+00A0, U+1680, U+2000–200A, U+2028, U+2029, U+202F, U+205F and U+3000; the result must be nonempty and at most 256 UTF-8 bytes."
           },
@@ -1008,22 +1073,25 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units; no NUL."
+            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "collectionId": {
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units; no NUL."
+            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "idempotencyKey": {
             "type": "string",
             "minLength": 1,
             "maxLength": 256,
+            "x-utf8MaxBytes": 256,
             "pattern": "^(?:[^\\u0000\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
-            "description": "Nonempty Unicode-scalar key of at most 256 UTF-8 bytes. Reuse it only with an identical request to recover a lost response."
+            "description": "Nonempty Unicode-scalar key of at most 256 UTF-8 bytes (x-utf8MaxBytes; clients must enforce it). Reuse it only with an identical request to recover a lost response."
           },
           "id": {
             "type": "string",
@@ -1071,22 +1139,25 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units; no NUL."
+            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "collectionId": {
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units; no NUL."
+            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "id": {
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Canonical record ID. At most 512 UTF-16 code units; no NUL."
+            "description": "Canonical record ID. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           }
         },
         "required": [
@@ -1115,15 +1186,17 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units; no NUL."
+            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "collectionId": {
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units; no NUL."
+            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "mode": {
             "enum": [
@@ -1136,8 +1209,9 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Key to resolve in the selected mode. At most 512 UTF-16 code units; no NUL."
+            "description": "Key to resolve in the selected mode. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           }
         },
         "required": [
@@ -1167,22 +1241,25 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units; no NUL."
+            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "collectionId": {
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units; no NUL."
+            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "idempotencyKey": {
             "type": "string",
             "minLength": 1,
             "maxLength": 256,
+            "x-utf8MaxBytes": 256,
             "pattern": "^(?:[^\\u0000\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
-            "description": "Nonempty Unicode-scalar key of at most 256 UTF-8 bytes. Reuse it only with an identical request to recover a lost response."
+            "description": "Nonempty Unicode-scalar key of at most 256 UTF-8 bytes (x-utf8MaxBytes; clients must enforce it). Reuse it only with an identical request to recover a lost response."
           },
           "id": {
             "type": "string",
@@ -1243,15 +1320,17 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units; no NUL."
+            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "collectionId": {
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units; no NUL."
+            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "predicates": {
             "type": "array",
@@ -1623,22 +1702,25 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units; no NUL."
+            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "collectionId": {
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units; no NUL."
+            "description": "Collection ID (the definition slug). At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           },
           "idempotencyKey": {
             "type": "string",
             "minLength": 1,
             "maxLength": 256,
+            "x-utf8MaxBytes": 256,
             "pattern": "^(?:[^\\u0000\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
-            "description": "Nonempty Unicode-scalar key of at most 256 UTF-8 bytes. Reuse it only with an identical request to recover a lost response."
+            "description": "Nonempty Unicode-scalar key of at most 256 UTF-8 bytes (x-utf8MaxBytes; clients must enforce it). Reuse it only with an identical request to recover a lost response."
           },
           "id": {
             "type": "string",
@@ -1691,8 +1773,9 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 512,
+            "x-utf16MaxLength": 512,
             "pattern": "^[^\\u0000]+$",
-            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units; no NUL."
+            "description": "Space ID, for example sp_123e4567-e89b-42d3-a456-426614174000. At most 512 UTF-16 code units (x-utf16MaxLength; clients must enforce it); no NUL."
           }
         },
         "required": [
@@ -1744,5 +1827,5 @@
   ],
   "resourceTemplates": [],
   "prompts": [],
-  "hash": "71abbf272d24f6806ec154d61aa2e6817caa11ae6ea6294b45c3a22ff6b5d595"
+  "hash": "2a0e16f3dcba5b2b5725483bdccf8d0af8703242c75e23af5fb9f7daea451d19"
 }
