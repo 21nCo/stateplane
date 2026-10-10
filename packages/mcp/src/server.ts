@@ -141,7 +141,10 @@ interface Admission {
 class BodyTooLarge extends Error {}
 async function readBody(request: Request, admission: Admission): Promise<string> {
   const declared = request.headers.get('content-length');
-  if (declared && Number(declared) > maxRequestBytes) throw new BodyTooLarge();
+  if (declared && Number(declared) > maxRequestBytes) {
+    await request.body?.cancel().catch(() => undefined);
+    throw new BodyTooLarge();
+  }
   if (!request.body) return '';
   const reader = request.body.getReader();
   admission.reader = reader;
@@ -280,7 +283,8 @@ export function createMcpEndpoint(options: McpEndpointOptions): McpEndpoint {
         // before dispatch. A body still unread is cancelled directly.
         void (admission.reader ? admission.reader.cancel() : request.body?.cancel())?.catch(() => undefined);
         void work.then(late => late.body?.cancel(), () => undefined);
-        scope.onTimeout?.();
+        // A failing callback must not keep the deadline response from the client.
+        try { scope.onTimeout?.(); } catch { /* the response below still answers */ }
         resolve(timedOut(admission));
       }, timeoutMs);
     });

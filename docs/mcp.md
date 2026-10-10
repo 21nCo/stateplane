@@ -19,12 +19,17 @@ fixed tools and one guidance resource. Defining a collection inserts registry
 data; it never adds a tool. Every credential sees the same list, and access is
 decided per call by the shared services. The public manifest is committed in
 [contracts/mcp-manifest.json](../contracts/mcp-manifest.json); review a change
-with `node scripts/mcp-manifest.mjs`, which builds `@stateplane/mcp` from the
-current source first, and record it with `--write`. The contract test rejects
+with `pnpm mcp:manifest`, which builds `@stateplane/mcp` and its workspace
+dependencies from the current source first, and record it with
+`pnpm mcp:manifest --write`. The script itself refuses a `dist` older than its
+source. The contract test rejects
 an unreviewed manifest change. JSON Schema `maxLength` counts code points, so a
 limit it cannot express is published as an extension that clients must enforce,
-as in the OpenAPI contract: `x-utf8MaxBytes` (256 for `idempotencyKey`,
-`externalKey` and `operationKey`) and `x-utf16MaxLength` (512 for selectors).
+as in the OpenAPI contract: `x-utf8MaxBytes` (256 for `idempotencyKey` and
+`operationKey`) and `x-utf16MaxLength` (512 for selectors). The 256-byte
+`externalKey` budget applies only after NFC and the fixed whitespace trim, so it
+is published as `x-nfcTrimmedUtf8MaxBytes`; a client must not apply it to the
+raw, possibly padded or decomposed value.
 `definition.schema` publishes the closed root that the authority requires.
 
 | Tool | Service | Annotations |
@@ -222,9 +227,12 @@ decoded, and it rewrites only its own exact origin, so other loopback and
 foreign origins still reach the endpoint's DNS-rebinding check. In the
 two-client gate both clients use the same forwarder: it drops the response to
 one committed `records_create`, which the owner then recovers by repeating the
-identical request, and it records the `401` challenge for a revoked AuthFn key.
-Every request to a host, and every fixture query, has a 30 s deadline, so a
-stalled host fails the gate instead of holding cleanup.
+identical request. Only the in-process run revokes an AuthFn key and asserts
+its `401` challenge; `--host` runs revoke the fixture cell credential and assert
+the shared services' denial. Every request to a host, and every fixture query,
+has a 30 s deadline, and a started host must pass its health check within one
+overall 120 s readiness deadline, so a stalled host fails the gate instead of
+holding cleanup.
 Each run writes credential-free evidence under `.data/`; its `mode` and
 `endpoint.runtime` name the backend that actually ran, and setting
 `STATEPLANE_MCP_ENDPOINT` without `--host` fails instead of running in

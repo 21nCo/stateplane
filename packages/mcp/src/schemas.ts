@@ -24,10 +24,13 @@ export const idempotencyKey: McpFnJsonSchema = {
   type: 'string', minLength: 1, maxLength: 256, 'x-utf8MaxBytes': 256, pattern: scalarPattern,
   description: 'Nonempty Unicode-scalar key of at most 256 UTF-8 bytes (x-utf8MaxBytes; clients must enforce it). Reuse it only with an identical request to recover a lost response.'
 };
+/* The external-key byte budget applies after NFC and the fixed trim, so a raw
+ * x-utf8MaxBytes would reject padded or decomposed keys the authority admits.
+ * It is published under its own extension name instead. */
 export const externalKey: McpFnJsonSchema = {
-  type: 'string', minLength: 1, 'x-utf8MaxBytes': 256,
+  type: 'string', minLength: 1, 'x-nfcTrimmedUtf8MaxBytes': 256,
   pattern: '^(?![\\u0009-\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*$)[^\\u0000\\ud800-\\udfff]+$',
-  description: 'Optional create-only key. Normalized to NFC, then trimmed of U+0009–000D, U+0020, U+0085, U+00A0, U+1680, U+2000–200A, U+2028, U+2029, U+202F, U+205F and U+3000; the result must be nonempty and at most 256 UTF-8 bytes.'
+  description: 'Optional create-only key. Normalized to NFC, then trimmed of U+0009–000D, U+0020, U+0085, U+00A0, U+1680, U+2000–200A, U+2028, U+2029, U+202F, U+205F and U+3000; the result must be nonempty and at most 256 UTF-8 bytes (x-nfcTrimmedUtf8MaxBytes; clients must enforce it on the normalized, trimmed key, not on the raw value).'
 };
 const expectedRevision = positive('Current record revision. A stale value fails REVISION_CONFLICT.');
 const expectedSchemaVersion = positive('Optional exact collection schema version precondition.');

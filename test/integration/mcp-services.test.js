@@ -210,11 +210,14 @@ test('a cell-revoked key whose provider still authenticates is denied by the sha
   assert.equal(await failed(agentClient,'collections_list',{spaceId}),'NOT_FOUND');
 });
 
+const trimmed=/^[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/gu;
 /** The published schema with its x- extensions applied as a client must. */
 function publishedValidator(name) {
   const ajv=new Ajv2020({strict:false,allErrors:true});
   ajv.addKeyword({keyword:'x-utf8MaxBytes',type:'string',validate:(limit,value)=>Buffer.byteLength(value)<=limit});
   ajv.addKeyword({keyword:'x-utf16MaxLength',type:'string',validate:(limit,value)=>value.length<=limit});
+  ajv.addKeyword({keyword:'x-nfcTrimmedUtf8MaxBytes',type:'string',
+    validate:(limit,value)=>Buffer.byteLength(value.normalize('NFC').replace(trimmed,''))<=limit});
   return ajv.compile(stateplaneMcpDeclaration().manifest().tools.find(tool=>tool.name===name).inputSchema);
 }
 
@@ -232,10 +235,9 @@ test('published key and definition limits accept exactly what the authority acce
   const collectionId='entries';
   const schema={$schema:'https://json-schema.org/draft/2020-12/schema',type:'object',properties:{label:{type:'string'}},
     required:['label'],additionalProperties:false};
-  const accepted=async(tool,args)=>{
-    const result=await call(client,tool,args);
-    return !['INVALID_ARGUMENT','SCHEMA_INVALID','SCHEMA_UNSUPPORTED'].includes(result.structuredContent.error?.code);
-  };
+  // Every case is otherwise valid and unique, so only a successful call counts as acceptance.
+  const accepted=async(tool,args)=>!(await call(client,tool,args)).isError;
+  const create=(idempotencyKey,externalKey)=>['records_create',{spaceId,collectionId,idempotencyKey,externalKey,data:{label:idempotencyKey}}];
   const cases=[
     ['collections_define',{spaceId,collectionId:'empty',definition:{slug:'empty',version:1,schema:{},unique:[],filterable:[],sortable:[]}}],
     ['collections_define',{spaceId,collectionId,definition:{slug:collectionId,version:1,schema,unique:[],filterable:[],sortable:[]}}],
@@ -244,12 +246,18 @@ test('published key and definition limits accept exactly what the authority acce
     ['records_create',{spaceId,collectionId,idempotencyKey:'\u{1F600}'.repeat(65),data:{label:'b'}}],
     ['batches_status',{spaceId,collectionId,operationKey:'\u{1F600}'.repeat(65)}],
     ['batches_ingest',{spaceId,collectionId,operationKey:'\u{1F600}'.repeat(64),items:[JSON.stringify({operation:'create',data:{label:'c'}})]}],
-    ['batches_ingest',{spaceId,collectionId,operationKey:'\u{1F600}'.repeat(65),items:[JSON.stringify({operation:'create',data:{label:'d'}})]}]
+    ['batches_ingest',{spaceId,collectionId,operationKey:'\u{1F600}'.repeat(65),items:[JSON.stringify({operation:'create',data:{label:'d'}})]}],
+    // The external-key budget applies after NFC and the fixed trim: padding and decomposition do not count.
+    create('padded',` ${'a'.repeat(256)}\u3000`),
+    create('decomposed','e\u0301'.repeat(128)),
+    create('padded-over',` ${'b'.repeat(257)} `),
+    create('decomposed-over','o\u0301'.repeat(129)),
+    create('blank','\u0085 \u2003')
   ];
   for (const [tool,args] of cases) {
     const valid=publishedValidator(tool)(args);
     assert.equal(await accepted(tool,args),valid,`${tool} ${JSON.stringify(args).slice(0,120)}`);
   }
-  assert.deepEqual(cases.map(([tool,args])=>publishedValidator(tool)(args)),[false,true,true,false,false,true,false],
+  assert.deepEqual(cases.map(([tool,args])=>publishedValidator(tool)(args)),[false,true,true,false,false,true,false,true,true,false,false,false],
     'each boundary is exercised on both sides');
 });

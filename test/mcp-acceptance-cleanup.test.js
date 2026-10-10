@@ -6,7 +6,7 @@ import { gzipSync } from 'node:zlib';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { finalizers, gateMode, hostBackend, loopbackForwarder, runGate, selectBackend, startLineProcess } from '../scripts/mcp-acceptance-hosts.mjs';
+import { awaitReady, finalizers, gateMode, hostBackend, loopbackForwarder, runGate, selectBackend, startLineProcess } from '../scripts/mcp-acceptance-hosts.mjs';
 
 test('acceptance cleanup runs every step after a failure and reports it incomplete',async()=>{
   const cleanup=finalizers();
@@ -162,4 +162,19 @@ test('a host that never answers fails the gate within its deadline and every fin
       assert.deepEqual(ran,['earlier finalizer'],`${stallPath}: later finalizers run`);
     } finally { await host.close(); }
   }
+});
+
+test('a host whose health check stalls fails readiness within one overall deadline',async()=>{
+  const stalled=new Set();
+  const server=createServer((req,res)=>{ stalled.add(res); }); // accepts and never answers
+  server.listen(0,'127.0.0.1'); await once(server,'listening');
+  try {
+    const url=`http://127.0.0.1:${server.address().port}/api/health`;
+    const started=Date.now();
+    // Each 2 s attempt alone would exceed the deadline; the overall bound must still hold.
+    await assert.rejects(awaitReady(url,{child:{exitCode:null},failed:new Promise(()=>{})},{timeoutMs:500}),
+      /did not become ready within 500 ms/);
+    assert.ok(Date.now()-started<1_500,`failed after ${Date.now()-started} ms`);
+    assert.ok(stalled.size>=1,'the stalled endpoint was reached');
+  } finally { server.closeAllConnections(); server.close(); }
 });

@@ -233,10 +233,25 @@ export async function inProcessBackend({cleanup}) {
     }};
 }
 
+/** Poll a started host's health URL under one overall deadline: each attempt
+ * gets at most the time remaining, so a host that accepts connections but
+ * never answers fails within timeoutMs instead of once per attempt. */
+export async function awaitReady(url,{child,failed},{timeoutMs,attemptMs=2_000,intervalMs=100}) {
+  const end=Date.now()+timeoutMs;
+  for (let remaining=timeoutMs;remaining>0;remaining=end-Date.now()) {
+    if (child.exitCode!==null) throw new Error('app host exited before readiness');
+    try {
+      if ((await fetch(url,{signal:AbortSignal.timeout(Math.min(attemptMs,remaining))})).ok) return; // NOSONAR -- readiness polling is sequential
+    } catch { /* still starting */ }
+    await Promise.race([new Promise(resolve=>setTimeout(resolve,Math.min(intervalMs,Math.max(0,end-Date.now())))),failed]); // NOSONAR -- readiness polling is sequential
+  }
+  throw new Error(`app host did not become ready within ${timeoutMs} ms`);
+}
+
 /** The app's opt-in host with its fixture identity: an external endpoint, or a
  * local vite (Node) or wrangler (workerd) run. Every request to the host and
  * every fixture query has a deadline, so a stalled host cannot hold cleanup. */
-export async function hostBackend({workerd=false,cleanup,httpTimeoutMs=30_000}) {
+export async function hostBackend({workerd=false,cleanup,httpTimeoutMs=30_000,readyTimeoutMs=120_000}) {
   const deadline=()=>AbortSignal.timeout(httpTimeoutMs);
   const external=process.env.STATEPLANE_MCP_ENDPOINT;
   const databaseUrl=external ? process.env.DATABASE_URL : await loopbackUrl();
@@ -274,14 +289,7 @@ export async function hostBackend({workerd=false,cleanup,httpTimeoutMs=30_000}) 
       started=spawnOwned(process.execPath,[join(root,'app/node_modules/vite/bin/vite.js'),'dev','--host','127.0.0.1','--port',String(port),
         '--strictPort'],{cwd:join(root,'app'),stdio:'ignore',env:{...process.env,...bindings,STATEPLANE_ENV:'local'}},cleanup);
     }
-    const app=started.child;
-    let ready=false;
-    for (let attempt=0;attempt<600 && !ready;attempt++) {
-      if (app.exitCode!==null) throw new Error('app host exited before readiness');
-      try { ready=(await fetch(new URL('/api/health',endpoint),{signal:AbortSignal.timeout(2_000)})).ok; } catch { /* still starting */ }
-      if (!ready) await Promise.race([new Promise(resolve=>setTimeout(resolve,100)),started.failed]); // NOSONAR -- readiness polling is sequential
-    }
-    assert(ready,'app host did not become ready');
+    await awaitReady(new URL('/api/health',endpoint),started,{timeoutMs:readyTimeoutMs});
   }
   // The advertised resource must be this endpoint; a Preview pins it with STATEPLANE_MCP_RESOURCE.
   const origin=new URL(endpoint);

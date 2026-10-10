@@ -30,7 +30,8 @@ function mcpEndpoint(resource:string,issuer:string,local:boolean):McpEndpoint {
   let endpoint=mcpEndpoints.get(key);
   if (!endpoint) {
     endpoint=createMcpEndpoint({resource,authorizationServers:[issuer],allowInsecureLoopback:local,requestTimeoutMs});
-    if (mcpEndpoints.size>=maxMcpResources) mcpEndpoints.clear();
+    // Evict only the oldest resource; the others keep their built endpoints.
+    if (mcpEndpoints.size>=maxMcpResources) mcpEndpoints.delete(mcpEndpoints.keys().next().value!);
     mcpEndpoints.set(key,endpoint);
   }
   return endpoint;
@@ -75,7 +76,8 @@ export function stateplaneHost(env:Bindings):Host | undefined {
   if (!connectionString) return clearHost();
   const cellId=env.STATEPLANE_TEST_CELL_ID??'cell-a';
   const storageTargetId=env.STATEPLANE_TEST_STORAGE_TARGET??'target-a';
-  const key=createHash('sha256').update(JSON.stringify([connectionString,cellId,storageTargetId,
+  // STATEPLANE_ENV is read by the cached MCP route, so it is part of the key.
+  const key=createHash('sha256').update(JSON.stringify([env.STATEPLANE_ENV,connectionString,cellId,storageTargetId,
     env.STATEPLANE_TEST_TOKEN,env.STATEPLANE_TEST_OWNER,env.STATEPLANE_TEST_CREDENTIAL,
     env.STATEPLANE_TEST_CURSOR_SECRET,env.STATEPLANE_TEST_AGENT_TOKEN,
     env.STATEPLANE_TEST_AGENT_CREDENTIAL,env.STATEPLANE_MCP_AUTHORIZATION_SERVER,
@@ -135,7 +137,8 @@ export function stateplaneHost(env:Bindings):Host | undefined {
   const identity={
     verify:(request:Request)=>{
       const bearer=request.headers.get('authorization');
-      if (!bearer?.startsWith('Bearer ')) return Promise.resolve(null);
+      // The scheme is case-insensitive, as in AuthFnIdentityVerifier.
+      if (!bearer || !/^Bearer /i.test(bearer)) return Promise.resolve(null);
       const candidate=createHash('sha256').update(bearer.slice(7)).digest();
       if (timingSafeEqual(candidate,tokenDigest)) return Promise.resolve(actor);
       return Promise.resolve(agent && agentDigest && timingSafeEqual(candidate,agentDigest) ? agent : null);

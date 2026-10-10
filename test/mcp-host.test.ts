@@ -85,3 +85,29 @@ it('a local host derives bounded resources only from loopback request hosts', as
   expect(state.endpoints - before).toBe(2);
   expect(state.resources.slice(-2)).toEqual(['http://127.0.0.1:5173/mcp', 'http://localhost:5173/mcp']);
 });
+
+it('a full resource cache evicts only its oldest endpoint', async () => {
+  const local = { ...env, STATEPLANE_MCP_RESOURCE: undefined, STATEPLANE_ENV: 'local' };
+  const serve = (port: number) => stateplaneHost(local as never)!.mcp(call(`http://127.0.0.1:${port}`));
+  // Across more inserts than the cap, the previous resource always survives the next insert.
+  for (let port = 6101; port <= 6106; port++) {
+    await serve(port);
+    const before = state.endpoints;
+    if (port > 6101) await serve(port - 1);
+    expect(state.endpoints - before, `resource ${port - 1} after inserting ${port}`).toBe(0);
+  }
+});
+
+it('a Node host rebuilds when STATEPLANE_ENV changes and accepts any bearer scheme case', async () => {
+  const node = { ...env, AUTHORITY: undefined, STATEPLANE_TEST_DATABASE_URL: 'postgres://example/db',
+    STATEPLANE_MCP_RESOURCE: undefined, STATEPLANE_TEST_AGENT_TOKEN: 'g'.repeat(32), STATEPLANE_TEST_AGENT_CREDENTIAL: 'agent-1' };
+  expect((await stateplaneHost({ ...node, STATEPLANE_ENV: 'local' } as never)!.mcp(call('http://127.0.0.1:6201'))).status).toBe(200);
+  const identity = state.scopes.at(-1)!.identity as { verify(request: Request): Promise<unknown> };
+  const bearer = (value: string) => identity.verify(new Request('http://127.0.0.1:6201/mcp', { headers: { authorization: value } }));
+  expect(await bearer(`bearer ${'o'.repeat(32)}`)).toMatchObject({ kind: 'session', credentialId: 'session-1' });
+  expect(await bearer(`BEARER ${'g'.repeat(32)}`)).toMatchObject({ kind: 'api-key', credentialId: 'agent-1' });
+  expect(await bearer(`Basic ${'o'.repeat(32)}`)).toBeNull();
+  // The same bindings as a Preview no longer derive a loopback resource.
+  const preview = await stateplaneHost({ ...node, STATEPLANE_ENV: 'preview' } as never)!.mcp(call('http://127.0.0.1:6201'));
+  expect(preview.status).toBe(503);
+});

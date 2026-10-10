@@ -84,7 +84,7 @@ test('the fixed registry publishes the committed manifest and annotations',async
   const manifest=stateplaneMcpDeclaration().manifest();
   const committed=JSON.parse(await readFile(new URL('../contracts/mcp-manifest.json',import.meta.url),'utf8'));
   const diff=diffManifests(committed,manifest);
-  assert.deepEqual(diff.changes,[],'regenerate contracts/mcp-manifest.json with node scripts/mcp-manifest.mjs --write after review');
+  assert.deepEqual(diff.changes,[],'regenerate contracts/mcp-manifest.json with pnpm mcp:manifest --write after review');
   assert.equal(manifest.hash,committed.hash);
   const names=manifest.tools.map(tool=>tool.name);
   assert.deepEqual(names,[...names].sort());
@@ -121,7 +121,12 @@ test('published mutation and predicate schemas agree with the HTTP OpenAPI contr
       http.required.filter(name=>name!=='operation').sort(),operation);
     assert.equal(mcp.properties.idempotencyKey.pattern,http.properties.idempotencyKey.pattern);
     assert.equal(mcp.properties.idempotencyKey.maxLength,http.properties.idempotencyKey.maxLength);
-    if (operation==='create') assert.equal(mcp.properties.externalKey.pattern,http.properties.externalKey.pattern);
+    if (operation==='create') {
+      assert.equal(mcp.properties.externalKey.pattern,http.properties.externalKey.pattern);
+      // OpenAPI applies its externalKey byte budget after NFC and trim; MCP names that rule explicitly.
+      assert.equal(mcp.properties.externalKey['x-nfcTrimmedUtf8MaxBytes'],http.properties.externalKey['x-utf8MaxBytes']);
+      assert.equal(mcp.properties.externalKey['x-utf8MaxBytes'],undefined,'no raw byte limit on a normalized key');
+    }
   }
   const predicate=input('records_query').properties.predicates.items;
   const published=document.components.schemas.Predicate;
@@ -513,6 +518,23 @@ test('one deadline bounds an unfinished request body, cancels it and never dispa
   await new Promise(resolve=>setTimeout(resolve,20));
   assert.equal(cancelled,true,'the body reader is cancelled');
   assert.throws(()=>controller.enqueue(new TextEncoder().encode(writeCall.slice(40))));
+  assert.deepEqual(state.calls,[]);
+});
+
+test('a throwing timeout callback still delivers the deadline response',async()=>{
+  const state=fixture();
+  state.identity.verify=()=>new Promise(()=>{});
+  const response=await bounded(direct(state,()=>{ throw new Error('pool already ended'); })(writeCall),'deadline response');
+  await assertRetryableBeforeDispatch(response);
+});
+
+test('a body declared over the limit is cancelled unread',async()=>{
+  const state=fixture();
+  let cancelled=false;
+  const body=new ReadableStream({cancel() { cancelled=true; }});
+  const response=await direct(state)(body,{'content-length':String(2**30)});
+  assert.equal(response.status,413);
+  assert.equal(cancelled,true,'the declared-oversize body stream is cancelled');
   assert.deepEqual(state.calls,[]);
 });
 

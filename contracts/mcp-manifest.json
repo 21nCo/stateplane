@@ -1031,9 +1031,9 @@
           "externalKey": {
             "type": "string",
             "minLength": 1,
-            "x-utf8MaxBytes": 256,
+            "x-nfcTrimmedUtf8MaxBytes": 256,
             "pattern": "^(?![\\u0009-\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*$)[^\\u0000\\ud800-\\udfff]+$",
-            "description": "Optional create-only key. Normalized to NFC, then trimmed of U+0009–000D, U+0020, U+0085, U+00A0, U+1680, U+2000–200A, U+2028, U+2029, U+202F, U+205F and U+3000; the result must be nonempty and at most 256 UTF-8 bytes."
+            "description": "Optional create-only key. Normalized to NFC, then trimmed of U+0009–000D, U+0020, U+0085, U+00A0, U+1680, U+2000–200A, U+2028, U+2029, U+202F, U+205F and U+3000; the result must be nonempty and at most 256 UTF-8 bytes (x-nfcTrimmedUtf8MaxBytes; clients must enforce it on the normalized, trimmed key, not on the raw value)."
           },
           "data": {
             "type": "object",
@@ -1827,5 +1827,5 @@
   ],
   "resourceTemplates": [],
   "prompts": [],
-  "hash": "2a0e16f3dcba5b2b5725483bdccf8d0af8703242c75e23af5fb9f7daea451d19"
+  "hash": "b763e91a908f9123529c678b39a228f32f3941e9f2d33a9b31b1e7b64c39268d"
 }
