@@ -99,9 +99,10 @@ async function pendingResponseBudget() {
   }
   roundTrips.sort((a,b) => a-b);
   // The budget allows ten measured network round trips plus two 50 ms lock
-  // probes and local scheduler jitter observed above 350 ms under this
-  // workload. It still rejects the old remote 17-statement path (~1.5 s).
-  return Math.max(600,Math.ceil(roundTrips[2] * 10 + 100));
+  // probes and local scheduler jitter. A disposable PostgreSQL 16 run on
+  // this host took 793 ms for the server-side function's bounded probes;
+  // 1100 ms still rejects the old remote 17-statement path (~1.5 s).
+  return Math.max(1100,Math.ceil(roundTrips[2] * 10 + 100));
 }
 
 async function scheduleGrantExpiry(scope, collectionId) {
@@ -694,7 +695,7 @@ test('a failed transaction cannot leak state into the next borrower of one poole
   } finally { await single.end(); }
 });
 
-test('authority commit separates confirmed cancellation from a late ambiguous acknowledgement', async()=>{
+test('authority treats every sent COMMIT cancellation as uncertain and reconciles by receipt', async()=>{
   const {scope}=await fixture();
   const probe=`sta8_commit_${randomUUID().replaceAll('-','')}`;
   await pool.query(`CREATE TABLE ${probe}(id integer NOT NULL)`);
@@ -719,7 +720,7 @@ test('authority commit separates confirmed cancellation from a late ambiguous ac
   try {
     const bounded=new PostgresAuthority(delayed,3600,undefined,500);
     const request=change('create',`commit-cancel-${randomUUID()}`,'{"label":"commit-cancel"}');
-    await assert.rejects(bounded.mutate(scope,request),{code:'RATE_LIMITED'});
+    await assert.rejects(bounded.mutate(scope,request),error=>error instanceof CommitOutcomeUnknownError);
     assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${probe}`)).rows[0].n,0);
     assert.equal((await counts(scope.spaceId)).records,0);
     assert.equal((await counts(scope.spaceId)).idempotency_receipts,0);
@@ -810,6 +811,30 @@ test('caller changes to create, replace and delete receipts cannot alter saved f
   assert.deepEqual(await counts(scope.spaceId),{
     records:1,record_unique_keys:0,record_index_values:0,record_events:3,
     idempotency_receipts:3,record_tombstones:1,projection_outbox:3 });
+});
+
+test('projection status follows a deleted revision without exposing content or bypassing read grant', async () => {
+  const {scope}=await fixture();
+  const created=await authority.mutate(scope,change('create','projection-create','{"label":"one"}'));
+  const reader={...scope,capability:'records:read'};
+  const status=()=>authority.transaction(reader,tx=>tx.projection(created.ref.id));
+  assert.deepEqual(await status(),{state:'pending',generation:1,revision:1});
+  const deleted=await authority.mutate(scope,change('delete','projection-delete',undefined,
+    {recordId:created.ref.id,expectedRevision:1}));
+  assert.equal(deleted.revision,2);
+  assert.equal(await authority.transaction(reader,tx=>tx.getRecord(created.ref.id)),null);
+  assert.deepEqual(await status(),{state:'pending',generation:1,revision:2});
+  await pool.query(`UPDATE projection_outbox SET delivery_state='delivered'
+    WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 AND revision=2`,
+  [scope.spaceId,scope.collectionId,created.ref.id]);
+  assert.deepEqual(await status(),{state:'current',generation:1,revision:2});
+  await pool.query(`UPDATE projection_outbox SET delivery_state='degraded'
+    WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 AND revision=2`,
+  [scope.spaceId,scope.collectionId,created.ref.id]);
+  assert.deepEqual(await status(),{state:'degraded',generation:1,revision:2});
+  await pool.query(`DELETE FROM collection_grants WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,
+    [scope.spaceId,scope.collectionId,scope.credentialId]);
+  await assert.rejects(status(),{code:'FORBIDDEN'});
 });
 
 test('date-time filters compare full UTC instants across query, count and exists', async () => {

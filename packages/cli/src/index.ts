@@ -1,2 +1,2 @@
-import type { RecordRef } from '@stateplane/contracts';
-export interface StateplaneClient { get(ref: RecordRef): Promise<unknown>; }
+export { StateplaneHttpClient, StateplaneCliError } from './transport.js';
+export { runCli } from './run.js';

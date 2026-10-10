@@ -9,6 +9,11 @@ import { backfillDirectory } from './backfill-directory-core.mjs';
 const authorityModule = new URL('../packages/postgres/dist/index.js',import.meta.url);
 if (!existsSync(authorityModule)) throw new Error('Build @stateplane/postgres before db:upgrade-smoke: pnpm --filter @stateplane/postgres build');
 const { PostgresRoutingDirectory, PostgresSpaces } = await import(authorityModule.href);
+const collectSpaces = async (spaces, actor) => {
+  const items=[];
+  for await (const item of spaces.list(actor)) items.push(item);
+  return items;
+};
 
 if (process.env.DATABASE_URL) throw new Error('Upgrade smoke uses the isolated local Postgres database only');
 const password = (await readFile(new URL('../.data/local-db-password', import.meta.url), 'utf8')).trim();
@@ -154,7 +159,7 @@ try {
         {create:async () => { throw new Error('unexpected provider create'); },
           find:async () => null,revoke:async () => {}},{current:async () => true});
       const directory=new PostgresRoutingDirectory(pool,cells);
-      const listed=await spaces.list(actor);
+      const listed=await collectSpaces(spaces,actor);
       assert.deepEqual(listed.map(space=>space.spaceId),['sp_upgrade']);
       assert.equal(listed[0].homeCellId,'cell-origin');
       assert.equal(listed[0].cellId,'cell-a');
@@ -249,7 +254,7 @@ try {
       assert.equal((await new PostgresRoutingDirectory(fresh,splitCells).lookup('sp_upgrade')).cellId,'cell-a');
       assert.equal(await splitSpaces.fencePlacement('sp_upgrade','cell-a',1),2);
       assert.equal((await splitSpaces.reconcile('sp_upgrade')).homeCellId,'cell-origin');
-      assert.equal((await splitSpaces.list({kind:'session',userPrincipalId:'owner',credentialId:'upgrade-session'}))[0].homeCellId,'cell-origin');
+      assert.equal((await collectSpaces(splitSpaces,{kind:'session',userPrincipalId:'owner',credentialId:'upgrade-session'}))[0].homeCellId,'cell-origin');
       const pending='sp_pre025_reservation';
       await upgraded.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
         VALUES($1,'pending-owner','cell-a','cell-a','target-a')`,[pending]);
@@ -261,7 +266,7 @@ try {
         error=>error.code==='23514');
       assert.equal((await fresh.query('SELECT home_cell_id FROM space_directory WHERE space_id=$1',[pending]))
         .rows[0].home_cell_id,null);
-      assert.deepEqual((await splitSpaces.list({kind:'session',userPrincipalId:'pending-owner',credentialId:'session'})),
+      assert.deepEqual((await collectSpaces(splitSpaces,{kind:'session',userPrincipalId:'pending-owner',credentialId:'session'})),
         [await splitSpaces.get({kind:'session',userPrincipalId:'pending-owner',credentialId:'session'},pending)]);
       assert.equal((await fresh.query('SELECT home_cell_id,lifecycle FROM space_directory WHERE space_id=$1',[pending]))
         .rows[0].home_cell_id,'cell-a');
@@ -277,10 +282,10 @@ try {
         .rows[0].lifecycle,'provisioning');
       assert.equal((await fresh.query('SELECT home_cell_id FROM space_directory WHERE space_id=$1',[pending]))
         .rows[0].home_cell_id,'cell-a');
-      assert.deepEqual(await splitSpaces.list({kind:'session',userPrincipalId:'pending-owner',credentialId:'session'}),[]);
+      assert.deepEqual(await collectSpaces(splitSpaces,{kind:'session',userPrincipalId:'pending-owner',credentialId:'session'}),[]);
       await fresh.query("UPDATE space_directory SET provisioning_lease_until=clock_timestamp()-interval '1 second' WHERE space_id=$1",
         [pending]);
-      assert.equal((await splitSpaces.list({kind:'session',userPrincipalId:'pending-owner',credentialId:'session'}))[0]
+      assert.equal((await collectSpaces(splitSpaces,{kind:'session',userPrincipalId:'pending-owner',credentialId:'session'}))[0]
         .spaceId,pending);
       await fresh.query("UPDATE space_directory SET home_cell_id='wrong-home' WHERE space_id=$1",[pending]);
       await assert.rejects(backfillDirectory(fresh,[{cellId:'cell-a',client:upgraded}],

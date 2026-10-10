@@ -1,0 +1,504 @@
+openapi: 3.1.0
+info:
+  title: Stateplane HTTP contract
+  version: 1.0.0
+  description: >-
+    Version 1 authority operations. All content operations reauthorize the current
+    credential, space placement, collection grant and lifecycle. Mutations retain
+    caller idempotency keys. Query cursors traverse live pages, not snapshots.
+    Encode each path selector as one URI component. Encoded slashes (%2F) and
+    backslashes (%5C) remain part of the selector. Because URL parsers remove
+    dot-only segments, send a selector of "." as ";." and ".." as ";..";
+    a literal semicolon is percent-encoded (%3B), so these forms are distinct.
+servers:
+  - url: https://stateplane.example.invalid
+security:
+  - bearer: []
+paths:
+  /v1/auth/session:
+    get:
+      operationId: verifyCredential
+      description: Verify a bearer session or API key without selecting a space; returns kind only.
+      responses:
+        '200':
+          description: Credential is valid at verification time
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [contractVersion, kind]
+                properties: { contractVersion: { const: '1' }, kind: { enum: [session, api-key] } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/spaces:
+    get:
+      operationId: listSpaces
+      description: Returns at most eight owner spaces per page. Each page rechecks the current credential; pending provisioning rows may yield a short or empty page with a continuation. Cursors are scoped to the owner and credential and expire after 15 minutes.
+      parameters: [ { name: cursor, in: query, schema: { type: string }, description: Opaque continuation from the prior page } ]
+      responses:
+        '200':
+          description: Bounded owner space page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, cursor]
+                properties:
+                  items: { type: array, maxItems: 8, items: { type: object } }
+                  cursor: { type: [string, 'null'] }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      operationId: createSpace
+      description: Caller supplies a stable sp_ UUID for recovery after a lost response; repeat the same ID and cell selection.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [spaceId]
+              properties:
+                spaceId: { type: string, pattern: '^sp_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' }
+                cellId: { type: string }
+      responses: { '201': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}:
+    parameters: [ { $ref: '#/components/parameters/spaceId' } ]
+    get:
+      operationId: getSpace
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+    patch:
+      operationId: updateSpaceLifecycle
+      requestBody: { $ref: '#/components/requestBodies/SpaceLifecycle' }
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+    delete:
+      operationId: deleteSpace
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections:
+    parameters: [ { $ref: '#/components/parameters/spaceId' } ]
+    get:
+      operationId: discoverCollections
+      description: Returns at most eight canonical definitions per page. Every page rechecks the caller's current space and collection grants.
+      parameters: [ { name: cursor, in: query, schema: { type: string }, description: Opaque continuation from the prior page } ]
+      responses:
+        '200':
+          description: Bounded collection discovery page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, cursor]
+                properties:
+                  items: { type: array, maxItems: 8, items: { type: object } }
+                  cursor: { type: [string, 'null'] }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/spaces/{spaceId}/collections/{collectionId}:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
+    get:
+      operationId: getCollectionDefinition
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+    put:
+      operationId: defineCollection
+      requestBody: { $ref: '#/components/requestBodies/CollectionDefinition' }
+      responses: { '201': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+    patch:
+      operationId: reviseCollection
+      parameters: [ { name: If-Match, in: header, required: true, schema: { type: integer, minimum: 1 } } ]
+      requestBody: { $ref: '#/components/requestBodies/CollectionDefinition' }
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/records:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
+    post:
+      operationId: mutateRecord
+      description: Create, replace, patch or delete; body includes operation and idempotencyKey.
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/RecordMutation' } }
+      responses: { '200': { $ref: '#/components/responses/Receipt' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/records/{recordId}:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { $ref: '#/components/parameters/recordId' } ]
+    get:
+      operationId: getRecord
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/records/by-key/{key}:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { name: key, in: path, required: true, schema: { type: string } }, { name: mode, in: query, required: true, schema: { enum: [generated, external] } } ]
+    get:
+      operationId: getRecordByKey
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/records/query:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
+    post:
+      operationId: queryRecords
+      description: Body has predicates, limit, optional sort and optional opaque cursor.
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/RecordQuery' } }
+      responses: { '200': { $ref: '#/components/responses/RecordPage' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/records/count:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
+    post:
+      operationId: countRecords
+      description: Body is a JSON array of typed predicates.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: array, items: { $ref: '#/components/schemas/Predicate' }, maxItems: 16 }
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/records/{recordId}/projection:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { $ref: '#/components/parameters/recordId' } ]
+    get:
+      operationId: getProjectionStatus
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/batches/{operationKey}:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { name: operationKey, in: path, required: true, schema: { type: string } } ]
+    put:
+      operationId: ingestBatch
+      description: >-
+        Immutable operation key and JSON array of serialized record requests;
+        retryFailed=true resumes failed items. One to 20 items, at most 1,048,576
+        UTF-8 bytes per item and 2,097,152 combined item bytes are accepted.
+        Fixed item count or byte violations return 400 INVALID_ARGUMENT with
+        retryable false before writes. A body over 3,145,728 bytes returns 429
+        RATE_LIMITED with retryable false and no Retry-After. Transient time or
+        capacity RATE_LIMITED remains retryable with Retry-After; clients must
+        inspect retryable and recover an uncertain write by its operation key.
+      parameters: [ { name: retryFailed, in: query, schema: { type: boolean } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: array, minItems: 1, maxItems: 20, items: { type: string, description: Serialized record mutation without idempotencyKey } }
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+    get:
+      operationId: getBatchProgress
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+    delete:
+      operationId: cancelBatch
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/events:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
+    get:
+      operationId: listEvents
+      description: Feed positions are assigned after writer commit. Poll nextCursor even after a short or empty page to observe later commits.
+      parameters: [ { name: cursor, in: query, schema: { type: string } } ]
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+components:
+  schemas:
+    SpaceLifecycle:
+      type: object
+      required: [lifecycle]
+      additionalProperties: false
+      properties:
+        lifecycle: { enum: [active, readOnly, suspended] }
+    SchemaNode:
+      type: object
+      required: [type]
+      additionalProperties: false
+      properties:
+        $schema: { type: string }
+        type:
+          oneOf:
+            - { enum: [string, integer, number, boolean, object, array] }
+            - { type: array, minItems: 2, maxItems: 2, items: { enum: [string, integer, number, boolean, 'null'] } }
+        properties: { type: object, additionalProperties: { $ref: '#/components/schemas/SchemaNode' } }
+        required: { type: array, items: { type: string } }
+        additionalProperties: { const: false }
+        items: { $ref: '#/components/schemas/SchemaNode' }
+        minItems: { type: integer, minimum: 0 }
+        maxItems: { type: integer, minimum: 0 }
+        minLength: { type: integer, minimum: 0 }
+        maxLength: { type: integer, minimum: 0 }
+        minimum: { type: number }
+        maximum: { type: number }
+        enum: { type: array, minItems: 1 }
+        format: { const: date-time }
+        description: { type: string }
+      description: >-
+        The authority further checks node-kind restrictions, nullable scalar
+        unions, depth, field count, bounds, and enum members.
+    SchemaRoot:
+      allOf:
+        - { $ref: '#/components/schemas/SchemaNode' }
+        - type: object
+          required: [$schema, type, additionalProperties]
+          properties:
+            $schema: { const: 'https://json-schema.org/draft/2020-12/schema' }
+            type: { const: object }
+            additionalProperties: { const: false }
+    CollectionDefinition:
+      type: object
+      required: [slug, version, schema, unique, filterable, sortable]
+      additionalProperties: false
+      properties:
+        slug: { type: string, minLength: 1 }
+        version: { type: integer, minimum: 1 }
+        schema: { $ref: '#/components/schemas/SchemaRoot' }
+        unique:
+          type: array
+          items:
+            type: object
+            required: [name, paths]
+            additionalProperties: false
+            properties:
+              name: { type: string, minLength: 1 }
+              paths: { type: array, minItems: 1, items: { type: string } }
+        filterable: { type: array, items: { type: string } }
+        sortable: { type: array, items: { type: string } }
+        lifecycle:
+          type: object
+          required: [field, initial, transitions]
+          additionalProperties: false
+          properties:
+            field: { type: string }
+            initial: { type: array, items: { type: string } }
+            transitions: { type: object, additionalProperties: { type: array, items: { type: string } } }
+      description: >-
+        Define requires version 1 and a slug matching the path. Revise requires
+        the next compatible version and the current version in If-Match.
+    RecordMutation:
+      oneOf:
+        - type: object
+          required: [operation, idempotencyKey, data]
+          properties:
+            operation: { const: create }
+            idempotencyKey: &idempotencyKey
+              type: string
+              minLength: 1
+              maxLength: 256
+              pattern: '^(?:[^\u0000\uD800-\uDFFF]|[\uD800-\uDBFF][\uDC00-\uDFFF])+$'
+              x-utf8MaxBytes: 256
+              description: >-
+                A nonempty Unicode-scalar key of at most 256 UTF-8 bytes.
+                Clients must enforce the byte extension; the server enforces it
+                before any mutation or receipt effect. Reuse the same key only
+                with an identical canonical request fingerprint.
+            expectedSchemaVersion: { type: integer, minimum: 1 }
+            externalKey:
+              type: string
+              minLength: 1
+              # The pattern excludes U+0000, lone surrogates and strings made
+              # entirely of the fixed v1 trim set. The byte extension applies
+              # after NFC and that trim; raw input may include padding.
+              pattern: '^(?![\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*$)[^\u0000\ud800-\udfff]+$'
+              x-utf8MaxBytes: 256
+              description: >-
+                Normalize to NFC, then trim U+0009–000D, U+0020, U+0085,
+                U+00A0, U+1680, U+2000–200A, U+2028, U+2029, U+202F,
+                U+205F and U+3000 at both ends. The result must be nonempty
+                and at most 256 UTF-8 bytes. Clients must enforce the byte
+                extension on the normalized result; the server enforces it.
+            data: { type: object }
+          additionalProperties: false
+        - type: object
+          required: [operation, idempotencyKey, id, expectedRevision, data]
+          properties:
+            operation: { const: replace }
+            idempotencyKey: *idempotencyKey
+            id: { type: string, minLength: 1 }
+            expectedRevision: { type: integer, minimum: 1 }
+            expectedSchemaVersion: { type: integer, minimum: 1 }
+            data: { type: object }
+          additionalProperties: false
+        - type: object
+          required: [operation, idempotencyKey, id, expectedRevision, set, unset]
+          properties:
+            operation: { const: patch }
+            idempotencyKey: *idempotencyKey
+            id: { type: string, minLength: 1 }
+            expectedRevision: { type: integer, minimum: 1 }
+            expectedSchemaVersion: { type: integer, minimum: 1 }
+            set: { type: object }
+            unset: { type: array, items: { type: string } }
+          additionalProperties: false
+        - type: object
+          required: [operation, idempotencyKey, id, expectedRevision]
+          properties:
+            operation: { const: delete }
+            idempotencyKey: *idempotencyKey
+            id: { type: string, minLength: 1 }
+            expectedRevision: { type: integer, minimum: 1 }
+            expectedSchemaVersion: { type: integer, minimum: 1 }
+          additionalProperties: false
+      description: >-
+        Create requires data and excludes id/expectedRevision. Replace requires
+        id, expectedRevision and data. Patch requires id, expectedRevision,
+        set and unset. Delete requires id and expectedRevision. Retry unchanged
+        input with the same idempotency key after an uncertain commit.
+    Predicate:
+      oneOf:
+        - type: object
+          required: [field, kind, operator]
+          properties:
+            field: &predicateField { type: string, minLength: 1, pattern: '^(?:[^\u0000\uD800-\uDFFF]|[\uD800-\uDBFF][\uDC00-\uDFFF])+$' }
+            kind: { const: 'null' }
+            operator: { const: isNull }
+          additionalProperties: false
+        - type: object
+          required: [field, kind, operator, value]
+          properties:
+            field: *predicateField
+            kind: { const: string }
+            operator: { enum: [eq, lt, lte, gt, gte] }
+            value: &predicateString
+              type: string
+              maxLength: 512
+              pattern: '^(?:[^\u0000\uD800-\uDFFF]|[\uD800-\uDBFF][\uDC00-\uDFFF])*$'
+              x-utf8MaxBytes: 512
+              description: At most 512 UTF-8 bytes; clients must check the byte limit as well as this structural schema.
+          additionalProperties: false
+        - type: object
+          required: [field, kind, operator, value]
+          properties:
+            field: *predicateField
+            kind: { const: string }
+            operator: { const: in }
+            value: { type: array, minItems: 1, maxItems: 16, items: *predicateString }
+          additionalProperties: false
+        - type: object
+          required: [field, kind, operator, value]
+          properties:
+            field: *predicateField
+            kind: { const: number }
+            operator: { enum: [eq, lt, lte, gt, gte] }
+            value: &predicateNumber { type: number, description: A finite JSON number. }
+          additionalProperties: false
+        - type: object
+          required: [field, kind, operator, value]
+          properties:
+            field: *predicateField
+            kind: { const: number }
+            operator: { const: in }
+            value: { type: array, minItems: 1, maxItems: 16, items: *predicateNumber }
+          additionalProperties: false
+        - type: object
+          required: [field, kind, operator, value]
+          properties:
+            field: *predicateField
+            kind: { const: boolean }
+            operator: { enum: [eq, lt, lte, gt, gte] }
+            value: &predicateBoolean { type: boolean }
+          additionalProperties: false
+        - type: object
+          required: [field, kind, operator, value]
+          properties:
+            field: *predicateField
+            kind: { const: boolean }
+            operator: { const: in }
+            value: { type: array, minItems: 1, maxItems: 16, items: *predicateBoolean }
+          additionalProperties: false
+        - type: object
+          required: [field, kind, operator, value]
+          properties:
+            field: *predicateField
+            kind: { const: date-time }
+            operator: { enum: [eq, lt, lte, gt, gte] }
+            value: &predicateInstant
+              type: string
+              maxLength: 512
+              x-utf8MaxBytes: 512
+              description: UTC instant with a valid Gregorian date and optional decimal seconds; at most 512 UTF-8 bytes. Leap seconds are limited to the listed UTC dates.
+              anyOf:
+                - pattern: '^(?:(?!0000)[0-9]{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12][0-9]|3[01])|(?:0[469]|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:(?!0000)(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00))-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\.[0-9]+)?Z$'
+                - pattern: '^(?:1972-(?:06-30|12-31)|1973-12-31|1974-12-31|1975-12-31|1976-12-31|1977-12-31|1978-12-31|1979-12-31|1981-06-30|1982-06-30|1983-06-30|1985-06-30|1987-12-31|1989-12-31|1990-12-31|1992-06-30|1993-06-30|1994-06-30|1995-12-31|1997-06-30|1998-12-31|2005-12-31|2008-12-31|2012-06-30|2015-06-30|2016-12-31)T23:59:60(?:\.[0-9]+)?Z$'
+          additionalProperties: false
+        - type: object
+          required: [field, kind, operator, value]
+          properties:
+            field: *predicateField
+            kind: { const: date-time }
+            operator: { const: in }
+            value: { type: array, minItems: 1, maxItems: 16, items: *predicateInstant }
+          additionalProperties: false
+    RecordQuery:
+      type: object
+      required: [predicates, limit]
+      properties:
+        predicates: { type: array, items: { $ref: '#/components/schemas/Predicate' }, maxItems: 16 }
+        limit: { type: integer, minimum: 1, maximum: 100 }
+        sort:
+          type: object
+          required: [field, direction]
+          properties:
+            field: { type: string }
+            direction: { enum: [asc, desc] }
+          additionalProperties: false
+        cursor: { type: string, minLength: 1 }
+      additionalProperties: false
+    Receipt:
+      type: object
+      required: [contractVersion, receiptId, spaceId, ref, operation, beforeRevision, revision, schemaVersion, committedAt, expiresAt, projection, replayed]
+      properties:
+        contractVersion: { const: '1' }
+        receiptId: { type: string }
+        spaceId: { type: string }
+        ref:
+          type: object
+          required: [kind, id]
+          properties: { kind: { const: record }, id: { type: string } }
+        operation: { enum: [create, replace, patch, delete] }
+        beforeRevision: { type: [integer, 'null'] }
+        revision: { type: integer, minimum: 1 }
+        schemaVersion: { type: integer, minimum: 1 }
+        committedAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        projection:
+          type: object
+          required: [generation, state]
+          properties: { generation: { type: integer }, state: { const: pending } }
+        replayed: { type: boolean }
+    RecordPage:
+      type: object
+      required: [records, nextCursor, schemaVersion]
+      properties:
+        records: { type: array, items: { type: object } }
+        nextCursor: { type: [string, 'null'] }
+        schemaVersion: { type: integer }
+  securitySchemes:
+    bearer: { type: http, scheme: bearer }
+  parameters:
+    spaceId: { name: spaceId, in: path, required: true, schema: { type: string } }
+    collectionId: { name: collectionId, in: path, required: true, schema: { type: string } }
+    recordId: { name: recordId, in: path, required: true, schema: { type: string } }
+  requestBodies:
+    SpaceLifecycle:
+      required: true
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/SpaceLifecycle' } }
+    CollectionDefinition:
+      required: true
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/CollectionDefinition' } }
+  responses:
+    Receipt:
+      description: Canonical committed or replayed authority receipt
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/Receipt' } }
+    RecordPage:
+      description: Exact live page; nextCursor is null at end
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/RecordPage' } }
+    Json:
+      description: Canonical application result or receipt
+      content:
+        application/json: { schema: {} }
+    Error:
+      description: Stable structured error; Retry-After is supplied for bounded retryable conditions
+      headers:
+        Retry-After: { schema: { type: integer, minimum: 0 } }
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [contractVersion, error]
+            properties:
+              contractVersion: { const: '1' }
+              error:
+                type: object
+                required: [code, message, retryable, requestId]
+                properties:
+                  code: { type: string }
+                  message: { type: string }
+                  retryable: { type: boolean }
+                  requestId: { type: string }

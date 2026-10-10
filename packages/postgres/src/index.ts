@@ -54,6 +54,7 @@ export interface RecordSort { field: string; direction: 'asc' | 'desc' }
 export interface RecordPage { records: AuthorityRecord[]; nextCursor: string | null; schemaVersion: number }
 export interface BatchItemStatus { ordinal:number; state:'pending'|'failed'|'succeeded'; attempts:number; receipt:Receipt|null; failureCode:string|null }
 export interface BatchProgress { operationKey:string; state:'active'|'cancelled'; items:BatchItemStatus[] }
+export interface EventPage { events: Array<{eventId:string;recordId:string;revision:number;operation:RecordMutation;schemaVersion:number;committedAt:string}>; nextCursor:string|null }
 interface PageCursor {
   space: string; collection: string; principal: string; credential: string;
   policy: number; placement: number; schema: number; query: string; expiresAt: number;
@@ -96,12 +97,16 @@ function validPredicateValue(kind:string,value:unknown):boolean {
 
 export class AuthorityError extends Error {
   /** Carry a safe current revision for caller-visible conflicts. */
-  constructor(public readonly code: string, message = code, public readonly currentRevision?: number) { super(message); this.name = 'AuthorityError'; }
+  constructor(public readonly code: string, message = code, public readonly currentRevision?: number,
+    public readonly retryable?: boolean) { super(message); this.name = 'AuthorityError'; }
 }
 class BatchItemFailure extends AuthorityError {}
 export class CommitOutcomeUnknownError extends Error {
-  /** Require an idempotent retry when COMMIT acknowledgement is ambiguous. */
-  constructor(cause: unknown) { super('Commit outcome unknown; retry with the same idempotency key', { cause }); }
+  /** A missing commit acknowledgement requires operation-specific recovery. */
+  constructor(cause: unknown) {
+    super('Commit outcome unknown; inspect authoritative state before retrying', { cause });
+    this.name='CommitOutcomeUnknownError';
+  }
 }
 
 const MAX_JSON_BYTES = 1_048_576;
@@ -299,7 +304,7 @@ function snapshotBatchManifest(operationKey:string,requests:readonly string[],re
     typeof operationKey!=='string' || !unicodeString(operationKey) || !operationKey ||
     Buffer.byteLength(operationKey)>MAX_INDEX_PART_BYTES || typeof retryFailed!=='boolean')
     throw new AuthorityError('INVALID_ARGUMENT');
-  if (requests.length>20) throw new AuthorityError('RATE_LIMITED','Batch item count limit exceeded');
+  if (requests.length>20) throw new AuthorityError('INVALID_ARGUMENT','Batch item count limit exceeded');
   if (Reflect.ownKeys(requests).length!==requests.length+1) throw new AuthorityError('INVALID_ARGUMENT');
   const fixed:string[]=[];
   let total=0;
@@ -308,7 +313,7 @@ function snapshotBatchManifest(operationKey:string,requests:readonly string[],re
     if (!unicodeString(item)) throw new AuthorityError('INVALID_ARGUMENT');
     total+=Buffer.byteLength(item);
     if (total>MAX_PAGE_BYTES || Buffer.byteLength(item)>MAX_JSON_BYTES)
-      throw new AuthorityError('RATE_LIMITED','Batch byte budget exceeded');
+      throw new AuthorityError('INVALID_ARGUMENT','Batch byte budget exceeded');
     append(fixed,item);
   }
   return fixed;
@@ -652,7 +657,8 @@ function pageCandidateSql(options:PageCandidateOptions):string {
 export class PostgresAuthority {
   /** Configure the receipt window used by new authority transactions. */
   constructor(private readonly pool: PoolLike, private readonly receiptRetentionSeconds: number,
-    private readonly cursorSecret?: Uint8Array, private readonly requestTimeoutMs = REQUEST_TIMEOUT_MS) {
+    private readonly cursorSecret?: Uint8Array, private readonly requestTimeoutMs = REQUEST_TIMEOUT_MS,
+    private readonly recheckCredential?: (client: pg.PoolClient) => Promise<void>) {
     if (!isSafeInteger(receiptRetentionSeconds) || receiptRetentionSeconds < 1) throw new RangeError('Invalid receipt retention');
     if (cursorSecret && cursorSecret.byteLength < 32) throw new RangeError('Cursor secret must contain at least 32 bytes');
     if (!isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > REQUEST_TIMEOUT_MS)
@@ -689,6 +695,7 @@ export class PostgresAuthority {
       await tx.checkScope();
       await tx.checkReplayScopes();
       await tx.ensureReceiptsCurrent();
+      await this.recheckCredential?.(client);
       // A failure while setting the final timeout is before COMMIT dispatch.
       // Only a missing COMMIT acknowledgement has an ambiguous outcome.
       await client.query(`SET LOCAL statement_timeout = '${Math.max(1,deadlineMs-Date.now())}ms'`);
@@ -699,7 +706,6 @@ export class PostgresAuthority {
       catch (error) {
         discard = true;
         if ((error as {code?:string}).code==='PZ003') throw new AuthorityError('SCHEMA_CONFLICT','Record index projection incomplete');
-        if ((error as {code?:string}).code==='57014') throw new AuthorityError('RATE_LIMITED','Database commit time limit exceeded');
         if (error instanceof CommitNotSentDeadlineExceeded) throw new AuthorityError('RATE_LIMITED','Request time budget exceeded');
         if (error instanceof AuthorityError) throw error;
         commitAmbiguous = true;
@@ -804,7 +810,9 @@ export class PostgresAuthority {
     const deadline=Date.now()+this.requestTimeoutMs;
     const requests=await this.transaction(fixedScope,tx=>{
       if (tx.scope.capability!=='records:write') throw new AuthorityError('FORBIDDEN');
-      if (typeof serialized!=='string' || Buffer.byteLength(serialized)>3_145_728) throw new AuthorityError('RATE_LIMITED');
+      if (typeof serialized!=='string') throw new AuthorityError('INVALID_ARGUMENT');
+      if (Buffer.byteLength(serialized)>3_145_728)
+        throw new AuthorityError('RATE_LIMITED','Batch envelope byte budget exceeded',undefined,false);
       try { return JSON.parse(serialized) as string[]; }
       catch { throw new AuthorityError('INVALID_ARGUMENT'); }
     },deadline);
@@ -1139,6 +1147,64 @@ export class AuthorityTransaction {
   /** Read a record through the admitted operation queue. */
   getRecord(recordId: string, includeTombstone = false): Promise<AuthorityRecord | null> {
     return this.admitOperation(() => this.readRecord(recordId,includeTombstone));
+  }
+  /** Read only immutable event metadata; content remains subject to record access. */
+  events(cursor?:string):Promise<EventPage> {
+    return this.admitOperation(async()=>{
+      if (this.#scope.capability!=='events:read') throw new AuthorityError('FORBIDDEN');
+      if (cursor!==undefined && (!/^evt_[0-9a-f-]{36}$/.test(cursor))) throw new AuthorityError('CURSOR_INVALID');
+      // Assign positions after record writers commit. A slow earlier writer
+      // can then appear after a cursor issued for a faster later writer.
+      await this.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 1))',
+        [JSON.stringify(scopeIds(this.#scope))]);
+      await this.query(`WITH next AS (
+          SELECT event_id,space_id,collection_id FROM record_event_pending
+          WHERE space_id=$1 AND collection_id=$2
+          ORDER BY committed_at,event_id LIMIT 101
+        ), published AS (
+          INSERT INTO record_event_feed(event_id,space_id,collection_id)
+          SELECT event_id,space_id,collection_id FROM next
+          ON CONFLICT DO NOTHING RETURNING event_id
+        )
+        DELETE FROM record_event_pending p USING published f
+        WHERE p.event_id=f.event_id`,scopeIds(this.#scope));
+      const rows=await this.query(`SELECT e.event_id,e.record_id,e.revision,e.operation,e.schema_version,e.committed_at
+        FROM record_event_feed f JOIN record_events e ON e.event_id=f.event_id
+        WHERE f.space_id=$1 AND f.collection_id=$2
+          AND ($3::text IS NULL OR f.position>(
+            SELECT position FROM record_event_feed WHERE event_id=$3 AND space_id=$1 AND collection_id=$2))
+        ORDER BY f.position LIMIT 101`,[...scopeIds(this.#scope),cursor??null]);
+      if (cursor && !rows.rows.length) {
+        const found=await this.query('SELECT 1 FROM record_event_feed WHERE event_id=$1 AND space_id=$2 AND collection_id=$3',
+          [cursor,...scopeIds(this.#scope)]);
+        if (!found.rows.length) throw new AuthorityError('CURSOR_INVALID');
+      }
+      const page=rows.rows.slice(0,100);
+      return {events:page.map(row=>({eventId:row.event_id,recordId:row.record_id,revision:Number(row.revision),
+        operation:row.operation,schemaVersion:Number(row.schema_version),committedAt:new Date(row.committed_at).toISOString()})),
+        // A quiet tail is still resumable: clients poll the returned cursor
+        // after an empty page and stop only when they choose to stop polling.
+        nextCursor:page.at(-1)?.event_id ?? cursor ?? null};
+    });
+  }
+  /** Report the latest authoritative revision's projection state. */
+  projection(recordId:string):Promise<{state:'pending'|'current'|'degraded';generation:number;revision:number}> {
+    return this.admitOperation(async()=>{
+      if (this.#scope.capability!=='records:read') throw new AuthorityError('FORBIDDEN');
+      if (!scalarString(recordId)) throw new AuthorityError('INVALID_ARGUMENT');
+      const rows=await this.query(`SELECT r.revision,o.generation,o.delivery_state FROM records r
+        JOIN projection_outbox o ON o.space_id=r.space_id AND o.collection_id=r.collection_id
+          AND o.record_id=r.record_id AND o.revision=r.revision
+        WHERE r.space_id=$1 AND r.collection_id=$2 AND r.record_id=$3`,
+        [...scopeIds(this.#scope),recordId]);
+      const row=rows.rows[0];
+      if (!row) throw new AuthorityError('NOT_FOUND');
+      let state:'current'|'degraded'|'pending'='pending';
+      if (row.delivery_state==='delivered') state='current';
+      else if (row.delivery_state==='degraded') state='degraded';
+      return {state,
+        generation:Number(row.generation),revision:Number(row.revision)};
+    });
   }
   /** Apply read authorization and tombstone visibility to a record lookup. */
   private async readRecord(recordId: string, includeTombstone = false): Promise<AuthorityRecord | null> {
@@ -1931,3 +1997,4 @@ export class AuthorityTransaction {
 
 export * from './spaces.js';
 export * from './cell-policy.js';
+export * from './services.js';

@@ -1,6 +1,7 @@
 import type pg from 'pg';
 import { randomUUID } from 'node:crypto';
-import { AuthorityError, type AuthorityScope } from './index.js';
+import type { Capability } from '@stateplane/contracts';
+import { AuthorityError, CommitOutcomeUnknownError, type AuthorityScope } from './index.js';
 import { canonical, compatibleParsed, derivedIndexValue, MAX_INDEX_PART_BYTES, plainJson, scalarString, validateParsedDefinition } from './schema.js';
 import type { CollectionDefinition, Json } from './schema.js';
 
@@ -17,6 +18,13 @@ const has=(values:readonly string[],value:string)=>{
 };
 /** Append to trusted arrays without invoking a replaced push method. */
 const append=<T>(values:T[],value:T)=>{ Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
+/** Definition discovery is available to keys that can read, write or define
+ * records; other direct registry scopes retain their own grant plus schema. */
+export function discoveryGrants(capability:AuthorityScope['capability']):readonly Capability[] {
+  if (capability==='outbox:worker') return [];
+  if (capability==='records:read') return ['records:read','records:write','schema:write'];
+  return [capability,'schema:write'];
+}
 /** Merge declared paths without trusting a replaced Set or array method. */
 const declaredFields=(first:readonly string[],second:readonly string[]):string[]=>{
   const fields:string[]=[];
@@ -24,6 +32,27 @@ const declaredFields=(first:readonly string[],second:readonly string[]):string[]
   for (let i=0;i<second.length;i++) if (!has(fields,second[i])) append(fields,second[i]); // NOSONAR -- own-slot scan avoids replaced array iterators
   return fields;
 };
+const visibleDiscoveryRow=(item:pg.QueryResultRow,space:pg.QueryResultRow,scope:AuthorityScope):boolean=>{
+  if (space.owner_principal_id===scope.principalId) return true;
+  if (!item.grant_current) return false;
+  const grants=discoveryGrants(scope.capability);
+  for (let i=0;i<grants.length;i++) { // NOSONAR -- do not trust a replaced array iterator at this grant boundary
+    if (has(item.capabilities??[],Object.getOwnPropertyDescriptor(grants,i)!.value)) return true;
+  }
+  return false;
+};
+/** Assemble only authorized definitions after the scoped SQL read completes. */
+function discoveredDefinitions(rows:pg.QueryResultRow[],space:pg.QueryResultRow,scope:AuthorityScope):
+  Array<{definition:CollectionDefinition;ready:string[];pending:string[]}> {
+  const collections:Array<{definition:CollectionDefinition;ready:string[];pending:string[]}>=[];
+  for (let i=0;i<rows.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
+    const item=rows[i];
+    if (!visibleDiscoveryRow(item,space,scope)) continue;
+    append(collections,{definition:JSON.parse(item.canonical_definition),
+      ready:item.ready_fields??[],pending:item.pending_fields??[]});
+  }
+  return collections;
+}
 /** Snapshot a schema scope; discovery accepts a space scope without a collection ID. */
 const snapshotScope=(scope:AuthorityScope,collectionRequired=true):AuthorityScope=>{
   const fixed=Object.freeze({...scope});
@@ -51,7 +80,7 @@ const snapshotDefinition=(input:unknown):(()=>unknown)=>{
 /** Schema administration and explicit index activation in the regional authority. */
 export class CollectionRegistry {
   /** Use the regional pool for schema and backfill transactions. */
-  constructor(private readonly pool: PoolLike) {}
+  constructor(private readonly pool: PoolLike, private readonly recheckCredential?: (client:Client,result?:unknown) => Promise<void>) {}
   /** Roll back failed schema work and discard clients with ambiguous boundaries. */
   private async transaction<T>(fn:(client:Client)=>Promise<T>):Promise<T> {
     const client=await this.pool.connect();
@@ -60,8 +89,19 @@ export class CollectionRegistry {
       beginAttempted=true;
       await client.query('BEGIN'); begun=true;
       const result=await fn(client);
+      await this.recheckCredential?.(client,result);
       try { await client.query('COMMIT'); begun=false; }
-      catch (error) { discard=true; throw error; }
+      catch (error) {
+        discard=true;
+        // A PostgreSQL SQLSTATE confirms that COMMIT was rejected. A broken
+        // transport without a SQLSTATE leaves the commit outcome unknown.
+        // Driver server errors carry SQLSTATE and server fields. An errno can
+        // also have five uppercase letters, so code shape alone is unsafe.
+        const server=error as {code?:unknown;severity?:unknown;routine?:unknown};
+        if (typeof server.code==='string' && /^[0-9A-Z]{5}$/.test(server.code) &&
+          typeof server.severity==='string' && typeof server.routine==='string') throw error;
+        throw new CommitOutcomeUnknownError(error);
+      }
       return result;
     } catch (error) {
       if (begun) try { await client.query('ROLLBACK'); } catch { discard=true; }
@@ -217,8 +257,11 @@ export class CollectionRegistry {
     });
   }
   /** A result includes only indexes proven ready; clients must not infer readiness from declaration. */
-  async discover(scope:Omit<AuthorityScope,'collectionId'> & {collectionId?:string}):Promise<Array<{definition:CollectionDefinition;ready:string[];pending:string[]}>> {
+  async discover(scope:Omit<AuthorityScope,'collectionId'> & {collectionId?:string},
+    requestedCollection?:string,after=''):Promise<Array<{definition:CollectionDefinition;ready:string[];pending:string[]}>> {
     scope=snapshotScope(scope as AuthorityScope,false);
+    if (requestedCollection!==undefined && (!scalarString(requestedCollection) || !requestedCollection ||
+      Buffer.byteLength(requestedCollection)>MAX_INDEX_PART_BYTES)) throw new AuthorityError('NOT_FOUND');
     return this.transaction(async client=>{
       const row=await client.query(`SELECT s.owner_principal_id,s.lifecycle,s.policy_version,s.placement_generation
         FROM spaces s WHERE s.space_id=$1 FOR SHARE OF s`,[scope.spaceId]);
@@ -226,26 +269,40 @@ export class CollectionRegistry {
       if (!space) throw new AuthorityError('NOT_FOUND');
       if (Number(space.policy_version)!==scope.policyVersion || Number(space.placement_generation)!==scope.placementGeneration) throw new AuthorityError('FORBIDDEN');
       if (space.lifecycle!=='active' && space.lifecycle!=='readOnly') throw new AuthorityError('SPACE_UNAVAILABLE');
-      const result=await client.query(`SELECT c.collection_id,v.canonical_definition,i.field_name,i.ready,
+      // Choose at most nine visible IDs before joining potentially large
+      // canonical definitions. The ninth ID only signals continuation.
+      const page=requestedCollection===undefined ? `WITH page AS (
+        SELECT c.collection_id FROM collections c
+        LEFT JOIN collection_grants grant_check ON grant_check.space_id=c.space_id
+          AND grant_check.collection_id=c.collection_id AND grant_check.credential_id=$2
+        WHERE c.space_id=$1 AND c.lifecycle<>'deleted' AND c.collection_id>$3
+          AND (c.space_id=$1 AND ($4::boolean OR (grant_check.expires_at IS NULL OR
+            grant_check.expires_at>clock_timestamp()) AND
+            grant_check.capabilities && $5::text[]))
+        ORDER BY c.collection_id LIMIT 9)
+        SELECT c.collection_id,v.canonical_definition,ix.ready_fields,ix.pending_fields,
+          g.capabilities,(g.expires_at IS NULL OR g.expires_at>clock_timestamp()) AS grant_current
+        FROM page p JOIN collections c ON c.space_id=$1 AND c.collection_id=p.collection_id
+        JOIN collection_versions v ON v.space_id=c.space_id AND v.collection_id=c.collection_id AND v.version=c.schema_version
+        LEFT JOIN LATERAL (SELECT
+          array_agg(i.field_name ORDER BY i.field_name) FILTER (WHERE i.ready) AS ready_fields,
+          array_agg(i.field_name ORDER BY i.field_name) FILTER (WHERE NOT i.ready) AS pending_fields
+          FROM collection_index_declarations i WHERE i.space_id=c.space_id AND i.collection_id=c.collection_id) ix ON TRUE
+        LEFT JOIN collection_grants g ON g.space_id=c.space_id AND g.collection_id=c.collection_id AND g.credential_id=$2
+        ORDER BY c.collection_id` : `SELECT c.collection_id,v.canonical_definition,ix.ready_fields,ix.pending_fields,
         g.capabilities,(g.expires_at IS NULL OR g.expires_at>clock_timestamp()) AS grant_current
         FROM collections c JOIN collection_versions v ON v.space_id=c.space_id AND v.collection_id=c.collection_id AND v.version=c.schema_version
-        LEFT JOIN collection_index_declarations i ON i.space_id=c.space_id AND i.collection_id=c.collection_id
+        LEFT JOIN LATERAL (SELECT
+          array_agg(i.field_name ORDER BY i.field_name) FILTER (WHERE i.ready) AS ready_fields,
+          array_agg(i.field_name ORDER BY i.field_name) FILTER (WHERE NOT i.ready) AS pending_fields
+          FROM collection_index_declarations i WHERE i.space_id=c.space_id AND i.collection_id=c.collection_id) ix ON TRUE
         LEFT JOIN collection_grants g ON g.space_id=c.space_id AND g.collection_id=c.collection_id AND g.credential_id=$2
-        WHERE c.space_id=$1 AND c.lifecycle<>'deleted' ORDER BY c.collection_id,i.field_name`,[scope.spaceId,scope.credentialId]);
-      const collections:Array<{definition:CollectionDefinition;ready:string[];pending:string[]}>=[];
-      let lastId:string|undefined;
-      let entry:typeof collections[number]|undefined;
-      for (let i=0;i<result.rows.length;i++) { // NOSONAR -- own-slot scan avoids replaced array iterators
-        const item=result.rows[i];
-        if (space.owner_principal_id!==scope.principalId && (!item.grant_current || !has(item.capabilities??[],scope.capability))) continue;
-        if (lastId!==item.collection_id) {
-          entry={definition:JSON.parse(item.canonical_definition),ready:[],pending:[]};
-          append(collections,entry);
-          lastId=item.collection_id;
-        }
-        if (item.field_name) append(item.ready ? entry!.ready : entry!.pending,item.field_name);
-      }
-      return collections;
+        WHERE c.space_id=$1 AND c.lifecycle<>'deleted' AND c.collection_id=$3 ORDER BY c.collection_id`;
+      const result=await client.query(page,
+      requestedCollection===undefined ? [scope.spaceId,scope.credentialId,after,
+        space.owner_principal_id===scope.principalId,discoveryGrants(scope.capability)] :
+        [scope.spaceId,scope.credentialId,requestedCollection]);
+      return discoveredDefinitions(result.rows,space,scope as AuthorityScope);
     });
   }
   /** One committed batch; repeat until ready. Cursor and values commit together. */

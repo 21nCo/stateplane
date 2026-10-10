@@ -1,7 +1,6 @@
 {
   "name": "@stateplane/cli",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -12,13 +11,18 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "bin"
   ],
-  "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+  "bin": {
+    "stateplane": "./bin/stateplane.js"
   },
-  "dependencies": {
-    "@stateplane/contracts": "workspace:*"
+  "devDependencies": {
+    "@stateplane/contracts": "workspace:*",
+    "esbuild": "0.28.1"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && esbuild src/index.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   }
 }

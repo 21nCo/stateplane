@@ -44,6 +44,46 @@ async function fixture() {
   return {owner,writer};
 }
 const read=scope=>({...scope,capability:'records:read'});
+
+test('write-only grants remain discoverable across bounded registry pages',async()=>{
+  const {owner,writer}=await fixture();
+  await pool.query(`UPDATE collection_grants SET capabilities=ARRAY['records:write']::text[]
+    WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,
+    [owner.spaceId,owner.collectionId,writer.credentialId]);
+  for (let i=0;i<9;i++) {
+    const slug=`entries_${i}`;
+    await registry.define({...owner,collectionId:slug},definition(slug));
+    await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
+      VALUES($1,$2,$3,ARRAY['records:write']::text[])`,[owner.spaceId,slug,writer.credentialId]);
+  }
+  const first=await registry.discover(writer);
+  assert.equal(first.length,9);
+  const second=await registry.discover(writer,undefined,first.at(-1).definition.slug);
+  assert.equal(second.length,1);
+  assert.equal(new Set([...first,...second].map(item=>item.definition.slug)).size,10);
+});
+
+test('a replaced array iterator cannot inject a discovery capability',async()=>{
+  const {owner,writer}=await fixture();
+  await pool.query(`UPDATE collection_grants SET capabilities=ARRAY['events:read']::text[]
+    WHERE space_id=$1 AND collection_id=$2 AND credential_id=$3`,
+  [owner.spaceId,owner.collectionId,writer.credentialId]);
+  const original=Array.prototype[Symbol.iterator];
+  try {
+    Array.prototype[Symbol.iterator]=function*(){
+      if (this.length===3 && this[0]==='records:read' && this[1]==='records:write') {
+        yield 'events:read';
+        return;
+      }
+      yield* Reflect.apply(original,this,[]);
+    };
+    assert.deepEqual(await registry.discover(read(writer),owner.collectionId),[],
+      'selected lookup must not expose a definition through an injected grant');
+    assert.deepEqual(await registry.discover(read(writer)),[],
+      'paged lookup must not expose a definition through an injected grant');
+  } finally { Array.prototype[Symbol.iterator]=original; }
+});
+
 function observedRegistry(matches) {
   let signal;
   const attempted=new Promise(resolve=>{signal=resolve;});
@@ -2329,7 +2369,7 @@ test('a 20-item indexed batch bounds timeout-setting round trips',async()=>{
     [writer.spaceId])).rows[0].n,20);
 });
 
-test('batch admission distinguishes count quotas from malformed manifests before durable writes',async()=>{
+test('batch admission rejects fixed limits as invalid input before durable writes',async()=>{
   const {writer}=await fixture();
   const valid=Array.from({length:20},(_,i)=>JSON.stringify({operation:'create',data:{label:`count-${randomUUID()}-${i}`,score:i}}));
   const readCounts=async()=>{
@@ -2347,15 +2387,15 @@ test('batch admission distinguishes count quotas from malformed manifests before
     const prefix=serialized?'serialized':'direct';
     assert.deepEqual(await readCounts(),[0,0,0]);
     await assert.rejects(ingest(`${prefix}-zero`,[]),{code:'INVALID_ARGUMENT'});
-    await assert.rejects(ingest(`${prefix}-too-many`,[...valid,valid[0]]),{code:'RATE_LIMITED'});
+    await assert.rejects(ingest(`${prefix}-too-many`,[...valid,valid[0]]),{code:'INVALID_ARGUMENT'});
     if (!serialized) {
       await assert.rejects(ingest(`${prefix}-sparse`,malformed),{code:'INVALID_ARGUMENT'});
       await assert.rejects(ingest(`${prefix}-custom`,custom),{code:'INVALID_ARGUMENT'});
       await assert.rejects(ingest(`${prefix}-inherited`,inherited),{code:'INVALID_ARGUMENT'});
     }
     else await assert.rejects(authority.ingestSerializedBatch(writer,`${prefix}-malformed`,'{"bad":true}'),{code:'INVALID_ARGUMENT'});
-    await assert.rejects(ingest(`${prefix}-item-byte`,['x'.repeat(1_048_577)]),{code:'RATE_LIMITED'});
-    await assert.rejects(ingest(`${prefix}-aggregate-byte`,Array(3).fill('x'.repeat(700_000))),{code:'RATE_LIMITED'});
+    await assert.rejects(ingest(`${prefix}-item-byte`,['x'.repeat(1_048_577)]),{code:'INVALID_ARGUMENT'});
+    await assert.rejects(ingest(`${prefix}-aggregate-byte`,Array(3).fill('x'.repeat(700_000))),{code:'INVALID_ARGUMENT'});
     assert.deepEqual(await readCounts(),[0,0,0]);
   }
   const million=Array(1_000_000).fill('');
@@ -2367,10 +2407,13 @@ test('batch admission distinguishes count quotas from malformed manifests before
     if (value===million) enumerated=true;
     return ownKeys(value);
   };
-  try { await assert.rejects(authority.ingestBatch(writer,'direct-million',million),{code:'RATE_LIMITED'}); }
+  try { await assert.rejects(authority.ingestBatch(writer,'direct-million',million),{code:'INVALID_ARGUMENT'}); }
   finally { Reflect.ownKeys=ownKeys; }
   assert.equal(enumerated,false,'over-count direct admission must not enumerate array keys');
-  await assert.rejects(authority.ingestSerializedBatch(writer,'serialized-million',wire),{code:'RATE_LIMITED'});
+  await assert.rejects(authority.ingestSerializedBatch(writer,'serialized-million',wire),{code:'INVALID_ARGUMENT'});
+  const oversizedEnvelope=JSON.stringify(['x'.repeat(3_145_728)]);
+  await assert.rejects(authority.ingestSerializedBatch(writer,'serialized-envelope',oversizedEnvelope),
+    {code:'RATE_LIMITED',retryable:false});
   assert.deepEqual(await readCounts(),[0,0,0]);
   for (const serialized of [false,true]) {
     const key=serialized?'serialized-twenty':'direct-twenty';
@@ -2555,4 +2598,26 @@ test('ninth concurrent collection write reports backpressure and succeeds after 
     assert.equal((await bounded.mutateRequest(writer,ninth)).revision,1);
     assert.equal(await bounded.transaction(read(writer),tx=>tx.countRecords([])),9);
   } finally { release?.(); await Promise.allSettled(active); await writerPool.end(); }
+});
+
+test('schema COMMIT distinguishes a PostgreSQL all-letter SQLSTATE from lost transport',async()=>{
+  for (const failure of ['server','transport']) {
+    const {owner}=await fixture();
+    const observed=new CollectionRegistry({connect:async()=>{
+      const client=await pool.connect();
+      return {query:(sql,...args)=>{
+        if (sql==='COMMIT') {
+          if (failure==='server') return client.query("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='PZABC'; END $$");
+          return Promise.reject(Object.assign(new Error('lost connection'),{code:'EPIPE'}));
+        }
+        return client.query(sql,...args);
+      },release:discard=>client.release(discard)};
+    }});
+    const revised=definition(owner.collectionId,{version:2,
+      schema:{...schema,properties:{...schema.properties,note:{type:'string'}}}});
+    await assert.rejects(observed.revise(owner,1,revised),error=>failure==='server'
+      ? error.code==='PZABC' && error.name!=='CommitOutcomeUnknownError'
+      : error.name==='CommitOutcomeUnknownError');
+    assert.equal((await registry.discover(owner))[0].definition.version,1);
+  }
 });

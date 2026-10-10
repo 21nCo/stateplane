@@ -1,9 +1,10 @@
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { types } from 'node:util';
 import type pg from 'pg';
 import type { DirectoryPlacement, RoutingDirectory } from '@stateplane/application';
-import type { Capability, VerifiedCredential } from '@stateplane/contracts';
+import type { Capability, CollectionId, SpaceId, VerifiedCredential } from '@stateplane/contracts';
 import { AuthorityError, CommitOutcomeUnknownError } from './index.js';
+import type { AuthorityScope } from './index.js';
 import type { CurrentCredential } from './cell-policy.js';
 
 type PoolLike = Pick<pg.Pool, 'connect' | 'query'>;
@@ -39,6 +40,11 @@ class CompletionOutcomeUnknownError extends Error {
   constructor(cause: unknown) { super('Journal completion outcome unknown',{cause}); }
 }
 export interface SpaceAuditPage { entries: ReadonlyArray<Record<string, unknown>>; nextCursor: string | null }
+export interface SpacePage { items: ReadonlyArray<SpaceInfo>; cursor: string | null }
+const spacePageSize = 8;
+const spaceCursorLifetimeMs = 15 * 60_000;
+// Allow a bounded issuing-node clock lead during cross-instance pagination.
+const spaceCursorFutureSkewMs = 60_000;
 /** A fixed cap bounds one owner audit read even when audit history is retained after deletion. */
 const auditPageSize = 100;
 const capabilities = new Set<Capability>(['schema:write','records:read','records:write','sources:read','sources:write','claims:read','claims:write','claims:review','events:read','export:read','space:admin']);
@@ -54,15 +60,20 @@ async function transaction<T>(pool: PoolLike, fn: (client: pg.PoolClient) => Pro
   let begun = false;
   let beginAttempted = false;
   let discard = false;
+  let commitAmbiguous = false;
   try {
     beginAttempted = true;
     await client.query('BEGIN'); begun = true;
     const result = await fn(client);
     try { await client.query('COMMIT'); begun = false; }
-    catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
+    catch (error) {
+      discard = true;
+      commitAmbiguous = true;
+      throw new CommitOutcomeUnknownError(error);
+    }
     return result;
   } catch (error) {
-    if (begun) await client.query('ROLLBACK').catch(() => { discard = true; });
+    if (begun && !commitAmbiguous) await client.query('ROLLBACK').catch(() => { discard = true; });
     else if (beginAttempted) discard = true;
     throw error;
   } finally { client.release(discard); }
@@ -170,8 +181,41 @@ export class PostgresRoutingDirectory implements RoutingDirectory {
 export class PostgresSpaces {
   constructor(private readonly control: PoolLike, private readonly cells: ReadonlyMap<string, CellDatabase>,
     private readonly defaultCellId: string, private readonly keys: AgentKeyProvider,
-    private readonly credentials: CurrentCredential) {
+    private readonly credentials: CurrentCredential,
+    cursorSecret?: Uint8Array) {
     if (!cells.has(defaultCellId)) throw new Error('Default cell is not configured');
+    if (cursorSecret && cursorSecret.byteLength < 32) throw new Error('Space cursor secret must have at least 32 bytes');
+    this.cursorSecret = cursorSecret ? Buffer.from(cursorSecret) : undefined;
+  }
+  private readonly cursorSecret?: Uint8Array;
+  private spaceCursorMac(value: string, secret:Uint8Array): Buffer {
+    return createHmac('sha256',secret).update(value).digest();
+  }
+  private spaceCursor(actor: VerifiedCredential, time: string, id: string, issued: number, secret:Uint8Array): string {
+    const body=JSON.stringify([owner(actor),actor.credentialId,time,id,issued]);
+    return Buffer.from(JSON.stringify([body,this.spaceCursorMac(body,secret).toString('hex')])).toString('base64url');
+  }
+  private spaceAfter(actor: VerifiedCredential, cursor:string|undefined, secret:Uint8Array): {time:string;id:string;issued:number}|null {
+    if (cursor===undefined) return null;
+    if (!/^[A-Za-z0-9_-]{1,16384}$/.test(cursor)) throw new AuthorityError('CURSOR_INVALID');
+    try {
+      const decoded=Buffer.from(cursor,'base64url').toString('utf8');
+      if (Buffer.from(decoded).toString('base64url')!==cursor) throw new Error('Noncanonical cursor');
+      const envelope:unknown=JSON.parse(decoded);
+      if (!Array.isArray(envelope) || envelope.length!==2 || typeof envelope[0]!=='string' ||
+        typeof envelope[1]!=='string' || !/^[0-9a-f]{64}$/.test(envelope[1])) throw new Error('Invalid cursor');
+      const expected=this.spaceCursorMac(envelope[0],secret);
+      if (!timingSafeEqual(expected,Buffer.from(envelope[1],'hex'))) throw new Error('Invalid signature');
+      const value:unknown=JSON.parse(envelope[0]);
+      const now=Date.now();
+      if (!Array.isArray(value) || value.length!==5 || value[0]!==owner(actor) ||
+        value[1]!==actor.credentialId || typeof value[2]!=='string' ||
+        !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/.test(value[2]) ||
+        !validId(value[3]) || typeof value[4]!=='number' || !Number.isSafeInteger(value[4]) ||
+        value[4]>now+spaceCursorFutureSkewMs || now-value[4]>spaceCursorLifetimeMs)
+        throw new Error('Invalid scope or age');
+      return {time:value[2],id:value[3],issued:value[4]};
+    } catch { throw new AuthorityError('CURSOR_INVALID'); }
   }
   private cell(id: string): CellDatabase {
     const cell = this.cells.get(id);
@@ -180,6 +224,79 @@ export class PostgresSpaces {
   }
   private async current(actor: VerifiedCredential, ownerPrincipalId: string = owner(actor)): Promise<void> {
     if (!await this.credentials.current(actor,ownerPrincipalId)) throw new AuthorityError('FORBIDDEN');
+  }
+  /** Recheck the provider while a cell transaction still holds its SQL policy locks. */
+  async assertCurrent(actor:VerifiedCredential,ownerPrincipalId:string):Promise<void> {
+    await this.current(actor,ownerPrincipalId);
+  }
+  /** Check the regional key and grant after the final provider await. The
+   * caller supplies its transaction client so a one-connection pool works. */
+  async assertScopeCurrent(actor:VerifiedCredential,ownerPrincipalId:string,scope:AuthorityScope,
+    db:Pick<pg.PoolClient,'query'>,collectionId:string|undefined,
+    capabilities:readonly Capability[]):Promise<void> {
+    await this.current(actor,ownerPrincipalId);
+    if (actor.kind!=='api-key') return;
+    const live=await db.query(`SELECT 1 FROM space_credentials sc
+      JOIN collection_grants g ON g.space_id=sc.space_id AND g.credential_id=sc.credential_id
+      JOIN collections c ON c.space_id=g.space_id AND c.collection_id=g.collection_id
+      WHERE sc.space_id=$1 AND sc.credential_id=$2 AND sc.owner_principal_id=$3
+        AND ($4::text IS NULL OR g.collection_id=$4) AND g.capabilities && $5::text[]
+        AND c.lifecycle<>'deleted' AND sc.activated_at IS NOT NULL AND sc.confirmed_at IS NOT NULL
+        AND sc.revoked_at IS NULL AND sc.expires_at>clock_timestamp()
+        AND (g.expires_at IS NULL OR g.expires_at>clock_timestamp()) LIMIT 1`,
+    [scope.spaceId,actor.credentialId,ownerPrincipalId,collectionId??null,capabilities]);
+    if (!live.rows.length) throw new AuthorityError('FORBIDDEN');
+  }
+  /** Recheck one provider credential and all discovered grants in one regional
+   * query. The final check still runs inside discovery's transaction. */
+  async assertDiscoveryCurrent(actor:VerifiedCredential,ownerPrincipalId:string,scope:AuthorityScope,
+    db:Pick<pg.PoolClient,'query'>,collectionIds:readonly string[],
+    capabilities:readonly Capability[]):Promise<void> {
+    await this.current(actor,ownerPrincipalId);
+    if (actor.kind!=='api-key') return;
+    const live=await db.query(`SELECT count(DISTINCT g.collection_id)::int AS granted
+      FROM space_credentials sc
+      JOIN collection_grants g ON g.space_id=sc.space_id AND g.credential_id=sc.credential_id
+      JOIN collections c ON c.space_id=g.space_id AND c.collection_id=g.collection_id
+      WHERE sc.space_id=$1 AND sc.credential_id=$2 AND sc.owner_principal_id=$3
+        AND (cardinality($4::text[])=0 OR g.collection_id=ANY($4::text[]))
+        AND g.capabilities && $5::text[] AND c.lifecycle<>'deleted'
+        AND sc.activated_at IS NOT NULL AND sc.confirmed_at IS NOT NULL
+        AND sc.revoked_at IS NULL AND sc.expires_at>clock_timestamp()
+        AND (g.expires_at IS NULL OR g.expires_at>clock_timestamp())`,
+    [scope.spaceId,actor.credentialId,ownerPrincipalId,collectionIds,capabilities]);
+    const granted=Number(live.rows[0]?.granted);
+    if (granted<1 || (collectionIds.length && granted!==new Set(collectionIds).size))
+      throw new AuthorityError('FORBIDDEN');
+  }
+  /** Snapshot placement and provider identity for one request. The collection
+   * transaction subsequently fences policy, placement, grant and lifecycle. */
+  async scope(actor: VerifiedCredential, spaceId: string, collectionId: string | undefined,
+    capability: Capability): Promise<{cellId:string; ownerPrincipalId:string; scope:AuthorityScope}> {
+    if (!validId(spaceId) || (collectionId !== undefined && !validId(collectionId))) throw new AuthorityError('NOT_FOUND');
+    const row=(await this.control.query(`SELECT owner_principal_id,cell_id,lifecycle,policy_version,placement_generation
+      FROM space_directory WHERE space_id=$1`,[spaceId])).rows[0];
+    if (!row || row.lifecycle==='deleted' || row.lifecycle==='provisioning') throw new AuthorityError('NOT_FOUND');
+    if (actor.kind==='session' && actor.userPrincipalId!==row.owner_principal_id) throw new AuthorityError('NOT_FOUND');
+    if (actor.kind==='api-key' && !await this.credentials.current(actor,row.owner_principal_id))
+      throw new AuthorityError('NOT_FOUND');
+    if (actor.kind==='session') await this.current(actor,row.owner_principal_id);
+    if (!this.cells.has(row.cell_id)) throw new AuthorityError('STALE_PLACEMENT');
+    let principalId:string=row.owner_principal_id;
+    if (actor.kind==='api-key') {
+      const active=await this.cell(row.cell_id).pool.query(`SELECT principal_id FROM space_credentials
+        WHERE space_id=$1 AND credential_id=$2 AND owner_principal_id=$3
+          AND activated_at IS NOT NULL AND confirmed_at IS NOT NULL
+          AND revoked_at IS NULL AND expires_at>clock_timestamp()`,
+        [spaceId,actor.credentialId,row.owner_principal_id]);
+      if (!active.rows.length) throw new AuthorityError('NOT_FOUND');
+      principalId=active.rows[0].principal_id;
+      if (!validId(principalId) || principalId===row.owner_principal_id) throw new AuthorityError('FORBIDDEN');
+    }
+    return {cellId:row.cell_id,ownerPrincipalId:row.owner_principal_id,scope:{spaceId:spaceId as SpaceId,
+      collectionId:collectionId as CollectionId,principalId,
+      credentialId:actor.credentialId,capability,policyVersion:safeVersion(row.policy_version),
+      placementGeneration:safeVersion(row.placement_generation)}};
   }
   private async owned(actor: VerifiedCredential, spaceId: string, includeDeleted = false,
     control: Pick<pg.Pool, 'query'> = this.control): Promise<SpaceInfo> {
@@ -207,6 +324,8 @@ export class PostgresSpaces {
     let beginAttempted = false;
     let begun = false;
     let discard = false;
+    let cellPublished = false;
+    let commitAmbiguous = false;
     try {
       await this.current(actor);
       // Recovery may see this committed reservation before the creator can
@@ -220,22 +339,139 @@ export class PostgresSpaces {
         WHERE space_id=$1 AND owner_principal_id=$2 AND lifecycle='provisioning' FOR UPDATE`,[spaceId,owner(actor)]);
       if (!reserved.rows[0]) throw new AuthorityError('STALE_PLACEMENT');
       if (cell.pool === this.control) await this.insertCreatedCell(actor,directory,spaceId,cellId,cell.storageTargetId);
-      else await transaction(cell.pool,db => this.insertCreatedCell(actor,db,spaceId,cellId,cell.storageTargetId));
+      else {
+        await transaction(cell.pool,db => this.insertCreatedCell(actor,db,spaceId,cellId,cell.storageTargetId));
+        cellPublished = true;
+      }
       try { await directory.query('COMMIT'); begun = false; }
-      catch (error) { discard = true; throw new CommitOutcomeUnknownError(error); }
+      catch (error) {
+        discard = true;
+        commitAmbiguous = true;
+        throw new CommitOutcomeUnknownError(error);
+      }
     } catch (error) {
-      if (begun) await directory.query('ROLLBACK').catch(() => { discard = true; });
+      if (begun && !commitAmbiguous) await directory.query('ROLLBACK').catch(() => { discard = true; });
       else if (beginAttempted) discard = true;
+      if (cellPublished && !(error instanceof CommitOutcomeUnknownError))
+        throw new CommitOutcomeUnknownError(error);
       throw error;
     } finally { directory.release(discard); }
   }
-  async create(actor: VerifiedCredential, requestedCellId?: string): Promise<SpaceInfo> {
+  /** An explicit retry of a selected ID may finish a reservation left by an
+   * interrupted creator. The directory lock serializes it with that creator
+   * and with lease-expiry reconciliation. */
+  private async resumeCreatedCell(actor: VerifiedCredential, spaceId: string,
+    cellId: string, cell: CellDatabase): Promise<SpaceInfo> {
+    const resumed = await transaction(this.control, async directory => {
+      await this.current(actor);
+      const row = (await directory.query(`SELECT * FROM space_directory WHERE space_id=$1 FOR UPDATE`,[spaceId])).rows[0];
+      if (!row) throw new AuthorityError('UNIQUE_CONFLICT');
+      if (row.owner_principal_id !== owner(actor) || row.cell_id !== cellId ||
+        row.storage_target_id !== cell.storageTargetId ||
+        (row.home_cell_id !== null && row.home_cell_id !== cellId) || row.lifecycle === 'deleted')
+        throw new AuthorityError('UNIQUE_CONFLICT');
+      if (row.lifecycle !== 'provisioning') {
+        await this.current(actor);
+        return info(row);
+      }
+      const db = cell.pool === this.control ? directory : cell.pool;
+      const local = (await db.query(`SELECT s.owner_principal_id,s.home_cell_id,s.cell_id,s.storage_target_id,s.lifecycle,
+        s.policy_version,s.placement_generation,
+        EXISTS (SELECT 1 FROM space_audit a WHERE a.space_id=s.space_id AND a.actor_principal_id=s.owner_principal_id
+          AND a.action='space:create' AND a.policy_version=1 AND a.placement_generation=1) AS created
+        FROM spaces s WHERE s.space_id=$1`,[spaceId])).rows[0];
+      if (local) {
+        if (local.owner_principal_id !== owner(actor) || local.home_cell_id !== cellId ||
+          local.cell_id !== cellId || local.storage_target_id !== cell.storageTargetId ||
+          local.lifecycle !== 'active' || safeVersion(local.policy_version) !== 1 ||
+          safeVersion(local.placement_generation) !== 1 || local.created !== true)
+          throw new AuthorityError('STALE_PLACEMENT');
+      } else if (cell.pool === this.control) {
+        await this.insertCreatedCell(actor,directory,spaceId,cellId,cell.storageTargetId);
+      } else {
+        await transaction(cell.pool,client => this.insertCreatedCell(actor,client,spaceId,cellId,cell.storageTargetId));
+      }
+      await this.current(actor);
+      const published = await directory.query(`UPDATE space_directory SET home_cell_id=COALESCE(home_cell_id,$2),
+        lifecycle='active',provisioning_lease_until=NULL,updated_at=clock_timestamp()
+        WHERE space_id=$1 AND lifecycle='provisioning' RETURNING *`,[spaceId,cellId]);
+      if (!published.rows[0]) throw new AuthorityError('STALE_PLACEMENT');
+      await this.current(actor);
+      return info(published.rows[0]);
+    });
+    await this.current(actor);
+    return resumed;
+  }
+  private async recoverSelectedCreate(actor:VerifiedCredential,spaceId:string,cellId:string,
+    cell:CellDatabase,selected:boolean,resume=false,prewrite=false):Promise<SpaceInfo|null> {
+    if (!selected) return null;
+    let existing;
+    try { existing=(await this.control.query('SELECT * FROM space_directory WHERE space_id=$1',[spaceId])).rows[0]; }
+    catch (error) {
+      // Only the initial lookup is known to precede every create effect. A
+      // recovery lookup can follow a committed cell or directory reservation.
+      if (prewrite && (error as {code?:unknown})?.code==='57014')
+        throw new AuthorityError('RATE_LIMITED','Database statement time limit exceeded',undefined,true);
+      throw error;
+    }
+    if (!existing) return null;
+    if (existing.owner_principal_id!==owner(actor) || existing.cell_id!==cellId ||
+        existing.storage_target_id!==cell.storageTargetId) throw new AuthorityError('UNIQUE_CONFLICT');
+    if (existing.lifecycle==='provisioning') {
+      if (resume) return this.resumeCreatedCell(actor,spaceId,cellId,cell);
+      throw new AuthorityError('RECEIPT_PENDING');
+    }
+    if (existing.lifecycle==='deleted') throw new AuthorityError('UNIQUE_CONFLICT');
+    await this.current(actor);
+    return info(existing);
+  }
+  /** Reconcile a lost directory publication acknowledgement against owner facts. */
+  private async reconcilePublishedCreate(actor:VerifiedCredential,spaceId:string,cellId:string,
+    cell:CellDatabase,error:unknown):Promise<SpaceInfo|null> {
+    const observed=await this.control.query('SELECT * FROM space_directory WHERE space_id=$1',[spaceId]).catch(()=>null);
+    if (!observed) throw new CommitOutcomeUnknownError(error);
+    const row=observed.rows[0];
+    if (row?.lifecycle==='active' && row.owner_principal_id===owner(actor) &&
+        row.home_cell_id===cellId && row.cell_id===cellId && row.storage_target_id===cell.storageTargetId) {
+      await this.current(actor);
+      return info(row);
+    }
+    if (row?.lifecycle!=='provisioning') throw new CommitOutcomeUnknownError(error);
+    return null;
+  }
+  /** Preserve the reservation until an owner retry can determine its outcome. */
+  private async recoverFailedCreate(actor:VerifiedCredential,spaceId:string,cellId:string,
+    cell:CellDatabase,selected:boolean,publicationAttempted:boolean,error:unknown):Promise<SpaceInfo> {
+    // Once publication is sent, neither a server cancellation nor a missing
+    // readback proves that the independently committed cell was rolled back.
+    if (publicationAttempted) {
+      const published=await this.reconcilePublishedCreate(actor,spaceId,cellId,cell,error);
+      if (published) return published;
+      throw new CommitOutcomeUnknownError(error);
+    }
+    if (selected) {
+      const recovered=await this.recoverSelectedCreate(actor,spaceId,cellId,cell,true).catch(recoveryError=>{
+        if (recoveryError instanceof AuthorityError &&
+            ['RECEIPT_PENDING','UNIQUE_CONFLICT','FORBIDDEN'].includes(recoveryError.code)) throw recoveryError;
+        return null;
+      });
+      if (recovered) return recovered;
+    }
+    // The cell COMMIT may have succeeded even when its acknowledgement was
+    // lost. Leave its reservation for a selected owner retry.
+    if (selected && !(error instanceof AuthorityError)) throw new CommitOutcomeUnknownError(error);
+    throw error;
+  }
+  async create(actor: VerifiedCredential, requestedCellId?: string, requestedSpaceId?: string): Promise<SpaceInfo> {
     actor = snapshotOwner(actor);
-    const principal = owner(actor);
     const cellId = requestedCellId ?? this.defaultCellId;
     const cell = this.cell(cellId); // only server-configured cells are selectable
-    const spaceId = `sp_${randomUUID()}`;
+    if (requestedSpaceId!==undefined && !/^sp_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(requestedSpaceId))
+      throw new AuthorityError('INVALID_ARGUMENT');
+    const spaceId = requestedSpaceId ?? `sp_${randomUUID()}`;
     await this.current(actor);
+    const previous=await this.recoverSelectedCreate(actor,spaceId,cellId,cell,requestedSpaceId!==undefined,true,true);
+    if (previous) return previous;
     let publicationAttempted = false;
     try {
       await this.reserveCreatedCell(actor,spaceId,cellId,cell);
@@ -244,22 +480,11 @@ export class PostgresSpaces {
       const published = await this.control.query(`UPDATE space_directory SET lifecycle='active',provisioning_lease_until=NULL,updated_at=clock_timestamp()
         WHERE space_id=$1 AND lifecycle='provisioning' RETURNING *`,[spaceId]);
       if (!published.rows[0]) throw new Error('Space publication was interrupted');
+      await this.current(actor);
       return info(published.rows[0]);
     } catch (error) {
-      if (publicationAttempted) {
-        // A control write may have committed even when its acknowledgement was
-        // lost. Never delete its live cell until the directory is known to be
-        // unrouteable. An unavailable readback leaves reconciliation possible.
-        const observed = await this.control.query('SELECT * FROM space_directory WHERE space_id=$1',[spaceId]).catch(() => null);
-        if (!observed) throw error;
-        const row = observed.rows[0];
-        if (row?.lifecycle === 'active' && row.owner_principal_id === principal && row.home_cell_id === cellId && row.cell_id === cellId &&
-          row.storage_target_id === cell.storageTargetId) return info(row);
-        if (row?.lifecycle !== 'provisioning') throw error;
-      }
-      // The cell commit may have succeeded even when its acknowledgement was
-      // lost. Leave the reservation for owner recovery to inspect under lock.
-      throw error;
+      return this.recoverFailedCreate(actor,spaceId,cellId,cell,
+        requestedSpaceId!==undefined,publicationAttempted,error);
     }
   }
   private async recoverProvisioning(spaceId: string, ownerPrincipalId: string): Promise<void> {
@@ -294,22 +519,50 @@ export class PostgresSpaces {
         WHERE space_id=$1 AND lifecycle='provisioning'`,[spaceId,existing.home_cell_id]);
     });
   }
-  async list(actor: VerifiedCredential): Promise<SpaceInfo[]> {
-    actor = snapshotOwner(actor);
+  /** Direct callers consume one bounded page at a time without an expiring wire cursor. */
+  async *list(actor: VerifiedCredential): AsyncGenerator<SpaceInfo> {
+    const selected=snapshotOwner(actor);
+    let after:{time:string;id:string}|null=null;
+    do {
+      const page=await this.scanPage(selected,after); // NOSONAR -- the next key depends on the previous page
+      for (const item of page.items) yield item;
+      after=page.next;
+    } while (after);
+  }
+  async listPage(actor: VerifiedCredential, cursor?: string): Promise<SpacePage> {
+    if (!this.cursorSecret) throw new Error('Shared space cursor secret is required for HTTP pagination');
+    const selected=snapshotOwner(actor);
+    const after=this.spaceAfter(selected,cursor,this.cursorSecret);
+    const page=await this.scanPage(selected,after);
+    return {items:page.items,cursor:page.next ? this.spaceCursor(selected,page.next.time,page.next.id,
+      after?.issued??Date.now(),this.cursorSecret) : null};
+  }
+  private async scanPage(actor: VerifiedCredential, after:{time:string;id:string}|null):
+    Promise<{items:ReadonlyArray<SpaceInfo>;next:{time:string;id:string}|null}> {
     await this.current(actor);
-    const pending = await this.control.query(`SELECT space_id FROM space_directory
-      WHERE owner_principal_id=$1 AND lifecycle='provisioning' ORDER BY created_at,space_id`,[owner(actor)]);
-    for (const row of pending.rows) {
-      await this.current(actor);
+    const candidates = await this.control.query(`SELECT space_id,lifecycle,
+      to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_time
+      FROM space_directory WHERE owner_principal_id=$1 AND lifecycle<>'deleted'
+        AND ($2::timestamptz IS NULL OR (created_at,space_id)>($2::timestamptz,$3::text))
+      ORDER BY created_at,space_id LIMIT $4`,
+    [owner(actor),after?.time??null,after?.id??null,spacePageSize+1]);
+    const page=candidates.rows.slice(0,spacePageSize);
+    for (const row of page) {
+      if (row.lifecycle!=='provisioning') continue;
+      await this.current(actor); // NOSONAR -- reauthorize before each bounded recovery
       // A pending cell can be offline while the owner's other spaces remain
       // available. Its directory row stays unrouteable until a later retry.
-      try { await this.recoverProvisioning(row.space_id,owner(actor)); }
+      try { await this.recoverProvisioning(row.space_id,owner(actor)); } // NOSONAR -- recovery is ordered and capped by the page
       catch { /* Keep this reservation pending and continue with healthy cells. */ }
     }
-    const rows = await this.control.query(`SELECT * FROM space_directory WHERE owner_principal_id=$1 AND lifecycle NOT IN ('provisioning','deleted')
-      ORDER BY created_at,space_id`,[owner(actor)]);
+    const rows = page.length ? await this.control.query(`SELECT * FROM space_directory
+      WHERE owner_principal_id=$1 AND space_id=ANY($2::text[]) AND lifecycle NOT IN ('provisioning','deleted') LIMIT $3`,
+    [owner(actor),page.map(row=>row.space_id),spacePageSize]) : {rows:[]};
     await this.current(actor);
-    return rows.rows.map(info);
+    const byId=new Map(rows.rows.map(row=>[row.space_id,info(row)]));
+    const last=page.at(-1);
+    return {items:page.flatMap(row=>byId.has(row.space_id)?[byId.get(row.space_id)!]:[]),
+      next:candidates.rows.length>spacePageSize && last ? {time:last.cursor_time,id:last.space_id} : null};
   }
   async get(actor: VerifiedCredential, spaceId: string): Promise<SpaceInfo> {
     if (!actor || types.isProxy(actor) || !validId(spaceId)) throw new AuthorityError('NOT_FOUND');
@@ -326,7 +579,7 @@ export class PostgresSpaces {
     if (!await this.credentials.current({kind:'api-key',credentialId},row.owner_principal_id))
       throw new AuthorityError('NOT_FOUND');
     if (!this.cells.has(row.cell_id)) throw new AuthorityError('NOT_FOUND');
-    const cell = await this.cell(row.cell_id).pool.query(`SELECT s.policy_version,s.placement_generation,s.home_cell_id,s.cell_id
+    const regional = () => this.cell(row.cell_id).pool.query(`SELECT s.policy_version,s.placement_generation,s.home_cell_id,s.cell_id
       FROM spaces s JOIN space_credentials sc ON sc.space_id=s.space_id AND sc.credential_id=$2
       JOIN collection_grants g ON g.space_id=s.space_id AND g.credential_id=sc.credential_id
       JOIN collections c ON c.space_id=g.space_id AND c.collection_id=g.collection_id
@@ -335,28 +588,31 @@ export class PostgresSpaces {
         AND sc.activated_at IS NOT NULL AND sc.confirmed_at IS NOT NULL AND sc.revoked_at IS NULL AND sc.expires_at>clock_timestamp()
         AND (g.expires_at IS NULL OR g.expires_at>clock_timestamp())
         AND g.capabilities @> ARRAY['space:admin']::text[] LIMIT 1`,[spaceId,credentialId]);
+    const cell = await regional();
     const local = cell.rows[0];
     if (!local) throw new AuthorityError('NOT_FOUND');
     if (local.home_cell_id !== row.home_cell_id || local.cell_id !== row.cell_id ||
       safeVersion(local.policy_version) !== safeVersion(row.policy_version) ||
       safeVersion(local.placement_generation) !== safeVersion(row.placement_generation)) throw new AuthorityError('STALE_PLACEMENT');
     await this.current({kind:'api-key',credentialId},row.owner_principal_id);
+    if (!(await regional()).rows[0]) throw new AuthorityError('NOT_FOUND');
     return info(row);
   }
 
   private async publish(space: SpaceInfo, policyVersion: number, lifecycle: string,
-    control: Pick<pg.Pool, 'query'> = this.control): Promise<void> {
+    control: Pick<pg.Pool, 'query'> = this.control): Promise<SpaceInfo> {
     try {
       const updated = await control.query(`UPDATE space_directory SET policy_version=$3,lifecycle=$4,updated_at=clock_timestamp()
-        WHERE space_id=$1 AND policy_version=$2 AND placement_generation=$5 AND cell_id=$6 AND home_cell_id=$7 RETURNING 1`,
+        WHERE space_id=$1 AND policy_version=$2 AND placement_generation=$5 AND cell_id=$6 AND home_cell_id=$7 RETURNING *`,
       [space.spaceId,space.policyVersion,policyVersion,lifecycle,space.placementGeneration,space.cellId,space.homeCellId]);
       if (updated.rowCount !== 1) throw new AuthorityError('STALE_PLACEMENT');
+      return info(updated.rows[0]);
     } catch (error) {
       const observed = await control.query('SELECT * FROM space_directory WHERE space_id=$1',[space.spaceId]).catch(() => null);
       const row = observed?.rows[0];
       if (row?.owner_principal_id === space.ownerPrincipalId && row.home_cell_id === space.homeCellId && row.cell_id === space.cellId &&
         row.storage_target_id === space.storageTargetId && row.lifecycle === lifecycle &&
-        safeVersion(row.policy_version) === policyVersion && safeVersion(row.placement_generation) === space.placementGeneration) return;
+        safeVersion(row.policy_version) === policyVersion && safeVersion(row.placement_generation) === space.placementGeneration) return info(row);
       throw error;
     }
   }
@@ -374,12 +630,15 @@ export class PostgresSpaces {
     await this.current(actor);
     return this.reconcile(space.spaceId);
   }
-  private async changeLifecycle(actor: VerifiedCredential, spaceId: string, lifecycle: 'active' | 'readOnly' | 'suspended' | 'deleting'): Promise<void> {
+  private async changeLifecycle(actor: VerifiedCredential, spaceId: string, lifecycle: 'active' | 'readOnly' | 'suspended' | 'deleting'): Promise<SpaceInfo> {
     actor = snapshotOwner(actor);
     const observed = await this.owned(actor,spaceId);
     const space = await this.publicationForRetry(actor,observed);
     const prior = space.lifecycle;
-    if (prior === lifecycle) return;
+    // The regional read (or reconciliation) can await while the provider
+    // revokes this owner. A no-op must still authorize the returned metadata.
+    await this.current(actor);
+    if (prior === lifecycle) return space;
     if (prior === 'deleting' || prior === 'deleted') throw new AuthorityError('SPACE_UNAVAILABLE');
     if (lifecycle === 'deleting' && prior !== 'readOnly' && prior !== 'suspended') throw new AuthorityError('INVALID_ARGUMENT', 'Archive or suspend before deletion');
     const next = lifecycle;
@@ -396,11 +655,19 @@ export class PostgresSpaces {
       return Number(changed.rows[0].policy_version);
     });
     await this.current(actor);
-    await this.publish(space,version,next);
+    let published: SpaceInfo;
+    try {
+      published = await this.publish(space,version,next);
+    } catch (error) {
+      if (error instanceof CommitOutcomeUnknownError) throw error;
+      throw new CommitOutcomeUnknownError(error);
+    }
+    await this.current(actor);
+    return published;
   }
-  archive(actor: VerifiedCredential, spaceId: string): Promise<void> { return this.changeLifecycle(actor,spaceId,'readOnly'); }
-  restore(actor: VerifiedCredential, spaceId: string): Promise<void> { return this.changeLifecycle(actor,spaceId,'active'); }
-  suspend(actor: VerifiedCredential, spaceId: string): Promise<void> { return this.changeLifecycle(actor,spaceId,'suspended'); }
+  archive(actor: VerifiedCredential, spaceId: string): Promise<SpaceInfo> { return this.changeLifecycle(actor,spaceId,'readOnly'); }
+  restore(actor: VerifiedCredential, spaceId: string): Promise<SpaceInfo> { return this.changeLifecycle(actor,spaceId,'active'); }
+  suspend(actor: VerifiedCredential, spaceId: string): Promise<SpaceInfo> { return this.changeLifecycle(actor,spaceId,'suspended'); }
   private async publishDeletedRetry(space: SpaceInfo): Promise<void> {
     await this.cleanupIssuances(space,true);
     if (!await this.erased(this.cell(space.cellId).pool,space.spaceId)) throw new AuthorityError('STALE_PLACEMENT');
@@ -414,11 +681,13 @@ export class PostgresSpaces {
     const observed = await this.owned(actor,spaceId,true);
     if (observed.lifecycle === 'deleted') {
       await this.publishDeletedRetry(observed);
+      await this.current(actor);
       return;
     }
     const current = await this.publicationForRetry(actor,observed);
     if (current.lifecycle === 'deleted') {
       await this.publishDeletedRetry(current);
+      await this.current(actor);
       return;
     }
     if (current.lifecycle !== 'deleting') await this.changeLifecycle(actor,spaceId,'deleting');
@@ -452,6 +721,7 @@ export class PostgresSpaces {
     if (!await this.erased(cell.pool,spaceId)) throw new AuthorityError('STALE_PLACEMENT');
     await this.current(actor);
     await this.publish(space,Number(deleted.rows[0].policy_version),'deleted');
+    await this.current(actor);
   }
   /** Explicit owner recovery for an inconsistent deleted cell tombstone. No directory publication occurs here. */
   async repairDeletedErasure(actor: VerifiedCredential, spaceId: string): Promise<void> {
@@ -500,7 +770,7 @@ export class PostgresSpaces {
       await this.current(actor);
     });
   }
-  update(actor: VerifiedCredential, spaceId: string, lifecycle: 'active' | 'readOnly' | 'suspended'): Promise<void> {
+  update(actor: VerifiedCredential, spaceId: string, lifecycle: 'active' | 'readOnly' | 'suspended'): Promise<SpaceInfo> {
     if (!['active','readOnly','suspended'].includes(lifecycle)) throw new AuthorityError('INVALID_ARGUMENT');
     return this.changeLifecycle(actor,spaceId,lifecycle);
   }

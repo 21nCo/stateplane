@@ -3,8 +3,30 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { runBoundedCommand } from '../scripts/bounded-command.mjs';
-import { assertProcessStopped } from './process-stopped.mjs';
+import { assertProcessStopped, processState } from './process-stopped.mjs';
+
+test('Linux observer accepts exit between liveness and procfs, but still sees a live descendant',
+  { skip: process.platform !== 'linux' }, async () => {
+    const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
+    await once(child,'spawn');
+    try {
+      const missingPs=()=>({error:Object.assign(new Error('procps unavailable'),{code:'ENOENT'}),
+        status:null,stdout:''});
+      await assert.rejects(processState(child.pid,{observeProcess:missingPs,readLinuxStat:async()=>{
+        throw Object.assign(new Error('procfs entry vanished'),{code:'ESRCH'});
+      }}),/OS process-state observer unavailable/,
+      'a live child cannot pass when both procfs and ps are unavailable');
+      const stopped=await processState(child.pid,{readLinuxStat:async()=>{
+        child.kill('SIGTERM');
+        await once(child,'exit');
+        throw Object.assign(new Error('procfs entry vanished'),{code:'ESRCH'});
+      },observeProcess:missingPs});
+      assert.equal(stopped,'gone');
+    } finally { if (child.exitCode===null) child.kill('SIGKILL'); }
+  });
 
 test('child output is bounded in combined bytes and the child is gone before rejection',
   { skip: process.platform === 'win32', timeout: 10_000 }, async () => {

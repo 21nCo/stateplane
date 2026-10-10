@@ -126,8 +126,6 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
         await commitBeforeDeadline(client,deadline); begun = false;
       } catch (error) {
         discard = true;
-        if ((error as {code?:string}).code==='57014')
-          throw new AuthorityError('RATE_LIMITED','Nonce admission timed out; obtain a new routing assertion');
         if (error instanceof CommitNotSentDeadlineExceeded)
           throw new AuthorityError('RATE_LIMITED','Nonce admission timed out; obtain a new routing assertion');
         commitAmbiguous = true;
@@ -365,7 +363,6 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       catch (error) {
         discard = true;
         if ((error as {code?:string}).code==='PZ003') throw new AuthorityError('SCHEMA_CONFLICT','Record index projection incomplete');
-        if ((error as {code?:string}).code==='57014') throw new AuthorityError('RATE_LIMITED','Database commit time limit exceeded');
         if (error instanceof CommitNotSentDeadlineExceeded) throw new AuthorityError('RATE_LIMITED','Cell request time budget exceeded');
         commitAmbiguous = true;
         throw new CommitOutcomeUnknownError(error);

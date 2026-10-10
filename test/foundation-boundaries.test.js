@@ -27,7 +27,8 @@ test('package and CLI checks reject forbidden imports with extra call arguments'
   try {
     await mkdir(join(directory, 'packages/api/src'), { recursive: true });
     await mkdir(join(directory, 'app/src'), { recursive: true });
-    await writeFile(join(directory, 'packages/api/package.json'), JSON.stringify({ dependencies: { '@stateplane/auth': 'workspace:*', '@stateplane/application': 'workspace:*' } }));
+    await writeFile(join(directory, 'packages/api/package.json'), JSON.stringify({ dependencies: {
+      '@stateplane/auth': 'workspace:*', '@stateplane/contracts': 'workspace:*', '@stateplane/application': 'workspace:*' } }));
     await writeFile(join(directory, 'packages/api/src/index.ts'), `require('@stateplane/postgres', ignored);`);
     assert.ok((await checkBoundaries(directory)).some(problem => problem.includes('forbidden dependency')));
   } finally {
@@ -74,7 +75,8 @@ test('workspace boundary scan rejects template loads in package and Svelte sourc
   try {
     await mkdir(join(directory, 'packages/api/src'), { recursive: true });
     await mkdir(join(directory, 'app/src/routes'), { recursive: true });
-    await writeFile(join(directory, 'packages/api/package.json'), JSON.stringify({ dependencies: { '@stateplane/auth': 'workspace:*', '@stateplane/application': 'workspace:*' } }));
+    await writeFile(join(directory, 'packages/api/package.json'), JSON.stringify({ dependencies: {
+      '@stateplane/auth': 'workspace:*', '@stateplane/contracts': 'workspace:*', '@stateplane/application': 'workspace:*' } }));
     await writeFile(join(directory, 'packages/api/src/index.ts'), 'void import(`@stateplane/postgres`);');
     await writeFile(join(directory, 'app/src/routes/+page.svelte'), '<script>require(`$lib/server/secret`)</script><button onclick={() => import(`@stateplane/postgres`)}>Load</button>');
     const problems = await checkBoundaries(directory);
@@ -108,7 +110,8 @@ test('unknown package roles fail clearly and dependency key order is irrelevant'
   try {
     await mkdir(join(directory, 'packages/api/src'), { recursive: true });
     await mkdir(join(directory, 'app/src'), { recursive: true });
-    await writeFile(join(directory, 'packages/api/package.json'), JSON.stringify({ dependencies: { '@stateplane/auth': 'workspace:*', '@stateplane/application': 'workspace:*' } }));
+    await writeFile(join(directory, 'packages/api/package.json'), JSON.stringify({ dependencies: {
+      '@stateplane/auth': 'workspace:*', '@stateplane/contracts': 'workspace:*', '@stateplane/application': 'workspace:*' } }));
     await writeFile(join(directory, 'packages/api/src/index.ts'), 'export const ok = true;');
     assert.deepEqual(await checkBoundaries(directory), []);
     await mkdir(join(directory, 'packages/unknown/src'), { recursive: true });

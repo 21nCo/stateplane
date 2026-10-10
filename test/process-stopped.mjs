@@ -12,25 +12,37 @@ function exists(pid) {
   }
 }
 
-function linuxFallback(pid, error) {
-  if (error.code === 'ENOENT' && !exists(pid)) return 'gone';
-  const observed = spawnSync('/bin/ps', ['-o', 'pid=,ppid=,pgid=,stat=,lstart=', '-p', String(pid)],
+/** Diagnostic only; liveness verdicts still use the fresh OS checks below. */
+export function processIdentity(pid) {
+  if (process.platform === 'win32') return `pid=${pid}`;
+  const observed=spawnSync('/bin/ps',['-o','pid=,ppid=,pgid=,stat=,lstart=','-p',String(pid)],
+    {encoding:'utf8',timeout:1000,maxBuffer:4096});
+  return `pid=${pid}; ps=${observed.stdout?.trim() || observed.error?.code || 'absent'}; observedAt=${new Date().toISOString()}`;
+}
+
+function linuxFallback(pid, error, observeProcess) {
+  if ((error.code === 'ENOENT' || error.code === 'ESRCH') && !exists(pid)) return 'gone';
+  const observed = observeProcess('/bin/ps', ['-o', 'pid=,ppid=,pgid=,stat=,lstart=', '-p', String(pid)],
     { encoding: 'utf8', timeout: 1000, maxBuffer: 4096 });
   const detail = observed.error?.code ?? observed.stdout?.trim() ?? 'empty';
   const psState = new RegExp(String.raw`^${pid}\s+\d+\s+\d+\s+([A-Z])`).exec(detail)?.[1];
   if (observed.status === 0 && psState) return psState;
+  // /proc and ps can both miss a descendant that exited between samples.
+  // A fresh kernel liveness check distinguishes that race from a live child
+  // whose OS observer failed.
+  if ((error.code === 'ENOENT' || error.code === 'ESRCH') && !exists(pid)) return 'gone';
   throw new Error(`OS process-state observer unavailable for PID ${pid}: /proc ${error.code ?? 'unknown'}; ps ${detail || 'empty'}`,
     { cause: error });
 }
 
 /** Observe execution with a trusted OS source; an unreaped zombie is stopped. */
-async function processState(pid) {
+export async function processState(pid, { readLinuxStat = readFile, observeProcess = spawnSync } = {}) {
   if (!exists(pid)) return 'gone';
   if (process.platform === 'linux') {
     try {
-      const stat = await readFile(`/proc/${pid}/stat`, 'utf8');
+      const stat = await readLinuxStat(`/proc/${pid}/stat`, 'utf8');
       return stat.slice(stat.lastIndexOf(')') + 2, stat.lastIndexOf(')') + 3);
-    } catch (error) { return linuxFallback(pid, error); }
+    } catch (error) { return linuxFallback(pid, error, observeProcess); }
   }
   const observed = spawnSync('/bin/ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' });
   if (observed.error) throw new Error('OS process-state observer unavailable', { cause: observed.error });
@@ -61,7 +73,7 @@ export async function assertProcessStopped(pid, message = 'process must stop exe
       await new Promise(resolve => setTimeout(resolve, 25));
       return poll();
     }
-    if (observerError) throw observerError;
+    if (observerError) throw new Error(`${message}: ${observerError.message}`, { cause: observerError });
     assert.fail(`${message}; observed process state ${state}`);
   }
   await poll();

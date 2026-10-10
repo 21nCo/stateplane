@@ -32,6 +32,9 @@ try {
   const pendingOutboxIndexBuild = files.some(name =>
     (name === '005_scoped_query_indexes.sql' || name === '006_outbox_due_order.sql') && !recorded.has(name));
   const pendingProjectionUpgrade = files.includes('031_index_missing_projection.sql') && !recorded.has('031_index_missing_projection.sql');
+  const pendingEventFeedUpgrade = ['036_event_cursor.sql','037_commit_safe_event_feed.sql',
+    '038_drop_superseded_event_cursor.sql']
+    .some(name => files.includes(name) && !recorded.has(name));
   if (pendingOutboxIndexBuild && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained') {
     const relation = await client.query("SELECT to_regclass('public.projection_outbox') AS name");
     if (relation.rows[0].name !== null) {
@@ -77,6 +80,27 @@ try {
       }
     }
   }
+  const preflightEventFeed = async () => {
+    const relations = await client.query(`SELECT to_regclass('public.records') AS records,
+      to_regclass('public.record_events') AS events`);
+    if (relations.rows[0].events) {
+      // A record writer can touch records before it inserts an event. Lock in
+      // that order and refuse contention instead of waiting behind a writer
+      // while holding a lock it needs to finish. Keep both locks until commit
+      // so the emptiness check and historical feed backfill cannot race writes.
+      try {
+        if (relations.rows[0].records) await client.query('LOCK TABLE public.records IN SHARE MODE NOWAIT');
+        await client.query('LOCK TABLE public.record_events IN SHARE MODE NOWAIT');
+      } catch(error) {
+        if (error?.code === '55P03')
+          throw new Error('Event feed upgrade requires drained traffic; stop active record writers before retrying', {cause:error});
+        throw error;
+      }
+      const populated = await client.query('SELECT EXISTS (SELECT 1 FROM public.record_events) AS present');
+      if (populated.rows[0].present && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained')
+        throw new Error('Populated event feed upgrade requires drained traffic; set STATEPLANE_POPULATED_INDEX_UPGRADE=drained only after stopping record writers');
+    }
+  };
   for (const name of files) {
     const sql = await readFile(resolve(directory, name), 'utf8');
     const sha256 = createHash('sha256').update(sql).digest('hex');
@@ -93,16 +117,26 @@ try {
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
       transactionOpen = true;
     }
+    // The 033/035 validation boundaries commit their preceding transaction.
+    // Recheck and retain the event writer locks in the transaction that will
+    // actually change the event indexes/feed, including upgrades from older ledger prefixes.
+    if (pendingEventFeedUpgrade &&
+      ['036_event_cursor.sql','037_commit_safe_event_feed.sql','038_drop_superseded_event_cursor.sql'].includes(name) &&
+      (name === '036_event_cursor.sql' || recorded.has('036_event_cursor.sql')))
+      await preflightEventFeed(); // NOSONAR -- preflight locks must precede this migration step
     const receiptDomainCutover = name === '034_batch_receipt_domain.sql' || name === '035_validate_batch_receipt_domain.sql';
-    const priorLockTimeout = receiptDomainCutover ? (await client.query('SHOW lock_timeout')).rows[0].lock_timeout : null;
-    if (receiptDomainCutover) await client.query("SET LOCAL lock_timeout = '5s'");
-    try { await client.query(sql); }
+    const boundedDdl = receiptDomainCutover || name === '038_drop_superseded_event_cursor.sql';
+    const priorLockTimeout = boundedDdl ? (await client.query('SHOW lock_timeout')).rows[0].lock_timeout : null; // NOSONAR -- migrations run in order within the current transaction
+    if (boundedDdl) await client.query("SET LOCAL lock_timeout = '5s'"); // NOSONAR -- set before this step's DDL, never concurrently
+    try { await client.query(sql); } // NOSONAR -- ordered DDL and ledger writes form one migration transaction
     catch (error) {
       if (receiptDomainCutover && error?.code === '55P03')
         throw new Error('Batch receipt domain upgrade requires drained traffic; stop record writers and retry', { cause:error });
+      if (name === '038_drop_superseded_event_cursor.sql' && error?.code === '55P03')
+        throw new Error('Event cursor index removal requires drained readers; stop long readers and retry', { cause:error });
       throw error;
     }
-    if (receiptDomainCutover) await client.query('SELECT set_config($1,$2,true)', ['lock_timeout',priorLockTimeout]);
+    if (boundedDdl) await client.query('SELECT set_config($1,$2,true)', ['lock_timeout',priorLockTimeout]); // NOSONAR -- restore this step's transaction-local timeout before the ledger write
     await client.query('INSERT INTO stateplane_migrations (name, sha256) VALUES ($1, $2)', [name, sha256]);
     process.stdout.write(`Applied ${name}\n`);
   }

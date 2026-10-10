@@ -13,11 +13,12 @@
     "test": "pnpm test:contracts && pnpm test:qualification",
     "topology:validate": "node scripts/topology.mjs validate",
     "topology:dry-run": "node scripts/topology-dry-run.mjs",
-    "test:contracts": "pnpm --filter @stateplane/postgres... build && node --test test/*.test.js",
+    "test:contracts": "pnpm --filter @stateplane/postgres... --filter @stateplane/api... --filter @stateplane/cli... build && node --test test/*.test.js",
     "test:provider": "node --test test/connected/*.test.js",
     "test:qualification": "pnpm --filter @stateplane/contracts build && pnpm --filter @stateplane/read-model build && vitest run test/qualification.test.ts test/qualification-worker.test.ts test/qualification-worker-postgres.test.ts test/operational-worker.test.ts && node scripts/qualify-exports.mjs",
     "test:consumer": "node scripts/test-consumer.mjs",
-    "test:postgres": "pnpm --filter @stateplane/contracts build && pnpm --filter @stateplane/application build && pnpm --filter @stateplane/auth build && pnpm --filter @stateplane/postgres build && node --test test/integration/*.test.js",
+    "test:http-host": "pnpm --filter @stateplane/postgres... --filter @stateplane/api... --filter @stateplane/cli... build && node scripts/test-http-host.mjs",
+    "test:postgres": "pnpm --filter @stateplane/api... --filter @stateplane/postgres... build && node --test test/integration/*.test.js",
     "test:e2e": "playwright test",
     "db:up": "node scripts/local-db.mjs up",
     "db:down": "node scripts/local-db.mjs down",
@@ -26,6 +27,7 @@
     "db:upgrade-smoke": "node scripts/migration-upgrade-smoke.mjs",
     "db:backfill-directory": "node scripts/backfill-space-directory.mjs",
     "db:grant-control-journal": "node scripts/grant-control-journal.mjs",
+    "db:grant-event-feed": "node scripts/grant-event-feed.mjs",
     "db:index-race-smoke": "node scripts/migration-index-race-smoke.mjs",
     "dev:worker": "pnpm --filter @stateplane/app dev:worker",
     "worker:dry-run": "pnpm --filter @stateplane/app exec wrangler deploy --dry-run --outdir ../.data/worker-dry-run",
@@ -35,9 +37,9 @@
   },
   "devDependencies": {
     "@authfn/api-keys": "0.1.2",
-    "@cloudflare/workers-types": "5.20260918.1",
     "@authfn/core": "0.1.1",
     "@authfn/multi-region": "0.1.2",
+    "@cloudflare/workers-types": "5.20260918.1",
     "@datafn/core": "0.1.1",
     "@datafn/server": "0.2.0",
     "@eslint/js": "10.0.1",
@@ -53,6 +55,7 @@
     "@superfunctions/storage-r2": "0.2.0",
     "@types/node": "22.20.1",
     "@types/pg": "8.20.0",
+    "ajv": "8.20.0",
     "eslint": "10.8.0",
     "globals": "17.7.0",
     "pg": "8.22.0",
@@ -61,6 +64,7 @@
     "turbo": "2.10.7",
     "typescript": "6.0.3",
     "typescript-eslint": "8.65.0",
-    "vitest": "4.1.11"
+    "vitest": "4.1.11",
+    "yaml": "2.8.3"
   }
 }

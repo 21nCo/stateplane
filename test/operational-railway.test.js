@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readOperationalRailway } from '../scripts/operational-railway.mjs';
-import { assertProcessStopped } from './process-stopped.mjs';
+import { assertProcessStopped, processIdentity } from './process-stopped.mjs';
 
 const resource = { serviceId: 'service', volumeInstanceId: 'volume' };
 const options = { projectId: 'project', environmentId: 'environment', account: 'test-account' };
@@ -65,11 +65,12 @@ setTimeout(()=>process.exit(0),80);
             catch { await new Promise(resolve => setTimeout(resolve, 25)); }
           }
           assert.ok(pid, `${failure} descendant started`);
+          const identity=processIdentity(pid);
           const started = Date.now();
           if (failure === 'abort') controller.abort();
           await assert.rejects(request, /Connected Railway provider readback failed/);
           assert.ok(Date.now() - started < 2500, `${failure} must settle before command timeout`);
-          await assertProcessStopped(pid, `${failure} operational Railway descendant must stop`);
+          await assertProcessStopped(pid, `${failure} operational Railway descendant must stop; ${identity}; settledAt=${new Date().toISOString()}`);
         } finally {
           controller.abort();
           await request.catch(() => {});
