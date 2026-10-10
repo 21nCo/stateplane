@@ -2,15 +2,16 @@
 // McpFn production client) and the official Python MCP SDK share one space.
 //
 //   node scripts/test-mcp-clients.mjs                 in-process AuthFn + Postgres composition
-//   node scripts/test-mcp-clients.mjs --host          the app's opt-in /mcp host (vite dev)
+//   node scripts/test-mcp-clients.mjs --host          the app's opt-in /mcp host under vite (Node)
+//   node scripts/test-mcp-clients.mjs --host --workerd   the built app under wrangler dev (workerd)
 //   STATEPLANE_MCP_ENDPOINT=https://<preview>/mcp node scripts/test-mcp-clients.mjs --host
-//                                                     an already deployed opt-in host
+//                                                     an already running opt-in host, such as a Preview
 //
 // The --host modes use the fixture identity of the opt-in host. They need
 // DATABASE_URL for that host's database (loopback, or sslmode=verify-full),
-// and for a deployed endpoint STATEPLANE_TEST_TOKEN, STATEPLANE_TEST_OWNER,
-// STATEPLANE_TEST_AGENT_TOKEN and STATEPLANE_TEST_AGENT_CREDENTIAL matching
-// its configuration. Evidence without credentials is written to
+// and for an external endpoint STATEPLANE_TEST_TOKEN, STATEPLANE_TEST_OWNER,
+// STATEPLANE_TEST_CREDENTIAL, STATEPLANE_TEST_AGENT_TOKEN and
+// STATEPLANE_TEST_AGENT_CREDENTIAL matching its configuration. Evidence without credentials is written to
 // .data/mcp-two-client-evidence.json (or --evidence <path>).
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -28,7 +29,7 @@ const hostMode=args.includes('--host');
 const evidencePath=resolve(args.includes('--evidence') ? args[args.indexOf('--evidence')+1] : join(root,'.data/mcp-two-client-evidence.json'));
 const commandTimeoutMs=60_000;
 const evidence={formatVersion:1,kind:'stateplane.mcp-two-client-gate',startedAt:new Date().toISOString(),
-  mode:process.env.STATEPLANE_MCP_ENDPOINT?'deployed-host':hostMode?'local-app-host':'in-process-authfn',
+  mode:process.env.STATEPLANE_MCP_ENDPOINT?'external-host':hostMode?(args.includes('--workerd')?'local-workerd-host':'local-app-host'):'in-process-authfn',
   clients:[],toolLists:{},steps:[],result:'failed'};
 function assert(condition,message) { if (!condition) throw new Error(message); }
 function step(client,action,outcome) {
@@ -190,7 +191,7 @@ async function scenario(backend) {
 let failure;
 let backend;
 try {
-  backend=hostMode ? await hostBackend() : await inProcessBackend();
+  backend=hostMode ? await hostBackend({workerd:args.includes('--workerd')}) : await inProcessBackend();
   evidence.endpoint=backend.endpointInfo;
   await scenario(backend);
   evidence.result='passed';

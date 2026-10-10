@@ -64,7 +64,10 @@ export function stateplaneHost(env:Bindings):Host | undefined {
     env.STATEPLANE_TEST_CURSOR_SECRET,env.STATEPLANE_TEST_AGENT_TOKEN,
     env.STATEPLANE_TEST_AGENT_CREDENTIAL,env.STATEPLANE_MCP_AUTHORIZATION_SERVER,
     env.STATEPLANE_MCP_RESOURCE])).digest('hex');
-  if (!env.AUTHORITY && cached?.key===key) return cached.host;
+  // A Worker cannot reuse one request's socket in another request, so it gets a
+  // pool per request; only the Node development host keeps one across requests.
+  const perRequest=!!env.AUTHORITY || globalThis.navigator?.userAgent==='Cloudflare-Workers';
+  if (!perRequest && cached?.key===key) return cached.host;
   // pg-pool applies this limit both to new connections and to clients queued
   // behind the four active connections. Without it a provider outage can leave
   // an authenticated HTTP request pending indefinitely.
@@ -175,7 +178,7 @@ export function stateplaneHost(env:Bindings):Host | undefined {
     try { return await handler(request); }
     finally { active--; after(); }
   };
-  if (env.AUTHORITY) {
+  if (perRequest) {
     clearHost();
     return {http:tracked(boundedServe,retire),mcp:tracked(mcpServe,retire)};
   }

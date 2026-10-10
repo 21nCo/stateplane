@@ -20,6 +20,7 @@
     "test:http-host": "pnpm --filter @stateplane/postgres... --filter @stateplane/api... --filter @stateplane/cli... build && node scripts/test-http-host.mjs",
     "test:mcp-clients": "pnpm --filter @stateplane/postgres... --filter @stateplane/mcp... build && node scripts/test-mcp-clients.mjs",
     "test:mcp-conformance": "pnpm --filter @stateplane/postgres... --filter @stateplane/mcp... build && node scripts/test-mcp-conformance.mjs",
+    "test:mcp-workerd": "pnpm --filter @stateplane/postgres... --filter @stateplane/mcp... build && node scripts/test-mcp-clients.mjs --host --workerd",
     "test:postgres": "pnpm --filter @stateplane/api... --filter @stateplane/postgres... --filter @stateplane/mcp... build && node --test test/integration/*.test.js",
     "test:e2e": "playwright test",
     "db:up": "node scripts/local-db.mjs up",

@@ -1,12 +1,14 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
 import { once } from 'node:events';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import pg from 'pg';
 import { connectionOptions } from './db-connection.mjs';
+import { wranglerInvocation } from './wrangler-command.mjs';
 import { CollectionRegistry, PostgresSpaces, postgresServices } from '../packages/postgres/dist/index.js';
 import { createMcpHandler } from '../packages/mcp/dist/index.js';
 
@@ -47,7 +49,7 @@ export async function inProcessBackend() {
   const session=await issueSession(config,{},{userId:user.id,methods:['password']});
   const owner=await identity.verify(new Request(endpoint,{headers:{authorization:`Bearer ${session.sessionToken}`}}));
   const spaceIds=[];
-  return {endpoint,ownerToken:session.sessionToken,denial:'transport',endpointInfo:{origin:'loopback',path:'/mcp'},
+  return {endpoint,ownerToken:session.sessionToken,denial:'transport',endpointInfo:{origin:'loopback',path:'/mcp',runtime:'node-in-process'},
     async createSpace() { const spaceId=`sp_${randomUUID()}`; spaceIds.push(spaceId); await spaces.create(owner,'cell-a',spaceId); return spaceId; },
     async grantAgent(spaceId,collectionId,capabilities) {
       const key=await spaces.issueAgentKey(owner,spaceId,new Date(Date.now()+3_600_000),[{collectionId,capabilities}]);
@@ -67,34 +69,49 @@ export async function inProcessBackend() {
 }
 
 /** The app's opt-in host, spawned locally or already deployed, with its fixture identity. */
-export async function hostBackend() {
-  const deployed=process.env.STATEPLANE_MCP_ENDPOINT;
-  const databaseUrl=deployed ? process.env.DATABASE_URL : await loopbackUrl();
+/** The app's opt-in host: an external endpoint, or a local vite (Node) or wrangler (workerd) run. */
+export async function hostBackend({workerd=false}={}) {
+  const external=process.env.STATEPLANE_MCP_ENDPOINT;
+  const databaseUrl=external ? process.env.DATABASE_URL : await loopbackUrl();
   assert(databaseUrl,'DATABASE_URL is required for fixture grants');
-  const env=deployed ? process.env : {STATEPLANE_TEST_TOKEN:randomBytes(32).toString('hex'),
+  const env=external ? process.env : {STATEPLANE_TEST_TOKEN:randomBytes(32).toString('hex'),
     STATEPLANE_TEST_OWNER:`owner-${randomUUID()}`,STATEPLANE_TEST_CREDENTIAL:`session-${randomUUID()}`,
     STATEPLANE_TEST_AGENT_TOKEN:randomBytes(32).toString('hex'),STATEPLANE_TEST_AGENT_CREDENTIAL:`agent-${randomUUID()}`,
     STATEPLANE_TEST_CURSOR_SECRET:randomBytes(32).toString('hex')};
-  for (const name of ['STATEPLANE_TEST_TOKEN','STATEPLANE_TEST_OWNER','STATEPLANE_TEST_AGENT_TOKEN','STATEPLANE_TEST_AGENT_CREDENTIAL'])
+  for (const name of ['STATEPLANE_TEST_TOKEN','STATEPLANE_TEST_OWNER','STATEPLANE_TEST_CREDENTIAL','STATEPLANE_TEST_AGENT_TOKEN','STATEPLANE_TEST_AGENT_CREDENTIAL'])
     assert(env[name],`${name} is required`);
   let app;
-  let endpoint=deployed;
-  if (!deployed) {
+  let secrets;
+  let endpoint=external;
+  if (!external) {
     const reservation=createNetServer();
     reservation.listen(0,'127.0.0.1'); await once(reservation,'listening');
     const port=reservation.address().port;
     reservation.close(); await once(reservation,'close');
     endpoint=`http://127.0.0.1:${port}/mcp`;
-    app=spawn(process.execPath,[join(root,'app/node_modules/vite/bin/vite.js'),'dev','--host','127.0.0.1','--port',String(port),
-      '--strictPort'],{cwd:join(root,'app'),stdio:'ignore',env:{...process.env,...env,STATEPLANE_ENV:'local',STATEPLANE_TEST_HTTP:'1',
-      STATEPLANE_TEST_DATABASE_URL:databaseUrl,STATEPLANE_MCP_AUTHORIZATION_SERVER:'http://127.0.0.1:9/'}});
+    const bindings={...env,STATEPLANE_TEST_HTTP:'1',STATEPLANE_TEST_DATABASE_URL:databaseUrl,
+      STATEPLANE_MCP_AUTHORIZATION_SERVER:'http://127.0.0.1:9/'};
+    if (workerd) {
+      // workerd receives the fixture secrets from a private file, never argv.
+      const built=spawnSync(process.execPath,[join(root,'app/node_modules/vite/bin/vite.js'),'build'],{cwd:join(root,'app'),stdio:'ignore'});
+      assert(built.status===0,'app build failed');
+      secrets=await mkdtemp(join(tmpdir(),'stateplane-workerd-'));
+      const file=join(secrets,'worker.env');
+      await writeFile(file,Object.entries(bindings).map(([name,value])=>`${name}=${value}`).join('\n')+'\n',{mode:0o600});
+      const {command,args}=wranglerInvocation(['dev','--config','wrangler.jsonc','--persist-to','../.data/wrangler/app',
+        '--ip','127.0.0.1','--port',String(port),'--env-file',file]);
+      app=spawn(command,args,{cwd:join(root,'app'),stdio:'ignore',env:{...process.env,WRANGLER_SEND_METRICS:'false'}});
+    } else {
+      app=spawn(process.execPath,[join(root,'app/node_modules/vite/bin/vite.js'),'dev','--host','127.0.0.1','--port',String(port),
+        '--strictPort'],{cwd:join(root,'app'),stdio:'ignore',env:{...process.env,...bindings,STATEPLANE_ENV:'local'}});
+    }
     let ready=false;
-    for (let attempt=0;attempt<150 && !ready;attempt++) {
-      if (app.exitCode!==null) throw new Error('app dev host exited before readiness');
+    for (let attempt=0;attempt<600 && !ready;attempt++) {
+      if (app.exitCode!==null) throw new Error('app host exited before readiness');
       try { ready=(await fetch(new URL('/api/health',endpoint))).ok; } catch { /* still starting */ }
       if (!ready) await new Promise(resolve=>setTimeout(resolve,100)); // NOSONAR -- readiness polling is sequential
     }
-    assert(ready,'app dev host did not become ready');
+    assert(ready,'app host did not become ready');
   }
   const origin=new URL(endpoint);
   const pool=new pg.Pool({...connectionOptions(databaseUrl),max:2});
@@ -107,7 +124,7 @@ export async function hostBackend() {
   const spaceIds=[];
   const agent=env.STATEPLANE_TEST_AGENT_CREDENTIAL;
   return {endpoint,ownerToken:env.STATEPLANE_TEST_TOKEN,denial:'service',
-    endpointInfo:{origin:deployed?origin.origin:'loopback',path:origin.pathname},
+    endpointInfo:{origin:external?origin.origin:'loopback',path:origin.pathname,runtime:external?'external':workerd?'workerd':'node-vite'},
     async createSpace() { const spaceId=`sp_${randomUUID()}`; spaceIds.push(spaceId); await http('POST','spaces',{spaceId}); return spaceId; },
     async grantAgent(spaceId,collectionId,capabilities) {
       // The fixture host authenticates one configured agent bearer; its cell
@@ -138,5 +155,6 @@ export async function hostBackend() {
       }
       await pool.end();
       if (app && app.exitCode===null) { app.kill('SIGTERM'); await Promise.race([once(app,'close'),new Promise(r=>setTimeout(r,3_000))]); }
+      if (secrets) await rm(secrets,{recursive:true,force:true});
     }};
 }

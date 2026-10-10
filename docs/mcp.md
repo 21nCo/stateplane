@@ -152,7 +152,11 @@ bindings, set `STATEPLANE_MCP_AUTHORIZATION_SERVER` to the AuthFn issuer
 `STATEPLANE_MCP_RESOURCE` to the public endpoint when it differs from the
 request origin plus `/mcp`. Without these bindings `/mcp` fails closed with a
 JSON-RPC `503`. The fixture host authenticates its configured owner and agent
-bearers; it is not connected AuthFn evidence. The routed global MCP gateway to
+bearers; it is not connected AuthFn evidence. Inside a Worker the host opens
+its PostgreSQL pool per request, as it already did for Hyperdrive: workerd
+cannot reuse one request's socket in another, and a cached direct-URL pool
+stalled every other request until the 12-second deadline under `wrangler dev`.
+Only the Node development host keeps a pool across requests. The routed global MCP gateway to
 cell service bindings in `deployment/workers` remains a scaffold for every
 transport and belongs to regional acceptance (STA-21).
 
@@ -164,10 +168,13 @@ transport and belongs to regional acceptance (STA-21).
 | `test/integration/mcp-services.test.js` (in `pnpm test:postgres`) | Real AuthFn sessions and keys, Postgres authority: shared IDs and revisions, revision conflict, `KEY_RESERVED` and `UNIQUE_CONFLICT`, MCP↔HTTP receipt replay, idempotency mismatch, `1e400` parity, authorization before shape, AuthFn and cell revocation | Local Postgres |
 | `pnpm test:mcp-clients` | Two distinct SDK clients in one space: official TypeScript SDK 1.29.0 (through `@mcpfn/client`) as owner and official Python SDK 2.3.0 as agent; create, read, query, replace, conflict, patch, both duplicate kinds, lost-response replay, typed filter, count, delete, event feed and revocation | Local Postgres, `uv` |
 | `pnpm test:mcp-conformance` | McpFn target suite (initialize, inventory against the manifest, guidance resource and semantic scenarios) and the applicable scenarios of the pinned official runner 0.1.16 | Local Postgres, network for `npx` |
+| `pnpm test:mcp-workerd` | The two-client gate through the built app under `wrangler dev`: workerd runtime, Workers `pg` sockets and the `@cfworker/json-schema` validator McpFn selects on Workers | Local Postgres, `uv` |
 
-`test:mcp-clients` and `test:mcp-conformance` also accept `--host`, which runs
-the app's `/mcp` route under `vite dev`, or a deployed opt-in host through
-`STATEPLANE_MCP_ENDPOINT` with that host's fixture tokens and `DATABASE_URL`.
+Both scripts accept `--host`, which runs the app's `/mcp` route under
+`vite dev` (add `--workerd` for `wrangler dev`), or an already running opt-in
+host through `STATEPLANE_MCP_ENDPOINT` with that host's fixture variables and
+`DATABASE_URL`. A non-loopback endpoint is reached through a fixed-path
+loopback forwarder because the official runner accepts only loopback URLs.
 Each run writes credential-free evidence under `.data/`. The official runner's
 remaining server scenarios call the reference server's fixture tools, prompts,
 logging, completions, sampling and elicitation; a fixed product registry does

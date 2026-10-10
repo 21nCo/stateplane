@@ -2,8 +2,9 @@
 // pinned official MCP conformance runner, against one authenticated endpoint.
 //
 //   node scripts/test-mcp-conformance.mjs           in-process AuthFn + Postgres composition
-//   node scripts/test-mcp-conformance.mjs --host    the app's opt-in /mcp host; set
-//                                                   STATEPLANE_MCP_ENDPOINT for a deployed one
+//   node scripts/test-mcp-conformance.mjs --host    the app's opt-in /mcp host (add --workerd
+//                                                   for wrangler dev); set STATEPLANE_MCP_ENDPOINT
+//                                                   and its fixture variables for a running one
 //
 // Reports without credentials are written under .data/mcp-conformance/.
 import { createServer } from 'node:http';
@@ -46,7 +47,7 @@ async function loopbackForwarder(endpoint) {
   return {url:`http://127.0.0.1:${server.address().port}${upstream.pathname}`,close:()=>new Promise(r=>server.close(r))};
 }
 
-const backend=process.argv.includes('--host') ? await hostBackend() : await inProcessBackend();
+const backend=process.argv.includes('--host') ? await hostBackend({workerd:process.argv.includes('--workerd')}) : await inProcessBackend();
 let forwarder;
 const summary={formatVersion:1,kind:'stateplane.mcp-conformance',startedAt:new Date().toISOString(),
   endpoint:backend.endpointInfo,officialSuiteVersion:OFFICIAL_CONFORMANCE_VERSION,official:[],notApplicable:[]};
