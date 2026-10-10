@@ -1,0 +1,45 @@
+contracts/mcp-manifest.json
+  s_1900bb15a7199a::t_40b560cae2bf89 32,34,40,42,47-50,79,81,87,89,94-97,140,142,148,150,155-158,187,189,195,197,224-242,339,341,347,349,377,379,411,413,419,421,454-472,570,572,578,580,613,615,621,623,629,631,660,662,668,670,1011,1013,1019,1021,1027,1029,1034,1076,1078,1084,1086,1092,1094,1142,1144,1150,1152,1158,1160,1189,1191,1197,1199,1212,1214,1244,1246,1252,1254,1260,1262,1323,1325,1331,1333,1705,1707,1713,1715,1721,1723,1776,1778,1830
+docs/mcp.md
+  s_1900bb15a7199a::t_fa4a1655d7b5dd 22-28,60-61,108-110,211,219-227,239-242,264-266,272-273
+package.json
+  s_1900bb15a7199a::t_53dc939059ab0b 18
+packages/application/src/errors.ts
+  s_1900bb15a7199a::t_0ea0b15c2543f3 37-38,40-41
+packages/mcp/src/guidance.ts
+  s_1900bb15a7199a::t_9ffbf9fb3871aa 34
+packages/mcp/src/schemas.ts
+  s_1900bb15a7199a::t_2f3b59c664fa06 9-11,13-14,24-25,28,70-73,88-89
+packages/mcp/src/server.ts
+  s_1900bb15a7199a::t_2b399839851286 252-256,258
+scripts/mcp-acceptance-hosts.mjs
+  s_1900bb15a7199a::t_8540887268929c 120-161,193-194,198-199,201,205-208,213,237-240,281,288,292,295,312-313,315
+scripts/mcp-manifest.mjs
+  s_1900bb15a7199a::t_2ef7dca0c6147c 1,6-10
+scripts/test-mcp-clients.mjs
+  s_1900bb15a7199a::t_f1a4d8504a7e24 20,86-91,114,126-131,133,135-137,148,150,166,168-174
+scripts/test-mcp-conformance.mjs
+  s_1900bb15a7199a::t_e693137f5c4ec4 16,86-87
+test/integration/mcp-services.test.js
+  s_1900bb15a7199a::t_00f93e7e394e2c 8,15,212-255
+test/mcp-acceptance-cleanup.test.js
+  s_1900bb15a7199a::t_19555cd2e39b7e 3-5,9,86-165
+test/mcp.test.js
+  s_1900bb15a7199a::t_08b495fb56b075 7,13,240-314
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "04a79733253ad635dd3418cdb426fc31d945f508",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
