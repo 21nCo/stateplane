@@ -17,9 +17,10 @@ const providerTimeoutMs=5_000;
 // connection. A client-side query timeout rejects while its SQL may still run.
 const socketTimeoutMs=7_000;
 const requestTimeoutMs=12_000;
-// A Preview can be reached through more than one hostname; bound the derived
+// A local host may be reached as 127.0.0.1 or localhost; bound the derived
 // MCP resource endpoints instead of growing with request Host headers.
 const maxMcpResources=4;
+const loopbackHosts=new Set(['127.0.0.1','localhost','[::1]']);
 // The MCP declaration, schema validators and metadata cost about 13 ms of CPU
 // to build, so each isolate builds them once per resource. Storage stays
 // request-scoped: every request passes its own services and identity.
@@ -172,11 +173,18 @@ export function stateplaneHost(env:Bindings):Host | undefined {
   };
   // MCP owns its deadline, from authentication through dispatch, because only
   // the JSON-RPC message identifies whether the stalled call can be retried.
-  // AuthFn issuers are configured, never derived.
+  // AuthFn issuers are configured, never derived. The resource origin is the
+  // DNS-rebinding allowlist, so it is configured too; only a local host
+  // derives it, and only from a loopback request host.
   const issuer=env.STATEPLANE_MCP_AUTHORIZATION_SERVER;
   const mcpServe=(request:Request):Promise<Response>=>{
     if (!issuer) return Promise.resolve(mcpUnavailable());
-    const resource=env.STATEPLANE_MCP_RESOURCE ?? new URL('/mcp',request.url).toString();
+    let resource=env.STATEPLANE_MCP_RESOURCE;
+    if (!resource) {
+      const url=new URL('/mcp',request.url);
+      if (env.STATEPLANE_ENV!=='local' || !loopbackHosts.has(url.hostname)) return Promise.resolve(mcpUnavailable());
+      resource=url.toString();
+    }
     let endpoint:McpEndpoint;
     try { endpoint=mcpEndpoint(resource,issuer,env.STATEPLANE_ENV==='local'); }
     catch { return Promise.resolve(mcpUnavailable()); }

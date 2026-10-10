@@ -123,7 +123,9 @@ used: `scopes_supported` is omitted and authorization is the space grant model.
   framing. A larger body returns `413` with a `RATE_LIMITED` envelope.
 - `Origin` is checked against DNS rebinding: the resource's own origin and an
   explicit allowlist are accepted; a loopback development resource also
-  accepts loopback origins. Any other browser origin receives `403`.
+  accepts loopback origins. Any other browser origin receives `403`. The
+  resource is configuration, never the request `Host`, so a rebound request
+  whose `Host` and `Origin` agree is still refused (see Hosting).
 - `requestTimeoutMs` is one deadline from admission through bearer
   verification, body ingestion and dispatch. Expiry cancels an unfinished body,
   and a request whose deadline answered never reaches a tool afterwards.
@@ -132,6 +134,10 @@ used: `scopes_supported` is omitted and authorization is the space grant model.
   answers its own JSON-RPC ID with `PROVIDER_UNAVAILABLE` (read) or
   `COMMIT_OUTCOME_UNKNOWN` (write). The opt-in host uses its existing 12-second
   request deadline, and `onTimeout` retires the request's pool as for HTTP.
+  McpFn's bearer handler holds a clone of the request, so during a stalled
+  verification the deadline cancels Stateplane's branch of the body while the
+  source stays open until verification settles. The response, `onTimeout` and
+  the absence of a late dispatch do not depend on it.
 
 These bounds reuse STA-8/9 limits or protocol framing; none is a measured
 Cloudflare or Railway capacity. The committed manifest publishes 19 tools in a
@@ -164,17 +170,20 @@ a bearer header to a remote HTTP server, with that client's evidence.
 The app mounts `/mcp` and its metadata route on the same opt-in nonproduction
 host as `/v1` (see [HTTP and CLI](http-cli.md)). In addition to that host's
 bindings, set `STATEPLANE_MCP_AUTHORIZATION_SERVER` to the AuthFn issuer
-(HTTPS; loopback HTTP only when `STATEPLANE_ENV=local`). Set
-`STATEPLANE_MCP_RESOURCE` to the public endpoint when it differs from the
-request origin plus `/mcp`. Without these bindings `/mcp` fails closed with a
-JSON-RPC `503`. The fixture host authenticates its configured owner and agent
+(HTTPS; loopback HTTP only when `STATEPLANE_ENV=local`) and
+`STATEPLANE_MCP_RESOURCE` to the public endpoint, for example
+`https://<preview-host>/mcp`. Its origin is the browser origin `/mcp` accepts.
+Only `STATEPLANE_ENV=local` may omit it, and then the resource is derived from
+a loopback request host (`127.0.0.1`, `localhost` or `[::1]`) alone. Without
+these bindings, or for a non-loopback host without a configured resource,
+`/mcp` and its metadata fail closed with a JSON-RPC `503`. The fixture host authenticates its configured owner and agent
 bearers; it is not connected AuthFn evidence. Inside a Worker the host opens
 its PostgreSQL pool per request, as it already did for Hyperdrive: workerd
 cannot reuse one request's socket in another, and a cached direct-URL pool
 stalled every other request until the 12-second deadline under `wrangler dev`.
 Only the Node development host keeps a pool across requests. The MCP endpoint
 is different: the host keeps one per isolate and resource (at most four
-derived resources) and passes each request's services, identity and pool
+loopback resources) and passes each request's services, identity and pool
 retirement with the call. Building it per request cost about 10 ms of CPU per
 `/mcp` request, which is the whole Workers Free CPU budget. Observed with
 Node 22.22.1 on Apple Silicon, in-memory services and one `records_count`
@@ -189,7 +198,8 @@ transport and belongs to regional acceptance (STA-21).
 | Command | Boundary | Needs |
 | --- | --- | --- |
 | `node --test test/mcp.test.js` (in `pnpm test:contracts`) | Registry, OpenAPI parity, service mapping, error parity with HTTP, precedence, re-encoding, OAuth challenges and metadata, origins, McpFn API-key regression matrix, body bounds, one deadline over stalled verification, unfinished body and dispatched reads and writes, one endpoint serving concurrent requests with their own services and equal JSON-RPC IDs, recovery guidance against write schemas | Node |
-| `test/mcp-host.test.ts` (in `pnpm test:qualification`) | The app host builds one MCP endpoint per isolate and resource while each Worker request passes its own services, identity and pool | Node |
+| `test/mcp-host.test.ts` (in `pnpm test:qualification`) | The app host builds one MCP endpoint per isolate and resource while each Worker request passes its own services, identity and pool; a Preview without `STATEPLANE_MCP_RESOURCE` and a local non-loopback `Host` with a matching `Origin` fail closed | Node |
+| `node --test test/mcp-acceptance-cleanup.test.js` (in `pnpm test:contracts`) | Gate cleanup: reverse-order finalizers; a client that cannot spawn, stalls before ready or answers not ready fails the gate, is terminated and awaited, and backend cleanup still runs; evidence mode is the backend that ran | Node |
 | `test/integration/mcp-services.test.js` (in `pnpm test:postgres`) | Real AuthFn sessions and keys, Postgres authority: shared IDs and revisions, revision conflict, `KEY_RESERVED` and `UNIQUE_CONFLICT`, MCP↔HTTP receipt replay, idempotency mismatch, `1e400` parity, authorization before shape, AuthFn and cell revocation | Local Postgres |
 | `pnpm test:mcp-clients` | Two distinct SDK clients in one space: official TypeScript SDK 1.29.0 (through `@mcpfn/client`) as owner and official Python SDK 2.3.0 as agent; create, read, query, replace, conflict, patch, both duplicate kinds, lost-response replay, typed filter, count, delete, event feed and revocation | Local Postgres, `uv` |
 | `pnpm test:mcp-conformance` | McpFn target suite (initialize, inventory against the manifest, guidance resource and semantic scenarios) and the applicable scenarios of the pinned official runner 0.1.16 | Local Postgres, network for `npx` |
@@ -200,10 +210,20 @@ Both scripts accept `--host`, which runs the app's `/mcp` route under
 host through `STATEPLANE_MCP_ENDPOINT` with that host's fixture variables and
 `DATABASE_URL`. A non-loopback endpoint is reached through a fixed-path
 loopback forwarder because the official runner accepts only loopback URLs.
-Each run writes credential-free evidence under `.data/`. Cleanup is owned
-before initialization: the app process, secret file, pools and disposable
-spaces are each released even when startup or an earlier step fails, and the
-evidence records `cleanup: failed` with the reason when any step fails. The official runner's
+Each run writes credential-free evidence under `.data/`; its `mode` and
+`endpoint.runtime` name the backend that actually ran, and setting
+`STATEPLANE_MCP_ENDPOINT` without `--host` fails instead of running in
+process. Every host run first checks that the protected resource metadata
+advertises exactly the endpoint under test; the workerd run pins
+`STATEPLANE_MCP_RESOURCE` as a Preview must, and the vite run uses the local
+loopback derivation. Cleanup is owned before initialization, and each
+resource joins it as soon as it exists: the app process and both client
+processes are registered at spawn or connect (stdin end, then `SIGTERM`, then
+`SIGKILL`, each awaited), a spawn error is a caught failure rather than an
+uncaught event, and the secret file, pools and disposable spaces follow.
+Every step runs even after a failure, `cleanupSteps` counts the client
+terminations, and the evidence records `cleanup: failed` with the reason
+when any step fails. The official runner's
 remaining server scenarios call the reference server's fixture tools, prompts,
 logging, completions, sampling and elicitation; a fixed product registry does
 not publish those, so they are recorded as not applicable rather than passed.
@@ -211,7 +231,8 @@ not publish those, so they are recorded as not applicable rather than passed.
 Local and in-process results do not establish deployed behavior. Exact-head
 acceptance still needs, in order: a disposable Railway PostgreSQL migration and
 fixture database; a Cloudflare Preview of the app with Hyperdrive and the MCP
-bindings, running both scripts with `--host` against the Preview endpoint; a
+bindings and `STATEPLANE_MCP_RESOURCE` set to its `/mcp` URL, running both
+scripts with `--host` against the Preview endpoint; a
 connected AuthFn provider sandbox for real session and key revocation through
 the deployed route; and an Aside Browser check of the Preview metadata route and
 UI/health. Clean up every disposable resource.
@@ -229,3 +250,5 @@ UI/health. Clean up every disposable resource.
 | Worker cost | Rebuilding the registry and validators on every request | One endpoint per isolate and resource; per-request scope test; recorded before/after cost |
 | Recovery guidance | Agents send idempotency keys that collection and batch tools reject | Per-tool recovery hints checked against each write schema |
 | Two clients | Inconsistent IDs, revisions, conflicts, receipts or revocation across implementations | TypeScript and Python SDK gate in-process and through the app host |
+| Resource origin | A request `Host` becomes the trusted origin, defeating the rebinding check | Configured resource outside local loopback; host fail-closed tests |
+| Gate cleanup | A failed start leaves a credential-bearing client, app process or space behind while evidence reports complete | Spawn-error, stalled-init and not-ready tests; client terminations counted in `cleanupSteps` |

@@ -15,7 +15,7 @@ import { authenticatedHttpTarget, createMcpFnTargetSuiteJUnit, disposeMcpFnTarge
   OFFICIAL_CONFORMANCE_VERSION, runAuthenticatedOfficialConformance, runMcpFnTargetSuite,
   serializeMcpFnTargetSuiteReport } from '@mcpfn/testing';
 import { guidanceUri, stateplaneMcpDeclaration } from '../packages/mcp/dist/index.js';
-import { finalizers, hostBackend, inProcessBackend } from './mcp-acceptance-hosts.mjs';
+import { gateMode, runGate, selectBackend } from './mcp-acceptance-hosts.mjs';
 
 const root=resolve(import.meta.dirname,'..');
 const output=join(root,'.data/mcp-conformance');
@@ -39,22 +39,23 @@ async function loopbackForwarder(endpoint) {
     try {
       if (headers.origin && ['127.0.0.1','localhost','[::1]'].includes(new URL(headers.origin).hostname)) headers.origin=upstream.origin;
     } catch { /* A malformed Origin passes through unchanged. */ }
-    const response=await fetch(target,{method:req.method,headers,body:chunks.length?Buffer.concat(chunks):undefined,redirect:'manual'});
-    res.writeHead(response.status,Object.fromEntries(response.headers));
-    res.end(Buffer.from(await response.arrayBuffer()));
+    // An upstream failure is the runner's 502, never an unhandled rejection that skips cleanup.
+    try {
+      const response=await fetch(target,{method:req.method,headers,body:chunks.length?Buffer.concat(chunks):undefined,redirect:'manual'});
+      res.writeHead(response.status,Object.fromEntries(response.headers));
+      res.end(Buffer.from(await response.arrayBuffer()));
+    } catch { if (!res.headersSent) res.writeHead(502); res.end(); }
   });
   server.listen(0,'127.0.0.1'); await once(server,'listening');
   return {url:`http://127.0.0.1:${server.address().port}${upstream.pathname}`,close:()=>new Promise(r=>server.close(r))};
 }
 
 const summary={formatVersion:1,kind:'stateplane.mcp-conformance',startedAt:new Date().toISOString(),
-  officialSuiteVersion:OFFICIAL_CONFORMANCE_VERSION,official:[],notApplicable:[]};
-let failure;
-// Owned before initialization, so a failed start still stops what it began.
-const cleanup=finalizers();
-try {
-  const backend=process.argv.includes('--host') ?
-    await hostBackend({workerd:process.argv.includes('--workerd'),cleanup}) : await inProcessBackend({cleanup});
+  officialSuiteVersion:OFFICIAL_CONFORMANCE_VERSION,mode:null,official:[],notApplicable:[]};
+// Cleanup is owned before initialization, so a failed start still stops what it began.
+const failure=await runGate(summary,async cleanup=>{
+  const backend=await selectBackend(process.argv.slice(2),cleanup);
+  summary.mode=gateMode(backend.endpointInfo);
   summary.endpoint=backend.endpointInfo;
   await mkdir(output,{recursive:true,mode:0o700});
   const spaceId=await backend.createSpace();
@@ -120,15 +121,9 @@ try {
   summary.notApplicable=['logging-set-level','completion-complete','tools-call-* (reference fixture tools)',
     'elicitation-*','resources-read-*/templates/subscribe (reference fixture resources)','prompts-*','server-sse-multiple-streams (JSON responses)'];
   assert(summary.official.every(item=>item.ok),'an applicable official conformance scenario failed');
-  summary.result='passed';
-} catch(error) { failure=error; summary.result='failed'; summary.error=String(error?.message??error); }
-finally {
-  summary.cleanupSteps=cleanup.size;
-  try { await cleanup.run(); summary.cleanup='complete'; }
-  catch(error) { summary.cleanup='failed'; summary.cleanupError=String(error?.message??error); failure??=error; }
-  summary.finishedAt=new Date().toISOString();
-  await mkdir(output,{recursive:true,mode:0o700});
-  await writeFile(join(output,'summary.json'),`${JSON.stringify(summary,null,2)}\n`,{mode:0o600});
-}
+});
+summary.finishedAt=new Date().toISOString();
+await mkdir(output,{recursive:true,mode:0o700});
+await writeFile(join(output,'summary.json'),`${JSON.stringify(summary,null,2)}\n`,{mode:0o600});
 if (failure) throw failure;
 console.log(`MCP protocol and semantic conformance passed; reports: ${output}`);

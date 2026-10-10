@@ -3,6 +3,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
 import { once } from 'node:events';
+import { createInterface } from 'node:readline';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -39,13 +40,92 @@ async function eraseAll(spaceIds,erase) {
   }
   if (errors.length) throw new AggregateError(errors,`space cleanup failed for ${errors.length} space(s)`);
 }
-async function stop(child) {
-  if (child.exitCode!==null || child.signalCode!==null) return;
-  const closed=once(child,'close');
-  child.kill('SIGTERM');
-  if (await Promise.race([closed.then(()=>true),new Promise(r=>setTimeout(()=>r(false),3_000))])) return;
-  child.kill('SIGKILL');
+/** Terminate an owned child and wait for it: end stdin, then SIGTERM, then
+ * SIGKILL. Each signal waits only while the child has not exited. */
+async function stop(child,{exited,closed},graceMs) {
+  if (child.pid===undefined) return; // It never started; spawnOwned saw the error.
+  const done=()=>child.exitCode!==null || child.signalCode!==null;
+  const within=async()=>{
+    let timer;
+    try { return await Promise.race([exited.then(()=>true),new Promise(resolve=>{timer=setTimeout(()=>resolve(false),graceMs);})]); }
+    finally { clearTimeout(timer); }
+  };
+  let stopped=done();
+  if (!stopped && child.stdin) { child.stdin.end(); stopped=await within(); }
+  if (!stopped) { child.kill('SIGTERM'); stopped=await within(); }
+  if (!stopped) { child.kill('SIGKILL'); await exited; }
+  // A descendant may still hold a pipe after the child exits; release ours.
+  for (const stream of [child.stdin,child.stdout,child.stderr]) stream?.destroy();
   await closed;
+}
+
+/** Spawn a child that cleanup owns from the moment it exists. A spawn failure
+ * becomes the `failed` rejection, never an uncaught 'error' event. */
+export function spawnOwned(command,args,options,cleanup,{graceMs=3_000}={}) {
+  const child=spawn(command,args,options);
+  const exited=new Promise(resolve=>child.once('exit',resolve));
+  const closed=new Promise(resolve=>child.once('close',resolve));
+  let fail;
+  const failed=new Promise((_,reject)=>{ fail=reject; });
+  failed.catch(()=>{});
+  child.on('error',error=>fail(error));
+  // Writes after the child exits surface through its exit, not as EPIPE.
+  child.stdin?.on('error',()=>{});
+  const terminate=()=>stop(child,{exited,closed},graceMs);
+  cleanup.add(terminate);
+  return {child,failed,terminate};
+}
+
+/** A child answering one JSON object per stdout line, owned by cleanup at
+ * spawn. Its first line must be {ready:true}; that wait races spawn failure,
+ * early exit and a timeout. Secrets never appear in an error message. */
+export async function startLineProcess(command,args,{cleanup,cwd,env,timeoutMs=60_000,graceMs,secrets=[]}) {
+  const {child,failed,terminate}=spawnOwned(command,args,{cwd,env,stdio:['pipe','pipe','pipe']},cleanup,{graceMs});
+  let stderr='';
+  child.stderr.setEncoding('utf8');child.stderr.on('data',chunk=>{stderr=(stderr+chunk).slice(-4000);});
+  const redacted=text=>secrets.reduce((value,secret)=>value.replaceAll(secret,'[redacted]'),text);
+  const lines=createInterface({input:child.stdout})[Symbol.asyncIterator]();
+  const next=async()=>{
+    let timer;
+    try {
+      const line=await Promise.race([lines.next(),failed,new Promise((_,reject)=>{
+        timer=setTimeout(()=>reject(new Error(`${command} timed out after ${timeoutMs} ms`)),timeoutMs);})]);
+      if (line.done) return {transportError:'ProcessExited'};
+      return JSON.parse(line.value);
+    } finally { clearTimeout(timer); }
+  };
+  let ready;
+  try { ready=await next(); } catch(error) { ready={error:String(error?.message??error)}; }
+  if (!ready?.ready) throw new Error(redacted(`${command} did not initialize: ${ready?.error??JSON.stringify(ready)} ${stderr}`.trim()));
+  return {ready,close:terminate,send:async message=>{
+    if (child.exitCode!==null || child.signalCode!==null) return {transportError:'ProcessExited'};
+    child.stdin.write(`${JSON.stringify(message)}\n`);
+    return next();
+  }};
+}
+
+/** Run one acceptance gate with caller-owned cleanup. The record states the
+ * result and whether every finalizer completed; returns the first failure. */
+export async function runGate(record,body) {
+  const cleanup=finalizers();
+  let failure;
+  try { await body(cleanup); record.result='passed'; }
+  catch(error) { failure=error; record.result='failed'; record.error=String(error?.message??error); }
+  record.cleanupSteps=cleanup.size;
+  try { await cleanup.run(); record.cleanup='complete'; }
+  catch(error) { record.cleanup='failed'; record.cleanupError=String(error?.message??error); failure??=error; }
+  return failure;
+}
+
+const modes={'node-in-process':'in-process-authfn','node-vite':'local-app-host',workerd:'local-workerd-host',external:'external-host'};
+/** The evidence mode is the backend that ran, never the environment requested. */
+export function gateMode(endpointInfo) { return modes[endpointInfo.runtime]; }
+
+/** An external endpoint is only used through the explicit --host mode. */
+export function selectBackend(argv,cleanup) {
+  const host=argv.includes('--host');
+  if (!host && process.env.STATEPLANE_MCP_ENDPOINT) throw new Error('STATEPLANE_MCP_ENDPOINT is set; add --host to target it');
+  return host ? hostBackend({workerd:argv.includes('--workerd'),cleanup}) : inProcessBackend({cleanup});
 }
 
 export function loopbackUrl() {
@@ -69,11 +149,14 @@ export async function inProcessBackend({cleanup}) {
   const services=postgresServices(spaces,new Map([['cell-a',{pool,cursorSecret:randomBytes(32)}]]),3600);
   const holder={};
   const server=createServer(async(req,res)=>{
-    const chunks=[];for await(const chunk of req) chunks.push(chunk);
-    const response=await holder.handler(new Request(`http://127.0.0.1:${server.address().port}${req.url}`,{
-      method:req.method,headers:req.headers,body:chunks.length?Buffer.concat(chunks):undefined}));
-    res.writeHead(response.status,Object.fromEntries(response.headers));
-    res.end(Buffer.from(await response.arrayBuffer()));
+    // An aborted request is a 500, never an unhandled rejection that skips cleanup.
+    try {
+      const chunks=[];for await(const chunk of req) chunks.push(chunk);
+      const response=await holder.handler(new Request(`http://127.0.0.1:${server.address().port}${req.url}`,{
+        method:req.method,headers:req.headers,body:chunks.length?Buffer.concat(chunks):undefined}));
+      res.writeHead(response.status,Object.fromEntries(response.headers));
+      res.end(Buffer.from(await response.arrayBuffer()));
+    } catch { if (!res.headersSent) res.writeHead(500); res.end(); }
   });
   server.listen(0,'127.0.0.1'); await once(server,'listening');
   cleanup.add(()=>new Promise(resolve=>{ server.closeAllConnections(); server.close(()=>resolve()); }));
@@ -112,8 +195,6 @@ export async function hostBackend({workerd=false,cleanup}) {
     STATEPLANE_TEST_CURSOR_SECRET:randomBytes(32).toString('hex')};
   for (const name of ['STATEPLANE_TEST_TOKEN','STATEPLANE_TEST_OWNER','STATEPLANE_TEST_CREDENTIAL','STATEPLANE_TEST_AGENT_TOKEN','STATEPLANE_TEST_AGENT_CREDENTIAL'])
     assert(env[name],`${name} is required`);
-  let app;
-  let secrets;
   let endpoint=external;
   if (!external) {
     const reservation=createNetServer();
@@ -123,32 +204,39 @@ export async function hostBackend({workerd=false,cleanup}) {
     endpoint=`http://127.0.0.1:${port}/mcp`;
     const bindings={...env,STATEPLANE_TEST_HTTP:'1',STATEPLANE_TEST_DATABASE_URL:databaseUrl,
       STATEPLANE_MCP_AUTHORIZATION_SERVER:'http://127.0.0.1:9/'};
+    let started;
     if (workerd) {
       // workerd receives the fixture secrets from a private file, never argv.
       const built=spawnSync(process.execPath,[join(root,'app/node_modules/vite/bin/vite.js'),'build'],{cwd:join(root,'app'),stdio:'ignore'});
       assert(built.status===0,'app build failed');
-      secrets=await mkdtemp(join(tmpdir(),'stateplane-workerd-'));
+      const secrets=await mkdtemp(join(tmpdir(),'stateplane-workerd-'));
       cleanup.add(()=>rm(secrets,{recursive:true,force:true}));
       const file=join(secrets,'worker.env');
+      bindings.STATEPLANE_MCP_RESOURCE=endpoint;
       await writeFile(file,Object.entries(bindings).map(([name,value])=>`${name}=${value}`).join('\n')+'\n',{mode:0o600});
       const {command,args}=wranglerInvocation(['dev','--config','wrangler.jsonc','--persist-to','../.data/wrangler/app',
         '--ip','127.0.0.1','--port',String(port),'--env-file',file]);
-      app=spawn(command,args,{cwd:join(root,'app'),stdio:'ignore',env:{...process.env,WRANGLER_SEND_METRICS:'false'}});
+      started=spawnOwned(command,args,{cwd:join(root,'app'),stdio:'ignore',env:{...process.env,WRANGLER_SEND_METRICS:'false'}},cleanup);
     } else {
-      app=spawn(process.execPath,[join(root,'app/node_modules/vite/bin/vite.js'),'dev','--host','127.0.0.1','--port',String(port),
-        '--strictPort'],{cwd:join(root,'app'),stdio:'ignore',env:{...process.env,...bindings,STATEPLANE_ENV:'local'}});
+      // The Node host derives its loopback resource; the workerd run pins it as a Preview must.
+      started=spawnOwned(process.execPath,[join(root,'app/node_modules/vite/bin/vite.js'),'dev','--host','127.0.0.1','--port',String(port),
+        '--strictPort'],{cwd:join(root,'app'),stdio:'ignore',env:{...process.env,...bindings,STATEPLANE_ENV:'local'}},cleanup);
     }
-    const child=app;
-    cleanup.add(()=>stop(child));
+    const app=started.child;
     let ready=false;
     for (let attempt=0;attempt<600 && !ready;attempt++) {
       if (app.exitCode!==null) throw new Error('app host exited before readiness');
       try { ready=(await fetch(new URL('/api/health',endpoint))).ok; } catch { /* still starting */ }
-      if (!ready) await new Promise(resolve=>setTimeout(resolve,100)); // NOSONAR -- readiness polling is sequential
+      if (!ready) await Promise.race([new Promise(resolve=>setTimeout(resolve,100)),started.failed]); // NOSONAR -- readiness polling is sequential
     }
     assert(ready,'app host did not become ready');
   }
+  // The advertised resource must be this endpoint; a Preview pins it with STATEPLANE_MCP_RESOURCE.
   const origin=new URL(endpoint);
+  const metadata=await fetch(new URL(`/.well-known/oauth-protected-resource${origin.pathname}`,endpoint));
+  assert(metadata.ok,`protected resource metadata returned ${metadata.status}; is STATEPLANE_MCP_RESOURCE set?`);
+  const advertised=(await metadata.json()).resource;
+  assert(new URL(advertised).href===origin.href,`the endpoint advertises resource ${advertised}, not ${origin.href}`);
   const pool=new pg.Pool({...connectionOptions(databaseUrl),max:2});
   cleanup.add(()=>pool.end());
   const http=async(method,path,body)=>{
