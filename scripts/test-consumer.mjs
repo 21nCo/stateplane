@@ -71,7 +71,7 @@ try {
     if (callerPath===undefined) delete process.env.PATH;
     else process.env.PATH=callerPath;
   }
-  const names = ['contracts', 'application', 'auth', 'api', 'cli', 'read-model', 'postgres', 'workers'];
+  const names = ['contracts', 'application', 'auth', 'api', 'cli', 'mcp', 'read-model', 'postgres', 'workers'];
   const tarballs = [];
   for (const name of names) {
     const tarball = join(temp, `${name}.tgz`);
@@ -129,11 +129,13 @@ try {
   run('npm', ['install', '--no-audit', '--no-fund', ...tarballs], temp);
   await writeFile(join(temp, 'consumer.mjs'), `
 import { healthResponse } from '@stateplane/api';
+import { stateplaneMcpDeclaration } from '@stateplane/mcp';
 import { readModelSchema } from '@stateplane/read-model';
 import { parseRevision } from '@stateplane/contracts';
 import { canonicalJsonObject } from '@stateplane/postgres';
 import { validateSchema } from '@datafn/core';
 if ((await healthResponse().json()).status !== 'scaffold') throw new Error('API export failed');
+if (!stateplaneMcpDeclaration().manifest().tools.some(tool => tool.name === 'records_create')) throw new Error('MCP export failed');
 if (readModelSchema.resources[0].name !== 'spacePlacements') throw new Error('fixed schema export failed');
 if (!validateSchema(readModelSchema)) throw new Error('DataFn schema rejected');
 if (parseRevision(1) !== 1) throw new Error('revision export failed');
@@ -213,6 +215,7 @@ if (canonicalJsonObject('{"answer":42}') !== '{"answer":42}') throw new Error('P
   }
   await writeFile(join(temp, 'consumer.ts'), `import { parseRevision, type RecordRef, type Revision, type CollectionId, type SpaceId } from '@stateplane/contracts';
 import type { HttpDependencies } from '@stateplane/api';
+import type { McpHandlerOptions } from '@stateplane/mcp';
 import type { StateplaneHttpClient } from '@stateplane/cli';
 import type { AuthorityScope, AuthorityTransaction, RecordChange, PostgresAuthority, Receipt } from '@stateplane/postgres';
 import type { ProjectionJob } from '@stateplane/workers';
@@ -233,7 +236,8 @@ const receipt: Receipt = await repository.mutate(scope, change);
 // @ts-expect-error An authority mutation must include a request fingerprint.
 const unsafe: RecordChange = { operation: 'create', idempotencyKey: 'retry', canonicalData: '{}' };
 declare const cli: StateplaneHttpClient;
-void tx; void receipt; void unsafe; void ref; void deps; void revision; void invalid; void cli;
+declare const mcp: McpHandlerOptions;
+void tx; void receipt; void unsafe; void ref; void deps; void revision; void invalid; void cli; void mcp;
 `);
   await writeFile(join(temp, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'NodeNext', moduleResolution: 'NodeNext', target: 'ES2022', strict: true, skipLibCheck: true, noEmit: true }, files: ['consumer.ts'] }));
   run(process.execPath, [join(root, 'node_modules/typescript/bin/tsc'), '-p', 'tsconfig.json'], temp);
