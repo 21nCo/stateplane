@@ -237,6 +237,13 @@ test('published key and definition limits accept exactly what the authority acce
     required:['label'],additionalProperties:false};
   // Every case is otherwise valid and unique, so only a successful call counts as acceptance.
   const accepted=async(tool,args)=>!(await call(client,tool,args)).isError;
+  // Predicate cases query a collection whose filter indexes are ready.
+  await ok(client,'collections_define',{spaceId,collectionId:'filters',definition:{slug:'filters',version:1,
+    schema:{...schema,properties:{label:{type:'string'},at:{type:'string',format:'date-time'}}},
+    unique:[],filterable:['label','at'],sortable:[]}});
+  const {scope}=await spaces.scope(owner,spaceId,'filters','schema:write');
+  for (const field of ['label','at']) assert.equal((await new CollectionRegistry(pool).backfill(scope,field)).ready,true);
+  const query=(tool,predicates)=>[tool,{spaceId,collectionId:'filters',predicates,...tool==='records_query'?{limit:1}:{}}];
   const create=(idempotencyKey,externalKey)=>['records_create',{spaceId,collectionId,idempotencyKey,externalKey,data:{label:idempotencyKey}}];
   const cases=[
     ['collections_define',{spaceId,collectionId:'empty',definition:{slug:'empty',version:1,schema:{},unique:[],filterable:[],sortable:[]}}],
@@ -252,12 +259,20 @@ test('published key and definition limits accept exactly what the authority acce
     create('decomposed','e\u0301'.repeat(128)),
     create('padded-over',` ${'b'.repeat(257)} `),
     create('decomposed-over','o\u0301'.repeat(129)),
-    create('blank','\u0085 \u2003')
+    create('blank','\u0085 \u2003'),
+    // Predicate string values are limited to 512 UTF-8 bytes, scalar and in each `in` element: 128 four-byte
+    // characters are 512 bytes, 129 are 516 bytes but only 129 code points. Instants are ASCII.
+    query('records_query',[{field:'label',kind:'string',operator:'eq',value:'\u{1F600}'.repeat(128)}]),
+    query('records_query',[{field:'label',kind:'string',operator:'eq',value:'\u{1F600}'.repeat(129)}]),
+    query('records_count',[{field:'label',kind:'string',operator:'in',value:['a','\u{1F600}'.repeat(128)]}]),
+    query('records_count',[{field:'label',kind:'string',operator:'in',value:['a','\u{1F600}'.repeat(129)]}]),
+    query('records_query',[{field:'at',kind:'date-time',operator:'gte',value:`2026-01-31T12:00:00.${'0'.repeat(491)}Z`}]),
+    query('records_count',[{field:'at',kind:'date-time',operator:'in',value:[`2026-01-31T12:00:00.${'0'.repeat(492)}Z`]}])
   ];
-  for (const [tool,args] of cases) {
+  for (const [index,[tool,args]] of cases.entries()) {
     const valid=publishedValidator(tool)(args);
-    assert.equal(await accepted(tool,args),valid,`${tool} ${JSON.stringify(args).slice(0,120)}`);
+    assert.equal(await accepted(tool,args),valid,`case ${index}: ${tool} ${JSON.stringify(args).slice(0,120)}`);
   }
-  assert.deepEqual(cases.map(([tool,args])=>publishedValidator(tool)(args)),[false,true,true,false,false,true,false,true,true,false,false,false],
+  assert.deepEqual(cases.map(([tool,args])=>publishedValidator(tool)(args)),[false,true,true,false,false,true,false,true,true,false,false,false,true,false,true,false,true,false],
     'each boundary is exercised on both sides');
 });

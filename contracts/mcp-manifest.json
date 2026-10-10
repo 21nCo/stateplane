@@ -726,8 +726,9 @@
                     "value": {
                       "type": "string",
                       "maxLength": 512,
+                      "x-utf8MaxBytes": 512,
                       "pattern": "^(?:[^\\u0000\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])*$",
-                      "description": "At most 512 UTF-8 bytes."
+                      "description": "At most 512 UTF-8 bytes (x-utf8MaxBytes; clients must enforce it)."
                     }
                   }
                 },
@@ -759,8 +760,9 @@
                       "items": {
                         "type": "string",
                         "maxLength": 512,
+                        "x-utf8MaxBytes": 512,
                         "pattern": "^(?:[^\\u0000\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])*$",
-                        "description": "At most 512 UTF-8 bytes."
+                        "description": "At most 512 UTF-8 bytes (x-utf8MaxBytes; clients must enforce it)."
                       }
                     }
                   }
@@ -923,7 +925,8 @@
                     "value": {
                       "type": "string",
                       "maxLength": 512,
-                      "description": "UTC instant such as 2026-01-31T12:00:00.5Z with a valid Gregorian date; at most 512 UTF-8 bytes. Leap seconds are limited to the listed UTC dates.",
+                      "x-utf8MaxBytes": 512,
+                      "description": "UTC instant such as 2026-01-31T12:00:00.5Z with a valid Gregorian date; at most 512 UTF-8 bytes (x-utf8MaxBytes). Leap seconds are limited to the listed UTC dates.",
                       "anyOf": [
                         {
                           "pattern": "^(?:(?!0000)[0-9]{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12][0-9]|3[01])|(?:0[469]|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:(?!0000)(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00))-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\\.[0-9]+)?Z$"
@@ -963,7 +966,8 @@
                       "items": {
                         "type": "string",
                         "maxLength": 512,
-                        "description": "UTC instant such as 2026-01-31T12:00:00.5Z with a valid Gregorian date; at most 512 UTF-8 bytes. Leap seconds are limited to the listed UTC dates.",
+                        "x-utf8MaxBytes": 512,
+                        "description": "UTC instant such as 2026-01-31T12:00:00.5Z with a valid Gregorian date; at most 512 UTF-8 bytes (x-utf8MaxBytes). Leap seconds are limited to the listed UTC dates.",
                         "anyOf": [
                           {
                             "pattern": "^(?:(?!0000)[0-9]{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12][0-9]|3[01])|(?:0[469]|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:(?!0000)(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00))-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\\.[0-9]+)?Z$"
@@ -1389,8 +1393,9 @@
                     "value": {
                       "type": "string",
                       "maxLength": 512,
+                      "x-utf8MaxBytes": 512,
                       "pattern": "^(?:[^\\u0000\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])*$",
-                      "description": "At most 512 UTF-8 bytes."
+                      "description": "At most 512 UTF-8 bytes (x-utf8MaxBytes; clients must enforce it)."
                     }
                   }
                 },
@@ -1422,8 +1427,9 @@
                       "items": {
                         "type": "string",
                         "maxLength": 512,
+                        "x-utf8MaxBytes": 512,
                         "pattern": "^(?:[^\\u0000\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])*$",
-                        "description": "At most 512 UTF-8 bytes."
+                        "description": "At most 512 UTF-8 bytes (x-utf8MaxBytes; clients must enforce it)."
                       }
                     }
                   }
@@ -1586,7 +1592,8 @@
                     "value": {
                       "type": "string",
                       "maxLength": 512,
-                      "description": "UTC instant such as 2026-01-31T12:00:00.5Z with a valid Gregorian date; at most 512 UTF-8 bytes. Leap seconds are limited to the listed UTC dates.",
+                      "x-utf8MaxBytes": 512,
+                      "description": "UTC instant such as 2026-01-31T12:00:00.5Z with a valid Gregorian date; at most 512 UTF-8 bytes (x-utf8MaxBytes). Leap seconds are limited to the listed UTC dates.",
                       "anyOf": [
                         {
                           "pattern": "^(?:(?!0000)[0-9]{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12][0-9]|3[01])|(?:0[469]|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:(?!0000)(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00))-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\\.[0-9]+)?Z$"
@@ -1626,7 +1633,8 @@
                       "items": {
                         "type": "string",
                         "maxLength": 512,
-                        "description": "UTC instant such as 2026-01-31T12:00:00.5Z with a valid Gregorian date; at most 512 UTF-8 bytes. Leap seconds are limited to the listed UTC dates.",
+                        "x-utf8MaxBytes": 512,
+                        "description": "UTC instant such as 2026-01-31T12:00:00.5Z with a valid Gregorian date; at most 512 UTF-8 bytes (x-utf8MaxBytes). Leap seconds are limited to the listed UTC dates.",
                         "anyOf": [
                           {
                             "pattern": "^(?:(?!0000)[0-9]{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12][0-9]|3[01])|(?:0[469]|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:(?!0000)(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00))-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\\.[0-9]+)?Z$"
@@ -1827,5 +1835,5 @@
   ],
   "resourceTemplates": [],
   "prompts": [],
-  "hash": "b763e91a908f9123529c678b39a228f32f3941e9f2d33a9b31b1e7b64c39268d"
+  "hash": "8808ccce05034ef6d566888c7c9e3ce034738b9c99e6de346f392d7725b9d8c4"
 }

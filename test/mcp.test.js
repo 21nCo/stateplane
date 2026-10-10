@@ -106,6 +106,7 @@ test('the fixed registry publishes the committed manifest and annotations',async
   assert.notEqual(compatibility.status,'incompatible');
 });
 
+const strip=value=>JSON.parse(JSON.stringify(value,(key,item)=>key==='description'?undefined:item));
 test('published mutation and predicate schemas agree with the HTTP OpenAPI contract',async()=>{
   const document=YAML.parse(await readFile(new URL('../contracts/openapi.yaml',import.meta.url),'utf8'));
   const variants=document.components.schemas.RecordMutation.oneOf;
@@ -119,19 +120,17 @@ test('published mutation and predicate schemas agree with the HTTP OpenAPI contr
     assert.deepEqual(Object.keys(mcp.properties).filter(name=>!['spaceId','collectionId'].includes(name)).sort(),fields,operation);
     assert.deepEqual(mcp.required.filter(name=>!['spaceId','collectionId'].includes(name)).sort(),
       http.required.filter(name=>name!=='operation').sort(),operation);
-    assert.equal(mcp.properties.idempotencyKey.pattern,http.properties.idempotencyKey.pattern);
-    assert.equal(mcp.properties.idempotencyKey.maxLength,http.properties.idempotencyKey.maxLength);
+    // Every keyword, x- extensions included, matches; only prose may differ.
+    assert.deepEqual(strip(mcp.properties.idempotencyKey),strip(http.properties.idempotencyKey),operation);
     if (operation==='create') {
-      assert.equal(mcp.properties.externalKey.pattern,http.properties.externalKey.pattern);
       // OpenAPI applies its externalKey byte budget after NFC and trim; MCP names that rule explicitly.
-      assert.equal(mcp.properties.externalKey['x-nfcTrimmedUtf8MaxBytes'],http.properties.externalKey['x-utf8MaxBytes']);
-      assert.equal(mcp.properties.externalKey['x-utf8MaxBytes'],undefined,'no raw byte limit on a normalized key');
+      const {'x-utf8MaxBytes':budget,...rest}=strip(http.properties.externalKey);
+      assert.deepEqual(strip(mcp.properties.externalKey),{...rest,'x-nfcTrimmedUtf8MaxBytes':budget});
     }
   }
   const predicate=input('records_query').properties.predicates.items;
   const published=document.components.schemas.Predicate;
   assert.equal(predicate.oneOf.length,published.oneOf.length);
-  const strip=value=>JSON.parse(JSON.stringify(value,(key,item)=>key==='description'||key.startsWith('x-')?undefined:item));
   assert.deepEqual(strip(predicate.oneOf).map(item=>item.properties.kind.const).sort(),
     strip(published.oneOf).map(item=>item.properties.kind.const).sort());
   for (const variant of published.oneOf) {
@@ -142,6 +141,27 @@ test('published mutation and predicate schemas agree with the HTTP OpenAPI contr
       variant.properties.value===undefined?null:strip(variant.properties.value));
   }
   assert.deepEqual(input('records_query').properties.limit,{type:'integer',minimum:1,maximum:100});
+});
+
+test('every published x- extension is checked against OpenAPI or the authority',()=>{
+  const found=new Set();
+  const walk=(node,name)=>{
+    if (Array.isArray(node)) { for (const item of node) walk(item,name); return; }
+    if (!node || typeof node!=='object') return;
+    for (const [key,item] of Object.entries(node)) {
+      if (key.startsWith('x-')) found.add(`${name} ${key} ${item}`);
+      else if (key==='properties') for (const [child,schema] of Object.entries(item)) walk(schema,child);
+      else walk(item,name);
+    }
+  };
+  for (const tool of stateplaneMcpDeclaration().manifest().tools) walk(tool.inputSchema,tool.name);
+  assert.deepEqual([...found].sort(),[
+    // OpenAPI parity above; predicate string and instant values in scalar and `in` form.
+    'externalKey x-nfcTrimmedUtf8MaxBytes 256','idempotencyKey x-utf8MaxBytes 256','value x-utf8MaxBytes 512',
+    // Authority parity: the selector test below and test/integration/mcp-services.test.js.
+    'collectionId x-utf16MaxLength 512','id x-utf16MaxLength 512','key x-utf16MaxLength 512',
+    'operationKey x-utf8MaxBytes 256','spaceId x-utf16MaxLength 512'
+  ].sort(),'a new extension needs a parity check');
 });
 
 test('two credentials use one fixed tool list and every tool reaches the shared services',async t=>{
@@ -472,9 +492,9 @@ test('bounded single-message requests and post-dispatch deadlines classify reads
 });
 
 /** Calls the endpoint directly so a body or verification can stay unfinished. */
-function direct(state,onTimeout) {
+function direct(state,onTimeout,requestTimeoutMs=50) {
   const handler=createMcpHandler({services:state.services,identity:state.identity,resource:'https://stateplane.example/mcp',
-    authorizationServers:['https://auth.example'],requestTimeoutMs:50,onTimeout});
+    authorizationServers:['https://auth.example'],requestTimeoutMs,onTimeout});
   return (body,headers={})=>handler(new Request('https://stateplane.example/mcp',{method:'POST',body,duplex:'half',
     headers:{'content-type':'application/json',accept:'application/json, text/event-stream',authorization:'Bearer owner-token',
       'mcp-protocol-version':'2025-06-18',...headers}}));
@@ -521,21 +541,51 @@ test('one deadline bounds an unfinished request body, cancels it and never dispa
   assert.deepEqual(state.calls,[]);
 });
 
-test('a throwing timeout callback still delivers the deadline response',async()=>{
-  const state=fixture();
-  state.identity.verify=()=>new Promise(()=>{});
-  const response=await bounded(direct(state,()=>{ throw new Error('pool already ended'); })(writeCall),'deadline response');
-  await assertRetryableBeforeDispatch(response);
+/** Records unhandled rejections raised while fn runs and shortly after. */
+async function unhandledDuring(fn) {
+  const seen=[];
+  const listener=reason=>{ seen.push(reason); };
+  process.on('unhandledRejection',listener);
+  try { await fn(); await new Promise(resolve=>setTimeout(resolve,30)); }
+  finally { process.off('unhandledRejection',listener); }
+  return seen;
+}
+
+test('a failing timeout callback, sync or async, never delays the deadline response or leaks a rejection',async()=>{
+  for (const [label,onTimeout] of [['sync',()=>{ throw new Error('pool already ended'); }],
+    ['async',async()=>{ throw new Error('pool already ended'); }]]) {
+    const state=fixture();
+    state.identity.verify=()=>new Promise(()=>{});
+    const leaked=await unhandledDuring(async()=>{
+      await assertRetryableBeforeDispatch(await bounded(direct(state,onTimeout)(writeCall),`${label} deadline response`));
+    });
+    assert.deepEqual(leaked,[],`${label} callback failure is contained`);
+  }
 });
 
-test('a body declared over the limit is cancelled unread',async()=>{
-  const state=fixture();
-  let cancelled=false;
-  const body=new ReadableStream({cancel() { cancelled=true; }});
-  const response=await direct(state)(body,{'content-length':String(2**30)});
-  assert.equal(response.status,413);
-  assert.equal(cancelled,true,'the declared-oversize body stream is cancelled');
-  assert.deepEqual(state.calls,[]);
+test('an oversized body answers 413 at once whatever its cancellation does',async()=>{
+  const cancels={'never settles':()=>new Promise(()=>{}),rejects:()=>Promise.reject(new Error('source gone'))};
+  for (const declared of [true,false])
+    for (const [label,cancel] of Object.entries(cancels))
+      for (const timeoutMs of [0,50]) {
+        const name=`${declared?'declared':'streamed'} overflow, cancel ${label}, deadline ${timeoutMs}`;
+        const state=fixture();
+        let cancelled=false;
+        let timeouts=0;
+        const body=new ReadableStream({
+          start(controller) { if (!declared) controller.enqueue(new Uint8Array(maxRequestBytes+1)); },
+          cancel() { cancelled=true; return cancel(); }});
+        const leaked=await unhandledDuring(async()=>{
+          const response=await bounded(direct(state,()=>{timeouts++;},timeoutMs)(body,
+            declared?{'content-length':String(2**30)}:{}),name);
+          assert.equal(response.status,413,name);
+          assert.equal((await response.json()).error.data.error.code,'RATE_LIMITED',name);
+        });
+        assert.equal(cancelled,true,`${name}: the body is cancelled`);
+        assert.equal(timeouts,0,`${name}: the deadline never answers`);
+        assert.deepEqual(state.calls,[],name);
+        assert.deepEqual(leaked,[],`${name}: no unhandled rejection`);
+      }
 });
 
 test('one endpoint serves concurrent requests with their own services and credentials',async()=>{

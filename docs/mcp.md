@@ -26,10 +26,12 @@ source. The contract test rejects
 an unreviewed manifest change. JSON Schema `maxLength` counts code points, so a
 limit it cannot express is published as an extension that clients must enforce,
 as in the OpenAPI contract: `x-utf8MaxBytes` (256 for `idempotencyKey` and
-`operationKey`) and `x-utf16MaxLength` (512 for selectors). The 256-byte
+`operationKey`; 512 for each string and date-time predicate value, scalar or
+`in` element) and `x-utf16MaxLength` (512 for selectors). The 256-byte
 `externalKey` budget applies only after NFC and the fixed whitespace trim, so it
 is published as `x-nfcTrimmedUtf8MaxBytes`; a client must not apply it to the
-raw, possibly padded or decomposed value.
+raw, possibly padded or decomposed value. A contract test asserts the exact set
+of published extensions and compares each with OpenAPI or the Postgres authority.
 `definition.schema` publishes the closed root that the authority requires.
 
 | Tool | Service | Annotations |
@@ -149,11 +151,15 @@ used: `scopes_supported` is omitted and authorization is the space grant model.
   McpFn's bearer handler holds a clone of the request, so during a stalled
   verification the deadline cancels Stateplane's branch of the body while the
   source stays open until verification settles. The response, `onTimeout` and
-  the absence of a late dispatch do not depend on it.
+  the absence of a late dispatch do not depend on it. Body cancellation (an
+  oversized body, or expiry) is started but never awaited, so a source whose
+  cancel never settles or rejects cannot delay a `413` or the deadline answer,
+  and a throwing or rejecting `onTimeout` is contained.
 
 These bounds reuse STA-8/9 limits or protocol framing; none is a measured
 Cloudflare or Railway capacity. The committed manifest publishes 19 tools in a
-35,413-byte compact `tools/list` payload plus 1,334 characters of instructions.
+39,573-byte compact `tools/list` result (39,607 bytes on the wire) plus 1,334
+characters of instructions.
 McpFn bundles the official SDK and schema validators: the app Worker dry-run
 grew from 834.94 KiB (178.06 KiB gzip) at the STA-9 base to 1,905.65 KiB
 (375.36 KiB gzip). This is a local bundle observation, not a deployed limit.

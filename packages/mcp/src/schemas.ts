@@ -36,10 +36,11 @@ const expectedRevision = positive('Current record revision. A stale value fails 
 const expectedSchemaVersion = positive('Optional exact collection schema version precondition.');
 
 const field = { type: 'string', minLength: 1, pattern: scalarPattern };
-const shortString = { type: 'string', maxLength: 512, pattern: '^(?:[^\\u0000\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])*$',
-  description: 'At most 512 UTF-8 bytes.' };
-const instant = { type: 'string', maxLength: 512,
-  description: 'UTC instant such as 2026-01-31T12:00:00.5Z with a valid Gregorian date; at most 512 UTF-8 bytes. Leap seconds are limited to the listed UTC dates.',
+const shortString = { type: 'string', maxLength: 512, 'x-utf8MaxBytes': 512,
+  pattern: '^(?:[^\\u0000\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])*$',
+  description: 'At most 512 UTF-8 bytes (x-utf8MaxBytes; clients must enforce it).' };
+const instant = { type: 'string', maxLength: 512, 'x-utf8MaxBytes': 512,
+  description: 'UTC instant such as 2026-01-31T12:00:00.5Z with a valid Gregorian date; at most 512 UTF-8 bytes (x-utf8MaxBytes). Leap seconds are limited to the listed UTC dates.',
   anyOf: [
     { pattern: '^(?:(?!0000)[0-9]{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12][0-9]|3[01])|(?:0[469]|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:(?!0000)(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00))-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\\.[0-9]+)?Z$' },
     { pattern: '^(?:1972-(?:06-30|12-31)|1973-12-31|1974-12-31|1975-12-31|1976-12-31|1977-12-31|1978-12-31|1979-12-31|1981-06-30|1982-06-30|1983-06-30|1985-06-30|1987-12-31|1989-12-31|1990-12-31|1992-06-30|1993-06-30|1994-06-30|1995-12-31|1997-06-30|1998-12-31|2005-12-31|2008-12-31|2012-06-30|2015-06-30|2016-12-31)T23:59:60(?:\\.[0-9]+)?Z$' }

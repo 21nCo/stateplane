@@ -101,8 +101,9 @@ export function stateplaneMcpDeclaration(): McpFnServerDeclaration<McpContext> {
 export interface McpRequestScope {
   services: StateplaneServices;
   identity: IdentityVerifier;
-  /** Runs when the request deadline answers before the request settles. */
-  onTimeout?: () => void;
+  /** Runs when the request deadline answers before the request settles. A
+   * throw or a rejected promise is contained and never delays that answer. */
+  onTimeout?: () => void | Promise<void>;
 }
 
 export interface McpEndpointOptions {
@@ -138,11 +139,17 @@ interface Admission {
   reader?: ReadableStreamDefaultReader<Uint8Array>;
 }
 
+/** Start a cleanup without waiting for it: a source that never settles or
+ * rejects must not delay or replace the response. */
+function discard(cleanup: () => Promise<unknown> | undefined): void {
+  try { void cleanup()?.catch(() => undefined); } catch { /* the response still answers */ }
+}
+
 class BodyTooLarge extends Error {}
 async function readBody(request: Request, admission: Admission): Promise<string> {
   const declared = request.headers.get('content-length');
   if (declared && Number(declared) > maxRequestBytes) {
-    await request.body?.cancel().catch(() => undefined);
+    discard(() => request.body?.cancel());
     throw new BodyTooLarge();
   }
   if (!request.body) return '';
@@ -156,7 +163,7 @@ async function readBody(request: Request, admission: Admission): Promise<string>
       if (next.done) break;
       size += next.value.byteLength;
       if (size > maxRequestBytes) {
-        await reader.cancel().catch(() => undefined);
+        discard(() => reader.cancel());
         throw new BodyTooLarge();
       }
       chunks.push(next.value);
@@ -281,10 +288,11 @@ export function createMcpEndpoint(options: McpEndpointOptions): McpEndpoint {
         admission.expired = true;
         // Stop ingesting: a pending read ends, and serve sees the expiry
         // before dispatch. A body still unread is cancelled directly.
-        void (admission.reader ? admission.reader.cancel() : request.body?.cancel())?.catch(() => undefined);
-        void work.then(late => late.body?.cancel(), () => undefined);
-        // A failing callback must not keep the deadline response from the client.
-        try { scope.onTimeout?.(); } catch { /* the response below still answers */ }
+        const reader = admission.reader;
+        discard(() => reader ? reader.cancel() : request.body?.cancel());
+        void work.then(late => discard(() => late.body?.cancel()), () => undefined);
+        // A failing callback, sync or async, must not keep the deadline response from the client.
+        discard(async () => scope.onTimeout?.());
         resolve(timedOut(admission));
       }, timeoutMs);
     });
