@@ -10,6 +10,8 @@ type ToolAnnotations = NonNullable<McpFnToolDefinition['annotations']>;
 export type ToolName = keyof typeof inputs;
 export interface StateplaneTool {
   name: ToolName; title: string; description: string; read: boolean;
+  /** For a write: how to recover after COMMIT_OUTCOME_UNKNOWN. */
+  recovery?: string;
   annotations: ToolAnnotations; inputSchema: McpFnObjectSchema;
   run(services: StateplaneServices, actor: VerifiedCredential, args: Args): Promise<Record<string, unknown>>;
 }
@@ -73,10 +75,18 @@ const read: ToolAnnotations = { readOnlyHint: true, destructiveHint: false, idem
 const additive: ToolAnnotations = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 const destructive: ToolAnnotations = { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false };
 
+/* Recovery after a write whose outcome is unknown. Only record mutations take
+ * an idempotencyKey and replay a receipt. */
+const recordRecovery = 'The write may have committed. Repeat the identical request with the same idempotencyKey and credential to recover its receipt.';
+const defineRecovery = 'The definition may have committed. Read it with collections_get before defining again.';
+const reviseRecovery = 'The revision may have committed. Read the collection with collections_get and compare its version and definition before revising again.';
+const ingestRecovery = 'Items may have committed. Read batches_status, or repeat with the same operationKey and unchanged items to resume.';
+const cancelRecovery = 'The cancellation may have committed. Read batches_status before cancelling again.';
+
 function mutation(operation: 'create' | 'replace' | 'patch' | 'delete', title: string, description: string,
   annotations: ToolAnnotations): StateplaneTool {
   const name = `records_${operation}` as const;
-  return { name, title, description, read: false, annotations, inputSchema: inputs[name],
+  return { name, title, description, read: false, recovery: recordRecovery, annotations, inputSchema: inputs[name],
     run: async (services, actor, args) => {
       const [spaceId, collectionId] = scope(args);
       // The operation comes from the tool. Every other field reaches the
@@ -106,7 +116,8 @@ export const tools: readonly StateplaneTool[] = [
       only(args, ['spaceId', 'collectionId']);
       return result(await services.collections.list(actor, ...scope(args)));
     } },
-  { name: 'collections_define', title: 'Define a collection', read: false, annotations: additive, inputSchema: inputs.collections_define,
+  { name: 'collections_define', title: 'Define a collection', read: false, recovery: defineRecovery, annotations: additive,
+    inputSchema: inputs.collections_define,
     description: 'Create a collection at version 1 with a closed JSON Schema definition. Requires schema:write. An existing collection fails SCHEMA_CONFLICT. After COMMIT_OUTCOME_UNKNOWN, read it with collections_get before defining again.',
     run: async (services, actor, args) => {
       only(args, ['spaceId', 'collectionId', 'definition']);
@@ -114,8 +125,9 @@ export const tools: readonly StateplaneTool[] = [
       return result(await services.collections.define(actor, spaceId, collectionId,
         serialized(present(args, 'definition'), recordBodyBytes)));
     } },
-  { name: 'collections_revise', title: 'Revise a collection', read: false, annotations: additive, inputSchema: inputs.collections_revise,
-    description: 'Apply a compatible additive revision at the next version. expectedVersion must equal the current version (SCHEMA_CONFLICT otherwise); breaking changes fail SCHEMA_BREAKING without changing records.',
+  { name: 'collections_revise', title: 'Revise a collection', read: false, recovery: reviseRecovery, annotations: additive,
+    inputSchema: inputs.collections_revise,
+    description: 'Apply a compatible additive revision at the next version. expectedVersion must equal the current version (SCHEMA_CONFLICT otherwise); breaking changes fail SCHEMA_BREAKING without changing records. After COMMIT_OUTCOME_UNKNOWN, read the collection with collections_get before revising again.',
     run: async (services, actor, args) => {
       only(args, ['spaceId', 'collectionId', 'expectedVersion', 'definition']);
       const [spaceId, collectionId] = scope(args);
@@ -164,7 +176,8 @@ export const tools: readonly StateplaneTool[] = [
     'Set or unset top-level fields of a record at expectedRevision, then validate the whole record. Overlapping set/unset paths fail INVALID_ARGUMENT.', destructive),
   mutation('delete', 'Delete a record',
     'Tombstone a record at expectedRevision. Its keys stay reserved. A retry with the same key and request returns the saved receipt.', destructive),
-  { name: 'batches_ingest', title: 'Ingest a bounded batch', read: false, annotations: destructive, inputSchema: inputs.batches_ingest,
+  { name: 'batches_ingest', title: 'Ingest a bounded batch', read: false, recovery: ingestRecovery, annotations: destructive,
+    inputSchema: inputs.batches_ingest,
     description: 'Store an immutable manifest of 1–20 serialized record requests under operationKey and apply pending items. Items may replace or delete records. Resume with the same key and unchanged items; set retryFailed only to retry failed items.',
     run: async (services, actor, args) => {
       only(args, ['spaceId', 'collectionId', 'operationKey', 'items', 'retryFailed']);
@@ -181,8 +194,9 @@ export const tools: readonly StateplaneTool[] = [
       only(args, ['spaceId', 'collectionId', 'operationKey']);
       return result(await services.batches.progress(actor, ...scope(args), selector(args, 'operationKey')));
     } },
-  { name: 'batches_cancel', title: 'Cancel a batch', read: false, annotations: destructive, inputSchema: inputs.batches_cancel,
-    description: 'Cancel the pending items of a batch. Committed items stay committed.',
+  { name: 'batches_cancel', title: 'Cancel a batch', read: false, recovery: cancelRecovery, annotations: destructive,
+    inputSchema: inputs.batches_cancel,
+    description: 'Cancel the pending items of a batch. Committed items stay committed. After COMMIT_OUTCOME_UNKNOWN, read batches_status before cancelling again.',
     run: async (services, actor, args) => {
       only(args, ['spaceId', 'collectionId', 'operationKey']);
       return result(await services.batches.cancel(actor, ...scope(args), selector(args, 'operationKey')));

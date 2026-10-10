@@ -15,7 +15,7 @@ import { authenticatedHttpTarget, createMcpFnTargetSuiteJUnit, disposeMcpFnTarge
   OFFICIAL_CONFORMANCE_VERSION, runAuthenticatedOfficialConformance, runMcpFnTargetSuite,
   serializeMcpFnTargetSuiteReport } from '@mcpfn/testing';
 import { guidanceUri, stateplaneMcpDeclaration } from '../packages/mcp/dist/index.js';
-import { hostBackend, inProcessBackend } from './mcp-acceptance-hosts.mjs';
+import { finalizers, hostBackend, inProcessBackend } from './mcp-acceptance-hosts.mjs';
 
 const root=resolve(import.meta.dirname,'..');
 const output=join(root,'.data/mcp-conformance');
@@ -47,12 +47,15 @@ async function loopbackForwarder(endpoint) {
   return {url:`http://127.0.0.1:${server.address().port}${upstream.pathname}`,close:()=>new Promise(r=>server.close(r))};
 }
 
-const backend=process.argv.includes('--host') ? await hostBackend({workerd:process.argv.includes('--workerd')}) : await inProcessBackend();
-let forwarder;
 const summary={formatVersion:1,kind:'stateplane.mcp-conformance',startedAt:new Date().toISOString(),
-  endpoint:backend.endpointInfo,officialSuiteVersion:OFFICIAL_CONFORMANCE_VERSION,official:[],notApplicable:[]};
+  officialSuiteVersion:OFFICIAL_CONFORMANCE_VERSION,official:[],notApplicable:[]};
 let failure;
+// Owned before initialization, so a failed start still stops what it began.
+const cleanup=finalizers();
 try {
+  const backend=process.argv.includes('--host') ?
+    await hostBackend({workerd:process.argv.includes('--workerd'),cleanup}) : await inProcessBackend({cleanup});
+  summary.endpoint=backend.endpointInfo;
   await mkdir(output,{recursive:true,mode:0o700});
   const spaceId=await backend.createSpace();
   const collectionId='entries';
@@ -105,7 +108,8 @@ try {
     `McpFn scenarios failed: ${JSON.stringify(summary.mcpfn.failures)}`);
 
   const loopback=/^(?:127\.0\.0\.1|localhost|\[::1\])$/.test(new URL(backend.endpoint).hostname);
-  if (!loopback) forwarder=await loopbackForwarder(backend.endpoint);
+  const forwarder=loopback ? null : await loopbackForwarder(backend.endpoint);
+  if (forwarder) cleanup.add(forwarder.close);
   const url=forwarder?.url??backend.endpoint;
   for (const scenario of applicable) {
     const result=await runAuthenticatedOfficialConformance({url,scenario,credential,cwd:output});
@@ -119,8 +123,9 @@ try {
   summary.result='passed';
 } catch(error) { failure=error; summary.result='failed'; summary.error=String(error?.message??error); }
 finally {
-  try { await forwarder?.close(); await backend.cleanup(); summary.cleanup='complete'; }
-  catch(error) { summary.cleanup='failed'; failure??=error; }
+  summary.cleanupSteps=cleanup.size;
+  try { await cleanup.run(); summary.cleanup='complete'; }
+  catch(error) { summary.cleanup='failed'; summary.cleanupError=String(error?.message??error); failure??=error; }
   summary.finishedAt=new Date().toISOString();
   await mkdir(output,{recursive:true,mode:0o700});
   await writeFile(join(output,'summary.json'),`${JSON.stringify(summary,null,2)}\n`,{mode:0o600});

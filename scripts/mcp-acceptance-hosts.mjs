@@ -15,6 +15,39 @@ import { createMcpHandler } from '../packages/mcp/dist/index.js';
 const root=resolve(import.meta.dirname,'..');
 function assert(condition,message) { if (!condition) throw new Error(message); }
 
+/** Cleanup owned by the caller from before initialization starts. Steps run in
+ * reverse registration order, and each runs even when an earlier one fails. */
+export function finalizers() {
+  const steps=[];
+  return {
+    add(step) { steps.push(step); },
+    get size() { return steps.length; },
+    async run() {
+      const errors=[];
+      while (steps.length) {
+        try { await steps.pop()(); } catch(error) { errors.push(error); }
+      }
+      if (errors.length) throw new AggregateError(errors,`cleanup incomplete: ${errors.map(error=>error?.message??error).join('; ')}`);
+    }
+  };
+}
+/** Erase every disposable space; one failure does not skip the others. */
+async function eraseAll(spaceIds,erase) {
+  const errors=[];
+  for (const spaceId of spaceIds) {
+    try { await erase(spaceId); } catch(error) { errors.push(error); }
+  }
+  if (errors.length) throw new AggregateError(errors,`space cleanup failed for ${errors.length} space(s)`);
+}
+async function stop(child) {
+  if (child.exitCode!==null || child.signalCode!==null) return;
+  const closed=once(child,'close');
+  child.kill('SIGTERM');
+  if (await Promise.race([closed.then(()=>true),new Promise(r=>setTimeout(()=>r(false),3_000))])) return;
+  child.kill('SIGKILL');
+  await closed;
+}
+
 export function loopbackUrl() {
   if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
   return readFile(join(root,'.data/local-db-password'),'utf8').then(password=>
@@ -22,11 +55,12 @@ export function loopbackUrl() {
 }
 
 /** Production composition outside Cloudflare: AuthFn sessions and keys, real issue and revoke. */
-export async function inProcessBackend() {
+export async function inProcessBackend({cleanup}) {
   const { memoryAdapter }=await import('@superfunctions/db/testing');
   const { createAuthFn, createUser, issueSession }=await import('@authfn/core');
   const { AuthFnIdentityVerifier, AuthFnAgentKeys }=await import('../packages/auth/dist/index.js');
   const pool=new pg.Pool({...connectionOptions(await loopbackUrl()),max:6});
+  cleanup.add(()=>pool.end());
   const config={database:memoryAdapter(),namespace:`sta10-gate-${randomUUID()}`,plugins:[]};
   createAuthFn(config);
   const identity=new AuthFnIdentityVerifier(config);
@@ -42,6 +76,7 @@ export async function inProcessBackend() {
     res.end(Buffer.from(await response.arrayBuffer()));
   });
   server.listen(0,'127.0.0.1'); await once(server,'listening');
+  cleanup.add(()=>new Promise(resolve=>{ server.closeAllConnections(); server.close(()=>resolve()); }));
   const endpoint=`http://127.0.0.1:${server.address().port}/mcp`;
   holder.handler=createMcpHandler({services,identity,resource:endpoint,authorizationServers:['http://127.0.0.1:9/'],
     allowInsecureLoopback:true,requestTimeoutMs:12_000});
@@ -49,6 +84,10 @@ export async function inProcessBackend() {
   const session=await issueSession(config,{},{userId:user.id,methods:['password']});
   const owner=await identity.verify(new Request(endpoint,{headers:{authorization:`Bearer ${session.sessionToken}`}}));
   const spaceIds=[];
+  cleanup.add(()=>eraseAll(spaceIds,async spaceId=>{
+    try { await spaces.archive(owner,spaceId); await spaces.delete(owner,spaceId); }
+    catch(error) { if (error?.code!=='NOT_FOUND') throw error; }
+  }));
   return {endpoint,ownerToken:session.sessionToken,denial:'transport',endpointInfo:{origin:'loopback',path:'/mcp',runtime:'node-in-process'},
     async createSpace() { const spaceId=`sp_${randomUUID()}`; spaceIds.push(spaceId); await spaces.create(owner,'cell-a',spaceId); return spaceId; },
     async grantAgent(spaceId,collectionId,capabilities) {
@@ -58,19 +97,12 @@ export async function inProcessBackend() {
     async backfill(spaceId,collectionId,field) {
       const {scope}=await spaces.scope(owner,spaceId,collectionId,'schema:write');
       return (await new CollectionRegistry(pool).backfill(scope,field)).ready;
-    },
-    async cleanup() {
-      for (const spaceId of spaceIds) {
-        try { await spaces.archive(owner,spaceId); await spaces.delete(owner,spaceId); }
-        catch(error) { if (error?.code!=='NOT_FOUND') throw error; }
-      }
-      server.close(); await pool.end();
     }};
 }
 
-/** The app's opt-in host, spawned locally or already deployed, with its fixture identity. */
-/** The app's opt-in host: an external endpoint, or a local vite (Node) or wrangler (workerd) run. */
-export async function hostBackend({workerd=false}={}) {
+/** The app's opt-in host with its fixture identity: an external endpoint, or a
+ * local vite (Node) or wrangler (workerd) run. */
+export async function hostBackend({workerd=false,cleanup}) {
   const external=process.env.STATEPLANE_MCP_ENDPOINT;
   const databaseUrl=external ? process.env.DATABASE_URL : await loopbackUrl();
   assert(databaseUrl,'DATABASE_URL is required for fixture grants');
@@ -96,6 +128,7 @@ export async function hostBackend({workerd=false}={}) {
       const built=spawnSync(process.execPath,[join(root,'app/node_modules/vite/bin/vite.js'),'build'],{cwd:join(root,'app'),stdio:'ignore'});
       assert(built.status===0,'app build failed');
       secrets=await mkdtemp(join(tmpdir(),'stateplane-workerd-'));
+      cleanup.add(()=>rm(secrets,{recursive:true,force:true}));
       const file=join(secrets,'worker.env');
       await writeFile(file,Object.entries(bindings).map(([name,value])=>`${name}=${value}`).join('\n')+'\n',{mode:0o600});
       const {command,args}=wranglerInvocation(['dev','--config','wrangler.jsonc','--persist-to','../.data/wrangler/app',
@@ -105,6 +138,8 @@ export async function hostBackend({workerd=false}={}) {
       app=spawn(process.execPath,[join(root,'app/node_modules/vite/bin/vite.js'),'dev','--host','127.0.0.1','--port',String(port),
         '--strictPort'],{cwd:join(root,'app'),stdio:'ignore',env:{...process.env,...bindings,STATEPLANE_ENV:'local'}});
     }
+    const child=app;
+    cleanup.add(()=>stop(child));
     let ready=false;
     for (let attempt=0;attempt<600 && !ready;attempt++) {
       if (app.exitCode!==null) throw new Error('app host exited before readiness');
@@ -115,6 +150,7 @@ export async function hostBackend({workerd=false}={}) {
   }
   const origin=new URL(endpoint);
   const pool=new pg.Pool({...connectionOptions(databaseUrl),max:2});
+  cleanup.add(()=>pool.end());
   const http=async(method,path,body)=>{
     const response=await fetch(new URL(`/v1/${path}`,endpoint),{method,headers:{authorization:`Bearer ${env.STATEPLANE_TEST_TOKEN}`,
       ...(body?{'content-type':'application/json'}:{})},body:body?JSON.stringify(body):undefined});
@@ -123,6 +159,16 @@ export async function hostBackend({workerd=false}={}) {
   };
   const spaceIds=[];
   const agent=env.STATEPLANE_TEST_AGENT_CREDENTIAL;
+  // Registered last, so it runs first, while the app and pool still exist.
+  cleanup.add(()=>eraseAll(spaceIds,async spaceId=>{
+    await pool.query('DELETE FROM collection_grants WHERE space_id=$1 AND credential_id=$2',[spaceId,agent]);
+    await pool.query('DELETE FROM space_credentials WHERE space_id=$1 AND credential_id=$2',[spaceId,agent]);
+    await http('PATCH',`spaces/${spaceId}`,{lifecycle:'readOnly'});
+    await http('DELETE',`spaces/${spaceId}`);
+    const left=(await pool.query(`SELECT (SELECT count(*)::int FROM spaces WHERE space_id=$1 AND lifecycle<>'deleted')+
+      (SELECT count(*)::int FROM space_directory WHERE space_id=$1 AND lifecycle<>'deleted') AS n`,[spaceId])).rows[0].n;
+    assert(left===0,'the disposable space is erased');
+  }));
   return {endpoint,ownerToken:env.STATEPLANE_TEST_TOKEN,denial:'service',
     endpointInfo:{origin:external?origin.origin:'loopback',path:origin.pathname,runtime:external?'external':workerd?'workerd':'node-vite'},
     async createSpace() { const spaceId=`sp_${randomUUID()}`; spaceIds.push(spaceId); await http('POST','spaces',{spaceId}); return spaceId; },
@@ -142,19 +188,5 @@ export async function hostBackend({workerd=false}={}) {
       const scope={spaceId,collectionId,principalId:env.STATEPLANE_TEST_OWNER,credentialId:env.STATEPLANE_TEST_CREDENTIAL,
         capability:'schema:write',policyVersion:Number(placement.policy_version),placementGeneration:Number(placement.placement_generation)};
       return (await new CollectionRegistry(pool).backfill(scope,field)).ready;
-    },
-    async cleanup() {
-      for (const spaceId of spaceIds) {
-        await pool.query('DELETE FROM collection_grants WHERE space_id=$1 AND credential_id=$2',[spaceId,agent]);
-        await pool.query('DELETE FROM space_credentials WHERE space_id=$1 AND credential_id=$2',[spaceId,agent]);
-        await http('PATCH',`spaces/${spaceId}`,{lifecycle:'readOnly'});
-        await http('DELETE',`spaces/${spaceId}`);
-        const left=(await pool.query(`SELECT (SELECT count(*)::int FROM spaces WHERE space_id=$1 AND lifecycle<>'deleted')+
-          (SELECT count(*)::int FROM space_directory WHERE space_id=$1 AND lifecycle<>'deleted') AS n`,[spaceId])).rows[0].n;
-        assert(left===0,'the disposable space is erased');
-      }
-      await pool.end();
-      if (app && app.exitCode===null) { app.kill('SIGTERM'); await Promise.race([once(app,'close'),new Promise(r=>setTimeout(r,3_000))]); }
-      if (secrets) await rm(secrets,{recursive:true,force:true});
     }};
 }

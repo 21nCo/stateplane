@@ -9,8 +9,8 @@ import { McpFnTestClient, authenticatedHttpTarget, assertManifestContract, check
 import { assertAuthRegressionSuite, createFetchAuthTarget, bearerCredential } from '@mcpfn/testing/auth';
 import { diffManifests } from '@mcpfn/core';
 import { createHttpHandler } from '../packages/api/dist/index.js';
-import { createMcpHandler, stateplaneMcpDeclaration, serializeJson, tools, guidanceUri, maxRequestBytes }
-  from '../packages/mcp/dist/index.js';
+import { createMcpEndpoint, createMcpHandler, stateplaneMcpDeclaration, serializeJson, tools, guidance, guidanceUri,
+  instructions, maxRequestBytes } from '../packages/mcp/dist/index.js';
 
 const owner={kind:'session',userPrincipalId:'owner',credentialId:'session-1'};
 const agent={kind:'api-key',credentialId:'agent-1'};
@@ -358,7 +358,7 @@ test('API-key revocation passes the McpFn transport regression suite',async t=>{
       async revoke(credential) { keys.delete(new Headers(credential.headers).get('authorization').slice(7)); }}});
 });
 
-test('bounded single-message requests and deadlines classify reads and writes',async t=>{
+test('bounded single-message requests and post-dispatch deadlines classify reads and writes',async t=>{
   const state=fixture();
   let timeouts=0;
   const {server,url}=await mcpServer(state,{requestTimeoutMs:50,onTimeout:()=>{timeouts++;}});
@@ -374,10 +374,118 @@ test('bounded single-message requests and deadlines classify reads and writes',a
   assert.equal(write.id,3);
   assert.deepEqual([write.result.isError,write.result.structuredContent.error.code,write.result.structuredContent.error.retryable],
     [true,'COMMIT_OUTCOME_UNKNOWN',false]);
+  assert.match(write.result.structuredContent.error.message,/same idempotencyKey/);
   const read=await (await post(url,call('records_get',{spaceId:'sp_a',collectionId:'entries',id:'r'},4))).json();
   assert.deepEqual([read.result.structuredContent.error.code,read.result.structuredContent.error.retryable],['PROVIDER_UNAVAILABLE',true]);
-  assert.equal(timeouts,2);
+  const batch=await (await post(url,call('batches_ingest',{spaceId:'sp_a',collectionId:'entries',operationKey:'op',items:['{}']},5))).json();
+  assert.equal(batch.result.structuredContent.error.code,'COMMIT_OUTCOME_UNKNOWN');
+  assert.match(batch.result.structuredContent.error.message,/operationKey/);
+  assert.doesNotMatch(batch.result.structuredContent.error.message,/idempotency/i);
+  assert.equal(timeouts,3);
+  assert.deepEqual(state.calls.map(call=>call.name),['records.mutate','records.get','batches.ingest'],
+    'each dispatched call reached its service exactly once');
   release();
+  await new Promise(resolve=>setTimeout(resolve,20));
+  assert.equal(state.calls.length,3,'the deadline never re-dispatches');
+});
+
+/** Calls the endpoint directly so a body or verification can stay unfinished. */
+function direct(state,onTimeout) {
+  const handler=createMcpHandler({services:state.services,identity:state.identity,resource:'https://stateplane.example/mcp',
+    authorizationServers:['https://auth.example'],requestTimeoutMs:50,onTimeout});
+  return (body,headers={})=>handler(new Request('https://stateplane.example/mcp',{method:'POST',body,duplex:'half',
+    headers:{'content-type':'application/json',accept:'application/json, text/event-stream',authorization:'Bearer owner-token',
+      'mcp-protocol-version':'2025-06-18',...headers}}));
+}
+const bounded=(promise,label)=>Promise.race([promise,new Promise((_,reject)=>
+  setTimeout(()=>reject(new Error(`${label} is unbounded`)),2_000))]);
+const writeCall=JSON.stringify({jsonrpc:'2.0',id:9,method:'tools/call',params:{name:'records_create',
+  arguments:{spaceId:'sp_a',collectionId:'entries',idempotencyKey:'k',data:{}}}});
+async function assertRetryableBeforeDispatch(response) {
+  assert.equal(response.status,503);
+  assert.equal(response.headers.get('retry-after'),'1');
+  const body=await response.json();
+  assert.equal(body.error.message,'PROVIDER_UNAVAILABLE');
+  assert.deepEqual([body.error.data.error.code,body.error.data.error.retryable],['PROVIDER_UNAVAILABLE',true]);
+}
+
+test('one deadline bounds a stalled bearer verification and nothing dispatches later',async()=>{
+  const state=fixture();
+  let timeouts=0;
+  let finish;
+  const verify=state.identity.verify;
+  state.identity.verify=request=>new Promise(resolve=>{finish=()=>resolve(verify(request));});
+  const response=await bounded(direct(state,()=>{timeouts++;})(writeCall),'bearer verification');
+  await assertRetryableBeforeDispatch(response);
+  assert.equal(timeouts,1);
+  finish();
+  await new Promise(resolve=>setTimeout(resolve,20));
+  assert.deepEqual(state.calls,[],'a late verification never reaches a service');
+});
+
+test('one deadline bounds an unfinished request body, cancels it and never dispatches',async()=>{
+  const state=fixture();
+  let timeouts=0;
+  let cancelled=false;
+  let controller;
+  const body=new ReadableStream({start(c) { controller=c; c.enqueue(new TextEncoder().encode(writeCall.slice(0,40))); },
+    cancel() { cancelled=true; }});
+  const response=await bounded(direct(state,()=>{timeouts++;})(body),'body ingestion');
+  await assertRetryableBeforeDispatch(response);
+  assert.equal(timeouts,1);
+  await new Promise(resolve=>setTimeout(resolve,20));
+  assert.equal(cancelled,true,'the body reader is cancelled');
+  assert.throws(()=>controller.enqueue(new TextEncoder().encode(writeCall.slice(40))));
+  assert.deepEqual(state.calls,[]);
+});
+
+test('one endpoint serves concurrent requests with their own services and credentials',async()=>{
+  const endpoint=createMcpEndpoint({resource:'https://stateplane.example/mcp',authorizationServers:['https://auth.example']});
+  const a=fixture();
+  const b=fixture();
+  b.identity.verify=async request=>request.headers.get('authorization')==='Bearer agent-token'?agent:null;
+  const releaseA=a.hold();
+  const message=JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'records_count',
+    arguments:{spaceId:'sp_a',collectionId:'entries',predicates:[]}}});
+  const request=token=>new Request('https://stateplane.example/mcp',{method:'POST',body:message,
+    headers:{'content-type':'application/json',accept:'application/json, text/event-stream',authorization:`Bearer ${token}`,
+      'mcp-protocol-version':'2025-06-18'}});
+  // Equal JSON-RPC IDs: the first request is still in its service call.
+  const first=endpoint(request('owner-token'),a);
+  await new Promise(resolve=>setTimeout(resolve,10));
+  const second=await (await endpoint(request('agent-token'),b)).json();
+  releaseA();
+  const firstBody=await (await first).json();
+  assert.deepEqual([firstBody.id,firstBody.result.structuredContent],[1,{count:3}]);
+  assert.deepEqual([second.id,second.result.structuredContent],[1,{count:3}]);
+  assert.deepEqual(a.calls.map(call=>call.actor),[owner],'each request uses its own services');
+  assert.deepEqual(b.calls.map(call=>call.actor),[agent]);
+  const denied=await endpoint(request('owner-token'),b);
+  assert.equal(denied.status,401,'each request uses its own identity verifier');
+  assert.equal(b.calls.length,1);
+});
+
+test('recovery guidance matches each write tool schema',async()=>{
+  const manifest=stateplaneMcpDeclaration().manifest();
+  const writes=tools.filter(tool=>!tool.read);
+  assert.ok(writes.length>0);
+  for (const tool of writes) {
+    const keyed=Object.hasOwn(manifest.tools.find(item=>item.name===tool.name).inputSchema.properties,'idempotencyKey');
+    assert.equal(keyed,tool.name.startsWith('records_'),`${tool.name}: only record mutations take idempotencyKey`);
+    assert.ok(tool.recovery,`${tool.name} names its COMMIT_OUTCOME_UNKNOWN recovery`);
+    assert.equal(/idempotencyKey/.test(tool.recovery),keyed,`${tool.name} recovery matches its schema`);
+    if (tool.name.startsWith('batches_')) assert.match(tool.recovery,/batches_status/);
+    if (tool.name.startsWith('collections_')) assert.match(tool.recovery,/collections_get/);
+  }
+  // Every sentence that requires an idempotencyKey names only keyed tools.
+  for (const text of [instructions,guidance]) {
+    assert.doesNotMatch(text,/every write (needs|takes) an idempotencyKey/i);
+    for (const sentence of text.split(/(?<=\.)\s+|\n/).filter(item=>/idempotencyKey/.test(item) && !/no idempotencyKey/.test(item)))
+      for (const name of sentence.match(/\b(collections|batches)_[a-z]+/g)??[])
+        assert.fail(`${name} is described as keyed: ${sentence}`);
+  }
+  assert.match(guidance,/batches_status/);
+  assert.match(guidance,/collections_get/);
 });
 
 test('a deployed resource accepts only its own or an allowlisted browser origin',async()=>{

@@ -20,7 +20,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { stateplaneMcpDeclaration } from '../packages/mcp/dist/index.js';
-import { hostBackend, inProcessBackend } from './mcp-acceptance-hosts.mjs';
+import { finalizers, hostBackend, inProcessBackend } from './mcp-acceptance-hosts.mjs';
 
 const root=resolve(import.meta.dirname,'..');
 const pythonSdk='mcp==2.3.0';
@@ -189,16 +189,18 @@ async function scenario(backend) {
 }
 
 let failure;
-let backend;
+// Owned before initialization, so a failed start still stops what it began.
+const cleanup=finalizers();
 try {
-  backend=hostMode ? await hostBackend({workerd:args.includes('--workerd')}) : await inProcessBackend();
+  const backend=hostMode ? await hostBackend({workerd:args.includes('--workerd'),cleanup}) : await inProcessBackend({cleanup});
   evidence.endpoint=backend.endpointInfo;
   await scenario(backend);
   evidence.result='passed';
 } catch(error) { failure=error; evidence.error=String(error?.message??error); }
 finally {
-  try { await backend?.cleanup(); evidence.cleanup='complete'; }
-  catch(error) { evidence.cleanup='failed'; failure??=error; }
+  evidence.cleanupSteps=cleanup.size;
+  try { await cleanup.run(); evidence.cleanup='complete'; }
+  catch(error) { evidence.cleanup='failed'; evidence.cleanupError=String(error?.message??error); failure??=error; }
   evidence.finishedAt=new Date().toISOString();
   await mkdir(dirname(evidencePath),{recursive:true});
   await writeFile(evidencePath,`${JSON.stringify(evidence,null,2)}\n`,{mode:0o600});

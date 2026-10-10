@@ -3,7 +3,8 @@ import type { Socket } from 'node:net';
 import pg from 'pg';
 import { createHttpHandler } from '@stateplane/api';
 import { isSafeHttpRead, parseV1Path } from '@stateplane/contracts';
-import { createMcpHandler } from '@stateplane/mcp';
+import { createMcpEndpoint } from '@stateplane/mcp';
+import type { McpEndpoint } from '@stateplane/mcp';
 import { PostgresSpaces, postgresServices } from '@stateplane/postgres';
 
 export type Bindings = App.Platform['env'];
@@ -17,8 +18,22 @@ const providerTimeoutMs=5_000;
 const socketTimeoutMs=7_000;
 const requestTimeoutMs=12_000;
 // A Preview can be reached through more than one hostname; bound the derived
-// MCP resource handlers instead of growing with request Host headers.
+// MCP resource endpoints instead of growing with request Host headers.
 const maxMcpResources=4;
+// The MCP declaration, schema validators and metadata cost about 13 ms of CPU
+// to build, so each isolate builds them once per resource. Storage stays
+// request-scoped: every request passes its own services and identity.
+const mcpEndpoints=new Map<string,McpEndpoint>();
+function mcpEndpoint(resource:string,issuer:string,local:boolean):McpEndpoint {
+  const key=JSON.stringify([resource,issuer,local]);
+  let endpoint=mcpEndpoints.get(key);
+  if (!endpoint) {
+    endpoint=createMcpEndpoint({resource,authorizationServers:[issuer],allowInsecureLoopback:local,requestTimeoutMs});
+    if (mcpEndpoints.size>=maxMcpResources) mcpEndpoints.clear();
+    mcpEndpoints.set(key,endpoint);
+  }
+  return endpoint;
+}
 class HostProviderTimeoutError extends Error {
   constructor() { super('Provider socket timeout'); this.name='HostProviderTimeoutError'; }
 }
@@ -155,23 +170,17 @@ export function stateplaneHost(env:Bindings):Host | undefined {
       })]);
     } finally { if (timer) clearTimeout(timer); }
   };
-  // MCP owns its deadline because only the JSON-RPC message identifies whether
-  // the stalled call can be retried. AuthFn issuers are configured, never derived.
+  // MCP owns its deadline, from authentication through dispatch, because only
+  // the JSON-RPC message identifies whether the stalled call can be retried.
+  // AuthFn issuers are configured, never derived.
   const issuer=env.STATEPLANE_MCP_AUTHORIZATION_SERVER;
-  const mcpHandlers=new Map<string,Handler>();
   const mcpServe=(request:Request):Promise<Response>=>{
     if (!issuer) return Promise.resolve(mcpUnavailable());
     const resource=env.STATEPLANE_MCP_RESOURCE ?? new URL('/mcp',request.url).toString();
-    let handler=mcpHandlers.get(resource);
-    if (!handler) {
-      try {
-        handler=createMcpHandler({services,identity,resource,authorizationServers:[issuer],
-          allowInsecureLoopback:env.STATEPLANE_ENV==='local',requestTimeoutMs,onTimeout:retire});
-      } catch { return Promise.resolve(mcpUnavailable()); }
-      if (mcpHandlers.size>=maxMcpResources) mcpHandlers.clear();
-      mcpHandlers.set(resource,handler);
-    }
-    return handler(request);
+    let endpoint:McpEndpoint;
+    try { endpoint=mcpEndpoint(resource,issuer,env.STATEPLANE_ENV==='local'); }
+    catch { return Promise.resolve(mcpUnavailable()); }
+    return endpoint(request,{services,identity,onTimeout:retire});
   };
   const tracked=(handler:Handler,after:()=>void):Handler=>async request=>{
     active++;
