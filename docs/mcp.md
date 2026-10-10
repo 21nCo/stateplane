@@ -123,8 +123,8 @@ These bounds reuse STA-8/9 limits or protocol framing; none is a measured
 Cloudflare or Railway capacity. The committed manifest publishes 19 tools in a
 35,244-byte compact `tools/list` payload plus 1,071 characters of instructions.
 McpFn bundles the official SDK and schema validators: the app Worker dry-run
-grew from 834.94 KiB (178.06 KiB gzip) at the STA-9 base to 1,904.91 KiB
-(375.11 KiB gzip). This is a local bundle observation, not a deployed limit.
+grew from 834.94 KiB (178.06 KiB gzip) at the STA-9 base to 1,905.65 KiB
+(375.36 KiB gzip). This is a local bundle observation, not a deployed limit.
 
 ## Guidance for agents
 
