@@ -1,0 +1,33 @@
+.github/workflows/ci.yml
+  s_ce12272281eb3b::t_94817560af71f2 35
+app/src/lib/server/host.ts
+  s_ce12272281eb3b::t_caee0df54e2bf5 67-70,181
+docs/http-cli.md
+  s_ce12272281eb3b::t_8fec0fcadfd592 20-23
+docs/mcp.md
+  s_ce12272281eb3b::t_3f209f12c6f82c 155-159,171,173-177
+package.json
+  s_ce12272281eb3b::t_5d3a7ca4c4c6b5 23
+scripts/mcp-acceptance-hosts.mjs
+  s_ce12272281eb3b::t_c548237c602070 2,6-7,11,52,72-75,77,81,84-86,92-107,109-110,114,127,158
+scripts/test-mcp-clients.mjs
+  s_ce12272281eb3b::t_00379cc6bfc854 5-6,8,12-14,32,194
+scripts/test-mcp-conformance.mjs
+  s_ce12272281eb3b::t_007a2a229f698a 5-7,50
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9f0bae56fa6b19d960d013ba9243a64cbce28f04",
+  "prompts": {},
+  "sessions": {
+    "s_ce12272281eb3b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1d2376f8-4af3-4920-96da-dff6a042ab4c",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
