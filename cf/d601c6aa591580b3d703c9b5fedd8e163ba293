@@ -1,0 +1,29 @@
+test/mcp.test.js
+  s_1900bb15a7199a::t_15263d44b8267d 109,123-124,127-128,146-166,495,497,544-563,566-588
+contracts/mcp-manifest.json
+  s_1900bb15a7199a::t_b83e9a90e653d1 729,731,763,765,928-929,969-970,1396,1398,1430,1432,1595-1596,1636-1637,1838
+docs/mcp.md
+  s_1900bb15a7199a::t_960f0102c700db 29-30,33-34,154-157,161-162
+packages/mcp/src/schemas.ts
+  s_1900bb15a7199a::t_a8ccdad42c3d64 39-43
+packages/mcp/src/server.ts
+  s_1900bb15a7199a::t_110e6e46dcc2cc 104-106,142-147,152,166,291-295
+test/integration/mcp-services.test.js
+  s_1900bb15a7199a::t_22e4f49aa31554 240-246,262-270,272,274,276
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cfd601c6aa591580b3d703c9b5fedd8e163ba293",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
