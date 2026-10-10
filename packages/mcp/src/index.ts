@@ -1,3 +1,6 @@
-import type { ApplicationPorts } from '@stateplane/application';
-import type { IdentityVerifier } from '@stateplane/auth';
-export interface McpDependencies { services: ApplicationPorts; identity: IdentityVerifier; }
+export { createMcpEndpoint, createMcpHandler, maxRequestBytes, serverInfo, stateplaneMcpDeclaration } from './server.js';
+export type { McpContext, McpEndpoint, McpEndpointOptions, McpHandlerOptions, McpRequestScope } from './server.js';
+export { guidance, guidanceUri, instructions } from './guidance.js';
+export { serializeJson } from './json.js';
+export { tools } from './tools.js';
+export type { StateplaneTool, ToolName } from './tools.js';

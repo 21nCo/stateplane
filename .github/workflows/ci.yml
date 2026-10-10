@@ -29,6 +29,10 @@ jobs:
       - run: pnpm test:postgres
         env:
           STATEPLANE_TEST_SEPARATE_DBS: '1'
+      - run: pipx install uv==0.10.4
+      - run: pnpm test:mcp-clients
+      - run: pnpm test:mcp-conformance
+      - run: pnpm test:mcp-workerd
       - if: always()
         run: pnpm db:down
   windows-boundaries:

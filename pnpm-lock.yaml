@@ -107,6 +107,9 @@ importers:
       '@stateplane/contracts':
         specifier: workspace:*
         version: link:../packages/contracts
+      '@stateplane/mcp':
+        specifier: workspace:*
+        version: link:../packages/mcp
       '@stateplane/postgres':
         specifier: workspace:*
         version: link:../packages/postgres
@@ -182,12 +185,21 @@ importers:
 
   packages/mcp:
     dependencies:
+      '@mcpfn/auth':
+        specifier: 0.0.5
+        version: 0.0.5(@cfworker/json-schema@4.1.1)(@superfunctions/auth@0.2.0)(drizzle-orm@0.45.3(@cloudflare/workers-types@5.20260918.1)(@types/pg@8.20.0)(pg@8.22.0))(zod@4.6.5)
+      '@mcpfn/core':
+        specifier: 0.0.5
+        version: 0.0.5(zod@4.6.5)
       '@stateplane/application':
         specifier: workspace:*
         version: link:../application
       '@stateplane/auth':
         specifier: workspace:*
         version: link:../auth
+      '@stateplane/contracts':
+        specifier: workspace:*
+        version: link:../contracts
 
   packages/postgres:
     dependencies:

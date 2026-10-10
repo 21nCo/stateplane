@@ -11,7 +11,7 @@ const roles = new Map([
   ['contracts', []], ['application', ['contracts']], ['postgres', ['contracts', 'application']],
   ['auth', ['contracts']], ['storage', ['contracts']], ['retrieval', ['contracts']],
   ['workers', ['application', 'contracts']], ['api', ['application', 'auth', 'contracts']],
-  ['mcp', ['application', 'auth']], ['cli', ['contracts']], ['testing', ['contracts']],
+  ['mcp', ['application', 'auth', 'contracts']], ['cli', ['contracts']], ['testing', ['contracts']],
   ['read-model', []]
 ]);
 

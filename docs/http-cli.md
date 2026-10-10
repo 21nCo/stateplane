@@ -17,7 +17,10 @@ local or isolated Preview smoke, set `STATEPLANE_ENV=local` or `preview`,
 `STATEPLANE_TEST_CREDENTIAL`, and a private hex-encoded 32-byte
 `STATEPLANE_TEST_CURSOR_SECRET`. Supply either
 `STATEPLANE_TEST_DATABASE_URL` for local PostgreSQL or the `AUTHORITY`
-Hyperdrive binding for Preview. The optional cell and storage target IDs
+Hyperdrive binding for Preview. Inside a Worker the host opens its pool per
+request, because workerd cannot reuse one request's socket in another; only
+the Node development host keeps a pool across requests. The optional cell and
+storage target IDs
 default to `cell-a` and `target-a`. This fixture host uses one configured
 bearer and does not establish connected AuthFn provider acceptance. Without
 all opt-in bindings, `/v1/*` fails closed with a structured 503. Keep these
