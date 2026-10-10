@@ -1,0 +1,47 @@
+app/src/lib/server/host.ts
+  s_ce12272281eb3b::t_ded1dbcb5d205b 6-7,21,23-36,173-175,180-183
+contracts/mcp-manifest.json
+  s_ce12272281eb3b::t_764b2788ae9534 6,24,370,1747
+docs/mcp.md
+  s_ce12272281eb3b::t_07a4dbcc9801cd 9-13,86-94,127-134,138,151-153,175-183,191-192,203-206,228-230
+package.json
+  s_ce12272281eb3b::t_9c1f2cbb506ba0 12,18,21-23
+packages/mcp/src/guidance.ts
+  s_ce12272281eb3b::t_e490d25cc4f20a 9-10,33-35,38
+packages/mcp/src/index.ts
+  s_ce12272281eb3b::t_fce8471371a2ef 1-2
+packages/mcp/src/server.ts
+  s_ce12272281eb3b::t_f2d9d3845322ff 12-14,45-46,56-59,64-65,74,78,99-101,104-108,119-120,123-125,132-140,142,147,187-195,199,201,205-207,214-218,223-226,228,230,233,238,240-242,247-285,294,304,307-313
+packages/mcp/src/tools.ts
+  s_ce12272281eb3b::t_c97362722cb7ef 13-14,78-85,89,119-120,128-130,179-180,197-199
+scripts/mcp-acceptance-hosts.mjs
+  s_ce12272281eb3b::t_a8ddd7d9780aea 18-50,58,63,79,87-90,103-105,131,141-142,153,162-171
+scripts/test-mcp-clients.mjs
+  s_ce12272281eb3b::t_d2d49356eb3759 23,192-193,195,201-203
+scripts/test-mcp-conformance.mjs
+  s_ce12272281eb3b::t_263760bc1eadc8 18,51,53-54,56-58,111-112,126-128
+test/mcp-acceptance-cleanup.test.js
+  s_ce12272281eb3b::t_72adda301aa7e5 1-19
+test/mcp-host.test.ts
+  s_ce12272281eb3b::t_de99adf8e509ac 1-60
+test/mcp.test.js
+  s_ce12272281eb3b::t_3bc5c576d799dd 12-13,361,377,380-386,388-488
+vitest.config.ts
+  s_ce12272281eb3b::t_1d3cba16cd467f 4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "38ca8b9a3fcba9d47d52eb514a6072d3e4830a92",
+  "prompts": {},
+  "sessions": {
+    "s_ce12272281eb3b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1d2376f8-4af3-4920-96da-dff6a042ab4c",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
