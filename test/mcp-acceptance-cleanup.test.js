@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createServer } from 'node:http';
+import { createServer, request } from 'node:http';
 import { once } from 'node:events';
 import { gzipSync } from 'node:zlib';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { awaitReady, finalizers, gateMode, hostBackend, loopbackForwarder, runGate, selectBackend, startLineProcess } from '../scripts/mcp-acceptance-hosts.mjs';
+import { awaitReady, finalizers, gateMode, hostBackend, loopbackForwarder, runGate, selectBackend, startLineProcess,
+  withCredentialProxy } from '../scripts/mcp-acceptance-hosts.mjs';
 
 test('acceptance cleanup runs every step after a failure and reports it incomplete',async()=>{
   const cleanup=finalizers();
@@ -121,6 +122,60 @@ test('the forwarder relays a compressed upstream faithfully and rewrites only it
     await assert.rejects(fetch(forwarder.url,{method:'POST',body:JSON.stringify({drop:true})}));
     assert.equal(requests,before+1);
     assert.equal((await fetch(forwarder.url,{method:'POST',body:JSON.stringify({drop:true})})).status,401,'only one response is dropped');
+  } finally {
+    await cleanup.run();
+    await upstream.close();
+  }
+});
+
+/** A request shaped like the official dns-rebinding scenario: explicit Host and Origin. */
+function runnerPost(url,host) {
+  return new Promise((resolve,reject)=>{
+    const outgoing=request(url,{method:'POST',headers:{host,origin:`http://${host}`,'content-type':'application/json'}},response=>{
+      response.resume(); response.on('end',()=>resolve(response.statusCode));
+    });
+    outgoing.on('error',reject);
+    outgoing.end(JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{}}));
+  });
+}
+
+test('through the credential proxy and the forwarder, the runner origin reaches a deployed upstream as its own while foreign origins stay observable',async()=>{
+  let upstreamOrigin;
+  const seen=[];
+  // Like a deployed endpoint whose resource is not loopback: only its own Origin, and a bearer.
+  const upstream=await listen((req,res)=>{
+    seen.push({origin:req.headers.origin,authorization:req.headers.authorization});
+    req.resume();
+    if (req.headers.origin!==undefined && req.headers.origin!==upstreamOrigin) { res.writeHead(403).end(); return; }
+    res.writeHead(req.headers.authorization==='Bearer chain-secret'?200:401).end();
+  });
+  upstreamOrigin=upstream.origin;
+  const cleanup=finalizers();
+  try {
+    const forwarder=await loopbackForwarder(`${upstream.origin}/mcp`,{cleanup});
+    let proxyUrl;
+    const result=await withCredentialProxy(forwarder,{kind:'api-key',headers:{authorization:'Bearer chain-secret'}},async url=>{
+      proxyUrl=url;
+      const proxyHost=new URL(url).host;
+      return {valid:await runnerPost(url,proxyHost),foreign:await runnerPost(url,'evil.example.com'),
+        loopbackElsewhere:await new Promise((resolve,reject)=>{
+          const outgoing=request(url,{method:'POST',headers:{host:proxyHost,origin:'http://127.0.0.1:1'}},response=>{
+            response.resume(); response.on('end',()=>resolve(response.statusCode)); });
+          outgoing.on('error',reject); outgoing.end('{}');
+        }),echo:'Bearer chain-secret'};
+    });
+    assert.equal(result.valid,200,'the runner\'s own loopback origin is the upstream origin');
+    assert.deepEqual(seen[0],{origin:upstreamOrigin,authorization:'Bearer chain-secret'});
+    assert.equal(result.foreign,403,'a rebinding origin is refused by the upstream itself');
+    assert.deepEqual(seen[1],{origin:'http://evil.example.com',authorization:undefined},'unchanged and without the credential');
+    assert.equal(result.loopbackElsewhere,403,'another loopback origin passes unchanged');
+    assert.equal(seen[2].origin,'http://127.0.0.1:1');
+    assert.equal(JSON.stringify(result).includes('chain-secret'),false,'the result is redacted');
+    // Afterwards the proxy is gone and its origin no longer stands for the upstream.
+    await assert.rejects(fetch(proxyUrl,{method:'POST',body:'{}'}));
+    assert.equal((await fetch(forwarder.url,{method:'POST',headers:{origin:new URL(proxyUrl).origin},body:'{}'})).status,403);
+    assert.throws(()=>forwarder.standFor('http://evil.example.com'),/not a separate loopback origin/);
+    assert.throws(()=>forwarder.standFor(new URL(forwarder.url).origin),/not a separate loopback origin/);
   } finally {
     await cleanup.run();
     await upstream.close();

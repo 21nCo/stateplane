@@ -229,8 +229,11 @@ host through `STATEPLANE_MCP_ENDPOINT` with that host's fixture variables and
 `DATABASE_URL`. A non-loopback endpoint is reached through a fixed-path
 loopback forwarder because the official runner accepts only loopback URLs. The
 forwarder drops encoding and framing headers from the body it has already
-decoded, and it rewrites only its own exact origin, so other loopback and
-foreign origins still reach the endpoint's DNS-rebinding check. In the
+decoded. For the official runner, McpFn's credential proxy sits in front of
+the forwarder and injects the bearer only for its own authority. The forwarder
+rewrites only its own exact origin and that proxy's (the origin the runner
+addresses), so other loopback and foreign origins still reach the endpoint's
+DNS-rebinding check. In the
 two-client gate both clients use the same forwarder: it drops the response to
 one committed `records_create`, which the owner then recovers by repeating the
 identical request. Only the in-process run revokes an AuthFn key and asserts
@@ -284,4 +287,4 @@ UI/health. Clean up every disposable resource.
 | Two clients | Inconsistent IDs, revisions, conflicts, receipts or revocation across implementations | TypeScript and Python SDK gate in-process and through the app host |
 | Resource origin | A request `Host` becomes the trusted origin, defeating the rebinding check | Configured resource outside local loopback; host fail-closed tests |
 | Gate cleanup | A failed start leaves a credential-bearing client, app process or space behind while evidence reports complete; a stalled host holds cleanup | Spawn-error, stalled-init, not-ready and stalled-host tests; every finalizer counted in `cleanupSteps` |
-| Forwarder | A compressed or relabelled body, or a masked rebinding origin, on the hosted path | gzip upstream that rejects foreign origins |
+| Forwarder | A compressed or relabelled body, a masked rebinding origin, or the runner's own origin refused on the hosted path | gzip upstream that rejects foreign origins; runner-shaped requests through the real credential proxy |

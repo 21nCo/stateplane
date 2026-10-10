@@ -8,6 +8,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import pg from 'pg';
+import { acquireRemoteCredential, createAuthenticatedConformanceProxy, redactRemoteCredential, runOfficialConformance } from '@mcpfn/testing';
 import { connectionOptions } from './db-connection.mjs';
 import { wranglerInvocation } from './wrangler-command.mjs';
 import { CollectionRegistry, PostgresSpaces, postgresServices } from '../packages/postgres/dist/index.js';
@@ -15,6 +16,7 @@ import { createMcpHandler } from '../packages/mcp/dist/index.js';
 
 const root=resolve(import.meta.dirname,'..');
 function assert(condition,message) { if (!condition) throw new Error(message); }
+const loopbackHost=/^(?:127\.0\.0\.1|localhost|\[::1\])$/;
 
 /** Cleanup owned by the caller from before initialization starts. Steps run in
  * reverse registration order, and each runs even when an earlier one fails. */
@@ -123,12 +125,14 @@ const responseHop=new Set(['connection','keep-alive','content-length','transfer-
 const parsed=body=>{ try { return JSON.parse(body); } catch { return null; } };
 
 /** A loopback forwarder for one fixed upstream path. Only this forwarder's own
- * origin stands for the upstream origin; any other Origin passes through for
- * the upstream to judge. It records each upstream status and can drop the
- * next matching response after the upstream answered: a real lost response. */
+ * origin, and that of a loopback proxy registered in front of it, stands for
+ * the upstream origin; any other Origin passes through for the upstream to
+ * judge. It records each upstream status and can drop the next matching
+ * response after the upstream answered: a real lost response. */
 export async function loopbackForwarder(endpoint,{cleanup,timeoutMs=30_000}={}) {
   const upstream=new URL(endpoint);
   const observed=[];
+  const standIns=new Set();
   let own;
   let drop=null;
   const server=createServer(async(req,res)=>{
@@ -138,7 +142,7 @@ export async function loopbackForwarder(endpoint,{cleanup,timeoutMs=30_000}={}) 
       const chunks=[];for await(const chunk of req) chunks.push(chunk);
       const body=chunks.length?Buffer.concat(chunks):undefined;
       const headers=Object.fromEntries(Object.entries(req.headers).filter(([name])=>!requestHop.has(name)));
-      if (headers.origin===own) headers.origin=upstream.origin;
+      if (standIns.has(headers.origin)) headers.origin=upstream.origin;
       const response=await fetch(upstream,{method:req.method,headers,body,redirect:'manual',signal:AbortSignal.timeout(timeoutMs)});
       const payload=Buffer.from(await response.arrayBuffer());
       observed.push({status:response.status,wwwAuthenticate:response.headers.get('www-authenticate')});
@@ -152,11 +156,44 @@ export async function loopbackForwarder(endpoint,{cleanup,timeoutMs=30_000}={}) 
   });
   server.listen(0,'127.0.0.1'); await once(server,'listening');
   own=`http://127.0.0.1:${server.address().port}`;
+  standIns.add(own);
   const close=()=>new Promise(resolve=>{ server.closeAllConnections(); server.close(()=>resolve()); });
   cleanup?.add(close);
   return {url:`${own}${upstream.pathname}`,observed,close,
     /** Drop the response to the next request whose JSON-RPC message matches. */
-    dropNextResponse(match) { drop=match; }};
+    dropNextResponse(match) { drop=match; },
+    /** Let the loopback proxy at this origin, placed in front of the forwarder,
+     * also stand for the upstream origin until the returned function withdraws it. */
+    standFor(origin) {
+      const url=new URL(origin);
+      assert(url.origin===origin && url.protocol==='http:' && loopbackHost.test(url.hostname) && origin!==own,
+        `${origin} is not a separate loopback origin`);
+      standIns.add(origin);
+      return ()=>{ standIns.delete(origin); };
+    }};
+}
+
+/** McpFn's credential proxy in front of the forwarder, as runAuthenticatedOfficialConformance
+ * composes it, but with the proxy's origin standing for the upstream origin: the official
+ * runner sends Host and Origin for the proxy it addresses. The result is redacted, and the
+ * origin, proxy and credential lease are released even when the body fails. */
+export async function withCredentialProxy(forwarder,credential,body) {
+  const lease=await acquireRemoteCredential(credential,{url:forwarder.url,requestId:randomUUID()});
+  let proxy;
+  let withdraw;
+  try {
+    proxy=await createAuthenticatedConformanceProxy({url:forwarder.url,headers:lease.credential.headers});
+    withdraw=forwarder.standFor(new URL(proxy.url).origin);
+    return redactRemoteCredential(lease.credential,await body(proxy.url),{preserveKeys:true});
+  } finally {
+    withdraw?.();
+    try { await proxy?.close(); } finally { await lease.release(); }
+  }
+}
+
+/** One official conformance scenario against a deployed endpoint reached through the forwarder. */
+export function forwardedOfficialConformance(forwarder,{scenario,credential,cwd}) {
+  return withCredentialProxy(forwarder,credential,url=>runOfficialConformance({url,scenario,cwd,stdio:'pipe'}));
 }
 
 const modes={'node-in-process':'in-process-authfn','node-vite':'local-app-host',workerd:'local-workerd-host',external:'external-host'};

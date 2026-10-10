@@ -13,7 +13,7 @@ import { authenticatedHttpTarget, createMcpFnTargetSuiteJUnit, disposeMcpFnTarge
   OFFICIAL_CONFORMANCE_VERSION, runAuthenticatedOfficialConformance, runMcpFnTargetSuite,
   serializeMcpFnTargetSuiteReport } from '@mcpfn/testing';
 import { guidanceUri, stateplaneMcpDeclaration } from '../packages/mcp/dist/index.js';
-import { gateMode, loopbackForwarder, runGate, selectBackend } from './mcp-acceptance-hosts.mjs';
+import { forwardedOfficialConformance, gateMode, loopbackForwarder, runGate, selectBackend } from './mcp-acceptance-hosts.mjs';
 
 const root=resolve(import.meta.dirname,'..');
 const output=join(root,'.data/mcp-conformance');
@@ -83,10 +83,12 @@ const failure=await runGate(summary,async cleanup=>{
     `McpFn scenarios failed: ${JSON.stringify(summary.mcpfn.failures)}`);
 
   const loopback=/^(?:127\.0\.0\.1|localhost|\[::1\])$/.test(new URL(backend.endpoint).hostname);
-  // Official runners require a loopback URL; a deployed endpoint is reached through the forwarder.
-  const url=loopback ? backend.endpoint : (await loopbackForwarder(backend.endpoint,{cleanup})).url;
+  // Official runners require a loopback URL; a deployed endpoint is reached through the
+  // credential proxy and the forwarder, which present the runner's origin as the endpoint's.
+  const forwarder=loopback ? null : await loopbackForwarder(backend.endpoint,{cleanup});
   for (const scenario of applicable) {
-    const result=await runAuthenticatedOfficialConformance({url,scenario,credential,cwd:output});
+    const result=forwarder ? await forwardedOfficialConformance(forwarder,{scenario,credential,cwd:output})
+      : await runAuthenticatedOfficialConformance({url:backend.endpoint,scenario,credential,cwd:output});
     summary.official.push({scenario,ok:result.ok,exitCode:result.exitCode,
       outcome:result.stdout.split('\n').find(line=>line.includes(`${scenario}:`))?.trim()??null});
     console.log(`official ${scenario}: ${result.ok?'passed':'failed'}`);
