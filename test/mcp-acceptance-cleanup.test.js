@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import { createServer, request } from 'node:http';
 import { once } from 'node:events';
 import { gzipSync } from 'node:zlib';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { awaitReady, finalizers, gateMode, hostBackend, loopbackForwarder, runGate, selectBackend, startLineProcess,
+import { awaitReady, finalizers, gateMode, hostBackend, loopbackForwarder, recordGate, runGate, selectBackend, startLineProcess,
   withCredentialProxy } from '../scripts/mcp-acceptance-hosts.mjs';
 
 test('acceptance cleanup runs every step after a failure and reports it incomplete',async()=>{
@@ -23,6 +23,48 @@ test('acceptance cleanup runs every step after a failure and reports it incomple
   assert.equal(cleanup.size,0);
   await cleanup.run();
   assert.equal(ran.length,4,'a step runs once');
+});
+
+test('a persisted gate record is passed only when the body and every finalizer succeed',async()=>{
+  const directory=await mkdtemp(join(tmpdir(),'stateplane-receipt-'));
+  try {
+    const path=join(directory,'receipts','gate.json');
+    const ran=[];
+    const failure=await recordGate({result:'failed'},path,async cleanup=>{
+      cleanup.add(()=>{ ran.push('erase space'); });
+      cleanup.add(()=>{ ran.push('stop app'); throw new Error('stop failed'); });
+      cleanup.add(()=>{ ran.push('close client'); });
+    },{directoryMode:0o700});
+    assert.match(String(failure?.message),/stop failed/);
+    assert.deepEqual(ran,['close client','stop app','erase space'],'every finalizer runs');
+    const persisted=JSON.parse(await readFile(path,'utf8'));
+    assert.deepEqual({result:persisted.result,cleanup:persisted.cleanup,cleanupSteps:persisted.cleanupSteps},
+      {result:'failed',cleanup:'failed',cleanupSteps:3});
+    assert.match(persisted.error,/stop failed/);
+    assert.match(persisted.cleanupError,/stop failed/);
+    assert.ok(persisted.finishedAt);
+    if (process.platform!=='win32') assert.equal((await stat(path)).mode&0o777,0o600);
+
+    const passed=await recordGate({result:'failed'},path,async cleanup=>{ cleanup.add(()=>{}); });
+    assert.equal(passed,undefined);
+    const clean=JSON.parse(await readFile(path,'utf8'));
+    assert.deepEqual({result:clean.result,cleanup:clean.cleanup,error:clean.error},{result:'passed',cleanup:'complete',error:undefined});
+  } finally { await rm(directory,{recursive:true,force:true}); }
+});
+
+test('a body failure stays the gate error when cleanup also fails, and both are recorded',async()=>{
+  const record={};
+  const ran=[];
+  const failure=await runGate(record,async cleanup=>{
+    cleanup.add(()=>{ ran.push('erase space'); throw new Error('erase failed'); });
+    cleanup.add(()=>{ ran.push('stop app'); });
+    throw new Error('revision mismatch');
+  });
+  assert.equal(failure?.message,'revision mismatch');
+  assert.deepEqual(ran,['stop app','erase space']);
+  assert.deepEqual({result:record.result,error:record.error,cleanup:record.cleanup},
+    {result:'failed',error:'revision mismatch',cleanup:'failed'});
+  assert.match(record.cleanupError,/erase failed/);
 });
 
 const missing=`stateplane-missing-command-${process.pid}`;

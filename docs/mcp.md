@@ -217,7 +217,7 @@ transport and belongs to regional acceptance (STA-21).
 | --- | --- | --- |
 | `node --test test/mcp.test.js` (in `pnpm test:contracts`) | Registry, OpenAPI parity, service mapping, error parity with HTTP, precedence, re-encoding, OAuth challenges and metadata, origins, McpFn API-key regression matrix, body bounds, one deadline over stalled verification, unfinished body and dispatched reads and writes, one endpoint serving concurrent requests with their own services and equal JSON-RPC IDs, recovery guidance against write schemas | Node |
 | `test/mcp-host.test.ts` (in `pnpm test:qualification`) | The app host builds one MCP endpoint per isolate and resource while each Worker request passes its own services, identity and pool; a Preview without `STATEPLANE_MCP_RESOURCE` and a local non-loopback `Host` with a matching `Origin` fail closed | Node |
-| `node --test test/mcp-acceptance-cleanup.test.js` (in `pnpm test:contracts`) | Gate cleanup: reverse-order finalizers; a client that cannot spawn, stalls before ready or answers not ready fails the gate, is terminated and awaited, and backend cleanup still runs; evidence mode is the backend that ran | Node |
+| `node --test test/mcp-acceptance-cleanup.test.js` (in `pnpm test:contracts`) | Gate cleanup: reverse-order finalizers; a client that cannot spawn, stalls before ready or answers not ready fails the gate, is terminated and awaited, and backend cleanup still runs; a persisted record is passed only when every finalizer succeeds; evidence mode is the backend that ran | Node |
 | `test/integration/mcp-services.test.js` (in `pnpm test:postgres`) | Real AuthFn sessions and keys, Postgres authority: shared IDs and revisions, revision conflict, `KEY_RESERVED` and `UNIQUE_CONFLICT`, MCP↔HTTP receipt replay, idempotency mismatch, `1e400` parity, authorization before shape, AuthFn and cell revocation | Local Postgres |
 | `pnpm test:mcp-clients` | Two distinct SDK clients in one space: official TypeScript SDK 1.29.0 (through `@mcpfn/client`) as owner and official Python SDK 2.3.0 as agent; create, read, query, replace, conflict, patch, both duplicate kinds, a lost response injected after commit and recovered, duplicate-delivery replay, typed filter, count, delete, event feed and revocation (`401` challenge in process) | Local Postgres, `uv` |
 | `pnpm test:mcp-conformance` | McpFn target suite (initialize, inventory against the manifest, guidance resource and semantic scenarios) and the applicable scenarios of the pinned official runner 0.1.16 | Local Postgres, network for `npx` |
@@ -256,7 +256,9 @@ uncaught event, and the secret file, pools and disposable spaces follow.
 Every step runs even after a failure, `cleanupSteps` counts every registered
 finalizer (client terminations, forwarder, spaces, pools, server or app
 process and secret directory), and the evidence records `cleanup: failed` with
-the reason when any step fails. The official runner's
+the reason when any step fails. The evidence `result` is `passed` only when the
+scenario and every finalizer succeeded; a scenario failure stays the reported
+`error`, with any cleanup failure beside it in `cleanupError`. The official runner's
 remaining server scenarios call the reference server's fixture tools, prompts,
 logging, completions, sampling and elicitation; a fixed product registry does
 not publish those, so they are recorded as not applicable rather than passed.

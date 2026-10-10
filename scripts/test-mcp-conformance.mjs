@@ -13,7 +13,7 @@ import { authenticatedHttpTarget, createMcpFnTargetSuiteJUnit, disposeMcpFnTarge
   OFFICIAL_CONFORMANCE_VERSION, runAuthenticatedOfficialConformance, runMcpFnTargetSuite,
   serializeMcpFnTargetSuiteReport } from '@mcpfn/testing';
 import { guidanceUri, stateplaneMcpDeclaration } from '../packages/mcp/dist/index.js';
-import { forwardedOfficialConformance, gateMode, loopbackForwarder, runGate, selectBackend } from './mcp-acceptance-hosts.mjs';
+import { forwardedOfficialConformance, gateMode, loopbackForwarder, recordGate, selectBackend } from './mcp-acceptance-hosts.mjs';
 
 const root=resolve(import.meta.dirname,'..');
 const output=join(root,'.data/mcp-conformance');
@@ -27,7 +27,7 @@ function assert(condition,message) { if (!condition) throw new Error(message); }
 const summary={formatVersion:1,kind:'stateplane.mcp-conformance',startedAt:new Date().toISOString(),
   officialSuiteVersion:OFFICIAL_CONFORMANCE_VERSION,mode:null,official:[],notApplicable:[]};
 // Cleanup is owned before initialization, so a failed start still stops what it began.
-const failure=await runGate(summary,async cleanup=>{
+const failure=await recordGate(summary,join(output,'summary.json'),async cleanup=>{
   const backend=await selectBackend(process.argv.slice(2),cleanup);
   summary.mode=gateMode(backend.endpointInfo);
   summary.endpoint=backend.endpointInfo;
@@ -96,9 +96,6 @@ const failure=await runGate(summary,async cleanup=>{
   summary.notApplicable=['logging-set-level','completion-complete','tools-call-* (reference fixture tools)',
     'elicitation-*','resources-read-*/templates/subscribe (reference fixture resources)','prompts-*','server-sse-multiple-streams (JSON responses)'];
   assert(summary.official.every(item=>item.ok),'an applicable official conformance scenario failed');
-});
-summary.finishedAt=new Date().toISOString();
-await mkdir(output,{recursive:true,mode:0o700});
-await writeFile(join(output,'summary.json'),`${JSON.stringify(summary,null,2)}\n`,{mode:0o600});
+},{directoryMode:0o700});
 if (failure) throw failure;
 console.log(`MCP protocol and semantic conformance passed; reports: ${output}`);

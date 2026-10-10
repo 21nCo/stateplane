@@ -13,11 +13,11 @@
 // STATEPLANE_TEST_CREDENTIAL, STATEPLANE_TEST_AGENT_TOKEN and
 // STATEPLANE_TEST_AGENT_CREDENTIAL matching its configuration. Evidence without credentials is written to
 // .data/mcp-two-client-evidence.json (or --evidence <path>).
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { stateplaneMcpDeclaration } from '../packages/mcp/dist/index.js';
-import { gateMode, loopbackForwarder, runGate, selectBackend, startLineProcess } from './mcp-acceptance-hosts.mjs';
+import { gateMode, loopbackForwarder, recordGate, selectBackend, startLineProcess } from './mcp-acceptance-hosts.mjs';
 
 const root=resolve(import.meta.dirname,'..');
 const pythonSdk='mcp==2.3.0';
@@ -176,14 +176,11 @@ async function scenario(backend,cleanup) {
   assert(after.count===1,'the owner continues after revocation');
 }
 
-const failure=await runGate(evidence,async cleanup=>{
+const failure=await recordGate(evidence,evidencePath,async cleanup=>{
   const backend=await selectBackend(args,cleanup);
   evidence.mode=gateMode(backend.endpointInfo);
   evidence.endpoint=backend.endpointInfo;
   await scenario(backend,cleanup);
 });
-evidence.finishedAt=new Date().toISOString();
-await mkdir(dirname(evidencePath),{recursive:true});
-await writeFile(evidencePath,`${JSON.stringify(evidence,null,2)}\n`,{mode:0o600});
 if (failure) throw failure;
 console.log(`Two distinct MCP SDK clients passed the core-state gate (${evidence.mode}); evidence: ${evidencePath}`);

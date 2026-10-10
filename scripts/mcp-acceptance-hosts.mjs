@@ -4,9 +4,9 @@ import { createServer } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import pg from 'pg';
 import { acquireRemoteCredential, createAuthenticatedConformanceProxy, redactRemoteCredential, runOfficialConformance } from '@mcpfn/testing';
 import { connectionOptions } from './db-connection.mjs';
@@ -106,16 +106,31 @@ export async function startLineProcess(command,args,{cleanup,cwd,env,timeoutMs=6
   }};
 }
 
-/** Run one acceptance gate with caller-owned cleanup. The record states the
- * result and whether every finalizer completed; returns the first failure. */
+/** Run one acceptance gate with caller-owned cleanup. The record is passed
+ * only when the body and every finalizer succeed; a body failure stays the
+ * reported error and a cleanup failure is recorded beside it. Returns the
+ * first failure. */
 export async function runGate(record,body) {
   const cleanup=finalizers();
-  let failure;
-  try { await body(cleanup); record.result='passed'; }
-  catch(error) { failure=error; record.result='failed'; record.error=String(error?.message??error); }
+  const failures=[];
+  try { await body(cleanup); }
+  catch(error) { failures.push(error); record.error=String(error?.message??error); }
   record.cleanupSteps=cleanup.size;
   try { await cleanup.run(); record.cleanup='complete'; }
-  catch(error) { record.cleanup='failed'; record.cleanupError=String(error?.message??error); failure??=error; }
+  catch(error) { failures.push(error); record.cleanup='failed'; record.cleanupError=String(error?.message??error); }
+  if (!failures.length) { record.result='passed'; return undefined; }
+  record.result='failed';
+  record.error??=record.cleanupError;
+  return failures[0]??new Error(record.error);
+}
+
+/** Run a gate and persist its record, readable only by the owner, before the
+ * caller rethrows the returned failure. */
+export async function recordGate(record,path,body,{directoryMode}={}) {
+  const failure=await runGate(record,body);
+  record.finishedAt=new Date().toISOString();
+  await mkdir(dirname(path),{recursive:true,...directoryMode===undefined ? {} : {mode:directoryMode}});
+  await writeFile(path,`${JSON.stringify(record,null,2)}\n`,{mode:0o600});
   return failure;
 }
 
