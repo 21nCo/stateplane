@@ -1,0 +1,39 @@
+app/src/lib/server/host.ts
+  s_ce12272281eb3b::t_7900b3a7aa8c7c 20,23,176-178,182-187
+scripts/mcp-acceptance-hosts.mjs
+  s_ce12272281eb3b::t_45e8b233bf26e5 6,43-58,62-130,152-159,207,212,215,219,221-223,225,230,234,236-239
+scripts/test-mcp-clients.mjs
+  s_1900bb15a7199a::t_9ea6ac3f1ad462 20,28,58,63,66,73-77,80,83,86-113,115-159,162-164,166-170
+scripts/test-mcp-conformance.mjs
+  s_1900bb15a7199a::t_2a6b19be35e62f 18,42-47,54-58,124-127
+test/mcp-acceptance-cleanup.test.js
+  s_ce12272281eb3b::t_2e17381c9ade59 3-6,23-82
+test/mcp-host.test.ts
+  s_ce12272281eb3b::t_b17500d7431300 6,20,22,34-37,58-78,80-84,86
+docs/mcp.md
+  s_ce12272281eb3b::t_2f92fd355789b5 126-128,137-140,173-179,186,201-202,213-226,234-235,253-254
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7be5f3e43a1795490af6e82bd321b1736972ff73",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_ce12272281eb3b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1d2376f8-4af3-4920-96da-dff6a042ab4c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
