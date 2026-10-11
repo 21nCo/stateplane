@@ -1,0 +1,57 @@
+app/src/app.css
+  s_1900bb15a7199a::t_c7e0b36b3653ac 76-77
+app/src/lib/paths.ts
+  s_1900bb15a7199a::t_fde0fed2dde973 14-21
+app/src/lib/server/keycheck.ts
+  s_1900bb15a7199a::t_e1b04cb24e4c43 4-6
+app/src/routes/spaces/+page.svelte
+  s_1900bb15a7199a::t_a827e0d97deeb7 5,24
+app/src/routes/spaces/[space]/+layout.svelte
+  s_1900bb15a7199a::t_875e87e4ec45f2 3,12,15-17
+app/src/routes/spaces/[space]/+page.svelte
+  s_1900bb15a7199a::t_1dd08bdc6773a2 43
+app/src/routes/spaces/[space]/access/+page.server.ts
+  s_1900bb15a7199a::t_38bcefc0191937 54,60-62
+app/src/routes/spaces/[space]/access/+page.svelte
+  s_1900bb15a7199a::t_b122df05a4eb05 2,30-32,41,43,66,71,92-93
+app/src/routes/spaces/[space]/audit/+page.svelte
+  s_1900bb15a7199a::t_6fb2dfe818d11d 20
+app/src/routes/spaces/[space]/collections/[collection]/+page.svelte
+  s_1900bb15a7199a::t_fecdd9989475ae 30,74,101
+app/src/routes/spaces/[space]/collections/[collection]/batches/+page.svelte
+  s_1900bb15a7199a::t_11df8d981deede 52
+app/src/routes/spaces/[space]/collections/[collection]/events/+page.svelte
+  s_1900bb15a7199a::t_c00c726ff31039 21
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.svelte
+  s_1900bb15a7199a::t_d454ddd4235266 25,28
+app/src/routes/spaces/[space]/collections/[collection]/schema/+page.svelte
+  s_1900bb15a7199a::t_3c8a3e6f244450 15
+docs/ui.md
+  s_1900bb15a7199a::t_afd21de134c3af 12,17,26
+packages/postgres/src/spaces.ts
+  s_1900bb15a7199a::t_fb0d78f50b2b8b 1407-1408
+test/e2e/host.js
+  s_1900bb15a7199a::t_f019733b6c2e9c 61-62,75-79,102,104
+test/e2e/owner.spec.ts
+  s_1900bb15a7199a::t_f9baa89b54db93 42-46,422-479
+test/integration/owner-access-http.test.js
+  s_1900bb15a7199a::t_136c922f5468b8 96-99
+test/mcp-host.test.ts
+  s_1900bb15a7199a::t_4ffc9eeebed09f 35,143-157
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1dbf2353d5fb8b47c42037109dc99a73c385da6a",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
