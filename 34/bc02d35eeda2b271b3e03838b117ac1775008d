@@ -1,0 +1,29 @@
+contracts/mcp-manifest.json
+  s_ad318efcee62d5::t_0a290c45d3e4a8 223-225,227-244,246-247,322-445,580-582,584-601,603-604,680-803,2092
+contracts/openapi.yaml
+  s_ad318efcee62d5::t_0cc40c91b7e1c2 218-220,222-225
+docs/mcp.md
+  s_ad318efcee62d5::t_601285fe47f0a9 34-49,175,232,235
+packages/mcp/src/schemas.ts
+  s_ad318efcee62d5::t_1fb2c9837b5d6a 68-102,109,120-121,134-136
+test/integration/mcp-services.test.js
+  s_ad318efcee62d5::t_b3e786a1f70cc7 279-322
+test/mcp.test.js
+  s_ad318efcee62d5::t_388364562a6b4f 109-110,147-171,174-176,179-205
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "34bc02d35eeda2b271b3e03838b117ac1775008d",
+  "prompts": {},
+  "sessions": {
+    "s_ad318efcee62d5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_ad318efcee62d5",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
