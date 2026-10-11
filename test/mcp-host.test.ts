@@ -32,6 +32,8 @@ import { stateplaneHost } from '../app/src/lib/server/host';
 import { api } from '../app/src/lib/server/api';
 import { checkKey } from '../app/src/lib/server/keycheck';
 import { jsonObject } from '../app/src/lib/server/forms';
+import { segment, selectors } from '../app/src/lib/paths';
+import { predicates } from '../app/src/lib/query';
 import { handle } from '../app/src/hooks.server';
 
 const env = { STATEPLANE_ENV: 'preview', STATEPLANE_TEST_HTTP: '1', STATEPLANE_TEST_TOKEN: 'o'.repeat(32),
@@ -138,6 +140,35 @@ it('a key check reports provider rejection only for UNAUTHENTICATED; other failu
     Response.json({ error: { code: 'NOT_FOUND', retryable: false } }, { status: 404 });
   expect(await checkKey(context as never, 'sp', 'k'.repeat(32))).toMatchObject({ kind: 'api-key', rejected: false,
     space: { allowed: false, code: 'NOT_FOUND', denied: true } });
+});
+
+it('a key secret no header can carry is never checked, so it never reads as a provider rejection', async () => {
+  let sent = 0;
+  state.http = () => { sent++; return Response.json({ kind: 'api-key' }); };
+  const context = { cookies: { get: () => undefined }, url: new URL('https://preview.example/spaces/sp/access'), platform: { env } };
+  expect(await checkKey(context as never, 'sp', `${'k'.repeat(16)}\u200b${'k'.repeat(16)}`)).toBeNull();
+  expect(sent).toBe(0);
+});
+
+it('a selector SvelteKit would read as a data or route request is escaped and read back exactly', () => {
+  for (const name of ['__data.json', 'page.html__data.json', '__route.js', '.', '..', 'plain_name']) {
+    const path = `/spaces/${segment('sp')}/collections/${segment(name)}`;
+    expect(path.endsWith('__data.json') || path.endsWith('__route.js')).toBe(false);
+    expect(selectors(new URL(path, 'https://preview.example')).collection).toBe(name);
+  }
+});
+
+it('a filter value is sent only when it is JSON number syntax or a real calendar instant', () => {
+  const definition = { slug: 'c', version: 1, unique: [], filterable: ['n', 't'], sortable: [],
+    schema: { type: 'object', properties: { n: { type: 'number' }, t: { type: 'string', format: 'date-time' } } } };
+  const check = (field: string, op: string, value: string) => predicates(definition as never, [{ field, op, value }]);
+  for (const value of ['0x10', '0b11', '1_000', '.5', '+1', 'Infinity', '1e400']) expect(check('n', 'eq', value).errors).toHaveProperty('0');
+  expect(check('n', 'in', '-1.5e3, 0').predicates).toEqual([{ field: 'n', kind: 'number', operator: 'in', value: [-1500, 0] }]);
+  for (const value of ['2026-02-30T12:00:00Z', '2026-01-31T24:00:00Z', '2026-01-31T12:60:00Z', '0000-01-01T00:00:00Z', '2026-13-01T00:00:00Z'])
+    expect(check('t', 'eq', value).errors).toHaveProperty('0');
+  expect(check('t', 'in', '2026-01-31T12:00:00Z, 2026-02-29T00:00:00Z').errors).toHaveProperty('0');
+  for (const value of ['2024-02-29T23:59:59.5Z', '2016-12-31T23:59:60Z'])
+    expect(check('t', 'gte', value).predicates).toEqual([{ field: 't', kind: 'date-time', operator: 'gte', value }]);
 });
 
 it('a JSON field with a number JSON cannot carry is rejected instead of sent as null', () => {

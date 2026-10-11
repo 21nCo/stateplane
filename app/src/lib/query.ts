@@ -15,11 +15,20 @@ export function fieldKind(definition:Definition,field:string):Kind|null {
   return type==='boolean' || type==='string' ? type : null;
 }
 
+/** A real UTC calendar instant. 23:59:60 is left to the authority, which accepts it on leap-second days. */
+function instant(text:string):boolean {
+  const match=/^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?Z$/.exec(text);
+  if (!match || match[1].startsWith('0000-')) return false;
+  const clock=match[1].endsWith('T23:59:60') ? `${match[1].slice(0,-2)}59` : match[1];
+  const date=new Date(`${clock}Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0,19)===clock;
+}
 function scalar(kind:Kind,raw:string):string|number|boolean|undefined {
   const text=raw.trim();
-  if (kind==='number') { const value=Number(text); return text && Number.isFinite(value) ? value : undefined; }
+  // JSON decimal syntax only: Number() would also read 0x10 or 0b11 as a different value.
+  if (kind==='number') { const value=Number(text); return /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(text) && Number.isFinite(value) ? value : undefined; }
   if (kind==='boolean') return text==='true' ? true : text==='false' ? false : undefined;
-  if (kind==='date-time') return /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/.test(text) ? text : undefined;
+  if (kind==='date-time') return instant(text) ? text : undefined;
   return raw;
 }
 

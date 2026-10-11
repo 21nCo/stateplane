@@ -9,6 +9,8 @@ export type ApiResult<T>={ok:true;status:number;data:T}|{ok:false;status:number;
 interface Context { cookies:Cookies; url:URL; platform?:App.Platform|undefined; locals?:App.Locals }
 interface Options { body?:unknown; query?:Record<string,string|undefined>; headers?:Record<string,string>; token?:string }
 
+/** A bearer is visible ASCII; anything else cannot form a valid header. */
+export const bearer=(token:string)=>/^[\x21-\x7e]+$/.test(token);
 export const bindings=(platform?:App.Platform)=>({...process.env,...platform?.env}) as unknown as Bindings;
 
 /** A page render shares one Worker host, so it opens one pool rather than one
@@ -28,8 +30,7 @@ function hostFor(context:Context):Host|undefined {
  * HttpOnly cookie is verified by the API on every call. */
 export async function api<T>(context:Context,method:string,path:readonly string[],options:Options={}):Promise<ApiResult<T>> {
   const token=options.token ?? context.cookies.get(sessionCookie);
-  // A bearer is visible ASCII; anything else cannot form a valid header.
-  if (!token || !/^[\x21-\x7e]+$/.test(token)) return {ok:false,status:401,error:{code:'UNAUTHENTICATED',retryable:false,requestId:null}};
+  if (!token || !bearer(token)) return {ok:false,status:401,error:{code:'UNAUTHENTICATED',retryable:false,requestId:null}};
   const url=new URL(`/v1/${path.map(segment).join('/')}`,context.url.origin);
   for (const [name,value] of Object.entries(options.query??{})) if (value!==undefined) url.searchParams.set(name,value);
   const headers:Record<string,string>={authorization:`Bearer ${token}`,...options.headers};

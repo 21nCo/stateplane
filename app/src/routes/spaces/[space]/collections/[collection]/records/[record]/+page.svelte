@@ -10,7 +10,11 @@
   const draft=$derived(form?.raw ?? data.record?.pretty ?? '');
   // A submitted draft, its error and its retry render without the live read: a
   // concurrent delete or a lost acknowledgement must not hide them.
-  const editing=$derived(!!data.record || (form?.raw!==undefined && !form?.conflict));
+  // In an edit conflict the editor holds the draft and saves it at the current
+  // revision, so Apply sends exactly the text the owner sees there.
+  const current=$derived(form?.conflict?.revision ?? null);
+  const applyTo=$derived(form?.deleting ? null : current);
+  const editing=$derived(!!data.record || (form?.raw!==undefined && (!form?.conflict || applyTo!==null)));
   const retryDelete=$derived(!!form?.deleteError);
   const tone=(state?:string)=>state==='current' ? 'success' : state==='degraded' ? 'danger' : 'warning';
 </script>
@@ -47,13 +51,13 @@
     {#if form.conflict.revision!==null}
       <div class="mt-3 flex flex-wrap gap-2">
         <a class="btn-quiet" href="?">Keep current revision</a>
-        <form method="POST" action={form.deleting ? '?/delete' : '?/save'}>
+        {#if form.deleting}<form method="POST" action="?/delete">
           <input type="hidden" name="idempotencyKey" value={data.idempotencyKey} />
-          <input type="hidden" name="expectedRevision" value={form.conflict.revision} />
-          {#if !form.deleting}<input type="hidden" name="data" value={form.raw} />{/if}
-          <button class={form.deleting ? 'btn-danger' : 'btn'}>{form.deleting ? 'Delete current revision' : `Apply my edit to revision ${form.conflict.revision}`}</button>
-        </form>
+          <input type="hidden" name="expectedRevision" value={current} />
+          <button class="btn-danger">Delete current revision</button>
+        </form>{:else}<button class="btn" form="edit-form">Apply my edit to revision {applyTo}</button>{/if}
       </div>
+      {#if !form.deleting}<p class="hint mt-2">Apply saves the text in the editor below, including any changes you make there.</p>{/if}
     {/if}
   </section>
 {/if}
@@ -65,9 +69,9 @@
         <Notice error={form?.error} title="Record was not saved">
           {#if form?.error?.code==='COMMIT_OUTCOME_UNKNOWN'}<p class="mt-1">Save again unchanged: the same request key recovers the original result instead of writing twice.</p>{/if}
         </Notice>
-        <form method="POST" action="?/save" class="space-y-3">
+        <form id="edit-form" method="POST" action="?/save" class="space-y-3">
           <input type="hidden" name="idempotencyKey" value={form?.error || form?.invalid ? form.idempotencyKey : data.idempotencyKey} />
-          <input type="hidden" name="expectedRevision" value={form?.raw!==undefined ? form.expectedRevision : data.record?.revision} />
+          <input type="hidden" name="expectedRevision" value={applyTo ?? (form?.raw!==undefined ? form.expectedRevision : data.record?.revision)} />
           <label for="data">Data JSON (replaces the whole record)</label>
           <textarea id="data" name="data" rows="14" spellcheck="false" aria-invalid={form?.invalid || form?.error?.code==='SCHEMA_INVALID' ? 'true' : undefined}
             aria-describedby={form?.invalid ? 'data-error' : undefined}>{draft}</textarea>

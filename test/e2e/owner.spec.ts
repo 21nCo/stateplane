@@ -128,9 +128,12 @@ test('a stale edit opens a conflict instead of replacing data', async ({ browser
   await other.reload();
   await expect(other.getByLabel(/Data JSON/)).toHaveValue(/Theirs/);
 
+  // Apply sends the merge the owner made in the editor, not the original draft.
+  await expect(conflict).toContainText('Apply saves the text in the editor below');
+  await page.getByLabel(/Data JSON/).fill(JSON.stringify({ title: 'Merged', state: 'done', rank: 5 }));
   await conflict.getByRole('button', { name: 'Apply my edit to revision 2' }).click();
   await expect(page.getByRole('status')).toContainText('Saved revision 3 (was 2)');
-  await expect(page.getByLabel(/Data JSON/)).toHaveValue(/Mine/);
+  await expect(page.getByLabel(/Data JSON/)).toHaveValue(/Merged/);
 });
 
 test('an edit to a concurrently deleted record keeps the draft', async ({ browser, page }) => {
@@ -228,7 +231,8 @@ test('a schema revision whose reload fails keeps the draft and its version', asy
 
 test('collection names that look like routes or dot segments stay reachable', async ({ page }) => {
   await signIn(page, ownerToken);
-  for (const [name, segment] of [['new', 'new'], ['.', ';.'], ['..', ';..']]) {
+  // SvelteKit strips a trailing __data.json or __route.js, so the UI escapes it.
+  for (const [name, segment] of [['new', 'new'], ['.', ';.'], ['..', ';..'], ['__data.json', '%5F_data.json'], ['__route.js', '%5F_route.js']]) {
     await go(page, spaceUrl);
     await page.getByRole('link', { name: 'Define collection' }).click();
     await settle(page);
@@ -275,6 +279,21 @@ test('validation failures are announced on their fields', async ({ page }) => {
   const alert = page.getByRole('alert');
   await expect(alert).toContainText('SCHEMA_INVALID');
   await expect(alert).toBeFocused();
+  // An empty page position is a position the API judges, not the first page.
+  await go(page, `${itemsUrl()}?cursor=`);
+  await expect(page.getByRole('alert')).toContainText('CURSOR_INVALID');
+  await expect(page.getByRole('link', { name: 'Restart from the first page' })).toBeVisible();
+
+  // A taken collection name is reported on the name field, with a link to the collection.
+  await go(page, `${spaceUrl}/new-collection`);
+  await page.getByLabel('Collection name').fill('items');
+  await page.getByRole('button', { name: 'Define collection' }).click();
+  await expect(page.getByRole('alert')).toContainText('A collection with this name already exists');
+  await expect(page.getByRole('alert')).not.toContainText('A field is undeclared');
+  await expect(page.getByLabel('Collection name')).toHaveAttribute('aria-invalid', 'true');
+  await expect(page.getByLabel('Collection name')).toHaveAccessibleDescription(/A collection named items already exists/);
+  await page.getByRole('link', { name: 'Open its definition' }).click();
+  await expect(page.getByRole('main')).toContainText('items · version');
 
   // A blank-looking key secret passes the browser's required check; the server names the field.
   await go(page, `${spaceUrl}/access`);
@@ -352,7 +371,7 @@ test('owner grants an agent key, the API enforces it and revocation is verified'
   const agent = await asAgent(browser, secret);
   await expect(agent.getByRole('alert')).toContainText('FORBIDDEN');
   await go(agent, itemsUrl());
-  await expect(agent.getByRole('table')).toContainText('Mine');
+  await expect(agent.getByRole('table')).toContainText('Merged');
   await agent.getByLabel('Data JSON').fill(JSON.stringify({ title: 'Agent', state: 'open', rank: 9 }));
   await agent.getByRole('button', { name: 'Create record' }).click();
   await expect(agent.getByRole('alert')).toContainText('FORBIDDEN');
@@ -503,6 +522,38 @@ test('a schema revision with an unknown outcome is never reported as not applied
   await expect(page.getByText('your edit was not applied')).toHaveCount(0);
   await page.getByRole('link', { name: 'Load version 2' }).click();
   await expect(page.getByLabel('Definition JSON')).toHaveValue(/"added"/);
+});
+
+test('an uncertain key issuance or definition asks the owner to inspect state, never to retry for recovery', async ({ page }) => {
+  test.skip(!local, 'Needs the local fault proxy');
+  await signIn(page, ownerToken);
+  await go(page, `${spaceUrl}/access`);
+  await page.getByRole('group', { name: 'Collection items' }).getByLabel('records:read').check();
+  // Issuance completion, its readback and its retry all lose their replies.
+  await dropReply('SET completed_at=clock_timestamp()');
+  await dropReply('SELECT i.completed_at');
+  await dropReply('SET completed_at=COALESCE');
+  await page.getByRole('button', { name: 'Issue key' }).click();
+  const issue = page.getByRole('alert').filter({ hasText: 'Key was not issued' });
+  await expect(issue).toContainText('COMMIT_OUTCOME_UNKNOWN');
+  await expect(issue).toContainText('Check the key list');
+  await expect(issue).not.toContainText('Retry the identical request');
+
+  await go(page, `${spaceUrl}/new-collection`);
+  await page.getByLabel('Collection name').fill('uncertain');
+  await dropReply('COMMIT\0', 'INSERT INTO collection_versions');
+  await page.getByRole('button', { name: 'Define collection' }).click();
+  const notice = page.getByRole('alert').filter({ hasText: 'Definition was not saved' });
+  await expect(notice).toContainText('COMMIT_OUTCOME_UNKNOWN');
+  await expect(notice).toContainText('Check whether it exists before submitting again');
+  await expect(notice).not.toContainText('Retry the identical request');
+  await settle(page);
+  await page.getByRole('button', { name: 'Define collection' }).click();
+  await expect(notice).toContainText('SCHEMA_CONFLICT');
+  await expect(notice).toContainText('A collection with this name already exists');
+  await expect(page.getByLabel('Collection name')).toHaveAttribute('aria-invalid', 'true');
+  await page.getByRole('link', { name: 'Open its definition' }).click();
+  await expect(page.getByRole('main')).toContainText('uncertain · version 1');
 });
 
 test('failed listings are reported, not shown as empty or truncated', async ({ page }) => {

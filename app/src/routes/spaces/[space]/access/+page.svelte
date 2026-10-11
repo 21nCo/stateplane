@@ -90,9 +90,10 @@
       </div>{/if}
       <form method="POST" action="?/check" class="space-y-3">
         <label for="check-secret">Key secret</label>
-        <input id="check-secret" name="secret" type="password" autocomplete="off" required aria-invalid={form?.checkMissing ? 'true' : undefined}
-          aria-describedby={form?.checkMissing ? 'check-error' : undefined} />
+        <input id="check-secret" name="secret" type="password" autocomplete="off" required aria-invalid={form?.checkMissing || form?.checkMalformed ? 'true' : undefined}
+          aria-describedby={form?.checkMissing || form?.checkMalformed ? 'check-error' : undefined} />
         {#if form?.checkMissing}<p id="check-error" class="text-sm text-danger">Enter a key secret.</p>{/if}
+        {#if form?.checkMalformed}<p id="check-error" class="text-sm text-danger">A key secret holds only visible ASCII characters. This one was not checked; copy it again.</p>{/if}
         <button class="btn-quiet">Check key</button>
       </form>
     </section>

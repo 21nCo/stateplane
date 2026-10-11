@@ -29,7 +29,7 @@ export const load:PageServerLoad=async(event)=>{
   if (Object.keys(built.errors).length) return {...view,collection:collection.data,error:null,filterErrors:built.errors,page:null,count:null};
   const [page,count]=await Promise.all([
     api<{records:StoredRecord[];nextCursor:string|null;schemaVersion:number}>(event,'POST',[...path(event.url),'records','query'],
-      {body:{predicates:built.predicates,limit,...(sort ? {sort} : {}),...(cursor ? {cursor} : {})}}),
+      {body:{predicates:built.predicates,limit,...(sort ? {sort} : {}),...(cursor!==undefined ? {cursor} : {})}}),
     api<number>(event,'POST',[...path(event.url),'records','count'],{body:built.predicates})]);
   const error:ApiError|null=page.ok ? (count.ok ? null : count.error) : page.error;
   return {...view,collection:collection.data,error,filterErrors,page:page.ok ? page.data : null,

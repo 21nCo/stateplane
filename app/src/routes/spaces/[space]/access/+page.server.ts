@@ -60,7 +60,7 @@ export const actions:Actions={
   },
   check:async(event)=>{
     const token=String((await event.request.formData()).get('secret')??'').trim();
-    if (!token) return fail(400,{checkMissing:true});
-    return {check:await checkKey(event,selectors(event.url).space,token)};
+    const check=token ? await checkKey(event,selectors(event.url).space,token) : null;
+    return check ? {check} : fail(400,{checkMissing:!token,checkMalformed:!!token});
   }
 };

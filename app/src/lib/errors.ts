@@ -16,7 +16,8 @@ const guidance:Record<string,string>={
   SCHEMA_CONFLICT:'A field is undeclared, not filterable or sortable, or its index is still pending.',
   INVALID_ARGUMENT:'The request is malformed. Check the highlighted values.',
   CURSOR_INVALID:'The page position expired or no longer applies. Start again from the first page.',
-  COMMIT_OUTCOME_UNKNOWN:'The write may or may not have committed. Retry the identical request to recover its result.',
+  // Only a form that sends a retry identity may promise recovery; it adds that itself.
+  COMMIT_OUTCOME_UNKNOWN:'The write may or may not have committed. Check the current state before writing again.',
   PROVIDER_UNAVAILABLE:'The service is temporarily unavailable. Try again shortly.',
   RATE_LIMITED:'The request exceeded a time or size limit.',
   BACKPRESSURE:'The collection is busy. Try again shortly.',

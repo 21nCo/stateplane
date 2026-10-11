@@ -1,12 +1,14 @@
-import { api } from './api';
+import { api, bearer } from './api';
 
 type Context=Parameters<typeof api>[0];
 const denials=new Set(['UNAUTHENTICATED','FORBIDDEN','NOT_FOUND']);
 
 /** Check a key secret at the provider and in one space. Only UNAUTHENTICATED is
  * a provider rejection; an unavailable, throttled or failed check is not
- * determined and never reads as a verified revocation. */
+ * determined and never reads as a verified revocation. A secret no header can
+ * carry is never sent, so it returns null rather than a rejection. */
 export async function checkKey(context:Context,space:string,token:string) {
+  if (!bearer(token)) return null;
   const session=await api<{kind:string}>(context,'GET',['auth','session'],{token});
   if (!session.ok) return {kind:null,code:session.error.code,rejected:session.error.code==='UNAUTHENTICATED',space:null};
   // The provider authenticates the key; Stateplane authorizes it per space. A key
