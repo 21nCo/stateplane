@@ -43,6 +43,7 @@
     "@authfn/api-keys": "0.1.2",
     "@authfn/core": "0.1.1",
     "@authfn/multi-region": "0.1.2",
+    "@axe-core/playwright": "4.12.1",
     "@cloudflare/workers-types": "5.20260918.1",
     "@datafn/core": "0.1.1",
     "@datafn/server": "0.2.0",

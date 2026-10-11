@@ -6,6 +6,7 @@ import { AuthorityError, PostgresAuthority } from './index.js';
 import type { AuthorityScope } from './index.js';
 import { CollectionRegistry, discoveryGrants } from './collections.js';
 import { PostgresSpaces } from './spaces.js';
+import type { CollectionGrant } from './spaces.js';
 
 export interface ServiceCell { pool: Pick<pg.Pool,'connect'>; cursorSecret: Uint8Array }
 const collectionPageSize=8;
@@ -28,6 +29,32 @@ function discoveryAfter(cursor:string|undefined,spaceId:string,credentialId:stri
 }
 const discoveryCursor=(space:string,credential:string,after:string,secret:Uint8Array):string=>
   Buffer.from(JSON.stringify({space,credential,after,mac:cursorMac(space,credential,after,secret)})).toString('base64url');
+
+const instant=(value:unknown):Date=>{
+  if (typeof value!=='string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:\.\d{1,3})?)?Z$/.test(value)) throw new AuthorityError('INVALID_ARGUMENT');
+  const parsed=new Date(value);
+  // Date rolls an impossible day or 24:00 forward; require the same calendar instant.
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0,16)!==value.slice(0,16)) throw new AuthorityError('INVALID_ARGUMENT');
+  return parsed;
+};
+const plain=(value:unknown,keys:readonly string[],required:readonly string[]):Record<string,unknown>=>{
+  if (!value || typeof value!=='object' || Array.isArray(value) ||
+    Object.keys(value).some(key=>!keys.includes(key)) || required.some(key=>!Object.hasOwn(value,key)))
+    throw new AuthorityError('INVALID_ARGUMENT');
+  return value as Record<string,unknown>;
+};
+/** Parse the JSON issuance body; PostgresSpaces validates collections and capabilities. */
+function issueRequest(serialized:string):{expiresAt:Date;grants:CollectionGrant[]} {
+  let parsed:unknown;
+  try { parsed=JSON.parse(serialized); } catch { throw new AuthorityError('INVALID_ARGUMENT'); }
+  const body=plain(parsed,['expiresAt','grants'],['expiresAt','grants']);
+  if (!Array.isArray(body.grants)) throw new AuthorityError('INVALID_ARGUMENT');
+  return {expiresAt:instant(body.expiresAt),grants:body.grants.map(item=>{
+    const grant=plain(item,['collectionId','capabilities','expiresAt'],['collectionId','capabilities']);
+    return {collectionId:grant.collectionId as string,capabilities:grant.capabilities as Capability[],
+      ...(grant.expiresAt===undefined ? {} : {expiresAt:instant(grant.expiresAt)})};
+  })};
+}
 
 /** Composition of the existing authoritative services for HTTP consumers. */
 export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<string,ServiceCell>,
@@ -58,7 +85,17 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
       list:(actor,cursor)=>spaces.listPage(actor,cursor), create:(actor,cellId,spaceId)=>spaces.create(actor,cellId,spaceId),
       get:(actor,id)=>spaces.get(actor,id),
       update:(actor,id,lifecycle)=>spaces.update(actor,id,lifecycle),
-      delete:async(actor,id)=>{ await spaces.delete(actor,id); return {spaceId:id,deleted:true}; }
+      delete:async(actor,id)=>{ await spaces.delete(actor,id); return {spaceId:id,deleted:true}; },
+      audit:(actor,id,cursor)=>spaces.audit(actor,id,cursor)
+    },
+    agents: {
+      list:(actor,spaceId,cursor)=>spaces.agentKeys(actor,spaceId,cursor),
+      issue:async(actor,spaceId,serialized)=>{
+        const {expiresAt,grants}=issueRequest(serialized);
+        const key=await spaces.issueAgentKey(actor,spaceId,expiresAt,grants);
+        return {keyId:key.id,secret:key.secret,expiresAt:expiresAt.toISOString()};
+      },
+      revoke:async(actor,spaceId,keyId)=>{ await spaces.revokeAgentKey(actor,spaceId,keyId); return {keyId,revoked:true}; }
     },
     collections: {
       list:(actor,spaceId,collectionId,cursor)=>admitted(actor,spaceId,undefined,'records:read',async(cell,scope,recheck)=>{
@@ -76,7 +113,9 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
       define:(actor,spaceId,collectionId,serialized)=>admitted(actor,spaceId,collectionId,'schema:write',
         (cell,scope,recheck)=>new CollectionRegistry(cell.pool,recheck).defineSerialized(scope,serialized)),
       revise:(actor,spaceId,collectionId,version,serialized)=>admitted(actor,spaceId,collectionId,'schema:write',
-        (cell,scope,recheck)=>new CollectionRegistry(cell.pool,recheck).reviseSerialized(scope,version,serialized))
+        (cell,scope,recheck)=>new CollectionRegistry(cell.pool,recheck).reviseSerialized(scope,version,serialized)),
+      backfill:(actor,spaceId,collectionId,field)=>admitted(actor,spaceId,collectionId,'schema:write',
+        (cell,scope,recheck)=>new CollectionRegistry(cell.pool,recheck).backfill(scope,field))
     },
     records: {
       get:(actor,spaceId,collectionId,id)=>admitted(actor,spaceId,collectionId,'records:read',

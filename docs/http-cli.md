@@ -73,6 +73,8 @@ including `/` and `\\`. URL parsers remove dot-only path segments, so a selector
 whose entire value is `.` or `..` is sent as `;.` or `;..` respectively. A literal
 leading semicolon is encoded as `%3B`, keeping it distinct from that marker.
 
+Owner sessions can also read the space audit (`GET /v1/spaces/{id}/audit`) and list, issue and revoke agent keys (`/v1/spaces/{id}/agent-keys`). Both return at most 100 entries per page, and listings never include a key secret. An owner or `schema:write` holder advances a pending filter or sort index with `POST …/collections/{id}/indexes/{field}`, at most 100 records per call. The CLI does not expose these routes yet; the [owner UI](ui.md) uses them.
+
 ## Install the CLI on a clean machine
 
 Use Node 22.13+ and a tarball built from this checkout:

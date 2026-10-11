@@ -1,0 +1,75 @@
+<script lang="ts">
+  import Notice from '$lib/components/Notice.svelte';
+  import Status from '$lib/components/Status.svelte';
+  import { page } from '$app/state';
+  let { data, form } = $props();
+  const base=$derived(`/spaces/${encodeURIComponent(data.spaceId)}/collections/${encodeURIComponent(page.params.collection ?? '')}`);
+  // After a conflict the user's draft stays in the editor until they choose how to resolve it.
+  const draft=$derived(form?.raw ?? data.record?.pretty ?? '');
+  const tone=(state?:string)=>state==='current' ? 'success' : state==='degraded' ? 'danger' : 'warning';
+</script>
+
+<svelte:head><title>Record · Stateplane</title></svelte:head>
+<p class="hint"><a class="link" href={base}>Records</a> / record</p>
+<Notice error={data.error} title="Record could not be read" />
+{#if data.record}
+  <h1 class="break-all font-mono text-xl font-semibold">{data.record.keyMode==='external' ? data.record.normalizedKey : data.record.ref.id}</h1>
+  <dl class="mt-2 flex flex-wrap gap-x-6 gap-y-1 text-sm">
+    <div><dt class="inline text-subtle">Record ID</dt> <dd class="inline break-all font-mono">{data.record.ref.id}</dd></div>
+    <div><dt class="inline text-subtle">Revision</dt> <dd class="inline">{data.record.revision}</dd></div>
+    <div><dt class="inline text-subtle">Schema version</dt> <dd class="inline">{data.record.schemaVersion}</dd></div>
+    <div><dt class="inline text-subtle">Search projection</dt> <dd class="inline">{#if data.projection}<Status tone={tone(data.projection.state)}>{data.projection.state} for revision {data.projection.revision}</Status>{:else}unavailable{/if}</dd></div>
+  </dl>
+  {#if data.projection?.state!=='current'}<p class="hint mt-1">Search may lag behind this revision; the record shown here is the exact authoritative value.</p>{/if}
+  {#if form?.saved}<p role="status" class="mt-3 text-sm text-success">Saved revision {form.saved.revision} (was {form.saved.beforeRevision}){form.saved.replayed ? ', recovered from an earlier identical request' : ''}. Search projection: {form.saved.projection.state}.</p>{/if}
+  {#if form?.conflict}
+    <section aria-labelledby="conflict" class="mt-4 rounded-lg border border-warning bg-surface p-4" role="alert">
+      <h2 id="conflict" class="text-lg font-semibold">Edit conflict</h2>
+      {#if form.conflict.deleted}
+        <p class="mt-1">This record was deleted after revision {form.expectedRevision}. Your edit was not applied.</p>
+      {:else}
+        <p class="mt-1">You edited revision {form.expectedRevision}, but revision {form.conflict.revision} is now current. Nothing was overwritten. Compare, then keep the current record or apply your version on top of it.</p>
+        <div class="mt-3 grid gap-3 md:grid-cols-2">
+          <div><h3 class="font-semibold">Your {form.deleting ? 'deletion' : 'edit'} (from revision {form.expectedRevision})</h3><pre class="mt-1 whitespace-pre-wrap break-all rounded bg-muted p-2 text-xs">{form.deleting ? 'Delete this record' : form.raw}</pre></div>
+          <div><h3 class="font-semibold">Current revision {form.conflict.revision}</h3><pre class="mt-1 whitespace-pre-wrap break-all rounded bg-muted p-2 text-xs">{form.conflict.pretty}</pre></div>
+        </div>
+        <div class="mt-3 flex flex-wrap gap-2">
+          <a class="btn-quiet" href="?">Keep current revision</a>
+          <form method="POST" action={form.deleting ? '?/delete' : '?/save'}>
+            <input type="hidden" name="idempotencyKey" value={data.idempotencyKey} />
+            <input type="hidden" name="expectedRevision" value={form.conflict.revision} />
+            {#if !form.deleting}<input type="hidden" name="data" value={form.raw} />{/if}
+            <button class={form.deleting ? 'btn-danger' : 'btn'}>{form.deleting ? 'Delete current revision' : `Apply my edit to revision ${form.conflict.revision}`}</button>
+          </form>
+        </div>
+      {/if}
+    </section>
+  {/if}
+  <div class="mt-4 grid gap-6 lg:grid-cols-[2fr_1fr]">
+    <section aria-labelledby="edit" class="panel space-y-3">
+      <h2 id="edit" class="text-lg font-semibold">Edit data</h2>
+      <Notice error={form?.error} title="Record was not saved">
+        {#if form?.error?.code==='COMMIT_OUTCOME_UNKNOWN'}<p class="mt-1">Save again unchanged: the same request key recovers the original result instead of writing twice.</p>{/if}
+      </Notice>
+      <form method="POST" action="?/save" class="space-y-3">
+        <input type="hidden" name="idempotencyKey" value={form?.error || form?.invalid ? form.idempotencyKey : data.idempotencyKey} />
+        <input type="hidden" name="expectedRevision" value={form?.expectedRevision ?? data.record.revision} />
+        <label for="data">Data JSON (replaces the whole record)</label>
+        <textarea id="data" name="data" rows="14" spellcheck="false" aria-invalid={form?.invalid || form?.error?.code==='SCHEMA_INVALID' ? 'true' : undefined}
+          aria-describedby={form?.invalid ? 'data-error' : undefined}>{draft}</textarea>
+        {#if form?.invalid}<p id="data-error" class="text-sm text-danger">Data must be one JSON object.</p>{/if}
+        <button class="btn">Save revision</button>
+      </form>
+    </section>
+    <section aria-labelledby="remove" class="panel h-fit space-y-3">
+      <h2 id="remove" class="text-lg font-semibold">Delete</h2>
+      <Notice error={form?.deleteError} title="Record was not deleted" />
+      <p class="hint">Deletion leaves a tombstone; the ID and external key are never reused.</p>
+      <form method="POST" action="?/delete">
+        <input type="hidden" name="idempotencyKey" value={form?.deleteError ? form.idempotencyKey : data.idempotencyKey} />
+        <input type="hidden" name="expectedRevision" value={data.record.revision} />
+        <button class="btn-danger">Delete revision {data.record.revision}</button>
+      </form>
+    </section>
+  </div>
+{/if}

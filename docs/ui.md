@@ -1,0 +1,27 @@
+# Owner UI (STA-11)
+
+The SvelteKit app manages spaces, collections, records, agent access, audit and ingestion. Pages render on the server. Every load and form action calls `api()` in `app/src/lib/server/api.ts`. That function builds a standard `/v1` request and passes it to the same HTTP handler, identity verifier and services used by the CLI and MCP. The UI has no write path or authorization logic of its own. A browser can only send a form; the API decides each result.
+
+## Sessions
+
+Sign in with a session bearer or an agent key. The app checks it with `GET /v1/auth/session`. It then stores the bearer in an HttpOnly, `SameSite=Strict` cookie, which is `Secure` over HTTPS and lasts eight hours. Each page sends that bearer to the API again, so a revoked or expired credential stops working on the next request. SvelteKit rejects cross-origin form posts. The CSP keeps scripts, forms and framing on this origin. Pages send `no-store` and `no-referrer`, because page cursors appear in URLs. An agent key cannot list spaces or read placement unless it holds `space:admin`. It sees only its granted collections, and denied actions show the API's error code.
+
+## Behavior
+
+- **Spaces.** Create a space with a server-generated `sp_` ID. Resubmitting after `COMMIT_OUTCOME_UNKNOWN` reuses that ID. The optional home cell is passed to the API, which accepts only its configured cells. The overview shows lifecycle, home and current cell, storage target, placement generation and policy version.
+- **Schemas.** Owners define and revise a collection from JSON. A revision sends the loaded version in `If-Match`, so a concurrent revision returns `SCHEMA_CONFLICT` instead of replacing the other edit. New filter and sort fields stay pending until the owner builds them with `POST …/indexes/{field}`. Each call commits at most 100 records. One click makes at most 20 calls (2,000 records) to keep a request bounded; click again to continue.
+- **Records.** Filters take their type from the field's schema (string, number, boolean or UTC date-time). Invalid values are flagged on the field before any query is sent. Sorting uses only ready sortable fields. The page size is 1–100, defaulting to 25, and pagination follows the API's forward cursor. Each create and edit carries an idempotency key generated when the form loads. After an uncertain commit, resubmitting the unchanged form recovers the original receipt.
+- **Conflicts.** Edits and deletes send the revision the user loaded. On `REVISION_CONFLICT`, the page shows the user's draft next to the current revision; nothing is overwritten. The user can keep the current record, or explicitly apply their version as a new write against the current revision.
+- **Revisions and projections.** Record pages show the revision, schema version and search projection state. A pending projection means search may lag behind; exact reads are current. The Changes page lists committed events.
+- **Agent access.** Issuance offers 1, 7, 30 or 90 day lifetimes; these are UI presets, not service limits. The owner chooses capabilities per collection. The secret appears only in the issuance response, and the key list returns IDs, status and grants. Revocation removes grants at once. "Check a key" asks the API whether a pasted secret is still accepted. The audit shows creation, lifecycle, issuance and revocation events.
+- **Ingestion.** Submits 1–20 NDJSON lines under an operation key and shows each item's progress. It can retry failed items or cancel pending ones.
+
+Styling follows the Skillplane token convention: `app/src/app.css` is the only file with raw colors, and components use semantic Tailwind roles, visible focus and a reduced-motion fallback. Wide tables scroll inside labelled regions that keyboard users can focus.
+
+## Fixture host and tests
+
+The opt-in local host (see [HTTP and CLI](http-cli.md)) adds Node-only, in-memory agent keys so local journeys can issue, use and revoke a key. It holds at most 1,000 keys and loses them on restart. A Worker host builds a fresh host per request and keeps issuance disabled. Key issuance on Preview therefore needs connected AuthFn, which is checked by the STA-21 acceptance gate.
+
+`pnpm test:e2e` starts the UI. If `DATABASE_URL` or the local Compose password is available, it first creates and migrates a disposable database, and drops it on exit. The suite runs the owner journey, the conflict flow, validation and region denial. It issues, uses and revokes a key, runs ingestion, and checks every page with axe (WCAG 2.2 AA tags) at 390 px and 1440 px, plus keyboard sign-in. To run the same journeys against a deployed development service, set `STATEPLANE_E2E_BASE_URL` and `STATEPLANE_E2E_TOKEN`. The key journey needs a host that can issue keys.
+
+Local runs do not prove Railway Postgres, Cloudflare Preview with Hyperdrive, connected AuthFn sessions and key revocation, or Aside Browser observation. Those remain exact-head external acceptance boundaries.

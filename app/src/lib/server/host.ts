@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import type { Socket } from 'node:net';
 import pg from 'pg';
 import { createHttpHandler } from '@stateplane/api';
@@ -21,6 +21,43 @@ const requestTimeoutMs=12_000;
 // MCP resource endpoints instead of growing with request Host headers.
 const maxMcpResources=4;
 const loopbackHosts=new Set(['127.0.0.1','localhost','[::1]']);
+// Fixture agent keys live in one Node host's memory; bound that memory.
+const maxFixtureKeys=1_000;
+interface FixtureKey { id:string; owner:string; issuanceId:string; expiresAt:number; revoked:boolean }
+/** A Node-only stand-in for AuthFn keys so local journeys can issue, use and
+ * revoke a key. A Worker builds a host per request and keeps issuance off. */
+function fixtureKeys() {
+  const byDigest=new Map<string,FixtureKey>();
+  const byId=new Map<string,FixtureKey>();
+  const live=(key:FixtureKey|undefined):key is FixtureKey=>!!key && !key.revoked && key.expiresAt>Date.now();
+  return {
+    provider:{
+      create:(owner:string,expiresAt:Date,issuanceId:string)=>{
+        if (byId.size>=maxFixtureKeys) return Promise.reject(new Error('Fixture key capacity reached'));
+        const key={id:`key_${randomUUID()}`,owner,issuanceId,expiresAt:expiresAt.getTime(),revoked:false};
+        const secret=`spk_${randomBytes(32).toString('base64url')}`;
+        byDigest.set(createHash('sha256').update(secret).digest('hex'),key);
+        byId.set(key.id,key);
+        return Promise.resolve({id:key.id,secret});
+      },
+      find:(owner:string,issuanceId:string)=>Promise.resolve([...byId.values()]
+        .find(key=>key.owner===owner && key.issuanceId===issuanceId)?.id ?? null),
+      revoke:(id:string,owner:string)=>{
+        const key=byId.get(id);
+        if (key?.owner===owner) key.revoked=true;
+        return Promise.resolve();
+      }
+    },
+    verify:(secret:string)=>{
+      const key=byDigest.get(createHash('sha256').update(secret).digest('hex'));
+      return live(key) ? {kind:'api-key' as const,credentialId:key.id} : null;
+    },
+    current:(id:string,owner?:string)=>{
+      const key=byId.get(id);
+      return live(key) && (owner===undefined || key.owner===owner);
+    }
+  };
+}
 // The MCP declaration, schema validators and metadata cost about 13 ms of CPU
 // to build, so each isolate builds them once per resource. Storage stays
 // request-scoped: every request passes its own services and identity.
@@ -127,6 +164,7 @@ export function stateplaneHost(env:Bindings):Host | undefined {
   // goes away. The pool removes that client; consume the event without logging
   // provider diagnostics or allowing an unhandled error to kill the host.
   pool.on('error',()=>{});
+  const keys=perRequest ? null : fixtureKeys();
   const tokenDigest=createHash('sha256').update(env.STATEPLANE_TEST_TOKEN).digest();
   const agentDigest=env.STATEPLANE_TEST_AGENT_TOKEN ?
     createHash('sha256').update(env.STATEPLANE_TEST_AGENT_TOKEN).digest() : null;
@@ -141,14 +179,16 @@ export function stateplaneHost(env:Bindings):Host | undefined {
       if (!bearer || !/^Bearer /i.test(bearer)) return Promise.resolve(null);
       const candidate=createHash('sha256').update(bearer.slice(7)).digest();
       if (timingSafeEqual(candidate,tokenDigest)) return Promise.resolve(actor);
-      return Promise.resolve(agent && agentDigest && timingSafeEqual(candidate,agentDigest) ? agent : null);
+      if (agent && agentDigest && timingSafeEqual(candidate,agentDigest)) return Promise.resolve(agent);
+      return Promise.resolve(keys?.verify(bearer.slice(7)) ?? null);
     },
     current:(claims:{credentialId:string},owner?:string)=>
-      Promise.resolve((claims.credentialId===actor.credentialId ||
-        claims.credentialId===agent?.credentialId) && (owner===undefined || owner===actor.userPrincipalId))
+      Promise.resolve(((claims.credentialId===actor.credentialId ||
+        claims.credentialId===agent?.credentialId) && (owner===undefined || owner===actor.userPrincipalId)) ||
+        !!keys?.current(claims.credentialId,owner))
   };
   const cells=new Map([[cellId,{pool,storageTargetId}]]);
-  const spaces=new PostgresSpaces(pool,cells,cellId,{
+  const spaces=new PostgresSpaces(pool,cells,cellId,keys?.provider ?? {
     create:()=>Promise.reject(new Error('Agent issuance is not configured')),
     find:()=>Promise.resolve(null),revoke:()=>Promise.reject(new Error('Agent revocation is not configured'))
   },identity,Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex'));
