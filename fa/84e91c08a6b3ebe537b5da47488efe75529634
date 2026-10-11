@@ -1,0 +1,51 @@
+app/src/routes/spaces/[space]/collections/[collection]/schema/+page.server.ts
+  h_a39f9495f9ec1d 3,34
+app/src/routes/spaces/[space]/access/+page.svelte
+  h_a39f9495f9ec1d 6,31,47,74-75,94
+app/src/routes/spaces/[space]/collections/[collection]/batches/+page.svelte
+  h_a39f9495f9ec1d 6,41-44,59
+test/mcp-host.test.ts
+  h_a39f9495f9ec1d 35,160-175
+app/src/routes/spaces/[space]/collections/[collection]/schema/+page.svelte
+  h_a39f9495f9ec1d 5,25
+app/src/lib/paths.ts
+  h_a39f9495f9ec1d 16,19,24-28
+app/src/routes/spaces/+page.server.ts
+  h_a39f9495f9ec1d 5,26-28
+app/src/routes/spaces/[space]/access/+page.server.ts
+  h_a39f9495f9ec1d 4,46-48,60
+app/src/routes/spaces/[space]/collections/[collection]/+page.svelte
+  h_a39f9495f9ec1d 6,17-18,43,55
+app/src/routes/spaces/[space]/collections/[collection]/+page.server.ts
+  h_a39f9495f9ec1d 4,19-20,24
+test/e2e/owner.spec.ts
+  h_a39f9495f9ec1d 516-548
+  s_1900bb15a7199a::t_4384d1b575ece5 549-554
+app/src/routes/spaces/[space]/+layout.svelte
+  h_a39f9495f9ec1d 3,17
+app/src/routes/spaces/[space]/collections/[collection]/batches/+page.server.ts
+  h_a39f9495f9ec1d 3,38,40
+docs/ui.md
+  s_1900bb15a7199a::t_24318588b67c8b 12,17-18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fa84e91c08a6b3ebe537b5da47488efe75529634",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
