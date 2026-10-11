@@ -1,0 +1,71 @@
+app/src/app.d.ts
+  s_1900bb15a7199a::t_bc1a63ca15dab0 3-4
+app/src/hooks.server.ts
+  s_1900bb15a7199a::t_0c09dc9ca0e02b 2,9-11
+app/src/lib/components/DefinitionForm.svelte
+  s_1900bb15a7199a::t_6ef0195e0a8439 4-5,8
+app/src/lib/components/Notice.svelte
+  s_1900bb15a7199a::t_d44ae7a786d0c1 4,13
+app/src/lib/paths.ts
+  s_1900bb15a7199a::t_db5448d92e525a 12-15
+app/src/lib/server/api.ts
+  s_1900bb15a7199a::t_692f5af8443c43 5,9,14-25,42
+app/src/lib/server/forms.ts
+  s_1900bb15a7199a::t_901a2c49ddccd6 13-16
+app/src/lib/server/host.ts
+  s_1900bb15a7199a::t_f42d61fb212e7c 109-114,254-257
+app/src/routes/spaces/+page.server.ts
+  s_1900bb15a7199a::t_e6d9f581cf4300 4,21,27
+app/src/routes/spaces/+page.svelte
+  s_1900bb15a7199a::t_2ecc1597bb1639 52
+app/src/routes/spaces/[space]/access/+page.server.ts
+  s_1900bb15a7199a::t_380661c29c6ce4 5,23-24,26,29,38
+app/src/routes/spaces/[space]/access/+page.svelte
+  s_1900bb15a7199a::t_847f936d5219d6 59-61
+app/src/routes/spaces/[space]/audit/+page.svelte
+  s_1900bb15a7199a::t_b47054c62ec57c 10-12
+app/src/routes/spaces/[space]/collections/[collection]/+page.server.ts
+  s_1900bb15a7199a::t_0f392dba0a2ad4 5,49
+app/src/routes/spaces/[space]/collections/[collection]/+page.svelte
+  s_1900bb15a7199a::t_8ee4b04502f3a9 74
+app/src/routes/spaces/[space]/collections/[collection]/batches/+page.server.ts
+  s_1900bb15a7199a::t_2715582bb40b3c 4,31
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.svelte
+  s_1900bb15a7199a::t_927b20ec65440b 5,21
+app/src/routes/spaces/[space]/collections/[collection]/schema/+page.server.ts
+  s_1900bb15a7199a::t_717b614efbaf93 22-24,26,30-31
+app/src/routes/spaces/[space]/collections/[collection]/schema/+page.svelte
+  s_1900bb15a7199a::t_8e20fc45a5cf59 44-45,47-49
+app/src/routes/spaces/[space]/new-collection/+page.server.ts
+  s_1900bb15a7199a::t_ba0792694e3d97 4,10,14
+docs/owned-spaces.md
+  s_1900bb15a7199a::t_962fbd5e48511c 21
+docs/ui.md
+  s_1900bb15a7199a::t_99bf7e149b841f 12-13,17,24
+packages/postgres/src/spaces.ts
+  s_1900bb15a7199a::t_2a394a6debc7ad 1416,1429
+test/e2e/owner.spec.ts
+  s_1900bb15a7199a::t_269e13045024b1 279-289,443-521
+test/integration/owned-spaces.test.js
+  s_1900bb15a7199a::t_732405a0079126 803-804,809
+test/integration/owner-access-http.test.js
+  s_1900bb15a7199a::t_f8201b740dff7c 113
+test/mcp-host.test.ts
+  s_1900bb15a7199a::t_3801ba4d3a7eee 35,147-165
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3a0475ed23cdbfabe6c98b6d316c03580c464462",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
