@@ -5,7 +5,7 @@ import { beforeEach, expect, it, vi } from 'vitest';
  * scope handling is covered by test/mcp.test.js. */
 const state = vi.hoisted(() => ({ endpoints: 0, pools: 0, ended: 0, resources: [] as string[],
   scopes: [] as Array<{ services: unknown; identity: unknown; onTimeout?: () => void }>,
-  services: [] as unknown[] }));
+  services: [] as unknown[], http: null as null | ((request: Request) => Response) }));
 vi.mock('pg', () => ({ default: { Pool: class {
   constructor() { state.pools++; }
   on() { return this; }
@@ -15,7 +15,8 @@ vi.mock('../packages/postgres/dist/index.js', () => ({
   PostgresSpaces: class {},
   postgresServices: () => { const services = { request: state.services.length + 1 }; state.services.push(services); return services; }
 }));
-vi.mock('../packages/api/dist/index.js', () => ({ createHttpHandler: () => async () => new Response(null, { status: 204 }) }));
+vi.mock('../packages/api/dist/index.js', () => ({ createHttpHandler: () => async (request: Request) =>
+  state.http ? state.http(request) : new Response(null, { status: 204 }) }));
 vi.mock('../packages/mcp/dist/index.js', () => ({
   createMcpEndpoint: (options: { resource: string }) => {
     state.endpoints++;
@@ -29,6 +30,8 @@ vi.mock('../packages/mcp/dist/index.js', () => ({
 
 import { stateplaneHost } from '../app/src/lib/server/host';
 import { api } from '../app/src/lib/server/api';
+import { checkKey } from '../app/src/lib/server/keycheck';
+import { jsonObject } from '../app/src/lib/server/forms';
 
 const env = { STATEPLANE_ENV: 'preview', STATEPLANE_TEST_HTTP: '1', STATEPLANE_TEST_TOKEN: 'o'.repeat(32),
   STATEPLANE_TEST_OWNER: 'owner', STATEPLANE_TEST_CREDENTIAL: 'session-1', STATEPLANE_TEST_CURSOR_SECRET: 'a'.repeat(64),
@@ -37,7 +40,7 @@ const env = { STATEPLANE_ENV: 'preview', STATEPLANE_TEST_HTTP: '1', STATEPLANE_T
 const call = (host = 'preview.example', origin?: string) => new Request(`${host.startsWith('http') ? '' : 'https://'}${host}/mcp`,
   { method: 'POST', body: '{}', headers: origin ? { origin } : {} });
 
-beforeEach(() => { state.scopes.length = 0; state.services.length = 0; });
+beforeEach(() => { state.scopes.length = 0; state.services.length = 0; state.http = null; });
 
 it('a Worker builds the MCP endpoint once while each request brings its own services', async () => {
   const before = state.endpoints;
@@ -118,4 +121,25 @@ it('a UI write without a configured host reports a retryable unsent request, as 
     platform: { env: { STATEPLANE_ENV: 'local', STATEPLANE_TEST_HTTP: '0' } } };
   const result = await api(context as never, 'POST', ['spaces'], { body: { spaceId: 'sp_unsent' } });
   expect(result).toMatchObject({ ok: false, status: 503, error: { code: 'PROVIDER_UNAVAILABLE', retryable: true } });
+});
+
+it('a key check reports provider rejection only for UNAUTHENTICATED; other failures do not verify revocation', async () => {
+  const context = { cookies: { get: () => undefined }, url: new URL('https://preview.example/spaces/sp/access'), platform: { env } };
+  const outcome = async (status: number, code: string) => {
+    state.http = () => Response.json({ error: { code, retryable: status !== 401, requestId: 'r' } }, { status });
+    return checkKey(context as never, 'sp', 'k'.repeat(32));
+  };
+  expect(await outcome(401, 'UNAUTHENTICATED')).toMatchObject({ kind: null, rejected: true, code: 'UNAUTHENTICATED' });
+  for (const [status, code] of [[503, 'PROVIDER_UNAVAILABLE'], [429, 'RATE_LIMITED'], [500, 'INTERNAL']] as const)
+    expect(await outcome(status, code)).toMatchObject({ kind: null, rejected: false, code, space: null });
+  // A provider-accepted key revoked in this space is denied here, not rejected.
+  state.http = request => new URL(request.url).pathname === '/v1/auth/session' ? Response.json({ kind: 'api-key' }) :
+    Response.json({ error: { code: 'NOT_FOUND', retryable: false } }, { status: 404 });
+  expect(await checkKey(context as never, 'sp', 'k'.repeat(32))).toMatchObject({ kind: 'api-key', rejected: false,
+    space: { allowed: false, code: 'NOT_FOUND', denied: true } });
+});
+
+it('a JSON field with a number JSON cannot carry is rejected instead of sent as null', () => {
+  for (const raw of ['{"n":1e400}', '{"n":-1e400}', '{"a":[{"n":1e999}]}']) expect(jsonObject(raw)).toBeNull();
+  expect(JSON.stringify(jsonObject('{"n":1.5e300,"a":[0,null,"1e400"]}'))).toBe('{"n":1.5e+300,"a":[0,null,"1e400"]}');
 });

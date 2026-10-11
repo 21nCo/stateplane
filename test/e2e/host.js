@@ -88,7 +88,10 @@ async function proxy(target) {
         response.writeHead(204).end();
       } catch { response.writeHead(400).end(); }
     });
-  }).listen(faultPort,'127.0.0.1');
+  });
+  // once() rejects on 'error', so EADDRINUSE fails startup inside its try.
+  control.listen(faultPort,'127.0.0.1');
+  await once(control,'listening');
   return proxied;
 }
 

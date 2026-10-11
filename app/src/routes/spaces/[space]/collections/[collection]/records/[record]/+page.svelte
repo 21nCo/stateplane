@@ -70,7 +70,7 @@
           <label for="data">Data JSON (replaces the whole record)</label>
           <textarea id="data" name="data" rows="14" spellcheck="false" aria-invalid={form?.invalid || form?.error?.code==='SCHEMA_INVALID' ? 'true' : undefined}
             aria-describedby={form?.invalid ? 'data-error' : undefined}>{draft}</textarea>
-          {#if form?.invalid}<p id="data-error" class="text-sm text-danger">Data must be one JSON object.</p>{/if}
+          {#if form?.invalid}<p id="data-error" class="text-sm text-danger">Data must be one JSON object with finite numbers.</p>{/if}
           <button class="btn">Save revision</button>
         </form>
       </section>

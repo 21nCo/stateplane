@@ -1,5 +1,6 @@
 import { fail } from '@sveltejs/kit';
 import { api } from '$lib/server/api';
+import { checkKey } from '$lib/server/keycheck';
 import { selectors } from '$lib/paths';
 import type { Collection, Page } from '$lib/types';
 import type { Actions, PageServerLoad } from './$types';
@@ -9,16 +10,30 @@ export interface AgentKey { keyId:string; status:string; expiresAt:string; creat
 const grantable=['records:read','records:write','events:read','schema:write','space:admin'];
 // Lifetime presets keep issuance simple; the service still validates the instant.
 const lifetimes=new Set([1,7,30,90]);
-const denials=new Set(['UNAUTHENTICATED','FORBIDDEN','NOT_FOUND']);
+
+// Discovery returns 8 collections per page; the grant form follows at most 12
+// pages (96 collections) per load, and the free-text group names any other.
+const collectionPages=12;
+async function listCollections(event:Parameters<PageServerLoad>[0]) {
+  const slugs:string[]=[];
+  let cursor:string|undefined;
+  for (let page=0;page<collectionPages;page++) {
+    const result=await api<Page<Collection>>(event,'GET',['spaces',selectors(event.url).space,'collections'],{query:{cursor}});
+    if (!result.ok) return {slugs,more:slugs.length>0};
+    slugs.push(...result.data.items.map(item=>item.definition.slug));
+    if (result.data.cursor===null) return {slugs,more:false};
+    cursor=result.data.cursor;
+  }
+  return {slugs,more:true};
+}
 
 export const load:PageServerLoad=async(event)=>{
   const cursor=event.url.searchParams.get('cursor') ?? undefined;
   const [keys,collections]=await Promise.all([
     api<{items:AgentKey[];nextCursor:string|null}>(event,'GET',['spaces',selectors(event.url).space,'agent-keys'],{query:{cursor}}),
-    api<Page<Collection>>(event,'GET',['spaces',selectors(event.url).space,'collections'])]);
+    listCollections(event)]);
   return {cursor:cursor ?? null,keys:keys.ok ? keys.data : null,error:keys.ok ? null : keys.error,
-    collections:collections.ok ? collections.data.items.map(item=>item.definition.slug) : [],
-    moreCollections:collections.ok && collections.data.cursor!==null};
+    collections:collections.slugs,moreCollections:collections.more};
 };
 
 export const actions:Actions={
@@ -44,12 +59,6 @@ export const actions:Actions={
   check:async(event)=>{
     const token=String((await event.request.formData()).get('secret')??'').trim();
     if (!token) return fail(400,{checkMissing:true});
-    const session=await api<{kind:string}>(event,'GET',['auth','session'],{token});
-    if (!session.ok) return {check:{kind:null,code:session.error.code,space:null}};
-    // The provider authenticates the key; Stateplane authorizes it per space. A key
-    // revoked here stays denied while its provider cleanup is pending.
-    const here=await api(event,'GET',['spaces',selectors(event.url).space,'collections'],{token});
-    return {check:{kind:session.data.kind,code:null,space:here.ok ? {allowed:true,code:null} :
-      {allowed:false,code:here.error.code,denied:denials.has(here.error.code)}}};
+    return {check:await checkKey(event,selectors(event.url).space,token)};
   }
 };

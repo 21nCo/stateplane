@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { readFile } from 'node:fs/promises';
+import net from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import pg from 'pg';
 
@@ -40,4 +41,17 @@ test('the e2e launcher drops its database when the UI process dies from a signal
     assert.equal(code,0);
     assert.ok(!(await disposable()).includes(created),'the disposable database is dropped');
   } finally { launcher.kill('SIGKILL'); }
+});
+
+test('the e2e launcher drops its database when its control port is taken',{timeout:120_000},async()=>{
+  const before=new Set(await disposable());
+  const taken=net.createServer().listen(5744,'127.0.0.1');
+  await once(taken,'listening');
+  try {
+    const launcher=spawn(process.execPath,['test/e2e/host.js'],{cwd:root,stdio:'ignore',
+      env:{...process.env,STATEPLANE_E2E_BASE_DATABASE:url}});
+    const [code]=await Promise.race([once(launcher,'exit'),delay(90_000).then(()=>{ launcher.kill('SIGKILL'); throw new Error('launcher did not exit'); })]);
+    assert.equal(code,1);
+    assert.deepEqual((await disposable()).filter(name=>!before.has(name)),[],'no disposable database is left');
+  } finally { taken.close(); }
 });

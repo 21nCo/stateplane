@@ -199,7 +199,7 @@ test('validation failures are announced on their fields', async ({ page }) => {
   await page.getByLabel('Data JSON').fill('{not json');
   await page.getByRole('button', { name: 'Create record' }).click();
   await expect(page.getByLabel('Data JSON')).toHaveAttribute('aria-invalid', 'true');
-  await expect(page.getByText('Data must be one JSON object.')).toBeVisible();
+  await expect(page.getByText('Data must be one JSON object with finite numbers.')).toBeVisible();
   await settle(page);
   await page.getByLabel('Data JSON').fill(JSON.stringify({ state: 'open' }));
   await page.getByRole('button', { name: 'Create record' }).click();
@@ -215,6 +215,37 @@ test('validation failures are announced on their fields', async ({ page }) => {
     await page.getByRole('button', { name: button, exact: true }).click();
     await expect(page.getByLabel(label, { exact: true })).toHaveAccessibleDescription(message);
   }
+});
+
+test('a number JSON cannot carry is rejected on create and replace, never stored as null', async ({ page }) => {
+  await signIn(page, ownerToken);
+  await go(page, `${spaceUrl}/new-collection`);
+  await page.getByLabel('Collection name').fill('measures');
+  await page.getByLabel('Definition JSON').fill(JSON.stringify({ schema: { $schema: 'https://json-schema.org/draft/2020-12/schema',
+    type: 'object', additionalProperties: false, properties: { n: { type: ['number', 'null'] } } }, unique: [], filterable: [], sortable: [] }));
+  await page.getByRole('button', { name: 'Define collection' }).click();
+  await expect(page).toHaveURL(`${spaceUrl}/collections/measures/schema`);
+  const rejected = async () => {
+    await expect(page.getByLabel(/Data JSON/)).toHaveAttribute('aria-invalid', 'true');
+    await expect(page.getByText('Data must be one JSON object with finite numbers.')).toBeVisible();
+  };
+  await go(page, `${spaceUrl}/collections/measures`);
+  await page.getByLabel('Data JSON').fill('{"n":1e400}');
+  await page.getByRole('button', { name: 'Create record' }).click();
+  await rejected();
+  await expect(page.getByRole('heading', { name: 'Results · 0 matching' })).toBeVisible();
+
+  await settle(page);
+  await page.getByLabel('Data JSON').fill('{"n":1}');
+  await page.getByRole('button', { name: 'Create record' }).click();
+  await page.getByRole('status').getByRole('link').click();
+  await settle(page);
+  await page.getByLabel(/Data JSON/).fill('{"n":1e400}');
+  await page.getByRole('button', { name: 'Save revision' }).click();
+  await rejected();
+  await go(page, page.url());
+  await expect(page.getByText('Revision', { exact: true }).locator('..')).toContainText('1');
+  await expect(page.getByLabel(/Data JSON/)).toHaveValue(/"n": 1\n/);
 });
 
 test('an invalid credential is rejected without a session', async ({ page }) => {

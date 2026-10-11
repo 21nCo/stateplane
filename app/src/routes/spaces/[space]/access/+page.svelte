@@ -70,7 +70,7 @@
             {/each}
           </fieldset>
         {/each}
-        {#if data.moreCollections}<p class="hint">Only the first collections are listed; name others in the last group.</p>{/if}
+        {#if data.moreCollections}<p class="hint">Only the first 96 collections are listed; name others in the last group.</p>{/if}
         <button class="btn">Issue key</button>
       </form>
     </section>
@@ -78,7 +78,9 @@
       <h2 id="check" class="text-lg font-semibold">Check a key</h2>
       <p class="hint">Confirm whether the provider still authenticates a key secret and whether this space still authorizes it to discover collections, for example after revocation.</p>
       {#if form?.check}<div role="status" class="space-y-1 text-sm">
-        <p class={form.check.kind ? 'text-success' : 'text-danger'}>Provider: {form.check.kind ? `accepted as ${form.check.kind}` : `rejected (${form.check.code})`}.</p>
+        <p class={form.check.kind ? 'text-success' : form.check.rejected ? 'text-danger' : 'text-warning'}>Provider: {form.check.kind ? `accepted as ${form.check.kind}` :
+          `${form.check.rejected ? 'rejected' : 'not determined'} (${form.check.code})`}.</p>
+        {#if !form.check.kind && !form.check.rejected}<p class="hint">This does not confirm revocation. Check again when the provider is reachable.</p>{/if}
         {#if form.check.space}<p class={form.check.space.allowed ? 'text-success' : 'text-danger'}>This space: {form.check.space.allowed ? 'allowed' :
           `${form.check.space.denied ? 'denied' : 'not determined'} (${form.check.space.code})`}.</p>
           {#if form.check.space.denied}<p class="hint">The provider still accepts this key. If it shows provider cleanup pending, retry its revocation.</p>{/if}{/if}

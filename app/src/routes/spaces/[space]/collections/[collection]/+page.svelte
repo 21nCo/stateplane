@@ -2,7 +2,7 @@
   import Notice from '$lib/components/Notice.svelte';
   import Scroll from '$lib/components/Scroll.svelte';
   import { fieldKind, operators } from '$lib/query';
-  import { collectionHref, segment } from '$lib/paths';
+  import { collectionHref, segment, shown } from '$lib/paths';
   let { data, form } = $props();
   const definition=$derived(data.collection?.definition);
   const base=$derived(collectionHref(data.spaceId,definition?.slug ?? ''));
@@ -26,7 +26,7 @@
 <Notice error={data.collection ? null : data.error} title="Collection could not be read" />
 {#if data.collection && definition}
   <div class="flex flex-wrap items-baseline justify-between gap-2">
-    <h1 class="text-2xl font-semibold">Records in <span class="font-mono">{definition.slug}</span></h1>
+    <h1 class="text-2xl font-semibold">Records in <span class="font-mono">{shown(definition.slug)}</span></h1>
     <p class="flex flex-wrap gap-4 text-sm"><a class="link" href="{base}/schema">Schema v{definition.version}</a><a class="link" href="{base}/events">Changes</a><a class="link" href="{base}/batches">Ingestion</a></p>
   </div>
   {#if pending.length}<p class="mt-2 text-sm text-warning" role="status">Indexes pending for {pending.join(', ')}. They cannot be filtered or sorted until built on the schema page.</p>{/if}
@@ -48,7 +48,7 @@
               {#if data.filterErrors[index]}<p id="value-error-{index}" class="mt-1 text-sm text-danger">{data.filterErrors[index]}</p>{/if}</div>
           </fieldset>
         {/each}
-        <p class="hint">Use <code>in</code> with comma-separated values; <code>isNull</code> ignores the value.</p>
+        <p class="hint">Use <code>in</code> with comma-separated values; text matches exactly, including spaces after commas; <code>isNull</code> ignores the value.</p>
         <div class="grid gap-2 sm:grid-cols-3">
           <div><label for="sort">Sort by</label>
             <select id="sort" name="sort"><option value="">Creation order</option>{#each sortable as field (field)}<option selected={field===data.sort?.field}>{field}</option>{/each}</select></div>
@@ -96,7 +96,7 @@
         <div><label for="data">Data JSON</label>
           <textarea id="data" name="data" rows="8" spellcheck="false" aria-invalid={form?.create?.invalid || form?.create?.error?.code==='SCHEMA_INVALID' ? 'true' : undefined}
             aria-describedby={form?.create?.invalid ? 'data-error' : undefined}>{form?.create?.raw ?? '{}'}</textarea>
-          {#if form?.create?.invalid}<p id="data-error" class="mt-1 text-sm text-danger">Data must be one JSON object.</p>{/if}</div>
+          {#if form?.create?.invalid}<p id="data-error" class="mt-1 text-sm text-danger">Data must be one JSON object with finite numbers.</p>{/if}</div>
         <button class="btn">Create record</button>
       </form>
     </section>
