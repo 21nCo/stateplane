@@ -1,12 +1,12 @@
 import { fail } from '@sveltejs/kit';
-import { api } from '$lib/server/api';
+import { api, pageCursor } from '$lib/server/api';
 import { selectors } from '$lib/paths';
 import type { Collection, Page } from '$lib/types';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load:PageServerLoad=async(event)=>{
-  const cursor=event.url.searchParams.get('cursor') ?? undefined;
-  const page=await api<Page<Collection>>(event,'GET',['spaces',selectors(event.url).space,'collections'],{query:{cursor}});
+  const {cursor,rejected}=pageCursor(event.url);
+  const page=rejected ?? await api<Page<Collection>>(event,'GET',['spaces',selectors(event.url).space,'collections'],{query:{cursor}});
   return {cursor:cursor ?? null,collections:page.ok ? page.data : null,error:page.ok ? null : page.error};
 };
 

@@ -9,7 +9,7 @@ const guidance:Record<string,string>={
   REVISION_CONFLICT:'The record changed after you loaded it. Nothing was overwritten.',
   UNIQUE_CONFLICT:'Another record or space already holds this unique value or identifier.',
   KEY_RESERVED:'This external key is reserved by an existing or deleted record.',
-  IDEMPOTENCY_MISMATCH:'This request key was already used for a different request. Reload the form.',
+  IDEMPOTENCY_MISMATCH:'This request key was already used for a different request. Retry that request unchanged, or send the changed one as a new request.',
   SCHEMA_INVALID:'The data does not satisfy the collection schema.',
   SCHEMA_UNSUPPORTED:'The definition uses a keyword Stateplane does not support.',
   SCHEMA_BREAKING:'The revision changes an existing field, constraint or index incompatibly.',
@@ -28,3 +28,5 @@ const guidance:Record<string,string>={
   RECEIPT_PENDING:'The original request is still being processed. Try again shortly.'
 };
 export const describe=(code:string)=>guidance[code] ?? 'The request failed.';
+/** Codes after which an unchanged retry under the same key can recover the outcome. */
+export const uncertain=(error?:ApiError|null)=>['COMMIT_OUTCOME_UNKNOWN','RATE_LIMITED','PROVIDER_UNAVAILABLE'].includes(error?.code ?? '');

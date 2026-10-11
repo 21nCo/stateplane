@@ -202,15 +202,73 @@ test('a create whose acknowledgement and reload both fail keeps its form and req
   await expect(page.getByRole('alert').filter({ hasText: 'Collection could not be read' })).toBeVisible();
   const notice = page.getByRole('alert').filter({ hasText: 'Record was not created' });
   await expect(notice).toContainText('COMMIT_OUTCOME_UNKNOWN');
-  await expect(notice).toContainText('Submit again unchanged');
   await expect(page.getByLabel('Data JSON')).toHaveValue(new RegExp(title));
+  const titles = async () => {
+    const listed = await request.post(`/v1${itemsUrl()}/records/query`,
+      { headers: { authorization: `Bearer ${ownerToken}` }, data: { predicates: [], limit: 100 } });
+    return ((await listed.json()).records as { canonicalData: string }[]).map(record => JSON.parse(record.canonicalData).title);
+  };
 
-  await page.getByRole('button', { name: 'Create record' }).click();
+  // Retry unchanged resends the retained request, not the editor's changed text.
+  await settle(page);
+  await page.getByLabel('Data JSON').fill(JSON.stringify({ title: `${title} changed`, state: 'open', rank: 8 }));
+  await page.getByRole('button', { name: 'Retry unchanged' }).click();
   await expect(page.getByRole('status')).toContainText('(recovered earlier result)');
-  const listed = await request.post(`/v1${itemsUrl()}/records/query`,
-    { headers: { authorization: `Bearer ${ownerToken}` }, data: { predicates: [], limit: 100 } });
-  const records: { canonicalData: string }[] = (await listed.json()).records;
-  expect(records.filter(record => JSON.parse(record.canonicalData).title === title)).toHaveLength(1);
+  expect((await titles()).filter(item => item.startsWith(title))).toEqual([title]);
+
+  // A changed draft after a lost acknowledgement is a new request, never a key reuse.
+  const second = `Unacknowledged ${randomUUID()}`;
+  await settle(page);
+  await page.getByLabel('Data JSON').fill(JSON.stringify({ title: second, state: 'open', rank: 8 }));
+  await dropReply('COMMIT\0', 'INSERT INTO records(');
+  await page.getByRole('button', { name: 'Create record' }).click();
+  await expect(notice).toContainText('COMMIT_OUTCOME_UNKNOWN');
+  await expect(notice).toContainText('Create record sends a new request');
+  await settle(page);
+  await page.getByLabel('Data JSON').fill(JSON.stringify({ title: `${second} changed`, state: 'open', rank: 8 }));
+  await page.getByRole('button', { name: 'Create record' }).click();
+  await expect(page.getByRole('status')).toContainText('at revision 1');
+  await expect(page.getByRole('status')).not.toContainText('recovered');
+  expect((await titles()).filter(item => item.startsWith(second)).sort()).toEqual([second, `${second} changed`]);
+});
+
+test('after a lost save acknowledgement, retry recovers it and a changed draft is compared first', async ({ page, request }) => {
+  test.skip(!local, 'Needs the local fault proxy');
+  await signIn(page, ownerToken);
+  const id = await createRecord(page, { title: 'Acknowledged later', state: 'open', rank: 11 });
+  await go(page, `${itemsUrl()}/records/${id}`);
+  const editor = page.getByLabel(/Data JSON/);
+  const notice = page.getByRole('alert').filter({ hasText: 'Record was not saved' });
+  const read = async () => (await request.get(`/v1${itemsUrl()}/records/${encodeURIComponent(id)}`,
+    { headers: { authorization: `Bearer ${ownerToken}` } })).json();
+
+  // The replace commits but its acknowledgement is lost; the owner then changes the draft.
+  await editor.fill(JSON.stringify({ title: 'first edit', state: 'open', rank: 11 }));
+  await dropReply('COMMIT\0', 'UPDATE records SET');
+  await page.getByRole('button', { name: 'Save revision' }).click();
+  await expect(notice).toContainText('COMMIT_OUTCOME_UNKNOWN');
+  await settle(page);
+  await editor.fill(JSON.stringify({ title: 'second edit', state: 'open', rank: 11 }));
+  await page.getByRole('button', { name: 'Save revision' }).click();
+  const conflict = page.getByRole('alert', { name: 'Edit conflict' });
+  await expect(conflict).toContainText('You edited revision 1, but revision 2 is now current');
+  await expect(conflict).toContainText('first edit');
+  await expect(editor).toHaveValue(/second edit/);
+  await conflict.getByRole('button', { name: 'Apply my edit to revision 2' }).click();
+  await expect(page.getByRole('status')).toContainText('Saved revision 3 (was 2)');
+
+  // Retry unchanged resends the lost request, whatever the editor now holds.
+  await settle(page);
+  await editor.fill(JSON.stringify({ title: 'third edit', state: 'open', rank: 11 }));
+  await dropReply('COMMIT\0', 'UPDATE records SET');
+  await page.getByRole('button', { name: 'Save revision' }).click();
+  await expect(notice).toContainText('COMMIT_OUTCOME_UNKNOWN');
+  await settle(page);
+  await editor.fill(JSON.stringify({ title: 'not sent', state: 'open', rank: 11 }));
+  await page.getByRole('button', { name: 'Retry unchanged' }).click();
+  await expect(page.getByRole('status')).toContainText('Saved revision 4 (was 3), recovered from an earlier identical request');
+  const record = await read();
+  expect([record.revision, JSON.parse(record.canonicalData).title]).toEqual([4, 'third edit']);
 });
 
 test('a schema revision whose reload fails keeps the draft and its version', async ({ browser, page, request }) => {
@@ -284,11 +342,14 @@ test('validation failures are announced on their fields', async ({ page }) => {
   const alert = page.getByRole('alert');
   await expect(alert).toContainText('SCHEMA_INVALID');
   await expect(alert).toBeFocused();
-  // An empty page position is a position the API judges, not the first page.
-  await go(page, `${itemsUrl()}?cursor=`);
-  await expect(page.getByRole('alert')).toContainText('CURSOR_INVALID');
-  await expect(page.getByRole('link', { name: 'Restart from the first page' })).toBeVisible();
-
+  await expect(page.getByLabel('Data JSON')).toHaveAccessibleDescription(/does not satisfy the collection schema/);
+  // The edit form describes a schema failure on its field too.
+  const id = await createRecord(page, { title: 'Valid', state: 'open' });
+  await go(page, `${itemsUrl()}/records/${id}`);
+  await page.getByLabel(/Data JSON/).fill(JSON.stringify({ state: 'open' }));
+  await page.getByRole('button', { name: 'Save revision' }).click();
+  await expect(page.getByRole('alert')).toBeFocused();
+  await expect(page.getByLabel(/Data JSON/)).toHaveAccessibleDescription(/does not satisfy the collection schema/);
   // A taken collection name is reported on the name field, with a link to the collection.
   await go(page, `${spaceUrl}/new-collection`);
   await page.getByLabel('Collection name').fill('items');
@@ -565,6 +626,38 @@ test('ingestion reports per-item progress', async ({ page }) => {
   await expect(page.getByRole('table')).toContainText('SCHEMA_INVALID');
 });
 
+test('a partly failed batch keeps its lines, so failed items can be retried', async ({ page, request }) => {
+  await defineCollection(request, 'bulk');
+  await signIn(page, ownerToken);
+  const lines = [JSON.stringify({ operation: 'create', data: { title: 'kept' } }),
+    JSON.stringify({ operation: 'create', data: { title: 'noted', note: 'later' } })].join('\n');
+  await go(page, `${spaceUrl}/collections/bulk/batches`);
+  await page.getByLabel('Operation key').first().fill('partial-1');
+  await page.getByLabel(/Record requests/).fill(lines);
+  await page.getByRole('button', { name: 'Submit batch' }).click();
+  await expect(page.getByRole('status')).toContainText('1 failed');
+  await expect(page.getByLabel(/Record requests/)).toHaveValue(lines);
+  await expect(page.getByLabel('Operation key').first()).toHaveValue('partial-1');
+  await settle(page);
+
+  // A compatible revision admits the failed line; retrying resends the identical manifest.
+  const revised = await request.patch(`/v1${spaceUrl}/collections/bulk`, { headers: { authorization: `Bearer ${ownerToken}`, 'if-match': '1' },
+    data: { ...definition({ note: { type: 'string' } }), slug: 'bulk', version: 2 } });
+  expect(revised.status()).toBe(200);
+  await page.getByLabel('Retry failed items').check();
+  await page.getByRole('button', { name: 'Submit batch' }).click();
+  await expect(page.getByRole('status')).toContainText('2 succeeded');
+  await expect(page.getByRole('row').filter({ hasText: 'succeeded' }).nth(1)).toContainText(/succeeded\s*2/);
+  const listed = await request.post(`/v1${spaceUrl}/collections/bulk/records/query`,
+    { headers: { authorization: `Bearer ${ownerToken}` }, data: { predicates: [], limit: 100 } });
+  expect(((await listed.json()).records as { canonicalData: string }[]).map(record => JSON.parse(record.canonicalData).title).sort()).toEqual(['kept', 'noted']);
+
+  // Progress alone cannot supply the lines, so they are not prefilled under its key.
+  await go(page, `${spaceUrl}/collections/bulk/batches?operation=partial-1`);
+  await expect(page.getByLabel(/Record requests/)).toHaveValue('');
+  await expect(page.getByLabel(/Record requests/)).toHaveAccessibleDescription(/enter its exact original lines/);
+});
+
 test('identifiers that differ only by surrounding whitespace stay distinct', async ({ page, request }) => {
   await signIn(page, ownerToken);
   await go(page, `${spaceUrl}/new-collection`);
@@ -706,6 +799,24 @@ test('failed listings are reported, not shown as empty or truncated', async ({ p
   await expect(page.getByRole('alert')).toContainText('CURSOR_INVALID');
   await page.getByRole('link', { name: 'Start again from the first page' }).click();
   await expect(page.getByRole('table')).toContainText('space:create');
+});
+
+test('an empty cursor opens the first page and a rejected one offers a restart', async ({ page }) => {
+  await signIn(page, ownerToken);
+  const pages = [['/spaces', 'Spaces could not be listed'], [spaceUrl, 'Collections could not be listed'],
+    [`${spaceUrl}/access`, 'Keys could not be listed'], [`${spaceUrl}/audit`, 'Audit could not be read'],
+    [`${itemsUrl()}/events`, 'Changes could not be read'], [itemsUrl(), 'Records could not be read']];
+  for (const [path, title] of pages) {
+    await go(page, `${path}?cursor=`);
+    await expect(page.getByRole('alert'), path).toHaveCount(0);
+    // A repeated cursor is rejected as /v1 rejects it, never reduced to its first value.
+    // The key listing accepts any single cursor, so only its repeated form is rejected.
+    for (const query of path.endsWith('/access') ? ['cursor=a&cursor=b'] : ['cursor=malformed', 'cursor=a&cursor=b']) {
+      await go(page, `${path}?${query}`);
+      await expect(page.getByRole('alert').filter({ hasText: title }), `${path}?${query}`).toContainText('CURSOR_INVALID');
+      await expect(page.getByRole('link', { name: /(Start again|Restart) from the (first page|beginning)/ })).toBeVisible();
+    }
+  }
 });
 
 test('pages pass accessibility checks, keyboard use and small screens', async ({ page }) => {

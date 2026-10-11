@@ -4,12 +4,14 @@
   import { fieldKind, operators } from '$lib/query';
   import { page } from '$app/state';
   import { carry, collectionHref, segment, selectors, shown } from '$lib/paths';
+  import { uncertain } from '$lib/errors';
   let { data, form } = $props();
   const definition=$derived(data.collection?.definition);
   const base=$derived(collectionHref(data.spaceId,selectors(page.url).collection));
   const filterable=$derived(data.collection ? definition!.filterable.filter(field=>data.collection!.ready.includes(field)) : []);
   const sortable=$derived(data.collection ? definition!.sortable.filter(field=>data.collection!.ready.includes(field)) : []);
   const pending=$derived(data.collection?.pending ?? []);
+  const schemaInvalid=$derived(form?.create?.invalid || form?.create?.error?.code==='SCHEMA_INVALID');
   const columns=$derived(Object.keys(definition?.schema.properties ?? {}).slice(0,4));
   const rows=$derived([...data.rows,{field:'',op:'eq',value:''}]);
   const query=$derived.by(()=>{
@@ -96,17 +98,19 @@
   <section aria-labelledby="create" class="panel h-fit space-y-3">
     <h2 id="create" class="font-semibold">Create a record</h2>
     <Notice error={form?.create?.error} title="Record was not created">
-      {#if form?.create?.error?.code==='COMMIT_OUTCOME_UNKNOWN'}<p class="mt-1">Submit again unchanged: the same request key recovers the original result instead of writing twice.</p>{/if}
+      {#if uncertain(form?.create?.error)}<p class="mt-1">Retry unchanged resends the exact request under its key, which recovers the original result instead of creating twice. If you change the data or external key, Create record sends a new request, which creates another record even if the first one was created.</p>{/if}
     </Notice>
     {#if form?.created}<p role="status" class="text-sm text-success">Created <a class="ident link" href="{base}/records/{segment(form.created.ref.id)}">{form.created.ref.id}</a> at revision {form.created.revision}{form.created.replayed ? ' (recovered earlier result)' : ''}. Search projection: {form.created.projection.state}.</p>{/if}
     <form method="POST" action="?/create" class="space-y-3">
       <input type="hidden" name="idempotencyKey" value={form?.create?.idempotencyKey ?? data.idempotencyKey} />
+      {#if form?.create?.sent}<input type="hidden" name="sent" value={form.create.sent} />{/if}
       <div><label for="externalKey">External key (optional)</label><input id="externalKey" name="externalKey" value={form?.create?.externalKey ?? ''} /></div>
       <div><label for="data">Data JSON</label>
-        <textarea id="data" name="data" rows="8" spellcheck="false" aria-invalid={form?.create?.invalid || form?.create?.error?.code==='SCHEMA_INVALID' ? 'true' : undefined}
-          aria-describedby={form?.create?.invalid ? 'data-error' : undefined}>{form?.create?.raw ?? '{}'}</textarea>
-        {#if form?.create?.invalid}<p id="data-error" class="mt-1 text-sm text-danger">Data must be one JSON object with finite numbers.</p>{/if}</div>
-      <button class="btn">Create record</button>
+        <textarea id="data" name="data" rows="8" spellcheck="false" aria-invalid={schemaInvalid ? 'true' : undefined}
+          aria-describedby={schemaInvalid ? 'data-error' : undefined}>{form?.create?.raw ?? '{}'}</textarea>
+        {#if schemaInvalid}<p id="data-error" class="mt-1 text-sm text-danger">{form?.create?.invalid ? 'Data must be one JSON object with finite numbers.' : 'The data does not satisfy the collection schema. Correct it and create again.'}</p>{/if}</div>
+      <div class="flex flex-wrap gap-2"><button class="btn">Create record</button>
+        {#if form?.create?.sent && uncertain(form.create.error)}<button class="btn-quiet" name="intent" value="retry">Retry unchanged</button>{/if}</div>
     </form>
   </section>
 {/snippet}

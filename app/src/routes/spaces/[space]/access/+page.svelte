@@ -25,7 +25,9 @@
 <div class="mt-4 grid gap-6 lg:grid-cols-[2fr_1fr]">
   <section aria-labelledby="keys" class="min-w-0 space-y-3">
     <h2 id="keys" class="text-lg font-semibold">Keys</h2>
-    <Notice error={data.error} title="Keys could not be listed" />
+    <Notice error={data.error} title="Keys could not be listed">
+      {#if data.cursor}<p class="mt-1"><a class="link" href="?">Start again from the first page</a></p>{/if}
+    </Notice>
     <Notice error={form?.revokeError} title="Revocation did not finish">
       <p class="mt-1">Part of the revocation may have taken effect, whatever the key list shows. Retry until it finishes.</p>
       {#if form?.revokeKeyId}<form method="POST" action="?/revoke" class="mt-2"><input type="hidden" name="keyId" value={carry(form.revokeKeyId)} />

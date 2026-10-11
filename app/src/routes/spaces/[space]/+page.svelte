@@ -35,7 +35,9 @@
       <h2 id="collections" class="text-lg font-semibold">Collections</h2>
       {#if data.space}<a class="btn" href="{base}/new-collection">Define collection</a>{/if}
     </div>
-    <Notice error={data.error} title="Collections could not be listed" />
+    <Notice error={data.error} title="Collections could not be listed">
+      {#if data.cursor}<p class="mt-1"><a class="link" href={base}>Start again from the first page</a></p>{/if}
+    </Notice>
     {#if data.collections}
       {#if data.collections.items.length}
         <ul class="space-y-2">{#each data.collections.items as item (item.definition.slug)}

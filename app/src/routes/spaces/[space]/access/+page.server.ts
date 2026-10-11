@@ -1,5 +1,5 @@
 import { fail } from '@sveltejs/kit';
-import { api } from '$lib/server/api';
+import { api, pageCursor } from '$lib/server/api';
 import { checkKey } from '$lib/server/keycheck';
 import { carriedId, selectors } from '$lib/paths';
 import type { ApiError } from '$lib/errors';
@@ -30,9 +30,9 @@ async function listCollections(event:Parameters<PageServerLoad>[0]) {
 }
 
 export const load:PageServerLoad=async(event)=>{
-  const cursor=event.url.searchParams.get('cursor') ?? undefined;
+  const {cursor,rejected}=pageCursor(event.url);
   const [keys,collections]=await Promise.all([
-    api<{items:AgentKey[];nextCursor:string|null}>(event,'GET',['spaces',selectors(event.url).space,'agent-keys'],{query:{cursor}}),
+    rejected ?? api<{items:AgentKey[];nextCursor:string|null}>(event,'GET',['spaces',selectors(event.url).space,'agent-keys'],{query:{cursor}}),
     listCollections(event)]);
   return {cursor:cursor ?? null,keys:keys.ok ? keys.data : null,error:keys.ok ? null : keys.error,
     collections:collections.slugs,moreCollections:collections.more,collectionsError:collections.error};

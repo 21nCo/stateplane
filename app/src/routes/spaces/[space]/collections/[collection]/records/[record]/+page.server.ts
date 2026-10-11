@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { fail, redirect } from '@sveltejs/kit';
 import { api } from '$lib/server/api';
-import { jsonObject } from '$lib/server/forms';
+import { jsonObject, retainedSent, retried, writeIdentity } from '$lib/server/forms';
 import { collectionHref, selectors } from '$lib/paths';
 import type { Receipt, StoredRecord } from '$lib/types';
 import type { Actions, PageServerLoad, RequestEvent } from './$types';
@@ -28,17 +28,21 @@ async function conflict(event:RequestEvent,values:Record<string,unknown>) {
     pretty:current.ok ? pretty(current.data) : null,deleted:!current.ok && current.error.code==='NOT_FOUND',
     rereadError:current.ok || current.error.code==='NOT_FOUND' ? null : current.error}});
 }
-const stale=(code:string)=>code==='REVISION_CONFLICT' || code==='NOT_FOUND';
+// A key mismatch means the retained request was applied under another body: compare too.
+const stale=(code:string)=>['REVISION_CONFLICT','NOT_FOUND','IDEMPOTENCY_MISMATCH'].includes(code);
 
 export const actions:Actions={
   save:async(event)=>{
     const form=await event.request.formData();
+    // The editor's text always stays the draft; a retry resends the retained request instead.
     const raw=String(form.get('data')??'');
-    const idempotencyKey=String(form.get('idempotencyKey')??'');
-    const expectedRevision=Number(form.get('expectedRevision'));
-    const values={raw,idempotencyKey,expectedRevision};
-    const data=jsonObject(raw);
-    if (!data) return fail(400,{...values,invalid:true});
+    const retry=retried(form);
+    const expectedRevision=retry ? Number(retry.expectedRevision) : Number(form.get('expectedRevision'));
+    const data=retry ? jsonObject(JSON.stringify(retry.data)) : jsonObject(raw);
+    // A rejected draft keeps any retained request and key for a later retry.
+    if (!data) return fail(400,{raw,expectedRevision,idempotencyKey:String(form.get('idempotencyKey')??''),sent:retainedSent(form),invalid:true});
+    const {sent,idempotencyKey}=writeIdentity(form,{expectedRevision,data});
+    const values={raw,idempotencyKey,expectedRevision,sent};
     const result=await api<Receipt>(event,'POST',recordPath(event.url).slice(0,5),
       {body:{operation:'replace',id:selectors(event.url).record,expectedRevision,idempotencyKey,data}});
     if (result.ok) return {saved:result.data};

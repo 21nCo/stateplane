@@ -11,7 +11,9 @@
 <p class="hint"><a class="link" href={base}>Records</a> / changes</p>
 <h1 class="text-2xl font-semibold">Committed changes</h1>
 <p class="hint mt-1">Every accepted create, replace, patch and delete with its resulting revision, oldest first.</p>
-<Notice error={data.error} title="Changes could not be read" />
+<Notice error={data.error} title="Changes could not be read">
+  {#if data.cursor}<p class="mt-1"><a class="link" href="{base}/events">Start again from the beginning</a></p>{/if}
+</Notice>
 {#if data.feed}
   {#if data.feed.events.length}
     <div class="mt-3"><Scroll label="Committed changes"><table>

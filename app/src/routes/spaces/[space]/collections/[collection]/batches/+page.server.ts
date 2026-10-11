@@ -32,6 +32,9 @@ export const actions:Actions={
     if (!lines.length || lines.length>maxItems) return fail(400,{...values,countInvalid:true});
     const result=await api<Progress>(event,'PUT',batchPath(event,operationKey),{body:lines,query:{retryFailed:retryFailed ? 'true' : undefined}});
     if (!result.ok) return fail(result.status,{...values,error:result.error});
+    // Progress does not return the lines, so a batch that can still be resumed keeps
+    // them beside its key: Retry failed items must resend the identical manifest.
+    if (result.data.items.some(item=>item.state!=='succeeded')) return {...values,progress:result.data};
     redirect(303,here(event,operationKey));
   },
   cancel:async(event)=>{

@@ -32,6 +32,14 @@ function rejected(context:Context,options:Options,requestId:string|null=null):Ap
   return {ok:false,status:401,error:{code:'UNAUTHENTICATED',retryable:false,requestId}};
 }
 
+/** The page cursor in a page's query: an empty one means the first page. A
+ * repeated cursor is rejected before any call, as /v1 rejects it. */
+export function pageCursor(url:URL):{cursor?:string;rejected?:ApiResult<never>} {
+  const all=url.searchParams.getAll('cursor');
+  const cursor=all[0] || undefined;
+  return all.length>1 ? {cursor,rejected:{ok:false,status:400,error:{code:'CURSOR_INVALID',retryable:false,requestId:null}}} : {cursor};
+}
+
 /** Send one request through the same /v1 handler, identity check and services as
  * every other transport. The UI holds no authority of its own: the bearer in its
  * HttpOnly cookie is verified by the API on every call. */

@@ -3,6 +3,7 @@
   import Status from '$lib/components/Status.svelte';
   import { page } from '$app/state';
   import { collectionHref, selectors, shown } from '$lib/paths';
+  import { uncertain } from '$lib/errors';
   let { data, form } = $props();
   const base=$derived(collectionHref(data.spaceId,selectors(page.url).collection));
   // After a conflict the user's draft stays in the editor until they choose how to resolve it;
@@ -16,6 +17,9 @@
   const applyTo=$derived(form?.deleting ? null : current);
   const editing=$derived(!!data.record || (form?.raw!==undefined && (!form?.conflict || applyTo!==null)));
   const retryDelete=$derived(!!form?.deleteError);
+  // A failed save keeps its key only together with the exact request it identified.
+  const retained=$derived(form?.error || form?.invalid ? form : null);
+  const schemaInvalid=$derived(form?.invalid || form?.error?.code==='SCHEMA_INVALID');
   const tone=(state?:string)=>state==='current' ? 'success' : state==='degraded' ? 'danger' : 'warning';
 </script>
 
@@ -67,16 +71,18 @@
       <section aria-labelledby="edit" class="panel space-y-3">
         <h2 id="edit" class="text-lg font-semibold">Edit data</h2>
         <Notice error={form?.error} title="Record was not saved">
-          {#if form?.error?.code==='COMMIT_OUTCOME_UNKNOWN'}<p class="mt-1">Save again unchanged: the same request key recovers the original result instead of writing twice.</p>{/if}
+          {#if uncertain(form?.error)}<p class="mt-1">Retry unchanged resends the exact request under its key, which recovers the original result instead of writing twice. Save revision sends the editor's text; if you changed it, that is a new request, and a revision saved meanwhile is shown for comparison before anything is overwritten.</p>{/if}
         </Notice>
         <form id="edit-form" method="POST" action="?/save" class="space-y-3">
-          <input type="hidden" name="idempotencyKey" value={form?.error || form?.invalid ? form.idempotencyKey : data.idempotencyKey} />
+          <input type="hidden" name="idempotencyKey" value={retained ? retained.idempotencyKey : data.idempotencyKey} />
+          {#if retained?.sent}<input type="hidden" name="sent" value={retained.sent} />{/if}
           <input type="hidden" name="expectedRevision" value={applyTo ?? (form?.raw!==undefined ? form.expectedRevision : data.record?.revision)} />
           <label for="data">Data JSON (replaces the whole record)</label>
-          <textarea id="data" name="data" rows="14" spellcheck="false" aria-invalid={form?.invalid || form?.error?.code==='SCHEMA_INVALID' ? 'true' : undefined}
-            aria-describedby={form?.invalid ? 'data-error' : undefined}>{draft}</textarea>
-          {#if form?.invalid}<p id="data-error" class="text-sm text-danger">Data must be one JSON object with finite numbers.</p>{/if}
-          <button class="btn">Save revision</button>
+          <textarea id="data" name="data" rows="14" spellcheck="false" aria-invalid={schemaInvalid ? 'true' : undefined}
+            aria-describedby={schemaInvalid ? 'data-error' : undefined}>{draft}</textarea>
+          {#if schemaInvalid}<p id="data-error" class="text-sm text-danger">{form?.invalid ? 'Data must be one JSON object with finite numbers.' : 'The data does not satisfy the collection schema. Correct it and save again.'}</p>{/if}
+          <div class="flex flex-wrap gap-2"><button class="btn">Save revision</button>
+            {#if retained?.sent && uncertain(form?.error)}<button class="btn-quiet" name="intent" value="retry">Retry unchanged</button>{/if}</div>
         </form>
       </section>
     {/if}

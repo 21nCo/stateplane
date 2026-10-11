@@ -1,14 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { fail, redirect } from '@sveltejs/kit';
-import { api } from '$lib/server/api';
+import { api, pageCursor } from '$lib/server/api';
 import { given } from '$lib/server/forms';
 import { carriedId, spaceHref } from '$lib/paths';
 import type { Page, Space } from '$lib/types';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load:PageServerLoad=async(event)=>{
-  const cursor=event.url.searchParams.get('cursor') ?? undefined;
-  const page=await api<Page<Space>>(event,'GET',['spaces'],{query:{cursor}});
+  const {cursor,rejected}=pageCursor(event.url);
+  const page=rejected ?? await api<Page<Space>>(event,'GET',['spaces'],{query:{cursor}});
   // A fresh caller-selected ID lets a lost create response be retried by the same ID.
   return {cursor:cursor ?? null,page:page.ok ? page.data : null,error:page.ok ? null : page.error,newSpaceId:`sp_${randomUUID()}`};
 };
