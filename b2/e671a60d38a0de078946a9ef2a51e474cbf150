@@ -1,0 +1,51 @@
+app/src/lib/paths.ts
+  s_1900bb15a7199a::t_560950a5185d31 12-13
+app/src/routes/spaces/[space]/access/+page.svelte
+  s_1900bb15a7199a::t_387d49c961fe71 5,40,65,79-85
+test/e2e/owner.spec.ts
+  s_1900bb15a7199a::t_2abce4b7549e1b 42-52,258-261,265,269,276,280-282,287,308-336
+docs/ui.md
+  s_1900bb15a7199a::t_658f3f2d108503 12,17,26
+app/src/routes/spaces/[space]/new-collection/+page.server.ts
+  s_1900bb15a7199a::t_276884b9b1b0ff 10-11,14
+app/src/routes/spaces/[space]/collections/[collection]/batches/+page.server.ts
+  s_1900bb15a7199a::t_96acea7876ffb4 23-24,30
+app/src/routes/spaces/+page.server.ts
+  s_1900bb15a7199a::t_bc10e1326065c5 19-20,25-26
+app/src/routes/spaces/[space]/+page.svelte
+  s_1900bb15a7199a::t_210f7e419a6d9e 4,43
+packages/postgres/src/spaces.ts
+  s_1900bb15a7199a::t_0eaf6947778e40 1397
+test/mcp-host.test.ts
+  s_1900bb15a7199a::t_7ca7af2e9aba22 31,115-121
+app/src/lib/server/host.ts
+  s_1900bb15a7199a::t_7cf63e252b68c3 32,48-52,173-174
+app/src/lib/server/api.ts
+  s_1900bb15a7199a::t_5f0b8fce4279fd 3,31-32
+test/integration/owner-access-http.test.js
+  s_1900bb15a7199a::t_e8aed2d767bfc7 125-128
+test/integration/e2e-launcher.test.js
+  s_1900bb15a7199a::t_db59700320ce89 1-43
+app/src/app.d.ts
+  s_1900bb15a7199a::t_14c3331ac90297 17
+test/e2e/host.js
+  s_1900bb15a7199a::t_868ecc9cdf50c1 5-6,21-22,30,45-46,52,77-83,114-117
+app/src/routes/spaces/[space]/access/+page.server.ts
+  s_1900bb15a7199a::t_efb61bef32c902 12,28-29,31,47-53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b2e671a60d38a0de078946a9ef2a51e474cbf150",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
