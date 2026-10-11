@@ -157,6 +157,13 @@ it('an identifier with any non-printing character is displayed quoted and escape
   expect(new Set(['ab', 'a\ufeffb', 'a\u200bb', 'a\u2060b'].map(shown)).size).toBe(4);
 });
 
+it('no two identifiers share a display, even when one spells out the quoted form of the other', () => {
+  const pairs = [[' items ', '" items "'], ['\u200b', '"\\u200b"'], ['a\u200bb', '"a\\u200bb"'], ['"items"', 'items'], ['a\\u200bb', 'a\u200bb']];
+  for (const [one, other] of pairs) expect(shown(one)).not.toBe(shown(other));
+  expect(shown('"items"')).toBe('"\\"items\\""');
+  expect(shown('a"b')).toBe('a"b');
+});
+
 it('a key secret no header can carry is never checked, so it never reads as a provider rejection', async () => {
   let sent = 0;
   state.http = () => { sent++; return Response.json({ kind: 'api-key' }); };

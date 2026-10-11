@@ -30,7 +30,7 @@
     <h1 class="min-w-0 text-2xl font-semibold">Records in <span class="ident">{shown(definition.slug)}</span></h1>
     <p class="flex flex-wrap gap-4 text-sm"><a class="link" href="{base}/schema">Schema v{definition.version}</a><a class="link" href="{base}/events">Changes</a><a class="link" href="{base}/batches">Ingestion</a></p>
   </div>
-  {#if pending.length}<p class="mt-2 text-sm text-warning" role="status">Indexes pending for {pending.join(', ')}. They cannot be filtered or sorted until built on the schema page.</p>{/if}
+  {#if pending.length}<p class="mt-2 text-sm text-warning" role="status">Indexes pending for {#each pending as field, index (field)}{index ? ', ' : ''}<span class="ident">{shown(field)}</span>{/each}. They cannot be filtered or sorted until built on the schema page.</p>{/if}
   <div class="mt-4 grid gap-6 lg:grid-cols-[1fr_20rem]">
     <section aria-labelledby="results" class="min-w-0 space-y-3">
       <form method="GET" class="panel space-y-3" aria-labelledby="filter-title">
@@ -40,7 +40,7 @@
             <legend class="sr-only">Filter {index+1}</legend>
             <div><label for="field-{index}">Field</label>
               <select id="field-{index}" name="field"><option value="">{index===data.rows.length ? 'Add a filter…' : 'Remove filter'}</option>
-                {#each filterable as field (field)}<option value={field} selected={field===row.field}>{field} ({fieldKind(definition,field)})</option>{/each}</select></div>
+                {#each filterable as field (field)}<option value={field} selected={field===row.field}>{shown(field)} ({fieldKind(definition,field)})</option>{/each}</select></div>
             <div><label for="op-{index}">Operator</label>
               <select id="op-{index}" name="op">{#each operators as op (op)}<option selected={op===row.op}>{op}</option>{/each}</select></div>
             <div><label for="value-{index}">Value</label>
@@ -52,7 +52,7 @@
         <p class="hint">Use <code>in</code> with comma-separated values; text matches exactly, including spaces after commas; <code>isNull</code> ignores the value.</p>
         <div class="grid gap-2 sm:grid-cols-3">
           <div><label for="sort">Sort by</label>
-            <select id="sort" name="sort"><option value="">Creation order</option>{#each sortable as field (field)}<option selected={field===data.sort?.field}>{field}</option>{/each}</select></div>
+            <select id="sort" name="sort"><option value="">Creation order</option>{#each sortable as field (field)}<option value={field} selected={field===data.sort?.field}>{shown(field)}</option>{/each}</select></div>
           <div><label for="dir">Direction</label>
             <select id="dir" name="dir"><option value="asc">Ascending</option><option value="desc" selected={data.sort?.direction==='desc'}>Descending</option></select></div>
           <div><label for="limit">Page size (1–100)</label>
@@ -69,7 +69,7 @@
         {#if data.page.records.length}
           <Scroll label="Records"><table>
             <caption class="sr-only">Records on this page</caption>
-            <thead><tr><th scope="col">Record</th><th scope="col">Revision</th>{#each columns as column (column)}<th scope="col">{column}</th>{/each}</tr></thead>
+            <thead><tr><th scope="col">Record</th><th scope="col">Revision</th>{#each columns as column (column)}<th scope="col" class="ident">{shown(column)}</th>{/each}</tr></thead>
             <tbody>{#each data.page.records as record (record.ref.id)}<tr>
               <td><a class="ident link" href="{base}/records/{segment(record.ref.id)}">{record.keyMode==='external' ? shown(record.normalizedKey) : record.ref.id}</a></td>
               <td>{record.revision}</td>{#each columns as column (column)}<td class="max-w-48 truncate">{cell(record,column)}</td>{/each}

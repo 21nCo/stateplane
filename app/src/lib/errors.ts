@@ -2,7 +2,7 @@ export interface ApiError { code:string; retryable:boolean; requestId:string|nul
 
 /** Plain-language guidance for stable v1 error codes. The API never returns provider detail. */
 const guidance:Record<string,string>={
-  UNAUTHENTICATED:'The credential is missing, expired or revoked. Sign in again.',
+  UNAUTHENTICATED:'The credential is missing, expired or revoked.',
   FORBIDDEN:'This credential is not permitted to perform this action.',
   NOT_FOUND:'Not found, or this credential cannot see it.',
   SPACE_UNAVAILABLE:'The space or collection lifecycle does not allow this operation now.',

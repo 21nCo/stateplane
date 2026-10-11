@@ -27,8 +27,8 @@ async function audit(page: Page) {
   const result = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa']).analyze();
   expect(result.violations.map(item => `${item.id}: ${item.nodes.map(node => node.target).join(' ')}`)).toEqual([]);
 }
-async function createRecord(page: Page, data: object) {
-  await go(page, itemsUrl());
+async function createRecord(page: Page, data: object, url = itemsUrl()) {
+  await go(page, url);
   await page.getByLabel('Data JSON').fill(JSON.stringify(data));
   await page.getByRole('button', { name: 'Create record' }).click();
   await expect(page.getByRole('status')).toContainText('at revision 1');
@@ -57,9 +57,9 @@ async function checkKey(page: Page, secret: string) {
 }
 const definition = (properties: object) => ({ schema: { $schema: 'https://json-schema.org/draft/2020-12/schema', type: 'object',
   additionalProperties: false, required: ['title'], properties: { title: { type: 'string' }, ...properties } }, unique: [], filterable: [], sortable: [] });
-async function defineCollection(request: APIRequestContext, name: string) {
+async function defineCollection(request: APIRequestContext, name: string, overrides: object = {}) {
   const response = await request.put(`/v1${spaceUrl}/collections/${encodeURIComponent(name)}`,
-    { headers: { authorization: `Bearer ${ownerToken}` }, data: { ...definition({}), slug: name, version: 1 } });
+    { headers: { authorization: `Bearer ${ownerToken}` }, data: { ...definition({}), slug: name, version: 1, ...overrides } });
   expect(response.status()).toBe(201);
 }
 async function asAgent(browser: Browser, secret: string) {
@@ -392,6 +392,11 @@ test('owner grants an agent key, the API enforces it and revocation is verified'
   await expect(await checkKey(page, secret)).toContainText('Provider: rejected (UNAUTHENTICATED).');
   await go(agent, itemsUrl());
   await expect(agent.getByRole('alert')).toContainText('UNAUTHENTICATED');
+  // The rejected session is cleared, so sign-in is reachable without Sign out.
+  await agent.getByRole('link', { name: 'Sign in again' }).click();
+  await agent.getByLabel('Bearer credential').fill(ownerToken);
+  await agent.getByRole('button', { name: 'Sign in' }).click();
+  await expect(agent.getByRole('heading', { name: 'Spaces', exact: true })).toBeVisible();
 
   // A failed provider revocation leaves the key denied here, visibly pending cleanup.
   if (local) {
@@ -399,6 +404,7 @@ test('owner grants an agent key, the API enforces it and revocation is verified'
     await items.getByLabel('records:read').check();
     await page.getByRole('button', { name: 'Issue key' }).click();
     const interrupted = await page.getByLabel('Secret', { exact: true }).inputValue();
+    const interruptedId = (await page.getByRole('heading', { name: /^Key .* issued$/ }).innerText()).split(' ')[1];
     await go(page, `${spaceUrl}/access`);
     await failProviderRevocation();
     await page.getByRole('button', { name: /^Revoke key_/ }).click();
@@ -407,10 +413,9 @@ test('owner grants an agent key, the API enforces it and revocation is verified'
     const pending = await checkKey(page, interrupted);
     await expect(pending).toContainText('Provider: accepted as api-key.');
     await expect(pending).toContainText('This space: denied (NOT_FOUND).');
-    await page.getByRole('button', { name: /^Retry provider revocation for key_/ }).click();
+    await page.getByRole('button', { name: `Finish revocation ${interruptedId}`, exact: true }).click();
     await expect(page.getByRole('status')).toContainText('revoked');
     await expect(page.getByRole('table')).not.toContainText('provider cleanup pending');
-    await expect(page.getByRole('button', { name: /^Retry provider revocation/ })).toHaveCount(0);
     await expect(await checkKey(page, interrupted)).toContainText('Provider: rejected (UNAUTHENTICATED).');
   }
 
@@ -446,11 +451,17 @@ test('a revocation whose policy publication fails stays retryable after the prov
   const failed = page.getByRole('alert').filter({ hasText: 'Revocation did not finish' });
   await expect(failed).toBeVisible();
   await expect(page.getByRole('row').filter({ hasText: keyId })).toContainText('Provider key revoked');
+  await expect(failed.getByRole('button', { name: `Retry revocation of ${keyId}` })).toBeVisible();
   // Until the publication finishes, owner operations in the space are refused.
   expect((await request.post(`/v1${itemsUrl()}/records/count`, { headers, data: [] })).status()).toBe(403);
-  await failed.getByRole('button', { name: `Retry revocation of ${keyId}` }).click();
-  await expect(page.getByRole('status')).toContainText(`Key ${keyId} revoked.`);
+  // The failed response is gone after a reload and another submit; the key list still finishes it.
+  await page.reload();
+  await settle(page);
   await expect(await checkKey(page, secret)).toContainText('Provider: rejected (UNAUTHENTICATED).');
+  await expect(failed).toHaveCount(0);
+  expect((await request.post(`/v1${itemsUrl()}/records/count`, { headers, data: [] })).status()).toBe(403);
+  await page.getByRole('row').filter({ hasText: keyId }).getByRole('button', { name: `Finish revocation ${keyId}`, exact: true }).click();
+  await expect(page.getByRole('status')).toContainText(`Key ${keyId} revoked.`);
   expect((await request.post(`/v1${itemsUrl()}/records/count`, { headers, data: [] })).status()).toBe(200);
   await go(page, itemsUrl());
   await expect(page.getByRole('heading', { name: 'Records in items' })).toBeVisible();
@@ -474,6 +485,31 @@ test('long and invisible identifiers stay distinct, named and inside a small scr
     }
     await go(page, spaceUrl);
     for (const name of ['"\\u200b"', '"a\\ufeffb"', 'ab']) await expect(page.getByRole('link', { name, exact: true })).toBeVisible();
+
+    // Field names are displayed by the same rule, wherever they appear.
+    const fields = ['\u200b', '\u200c', 'f'.repeat(256)];
+    const named = ['"\\u200b"', '"\\u200c"', 'f'.repeat(256)];
+    await defineCollection(request, 'fields', { ...definition(Object.fromEntries(fields.map(field => [field, { type: 'string' }]))),
+      filterable: fields, sortable: fields });
+    await go(page, `${spaceUrl}/collections/fields/schema`);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await audit(page);
+    for (const name of named) {
+      await page.getByRole('button', { name: `Build ${name} index`, exact: true }).click();
+      await expect(page.getByRole('status')).toHaveText(`Index ${name} is ready.`);
+    }
+    for (const name of named) await expect(page.getByRole('listitem').getByText(name, { exact: true })).toBeVisible();
+    await createRecord(page, { title: 'Shown' }, `${spaceUrl}/collections/fields`);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await audit(page);
+    expect((await page.getByLabel('Field').first().locator('option').allInnerTexts()).slice(1).sort())
+      .toEqual(named.map(name => `${name} (string)`).sort());
+    expect((await page.getByLabel('Sort by').locator('option').allInnerTexts()).slice(1).sort()).toEqual([...named].sort());
+    for (const name of named) await expect(page.getByRole('columnheader', { name, exact: true })).toBeVisible();
+    await page.getByLabel('Sort by').selectOption({ label: '"\\u200c"' });
+    await page.getByRole('button', { name: 'Apply' }).click();
+    await expect(page).toHaveURL(/sort=%E2%80%8C/);
+    await expect(page.getByRole('heading', { name: /1 matching/ })).toBeVisible();
   } finally { spaceUrl = previous; }
 });
 

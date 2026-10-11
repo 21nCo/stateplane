@@ -12,12 +12,14 @@ export function selectors(url:URL):{space:string;collection:string;record:string
   return {space:decode(space),collection:decode(collection),record:decode(record)};
 }
 /** Display an identifier; selectors stay exact. A value with surrounding
- * whitespace or any non-printing character (Cc, Cf, Zl, Zp, or Zs other than
- * U+0020) is shown quoted, with each such character written as a \u escape. */
+ * whitespace, a leading quote or any non-printing character (Cc, Cf, Zl, Zp, or
+ * Zs other than U+0020) is shown as a JSON string, with each such character
+ * written as a \u escape. Only quoted displays begin with a quote, and JSON
+ * escapes quotes and backslashes, so two identifiers never display alike. */
 const hidden=/(?! )[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\p{Zs}]/u;
 const escape=(char:string)=>{ const code=char.codePointAt(0)!.toString(16);
   return code.length>4 ? `\\u{${code}}` : `\\u${code.padStart(4,'0')}`; };
-export const shown=(id:string)=>id===id.trim() && !hidden.test(id) ? id :
+export const shown=(id:string)=>id===id.trim() && !id.startsWith('"') && !hidden.test(id) ? id :
   JSON.stringify(id).replace(new RegExp(hidden.source,'gu'),escape);
 export const spaceHref=(space:string)=>`/spaces/${segment(space)}`;
 export const collectionHref=(space:string,collection:string)=>`${spaceHref(space)}/collections/${segment(collection)}`;

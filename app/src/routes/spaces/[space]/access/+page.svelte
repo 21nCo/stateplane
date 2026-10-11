@@ -12,7 +12,7 @@
 
 <svelte:head><title>Agent access · Stateplane</title></svelte:head>
 <h1 class="text-2xl font-semibold">Agent access</h1>
-<p class="hint mt-1">Agent keys act only through the collection capabilities granted here. Revocation takes effect on the next request.</p>
+<p class="hint mt-1">Agent keys act only through the collection capabilities granted here. Revocation takes effect on the next request. If a revocation was interrupted, Finish revocation completes it and is safe to repeat.</p>
 {#if form?.issued}
   <section aria-labelledby="issued" class="mt-4 rounded-lg border border-success bg-surface p-4" role="alert">
     <h2 id="issued" class="font-semibold">Key {form.issued.keyId} issued</h2>
@@ -42,8 +42,10 @@
               {#if key.revokedAt}<div class="hint">{key.providerRevokedAt ? 'Provider key revoked' : 'Denied here; provider cleanup pending'}</div>{/if}</td>
             <td>{#each key.grants as grant (grant.collectionId)}<div><span class="ident">{shown(grant.collectionId)}</span>: {grant.capabilities.join(', ')}</div>{:else}<span class="hint">none</span>{/each}</td>
             <td>{key.expiresAt}</td>
-            <td>{#if !key.revokedAt || !key.providerRevokedAt}<form method="POST" action="?/revoke"><input type="hidden" name="keyId" value={key.keyId} />
-              <button class="btn-danger" aria-label="{key.revokedAt ? 'Retry provider revocation for' : 'Revoke'} {key.keyId}">{key.revokedAt ? 'Retry revocation' : 'Revoke'}</button></form>{/if}</td>
+            <!-- A revoked key keeps an idempotent Finish control: the list cannot show whether
+                 the space's policy publication finished, and a repeat revocation completes it. -->
+            <td><form method="POST" action="?/revoke"><input type="hidden" name="keyId" value={key.keyId} />
+              <button class="btn-danger" aria-label="{key.revokedAt ? 'Finish revocation' : 'Revoke'} {key.keyId}">{key.revokedAt ? 'Finish revocation' : 'Revoke'}</button></form></td>
           </tr>{/each}</tbody>
         </table></Scroll>
       {:else}<p class="panel hint">No agent keys have been issued for this space.</p>{/if}
@@ -89,7 +91,7 @@
         {#if !form.check.kind && !form.check.rejected}<p class="hint">This does not confirm revocation. Check again when the provider is reachable.</p>{/if}
         {#if form.check.space}<p class={form.check.space.allowed ? 'text-success' : 'text-danger'}>This space: {form.check.space.allowed ? 'allowed' :
           `${form.check.space.denied ? 'denied' : 'not determined'} (${form.check.space.code})`}.</p>
-          {#if form.check.space.denied}<p class="hint">The provider still accepts this key. If it shows provider cleanup pending, retry its revocation.</p>
+          {#if form.check.space.denied}<p class="hint">The provider still accepts this key. Finish its revocation in the key list.</p>
           {:else if form.check.space.code==='FORBIDDEN'}<p class="hint">The key is authorized here, but holds no read, write or schema grant to check.</p>{/if}{/if}
       </div>{/if}
       <form method="POST" action="?/check" class="space-y-3">

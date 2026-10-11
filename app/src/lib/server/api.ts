@@ -25,12 +25,19 @@ function hostFor(context:Context):Host|undefined {
   return stateplaneHost(env,lease=>{ locals.hostLease=lease; });
 }
 
+/** A stored session the API rejects is cleared, so / offers sign-in again
+ * instead of returning the owner to pages that all fail. */
+function rejected(context:Context,options:Options,requestId:string|null=null):ApiResult<never> {
+  if (options.token===undefined) context.cookies.delete(sessionCookie,{path:'/'});
+  return {ok:false,status:401,error:{code:'UNAUTHENTICATED',retryable:false,requestId}};
+}
+
 /** Send one request through the same /v1 handler, identity check and services as
  * every other transport. The UI holds no authority of its own: the bearer in its
  * HttpOnly cookie is verified by the API on every call. */
 export async function api<T>(context:Context,method:string,path:readonly string[],options:Options={}):Promise<ApiResult<T>> {
   const token=options.token ?? context.cookies.get(sessionCookie);
-  if (!token || !bearer(token)) return {ok:false,status:401,error:{code:'UNAUTHENTICATED',retryable:false,requestId:null}};
+  if (!token || !bearer(token)) return rejected(context,options);
   const url=new URL(`/v1/${path.map(segment).join('/')}`,context.url.origin);
   for (const [name,value] of Object.entries(options.query??{})) if (value!==undefined) url.searchParams.set(name,value);
   const headers:Record<string,string>={authorization:`Bearer ${token}`,...options.headers};
@@ -45,6 +52,7 @@ export async function api<T>(context:Context,method:string,path:readonly string[
   const response=host ? await host.http(request) : unavailable();
   const value=await response.json().catch(()=>null) as {error?:Partial<ApiError>}|null;
   if (response.ok) return {ok:true,status:response.status,data:value as T};
+  if (value?.error?.code==='UNAUTHENTICATED') return rejected(context,options,value.error.requestId ?? null);
   return {ok:false,status:response.status,error:{code:value?.error?.code ?? 'PROVIDER_UNAVAILABLE',
     retryable:value?.error?.retryable===true,requestId:value?.error?.requestId ?? null}};
 }
