@@ -1,0 +1,89 @@
+app/src/routes/spaces/+page.svelte
+  s_b00b32c06373e1::t_240c651d43527b 3,18
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.svelte
+  s_b00b32c06373e1::t_2a682e8d3581eb 19-20,38,58,73-79,81-82,88-89,101,110-113
+app/src/routes/spaces/[space]/+page.server.ts
+  s_b00b32c06373e1::t_c65c2a35aed189 8,10
+app/src/routes/spaces/[space]/+page.svelte
+  s_b00b32c06373e1::t_b5e31c105b31db 3,40
+app/src/routes/spaces/[space]/access/+page.server.ts
+  h_a39f9495f9ec1d 49-50
+  s_b00b32c06373e1::t_eb1673d01e6bae 33,37
+  s_1900bb15a7199a::t_5e35b6ff514378 54
+  s_1900bb15a7199a::t_7ae73de4624294 51-52
+  s_1900bb15a7199a::t_84a94d75530399 53
+  s_b00b32c06373e1::t_a4b8cbba108483 48
+test/ui-errors.test.ts
+  s_b00b32c06373e1::t_b9d9a2771c0f50 1-17
+app/src/routes/spaces/[space]/collections/[collection]/events/+page.server.ts
+  s_b00b32c06373e1::t_e8b6b728b029c5 8,10
+app/src/routes/spaces/[space]/collections/[collection]/events/+page.svelte
+  s_b00b32c06373e1::t_9bb57013edb641 3,16
+app/src/routes/spaces/[space]/audit/+page.server.ts
+  s_b00b32c06373e1::t_6ae49c37325018 8,10
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.server.ts
+  s_b00b32c06373e1::t_8838caae473af6 4,37,39-42,44-46,54-55,60,62
+app/src/routes/spaces/[space]/collections/[collection]/+page.svelte
+  s_b00b32c06373e1::t_b2da8b620fb66f 3,15-17,71,103-110,112-114,117,119-121
+app/src/routes/spaces/[space]/collections/[collection]/+page.server.ts
+  s_b00b32c06373e1::t_ccbe93c452b476 5,25,27,43,46-50,52-57
+test/integration/owner-access-http.test.js
+  s_1900bb15a7199a::t_9c359e4158d635 49
+  s_b00b32c06373e1::t_32146eb3b4c154 54
+app/src/lib/errors.ts
+  s_b00b32c06373e1::t_66108a1c3ed47f 31-36
+app/src/routes/spaces/[space]/access/+page.svelte
+  s_b00b32c06373e1::t_3646e86aa5c7e7 4,30
+test/e2e/owner.spec.ts
+  s_ee79c2c2d33f35::t_c520db57d14d84 267
+  s_b00b32c06373e1::t_75a412c25c13c5 218,220-235,239-257,259-266,268-269,271-288,306-313,316,331-334,556-569,894-898,901,903-907
+app/src/lib/server/forms.ts
+  s_b00b32c06373e1::t_2cd4b0c2f5c9c2 1-2,21-38,40-48
+app/src/routes/spaces/[space]/audit/+page.svelte
+  s_b00b32c06373e1::t_4fe6608b93ce6b 3,12
+app/src/lib/components/Restart.svelte
+  s_b00b32c06373e1::t_772d53832429ee 1-9
+vitest.config.ts
+  s_b00b32c06373e1::t_b2f2401f992bcf 4
+app/src/routes/spaces/+page.server.ts
+  s_b00b32c06373e1::t_ccee425e639ebb 10,13
+package.json
+  s_b00b32c06373e1::t_b981a7e3c2e782 12,18
+app/src/lib/server/api.ts
+  s_b00b32c06373e1::t_cc315d2b8b69b7 36-39,42-43
+docs/ui.md
+  s_1900bb15a7199a::t_24318588b67c8b 17
+  s_b00b32c06373e1::t_0ba8752d1e4800 14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e2ed9e730ed2c59022a9cfaaaad2ef3c9e23fc5b",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_b00b32c06373e1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "08387dc8-8751-4fe7-bb0e-d0828228f71b",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_ee79c2c2d33f35": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_ee79c2c2d33f35",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
