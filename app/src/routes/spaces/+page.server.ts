@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { fail, redirect } from '@sveltejs/kit';
 import { api } from '$lib/server/api';
 import { given } from '$lib/server/forms';
-import { spaceHref } from '$lib/paths';
+import { carriedId, spaceHref } from '$lib/paths';
 import type { Page, Space } from '$lib/types';
 import type { Actions, PageServerLoad } from './$types';
 
@@ -23,7 +23,9 @@ export const actions:Actions={
     redirect(303,spaceHref(created.data.spaceId));
   },
   open:async({request})=>{
-    const spaceId=String((await request.formData()).get('spaceId')??'');
+    // The switcher carries a listed space ID; the open form sends the typed ID exactly.
+    const form=await request.formData();
+    const spaceId=form.has('listed') ? carriedId(String(form.get('listed'))) : String(form.get('spaceId')??'');
     if (!given(spaceId)) return fail(400,{open:{missing:true}});
     redirect(303,spaceHref(spaceId));
   }

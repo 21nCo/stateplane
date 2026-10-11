@@ -3,7 +3,7 @@
   import Scroll from '$lib/components/Scroll.svelte';
   import Status from '$lib/components/Status.svelte';
   import { page } from '$app/state';
-  import { collectionHref, segment, selectors } from '$lib/paths';
+  import { carry, collectionHref, segment, selectors } from '$lib/paths';
   let { data, form } = $props();
   const base=$derived(collectionHref(data.spaceId,selectors(page.url).collection));
   const counts=$derived((data.progress?.items ?? []).reduce<Record<string,number>>((all,item)=>({...all,[item.state]:(all[item.state] ?? 0)+1}),{}));
@@ -38,7 +38,10 @@
       <div class="grow"><label for="operation">Operation key</label><input id="operation" name="operation" value={data.operation} /></div>
       <button class="btn-quiet">Show progress</button>
     </form>
-    <Notice error={data.error ?? form?.cancelError} title="Progress could not be read" />
+    <Notice error={data.error} title="Progress could not be read" />
+    <Notice error={form?.cancelError} title="Remaining items were not cancelled">
+      {#if form?.cancelError?.code==='COMMIT_OUTCOME_UNKNOWN'}<p class="mt-1">The cancellation may have taken effect. <a class="link" href="?operation={encodeURIComponent(form.cancelKey ?? '')}">Reread progress</a> before cancelling again.</p>{/if}
+    </Notice>
     {#if data.progress}
       <p class="flex flex-wrap gap-2" role="status">
         <Status tone={data.progress.state==='active' ? 'neutral' : 'warning'}>{data.progress.state}</Status>
@@ -53,7 +56,7 @@
         </tr>{/each}</tbody>
       </table></Scroll>
       {#if data.progress.state==='active' && data.progress.items.some(item=>item.state==='pending')}
-        <form method="POST" action="?/cancel"><input type="hidden" name="operationKey" value={data.progress.operationKey} /><button class="btn-danger">Cancel remaining items</button></form>
+        <form method="POST" action="?/cancel"><input type="hidden" name="operationKey" value={carry(data.progress.operationKey)} /><button class="btn-danger">Cancel remaining items</button></form>
       {/if}
     {:else if !data.operation}
       <p class="hint">Enter an operation key to see its items.</p>

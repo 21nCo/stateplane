@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { fail } from '@sveltejs/kit';
 import { api } from '$lib/server/api';
-import { selectors } from '$lib/paths';
+import { carriedId, selectors } from '$lib/paths';
 import { given, jsonObject } from '$lib/server/forms';
 import { predicates } from '$lib/query';
 import type { FilterRow } from '$lib/query';
@@ -16,11 +16,12 @@ const path=(url:URL)=>{ const {space,collection}=selectors(url); return ['spaces
 export const load:PageServerLoad=async(event)=>{
   const params=event.url.searchParams;
   const collection=await api<Collection>(event,'GET',path(event.url));
-  const rows:FilterRow[]=params.getAll('field').map((field,index)=>({field,op:params.getAll('op')[index] ?? 'eq',
+  // Field names travel carried in the query, as the form and its links send them.
+  const rows:FilterRow[]=params.getAll('field').map((field,index)=>({field:carriedId(field),op:params.getAll('op')[index] ?? 'eq',
     value:params.getAll('value')[index] ?? ''})).filter(row=>row.field);
   const requested=Number(params.get('limit') ?? defaultLimit);
   const limit=Number.isInteger(requested) && requested>=1 && requested<=100 ? requested : defaultLimit;
-  const sort=params.get('sort') ? {field:params.get('sort')!,direction:params.get('dir')==='desc' ? 'desc' : 'asc'} : undefined;
+  const sort=params.get('sort') ? {field:carriedId(params.get('sort')!),direction:params.get('dir')==='desc' ? 'desc' : 'asc'} : undefined;
   const cursor=params.get('cursor') ?? undefined;
   const filterErrors:Record<number,string>={};
   const view={rows,limit,sort,cursor:cursor ?? null,limitInvalid:limit!==requested,idempotencyKey:`ui-${randomUUID()}`};

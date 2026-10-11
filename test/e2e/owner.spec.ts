@@ -513,6 +513,45 @@ test('long and invisible identifiers stay distinct, named and inside a small scr
   } finally { spaceUrl = previous; }
 });
 
+test('identifiers with line breaks travel through grant, index, filter and sort forms exactly', async ({ browser, page, request }) => {
+  const headers = { authorization: `Bearer ${ownerToken}` };
+  const created = await request.post('/v1/spaces', { headers, data: { spaceId: `sp_${randomUUID()}` } });
+  expect(created.status()).toBe(201);
+  const previous = spaceUrl;
+  spaceUrl = `/spaces/${(await created.json()).spaceId}`;
+  try {
+    for (const name of ['a\nb', 'a\r\nb']) await defineCollection(request, name);
+    await defineCollection(request, 'lines', { ...definition({ 'x\ny': { type: 'string' } }), filterable: ['x\ny'], sortable: ['x\ny'] });
+    // Native form posts submit a line break as CRLF; neither the no-script nor the
+    // enhanced issuance may grant "a\r\nb" when only "a\nb" is selected.
+    const native = await (await browser.newContext({ javaScriptEnabled: false })).newPage();
+    for (const issuer of [native, page]) {
+      await signIn(issuer, ownerToken);
+      await go(issuer, `${spaceUrl}/access`);
+      await issuer.getByRole('group', { name: 'Collection "a\\nb"' }).getByLabel('records:read').check();
+      await issuer.getByRole('button', { name: 'Issue key' }).click();
+      const agent = { authorization: `Bearer ${await issuer.getByLabel('Secret', { exact: true }).inputValue()}` };
+      expect((await request.get(`/v1${spaceUrl}/collections/a%0Ab`, { headers: agent })).status()).toBe(200);
+      expect((await request.get(`/v1${spaceUrl}/collections/a%0D%0Ab`, { headers: agent })).status()).toBe(404);
+    }
+
+    // No-script form posts and GET forms reach the field "x\ny"; so does the hydrated filter.
+    await go(native, `${spaceUrl}/collections/lines/schema`);
+    await native.getByRole('button', { name: 'Build "x\\ny" index', exact: true }).click();
+    await expect(native.getByRole('status')).toHaveText('Index "x\\ny" is ready.');
+    for (const value of ['v', 'w']) await createRecord(page, { title: value, 'x\ny': value }, `${spaceUrl}/collections/lines`);
+    for (const viewer of [native, page]) {
+      await go(viewer, `${spaceUrl}/collections/lines`);
+      await viewer.getByLabel('Field').first().selectOption({ label: '"x\\ny" (string)' });
+      await viewer.getByLabel('Value').first().fill('w');
+      await viewer.getByLabel('Sort by').selectOption({ label: '"x\\ny"' });
+      await viewer.getByRole('button', { name: 'Apply' }).click();
+      await expect(viewer.getByRole('heading', { name: /1 matching/ })).toBeVisible();
+      await expect(viewer.getByLabel('Sort by').locator('option:checked')).toHaveText('"x\\ny"');
+    }
+  } finally { spaceUrl = previous; }
+});
+
 test('ingestion reports per-item progress', async ({ page }) => {
   await signIn(page, ownerToken);
   await go(page, `${itemsUrl()}/batches`);

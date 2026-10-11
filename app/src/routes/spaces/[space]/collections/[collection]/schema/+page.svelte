@@ -2,7 +2,7 @@
   import DefinitionForm from '$lib/components/DefinitionForm.svelte';
   import Notice from '$lib/components/Notice.svelte';
   import Status from '$lib/components/Status.svelte';
-  import { collectionHref, shown } from '$lib/paths';
+  import { carry, collectionHref, shown } from '$lib/paths';
   let { data, form } = $props();
   const editable=$derived(data.collection ? (({slug:_slug,version:_version,...rest})=>JSON.stringify(rest,null,2))(data.collection.definition) : '');
   const records=$derived(collectionHref(data.spaceId,data.collection?.definition.slug ?? ''));
@@ -22,7 +22,7 @@
         {#each data.collection.ready as field (field)}<li class="flex items-center justify-between gap-2"><span class="ident">{shown(field)}</span><Status tone="success">ready</Status></li>{/each}
         {#each data.collection.pending as field (field)}<li class="flex flex-wrap items-center justify-between gap-2">
           <span class="ident">{shown(field)}</span><Status tone="warning">pending</Status>
-          <form method="POST" action="?/backfill" class="min-w-0"><input type="hidden" name="field" value={field} /><button class="btn-quiet"><span class="min-w-0">Build <span class="ident">{shown(field)}</span> index</span></button></form>
+          <form method="POST" action="?/backfill" class="min-w-0"><input type="hidden" name="field" value={carry(field)} /><button class="btn-quiet"><span class="min-w-0">Build <span class="ident">{shown(field)}</span> index</span></button></form>
         </li>{/each}
       </ul>
       {#if !data.collection.ready.length && !data.collection.pending.length}<p class="hint">No filter or sort fields are declared.</p>{/if}

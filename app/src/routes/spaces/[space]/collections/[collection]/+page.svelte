@@ -3,7 +3,7 @@
   import Scroll from '$lib/components/Scroll.svelte';
   import { fieldKind, operators } from '$lib/query';
   import { page } from '$app/state';
-  import { collectionHref, segment, selectors, shown } from '$lib/paths';
+  import { carry, collectionHref, segment, selectors, shown } from '$lib/paths';
   let { data, form } = $props();
   const definition=$derived(data.collection?.definition);
   const base=$derived(collectionHref(data.spaceId,selectors(page.url).collection));
@@ -14,8 +14,8 @@
   const rows=$derived([...data.rows,{field:'',op:'eq',value:''}]);
   const query=$derived.by(()=>{
     const params=new URLSearchParams();
-    for (const row of data.rows) { params.append('field',row.field); params.append('op',row.op); params.append('value',row.value); }
-    if (data.sort) { params.set('sort',data.sort.field); params.set('dir',data.sort.direction); }
+    for (const row of data.rows) { params.append('field',carry(row.field)); params.append('op',row.op); params.append('value',row.value); }
+    if (data.sort) { params.set('sort',carry(data.sort.field)); params.set('dir',data.sort.direction); }
     params.set('limit',String(data.limit));
     return params;
   });
@@ -40,7 +40,7 @@
             <legend class="sr-only">Filter {index+1}</legend>
             <div><label for="field-{index}">Field</label>
               <select id="field-{index}" name="field"><option value="">{index===data.rows.length ? 'Add a filter…' : 'Remove filter'}</option>
-                {#each filterable as field (field)}<option value={field} selected={field===row.field}>{shown(field)} ({fieldKind(definition,field)})</option>{/each}</select></div>
+                {#each filterable as field (field)}<option value={carry(field)} selected={field===row.field}>{shown(field)} ({fieldKind(definition,field)})</option>{/each}</select></div>
             <div><label for="op-{index}">Operator</label>
               <select id="op-{index}" name="op">{#each operators as op (op)}<option selected={op===row.op}>{op}</option>{/each}</select></div>
             <div><label for="value-{index}">Value</label>
@@ -52,7 +52,7 @@
         <p class="hint">Use <code>in</code> with comma-separated values; text matches exactly, including spaces after commas; <code>isNull</code> ignores the value.</p>
         <div class="grid gap-2 sm:grid-cols-3">
           <div><label for="sort">Sort by</label>
-            <select id="sort" name="sort"><option value="">Creation order</option>{#each sortable as field (field)}<option value={field} selected={field===data.sort?.field}>{shown(field)}</option>{/each}</select></div>
+            <select id="sort" name="sort"><option value="">Creation order</option>{#each sortable as field (field)}<option value={carry(field)} selected={field===data.sort?.field}>{shown(field)}</option>{/each}</select></div>
           <div><label for="dir">Direction</label>
             <select id="dir" name="dir"><option value="asc">Ascending</option><option value="desc" selected={data.sort?.direction==='desc'}>Descending</option></select></div>
           <div><label for="limit">Page size (1–100)</label>

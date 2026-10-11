@@ -1,7 +1,7 @@
 import { fail } from '@sveltejs/kit';
 import { api } from '$lib/server/api';
 import { checkKey } from '$lib/server/keycheck';
-import { selectors } from '$lib/paths';
+import { carriedId, selectors } from '$lib/paths';
 import type { ApiError } from '$lib/errors';
 import type { Collection, Page } from '$lib/types';
 import type { Actions, PageServerLoad } from './$types';
@@ -43,7 +43,9 @@ export const actions:Actions={
     const form=await event.request.formData();
     const days=Number(form.get('days'));
     // Collection IDs are exact API selectors: " items " and "items" are different collections.
-    const grants=form.getAll('collection').map((value,index)=>({collectionId:String(value),
+    // Listed IDs are carried; the free-text name of the last group is sent as typed.
+    const ids=[...form.getAll('collection').map(value=>carriedId(String(value))),String(form.get('other-collection')??'')];
+    const grants=ids.map((collectionId,index)=>({collectionId,
       capabilities:form.getAll(`capabilities-${index}`).map(String).filter(item=>grantable.includes(item))}))
       .filter(grant=>grant.collectionId && grant.capabilities.length);
     if (!lifetimes.has(days) || !grants.length) return fail(400,{issueInvalid:true});
@@ -55,7 +57,7 @@ export const actions:Actions={
     return issued.ok ? {issued:issued.data} : fail(issued.status,{issueError:issued.error});
   },
   revoke:async(event)=>{
-    const keyId=String((await event.request.formData()).get('keyId')??'');
+    const keyId=carriedId(String((await event.request.formData()).get('keyId')??''));
     const result=await api(event,'DELETE',['spaces',selectors(event.url).space,'agent-keys',keyId]);
     // The failed key stays retryable here whatever the key list shows: a repeat
     // DELETE finishes the provider revocation and the space's policy publication.

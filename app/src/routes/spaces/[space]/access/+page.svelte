@@ -3,7 +3,7 @@
   import Notice from '$lib/components/Notice.svelte';
   import Scroll from '$lib/components/Scroll.svelte';
   import Status from '$lib/components/Status.svelte';
-  import { shown } from '$lib/paths';
+  import { carry, shown } from '$lib/paths';
   let { data, form } = $props();
   const capabilities=['records:read','records:write','events:read','schema:write','space:admin'];
   const rows=$derived([...data.collections,'']);
@@ -28,7 +28,7 @@
     <Notice error={data.error} title="Keys could not be listed" />
     <Notice error={form?.revokeError} title="Revocation did not finish">
       <p class="mt-1">Part of the revocation may have taken effect, whatever the key list shows. Retry until it finishes.</p>
-      {#if form?.revokeKeyId}<form method="POST" action="?/revoke" class="mt-2"><input type="hidden" name="keyId" value={form.revokeKeyId} />
+      {#if form?.revokeKeyId}<form method="POST" action="?/revoke" class="mt-2"><input type="hidden" name="keyId" value={carry(form.revokeKeyId)} />
         <button class="btn-danger">Retry revocation of <span class="ident">{form.revokeKeyId}</span></button></form>{/if}
     </Notice>
     {#if form?.revoked}<p role="status" class="text-sm text-success">Key {form.revoked} revoked.</p>{/if}
@@ -44,7 +44,7 @@
             <td>{key.expiresAt}</td>
             <!-- A revoked key keeps an idempotent Finish control: the list cannot show whether
                  the space's policy publication finished, and a repeat revocation completes it. -->
-            <td><form method="POST" action="?/revoke"><input type="hidden" name="keyId" value={key.keyId} />
+            <td><form method="POST" action="?/revoke"><input type="hidden" name="keyId" value={carry(key.keyId)} />
               <button class="btn-danger" aria-label="{key.revokedAt ? 'Finish revocation' : 'Revoke'} {key.keyId}">{key.revokedAt ? 'Finish revocation' : 'Revoke'}</button></form></td>
           </tr>{/each}</tbody>
         </table></Scroll>
@@ -71,8 +71,8 @@
         {#each rows as slug, index (index)}
           <fieldset class="space-y-1 rounded border border-line p-2">
             <legend class="min-w-0 px-1 text-sm font-medium [overflow-wrap:anywhere]">{slug ? `Collection ${shown(slug)}` : 'Another collection'}</legend>
-            {#if slug}<input type="hidden" name="collection" value={slug} />{:else}
-              <label for="other-collection">Collection name</label><input id="other-collection" name="collection" />{/if}
+            {#if slug}<input type="hidden" name="collection" value={carry(slug)} />{:else}
+              <label for="other-collection">Collection name</label><input id="other-collection" name="other-collection" />{/if}
             {#each capabilities as capability (capability)}
               <label class="flex items-center gap-2 font-normal"><input type="checkbox" name="capabilities-{index}" value={capability} /> {capability}</label>
             {/each}
@@ -91,7 +91,7 @@
         {#if !form.check.kind && !form.check.rejected}<p class="hint">This does not confirm revocation. Check again when the provider is reachable.</p>{/if}
         {#if form.check.space}<p class={form.check.space.allowed ? 'text-success' : 'text-danger'}>This space: {form.check.space.allowed ? 'allowed' :
           `${form.check.space.denied ? 'denied' : 'not determined'} (${form.check.space.code})`}.</p>
-          {#if form.check.space.denied}<p class="hint">The provider still accepts this key. Finish its revocation in the key list.</p>
+          {#if form.check.space.denied}<p class="hint">The provider still accepts this key, but this space does not authorize it. A key from another space is never authorized here; if it is a key of this space that you revoked, Finish its revocation in the key list.</p>
           {:else if form.check.space.code==='FORBIDDEN'}<p class="hint">The key is authorized here, but holds no read, write or schema grant to check.</p>{/if}{/if}
       </div>{/if}
       <form method="POST" action="?/check" class="space-y-3">

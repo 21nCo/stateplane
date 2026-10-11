@@ -1,6 +1,6 @@
 import { fail } from '@sveltejs/kit';
 import { api } from '$lib/server/api';
-import { selectors } from '$lib/paths';
+import { carriedId, selectors } from '$lib/paths';
 import { jsonObject } from '$lib/server/forms';
 import type { Collection } from '$lib/types';
 import type { Actions, PageServerLoad } from './$types';
@@ -31,7 +31,7 @@ export const actions:Actions={
       uncertain:uncertain || saved.error.code==='COMMIT_OUTCOME_UNKNOWN'});
   },
   backfill:async(event)=>{
-    const field=String((await event.request.formData()).get('field')??'');
+    const field=carriedId(String((await event.request.formData()).get('field')??''));
     for (let batch=0;batch<backfillBatches;batch++) {
       const result=await api<{ready:boolean}>(event,'POST',[...path(event.url),'indexes',field]);
       if (!result.ok) return fail(result.status,{field,backfillError:result.error});

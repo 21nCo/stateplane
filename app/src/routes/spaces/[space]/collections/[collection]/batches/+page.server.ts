@@ -1,6 +1,6 @@
 import { fail, redirect } from '@sveltejs/kit';
 import { api } from '$lib/server/api';
-import { selectors } from '$lib/paths';
+import { carriedId, selectors } from '$lib/paths';
 import { given } from '$lib/server/forms';
 import type { Receipt } from '$lib/types';
 import type { Actions, PageServerLoad, RequestEvent } from './$types';
@@ -35,9 +35,9 @@ export const actions:Actions={
     redirect(303,here(event,operationKey));
   },
   cancel:async(event)=>{
-    const operationKey=String((await event.request.formData()).get('operationKey')??'');
+    const operationKey=carriedId(String((await event.request.formData()).get('operationKey')??''));
     const result=await api<Progress>(event,'DELETE',batchPath(event,operationKey));
-    if (!result.ok) return fail(result.status,{cancelError:result.error});
+    if (!result.ok) return fail(result.status,{cancelError:result.error,cancelKey:operationKey});
     redirect(303,here(event,operationKey));
   }
 };

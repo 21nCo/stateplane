@@ -32,7 +32,7 @@ import { stateplaneHost } from '../app/src/lib/server/host';
 import { api } from '../app/src/lib/server/api';
 import { checkKey } from '../app/src/lib/server/keycheck';
 import { jsonObject } from '../app/src/lib/server/forms';
-import { segment, selectors, shown } from '../app/src/lib/paths';
+import { carriedId, carry, segment, selectors, shown } from '../app/src/lib/paths';
 import { predicates } from '../app/src/lib/query';
 import { handle } from '../app/src/hooks.server';
 
@@ -155,6 +155,22 @@ it('an identifier with any non-printing character is displayed quoted and escape
   expect(shown('a\u00a0b\u2028c\u{e0001}')).toBe('"a\\u00a0b\\u2028c\\u{e0001}"');
   expect(shown(' items ')).toBe('" items "');
   expect(new Set(['ab', 'a\ufeffb', 'a\u200bb', 'a\u2060b'].map(shown)).size).toBe(4);
+});
+
+it('a default-ignorable character is escaped even outside the format and separator categories', () => {
+  expect(shown('a\u034fb')).toBe('"a\\u034fb"');
+  expect(shown('a\ufe0f')).toBe('"a\\ufe0f"');
+  expect(shown('\u3164')).toBe('"\\u3164"');
+  expect(new Set(['ab', 'a\u034fb', 'a\ufe0fb', 'a\u3164b'].map(shown)).size).toBe(4);
+});
+
+it('a listed identifier survives the line-break rewriting of form submission exactly', () => {
+  // Browsers submit every CR, LF and CRLF in form data as CRLF.
+  const submitted = (value: string) => value.replace(/\r\n|\r|\n/g, '\r\n');
+  const ids = ['a\nb', 'a\r\nb', 'a\rb', '%', '%25', '%0A', 'a%0D%0Ab', '\u200b', 'plain'];
+  for (const id of ids) expect(carriedId(submitted(carry(id)))).toBe(id);
+  expect(new Set(ids.map(carry)).size).toBe(ids.length);
+  expect(carry('\u200c')).toBe('\u200c');
 });
 
 it('no two identifiers share a display, even when one spells out the quoted form of the other', () => {
