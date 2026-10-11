@@ -1,0 +1,61 @@
+app/src/lib/server/forms.ts
+  s_ee79c2c2d33f35::t_c3005d9fbe53c7 1-2,19-31
+app/src/routes/spaces/+page.svelte
+  s_ee79c2c2d33f35::t_a35ffc518ac919 17
+app/src/routes/spaces/[space]/access/+page.server.ts
+  s_ee79c2c2d33f35::t_47fa452b4cc802 2,33,35
+app/src/app.html
+  s_ee79c2c2d33f35::t_dee78fd7d2ab10 2
+app/src/routes/spaces/[space]/collections/[collection]/+page.server.ts
+  s_ee79c2c2d33f35::t_5de4422967c4c8 3,5,25,31,43,45-54
+app/src/routes/spaces/[space]/collections/[collection]/batches/+page.server.ts
+  s_ee79c2c2d33f35::t_12abcfe42402aa 35-37
+test/e2e/owner.spec.ts
+  s_ee79c2c2d33f35::t_c520db57d14d84 206-210,212-215,217-271,345-352,629-660,804-821
+app/src/hooks.server.ts
+  s_ee79c2c2d33f35::t_aa40523396b787 4-10,17
+app/src/lib/errors.ts
+  s_ee79c2c2d33f35::t_6adb045db121eb 12,31-32
+docs/ui.md
+  s_ee79c2c2d33f35::t_779316f3ef8603 14,18
+app/src/routes/spaces/[space]/access/+page.svelte
+  s_ee79c2c2d33f35::t_7031bdad446308 28-30
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.svelte
+  s_ee79c2c2d33f35::t_fb64b7fe99079c 6,20-22,74,77-78,81-85
+app/src/routes/spaces/[space]/collections/[collection]/batches/+page.svelte
+  s_ee79c2c2d33f35::t_4e730331323e81 7,10-14,16,34-35,44,47,51,53,57,59,64-65
+app/src/routes/spaces/[space]/+page.server.ts
+  s_ee79c2c2d33f35::t_33c4899a4b52c9 2,8-9
+app/src/routes/spaces/[space]/collections/[collection]/events/+page.svelte
+  s_ee79c2c2d33f35::t_9f1024ff9ddd46 14-16
+app/src/routes/spaces/[space]/+page.svelte
+  s_ee79c2c2d33f35::t_849138880f3c98 38-40
+app/src/routes/spaces/+page.server.ts
+  s_ee79c2c2d33f35::t_9e92b3df8b5ac2 3,10-11
+app/src/routes/spaces/[space]/collections/[collection]/+page.svelte
+  s_ee79c2c2d33f35::t_996bad800954e3 7,14,101,106,109-113
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.server.ts
+  s_ee79c2c2d33f35::t_eb74877c121a54 4,31-32,37,39-45
+app/src/routes/spaces/[space]/audit/+page.server.ts
+  s_ee79c2c2d33f35::t_124f3c99408b11 1,8-9
+app/src/routes/spaces/[space]/collections/[collection]/events/+page.server.ts
+  s_ee79c2c2d33f35::t_151ff4711af00a 1,8-9
+app/src/lib/server/api.ts
+  s_ee79c2c2d33f35::t_c7ac7b4de4a982 35-42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9182efe2125d5b788315f56e3278a6e31f7be357",
+  "prompts": {},
+  "sessions": {
+    "s_ee79c2c2d33f35": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_ee79c2c2d33f35",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
