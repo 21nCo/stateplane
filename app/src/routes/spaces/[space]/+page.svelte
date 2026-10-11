@@ -1,5 +1,6 @@
 <script lang="ts">
   import Notice from '$lib/components/Notice.svelte';
+  import Restart from '$lib/components/Restart.svelte';
   import Status from '$lib/components/Status.svelte';
   import { collectionHref, shown, spaceHref } from '$lib/paths';
   let { data, form } = $props();
@@ -36,7 +37,7 @@
       {#if data.space}<a class="btn" href="{base}/new-collection">Define collection</a>{/if}
     </div>
     <Notice error={data.error} title="Collections could not be listed">
-      {#if data.cursor}<p class="mt-1"><a class="link" href={base}>Start again from the first page</a></p>{/if}
+      <Restart paged={data.paged} error={data.error} href={base} />
     </Notice>
     {#if data.collections}
       {#if data.collections.items.length}

@@ -1,4 +1,5 @@
-import { randomUUID } from 'node:crypto';
+import { uncertain } from '../errors';
+import type { ApiError } from '$lib/errors';
 
 // JSON.parse reads 1e400 as Infinity, which re-serializes as null. Such a value
 // is rejected on its field so the API never receives a different value.
@@ -17,15 +18,31 @@ export function jsonObject(raw:FormDataEntryValue|null):Record<string,unknown>|n
  * included, is sent exactly; the API alone normalizes and validates it. */
 export const given=(value:string)=>value!=='';
 
-/** A write key identifies one exact request. A failed write returns its key beside
- * "sent", the canonical JSON of that request; the form posts both back. A request
- * that differs from "sent" gets a new key, so a changed draft is never refused as
- * a key reuse, and "Retry unchanged" resends exactly "sent" under its key. */
-export const retainedSent=(form:FormData)=>{ const sent=form.get('sent'); return typeof sent==='string' ? sent : null; };
-export function writeIdentity(form:FormData,request:unknown) {
-  const sent=JSON.stringify(request);
-  const retained=retainedSent(form);
-  return {sent,idempotencyKey:retained===null || retained===sent ? String(form.get('idempotencyKey')??'') : `ui-${randomUUID()}`};
+/** A write whose outcome is unknown stays explicit page state, separate from the
+ * draft and from the latest result: its key and "sent", the canonical JSON of its
+ * exact request, which the form posts back as pendingKey and pendingSent. */
+export interface Unresolved { key:string; sent:string }
+export const unresolved=(form:FormData):Unresolved|null=>{
+  const key=form.get('pendingKey'), sent=form.get('pendingSent');
+  return typeof key==='string' && typeof sent==='string' && jsonObject(sent) ? {key,sent} : null;
+};
+
+/** One write submission. "Retry unchanged" resends the unresolved request under
+ * its key; any other submission is the draft, a new request under the key made
+ * when the page loaded. A malformed draft (request null) is never sent and leaves
+ * the unresolved write as it was. */
+export function writeAttempt(form:FormData,draft:Record<string,unknown>|null) {
+  const pending=unresolved(form);
+  const retry=form.get('intent')==='retry' && pending!==null;
+  const request=retry ? jsonObject(pending.sent) : draft;
+  return {pending,retry,request,key:retry ? pending.key : String(form.get('idempotencyKey')??'')};
 }
-/** The retained request when the owner chose "Retry unchanged", else null. */
-export const retried=(form:FormData)=>form.get('intent')==='retry' ? jsonObject(form.get('sent')) : null;
+type Attempt=ReturnType<typeof writeAttempt>;
+
+/** The unresolved write after a failed attempt. An uncertain result leaves this
+ * attempt unresolved; for a new request the owner chose to send instead, beside
+ * the stated consequence. A definitive result for the retried request resolves
+ * it. A new request the API refused wrote nothing, so the earlier one stays
+ * unresolved; only a receipt for a new request ends it, and the page says so. */
+export const unresolvedAfter=(attempt:Attempt,error:ApiError):Unresolved|null=>
+  uncertain(error) ? {key:attempt.key,sent:JSON.stringify(attempt.request)} : attempt.retry ? null : attempt.pending;

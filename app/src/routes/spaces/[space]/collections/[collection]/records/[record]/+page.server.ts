@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { fail, redirect } from '@sveltejs/kit';
 import { api } from '$lib/server/api';
-import { jsonObject, retainedSent, retried, writeIdentity } from '$lib/server/forms';
+import { jsonObject, unresolved, unresolvedAfter, writeAttempt } from '$lib/server/forms';
 import { collectionHref, selectors } from '$lib/paths';
 import type { Receipt, StoredRecord } from '$lib/types';
 import type { Actions, PageServerLoad, RequestEvent } from './$types';
@@ -34,18 +34,16 @@ const stale=(code:string)=>['REVISION_CONFLICT','NOT_FOUND','IDEMPOTENCY_MISMATC
 export const actions:Actions={
   save:async(event)=>{
     const form=await event.request.formData();
-    // The editor's text always stays the draft; a retry resends the retained request instead.
+    // The editor's text always stays the draft; a retry resends the unresolved request instead.
     const raw=String(form.get('data')??'');
-    const retry=retried(form);
-    const expectedRevision=retry ? Number(retry.expectedRevision) : Number(form.get('expectedRevision'));
-    const data=retry ? jsonObject(JSON.stringify(retry.data)) : jsonObject(raw);
-    // A rejected draft keeps any retained request and key for a later retry.
-    if (!data) return fail(400,{raw,expectedRevision,idempotencyKey:String(form.get('idempotencyKey')??''),sent:retainedSent(form),invalid:true});
-    const {sent,idempotencyKey}=writeIdentity(form,{expectedRevision,data});
-    const values={raw,idempotencyKey,expectedRevision,sent};
+    const draft=jsonObject(raw);
+    const attempt=writeAttempt(form,draft ? {expectedRevision:Number(form.get('expectedRevision')),data:draft} : null);
+    if (!attempt.request) return fail(400,{raw,expectedRevision:Number(form.get('expectedRevision')),pending:attempt.pending,invalid:true});
+    const {expectedRevision,data}=attempt.request as {expectedRevision:number;data:Record<string,unknown>};
     const result=await api<Receipt>(event,'POST',recordPath(event.url).slice(0,5),
-      {body:{operation:'replace',id:selectors(event.url).record,expectedRevision,idempotencyKey,data}});
-    if (result.ok) return {saved:result.data};
+      {body:{operation:'replace',id:selectors(event.url).record,expectedRevision,idempotencyKey:attempt.key,data}});
+    if (result.ok) return {saved:result.data,abandoned:!attempt.retry && attempt.pending!==null};
+    const values={raw,expectedRevision,pending:unresolvedAfter(attempt,result.error)};
     if (stale(result.error.code)) return conflict(event,values);
     return fail(result.status,{...values,error:result.error});
   },
@@ -53,12 +51,14 @@ export const actions:Actions={
     const form=await event.request.formData();
     const idempotencyKey=String(form.get('idempotencyKey')??'');
     const expectedRevision=Number(form.get('expectedRevision'));
+    // A failed delete leaves an unresolved save on the page.
+    const pending=unresolved(form);
     const {space,collection,record}=selectors(event.url);
     const result=await api<Receipt>(event,'POST',recordPath(event.url).slice(0,5),
       {body:{operation:'delete',id:record,expectedRevision,idempotencyKey}});
     if (result.ok) redirect(303,collectionHref(space,collection));
-    if (stale(result.error.code)) return conflict(event,{deleting:true,idempotencyKey,expectedRevision});
+    if (stale(result.error.code)) return conflict(event,{deleting:true,idempotencyKey,expectedRevision,pending});
     // The same key and revision stay with the form so an uncertain delete can replay.
-    return fail(result.status,{deleting:true,idempotencyKey,expectedRevision,deleteError:result.error});
+    return fail(result.status,{deleting:true,idempotencyKey,expectedRevision,pending,deleteError:result.error});
   }
 };

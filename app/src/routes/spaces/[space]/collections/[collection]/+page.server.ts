@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { fail } from '@sveltejs/kit';
 import { api, pageCursor } from '$lib/server/api';
 import { carriedId, selectors } from '$lib/paths';
-import { given, jsonObject, retainedSent, retried, writeIdentity } from '$lib/server/forms';
+import { given, jsonObject, unresolvedAfter, writeAttempt } from '$lib/server/forms';
 import { predicates } from '$lib/query';
 import type { FilterRow } from '$lib/query';
 import type { ApiError } from '$lib/errors';
@@ -22,9 +22,9 @@ export const load:PageServerLoad=async(event)=>{
   const requested=Number(params.get('limit') ?? defaultLimit);
   const limit=Number.isInteger(requested) && requested>=1 && requested<=100 ? requested : defaultLimit;
   const sort=params.get('sort') ? {field:carriedId(params.get('sort')!),direction:params.get('dir')==='desc' ? 'desc' : 'asc'} : undefined;
-  const {cursor,rejected}=pageCursor(event.url);
+  const {cursor,paged,rejected}=pageCursor(event.url);
   const filterErrors:Record<number,string>={};
-  const view={rows,limit,sort,cursor:cursor ?? null,limitInvalid:limit!==requested,idempotencyKey:`ui-${randomUUID()}`};
+  const view={rows,limit,sort,cursor:cursor ?? null,paged,limitInvalid:limit!==requested,idempotencyKey:`ui-${randomUUID()}`};
   if (!collection.ok) return {...view,collection:null,error:collection.error,filterErrors,page:null,count:null};
   const built=predicates(collection.data.definition,rows);
   if (Object.keys(built.errors).length) return {...view,collection:collection.data,error:null,filterErrors:built.errors,page:null,count:null};
@@ -40,20 +40,20 @@ export const load:PageServerLoad=async(event)=>{
 export const actions:Actions={
   create:async(event)=>{
     const form=await event.request.formData();
-    // The editor's text always stays the draft; a retry resends the retained request instead.
+    // The editor's text always stays the draft; a retry resends the unresolved request instead.
     const raw=String(form.get('data')??'');
-    const retry=retried(form);
     const draftKey=String(form.get('externalKey')??'');
-    const externalKey=retry ? String(retry.externalKey) : draftKey;
-    const data=retry ? jsonObject(JSON.stringify(retry.data)) : jsonObject(raw);
-    // A rejected draft keeps any retained request and key for a later retry.
-    const kept={idempotencyKey:String(form.get('idempotencyKey')??''),sent:retainedSent(form)};
-    const blank={raw,externalKey:draftKey,invalid:!data,error:null as ApiError|null};
-    if (!data) return fail(400,{create:{...blank,...kept}});
-    const {sent,idempotencyKey}=writeIdentity(form,{externalKey,data});
-    const values={...blank,idempotencyKey,sent};
+    const draft=jsonObject(raw);
+    const attempt=writeAttempt(form,draft ? {externalKey:draftKey,data:draft} : null);
+    const values={raw,externalKey:draftKey,invalid:!attempt.request,error:null as ApiError|null,pending:attempt.pending};
+    if (!attempt.request) return fail(400,{create:values});
+    const {externalKey,data}=attempt.request as {externalKey:string;data:Record<string,unknown>};
     const result=await api<Receipt>(event,'POST',[...path(event.url),'records'],
-      {body:{operation:'create',idempotencyKey,data,...(given(externalKey) ? {externalKey} : {})}});
-    return result.ok ? {created:result.data} : fail(result.status,{create:{...values,error:result.error}});
+      {body:{operation:'create',idempotencyKey:attempt.key,data,...(given(externalKey) ? {externalKey} : {})}});
+    // A new request created while an earlier one was unresolved is reported with it;
+    // a retry sent the earlier request, so the unsent draft stays in the editor.
+    if (result.ok) return {created:result.data,abandoned:!attempt.retry && attempt.pending!==null,
+      draft:attempt.retry ? {raw,externalKey:draftKey} : null};
+    return fail(result.status,{create:{...values,error:result.error,pending:unresolvedAfter(attempt,result.error)}});
   }
 };

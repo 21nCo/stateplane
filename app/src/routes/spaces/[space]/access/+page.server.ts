@@ -30,11 +30,11 @@ async function listCollections(event:Parameters<PageServerLoad>[0]) {
 }
 
 export const load:PageServerLoad=async(event)=>{
-  const {cursor,rejected}=pageCursor(event.url);
+  const {cursor,paged,rejected}=pageCursor(event.url);
   const [keys,collections]=await Promise.all([
     rejected ?? api<{items:AgentKey[];nextCursor:string|null}>(event,'GET',['spaces',selectors(event.url).space,'agent-keys'],{query:{cursor}}),
     listCollections(event)]);
-  return {cursor:cursor ?? null,keys:keys.ok ? keys.data : null,error:keys.ok ? null : keys.error,
+  return {cursor:cursor ?? null,paged,keys:keys.ok ? keys.data : null,error:keys.ok ? null : keys.error,
     collections:collections.slugs,moreCollections:collections.more,collectionsError:collections.error};
 };
 
@@ -45,9 +45,13 @@ export const actions:Actions={
     // Collection IDs are exact API selectors: " items " and "items" are different collections.
     // Listed IDs are carried; the free-text name of the last group is sent as typed.
     const ids=[...form.getAll('collection').map(value=>carriedId(String(value))),String(form.get('other-collection')??'')];
-    const grants=ids.map((collectionId,index)=>({collectionId,
-      capabilities:form.getAll(`capabilities-${index}`).map(String).filter(item=>grantable.includes(item))}))
-      .filter(grant=>grant.collectionId && grant.capabilities.length);
+    // A collection named in more than one group gets one grant with every chosen capability.
+    const chosen=new Map<string,Set<string>>();
+    ids.forEach((collectionId,index)=>{
+      const capabilities=form.getAll(`capabilities-${index}`).map(String).filter(item=>grantable.includes(item));
+      if (collectionId && capabilities.length) chosen.set(collectionId,new Set([...chosen.get(collectionId) ?? [],...capabilities]));
+    });
+    const grants=[...chosen].map(([collectionId,capabilities])=>({collectionId,capabilities:[...capabilities]}));
     if (!lifetimes.has(days) || !grants.length) return fail(400,{issueInvalid:true});
     const expiresAt=new Date(Date.now()+days*86_400_000).toISOString();
     const issued=await api<{keyId:string;secret:string;expiresAt:string}>(event,'POST',['spaces',selectors(event.url).space,'agent-keys'],

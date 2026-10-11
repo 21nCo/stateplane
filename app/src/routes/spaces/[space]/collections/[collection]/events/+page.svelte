@@ -1,5 +1,6 @@
 <script lang="ts">
   import Notice from '$lib/components/Notice.svelte';
+  import Restart from '$lib/components/Restart.svelte';
   import Scroll from '$lib/components/Scroll.svelte';
   import { page } from '$app/state';
   import { collectionHref, segment, selectors } from '$lib/paths';
@@ -12,7 +13,7 @@
 <h1 class="text-2xl font-semibold">Committed changes</h1>
 <p class="hint mt-1">Every accepted create, replace, patch and delete with its resulting revision, oldest first.</p>
 <Notice error={data.error} title="Changes could not be read">
-  {#if data.cursor}<p class="mt-1"><a class="link" href="{base}/events">Start again from the beginning</a></p>{/if}
+  <Restart paged={data.paged} error={data.error} href="{base}/events" label="Start again from the beginning" />
 </Notice>
 {#if data.feed}
   {#if data.feed.events.length}

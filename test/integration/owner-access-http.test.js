@@ -46,11 +46,12 @@ const json=response=>JSON.parse(response.text);
 
 test('owner key issuance, listing, revocation, audit and index backfill go through shared HTTP services',async t=>{
   const spaceId=`sp_${randomUUID()}`;
-  assert.equal((await route('POST','/v1/spaces',{spaceId})).status,201);
+  // Cleanup is registered first, so a space committed behind an unexpected response is still removed.
   t.after(async()=>{
     try { await spaces.archive(owner,spaceId); await spaces.delete(owner,spaceId); }
     catch { /* A failed test retains the disposable database for inspection. */ }
   });
+  assert.equal((await route('POST','/v1/spaces',{spaceId})).status,201);
   const base=`/v1/spaces/${spaceId}/collections/entries`;
   assert.equal((await route('PUT',base,{slug:'entries',version:1,schema:{$schema:'https://json-schema.org/draft/2020-12/schema',
     type:'object',properties:{label:{type:'string'}},required:['label'],additionalProperties:false},

@@ -5,9 +5,9 @@ import type { Collection, Page } from '$lib/types';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load:PageServerLoad=async(event)=>{
-  const {cursor,rejected}=pageCursor(event.url);
+  const {cursor,paged,rejected}=pageCursor(event.url);
   const page=rejected ?? await api<Page<Collection>>(event,'GET',['spaces',selectors(event.url).space,'collections'],{query:{cursor}});
-  return {cursor:cursor ?? null,collections:page.ok ? page.data : null,error:page.ok ? null : page.error};
+  return {cursor:cursor ?? null,paged,collections:page.ok ? page.data : null,error:page.ok ? null : page.error};
 };
 
 export const actions:Actions={

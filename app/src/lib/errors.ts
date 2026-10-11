@@ -28,5 +28,9 @@ const guidance:Record<string,string>={
   RECEIPT_PENDING:'The original request is still being processed. Try again shortly.'
 };
 export const describe=(code:string)=>guidance[code] ?? 'The request failed.';
-/** Codes after which an unchanged retry under the same key can recover the outcome. */
-export const uncertain=(error?:ApiError|null)=>['COMMIT_OUTCOME_UNKNOWN','RATE_LIMITED','PROVIDER_UNAVAILABLE'].includes(error?.code ?? '');
+/** Results after which an unchanged retry under the same key can recover the
+ * outcome: an unknown commit, an unavailable provider, an original request still
+ * in progress, or a retryable time limit. A nonretryable RATE_LIMITED is a size
+ * rejection before any write, so its outcome is known. */
+export const uncertain=(error?:ApiError|null)=>!!error && (['COMMIT_OUTCOME_UNKNOWN','PROVIDER_UNAVAILABLE','RECEIPT_PENDING'].includes(error.code) ||
+  (error.code==='RATE_LIMITED' && error.retryable));

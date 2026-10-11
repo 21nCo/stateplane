@@ -1,6 +1,7 @@
 <script lang="ts">
   import { enhance } from '$app/forms';
   import Notice from '$lib/components/Notice.svelte';
+  import Restart from '$lib/components/Restart.svelte';
   import Scroll from '$lib/components/Scroll.svelte';
   import Status from '$lib/components/Status.svelte';
   import { carry, shown } from '$lib/paths';
@@ -26,7 +27,7 @@
   <section aria-labelledby="keys" class="min-w-0 space-y-3">
     <h2 id="keys" class="text-lg font-semibold">Keys</h2>
     <Notice error={data.error} title="Keys could not be listed">
-      {#if data.cursor}<p class="mt-1"><a class="link" href="?">Start again from the first page</a></p>{/if}
+      <Restart paged={data.paged} error={data.error} href="?" />
     </Notice>
     <Notice error={form?.revokeError} title="Revocation did not finish">
       <p class="mt-1">Part of the revocation may have taken effect, whatever the key list shows. Retry until it finishes.</p>

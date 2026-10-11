@@ -1,5 +1,6 @@
 <script lang="ts">
   import Notice from '$lib/components/Notice.svelte';
+  import Restart from '$lib/components/Restart.svelte';
   import Scroll from '$lib/components/Scroll.svelte';
   import Status from '$lib/components/Status.svelte';
   import { shown, spaceHref } from '$lib/paths';
@@ -14,7 +15,7 @@
     <h2 id="owned" class="text-lg font-semibold">Your spaces</h2>
     <Notice error={data.error} title="Spaces could not be listed">
       {#if data.error?.code==='FORBIDDEN'}<p class="mt-1">Agent keys cannot list spaces. Open the space you were granted by its ID.</p>{/if}
-      {#if data.cursor}<p class="mt-1"><a class="link" href="/spaces">Start again from the first page</a></p>{/if}
+      <Restart paged={data.paged} error={data.error} href="/spaces" />
     </Notice>
     {#if data.page}
       {#if data.page.items.length}

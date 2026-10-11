@@ -1,5 +1,6 @@
 <script lang="ts">
   import Notice from '$lib/components/Notice.svelte';
+  import Restart from '$lib/components/Restart.svelte';
   import Scroll from '$lib/components/Scroll.svelte';
   let { data } = $props();
 </script>
@@ -8,7 +9,7 @@
 <h1 class="text-2xl font-semibold">Audit</h1>
 <p class="hint mt-1">Immutable space administration events, oldest first: creation, lifecycle, key issuance and revocation.</p>
 <Notice error={data.error} title="Audit could not be read">
-  {#if data.cursor}<p class="mt-1"><a class="link" href="?">Start again from the first page</a></p>{/if}
+  <Restart paged={data.paged} error={data.error} href="?" />
 </Notice>
 {#if data.audit}
   {#if data.audit.entries.length}

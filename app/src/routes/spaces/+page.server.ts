@@ -7,10 +7,10 @@ import type { Page, Space } from '$lib/types';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load:PageServerLoad=async(event)=>{
-  const {cursor,rejected}=pageCursor(event.url);
+  const {cursor,paged,rejected}=pageCursor(event.url);
   const page=rejected ?? await api<Page<Space>>(event,'GET',['spaces'],{query:{cursor}});
   // A fresh caller-selected ID lets a lost create response be retried by the same ID.
-  return {cursor:cursor ?? null,page:page.ok ? page.data : null,error:page.ok ? null : page.error,newSpaceId:`sp_${randomUUID()}`};
+  return {cursor:cursor ?? null,paged,page:page.ok ? page.data : null,error:page.ok ? null : page.error,newSpaceId:`sp_${randomUUID()}`};
 };
 
 export const actions:Actions={

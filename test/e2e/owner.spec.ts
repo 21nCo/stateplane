@@ -215,21 +215,77 @@ test('a create whose acknowledgement and reload both fail keeps its form and req
   await page.getByRole('button', { name: 'Retry unchanged' }).click();
   await expect(page.getByRole('status')).toContainText('(recovered earlier result)');
   expect((await titles()).filter(item => item.startsWith(title))).toEqual([title]);
+});
 
-  // A changed draft after a lost acknowledgement is a new request, never a key reuse.
-  const second = `Unacknowledged ${randomUUID()}`;
-  await settle(page);
-  await page.getByLabel('Data JSON').fill(JSON.stringify({ title: second, state: 'open', rank: 8 }));
+test('an unresolved create stays on the page until it is retried or a new request replaces it', async ({ page, request }) => {
+  test.skip(!local, 'Needs the local fault proxy');
+  await defineCollection(request, 'creates');
+  await signIn(page, ownerToken);
+  await go(page, `${spaceUrl}/collections/creates`);
+  const editor = page.getByLabel('Data JSON');
+  const notice = page.getByRole('alert').filter({ hasText: 'Record was not created' });
+  const unresolved = page.getByText('An earlier create may have committed');
+  const retry = page.getByRole('button', { name: 'Retry unchanged' });
+  const sendNew = page.getByRole('button', { name: 'Send as new request' });
+  const titles = async () => {
+    const listed = await request.post(`/v1${spaceUrl}/collections/creates/records/query`,
+      { headers: { authorization: `Bearer ${ownerToken}` }, data: { predicates: [], limit: 100 } });
+    return ((await listed.json()).records as { canonicalData: string }[]).map(record => JSON.parse(record.canonicalData).title).sort();
+  };
+  await editor.fill(JSON.stringify({ title: 'original' }));
   await dropReply('COMMIT\0', 'INSERT INTO records(');
   await page.getByRole('button', { name: 'Create record' }).click();
   await expect(notice).toContainText('COMMIT_OUTCOME_UNKNOWN');
-  await expect(notice).toContainText('Create record sends a new request');
+
+  // Drafts that are malformed, or refused by the schema, wrote nothing: the first create stays unresolved.
+  for (const typo of ['{"title": "changed"', '{"title": "changed"']) {
+    await settle(page);
+    await editor.fill(typo);
+    await sendNew.click();
+    await expect(editor).toHaveAccessibleDescription('Data must be one JSON object with finite numbers.');
+    await expect(unresolved).toBeVisible();
+    await expect(retry).toBeVisible();
+  }
   await settle(page);
-  await page.getByLabel('Data JSON').fill(JSON.stringify({ title: `${second} changed`, state: 'open', rank: 8 }));
+  await editor.fill(JSON.stringify({ name: 'no title' }));
+  await sendNew.click();
+  await expect(notice).toContainText('SCHEMA_INVALID');
+  await expect(unresolved).toBeVisible();
+  await audit(page);
+  expect(await titles()).toEqual(['original']);
+
+  // Retry unchanged, by keyboard, recovers the first create once and keeps the unsent draft.
+  await settle(page);
+  await retry.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('status')).toContainText('(recovered earlier result)');
+  await expect(unresolved).toHaveCount(0);
+  await expect(editor).toHaveValue(JSON.stringify({ name: 'no title' }));
+  expect(await titles()).toEqual(['original']);
+
+  // A changed draft sent as new is created, and the page says the first may also exist.
+  await settle(page);
+  await editor.fill(JSON.stringify({ title: 'second' }));
+  await dropReply('COMMIT\0', 'INSERT INTO records(');
   await page.getByRole('button', { name: 'Create record' }).click();
-  await expect(page.getByRole('status')).toContainText('at revision 1');
-  await expect(page.getByRole('status')).not.toContainText('recovered');
-  expect((await titles()).filter(item => item.startsWith(second)).sort()).toEqual([second, `${second} changed`]);
+  await expect(unresolved).toBeVisible();
+  await settle(page);
+  await editor.fill(JSON.stringify({ title: 'second changed' }));
+  await sendNew.click();
+  await expect(page.getByRole('status')).toContainText('may also have created a record');
+  await expect(unresolved).toHaveCount(0);
+  expect(await titles()).toEqual(['original', 'second', 'second changed']);
+});
+
+test('a size rejection is a known outcome, so no retry is offered', async ({ page }) => {
+  await signIn(page, ownerToken);
+  await go(page, itemsUrl());
+  // Over the 1 MiB record body limit: nonretryable RATE_LIMITED before any write.
+  await page.getByLabel('Data JSON').fill(JSON.stringify({ title: 'x'.repeat(1_100_000), state: 'open', rank: 1 }));
+  await page.getByRole('button', { name: 'Create record' }).click();
+  await expect(page.getByRole('alert').filter({ hasText: 'Record was not created' })).toContainText('RATE_LIMITED');
+  await expect(page.getByText('may have committed')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Retry unchanged' })).toHaveCount(0);
 });
 
 test('after a lost save acknowledgement, retry recovers it and a changed draft is compared first', async ({ page, request }) => {
@@ -247,9 +303,17 @@ test('after a lost save acknowledgement, retry recovers it and a changed draft i
   await dropReply('COMMIT\0', 'UPDATE records SET');
   await page.getByRole('button', { name: 'Save revision' }).click();
   await expect(notice).toContainText('COMMIT_OUTCOME_UNKNOWN');
+  // A malformed draft is refused on its field and leaves the unresolved save.
+  const unresolved = page.getByText('An earlier save may have committed');
+  await settle(page);
+  await editor.fill('{"title":');
+  await page.getByRole('button', { name: 'Send as new request' }).click();
+  await expect(editor).toHaveAccessibleDescription('Data must be one JSON object with finite numbers.');
+  await expect(unresolved).toBeVisible();
+  // A changed draft sent as new meets the first save's revision instead of replacing it.
   await settle(page);
   await editor.fill(JSON.stringify({ title: 'second edit', state: 'open', rank: 11 }));
-  await page.getByRole('button', { name: 'Save revision' }).click();
+  await page.getByRole('button', { name: 'Send as new request' }).click();
   const conflict = page.getByRole('alert', { name: 'Edit conflict' });
   await expect(conflict).toContainText('You edited revision 1, but revision 2 is now current');
   await expect(conflict).toContainText('first edit');
@@ -263,6 +327,10 @@ test('after a lost save acknowledgement, retry recovers it and a changed draft i
   await dropReply('COMMIT\0', 'UPDATE records SET');
   await page.getByRole('button', { name: 'Save revision' }).click();
   await expect(notice).toContainText('COMMIT_OUTCOME_UNKNOWN');
+  await settle(page);
+  await editor.fill('{"title": "not sent"');
+  await page.getByRole('button', { name: 'Send as new request' }).click();
+  await expect(unresolved).toBeVisible();
   await settle(page);
   await editor.fill(JSON.stringify({ title: 'not sent', state: 'open', rank: 11 }));
   await page.getByRole('button', { name: 'Retry unchanged' }).click();
@@ -483,6 +551,20 @@ test('owner grants an agent key, the API enforces it and revocation is verified'
   await go(page, `${spaceUrl}/audit`);
   await expect(page.getByRole('table')).toContainText('key:issue');
   await expect(page.getByRole('table')).toContainText('key:revoke');
+});
+
+test('naming a listed collection again merges its capabilities into one grant', async ({ page, request }) => {
+  await signIn(page, ownerToken);
+  await go(page, `${spaceUrl}/access`);
+  await page.getByRole('group', { name: 'Collection items' }).getByLabel('records:read').check();
+  const other = page.getByRole('group', { name: 'Another collection' });
+  await other.getByLabel('Collection name').fill('items');
+  await other.getByLabel('records:write').check();
+  await page.getByRole('button', { name: 'Issue key' }).click();
+  const headers = { authorization: `Bearer ${await page.getByLabel('Secret', { exact: true }).inputValue()}` };
+  expect((await request.post(`/v1${itemsUrl()}/records/query`, { headers, data: { predicates: [], limit: 1 } })).status()).toBe(200);
+  expect((await request.post(`/v1${itemsUrl()}/records`, { headers,
+    data: { operation: 'create', idempotencyKey: randomUUID(), data: { title: 'Merged grant', state: 'open', rank: 1 } } })).status()).toBe(200);
 });
 
 test('a revocation whose policy publication fails stays retryable after the provider revoked the key', async ({ page, request }) => {
@@ -809,13 +891,20 @@ test('an empty cursor opens the first page and a rejected one offers a restart',
   for (const [path, title] of pages) {
     await go(page, `${path}?cursor=`);
     await expect(page.getByRole('alert'), path).toHaveCount(0);
-    // A repeated cursor is rejected as /v1 rejects it, never reduced to its first value.
-    // The key listing accepts any single cursor, so only its repeated form is rejected.
-    for (const query of path.endsWith('/access') ? ['cursor=a&cursor=b'] : ['cursor=malformed', 'cursor=a&cursor=b']) {
+    // A repeated cursor is rejected as /v1 rejects it, never reduced to its first value,
+    // and the restart is offered whichever value comes first. The key listing accepts
+    // any single cursor, so only its repeated forms are rejected.
+    const restart = page.getByRole('link', { name: /Start again from the (first page|beginning)/ });
+    for (const query of [...(path.endsWith('/access') ? [] : ['cursor=malformed']), 'cursor=a&cursor=b', 'cursor=&cursor=second', 'cursor=second&cursor=']) {
       await go(page, `${path}?${query}`);
       await expect(page.getByRole('alert').filter({ hasText: title }), `${path}?${query}`).toContainText('CURSOR_INVALID');
-      await expect(page.getByRole('link', { name: /(Start again|Restart) from the (first page|beginning)/ })).toBeVisible();
+      await expect(restart, `${path}?${query}`).toHaveCount(1);
     }
+    await restart.focus();
+    await page.keyboard.press('Enter');
+    await settle(page);
+    await expect(page.getByRole('alert'), path).toHaveCount(0);
+    expect(new URL(page.url()).searchParams.has('cursor'), path).toBe(false);
   }
 });
 

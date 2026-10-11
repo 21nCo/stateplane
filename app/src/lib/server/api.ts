@@ -33,11 +33,14 @@ function rejected(context:Context,options:Options,requestId:string|null=null):Ap
 }
 
 /** The page cursor in a page's query: an empty one means the first page. A
- * repeated cursor is rejected before any call, as /v1 rejects it. */
-export function pageCursor(url:URL):{cursor?:string;rejected?:ApiResult<never>} {
+ * repeated cursor is rejected before any call, as /v1 rejects it. "paged" says
+ * whether the request carried any cursor, so a failed page offers its restart
+ * whatever value the cursor normalized to. */
+export function pageCursor(url:URL):{cursor?:string;paged:boolean;rejected?:ApiResult<never>} {
   const all=url.searchParams.getAll('cursor');
   const cursor=all[0] || undefined;
-  return all.length>1 ? {cursor,rejected:{ok:false,status:400,error:{code:'CURSOR_INVALID',retryable:false,requestId:null}}} : {cursor};
+  const paged=all.length>0;
+  return all.length>1 ? {cursor,paged,rejected:{ok:false,status:400,error:{code:'CURSOR_INVALID',retryable:false,requestId:null}}} : {cursor,paged};
 }
 
 /** Send one request through the same /v1 handler, identity check and services as
