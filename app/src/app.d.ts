@@ -1,5 +1,7 @@
 declare global {
   namespace App {
+    // The Worker host one page render shares; see $lib/server/host HostLease.
+    interface Locals { hostLease?:{ host:Record<'http'|'mcp',(request:Request)=>Promise<Response>>; retire:()=>void; retired:()=>boolean } }
     interface Platform {
       env: {
         ORIGINALS: R2Bucket;

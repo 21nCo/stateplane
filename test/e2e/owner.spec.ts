@@ -276,14 +276,17 @@ test('validation failures are announced on their fields', async ({ page }) => {
   await expect(alert).toContainText('SCHEMA_INVALID');
   await expect(alert).toBeFocused();
 
-  // Blank-looking input passes the browser's required check; the server names the field.
-  for (const [path, label, button, message] of [['/spaces', 'Space ID', 'Open', 'Enter a space ID.'],
-    [`${spaceUrl}/access`, 'Key secret', 'Check key', 'Enter a key secret.']]) {
-    await go(page, path);
-    await page.getByLabel(label, { exact: true }).fill('  ');
-    await page.getByRole('button', { name: button, exact: true }).click();
-    await expect(page.getByLabel(label, { exact: true })).toHaveAccessibleDescription(message);
-  }
+  // A blank-looking key secret passes the browser's required check; the server names the field.
+  await go(page, `${spaceUrl}/access`);
+  await page.getByLabel('Key secret', { exact: true }).fill('  ');
+  await page.getByRole('button', { name: 'Check key', exact: true }).click();
+  await expect(page.getByLabel('Key secret', { exact: true })).toHaveAccessibleDescription('Enter a key secret.');
+  // A space ID is an identifier: only empty is absent, so the API judges a blank-looking one.
+  await go(page, '/spaces');
+  await page.getByLabel('Space ID', { exact: true }).fill('  ');
+  await page.getByRole('button', { name: 'Open', exact: true }).click();
+  await expect(page).toHaveURL(/\/spaces\/%20%20$/);
+  await expect(page.getByRole('alert').first()).toBeVisible();
 });
 
 test('a number JSON cannot carry is rejected on create and replace, never stored as null', async ({ page }) => {
@@ -435,6 +438,85 @@ test('identifiers that differ only by surrounding whitespace stay distinct', asy
     await expect(page.getByRole('status')).toContainText('1 succeeded');
     await expect(page.getByRole('status')).not.toContainText('failed');
   }
+});
+
+test('an identifier field is absent only when empty; any other value reaches the API unchanged', async ({ page, request }) => {
+  const headers = { authorization: `Bearer ${ownerToken}` };
+  const count = async () => (await request.post(`/v1${itemsUrl()}/records/count`, { headers, data: [] })).json();
+  await signIn(page, ownerToken);
+  // The API keeps U+FEFF in an external key, so the record is created under it.
+  await go(page, itemsUrl());
+  await page.getByLabel('Data JSON').fill(JSON.stringify({ title: 'Marked key', state: 'open' }));
+  await page.getByLabel('External key (optional)').fill('﻿');
+  await page.getByRole('button', { name: 'Create record' }).click();
+  await expect(page.getByRole('status')).toContainText('at revision 1');
+  const id = await page.getByRole('status').getByRole('link').innerText();
+  const read = await request.get(`/v1${itemsUrl()}/records/${encodeURIComponent(id)}`, { headers });
+  expect(JSON.stringify(await read.json())).toContain('"keyMode":"external"');
+  // An invisible key is listed with a visible escape, so its link has a name.
+  await go(page, itemsUrl());
+  await expect(page.getByRole('link', { name: '"\\ufeff"' })).toBeVisible();
+
+  // A whitespace-only key is the API's to reject; no generated-key record is written.
+  const before = await count();
+  await go(page, itemsUrl());
+  await page.getByLabel('Data JSON').fill(JSON.stringify({ title: 'Blank key', state: 'open' }));
+  await page.getByLabel('External key (optional)').fill('   ');
+  await page.getByRole('button', { name: 'Create record' }).click();
+  await expect(page.getByRole('alert').filter({ hasText: 'Record was not created' })).toContainText('INVALID_ARGUMENT');
+  expect(await count()).toBe(before);
+
+  // A whitespace-only home cell is rejected by the API, never replaced by the default cell.
+  await go(page, '/spaces');
+  const spaceId = await page.locator('input[name="spaceId"]').first().inputValue();
+  await page.getByLabel('Home cell (optional)').fill('   ');
+  await page.getByRole('button', { name: 'Create space' }).click();
+  await expect(page.getByRole('alert').filter({ hasText: 'Space was not created' })).toBeVisible();
+  expect((await request.get(`/v1/spaces/${spaceId}`, { headers })).status()).toBe(404);
+
+  // A whitespace-only collection name is a valid API selector.
+  await go(page, `${spaceUrl}/new-collection`);
+  await page.getByLabel('Collection name').fill('  ');
+  await page.getByRole('button', { name: 'Define collection' }).click();
+  await expect(page).toHaveURL(`${spaceUrl}/collections/%20%20/schema`);
+  await expect(page.getByText('Enter a collection name.')).toHaveCount(0);
+});
+
+test('a schema revision with an unknown outcome is never reported as not applied', async ({ page, request }) => {
+  test.skip(!local, 'Needs the local fault proxy');
+  await defineCollection(request, 'revisions');
+  await signIn(page, ownerToken);
+  await go(page, `${spaceUrl}/collections/revisions/schema`);
+  await page.getByLabel('Definition JSON').fill(JSON.stringify(definition({ added: { type: 'string' } })));
+  // The revision commits but its acknowledgement is lost.
+  await dropReply('COMMIT\0', 'UPDATE collections SET schema_version');
+  await page.getByRole('button', { name: 'Save revision' }).click();
+  const notice = page.getByRole('alert').filter({ hasText: 'Definition was not saved' });
+  await expect(notice).toContainText('COMMIT_OUTCOME_UNKNOWN');
+  await expect(notice).toContainText('may have committed');
+  await expect(notice).not.toContainText('Retry the identical request');
+
+  await settle(page);
+  await page.getByRole('button', { name: 'Save revision' }).click();
+  await expect(notice).toContainText('SCHEMA_CONFLICT');
+  await expect(page.getByText('The current version may already hold this edit.')).toBeVisible();
+  await expect(page.getByText('your edit was not applied')).toHaveCount(0);
+  await page.getByRole('link', { name: 'Load version 2' }).click();
+  await expect(page.getByLabel('Definition JSON')).toHaveValue(/"added"/);
+});
+
+test('failed listings are reported, not shown as empty or truncated', async ({ page }) => {
+  test.skip(!local, 'Needs the local fault proxy');
+  await signIn(page, ownerToken);
+  await dropReply('ORDER BY c.collection_id LIMIT 9)');
+  await go(page, `${spaceUrl}/access`);
+  await expect(page.getByRole('alert').filter({ hasText: 'Collections could not all be listed' })).toContainText('PROVIDER_UNAVAILABLE');
+  await expect(page.getByText('Only the first 96 collections')).toHaveCount(0);
+
+  await go(page, `${spaceUrl}/audit?cursor=malformed`);
+  await expect(page.getByRole('alert')).toContainText('CURSOR_INVALID');
+  await page.getByRole('link', { name: 'Start again from the first page' }).click();
+  await expect(page.getByRole('table')).toContainText('space:create');
 });
 
 test('pages pass accessibility checks, keyboard use and small screens', async ({ page }) => {

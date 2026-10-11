@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { fail } from '@sveltejs/kit';
 import { api } from '$lib/server/api';
 import { selectors } from '$lib/paths';
-import { jsonObject } from '$lib/server/forms';
+import { given, jsonObject } from '$lib/server/forms';
 import { predicates } from '$lib/query';
 import type { FilterRow } from '$lib/query';
 import type { ApiError } from '$lib/errors';
@@ -46,7 +46,7 @@ export const actions:Actions={
     const values={raw,externalKey,idempotencyKey,invalid:!data,error:null as ApiError|null};
     if (!data) return fail(400,{create:values});
     const result=await api<Receipt>(event,'POST',[...path(event.url),'records'],
-      {body:{operation:'create',idempotencyKey,data,...(externalKey.trim() ? {externalKey} : {})}});
+      {body:{operation:'create',idempotencyKey,data,...(given(externalKey) ? {externalKey} : {})}});
     return result.ok ? {created:result.data} : fail(result.status,{create:{...values,error:result.error}});
   }
 };

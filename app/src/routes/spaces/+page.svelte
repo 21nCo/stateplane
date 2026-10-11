@@ -49,7 +49,7 @@
         <div>
           <label for="cellId">Home cell (optional)</label>
           <input id="cellId" name="cellId" value={form?.create?.cellId ?? ''} aria-describedby="cell-hint" />
-          <p id="cell-hint" class="hint mt-1">Leave blank for the service default. The service accepts only its configured cells.</p>
+          <p id="cell-hint" class="hint mt-1">Leave empty for the service default. The service accepts only its configured cells.</p>
         </div>
         <button class="btn">Create space</button>
       </form>

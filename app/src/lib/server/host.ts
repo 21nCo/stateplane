@@ -106,8 +106,12 @@ function clearHost():undefined {
   return undefined;
 }
 
-/** A deliberately opt-in host for isolated local and Preview acceptance. */
-export function stateplaneHost(env:Bindings):Host | undefined {
+/** One Worker host kept for a whole page render; the caller retires it. */
+export interface HostLease { host:Host; retire:()=>void; retired:()=>boolean }
+/** A deliberately opt-in host for isolated local and Preview acceptance. A
+ * caller that passes lease receives a Worker host's retirement instead of
+ * retiring it after each call; a Node host is shared and never leased. */
+export function stateplaneHost(env:Bindings,lease?:(lease:HostLease)=>void):Host | undefined {
   if (!['local','preview'].includes(env.STATEPLANE_ENV) || env.STATEPLANE_TEST_HTTP!=='1' ||
       !env.STATEPLANE_TEST_TOKEN || env.STATEPLANE_TEST_TOKEN.length<32 ||
       !env.STATEPLANE_TEST_OWNER || !env.STATEPLANE_TEST_CREDENTIAL ||
@@ -247,7 +251,10 @@ export function stateplaneHost(env:Bindings):Host | undefined {
   };
   if (perRequest) {
     clearHost();
-    return {http:tracked(boundedServe,retire),mcp:tracked(mcpServe,retire)};
+    const after=lease ? closeIfIdle : retire;
+    const host={http:tracked(boundedServe,after),mcp:tracked(mcpServe,after)};
+    lease?.({host,retire,retired:()=>retired});
+    return host;
   }
   const previous=cached;
   cached={key,retire,host:{http:tracked(boundedServe,closeIfIdle),mcp:tracked(mcpServe,closeIfIdle)}};

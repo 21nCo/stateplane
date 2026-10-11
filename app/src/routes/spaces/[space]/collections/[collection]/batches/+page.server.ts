@@ -1,6 +1,7 @@
 import { fail, redirect } from '@sveltejs/kit';
 import { api } from '$lib/server/api';
 import { selectors } from '$lib/paths';
+import { given } from '$lib/server/forms';
 import type { Receipt } from '$lib/types';
 import type { Actions, PageServerLoad, RequestEvent } from './$types';
 
@@ -27,7 +28,7 @@ export const actions:Actions={
     // Each nonblank line is sent as its exact text; reformatting a line changes the batch identity.
     const lines=items.split(/\r?\n/).filter(line=>line.trim());
     const values={operationKey,items,retryFailed};
-    if (!operationKey.trim()) return fail(400,{...values,keyMissing:true});
+    if (!given(operationKey)) return fail(400,{...values,keyMissing:true});
     if (!lines.length || lines.length>maxItems) return fail(400,{...values,countInvalid:true});
     const result=await api<Progress>(event,'PUT',batchPath(event,operationKey),{body:lines,query:{retryFailed:retryFailed ? 'true' : undefined}});
     if (!result.ok) return fail(result.status,{...values,error:result.error});

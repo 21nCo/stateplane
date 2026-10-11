@@ -41,9 +41,12 @@
   <section aria-labelledby="revise" class="panel space-y-3">
     <h2 id="revise" class="text-lg font-semibold">Revise definition</h2>
     {#if form?.revised}<p role="status" class="text-sm text-success">Saved as version {form.revised}.</p>{/if}
-    <DefinitionForm action="?/revise" definition={form?.definition ?? editable} invalid={form?.invalid} error={form?.error} submit="Save revision">
+    <DefinitionForm action="?/revise" definition={form?.definition ?? editable} invalid={form?.invalid} error={form?.error} submit="Save revision"
+      hint={form?.uncertain ? 'An earlier save of this edit may have committed. Load the current definition and compare it before saving again.' : undefined}>
       <input type="hidden" name="version" value={form?.version ?? data.collection?.definition.version} />
-      {#if form?.error?.code==='SCHEMA_CONFLICT'}<p class="text-sm">Another revision was saved first; your edit was not applied. <a class="link" href="?">Discard my edit and load {data.collection ? `version ${data.collection.definition.version}` : 'the current version'}</a></p>{/if}
+      <input type="hidden" name="uncertain" value={form?.uncertain ? '1' : ''} />
+      {#if form?.error?.code==='SCHEMA_CONFLICT' || form?.uncertain}<p class="text-sm">{form.uncertain ? 'The current version may already hold this edit.' : 'Another revision was saved first; your edit was not applied.'}
+        <a class="link" href="?">{form.uncertain ? 'Load' : 'Discard my edit and load'} {data.collection ? `version ${data.collection.definition.version}` : 'the current version'}</a></p>{/if}
     </DefinitionForm>
   </section>
 {/snippet}

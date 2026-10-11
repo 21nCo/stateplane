@@ -19,12 +19,16 @@ export const actions:Actions={
     const form=await event.request.formData();
     const definition=String(form.get('definition')??'');
     const version=Number(form.get('version'));
+    // A revision has no request key; once one attempt's outcome is unknown, a
+    // later conflict may be that attempt's own commit.
+    const uncertain=form.get('uncertain')==='1';
     const parsed=jsonObject(definition);
-    if (!parsed) return fail(400,{definition,version,invalid:true});
+    if (!parsed) return fail(400,{definition,version,uncertain,invalid:true});
     // If-Match carries the version the editor loaded; a concurrent revision is rejected, not replaced.
     const saved=await api(event,'PATCH',path(event.url),{headers:{'if-match':String(version)},
       body:{...parsed,slug:selectors(event.url).collection,version:version+1}});
-    return saved.ok ? {revised:version+1} : fail(saved.status,{definition,version,error:saved.error});
+    return saved.ok ? {revised:version+1} : fail(saved.status,{definition,version,error:saved.error,
+      uncertain:uncertain || saved.error.code==='COMMIT_OUTCOME_UNKNOWN'});
   },
   backfill:async(event)=>{
     const field=String((await event.request.formData()).get('field')??'');

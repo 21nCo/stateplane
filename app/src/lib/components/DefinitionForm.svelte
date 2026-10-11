@@ -1,11 +1,11 @@
 <script lang="ts">
   import Notice from '$lib/components/Notice.svelte';
   import type { ApiError } from '$lib/errors';
-  let { action, definition, invalid=false, error, submit, children }:{ action:string; definition:string; invalid?:boolean;
-    error?:ApiError|null; submit:string; children?:import('svelte').Snippet } = $props();
+  let { action, definition, invalid=false, error, hint, submit, children }:{ action:string; definition:string; invalid?:boolean;
+    error?:ApiError|null; hint?:string; submit:string; children?:import('svelte').Snippet } = $props();
 </script>
 
-<Notice {error} title="Definition was not saved" />
+<Notice {error} {hint} title="Definition was not saved" />
 <form method="POST" {action} class="space-y-3">
   {@render children?.()}
   <div>

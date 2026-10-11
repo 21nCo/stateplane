@@ -2,6 +2,7 @@ import { fail } from '@sveltejs/kit';
 import { api } from '$lib/server/api';
 import { checkKey } from '$lib/server/keycheck';
 import { selectors } from '$lib/paths';
+import type { ApiError } from '$lib/errors';
 import type { Collection, Page } from '$lib/types';
 import type { Actions, PageServerLoad } from './$types';
 
@@ -19,12 +20,13 @@ async function listCollections(event:Parameters<PageServerLoad>[0]) {
   let cursor:string|undefined;
   for (let page=0;page<collectionPages;page++) {
     const result=await api<Page<Collection>>(event,'GET',['spaces',selectors(event.url).space,'collections'],{query:{cursor}});
-    if (!result.ok) return {slugs,more:slugs.length>0};
+    // A failed page is reported, never shown as an empty or truncated list.
+    if (!result.ok) return {slugs,more:false,error:result.error as ApiError|null};
     slugs.push(...result.data.items.map(item=>item.definition.slug));
-    if (result.data.cursor===null) return {slugs,more:false};
+    if (result.data.cursor===null) return {slugs,more:false,error:null};
     cursor=result.data.cursor;
   }
-  return {slugs,more:true};
+  return {slugs,more:true,error:null};
 }
 
 export const load:PageServerLoad=async(event)=>{
@@ -33,7 +35,7 @@ export const load:PageServerLoad=async(event)=>{
     api<{items:AgentKey[];nextCursor:string|null}>(event,'GET',['spaces',selectors(event.url).space,'agent-keys'],{query:{cursor}}),
     listCollections(event)]);
   return {cursor:cursor ?? null,keys:keys.ok ? keys.data : null,error:keys.ok ? null : keys.error,
-    collections:collections.slugs,moreCollections:collections.more};
+    collections:collections.slugs,moreCollections:collections.more,collectionsError:collections.error};
 };
 
 export const actions:Actions={

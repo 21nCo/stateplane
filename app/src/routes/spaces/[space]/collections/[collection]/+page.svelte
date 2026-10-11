@@ -71,7 +71,7 @@
             <caption class="sr-only">Records on this page</caption>
             <thead><tr><th scope="col">Record</th><th scope="col">Revision</th>{#each columns as column (column)}<th scope="col">{column}</th>{/each}</tr></thead>
             <tbody>{#each data.page.records as record (record.ref.id)}<tr>
-              <td><a class="link font-mono" href="{base}/records/{segment(record.ref.id)}">{record.keyMode==='external' ? record.normalizedKey : record.ref.id}</a></td>
+              <td><a class="link font-mono" href="{base}/records/{segment(record.ref.id)}">{record.keyMode==='external' ? shown(record.normalizedKey) : record.ref.id}</a></td>
               <td>{record.revision}</td>{#each columns as column (column)}<td class="max-w-48 truncate">{cell(record,column)}</td>{/each}
             </tr>{/each}</tbody>
           </table></Scroll>

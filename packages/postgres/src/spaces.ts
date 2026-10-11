@@ -1413,7 +1413,7 @@ export class PostgresSpaces {
     let after: { recordedAt: string; auditId: string } | undefined;
     if (cursor !== undefined) {
       if (typeof cursor !== 'string' || cursor.length === 0 || cursor.length > 1024 || !/^[A-Za-z0-9_-]+$/.test(cursor)) {
-        throw new AuthorityError('INVALID_ARGUMENT');
+        throw new AuthorityError('CURSOR_INVALID');
       }
       try {
         const decoded: unknown = JSON.parse(Buffer.from(cursor,'base64url').toString('utf8'));
@@ -1426,7 +1426,7 @@ export class PostgresSpaces {
         if (!Number.isFinite(instant) || new Date(instant).toISOString().slice(0,23) !==
           value.recordedAt.slice(0,23)) throw new Error('Invalid cursor');
         after = {recordedAt:value.recordedAt,auditId:value.auditId};
-      } catch { throw new AuthorityError('INVALID_ARGUMENT'); }
+      } catch { throw new AuthorityError('CURSOR_INVALID'); }
     }
     const space = await this.owned(actor,spaceId);
     await this.current(actor);

@@ -56,6 +56,9 @@
       <Notice error={form?.issueError} title="Key was not issued">
         {#if form?.issueError?.code==='COMMIT_OUTCOME_UNKNOWN'}<p class="mt-1">The key may exist. Check the key list and revoke any key you cannot account for before issuing another.</p>{/if}
       </Notice>
+      <Notice error={data.collectionsError} title="Collections could not all be listed">
+        <p class="mt-1">Reload to list them again, or name a collection in the last group.</p>
+      </Notice>
       {#if form?.issueInvalid}<p role="alert" class="text-sm text-danger">Choose a lifetime and at least one capability for a named collection.</p>{/if}
       <form method="POST" action="?/issue" class="space-y-3">
         <div><label for="days">Lifetime</label>

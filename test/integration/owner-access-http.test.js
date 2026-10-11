@@ -110,6 +110,7 @@ test('owner key issuance, listing, revocation, audit and index backfill go throu
   const actions=json(audit).entries.map(entry=>entry.action);
   for (const action of ['space:create','key:issue','key:revoke']) assert.ok(actions.includes(action),action);
   assert.equal(json(await route('GET',`/v1/spaces/${spaceId}/audit?cursor=a&cursor=b`)).error.code,'CURSOR_INVALID');
+  assert.equal(json(await route('GET',`/v1/spaces/${spaceId}/audit?cursor=malformed!`)).error.code,'CURSOR_INVALID');
 
   // Listing is keyset-paged at 100 keys.
   await pool.query(`INSERT INTO space_credentials(space_id,credential_id,principal_id,owner_principal_id,expires_at)

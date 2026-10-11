@@ -10,3 +10,7 @@ export function jsonObject(raw:FormDataEntryValue|null):Record<string,unknown>|n
     return value && typeof value==='object' && !Array.isArray(value) && finite(value) ? value as Record<string,unknown> : null;
   } catch { return null; }
 }
+
+/** An identifier field is absent only when empty. Any other value, whitespace
+ * included, is sent exactly; the API alone normalizes and validates it. */
+export const given=(value:string)=>value!=='';

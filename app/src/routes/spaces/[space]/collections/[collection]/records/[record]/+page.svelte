@@ -2,7 +2,7 @@
   import Notice from '$lib/components/Notice.svelte';
   import Status from '$lib/components/Status.svelte';
   import { page } from '$app/state';
-  import { collectionHref, selectors } from '$lib/paths';
+  import { collectionHref, selectors, shown } from '$lib/paths';
   let { data, form } = $props();
   const base=$derived(collectionHref(data.spaceId,selectors(page.url).collection));
   // After a conflict the user's draft stays in the editor until they choose how to resolve it;
@@ -18,7 +18,7 @@
 <svelte:head><title>Record · Stateplane</title></svelte:head>
 <p class="hint"><a class="link" href={base}>Records</a> / record</p>
 <Notice error={data.error} title="Record could not be read" />
-<h1 class="break-all font-mono text-xl font-semibold">{data.record?.keyMode==='external' ? data.record.normalizedKey : selectors(page.url).record}</h1>
+<h1 class="break-all font-mono text-xl font-semibold">{data.record?.keyMode==='external' ? shown(data.record.normalizedKey) : selectors(page.url).record}</h1>
 {#if data.record}
   <dl class="mt-2 flex flex-wrap gap-x-6 gap-y-1 text-sm">
     <div><dt class="inline text-subtle">Record ID</dt> <dd class="inline break-all font-mono">{data.record.ref.id}</dd></div>

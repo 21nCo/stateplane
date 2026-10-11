@@ -32,6 +32,7 @@ import { stateplaneHost } from '../app/src/lib/server/host';
 import { api } from '../app/src/lib/server/api';
 import { checkKey } from '../app/src/lib/server/keycheck';
 import { jsonObject } from '../app/src/lib/server/forms';
+import { handle } from '../app/src/hooks.server';
 
 const env = { STATEPLANE_ENV: 'preview', STATEPLANE_TEST_HTTP: '1', STATEPLANE_TEST_TOKEN: 'o'.repeat(32),
   STATEPLANE_TEST_OWNER: 'owner', STATEPLANE_TEST_CREDENTIAL: 'session-1', STATEPLANE_TEST_CURSOR_SECRET: 'a'.repeat(64),
@@ -142,4 +143,23 @@ it('a key check reports provider rejection only for UNAUTHENTICATED; other failu
 it('a JSON field with a number JSON cannot carry is rejected instead of sent as null', () => {
   for (const raw of ['{"n":1e400}', '{"n":-1e400}', '{"a":[{"n":1e999}]}']) expect(jsonObject(raw)).toBeNull();
   expect(JSON.stringify(jsonObject('{"n":1.5e300,"a":[0,null,"1e400"]}'))).toBe('{"n":1.5e+300,"a":[0,null,"1e400"]}');
+});
+
+it('a Worker page render shares one host and pool, which the hook retires after the response', async () => {
+  const before = { pools: state.pools, ended: state.ended };
+  const event = { url: new URL('https://preview.example/spaces/sp/access'), cookies: { get: () => 'o'.repeat(32) },
+    platform: { env }, locals: {} as App.Locals };
+  const response = await handle({ event: event as never, resolve: async () => {
+    for (let call = 0; call < 3; call++) expect((await api(event as never, 'GET', ['spaces'])).ok).toBe(true);
+    expect(state.ended).toBe(before.ended);
+    return new Response('page');
+  } } as never);
+  expect(response.status).toBe(200);
+  expect(state.pools - before.pools).toBe(1);
+  expect(state.ended - before.ended).toBe(1);
+  // A retired host, for example after a request timeout, is replaced rather than reused.
+  expect((await api(event as never, 'GET', ['spaces'])).ok).toBe(true);
+  expect(state.pools - before.pools).toBe(2);
+  event.locals.hostLease?.retire();
+  expect(state.ended - before.ended).toBe(2);
 });

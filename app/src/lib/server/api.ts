@@ -2,14 +2,26 @@ import type { Cookies } from '@sveltejs/kit';
 import type { ApiError } from '$lib/errors';
 import { segment } from '../paths';
 import { stateplaneHost, unavailable } from './host';
-import type { Bindings } from './host';
+import type { Bindings, Host } from './host';
 
 export const sessionCookie='stateplane_session';
 export type ApiResult<T>={ok:true;status:number;data:T}|{ok:false;status:number;error:ApiError};
-interface Context { cookies:Cookies; url:URL; platform?:App.Platform|undefined }
+interface Context { cookies:Cookies; url:URL; platform?:App.Platform|undefined; locals?:App.Locals }
 interface Options { body?:unknown; query?:Record<string,string|undefined>; headers?:Record<string,string>; token?:string }
 
 export const bindings=(platform?:App.Platform)=>({...process.env,...platform?.env}) as unknown as Bindings;
+
+/** A page render shares one Worker host, so it opens one pool rather than one
+ * per call; hooks.server.ts retires it after the response. A host retired by a
+ * request timeout is replaced instead of reused. */
+function hostFor(context:Context):Host|undefined {
+  const env=bindings(context.platform);
+  const locals=context.locals;
+  if (!locals) return stateplaneHost(env);
+  const current=locals.hostLease;
+  if (current && !current.retired()) return current.host;
+  return stateplaneHost(env,lease=>{ locals.hostLease=lease; });
+}
 
 /** Send one request through the same /v1 handler, identity check and services as
  * every other transport. The UI holds no authority of its own: the bearer in its
@@ -27,7 +39,7 @@ export async function api<T>(context:Context,method:string,path:readonly string[
     headers['content-type']='application/json';
   }
   const request=new Request(url,{method,headers,body});
-  const host=stateplaneHost(bindings(context.platform));
+  const host=hostFor(context);
   // Without a host the request was never sent, so it is retryable, as on /v1.
   const response=host ? await host.http(request) : unavailable();
   const value=await response.json().catch(()=>null) as {error?:Partial<ApiError>}|null;
