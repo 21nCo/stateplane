@@ -1,0 +1,131 @@
+.github/workflows/ci.yml
+  s_1900bb15a7199a::t_e9fabe0ffac0e4 28-29
+README.md
+  s_1900bb15a7199a::t_6c692f9912ad8a 5,41
+app/src/app.css
+  s_1900bb15a7199a::t_3fab2b4c60a29c 2-76
+app/src/hooks.server.ts
+  s_1900bb15a7199a::t_5680ba3755db7e 1-14
+app/src/lib/components/DefinitionForm.svelte
+  s_1900bb15a7199a::t_5713de7d1ba7bb 1-19
+app/src/lib/components/Notice.svelte
+  s_1900bb15a7199a::t_83c5bf4145a128 1-17
+app/src/lib/components/Scroll.svelte
+  s_1900bb15a7199a::t_a816f06515ccec 1-7
+app/src/lib/components/Status.svelte
+  s_1900bb15a7199a::t_863d22ea522815 1-6
+app/src/lib/errors.ts
+  s_1900bb15a7199a::t_138af61d9fdd3f 1-29
+app/src/lib/query.ts
+  s_1900bb15a7199a::t_3ff826549b18ef 1-46
+app/src/lib/server/api.ts
+  s_1900bb15a7199a::t_2d8170bb330afe 1-36
+app/src/lib/server/forms.ts
+  s_1900bb15a7199a::t_255fbb3537cd85 1-7
+app/src/lib/server/host.ts
+  s_1900bb15a7199a::t_39767f83f54763 1,24-60,167,182-183,186-188,191
+app/src/lib/types.ts
+  s_1900bb15a7199a::t_35c599fad10cdc 1-20
+app/src/routes/+layout.server.ts
+  s_1900bb15a7199a::t_2f37401290b4de 1-4
+app/src/routes/+layout.svelte
+  s_1900bb15a7199a::t_79294ddeb1b1e7 3,6-15
+app/src/routes/+page.server.ts
+  s_1900bb15a7199a::t_921647fc092058 1-18
+app/src/routes/+page.svelte
+  s_1900bb15a7199a::t_31d055daa2555d 1-20
+app/src/routes/signout/+server.ts
+  s_1900bb15a7199a::t_0b34dcbd9f6bcf 1-6
+app/src/routes/spaces/+page.server.ts
+  s_1900bb15a7199a::t_253eaaf802b4de 1-28
+app/src/routes/spaces/+page.svelte
+  s_1900bb15a7199a::t_638b1f5b8cfdee 1-65
+app/src/routes/spaces/[space]/+layout.server.ts
+  s_1900bb15a7199a::t_2f1a423c8d62c3 1-11
+app/src/routes/spaces/[space]/+layout.svelte
+  s_1900bb15a7199a::t_5e092e9f4bc02b 1-26
+app/src/routes/spaces/[space]/+page.server.ts
+  s_1900bb15a7199a::t_7153b580854cd4 1-18
+app/src/routes/spaces/[space]/+page.svelte
+  s_1900bb15a7199a::t_2fbbad49bfb3be 1-57
+app/src/routes/spaces/[space]/access/+page.server.ts
+  s_1900bb15a7199a::t_7ae73de4624294 1-47
+app/src/routes/spaces/[space]/access/+page.svelte
+  s_1900bb15a7199a::t_316dee6a3ea02e 1-83
+app/src/routes/spaces/[space]/audit/+page.server.ts
+  s_1900bb15a7199a::t_525b7959212fc7 1-10
+app/src/routes/spaces/[space]/audit/+page.svelte
+  s_1900bb15a7199a::t_4afdb8ae633f62 1-26
+app/src/routes/spaces/[space]/collections/[collection]/+page.server.ts
+  s_1900bb15a7199a::t_3717366a24e849 1-51
+app/src/routes/spaces/[space]/collections/[collection]/+page.svelte
+  s_1900bb15a7199a::t_5a6e8d716d3de6 1-103
+app/src/routes/spaces/[space]/collections/[collection]/batches/+page.server.ts
+  s_1900bb15a7199a::t_9858b6d092e70c 1-40
+app/src/routes/spaces/[space]/collections/[collection]/batches/+page.svelte
+  s_1900bb15a7199a::t_13359d23ea36af 1-61
+app/src/routes/spaces/[space]/collections/[collection]/events/+page.server.ts
+  s_1900bb15a7199a::t_4cc3ddbb3e2a96 1-10
+app/src/routes/spaces/[space]/collections/[collection]/events/+page.svelte
+  s_1900bb15a7199a::t_47e207d498c0b3 1-31
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.server.ts
+  s_1900bb15a7199a::t_1cb163d6d74a9f 1-50
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.svelte
+  s_1900bb15a7199a::t_a5859046ac2cdf 1-75
+app/src/routes/spaces/[space]/collections/[collection]/schema/+page.server.ts
+  s_1900bb15a7199a::t_31c0e6e1eab81d 1-37
+app/src/routes/spaces/[space]/collections/[collection]/schema/+page.svelte
+  s_1900bb15a7199a::t_66cf3f19df546c 1-39
+app/src/routes/spaces/[space]/collections/new/+page.server.ts
+  s_1900bb15a7199a::t_138ff9dadd39e0 1-17
+app/src/routes/spaces/[space]/collections/new/+page.svelte
+  s_1900bb15a7199a::t_8f627879c0fcf1 1-21
+app/svelte.config.js
+  s_1900bb15a7199a::t_1b4273e776aa71 4-8
+contracts/openapi.yaml
+  s_1900bb15a7199a::t_ac59409e0dac55 76-123,202-207
+docs/http-cli.md
+  s_1900bb15a7199a::t_8098d39dcddd93 76-77
+docs/ui.md
+  s_1900bb15a7199a::t_266a4cced70bc3 1-27
+package.json
+  s_1900bb15a7199a::t_93fe9a6b1e6231 46
+packages/api/src/http.ts
+  s_1900bb15a7199a::t_ee9c8006d5b7cf 160-162,171-172,177-188
+packages/application/src/errors.ts
+  s_1900bb15a7199a::t_2263aa350a2600 30-31
+packages/application/src/services.ts
+  s_1900bb15a7199a::t_95812d57558480 12-18,24-25
+packages/postgres/src/services.ts
+  s_1900bb15a7199a::t_1fae87f20f1046 9,33-57,87-97,115-117
+packages/postgres/src/spaces.ts
+  s_1900bb15a7199a::t_53d1df261ae529 44-48,55-56,1389-1407
+playwright.config.ts
+  s_1900bb15a7199a::t_b59cef8bc1889a 1-2,5-15,18-27
+pnpm-lock.yaml
+  s_1900bb15a7199a::t_f743cb0fa85d14 20-22,370-374,1467-1470,2992-2996,3989-3990
+test/e2e/host.js
+  s_1900bb15a7199a::t_b32223bfa8d932 1-39
+test/e2e/owner.spec.ts
+  s_1900bb15a7199a::t_4e3010d432a635 1-208
+test/http-cli.test.js
+  s_1900bb15a7199a::t_f75497ae2dcb65 1602-1614
+test/integration/owner-access-http.test.js
+  s_1900bb15a7199a::t_9c359e4158d635 1-114
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "960e086e17868f88bc5f5dcb7fcbe6c659365fbc",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
