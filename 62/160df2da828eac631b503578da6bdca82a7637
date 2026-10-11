@@ -1,0 +1,37 @@
+app/src/lib/components/Notice.svelte
+  s_1900bb15a7199a::t_15818e544e2943 4,15
+app/src/lib/errors.ts
+  s_1900bb15a7199a::t_554b9e725c214a 5
+app/src/lib/paths.ts
+  s_1900bb15a7199a::t_181365714332d4 15-18,22
+app/src/lib/server/api.ts
+  s_1900bb15a7199a::t_ed9cebcbc8fce3 28-34,40,55
+app/src/routes/spaces/[space]/access/+page.svelte
+  s_1900bb15a7199a::t_c17dc4ae133467 15,45-48,94
+app/src/routes/spaces/[space]/collections/[collection]/+page.svelte
+  s_1900bb15a7199a::t_6605f99468d812 33,43,55,72
+app/src/routes/spaces/[space]/collections/[collection]/schema/+page.svelte
+  s_1900bb15a7199a::t_7c04087d683e24 20,22,24-25
+docs/ui.md
+  s_1900bb15a7199a::t_8e0de77db28697 7,12,17
+test/e2e/owner.spec.ts
+  s_1900bb15a7199a::t_1ae4144f6c9abf 30-31,60,62,395-399,407,416,454,457-459,461-464,488-512
+test/mcp-host.test.ts
+  s_1900bb15a7199a::t_93f347ec986693 160-166
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "62160df2da828eac631b503578da6bdca82a7637",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
