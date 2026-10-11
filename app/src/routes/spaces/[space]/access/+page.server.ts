@@ -9,6 +9,7 @@ export interface AgentKey { keyId:string; status:string; expiresAt:string; creat
 const grantable=['records:read','records:write','events:read','schema:write','space:admin'];
 // Lifetime presets keep issuance simple; the service still validates the instant.
 const lifetimes=new Set([1,7,30,90]);
+const denials=new Set(['UNAUTHENTICATED','FORBIDDEN','NOT_FOUND']);
 
 export const load:PageServerLoad=async(event)=>{
   const cursor=event.url.searchParams.get('cursor') ?? undefined;
@@ -24,9 +25,10 @@ export const actions:Actions={
   issue:async(event)=>{
     const form=await event.request.formData();
     const days=Number(form.get('days'));
-    const grants=form.getAll('collection').map((value,index)=>({collectionId:String(value).trim(),
+    // Collection IDs are exact API selectors: " items " and "items" are different collections.
+    const grants=form.getAll('collection').map((value,index)=>({collectionId:String(value),
       capabilities:form.getAll(`capabilities-${index}`).map(String).filter(item=>grantable.includes(item))}))
-      .filter(grant=>grant.collectionId && grant.capabilities.length);
+      .filter(grant=>grant.collectionId.trim() && grant.capabilities.length);
     if (!lifetimes.has(days) || !grants.length) return fail(400,{issueInvalid:true});
     const expiresAt=new Date(Date.now()+days*86_400_000).toISOString();
     const issued=await api<{keyId:string;secret:string;expiresAt:string}>(event,'POST',['spaces',selectors(event.url).space,'agent-keys'],
@@ -42,7 +44,12 @@ export const actions:Actions={
   check:async(event)=>{
     const token=String((await event.request.formData()).get('secret')??'').trim();
     if (!token) return fail(400,{checkMissing:true});
-    const result=await api<{kind:string}>(event,'GET',['auth','session'],{token});
-    return {check:result.ok ? {accepted:true,kind:result.data.kind} : {accepted:false,code:result.error.code}};
+    const session=await api<{kind:string}>(event,'GET',['auth','session'],{token});
+    if (!session.ok) return {check:{kind:null,code:session.error.code,space:null}};
+    // The provider authenticates the key; Stateplane authorizes it per space. A key
+    // revoked here stays denied while its provider cleanup is pending.
+    const here=await api(event,'GET',['spaces',selectors(event.url).space,'collections'],{token});
+    return {check:{kind:session.data.kind,code:null,space:here.ok ? {allowed:true,code:null} :
+      {allowed:false,code:here.error.code,denied:denials.has(here.error.code)}}};
   }
 };

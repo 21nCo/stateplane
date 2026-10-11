@@ -1,7 +1,7 @@
 <script lang="ts">
   import Notice from '$lib/components/Notice.svelte';
   import Status from '$lib/components/Status.svelte';
-  import { collectionHref, spaceHref } from '$lib/paths';
+  import { collectionHref, shown, spaceHref } from '$lib/paths';
   let { data, form } = $props();
   const base=$derived(spaceHref(data.spaceId));
   const placement=$derived(data.space ? [['Lifecycle',data.space.lifecycle],['Home cell',data.space.homeCellId],
@@ -40,7 +40,7 @@
       {#if data.collections.items.length}
         <ul class="space-y-2">{#each data.collections.items as item (item.definition.slug)}
           <li class="panel flex flex-wrap items-center justify-between gap-2">
-            <a class="link font-mono" href={collectionHref(data.spaceId,item.definition.slug)}>{item.definition.slug}</a>
+            <a class="link font-mono" href={collectionHref(data.spaceId,item.definition.slug)}>{shown(item.definition.slug)}</a>
             <span class="flex flex-wrap gap-2 text-sm">
               <Status>schema v{item.definition.version}</Status>
               {#if item.pending.length}<Status tone="warning">{item.pending.length} index pending</Status>{/if}

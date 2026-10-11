@@ -2,6 +2,7 @@
   import Notice from '$lib/components/Notice.svelte';
   import Scroll from '$lib/components/Scroll.svelte';
   import Status from '$lib/components/Status.svelte';
+  import { shown } from '$lib/paths';
   let { data, form } = $props();
   const capabilities=['records:read','records:write','events:read','schema:write','space:admin'];
   const rows=$derived([...data.collections,'']);
@@ -36,7 +37,7 @@
           <tbody>{#each data.keys.items as key (key.keyId)}<tr>
             <td class="break-all font-mono">{key.keyId}</td><td><Status tone={tone(key.status)}>{key.status}</Status>
               {#if key.revokedAt}<div class="hint">{key.providerRevokedAt ? 'Provider key revoked' : 'Denied here; provider cleanup pending'}</div>{/if}</td>
-            <td>{#each key.grants as grant (grant.collectionId)}<div><span class="font-mono">{grant.collectionId}</span>: {grant.capabilities.join(', ')}</div>{:else}<span class="hint">none</span>{/each}</td>
+            <td>{#each key.grants as grant (grant.collectionId)}<div><span class="font-mono">{shown(grant.collectionId)}</span>: {grant.capabilities.join(', ')}</div>{:else}<span class="hint">none</span>{/each}</td>
             <td>{key.expiresAt}</td>
             <td>{#if !key.revokedAt || !key.providerRevokedAt}<form method="POST" action="?/revoke"><input type="hidden" name="keyId" value={key.keyId} />
               <button class="btn-danger" aria-label="{key.revokedAt ? 'Retry provider revocation for' : 'Revoke'} {key.keyId}">{key.revokedAt ? 'Retry revocation' : 'Revoke'}</button></form>{/if}</td>
@@ -61,7 +62,7 @@
           <select id="days" name="days">{#each [1,7,30,90] as days (days)}<option value={days} selected={days===30}>{days} {days===1 ? 'day' : 'days'}</option>{/each}</select></div>
         {#each rows as slug, index (index)}
           <fieldset class="space-y-1 rounded border border-line p-2">
-            <legend class="px-1 text-sm font-medium">{slug ? `Collection ${slug}` : 'Another collection'}</legend>
+            <legend class="px-1 text-sm font-medium">{slug ? `Collection ${shown(slug)}` : 'Another collection'}</legend>
             {#if slug}<input type="hidden" name="collection" value={slug} />{:else}
               <label for="other-collection">Collection name</label><input id="other-collection" name="collection" />{/if}
             {#each capabilities as capability (capability)}
@@ -75,8 +76,13 @@
     </section>
     <section aria-labelledby="check" class="panel space-y-3">
       <h2 id="check" class="text-lg font-semibold">Check a key</h2>
-      <p class="hint">Confirm whether the API still accepts a key secret, for example after revocation.</p>
-      {#if form?.check}<p role="status" class="text-sm {form.check.accepted ? 'text-success' : 'text-danger'}">{form.check.accepted ? `Accepted as ${form.check.kind}.` : `Rejected: ${form.check.code}.`}</p>{/if}
+      <p class="hint">Confirm whether the provider still authenticates a key secret and whether this space still authorizes it to discover collections, for example after revocation.</p>
+      {#if form?.check}<div role="status" class="space-y-1 text-sm">
+        <p class={form.check.kind ? 'text-success' : 'text-danger'}>Provider: {form.check.kind ? `accepted as ${form.check.kind}` : `rejected (${form.check.code})`}.</p>
+        {#if form.check.space}<p class={form.check.space.allowed ? 'text-success' : 'text-danger'}>This space: {form.check.space.allowed ? 'allowed' :
+          `${form.check.space.denied ? 'denied' : 'not determined'} (${form.check.space.code})`}.</p>
+          {#if form.check.space.denied}<p class="hint">The provider still accepts this key. If it shows provider cleanup pending, retry its revocation.</p>{/if}{/if}
+      </div>{/if}
       <form method="POST" action="?/check" class="space-y-3">
         <label for="check-secret">Key secret</label>
         <input id="check-secret" name="secret" type="password" autocomplete="off" required aria-invalid={form?.checkMissing ? 'true' : undefined}

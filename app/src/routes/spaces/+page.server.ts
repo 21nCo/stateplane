@@ -16,14 +16,14 @@ export const actions:Actions={
   create:async(event)=>{
     const form=await event.request.formData();
     const spaceId=String(form.get('spaceId')??'');
-    const cellId=String(form.get('cellId')??'').trim();
-    const created=await api<Space>(event,'POST',['spaces'],{body:{spaceId,...(cellId ? {cellId} : {})}});
+    const cellId=String(form.get('cellId')??'');
+    const created=await api<Space>(event,'POST',['spaces'],{body:{spaceId,...(cellId.trim() ? {cellId} : {})}});
     if (!created.ok) return fail(created.status,{create:{error:created.error,spaceId,cellId}});
     redirect(303,spaceHref(created.data.spaceId));
   },
   open:async({request})=>{
-    const spaceId=String((await request.formData()).get('spaceId')??'').trim();
-    if (!spaceId) return fail(400,{open:{missing:true}});
+    const spaceId=String((await request.formData()).get('spaceId')??'');
+    if (!spaceId.trim()) return fail(400,{open:{missing:true}});
     redirect(303,spaceHref(spaceId));
   }
 };

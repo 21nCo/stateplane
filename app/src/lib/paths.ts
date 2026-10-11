@@ -9,5 +9,7 @@ export function selectors(url:URL):{space:string;collection:string;record:string
   const [, , space, , collection, , record]=url.pathname.split('/');
   return {space:decode(space),collection:decode(collection),record:decode(record)};
 }
+/** Display an identifier with surrounding whitespace made visible; selectors stay exact. */
+export const shown=(id:string)=>id===id.trim() ? id : JSON.stringify(id);
 export const spaceHref=(space:string)=>`/spaces/${segment(space)}`;
 export const collectionHref=(space:string,collection:string)=>`${spaceHref(space)}/collections/${segment(collection)}`;

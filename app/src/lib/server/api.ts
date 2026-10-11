@@ -1,6 +1,6 @@
 import type { Cookies } from '@sveltejs/kit';
 import type { ApiError } from '$lib/errors';
-import { segment } from '$lib/paths';
+import { segment } from '../paths';
 import { stateplaneHost, unavailable } from './host';
 import type { Bindings } from './host';
 
@@ -28,7 +28,8 @@ export async function api<T>(context:Context,method:string,path:readonly string[
   }
   const request=new Request(url,{method,headers,body});
   const host=stateplaneHost(bindings(context.platform));
-  const response=host ? await host.http(request) : unavailable(request);
+  // Without a host the request was never sent, so it is retryable, as on /v1.
+  const response=host ? await host.http(request) : unavailable();
   const value=await response.json().catch(()=>null) as {error?:Partial<ApiError>}|null;
   if (response.ok) return {ok:true,status:response.status,data:value as T};
   return {ok:false,status:response.status,error:{code:value?.error?.code ?? 'PROVIDER_UNAVAILABLE',

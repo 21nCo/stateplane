@@ -28,6 +28,7 @@ vi.mock('../packages/mcp/dist/index.js', () => ({
 }));
 
 import { stateplaneHost } from '../app/src/lib/server/host';
+import { api } from '../app/src/lib/server/api';
 
 const env = { STATEPLANE_ENV: 'preview', STATEPLANE_TEST_HTTP: '1', STATEPLANE_TEST_TOKEN: 'o'.repeat(32),
   STATEPLANE_TEST_OWNER: 'owner', STATEPLANE_TEST_CREDENTIAL: 'session-1', STATEPLANE_TEST_CURSOR_SECRET: 'a'.repeat(64),
@@ -110,4 +111,11 @@ it('a Node host rebuilds when STATEPLANE_ENV changes and accepts any bearer sche
   // The same bindings as a Preview no longer derive a loopback resource.
   const preview = await stateplaneHost({ ...node, STATEPLANE_ENV: 'preview' } as never)!.mcp(call('http://127.0.0.1:6201'));
   expect(preview.status).toBe(503);
+});
+
+it('a UI write without a configured host reports a retryable unsent request, as /v1 does', async () => {
+  const context = { cookies: { get: () => 'o'.repeat(32) }, url: new URL('http://127.0.0.1/spaces'),
+    platform: { env: { STATEPLANE_ENV: 'local', STATEPLANE_TEST_HTTP: '0' } } };
+  const result = await api(context as never, 'POST', ['spaces'], { body: { spaceId: 'sp_unsent' } });
+  expect(result).toMatchObject({ ok: false, status: 503, error: { code: 'PROVIDER_UNAVAILABLE', retryable: true } });
 });

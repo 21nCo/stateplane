@@ -122,5 +122,9 @@ test('owner key issuance, listing, revocation, audit and index backfill go throu
   assert.equal(second.nextCursor,null);
   // Unconfirmed issuance rows are reported as pending rather than usable.
   assert.equal([...first.items,...second.items].filter(item=>item.status==='pending').length,100);
+  // Authorization needs confirmation too, so an activated but unconfirmed key (a lost issuance ack) is pending.
+  await pool.query(`UPDATE space_credentials SET activated_at=clock_timestamp() WHERE space_id=$1 AND credential_id='key-bulk-001'`,[spaceId]);
+  const activated=json(await route('GET',`/v1/spaces/${spaceId}/agent-keys`)).items.find(item=>item.keyId==='key-bulk-001');
+  assert.equal(activated.status,'pending');
   await pool.query(`DELETE FROM space_credentials WHERE space_id=$1 AND credential_id LIKE 'key-bulk-%'`,[spaceId]);
 });

@@ -1394,7 +1394,7 @@ export class PostgresSpaces {
     if (cursor !== undefined && !validId(cursor)) throw new AuthorityError('CURSOR_INVALID');
     const space = await this.owned(actor,spaceId);
     const rows = await this.cell(space.cellId).pool.query(`SELECT c.credential_id,c.expires_at,c.created_at,c.revoked_at,c.provider_revoked_at,
-        CASE WHEN c.revoked_at IS NOT NULL THEN 'revoked' WHEN c.activated_at IS NULL THEN 'pending'
+        CASE WHEN c.revoked_at IS NOT NULL THEN 'revoked' WHEN c.activated_at IS NULL OR c.confirmed_at IS NULL THEN 'pending'
           WHEN c.expires_at<=clock_timestamp() THEN 'expired' ELSE 'active' END AS status,
         COALESCE((SELECT json_agg(json_build_object('collectionId',g.collection_id,'capabilities',g.capabilities,
           'expiresAt',g.expires_at) ORDER BY g.collection_id) FROM collection_grants g

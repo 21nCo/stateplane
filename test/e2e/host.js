@@ -2,7 +2,8 @@
 // creates a disposable database, migrates it and enables the opt-in fixture
 // host; the database is dropped when Playwright stops this process. The UI
 // reaches that database through a loopback proxy whose control port lets a
-// test drop one reply, so a lost acknowledgement is reproducible.
+// test drop one reply, so a lost acknowledgement is reproducible, or fail the
+// fixture provider's next key revocation.
 import { execFileSync, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
@@ -17,6 +18,8 @@ const faultPort=5744;
 let url;
 let creating;
 let app;
+// Settles once the UI process has ended, whether it exited or was signalled.
+let ended;
 let control;
 let stopping=false;
 async function stop(code=0) {
@@ -24,7 +27,7 @@ async function stop(code=0) {
   stopping=true;
   if (app) {
     app.kill('SIGTERM');
-    if (app.exitCode===null) await once(app,'exit');
+    await ended;
   }
   control?.close();
   try {
@@ -39,12 +42,14 @@ async function stop(code=0) {
 }
 // Cleanup is registered before the database exists, so an interrupt or a failed
 // migration during startup still drops it.
-for (const signal of ['SIGTERM','SIGINT']) process.on(signal,()=>void stop());
+// A second signal during cleanup exits at once.
+for (const signal of ['SIGTERM','SIGINT']) process.on(signal,()=>{ if (stopping) process.exit(1); void stop(); });
 
 /** One armed fault: after a client message containing `after` (or at once),
  * the reply to the next message containing `match` is dropped and both sockets
  * close, as when a connection fails after the database acted. */
 let fault=null;
+let providerFault=false;
 async function proxy(target) {
   const server=net.createServer(client=>{
     const upstream=net.connect(Number(target.port || 5432),target.hostname);
@@ -69,6 +74,13 @@ async function proxy(target) {
     let body='';
     request.on('data',chunk=>{ body+=chunk; });
     request.on('end',()=>{
+      // A test posts "arm"; the fixture provider's empty post consumes the
+      // armed failure (200) or proceeds (204).
+      if (request.url==='/provider-fault') {
+        response.writeHead(body!=='arm' && providerFault ? 200 : 204).end();
+        providerFault=body==='arm';
+        return;
+      }
       try {
         const {match,after}=JSON.parse(body);
         if (typeof match!=='string' || !match) throw new Error('match');
@@ -99,5 +111,7 @@ if (base) {
   }
 }
 app=spawn(process.execPath,['node_modules/vite/bin/vite.js','dev','--host','127.0.0.1','--port','5743','--strictPort'],
-  {cwd:`${root}/app`,stdio:'inherit',env:{...process.env,...(databaseUrl ? {STATEPLANE_TEST_DATABASE_URL:databaseUrl} : {})}});
-app.on('exit',()=>void stop());
+  {cwd:`${root}/app`,stdio:'inherit',env:{...process.env,...(databaseUrl ? {STATEPLANE_TEST_DATABASE_URL:databaseUrl,
+    STATEPLANE_TEST_PROVIDER_FAULT_URL:`http://127.0.0.1:${faultPort}/provider-fault`} : {})}});
+ended=new Promise(resolve=>{ app.once('exit',resolve); app.once('error',resolve); });
+void ended.then(()=>stop());

@@ -20,13 +20,14 @@ export const load:PageServerLoad=async(event)=>{
 export const actions:Actions={
   ingest:async(event)=>{
     const form=await event.request.formData();
-    const operationKey=String(form.get('operationKey')??'').trim();
+    // The operation key is the ledger identity, so it is sent exactly as entered.
+    const operationKey=String(form.get('operationKey')??'');
     const items=String(form.get('items')??'');
     const retryFailed=form.get('retryFailed')==='on';
     // Each nonblank line is sent as its exact text; reformatting a line changes the batch identity.
     const lines=items.split(/\r?\n/).filter(line=>line.trim());
     const values={operationKey,items,retryFailed};
-    if (!operationKey) return fail(400,{...values,keyMissing:true});
+    if (!operationKey.trim()) return fail(400,{...values,keyMissing:true});
     if (!lines.length || lines.length>maxItems) return fail(400,{...values,countInvalid:true});
     const result=await api<Progress>(event,'PUT',batchPath(event,operationKey),{body:lines,query:{retryFailed:retryFailed ? 'true' : undefined}});
     if (!result.ok) return fail(result.status,{...values,error:result.error});

@@ -29,7 +29,7 @@ interface FixtureKey { id:string; owner:string; issuanceId:string; expiresAt:num
  * The store outlives a retired host, as a provider outlives one connection
  * pool; it is lost only when the Node process restarts. */
 let fixtureStore:ReturnType<typeof fixtureKeys>|undefined;
-function fixtureKeys() {
+function fixtureKeys(faultUrl?:string) {
   const byDigest=new Map<string,FixtureKey>();
   const byId=new Map<string,FixtureKey>();
   const live=(key:FixtureKey|undefined):key is FixtureKey=>!!key && !key.revoked && key.expiresAt>Date.now();
@@ -45,10 +45,13 @@ function fixtureKeys() {
       },
       find:(owner:string,issuanceId:string)=>Promise.resolve([...byId.values()]
         .find(key=>key.owner===owner && key.issuanceId===issuanceId)?.id ?? null),
-      revoke:(id:string,owner:string)=>{
+      revoke:async(id:string,owner:string)=>{
+        // A local journey can arm one failed provider call; the provider then
+        // keeps accepting the key until a retried revocation succeeds.
+        if (faultUrl && (await fetch(faultUrl,{method:'POST'}).catch(()=>null))?.status===200)
+          throw new Error('Fixture provider revocation failed');
         const key=byId.get(id);
         if (key?.owner===owner) key.revoked=true;
-        return Promise.resolve();
       }
     },
     verify:(secret:string)=>{
@@ -167,7 +170,8 @@ export function stateplaneHost(env:Bindings):Host | undefined {
   // goes away. The pool removes that client; consume the event without logging
   // provider diagnostics or allowing an unhandled error to kill the host.
   pool.on('error',()=>{});
-  const keys=perRequest ? null : fixtureStore??=fixtureKeys();
+  const keys=perRequest ? null : fixtureStore??=fixtureKeys(env.STATEPLANE_ENV==='local' ?
+    env.STATEPLANE_TEST_PROVIDER_FAULT_URL : undefined);
   const tokenDigest=createHash('sha256').update(env.STATEPLANE_TEST_TOKEN).digest();
   const agentDigest=env.STATEPLANE_TEST_AGENT_TOKEN ?
     createHash('sha256').update(env.STATEPLANE_TEST_AGENT_TOKEN).digest() : null;

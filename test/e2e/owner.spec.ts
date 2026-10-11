@@ -39,6 +39,17 @@ async function dropReply(match: string, after?: string) {
   const response = await fetch('http://127.0.0.1:5744/fault', { method: 'POST', body: JSON.stringify({ match, after }) });
   expect(response.status).toBe(204);
 }
+/** Fail the fixture provider's next key revocation. */
+async function failProviderRevocation() {
+  const response = await fetch('http://127.0.0.1:5744/provider-fault', { method: 'POST', body: 'arm' });
+  expect(response.status).toBe(204);
+}
+async function checkKey(page: Page, secret: string) {
+  await settle(page);
+  await page.getByLabel('Key secret').fill(secret);
+  await page.getByRole('button', { name: 'Check key' }).click();
+  return page.getByRole('status');
+}
 async function asAgent(browser: Browser, secret: string) {
   const page = await (await browser.newContext()).newPage();
   await signIn(page, secret);
@@ -244,35 +255,36 @@ test('owner grants an agent key, the API enforces it and revocation is verified'
   await expect(agent.getByRole('alert')).toContainText('FORBIDDEN');
   await go(agent, `${spaceUrl}/access`);
   await expect(agent.getByRole('alert').first()).toContainText(/FORBIDDEN|NOT_FOUND/);
+  await go(page, `${spaceUrl}/access`);
+  const live = await checkKey(page, secret);
+  await expect(live).toContainText('Provider: accepted as api-key.');
+  await expect(live).toContainText('This space: allowed.');
 
   await page.getByRole('button', { name: /^Revoke key_/ }).click();
   await expect(page.getByRole('status')).toContainText('revoked');
-  await settle(page);
-  await page.getByLabel('Key secret').fill(secret);
-  await page.getByRole('button', { name: 'Check key' }).click();
-  await expect(page.getByRole('status')).toContainText('Rejected: UNAUTHENTICATED');
+  await expect(await checkKey(page, secret)).toContainText('Provider: rejected (UNAUTHENTICATED).');
   await go(agent, itemsUrl());
   await expect(agent.getByRole('alert')).toContainText('UNAUTHENTICATED');
 
-  // A provider failure after the local revocation stays visible and can be finished.
+  // A failed provider revocation leaves the key denied here, visibly pending cleanup.
   if (local) {
     await go(page, `${spaceUrl}/access`);
     await items.getByLabel('records:read').check();
     await page.getByRole('button', { name: 'Issue key' }).click();
     const interrupted = await page.getByLabel('Secret', { exact: true }).inputValue();
     await go(page, `${spaceUrl}/access`);
-    await dropReply('UPDATE space_credentials SET provider_revoked_at');
+    await failProviderRevocation();
     await page.getByRole('button', { name: /^Revoke key_/ }).click();
     await expect(page.getByRole('alert')).toBeVisible();
     await expect(page.getByRole('table')).toContainText('Denied here; provider cleanup pending');
-    await settle(page);
-    await page.getByLabel('Key secret').fill(interrupted);
-    await page.getByRole('button', { name: 'Check key' }).click();
-    await expect(page.getByRole('status')).toContainText('Rejected: UNAUTHENTICATED');
+    const pending = await checkKey(page, interrupted);
+    await expect(pending).toContainText('Provider: accepted as api-key.');
+    await expect(pending).toContainText('This space: denied (NOT_FOUND).');
     await page.getByRole('button', { name: /^Retry provider revocation for key_/ }).click();
     await expect(page.getByRole('status')).toContainText('revoked');
     await expect(page.getByRole('table')).not.toContainText('provider cleanup pending');
     await expect(page.getByRole('button', { name: /^Retry provider revocation/ })).toHaveCount(0);
+    await expect(await checkKey(page, interrupted)).toContainText('Provider: rejected (UNAUTHENTICATED).');
   }
 
   await go(page, `${spaceUrl}/audit`);
@@ -291,6 +303,35 @@ test('ingestion reports per-item progress', async ({ page }) => {
   await expect(page.getByRole('status')).toContainText('1 succeeded');
   await expect(page.getByRole('status')).toContainText('1 failed');
   await expect(page.getByRole('table')).toContainText('SCHEMA_INVALID');
+});
+
+test('identifiers that differ only by surrounding whitespace stay distinct', async ({ page, request }) => {
+  await signIn(page, ownerToken);
+  await go(page, `${spaceUrl}/new-collection`);
+  await page.getByLabel('Collection name').fill(' items ');
+  await page.getByRole('button', { name: 'Define collection' }).click();
+  await expect(page).toHaveURL(`${spaceUrl}/collections/%20items%20/schema`);
+
+  // The grant reaches only the selected sibling.
+  await go(page, `${spaceUrl}/access`);
+  await page.getByRole('group', { name: 'Collection " items "' }).getByLabel('records:read').check();
+  await page.getByRole('button', { name: 'Issue key' }).click();
+  const headers = { authorization: `Bearer ${await page.getByLabel('Secret', { exact: true }).inputValue()}` };
+  expect((await request.get(`/v1${spaceUrl}/collections/%20items%20`, { headers })).status()).toBe(200);
+  expect((await request.get(`/v1${spaceUrl}/collections/items`, { headers })).status()).toBe(404);
+
+  // A padded operation key resumes its own batch, not its trimmed sibling.
+  await go(page, `${itemsUrl()}/batches`);
+  const line = JSON.stringify({ operation: 'create', data: { title: 'Padded', state: 'open' } });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await settle(page);
+    await page.getByLabel('Operation key').first().fill(' import-1 ');
+    await page.getByLabel(/Record requests/).fill(line);
+    await page.getByRole('button', { name: 'Submit batch' }).click();
+    await expect(page).toHaveURL(/\?operation=%20import-1%20$/);
+    await expect(page.getByRole('status')).toContainText('1 succeeded');
+    await expect(page.getByRole('status')).not.toContainText('failed');
+  }
 });
 
 test('pages pass accessibility checks, keyboard use and small screens', async ({ page }) => {
