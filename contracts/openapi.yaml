@@ -215,9 +215,14 @@ components:
         enum: { type: array, minItems: 1 }
         format: { const: date-time }
         description: { type: string }
+      allOf:
+        - { if: { properties: { type: { const: object } } }, then: { required: [additionalProperties] } }
+        - { if: { properties: { type: { const: array } } }, then: { required: [items] } }
       description: >-
-        The authority further checks node-kind restrictions, nullable scalar
-        unions, depth, field count, bounds, and enum members.
+        An object node declares additionalProperties false and an array node
+        declares items. The authority further checks the remaining node-kind
+        restrictions, nullable scalar unions, depth, field count, bounds, and
+        enum members.
     SchemaRoot:
       allOf:
         - { $ref: '#/components/schemas/SchemaNode' }

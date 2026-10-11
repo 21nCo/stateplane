@@ -220,27 +220,31 @@
                 "description": "1 for collections_define; the next version for collections_revise."
               },
               "schema": {
-                "type": "object",
-                "required": [
-                  "$schema",
-                  "type",
-                  "additionalProperties"
-                ],
-                "properties": {
-                  "$schema": {
-                    "const": "https://json-schema.org/draft/2020-12/schema"
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/schemaNode"
                   },
-                  "type": {
-                    "const": "object"
-                  },
-                  "properties": {
-                    "type": "object"
-                  },
-                  "additionalProperties": {
-                    "const": false
+                  {
+                    "type": "object",
+                    "required": [
+                      "$schema",
+                      "type",
+                      "additionalProperties"
+                    ],
+                    "properties": {
+                      "$schema": {
+                        "const": "https://json-schema.org/draft/2020-12/schema"
+                      },
+                      "type": {
+                        "const": "object"
+                      },
+                      "additionalProperties": {
+                        "const": false
+                      }
+                    }
                   }
-                },
-                "description": "Closed JSON Schema Draft 2020-12 root: $schema \"https://json-schema.org/draft/2020-12/schema\", type \"object\", properties and additionalProperties false at every object node. Only type, properties, required, additionalProperties, items, minItems, maxItems, minLength, maxLength, minimum, maximum, enum, format \"date-time\" and description are supported."
+                ],
+                "description": "Closed JSON Schema Draft 2020-12 root: a schema node with $schema \"https://json-schema.org/draft/2020-12/schema\", type \"object\" and additionalProperties false."
               },
               "unique": {
                 "type": "array",
@@ -315,7 +319,130 @@
           "collectionId",
           "definition"
         ],
-        "additionalProperties": false
+        "additionalProperties": false,
+        "$defs": {
+          "schemaNode": {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "$schema": {
+                "type": "string"
+              },
+              "type": {
+                "oneOf": [
+                  {
+                    "enum": [
+                      "string",
+                      "integer",
+                      "number",
+                      "boolean",
+                      "object",
+                      "array"
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": {
+                      "enum": [
+                        "string",
+                        "integer",
+                        "number",
+                        "boolean",
+                        "null"
+                      ]
+                    }
+                  }
+                ]
+              },
+              "properties": {
+                "type": "object",
+                "additionalProperties": {
+                  "$ref": "#/$defs/schemaNode"
+                }
+              },
+              "required": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": {
+                "const": false
+              },
+              "items": {
+                "$ref": "#/$defs/schemaNode"
+              },
+              "minItems": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "maxItems": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "minLength": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "maxLength": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "minimum": {
+                "type": "number"
+              },
+              "maximum": {
+                "type": "number"
+              },
+              "enum": {
+                "type": "array",
+                "minItems": 1
+              },
+              "format": {
+                "const": "date-time"
+              },
+              "description": {
+                "type": "string"
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "object"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "additionalProperties"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "array"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "items"
+                  ]
+                }
+              }
+            ],
+            "description": "Closed schema node: only these 15 keywords. An object node requires additionalProperties false and an array node requires items. type is one name or a two-member scalar type plus \"null\". The service also checks keyword placement by type, $schema only at the root, depth, field count, bounds and enum members."
+          }
+        }
       },
       "annotations": {
         "readOnlyHint": false,
@@ -450,27 +577,31 @@
                 "description": "1 for collections_define; the next version for collections_revise."
               },
               "schema": {
-                "type": "object",
-                "required": [
-                  "$schema",
-                  "type",
-                  "additionalProperties"
-                ],
-                "properties": {
-                  "$schema": {
-                    "const": "https://json-schema.org/draft/2020-12/schema"
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/schemaNode"
                   },
-                  "type": {
-                    "const": "object"
-                  },
-                  "properties": {
-                    "type": "object"
-                  },
-                  "additionalProperties": {
-                    "const": false
+                  {
+                    "type": "object",
+                    "required": [
+                      "$schema",
+                      "type",
+                      "additionalProperties"
+                    ],
+                    "properties": {
+                      "$schema": {
+                        "const": "https://json-schema.org/draft/2020-12/schema"
+                      },
+                      "type": {
+                        "const": "object"
+                      },
+                      "additionalProperties": {
+                        "const": false
+                      }
+                    }
                   }
-                },
-                "description": "Closed JSON Schema Draft 2020-12 root: $schema \"https://json-schema.org/draft/2020-12/schema\", type \"object\", properties and additionalProperties false at every object node. Only type, properties, required, additionalProperties, items, minItems, maxItems, minLength, maxLength, minimum, maximum, enum, format \"date-time\" and description are supported."
+                ],
+                "description": "Closed JSON Schema Draft 2020-12 root: a schema node with $schema \"https://json-schema.org/draft/2020-12/schema\", type \"object\" and additionalProperties false."
               },
               "unique": {
                 "type": "array",
@@ -546,7 +677,130 @@
           "expectedVersion",
           "definition"
         ],
-        "additionalProperties": false
+        "additionalProperties": false,
+        "$defs": {
+          "schemaNode": {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "$schema": {
+                "type": "string"
+              },
+              "type": {
+                "oneOf": [
+                  {
+                    "enum": [
+                      "string",
+                      "integer",
+                      "number",
+                      "boolean",
+                      "object",
+                      "array"
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": {
+                      "enum": [
+                        "string",
+                        "integer",
+                        "number",
+                        "boolean",
+                        "null"
+                      ]
+                    }
+                  }
+                ]
+              },
+              "properties": {
+                "type": "object",
+                "additionalProperties": {
+                  "$ref": "#/$defs/schemaNode"
+                }
+              },
+              "required": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": {
+                "const": false
+              },
+              "items": {
+                "$ref": "#/$defs/schemaNode"
+              },
+              "minItems": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "maxItems": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "minLength": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "maxLength": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "minimum": {
+                "type": "number"
+              },
+              "maximum": {
+                "type": "number"
+              },
+              "enum": {
+                "type": "array",
+                "minItems": 1
+              },
+              "format": {
+                "const": "date-time"
+              },
+              "description": {
+                "type": "string"
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "object"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "additionalProperties"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "array"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "items"
+                  ]
+                }
+              }
+            ],
+            "description": "Closed schema node: only these 15 keywords. An object node requires additionalProperties false and an array node requires items. type is one name or a two-member scalar type plus \"null\". The service also checks keyword placement by type, $schema only at the root, depth, field count, bounds and enum members."
+          }
+        }
       },
       "annotations": {
         "readOnlyHint": false,
@@ -1835,5 +2089,5 @@
   ],
   "resourceTemplates": [],
   "prompts": [],
-  "hash": "8808ccce05034ef6d566888c7c9e3ce034738b9c99e6de346f392d7725b9d8c4"
+  "hash": "339e7b68be309cff897fb71291fe6175626be81a2e982b00d2635e2239379a6c"
 }

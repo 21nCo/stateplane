@@ -65,16 +65,49 @@ export const predicate: McpFnJsonSchema = {
 };
 const predicates = { type: 'array', maxItems: 16, items: predicate, description: 'Up to 16 typed predicates; [] matches every live record.' };
 
+/* contracts/openapi.yaml SchemaNode and SchemaRoot. A node recurses through
+ * the tool's own $defs, so every node is closed to the 15 supported keywords,
+ * an object node declares additionalProperties false and an array node
+ * declares items. The authority alone checks the remaining node-kind
+ * restrictions (for example $schema only at the root), nullable unions,
+ * depth, field count, bounds and enum members. */
+// A fresh object per use: McpFn rewrites each $ref in place, once per object.
+const nodeRef = () => ({ $ref: '#/$defs/schemaNode' });
+const size = { type: 'integer', minimum: 0 };
+export const schemaNode: McpFnJsonSchema = {
+  type: 'object', required: ['type'], additionalProperties: false,
+  properties: {
+    $schema: { type: 'string' },
+    type: { oneOf: [{ enum: ['string', 'integer', 'number', 'boolean', 'object', 'array'] },
+      { type: 'array', minItems: 2, maxItems: 2, items: { enum: ['string', 'integer', 'number', 'boolean', 'null'] } }] },
+    properties: { type: 'object', additionalProperties: nodeRef() },
+    required: { type: 'array', items: { type: 'string' } },
+    additionalProperties: { const: false },
+    items: nodeRef(),
+    minItems: size, maxItems: size, minLength: size, maxLength: size,
+    minimum: { type: 'number' }, maximum: { type: 'number' },
+    enum: { type: 'array', minItems: 1 },
+    format: { const: 'date-time' },
+    description: { type: 'string' }
+  },
+  allOf: [{ if: { properties: { type: { const: 'object' } } }, then: { required: ['additionalProperties'] } },
+    { if: { properties: { type: { const: 'array' } } }, then: { required: ['items'] } }],
+  description: 'Closed schema node: only these 15 keywords. An object node requires additionalProperties false and an array node requires items. type is one name or a two-member scalar type plus "null". The service also checks keyword placement by type, $schema only at the root, depth, field count, bounds and enum members.'
+};
+const schemaRoot: McpFnJsonSchema = {
+  allOf: [nodeRef(), { type: 'object', required: ['$schema', 'type', 'additionalProperties'],
+    properties: { $schema: { const: 'https://json-schema.org/draft/2020-12/schema' }, type: { const: 'object' },
+      additionalProperties: { const: false } } }],
+  description: 'Closed JSON Schema Draft 2020-12 root: a schema node with $schema "https://json-schema.org/draft/2020-12/schema", type "object" and additionalProperties false.'
+};
+
 const definition: McpFnJsonSchema = {
   type: 'object', required: ['slug', 'version', 'schema', 'unique', 'filterable', 'sortable'], additionalProperties: false,
   description: 'Collection definition. slug must equal collectionId.',
   properties: {
     slug: { type: 'string', minLength: 1 },
     version: positive('1 for collections_define; the next version for collections_revise.'),
-    schema: { type: 'object', required: ['$schema', 'type', 'additionalProperties'],
-      properties: { $schema: { const: 'https://json-schema.org/draft/2020-12/schema' }, type: { const: 'object' },
-        properties: { type: 'object' }, additionalProperties: { const: false } },
-      description: 'Closed JSON Schema Draft 2020-12 root: $schema "https://json-schema.org/draft/2020-12/schema", type "object", properties and additionalProperties false at every object node. Only type, properties, required, additionalProperties, items, minItems, maxItems, minLength, maxLength, minimum, maximum, enum, format "date-time" and description are supported.' },
+    schema: schemaRoot,
     unique: { type: 'array', items: { type: 'object', required: ['name', 'paths'], additionalProperties: false,
       properties: { name: { type: 'string', minLength: 1 }, paths: { type: 'array', minItems: 1, items: { type: 'string' } } } } },
     filterable: { type: 'array', items: { type: 'string' } },
@@ -85,6 +118,8 @@ const definition: McpFnJsonSchema = {
   }
 };
 
+/* Both definition tools resolve nodeRef() against their own $defs. */
+const withSchemaNode = (schema: McpFnObjectSchema): McpFnObjectSchema => ({ ...schema, $defs: { schemaNode } });
 const object = (properties: Record<string, McpFnJsonSchema>, required: string[]): McpFnObjectSchema =>
   ({ type: 'object', properties, required, additionalProperties: false });
 const scoped = (properties: Record<string, McpFnJsonSchema> = {}, required: string[] = []): McpFnObjectSchema =>
@@ -97,8 +132,9 @@ export const inputs = {
   spaces_get: object({ spaceId }, ['spaceId']),
   collections_list: object({ spaceId, cursor: cursor('Opaque cursor from a previous collections_list page.') }, ['spaceId']),
   collections_get: scoped(),
-  collections_define: scoped({ definition }, ['definition']),
-  collections_revise: scoped({ expectedVersion: positive('Current collection version.'), definition }, ['expectedVersion', 'definition']),
+  collections_define: withSchemaNode(scoped({ definition }, ['definition'])),
+  collections_revise: withSchemaNode(scoped({ expectedVersion: positive('Current collection version.'), definition },
+    ['expectedVersion', 'definition'])),
   records_get: scoped({ id: selector('Canonical record ID.') }, ['id']),
   records_get_by_key: scoped({ mode: { enum: ['generated', 'external'], description: 'generated looks up a record ID; external normalizes the key as on create.' },
     key: selector('Key to resolve in the selected mode.') }, ['mode', 'key']),

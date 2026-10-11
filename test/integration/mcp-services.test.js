@@ -276,3 +276,47 @@ test('published key and definition limits accept exactly what the authority acce
   assert.deepEqual(cases.map(([tool,args])=>publishedValidator(tool)(args)),[false,true,true,false,false,true,false,true,true,false,false,false,true,false,true,false,true,false],
     'each boundary is exercised on both sides');
 });
+
+test('published definition schemas accept exactly the nodes the authority accepts through define and revise',async t=>{
+  const user=await createUser(config,{primaryEmail:`owner-${randomUUID()}@example.invalid`});
+  const session=await issueSession(config,{},{userId:user.id,methods:['password']});
+  const owner=await identity.verify(new Request('https://h.invalid',{headers:{authorization:`Bearer ${session.sessionToken}`}}));
+  const spaceId=`sp_${randomUUID()}`;
+  await spaces.create(owner,'cell-a',spaceId);
+  t.after(async()=>{ await spaces.archive(owner,spaceId); await spaces.delete(owner,spaceId); });
+  const {server,endpoint}=await host();
+  t.after(()=>server.close());
+  const client=await connect(endpoint,session.sessionToken,'owner-client');
+  t.after(()=>client.close());
+  const root={$schema:'https://json-schema.org/draft/2020-12/schema',type:'object',properties:{label:{type:'string'}},
+    required:['label'],additionalProperties:false};
+  const body=(slug,version,schema)=>({slug,version,schema,unique:[],filterable:[],sortable:[]});
+  await ok(client,'collections_define',{spaceId,collectionId:'revised',definition:body('revised',1,root)});
+  const version=async()=>(await ok(client,'collections_get',{spaceId,collectionId:'revised'})).definition.version;
+  // Each schema adds one optional field or root keyword, so a revise is otherwise compatible.
+  const field=node=>({...root,properties:{...root.properties,extra:node}});
+  const unsupported=[
+    {...root,$ref:'#/$defs/x'},
+    {...root,allOf:[{type:'object'}]},
+    {...root,patternProperties:{}},
+    field({type:'object',properties:{}}),
+    field({type:'array'}),
+    field({type:'string',oneOf:[{type:'string'}]}),
+    field({type:'array',items:{$ref:'#'}})
+  ];
+  const supported=field({type:'object',additionalProperties:false,required:['tag'],description:'Nested.',properties:{
+    tag:{type:'string',enum:['a','b'],minLength:1,maxLength:8},at:{type:'string',format:'date-time'},
+    score:{type:['integer','null'],minimum:0,maximum:9},
+    tags:{type:'array',minItems:0,maxItems:3,items:{type:'string'}}}});
+  for (const [index,schema] of [...unsupported,supported].entries()) {
+    const valid=index===unsupported.length;
+    const define=['collections_define',{spaceId,collectionId:`d${index}`,definition:body(`d${index}`,1,schema)}];
+    const revise=['collections_revise',{spaceId,collectionId:'revised',expectedVersion:1,definition:body('revised',2,schema)}];
+    for (const [tool,args] of [define,revise]) {
+      assert.equal(publishedValidator(tool)(args),valid,`case ${index}: published ${tool}`);
+      if (valid) await ok(client,tool,args);
+      else assert.equal(await failed(client,tool,args),'SCHEMA_UNSUPPORTED',`case ${index}: authority ${tool}`);
+    }
+    assert.equal(await version(),valid?2:1,`case ${index}: a rejected revise keeps the version`);
+  }
+});

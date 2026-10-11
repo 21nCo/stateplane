@@ -31,8 +31,23 @@ as in the OpenAPI contract: `x-utf8MaxBytes` (256 for `idempotencyKey` and
 `externalKey` budget applies only after NFC and the fixed whitespace trim, so it
 is published as `x-nfcTrimmedUtf8MaxBytes`; a client must not apply it to the
 raw, possibly padded or decomposed value. A contract test asserts the exact set
-of published extensions and compares each with OpenAPI or the Postgres authority.
-`definition.schema` publishes the closed root that the authority requires.
+of published extensions, keyed by tool and JSON pointer with duplicates kept,
+and compares each with OpenAPI or the Postgres authority.
+
+`collections_define` and `collections_revise` publish the same OpenAPI
+`CollectionDefinition`. Its `schema` is `SchemaRoot`, and every node below it
+refers to one recursive `schemaNode` in the tool's own `$defs`, which equals
+OpenAPI `SchemaNode`: each node is closed to the 15 supported keywords, an
+object node must declare `additionalProperties: false` and an array node must
+declare `items`. The authority alone checks the remaining node-kind rules (for
+example `$schema` only at the root and `minLength` only on strings), nullable
+unions, depth, field count, bounds and enum members, and answers
+`SCHEMA_UNSUPPORTED`. The only intended difference from OpenAPI is the
+published safe-integer maximum on `version`. A contract test compares both
+tools with OpenAPI and compiles every tool with McpFn's Node (Ajv) and Worker
+(`@cfworker/json-schema`) engines, and a Postgres test sends the same supported and
+unsupported root and nested schemas through both tools to the published schema
+and the authority.
 
 | Tool | Service | Annotations |
 | --- | --- | --- |
@@ -55,7 +70,8 @@ cannot mint or revoke credentials through MCP.
 
 Input schemas follow [the OpenAPI contract](../contracts/openapi.yaml): the
 mutation variants, idempotency and external-key patterns and every typed
-predicate variant are compared with OpenAPI by `test/mcp.test.js`. Results are
+predicate variant, and the collection definition of both definition tools, are
+compared with OpenAPI by `test/mcp.test.js`. Results are
 the JSON an HTTP client receives, in `structuredContent` and as JSON text;
 `records_count` returns `{count}` because MCP results are objects.
 
@@ -158,7 +174,7 @@ used: `scopes_supported` is omitted and authorization is the space grant model.
 
 These bounds reuse STA-8/9 limits or protocol framing; none is a measured
 Cloudflare or Railway capacity. The committed manifest publishes 19 tools in a
-39,573-byte compact `tools/list` result (39,607 bytes on the wire) plus 1,334
+41,961-byte compact `tools/list` result (41,995 bytes on the wire) plus 1,334
 characters of instructions.
 McpFn bundles the official SDK and schema validators: the app Worker dry-run
 grew from 834.94 KiB (178.06 KiB gzip) at the STA-9 base to 1,905.65 KiB
@@ -215,10 +231,10 @@ transport and belongs to regional acceptance (STA-21).
 
 | Command | Boundary | Needs |
 | --- | --- | --- |
-| `node --test test/mcp.test.js` (in `pnpm test:contracts`) | Registry, OpenAPI parity, service mapping, error parity with HTTP, precedence, re-encoding, OAuth challenges and metadata, origins, McpFn API-key regression matrix, body bounds, one deadline over stalled verification, unfinished body and dispatched reads and writes, one endpoint serving concurrent requests with their own services and equal JSON-RPC IDs, recovery guidance against write schemas | Node |
+| `node --test test/mcp.test.js` (in `pnpm test:contracts`) | Registry, OpenAPI parity (mutations, predicates and both definition tools), x- inventory by tool and pointer, service mapping, error parity with HTTP, precedence, re-encoding, OAuth challenges and metadata, origins, McpFn API-key regression matrix, body bounds, one deadline over stalled verification, unfinished body and dispatched reads and writes, one endpoint serving concurrent requests with their own services and equal JSON-RPC IDs, recovery guidance against write schemas | Node |
 | `test/mcp-host.test.ts` (in `pnpm test:qualification`) | The app host builds one MCP endpoint per isolate and resource while each Worker request passes its own services, identity and pool; a Preview without `STATEPLANE_MCP_RESOURCE` and a local non-loopback `Host` with a matching `Origin` fail closed | Node |
 | `node --test test/mcp-acceptance-cleanup.test.js` (in `pnpm test:contracts`) | Gate cleanup: reverse-order finalizers; a client that cannot spawn, stalls before ready or answers not ready fails the gate, is terminated and awaited, and backend cleanup still runs; a persisted record is passed only when every finalizer succeeds; evidence mode is the backend that ran | Node |
-| `test/integration/mcp-services.test.js` (in `pnpm test:postgres`) | Real AuthFn sessions and keys, Postgres authority: shared IDs and revisions, revision conflict, `KEY_RESERVED` and `UNIQUE_CONFLICT`, MCP↔HTTP receipt replay, idempotency mismatch, `1e400` parity, authorization before shape, AuthFn and cell revocation | Local Postgres |
+| `test/integration/mcp-services.test.js` (in `pnpm test:postgres`) | Real AuthFn sessions and keys, Postgres authority: shared IDs and revisions, revision conflict, `KEY_RESERVED` and `UNIQUE_CONFLICT`, MCP↔HTTP receipt replay, idempotency mismatch, `1e400` parity, authorization before shape, published key, predicate and definition-schema limits against the authority through define and revise, AuthFn and cell revocation | Local Postgres |
 | `pnpm test:mcp-clients` | Two distinct SDK clients in one space: official TypeScript SDK 1.29.0 (through `@mcpfn/client`) as owner and official Python SDK 2.3.0 as agent; create, read, query, replace, conflict, patch, both duplicate kinds, a lost response injected after commit and recovered, duplicate-delivery replay, typed filter, count, delete, event feed and revocation (`401` challenge in process) | Local Postgres, `uv` |
 | `pnpm test:mcp-conformance` | McpFn target suite (initialize, inventory against the manifest, guidance resource and semantic scenarios) and the applicable scenarios of the pinned official runner 0.1.16 | Local Postgres, network for `npx` |
 | `pnpm test:mcp-workerd` | The two-client gate through the built app under `wrangler dev`: workerd runtime, Workers `pg` sockets and the `@cfworker/json-schema` validator McpFn selects on Workers | Local Postgres, `uv` |

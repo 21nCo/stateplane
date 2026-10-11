@@ -8,7 +8,7 @@ import Ajv2020 from 'ajv/dist/2020.js';
 import { McpFnTestClient, authenticatedHttpTarget, assertManifestContract, checkHostCompatibility,
   MCPFN_HOST_PROFILES } from '@mcpfn/testing';
 import { assertAuthRegressionSuite, createFetchAuthTarget, bearerCredential } from '@mcpfn/testing/auth';
-import { diffManifests } from '@mcpfn/core';
+import { createSchemaCompiler, diffManifests } from '@mcpfn/core';
 import { createHttpHandler } from '../packages/api/dist/index.js';
 import { TransportFailure } from '../packages/application/dist/index.js';
 import { createMcpEndpoint, createMcpHandler, stateplaneMcpDeclaration, serializeJson, tools, guidance, guidanceUri,
@@ -106,7 +106,8 @@ test('the fixed registry publishes the committed manifest and annotations',async
   assert.notEqual(compatibility.status,'incompatible');
 });
 
-const strip=value=>JSON.parse(JSON.stringify(value,(key,item)=>key==='description'?undefined:item));
+// Drops prose only: SchemaNode also declares a `description` keyword whose value is a schema.
+const strip=value=>JSON.parse(JSON.stringify(value,(key,item)=>key==='description'&&typeof item==='string'?undefined:item));
 test('published mutation and predicate schemas agree with the HTTP OpenAPI contract',async()=>{
   const document=YAML.parse(await readFile(new URL('../contracts/openapi.yaml',import.meta.url),'utf8'));
   const variants=document.components.schemas.RecordMutation.oneOf;
@@ -143,25 +144,89 @@ test('published mutation and predicate schemas agree with the HTTP OpenAPI contr
   assert.deepEqual(input('records_query').properties.limit,{type:'integer',minimum:1,maximum:100});
 });
 
-test('every published x- extension is checked against OpenAPI or the authority',()=>{
-  const found=new Set();
-  const walk=(node,name)=>{
-    if (Array.isArray(node)) { for (const item of node) walk(item,name); return; }
+test('both definition tools publish the OpenAPI CollectionDefinition with a closed recursive SchemaNode',async()=>{
+  const {schemas}=YAML.parse(await readFile(new URL('../contracts/openapi.yaml',import.meta.url),'utf8')).components;
+  // The OpenAPI component reference becomes the tool-local one; nothing else is renamed.
+  const local=value=>JSON.parse(JSON.stringify(strip(value)).replaceAll('"#/components/schemas/SchemaNode"','"#/$defs/schemaNode"'));
+  const expected=local(schemas.CollectionDefinition);
+  expected.properties.schema=local(schemas.SchemaRoot);
+  // The authority admits only safe-integer versions, which MCP publishes as a bound.
+  expected.properties.version.maximum=Number.MAX_SAFE_INTEGER;
+  const manifest=stateplaneMcpDeclaration().manifest();
+  for (const name of ['collections_define','collections_revise']) {
+    const {inputSchema}=manifest.tools.find(tool=>tool.name===name);
+    assert.deepEqual(strip(inputSchema.properties.definition),expected,name);
+    assert.deepEqual(Object.keys(inputSchema.$defs),['schemaNode'],name);
+    assert.deepEqual(strip(inputSchema.$defs.schemaNode),local(schemas.SchemaNode),name);
+  }
+  assert.deepEqual(Object.keys(schemas.SchemaNode.properties).sort(),
+    ['$schema','additionalProperties','description','enum','format','items','maxItems','maxLength','maximum',
+      'minItems','minLength','minimum','properties','required','type'],'the 15 keywords the authority admits');
+  assert.ok(manifest.tools.filter(tool=>tool.inputSchema.$defs).every(tool=>tool.name.startsWith('collections_')));
+});
+
+test('the Node and Worker schema engines compile every tool and agree on definition schemas',()=>{
+  const root={$schema:'https://json-schema.org/draft/2020-12/schema',type:'object',additionalProperties:false};
+  const field=node=>({...root,properties:{extra:node}});
+  const cases=[
+    [{...root,$ref:'#'},false],[{...root,allOf:[{type:'object'}]},false],[{...root,patternProperties:{}},false],
+    [field({type:'object',properties:{}}),false],[field({type:'array'}),false],
+    [field({type:'string',oneOf:[{type:'string'}]}),false],[field({type:'array',items:{$ref:'#'}}),false],
+    [field({type:'object',additionalProperties:false,required:['tag'],properties:{tag:{type:'string',enum:['a']},
+      at:{type:'string',format:'date-time'},score:{type:['integer','null'],minimum:0,maximum:9},
+      tags:{type:'array',maxItems:3,items:{type:'string',maxLength:8}}}}),true]
+  ];
+  // McpFn validates with Ajv in Node and with @cfworker/json-schema in a Worker.
+  for (const engine of ['ajv','cfworker']) {
+    const compiler=createSchemaCompiler(engine);
+    for (const tool of stateplaneMcpDeclaration().manifest().tools) {
+      const validate=compiler.compile(tool.inputSchema);
+      if (!['collections_define','collections_revise'].includes(tool.name)) continue;
+      for (const [index,[schema,valid]] of cases.entries())
+        assert.equal(validate({spaceId:'sp_a',collectionId:'c',...tool.name==='collections_revise'?{expectedVersion:1}:{},
+          definition:{slug:'c',version:1,schema,unique:[],filterable:[],sortable:[]}}),valid,`${engine} ${tool.name} case ${index}`);
+    }
+  }
+});
+
+/** Every published x- extension as `tool pointer=value`, duplicates kept. */
+const extensions=manifest=>{
+  const found=[];
+  const walk=(node,tool,pointer)=>{
     if (!node || typeof node!=='object') return;
     for (const [key,item] of Object.entries(node)) {
-      if (key.startsWith('x-')) found.add(`${name} ${key} ${item}`);
-      else if (key==='properties') for (const [child,schema] of Object.entries(item)) walk(schema,child);
-      else walk(item,name);
+      const path=`${pointer}/${key.replaceAll('~','~0').replaceAll('/','~1')}`;
+      if (key.startsWith('x-')) found.push(`${tool} ${path}=${item}`);
+      else walk(item,tool,path);
     }
   };
-  for (const tool of stateplaneMcpDeclaration().manifest().tools) walk(tool.inputSchema,tool.name);
-  assert.deepEqual([...found].sort(),[
-    // OpenAPI parity above; predicate string and instant values in scalar and `in` form.
-    'externalKey x-nfcTrimmedUtf8MaxBytes 256','idempotencyKey x-utf8MaxBytes 256','value x-utf8MaxBytes 512',
-    // Authority parity: the selector test below and test/integration/mcp-services.test.js.
-    'collectionId x-utf16MaxLength 512','id x-utf16MaxLength 512','key x-utf16MaxLength 512',
-    'operationKey x-utf8MaxBytes 256','spaceId x-utf16MaxLength 512'
-  ].sort(),'a new extension needs a parity check');
+  for (const tool of manifest.tools) walk(tool.inputSchema,tool.name,'');
+  return found.sort();
+};
+test('every published x- extension is checked against OpenAPI or the authority',()=>{
+  const manifest=stateplaneMcpDeclaration().manifest();
+  const names=manifest.tools.map(tool=>tool.name);
+  const expected=[];
+  const each=(tools,pointer,value)=>{ for (const tool of tools) expected.push(`${tool} ${pointer}=${value}`); };
+  // Authority parity: the selector test below and test/integration/mcp-services.test.js.
+  each(names.filter(name=>name!=='spaces_list'),'/properties/spaceId/x-utf16MaxLength',512);
+  each(names.filter(name=>!['spaces_list','spaces_get','collections_list'].includes(name)),'/properties/collectionId/x-utf16MaxLength',512);
+  each(['records_get','projection_status'],'/properties/id/x-utf16MaxLength',512);
+  each(['records_get_by_key'],'/properties/key/x-utf16MaxLength',512);
+  each(['batches_ingest','batches_status','batches_cancel'],'/properties/operationKey/x-utf8MaxBytes',256);
+  // OpenAPI parity above; predicate string and instant values in scalar and `in` form.
+  each(['records_create','records_replace','records_patch','records_delete'],'/properties/idempotencyKey/x-utf8MaxBytes',256);
+  each(['records_create'],'/properties/externalKey/x-nfcTrimmedUtf8MaxBytes',256);
+  for (const variant of ['1/properties/value','2/properties/value/items','7/properties/value','8/properties/value/items'])
+    each(['records_query','records_count'],`/properties/predicates/items/oneOf/${variant}/x-utf8MaxBytes`,512);
+  assert.deepEqual(extensions(manifest),expected.sort(),'a new extension needs a parity check');
+  // Each mutation repeats a name, key and value published elsewhere, so only the tool and pointer reveal it.
+  const mutate=change=>{ const copy=structuredClone(manifest); change(name=>copy.tools.find(tool=>tool.name===name).inputSchema); return extensions(copy); };
+  for (const change of [
+    input=>{ input('records_query').properties.predicates.items.oneOf[3].properties.value['x-utf8MaxBytes']=512; },
+    input=>{ delete input('records_count').properties.predicates.items.oneOf[8].properties.value.items['x-utf8MaxBytes']; },
+    input=>{ delete input('records_get').properties.id['x-utf16MaxLength']; }
+  ]) assert.notDeepEqual(mutate(change),expected);
 });
 
 test('two credentials use one fixed tool list and every tool reaches the shared services',async t=>{
