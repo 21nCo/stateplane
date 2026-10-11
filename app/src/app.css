@@ -73,4 +73,6 @@
   .panel { @apply rounded-lg border border-line bg-surface p-4; }
   .link { @apply text-accent underline underline-offset-2; }
   .hint { @apply text-sm text-subtle; }
+  /* Every displayed API identifier wraps anywhere, even as a flex item. */
+  .ident { @apply min-w-0 font-mono [overflow-wrap:anywhere]; }
 }

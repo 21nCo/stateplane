@@ -51,12 +51,15 @@ export const actions:Actions={
     const issued=await api<{keyId:string;secret:string;expiresAt:string}>(event,'POST',['spaces',selectors(event.url).space,'agent-keys'],
       {body:{expiresAt,grants}});
     // The secret is rendered in this one response only; it is never stored or listed.
+    // The enhanced form keeps it out of a replayable POST history entry.
     return issued.ok ? {issued:issued.data} : fail(issued.status,{issueError:issued.error});
   },
   revoke:async(event)=>{
     const keyId=String((await event.request.formData()).get('keyId')??'');
     const result=await api(event,'DELETE',['spaces',selectors(event.url).space,'agent-keys',keyId]);
-    return result.ok ? {revoked:keyId} : fail(result.status,{revokeError:result.error});
+    // The failed key stays retryable here whatever the key list shows: a repeat
+    // DELETE finishes the provider revocation and the space's policy publication.
+    return result.ok ? {revoked:keyId} : fail(result.status,{revokeError:result.error,revokeKeyId:keyId});
   },
   check:async(event)=>{
     const token=String((await event.request.formData()).get('secret')??'').trim();

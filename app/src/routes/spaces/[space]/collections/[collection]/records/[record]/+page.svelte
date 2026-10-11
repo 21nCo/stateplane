@@ -22,10 +22,10 @@
 <svelte:head><title>Record · Stateplane</title></svelte:head>
 <p class="hint"><a class="link" href={base}>Records</a> / record</p>
 <Notice error={data.error} title="Record could not be read" />
-<h1 class="break-all font-mono text-xl font-semibold">{data.record?.keyMode==='external' ? shown(data.record.normalizedKey) : selectors(page.url).record}</h1>
+<h1 class="ident text-xl font-semibold">{data.record?.keyMode==='external' ? shown(data.record.normalizedKey) : shown(selectors(page.url).record)}</h1>
 {#if data.record}
   <dl class="mt-2 flex flex-wrap gap-x-6 gap-y-1 text-sm">
-    <div><dt class="inline text-subtle">Record ID</dt> <dd class="inline break-all font-mono">{data.record.ref.id}</dd></div>
+    <div><dt class="inline text-subtle">Record ID</dt> <dd class="ident inline">{data.record.ref.id}</dd></div>
     <div><dt class="inline text-subtle">Revision</dt> <dd class="inline">{data.record.revision}</dd></div>
     <div><dt class="inline text-subtle">Schema version</dt> <dd class="inline">{data.record.schemaVersion}</dd></div>
     <div><dt class="inline text-subtle">Search projection</dt> <dd class="inline">{#if data.projection}<Status tone={tone(data.projection.state)}>{data.projection.state} for revision {data.projection.revision}</Status>{:else}unavailable{/if}</dd></div>

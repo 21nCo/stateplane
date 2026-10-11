@@ -1,7 +1,9 @@
 import { api, bearer } from './api';
 
 type Context=Parameters<typeof api>[0];
-const denials=new Set(['UNAUTHENTICATED','FORBIDDEN','NOT_FOUND']);
+// A revoked, expired or inactive key is NOT_FOUND here. FORBIDDEN means the key
+// is authorized in the space but holds no grant that discovery checks.
+const denials=new Set(['UNAUTHENTICATED','NOT_FOUND']);
 
 /** Check a key secret at the provider and in one space. Only UNAUTHENTICATED is
  * a provider rejection; an unavailable, throttled or failed check is not

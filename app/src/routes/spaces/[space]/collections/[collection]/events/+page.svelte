@@ -18,7 +18,7 @@
       <caption class="sr-only">Record revisions</caption>
       <thead><tr><th scope="col">Committed</th><th scope="col">Record</th><th scope="col">Operation</th><th scope="col">Revision</th><th scope="col">Schema</th></tr></thead>
       <tbody>{#each data.feed.events as item (item.eventId)}<tr>
-        <td>{new Date(item.committedAt).toISOString()}</td><td><a class="link font-mono" href="{base}/records/{segment(item.recordId)}">{item.recordId}</a></td>
+        <td>{new Date(item.committedAt).toISOString()}</td><td><a class="ident link" href="{base}/records/{segment(item.recordId)}">{item.recordId}</a></td>
         <td>{item.operation}</td><td>{item.revision}</td><td>v{item.schemaVersion}</td>
       </tr>{/each}</tbody>
     </table></Scroll></div>

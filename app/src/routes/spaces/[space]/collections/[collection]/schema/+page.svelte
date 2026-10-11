@@ -12,7 +12,7 @@
 <h1 class="text-2xl font-semibold">Schema</h1>
 <Notice error={data.error} title="Collection could not be read" />
 {#if data.collection}
-  <p class="mt-1"><span class="font-mono">{shown(data.collection.definition.slug)}</span> · version {data.collection.definition.version} · <a class="link" href={records}>Records</a></p>
+  <p class="mt-1"><span class="ident">{shown(data.collection.definition.slug)}</span> · version {data.collection.definition.version} · <a class="link" href={records}>Records</a></p>
   <div class="mt-4 grid gap-6 lg:grid-cols-[1fr_2fr]">
     <section aria-labelledby="indexes" class="panel space-y-3">
       <h2 id="indexes" class="text-lg font-semibold">Filter and sort indexes</h2>

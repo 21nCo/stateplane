@@ -2,7 +2,7 @@
   import Notice from '$lib/components/Notice.svelte';
   import Scroll from '$lib/components/Scroll.svelte';
   import Status from '$lib/components/Status.svelte';
-  import { spaceHref } from '$lib/paths';
+  import { shown, spaceHref } from '$lib/paths';
   let { data, form } = $props();
   const spaceId=$derived(form?.create?.spaceId ?? data.newSpaceId);
 </script>
@@ -21,7 +21,7 @@
           <caption class="sr-only">Owned spaces and their placement</caption>
           <thead><tr><th scope="col">Space</th><th scope="col">Lifecycle</th><th scope="col">Home cell</th><th scope="col">Current cell</th><th scope="col">Storage target</th></tr></thead>
           <tbody>{#each data.page.items as space (space.spaceId)}<tr>
-            <td><a class="link font-mono" href={spaceHref(space.spaceId)}>{space.spaceId}</a></td>
+            <td><a class="ident link" href={spaceHref(space.spaceId)}>{shown(space.spaceId)}</a></td>
             <td><Status tone={space.lifecycle==='active' ? 'success' : 'warning'}>{space.lifecycle}</Status></td>
             <td>{space.homeCellId}</td><td>{space.cellId}</td><td>{space.storageTargetId}</td>
           </tr>{/each}</tbody>

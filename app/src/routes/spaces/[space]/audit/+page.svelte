@@ -17,7 +17,7 @@
       <thead><tr><th scope="col">Recorded</th><th scope="col">Action</th><th scope="col">Credential</th><th scope="col">Policy</th><th scope="col">Placement</th></tr></thead>
       <tbody>{#each data.audit.entries as entry (entry.audit_id)}<tr>
         <td>{new Date(entry.recorded_at).toISOString()}</td><td class="font-mono">{entry.action}</td>
-        <td class="break-all font-mono">{entry.credential_id ?? '—'}</td><td>v{entry.policy_version}</td><td>g{entry.placement_generation}</td>
+        <td class="ident">{entry.credential_id ?? '—'}</td><td>v{entry.policy_version}</td><td>g{entry.placement_generation}</td>
       </tr>{/each}</tbody>
     </table></Scroll></div>
   {:else}<p class="panel mt-3 hint">No audit entries on this page.</p>{/if}

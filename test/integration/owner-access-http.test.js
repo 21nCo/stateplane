@@ -93,6 +93,10 @@ test('owner key issuance, listing, revocation, audit and index backfill go throu
     assert.equal(denied.status,403,`${method} ${path}`);
   }
 
+  // A grant expiry is listed in the same ISO-8601 UTC form as the key's own timestamps.
+  const grantExpiry=new Date(Date.parse(expiresAt)-60_000).toISOString();
+  await pool.query('UPDATE collection_grants SET expires_at=$3 WHERE space_id=$1 AND credential_id=$2',[spaceId,keyId,grantExpiry]);
+  assert.equal(json(await route('GET',`/v1/spaces/${spaceId}/agent-keys`)).items[0].grants[0].expiresAt,grantExpiry);
   assert.equal(json(listed).items[0].providerRevokedAt,null);
   // A provider failure after the local revocation leaves cleanup visible and repeatable.
   failRevoke=true;

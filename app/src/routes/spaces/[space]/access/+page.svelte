@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { enhance } from '$app/forms';
   import Notice from '$lib/components/Notice.svelte';
   import Scroll from '$lib/components/Scroll.svelte';
   import Status from '$lib/components/Status.svelte';
@@ -26,7 +27,9 @@
     <h2 id="keys" class="text-lg font-semibold">Keys</h2>
     <Notice error={data.error} title="Keys could not be listed" />
     <Notice error={form?.revokeError} title="Revocation did not finish">
-      <p class="mt-1">If the key now shows provider cleanup pending, the API already denies it. Retry to finish revoking it at the provider.</p>
+      <p class="mt-1">Part of the revocation may have taken effect, whatever the key list shows. Retry until it finishes.</p>
+      {#if form?.revokeKeyId}<form method="POST" action="?/revoke" class="mt-2"><input type="hidden" name="keyId" value={form.revokeKeyId} />
+        <button class="btn-danger">Retry revocation of <span class="ident">{form.revokeKeyId}</span></button></form>{/if}
     </Notice>
     {#if form?.revoked}<p role="status" class="text-sm text-success">Key {form.revoked} revoked.</p>{/if}
     {#if data.keys}
@@ -35,9 +38,9 @@
           <caption class="sr-only">Agent keys and grants</caption>
           <thead><tr><th scope="col">Key</th><th scope="col">Status</th><th scope="col">Grants</th><th scope="col">Expires</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
           <tbody>{#each data.keys.items as key (key.keyId)}<tr>
-            <td class="break-all font-mono">{key.keyId}</td><td><Status tone={tone(key.status)}>{key.status}</Status>
+            <td class="ident">{key.keyId}</td><td><Status tone={tone(key.status)}>{key.status}</Status>
               {#if key.revokedAt}<div class="hint">{key.providerRevokedAt ? 'Provider key revoked' : 'Denied here; provider cleanup pending'}</div>{/if}</td>
-            <td>{#each key.grants as grant (grant.collectionId)}<div><span class="font-mono">{shown(grant.collectionId)}</span>: {grant.capabilities.join(', ')}</div>{:else}<span class="hint">none</span>{/each}</td>
+            <td>{#each key.grants as grant (grant.collectionId)}<div><span class="ident">{shown(grant.collectionId)}</span>: {grant.capabilities.join(', ')}</div>{:else}<span class="hint">none</span>{/each}</td>
             <td>{key.expiresAt}</td>
             <td>{#if !key.revokedAt || !key.providerRevokedAt}<form method="POST" action="?/revoke"><input type="hidden" name="keyId" value={key.keyId} />
               <button class="btn-danger" aria-label="{key.revokedAt ? 'Retry provider revocation for' : 'Revoke'} {key.keyId}">{key.revokedAt ? 'Retry revocation' : 'Revoke'}</button></form>{/if}</td>
@@ -60,12 +63,12 @@
         <p class="mt-1">Reload to list them again, or name a collection in the last group.</p>
       </Notice>
       {#if form?.issueInvalid}<p role="alert" class="text-sm text-danger">Choose a lifetime and at least one capability for a named collection.</p>{/if}
-      <form method="POST" action="?/issue" class="space-y-3">
+      <form method="POST" action="?/issue" class="space-y-3" use:enhance>
         <div><label for="days">Lifetime</label>
           <select id="days" name="days">{#each [1,7,30,90] as days (days)}<option value={days} selected={days===30}>{days} {days===1 ? 'day' : 'days'}</option>{/each}</select></div>
         {#each rows as slug, index (index)}
           <fieldset class="space-y-1 rounded border border-line p-2">
-            <legend class="px-1 text-sm font-medium">{slug ? `Collection ${shown(slug)}` : 'Another collection'}</legend>
+            <legend class="min-w-0 px-1 text-sm font-medium [overflow-wrap:anywhere]">{slug ? `Collection ${shown(slug)}` : 'Another collection'}</legend>
             {#if slug}<input type="hidden" name="collection" value={slug} />{:else}
               <label for="other-collection">Collection name</label><input id="other-collection" name="collection" />{/if}
             {#each capabilities as capability (capability)}
@@ -86,7 +89,8 @@
         {#if !form.check.kind && !form.check.rejected}<p class="hint">This does not confirm revocation. Check again when the provider is reachable.</p>{/if}
         {#if form.check.space}<p class={form.check.space.allowed ? 'text-success' : 'text-danger'}>This space: {form.check.space.allowed ? 'allowed' :
           `${form.check.space.denied ? 'denied' : 'not determined'} (${form.check.space.code})`}.</p>
-          {#if form.check.space.denied}<p class="hint">The provider still accepts this key. If it shows provider cleanup pending, retry its revocation.</p>{/if}{/if}
+          {#if form.check.space.denied}<p class="hint">The provider still accepts this key. If it shows provider cleanup pending, retry its revocation.</p>
+          {:else if form.check.space.code==='FORBIDDEN'}<p class="hint">The key is authorized here, but holds no read, write or schema grant to check.</p>{/if}{/if}
       </div>{/if}
       <form method="POST" action="?/check" class="space-y-3">
         <label for="check-secret">Key secret</label>

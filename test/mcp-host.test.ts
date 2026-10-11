@@ -32,7 +32,7 @@ import { stateplaneHost } from '../app/src/lib/server/host';
 import { api } from '../app/src/lib/server/api';
 import { checkKey } from '../app/src/lib/server/keycheck';
 import { jsonObject } from '../app/src/lib/server/forms';
-import { segment, selectors } from '../app/src/lib/paths';
+import { segment, selectors, shown } from '../app/src/lib/paths';
 import { predicates } from '../app/src/lib/query';
 import { handle } from '../app/src/hooks.server';
 
@@ -140,6 +140,21 @@ it('a key check reports provider rejection only for UNAUTHENTICATED; other failu
     Response.json({ error: { code: 'NOT_FOUND', retryable: false } }, { status: 404 });
   expect(await checkKey(context as never, 'sp', 'k'.repeat(32))).toMatchObject({ kind: 'api-key', rejected: false,
     space: { allowed: false, code: 'NOT_FOUND', denied: true } });
+  // An active key with only events:read or space:admin is FORBIDDEN by discovery, which is not a denial.
+  state.http = request => new URL(request.url).pathname === '/v1/auth/session' ? Response.json({ kind: 'api-key' }) :
+    Response.json({ error: { code: 'FORBIDDEN', retryable: false } }, { status: 403 });
+  expect(await checkKey(context as never, 'sp', 'k'.repeat(32))).toMatchObject({ kind: 'api-key',
+    space: { allowed: false, code: 'FORBIDDEN', denied: false } });
+});
+
+it('an identifier with any non-printing character is displayed quoted and escaped wherever the character occurs', () => {
+  expect(shown('items')).toBe('items');
+  expect(shown('two words')).toBe('two words');
+  expect(shown('\u200b')).toBe('"\\u200b"');
+  expect(shown('a\ufeffb')).toBe('"a\\ufeffb"');
+  expect(shown('a\u00a0b\u2028c\u{e0001}')).toBe('"a\\u00a0b\\u2028c\\u{e0001}"');
+  expect(shown(' items ')).toBe('" items "');
+  expect(new Set(['ab', 'a\ufeffb', 'a\u200bb', 'a\u2060b'].map(shown)).size).toBe(4);
 });
 
 it('a key secret no header can carry is never checked, so it never reads as a provider rejection', async () => {

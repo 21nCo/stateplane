@@ -11,9 +11,13 @@ export function selectors(url:URL):{space:string;collection:string;record:string
   const [, , space, , collection, , record]=url.pathname.split('/');
   return {space:decode(space),collection:decode(collection),record:decode(record)};
 }
-/** Display an identifier with surrounding whitespace made visible; selectors stay
- * exact. Invisible characters such as U+FEFF are written as \u escapes. */
-export const shown=(id:string)=>id===id.trim() ? id : JSON.stringify(id)
-  .replace(/[^\x20-\x7e\p{L}\p{M}\p{N}\p{P}\p{S}]/gu,char=>`\\u${char.codePointAt(0)!.toString(16).padStart(4,'0')}`);
+/** Display an identifier; selectors stay exact. A value with surrounding
+ * whitespace or any non-printing character (Cc, Cf, Zl, Zp, or Zs other than
+ * U+0020) is shown quoted, with each such character written as a \u escape. */
+const hidden=/(?! )[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\p{Zs}]/u;
+const escape=(char:string)=>{ const code=char.codePointAt(0)!.toString(16);
+  return code.length>4 ? `\\u{${code}}` : `\\u${code.padStart(4,'0')}`; };
+export const shown=(id:string)=>id===id.trim() && !hidden.test(id) ? id :
+  JSON.stringify(id).replace(new RegExp(hidden.source,'gu'),escape);
 export const spaceHref=(space:string)=>`/spaces/${segment(space)}`;
 export const collectionHref=(space:string,collection:string)=>`${spaceHref(space)}/collections/${segment(collection)}`;

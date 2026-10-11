@@ -27,7 +27,7 @@
 <Notice error={data.collection ? null : data.error} title="Collection could not be read" />
 {#if data.collection && definition}
   <div class="flex flex-wrap items-baseline justify-between gap-2">
-    <h1 class="text-2xl font-semibold">Records in <span class="font-mono">{shown(definition.slug)}</span></h1>
+    <h1 class="min-w-0 text-2xl font-semibold">Records in <span class="ident">{shown(definition.slug)}</span></h1>
     <p class="flex flex-wrap gap-4 text-sm"><a class="link" href="{base}/schema">Schema v{definition.version}</a><a class="link" href="{base}/events">Changes</a><a class="link" href="{base}/batches">Ingestion</a></p>
   </div>
   {#if pending.length}<p class="mt-2 text-sm text-warning" role="status">Indexes pending for {pending.join(', ')}. They cannot be filtered or sorted until built on the schema page.</p>{/if}
@@ -71,7 +71,7 @@
             <caption class="sr-only">Records on this page</caption>
             <thead><tr><th scope="col">Record</th><th scope="col">Revision</th>{#each columns as column (column)}<th scope="col">{column}</th>{/each}</tr></thead>
             <tbody>{#each data.page.records as record (record.ref.id)}<tr>
-              <td><a class="link font-mono" href="{base}/records/{segment(record.ref.id)}">{record.keyMode==='external' ? shown(record.normalizedKey) : record.ref.id}</a></td>
+              <td><a class="ident link" href="{base}/records/{segment(record.ref.id)}">{record.keyMode==='external' ? shown(record.normalizedKey) : record.ref.id}</a></td>
               <td>{record.revision}</td>{#each columns as column (column)}<td class="max-w-48 truncate">{cell(record,column)}</td>{/each}
             </tr>{/each}</tbody>
           </table></Scroll>
@@ -98,7 +98,7 @@
     <Notice error={form?.create?.error} title="Record was not created">
       {#if form?.create?.error?.code==='COMMIT_OUTCOME_UNKNOWN'}<p class="mt-1">Submit again unchanged: the same request key recovers the original result instead of writing twice.</p>{/if}
     </Notice>
-    {#if form?.created}<p role="status" class="text-sm text-success">Created <a class="link font-mono" href="{base}/records/{segment(form.created.ref.id)}">{form.created.ref.id}</a> at revision {form.created.revision}{form.created.replayed ? ' (recovered earlier result)' : ''}. Search projection: {form.created.projection.state}.</p>{/if}
+    {#if form?.created}<p role="status" class="text-sm text-success">Created <a class="ident link" href="{base}/records/{segment(form.created.ref.id)}">{form.created.ref.id}</a> at revision {form.created.revision}{form.created.replayed ? ' (recovered earlier result)' : ''}. Search projection: {form.created.projection.state}.</p>{/if}
     <form method="POST" action="?/create" class="space-y-3">
       <input type="hidden" name="idempotencyKey" value={form?.create?.idempotencyKey ?? data.idempotencyKey} />
       <div><label for="externalKey">External key (optional)</label><input id="externalKey" name="externalKey" value={form?.create?.externalKey ?? ''} /></div>

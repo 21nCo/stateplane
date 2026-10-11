@@ -58,7 +58,8 @@ function run(args,options) {
 
 /** Armed faults, applied in order: after a client message containing `after`
  * (or at once), the reply to the next message containing `match` is dropped and
- * both sockets close, as when a connection fails after the database acted. */
+ * both sockets close, as when a connection fails after the database acted. A
+ * `refuse` fault closes them before that message is sent, so the database never acts. */
 const faults=[];
 let providerFault=false;
 async function proxy(target) {
@@ -71,7 +72,11 @@ async function proxy(target) {
       const text=chunk.toString('latin1');
       const [fault]=faults;
       if (fault && (!fault.after || text.includes(fault.after))) seen=fault;
-      if (fault && seen===fault && text.includes(fault.match)) { drop=true; faults.shift(); }
+      if (fault && seen===fault && text.includes(fault.match)) {
+        faults.shift();
+        if (fault.refuse) return close();
+        drop=true;
+      }
       upstream.write(chunk);
     });
     upstream.on('data',chunk=>{ if (drop) close(); else client.write(chunk); });
@@ -94,9 +99,9 @@ async function proxy(target) {
         return;
       }
       try {
-        const {match,after}=JSON.parse(body);
+        const {match,after,refuse}=JSON.parse(body);
         if (typeof match!=='string' || !match) throw new Error('match');
-        faults.push({match,after:typeof after==='string' ? after : null});
+        faults.push({match,after:typeof after==='string' ? after : null,refuse:refuse===true});
         response.writeHead(204).end();
       } catch { response.writeHead(400).end(); }
     });

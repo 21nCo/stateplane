@@ -39,6 +39,11 @@ async function dropReply(match: string, after?: string) {
   const response = await fetch('http://127.0.0.1:5744/fault', { method: 'POST', body: JSON.stringify({ match, after }) });
   expect(response.status).toBe(204);
 }
+/** Fail the next message containing `match` before the database receives it. */
+async function refuse(match: string) {
+  const response = await fetch('http://127.0.0.1:5744/fault', { method: 'POST', body: JSON.stringify({ match, refuse: true }) });
+  expect(response.status).toBe(204);
+}
 /** Fail the fixture provider's next key revocation. */
 async function failProviderRevocation() {
   const response = await fetch('http://127.0.0.1:5744/provider-fault', { method: 'POST', body: 'arm' });
@@ -412,6 +417,64 @@ test('owner grants an agent key, the API enforces it and revocation is verified'
   await go(page, `${spaceUrl}/audit`);
   await expect(page.getByRole('table')).toContainText('key:issue');
   await expect(page.getByRole('table')).toContainText('key:revoke');
+});
+
+test('a revocation whose policy publication fails stays retryable after the provider revoked the key', async ({ page, request }) => {
+  test.skip(!local, 'Needs the local fault proxy');
+  const headers = { authorization: `Bearer ${ownerToken}` };
+  const keyCount = async () => (await (await request.get(`/v1${spaceUrl}/agent-keys`, { headers })).json()).items.length;
+  await signIn(page, ownerToken);
+  await go(page, `${spaceUrl}/access`);
+  const before = await keyCount();
+  // Issuance is not a replayable document POST: a reload shows no secret and issues nothing.
+  const documentPosts: string[] = [];
+  page.on('request', item => { if (item.method() === 'POST' && item.resourceType() === 'document') documentPosts.push(item.url()); });
+  await page.getByRole('group', { name: 'Collection items' }).getByLabel('records:read').check();
+  await page.getByRole('button', { name: 'Issue key' }).click();
+  const secret = await page.getByLabel('Secret', { exact: true }).inputValue();
+  const keyId = (await page.getByRole('heading', { name: /^Key .* issued$/ }).innerText()).split(' ')[1];
+  expect(documentPosts).toEqual([]);
+  await page.reload();
+  await settle(page);
+  await expect(page.getByLabel('Secret', { exact: true })).toHaveCount(0);
+  expect(await keyCount()).toBe(before + 1);
+
+  // The cell commits the revocation and the provider revokes the key, but the
+  // directory never receives the new policy version.
+  await refuse('UPDATE space_directory SET policy_version');
+  await page.getByRole('button', { name: `Revoke ${keyId}` }).click();
+  const failed = page.getByRole('alert').filter({ hasText: 'Revocation did not finish' });
+  await expect(failed).toBeVisible();
+  await expect(page.getByRole('row').filter({ hasText: keyId })).toContainText('Provider key revoked');
+  // Until the publication finishes, owner operations in the space are refused.
+  expect((await request.post(`/v1${itemsUrl()}/records/count`, { headers, data: [] })).status()).toBe(403);
+  await failed.getByRole('button', { name: `Retry revocation of ${keyId}` }).click();
+  await expect(page.getByRole('status')).toContainText(`Key ${keyId} revoked.`);
+  await expect(await checkKey(page, secret)).toContainText('Provider: rejected (UNAUTHENTICATED).');
+  expect((await request.post(`/v1${itemsUrl()}/records/count`, { headers, data: [] })).status()).toBe(200);
+  await go(page, itemsUrl());
+  await expect(page.getByRole('heading', { name: 'Records in items' })).toBeVisible();
+});
+
+test('long and invisible identifiers stay distinct, named and inside a small screen', async ({ page, request }) => {
+  const headers = { authorization: `Bearer ${ownerToken}` };
+  const created = await request.post('/v1/spaces', { headers, data: { spaceId: `sp_${randomUUID()}` } });
+  expect(created.status()).toBe(201);
+  const previous = spaceUrl;
+  spaceUrl = `/spaces/${(await created.json()).spaceId}`;
+  const long = 'a'.repeat(256);
+  try {
+    for (const name of [long, '\u200b', 'a\ufeffb', 'ab']) await defineCollection(request, name);
+    await page.setViewportSize({ width: 390, height: 900 });
+    await signIn(page, ownerToken);
+    for (const path of [spaceUrl, `${spaceUrl}/collections/${long}`, `${spaceUrl}/collections/${long}/schema`, `${spaceUrl}/access`]) {
+      await go(page, path);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), path).toBe(true);
+      await audit(page);
+    }
+    await go(page, spaceUrl);
+    for (const name of ['"\\u200b"', '"a\\ufeffb"', 'ab']) await expect(page.getByRole('link', { name, exact: true })).toBeVisible();
+  } finally { spaceUrl = previous; }
 });
 
 test('ingestion reports per-item progress', async ({ page }) => {
