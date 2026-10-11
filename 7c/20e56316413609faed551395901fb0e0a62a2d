@@ -1,0 +1,33 @@
+app/src/routes/spaces/[space]/access/+page.server.ts
+  s_1900bb15a7199a::t_5e35b6ff514378 46
+app/src/routes/spaces/[space]/collections/[collection]/+page.svelte
+  s_1900bb15a7199a::t_1162cae4cfae63 5-6,9,88,90-92,94-112
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.svelte
+  s_1900bb15a7199a::t_d9fc47a9e7f0d0 8-9,70
+app/src/routes/spaces/[space]/collections/[collection]/schema/+page.server.ts
+  s_1900bb15a7199a::t_ab32d821b32da1 27
+app/src/routes/spaces/[space]/collections/[collection]/schema/+page.svelte
+  s_1900bb15a7199a::t_f745617c95e170 31,33-37,39-49
+test/e2e/host.js
+  s_1900bb15a7199a::t_3b7536c915e7b8 5,7,12,20-23,25,28-31,35,37-43,53-57,59-62,65,72,74,99,110-126,128,130-132,134-135
+test/e2e/owner.spec.ts
+  s_1900bb15a7199a::t_8bb9c5c74582ed 4,53-59,167-228,415-416,419,423
+test/integration/e2e-launcher.test.js
+  s_1900bb15a7199a::t_cd12837d8834d3 58-82
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7c20e56316413609faed551395901fb0e0a62a2d",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
