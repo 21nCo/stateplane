@@ -1,0 +1,38 @@
+app/src/lib/paths.ts
+  h_a39f9495f9ec1d 16,19,24-28
+app/src/routes/spaces/+page.server.ts
+  h_a39f9495f9ec1d 5,26-28
+app/src/routes/spaces/[space]/+layout.svelte
+  h_a39f9495f9ec1d 3,17
+app/src/routes/spaces/[space]/access/+page.server.ts
+  h_a39f9495f9ec1d 4,46-48,60
+app/src/routes/spaces/[space]/access/+page.svelte
+  h_a39f9495f9ec1d 6,31,47,74-75,94
+app/src/routes/spaces/[space]/collections/[collection]/+page.server.ts
+  h_a39f9495f9ec1d 4,19-20,24
+app/src/routes/spaces/[space]/collections/[collection]/+page.svelte
+  h_a39f9495f9ec1d 6,17-18,43,55
+app/src/routes/spaces/[space]/collections/[collection]/batches/+page.server.ts
+  h_a39f9495f9ec1d 3,38,40
+app/src/routes/spaces/[space]/collections/[collection]/batches/+page.svelte
+  h_a39f9495f9ec1d 6,41-44,59
+app/src/routes/spaces/[space]/collections/[collection]/schema/+page.server.ts
+  h_a39f9495f9ec1d 3,34
+app/src/routes/spaces/[space]/collections/[collection]/schema/+page.svelte
+  h_a39f9495f9ec1d 5,25
+test/e2e/owner.spec.ts
+  h_a39f9495f9ec1d 516-548
+test/mcp-host.test.ts
+  h_a39f9495f9ec1d 35,160-175
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cce7784f85df672271d8dc2f4254348ca5e81139",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
