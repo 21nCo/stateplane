@@ -2,8 +2,9 @@
   import Notice from '$lib/components/Notice.svelte';
   import Scroll from '$lib/components/Scroll.svelte';
   import { page } from '$app/state';
+  import { collectionHref, segment, selectors } from '$lib/paths';
   let { data } = $props();
-  const base=$derived(`/spaces/${encodeURIComponent(data.spaceId)}/collections/${encodeURIComponent(page.params.collection ?? '')}`);
+  const base=$derived(collectionHref(data.spaceId,selectors(page.url).collection));
 </script>
 
 <svelte:head><title>Changes · Stateplane</title></svelte:head>
@@ -17,7 +18,7 @@
       <caption class="sr-only">Record revisions</caption>
       <thead><tr><th scope="col">Committed</th><th scope="col">Record</th><th scope="col">Operation</th><th scope="col">Revision</th><th scope="col">Schema</th></tr></thead>
       <tbody>{#each data.feed.events as item (item.eventId)}<tr>
-        <td>{new Date(item.committedAt).toISOString()}</td><td><a class="link font-mono" href="{base}/records/{encodeURIComponent(item.recordId)}">{item.recordId}</a></td>
+        <td>{new Date(item.committedAt).toISOString()}</td><td><a class="link font-mono" href="{base}/records/{segment(item.recordId)}">{item.recordId}</a></td>
         <td>{item.operation}</td><td>{item.revision}</td><td>v{item.schemaVersion}</td>
       </tr>{/each}</tbody>
     </table></Scroll></div>

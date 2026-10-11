@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { fail, redirect } from '@sveltejs/kit';
 import { api } from '$lib/server/api';
+import { spaceHref } from '$lib/paths';
 import type { Page, Space } from '$lib/types';
 import type { Actions, PageServerLoad } from './$types';
 
@@ -18,11 +19,11 @@ export const actions:Actions={
     const cellId=String(form.get('cellId')??'').trim();
     const created=await api<Space>(event,'POST',['spaces'],{body:{spaceId,...(cellId ? {cellId} : {})}});
     if (!created.ok) return fail(created.status,{create:{error:created.error,spaceId,cellId}});
-    redirect(303,`/spaces/${encodeURIComponent(created.data.spaceId)}`);
+    redirect(303,spaceHref(created.data.spaceId));
   },
   open:async({request})=>{
     const spaceId=String((await request.formData()).get('spaceId')??'').trim();
     if (!spaceId) return fail(400,{open:{missing:true}});
-    redirect(303,`/spaces/${encodeURIComponent(spaceId)}`);
+    redirect(303,spaceHref(spaceId));
   }
 };

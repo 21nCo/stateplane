@@ -24,7 +24,9 @@
   <section aria-labelledby="keys" class="min-w-0 space-y-3">
     <h2 id="keys" class="text-lg font-semibold">Keys</h2>
     <Notice error={data.error} title="Keys could not be listed" />
-    <Notice error={form?.revokeError} title="Key was not revoked" />
+    <Notice error={form?.revokeError} title="Revocation did not finish">
+      <p class="mt-1">If the key now shows provider cleanup pending, the API already denies it. Retry to finish revoking it at the provider.</p>
+    </Notice>
     {#if form?.revoked}<p role="status" class="text-sm text-success">Key {form.revoked} revoked.</p>{/if}
     {#if data.keys}
       {#if data.keys.items.length}
@@ -32,10 +34,12 @@
           <caption class="sr-only">Agent keys and grants</caption>
           <thead><tr><th scope="col">Key</th><th scope="col">Status</th><th scope="col">Grants</th><th scope="col">Expires</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
           <tbody>{#each data.keys.items as key (key.keyId)}<tr>
-            <td class="break-all font-mono">{key.keyId}</td><td><Status tone={tone(key.status)}>{key.status}</Status></td>
+            <td class="break-all font-mono">{key.keyId}</td><td><Status tone={tone(key.status)}>{key.status}</Status>
+              {#if key.revokedAt}<div class="hint">{key.providerRevokedAt ? 'Provider key revoked' : 'Denied here; provider cleanup pending'}</div>{/if}</td>
             <td>{#each key.grants as grant (grant.collectionId)}<div><span class="font-mono">{grant.collectionId}</span>: {grant.capabilities.join(', ')}</div>{:else}<span class="hint">none</span>{/each}</td>
             <td>{key.expiresAt}</td>
-            <td>{#if key.status!=='revoked'}<form method="POST" action="?/revoke"><input type="hidden" name="keyId" value={key.keyId} /><button class="btn-danger" aria-label="Revoke {key.keyId}">Revoke</button></form>{/if}</td>
+            <td>{#if !key.revokedAt || !key.providerRevokedAt}<form method="POST" action="?/revoke"><input type="hidden" name="keyId" value={key.keyId} />
+              <button class="btn-danger" aria-label="{key.revokedAt ? 'Retry provider revocation for' : 'Revoke'} {key.keyId}">{key.revokedAt ? 'Retry revocation' : 'Revoke'}</button></form>{/if}</td>
           </tr>{/each}</tbody>
         </table></Scroll>
       {:else}<p class="panel hint">No agent keys have been issued for this space.</p>{/if}
@@ -75,7 +79,9 @@
       {#if form?.check}<p role="status" class="text-sm {form.check.accepted ? 'text-success' : 'text-danger'}">{form.check.accepted ? `Accepted as ${form.check.kind}.` : `Rejected: ${form.check.code}.`}</p>{/if}
       <form method="POST" action="?/check" class="space-y-3">
         <label for="check-secret">Key secret</label>
-        <input id="check-secret" name="secret" type="password" autocomplete="off" required aria-invalid={form?.checkMissing ? 'true' : undefined} />
+        <input id="check-secret" name="secret" type="password" autocomplete="off" required aria-invalid={form?.checkMissing ? 'true' : undefined}
+          aria-describedby={form?.checkMissing ? 'check-error' : undefined} />
+        {#if form?.checkMissing}<p id="check-error" class="text-sm text-danger">Enter a key secret.</p>{/if}
         <button class="btn-quiet">Check key</button>
       </form>
     </section>

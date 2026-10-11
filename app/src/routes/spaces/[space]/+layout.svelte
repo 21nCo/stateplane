@@ -1,7 +1,8 @@
 <script lang="ts">
   import { page } from '$app/state';
+  import { spaceHref } from '$lib/paths';
   let { data, children } = $props();
-  const base=$derived(`/spaces/${encodeURIComponent(data.spaceId)}`);
+  const base=$derived(spaceHref(data.spaceId));
   const links=$derived([{href:base,label:'Collections'},{href:`${base}/access`,label:'Agent access'},{href:`${base}/audit`,label:'Audit'}]);
 </script>
 
@@ -13,8 +14,9 @@
   {#if data.switchable.length}
     <form method="POST" action="/spaces?/open" class="flex items-end gap-2">
       <div><label for="switch">Switch space</label>
-        <select id="switch" name="spaceId">{#each data.switchable as item (item.spaceId)}<option value={item.spaceId} selected={item.spaceId===data.spaceId}>{item.spaceId}</option>{/each}</select></div>
+        <select id="switch" name="spaceId">{#each data.switchable as item (item)}<option value={item} selected={item===data.spaceId}>{item}</option>{/each}</select></div>
       <button class="btn-quiet">Switch</button>
+      {#if data.moreSpaces}<a class="link text-sm" href="/spaces">More spaces</a>{/if}
     </form>
   {/if}
 </div>

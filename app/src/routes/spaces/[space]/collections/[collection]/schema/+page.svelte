@@ -2,9 +2,10 @@
   import DefinitionForm from '$lib/components/DefinitionForm.svelte';
   import Notice from '$lib/components/Notice.svelte';
   import Status from '$lib/components/Status.svelte';
+  import { collectionHref } from '$lib/paths';
   let { data, form } = $props();
   const editable=$derived(data.collection ? (({slug:_slug,version:_version,...rest})=>JSON.stringify(rest,null,2))(data.collection.definition) : '');
-  const records=$derived(`/spaces/${encodeURIComponent(data.spaceId)}/collections/${encodeURIComponent(data.collection?.definition.slug ?? '')}`);
+  const records=$derived(collectionHref(data.spaceId,data.collection?.definition.slug ?? ''));
 </script>
 
 <svelte:head><title>Schema · Stateplane</title></svelte:head>

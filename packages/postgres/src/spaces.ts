@@ -44,6 +44,8 @@ export interface SpacePage { items: ReadonlyArray<SpaceInfo>; cursor: string | n
 export interface AgentKeySummary {
   keyId: string; status: 'pending' | 'active' | 'expired' | 'revoked'; expiresAt: string; createdAt: string;
   revokedAt: string | null; grants: ReadonlyArray<{ collectionId: string; capabilities: Capability[]; expiresAt: string | null }>;
+  /** Null after revocation means provider cleanup is still pending; repeat revocation to finish it. */
+  providerRevokedAt: string | null;
 }
 export interface AgentKeyPage { items: ReadonlyArray<AgentKeySummary>; nextCursor: string | null }
 const spacePageSize = 8;
@@ -1391,7 +1393,7 @@ export class PostgresSpaces {
     actor = snapshotOwner(actor);
     if (cursor !== undefined && !validId(cursor)) throw new AuthorityError('CURSOR_INVALID');
     const space = await this.owned(actor,spaceId);
-    const rows = await this.cell(space.cellId).pool.query(`SELECT c.credential_id,c.expires_at,c.created_at,c.revoked_at,
+    const rows = await this.cell(space.cellId).pool.query(`SELECT c.credential_id,c.expires_at,c.created_at,c.revoked_at,c.provider_revoked_at,
         CASE WHEN c.revoked_at IS NOT NULL THEN 'revoked' WHEN c.activated_at IS NULL THEN 'pending'
           WHEN c.expires_at<=clock_timestamp() THEN 'expired' ELSE 'active' END AS status,
         COALESCE((SELECT json_agg(json_build_object('collectionId',g.collection_id,'capabilities',g.capabilities,
@@ -1402,7 +1404,8 @@ export class PostgresSpaces {
     await this.current(actor);
     const iso = (value: unknown) => value == null ? null : new Date(value as string).toISOString();
     const items = rows.rows.slice(0,keyPageSize).map(row => ({keyId:row.credential_id,status:row.status,
-      expiresAt:iso(row.expires_at)!,createdAt:iso(row.created_at)!,revokedAt:iso(row.revoked_at),grants:row.grants}));
+      expiresAt:iso(row.expires_at)!,createdAt:iso(row.created_at)!,revokedAt:iso(row.revoked_at),grants:row.grants,
+      providerRevokedAt:iso(row.provider_revoked_at)}));
     return {items,nextCursor:rows.rows.length > keyPageSize ? items.at(-1)!.keyId : null};
   }
   async audit(actor: VerifiedCredential, spaceId: string, cursor?: string): Promise<SpaceAuditPage> {

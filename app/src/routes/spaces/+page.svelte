@@ -2,6 +2,7 @@
   import Notice from '$lib/components/Notice.svelte';
   import Scroll from '$lib/components/Scroll.svelte';
   import Status from '$lib/components/Status.svelte';
+  import { spaceHref } from '$lib/paths';
   let { data, form } = $props();
   const spaceId=$derived(form?.create?.spaceId ?? data.newSpaceId);
 </script>
@@ -20,7 +21,7 @@
           <caption class="sr-only">Owned spaces and their placement</caption>
           <thead><tr><th scope="col">Space</th><th scope="col">Lifecycle</th><th scope="col">Home cell</th><th scope="col">Current cell</th><th scope="col">Storage target</th></tr></thead>
           <tbody>{#each data.page.items as space (space.spaceId)}<tr>
-            <td><a class="link font-mono" href="/spaces/{encodeURIComponent(space.spaceId)}">{space.spaceId}</a></td>
+            <td><a class="link font-mono" href={spaceHref(space.spaceId)}>{space.spaceId}</a></td>
             <td><Status tone={space.lifecycle==='active' ? 'success' : 'warning'}>{space.lifecycle}</Status></td>
             <td>{space.homeCellId}</td><td>{space.cellId}</td><td>{space.storageTargetId}</td>
           </tr>{/each}</tbody>
@@ -57,7 +58,9 @@
       <h2 id="open" class="text-lg font-semibold">Open a space by ID</h2>
       <form method="POST" action="?/open" class="space-y-3">
         <label for="open-id">Space ID</label>
-        <input id="open-id" name="spaceId" required aria-invalid={form?.open?.missing ? 'true' : undefined} />
+        <input id="open-id" name="spaceId" required aria-invalid={form?.open?.missing ? 'true' : undefined}
+          aria-describedby={form?.open?.missing ? 'open-error' : undefined} />
+        {#if form?.open?.missing}<p id="open-error" class="text-sm text-danger">Enter a space ID.</p>{/if}
         <button class="btn-quiet">Open</button>
       </form>
     </section>

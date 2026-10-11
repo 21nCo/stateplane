@@ -1,12 +1,13 @@
 import { fail, redirect } from '@sveltejs/kit';
 import { api } from '$lib/server/api';
+import { selectors } from '$lib/paths';
 import type { Receipt } from '$lib/types';
 import type { Actions, PageServerLoad, RequestEvent } from './$types';
 
 export interface Progress { operationKey:string; state:'active'|'cancelled'; items:{ordinal:number;state:string;attempts:number;failureCode:string|null;receipt:Receipt|null}[] }
 // The authority accepts 1–20 items per operation; reject a larger manifest before sending it.
 const maxItems=20;
-const batchPath=(event:RequestEvent,key:string)=>['spaces',event.params.space,'collections',event.params.collection,'batches',key];
+const batchPath=(event:RequestEvent,key:string)=>{ const {space,collection}=selectors(event.url); return ['spaces',space,'collections',collection,'batches',key]; };
 const here=(event:RequestEvent,key:string)=>`${event.url.pathname}?operation=${encodeURIComponent(key)}`;
 
 export const load:PageServerLoad=async(event)=>{

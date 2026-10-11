@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import AxeBuilder from '@axe-core/playwright';
 import { expect, test } from '@playwright/test';
 import type { Browser, Page } from '@playwright/test';
@@ -6,6 +7,8 @@ test.skip(process.env.STATEPLANE_E2E_STATE !== '1', 'Needs Postgres or a deploye
 test.describe.configure({ mode: 'serial' });
 
 const ownerToken = process.env.STATEPLANE_E2E_TOKEN!;
+// The local host reaches Postgres through test/e2e/host.js's fault proxy.
+const local = !process.env.STATEPLANE_E2E_BASE_URL;
 let spaceUrl = '';
 const itemsUrl = () => `${spaceUrl}/collections/items`;
 
@@ -30,6 +33,11 @@ async function createRecord(page: Page, data: object) {
   await page.getByRole('button', { name: 'Create record' }).click();
   await expect(page.getByRole('status')).toContainText('at revision 1');
   return page.getByRole('status').getByRole('link').innerText();
+}
+/** Drop the database reply to the next message containing `match` (after one containing `after`). */
+async function dropReply(match: string, after?: string) {
+  const response = await fetch('http://127.0.0.1:5744/fault', { method: 'POST', body: JSON.stringify({ match, after }) });
+  expect(response.status).toBe(204);
 }
 async function asAgent(browser: Browser, secret: string) {
   const page = await (await browser.newContext()).newPage();
@@ -107,6 +115,73 @@ test('a stale edit opens a conflict instead of replacing data', async ({ browser
   await expect(page.getByLabel(/Data JSON/)).toHaveValue(/Mine/);
 });
 
+test('an edit to a concurrently deleted record keeps the draft', async ({ browser, page }) => {
+  await signIn(page, ownerToken);
+  const id = await createRecord(page, { title: 'Doomed', state: 'open', rank: 6 });
+  await go(page, `${itemsUrl()}/records/${id}`);
+  const other = await browser.newPage({ storageState: await page.context().storageState() });
+  await go(other, `${itemsUrl()}/records/${id}`);
+  await other.getByRole('button', { name: 'Delete revision 1' }).click();
+  await expect(other).toHaveURL(new RegExp(`${itemsUrl()}$`));
+
+  await page.getByLabel(/Data JSON/).fill(JSON.stringify({ title: 'Unsaved draft', state: 'open', rank: 6 }));
+  await page.getByRole('button', { name: 'Save revision' }).click();
+  const conflict = page.getByRole('alert', { name: 'Edit conflict' });
+  await expect(conflict).toContainText('This record was deleted');
+  await expect(conflict).toContainText('Unsaved draft');
+  await expect(conflict.getByRole('button')).toHaveCount(0);
+});
+
+test('an uncertain delete is replayed with its original request key', async ({ page }) => {
+  test.skip(!local, 'Needs the local fault proxy');
+  await signIn(page, ownerToken);
+  const id = await createRecord(page, { title: 'Lost acknowledgement', state: 'open', rank: 7 });
+  await go(page, `${itemsUrl()}/records/${id}`);
+  // The delete commits, but its COMMIT acknowledgement never reaches the host.
+  await dropReply('COMMIT\0', 'record_tombstones');
+  await page.getByRole('button', { name: 'Delete revision 1' }).click();
+  await expect(page.getByRole('alert').filter({ hasText: 'Record was not deleted' })).toContainText('COMMIT_OUTCOME_UNKNOWN');
+  await expect(page.getByRole('alert').filter({ hasText: 'Record could not be read' })).toContainText('NOT_FOUND');
+  await page.getByRole('button', { name: 'Retry deletion of revision 1' }).click();
+  await expect(page).toHaveURL(new RegExp(`${itemsUrl()}$`));
+});
+
+test('collection names that look like routes or dot segments stay reachable', async ({ page }) => {
+  await signIn(page, ownerToken);
+  for (const [name, segment] of [['new', 'new'], ['.', ';.'], ['..', ';..']]) {
+    await go(page, spaceUrl);
+    await page.getByRole('link', { name: 'Define collection' }).click();
+    await settle(page);
+    await page.getByLabel('Collection name').fill(name);
+    await page.getByRole('button', { name: 'Define collection' }).click();
+    await expect(page).toHaveURL(`${spaceUrl}/collections/${segment}/schema`);
+    await expect(page.getByRole('main')).toContainText(`${name} · version 1`);
+    await page.getByRole('link', { name: 'Records', exact: true }).click();
+    await expect(page).toHaveURL(`${spaceUrl}/collections/${segment}`);
+    await expect(page.getByRole('link', { name: 'Schema v1' })).toBeVisible();
+  }
+  await go(page, `${spaceUrl}/collections/;.`);
+  await settle(page);
+  await page.getByLabel('Data JSON').fill(JSON.stringify({ title: 'Dot', state: 'open', rank: 1 }));
+  await page.getByRole('button', { name: 'Create record' }).click();
+  await page.getByRole('status').getByRole('link').click();
+  await expect(page.getByText('Revision', { exact: true }).locator('..')).toContainText('1');
+  await expect(page.getByLabel(/Data JSON/)).toHaveValue(/Dot/);
+});
+
+test('the space switcher keeps the open space selected past the first page', async ({ page, request }) => {
+  const headers = { authorization: `Bearer ${ownerToken}` };
+  for (let created = 0; created < 9; created++)
+    expect((await request.post('/v1/spaces', { headers, data: { spaceId: `sp_${randomUUID()}` } })).status()).toBe(201);
+  const first = await (await request.get('/v1/spaces', { headers })).json();
+  const later = await (await request.get(`/v1/spaces?cursor=${encodeURIComponent(first.cursor)}`, { headers })).json();
+  const spaceId: string = later.items[0].spaceId;
+  await signIn(page, ownerToken);
+  await go(page, `/spaces/${encodeURIComponent(spaceId)}`);
+  await expect(page.getByLabel('Switch space')).toHaveValue(spaceId);
+  await expect(page.getByRole('link', { name: 'More spaces' })).toBeVisible();
+});
+
 test('validation failures are announced on their fields', async ({ page }) => {
   await signIn(page, ownerToken);
   await go(page, itemsUrl());
@@ -120,6 +195,15 @@ test('validation failures are announced on their fields', async ({ page }) => {
   const alert = page.getByRole('alert');
   await expect(alert).toContainText('SCHEMA_INVALID');
   await expect(alert).toBeFocused();
+
+  // Blank-looking input passes the browser's required check; the server names the field.
+  for (const [path, label, button, message] of [['/spaces', 'Space ID', 'Open', 'Enter a space ID.'],
+    [`${spaceUrl}/access`, 'Key secret', 'Check key', 'Enter a key secret.']]) {
+    await go(page, path);
+    await page.getByLabel(label, { exact: true }).fill('  ');
+    await page.getByRole('button', { name: button, exact: true }).click();
+    await expect(page.getByLabel(label, { exact: true })).toHaveAccessibleDescription(message);
+  }
 });
 
 test('an invalid credential is rejected without a session', async ({ page }) => {
@@ -170,6 +254,27 @@ test('owner grants an agent key, the API enforces it and revocation is verified'
   await go(agent, itemsUrl());
   await expect(agent.getByRole('alert')).toContainText('UNAUTHENTICATED');
 
+  // A provider failure after the local revocation stays visible and can be finished.
+  if (local) {
+    await go(page, `${spaceUrl}/access`);
+    await items.getByLabel('records:read').check();
+    await page.getByRole('button', { name: 'Issue key' }).click();
+    const interrupted = await page.getByLabel('Secret', { exact: true }).inputValue();
+    await go(page, `${spaceUrl}/access`);
+    await dropReply('UPDATE space_credentials SET provider_revoked_at');
+    await page.getByRole('button', { name: /^Revoke key_/ }).click();
+    await expect(page.getByRole('alert')).toBeVisible();
+    await expect(page.getByRole('table')).toContainText('Denied here; provider cleanup pending');
+    await settle(page);
+    await page.getByLabel('Key secret').fill(interrupted);
+    await page.getByRole('button', { name: 'Check key' }).click();
+    await expect(page.getByRole('status')).toContainText('Rejected: UNAUTHENTICATED');
+    await page.getByRole('button', { name: /^Retry provider revocation for key_/ }).click();
+    await expect(page.getByRole('status')).toContainText('revoked');
+    await expect(page.getByRole('table')).not.toContainText('provider cleanup pending');
+    await expect(page.getByRole('button', { name: /^Retry provider revocation/ })).toHaveCount(0);
+  }
+
   await go(page, `${spaceUrl}/audit`);
   await expect(page.getByRole('table')).toContainText('key:issue');
   await expect(page.getByRole('table')).toContainText('key:revoke');
@@ -196,9 +301,10 @@ test('pages pass accessibility checks, keyboard use and small screens', async ({
     await signIn(page, ownerToken);
     const id = await createRecord(page, { title: 'Layout', state: 'open', rank: 1 });
     for (const path of ['/spaces', spaceUrl, itemsUrl(), `${itemsUrl()}/schema`, `${itemsUrl()}/records/${id}`,
-      `${itemsUrl()}/events`, `${itemsUrl()}/batches`, `${spaceUrl}/access`, `${spaceUrl}/audit`]) {
+      `${itemsUrl()}/events`, `${itemsUrl()}/batches`, `${spaceUrl}/access`, `${spaceUrl}/audit`, `${spaceUrl}/new-collection`]) {
       await go(page, path);
       await audit(page);
+      await expect(page.locator('title')).toHaveCount(1);
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `${path} at ${width}px`).toBe(true);
     }
     await page.getByRole('button', { name: 'Sign out' }).click();

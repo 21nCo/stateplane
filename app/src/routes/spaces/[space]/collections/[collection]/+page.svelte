@@ -2,9 +2,10 @@
   import Notice from '$lib/components/Notice.svelte';
   import Scroll from '$lib/components/Scroll.svelte';
   import { fieldKind, operators } from '$lib/query';
+  import { collectionHref, segment } from '$lib/paths';
   let { data, form } = $props();
   const definition=$derived(data.collection?.definition);
-  const base=$derived(`/spaces/${encodeURIComponent(data.spaceId)}/collections/${encodeURIComponent(definition?.slug ?? '')}`);
+  const base=$derived(collectionHref(data.spaceId,definition?.slug ?? ''));
   const filterable=$derived(data.collection ? definition!.filterable.filter(field=>data.collection!.ready.includes(field)) : []);
   const sortable=$derived(data.collection ? definition!.sortable.filter(field=>data.collection!.ready.includes(field)) : []);
   const pending=$derived(data.collection?.pending ?? []);
@@ -69,7 +70,7 @@
             <caption class="sr-only">Records on this page</caption>
             <thead><tr><th scope="col">Record</th><th scope="col">Revision</th>{#each columns as column (column)}<th scope="col">{column}</th>{/each}</tr></thead>
             <tbody>{#each data.page.records as record (record.ref.id)}<tr>
-              <td><a class="link font-mono" href="{base}/records/{encodeURIComponent(record.ref.id)}">{record.keyMode==='external' ? record.normalizedKey : record.ref.id}</a></td>
+              <td><a class="link font-mono" href="{base}/records/{segment(record.ref.id)}">{record.keyMode==='external' ? record.normalizedKey : record.ref.id}</a></td>
               <td>{record.revision}</td>{#each columns as column (column)}<td class="max-w-48 truncate">{cell(record,column)}</td>{/each}
             </tr>{/each}</tbody>
           </table></Scroll>
@@ -88,7 +89,7 @@
       <Notice error={form?.create?.error} title="Record was not created">
         {#if form?.create?.error?.code==='COMMIT_OUTCOME_UNKNOWN'}<p class="mt-1">Submit again unchanged: the same request key recovers the original result instead of writing twice.</p>{/if}
       </Notice>
-      {#if form?.created}<p role="status" class="text-sm text-success">Created <a class="link font-mono" href="{base}/records/{encodeURIComponent(form.created.ref.id)}">{form.created.ref.id}</a> at revision {form.created.revision}{form.created.replayed ? ' (recovered earlier result)' : ''}. Search projection: {form.created.projection.state}.</p>{/if}
+      {#if form?.created}<p role="status" class="text-sm text-success">Created <a class="link font-mono" href="{base}/records/{segment(form.created.ref.id)}">{form.created.ref.id}</a> at revision {form.created.revision}{form.created.replayed ? ' (recovered earlier result)' : ''}. Search projection: {form.created.projection.state}.</p>{/if}
       <form method="POST" action="?/create" class="space-y-3">
         <input type="hidden" name="idempotencyKey" value={form?.create?.idempotencyKey ?? data.idempotencyKey} />
         <div><label for="externalKey">External key (optional)</label><input id="externalKey" name="externalKey" value={form?.create?.externalKey ?? ''} /></div>

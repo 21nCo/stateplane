@@ -14,11 +14,15 @@ const owner={kind:'session',userPrincipalId:`owner-${randomUUID()}`,credentialId
 // A provider stand-in: Stateplane stores key IDs and grants, never these secrets.
 const keys=new Map();
 let created=0;
+let failRevoke=false;
 const provider={
   create:async(principal,expiresAt,issuanceId)=>{ created++; const key={id:`key-${randomUUID()}`,secret:`secret-${randomUUID()}`,principal,issuanceId,revoked:false};
     keys.set(key.secret,key); return {id:key.id,secret:key.secret}; },
   find:async(principal,issuanceId)=>[...keys.values()].find(key=>key.principal===principal && key.issuanceId===issuanceId)?.id??null,
-  revoke:async id=>{ for (const key of keys.values()) if (key.id===id) key.revoked=true; }
+  revoke:async id=>{
+    if (failRevoke) { failRevoke=false; throw new Error('provider unavailable'); }
+    for (const key of keys.values()) if (key.id===id) key.revoked=true;
+  }
 };
 const identity={
   verify:async request=>{
@@ -89,9 +93,16 @@ test('owner key issuance, listing, revocation, audit and index backfill go throu
     assert.equal(denied.status,403,`${method} ${path}`);
   }
 
+  assert.equal(json(listed).items[0].providerRevokedAt,null);
+  // A provider failure after the local revocation leaves cleanup visible and repeatable.
+  failRevoke=true;
+  assert.notEqual((await route('DELETE',`/v1/spaces/${spaceId}/agent-keys/${keyId}`)).status,200);
+  const interrupted=json(await route('GET',`/v1/spaces/${spaceId}/agent-keys`)).items[0];
+  assert.deepEqual([interrupted.status,interrupted.providerRevokedAt],['revoked',null]);
   assert.deepEqual(json(await route('DELETE',`/v1/spaces/${spaceId}/agent-keys/${keyId}`)),{keyId,revoked:true});
   const revoked=json(await route('GET',`/v1/spaces/${spaceId}/agent-keys`)).items[0];
   assert.equal(revoked.status,'revoked');
+  assert.ok(revoked.providerRevokedAt);
   assert.deepEqual(revoked.grants,[]);
   assert.equal((await route('GET','/v1/auth/session',undefined,secret)).status,401);
   const audit=await route('GET',`/v1/spaces/${spaceId}/audit`);

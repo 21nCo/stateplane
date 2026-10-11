@@ -25,7 +25,10 @@ const loopbackHosts=new Set(['127.0.0.1','localhost','[::1]']);
 const maxFixtureKeys=1_000;
 interface FixtureKey { id:string; owner:string; issuanceId:string; expiresAt:number; revoked:boolean }
 /** A Node-only stand-in for AuthFn keys so local journeys can issue, use and
- * revoke a key. A Worker builds a host per request and keeps issuance off. */
+ * revoke a key. A Worker builds a host per request and keeps issuance off.
+ * The store outlives a retired host, as a provider outlives one connection
+ * pool; it is lost only when the Node process restarts. */
+let fixtureStore:ReturnType<typeof fixtureKeys>|undefined;
 function fixtureKeys() {
   const byDigest=new Map<string,FixtureKey>();
   const byId=new Map<string,FixtureKey>();
@@ -164,7 +167,7 @@ export function stateplaneHost(env:Bindings):Host | undefined {
   // goes away. The pool removes that client; consume the event without logging
   // provider diagnostics or allowing an unhandled error to kill the host.
   pool.on('error',()=>{});
-  const keys=perRequest ? null : fixtureKeys();
+  const keys=perRequest ? null : fixtureStore??=fixtureKeys();
   const tokenDigest=createHash('sha256').update(env.STATEPLANE_TEST_TOKEN).digest();
   const agentDigest=env.STATEPLANE_TEST_AGENT_TOKEN ?
     createHash('sha256').update(env.STATEPLANE_TEST_AGENT_TOKEN).digest() : null;

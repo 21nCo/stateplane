@@ -3,8 +3,9 @@
   import Scroll from '$lib/components/Scroll.svelte';
   import Status from '$lib/components/Status.svelte';
   import { page } from '$app/state';
+  import { collectionHref, segment, selectors } from '$lib/paths';
   let { data, form } = $props();
-  const base=$derived(`/spaces/${encodeURIComponent(data.spaceId)}/collections/${encodeURIComponent(page.params.collection ?? '')}`);
+  const base=$derived(collectionHref(data.spaceId,selectors(page.url).collection));
   const counts=$derived((data.progress?.items ?? []).reduce<Record<string,number>>((all,item)=>({...all,[item.state]:(all[item.state] ?? 0)+1}),{}));
   const tone=(state:string)=>state==='succeeded' ? 'success' : state==='failed' ? 'danger' : 'warning';
   const uncertain=$derived(['COMMIT_OUTCOME_UNKNOWN','RATE_LIMITED','PROVIDER_UNAVAILABLE'].includes(form?.error?.code ?? ''));
@@ -48,7 +49,7 @@
         <thead><tr><th scope="col">Line</th><th scope="col">State</th><th scope="col">Attempts</th><th scope="col">Result</th></tr></thead>
         <tbody>{#each data.progress.items as item (item.ordinal)}<tr>
           <td>{item.ordinal+1}</td><td>{item.state}</td><td>{item.attempts}</td>
-          <td>{#if item.receipt}<a class="link font-mono" href="{base}/records/{encodeURIComponent(item.receipt.ref.id)}">{item.receipt.ref.id}</a> r{item.receipt.revision}{:else if item.failureCode}<code>{item.failureCode}</code>{:else}—{/if}</td>
+          <td>{#if item.receipt}<a class="link font-mono" href="{base}/records/{segment(item.receipt.ref.id)}">{item.receipt.ref.id}</a> r{item.receipt.revision}{:else if item.failureCode}<code>{item.failureCode}</code>{:else}—{/if}</td>
         </tr>{/each}</tbody>
       </table></Scroll>
       {#if data.progress.state==='active' && data.progress.items.some(item=>item.state==='pending')}

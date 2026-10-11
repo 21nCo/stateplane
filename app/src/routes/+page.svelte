@@ -3,7 +3,7 @@
   let { form } = $props();
 </script>
 
-<svelte:head><meta name="description" content="Stateplane owned state spaces" /></svelte:head>
+<svelte:head><title>Stateplane</title><meta name="description" content="Stateplane owned state spaces" /></svelte:head>
 <div class="mx-auto max-w-md space-y-4">
   <h1 class="text-3xl font-semibold">Stateplane</h1>
   <p class="hint">Owned spaces, collections and authoritative records. Sign in with a session bearer to manage your spaces, or with an agent key to use its granted collections.</p>

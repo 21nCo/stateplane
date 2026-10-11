@@ -84,7 +84,7 @@ paths:
     parameters: [ { $ref: '#/components/parameters/spaceId' } ]
     get:
       operationId: listAgentKeys
-      description: Owner session only. At most 100 keys per page with status and current grants; secrets are never returned.
+      description: Owner session only. At most 100 keys per page with status, current grants and providerRevokedAt, which stays null after revocation until provider cleanup completes; secrets are never returned.
       parameters: [ { name: cursor, in: query, schema: { type: string } } ]
       responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
     post:
