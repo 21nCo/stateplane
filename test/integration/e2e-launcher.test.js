@@ -55,3 +55,28 @@ test('the e2e launcher drops its database when its control port is taken',{timeo
     assert.deepEqual((await disposable()).filter(name=>!before.has(name)),[],'no disposable database is left');
   } finally { taken.close(); }
 });
+
+test('the e2e launcher stopped during startup starts nothing and drops its database',{timeout:120_000},async()=>{
+  const before=new Set(await disposable());
+  const launcher=spawn(process.execPath,['test/e2e/host.js'],{cwd:root,stdio:['ignore','pipe','pipe'],
+    env:{...process.env,STATEPLANE_E2E_BASE_DATABASE:url,STATEPLANE_E2E_TEST_STARTUP_DELAY_MS:'60000'}});
+  let output='';
+  for (const stream of [launcher.stdout,launcher.stderr]) stream.on('data',chunk=>{ output+=chunk; });
+  const exited=once(launcher,'exit');
+  try {
+    let created;
+    for (let waited=0;!created && waited<30_000;waited+=50) {
+      await delay(50);
+      created=(await disposable()).find(name=>!before.has(name));
+    }
+    assert.ok(created,'the launcher created a database');
+    launcher.kill('SIGTERM');
+    const [code]=await Promise.race([exited,delay(30_000).then(()=>{ throw new Error('launcher did not exit'); })]);
+    assert.equal(code,0);
+    assert.ok(!(await disposable()).includes(created),'the disposable database is dropped');
+    // Startup ran no further step once shutdown began, so no migration or UI was started.
+    assert.doesNotMatch(output,/Applied /);
+    await delay(5_000);
+    assert.equal(await fetch('http://127.0.0.1:5743/api/health').then(()=>'answered',()=>'refused'),'refused');
+  } finally { launcher.kill('SIGKILL'); }
+});

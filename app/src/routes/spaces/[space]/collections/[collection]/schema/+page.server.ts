@@ -24,7 +24,7 @@ export const actions:Actions={
     // If-Match carries the version the editor loaded; a concurrent revision is rejected, not replaced.
     const saved=await api(event,'PATCH',path(event.url),{headers:{'if-match':String(version)},
       body:{...parsed,slug:selectors(event.url).collection,version:version+1}});
-    return saved.ok ? {revised:true} : fail(saved.status,{definition,version,error:saved.error});
+    return saved.ok ? {revised:version+1} : fail(saved.status,{definition,version,error:saved.error});
   },
   backfill:async(event)=>{
     const field=String((await event.request.formData()).get('field')??'');

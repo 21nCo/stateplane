@@ -43,7 +43,7 @@ export const actions:Actions={
     // Collection IDs are exact API selectors: " items " and "items" are different collections.
     const grants=form.getAll('collection').map((value,index)=>({collectionId:String(value),
       capabilities:form.getAll(`capabilities-${index}`).map(String).filter(item=>grantable.includes(item))}))
-      .filter(grant=>grant.collectionId.trim() && grant.capabilities.length);
+      .filter(grant=>grant.collectionId && grant.capabilities.length);
     if (!lifetimes.has(days) || !grants.length) return fail(400,{issueInvalid:true});
     const expiresAt=new Date(Date.now()+days*86_400_000).toISOString();
     const issued=await api<{keyId:string;secret:string;expiresAt:string}>(event,'POST',['spaces',selectors(event.url).space,'agent-keys'],

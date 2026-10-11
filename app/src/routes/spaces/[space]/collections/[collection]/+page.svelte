@@ -2,10 +2,11 @@
   import Notice from '$lib/components/Notice.svelte';
   import Scroll from '$lib/components/Scroll.svelte';
   import { fieldKind, operators } from '$lib/query';
-  import { collectionHref, segment, shown } from '$lib/paths';
+  import { page } from '$app/state';
+  import { collectionHref, segment, selectors, shown } from '$lib/paths';
   let { data, form } = $props();
   const definition=$derived(data.collection?.definition);
-  const base=$derived(collectionHref(data.spaceId,definition?.slug ?? ''));
+  const base=$derived(collectionHref(data.spaceId,selectors(page.url).collection));
   const filterable=$derived(data.collection ? definition!.filterable.filter(field=>data.collection!.ready.includes(field)) : []);
   const sortable=$derived(data.collection ? definition!.sortable.filter(field=>data.collection!.ready.includes(field)) : []);
   const pending=$derived(data.collection?.pending ?? []);
@@ -84,21 +85,28 @@
         <p class="hint">Pages are exact when read but follow live data: records changed between pages can move.</p>
       {/if}
     </section>
-    <section aria-labelledby="create" class="panel h-fit space-y-3">
-      <h2 id="create" class="font-semibold">Create a record</h2>
-      <Notice error={form?.create?.error} title="Record was not created">
-        {#if form?.create?.error?.code==='COMMIT_OUTCOME_UNKNOWN'}<p class="mt-1">Submit again unchanged: the same request key recovers the original result instead of writing twice.</p>{/if}
-      </Notice>
-      {#if form?.created}<p role="status" class="text-sm text-success">Created <a class="link font-mono" href="{base}/records/{segment(form.created.ref.id)}">{form.created.ref.id}</a> at revision {form.created.revision}{form.created.replayed ? ' (recovered earlier result)' : ''}. Search projection: {form.created.projection.state}.</p>{/if}
-      <form method="POST" action="?/create" class="space-y-3">
-        <input type="hidden" name="idempotencyKey" value={form?.create?.idempotencyKey ?? data.idempotencyKey} />
-        <div><label for="externalKey">External key (optional)</label><input id="externalKey" name="externalKey" value={form?.create?.externalKey ?? ''} /></div>
-        <div><label for="data">Data JSON</label>
-          <textarea id="data" name="data" rows="8" spellcheck="false" aria-invalid={form?.create?.invalid || form?.create?.error?.code==='SCHEMA_INVALID' ? 'true' : undefined}
-            aria-describedby={form?.create?.invalid ? 'data-error' : undefined}>{form?.create?.raw ?? '{}'}</textarea>
-          {#if form?.create?.invalid}<p id="data-error" class="mt-1 text-sm text-danger">Data must be one JSON object with finite numbers.</p>{/if}</div>
-        <button class="btn">Create record</button>
-      </form>
-    </section>
+    {@render create()}
   </div>
+{:else if form?.create || form?.created}
+  <!-- A submitted create keeps its draft, error and request key when the reload fails. -->
+  <div class="mt-4 max-w-xl">{@render create()}</div>
 {/if}
+
+{#snippet create()}
+  <section aria-labelledby="create" class="panel h-fit space-y-3">
+    <h2 id="create" class="font-semibold">Create a record</h2>
+    <Notice error={form?.create?.error} title="Record was not created">
+      {#if form?.create?.error?.code==='COMMIT_OUTCOME_UNKNOWN'}<p class="mt-1">Submit again unchanged: the same request key recovers the original result instead of writing twice.</p>{/if}
+    </Notice>
+    {#if form?.created}<p role="status" class="text-sm text-success">Created <a class="link font-mono" href="{base}/records/{segment(form.created.ref.id)}">{form.created.ref.id}</a> at revision {form.created.revision}{form.created.replayed ? ' (recovered earlier result)' : ''}. Search projection: {form.created.projection.state}.</p>{/if}
+    <form method="POST" action="?/create" class="space-y-3">
+      <input type="hidden" name="idempotencyKey" value={form?.create?.idempotencyKey ?? data.idempotencyKey} />
+      <div><label for="externalKey">External key (optional)</label><input id="externalKey" name="externalKey" value={form?.create?.externalKey ?? ''} /></div>
+      <div><label for="data">Data JSON</label>
+        <textarea id="data" name="data" rows="8" spellcheck="false" aria-invalid={form?.create?.invalid || form?.create?.error?.code==='SCHEMA_INVALID' ? 'true' : undefined}
+          aria-describedby={form?.create?.invalid ? 'data-error' : undefined}>{form?.create?.raw ?? '{}'}</textarea>
+        {#if form?.create?.invalid}<p id="data-error" class="mt-1 text-sm text-danger">Data must be one JSON object with finite numbers.</p>{/if}</div>
+      <button class="btn">Create record</button>
+    </form>
+  </section>
+{/snippet}

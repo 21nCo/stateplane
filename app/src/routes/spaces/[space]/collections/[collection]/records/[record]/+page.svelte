@@ -5,7 +5,8 @@
   import { collectionHref, selectors } from '$lib/paths';
   let { data, form } = $props();
   const base=$derived(collectionHref(data.spaceId,selectors(page.url).collection));
-  // After a conflict the user's draft stays in the editor until they choose how to resolve it.
+  // After a conflict the user's draft stays in the editor until they choose how to resolve it;
+  // the form's revision travels only with that draft, never with the displayed record.
   const draft=$derived(form?.raw ?? data.record?.pretty ?? '');
   // A submitted draft, its error and its retry render without the live read: a
   // concurrent delete or a lost acknowledgement must not hide them.
@@ -66,7 +67,7 @@
         </Notice>
         <form method="POST" action="?/save" class="space-y-3">
           <input type="hidden" name="idempotencyKey" value={form?.error || form?.invalid ? form.idempotencyKey : data.idempotencyKey} />
-          <input type="hidden" name="expectedRevision" value={form?.expectedRevision ?? data.record?.revision} />
+          <input type="hidden" name="expectedRevision" value={form?.raw!==undefined ? form.expectedRevision : data.record?.revision} />
           <label for="data">Data JSON (replaces the whole record)</label>
           <textarea id="data" name="data" rows="14" spellcheck="false" aria-invalid={form?.invalid || form?.error?.code==='SCHEMA_INVALID' ? 'true' : undefined}
             aria-describedby={form?.invalid ? 'data-error' : undefined}>{draft}</textarea>

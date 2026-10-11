@@ -28,13 +28,22 @@
       {#if !data.collection.ready.length && !data.collection.pending.length}<p class="hint">No filter or sort fields are declared.</p>{/if}
       <p class="hint">A pending index is not used for filters or sorting until it is ready, so results are never partial.</p>
     </section>
-    <section aria-labelledby="revise" class="panel space-y-3">
-      <h2 id="revise" class="text-lg font-semibold">Revise definition</h2>
-      {#if form?.revised}<p role="status" class="text-sm text-success">Saved as version {data.collection.definition.version}.</p>{/if}
-      <DefinitionForm action="?/revise" definition={form?.definition ?? editable} invalid={form?.invalid} error={form?.error} submit="Save revision">
-        <input type="hidden" name="version" value={form?.version ?? data.collection.definition.version} />
-        {#if form?.error?.code==='SCHEMA_CONFLICT'}<p class="text-sm">Another revision was saved first; your edit was not applied. <a class="link" href="?">Discard my edit and load version {data.collection.definition.version}</a></p>{/if}
-      </DefinitionForm>
-    </section>
+    {@render revise()}
   </div>
+{:else if form?.definition!==undefined}
+  <!-- A submitted revision keeps its draft, version and error when the reload fails. -->
+  <div class="mt-4 max-w-2xl">{@render revise()}</div>
+{:else if form?.revised}
+  <p role="status" class="mt-4 text-sm text-success">Saved as version {form.revised}.</p>
 {/if}
+
+{#snippet revise()}
+  <section aria-labelledby="revise" class="panel space-y-3">
+    <h2 id="revise" class="text-lg font-semibold">Revise definition</h2>
+    {#if form?.revised}<p role="status" class="text-sm text-success">Saved as version {form.revised}.</p>{/if}
+    <DefinitionForm action="?/revise" definition={form?.definition ?? editable} invalid={form?.invalid} error={form?.error} submit="Save revision">
+      <input type="hidden" name="version" value={form?.version ?? data.collection?.definition.version} />
+      {#if form?.error?.code==='SCHEMA_CONFLICT'}<p class="text-sm">Another revision was saved first; your edit was not applied. <a class="link" href="?">Discard my edit and load {data.collection ? `version ${data.collection.definition.version}` : 'the current version'}</a></p>{/if}
+    </DefinitionForm>
+  </section>
+{/snippet}

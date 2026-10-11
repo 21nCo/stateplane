@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import AxeBuilder from '@axe-core/playwright';
 import { expect, test } from '@playwright/test';
-import type { Browser, Page } from '@playwright/test';
+import type { APIRequestContext, Browser, Page } from '@playwright/test';
 
 test.skip(process.env.STATEPLANE_E2E_STATE !== '1', 'Needs Postgres or a deployed development target');
 test.describe.configure({ mode: 'serial' });
@@ -49,6 +49,13 @@ async function checkKey(page: Page, secret: string) {
   await page.getByLabel('Key secret').fill(secret);
   await page.getByRole('button', { name: 'Check key' }).click();
   return page.getByRole('status');
+}
+const definition = (properties: object) => ({ schema: { $schema: 'https://json-schema.org/draft/2020-12/schema', type: 'object',
+  additionalProperties: false, required: ['title'], properties: { title: { type: 'string' }, ...properties } }, unique: [], filterable: [], sortable: [] });
+async function defineCollection(request: APIRequestContext, name: string) {
+  const response = await request.put(`/v1${spaceUrl}/collections/${encodeURIComponent(name)}`,
+    { headers: { authorization: `Bearer ${ownerToken}` }, data: { ...definition({}), slug: name, version: 1 } });
+  expect(response.status()).toBe(201);
 }
 async function asAgent(browser: Browser, secret: string) {
   const page = await (await browser.newContext()).newPage();
@@ -155,6 +162,68 @@ test('an uncertain delete is replayed with its original request key', async ({ p
   await expect(page.getByRole('alert').filter({ hasText: 'Record could not be read' })).toContainText('NOT_FOUND');
   await page.getByRole('button', { name: 'Retry deletion of revision 1' }).click();
   await expect(page).toHaveURL(new RegExp(`${itemsUrl()}$`));
+});
+
+test('after a delete conflict the displayed record saves at its current revision', async ({ browser, page }) => {
+  await signIn(page, ownerToken);
+  const id = await createRecord(page, { title: 'Contested', state: 'open', rank: 9 });
+  await go(page, `${itemsUrl()}/records/${id}`);
+  const other = await browser.newPage({ storageState: await page.context().storageState() });
+  await go(other, `${itemsUrl()}/records/${id}`);
+  await other.getByLabel(/Data JSON/).fill(JSON.stringify({ title: 'Changed elsewhere', state: 'done', rank: 9 }));
+  await other.getByRole('button', { name: 'Save revision' }).click();
+  await expect(other.getByRole('status')).toContainText('Saved revision 2');
+
+  await page.getByRole('button', { name: 'Delete revision 1' }).click();
+  await expect(page.getByRole('alert', { name: 'Edit conflict' })).toContainText('revision 2 is now current');
+  await expect(page.getByLabel(/Data JSON/)).toHaveValue(/Changed elsewhere/);
+  await page.getByRole('button', { name: 'Save revision' }).click();
+  await expect(page.getByRole('status')).toContainText('Saved revision 3 (was 2)');
+});
+
+test('a create whose acknowledgement and reload both fail keeps its form and request key', async ({ page, request }) => {
+  test.skip(!local, 'Needs the local fault proxy');
+  await signIn(page, ownerToken);
+  await go(page, itemsUrl());
+  const title = `Unacknowledged ${randomUUID()}`;
+  await page.getByLabel('Data JSON').fill(JSON.stringify({ title, state: 'open', rank: 8 }));
+  // The create commits but its acknowledgement is lost; then the page's collection read fails.
+  await dropReply('COMMIT\0', 'INSERT INTO records(');
+  await dropReply('c.collection_id=$3 ORDER BY');
+  await page.getByRole('button', { name: 'Create record' }).click();
+  await expect(page.getByRole('alert').filter({ hasText: 'Collection could not be read' })).toBeVisible();
+  const notice = page.getByRole('alert').filter({ hasText: 'Record was not created' });
+  await expect(notice).toContainText('COMMIT_OUTCOME_UNKNOWN');
+  await expect(notice).toContainText('Submit again unchanged');
+  await expect(page.getByLabel('Data JSON')).toHaveValue(new RegExp(title));
+
+  await page.getByRole('button', { name: 'Create record' }).click();
+  await expect(page.getByRole('status')).toContainText('(recovered earlier result)');
+  const listed = await request.post(`/v1${itemsUrl()}/records/query`,
+    { headers: { authorization: `Bearer ${ownerToken}` }, data: { predicates: [], limit: 100 } });
+  const records: { canonicalData: string }[] = (await listed.json()).records;
+  expect(records.filter(record => JSON.parse(record.canonicalData).title === title)).toHaveLength(1);
+});
+
+test('a schema revision whose reload fails keeps the draft and its version', async ({ browser, page, request }) => {
+  test.skip(!local, 'Needs the local fault proxy');
+  await defineCollection(request, 'drafts');
+  await signIn(page, ownerToken);
+  await go(page, `${spaceUrl}/collections/drafts/schema`);
+  const other = await browser.newPage({ storageState: await page.context().storageState() });
+  await go(other, `${spaceUrl}/collections/drafts/schema`);
+  await other.getByLabel('Definition JSON').fill(JSON.stringify(definition({ theirs: { type: 'string' } })));
+  await other.getByRole('button', { name: 'Save revision' }).click();
+  await expect(other.getByRole('status')).toContainText('Saved as version 2');
+
+  await page.getByLabel('Definition JSON').fill(JSON.stringify(definition({ mine: { type: 'string' } })));
+  await dropReply('c.collection_id=$3 ORDER BY');
+  await page.getByRole('button', { name: 'Save revision' }).click();
+  await expect(page.getByRole('alert').filter({ hasText: 'Collection could not be read' })).toBeVisible();
+  await expect(page.getByRole('alert').filter({ hasText: 'Definition was not saved' })).toContainText('SCHEMA_CONFLICT');
+  await expect(page.getByText('Another revision was saved first')).toBeVisible();
+  await expect(page.getByLabel('Definition JSON')).toHaveValue(/"mine"/);
+  await expect(page.locator('input[name="version"]')).toHaveValue('1');
 });
 
 test('collection names that look like routes or dot segments stay reachable', async ({ page }) => {
@@ -343,12 +412,15 @@ test('identifiers that differ only by surrounding whitespace stay distinct', asy
   await page.getByRole('button', { name: 'Define collection' }).click();
   await expect(page).toHaveURL(`${spaceUrl}/collections/%20items%20/schema`);
 
-  // The grant reaches only the selected sibling.
+  // The grant reaches only the selected siblings, including a whitespace-only name.
+  await defineCollection(request, ' ');
   await go(page, `${spaceUrl}/access`);
   await page.getByRole('group', { name: 'Collection " items "' }).getByLabel('records:read').check();
+  await page.getByRole('group', { name: 'Collection " "' }).getByLabel('records:read').check();
   await page.getByRole('button', { name: 'Issue key' }).click();
   const headers = { authorization: `Bearer ${await page.getByLabel('Secret', { exact: true }).inputValue()}` };
   expect((await request.get(`/v1${spaceUrl}/collections/%20items%20`, { headers })).status()).toBe(200);
+  expect((await request.get(`/v1${spaceUrl}/collections/%20`, { headers })).status()).toBe(200);
   expect((await request.get(`/v1${spaceUrl}/collections/items`, { headers })).status()).toBe(404);
 
   // A padded operation key resumes its own batch, not its trimmed sibling.

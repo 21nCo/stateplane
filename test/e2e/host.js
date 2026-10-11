@@ -2,13 +2,14 @@
 // creates a disposable database, migrates it and enables the opt-in fixture
 // host; the database is dropped when Playwright stops this process. The UI
 // reaches that database through a loopback proxy whose control port lets a
-// test drop one reply, so a lost acknowledgement is reproducible, or fail the
+// test drop chosen replies, so a lost acknowledgement is reproducible, or fail the
 // fixture provider's next key revocation.
-import { execFileSync, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 import net from 'node:net';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 
@@ -16,23 +17,30 @@ const root=fileURLToPath(new URL('../..',import.meta.url));
 const base=process.env.STATEPLANE_E2E_BASE_DATABASE;
 const faultPort=5744;
 let url;
-let creating;
-let app;
-// Settles once the UI process has ended, whether it exited or was signalled.
+let created=false;
+// The running child (migration, then the UI) and a promise that settles once
+// it has ended, whether it exited or was signalled.
+let child;
 let ended;
+let server;
 let control;
 let stopping=false;
+let startup;
+const halted=new AbortController();
+/** Shutdown waits for startup to settle; startup opens nothing once shutdown
+ * has begun, so every child is killed and awaited before the DROP. */
 async function stop(code=0) {
   if (stopping) return;
   stopping=true;
-  if (app) {
-    app.kill('SIGTERM');
-    await ended;
-  }
-  control?.close();
+  halted.abort();
   try {
-    await creating?.catch(()=>{});
-    if (url) {
+    child?.kill('SIGTERM');
+    await startup?.catch(()=>{});
+    child?.kill('SIGTERM');
+    await ended;
+    server?.close();
+    control?.close();
+    if (created) {
       const admin=new pg.Client({connectionString:base});
       await admin.connect();
       await admin.query(`DROP DATABASE IF EXISTS ${url.pathname.slice(1)} WITH (FORCE)`);
@@ -40,26 +48,30 @@ async function stop(code=0) {
     }
   } finally { process.exit(code); }
 }
-// Cleanup is registered before the database exists, so an interrupt or a failed
-// migration during startup still drops it.
 // A second signal during cleanup exits at once.
 for (const signal of ['SIGTERM','SIGINT']) process.on(signal,()=>{ if (stopping) process.exit(1); void stop(); });
+function run(args,options) {
+  child=spawn(process.execPath,args,{stdio:'inherit',...options});
+  ended=new Promise(resolve=>{ child.once('exit',code=>resolve(code)); child.once('error',()=>resolve(1)); });
+  return ended;
+}
 
-/** One armed fault: after a client message containing `after` (or at once),
- * the reply to the next message containing `match` is dropped and both sockets
- * close, as when a connection fails after the database acted. */
-let fault=null;
+/** Armed faults, applied in order: after a client message containing `after`
+ * (or at once), the reply to the next message containing `match` is dropped and
+ * both sockets close, as when a connection fails after the database acted. */
+const faults=[];
 let providerFault=false;
 async function proxy(target) {
-  const server=net.createServer(client=>{
+  server=net.createServer(client=>{
     const upstream=net.connect(Number(target.port || 5432),target.hostname);
     let seen=null;
     let drop=false;
     const close=()=>{ client.destroy(); upstream.destroy(); };
     client.on('data',chunk=>{
       const text=chunk.toString('latin1');
+      const [fault]=faults;
       if (fault && (!fault.after || text.includes(fault.after))) seen=fault;
-      if (fault && seen===fault && text.includes(fault.match)) { drop=true; fault=null; }
+      if (fault && seen===fault && text.includes(fault.match)) { drop=true; faults.shift(); }
       upstream.write(chunk);
     });
     upstream.on('data',chunk=>{ if (drop) close(); else client.write(chunk); });
@@ -84,7 +96,7 @@ async function proxy(target) {
       try {
         const {match,after}=JSON.parse(body);
         if (typeof match!=='string' || !match) throw new Error('match');
-        fault={match,after:typeof after==='string' ? after : null};
+        faults.push({match,after:typeof after==='string' ? after : null});
         response.writeHead(204).end();
       } catch { response.writeHead(400).end(); }
     });
@@ -95,26 +107,29 @@ async function proxy(target) {
   return proxied;
 }
 
-let databaseUrl;
-if (base) {
-  url=new URL(base);
-  url.pathname=`/stateplane_e2e_${randomUUID().replaceAll('-','')}`;
-  try {
-    creating=(async()=>{
-      const admin=new pg.Client({connectionString:base});
-      await admin.connect();
-      try { await admin.query(`CREATE DATABASE ${url.pathname.slice(1)}`); } finally { await admin.end(); }
-    })();
-    await creating;
-    execFileSync(process.execPath,['scripts/migrate.mjs'],{cwd:root,env:{...process.env,DATABASE_URL:url.href},stdio:'inherit'});
+async function start() {
+  let databaseUrl;
+  if (base) {
+    url=new URL(base);
+    url.pathname=`/stateplane_e2e_${randomUUID().replaceAll('-','')}`;
+    const admin=new pg.Client({connectionString:base});
+    await admin.connect();
+    try {
+      await admin.query(`CREATE DATABASE ${url.pathname.slice(1)}`);
+      created=true;
+    } finally { await admin.end(); }
+    // Test-only: hold startup here so a launcher test can signal mid-startup.
+    await delay(Number(process.env.STATEPLANE_E2E_TEST_STARTUP_DELAY_MS ?? 0),undefined,{signal:halted.signal});
+    if (stopping) return;
+    const code=await run(['scripts/migrate.mjs'],{cwd:root,env:{...process.env,DATABASE_URL:url.href}});
+    if (stopping) return;
+    if (code!==0) throw new Error(`migration exited with ${code}`);
     databaseUrl=(await proxy(url)).href;
-  } catch (error) {
-    console.error(error);
-    await stop(1);
+    if (stopping) return;
   }
+  void run(['node_modules/vite/bin/vite.js','dev','--host','127.0.0.1','--port','5743','--strictPort'],
+    {cwd:`${root}/app`,env:{...process.env,...(databaseUrl ? {STATEPLANE_TEST_DATABASE_URL:databaseUrl,
+      STATEPLANE_TEST_PROVIDER_FAULT_URL:`http://127.0.0.1:${faultPort}/provider-fault`} : {})}}).then(()=>stop());
 }
-app=spawn(process.execPath,['node_modules/vite/bin/vite.js','dev','--host','127.0.0.1','--port','5743','--strictPort'],
-  {cwd:`${root}/app`,stdio:'inherit',env:{...process.env,...(databaseUrl ? {STATEPLANE_TEST_DATABASE_URL:databaseUrl,
-    STATEPLANE_TEST_PROVIDER_FAULT_URL:`http://127.0.0.1:${faultPort}/provider-fault`} : {})}});
-ended=new Promise(resolve=>{ app.once('exit',resolve); app.once('error',resolve); });
-void ended.then(()=>stop());
+startup=start();
+startup.catch(error=>{ if (!stopping) console.error(error); void stop(1); });
