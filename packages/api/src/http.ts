@@ -1,4 +1,5 @@
 import type { StateplaneServices } from '@stateplane/application';
+import { TransportFailure, classifyError } from '@stateplane/application';
 import type { IdentityVerifier } from '@stateplane/auth';
 import type { VerifiedCredential } from '@stateplane/contracts';
 import { isSafeHttpRead, parseV1Path } from '@stateplane/contracts';
@@ -12,11 +13,7 @@ const status:Record<string,number> = {
   RECEIPT_PENDING:503,PROVIDER_UNAVAILABLE:503,BACKPRESSURE:503,RATE_LIMITED:429,
   COMMIT_OUTCOME_UNKNOWN:503,STALE_PLACEMENT:503
 };
-const retryable = new Set(['RECEIPT_PENDING','PROVIDER_UNAVAILABLE','BACKPRESSURE','RATE_LIMITED','STALE_PLACEMENT']);
-class HttpFailure extends Error {
-  constructor(readonly code:string,readonly retryableOverride?:boolean) { super(code); }
-}
-const fail=(code:string,retryableOverride?:boolean):never=>{ throw new HttpFailure(code,retryableOverride); };
+const fail=(code:string,retryableOverride?:boolean):never=>{ throw new TransportFailure(code,retryableOverride); };
 const json=(value:unknown,code=200)=>Response.json(value,{status:code,headers});
 function path(value:string):string[] {
   return parseV1Path(value)??fail('NOT_FOUND');
@@ -63,33 +60,8 @@ function safeRead(request:Request):boolean {
     return route!==null && isSafeHttpRead(request.method,route); }
   catch { return false; }
 }
-function hostWriteTimeout(error:unknown):boolean {
-  return error instanceof Error && (error.name==='HostProviderTimeoutError' ||
-    error.message==='Query read timeout');
-}
-function errorCode(error:unknown,read:boolean):string {
-  const name=error instanceof Error ? error.name : '';
-  const raw=(error as {code?:unknown})?.code;
-  if (name==='CommitOutcomeUnknownError') return 'COMMIT_OUTCOME_UNKNOWN';
-  if (typeof raw==='string' && Object.hasOwn(status,raw)) return raw;
-  if (error instanceof HttpFailure) return error.code;
-  if (raw==='57014') return read?'RATE_LIMITED':'COMMIT_OUTCOME_UNKNOWN';
-  if (!read && hostWriteTimeout(error)) return 'COMMIT_OUTCOME_UNKNOWN';
-  return 'PROVIDER_UNAVAILABLE';
-}
-function errorRetryable(error:unknown,code:string,read:boolean):boolean {
-  let canRetry=retryable.has(code);
-  if (code==='COMMIT_OUTCOME_UNKNOWN') canRetry=read;
-  if (error instanceof HttpFailure && error.retryableOverride!==undefined)
-    canRetry=error.retryableOverride;
-  else if (typeof (error as {retryable?:unknown})?.retryable==='boolean')
-    canRetry=(error as {retryable:boolean}).retryable;
-  return canRetry;
-}
 function errorResponse(error:unknown,requestId:string,request:Request):Response {
-  const read=safeRead(request);
-  const code=errorCode(error,read);
-  const canRetry=errorRetryable(error,code,read);
+  const {code,retryable:canRetry}=classifyError(error,safeRead(request));
   const response=json({contractVersion:'1',error:{code,message:code,retryable:canRetry,requestId}},status[code]??503);
   if (canRetry) response.headers.set('Retry-After','1');
   return response;

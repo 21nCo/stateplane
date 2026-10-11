@@ -11,6 +11,7 @@
   "dependencies": {
     "@stateplane/api": "workspace:*",
     "@stateplane/contracts": "workspace:*",
+    "@stateplane/mcp": "workspace:*",
     "@stateplane/postgres": "workspace:*",
     "pg": "8.22.0"
   },

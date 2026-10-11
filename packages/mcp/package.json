@@ -19,7 +19,10 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@mcpfn/auth": "0.0.5",
+    "@mcpfn/core": "0.0.5",
     "@stateplane/application": "workspace:*",
-    "@stateplane/auth": "workspace:*"
+    "@stateplane/auth": "workspace:*",
+    "@stateplane/contracts": "workspace:*"
   }
 }

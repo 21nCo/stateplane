@@ -14,6 +14,8 @@ declare global {
         STATEPLANE_TEST_CURSOR_SECRET?: string;
         STATEPLANE_TEST_CELL_ID?: string;
         STATEPLANE_TEST_STORAGE_TARGET?: string;
+        STATEPLANE_MCP_AUTHORIZATION_SERVER?: string;
+        STATEPLANE_MCP_RESOURCE?: string;
         AUTHORITY?: Hyperdrive;
       };
     }

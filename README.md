@@ -2,7 +2,7 @@
 
 STA-4's [regional topology, provider budget and provisioning runbook](docs/regional-topology.md) define isolated development and production cells and a disposable Cloudflare-to-Postgres qualification path. Generated configs live under ignored `.data/`; no production route or database is inferred from a local build.
 
-Stateplane is a generic owned-state service under construction. [The v1 logical contract](contracts/v1.md) is normative; this checkout supplies a Cloudflare/SvelteKit foundation, package boundaries, a fixed read-model schema, qualification probes, the [transactional Postgres authority](docs/postgres-authority.md), [owned-space identity and regional policy services](docs/owned-spaces.md), and [HTTP/CLI v1 transport](docs/http-cli.md). The `/api/health` route reports `scaffold`, not operational state readiness.
+Stateplane is a generic owned-state service under construction. [The v1 logical contract](contracts/v1.md) is normative; this checkout supplies a Cloudflare/SvelteKit foundation, package boundaries, a fixed read-model schema, qualification probes, the [transactional Postgres authority](docs/postgres-authority.md), [owned-space identity and regional policy services](docs/owned-spaces.md), [HTTP/CLI v1 transport](docs/http-cli.md) and [remote MCP](docs/mcp.md). The `/api/health` route reports `scaffold`, not operational state readiness.
 
 ## Fresh checkout
 
@@ -40,6 +40,6 @@ The isolated Postgres service binds only `127.0.0.1:55432` and uses the `statepl
 | `packages/testing`, `test` | Generic fixtures, package qualification and consumer checks |
 | `app` | SvelteKit UI and Cloudflare HTTP entry point |
 
-`scripts/check-boundaries.mjs` enforces the package dependency graph and keeps browser sources from importing server packages. The packed external consumer checks exports and TypeScript declarations independently of pnpm workspace links. Space, identity and routing services now have package implementations; the HTTP adapter and installable CLI expose their implemented authority operations. MCP, source storage, search and job processing remain later transport or feature work. See [package qualification](docs/package-qualification.md) for version evidence and upstream dependencies.
+`scripts/check-boundaries.mjs` enforces the package dependency graph and keeps browser sources from importing server packages. The packed external consumer checks exports and TypeScript declarations independently of pnpm workspace links. Space, identity and routing services now have package implementations; the HTTP adapter, installable CLI and [remote MCP endpoint](docs/mcp.md) expose their implemented authority operations through the same services. Source storage, search and job processing remain later feature work. See [package qualification](docs/package-qualification.md) for version evidence and upstream dependencies.
 
 Cloudflare's [SvelteKit Worker guide](https://developers.cloudflare.com/workers/framework-guides/web-apps/sveltekit/) documents the adapter and generated Worker entry; its [Wrangler bundling guide](https://developers.cloudflare.com/workers/wrangler/bundling/) documents `deploy --dry-run` as a bundle inspection step. A successful dry-run does not establish deployed behavior.
