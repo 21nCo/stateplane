@@ -1599,3 +1599,16 @@ test('HTTP and CLI selected-space retries deny metadata when owner access is rev
   gate.release();
   assertErrorParity(direct,await cliPending);
 });
+
+test('an uncertain agent key issuance is a nonretryable unknown outcome without the secret',async()=>{
+  const {AgentKeyOutcomeUnknownError}=await import('../packages/postgres/dist/index.js');
+  const services={agents:{issue:async()=>{ throw new AgentKeyOutcomeUnknownError({id:'key-1',secret:'issued-secret'},new Error('lost ack')); }}};
+  const identity={verify:async()=>({kind:'session',userPrincipalId:'owner',credentialId:'session-1'})};
+  const response=await createHttpHandler({services,identity})(new Request('https://stateplane.example.invalid/v1/spaces/sp_a/agent-keys',
+    {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({expiresAt:'2099-01-01T00:00:00Z',grants:[]})}));
+  const text=await response.text();
+  assert.equal(response.status,503);
+  assert.equal(response.headers.get('retry-after'),null);
+  assert.deepEqual({code:JSON.parse(text).error.code,retryable:JSON.parse(text).error.retryable},{code:'COMMIT_OUTCOME_UNKNOWN',retryable:false});
+  assert.ok(!text.includes('issued-secret'));
+});

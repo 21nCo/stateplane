@@ -1,1 +1,78 @@
 @import 'tailwindcss';
+
+/* The sole raw-color authority, following the Skillplane token convention.
+   Components use the semantic Tailwind roles below, never raw colors. */
+:root {
+  color-scheme: light dark;
+  --sp-color-canvas: #f7f7f8;
+  --sp-color-surface: #ffffff;
+  --sp-color-surface-muted: #eef0f3;
+  --sp-color-border: #c9ccd3;
+  --sp-color-text: #15161a;
+  --sp-color-text-muted: #4a4d57;
+  --sp-color-accent: #4f3fd1;
+  --sp-color-accent-text: #ffffff;
+  --sp-color-success: #146c43;
+  --sp-color-warning: #8a5300;
+  --sp-color-danger: #b42318;
+  --sp-color-focus: #4f3fd1;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --sp-color-canvas: #0b0c0f;
+    --sp-color-surface: #111216;
+    --sp-color-surface-muted: #1c1d23;
+    --sp-color-border: #3d404a;
+    --sp-color-text: #f6f6f7;
+    --sp-color-text-muted: #b0b3bc;
+    --sp-color-accent: #b6adff;
+    --sp-color-accent-text: #0b0c0f;
+    --sp-color-success: #62d49a;
+    --sp-color-warning: #f0bd63;
+    --sp-color-danger: #f28a7f;
+    --sp-color-focus: #b6adff;
+  }
+}
+
+@theme inline {
+  --color-canvas: var(--sp-color-canvas);
+  --color-surface: var(--sp-color-surface);
+  --color-muted: var(--sp-color-surface-muted);
+  --color-line: var(--sp-color-border);
+  --color-content: var(--sp-color-text);
+  --color-subtle: var(--sp-color-text-muted);
+  --color-accent: var(--sp-color-accent);
+  --color-on-accent: var(--sp-color-accent-text);
+  --color-success: var(--sp-color-success);
+  --color-warning: var(--sp-color-warning);
+  --color-danger: var(--sp-color-danger);
+}
+
+@layer base {
+  body { @apply bg-canvas text-content antialiased; }
+  :focus-visible { outline: 2px solid var(--sp-color-focus); outline-offset: 2px; }
+  label { @apply text-sm font-medium; }
+  input, select, textarea { @apply w-full rounded-md border border-line bg-surface px-2.5 py-1.5 text-sm; }
+  input[type='checkbox'], input[type='radio'] { @apply w-auto; }
+  textarea { @apply font-mono; }
+  [aria-invalid='true'] { @apply border-danger; }
+  /* Let wide tables and code scroll inside their panel on small screens. */
+  .grid > * { min-width: 0; }
+  table { @apply w-full text-left text-sm; }
+  th { @apply border-b border-line px-2 py-1.5 font-semibold; }
+  td { @apply border-b border-line px-2 py-1.5 align-top; }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+  }
+}
+
+@layer components {
+  .btn { @apply inline-flex items-center justify-center rounded-md bg-accent px-3 py-1.5 text-sm font-semibold text-on-accent; }
+  .btn-quiet { @apply inline-flex items-center justify-center rounded-md border border-line px-3 py-1.5 text-sm font-medium; }
+  .btn-danger { @apply inline-flex items-center justify-center rounded-md border border-danger px-3 py-1.5 text-sm font-semibold text-danger; }
+  .panel { @apply rounded-lg border border-line bg-surface p-4; }
+  .link { @apply text-accent underline underline-offset-2; }
+  .hint { @apply text-sm text-subtle; }
+  /* Every displayed API identifier wraps anywhere, even as a flex item. */
+  .ident { @apply min-w-0 font-mono [overflow-wrap:anywhere]; }
+}

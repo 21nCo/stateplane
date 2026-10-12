@@ -9,11 +9,20 @@ export interface StateplaneServices {
     get(actor: VerifiedCredential, spaceId: string): Promise<unknown>;
     update(actor: VerifiedCredential, spaceId: string, lifecycle: 'active' | 'readOnly' | 'suspended'): Promise<unknown>;
     delete(actor: VerifiedCredential, spaceId: string): Promise<unknown>;
+    audit(actor: VerifiedCredential, spaceId: string, cursor?: string): Promise<unknown>;
+  };
+  /** Owner-session agent access. An issued secret is returned once and never listed. */
+  agents: {
+    list(actor: VerifiedCredential, spaceId: string, cursor?: string): Promise<unknown>;
+    issue(actor: VerifiedCredential, spaceId: string, serialized: string): Promise<unknown>;
+    revoke(actor: VerifiedCredential, spaceId: string, keyId: string): Promise<unknown>;
   };
   collections: {
     list(actor: VerifiedCredential, spaceId: string, collectionId?: string, cursor?: string): Promise<unknown>;
     define(actor: VerifiedCredential, spaceId: string, collectionId: string, serialized: string): Promise<unknown>;
     revise(actor: VerifiedCredential, spaceId: string, collectionId: string, version: number, serialized: string): Promise<unknown>;
+    /** Advance one bounded batch of a pending filter/sort index. */
+    backfill(actor: VerifiedCredential, spaceId: string, collectionId: string, field: string): Promise<unknown>;
   };
   records: {
     get(actor: VerifiedCredential, spaceId: string, collectionId: string, recordId: string): Promise<unknown>;

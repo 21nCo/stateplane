@@ -800,13 +800,13 @@ test('owner audit reads use bounded stable pages and reject cross-space cursors'
   assert.equal(pages,3);
   assert.deepEqual(seen,expected,'equal timestamps and page boundaries neither skip nor repeat audit rows');
   const firstPage = await spaces.audit(owner,first.spaceId);
-  await assert.rejects(spaces.audit(owner,second.spaceId,firstPage.nextCursor),denied('INVALID_ARGUMENT'));
-  await assert.rejects(spaces.audit(owner,first.spaceId,'malformed!'),denied('INVALID_ARGUMENT'));
+  await assert.rejects(spaces.audit(owner,second.spaceId,firstPage.nextCursor),denied('CURSOR_INVALID'));
+  await assert.rejects(spaces.audit(owner,first.spaceId,'malformed!'),denied('CURSOR_INVALID'));
   const crafted = recordedAt => Buffer.from(JSON.stringify({spaceId:first.spaceId,recordedAt,
     auditId:'aud_cursor'})).toString('base64url');
   for (const invalid of ['2026-02-30T00:00:00.000000Z','2025-02-29T00:00:00.000000Z',
     '2026-04-31T00:00:00.000000Z','2026-13-01T00:00:00.000000Z','0000-01-01T00:00:00.000000Z']) {
-    await assert.rejects(spaces.audit(owner,first.spaceId,crafted(invalid)),denied('INVALID_ARGUMENT'),invalid);
+    await assert.rejects(spaces.audit(owner,first.spaceId,crafted(invalid)),denied('CURSOR_INVALID'),invalid);
   }
   await spaces.audit(owner,first.spaceId,crafted('2024-02-29T23:59:59.123456Z'));
   await assert.rejects(spaces.audit(stranger,first.spaceId),denied('NOT_FOUND'));

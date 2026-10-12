@@ -1,5 +1,7 @@
 declare global {
   namespace App {
+    // The Worker host one page render shares; see $lib/server/host HostLease.
+    interface Locals { hostLease?:{ host:Record<'http'|'mcp',(request:Request)=>Promise<Response>>; retire:()=>void; retired:()=>boolean } }
     interface Platform {
       env: {
         ORIGINALS: R2Bucket;
@@ -14,6 +16,7 @@ declare global {
         STATEPLANE_TEST_CURSOR_SECRET?: string;
         STATEPLANE_TEST_CELL_ID?: string;
         STATEPLANE_TEST_STORAGE_TARGET?: string;
+        STATEPLANE_TEST_PROVIDER_FAULT_URL?: string;
         STATEPLANE_MCP_AUTHORIZATION_SERVER?: string;
         STATEPLANE_MCP_RESOURCE?: string;
         AUTHORITY?: Hyperdrive;
