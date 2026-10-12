@@ -113,7 +113,7 @@
           aria-describedby={schemaInvalid ? 'data-error' : undefined}>{draft?.raw ?? '{}'}</textarea>
         {#if schemaInvalid}<p id="data-error" class="mt-1 text-sm text-danger">{form?.create?.invalid ? 'Data must be one JSON object with finite numbers.' : 'The data does not satisfy the collection schema. Correct it and create again.'}</p>{/if}</div>
       <div class="flex flex-wrap gap-2">{#if !unresolved.length}<button class="btn">Create record</button>
-        {:else if unresolved.length<maxUnresolved}<button class="btn-quiet" aria-describedby="create-pending">Send as new request</button>
+        {:else if unresolved.length<maxUnresolved}<button class="btn-quiet" aria-describedby="create-pending-why">Send as new request</button>
         {:else}<p class="hint">Retry or forget an earlier create before sending another.</p>{/if}</div>
     </form>
   </section>

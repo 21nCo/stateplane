@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { definitive, maxUnresolved, uncertain } from '../app/src/lib/errors';
 import { unresolvedAfter, writeAttempt } from '../app/src/lib/server/forms';
+import { receiptRetentionSeconds, retryMarginSeconds, seal, sealSecret } from '../app/src/lib/server/receipts';
 
 const error = (code: string, retryable: boolean) => ({ code, retryable, requestId: null });
 
@@ -27,34 +28,52 @@ it('ends a retried write only on a result that its key can never recover from', 
 });
 
 describe('unresolved writes', () => {
+  const secret = sealSecret('ab'.repeat(32));
+  const now = Date.UTC(2026, 9, 12, 8);
+  const clock = { secret, now };
   const submit = (fields: [string, string][]) => { const form = new FormData(); for (const [name, value] of fields) form.append(name, value); return form; };
-  const write = (key: string, title: string) => ({ key, sent: JSON.stringify({ data: { title } }) });
-  const posted = (writes: { key: string; sent: string }[]) => writes.flatMap(item => [['pendingKey', item.key], ['pendingSent', item.sent]] as [string, string][]);
+  const write = (key: string, title: string, at = now) => seal(secret, key, JSON.stringify({ data: { title } }), at);
+  const posted = (writes: { key: string; sent: string; at: string; seal: string }[]) => writes.flatMap(item =>
+    [['pendingKey', item.key], ['pendingSent', item.sent], ['pendingAt', item.at], ['pendingSeal', item.seal]] as [string, string][]);
+  const shown = (item: ReturnType<typeof write>) => expect.objectContaining({ key: item.key, sent: item.sent, expired: false });
   const first = write('k1', 'first'), second = write('k2', 'second');
 
   it('keeps a retried write after a refusal and ends it only on a receipt or a definitive result', () => {
-    const retry = writeAttempt(submit([...posted([first, second]), ['retry', '1'], ['idempotencyKey', 'fresh']]), { data: { title: 'draft' } });
-    expect([retry.key, retry.request]).toEqual(['k2', { data: { title: 'second' } }]);
+    const retry = writeAttempt(submit([...posted([first, second]), ['retry', '1'], ['idempotencyKey', 'fresh']]), { data: { title: 'draft' } }, clock);
+    expect([retry.key, retry.request, retry.expired]).toEqual(['k2', { data: { title: 'second' } }, false]);
     for (const code of ['SPACE_UNAVAILABLE', 'FORBIDDEN', 'UNAUTHENTICATED', 'NOT_FOUND', 'REVISION_CONFLICT', 'COMMIT_OUTCOME_UNKNOWN'])
-      expect(unresolvedAfter(retry, error(code, false))).toEqual([first, second]);
-    expect(unresolvedAfter(retry, null)).toEqual([first]);
-    expect(unresolvedAfter(retry, error('IDEMPOTENCY_MISMATCH', false))).toEqual([first]);
+      expect(unresolvedAfter(retry, error(code, false))).toEqual([shown(first), shown(second)]);
+    expect(unresolvedAfter(retry, null)).toEqual([shown(first)]);
+    expect(unresolvedAfter(retry, error('IDEMPOTENCY_MISMATCH', false))).toEqual([shown(first)]);
   });
 
   it('adds an uncertain new request beside earlier ones and refuses one past the bound', () => {
-    const fresh = writeAttempt(submit([...posted([first]), ['idempotencyKey', 'k2']]), { data: { title: 'second' } });
-    expect(unresolvedAfter(fresh, error('COMMIT_OUTCOME_UNKNOWN', false))).toEqual([first, second]);
-    expect(unresolvedAfter(fresh, error('SCHEMA_INVALID', false))).toEqual([first]);
-    expect(unresolvedAfter(fresh, null)).toEqual([first]);
+    const fresh = writeAttempt(submit([...posted([first]), ['idempotencyKey', 'k2']]), { data: { title: 'second' } }, clock);
+    expect(unresolvedAfter(fresh, error('COMMIT_OUTCOME_UNKNOWN', false))).toEqual([shown(first), { ...second, deadline:
+      new Date(now + (receiptRetentionSeconds - retryMarginSeconds) * 1000).toISOString(), expired: false }]);
+    expect(unresolvedAfter(fresh, error('SCHEMA_INVALID', false))).toEqual([shown(first)]);
+    expect(unresolvedAfter(fresh, null)).toEqual([shown(first)]);
     const writes = Array.from({ length: maxUnresolved }, (_, index) => write(`k${index}`, `t${index}`));
-    expect(writeAttempt(submit([...posted(writes), ['idempotencyKey', 'k9']]), { data: {} }).full).toBe(true);
-    expect(writeAttempt(submit([...posted(writes), ['retry', '0']]), { data: {} }).full).toBe(false);
+    expect(writeAttempt(submit([...posted(writes), ['idempotencyKey', 'k9']]), { data: {} }, clock).full).toBe(true);
+    expect(writeAttempt(submit([...posted(writes), ['retry', '0']]), { data: {} }, clock).full).toBe(false);
   });
 
   it('forgets only the named write and sends nothing', () => {
-    const forget = writeAttempt(submit([...posted([first, second]), ['forget', '0']]), { data: { title: 'draft' } });
-    expect([forget.request, forget.rest]).toEqual([null, [second]]);
+    const forget = writeAttempt(submit([...posted([first, second]), ['forget', '0']]), { data: { title: 'draft' } }, clock);
+    expect([forget.request, forget.rest]).toEqual([null, [shown(second)]]);
     // An index the page never offered names no write.
-    expect(writeAttempt(submit([...posted([first]), ['retry', '']]), { data: {} }).retry).toBe(false);
+    expect(writeAttempt(submit([...posted([first]), ['retry', '']]), { data: {} }, clock).retry).toBe(false);
+  });
+
+  it('expires a write at its deadline, and a posted time cannot extend it', () => {
+    const window = (receiptRetentionSeconds - retryMarginSeconds) * 1000;
+    const retry = (item: ReturnType<typeof write>, at = now) => writeAttempt(submit([...posted([item]), ['retry', '0']]), null, { secret, now: at });
+    expect(retry(first, now + window).expired).toBe(false);
+    expect(retry(first, now + window + 1).expired).toBe(true);
+    // An altered time, a missing stamp or another server's secret makes it expired, never later.
+    for (const altered of [{ ...first, at: String(now + window) }, { ...first, seal: '' }, { ...first, at: '' },
+      seal(sealSecret('cd'.repeat(32)), first.key, first.sent, now)])
+      expect(retry(altered)).toMatchObject({ expired: true, pending: [{ deadline: null, expired: true }] });
+    expect(writeAttempt(submit(posted([first])), null, { secret: null, now }).pending[0].expired).toBe(true);
   });
 });

@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { fail } from '@sveltejs/kit';
-import { api, pageCursor } from '$lib/server/api';
+import { api, pageCursor, writeClock } from '$lib/server/api';
 import { carriedId, selectors } from '$lib/paths';
-import { given, jsonObject, unresolvedAfter, writeAttempt } from '$lib/server/forms';
+import { expiredRetry, given, jsonObject, unresolvedAfter, writeAttempt } from '$lib/server/forms';
 import { predicates } from '$lib/query';
 import type { FilterRow } from '$lib/query';
 import type { ApiError } from '$lib/errors';
@@ -44,11 +44,13 @@ export const actions:Actions={
     const raw=String(form.get('data')??'');
     const draftKey=String(form.get('externalKey')??'');
     const draft=jsonObject(raw);
-    const attempt=writeAttempt(form,draft ? {externalKey:draftKey,data:draft} : null);
+    const attempt=writeAttempt(form,draft ? {externalKey:draftKey,data:draft} : null,writeClock(event));
     const values={raw,externalKey:draftKey,invalid:!attempt.request && attempt.forgotten===null,error:null as ApiError|null,retried:attempt.retry};
     // Forgetting a write sends nothing; the draft stays in the editor.
     if (attempt.forgotten!==null) return {draft:{raw,externalKey:draftKey},pending:attempt.rest};
     if (!attempt.request || attempt.full) return fail(400,{create:values,pending:attempt.pending});
+    // Past its deadline the key may no longer recover the write, so a retry could create it twice.
+    if (attempt.expired) return fail(400,{create:{...values,error:expiredRetry},pending:attempt.pending});
     const {externalKey,data}=attempt.request as {externalKey:string;data:Record<string,unknown>};
     const result=await api<Receipt>(event,'POST',[...path(event.url),'records'],
       {body:{operation:'create',idempotencyKey:attempt.key,data,...(given(externalKey) ? {externalKey} : {})}});

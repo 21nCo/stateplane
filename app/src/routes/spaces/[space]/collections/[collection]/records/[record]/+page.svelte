@@ -16,10 +16,11 @@
   // revision, so Apply sends exactly the text the owner sees there.
   const current=$derived(form?.conflict?.revision ?? null);
   const applyTo=$derived(form?.deleting ? null : current);
-  const editing=$derived(!!data.record || (form?.raw!==undefined && (!form?.conflict || applyTo!==null)));
-  const retryDelete=$derived(!!form?.deleteError);
-  // Unresolved saves stay on the page, whatever later drafts or a delete return.
+  // Unresolved saves stay on the page, whatever later drafts or a delete return, and
+  // the editor that carries them renders even when the record cannot be read.
   const unresolved=$derived(form?.pending ?? []);
+  const editing=$derived(!!data.record || unresolved.length>0 || (form?.raw!==undefined && (!form?.conflict || applyTo!==null)));
+  const retryDelete=$derived(!!form?.deleteError);
   const schemaInvalid=$derived(form?.invalid || form?.error?.code==='SCHEMA_INVALID');
   const tone=(state?:string)=>state==='current' ? 'success' : state==='degraded' ? 'danger' : 'warning';
 </script>
@@ -76,13 +77,13 @@
         <form id="edit-form" method="POST" action="?/save" class="space-y-3">
           <input type="hidden" name="idempotencyKey" value={data.idempotencyKey} />
           <Unresolved writes={unresolved} kind="save" />
-          <input type="hidden" name="expectedRevision" value={applyTo ?? (form?.raw!==undefined ? form.expectedRevision : data.record?.revision)} />
+          <input type="hidden" name="expectedRevision" value={applyTo ?? (form?.raw!==undefined ? form.expectedRevision : data.record?.revision ?? form?.expectedRevision)} />
           <label for="data">Data JSON (replaces the whole record)</label>
           <textarea id="data" name="data" rows="14" spellcheck="false" aria-invalid={schemaInvalid ? 'true' : undefined}
             aria-describedby={schemaInvalid ? 'data-error' : undefined}>{draft}</textarea>
           {#if schemaInvalid}<p id="data-error" class="text-sm text-danger">{form?.invalid ? 'Data must be one JSON object with finite numbers.' : 'The data does not satisfy the collection schema. Correct it and save again.'}</p>{/if}
           <div class="flex flex-wrap gap-2">{#if !unresolved.length}<button class="btn">Save revision</button>
-            {:else if unresolved.length<maxUnresolved}<button class="btn-quiet" aria-describedby="save-pending">Send as new request</button>
+            {:else if unresolved.length<maxUnresolved}<button class="btn-quiet" aria-describedby="save-pending-why">Send as new request</button>
             {:else}<p class="hint">Retry or forget an earlier save before sending another.</p>{/if}</div>
         </form>
       </section>
@@ -91,7 +92,7 @@
       <section aria-labelledby="remove" class="panel h-fit space-y-3">
         <h2 id="remove" class="text-lg font-semibold">Delete</h2>
         <Notice error={form?.deleteError} title="Record was not deleted">
-          {#if form?.deleteError?.code==='COMMIT_OUTCOME_UNKNOWN'}<p class="mt-1">Retry unchanged: the same request key recovers the original result instead of deleting a newer revision.</p>{/if}
+          {#if form?.deleteError?.code==='COMMIT_OUTCOME_UNKNOWN'}<p class="mt-1">Retry deletion resends the same request. Within the receipt retention window its key recovers the original result; after that a committed deletion shows as deleted instead. Its revision means it never deletes a newer revision.</p>{/if}
         </Notice>
         <p class="hint">Deletion leaves a tombstone; the ID and external key are never reused.</p>
         <form method="POST" action="?/delete">

@@ -6,6 +6,7 @@ import { isSafeHttpRead, parseV1Path } from '@stateplane/contracts';
 import { createMcpEndpoint } from '@stateplane/mcp';
 import type { McpEndpoint } from '@stateplane/mcp';
 import { PostgresSpaces, postgresServices } from '@stateplane/postgres';
+import { receiptRetentionSeconds } from './receipts';
 
 export type Bindings = App.Platform['env'];
 type Handler=(request:Request)=>Promise<Response>;
@@ -203,7 +204,7 @@ export function stateplaneHost(env:Bindings,lease?:(lease:HostLease)=>void):Host
     create:()=>Promise.reject(new Error('Agent issuance is not configured')),
     find:()=>Promise.resolve(null),revoke:()=>Promise.reject(new Error('Agent revocation is not configured'))
   },identity,Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex'));
-  const services=postgresServices(spaces,new Map([[cellId,{pool,cursorSecret:Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex')}]]),3600);
+  const services=postgresServices(spaces,new Map([[cellId,{pool,cursorSecret:Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex')}]]),receiptRetentionSeconds);
   const serve=createHttpHandler({services,identity});
   let active=0;let retired=false;let ended=false;
   const closeIfIdle=()=>{

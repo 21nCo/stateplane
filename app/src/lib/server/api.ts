@@ -2,6 +2,7 @@ import type { Cookies } from '@sveltejs/kit';
 import type { ApiError } from '$lib/errors';
 import { segment } from '../paths';
 import { stateplaneHost, unavailable } from './host';
+import { sealSecret } from './receipts';
 import type { Bindings, Host } from './host';
 
 export const sessionCookie='stateplane_session';
@@ -12,6 +13,9 @@ interface Options { body?:unknown; query?:Record<string,string|undefined>; heade
 /** A bearer is visible ASCII; anything else cannot form a valid header. */
 export const bearer=(token:string)=>/^[\x21-\x7e]+$/.test(token);
 export const bindings=(platform?:App.Platform)=>({...process.env,...platform?.env}) as unknown as Bindings;
+/** The secret and server time that stamp a write submission's unresolved writes. */
+export const writeClock=(context:{platform?:App.Platform|undefined})=>
+  ({secret:sealSecret(bindings(context.platform).STATEPLANE_TEST_CURSOR_SECRET),now:Date.now()});
 
 /** A page render shares one Worker host, so it opens one pool rather than one
  * per call; hooks.server.ts retires it after the response. A host retired by a

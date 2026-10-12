@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import AxeBuilder from '@axe-core/playwright';
 import { expect, test } from '@playwright/test';
 import type { APIRequestContext, Browser, Page } from '@playwright/test';
@@ -410,6 +410,11 @@ test('a refused retry keeps an unresolved create, and each lost create stays rec
   await expect(page.getByText('2 earlier creates may have committed')).toBeVisible();
   await expect(entries.nth(0)).toContainText('"original"');
   await expect(entries.nth(1)).toContainText('"second"');
+  // Each control is described by the explanation and its own request only.
+  const firstRetry = entries.nth(0).getByRole('button', { name: 'Retry unchanged' });
+  await expect(firstRetry).toHaveAccessibleDescription(/^The outcome is unknown\..*"original".*retry window closes at/);
+  await expect(firstRetry).not.toHaveAccessibleDescription(/"second"|Forget this request/);
+  await expect(entries.nth(1).getByRole('button', { name: 'Forget this request' })).toHaveAccessibleDescription(/^\{.*"second".*\}.*retry window closes at[^.]*\.$/);
   await audit(page);
   expect(await titles()).toEqual(['original', 'second']);
   for (const recovered of ['original', 'second']) {
@@ -461,6 +466,133 @@ test('a refused save retry keeps the unresolved save until it recovers', async (
   await expect(editor).toHaveValue(/kept draft/);
   await expect(page.getByRole('button', { name: 'Save revision' })).toBeVisible();
   expect((await read()).revision).toBe(3);
+});
+
+test('unresolved saves and the editor stay when a later save succeeds but the record cannot be reread', async ({ page, request }) => {
+  test.skip(!local, 'Needs the local fault proxy');
+  await signIn(page, ownerToken);
+  const id = await createRecord(page, { title: 'Reread fails', state: 'open', rank: 13 });
+  await go(page, `${itemsUrl()}/records/${id}`);
+  const editor = page.getByLabel(/Data JSON/);
+  const entries = page.locator('#save-pending li');
+  const conflict = page.getByRole('alert', { name: 'Edit conflict' });
+  const edit = (title: string) => JSON.stringify({ title, state: 'open', rank: 13 });
+  // Two saves commit with lost acknowledgements; the second is applied over the first.
+  await editor.fill(edit('first edit'));
+  await dropReply('COMMIT\0', 'UPDATE records SET');
+  await page.getByRole('button', { name: 'Save revision' }).click();
+  await expect(entries).toHaveCount(1);
+  for (const [title, revision] of [['second edit', 2], ['third edit', 3]] as const) {
+    await settle(page);
+    await editor.fill(edit(title));
+    await page.getByRole('button', { name: 'Send as new request' }).click();
+    await expect(conflict).toContainText(`revision ${revision} is now current`);
+    if (revision === 2) await dropReply('COMMIT\0', 'UPDATE records SET');
+    // The last Apply succeeds, but the page's record read after it is refused.
+    else await refuse('tombstone FROM records');
+    await conflict.getByRole('button', { name: `Apply my edit to revision ${revision}` }).click();
+    if (revision === 2) {
+      await expect(entries).toHaveCount(2);
+      const retry = entries.nth(1).getByRole('button', { name: 'Retry unchanged' });
+      await expect(retry).toHaveAccessibleDescription(/"second edit"/);
+      await expect(retry).not.toHaveAccessibleDescription(/"first edit"|Forget this request/);
+      await audit(page);
+    }
+  }
+  await expect(page.getByRole('status')).toContainText('Saved revision 4 (was 3)');
+  await expect(page.getByRole('alert').filter({ hasText: 'Record could not be read' })).toContainText('PROVIDER_UNAVAILABLE');
+  await expect(editor).toHaveValue(/third edit/);
+  await expect(entries).toHaveCount(2);
+  await expect(page.getByRole('button', { name: 'Forget this request' })).toHaveCount(2);
+  // Each still recovers its own receipt, and nothing is written twice.
+  for (const recovered of ['Saved revision 2 (was 1)', 'Saved revision 3 (was 2)']) {
+    await settle(page);
+    await entries.first().getByRole('button', { name: 'Retry unchanged' }).click();
+    await expect(page.getByRole('status')).toContainText(`${recovered}, recovered from an earlier identical request`);
+  }
+  await expect(entries).toHaveCount(0);
+  const record = await (await request.get(`/v1${itemsUrl()}/records/${encodeURIComponent(id)}`,
+    { headers: { authorization: `Bearer ${ownerToken}` } })).json();
+  expect([record.revision, JSON.parse(record.canonicalData).title]).toEqual([4, 'third edit']);
+});
+
+test('an unresolved create stays when a later create succeeds but the collection cannot be reread', async ({ page, request }) => {
+  test.skip(!local, 'Needs the local fault proxy');
+  await defineCollection(request, 'rereads');
+  await signIn(page, ownerToken);
+  await go(page, `${spaceUrl}/collections/rereads`);
+  const editor = page.getByLabel('Data JSON');
+  await editor.fill(JSON.stringify({ title: 'original' }));
+  await dropReply('COMMIT\0', 'INSERT INTO records(');
+  await page.getByRole('button', { name: 'Create record' }).click();
+  await expect(page.getByText('An earlier create may have committed')).toBeVisible();
+  await settle(page);
+  await editor.fill(JSON.stringify({ title: 'second' }));
+  await dropReply('c.collection_id=$3 ORDER BY');
+  await page.getByRole('button', { name: 'Send as new request' }).click();
+  await expect(page.getByRole('alert').filter({ hasText: 'Collection could not be read' })).toBeVisible();
+  await expect(page.getByRole('status')).toContainText('at revision 1.');
+  await expect(page.getByText('An earlier create may have committed')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Forget this request' })).toHaveCount(1);
+  await settle(page);
+  await page.getByRole('button', { name: 'Retry unchanged' }).click();
+  await expect(page.getByRole('status')).toContainText('(recovered earlier result)');
+});
+
+test('a create is retried only within its receipt window, which a posted time cannot extend', async ({ page, request }) => {
+  test.skip(!local, 'Needs the local fault proxy and host secret');
+  await defineCollection(request, 'windows');
+  await signIn(page, ownerToken);
+  await go(page, `${spaceUrl}/collections/windows`);
+  const editor = page.getByLabel('Data JSON');
+  const entry = page.locator('#create-pending li');
+  const refusal = page.getByRole('region', { name: 'Create a record' }).getByRole('alert');
+  const count = async () => (await (await request.post(`/v1${spaceUrl}/collections/windows/records/count`,
+    { headers: { authorization: `Bearer ${ownerToken}` }, data: [] })).json()) as number;
+  // The COMMIT never reaches the database: nothing is written, and the outcome is unknown.
+  // A retry that was sent would therefore create the record.
+  const lose = async () => {
+    const response = await fetch('http://127.0.0.1:5744/fault', { method: 'POST', body: JSON.stringify({ match: 'COMMIT\0', after: 'INSERT INTO records(', refuse: true }) });
+    expect(response.status).toBe(204);
+    await page.getByRole('button', { name: 'Create record' }).click();
+    await expect(refusal).toContainText('COMMIT_OUTCOME_UNKNOWN');
+    await settle(page);
+  };
+  const stamp = async (at: (current: string) => string, signed: boolean) => {
+    const key = await entry.locator('input[name="pendingKey"]').inputValue();
+    const sent = await entry.locator('input[name="pendingSent"]').inputValue();
+    const secret = createHmac('sha256', Buffer.from(process.env.STATEPLANE_E2E_CURSOR_SECRET!, 'hex')).update('stateplane-ui-unresolved-write-v1').digest();
+    const time = at(await entry.locator('input[name="pendingAt"]').inputValue());
+    const seal = createHmac('sha256', secret).update(JSON.stringify([key, sent, time])).digest('base64url');
+    await entry.locator('input[name="pendingAt"]').evaluate((input: HTMLInputElement, value) => { input.value = value; }, time);
+    if (signed) await entry.locator('input[name="pendingSeal"]').evaluate((input: HTMLInputElement, value) => { input.value = value; }, seal);
+  };
+  await editor.fill(JSON.stringify({ title: 'original' }));
+  await lose();
+  await expect(entry).toContainText(/Its retry window closes at \d{4}-\d\d-\d\d \d\d:\d\d UTC\./);
+
+  // Two hours later, as the server would have signed it then: the receipt has expired, so nothing is sent.
+  await stamp(current => String(Number(current) - 2 * 3600_000), true);
+  await page.getByRole('button', { name: 'Retry unchanged' }).click();
+  await expect(refusal).toContainText('The earlier create is still unresolved');
+  await expect(refusal).toContainText('RECEIPT_EXPIRED');
+  await expect(entry).toContainText(/Its retry window closed at .* UTC, so a retry could create it again\. Check the records list/);
+  await expect(page.getByRole('button', { name: 'Retry unchanged' })).toBeDisabled();
+  expect(await count()).toBe(0);
+  await audit(page);
+  // Only Forget removes it.
+  await page.getByRole('button', { name: 'Forget this request' }).click();
+  await expect(entry).toHaveCount(0);
+  expect(await count()).toBe(0);
+
+  // A later time without the server's signature cannot extend the window.
+  await settle(page);
+  await lose();
+  await stamp(current => String(Number(current) + 3600_000), false);
+  await page.getByRole('button', { name: 'Retry unchanged' }).click();
+  await expect(refusal).toContainText('RECEIPT_EXPIRED');
+  await expect(entry).toContainText('Its retry window cannot be confirmed');
+  expect(await count()).toBe(0);
 });
 
 test('a schema revision whose reload fails keeps the draft and its version', async ({ browser, page, request }) => {

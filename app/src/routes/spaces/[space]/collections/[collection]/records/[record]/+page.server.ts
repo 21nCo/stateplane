@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { fail, redirect } from '@sveltejs/kit';
-import { api } from '$lib/server/api';
-import { jsonObject, unresolved, unresolvedAfter, writeAttempt } from '$lib/server/forms';
+import { api, writeClock } from '$lib/server/api';
+import { expiredRetry, jsonObject, unresolved, unresolvedAfter, writeAttempt } from '$lib/server/forms';
 import { collectionHref, selectors } from '$lib/paths';
 import type { Receipt, StoredRecord } from '$lib/types';
 import type { Actions, PageServerLoad, RequestEvent } from './$types';
@@ -38,15 +38,18 @@ export const actions:Actions={
     const raw=String(form.get('data')??'');
     const draft=jsonObject(raw);
     const expectedRevision=Number(form.get('expectedRevision'));
-    const attempt=writeAttempt(form,draft ? {expectedRevision,data:draft} : null);
+    const attempt=writeAttempt(form,draft ? {expectedRevision,data:draft} : null,writeClock(event));
     if (attempt.forgotten!==null) return {raw,expectedRevision,pending:attempt.rest};
     if (!attempt.request || attempt.full) return fail(400,{raw,expectedRevision,pending:attempt.pending,invalid:!attempt.request});
+    if (attempt.expired) return fail(400,{raw,expectedRevision,pending:attempt.pending,error:expiredRetry,retried:true});
     const request=attempt.request as {expectedRevision:number;data:Record<string,unknown>};
     const result=await api<Receipt>(event,'POST',recordPath(event.url).slice(0,5),
       {body:{operation:'replace',id:selectors(event.url).record,expectedRevision:request.expectedRevision,idempotencyKey:attempt.key,data:request.data}});
-    // A recovered save keeps the unsent text; it now targets the recovered revision unless it already targeted a later one.
-    if (result.ok) return {saved:result.data,pending:unresolvedAfter(attempt,null),
-      ...(attempt.retry ? {raw,expectedRevision:Math.max(expectedRevision,result.data.revision)} : {})};
+    // Every outcome returns the editor's text, so the editor and the unresolved saves it
+    // carries render without the record's reread. A recovered save keeps the unsent text;
+    // it now targets the recovered revision unless it already targeted a later one.
+    if (result.ok) return {saved:result.data,pending:unresolvedAfter(attempt,null),raw,
+      expectedRevision:attempt.retry ? Math.max(expectedRevision,result.data.revision) : result.data.revision};
     const values={raw,expectedRevision,pending:unresolvedAfter(attempt,result.error)};
     // Only the draft's own stale write opens the comparison; a refused retry says what happened to it.
     if (!attempt.retry && stale(result.error.code)) return conflict(event,values);
@@ -56,8 +59,9 @@ export const actions:Actions={
     const form=await event.request.formData();
     const idempotencyKey=String(form.get('idempotencyKey')??'');
     const expectedRevision=Number(form.get('expectedRevision'));
-    // A failed delete leaves the unresolved saves on the page.
-    const pending=unresolved(form);
+    // A failed delete leaves the unresolved saves on the page. A successful one ends
+    // them: each committed before the deletion or can no longer apply after it.
+    const pending=unresolved(form,writeClock(event));
     const {space,collection,record}=selectors(event.url);
     const result=await api<Receipt>(event,'POST',recordPath(event.url).slice(0,5),
       {body:{operation:'delete',id:record,expectedRevision,idempotencyKey}});

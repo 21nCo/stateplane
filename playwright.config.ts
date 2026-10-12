@@ -11,6 +11,8 @@ const database = process.env.DATABASE_URL ?? (existsSync(passwordFile) ?
   `postgres://stateplane:${encodeURIComponent(readFileSync(passwordFile, 'utf8').trim())}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT ?? '55432'}/stateplane` : undefined);
 // Workers re-read this file; the runner's values are inherited, so all agree.
 process.env.STATEPLANE_E2E_TOKEN ??= randomBytes(32).toString('hex');
+// Tests sign a backdated unresolved write with it to stand in for elapsed time.
+process.env.STATEPLANE_E2E_CURSOR_SECRET ??= randomBytes(32).toString('hex');
 if (deployed || database) process.env.STATEPLANE_E2E_STATE = '1';
 
 export default defineConfig({
@@ -23,6 +25,6 @@ export default defineConfig({
     gracefulShutdown: { signal: 'SIGTERM', timeout: 15_000 },
     env: database ? { STATEPLANE_E2E_BASE_DATABASE: database, STATEPLANE_ENV: 'local', STATEPLANE_TEST_HTTP: '1',
       STATEPLANE_TEST_TOKEN: process.env.STATEPLANE_E2E_TOKEN, STATEPLANE_TEST_OWNER: 'owner-e2e',
-      STATEPLANE_TEST_CREDENTIAL: 'session-e2e', STATEPLANE_TEST_CURSOR_SECRET: randomBytes(32).toString('hex') } : {}
+      STATEPLANE_TEST_CREDENTIAL: 'session-e2e', STATEPLANE_TEST_CURSOR_SECRET: process.env.STATEPLANE_E2E_CURSOR_SECRET } : {}
   }
 });
