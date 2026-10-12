@@ -1,6 +1,8 @@
 <script lang="ts">
   import Notice from '$lib/components/Notice.svelte';
   import Status from '$lib/components/Status.svelte';
+  import Unresolved from '$lib/components/Unresolved.svelte';
+  import { maxUnresolved } from '$lib/errors';
   import { page } from '$app/state';
   import { collectionHref, selectors, shown } from '$lib/paths';
   let { data, form } = $props();
@@ -16,8 +18,8 @@
   const applyTo=$derived(form?.deleting ? null : current);
   const editing=$derived(!!data.record || (form?.raw!==undefined && (!form?.conflict || applyTo!==null)));
   const retryDelete=$derived(!!form?.deleteError);
-  // An unresolved save stays on the page, whatever later drafts or a delete return.
-  const unresolved=$derived(form?.pending ?? null);
+  // Unresolved saves stay on the page, whatever later drafts or a delete return.
+  const unresolved=$derived(form?.pending ?? []);
   const schemaInvalid=$derived(form?.invalid || form?.error?.code==='SCHEMA_INVALID');
   const tone=(state?:string)=>state==='current' ? 'success' : state==='degraded' ? 'danger' : 'warning';
 </script>
@@ -35,7 +37,7 @@
   </dl>
   {#if data.projection?.state!=='current'}<p class="hint mt-1">Search may lag behind this revision; the record shown here is the exact authoritative value.</p>{/if}
 {/if}
-{#if form?.saved}<p role="status" class="mt-3 text-sm text-success">Saved revision {form.saved.revision} (was {form.saved.beforeRevision}){form.saved.replayed ? ', recovered from an earlier identical request' : ''}. Search projection: {form.saved.projection.state}.{form.abandoned ? ' The earlier save whose outcome was unknown was not retried; the record\'s changes show whether it was applied.' : ''}</p>{/if}
+{#if form?.saved}<p role="status" class="mt-3 text-sm text-success">Saved revision {form.saved.revision} (was {form.saved.beforeRevision}){form.saved.replayed ? ', recovered from an earlier identical request' : ''}. Search projection: {form.saved.projection.state}.</p>{/if}
 {#if form?.conflict}
   <section aria-labelledby="conflict" class="mt-4 rounded-lg border border-warning bg-surface p-4" role="alert">
     <h2 id="conflict" class="text-lg font-semibold">Edit conflict</h2>
@@ -70,23 +72,18 @@
     {#if editing}
       <section aria-labelledby="edit" class="panel space-y-3">
         <h2 id="edit" class="text-lg font-semibold">Edit data</h2>
-        <Notice error={form?.error} title="Record was not saved" />
-        {#if unresolved}
-          <div id="save-pending" class="rounded-lg border border-warning p-3 text-sm">
-            <p class="font-semibold">An earlier save may have committed</p>
-            <p class="mt-1">Its outcome is unknown. Retry unchanged resends that exact request under its key, which recovers its result instead of writing twice. Send as new request saves the editor's text instead; if a revision was saved meanwhile, it is shown for comparison before anything is overwritten.</p>
-          </div>
-        {/if}
+        <Notice error={form?.error} title={form?.retried ? 'The earlier save is still unresolved' : 'Record was not saved'} />
         <form id="edit-form" method="POST" action="?/save" class="space-y-3">
           <input type="hidden" name="idempotencyKey" value={data.idempotencyKey} />
-          {@render carryUnresolved()}
+          <Unresolved writes={unresolved} kind="save" />
           <input type="hidden" name="expectedRevision" value={applyTo ?? (form?.raw!==undefined ? form.expectedRevision : data.record?.revision)} />
           <label for="data">Data JSON (replaces the whole record)</label>
           <textarea id="data" name="data" rows="14" spellcheck="false" aria-invalid={schemaInvalid ? 'true' : undefined}
             aria-describedby={schemaInvalid ? 'data-error' : undefined}>{draft}</textarea>
           {#if schemaInvalid}<p id="data-error" class="text-sm text-danger">{form?.invalid ? 'Data must be one JSON object with finite numbers.' : 'The data does not satisfy the collection schema. Correct it and save again.'}</p>{/if}
-          <div class="flex flex-wrap gap-2">{#if unresolved}<button class="btn" name="intent" value="retry" aria-describedby="save-pending">Retry unchanged</button>
-            <button class="btn-quiet" aria-describedby="save-pending">Send as new request</button>{:else}<button class="btn">Save revision</button>{/if}</div>
+          <div class="flex flex-wrap gap-2">{#if !unresolved.length}<button class="btn">Save revision</button>
+            {:else if unresolved.length<maxUnresolved}<button class="btn-quiet" aria-describedby="save-pending">Send as new request</button>
+            {:else}<p class="hint">Retry or forget an earlier save before sending another.</p>{/if}</div>
         </form>
       </section>
     {/if}
@@ -109,5 +106,5 @@
 {/if}
 
 {#snippet carryUnresolved()}
-  {#if unresolved}<input type="hidden" name="pendingKey" value={unresolved.key} /><input type="hidden" name="pendingSent" value={unresolved.sent} />{/if}
+  <Unresolved writes={unresolved} kind="save" controls={false} />
 {/snippet}

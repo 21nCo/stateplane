@@ -217,7 +217,7 @@ test('a create whose acknowledgement and reload both fail keeps its form and req
   expect((await titles()).filter(item => item.startsWith(title))).toEqual([title]);
 });
 
-test('an unresolved create stays on the page until it is retried or a new request replaces it', async ({ page, request }) => {
+test('an unresolved create stays on the page until it is retried, whatever later requests return', async ({ page, request }) => {
   test.skip(!local, 'Needs the local fault proxy');
   await defineCollection(request, 'creates');
   await signIn(page, ownerToken);
@@ -263,7 +263,7 @@ test('an unresolved create stays on the page until it is retried or a new reques
   await expect(editor).toHaveValue(JSON.stringify({ name: 'no title' }));
   expect(await titles()).toEqual(['original']);
 
-  // A changed draft sent as new is created, and the page says the first may also exist.
+  // A changed draft sent as new is created, and the unresolved create stays until it is retried.
   await settle(page);
   await editor.fill(JSON.stringify({ title: 'second' }));
   await dropReply('COMMIT\0', 'INSERT INTO records(');
@@ -272,7 +272,12 @@ test('an unresolved create stays on the page until it is retried or a new reques
   await settle(page);
   await editor.fill(JSON.stringify({ title: 'second changed' }));
   await sendNew.click();
-  await expect(page.getByRole('status')).toContainText('may also have created a record');
+  await expect(page.getByRole('status')).toContainText('at revision 1.');
+  await expect(unresolved).toBeVisible();
+  expect(await titles()).toEqual(['original', 'second', 'second changed']);
+  await settle(page);
+  await retry.click();
+  await expect(page.getByRole('status')).toContainText('(recovered earlier result)');
   await expect(unresolved).toHaveCount(0);
   expect(await titles()).toEqual(['original', 'second', 'second changed']);
 });
@@ -320,8 +325,16 @@ test('after a lost save acknowledgement, retry recovers it and a changed draft i
   await expect(editor).toHaveValue(/second edit/);
   await conflict.getByRole('button', { name: 'Apply my edit to revision 2' }).click();
   await expect(page.getByRole('status')).toContainText('Saved revision 3 (was 2)');
+  // The first save stays unresolved until its retry recovers it; the editor keeps revision 3.
+  await expect(unresolved).toBeVisible();
+  await settle(page);
+  await page.getByRole('button', { name: 'Retry unchanged' }).click();
+  await expect(page.getByRole('status')).toContainText('Saved revision 2 (was 1), recovered from an earlier identical request');
+  await expect(unresolved).toHaveCount(0);
+  await expect(editor).toHaveValue(/second edit/);
+  await expect(page.locator('input[name="expectedRevision"]').first()).toHaveValue('3');
 
-  // Retry unchanged resends the lost request, whatever the editor now holds.
+  // Retry unchanged resends the lost request, whatever the editor now holds, and keeps that text.
   await settle(page);
   await editor.fill(JSON.stringify({ title: 'third edit', state: 'open', rank: 11 }));
   await dropReply('COMMIT\0', 'UPDATE records SET');
@@ -337,6 +350,117 @@ test('after a lost save acknowledgement, retry recovers it and a changed draft i
   await expect(page.getByRole('status')).toContainText('Saved revision 4 (was 3), recovered from an earlier identical request');
   const record = await read();
   expect([record.revision, JSON.parse(record.canonicalData).title]).toEqual([4, 'third edit']);
+  await expect(editor).toHaveValue(/not sent/);
+  // The kept text saves on top of the recovered revision.
+  await settle(page);
+  await page.getByRole('button', { name: 'Save revision' }).click();
+  await expect(page.getByRole('status')).toContainText('Saved revision 5 (was 4)');
+  expect(JSON.parse((await read()).canonicalData).title).toBe('not sent');
+});
+
+/** Suspend the test space, or make it active again. */
+async function setLifecycle(request: APIRequestContext, lifecycle: string) {
+  const response = await request.patch(`/v1${spaceUrl}`, { headers: { authorization: `Bearer ${ownerToken}` }, data: { lifecycle } });
+  expect(response.status()).toBe(200);
+}
+
+test('a refused retry keeps an unresolved create, and each lost create stays recoverable', async ({ page, request }) => {
+  test.skip(!local, 'Needs the local fault proxy');
+  await defineCollection(request, 'refused');
+  await signIn(page, ownerToken);
+  await go(page, `${spaceUrl}/collections/refused`);
+  const editor = page.getByLabel('Data JSON');
+  const entries = page.locator('#create-pending li');
+  const titles = async () => {
+    const listed = await request.post(`/v1${spaceUrl}/collections/refused/records/query`,
+      { headers: { authorization: `Bearer ${ownerToken}` }, data: { predicates: [], limit: 100 } });
+    return ((await listed.json()).records as { canonicalData: string }[]).map(record => JSON.parse(record.canonicalData).title).sort();
+  };
+  await editor.fill(JSON.stringify({ title: 'original' }));
+  await dropReply('COMMIT\0', 'INSERT INTO records(');
+  await page.getByRole('button', { name: 'Create record' }).click();
+  await expect(page.getByRole('alert').filter({ hasText: 'Record was not created' })).toContainText('COMMIT_OUTCOME_UNKNOWN');
+  const key = await page.locator('input[name="pendingKey"]').inputValue();
+
+  // Refusals before the key is looked up say nothing about the first create: it stays.
+  const refusal = (code: string) => page.getByRole('region', { name: 'Create a record' }).getByRole('alert').filter({ hasText: code });
+  try {
+    await setLifecycle(request, 'suspended');
+    await settle(page);
+    await page.getByRole('button', { name: 'Retry unchanged' }).click();
+    await expect(refusal('SPACE_UNAVAILABLE')).toBeVisible();
+  } finally { await setLifecycle(request, 'active'); }
+  await expect(page.locator('input[name="pendingKey"]')).toHaveValue(key);
+  await expect(refusal('SPACE_UNAVAILABLE')).toContainText('The earlier create is still unresolved');
+  await expect(entries).toHaveCount(1);
+  const session = (await page.context().cookies()).find(cookie => cookie.name === 'stateplane_session')!;
+  await page.context().addCookies([{ ...session, value: 'not-a-session' }]);
+  await settle(page);
+  await page.getByRole('button', { name: 'Retry unchanged' }).click();
+  await expect(refusal('UNAUTHENTICATED')).toBeVisible();
+  await expect(page.locator('input[name="pendingKey"]')).toHaveValue(key);
+  await page.context().addCookies([session]);
+
+  // A second lost create joins the first instead of replacing it.
+  await settle(page);
+  await editor.fill(JSON.stringify({ title: 'second' }));
+  await dropReply('COMMIT\0', 'INSERT INTO records(');
+  await page.getByRole('button', { name: 'Send as new request' }).click();
+  await expect(page.getByRole('alert').filter({ hasText: 'Record was not created' })).toContainText('COMMIT_OUTCOME_UNKNOWN');
+  await expect(page.getByText('2 earlier creates may have committed')).toBeVisible();
+  await expect(entries.nth(0)).toContainText('"original"');
+  await expect(entries.nth(1)).toContainText('"second"');
+  await audit(page);
+  expect(await titles()).toEqual(['original', 'second']);
+  for (const recovered of ['original', 'second']) {
+    await settle(page);
+    await entries.first().getByRole('button', { name: 'Retry unchanged' }).click();
+    await expect(page.getByRole('status')).toContainText('(recovered earlier result)');
+    await expect(entries.filter({ hasText: `"${recovered}"` })).toHaveCount(0);
+  }
+  await expect(entries).toHaveCount(0);
+  expect(await titles()).toEqual(['original', 'second']);
+});
+
+test('a refused save retry keeps the unresolved save until it recovers', async ({ page, request }) => {
+  test.skip(!local, 'Needs the local fault proxy');
+  await signIn(page, ownerToken);
+  const id = await createRecord(page, { title: 'Suspended later', state: 'open', rank: 12 });
+  await go(page, `${itemsUrl()}/records/${id}`);
+  const editor = page.getByLabel(/Data JSON/);
+  await editor.fill(JSON.stringify({ title: 'first edit', state: 'open', rank: 12 }));
+  await dropReply('COMMIT\0', 'UPDATE records SET');
+  await page.getByRole('button', { name: 'Save revision' }).click();
+  await expect(page.getByRole('alert').filter({ hasText: 'Record was not saved' })).toContainText('COMMIT_OUTCOME_UNKNOWN');
+  try {
+    await setLifecycle(request, 'suspended');
+    await settle(page);
+    await page.getByRole('button', { name: 'Retry unchanged' }).click();
+    await expect(page.getByRole('region', { name: 'Edit data' }).getByRole('alert')).toContainText('SPACE_UNAVAILABLE');
+  } finally { await setLifecycle(request, 'active'); }
+  await expect(page.getByText('An earlier save may have committed')).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Edit data' }).getByRole('alert')).toContainText('The earlier save is still unresolved');
+  await settle(page);
+  await page.getByRole('button', { name: 'Retry unchanged' }).click();
+  await expect(page.getByRole('status')).toContainText('Saved revision 2 (was 1), recovered from an earlier identical request');
+  const read = async () => (await request.get(`/v1${itemsUrl()}/records/${encodeURIComponent(id)}`,
+    { headers: { authorization: `Bearer ${ownerToken}` } })).json();
+  const record = await read();
+  expect([record.revision, JSON.parse(record.canonicalData).title]).toEqual([2, 'first edit']);
+
+  // Only the owner's explicit Forget stops tracking a save; it sends nothing and keeps the draft.
+  await settle(page);
+  await editor.fill(JSON.stringify({ title: 'second edit', state: 'open', rank: 12 }));
+  await dropReply('COMMIT\0', 'UPDATE records SET');
+  await page.getByRole('button', { name: 'Save revision' }).click();
+  await expect(page.getByText('An earlier save may have committed')).toBeVisible();
+  await settle(page);
+  await editor.fill(JSON.stringify({ title: 'kept draft', state: 'open', rank: 12 }));
+  await page.getByRole('button', { name: 'Forget this request' }).click();
+  await expect(page.getByText('An earlier save may have committed')).toHaveCount(0);
+  await expect(editor).toHaveValue(/kept draft/);
+  await expect(page.getByRole('button', { name: 'Save revision' })).toBeVisible();
+  expect((await read()).revision).toBe(3);
 });
 
 test('a schema revision whose reload fails keeps the draft and its version', async ({ browser, page, request }) => {

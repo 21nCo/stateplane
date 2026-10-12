@@ -45,15 +45,16 @@ export const actions:Actions={
     const draftKey=String(form.get('externalKey')??'');
     const draft=jsonObject(raw);
     const attempt=writeAttempt(form,draft ? {externalKey:draftKey,data:draft} : null);
-    const values={raw,externalKey:draftKey,invalid:!attempt.request,error:null as ApiError|null,pending:attempt.pending};
-    if (!attempt.request) return fail(400,{create:values});
+    const values={raw,externalKey:draftKey,invalid:!attempt.request && attempt.forgotten===null,error:null as ApiError|null,retried:attempt.retry};
+    // Forgetting a write sends nothing; the draft stays in the editor.
+    if (attempt.forgotten!==null) return {draft:{raw,externalKey:draftKey},pending:attempt.rest};
+    if (!attempt.request || attempt.full) return fail(400,{create:values,pending:attempt.pending});
     const {externalKey,data}=attempt.request as {externalKey:string;data:Record<string,unknown>};
     const result=await api<Receipt>(event,'POST',[...path(event.url),'records'],
       {body:{operation:'create',idempotencyKey:attempt.key,data,...(given(externalKey) ? {externalKey} : {})}});
-    // A new request created while an earlier one was unresolved is reported with it;
-    // a retry sent the earlier request, so the unsent draft stays in the editor.
-    if (result.ok) return {created:result.data,abandoned:!attempt.retry && attempt.pending!==null,
+    // A retry sent an earlier request, so the unsent draft stays in the editor.
+    if (result.ok) return {created:result.data,pending:unresolvedAfter(attempt,null),
       draft:attempt.retry ? {raw,externalKey:draftKey} : null};
-    return fail(result.status,{create:{...values,error:result.error,pending:unresolvedAfter(attempt,result.error)}});
+    return fail(result.status,{create:{...values,error:result.error},pending:unresolvedAfter(attempt,result.error)});
   }
 };

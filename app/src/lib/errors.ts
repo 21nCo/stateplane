@@ -34,3 +34,11 @@ export const describe=(code:string)=>guidance[code] ?? 'The request failed.';
  * rejection before any write, so its outcome is known. */
 export const uncertain=(error?:ApiError|null)=>!!error && (['COMMIT_OUTCOME_UNKNOWN','PROVIDER_UNAVAILABLE','RECEIPT_PENDING'].includes(error.code) ||
   (error.code==='RATE_LIMITED' && error.retryable));
+/** Errors a record write returns only after finding a receipt for the request's key
+ * under a different request (packages/postgres/src/index.ts lookupReplay), so that
+ * key can never recover the retried request. Every other code may come before the
+ * key is looked up (routing, admission, lifecycle and capability checks) or after
+ * its receipt expired, so it says nothing about the earlier attempt. */
+export const definitive=(error:ApiError)=>error.code==='IDEMPOTENCY_MISMATCH';
+/** Unresolved writes a form keeps; every submission posts them all back. */
+export const maxUnresolved=3;

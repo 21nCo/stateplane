@@ -2,6 +2,8 @@
   import Notice from '$lib/components/Notice.svelte';
   import Restart from '$lib/components/Restart.svelte';
   import Scroll from '$lib/components/Scroll.svelte';
+  import Unresolved from '$lib/components/Unresolved.svelte';
+  import { maxUnresolved } from '$lib/errors';
   import { fieldKind, operators } from '$lib/query';
   import { page } from '$app/state';
   import { carry, collectionHref, segment, selectors, shown } from '$lib/paths';
@@ -12,8 +14,8 @@
   const sortable=$derived(data.collection ? definition!.sortable.filter(field=>data.collection!.ready.includes(field)) : []);
   const pending=$derived(data.collection?.pending ?? []);
   const schemaInvalid=$derived(form?.create?.invalid || form?.create?.error?.code==='SCHEMA_INVALID');
-  // An unresolved create stays on the page, whatever later drafts return.
-  const unresolved=$derived(form?.create?.pending ?? null);
+  // Unresolved creates stay on the page, whatever later drafts return.
+  const unresolved=$derived(form?.pending ?? []);
   const draft=$derived(form?.create ?? form?.draft ?? null);
   const columns=$derived(Object.keys(definition?.schema.properties ?? {}).slice(0,4));
   const rows=$derived([...data.rows,{field:'',op:'eq',value:''}]);
@@ -92,7 +94,7 @@
     </section>
     {@render create()}
   </div>
-{:else if form?.create || form?.created}
+{:else if form?.create || form?.created || form?.draft}
   <!-- A submitted create keeps its draft, error and request key when the reload fails. -->
   <div class="mt-4 max-w-xl">{@render create()}</div>
 {/if}
@@ -100,25 +102,19 @@
 {#snippet create()}
   <section aria-labelledby="create" class="panel h-fit space-y-3">
     <h2 id="create" class="font-semibold">Create a record</h2>
-    <Notice error={form?.create?.error} title="Record was not created" />
-    {#if unresolved}
-      <div id="create-pending" class="rounded-lg border border-warning p-3 text-sm">
-        <p class="font-semibold">An earlier create may have committed</p>
-        <p class="mt-1">Its outcome is unknown. Retry unchanged resends that exact request under its key, which recovers its result instead of creating twice. Send as new request creates the draft below as another record, even if the earlier one was created.</p>
-      </div>
-    {/if}
-    {#if form?.created}<p role="status" class="text-sm text-success">Created <a class="ident link" href="{base}/records/{segment(form.created.ref.id)}">{form.created.ref.id}</a> at revision {form.created.revision}{form.created.replayed ? ' (recovered earlier result)' : ''}. Search projection: {form.created.projection.state}.{form.abandoned ? ' The earlier create whose outcome was unknown was not retried, so it may also have created a record.' : ''}</p>{/if}
+    <Notice error={form?.create?.error} title={form?.create?.retried ? 'The earlier create is still unresolved' : 'Record was not created'} />
+    {#if form?.created}<p role="status" class="text-sm text-success">Created <a class="ident link" href="{base}/records/{segment(form.created.ref.id)}">{form.created.ref.id}</a> at revision {form.created.revision}{form.created.replayed ? ' (recovered earlier result)' : ''}. Search projection: {form.created.projection.state}.</p>{/if}
     <form method="POST" action="?/create" class="space-y-3">
       <input type="hidden" name="idempotencyKey" value={data.idempotencyKey} />
-      {#if unresolved}<input type="hidden" name="pendingKey" value={unresolved.key} /><input type="hidden" name="pendingSent" value={unresolved.sent} />{/if}
+      <Unresolved writes={unresolved} kind="create" />
       <div><label for="externalKey">External key (optional)</label><input id="externalKey" name="externalKey" value={draft?.externalKey ?? ''} /></div>
       <div><label for="data">Data JSON</label>
         <textarea id="data" name="data" rows="8" spellcheck="false" aria-invalid={schemaInvalid ? 'true' : undefined}
           aria-describedby={schemaInvalid ? 'data-error' : undefined}>{draft?.raw ?? '{}'}</textarea>
         {#if schemaInvalid}<p id="data-error" class="mt-1 text-sm text-danger">{form?.create?.invalid ? 'Data must be one JSON object with finite numbers.' : 'The data does not satisfy the collection schema. Correct it and create again.'}</p>{/if}</div>
-      <!-- While a create is unresolved, the safe retry comes first, so Enter cannot duplicate it. -->
-      <div class="flex flex-wrap gap-2">{#if unresolved}<button class="btn" name="intent" value="retry" aria-describedby="create-pending">Retry unchanged</button>
-        <button class="btn-quiet" aria-describedby="create-pending">Send as new request</button>{:else}<button class="btn">Create record</button>{/if}</div>
+      <div class="flex flex-wrap gap-2">{#if !unresolved.length}<button class="btn">Create record</button>
+        {:else if unresolved.length<maxUnresolved}<button class="btn-quiet" aria-describedby="create-pending">Send as new request</button>
+        {:else}<p class="hint">Retry or forget an earlier create before sending another.</p>{/if}</div>
     </form>
   </section>
 {/snippet}

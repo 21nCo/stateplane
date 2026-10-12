@@ -34,24 +34,29 @@ const stale=(code:string)=>['REVISION_CONFLICT','NOT_FOUND','IDEMPOTENCY_MISMATC
 export const actions:Actions={
   save:async(event)=>{
     const form=await event.request.formData();
-    // The editor's text always stays the draft; a retry resends the unresolved request instead.
+    // The editor's text and revision always stay the draft; a retry resends an unresolved request instead.
     const raw=String(form.get('data')??'');
     const draft=jsonObject(raw);
-    const attempt=writeAttempt(form,draft ? {expectedRevision:Number(form.get('expectedRevision')),data:draft} : null);
-    if (!attempt.request) return fail(400,{raw,expectedRevision:Number(form.get('expectedRevision')),pending:attempt.pending,invalid:true});
-    const {expectedRevision,data}=attempt.request as {expectedRevision:number;data:Record<string,unknown>};
+    const expectedRevision=Number(form.get('expectedRevision'));
+    const attempt=writeAttempt(form,draft ? {expectedRevision,data:draft} : null);
+    if (attempt.forgotten!==null) return {raw,expectedRevision,pending:attempt.rest};
+    if (!attempt.request || attempt.full) return fail(400,{raw,expectedRevision,pending:attempt.pending,invalid:!attempt.request});
+    const request=attempt.request as {expectedRevision:number;data:Record<string,unknown>};
     const result=await api<Receipt>(event,'POST',recordPath(event.url).slice(0,5),
-      {body:{operation:'replace',id:selectors(event.url).record,expectedRevision,idempotencyKey:attempt.key,data}});
-    if (result.ok) return {saved:result.data,abandoned:!attempt.retry && attempt.pending!==null};
+      {body:{operation:'replace',id:selectors(event.url).record,expectedRevision:request.expectedRevision,idempotencyKey:attempt.key,data:request.data}});
+    // A recovered save keeps the unsent text; it now targets the recovered revision unless it already targeted a later one.
+    if (result.ok) return {saved:result.data,pending:unresolvedAfter(attempt,null),
+      ...(attempt.retry ? {raw,expectedRevision:Math.max(expectedRevision,result.data.revision)} : {})};
     const values={raw,expectedRevision,pending:unresolvedAfter(attempt,result.error)};
-    if (stale(result.error.code)) return conflict(event,values);
-    return fail(result.status,{...values,error:result.error});
+    // Only the draft's own stale write opens the comparison; a refused retry says what happened to it.
+    if (!attempt.retry && stale(result.error.code)) return conflict(event,values);
+    return fail(result.status,{...values,error:result.error,retried:attempt.retry});
   },
   delete:async(event)=>{
     const form=await event.request.formData();
     const idempotencyKey=String(form.get('idempotencyKey')??'');
     const expectedRevision=Number(form.get('expectedRevision'));
-    // A failed delete leaves an unresolved save on the page.
+    // A failed delete leaves the unresolved saves on the page.
     const pending=unresolved(form);
     const {space,collection,record}=selectors(event.url);
     const result=await api<Receipt>(event,'POST',recordPath(event.url).slice(0,5),
