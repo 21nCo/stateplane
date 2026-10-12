@@ -1,0 +1,37 @@
+app/src/lib/components/Unresolved.svelte
+  s_a210199ed5a2ab::t_5eebad075e45ec 1-30
+app/src/lib/errors.ts
+  s_a210199ed5a2ab::t_699d59bec8ca95 37-44
+app/src/lib/server/forms.ts
+  s_a210199ed5a2ab::t_a919b584a83a76 1,23-26,28-31,34-38,41-47,51-56
+app/src/routes/spaces/[space]/collections/[collection]/+page.server.ts
+  s_a210199ed5a2ab::t_18c230cd7d908f 48-51,55-56,58
+app/src/routes/spaces/[space]/collections/[collection]/+page.svelte
+  s_a210199ed5a2ab::t_f1df8c67db74b8 5-6,17-18,97,105-106,109,115-117
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.server.ts
+  s_a210199ed5a2ab::t_e6eaa19f006300 37,40-44,46-49,51-53,59
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.svelte
+  s_a210199ed5a2ab::t_dd85ab47848e51 4-5,21-22,40,75,78,84-86,109
+docs/ui.md
+  s_a210199ed5a2ab::t_3925aaa421d47a 14
+test/e2e/owner.spec.ts
+  s_a210199ed5a2ab::t_fefe8006502c3e 220,266,275-280,328-335,337,353-463
+test/ui-errors.test.ts
+  s_a210199ed5a2ab::t_7d1c3e8594665a 1-3,19-60
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "853d4196c1d7cb994b8a42b712ee222a1bbd17af",
+  "prompts": {},
+  "sessions": {
+    "s_a210199ed5a2ab": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_a210199ed5a2ab",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
