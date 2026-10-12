@@ -1,0 +1,43 @@
+app/src/lib/components/Unresolved.svelte
+  s_1900bb15a7199a::t_9cb9c0b4777d91 2-7,9-10,13-17,19,23,29,31,33-34
+app/src/lib/server/api.ts
+  s_1900bb15a7199a::t_20622b5c4b7cbe 5,16-18
+app/src/lib/server/forms.ts
+  s_1900bb15a7199a::t_c21693508f8b3c 3-4,25-26,29-40,42,44-45,48-53,58-59,67-68,71-72
+app/src/lib/server/host.ts
+  s_1900bb15a7199a::t_c095508c1efe2e 9,207
+app/src/lib/server/receipts.ts
+  s_1900bb15a7199a::t_8cc030cc92beb9 1-31
+app/src/routes/spaces/[space]/collections/[collection]/+page.server.ts
+  s_1900bb15a7199a::t_777e390e7bba5c 3,5,47,52-53
+app/src/routes/spaces/[space]/collections/[collection]/+page.svelte
+  s_1900bb15a7199a::t_24a92d11be7972 116
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.server.ts
+  s_1900bb15a7199a::t_af88c6258c2453 3-4,41,44,48-52,62-64
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.svelte
+  s_1900bb15a7199a::t_0b118edc9d78ba 19-20,22-23,80,86,95
+docs/ui.md
+  s_1900bb15a7199a::t_33eb7745dbbeea 14
+playwright.config.ts
+  s_1900bb15a7199a::t_4b83996a797270 14-15,28
+test/e2e/owner.spec.ts
+  s_1900bb15a7199a::t_25d416fb439f7d 1,413-417,471-597
+test/ui-errors.test.ts
+  s_1900bb15a7199a::t_ca98f0856c8483 4,31-33,35-38,42-43,45-47,51-55,57-58,62-63,65-77
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "89916b7a3a197062b171f75f71f8ba16d7c4f790",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
