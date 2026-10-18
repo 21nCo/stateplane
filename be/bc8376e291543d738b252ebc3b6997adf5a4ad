@@ -1,0 +1,45 @@
+packages/postgres/src/services.ts
+  s_92427ff18a8304::t_3686e6112c000f 9,33-75,105-115,133-135
+test/http-cli.test.js
+  s_7d0a48f0aaecda::t_8652e72fa8165d 12,1602-1636
+packages/api/src/http.ts
+  s_92427ff18a8304::t_2e43b4d926a818 160-162,165-169,176-177,182-193
+docs/owned-spaces.md
+  s_92427ff18a8304::t_baa9d17dcbab25 21
+contracts/openapi.yaml
+  s_92427ff18a8304::t_24f17c87560337 76-125,204-209
+packages/application/src/errors.ts
+  s_92427ff18a8304::t_c93f9b74b8a8eb 30-31
+packages/postgres/src/spaces.ts
+  s_92427ff18a8304::t_b1b7c3c1c0b4b6 44-50,57-58,1391-1411,1417,1430
+test/integration/owned-spaces.test.js
+  s_92427ff18a8304::t_561d9b6b511d25 13-14,804-805,810,3814-3846
+docs/http-cli.md
+  s_92427ff18a8304::t_512d1deaebce51 76-77
+packages/application/src/services.ts
+  s_92427ff18a8304::t_d00fc731d8dca7 12-18,24-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bebc8376e291543d738b252ebc3b6997adf5a4ad",
+  "prompts": {},
+  "sessions": {
+    "s_7d0a48f0aaecda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec9cf707-0884-40ca-b283-dbc4d0f2a4b5",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_92427ff18a8304": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26336501-b0e6-4534-a7c2-345f5528a4ba",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
