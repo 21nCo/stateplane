@@ -1,0 +1,19 @@
+test/http-cli.test.js
+  s_400cf34da5fb6b::t_52d6ad00434a58 1616-1624
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5806958b9b8732b20009d0d5eb2d9de1526578a5",
+  "prompts": {},
+  "sessions": {
+    "s_400cf34da5fb6b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_400cf34da5fb6b",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
