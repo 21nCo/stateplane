@@ -1,0 +1,23 @@
+docs/http-cli.md
+  s_96f82ad79c5fee::t_cf1eed491ac138 76
+packages/postgres/src/services.ts
+  s_96f82ad79c5fee::t_62c92e7fc3bcba 9,52,54,57-62
+test/http-cli.test.js
+  s_96f82ad79c5fee::t_7d0bd3e1282553 1631
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e0bdd3bd4230e1077f67acc409d86087aaeceb83",
+  "prompts": {},
+  "sessions": {
+    "s_96f82ad79c5fee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_96f82ad79c5fee",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
