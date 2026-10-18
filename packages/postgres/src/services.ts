@@ -6,6 +6,7 @@ import { AuthorityError, PostgresAuthority } from './index.js';
 import type { AuthorityScope } from './index.js';
 import { CollectionRegistry, discoveryGrants } from './collections.js';
 import { PostgresSpaces } from './spaces.js';
+import { utcInstant } from './schema.js';
 import type { CollectionGrant } from './spaces.js';
 
 export interface ServiceCell { pool: Pick<pg.Pool,'connect'>; cursorSecret: Uint8Array }
@@ -48,12 +49,17 @@ const instant=(value:unknown):Date=>{
   const offset=(match[8]==='-' ? -1 : 1)*(offsetHour*60+offsetMinute);
   const parsed=new Date(0);
   parsed.setUTCFullYear(year,month-1,day);
-  // A leap second is valid only at 23:59 UTC; Date cannot represent it, so use its last earlier millisecond.
+  // Date cannot represent a leap second, so use its last earlier millisecond.
   parsed.setUTCHours(hour,minute-offset,Math.min(second,59),second===60 ? 999 : Number((match[7]??'').padEnd(3,'0').slice(0,3)));
-  const leapSecondMisplaced=second===60 && (parsed.getUTCHours()!==23 || parsed.getUTCMinutes()!==59);
-  if (leapSecondMisplaced || parsed.getUTCFullYear()<0 || parsed.getUTCFullYear()>9999) throw new AuthorityError('INVALID_ARGUMENT');
+  if (parsed.getUTCFullYear()<0 || parsed.getUTCFullYear()>9999 || (second===60 && !leapSecond(parsed))) throw new AuthorityError('INVALID_ARGUMENT');
   return parsed;
 };
+/** A leap second is valid only at 23:59:60 UTC on a known leap-second date, as for record date-times. */
+function leapSecond(parsed:Date):boolean {
+  const utc=parsed.toISOString();
+  if (utc.slice(11,19)!=='23:59:59') return false;
+  try { utcInstant(`${utc.slice(0,10)}T23:59:60Z`); return true; } catch { return false; }
+}
 const plain=(value:unknown,keys:readonly string[],required:readonly string[]):Record<string,unknown>=>{
   if (!value || typeof value!=='object' || Array.isArray(value) ||
     Object.keys(value).some(key=>!keys.includes(key)) || required.some(key=>!Object.hasOwn(value,key)))
