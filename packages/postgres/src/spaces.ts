@@ -41,12 +41,21 @@ class CompletionOutcomeUnknownError extends Error {
 }
 export interface SpaceAuditPage { entries: ReadonlyArray<Record<string, unknown>>; nextCursor: string | null }
 export interface SpacePage { items: ReadonlyArray<SpaceInfo>; cursor: string | null }
+export interface AgentKeySummary {
+  keyId: string; status: 'pending' | 'active' | 'expired' | 'revoked'; expiresAt: string; createdAt: string;
+  revokedAt: string | null; grants: ReadonlyArray<{ collectionId: string; capabilities: Capability[]; expiresAt: string | null }>;
+  /** Null after revocation means provider cleanup is still pending; repeat revocation to finish it. */
+  providerRevokedAt: string | null;
+}
+export interface AgentKeyPage { items: ReadonlyArray<AgentKeySummary>; nextCursor: string | null }
 const spacePageSize = 8;
 const spaceCursorLifetimeMs = 15 * 60_000;
 // Allow a bounded issuing-node clock lead during cross-instance pagination.
 const spaceCursorFutureSkewMs = 60_000;
 /** A fixed cap bounds one owner audit read even when audit history is retained after deletion. */
 const auditPageSize = 100;
+/** Key listings use the same fixed page bound as owner audit reads. */
+const keyPageSize = 100;
 const capabilities = new Set<Capability>(['schema:write','records:read','records:write','sources:read','sources:write','claims:read','claims:write','claims:review','events:read','export:read','space:admin']);
 const validId = (id: unknown): id is string => typeof id === 'string' && id.length > 0 && id.length <= 256 && !id.includes('\0');
 function safeVersion(value: unknown): number {
@@ -1379,12 +1388,33 @@ export class PostgresSpaces {
     await this.revokeAgentKeyInternal(actor,spaceId,oldKeyId,true);
     return this.issueAgentKey(actor,spaceId,expiresAt,grants);
   }
+  /** List key IDs, status and current grants for the owner. Secrets are never stored. */
+  async agentKeys(actor: VerifiedCredential, spaceId: string, cursor?: string): Promise<AgentKeyPage> {
+    actor = snapshotOwner(actor);
+    if (cursor !== undefined && !validId(cursor)) throw new AuthorityError('CURSOR_INVALID');
+    const space = await this.owned(actor,spaceId);
+    const rows = await this.cell(space.cellId).pool.query(`SELECT c.credential_id,c.expires_at,c.created_at,c.revoked_at,c.provider_revoked_at,
+        CASE WHEN c.revoked_at IS NOT NULL THEN 'revoked' WHEN c.activated_at IS NULL OR c.confirmed_at IS NULL THEN 'pending'
+          WHEN c.expires_at<=clock_timestamp() THEN 'expired' ELSE 'active' END AS status,
+        COALESCE((SELECT json_agg(json_build_object('collectionId',g.collection_id,'capabilities',g.capabilities,
+          'expiresAt',g.expires_at) ORDER BY g.collection_id) FROM collection_grants g
+          WHERE g.space_id=c.space_id AND g.credential_id=c.credential_id),'[]'::json) AS grants
+      FROM space_credentials c WHERE c.space_id=$1 AND c.owner_principal_id=$2 AND ($3::text IS NULL OR c.credential_id>$3)
+      ORDER BY c.credential_id LIMIT $4`,[spaceId,owner(actor),cursor ?? null,keyPageSize+1]);
+    await this.current(actor);
+    const iso = (value: unknown) => value == null ? null : new Date(value as string).toISOString();
+    const items = rows.rows.slice(0,keyPageSize).map(row => ({keyId:row.credential_id,status:row.status,
+      expiresAt:iso(row.expires_at)!,createdAt:iso(row.created_at)!,revokedAt:iso(row.revoked_at),
+      grants:row.grants.map((grant: { expiresAt: unknown }) => ({...grant,expiresAt:iso(grant.expiresAt)})),
+      providerRevokedAt:iso(row.provider_revoked_at)}));
+    return {items,nextCursor:rows.rows.length > keyPageSize ? items.at(-1)!.keyId : null};
+  }
   async audit(actor: VerifiedCredential, spaceId: string, cursor?: string): Promise<SpaceAuditPage> {
     actor = snapshotOwner(actor);
     let after: { recordedAt: string; auditId: string } | undefined;
     if (cursor !== undefined) {
       if (typeof cursor !== 'string' || cursor.length === 0 || cursor.length > 1024 || !/^[A-Za-z0-9_-]+$/.test(cursor)) {
-        throw new AuthorityError('INVALID_ARGUMENT');
+        throw new AuthorityError('CURSOR_INVALID');
       }
       try {
         const decoded: unknown = JSON.parse(Buffer.from(cursor,'base64url').toString('utf8'));
@@ -1397,7 +1427,7 @@ export class PostgresSpaces {
         if (!Number.isFinite(instant) || new Date(instant).toISOString().slice(0,23) !==
           value.recordedAt.slice(0,23)) throw new Error('Invalid cursor');
         after = {recordedAt:value.recordedAt,auditId:value.auditId};
-      } catch { throw new AuthorityError('INVALID_ARGUMENT'); }
+      } catch { throw new AuthorityError('CURSOR_INVALID'); }
     }
     const space = await this.owned(actor,spaceId);
     await this.current(actor);

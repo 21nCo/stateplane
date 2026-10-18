@@ -27,7 +27,8 @@ function hostWriteTimeout(error: unknown): boolean {
 export function errorCode(error: unknown, read: boolean): string {
   const name = error instanceof Error ? error.name : '';
   const raw = (error as { code?: unknown })?.code;
-  if (name === 'CommitOutcomeUnknownError') return 'COMMIT_OUTCOME_UNKNOWN';
+  // An agent key may be active although its completion was not observed.
+  if (name === 'CommitOutcomeUnknownError' || name === 'AgentKeyOutcomeUnknownError') return 'COMMIT_OUTCOME_UNKNOWN';
   if (typeof raw === 'string' && stableErrorCodes.has(raw)) return raw;
   if (raw === '57014') return read ? 'RATE_LIMITED' : 'COMMIT_OUTCOME_UNKNOWN';
   if (!read && hostWriteTimeout(error)) return 'COMMIT_OUTCOME_UNKNOWN';

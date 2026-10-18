@@ -10,7 +10,8 @@ import { memoryAdapter } from '@superfunctions/db/testing';
 import { createAuthFn, createUser, issueSession } from '@authfn/core';
 import { AuthFnIdentityVerifier, AuthFnAgentKeys } from '../../packages/auth/dist/index.js';
 import { RegionalRouter, RegionalCell, RoutingKeys } from '../../packages/application/dist/index.js';
-import { PostgresAuthority, PostgresSpaces, PostgresRoutingDirectory, PostgresCellPolicy, CommitOutcomeUnknownError } from '../../packages/postgres/dist/index.js';
+import { PostgresAuthority, PostgresSpaces, PostgresRoutingDirectory, PostgresCellPolicy, CommitOutcomeUnknownError, postgresServices } from '../../packages/postgres/dist/index.js';
+import { createHttpHandler } from '../../packages/api/dist/index.js';
 
 async function collectSpaces(spaces,actor) {
   const items=[];
@@ -800,13 +801,13 @@ test('owner audit reads use bounded stable pages and reject cross-space cursors'
   assert.equal(pages,3);
   assert.deepEqual(seen,expected,'equal timestamps and page boundaries neither skip nor repeat audit rows');
   const firstPage = await spaces.audit(owner,first.spaceId);
-  await assert.rejects(spaces.audit(owner,second.spaceId,firstPage.nextCursor),denied('INVALID_ARGUMENT'));
-  await assert.rejects(spaces.audit(owner,first.spaceId,'malformed!'),denied('INVALID_ARGUMENT'));
+  await assert.rejects(spaces.audit(owner,second.spaceId,firstPage.nextCursor),denied('CURSOR_INVALID'));
+  await assert.rejects(spaces.audit(owner,first.spaceId,'malformed!'),denied('CURSOR_INVALID'));
   const crafted = recordedAt => Buffer.from(JSON.stringify({spaceId:first.spaceId,recordedAt,
     auditId:'aud_cursor'})).toString('base64url');
   for (const invalid of ['2026-02-30T00:00:00.000000Z','2025-02-29T00:00:00.000000Z',
     '2026-04-31T00:00:00.000000Z','2026-13-01T00:00:00.000000Z','0000-01-01T00:00:00.000000Z']) {
-    await assert.rejects(spaces.audit(owner,first.spaceId,crafted(invalid)),denied('INVALID_ARGUMENT'),invalid);
+    await assert.rejects(spaces.audit(owner,first.spaceId,crafted(invalid)),denied('CURSOR_INVALID'),invalid);
   }
   await spaces.audit(owner,first.spaceId,crafted('2024-02-29T23:59:59.123456Z'));
   await assert.rejects(spaces.audit(stranger,first.spaceId),denied('NOT_FOUND'));
@@ -3809,4 +3810,37 @@ test('router rejects malformed verifier identifiers before signing or directory 
     await assert.rejects(router.assertion(new Request('https://example.invalid'),'space','collection','records:read'),denied('FORBIDDEN'));
   }
   assert.equal(lookups,0);
+});
+
+test('owner HTTP agent key routes store normalized RFC 3339 expiries, list without secrets and revoke', async () => {
+  const config = { database:memoryAdapter(),namespace:`sta6-${crypto.randomUUID()}`,plugins:[] };
+  createAuthFn(config);
+  const user = await createUser(config,{primaryEmail:`owner-${crypto.randomUUID()}@example.invalid`});
+  const session = await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity = new AuthFnIdentityVerifier(config);
+  const owner = await identity.verify(request(session.sessionToken));
+  const cells = new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
+  const spaces = new PostgresSpaces(controlPool,cells,'cell-a',new AuthFnAgentKeys(config),identity);
+  const {spaceId} = await spaces.create(owner);
+  const collectionId = `entries_${crypto.randomUUID()}`;
+  await collection(spaceId,collectionId);
+  const handler = createHttpHandler({services:postgresServices(spaces,new Map(),3600),identity});
+  const call = (method,path,body,token=session.sessionToken) => handler(new Request(`https://stateplane.example.invalid/v1/spaces/${spaceId}${path}`,{method,
+    headers:{Authorization:`Bearer ${token}`,...(body===undefined?{}:{'Content-Type':'application/json'})},body:body===undefined?undefined:JSON.stringify(body)}));
+  const expiry = Math.floor(Date.now()/1000)*1000+3_600_123, normalized = new Date(expiry).toISOString();
+  // One instant: the key uses a +05:30 offset with sub-millisecond digits, the grant lowercase separators.
+  const issue = grantExpiry => call('POST','/agent-keys',{expiresAt:`${new Date(expiry+19_800_000).toISOString().slice(0,23)}999+05:30`,
+    grants:[{collectionId,capabilities:['records:read'],expiresAt:grantExpiry}]});
+  assert.equal((await (await issue(`${new Date(expiry+1).toISOString().slice(0,23)}9-00:00`)).json()).error.code,'INVALID_ARGUMENT','a grant may not outlive its key');
+  const issued = await issue(`${normalized.slice(0,23).replace('T','t')}4z`);
+  const key = await issued.json();
+  assert.deepEqual([issued.status,key.expiresAt],[201,normalized]);
+  const listing = await (await call('GET','/agent-keys')).text();
+  assert.ok(!listing.includes(key.secret),'a listing never returns the secret');
+  assert.deepEqual(JSON.parse(listing).items.map(({createdAt,...item}) => item),[{keyId:key.keyId,status:'active',expiresAt:normalized,
+    revokedAt:null,grants:[{collectionId,capabilities:['records:read'],expiresAt:normalized}],providerRevokedAt:null}]);
+  assert.equal((await (await call('GET','/agent-keys',undefined,key.secret)).json()).error.code,'FORBIDDEN','an agent key cannot manage keys');
+  assert.equal((await (await call('GET','/agent-keys?cursor=a&cursor=b')).json()).error.code,'CURSOR_INVALID');
+  assert.deepEqual(await (await call('DELETE',`/agent-keys/${key.keyId}`)).json(),{keyId:key.keyId,revoked:true});
+  assert.equal((await (await call('GET','/agent-keys')).json()).items[0].status,'revoked');
 });
