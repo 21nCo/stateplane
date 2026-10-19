@@ -77,14 +77,22 @@ paths:
     parameters: [ { $ref: '#/components/parameters/spaceId' } ]
     get:
       operationId: listSpaceAudit
-      description: Owner session only. At most 100 immutable entries per page in recording order.
+      description: Owner session only. Returns {entries,nextCursor} with at most 100 immutable entries per page in recording order; nextCursor is null on the last page and valid only for this space.
       parameters: [ { name: cursor, in: query, schema: { type: string } } ]
       responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
   /v1/spaces/{spaceId}/agent-keys:
     parameters: [ { $ref: '#/components/parameters/spaceId' } ]
     get:
       operationId: listAgentKeys
-      description: Owner session only. At most 100 keys per page with status, current grants and providerRevokedAt, which stays null after revocation until provider cleanup completes; secrets are never returned.
+      description: >-
+        Owner session only. Returns {items,nextCursor} with at most 100 keys per
+        page in keyId order. Each item has keyId, status (pending, active,
+        expired or revoked), expiresAt, createdAt, revokedAt, the configured
+        grants (collectionId, capabilities, expiresAt; expired grants are
+        included) and providerRevokedAt, which stays null after revocation until
+        provider cleanup completes. Secrets are never returned. nextCursor is
+        null on the last page and valid only for this space. Pages are not a
+        snapshot; restart enumeration to observe keys issued meanwhile.
       parameters: [ { name: cursor, in: query, schema: { type: string } } ]
       responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
     post:
@@ -92,7 +100,11 @@ paths:
       description: >-
         Owner session only. Returns keyId, secret and expiresAt once. Expiry
         values are RFC 3339 date-times with any offset or fraction, normalized to
-        UTC milliseconds by truncation; the returned expiresAt is that value. An uncertain
+        UTC milliseconds by truncation; the returned expiresAt is that value.
+        After normalization the year must be 0000-9999, the key expiry must be
+        in the future and no grant may expire after its key. Second 60 is
+        accepted only as 23:59:60 UTC on a known leap-second date and becomes
+        23:59:59.999Z. An uncertain
         completion returns COMMIT_OUTCOME_UNKNOWN; list keys and revoke any
         unaccounted key instead of retrying blindly.
       requestBody:

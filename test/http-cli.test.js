@@ -1615,10 +1615,10 @@ test('an uncertain agent key issuance is a nonretryable unknown outcome without 
 
 test('owner audit and index backfill routes reach their services and refuse a duplicate cursor',async()=>{
   const calls=[],record=result=>async(_actor,...args)=>(calls.push(args),result),identity={verify:async()=>({kind:'session',userPrincipalId:'owner',credentialId:'session-1'})};
-  const handler=createHttpHandler({services:{spaces:{audit:record({items:[],cursor:null})},collections:{backfill:record({processed:2,ready:true})}},identity});
+  const handler=createHttpHandler({services:{spaces:{audit:record({entries:[],nextCursor:null})},collections:{backfill:record({processed:2,ready:true})}},identity});
   const call=async(path,method='GET')=>{ const response=await handler(new Request(`https://stateplane.example.invalid/v1/spaces/sp_a/${path}`,{method})); return [response.status,await response.json()]; };
   assert.deepEqual([await call('audit?cursor=c1'),await call('collections/entries/indexes/title','POST'),(await call('audit?cursor=a&cursor=b'))[1].error.code,calls],
-    [[200,{items:[],cursor:null}],[200,{processed:2,ready:true}],'CURSOR_INVALID',[['sp_a','c1'],['sp_a','entries','title']]]);
+    [[200,{entries:[],nextCursor:null}],[200,{processed:2,ready:true}],'CURSOR_INVALID',[['sp_a','c1'],['sp_a','entries','title']]]);
 });
 
 test('agent key issuance accepts RFC 3339 key and grant expiries and normalizes them to UTC milliseconds',async()=>{

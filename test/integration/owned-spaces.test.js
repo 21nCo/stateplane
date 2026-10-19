@@ -50,6 +50,22 @@ test.after(async () => {
   }
 });
 
+/** One AuthFn owner with an active cell-A space and one collection. */
+async function authFnOwnerSpace() {
+  const config = { database:memoryAdapter(),namespace:`sta6-${crypto.randomUUID()}`,plugins:[] };
+  createAuthFn(config);
+  const user = await createUser(config,{primaryEmail:`owner-${crypto.randomUUID()}@example.invalid`});
+  const session = await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity = new AuthFnIdentityVerifier(config);
+  const owner = await identity.verify(request(session.sessionToken));
+  const cells = new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
+  const spaces = new PostgresSpaces(controlPool,cells,'cell-a',new AuthFnAgentKeys(config),identity);
+  const {spaceId} = await spaces.create(owner);
+  const collectionId = `entries_${crypto.randomUUID()}`;
+  await collection(spaceId,collectionId);
+  return {session,identity,owner,cells,spaces,spaceId,collectionId};
+}
+
 async function collection(spaceId,collectionId,cellPool=pool) {
   const db = await cellPool.connect();
   try {
@@ -398,17 +414,7 @@ test('stable home metadata survives a different current cell and placement fenci
 });
 
 test('archived spaces replay owner and agent receipts but deny external writes at the effect boundary', async () => {
-  const config = { database:memoryAdapter(),namespace:`sta6-${crypto.randomUUID()}`,plugins:[] };
-  createAuthFn(config);
-  const user = await createUser(config,{primaryEmail:`owner-${crypto.randomUUID()}@example.invalid`});
-  const session = await issueSession(config,{}, {userId:user.id,methods:['password']});
-  const identity = new AuthFnIdentityVerifier(config);
-  const owner = await identity.verify(request(session.sessionToken));
-  const cells = new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
-  const spaces = new PostgresSpaces(controlPool,cells,'cell-a',new AuthFnAgentKeys(config),identity);
-  const {spaceId} = await spaces.create(owner);
-  const collectionId = `entries_${crypto.randomUUID()}`;
-  await collection(spaceId,collectionId);
+  const {session,identity,owner,cells,spaces,spaceId,collectionId} = await authFnOwnerSpace();
   const agent = await spaces.issueAgentKey(owner,spaceId,new Date(Date.now()+3_600_000),
     [{collectionId,capabilities:['records:write']}]);
   const reader = await spaces.issueAgentKey(owner,spaceId,new Date(Date.now()+3_600_000),
@@ -3813,17 +3819,7 @@ test('router rejects malformed verifier identifiers before signing or directory 
 });
 
 test('owner HTTP agent key routes store normalized RFC 3339 expiries, list without secrets and revoke', async () => {
-  const config = { database:memoryAdapter(),namespace:`sta6-${crypto.randomUUID()}`,plugins:[] };
-  createAuthFn(config);
-  const user = await createUser(config,{primaryEmail:`owner-${crypto.randomUUID()}@example.invalid`});
-  const session = await issueSession(config,{}, {userId:user.id,methods:['password']});
-  const identity = new AuthFnIdentityVerifier(config);
-  const owner = await identity.verify(request(session.sessionToken));
-  const cells = new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
-  const spaces = new PostgresSpaces(controlPool,cells,'cell-a',new AuthFnAgentKeys(config),identity);
-  const {spaceId} = await spaces.create(owner);
-  const collectionId = `entries_${crypto.randomUUID()}`;
-  await collection(spaceId,collectionId);
+  const {session,identity,spaces,spaceId,collectionId} = await authFnOwnerSpace();
   const handler = createHttpHandler({services:postgresServices(spaces,new Map(),3600),identity});
   const call = (method,path,body,token=session.sessionToken) => handler(new Request(`https://stateplane.example.invalid/v1/spaces/${spaceId}${path}`,{method,
     headers:{Authorization:`Bearer ${token}`,...(body===undefined?{}:{'Content-Type':'application/json'})},body:body===undefined?undefined:JSON.stringify(body)}));
@@ -3843,4 +3839,40 @@ test('owner HTTP agent key routes store normalized RFC 3339 expiries, list witho
   assert.equal((await (await call('GET','/agent-keys?cursor=a&cursor=b')).json()).error.code,'CURSOR_INVALID');
   assert.deepEqual(await (await call('DELETE',`/agent-keys/${key.keyId}`)).json(),{keyId:key.keyId,revoked:true});
   assert.equal((await (await call('GET','/agent-keys')).json()).items[0].status,'revoked');
+  // Accepted historical grant expiries round-trip exactly, including year zero (1 BC) and a local-mean-time era instant.
+  const older = `older_${crypto.randomUUID()}`;
+  await collection(spaceId,older);
+  const historical = await (await call('POST','/agent-keys',{expiresAt:normalized,grants:[
+    {collectionId,capabilities:['records:read'],expiresAt:'0000-01-01T00:00:00Z'},
+    {collectionId:older,capabilities:['records:read'],expiresAt:'1850-06-01T12:00:00.123Z'}]})).json();
+  const page = await call('GET','/agent-keys');
+  assert.equal(page.status,200,'a historical grant expiry does not break the listing');
+  assert.deepEqual((await page.json()).items.find(item => item.keyId === historical.keyId).grants.map(grant => grant.expiresAt),
+    ['0000-01-01T00:00:00.000Z','1850-06-01T12:00:00.123Z']);
+});
+
+test('owner agent key listing pages past 100 keys and binds continuations to their space', async () => {
+  const {owner,spaces,spaceId,collectionId} = await authFnOwnerSpace();
+  const other = (await spaces.create(owner)).spaceId;
+  const second = `second_${crypto.randomUUID()}`;
+  await collection(spaceId,second);
+  const prefix = `key_${crypto.randomUUID()}_`;
+  const insert = (space,from,to) => pool.query(`INSERT INTO space_credentials(space_id,credential_id,principal_id,owner_principal_id,expires_at,activated_at,confirmed_at)
+    SELECT $1,$2||lpad(n::text,3,'0'),'agent-'||$2||n,$3,clock_timestamp()+interval '1 hour',clock_timestamp(),clock_timestamp()
+    FROM generate_series($4::int,$5::int) n`,[space,prefix,owner.userPrincipalId,from,to]);
+  await insert(spaceId,1,150);
+  await insert(other,151,151);
+  await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
+    SELECT $1,collection_id,$3||lpad(n::text,3,'0'),ARRAY['records:read']::text[]
+    FROM generate_series(1,150) n, unnest($2::text[]) collection_id WHERE n%2=0 OR collection_id<>$4`,
+  [spaceId,[collectionId,second],prefix,second]);
+  const first = await spaces.agentKeys(owner,spaceId);
+  const rest = await spaces.agentKeys(owner,spaceId,first.nextCursor);
+  assert.deepEqual([first.items.length,rest.items.length,rest.nextCursor],[100,50,null]);
+  const seen = [...first.items,...rest.items];
+  assert.deepEqual(seen.map(item => item.keyId),Array.from({length:150},(_,index) => `${prefix}${String(index+1).padStart(3,'0')}`),
+    'traversal returns every key once in order');
+  assert.ok(seen.every((item,index) => item.grants.length === (index%2 ? 2 : 1)),'each key carries only its own grants');
+  await assert.rejects(spaces.agentKeys(owner,other,first.nextCursor),denied('CURSOR_INVALID'),'a continuation is bound to its space');
+  await assert.rejects(spaces.agentKeys(owner,spaceId,`${prefix}151`),denied('CURSOR_INVALID'),'another space key is not a cursor here');
 });
