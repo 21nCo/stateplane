@@ -1,0 +1,21 @@
+packages/postgres/src/spaces.ts
+  s_3176a7c4953ce1::t_7560d41ae22162 59-63
+test/integration/owned-spaces.test.js
+  s_3176a7c4953ce1::t_19e36b375e9a78 54,61-62,65,3879-3925
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6ab90cc9ad5d73d6d32a656493ac374f76b91e96",
+  "prompts": {},
+  "sessions": {
+    "s_3176a7c4953ce1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_3176a7c4953ce1",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
