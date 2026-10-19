@@ -56,8 +56,11 @@ const spaceCursorFutureSkewMs = 60_000;
 const auditPageSize = 100;
 /** Key listings use the same fixed page bound as owner audit reads. */
 const keyPageSize = 100;
-/** Expiries cross SQL as integer epoch milliseconds: host time zones and BC years cannot shift or break them. */
-const fromEpochMs = (param: string) => `'epoch'::timestamptz + ${param}::bigint * interval '1 millisecond'`;
+/** Expiries cross SQL as integer epoch milliseconds: host time zones and BC years cannot shift or break them.
+ * Whole days and the sub-day remainder keep interval multiplication within exact float8 integers,
+ * and UTC timestamp arithmetic keeps the session time zone out of the day addition. */
+const fromEpochMs = (param: string) => `(timestamp '1970-01-01'+(${param}::bigint/86400000)*interval '1 day'+
+  (${param}::bigint%86400000)*interval '1 millisecond') AT TIME ZONE 'UTC'`;
 const epochMs = (column: string) => `floor(extract(epoch FROM ${column})*1000)::bigint`;
 const capabilities = new Set<Capability>(['schema:write','records:read','records:write','sources:read','sources:write','claims:read','claims:write','claims:review','events:read','export:read','space:admin']);
 const validId = (id: unknown): id is string => typeof id === 'string' && id.length > 0 && id.length <= 256 && !id.includes('\0');

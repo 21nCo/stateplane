@@ -51,18 +51,18 @@ test.after(async () => {
 });
 
 /** One AuthFn owner with an active cell-A space and one collection. */
-async function authFnOwnerSpace() {
+async function authFnOwnerSpace(control=controlPool,cellPool=pool) {
   const config = { database:memoryAdapter(),namespace:`sta6-${crypto.randomUUID()}`,plugins:[] };
   createAuthFn(config);
   const user = await createUser(config,{primaryEmail:`owner-${crypto.randomUUID()}@example.invalid`});
   const session = await issueSession(config,{}, {userId:user.id,methods:['password']});
   const identity = new AuthFnIdentityVerifier(config);
   const owner = await identity.verify(request(session.sessionToken));
-  const cells = new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
-  const spaces = new PostgresSpaces(controlPool,cells,'cell-a',new AuthFnAgentKeys(config),identity);
+  const cells = new Map([['cell-a',{pool:cellPool,storageTargetId:'target-a'}]]);
+  const spaces = new PostgresSpaces(control,cells,'cell-a',new AuthFnAgentKeys(config),identity);
   const {spaceId} = await spaces.create(owner);
   const collectionId = `entries_${crypto.randomUUID()}`;
-  await collection(spaceId,collectionId);
+  await collection(spaceId,collectionId,cellPool);
   return {session,identity,owner,cells,spaces,spaceId,collectionId};
 }
 
@@ -3875,4 +3875,51 @@ test('owner agent key listing pages past 100 keys and binds continuations to the
   assert.ok(seen.every((item,index) => item.grants.length === (index%2 ? 2 : 1)),'each key carries only its own grants');
   await assert.rejects(spaces.agentKeys(owner,other,first.nextCursor),denied('CURSOR_INVALID'),'a continuation is bound to its space');
   await assert.rejects(spaces.agentKeys(owner,spaceId,`${prefix}151`),denied('CURSOR_INVALID'),'another space key is not a cursor here');
+});
+
+test('agent key and grant expiries are stored and listed exactly in any session time zone', async () => {
+  const zoned = [controlUrl,cellAUrl].map(connectionString => new pg.Pool({connectionString,max:2,options:'-c timezone=America/St_Johns'}));
+  try {
+    const {owner,spaces,spaceId,collectionId} = await authFnOwnerSpace(...zoned);
+    const collections = [collectionId];
+    for (let index = 0; index < 4; index++) await collection(spaceId,collections[collections.push(`sweep_${crypto.randomUUID()}`)-1],zoned[1]);
+    const first = Date.parse('0000-01-01T00:00:00Z'), last = Date.parse('9999-12-31T23:59:59.999Z');
+    // Large epochs with nonzero milliseconds, year zero and a local-mean-time era, then a seeded sweep of 1000 instants.
+    const requests = [[Date.parse('9999-12-31T23:59:59.997Z'),[Date.parse('5000-01-01T00:00:00.001Z'),first,
+      Date.parse('1850-06-01T12:00:00.123Z'),Date.parse('0000-06-15T07:08:09.011Z')]]];
+    let seed = 23;
+    const between = (low,high) => { seed = (seed*48271) % 2147483647; return low+Math.floor(seed/2147483647*(high-low)); };
+    const nonzeroMs = ms => ms-((ms%1000+1000)%1000)+1+between(0,998);
+    while (requests.length < 200) {
+      const key = nonzeroMs(between(Date.now()+3_600_000,last-1000));
+      requests.push([key,Array.from({length:4},() => nonzeroMs(between(first,key-1000)))]);
+    }
+    const issued = new Map();
+    for (const [key,grants] of requests) {
+      const {id} = await spaces.issueAgentKey(owner,spaceId,new Date(key),
+        grants.map((expiresAt,index) => ({collectionId:collections[index],capabilities:['records:read'],expiresAt:new Date(expiresAt)})));
+      issued.set(id,[key,Object.fromEntries(grants.map((ms,index) => [collections[index],ms]))]);
+    }
+    const stored = await pool.query(`SELECT c.credential_id,(extract(epoch FROM c.expires_at)*1000)::text AS key,
+      json_object_agg(g.collection_id,(extract(epoch FROM g.expires_at)*1000)::text) AS grants
+      FROM space_credentials c JOIN collection_grants g USING(space_id,credential_id) WHERE c.space_id=$1 GROUP BY c.credential_id,c.expires_at`,[spaceId]);
+    assert.equal(stored.rowCount,200);
+    for (const row of stored.rows) {
+      const [key,grants] = issued.get(row.credential_id);
+      assert.deepEqual([Number(row.key),Object.fromEntries(Object.entries(row.grants).map(([id,ms]) => [id,Number(ms)]))],[key,grants],
+        `${row.credential_id} stores the requested instants`);
+    }
+    const listed = [];
+    for (let page = await spaces.agentKeys(owner,spaceId); ; page = await spaces.agentKeys(owner,spaceId,page.nextCursor)) {
+      listed.push(...page.items);
+      if (!page.nextCursor) break;
+    }
+    assert.equal(listed.length,200);
+    for (const item of listed) {
+      const [key,grants] = issued.get(item.keyId);
+      assert.deepEqual([item.expiresAt,Object.fromEntries(item.grants.map(grant => [grant.collectionId,grant.expiresAt]))],
+        [new Date(key).toISOString(),Object.fromEntries(Object.entries(grants).map(([id,ms]) => [id,new Date(ms).toISOString()]))],
+        `${item.keyId} lists the issued instants`);
+    }
+  } finally { await Promise.all(zoned.map(zone => zone.end())); }
 });
