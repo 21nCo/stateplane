@@ -1,0 +1,27 @@
+contracts/openapi.yaml
+  s_c558f2dd913b81::t_7bb5eecee1b923 80,87-95,103-107
+docs/http-cli.md
+  s_c558f2dd913b81::t_6d3f825a7f8f5c 76
+packages/postgres/src/spaces.ts
+  s_c558f2dd913b81::t_06327fab53e629 59-61,1190,1210,1394,1399-1414,1416
+test/http-cli.test.js
+  s_c558f2dd913b81::t_6496c8e8e65eab 1618,1621
+test/integration/owned-spaces.test.js
+  s_c558f2dd913b81::t_6e5cd5105a83ee 53-68,417,3822,3842-3877
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d78abd874399699d024b7500b8a719fb44d6a9ba",
+  "prompts": {},
+  "sessions": {
+    "s_c558f2dd913b81": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_c558f2dd913b81",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
