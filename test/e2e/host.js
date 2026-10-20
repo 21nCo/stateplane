@@ -8,6 +8,7 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
+import { realpathSync } from 'node:fs';
 import { createServer } from 'node:http';
 import net from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -167,7 +168,8 @@ async function start() {
     {cwd:`${root}/app`,env:{...process.env,...(databaseUrl ? {STATEPLANE_TEST_DATABASE_URL:databaseUrl,
       STATEPLANE_TEST_PROVIDER_FAULT_URL:`http://127.0.0.1:${faultPort}/provider-fault`} : {})}}).then(code=>stop(code));
 }
-if (process.argv[1]===fileURLToPath(import.meta.url)) {
+// import.meta.url is a real path; the script may be run through a symlink.
+if (process.argv[1] && realpathSync(process.argv[1])===fileURLToPath(import.meta.url)) {
   // A second signal during cleanup exits at once.
   for (const signal of ['SIGTERM','SIGINT']) process.on(signal,()=>{ if (stopping) process.exit(1); void stop(); });
   startup=start();
