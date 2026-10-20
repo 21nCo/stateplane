@@ -1,0 +1,23 @@
+docs/ui.md
+  s_1900bb15a7199a::t_fd7907a8b7934d 26
+playwright.config.ts
+  s_1900bb15a7199a::t_298dc4aa912fec 12-15,17
+test/ui-shell.test.ts
+  s_1900bb15a7199a::t_9dc84229117b78 1-2,66-76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fb6be22a5e9f3aa741f179d79cc891712a6f21ef",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
