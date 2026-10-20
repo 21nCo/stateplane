@@ -20,7 +20,7 @@ const base=process.env.STATEPLANE_E2E_BASE_DATABASE;
 const faultPort=5744;
 let url;
 let created=false;
-// The backend running CREATE DATABASE until its outcome is known.
+// The session running CREATE DATABASE until its outcome is known.
 let creator;
 // The running child (migration, then the UI) and a promise that settles once
 // it has ended, whether it exited or was signalled.
@@ -61,13 +61,23 @@ async function stop(code=0) {
       await admin.connect();
       try {
         // An unanswered CREATE may still commit: end its session so the DROP is final.
-        const [session]=creator ? (await admin.query('SELECT pg_terminate_backend(pid,3000) AS ended FROM pg_stat_activity WHERE pid=$1',[creator])).rows : [];
-        if (session && !session.ended) throw new Error('the CREATE DATABASE session did not end');
+        if (creator && !await endSession(admin,creator)) throw new Error('the CREATE DATABASE session did not end');
         await admin.query(`DROP DATABASE IF EXISTS ${url.pathname.slice(1)} WITH (FORCE)`);
       } finally { await admin.end(); }
     }
   } catch (error) { abandon(error.message || error.code); }
   process.exit(code);
+}
+/** A session's identity: its pid and start time, since a later session can reuse the pid. */
+export async function sessionOf(client) {
+  const {rows:[{started}]}=await client.query('SELECT extract(epoch FROM backend_start)::text AS started FROM pg_stat_activity WHERE pid=pg_backend_pid()');
+  return {pid:client.processID,started};
+}
+/** End that session if it is still running; false if it did not end in time. */
+export async function endSession(admin,{pid,started}) {
+  const {rows:[session]}=await admin.query(`SELECT pg_terminate_backend(pid,3000) AS ended FROM pg_stat_activity
+    WHERE pid=$1 AND extract(epoch FROM backend_start)=$2::numeric`,[pid,started]);
+  return !session || session.ended;
 }
 function run(args,options) {
   child=spawn(process.execPath,args,{stdio:'inherit',...options});
@@ -79,21 +89,23 @@ function run(args,options) {
 /** The proxy reads protocol messages, so only a database reached without TLS
  * is proxied: any TLS setting in the URL, or PGSSLMODE, keeps the database's host. */
 export const plaintext=(target,env=process.env)=>[...target.searchParams].every(([name,value])=>
-  !/^ssl/.test(name) || (name==='sslmode' && value==='disable')) && [undefined,'','disable'].includes(env.PGSSLMODE);
+  !name.startsWith('ssl') || (name==='sslmode' && value==='disable')) && [undefined,'','disable'].includes(env.PGSSLMODE);
 
 /** Armed faults, applied in order: after a client message containing `after`
  * (or at once), the reply to the next message containing `match` is dropped and
  * both sockets close, as when a connection fails after the database acted. A
  * `refuse` fault closes them before that message is sent, so the database never
  * acts. A `hold` fault keeps both sockets open and discards every later reply,
- * as when a connection stalls. Markers match whole protocol messages, however
- * TCP splits them. */
+ * as when a connection stalls. A `fatal` fault replaces the reply with a server
+ * FATAL error, as when the session is ended after the database acted. Markers
+ * match whole protocol messages, however TCP splits them. */
 export function faultProxy(target,faults) {
   return net.createServer(client=>{
     // URL.hostname keeps an IPv6 address in brackets; net.connect takes it bare.
     const upstream=net.connect(Number(target.port || 5432),target.hostname.replace(/^\[(.*)\]$/,'$1'));
     let seen=null;
-    let drop=false;
+    // What becomes of the replies: forward, close, hold or fatal.
+    let reply='forward';
     // The startup message (or an SSL or GSSAPI request before it) has no type byte.
     let typed=false;
     let pending=Buffer.alloc(0);
@@ -113,14 +125,29 @@ export function faultProxy(target,faults) {
         if (fault && seen===fault && text.includes(fault.match)) {
           faults.shift();
           if (fault.refuse) return close();
-          drop=fault.hold ? 'hold' : true;
+          reply=fault.hold ? 'hold' : fault.fatal ? 'fatal' : 'close';
         }
         upstream.write(message);
       }
     });
-    upstream.on('data',chunk=>{ if (drop==='hold') return; if (drop) close(); else client.write(chunk); });
+    upstream.on('data',chunk=>{
+      if (reply==='forward') client.write(chunk);
+      else if (reply==='close') close();
+      else if (reply==='fatal') {
+        // Later replies are discarded; both sockets close once the error is sent.
+        reply='hold';
+        client.end(serverError('FATAL','57P05','terminating connection due to idle-session timeout'),close);
+      }
+    });
     for (const socket of [client,upstream]) { socket.on('error',close); socket.on('close',close); }
   });
+}
+/** A server ErrorResponse message. */
+function serverError(severity,code,text) {
+  const body=Buffer.from(`S${severity}\0V${severity}\0C${code}\0M${text}\0\0`,'latin1');
+  const head=Buffer.from('E\0\0\0\0','latin1');
+  head.writeUInt32BE(body.length+4,1);
+  return Buffer.concat([head,body]);
 }
 const faults=[];
 let providerFault=false;
@@ -173,13 +200,19 @@ async function start() {
     await admin.connect();
     try {
       if (stopping) return;
+      const session=await sessionOf(admin);
+      if (stopping) return;
       // Once CREATE is sent the database may exist, unless Postgres refused it.
       created=true;
-      creator=admin.processID;
+      creator=session;
       await admin.query(`CREATE DATABASE ${url.pathname.slice(1)}`);
       creator=undefined;
     } catch (error) {
-      if (error.severity) { created=false; creator=undefined; }
+      // Only a statement ERROR is a refusal; a FATAL can end the session after
+      // the CREATE committed. pg reports the localized severity, so a refusal
+      // in another language is cleaned up as uncertain, except for an existing
+      // database of that name, which is never this launcher's to drop.
+      if (error.severity==='ERROR' || error.code==='42P04') { created=false; creator=undefined; }
       throw error;
     } finally { await admin.end(); }
     // Test-only: hold startup here so a launcher test can signal mid-startup.

@@ -10,14 +10,14 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
-import { faultProxy, plaintext } from '../e2e/host.js';
+import { endSession, faultProxy, plaintext, sessionOf } from '../e2e/host.js';
 
 const password=process.env.DATABASE_URL?null:(await readFile(new URL('../../.data/local-db-password',import.meta.url),'utf8')).trim();
 const url=process.env.DATABASE_URL??`postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT??'55432'}/stateplane`;
 const root=new URL('../..',import.meta.url);
 
 async function admin(sql,values) {
-  const client=new pg.Client({connectionString:url});
+  const client=new pg.Client({connectionString:url,connectionTimeoutMillis:10_000,query_timeout:20_000});
   await client.connect();
   try { return (await client.query(sql,values)).rows; }
   finally { await client.end(); }
@@ -37,8 +37,10 @@ async function created(name) {
 
 /** Run one launcher with a database name of its own. However the body ends, the
  * launcher is stopped as Playwright stops it; one that does not exit within
- * `grace` is killed with its children, and its database, and no other, is dropped. */
-async function launch(env,body,{grace=20_000,script='test/e2e/host.js',cwd=root}={}) {
+ * `grace` is killed with its children, and its database, and no other, is dropped.
+ * A body still pending after `limit` fails, so a call that never answers cannot
+ * skip that cleanup; the limit and grace fit within the test's own timeout. */
+async function launch(env,body,{grace=20_000,limit=90_000,script='test/e2e/host.js',cwd=root}={}) {
   const id=randomUUID().replaceAll('-','');
   const name=`stateplane_e2e_${id}`;
   const launcher=spawn(process.execPath,[script],{cwd,stdio:['ignore','pipe','pipe'],
@@ -47,8 +49,11 @@ async function launch(env,body,{grace=20_000,script='test/e2e/host.js',cwd=root}
   for (const stream of [launcher.stdout,launcher.stderr]) stream.on('data',chunk=>{ output+=chunk; });
   const exited=once(launcher,'exit');
   const exit=async(ms=30_000)=>(await Promise.race([exited,delay(ms).then(()=>{ throw new Error('launcher did not exit'); })]))[0];
-  try { return await body({launcher,name,exit,output:()=>output}); }
+  let timer;
+  const expired=new Promise((_,reject)=>{ timer=setTimeout(()=>reject(new Error(`the test body did not finish in ${limit} ms`)),limit); });
+  try { return await Promise.race([body({launcher,name,exit,output:()=>output}),expired]); }
   finally {
+    clearTimeout(timer);
     if (launcher.exitCode===null && launcher.signalCode===null) {
       launcher.kill('SIGTERM');
       if (!await Promise.race([exited.then(()=>true),delay(grace).then(()=>false)])) {
@@ -93,7 +98,7 @@ test('the e2e launcher fails when the UI cannot be spawned',{timeout:60_000},asy
   try {
     await cp(fileURLToPath(new URL('test/e2e/host.js',root)),join(copy,'test/e2e/host.js'));
     await symlink(fileURLToPath(new URL('node_modules',root)),join(copy,'node_modules'));
-    await launch({STATEPLANE_E2E_BASE_DATABASE:''},async({exit})=>assert.equal(await exit(),1),{cwd:copy});
+    await launch({STATEPLANE_E2E_BASE_DATABASE:''},async({exit})=>assert.equal(await exit(),1),{cwd:copy,limit:30_000});
   } finally { await rm(copy,{recursive:true,force:true}); }
 });
 
@@ -142,10 +147,11 @@ test('the e2e launcher reports a failed connection or DROP at shutdown instead o
   }
 });
 
-test('the e2e launcher drops a database whose CREATE acknowledgement was lost, or names it for a manual drop',{timeout:120_000},async()=>{
-  for (const dropRefused of [false,true]) {
-    // The reply to CREATE DATABASE is lost after Postgres created it.
-    const faults=[{match:'CREATE DATABASE',after:null,refuse:false},...dropRefused ? [{match:'DROP DATABASE',after:null,refuse:true}] : []];
+test('the e2e launcher drops a database whose CREATE acknowledgement was lost or ended in a FATAL, or names it for a manual drop',{timeout:240_000},async()=>{
+  for (const [reply,dropRefused] of [['lost',false],['lost',true],['FATAL',false],['FATAL',true]]) {
+    // After Postgres created the database, the reply to CREATE DATABASE is lost,
+    // or the server ends the session with a FATAL error instead.
+    const faults=[{match:'CREATE DATABASE',after:null,refuse:false,fatal:reply==='FATAL'},...dropRefused ? [{match:'DROP DATABASE',after:null,refuse:true}] : []];
     const proxy=faultProxy(new URL(url),faults).listen(0,'127.0.0.1');
     await once(proxy,'listening');
     const proxied=new URL(url);
@@ -154,6 +160,7 @@ test('the e2e launcher drops a database whose CREATE acknowledgement was lost, o
       await launch({STATEPLANE_E2E_BASE_DATABASE:proxied.href},async({name,exit,output})=>{
         assert.equal(await exit(),1,output());
         assert.deepEqual(faults,[]);
+        if (reply==='FATAL') assert.match(output(),/idle-session timeout/);
         if (dropRefused) {
           assert.match(output(),new RegExp(`e2e cleanup failed; drop database ${name} by hand`));
           assert.equal(await exists(name),true,'the database was created');
@@ -186,6 +193,38 @@ test('the e2e launcher stopped while a reply stalls exits within Playwright\'s 1
   }
 });
 
+test('the e2e launcher refused CREATE DATABASE for an existing name keeps that database',{timeout:60_000},async()=>{
+  // Another run's database already has this launcher's name.
+  const id=randomUUID().replaceAll('-','');
+  const existing=`stateplane_e2e_${id}`;
+  await admin(`CREATE DATABASE ${existing}`);
+  try {
+    await launch({STATEPLANE_E2E_TEST_DATABASE_ID:id},async({exit,output})=>{
+      assert.equal(await exit(),1,output());
+      assert.match(output(),/already exists/);
+      assert.doesNotMatch(output(),/drop database/);
+    },{limit:30_000});
+    assert.equal(await exists(existing),true,'the existing database is kept');
+  } finally { await admin(`DROP DATABASE IF EXISTS ${existing} WITH (FORCE)`); }
+});
+
+test('the launcher ends only the session that ran its CREATE, not a later one with the same pid',{timeout:30_000},async()=>{
+  const client=new pg.Client({connectionString:url});
+  client.on('error',()=>{});
+  await client.connect();
+  const control=new pg.Client({connectionString:url});
+  await control.connect();
+  try {
+    const session=await sessionOf(client);
+    // The CREATE's session ended and a later session reused its pid.
+    assert.equal(await endSession(control,{pid:session.pid,started:String(Number(session.started)-60)}),true);
+    assert.deepEqual((await client.query('SELECT 1 AS alive')).rows,[{alive:1}],'the later session is untouched');
+    assert.equal(await endSession(control,session),true);
+    await assert.rejects(client.query('SELECT 1'),'the CREATE session is ended');
+    assert.equal((await control.query('SELECT count(*)::int AS n FROM pg_stat_activity WHERE pid=$1',[session.pid])).rows[0].n,0);
+  } finally { await control.end(); await client.end().catch(()=>{}); }
+});
+
 test('a launcher test drops only its own database',{timeout:60_000},async()=>{
   const foreign=`stateplane_e2e_${randomUUID().replaceAll('-','')}`;
   try {
@@ -193,23 +232,27 @@ test('a launcher test drops only its own database',{timeout:60_000},async()=>{
       assert.ok(await created(name));
       // Another run's database appears while this launcher runs.
       await admin(`CREATE DATABASE ${foreign}`);
-    });
+    },{limit:30_000});
     assert.equal(await exists(foreign),true,'the other run keeps its database');
   } finally { await admin(`DROP DATABASE IF EXISTS ${foreign} WITH (FORCE)`); }
 });
 
-test('a failed or stuck launcher test still kills the launcher and drops its database',{timeout:60_000},async()=>{
-  let database;
-  let pid;
-  await assert.rejects(launch({STATEPLANE_E2E_TEST_STARTUP_DELAY_MS:'60000'},async({launcher,name})=>{
-    database=await created(name);
-    pid=launcher.pid;
-    // A stopped launcher cannot handle SIGTERM, so only the forced path can end it.
-    process.kill(pid,'SIGSTOP');
-    assert.fail('a failing assertion');
-  },{grace:2_000}),/a failing assertion/);
-  assert.ok(database && !await exists(database),'the disposable database is dropped');
-  assert.throws(()=>process.kill(pid,0),{code:'ESRCH'});
+test('a failed, stuck or never-finishing launcher test still kills the launcher and drops its database',{timeout:90_000},async()=>{
+  for (const ending of ['fails','never finishes']) {
+    let database;
+    let pid;
+    await assert.rejects(launch({STATEPLANE_E2E_TEST_STARTUP_DELAY_MS:'60000'},async({launcher,name})=>{
+      database=await created(name);
+      pid=launcher.pid;
+      // A stopped launcher cannot handle SIGTERM, so only the forced path can end it.
+      process.kill(pid,'SIGSTOP');
+      if (ending==='fails') assert.fail('a failing assertion');
+      // A database call or fetch that never answers.
+      await new Promise(()=>{});
+    },{grace:2_000,limit:10_000}),ending==='fails' ? /a failing assertion/ : /did not finish in 10000 ms/);
+    assert.ok(database && !await exists(database),`${ending}: the disposable database is dropped`);
+    assert.throws(()=>process.kill(pid,0),{code:'ESRCH'},ending);
+  }
 });
 
 test('only a database reached without TLS goes through the fault proxy',()=>{
