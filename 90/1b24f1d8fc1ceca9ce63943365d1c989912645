@@ -1,0 +1,23 @@
+test/integration/e2e-launcher.test.js
+  s_304323feac4423::t_23a39390350c71 166-188,263-279
+test/ui-shell.test.ts
+  s_304323feac4423::t_bc93ed20b50811 6-7,17-20,22,46-63
+test/e2e/host.js
+  s_304323feac4423::t_a93468a6d248e3 23-24,34-44,49,52,54,58,62-67,69-70,88-90,93-94,116,121,174-184,200-201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "901b24f1d8fc1ceca9ce63943365d1c989912645",
+  "prompts": {},
+  "sessions": {
+    "s_304323feac4423": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8115278-90ea-4ee2-8489-294b52637f0c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
