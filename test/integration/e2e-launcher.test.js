@@ -163,6 +163,29 @@ test('the e2e launcher drops a database whose CREATE acknowledgement was lost, o
   }
 });
 
+test('the e2e launcher stopped while a reply stalls exits within Playwright\'s 15 s, dropping its database or naming it',{timeout:180_000},async()=>{
+  for (const stall of ['CREATE','CREATE and DROP','CREATE and DROP, then a second signal']) {
+    // Postgres acts on each held message, but its reply never arrives and no socket closes.
+    const faults=[{match:'CREATE DATABASE',hold:true},...stall==='CREATE' ? [] : [{match:'DROP DATABASE',hold:true}]];
+    const proxy=faultProxy(new URL(url),faults).listen(0,'127.0.0.1');
+    await once(proxy,'listening');
+    const proxied=new URL(url);
+    proxied.port=String(proxy.address().port);
+    try {
+      await launch({STATEPLANE_E2E_BASE_DATABASE:proxied.href},async({launcher,name,exit,output})=>{
+        assert.ok(await created(name),'Postgres created the database');
+        const stopped=Date.now();
+        launcher.kill('SIGTERM');
+        if (stall.endsWith('second signal')) { await delay(4_000); launcher.kill('SIGTERM'); }
+        assert.equal(await exit(15_000),1,output());
+        assert.ok(Date.now()-stopped<(stall.endsWith('second signal') ? 10_000 : 15_000),stall);
+        if (stall==='CREATE') assert.equal(await exists(name),false,'the database is dropped');
+        else assert.match(output(),new RegExp(`e2e cleanup failed; drop database ${name} by hand`),stall);
+      });
+    } finally { proxy.close(); }
+  }
+});
+
 test('a launcher test drops only its own database',{timeout:60_000},async()=>{
   const foreign=`stateplane_e2e_${randomUUID().replaceAll('-','')}`;
   try {
@@ -236,4 +259,21 @@ test('a fault matches whole protocol messages however TCP splits its markers',{t
       assert.deepEqual(received,refuse ? Buffer.concat(sent.slice(0,3)) : Buffer.concat(sent),refuse ? 'refused before the database' : 'sent, then its reply dropped');
     } finally { proxy.close(); upstream.close(); }
   }
+});
+
+test('the fault proxy reaches a database at an IPv6 address',{timeout:30_000},async t=>{
+  const upstream=net.createServer(socket=>socket.write('ok'));
+  try {
+    upstream.listen(0,'::1');
+    await once(upstream,'listening');
+  } catch { return t.skip('no IPv6 loopback'); }
+  const proxy=faultProxy(new URL(`postgres://[::1]:${upstream.address().port}/db`),[]).listen(0,'127.0.0.1');
+  await once(proxy,'listening');
+  try {
+    const client=net.connect(proxy.address().port,'127.0.0.1');
+    client.on('error',()=>{});
+    const reply=await Promise.race([once(client,'data').then(([chunk])=>String(chunk)),once(client,'close').then(()=>'closed')]);
+    client.destroy();
+    assert.equal(reply,'ok');
+  } finally { proxy.close(); upstream.close(); }
 });

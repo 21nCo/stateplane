@@ -20,6 +20,8 @@ const base=process.env.STATEPLANE_E2E_BASE_DATABASE;
 const faultPort=5744;
 let url;
 let created=false;
+// The backend running CREATE DATABASE until its outcome is known.
+let creator;
 // The running child (migration, then the UI) and a promise that settles once
 // it has ended, whether it exited or was signalled.
 let child;
@@ -29,32 +31,43 @@ let control;
 let stopping=false;
 let startup;
 const halted=new AbortController();
-/** Shutdown waits for startup to settle; startup opens nothing once shutdown
- * has begun, so every child is killed and awaited before the DROP. The exit
- * status is the first failure: startup, the UI's own exit or the cleanup. */
+const within=(promise,ms)=>Promise.race([promise.then(()=>true,()=>true),delay(ms).then(()=>false)]);
+/** Exit 1, naming the database if it may exist and was not dropped. */
+function abandon(reason) {
+  if (created) console.error(`e2e cleanup failed; drop database ${url.pathname.slice(1)} by hand:`,reason);
+  process.exit(1);
+}
+/** Shutdown waits a bounded time for startup to settle; startup opens nothing
+ * once shutdown has begun, so every child is killed and awaited before the
+ * DROP. Playwright kills this process 15 s after SIGTERM, so a step that
+ * stalls ends in a named database before then. The exit status is the first
+ * failure: startup, the UI's own exit or the cleanup. */
 async function stop(code=0) {
   if (stopping) return;
   stopping=true;
   halted.abort();
+  setTimeout(()=>abandon('cleanup did not finish in time'),12_000);
   try {
     child?.kill('SIGTERM');
-    await startup?.catch(()=>{});
+    if (!await within(startup ?? Promise.resolve(),3_000)) { console.error('e2e startup did not finish'); code||=1; }
     child?.kill('SIGTERM');
-    await ended;
+    if (child && !await within(ended,3_000)) { child.kill('SIGKILL'); await ended; }
     server?.close();
     control?.close();
     if (created) {
-      const admin=new pg.Client({connectionString:base,connectionTimeoutMillis:10_000});
+      const admin=new pg.Client({connectionString:base,connectionTimeoutMillis:5_000});
       // A lost connection also rejects the pending call, which reports it.
       admin.on('error',()=>{});
       await admin.connect();
-      try { await admin.query(`DROP DATABASE IF EXISTS ${url.pathname.slice(1)} WITH (FORCE)`); }
-      finally { await admin.end(); }
+      try {
+        // An unanswered CREATE may still commit: end its session so the DROP is final.
+        const [session]=creator ? (await admin.query('SELECT pg_terminate_backend(pid,3000) AS ended FROM pg_stat_activity WHERE pid=$1',[creator])).rows : [];
+        if (session && !session.ended) throw new Error('the CREATE DATABASE session did not end');
+        await admin.query(`DROP DATABASE IF EXISTS ${url.pathname.slice(1)} WITH (FORCE)`);
+      } finally { await admin.end(); }
     }
-  } catch (error) {
-    console.error(`e2e cleanup failed; drop database ${url?.pathname.slice(1)} by hand:`,error.message || error.code);
-    code||=1;
-  } finally { process.exit(code); }
+  } catch (error) { abandon(error.message || error.code); }
+  process.exit(code);
 }
 function run(args,options) {
   child=spawn(process.execPath,args,{stdio:'inherit',...options});
@@ -72,10 +85,13 @@ export const plaintext=(target,env=process.env)=>[...target.searchParams].every(
  * (or at once), the reply to the next message containing `match` is dropped and
  * both sockets close, as when a connection fails after the database acted. A
  * `refuse` fault closes them before that message is sent, so the database never
- * acts. Markers match whole protocol messages, however TCP splits them. */
+ * acts. A `hold` fault keeps both sockets open and discards every later reply,
+ * as when a connection stalls. Markers match whole protocol messages, however
+ * TCP splits them. */
 export function faultProxy(target,faults) {
   return net.createServer(client=>{
-    const upstream=net.connect(Number(target.port || 5432),target.hostname);
+    // URL.hostname keeps an IPv6 address in brackets; net.connect takes it bare.
+    const upstream=net.connect(Number(target.port || 5432),target.hostname.replace(/^\[(.*)\]$/,'$1'));
     let seen=null;
     let drop=false;
     // The startup message (or an SSL or GSSAPI request before it) has no type byte.
@@ -97,12 +113,12 @@ export function faultProxy(target,faults) {
         if (fault && seen===fault && text.includes(fault.match)) {
           faults.shift();
           if (fault.refuse) return close();
-          drop=true;
+          drop=fault.hold ? 'hold' : true;
         }
         upstream.write(message);
       }
     });
-    upstream.on('data',chunk=>{ if (drop) close(); else client.write(chunk); });
+    upstream.on('data',chunk=>{ if (drop==='hold') return; if (drop) close(); else client.write(chunk); });
     for (const socket of [client,upstream]) { socket.on('error',close); socket.on('close',close); }
   });
 }
@@ -155,11 +171,17 @@ async function start() {
     const admin=new pg.Client({connectionString:base});
     admin.on('error',()=>{});
     await admin.connect();
-    // Once CREATE is sent the database may exist, unless Postgres refused it.
-    created=true;
-    try { await admin.query(`CREATE DATABASE ${url.pathname.slice(1)}`); }
-    catch (error) { if (error.severity) created=false; throw error; }
-    finally { await admin.end(); }
+    try {
+      if (stopping) return;
+      // Once CREATE is sent the database may exist, unless Postgres refused it.
+      created=true;
+      creator=admin.processID;
+      await admin.query(`CREATE DATABASE ${url.pathname.slice(1)}`);
+      creator=undefined;
+    } catch (error) {
+      if (error.severity) { created=false; creator=undefined; }
+      throw error;
+    } finally { await admin.end(); }
     // Test-only: hold startup here so a launcher test can signal mid-startup.
     await delay(Number(process.env.STATEPLANE_E2E_TEST_STARTUP_DELAY_MS ?? 0),undefined,{signal:halted.signal});
     if (stopping) return;
@@ -175,8 +197,8 @@ async function start() {
 }
 // import.meta.url is a real path; the script may be run through a symlink.
 if (process.argv[1] && realpathSync(process.argv[1])===fileURLToPath(import.meta.url)) {
-  // A second signal during cleanup exits at once.
-  for (const signal of ['SIGTERM','SIGINT']) process.on(signal,()=>{ if (stopping) process.exit(1); void stop(); });
+  // A second signal during cleanup exits at once, naming the database.
+  for (const signal of ['SIGTERM','SIGINT']) process.on(signal,()=>{ if (stopping) abandon(`second ${signal}`); void stop(); });
   startup=start();
   startup.catch(error=>{ if (!stopping) console.error(error); void stop(1); });
 }
