@@ -1,0 +1,89 @@
+.github/workflows/ci.yml
+  s_e1c5fc1a65c0cf::t_51ca07ca653653 28-29
+README.md
+  s_e1c5fc1a65c0cf::t_5d462fa57dfb7e 5,41
+app/src/app.css
+  s_e1c5fc1a65c0cf::t_f54518a00f1bfd 2-78
+app/src/app.d.ts
+  s_e1c5fc1a65c0cf::t_eb843e6ebe0e33 3-4,19
+app/src/app.html
+  s_e1c5fc1a65c0cf::t_5e0904b2f81353 2
+app/src/lib/components/Notice.svelte
+  s_e1c5fc1a65c0cf::t_c88fdeabf6e3b1 1-19
+app/src/lib/components/Restart.svelte
+  s_e1c5fc1a65c0cf::t_905b20fcae0b5a 1-9
+app/src/lib/components/Scroll.svelte
+  s_e1c5fc1a65c0cf::t_ed3fe908cc5d36 1-7
+app/src/lib/components/Status.svelte
+  s_e1c5fc1a65c0cf::t_489736df607df1 1-6
+app/src/lib/errors.ts
+  s_e1c5fc1a65c0cf::t_ffe82096da2ca1 1-44
+app/src/lib/paths.ts
+  s_e1c5fc1a65c0cf::t_1f4733a28649fa 1-30
+app/src/lib/server/api.ts
+  s_e1c5fc1a65c0cf::t_b21cf6cda10197 1-73
+app/src/lib/server/receipts.ts
+  s_e1c5fc1a65c0cf::t_a3502767c4802d 1-31
+app/src/lib/types.ts
+  s_e1c5fc1a65c0cf::t_dbf64cca0da09d 1-20
+app/src/routes/+error.svelte
+  s_e1c5fc1a65c0cf::t_d4977d962ea77b 1-7
+app/src/routes/+layout.server.ts
+  s_e1c5fc1a65c0cf::t_9e6b55a981b3e7 1-4
+app/src/routes/+layout.svelte
+  s_e1c5fc1a65c0cf::t_2889dfdb14468b 3,6-15
+app/src/routes/+page.server.ts
+  s_e1c5fc1a65c0cf::t_704314b907d236 1-18
+app/src/routes/+page.svelte
+  s_e1c5fc1a65c0cf::t_d87db5a9a341e9 1-20
+app/src/routes/signout/+server.ts
+  s_e1c5fc1a65c0cf::t_5405788703b55e 1-6
+app/svelte.config.js
+  s_e1c5fc1a65c0cf::t_86c5517bc34377 4-8
+docs/ui.md
+  s_e1c5fc1a65c0cf::t_1eff2430ee26fc 1-28
+package.json
+  s_e1c5fc1a65c0cf::t_323632f908c7f8 12,18,46
+playwright.config.ts
+  s_e1c5fc1a65c0cf::t_3c21a051a2e7df 1-2,5-17,20-29
+pnpm-lock.yaml
+  s_e1c5fc1a65c0cf::t_fc867d0115e5d7 20-22,370-374,1467-1470,2992-2996,3989-3990
+test/e2e/foundation.spec.ts
+  s_e1c5fc1a65c0cf::t_41cfe074d2e220 12-19
+test/e2e/host.js
+  s_e1c5fc1a65c0cf::t_64e14999fe3d13 1-175
+test/integration/e2e-launcher.test.js
+  s_e1c5fc1a65c0cf::t_a9011fc5c65e0e 1-209
+test/ui-shell.config.ts
+  s_e1c5fc1a65c0cf::t_5d12f51ce66df2 1-3
+test/ui-shell.test.ts
+  s_e1c5fc1a65c0cf::t_8647148638d26c 1-25
+app/src/hooks.server.ts
+  s_92427ff18a8304::t_0e4012cc61bf72 1-25
+app/src/lib/server/host.ts
+  s_92427ff18a8304::t_3e31964da73c07 1,9,25-67,110-115,178-179,194-195,198-200,203-208,210,258-261
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "080417ffdc5cae3e590ec8ccdc6fa503dfe17c9a",
+  "prompts": {},
+  "sessions": {
+    "s_92427ff18a8304": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26336501-b0e6-4534-a7c2-345f5528a4ba",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_e1c5fc1a65c0cf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a13e18-4241-7662-a24f-782076addabe",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
