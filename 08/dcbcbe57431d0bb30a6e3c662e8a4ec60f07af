@@ -1,0 +1,21 @@
+test/e2e/host.js
+  s_1900bb15a7199a::t_4343cabf066bae 23,64,71-81,92,99-101,107-108,128,133-141,145-151,202-203,207,211-215
+test/integration/e2e-launcher.test.js
+  s_1900bb15a7199a::t_e2549d63b57279 13,20,40-43,52-54,56,101,150-154,163,196-227,235,240-255
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "08dcbcbe57431d0bb30a6e3c662e8a4ec60f07af",
+  "prompts": {},
+  "sessions": {
+    "s_1900bb15a7199a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e049926-ee38-44b5-a734-8c7117ee5ff7",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
