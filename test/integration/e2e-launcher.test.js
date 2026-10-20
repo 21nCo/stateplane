@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { cp, mkdtemp, readFile, rm, symlink } from 'node:fs/promises';
 import net from 'node:net';
@@ -15,38 +16,38 @@ const password=process.env.DATABASE_URL?null:(await readFile(new URL('../../.dat
 const url=process.env.DATABASE_URL??`postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT??'55432'}/stateplane`;
 const root=new URL('../..',import.meta.url);
 
-async function disposable() {
+async function admin(sql,values) {
   const client=new pg.Client({connectionString:url});
   await client.connect();
-  try {
-    return (await client.query(`SELECT datname FROM pg_database WHERE datname LIKE 'stateplane\\_e2e\\_%'`)).rows.map(row=>row.datname);
-  } finally { await client.end(); }
+  try { return (await client.query(sql,values)).rows; }
+  finally { await client.end(); }
 }
+const exists=async name=>(await admin('SELECT 1 FROM pg_database WHERE datname=$1',[name])).length>0;
 const descendants=pid=>{
   let found='';
   try { found=execFileSync('pgrep',['-P',String(pid)],{encoding:'utf8'}); } catch { /* none */ }
   return found.split('\n').filter(Boolean).flatMap(child=>[...descendants(child),Number(child)]);
 };
-async function createdSince(before) {
+async function created(name) {
   for (let waited=0;waited<30_000;waited+=50) {
-    const created=(await disposable()).find(name=>!before.has(name));
-    if (created) return created;
+    if (await exists(name)) return name;
     await delay(50);
   }
 }
 
-/** Run one launcher. However the body ends, the launcher is stopped as
- * Playwright stops it; one that does not exit within `grace` is killed with its
- * children, and every database created since it started is dropped. */
+/** Run one launcher with a database name of its own. However the body ends, the
+ * launcher is stopped as Playwright stops it; one that does not exit within
+ * `grace` is killed with its children, and its database, and no other, is dropped. */
 async function launch(env,body,{grace=20_000,script='test/e2e/host.js',cwd=root}={}) {
-  const before=new Set(await disposable());
+  const id=randomUUID().replaceAll('-','');
+  const name=`stateplane_e2e_${id}`;
   const launcher=spawn(process.execPath,[script],{cwd,stdio:['ignore','pipe','pipe'],
-    env:{...process.env,STATEPLANE_E2E_BASE_DATABASE:url,...env}});
+    env:{...process.env,STATEPLANE_E2E_BASE_DATABASE:url,STATEPLANE_E2E_TEST_DATABASE_ID:id,...env}});
   let output='';
   for (const stream of [launcher.stdout,launcher.stderr]) stream.on('data',chunk=>{ output+=chunk; });
   const exited=once(launcher,'exit');
   const exit=async(ms=30_000)=>(await Promise.race([exited,delay(ms).then(()=>{ throw new Error('launcher did not exit'); })]))[0];
-  try { return await body({launcher,before,exit,output:()=>output}); }
+  try { return await body({launcher,name,exit,output:()=>output}); }
   finally {
     if (launcher.exitCode===null && launcher.signalCode===null) {
       launcher.kill('SIGTERM');
@@ -56,24 +57,21 @@ async function launch(env,body,{grace=20_000,script='test/e2e/host.js',cwd=root}
         await exited;
       }
     }
-    const admin=new pg.Client({connectionString:url});
-    await admin.connect();
-    try { for (const name of (await disposable()).filter(name=>!before.has(name))) await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`); }
-    finally { await admin.end(); }
+    await admin(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
   }
 }
 const healthy=async()=>(await fetch('http://127.0.0.1:5743/api/health').catch(()=>null))?.ok===true;
 
 test('the e2e launcher drops its database and fails when the UI process dies from a signal',{timeout:120_000},async()=>{
-  await launch({},async({launcher,before,exit})=>{
-    const created=await createdSince(before);
+  await launch({},async({launcher,name,exit})=>{
+    const database=await created(name);
     // Once the UI answers, migration has finished and the UI is the only child.
     for (let waited=0;!await healthy() && waited<90_000;waited+=250) await delay(250);
     const ui=Number(execFileSync('pgrep',['-P',String(launcher.pid)],{encoding:'utf8'}).trim());
-    assert.ok(created && ui,'the launcher created a database and started the UI');
+    assert.ok(database && ui,'the launcher created a database and started the UI');
     process.kill(ui,'SIGKILL');
     assert.equal(await exit(),1,'a UI that died on its own is a failed run');
-    assert.ok(!(await disposable()).includes(created),'the disposable database is dropped');
+    assert.ok(!await exists(name),'the disposable database is dropped');
   });
 });
 
@@ -81,10 +79,10 @@ test('the e2e launcher fails with the UI exit status when the UI cannot start, a
   const taken=net.createServer().listen(5743,'127.0.0.1');
   await once(taken,'listening');
   try {
-    await launch({},async({before,exit,output})=>{
-      const created=await createdSince(before);
+    await launch({},async({name,exit,output})=>{
+      const database=await created(name);
       assert.equal(await exit(90_000),1,output());
-      assert.ok(created && !(await disposable()).includes(created),'the disposable database is dropped');
+      assert.ok(database && !await exists(name),'the disposable database is dropped');
     });
   } finally { taken.close(); }
 });
@@ -103,20 +101,19 @@ test('the e2e launcher drops its database when its control port is taken',{timeo
   const taken=net.createServer().listen(5744,'127.0.0.1');
   await once(taken,'listening');
   try {
-    await launch({},async({before,exit})=>{
+    await launch({},async({name,exit})=>{
       assert.equal(await exit(90_000),1);
-      assert.deepEqual((await disposable()).filter(name=>!before.has(name)),[],'no disposable database is left');
+      assert.equal(await exists(name),false,'no disposable database is left');
     });
   } finally { taken.close(); }
 });
 
 test('the e2e launcher stopped during startup starts nothing and drops its database',{timeout:120_000},async()=>{
-  await launch({STATEPLANE_E2E_TEST_STARTUP_DELAY_MS:'60000'},async({launcher,before,exit,output})=>{
-    const created=await createdSince(before);
-    assert.ok(created,'the launcher created a database');
+  await launch({STATEPLANE_E2E_TEST_STARTUP_DELAY_MS:'60000'},async({launcher,name,exit,output})=>{
+    assert.ok(await created(name),'the launcher created a database');
     launcher.kill('SIGTERM');
     assert.equal(await exit(),0);
-    assert.ok(!(await disposable()).includes(created),'the disposable database is dropped');
+    assert.ok(!await exists(name),'the disposable database is dropped');
     // Startup ran no further step once shutdown began, so no migration or UI was started.
     assert.doesNotMatch(output(),/Applied /);
     await delay(5_000);
@@ -133,29 +130,62 @@ test('the e2e launcher reports a failed connection or DROP at shutdown instead o
     const proxied=new URL(url);
     proxied.port=String(proxy.address().port);
     try {
-      await launch({STATEPLANE_E2E_BASE_DATABASE:proxied.href,STATEPLANE_E2E_TEST_STARTUP_DELAY_MS:'60000'},async({launcher,before,exit,output})=>{
-        const created=await createdSince(before);
+      await launch({STATEPLANE_E2E_BASE_DATABASE:proxied.href,STATEPLANE_E2E_TEST_STARTUP_DELAY_MS:'60000'},async({launcher,name,exit,output})=>{
+        await created(name);
         if (failure==='refuse DROP') faults.push({match:'DROP DATABASE',after:null,refuse:true});
         else proxy.close();
         launcher.kill('SIGTERM');
         assert.equal(await exit(),1,failure);
-        assert.match(output(),new RegExp(`e2e cleanup failed; drop database ${created} by hand`),failure);
+        assert.match(output(),new RegExp(`e2e cleanup failed; drop database ${name} by hand`),failure);
       });
     } finally { proxy.close(); }
   }
 });
 
+test('the e2e launcher drops a database whose CREATE acknowledgement was lost, or names it for a manual drop',{timeout:120_000},async()=>{
+  for (const dropRefused of [false,true]) {
+    // The reply to CREATE DATABASE is lost after Postgres created it.
+    const faults=[{match:'CREATE DATABASE',after:null,refuse:false},...dropRefused ? [{match:'DROP DATABASE',after:null,refuse:true}] : []];
+    const proxy=faultProxy(new URL(url),faults).listen(0,'127.0.0.1');
+    await once(proxy,'listening');
+    const proxied=new URL(url);
+    proxied.port=String(proxy.address().port);
+    try {
+      await launch({STATEPLANE_E2E_BASE_DATABASE:proxied.href},async({name,exit,output})=>{
+        assert.equal(await exit(),1,output());
+        assert.deepEqual(faults,[]);
+        if (dropRefused) {
+          assert.match(output(),new RegExp(`e2e cleanup failed; drop database ${name} by hand`));
+          assert.equal(await exists(name),true,'the database was created');
+        } else assert.equal(await exists(name),false,'the database is dropped');
+      });
+    } finally { proxy.close(); }
+  }
+});
+
+test('a launcher test drops only its own database',{timeout:60_000},async()=>{
+  const foreign=`stateplane_e2e_${randomUUID().replaceAll('-','')}`;
+  try {
+    await launch({STATEPLANE_E2E_TEST_STARTUP_DELAY_MS:'60000'},async({name})=>{
+      assert.ok(await created(name));
+      // Another run's database appears while this launcher runs.
+      await admin(`CREATE DATABASE ${foreign}`);
+    });
+    assert.equal(await exists(foreign),true,'the other run keeps its database');
+  } finally { await admin(`DROP DATABASE IF EXISTS ${foreign} WITH (FORCE)`); }
+});
+
 test('a failed or stuck launcher test still kills the launcher and drops its database',{timeout:60_000},async()=>{
-  let created;
+  let database;
   let pid;
-  await assert.rejects(launch({STATEPLANE_E2E_TEST_STARTUP_DELAY_MS:'60000'},async({launcher,before})=>{
-    created=await createdSince(before);
+  await assert.rejects(launch({STATEPLANE_E2E_TEST_STARTUP_DELAY_MS:'60000'},async({launcher,name})=>{
+    database=await created(name);
     pid=launcher.pid;
     // A stopped launcher cannot handle SIGTERM, so only the forced path can end it.
     process.kill(pid,'SIGSTOP');
     assert.fail('a failing assertion');
   },{grace:2_000}),/a failing assertion/);
-  assert.ok(created && !(await disposable()).includes(created),'the disposable database is dropped');
+  assert.ok(database && !await exists(database),'the disposable database is dropped');
   assert.throws(()=>process.kill(pid,0),{code:'ESRCH'});
 });
 

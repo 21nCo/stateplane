@@ -23,3 +23,21 @@ it('a Worker host without a key provider refuses issuance and revocation with a 
     expect(classifyError(await attempt.catch((error: unknown) => error), false)).toEqual({ code: 'PROVIDER_UNAVAILABLE', retryable: false });
   expect(await provider.find('owner', 'iss_1')).toBeNull();
 });
+
+it('a page request without a session goes to sign-in as a document, data, remote or form action request, however its path is encoded', async () => {
+  const { isRedirect } = await import('../app/node_modules/@sveltejs/kit');
+  const { handle } = await import('../app/src/hooks.server');
+  const request = (path: string, init: { method?: string; isDataRequest?: boolean; isRemoteRequest?: boolean } = {}) => handle({
+    event: { url: new URL(path, 'http://127.0.0.1'), request: new Request(new URL(path, 'http://127.0.0.1'), { method: init.method ?? 'GET' }),
+      cookies: { get: () => undefined }, locals: {}, isDataRequest: init.isDataRequest ?? false, isRemoteRequest: init.isRemoteRequest ?? false },
+    resolve: async () => new Response('page')
+  } as never);
+  for (const path of ['/spaces', '/%73paces/s1']) {
+    const document = await request(path);
+    expect([document.status, document.headers.get('location'), document.headers.get('cache-control')]).toEqual([303, '/', 'no-store']);
+  }
+  // SvelteKit turns a thrown redirect into the JSON redirect each of these clients follows.
+  for (const init of [{ isDataRequest: true }, { isRemoteRequest: true }, { method: 'POST' }])
+    expect(await request('/spaces/s1', init).then(() => null, (error: unknown) => isRedirect(error) && [error.status, error.location])).toEqual([303, '/']);
+  expect(await (await request('/%2Fspaces')).text()).toBe('page');
+});

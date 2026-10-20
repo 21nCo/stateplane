@@ -147,14 +147,19 @@ async function proxy(target) {
 async function start() {
   let databaseUrl;
   if (base) {
+    // A launcher test names the database, so that it cleans up only its own.
+    const id=process.env.STATEPLANE_E2E_TEST_DATABASE_ID ?? randomUUID().replaceAll('-','');
+    if (!/^[a-z0-9]+$/.test(id)) throw new Error('the database id is lowercase letters and digits');
     url=new URL(base);
-    url.pathname=`/stateplane_e2e_${randomUUID().replaceAll('-','')}`;
+    url.pathname=`/stateplane_e2e_${id}`;
     const admin=new pg.Client({connectionString:base});
+    admin.on('error',()=>{});
     await admin.connect();
-    try {
-      await admin.query(`CREATE DATABASE ${url.pathname.slice(1)}`);
-      created=true;
-    } finally { await admin.end(); }
+    // Once CREATE is sent the database may exist, unless Postgres refused it.
+    created=true;
+    try { await admin.query(`CREATE DATABASE ${url.pathname.slice(1)}`); }
+    catch (error) { if (error.severity) created=false; throw error; }
+    finally { await admin.end(); }
     // Test-only: hold startup here so a launcher test can signal mid-startup.
     await delay(Number(process.env.STATEPLANE_E2E_TEST_STARTUP_DELAY_MS ?? 0),undefined,{signal:halted.signal});
     if (stopping) return;

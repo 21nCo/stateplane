@@ -14,6 +14,7 @@ test('a page request without a session goes to sign-in, as a document or as clie
   const document = await request.get('/spaces', { maxRedirects: 0 });
   expect(document.status()).toBe(303);
   expect(document.headers().location).toBe('/');
+  expect((await request.get('/%73paces', { maxRedirects: 0 })).status()).toBe(303);
   const data = await request.get('/spaces/__data.json', { maxRedirects: 0 });
   expect(await data.json()).toEqual({ type: 'redirect', location: '/' });
 });
