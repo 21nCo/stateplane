@@ -9,8 +9,12 @@ const deployed = process.env.STATEPLANE_E2E_BASE_URL;
 const passwordFile = '.data/local-db-password';
 const database = process.env.DATABASE_URL ?? (existsSync(passwordFile) ?
   `postgres://stateplane:${encodeURIComponent(readFileSync(passwordFile, 'utf8').trim())}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT ?? '55432'}/stateplane` : undefined);
+// Only the local fixture host accepts a generated bearer; a deployed target
+// would reject it, so a run without its owner bearer stops here.
+if (deployed && !process.env.STATEPLANE_E2E_TOKEN)
+  throw new Error('STATEPLANE_E2E_BASE_URL needs the target owner bearer in STATEPLANE_E2E_TOKEN');
 // Workers re-read this file; the runner's values are inherited, so all agree.
-process.env.STATEPLANE_E2E_TOKEN ??= randomBytes(32).toString('hex');
+process.env.STATEPLANE_E2E_TOKEN ||= randomBytes(32).toString('hex');
 // Tests sign a backdated unresolved write with it to stand in for elapsed time.
 process.env.STATEPLANE_E2E_CURSOR_SECRET ??= randomBytes(32).toString('hex');
 if (deployed || database) process.env.STATEPLANE_E2E_STATE = '1';

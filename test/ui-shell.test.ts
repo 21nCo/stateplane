@@ -1,3 +1,5 @@
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { expect, it, vi } from 'vitest';
 import { classifyError } from '../packages/application/dist/index.js';
 
@@ -61,3 +63,14 @@ it('a Worker page render opens one pool for all its API calls and ends it once a
     expect([state.pools - pools, state.ends - ends]).toEqual([1, 1]);
   }
 });
+
+it('a deployed e2e run without its owner bearer stops before any test, and only a local run generates one', async () => {
+  const env = { ...process.env };
+  delete env.STATEPLANE_E2E_TOKEN;
+  delete env.STATEPLANE_E2E_BASE_URL;
+  const list = (extra: Record<string, string>) => promisify(execFile)('node_modules/.bin/playwright', ['test', '--list'], { env: { ...env, ...extra } })
+    .then(() => 'listed', (error: { stderr: string }) => error.stderr);
+  const deployed = { STATEPLANE_E2E_BASE_URL: 'https://stateplane.invalid' };
+  for (const token of [{}, { STATEPLANE_E2E_TOKEN: '' }]) expect(await list({ ...deployed, ...token })).toContain('needs the target owner bearer in STATEPLANE_E2E_TOKEN');
+  expect([await list({ ...deployed, STATEPLANE_E2E_TOKEN: 't'.repeat(64) }), await list({})]).toEqual(['listed', 'listed']);
+}, 60_000);
