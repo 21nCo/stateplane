@@ -73,6 +73,68 @@ paths:
     delete:
       operationId: deleteSpace
       responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/audit:
+    parameters: [ { $ref: '#/components/parameters/spaceId' } ]
+    get:
+      operationId: listSpaceAudit
+      description: Owner session only. Returns {entries,nextCursor} with at most 100 immutable entries per page in recording order; nextCursor is null on the last page and valid only for this space.
+      parameters: [ { name: cursor, in: query, schema: { type: string } } ]
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/agent-keys:
+    parameters: [ { $ref: '#/components/parameters/spaceId' } ]
+    get:
+      operationId: listAgentKeys
+      description: >-
+        Owner session only. Returns {items,nextCursor} with at most 100 keys per
+        page in keyId order. Each item has keyId, status (pending, active,
+        expired or revoked), expiresAt, createdAt, revokedAt, the configured
+        grants (collectionId, capabilities, expiresAt; expired grants are
+        included) and providerRevokedAt, which stays null after revocation until
+        provider cleanup completes. Secrets are never returned. nextCursor is
+        null on the last page and valid only for this space. Pages are not a
+        snapshot; restart enumeration to observe keys issued meanwhile.
+      parameters: [ { name: cursor, in: query, schema: { type: string } } ]
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+    post:
+      operationId: issueAgentKey
+      description: >-
+        Owner session only. Returns keyId, secret and expiresAt once. Expiry
+        values are RFC 3339 date-times with any offset or fraction, normalized to
+        UTC milliseconds by truncation; the returned expiresAt is that value.
+        After normalization the year must be 0000-9999, the key expiry must be
+        in the future and no grant may expire after its key. Second 60 is
+        accepted only as 23:59:60 UTC on a known leap-second date and becomes
+        23:59:59.999Z. An uncertain
+        completion returns COMMIT_OUTCOME_UNKNOWN; list keys and revoke any
+        unaccounted key instead of retrying blindly.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expiresAt, grants]
+              properties:
+                expiresAt: { type: string, format: date-time }
+                grants:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [collectionId, capabilities]
+                    properties:
+                      collectionId: { type: string }
+                      capabilities: { type: array, minItems: 1, items: { type: string } }
+                      expiresAt: { type: string, format: date-time }
+      responses: { '201': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/agent-keys/{keyId}:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { name: keyId, in: path, required: true, schema: { type: string } } ]
+    delete:
+      operationId: revokeAgentKey
+      description: Owner session only. Removes grants locally first, then revokes the provider key; repeat to retry provider cleanup.
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
   /v1/spaces/{spaceId}/collections:
     parameters: [ { $ref: '#/components/parameters/spaceId' } ]
     get:
@@ -150,6 +212,12 @@ paths:
     parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { $ref: '#/components/parameters/recordId' } ]
     get:
       operationId: getProjectionStatus
+      responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/indexes/{field}:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { name: field, in: path, required: true, schema: { type: string } } ]
+    post:
+      operationId: backfillIndex
+      description: Requires the owner or schema:write. Commits at most 100 records per call; returns processed and ready. Repeat until ready.
       responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
   /v1/spaces/{spaceId}/collections/{collectionId}/batches/{operationKey}:
     parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { name: operationKey, in: path, required: true, schema: { type: string } } ]

@@ -73,6 +73,8 @@ including `/` and `\\`. URL parsers remove dot-only path segments, so a selector
 whose entire value is `.` or `..` is sent as `;.` or `;..` respectively. A literal
 leading semicolon is encoded as `%3B`, keeping it distinct from that marker.
 
+Owner sessions can also read the space audit (`GET /v1/spaces/{id}/audit`) and list, issue and revoke agent keys (`/v1/spaces/{id}/agent-keys`). Both return at most 100 entries per page, and listings never include a key secret. An owner or `schema:write` holder advances a pending filter or sort index with `POST …/collections/{id}/indexes/{field}`, at most 100 records per call. Issuance takes RFC 3339 `expiresAt` values for the key and each optional grant, with any offset and fraction; Stateplane stores and returns them as UTC milliseconds, truncating extra fraction digits so an expiry never moves later. An impossible calendar date or time, including a leap second other than 23:59:60 UTC on a known leap-second date, returns `INVALID_ARGUMENT`; an accepted leap second is stored as the last earlier millisecond, 23:59:59.999Z. The CLI does not expose these routes yet.
+
 ## Install the CLI on a clean machine
 
 Use Node 22.13+ and a tarball built from this checkout:

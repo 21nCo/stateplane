@@ -157,16 +157,38 @@ async function dispatch(services:StateplaneServices,actor:VerifiedCredential,req
   const space=p[1];
   if (!space) return fail('NOT_FOUND');
   if (p.length===2) return selectedSpace(services,actor,space,request);
+  if (p[2]==='audit' && p.length===3 && request.method==='GET')
+    return json(await services.spaces.audit(actor,space,singleCursor(url)));
+  if (p[2]==='agent-keys') return agentKeysRoute(services,actor,space,p,request,url);
   if (p[2]!=='collections') return fail('NOT_FOUND');
   if (p.length===3 && request.method==='GET') return collectionDiscovery(services,actor,space,url);
+  return collectionRoute(services,actor,space,p,request,url);
+}
+/** Routes below one selected collection, all admitted under its scope. */
+async function collectionRoute(services:StateplaneServices,actor:VerifiedCredential,space:string,p:string[],
+  request:Request,url:URL):Promise<Response> {
   const collection=p[3];
   if (!collection) return fail('NOT_FOUND');
   if (p.length===4) return selectedCollection(services,actor,space,collection,request);
   const prefix=[actor,space,collection] as const;
   if (p[4]==='records') return recordsRoute(services,p,request,url,prefix);
   if (p[4]==='batches') return batchesRoute(services,p,request,url,prefix);
+  if (p[4]==='indexes' && p.length===6 && request.method==='POST')
+    return json(await services.collections.backfill(...prefix,p[5]));
   if (p[4]==='events' && p.length===5 && request.method==='GET')
     return json(await services.events.list(...prefix,url.searchParams.get('cursor')??undefined));
+  return fail('NOT_FOUND');
+}
+function singleCursor(url:URL):string|undefined {
+  if (url.searchParams.getAll('cursor').length>1) fail('CURSOR_INVALID');
+  return url.searchParams.get('cursor')??undefined;
+}
+/** Owner agent access; the issuance response is the only place a secret appears. */
+async function agentKeysRoute(services:StateplaneServices,actor:VerifiedCredential,space:string,p:string[],
+  request:Request,url:URL):Promise<Response> {
+  if (p.length===3 && request.method==='GET') return json(await services.agents.list(actor,space,singleCursor(url)));
+  if (p.length===3 && request.method==='POST') return json(await services.agents.issue(actor,space,await body(request,16_384)),201);
+  if (p.length===4 && request.method==='DELETE') return json(await services.agents.revoke(actor,space,p[3]));
   return fail('NOT_FOUND');
 }
 async function collectionDiscovery(services:StateplaneServices,actor:VerifiedCredential,space:string,url:URL):Promise<Response> {

@@ -6,6 +6,8 @@ import { AuthorityError, PostgresAuthority } from './index.js';
 import type { AuthorityScope } from './index.js';
 import { CollectionRegistry, discoveryGrants } from './collections.js';
 import { PostgresSpaces } from './spaces.js';
+import { utcInstant } from './schema.js';
+import type { CollectionGrant } from './spaces.js';
 
 export interface ServiceCell { pool: Pick<pg.Pool,'connect'>; cursorSecret: Uint8Array }
 const collectionPageSize=8;
@@ -28,6 +30,54 @@ function discoveryAfter(cursor:string|undefined,spaceId:string,credentialId:stri
 }
 const discoveryCursor=(space:string,credential:string,after:string,secret:Uint8Array):string=>
   Buffer.from(JSON.stringify({space,credential,after,mac:cursorMac(space,credential,after,secret)})).toString('base64url');
+
+// RFC 3339 date-time (OpenAPI format: date-time): seconds required, any fraction, Z or a numeric offset.
+const dateTime=/^(\d{4})-(\d\d)-(\d\d)[Tt](\d\d):(\d\d):(\d\d)(?:\.(\d+))?(?:[Zz]|([+-])(\d\d):(\d\d))$/;
+const monthDays=[31,28,31,30,31,30,31,31,30,31,30,31];
+function calendarFields(year:number,month:number,day:number,hour:number,minute:number,second:number):boolean {
+  const leap=year%4===0 && (year%100!==0 || year%400===0);
+  return month>=1 && month<=12 && day>=1 && day<=(month===2 && leap ? 29 : monthDays[month-1]) &&
+    hour<=23 && minute<=59 && second<=60;
+}
+/** Normalize an RFC 3339 expiry to a UTC millisecond. Extra fraction digits are
+ * truncated, so a normalized expiry is never later than the one requested. */
+const instant=(value:unknown):Date=>{
+  const match=typeof value==='string' ? dateTime.exec(value) : null;
+  if (!match) throw new AuthorityError('INVALID_ARGUMENT');
+  const [year,month,day,hour,minute,second,offsetHour,offsetMinute]=[...match.slice(1,7),...match.slice(9,11)].map(field=>Number(field??0));
+  if (!calendarFields(year,month,day,hour,minute,second) || offsetHour>23 || offsetMinute>59) throw new AuthorityError('INVALID_ARGUMENT');
+  const offset=(match[8]==='-' ? -1 : 1)*(offsetHour*60+offsetMinute);
+  const parsed=new Date(0);
+  parsed.setUTCFullYear(year,month-1,day);
+  // Date cannot represent a leap second, so use its last earlier millisecond.
+  parsed.setUTCHours(hour,minute-offset,Math.min(second,59),second===60 ? 999 : Number((match[7]??'').padEnd(3,'0').slice(0,3)));
+  if (parsed.getUTCFullYear()<0 || parsed.getUTCFullYear()>9999 || (second===60 && !leapSecond(parsed))) throw new AuthorityError('INVALID_ARGUMENT');
+  return parsed;
+};
+/** A leap second is valid only at 23:59:60 UTC on a known leap-second date, as for record date-times. */
+function leapSecond(parsed:Date):boolean {
+  const utc=parsed.toISOString();
+  if (utc.slice(11,19)!=='23:59:59') return false;
+  try { utcInstant(`${utc.slice(0,10)}T23:59:60Z`); return true; } catch { return false; }
+}
+const plain=(value:unknown,keys:readonly string[],required:readonly string[]):Record<string,unknown>=>{
+  if (!value || typeof value!=='object' || Array.isArray(value) ||
+    Object.keys(value).some(key=>!keys.includes(key)) || required.some(key=>!Object.hasOwn(value,key)))
+    throw new AuthorityError('INVALID_ARGUMENT');
+  return value as Record<string,unknown>;
+};
+/** Parse the JSON issuance body; PostgresSpaces validates collections and capabilities. */
+function issueRequest(serialized:string):{expiresAt:Date;grants:CollectionGrant[]} {
+  let parsed:unknown;
+  try { parsed=JSON.parse(serialized); } catch { throw new AuthorityError('INVALID_ARGUMENT'); }
+  const body=plain(parsed,['expiresAt','grants'],['expiresAt','grants']);
+  if (!Array.isArray(body.grants)) throw new AuthorityError('INVALID_ARGUMENT');
+  return {expiresAt:instant(body.expiresAt),grants:body.grants.map(item=>{
+    const grant=plain(item,['collectionId','capabilities','expiresAt'],['collectionId','capabilities']);
+    return {collectionId:grant.collectionId as string,capabilities:grant.capabilities as Capability[],
+      ...(grant.expiresAt===undefined ? {} : {expiresAt:instant(grant.expiresAt)})};
+  })};
+}
 
 /** Composition of the existing authoritative services for HTTP consumers. */
 export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<string,ServiceCell>,
@@ -58,7 +108,17 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
       list:(actor,cursor)=>spaces.listPage(actor,cursor), create:(actor,cellId,spaceId)=>spaces.create(actor,cellId,spaceId),
       get:(actor,id)=>spaces.get(actor,id),
       update:(actor,id,lifecycle)=>spaces.update(actor,id,lifecycle),
-      delete:async(actor,id)=>{ await spaces.delete(actor,id); return {spaceId:id,deleted:true}; }
+      delete:async(actor,id)=>{ await spaces.delete(actor,id); return {spaceId:id,deleted:true}; },
+      audit:(actor,id,cursor)=>spaces.audit(actor,id,cursor)
+    },
+    agents: {
+      list:(actor,spaceId,cursor)=>spaces.agentKeys(actor,spaceId,cursor),
+      issue:async(actor,spaceId,serialized)=>{
+        const {expiresAt,grants}=issueRequest(serialized);
+        const key=await spaces.issueAgentKey(actor,spaceId,expiresAt,grants);
+        return {keyId:key.id,secret:key.secret,expiresAt:expiresAt.toISOString()};
+      },
+      revoke:async(actor,spaceId,keyId)=>{ await spaces.revokeAgentKey(actor,spaceId,keyId); return {keyId,revoked:true}; }
     },
     collections: {
       list:(actor,spaceId,collectionId,cursor)=>admitted(actor,spaceId,undefined,'records:read',async(cell,scope,recheck)=>{
@@ -76,7 +136,9 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
       define:(actor,spaceId,collectionId,serialized)=>admitted(actor,spaceId,collectionId,'schema:write',
         (cell,scope,recheck)=>new CollectionRegistry(cell.pool,recheck).defineSerialized(scope,serialized)),
       revise:(actor,spaceId,collectionId,version,serialized)=>admitted(actor,spaceId,collectionId,'schema:write',
-        (cell,scope,recheck)=>new CollectionRegistry(cell.pool,recheck).reviseSerialized(scope,version,serialized))
+        (cell,scope,recheck)=>new CollectionRegistry(cell.pool,recheck).reviseSerialized(scope,version,serialized)),
+      backfill:(actor,spaceId,collectionId,field)=>admitted(actor,spaceId,collectionId,'schema:write',
+        (cell,scope,recheck)=>new CollectionRegistry(cell.pool,recheck).backfill(scope,field))
     },
     records: {
       get:(actor,spaceId,collectionId,id)=>admitted(actor,spaceId,collectionId,'records:read',

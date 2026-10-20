@@ -41,12 +41,27 @@ class CompletionOutcomeUnknownError extends Error {
 }
 export interface SpaceAuditPage { entries: ReadonlyArray<Record<string, unknown>>; nextCursor: string | null }
 export interface SpacePage { items: ReadonlyArray<SpaceInfo>; cursor: string | null }
+export interface AgentKeySummary {
+  keyId: string; status: 'pending' | 'active' | 'expired' | 'revoked'; expiresAt: string; createdAt: string;
+  revokedAt: string | null; grants: ReadonlyArray<{ collectionId: string; capabilities: Capability[]; expiresAt: string | null }>;
+  /** Null after revocation means provider cleanup is still pending; repeat revocation to finish it. */
+  providerRevokedAt: string | null;
+}
+export interface AgentKeyPage { items: ReadonlyArray<AgentKeySummary>; nextCursor: string | null }
 const spacePageSize = 8;
 const spaceCursorLifetimeMs = 15 * 60_000;
 // Allow a bounded issuing-node clock lead during cross-instance pagination.
 const spaceCursorFutureSkewMs = 60_000;
 /** A fixed cap bounds one owner audit read even when audit history is retained after deletion. */
 const auditPageSize = 100;
+/** Key listings use the same fixed page bound as owner audit reads. */
+const keyPageSize = 100;
+/** Expiries cross SQL as integer epoch milliseconds: host time zones and BC years cannot shift or break them.
+ * Whole days and the sub-day remainder keep interval multiplication within exact float8 integers,
+ * and UTC timestamp arithmetic keeps the session time zone out of the day addition. */
+const fromEpochMs = (param: string) => `(timestamp '1970-01-01'+(${param}::bigint/86400000)*interval '1 day'+
+  (${param}::bigint%86400000)*interval '1 millisecond') AT TIME ZONE 'UTC'`;
+const epochMs = (column: string) => `floor(extract(epoch FROM ${column})*1000)::bigint`;
 const capabilities = new Set<Capability>(['schema:write','records:read','records:write','sources:read','sources:write','claims:read','claims:write','claims:review','events:read','export:read','space:admin']);
 const validId = (id: unknown): id is string => typeof id === 'string' && id.length > 0 && id.length <= 256 && !id.includes('\0');
 function safeVersion(value: unknown): number {
@@ -1175,7 +1190,7 @@ export class PostgresSpaces {
         safeVersion(local.placement_generation) !== space.placementGeneration)
         throw new AuthorityError('STALE_PLACEMENT');
       await db.query(`INSERT INTO space_credentials(space_id,credential_id,principal_id,owner_principal_id,expires_at,activated_at)
-        VALUES($1,$2,$3,$4,$5,NULL)`,[space.spaceId,keyId,`agent_${randomUUID()}`,owner(actor),new Date(expiryMs)]);
+        VALUES($1,$2,$3,$4,${fromEpochMs('$5')},NULL)`,[space.spaceId,keyId,`agent_${randomUUID()}`,owner(actor),expiryMs]);
       await db.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,credential_id,action,policy_version,placement_generation)
         SELECT $1,$2,$3,$4,'key:created-pending',policy_version,placement_generation FROM spaces WHERE space_id=$2`,
       [`aud_${randomUUID()}`,space.spaceId,owner(actor),keyId]);
@@ -1195,7 +1210,7 @@ export class PostgresSpaces {
       for (let index = 0; index < grants.length; index++) {
         const grant = grants[index];
         await db.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities,expires_at)
-          VALUES($1,$2,$3,$4,$5)`,[space.spaceId,grant.collectionId,keyId,grant.capabilities,grant.expiresAt ?? null]);
+          VALUES($1,$2,$3,$4,${fromEpochMs('$5')})`,[space.spaceId,grant.collectionId,keyId,grant.capabilities,grant.expiresAt?.getTime() ?? null]);
         Object.defineProperty(auditGrants,index,{value:{collectionId:grant.collectionId,capabilities:grant.capabilities,
           expiresAt:grant.expiresAt?.toISOString() ?? null},writable:true,enumerable:true,configurable:true});
       }
@@ -1379,12 +1394,41 @@ export class PostgresSpaces {
     await this.revokeAgentKeyInternal(actor,spaceId,oldKeyId,true);
     return this.issueAgentKey(actor,spaceId,expiresAt,grants);
   }
+  /** List key IDs, status and configured grants for the owner. Secrets are never stored. */
+  async agentKeys(actor: VerifiedCredential, spaceId: string, cursor?: string): Promise<AgentKeyPage> {
+    actor = snapshotOwner(actor);
+    if (cursor !== undefined && !validId(cursor)) throw new AuthorityError('CURSOR_INVALID');
+    const space = await this.owned(actor,spaceId);
+    const db = this.cell(space.cellId).pool;
+    // A continuation is a key of this space and owner; another bound would silently skip keys.
+    if (cursor !== undefined && !(await db.query(`SELECT 1 FROM space_credentials
+      WHERE space_id=$1 AND owner_principal_id=$2 AND credential_id=$3`,[spaceId,owner(actor),cursor])).rowCount)
+      throw new AuthorityError('CURSOR_INVALID');
+    // Grants are aggregated once for the selected page, not once per key.
+    const rows = await db.query(`WITH page AS (SELECT * FROM space_credentials
+        WHERE space_id=$1 AND owner_principal_id=$2 AND ($3::text IS NULL OR credential_id>$3) ORDER BY credential_id LIMIT $4),
+      grants AS (SELECT g.credential_id,json_agg(json_build_object('collectionId',g.collection_id,'capabilities',g.capabilities,
+          'expiresAt',${epochMs('g.expires_at')}) ORDER BY g.collection_id) AS grants
+        FROM collection_grants g WHERE g.space_id=$1 AND g.credential_id IN (SELECT credential_id FROM page) GROUP BY g.credential_id)
+      SELECT p.credential_id,${epochMs('p.expires_at')} AS expires_at,${epochMs('p.created_at')} AS created_at,
+        ${epochMs('p.revoked_at')} AS revoked_at,${epochMs('p.provider_revoked_at')} AS provider_revoked_at,
+        CASE WHEN p.revoked_at IS NOT NULL THEN 'revoked' WHEN p.activated_at IS NULL OR p.confirmed_at IS NULL THEN 'pending'
+          WHEN p.expires_at<=clock_timestamp() THEN 'expired' ELSE 'active' END AS status,COALESCE(grants.grants,'[]'::json) AS grants
+      FROM page p LEFT JOIN grants USING (credential_id) ORDER BY p.credential_id`,[spaceId,owner(actor),cursor ?? null,keyPageSize+1]);
+    await this.current(actor);
+    const iso = (ms: unknown) => ms == null ? null : new Date(Number(ms)).toISOString();
+    const items = rows.rows.slice(0,keyPageSize).map(row => ({keyId:row.credential_id,status:row.status,
+      expiresAt:iso(row.expires_at)!,createdAt:iso(row.created_at)!,revokedAt:iso(row.revoked_at),
+      grants:row.grants.map((grant: { expiresAt: unknown }) => ({...grant,expiresAt:iso(grant.expiresAt)})),
+      providerRevokedAt:iso(row.provider_revoked_at)}));
+    return {items,nextCursor:rows.rows.length > keyPageSize ? items.at(-1)!.keyId : null};
+  }
   async audit(actor: VerifiedCredential, spaceId: string, cursor?: string): Promise<SpaceAuditPage> {
     actor = snapshotOwner(actor);
     let after: { recordedAt: string; auditId: string } | undefined;
     if (cursor !== undefined) {
       if (typeof cursor !== 'string' || cursor.length === 0 || cursor.length > 1024 || !/^[A-Za-z0-9_-]+$/.test(cursor)) {
-        throw new AuthorityError('INVALID_ARGUMENT');
+        throw new AuthorityError('CURSOR_INVALID');
       }
       try {
         const decoded: unknown = JSON.parse(Buffer.from(cursor,'base64url').toString('utf8'));
@@ -1397,7 +1441,7 @@ export class PostgresSpaces {
         if (!Number.isFinite(instant) || new Date(instant).toISOString().slice(0,23) !==
           value.recordedAt.slice(0,23)) throw new Error('Invalid cursor');
         after = {recordedAt:value.recordedAt,auditId:value.auditId};
-      } catch { throw new AuthorityError('INVALID_ARGUMENT'); }
+      } catch { throw new AuthorityError('CURSOR_INVALID'); }
     }
     const space = await this.owned(actor,spaceId);
     await this.current(actor);

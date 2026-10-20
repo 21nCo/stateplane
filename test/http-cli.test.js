@@ -9,7 +9,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { platform } from 'node:os';
 import { createHttpHandler } from '../packages/api/dist/index.js';
-import { PostgresSpaces, AuthorityError, AuthorityTransaction } from '../packages/postgres/dist/index.js';
+import { PostgresSpaces, AuthorityError, AuthorityTransaction, postgresServices } from '../packages/postgres/dist/index.js';
 import { StateplaneHttpClient, StateplaneCliError } from '../packages/cli/dist/index.js';
 import { saveToken, loadToken, removeToken, configureToken, removeTrackedTokens,
   saveConfig, withConfigMutation, logoutConfig,
@@ -1598,4 +1598,47 @@ test('HTTP and CLI selected-space retries deny metadata when owner access is rev
   granted=false;
   gate.release();
   assertErrorParity(direct,await cliPending);
+});
+
+test('an uncertain agent key issuance is a nonretryable unknown outcome without the secret',async()=>{
+  const {AgentKeyOutcomeUnknownError}=await import('../packages/postgres/dist/index.js');
+  const services={agents:{issue:async()=>{ throw new AgentKeyOutcomeUnknownError({id:'key-1',secret:'issued-secret'},new Error('lost ack')); }}};
+  const identity={verify:async()=>({kind:'session',userPrincipalId:'owner',credentialId:'session-1'})};
+  const response=await createHttpHandler({services,identity})(new Request('https://stateplane.example.invalid/v1/spaces/sp_a/agent-keys',
+    {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({expiresAt:'2099-01-01T00:00:00Z',grants:[]})}));
+  const text=await response.text();
+  assert.equal(response.status,503);
+  assert.equal(response.headers.get('retry-after'),null);
+  assert.deepEqual({code:JSON.parse(text).error.code,retryable:JSON.parse(text).error.retryable},{code:'COMMIT_OUTCOME_UNKNOWN',retryable:false});
+  assert.ok(!text.includes('issued-secret'));
+});
+
+test('owner audit and index backfill routes reach their services and refuse a duplicate cursor',async()=>{
+  const calls=[],record=result=>async(_actor,...args)=>(calls.push(args),result),identity={verify:async()=>({kind:'session',userPrincipalId:'owner',credentialId:'session-1'})};
+  const handler=createHttpHandler({services:{spaces:{audit:record({entries:[],nextCursor:null})},collections:{backfill:record({processed:2,ready:true})}},identity});
+  const call=async(path,method='GET')=>{ const response=await handler(new Request(`https://stateplane.example.invalid/v1/spaces/sp_a/${path}`,{method})); return [response.status,await response.json()]; };
+  assert.deepEqual([await call('audit?cursor=c1'),await call('collections/entries/indexes/title','POST'),(await call('audit?cursor=a&cursor=b'))[1].error.code,calls],
+    [[200,{entries:[],nextCursor:null}],[200,{processed:2,ready:true}],'CURSOR_INVALID',[['sp_a','c1'],['sp_a','entries','title']]]);
+});
+
+test('agent key issuance accepts RFC 3339 key and grant expiries and normalizes them to UTC milliseconds',async()=>{
+  const issued=[];
+  const services=postgresServices({issueAgentKey:async(_actor,_space,expiresAt,grants)=>{
+    issued.push([expiresAt,grants[0].expiresAt].map(value=>value.toISOString())); return {id:'key-1',secret:'issued-secret'}; }},new Map(),3600);
+  const handler=createHttpHandler({services,identity:{verify:async()=>({kind:'session',userPrincipalId:'owner',credentialId:'session-1'})}});
+  const issue=(expiresAt,grantExpiry=expiresAt)=>handler(new Request('https://stateplane.example.invalid/v1/spaces/sp_a/agent-keys',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({expiresAt,grants:[{collectionId:'entries',capabilities:['records:read'],expiresAt:grantExpiry}]})}));
+  for (const [value,normalized] of [['2099-01-01T05:30:00.1239+05:30','2099-01-01T00:00:00.123Z'],['2098-12-31t19:00:00-05:00','2099-01-01T00:00:00.000Z'],
+    ['2099-01-01T00:00:00.5z','2099-01-01T00:00:00.500Z'],['2000-02-29T00:00:00Z','2000-02-29T00:00:00.000Z'],
+    ['2016-12-31T23:59:60.5Z','2016-12-31T23:59:59.999Z'],['2017-01-01T08:59:60+09:00','2016-12-31T23:59:59.999Z']]) {
+    const response=await issue(value);
+    assert.deepEqual([response.status,(await response.json()).expiresAt,issued.pop()],[201,normalized,[normalized,normalized]],value);
+  }
+  for (const value of ['2099-01-01T00:00Z','2099-01-01T00:00:00','2099-01-01 00:00:00Z','2099-01-01T00:00:00.Z','2099-02-29T00:00:00Z',
+    '2100-02-29T00:00:00Z','2099-04-31T00:00:00Z','2099-13-01T00:00:00Z','2099-00-01T00:00:00Z','2099-01-01T24:00:00Z','2099-01-01T00:60:00Z',
+    '2099-01-01T12:59:60Z','2099-01-01T23:59:60Z','2099-06-30T23:59:60Z','2099-01-02T08:59:60+09:00','2099-01-01T00:00:00+24:00','2099-01-01T00:00:00+05:60','9999-12-31T23:00:00-05:00',' 2099-01-01T00:00:00Z',20990101]) {
+    for (const response of [await issue(value),await issue('2099-01-02T00:00:00Z',value)])
+      assert.deepEqual([response.status,(await response.json()).error.code],[400,'INVALID_ARGUMENT'],String(value));
+  }
+  assert.equal(issued.length,0,'an invalid expiry never reaches issuance');
 });

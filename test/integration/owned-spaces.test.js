@@ -10,7 +10,8 @@ import { memoryAdapter } from '@superfunctions/db/testing';
 import { createAuthFn, createUser, issueSession } from '@authfn/core';
 import { AuthFnIdentityVerifier, AuthFnAgentKeys } from '../../packages/auth/dist/index.js';
 import { RegionalRouter, RegionalCell, RoutingKeys } from '../../packages/application/dist/index.js';
-import { PostgresAuthority, PostgresSpaces, PostgresRoutingDirectory, PostgresCellPolicy, CommitOutcomeUnknownError } from '../../packages/postgres/dist/index.js';
+import { PostgresAuthority, PostgresSpaces, PostgresRoutingDirectory, PostgresCellPolicy, CommitOutcomeUnknownError, postgresServices } from '../../packages/postgres/dist/index.js';
+import { createHttpHandler } from '../../packages/api/dist/index.js';
 
 async function collectSpaces(spaces,actor) {
   const items=[];
@@ -48,6 +49,22 @@ test.after(async () => {
     finally { await admin.end(); }
   }
 });
+
+/** One AuthFn owner with an active cell-A space and one collection. */
+async function authFnOwnerSpace(control=controlPool,cellPool=pool) {
+  const config = { database:memoryAdapter(),namespace:`sta6-${crypto.randomUUID()}`,plugins:[] };
+  createAuthFn(config);
+  const user = await createUser(config,{primaryEmail:`owner-${crypto.randomUUID()}@example.invalid`});
+  const session = await issueSession(config,{}, {userId:user.id,methods:['password']});
+  const identity = new AuthFnIdentityVerifier(config);
+  const owner = await identity.verify(request(session.sessionToken));
+  const cells = new Map([['cell-a',{pool:cellPool,storageTargetId:'target-a'}]]);
+  const spaces = new PostgresSpaces(control,cells,'cell-a',new AuthFnAgentKeys(config),identity);
+  const {spaceId} = await spaces.create(owner);
+  const collectionId = `entries_${crypto.randomUUID()}`;
+  await collection(spaceId,collectionId,cellPool);
+  return {session,identity,owner,cells,spaces,spaceId,collectionId};
+}
 
 async function collection(spaceId,collectionId,cellPool=pool) {
   const db = await cellPool.connect();
@@ -397,17 +414,7 @@ test('stable home metadata survives a different current cell and placement fenci
 });
 
 test('archived spaces replay owner and agent receipts but deny external writes at the effect boundary', async () => {
-  const config = { database:memoryAdapter(),namespace:`sta6-${crypto.randomUUID()}`,plugins:[] };
-  createAuthFn(config);
-  const user = await createUser(config,{primaryEmail:`owner-${crypto.randomUUID()}@example.invalid`});
-  const session = await issueSession(config,{}, {userId:user.id,methods:['password']});
-  const identity = new AuthFnIdentityVerifier(config);
-  const owner = await identity.verify(request(session.sessionToken));
-  const cells = new Map([['cell-a',{pool,storageTargetId:'target-a'}]]);
-  const spaces = new PostgresSpaces(controlPool,cells,'cell-a',new AuthFnAgentKeys(config),identity);
-  const {spaceId} = await spaces.create(owner);
-  const collectionId = `entries_${crypto.randomUUID()}`;
-  await collection(spaceId,collectionId);
+  const {session,identity,owner,cells,spaces,spaceId,collectionId} = await authFnOwnerSpace();
   const agent = await spaces.issueAgentKey(owner,spaceId,new Date(Date.now()+3_600_000),
     [{collectionId,capabilities:['records:write']}]);
   const reader = await spaces.issueAgentKey(owner,spaceId,new Date(Date.now()+3_600_000),
@@ -800,13 +807,13 @@ test('owner audit reads use bounded stable pages and reject cross-space cursors'
   assert.equal(pages,3);
   assert.deepEqual(seen,expected,'equal timestamps and page boundaries neither skip nor repeat audit rows');
   const firstPage = await spaces.audit(owner,first.spaceId);
-  await assert.rejects(spaces.audit(owner,second.spaceId,firstPage.nextCursor),denied('INVALID_ARGUMENT'));
-  await assert.rejects(spaces.audit(owner,first.spaceId,'malformed!'),denied('INVALID_ARGUMENT'));
+  await assert.rejects(spaces.audit(owner,second.spaceId,firstPage.nextCursor),denied('CURSOR_INVALID'));
+  await assert.rejects(spaces.audit(owner,first.spaceId,'malformed!'),denied('CURSOR_INVALID'));
   const crafted = recordedAt => Buffer.from(JSON.stringify({spaceId:first.spaceId,recordedAt,
     auditId:'aud_cursor'})).toString('base64url');
   for (const invalid of ['2026-02-30T00:00:00.000000Z','2025-02-29T00:00:00.000000Z',
     '2026-04-31T00:00:00.000000Z','2026-13-01T00:00:00.000000Z','0000-01-01T00:00:00.000000Z']) {
-    await assert.rejects(spaces.audit(owner,first.spaceId,crafted(invalid)),denied('INVALID_ARGUMENT'),invalid);
+    await assert.rejects(spaces.audit(owner,first.spaceId,crafted(invalid)),denied('CURSOR_INVALID'),invalid);
   }
   await spaces.audit(owner,first.spaceId,crafted('2024-02-29T23:59:59.123456Z'));
   await assert.rejects(spaces.audit(stranger,first.spaceId),denied('NOT_FOUND'));
@@ -3809,4 +3816,110 @@ test('router rejects malformed verifier identifiers before signing or directory 
     await assert.rejects(router.assertion(new Request('https://example.invalid'),'space','collection','records:read'),denied('FORBIDDEN'));
   }
   assert.equal(lookups,0);
+});
+
+test('owner HTTP agent key routes store normalized RFC 3339 expiries, list without secrets and revoke', async () => {
+  const {session,identity,spaces,spaceId,collectionId} = await authFnOwnerSpace();
+  const handler = createHttpHandler({services:postgresServices(spaces,new Map(),3600),identity});
+  const call = (method,path,body,token=session.sessionToken) => handler(new Request(`https://stateplane.example.invalid/v1/spaces/${spaceId}${path}`,{method,
+    headers:{Authorization:`Bearer ${token}`,...(body===undefined?{}:{'Content-Type':'application/json'})},body:body===undefined?undefined:JSON.stringify(body)}));
+  const expiry = Math.floor(Date.now()/1000)*1000+3_600_123, normalized = new Date(expiry).toISOString();
+  // One instant: the key uses a +05:30 offset with sub-millisecond digits, the grant lowercase separators.
+  const issue = grantExpiry => call('POST','/agent-keys',{expiresAt:`${new Date(expiry+19_800_000).toISOString().slice(0,23)}999+05:30`,
+    grants:[{collectionId,capabilities:['records:read'],expiresAt:grantExpiry}]});
+  assert.equal((await (await issue(`${new Date(expiry+1).toISOString().slice(0,23)}9-00:00`)).json()).error.code,'INVALID_ARGUMENT','a grant may not outlive its key');
+  const issued = await issue(`${normalized.slice(0,23).replace('T','t')}4z`);
+  const key = await issued.json();
+  assert.deepEqual([issued.status,key.expiresAt],[201,normalized]);
+  const listing = await (await call('GET','/agent-keys')).text();
+  assert.ok(!listing.includes(key.secret),'a listing never returns the secret');
+  assert.deepEqual(JSON.parse(listing).items.map(({createdAt,...item}) => item),[{keyId:key.keyId,status:'active',expiresAt:normalized,
+    revokedAt:null,grants:[{collectionId,capabilities:['records:read'],expiresAt:normalized}],providerRevokedAt:null}]);
+  assert.equal((await (await call('GET','/agent-keys',undefined,key.secret)).json()).error.code,'FORBIDDEN','an agent key cannot manage keys');
+  assert.equal((await (await call('GET','/agent-keys?cursor=a&cursor=b')).json()).error.code,'CURSOR_INVALID');
+  assert.deepEqual(await (await call('DELETE',`/agent-keys/${key.keyId}`)).json(),{keyId:key.keyId,revoked:true});
+  assert.equal((await (await call('GET','/agent-keys')).json()).items[0].status,'revoked');
+  // Accepted historical grant expiries round-trip exactly, including year zero (1 BC) and a local-mean-time era instant.
+  const older = `older_${crypto.randomUUID()}`;
+  await collection(spaceId,older);
+  const historical = await (await call('POST','/agent-keys',{expiresAt:normalized,grants:[
+    {collectionId,capabilities:['records:read'],expiresAt:'0000-01-01T00:00:00Z'},
+    {collectionId:older,capabilities:['records:read'],expiresAt:'1850-06-01T12:00:00.123Z'}]})).json();
+  const page = await call('GET','/agent-keys');
+  assert.equal(page.status,200,'a historical grant expiry does not break the listing');
+  assert.deepEqual((await page.json()).items.find(item => item.keyId === historical.keyId).grants.map(grant => grant.expiresAt),
+    ['0000-01-01T00:00:00.000Z','1850-06-01T12:00:00.123Z']);
+});
+
+test('owner agent key listing pages past 100 keys and binds continuations to their space', async () => {
+  const {owner,spaces,spaceId,collectionId} = await authFnOwnerSpace();
+  const other = (await spaces.create(owner)).spaceId;
+  const second = `second_${crypto.randomUUID()}`;
+  await collection(spaceId,second);
+  const prefix = `key_${crypto.randomUUID()}_`;
+  const insert = (space,from,to) => pool.query(`INSERT INTO space_credentials(space_id,credential_id,principal_id,owner_principal_id,expires_at,activated_at,confirmed_at)
+    SELECT $1,$2||lpad(n::text,3,'0'),'agent-'||$2||n,$3,clock_timestamp()+interval '1 hour',clock_timestamp(),clock_timestamp()
+    FROM generate_series($4::int,$5::int) n`,[space,prefix,owner.userPrincipalId,from,to]);
+  await insert(spaceId,1,150);
+  await insert(other,151,151);
+  await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities)
+    SELECT $1,collection_id,$3||lpad(n::text,3,'0'),ARRAY['records:read']::text[]
+    FROM generate_series(1,150) n, unnest($2::text[]) collection_id WHERE n%2=0 OR collection_id<>$4`,
+  [spaceId,[collectionId,second],prefix,second]);
+  const first = await spaces.agentKeys(owner,spaceId);
+  const rest = await spaces.agentKeys(owner,spaceId,first.nextCursor);
+  assert.deepEqual([first.items.length,rest.items.length,rest.nextCursor],[100,50,null]);
+  const seen = [...first.items,...rest.items];
+  assert.deepEqual(seen.map(item => item.keyId),Array.from({length:150},(_,index) => `${prefix}${String(index+1).padStart(3,'0')}`),
+    'traversal returns every key once in order');
+  assert.ok(seen.every((item,index) => item.grants.length === (index%2 ? 2 : 1)),'each key carries only its own grants');
+  await assert.rejects(spaces.agentKeys(owner,other,first.nextCursor),denied('CURSOR_INVALID'),'a continuation is bound to its space');
+  await assert.rejects(spaces.agentKeys(owner,spaceId,`${prefix}151`),denied('CURSOR_INVALID'),'another space key is not a cursor here');
+});
+
+test('agent key and grant expiries are stored and listed exactly in any session time zone', async () => {
+  const zoned = [controlUrl,cellAUrl].map(connectionString => new pg.Pool({connectionString,max:2,options:'-c timezone=America/St_Johns'}));
+  try {
+    const {owner,spaces,spaceId,collectionId} = await authFnOwnerSpace(...zoned);
+    const collections = [collectionId];
+    for (let index = 0; index < 4; index++) await collection(spaceId,collections[collections.push(`sweep_${crypto.randomUUID()}`)-1],zoned[1]);
+    const first = Date.parse('0000-01-01T00:00:00Z'), last = Date.parse('9999-12-31T23:59:59.999Z');
+    // Large epochs with nonzero milliseconds, year zero and a local-mean-time era, then a seeded sweep of 1000 instants.
+    const requests = [[Date.parse('9999-12-31T23:59:59.997Z'),[Date.parse('5000-01-01T00:00:00.001Z'),first,
+      Date.parse('1850-06-01T12:00:00.123Z'),Date.parse('0000-06-15T07:08:09.011Z')]]];
+    let seed = 23;
+    const between = (low,high) => { seed = (seed*48271) % 2147483647; return low+Math.floor(seed/2147483647*(high-low)); };
+    const nonzeroMs = ms => ms-((ms%1000+1000)%1000)+1+between(0,998);
+    while (requests.length < 200) {
+      const key = nonzeroMs(between(Date.now()+3_600_000,last-1000));
+      requests.push([key,Array.from({length:4},() => nonzeroMs(between(first,key-1000)))]);
+    }
+    const issued = new Map();
+    for (const [key,grants] of requests) {
+      const {id} = await spaces.issueAgentKey(owner,spaceId,new Date(key),
+        grants.map((expiresAt,index) => ({collectionId:collections[index],capabilities:['records:read'],expiresAt:new Date(expiresAt)})));
+      issued.set(id,[key,Object.fromEntries(grants.map((ms,index) => [collections[index],ms]))]);
+    }
+    const stored = await pool.query(`SELECT c.credential_id,(extract(epoch FROM c.expires_at)*1000)::text AS key,
+      json_object_agg(g.collection_id,(extract(epoch FROM g.expires_at)*1000)::text) AS grants
+      FROM space_credentials c JOIN collection_grants g USING(space_id,credential_id) WHERE c.space_id=$1 GROUP BY c.credential_id,c.expires_at`,[spaceId]);
+    assert.equal(stored.rowCount,200);
+    for (const row of stored.rows) {
+      const [key,grants] = issued.get(row.credential_id);
+      assert.deepEqual([Number(row.key),Object.fromEntries(Object.entries(row.grants).map(([id,ms]) => [id,Number(ms)]))],[key,grants],
+        `${row.credential_id} stores the requested instants`);
+    }
+    const listed = [];
+    for (let page = await spaces.agentKeys(owner,spaceId); ; page = await spaces.agentKeys(owner,spaceId,page.nextCursor)) {
+      listed.push(...page.items);
+      if (!page.nextCursor) break;
+    }
+    assert.equal(listed.length,200);
+    for (const item of listed) {
+      const [key,grants] = issued.get(item.keyId);
+      assert.deepEqual([item.expiresAt,Object.fromEntries(item.grants.map(grant => [grant.collectionId,grant.expiresAt]))],
+        [new Date(key).toISOString(),Object.fromEntries(Object.entries(grants).map(([id,ms]) => [id,new Date(ms).toISOString()]))],
+        `${item.keyId} lists the issued instants`);
+    }
+  } finally { await Promise.all(zoned.map(zone => zone.end())); }
 });
