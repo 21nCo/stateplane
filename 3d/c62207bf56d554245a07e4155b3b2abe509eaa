@@ -1,0 +1,29 @@
+app/src/hooks.server.ts
+  s_92427ff18a8304::t_932472247cba72 1,11-14,17-20,22-27,33
+docs/ui.md
+  s_92427ff18a8304::t_dfd57cfc9505a1 7,26
+test/e2e/foundation.spec.ts
+  s_92427ff18a8304::t_043bf39ac0e9e7 17
+test/e2e/host.js
+  s_92427ff18a8304::t_dad01dc7629f11 150-152,154,156,158-162
+test/integration/e2e-launcher.test.js
+  s_92427ff18a8304::t_9b31e6af7485d4 4,19,22-23,25,31,33,38-40,42-43,45,50,60,66-67,71,74,82-83,85,104,106,112-113,116,133-134,139,145-177,179,181-182,188
+test/ui-shell.test.ts
+  s_92427ff18a8304::t_7191a1ecd66616 26-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3dc62207bf56d554245a07e4155b3b2abe509eaa",
+  "prompts": {},
+  "sessions": {
+    "s_92427ff18a8304": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26336501-b0e6-4534-a7c2-345f5528a4ba",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
