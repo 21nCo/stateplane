@@ -1,0 +1,22 @@
+app/src/lib/server/keycheck.ts
+  h_a39f9495f9ec1d 1-21
+app/src/routes/spaces/[space]/access/+page.server.ts
+  h_a39f9495f9ec1d 1-75
+app/src/routes/spaces/[space]/access/+page.svelte
+  h_a39f9495f9ec1d 1-110
+test/integration/owner-access-http.test.js
+  h_a39f9495f9ec1d 1-136
+test/mcp-host.test.ts
+  h_a39f9495f9ec1d 8,18-19,32-37,46,121-234
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7a029dbc46cb72373613a2a4152c05b3062ca81b",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
