@@ -1,0 +1,14 @@
+app/src/routes/spaces/[space]/+layout.svelte
+  h_a39f9495f9ec1d 6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9ba70b207447aaea7d18fa936dbd27bc738b368c",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
