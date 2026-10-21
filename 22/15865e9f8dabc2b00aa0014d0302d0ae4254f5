@@ -1,0 +1,41 @@
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.svelte
+  h_a39f9495f9ec1d 83,102
+app/src/routes/spaces/[space]/collections/[collection]/+page.server.ts
+  h_a39f9495f9ec1d 3,5,59-60
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.server.ts
+  h_a39f9495f9ec1d 3-4,45
+app/src/routes/spaces/[space]/collections/[collection]/batches/+page.svelte
+  h_a39f9495f9ec1d 27
+app/src/lib/server/forms.ts
+  h_a39f9495f9ec1d 1-2,5,34-44,46,49,52,56,59,69,82
+app/src/routes/spaces/[space]/collections/[collection]/+page.svelte
+  h_a39f9495f9ec1d 83,120
+app/src/lib/components/Unresolved.svelte
+  h_a39f9495f9ec1d 6
+  h_a39f9495f9ec1d 5,7-8,17,25,34,36
+test/e2e/owner.spec.ts
+  s_f3c85c4a41c7b4::t_1387ad4032e163 504-505,535-580,715-717,993-996
+test/ui-errors.test.ts
+  h_a39f9495f9ec1d 3,33,43,53,70-72,76-95
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2215865e9f8dabc2b00aa0014d0302d0ae4254f5",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_f3c85c4a41c7b4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "576ab5f3-7d04-4063-8537-8fe2ce57d4fb",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
