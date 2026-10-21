@@ -1,0 +1,25 @@
+app/src/lib/query.ts
+  s_92427ff18a8304::t_5f13816ab4e8f6 53,67,69,72
+app/src/routes/spaces/[space]/collections/[collection]/batches/+page.svelte
+  s_92427ff18a8304::t_98b2a84fda97d9 10-11,13-14,66
+test/e2e/owner.spec.ts
+  s_92427ff18a8304::t_9fbcf57aa41107 994-1022
+test/ui-query.test.ts
+  s_92427ff18a8304::t_3fabc0835fa868 4-5,8,65-75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c4c1333a8ff3528a488b6fe698f6bce8768bce37",
+  "prompts": {},
+  "sessions": {
+    "s_92427ff18a8304": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26336501-b0e6-4534-a7c2-345f5528a4ba",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
