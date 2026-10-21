@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import type { Socket } from 'node:net';
 import pg from 'pg';
 import { createHttpHandler } from '@stateplane/api';
@@ -6,6 +6,7 @@ import { isSafeHttpRead, parseV1Path } from '@stateplane/contracts';
 import { createMcpEndpoint } from '@stateplane/mcp';
 import type { McpEndpoint } from '@stateplane/mcp';
 import { PostgresSpaces, postgresServices } from '@stateplane/postgres';
+import { receiptRetentionSeconds } from './receipts';
 
 export type Bindings = App.Platform['env'];
 type Handler=(request:Request)=>Promise<Response>;
@@ -21,6 +22,49 @@ const requestTimeoutMs=12_000;
 // MCP resource endpoints instead of growing with request Host headers.
 const maxMcpResources=4;
 const loopbackHosts=new Set(['127.0.0.1','localhost','[::1]']);
+// Fixture agent keys live in one Node host's memory; bound that memory.
+const maxFixtureKeys=1_000;
+interface FixtureKey { id:string; owner:string; issuanceId:string; expiresAt:number; revoked:boolean }
+/** A Node-only stand-in for AuthFn keys so local journeys can issue, use and
+ * revoke a key. A Worker builds a host per request and keeps issuance off.
+ * The store outlives a retired host, as a provider outlives one connection
+ * pool; it is lost only when the Node process restarts. */
+let fixtureStore:ReturnType<typeof fixtureKeys>|undefined;
+function fixtureKeys(faultUrl?:string) {
+  const byDigest=new Map<string,FixtureKey>();
+  const byId=new Map<string,FixtureKey>();
+  const live=(key:FixtureKey|undefined):key is FixtureKey=>!!key && !key.revoked && key.expiresAt>Date.now();
+  return {
+    provider:{
+      create:(owner:string,expiresAt:Date,issuanceId:string)=>{
+        if (byId.size>=maxFixtureKeys) return Promise.reject(new Error('Fixture key capacity reached'));
+        const key={id:`key_${randomUUID()}`,owner,issuanceId,expiresAt:expiresAt.getTime(),revoked:false};
+        const secret=`spk_${randomBytes(32).toString('base64url')}`;
+        byDigest.set(createHash('sha256').update(secret).digest('hex'),key);
+        byId.set(key.id,key);
+        return Promise.resolve({id:key.id,secret});
+      },
+      find:(owner:string,issuanceId:string)=>Promise.resolve([...byId.values()]
+        .find(key=>key.owner===owner && key.issuanceId===issuanceId)?.id ?? null),
+      revoke:async(id:string,owner:string)=>{
+        // A local journey can arm one failed provider call; the provider then
+        // keeps accepting the key until a retried revocation succeeds.
+        if (faultUrl && (await fetch(faultUrl,{method:'POST'}).catch(()=>null))?.status===200)
+          throw new Error('Fixture provider revocation failed');
+        const key=byId.get(id);
+        if (key?.owner===owner) key.revoked=true;
+      }
+    },
+    verify:(secret:string)=>{
+      const key=byDigest.get(createHash('sha256').update(secret).digest('hex'));
+      return live(key) ? {kind:'api-key' as const,credentialId:key.id} : null;
+    },
+    current:(id:string,owner?:string)=>{
+      const key=byId.get(id);
+      return live(key) && (owner===undefined || key.owner===owner);
+    }
+  };
+}
 // The MCP declaration, schema validators and metadata cost about 13 ms of CPU
 // to build, so each isolate builds them once per resource. Storage stays
 // request-scoped: every request passes its own services and identity.
@@ -63,8 +107,12 @@ function clearHost():undefined {
   return undefined;
 }
 
-/** A deliberately opt-in host for isolated local and Preview acceptance. */
-export function stateplaneHost(env:Bindings):Host | undefined {
+/** One Worker host kept for a whole page render; the caller retires it. */
+export interface HostLease { host:Host; retire:()=>void; retired:()=>boolean }
+/** A deliberately opt-in host for isolated local and Preview acceptance. A
+ * caller that passes lease receives a Worker host's retirement instead of
+ * retiring it after each call; a Node host is shared and never leased. */
+export function stateplaneHost(env:Bindings,lease?:(lease:HostLease)=>void):Host | undefined {
   if (!['local','preview'].includes(env.STATEPLANE_ENV) || env.STATEPLANE_TEST_HTTP!=='1' ||
       !env.STATEPLANE_TEST_TOKEN || env.STATEPLANE_TEST_TOKEN.length<32 ||
       !env.STATEPLANE_TEST_OWNER || !env.STATEPLANE_TEST_CREDENTIAL ||
@@ -127,6 +175,8 @@ export function stateplaneHost(env:Bindings):Host | undefined {
   // goes away. The pool removes that client; consume the event without logging
   // provider diagnostics or allowing an unhandled error to kill the host.
   pool.on('error',()=>{});
+  const keys=perRequest ? null : fixtureStore??=fixtureKeys(env.STATEPLANE_ENV==='local' ?
+    env.STATEPLANE_TEST_PROVIDER_FAULT_URL : undefined);
   const tokenDigest=createHash('sha256').update(env.STATEPLANE_TEST_TOKEN).digest();
   const agentDigest=env.STATEPLANE_TEST_AGENT_TOKEN ?
     createHash('sha256').update(env.STATEPLANE_TEST_AGENT_TOKEN).digest() : null;
@@ -141,18 +191,23 @@ export function stateplaneHost(env:Bindings):Host | undefined {
       if (!bearer || !/^Bearer /i.test(bearer)) return Promise.resolve(null);
       const candidate=createHash('sha256').update(bearer.slice(7)).digest();
       if (timingSafeEqual(candidate,tokenDigest)) return Promise.resolve(actor);
-      return Promise.resolve(agent && agentDigest && timingSafeEqual(candidate,agentDigest) ? agent : null);
+      if (agent && agentDigest && timingSafeEqual(candidate,agentDigest)) return Promise.resolve(agent);
+      return Promise.resolve(keys?.verify(bearer.slice(7)) ?? null);
     },
     current:(claims:{credentialId:string},owner?:string)=>
-      Promise.resolve((claims.credentialId===actor.credentialId ||
-        claims.credentialId===agent?.credentialId) && (owner===undefined || owner===actor.userPrincipalId))
+      Promise.resolve(((claims.credentialId===actor.credentialId ||
+        claims.credentialId===agent?.credentialId) && (owner===undefined || owner===actor.userPrincipalId)) ||
+        !!keys?.current(claims.credentialId,owner))
   };
   const cells=new Map([[cellId,{pool,storageTargetId}]]);
-  const spaces=new PostgresSpaces(pool,cells,cellId,{
-    create:()=>Promise.reject(new Error('Agent issuance is not configured')),
-    find:()=>Promise.resolve(null),revoke:()=>Promise.reject(new Error('Agent revocation is not configured'))
+  // Without a key provider (a Worker host), issuance and revocation fail closed
+  // with a stable code that says no unchanged retry can succeed.
+  const unconfigured=()=>Promise.reject(Object.assign(new Error('Agent keys are not configured'),
+    {code:'PROVIDER_UNAVAILABLE',retryable:false}));
+  const spaces=new PostgresSpaces(pool,cells,cellId,keys?.provider ?? {
+    create:unconfigured,find:()=>Promise.resolve(null),revoke:unconfigured
   },identity,Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex'));
-  const services=postgresServices(spaces,new Map([[cellId,{pool,cursorSecret:Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex')}]]),3600);
+  const services=postgresServices(spaces,new Map([[cellId,{pool,cursorSecret:Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex')}]]),receiptRetentionSeconds);
   const serve=createHttpHandler({services,identity});
   let active=0;let retired=false;let ended=false;
   const closeIfIdle=()=>{
@@ -200,7 +255,10 @@ export function stateplaneHost(env:Bindings):Host | undefined {
   };
   if (perRequest) {
     clearHost();
-    return {http:tracked(boundedServe,retire),mcp:tracked(mcpServe,retire)};
+    const after=lease ? closeIfIdle : retire;
+    const host={http:tracked(boundedServe,after),mcp:tracked(mcpServe,after)};
+    lease?.({host,retire,retired:()=>retired});
+    return host;
   }
   const previous=cached;
   cached={key,retire,host:{http:tracked(boundedServe,closeIfIdle),mcp:tracked(mcpServe,closeIfIdle)}};
