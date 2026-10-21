@@ -371,6 +371,43 @@ test('after a lost save acknowledgement, retry recovers it and a changed draft i
   expect(JSON.parse((await read()).canonicalData).title).toBe('not sent');
 });
 
+test('keeping the current revision after a conflict keeps every unresolved save', async ({ page, request }) => {
+  test.skip(!local, 'Needs the local fault proxy');
+  await signIn(page, ownerToken);
+  const id = await createRecord(page, { title: 'Kept', state: 'open', rank: 13 });
+  await go(page, `${itemsUrl()}/records/${id}`);
+  const editor = page.getByLabel(/Data JSON/);
+  const unresolved = page.getByText('An earlier save may have committed');
+  const conflict = page.getByRole('alert', { name: 'Edit conflict' });
+  await editor.fill(JSON.stringify({ title: 'lost ack', state: 'open', rank: 13 }));
+  await dropReply('COMMIT\0', 'UPDATE records SET');
+  await page.getByRole('button', { name: 'Save revision' }).click();
+  await expect(unresolved).toBeVisible();
+  await expect(page.getByText('Only this page tracks them: leaving or reloading it stops tracking them.')).toBeVisible();
+  // An edit conflict, then Keep: the draft goes, the unresolved save stays retryable.
+  await settle(page);
+  await editor.fill(JSON.stringify({ title: 'discarded', state: 'open', rank: 13 }));
+  await page.getByRole('button', { name: 'Send as new request' }).click();
+  await conflict.getByRole('button', { name: 'Keep current revision' }).click();
+  await expect(conflict).toHaveCount(0);
+  await expect(unresolved).toBeVisible();
+  await expect(editor).toHaveValue(/lost ack/);
+  // A delete conflict, then Keep: the deletion goes, the unresolved save stays retryable.
+  const other = await request.post(`/v1${itemsUrl()}/records`, { headers: { authorization: `Bearer ${ownerToken}` },
+    data: { operation: 'replace', id, expectedRevision: 2, idempotencyKey: `e2e-${randomUUID()}`, data: { title: 'elsewhere', state: 'open', rank: 13 } } });
+  expect(other.ok()).toBe(true);
+  await settle(page);
+  await page.getByRole('button', { name: 'Delete revision 2' }).click();
+  await expect(conflict).toContainText('revision 3 is now current');
+  await conflict.getByRole('button', { name: 'Keep current revision' }).click();
+  await expect(conflict).toHaveCount(0);
+  await expect(editor).toHaveValue(/elsewhere/);
+  await expect(page.getByRole('button', { name: 'Retry unchanged' })).toBeEnabled();
+  await page.getByRole('button', { name: 'Retry unchanged' }).click();
+  await expect(page.getByRole('status')).toContainText('Saved revision 2 (was 1), recovered from an earlier identical request');
+  await expect(unresolved).toHaveCount(0);
+});
+
 /** Suspend the test space, or make it active again. */
 async function setLifecycle(request: APIRequestContext, lifecycle: string) {
   const response = await request.patch(`/v1${spaceUrl}`, { headers: { authorization: `Bearer ${ownerToken}` }, data: { lifecycle } });

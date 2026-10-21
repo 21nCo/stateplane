@@ -61,7 +61,7 @@
     </div>{/if}
     {#if form.conflict.revision!==null}
       <div class="mt-3 flex flex-wrap gap-2">
-        <a class="btn-quiet" href="?">Keep current revision</a>
+        <form method="POST" action="?/keep">{@render carryUnresolved()}<button class="btn-quiet">Keep current revision</button></form>
         {#if form.deleting}<form method="POST" action="?/delete">
           {@render carryUnresolved()}
           <input type="hidden" name="idempotencyKey" value={data.idempotencyKey} />

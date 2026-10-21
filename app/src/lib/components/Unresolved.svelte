@@ -23,6 +23,7 @@
     <p id="{id}-why" class="mt-1">The outcome is unknown. Until a request's retry window closes, Retry unchanged resends that exact request under its key, which recovers its result instead of writing twice. After the window closes its key may no longer recover it, so the retry is not offered. Forget stops tracking a request; it may still have committed. {kind==='create' ?
       'Send as new request creates the draft below as another record, even if an earlier one was created.' :
       'Send as new request saves the editor\'s text instead; if a revision was saved meanwhile, it is shown for comparison before anything is overwritten.'}</p>
+    <p class="mt-1">Only this page tracks them: leaving or reloading it{kind==='create' ? ', or changing its filters or records page,' : ''} stops tracking them.</p>
     <ol class="mt-2 space-y-2">
       {#each writes as write, index (index)}
         <li>

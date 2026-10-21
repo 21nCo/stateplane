@@ -70,5 +70,7 @@ export const actions:Actions={
     if (stale(result.error.code)) return conflict(event,{deleting:true,idempotencyKey,expectedRevision,pending});
     // The same key and revision stay with the form so an uncertain delete can replay.
     return fail(result.status,{deleting:true,idempotencyKey,expectedRevision,pending,deleteError:result.error});
-  }
+  },
+  // Keeping the current revision drops the draft or deletion, never the unresolved saves.
+  keep:async(event)=>({pending:unresolved(await event.request.formData(),writeClock(event))})
 };
