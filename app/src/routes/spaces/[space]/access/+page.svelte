@@ -1,0 +1,116 @@
+<script lang="ts">
+  import { enhance } from '$app/forms';
+  import Notice from '$lib/components/Notice.svelte';
+  import Restart from '$lib/components/Restart.svelte';
+  import Scroll from '$lib/components/Scroll.svelte';
+  import Status from '$lib/components/Status.svelte';
+  import { carry, shown } from '$lib/paths';
+  import type { ApiError } from '$lib/errors';
+  let { data, form } = $props();
+  const rows=$derived([...data.collections,'']);
+  const tone=(status:string)=>status==='active' ? 'success' : status==='revoked' ? 'danger' : 'warning';
+  // A host without a key provider refuses issuance and revocation as a nonretryable PROVIDER_UNAVAILABLE.
+  const unconfigured=(error?:ApiError|null)=>error?.code==='PROVIDER_UNAVAILABLE' && !error.retryable;
+  const notConfigured='Agent keys are not configured on this host, so no retry here can succeed.';
+</script>
+
+<svelte:head><title>Agent access · Stateplane</title></svelte:head>
+<h1 class="text-2xl font-semibold">Agent access</h1>
+<p class="hint mt-1">Agent keys act only through the collection capabilities granted here. Revocation takes effect on the next request. If a revocation was interrupted, Finish revocation completes it and is safe to repeat.</p>
+{#if form?.issued}
+  <section aria-labelledby="issued" class="mt-4 rounded-lg border border-success bg-surface p-4" role="alert">
+    <h2 id="issued" class="font-semibold">Key {form.issued.keyId} issued</h2>
+    <p class="mt-1 text-sm">Copy the secret now. It is shown only in this response and cannot be retrieved later.</p>
+    <label for="secret" class="mt-2 block">Secret</label>
+    <input id="secret" readonly value={form.issued.secret} class="font-mono" />
+    <p class="hint mt-1">Expires {form.issued.expiresAt}.</p>
+  </section>
+{/if}
+<div class="mt-4 grid gap-6 lg:grid-cols-[2fr_1fr]">
+  <section aria-labelledby="keys" class="min-w-0 space-y-3">
+    <h2 id="keys" class="text-lg font-semibold">Keys</h2>
+    <Notice error={data.error} title="Keys could not be listed">
+      <Restart paged={data.paged} error={data.error} href="?" />
+    </Notice>
+    <Notice error={form?.revokeError} title="Revocation did not finish" hint={unconfigured(form?.revokeError) ? notConfigured : undefined}>
+      <p class="mt-1">Part of the revocation may have taken effect, whatever the key list shows. {unconfigured(form?.revokeError) ?
+        'Finish it from a host where agent keys are configured.' : 'Retry until it finishes.'}</p>
+      {#if form?.revokeKeyId}<form method="POST" action="?/revoke" class="mt-2"><input type="hidden" name="keyId" value={carry(form.revokeKeyId)} />
+        <button class="btn-danger">Retry revocation of <span class="ident">{form.revokeKeyId}</span></button></form>{/if}
+    </Notice>
+    {#if form?.revoked}<p role="status" class="text-sm text-success">Key {form.revoked} revoked.</p>{/if}
+    {#if data.keys}
+      {#if data.keys.items.length}
+        <Scroll label="Agent keys"><table>
+          <caption class="sr-only">Agent keys and grants</caption>
+          <thead><tr><th scope="col">Key</th><th scope="col">Status</th><th scope="col">Grants</th><th scope="col">Expires</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+          <tbody>{#each data.keys.items as key (key.keyId)}<tr>
+            <td class="ident">{key.keyId}</td><td><Status tone={tone(key.status)}>{key.status}</Status>
+              {#if key.revokedAt}<div class="hint">{key.providerRevokedAt ? 'Provider key revoked' : 'Denied here; provider cleanup pending'}</div>{/if}</td>
+            <td>{#each key.grants as grant (grant.collectionId)}<div><span class="ident">{shown(grant.collectionId)}</span>: {grant.capabilities.join(', ')}
+              {#if grant.expiresAt}<span class={grant.expired ? 'text-danger' : 'hint'}>({grant.expired ? 'expired' : 'expires'} <time datetime={grant.expiresAt}>{grant.expiresAt}</time>)</span>{/if}</div>{:else}<span class="hint">none</span>{/each}</td>
+            <td>{key.expiresAt}</td>
+            <!-- A revoked key keeps an idempotent Finish control: the list cannot show whether
+                 the space's policy publication finished, and a repeat revocation completes it. -->
+            <td><form method="POST" action="?/revoke"><input type="hidden" name="keyId" value={carry(key.keyId)} />
+              <button class="btn-danger" aria-label="{key.revokedAt ? 'Finish revocation' : 'Revoke'} {key.keyId}">{key.revokedAt ? 'Finish revocation' : 'Revoke'}</button></form></td>
+          </tr>{/each}</tbody>
+        </table></Scroll>
+      {:else}<p class="panel hint">No agent keys have been issued for this space.</p>{/if}
+      <nav aria-label="Key pages" class="flex gap-3">
+        {#if data.cursor}<a class="link" href="?">First page</a>{/if}
+        {#if data.keys.nextCursor}<a class="link" href="?cursor={encodeURIComponent(data.keys.nextCursor)}">Next page</a>{/if}
+      </nav>
+    {/if}
+  </section>
+  <div class="space-y-6">
+    <section aria-labelledby="issue" class="panel space-y-3">
+      <h2 id="issue" class="text-lg font-semibold">Issue a key</h2>
+      <Notice error={form?.issueError} title="Key was not issued" hint={unconfigured(form?.issueError) ? notConfigured : undefined}>
+        {#if form?.issueError?.code==='COMMIT_OUTCOME_UNKNOWN'}<p class="mt-1">The key may exist. Check the key list and revoke any key you cannot account for before issuing another.</p>{/if}
+      </Notice>
+      <Notice error={data.collectionsError} title="Collections could not all be listed">
+        <p class="mt-1">Reload to list them again, or name a collection in the last group.</p>
+      </Notice>
+      {#if form?.issueInvalid}<p role="alert" class="text-sm text-danger">Choose a lifetime and at least one capability for a named collection.</p>{/if}
+      {#if form?.issueTooLarge}<p role="alert" class="text-sm text-danger">These grants need {form.issueTooLarge.bytes} bytes; one key's issuance accepts at most {form.issueTooLarge.limit}. Nothing was sent. Choose fewer collections or capabilities, or issue them to more than one key.</p>{/if}
+      <form method="POST" action="?/issue" class="space-y-3" use:enhance>
+        <div><label for="days">Lifetime</label>
+          <select id="days" name="days">{#each data.lifetimes as days (days)}<option value={days} selected={days===30}>{days} {days===1 ? 'day' : 'days'}</option>{/each}</select></div>
+        {#each rows as slug, index (index)}
+          <fieldset class="space-y-1 rounded border border-line p-2">
+            <legend class="min-w-0 px-1 text-sm font-medium [overflow-wrap:anywhere]">{slug ? `Collection ${shown(slug)}` : 'Another collection'}</legend>
+            {#if slug}<input type="hidden" name="collection" value={carry(slug)} />{:else}
+              <label for="other-collection">Collection name</label><input id="other-collection" name="other-collection" />{/if}
+            {#each data.capabilities as capability (capability)}
+              <label class="flex items-center gap-2 font-normal"><input type="checkbox" name="capabilities-{index}" value={capability} /> {capability}</label>
+            {/each}
+          </fieldset>
+        {/each}
+        {#if data.moreCollections}<p class="hint">Only the first 96 collections are listed; name others in the last group.</p>{/if}
+        <button class="btn">Issue key</button>
+      </form>
+    </section>
+    <section aria-labelledby="check" class="panel space-y-3">
+      <h2 id="check" class="text-lg font-semibold">Check a key</h2>
+      <p class="hint">Confirm whether the provider still authenticates a key secret and whether this space still authorizes it to discover collections, for example after revocation.</p>
+      {#if form?.check}<div role="status" class="space-y-1 text-sm">
+        <p class={form.check.kind ? 'text-success' : form.check.rejected ? 'text-danger' : 'text-warning'}>Provider: {form.check.kind ? `accepted as ${form.check.kind}` :
+          `${form.check.rejected ? 'rejected' : 'not determined'} (${form.check.code})`}.</p>
+        {#if !form.check.kind && !form.check.rejected}<p class="hint">This does not confirm revocation. Check again when the provider is reachable.</p>{/if}
+        {#if form.check.space}<p class={form.check.space.allowed ? 'text-success' : form.check.space.denied ? 'text-danger' : 'text-warning'}>This space: {form.check.space.allowed ? 'allowed' :
+          `${form.check.space.denied ? 'denied' : 'not determined'} (${form.check.space.code})`}.</p>
+          {#if form.check.space.denied}<p class="hint">The provider still accepts this key, but this space does not authorize it. A key from another space is never authorized here; if it is a key of this space that you revoked, Finish its revocation in the key list.</p>
+          {:else if !form.check.space.allowed}<p class="hint">This does not confirm whether this space authorizes the key.</p>{/if}{/if}
+      </div>{/if}
+      <form method="POST" action="?/check" class="space-y-3">
+        <label for="check-secret">Key secret</label>
+        <input id="check-secret" name="secret" type="password" autocomplete="off" required aria-invalid={form?.checkMissing || form?.checkMalformed ? 'true' : undefined}
+          aria-describedby={form?.checkMissing || form?.checkMalformed ? 'check-error' : undefined} />
+        {#if form?.checkMissing}<p id="check-error" class="text-sm text-danger">Enter a key secret.</p>{/if}
+        {#if form?.checkMalformed}<p id="check-error" class="text-sm text-danger">A key secret holds only visible ASCII characters. This one was not checked; copy it again.</p>{/if}
+        <button class="btn-quiet">Check key</button>
+      </form>
+    </section>
+  </div>
+</div>
