@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { fail, redirect } from '@sveltejs/kit';
-import { api, writeClock } from '$lib/server/api';
-import { expiredRetry, jsonObject, unresolved, unresolvedAfter, writeAttempt } from '$lib/server/forms';
+import { api } from '$lib/server/api';
+import { jsonObject, unresolved, unresolvedAfter, writeAttempt, writeClock } from '$lib/server/forms';
 import { collectionHref, selectors } from '$lib/paths';
 import type { Receipt, StoredRecord } from '$lib/types';
 import type { Actions, PageServerLoad, RequestEvent } from './$types';
@@ -42,7 +42,7 @@ export const actions:Actions={
     const attempt=writeAttempt(form,draft ? {expectedRevision,data:draft} : null,writeClock(event));
     if (attempt.forgotten!==null) return {raw,expectedRevision,pending:attempt.rest};
     if (!attempt.request || attempt.full) return fail(400,{raw,expectedRevision,pending:attempt.pending,invalid:!attempt.request});
-    if (attempt.expired) return fail(400,{raw,expectedRevision,pending:attempt.pending,error:expiredRetry,retried:true});
+    if (attempt.refused) return fail(400,{raw,expectedRevision,pending:attempt.pending,error:attempt.refused,retried:true});
     const request=attempt.request as {expectedRevision:number;data:Record<string,unknown>};
     const result=await api<Receipt>(event,'POST',recordPath(event.url).slice(0,5),
       {body:{operation:'replace',id:selectors(event.url).record,expectedRevision:request.expectedRevision,idempotencyKey:attempt.key,data:request.data}});

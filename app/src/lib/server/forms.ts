@@ -1,5 +1,8 @@
+import { createHmac } from 'node:crypto';
+import type { Cookies } from '@sveltejs/kit';
 import { definitive, maxUnresolved, uncertain } from '../errors';
 import type { ApiError } from '$lib/errors';
+import { sessionCookie, writeClock as hostClock } from './api';
 import { retryDeadline, seal } from './receipts';
 import type { Sealed } from './receipts';
 
@@ -28,24 +31,32 @@ export const given=(value:string)=>value!=='';
  * forgets it; a later write never replaces it. Every submission posts the whole
  * list back, so at most three are kept and a new request is refused past that.
  * Its key recovers it only until its receipt can expire, so past its deadline, or
- * with an altered stamp, it is expired: still shown, never retried. */
-export interface Unresolved extends Sealed { deadline:string|null; expired:boolean }
-export interface WriteClock { secret:Buffer|null; now:number }
-const shown=(clock:WriteClock,write:Sealed):Unresolved=>{
+ * with an altered stamp, it is expired: still shown, never retried. A receipt belongs to
+ * the credential that sent its request (contracts/v1.md), so each write is sealed for the
+ * session's credential and carries "by", a digest of it, never the bearer: under another
+ * credential it is foreign, never retried, and recoverable again once that one returns. */
+export interface Unresolved extends Sealed { by:string; deadline:string|null; expired:boolean; foreign:boolean }
+export interface WriteClock { secret:Buffer|null; now:number; by:string }
+export const writeClock=(event:{platform?:App.Platform|undefined;cookies:Cookies}):WriteClock=>{
+  const {secret,now}=hostClock(event), mac=(use:string)=>secret && createHmac('sha256',secret).update(`${use}\0${event.cookies.get(sessionCookie)??''}`).digest();
+  return {secret:mac('seal'),now,by:mac('by')?.toString('base64url') ?? ''};
+};
+const shown=(clock:WriteClock,write:Sealed&{by:string}):Unresolved=>{
   const deadline=retryDeadline(clock.secret,write);
-  return {...write,deadline:deadline===null ? null : new Date(deadline).toISOString(),expired:deadline===null || clock.now>deadline};
+  return {...write,deadline:deadline===null ? null : new Date(deadline).toISOString(),expired:deadline===null || clock.now>deadline,foreign:write.by!==clock.by};
 };
 export const unresolved=(form:FormData,clock:WriteClock):Unresolved[]=>{
-  const [keys,sent,at,seals]=['pendingKey','pendingSent','pendingAt','pendingSeal'].map(name=>form.getAll(name));
+  const [keys,sent,at,seals,by]=['pendingKey','pendingSent','pendingAt','pendingSeal','pendingBy'].map(name=>form.getAll(name));
   const text=(value:FormDataEntryValue|undefined)=>typeof value==='string' ? value : '';
   return keys.flatMap((key,index)=>typeof key==='string' && typeof sent[index]==='string' && jsonObject(sent[index]) ?
-    [shown(clock,{key,sent:sent[index] as string,at:text(at[index]),seal:text(seals[index])})] : []).slice(0,maxUnresolved);
+    [shown(clock,{key,sent:sent[index] as string,at:text(at[index]),seal:text(seals[index]),by:text(by[index])})] : []).slice(0,maxUnresolved);
 };
 /** A retry that is not sent, because its key may no longer recover its request. */
 export const expiredRetry:ApiError={code:'RECEIPT_EXPIRED',retryable:false,requestId:null};
+export const foreignRetry:ApiError={...expiredRetry,code:'OTHER_CREDENTIAL'};
 
 /** One write submission. "Retry unchanged" names one unresolved write and resends
- * its request under its key, unless it expired; "Forget" names one to stop
+ * its request under its key, unless it expired or is foreign; "Forget" names one to stop
  * tracking and sends nothing. Any other submission is the draft, a new request
  * under the key made when the page loaded. A malformed draft (request null) is
  * never sent, and while the list is full (full) no new request is sent. */
@@ -55,7 +66,7 @@ export function writeAttempt(form:FormData,draft:Record<string,unknown>|null,clo
   const retried=chosen('retry'), forgotten=chosen('forget');
   const retry=retried!==null;
   const request=retry ? jsonObject(pending[retried].sent) : forgotten===null ? draft : null;
-  return {pending,retried,forgotten,retry,request,clock,expired:retry && pending[retried].expired,
+  return {pending,retried,forgotten,retry,request,clock,refused:!retry || !pending[retried].expired ? null : pending[retried].foreign ? foreignRetry : expiredRetry,
     full:!retry && forgotten===null && pending.length>=maxUnresolved,
     rest:pending.filter((_,index)=>index!==(retried ?? forgotten)),
     key:retry ? pending[retried].key : String(form.get('idempotencyKey')??'')};
@@ -68,5 +79,5 @@ type Attempt=ReturnType<typeof writeAttempt>;
  * with the time the submission arrived, before it was sent. */
 export const unresolvedAfter=(attempt:Attempt,error:ApiError|null):Unresolved[]=>
   attempt.retry ? (!error || definitive(error) ? attempt.rest : attempt.pending) :
-  error && uncertain(error) ? [...attempt.pending,shown(attempt.clock,seal(attempt.clock.secret,attempt.key,JSON.stringify(attempt.request),attempt.clock.now))] :
+  error && uncertain(error) ? [...attempt.pending,shown(attempt.clock,{...seal(attempt.clock.secret,attempt.key,JSON.stringify(attempt.request),attempt.clock.now),by:attempt.clock.by})] :
   attempt.pending;

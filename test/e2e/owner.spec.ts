@@ -501,7 +501,8 @@ test('a refused retry keeps an unresolved create, and each lost create stays rec
   await page.context().addCookies([{ ...session, value: 'not-a-session' }]);
   await settle(page);
   await page.getByRole('button', { name: 'Retry unchanged' }).click();
-  await expect(refusal('UNAUTHENTICATED')).toBeVisible();
+  // Another session is another credential, so nothing is sent.
+  await expect(refusal('OTHER_CREDENTIAL')).toBeVisible();
   await expect(page.locator('input[name="pendingKey"]')).toHaveValue(key);
   await page.context().addCookies([session]);
 
@@ -529,6 +530,52 @@ test('a refused retry keeps an unresolved create, and each lost create stays rec
   }
   await expect(entries).toHaveCount(0);
   expect(await titles()).toEqual(['original', 'second']);
+});
+
+test('an unresolved create is retried only under the credential that sent it', async ({ page, request }) => {
+  test.skip(!local, 'Needs the local fault proxy');
+  await defineCollection(request, 'bound');
+  const headers = { authorization: `Bearer ${ownerToken}` };
+  const issued = await request.post(`/v1${spaceUrl}/agent-keys`, { headers, data: { expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+    grants: [{ collectionId: 'bound', capabilities: ['records:read', 'records:write'] }] } });
+  expect(issued.status()).toBe(201);
+  const titles = async () => {
+    const listed = await request.post(`/v1${spaceUrl}/collections/bound/records/query`, { headers, data: { predicates: [], limit: 100 } });
+    return ((await listed.json()).records as { canonicalData: string }[]).map(record => JSON.parse(record.canonicalData).title);
+  };
+  await signIn(page, ownerToken);
+  await go(page, `${spaceUrl}/collections/bound`);
+  await page.getByLabel('Data JSON').fill(JSON.stringify({ title: 'once' }));
+  await dropReply('COMMIT\0', 'INSERT INTO records(');
+  await page.getByRole('button', { name: 'Create record' }).click();
+  await expect(page.getByRole('alert').filter({ hasText: 'Record was not created' })).toContainText('COMMIT_OUTCOME_UNKNOWN');
+  const key = await page.locator('input[name="pendingKey"]').inputValue();
+  expect(await titles()).toEqual(['once']);
+
+  // Another tab signs in with a records:write agent key; tabs share the session cookie.
+  const session = (await page.context().cookies()).find(cookie => cookie.name === 'stateplane_session')!;
+  await page.context().addCookies([{ ...session, value: (await issued.json()).secret }]);
+  await settle(page);
+  await page.getByRole('button', { name: 'Retry unchanged' }).click();
+  const refusal = page.getByRole('region', { name: 'Create a record' }).getByRole('alert');
+  await expect(refusal).toContainText('OTHER_CREDENTIAL');
+  await expect(refusal).toContainText('The earlier create is still unresolved');
+  await expect(refusal).toContainText('Nothing was sent. Another credential sent it, and only that credential can recover it');
+  await expect(page.locator('input[name="pendingKey"]')).toHaveValue(key);
+  // The write stays listed for the credential that sent it, never as an expired window.
+  const entry = page.locator('#create-pending li');
+  await expect(entry).toContainText('sign in with that credential to retry it');
+  await expect(entry).not.toContainText('retry window');
+  await expect(page.locator('input[name="pendingBy"]')).not.toHaveValue(/^$|agent|sp_/);
+  expect(await titles()).toEqual(['once']);
+
+  // Back under the credential that sent it, the retry recovers the create instead of repeating it.
+  await page.context().addCookies([session]);
+  await settle(page);
+  await page.getByRole('button', { name: 'Retry unchanged' }).click();
+  await expect(page.getByRole('status')).toContainText('(recovered earlier result)');
+  await expect(entry).toHaveCount(0);
+  expect(await titles()).toEqual(['once']);
 });
 
 test('a refused save retry keeps the unresolved save until it recovers', async ({ page, request }) => {
@@ -665,7 +712,9 @@ test('a create is retried only within its receipt window, which a posted time ca
   const stamp = async (at: (current: string) => string, signed: boolean) => {
     const key = await entry.locator('input[name="pendingKey"]').inputValue();
     const sent = await entry.locator('input[name="pendingSent"]').inputValue();
-    const secret = createHmac('sha256', Buffer.from(process.env.STATEPLANE_E2E_CURSOR_SECRET!, 'hex')).update('stateplane-ui-unresolved-write-v1').digest();
+    const host = createHmac('sha256', Buffer.from(process.env.STATEPLANE_E2E_CURSOR_SECRET!, 'hex')).update('stateplane-ui-unresolved-write-v1').digest();
+    // Each write is sealed for the credential that sent it.
+    const secret = createHmac('sha256', host).update(`seal\0${ownerToken}`).digest();
     const time = at(await entry.locator('input[name="pendingAt"]').inputValue());
     const seal = createHmac('sha256', secret).update(JSON.stringify([key, sent, time])).digest('base64url');
     await entry.locator('input[name="pendingAt"]').evaluate((input: HTMLInputElement, value) => { input.value = value; }, time);
@@ -941,6 +990,10 @@ test('page navigation never counts, and a failed count leaves the records in pla
   await expect(page.getByRole('alert').filter({ hasText: 'Records could not be read' })).toHaveCount(0);
   await expect(page.getByRole('table')).toBeVisible();
   await expect(page).toHaveURL(/cursor=/);
+  // The failed count offers its retry in place.
+  await page.getByRole('link', { name: 'Count matching records' }).click();
+  await expect(page.getByRole('heading', { name: /matching$/ })).toBeVisible();
+  await expect(page.getByRole('alert')).toHaveCount(0);
 });
 
 test('a filter or sort the authority would refuse is reported on its field and never sent', async ({ page, request }) => {

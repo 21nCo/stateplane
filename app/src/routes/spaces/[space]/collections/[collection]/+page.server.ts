@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { fail } from '@sveltejs/kit';
-import { api, pageCursor, writeClock } from '$lib/server/api';
+import { api, pageCursor } from '$lib/server/api';
 import { carriedId, selectors } from '$lib/paths';
-import { expiredRetry, given, jsonObject, unresolvedAfter, writeAttempt } from '$lib/server/forms';
+import { given, jsonObject, unresolvedAfter, writeAttempt, writeClock } from '$lib/server/forms';
 import { predicates, queryBody, sortProblem } from '$lib/query';
 import type { FilterRow } from '$lib/query';
 import type { ApiError } from '$lib/errors';
@@ -56,8 +56,8 @@ export const actions:Actions={
     // Forgetting a write sends nothing; the draft stays in the editor.
     if (attempt.forgotten!==null) return {draft:{raw,externalKey:draftKey},pending:attempt.rest};
     if (!attempt.request || attempt.full) return fail(400,{create:values,pending:attempt.pending});
-    // Past its deadline the key may no longer recover the write, so a retry could create it twice.
-    if (attempt.expired) return fail(400,{create:{...values,error:expiredRetry},pending:attempt.pending});
+    // Past its deadline, or under another credential, the key may not recover the write, so a retry could create it twice.
+    if (attempt.refused) return fail(400,{create:{...values,error:attempt.refused},pending:attempt.pending});
     const {externalKey,data}=attempt.request as {externalKey:string;data:Record<string,unknown>};
     const result=await api<Receipt>(event,'POST',[...path(event.url),'records'],
       {body:{operation:'create',idempotencyKey:attempt.key,data,...(given(externalKey) ? {externalKey} : {})}});

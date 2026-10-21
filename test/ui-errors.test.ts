@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { definitive, maxUnresolved, uncertain } from '../app/src/lib/errors';
-import { unresolvedAfter, writeAttempt } from '../app/src/lib/server/forms';
+import { unresolvedAfter, writeAttempt, writeClock } from '../app/src/lib/server/forms';
 import { receiptRetentionSeconds, retryMarginSeconds, seal, sealSecret } from '../app/src/lib/server/receipts';
 
 const error = (code: string, retryable: boolean) => ({ code, retryable, requestId: null });
@@ -30,7 +30,7 @@ it('ends a retried write only on a result that its key can never recover from', 
 describe('unresolved writes', () => {
   const secret = sealSecret('ab'.repeat(32));
   const now = Date.UTC(2026, 9, 12, 8);
-  const clock = { secret, now };
+  const clock = { secret, now, by: '' };
   const submit = (fields: [string, string][]) => { const form = new FormData(); for (const [name, value] of fields) form.append(name, value); return form; };
   const write = (key: string, title: string, at = now) => seal(secret, key, JSON.stringify({ data: { title } }), at);
   const posted = (writes: { key: string; sent: string; at: string; seal: string }[]) => writes.flatMap(item =>
@@ -40,7 +40,7 @@ describe('unresolved writes', () => {
 
   it('keeps a retried write after a refusal and ends it only on a receipt or a definitive result', () => {
     const retry = writeAttempt(submit([...posted([first, second]), ['retry', '1'], ['idempotencyKey', 'fresh']]), { data: { title: 'draft' } }, clock);
-    expect([retry.key, retry.request, retry.expired]).toEqual(['k2', { data: { title: 'second' } }, false]);
+    expect([retry.key, retry.request, retry.refused]).toEqual(['k2', { data: { title: 'second' } }, null]);
     for (const code of ['SPACE_UNAVAILABLE', 'FORBIDDEN', 'UNAUTHENTICATED', 'NOT_FOUND', 'REVISION_CONFLICT', 'COMMIT_OUTCOME_UNKNOWN'])
       expect(unresolvedAfter(retry, error(code, false))).toEqual([shown(first), shown(second)]);
     expect(unresolvedAfter(retry, null)).toEqual([shown(first)]);
@@ -50,7 +50,7 @@ describe('unresolved writes', () => {
   it('adds an uncertain new request beside earlier ones and refuses one past the bound', () => {
     const fresh = writeAttempt(submit([...posted([first]), ['idempotencyKey', 'k2']]), { data: { title: 'second' } }, clock);
     expect(unresolvedAfter(fresh, error('COMMIT_OUTCOME_UNKNOWN', false))).toEqual([shown(first), { ...second, deadline:
-      new Date(now + (receiptRetentionSeconds - retryMarginSeconds) * 1000).toISOString(), expired: false }]);
+      new Date(now + (receiptRetentionSeconds - retryMarginSeconds) * 1000).toISOString(), expired: false, by: '', foreign: false }]);
     expect(unresolvedAfter(fresh, error('SCHEMA_INVALID', false))).toEqual([shown(first)]);
     expect(unresolvedAfter(fresh, null)).toEqual([shown(first)]);
     const writes = Array.from({ length: maxUnresolved }, (_, index) => write(`k${index}`, `t${index}`));
@@ -67,13 +67,31 @@ describe('unresolved writes', () => {
 
   it('expires a write at its deadline, and a posted time cannot extend it', () => {
     const window = (receiptRetentionSeconds - retryMarginSeconds) * 1000;
-    const retry = (item: ReturnType<typeof write>, at = now) => writeAttempt(submit([...posted([item]), ['retry', '0']]), null, { secret, now: at });
-    expect(retry(first, now + window).expired).toBe(false);
-    expect(retry(first, now + window + 1).expired).toBe(true);
+    const retry = (item: ReturnType<typeof write>, at = now) => writeAttempt(submit([...posted([item]), ['retry', '0']]), null, { secret, now: at, by: '' });
+    expect(retry(first, now + window).refused).toBe(null);
+    expect(retry(first, now + window + 1).refused).toMatchObject({ code: 'RECEIPT_EXPIRED' });
     // An altered time, a missing stamp or another server's secret makes it expired, never later.
     for (const altered of [{ ...first, at: String(now + window) }, { ...first, seal: '' }, { ...first, at: '' },
       seal(sealSecret('cd'.repeat(32)), first.key, first.sent, now)])
-      expect(retry(altered)).toMatchObject({ expired: true, pending: [{ deadline: null, expired: true }] });
-    expect(writeAttempt(submit(posted([first])), null, { secret: null, now }).pending[0].expired).toBe(true);
+      expect(retry(altered)).toMatchObject({ refused: { code: 'RECEIPT_EXPIRED' }, pending: [{ deadline: null, expired: true }] });
+    expect(writeAttempt(submit(posted([first])), null, { secret: null, now, by: '' }).pending[0].expired).toBe(true);
+  });
+
+  it('retries a write only under the credential that sent it', () => {
+    // A receipt belongs to the credential that sent its request; the session cookie is shared by every tab.
+    const as = (token: string) => writeClock({ platform: { env: { STATEPLANE_TEST_CURSOR_SECRET: 'ab'.repeat(32) } } as never,
+      cookies: { get: () => token } as never });
+    const owner = as('owner-bearer'), agent = as('agent-bearer');
+    const sent = writeAttempt(submit([['idempotencyKey', 'k1']]), { data: { title: 'once' } }, owner);
+    const [lost] = unresolvedAfter(sent, error('COMMIT_OUTCOME_UNKNOWN', false));
+    expect(JSON.stringify(lost)).not.toContain('bearer');
+    const pendingBy = (item: typeof lost) => [...posted([item]), ['pendingBy', item.by]] as [string, string][];
+    const retry = (item: typeof lost, clock: typeof owner) => writeAttempt(submit([...pendingBy(item), ['retry', '0']]), null, clock);
+    // Under another credential it is refused unsent and stays listed, never called expired.
+    expect(retry(lost, agent)).toMatchObject({ refused: { code: 'OTHER_CREDENTIAL' }, key: 'k1', pending: [{ key: 'k1', foreign: true }] });
+    // Back under the credential that sent it, the same request is retried under its key.
+    expect(retry(lost, owner)).toMatchObject({ refused: null, key: 'k1', request: { data: { title: 'once' } }, pending: [{ foreign: false, expired: false }] });
+    // Claiming the current credential's digest cannot make another credential's seal valid.
+    expect(retry({ ...lost, by: agent.by }, agent)).toMatchObject({ refused: { code: 'RECEIPT_EXPIRED' }, pending: [{ expired: true }] });
   });
 });

@@ -80,7 +80,7 @@
     {#if editing}
       <section aria-labelledby="edit" class="panel space-y-3">
         <h2 id="edit" class="text-lg font-semibold">Edit data</h2>
-        <Notice error={form?.error} title={!form?.retried ? 'Record was not saved' : lost ? 'The earlier save is no longer tracked' : 'The earlier save is still unresolved'} hint={lost ? 'Its request key now belongs to a different request, so a retry can never recover it, and it is no longer tracked. Check the current record before saving again.' : undefined} />
+        <Notice error={form?.error} title={!form?.retried ? 'Record was not saved' : lost ? 'The earlier save is no longer tracked' : 'The earlier save is still unresolved'} hint={lost ? 'Its request key now belongs to a different request, so a retry can never recover it, and it is no longer tracked. Check the current record before saving again.' : form?.error?.code==='OTHER_CREDENTIAL' ? 'Nothing was sent. Another credential sent it, and only that credential can recover it: sign in with that credential to retry it.' : undefined} />
         <form id="edit-form" method="POST" action="?/save" class="space-y-3">
           <input type="hidden" name="idempotencyKey" value={data.idempotencyKey} />
           <Unresolved writes={unresolved} kind="save" />
@@ -99,7 +99,7 @@
       <section aria-labelledby="remove" class="panel h-fit space-y-3">
         <h2 id="remove" class="text-lg font-semibold">Delete</h2>
         <Notice error={form?.deleteError} title="Record was not deleted">
-          {#if form?.deleteError?.code==='COMMIT_OUTCOME_UNKNOWN'}<p class="mt-1">Retry deletion resends the same request. Within the receipt retention window its key recovers the original result; after that a committed deletion shows as deleted instead. Its revision means it never deletes a newer revision.</p>{/if}
+          {#if form?.deleteError?.code==='COMMIT_OUTCOME_UNKNOWN'}<p class="mt-1">Retry deletion resends the same request. Within the receipt retention window, and only with the credential that sent it, its key recovers the original result; after that a committed deletion shows as deleted instead. Its revision means it never deletes a newer revision.</p>{/if}
         </Notice>
         <p class="hint">Deletion leaves a tombstone; the ID and external key are never reused.</p>
         <form method="POST" action="?/delete">

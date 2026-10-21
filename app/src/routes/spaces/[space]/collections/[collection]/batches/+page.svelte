@@ -24,7 +24,7 @@
   <section aria-labelledby="submit" class="panel space-y-3">
     <h2 id="submit" class="text-lg font-semibold">Submit a batch</h2>
     <Notice error={form?.error} title="Batch was not accepted">
-      {#if uncertain}<p class="mt-1">Some items may have committed. <a class="link" href="?operation={encodeURIComponent(form?.operationKey ?? '')}">Read this operation's progress</a>, then resubmit the same key and unchanged lines to resume pending items.</p>{/if}
+      {#if uncertain}<p class="mt-1">Some items may have committed. <a class="link" href="?operation={encodeURIComponent(form?.operationKey ?? '')}">Read this operation's progress</a>, then resubmit the same key and unchanged lines with the same credential to resume pending items; another credential's operation is a separate one.</p>{/if}
     </Notice>
     <form method="POST" action="?/ingest" class="space-y-3">
       <div><label for="operationKey">Operation key</label>

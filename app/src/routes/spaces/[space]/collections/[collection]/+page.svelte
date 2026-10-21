@@ -80,7 +80,7 @@
       </form>
       <div class="flex flex-wrap items-baseline justify-between gap-2">
         <h2 id="results" class="font-semibold">Results{data.count===null ? '' : ` · ${data.count} matching`}</h2>
-        {#if data.page && !data.counted}<a class="link text-sm" href="{here}&count=1" aria-describedby="count-hint">Count matching records</a>{/if}
+        {#if data.page && (!data.counted || data.countError)}<a class="link text-sm" href="{here}&count=1" data-sveltekit-reload={!!data.countError} aria-describedby="count-hint">Count matching records</a>{/if}
       </div>
       <p id="count-hint" class="hint">Counting reads every matching record, so it runs only when asked for.</p>
       <Notice error={data.countError} title="Matching records could not be counted" />
@@ -117,7 +117,7 @@
 {#snippet create()}
   <section aria-labelledby="create" class="panel h-fit space-y-3">
     <h2 id="create" class="font-semibold">Create a record</h2>
-    <Notice error={form?.create?.error} title={!form?.create?.retried ? 'Record was not created' : lost ? 'The earlier create is no longer tracked' : 'The earlier create is still unresolved'} hint={lost ? 'Its request key now belongs to a different request, so a retry can never recover it, and it is no longer tracked. Check the records list before creating it again.' : undefined} />
+    <Notice error={form?.create?.error} title={!form?.create?.retried ? 'Record was not created' : lost ? 'The earlier create is no longer tracked' : 'The earlier create is still unresolved'} hint={lost ? 'Its request key now belongs to a different request, so a retry can never recover it, and it is no longer tracked. Check the records list before creating it again.' : form?.create?.error?.code==='OTHER_CREDENTIAL' ? 'Nothing was sent. Another credential sent it, and only that credential can recover it: sign in with that credential to retry it.' : undefined} />
     {#if form?.created}<p role="status" class="text-sm text-success">Created <a class="ident link" href="{base}/records/{segment(form.created.ref.id)}">{form.created.ref.id}</a> at revision {form.created.revision}{form.created.replayed ? ' (recovered earlier result)' : ''}. Search projection: {form.created.projection.state}.</p>{/if}
     <form method="POST" action="?/create" class="space-y-3">
       <input type="hidden" name="idempotencyKey" value={data.idempotencyKey} />
