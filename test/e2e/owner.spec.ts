@@ -1013,11 +1013,11 @@ test('a filter or sort the authority would refuse is reported on its field and n
 
   const headers = { authorization: `Bearer ${ownerToken}` };
   expect((await request.post(`/v1${checks}/indexes/note`, { headers })).status()).toBe(200);
-  // A seventeenth filter and a value past 512 UTF-8 bytes are refused before any request.
+  // A seventeenth filter, which the form never sends, and a value past 512 UTF-8 bytes are refused before any request.
   await go(page, `${checks}?${Array.from({ length: 17 }, () => 'field=note&op=eq&value=x').join('&')}`);
   await expect(page.getByRole('alert')).toHaveCount(0);
-  await expect(page.getByLabel('Value').nth(16)).toHaveAccessibleDescription(/At most 16 filters/);
-  await expect(page.getByLabel('Value')).toHaveCount(17);
+  await expect(page.getByText('At most 16 filters apply. Remove filters.')).toBeVisible();
+  await expect(page.getByLabel('Value')).toHaveCount(16);
   await go(page, `${checks}?field=note&op=eq&value=${encodeURIComponent('é'.repeat(257))}`);
   await expect(page.getByLabel('Value').first()).toHaveAccessibleDescription(/512 bytes/);
   // The authority refuses U+0000 in text, so the row says so instead of a refused query.
@@ -1071,6 +1071,18 @@ test('filters too long for a page address are refused on the page, with and with
   await expect(page.getByLabel('Value').first()).toHaveValue(ascii);
   await expect(page.getByRole('link', { name: 'Count matching records' })).toHaveCount(0);
   await expect(page.getByRole('alert')).toHaveCount(0);
+  // The form sends at most sixteen rows. A posted list of 20,000 is refused at once, before any row is read,
+  // and neither its rows nor anything else in proportion to its size comes back.
+  const flood = new URLSearchParams([...Array.from({ length: 20_000 }, () => [['field', 'note'], ['op', 'eq'], ['value', 'x']]).flat(), ['limit', '10']]);
+  const started = Date.now();
+  const refused = await page.request.post(`${addresses}?/filter`, { headers: { origin: new URL(page.url()).origin, accept: 'text/html',
+    'content-type': 'application/x-www-form-urlencoded' }, data: flood.toString() });
+  expect(Date.now() - started).toBeLessThan(5_000);
+  expect(refused.status()).toBe(400);
+  const html = await refused.text();
+  expect(html).toContain('At most 16 filters apply. Remove filters.');
+  expect(html).toContain('kept');
+  expect(html.match(/<fieldset/g)?.length).toBeLessThanOrEqual(16);
 });
 
 test('a key granted only changes opens them from the space page, and still reads no records', async ({ browser, request }) => {

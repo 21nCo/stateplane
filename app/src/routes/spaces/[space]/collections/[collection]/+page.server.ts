@@ -3,7 +3,7 @@ import { fail, redirect } from '@sveltejs/kit';
 import { api, pageCursor } from '$lib/server/api';
 import { carriedId, carry, selectors } from '$lib/paths';
 import { given, jsonObject, unresolvedAfter, writeAttempt, writeClock } from '$lib/server/forms';
-import { predicates, queryBody, searchProblem, sortProblem } from '$lib/query';
+import { maxPredicates, predicates, queryBody, searchProblem, sortProblem } from '$lib/query';
 import type { FilterRow } from '$lib/query';
 import type { ApiError } from '$lib/errors';
 import type { Collection, Receipt, StoredRecord } from '$lib/types';
@@ -15,13 +15,13 @@ const path=(url:URL)=>{ const {space,collection}=selectors(url); return ['spaces
 
 // Field names travel carried in the query, as the form and its links send them.
 const filterState=(params:URLSearchParams)=>{
-  const rows:FilterRow[]=params.getAll('field').map((field,index)=>({field:carriedId(field),op:params.getAll('op')[index] ?? 'eq',
-    value:params.getAll('value')[index] ?? ''})).filter(row=>row.field);
+  // Each list is read once; past the maxPredicates rows the form sends, the list is refused before any row is built.
+  const [fields,ops,values]=['field','op','value'].map(name=>params.getAll(name)), many=fields.length>maxPredicates, rows:FilterRow[]=fields.slice(0,maxPredicates).map((field,index)=>({field:carriedId(field),op:ops[index] ?? 'eq',value:values[index] ?? ''})).filter(row=>row.field);
   const requested=Number(params.get('limit') ?? defaultLimit);
   const limit=Number.isInteger(requested) && requested>=1 && requested<=100 ? requested : defaultLimit;
   const sort=params.get('sort') ? {field:carriedId(params.get('sort')!),direction:params.get('dir')==='desc' ? 'desc' : 'asc'} : undefined;
   const query=new URLSearchParams([...rows.flatMap(row=>[['field',carry(row.field)],['op',row.op],['value',row.value]]),...(sort ? [['sort',carry(sort.field)],['dir',sort.direction]] : []),['limit',String(limit)]]).toString();
-  return {rows,requested,limit,sort,query,error:searchProblem(query)};
+  return {rows,requested,limit,sort,query,error:many ? `At most ${maxPredicates} filters apply. Remove filters.` : searchProblem(query)};
 };
 
 export const load:PageServerLoad=async(event)=>{
