@@ -1,0 +1,54 @@
+test/fixtures/sveltekit-app.ts
+  s_20b5a6b7ff8d47::t_24ef1977eb417b 1-3
+app/src/lib/server/keycheck.ts
+  s_20b5a6b7ff8d47::t_bfd461266d78c8 22
+  h_a39f9495f9ec1d 1-21
+test/ui-render.config.ts
+  s_20b5a6b7ff8d47::t_2fef226fdb2034 1-12
+test/ui-access.test.ts
+  s_20b5a6b7ff8d47::t_d56c849946c1de 1-73
+packages/contracts/src/index.ts
+  s_20b5a6b7ff8d47::t_c952c22cfc30a1 14-18
+app/src/routes/spaces/[space]/access/+page.server.ts
+  h_a39f9495f9ec1d 1-33,35-41,44-45,48-49,51-67
+  s_20b5a6b7ff8d47::t_7c2db3f5a68e59 34,42-43,46-47,50
+test/mcp-host.test.ts
+  h_a39f9495f9ec1d 8,18-19,32-37,46,121-234
+app/src/lib/server/grants.ts
+  s_20b5a6b7ff8d47::t_73014d5ccac553 1-37
+test/e2e/access.spec.ts
+  s_20b5a6b7ff8d47::t_fb11f525981edd 1-303
+app/src/routes/spaces/[space]/access/+page.svelte
+  s_20b5a6b7ff8d47::t_4f901e24d3542d 103-109
+  h_a39f9495f9ec1d 1-102
+  s_20b5a6b7ff8d47::t_a8bea479de9101 110-112
+  s_20b5a6b7ff8d47::t_9f456610dced3d 113-116
+test/integration/owner-access-http.test.js
+  h_a39f9495f9ec1d 1-7,9-136,171
+  s_20b5a6b7ff8d47::t_f090eef0713e1f 8,137-170
+test/ui-render.test.ts
+  s_20b5a6b7ff8d47::t_c0e536efb4edc3 1-47
+test/ui-shell.config.ts
+  s_20b5a6b7ff8d47::t_c06c7be0f30150 2,4-6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b21bc9ee58426575c48ab868d298d0e9d6b35ece",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_20b5a6b7ff8d47": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_20b5a6b7ff8d47",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
