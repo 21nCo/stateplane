@@ -3,7 +3,7 @@
   import Restart from '$lib/components/Restart.svelte';
   import Scroll from '$lib/components/Scroll.svelte';
   import Unresolved from '$lib/components/Unresolved.svelte';
-  import { maxUnresolved } from '$lib/errors';
+  import { definitive, maxUnresolved } from '$lib/errors';
   import { fieldKind, maxPredicates, operators } from '$lib/query';
   import { page } from '$app/state';
   import { carry, collectionHref, segment, selectors, shown } from '$lib/paths';
@@ -17,6 +17,7 @@
   // Unresolved creates stay on the page, whatever later drafts return.
   const unresolved=$derived(form?.pending ?? []);
   const draft=$derived(form?.create ?? form?.draft ?? null);
+  const lost=$derived(!!form?.create?.retried && !!form.create.error && definitive(form.create.error));
   const columns=$derived(Object.keys(definition?.schema.properties ?? {}).slice(0,4));
   const rows=$derived(data.rows.length<maxPredicates ? [...data.rows,{field:'',op:'eq',value:''}] : data.rows);
   const query=$derived.by(()=>{
@@ -28,7 +29,7 @@
   });
   const here=$derived(`${base}?${query}${data.cursor ? `&cursor=${encodeURIComponent(data.cursor)}` : ''}`);
   const next=$derived(data.page?.nextCursor ? `${base}?${query}&cursor=${encodeURIComponent(data.page.nextCursor)}` : null);
-  const cell=(record:{canonicalData:string},column:string)=>{ const value=(JSON.parse(record.canonicalData) as Record<string,unknown>)[column]; return value===undefined ? '—' : typeof value==='string' ? value : JSON.stringify(value); };
+  const cell=(record:{canonicalData:string},column:string)=>{ const data=JSON.parse(record.canonicalData) as Record<string,unknown>; return !Object.hasOwn(data,column) ? '—' : typeof data[column]==='string' ? data[column] : JSON.stringify(data[column]); };
 </script>
 
 <svelte:head><title>Records · Stateplane</title></svelte:head>
@@ -61,6 +62,7 @@
               {#if data.filterErrors[index]}<p id="value-error-{index}" class="mt-1 text-sm text-danger">{data.filterErrors[index]}</p>{/if}</div>
           </fieldset>
         {/each}
+        {#if data.queryError}<p id="query-error" class="text-sm text-danger">{data.queryError}</p>{/if}
         <p class="hint">Use <code>in</code> with comma-separated values; text matches exactly, including spaces after commas; <code>isNull</code> ignores the value.</p>
         <div class="grid gap-2 sm:grid-cols-3">
           <div><label for="sort">Sort by</label>
@@ -115,7 +117,7 @@
 {#snippet create()}
   <section aria-labelledby="create" class="panel h-fit space-y-3">
     <h2 id="create" class="font-semibold">Create a record</h2>
-    <Notice error={form?.create?.error} title={form?.create?.retried ? 'The earlier create is still unresolved' : 'Record was not created'} />
+    <Notice error={form?.create?.error} title={!form?.create?.retried ? 'Record was not created' : lost ? 'The earlier create is no longer tracked' : 'The earlier create is still unresolved'} hint={lost ? 'Its request key now belongs to a different request, so a retry can never recover it, and it is no longer tracked. Check the records list before creating it again.' : undefined} />
     {#if form?.created}<p role="status" class="text-sm text-success">Created <a class="ident link" href="{base}/records/{segment(form.created.ref.id)}">{form.created.ref.id}</a> at revision {form.created.revision}{form.created.replayed ? ' (recovered earlier result)' : ''}. Search projection: {form.created.projection.state}.</p>{/if}
     <form method="POST" action="?/create" class="space-y-3">
       <input type="hidden" name="idempotencyKey" value={data.idempotencyKey} />

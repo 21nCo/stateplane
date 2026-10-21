@@ -295,6 +295,60 @@ test('an unresolved create stays on the page until it is retried, whatever later
   expect(await titles()).toEqual(['original', 'second', 'second changed']);
 });
 
+test('a retry whose key now belongs to another request says the write is no longer tracked', async ({ page, request }) => {
+  test.skip(!local, 'Needs the local fault proxy');
+  await defineCollection(request, 'rekeyed');
+  await signIn(page, ownerToken);
+  const rekeyed = `${spaceUrl}/collections/rekeyed`;
+  await go(page, rekeyed);
+  const headers = { authorization: `Bearer ${ownerToken}` };
+  const keyedWrite = async (path: string, key: string, body: object) =>
+    expect((await request.post(`/v1${path}/records`, { headers, data: { ...body, idempotencyKey: key } })).ok()).toBe(true);
+  // The create never reaches the database, so its key is still free for another request.
+  await page.getByLabel('Data JSON').fill(JSON.stringify({ title: 'never sent' }));
+  await refuse('INSERT INTO records(');
+  await page.getByRole('button', { name: 'Create record' }).click();
+  await expect(page.getByText('An earlier create may have committed')).toBeVisible();
+  await keyedWrite(rekeyed, await page.locator('input[name="pendingKey"]').inputValue(), { operation: 'create', data: { title: 'other' } });
+  await settle(page);
+  await page.getByRole('button', { name: 'Retry unchanged' }).click();
+  const created = page.getByRole('region', { name: 'Create a record' }).getByRole('alert');
+  await expect(created).toContainText('The earlier create is no longer tracked: IDEMPOTENCY_MISMATCH');
+  await expect(created).toContainText('Check the records list');
+  await expect(created).not.toContainText(/still unresolved|Retry that request/);
+  await expect(page.getByRole('button', { name: 'Retry unchanged' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Create record' })).toBeVisible();
+
+  // The same for a save whose request never reached the database.
+  const id = await createRecord(page, { title: 'saved' }, rekeyed);
+  await go(page, `${rekeyed}/records/${id}`);
+  await page.getByLabel(/Data JSON/).fill(JSON.stringify({ title: 'never saved' }));
+  await refuse('UPDATE records SET');
+  await page.getByRole('button', { name: 'Save revision' }).click();
+  await expect(page.getByText('An earlier save may have committed')).toBeVisible();
+  await keyedWrite(rekeyed, await page.locator('input[name="pendingKey"]').first().inputValue(),
+    { operation: 'replace', id, expectedRevision: 1, data: { title: 'other save' } });
+  await settle(page);
+  await page.getByRole('button', { name: 'Retry unchanged' }).click();
+  const saved = page.getByRole('region', { name: 'Edit data' }).getByRole('alert');
+  await expect(saved).toContainText('The earlier save is no longer tracked: IDEMPOTENCY_MISMATCH');
+  await expect(saved).toContainText('Check the current record');
+  await expect(saved).not.toContainText(/still unresolved|Retry that request/);
+  await expect(page.getByRole('button', { name: 'Retry unchanged' })).toHaveCount(0);
+});
+
+test('a records table shows an absent field named like an Object member as absent', async ({ page, request }) => {
+  await defineCollection(request, 'members', definition({ constructor: { type: 'string' }, toString: { type: ['number', 'null'] }, valueOf: { type: 'string' } }));
+  await signIn(page, ownerToken);
+  await createRecord(page, { title: 'bare' }, `${spaceUrl}/collections/members`);
+  await createRecord(page, { title: 'set', constructor: 'built', toString: null, valueOf: '' }, `${spaceUrl}/collections/members`);
+  await go(page, `${spaceUrl}/collections/members`);
+  const cells = (title: string) => page.getByRole('row').filter({ hasText: title }).getByRole('cell');
+  // Columns follow the stored definition: constructor, title, toString, valueOf.
+  await expect(cells('bare')).toHaveText([/./, '1', '—', 'bare', '—', '—']);
+  await expect(cells('set')).toHaveText([/./, '1', 'built', 'set', 'null', '']);
+});
+
 test('a size rejection is a known outcome, so no retry is offered', async ({ page }) => {
   await signIn(page, ownerToken);
   await go(page, itemsUrl());

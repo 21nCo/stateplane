@@ -3,7 +3,7 @@ import { fail } from '@sveltejs/kit';
 import { api, pageCursor, writeClock } from '$lib/server/api';
 import { carriedId, selectors } from '$lib/paths';
 import { expiredRetry, given, jsonObject, unresolvedAfter, writeAttempt } from '$lib/server/forms';
-import { predicates, sortProblem } from '$lib/query';
+import { predicates, queryBody, sortProblem } from '$lib/query';
 import type { FilterRow } from '$lib/query';
 import type { ApiError } from '$lib/errors';
 import type { Collection, Receipt, StoredRecord } from '$lib/types';
@@ -28,16 +28,17 @@ export const load:PageServerLoad=async(event)=>{
   // never on page navigation, and its failure leaves the page's records in place.
   const counted=params.get('count')==='1';
   const view={rows,limit,sort,cursor:cursor ?? null,paged,counted,limitInvalid:limit!==requested,idempotencyKey:`ui-${randomUUID()}`,
-    sortError:null as string|null,count:null as number|null,countError:null as ApiError|null};
+    sortError:null as string|null,queryError:null as string|null,count:null as number|null,countError:null as ApiError|null};
   if (!collection.ok) return {...view,collection:null,error:collection.error,filterErrors,page:null};
   // A query the authority would refuse is reported on its fields and never sent.
   const {definition,ready}=collection.data;
   const built=predicates(definition,rows,ready);
   const sortError=sort ? sortProblem(definition,ready,sort.field) : null;
-  if (Object.keys(built.errors).length || sortError) return {...view,collection:collection.data,error:null,filterErrors:built.errors,sortError,page:null};
+  const {body,error:queryError}=queryBody(built.predicates,limit,sort,cursor);
+  if (Object.keys(built.errors).length || sortError || queryError)
+    return {...view,collection:collection.data,error:null,filterErrors:built.errors,sortError,queryError,page:null};
   const [page,count]=rejected ? [rejected,null] : await Promise.all([
-    api<{records:StoredRecord[];nextCursor:string|null;schemaVersion:number}>(event,'POST',[...path(event.url),'records','query'],
-      {body:{predicates:built.predicates,limit,...(sort ? {sort} : {}),...(cursor!==undefined ? {cursor} : {})}}),
+    api<{records:StoredRecord[];nextCursor:string|null;schemaVersion:number}>(event,'POST',[...path(event.url),'records','query'],{body}),
     counted ? api<number>(event,'POST',[...path(event.url),'records','count'],{body:built.predicates}) : null]);
   return {...view,collection:collection.data,error:page.ok ? null : page.error,filterErrors,page:page.ok ? page.data : null,
     count:count?.ok ? count.data : null,countError:count && !count.ok ? count.error : null};

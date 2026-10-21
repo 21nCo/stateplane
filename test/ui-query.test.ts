@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { maxPredicates, predicates, sortProblem } from '../app/src/lib/query';
+import { maxPredicates, predicates, queryBody, sortProblem } from '../app/src/lib/query';
 
 const definition = { slug: 'c', version: 1, unique: [], filterable: ['n', 't', 's', 'b', 'built', 'pending'], sortable: ['n', 'hidden', 'pending'],
   schema: { type: 'object', properties: { n: { type: 'number' }, t: { type: 'string', format: 'date-time' }, s: { type: 'string' }, b: { type: 'boolean' },
@@ -72,4 +72,25 @@ it('an "in" filter takes at most 16 values of any kind, and a 17th is reported a
   }
   // A malformed member of a short list still names its kind.
   expect(check('n', 'in', '1,x').errors[0]).toBe('Enter a number.');
+});
+
+it('a query whose JSON body the authority would refuse as over 32768 bytes is reported and never sent', () => {
+  const list = (item: string, count = 16) => ({ field: 's', op: 'in', value: Array(count).fill(item).join(',') });
+  const sent = (rows: { field: string; op: string; value: string }[], cursor?: string) => {
+    const built = predicates(definition as never, rows, ready);
+    expect(built.errors).toEqual({});
+    return queryBody(built.predicates, 25, { field: 'n', direction: 'asc' }, cursor);
+  };
+  // Every value is within its own limit; four full lists of 512-byte values are not, together.
+  const full = list('a'.repeat(512));
+  expect(sent([full, full, full]).error).toBeNull();
+  expect(sent([full, full, full, full]).error).toMatch(/too large to send \(over 32768 bytes\)/);
+  // A control character is one UTF-8 byte but six once JSON escapes it.
+  expect(sent([list('\u0001'.repeat(512), 10)]).error).toBeNull();
+  expect(sent([list('\u0001'.repeat(512))]).error).toMatch(/too large/);
+  // The body is the one sent, cursor included.
+  const near = sent([full, full, full, list('a'.repeat(512), 14)]);
+  expect([near.error, Buffer.byteLength(JSON.stringify(near.body)) < 32768]).toEqual([null, true]);
+  expect(sent([full, full, full, list('a'.repeat(512), 14)], 'c'.repeat(32768 - Buffer.byteLength(JSON.stringify(near.body)))).error).toMatch(/too large/);
+  expect(near.body).toEqual({ predicates: expect.any(Array), limit: 25, sort: { field: 'n', direction: 'asc' } });
 });

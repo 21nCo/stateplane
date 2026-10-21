@@ -2,7 +2,7 @@
   import Notice from '$lib/components/Notice.svelte';
   import Status from '$lib/components/Status.svelte';
   import Unresolved from '$lib/components/Unresolved.svelte';
-  import { maxUnresolved } from '$lib/errors';
+  import { definitive, maxUnresolved } from '$lib/errors';
   import { page } from '$app/state';
   import { collectionHref, selectors, shown } from '$lib/paths';
   let { data, form } = $props();
@@ -24,6 +24,8 @@
   // A delete that meets a missing record may itself have committed earlier: an uncertain
   // delete retried after its receipt window. Never say that deletion was not applied.
   const gone=$derived(!!form?.conflict?.deleted && !!form?.deleting);
+  // A retry that met a definitive result (forms.ts unresolvedAfter) ended its unresolved write.
+  const lost=$derived(!!form?.retried && !!form.error && definitive(form.error));
   const schemaInvalid=$derived(form?.invalid || form?.error?.code==='SCHEMA_INVALID');
   const tone=(state?:string)=>state==='current' ? 'success' : state==='degraded' ? 'danger' : 'warning';
 </script>
@@ -78,7 +80,7 @@
     {#if editing}
       <section aria-labelledby="edit" class="panel space-y-3">
         <h2 id="edit" class="text-lg font-semibold">Edit data</h2>
-        <Notice error={form?.error} title={form?.retried ? 'The earlier save is still unresolved' : 'Record was not saved'} />
+        <Notice error={form?.error} title={!form?.retried ? 'Record was not saved' : lost ? 'The earlier save is no longer tracked' : 'The earlier save is still unresolved'} hint={lost ? 'Its request key now belongs to a different request, so a retry can never recover it, and it is no longer tracked. Check the current record before saving again.' : undefined} />
         <form id="edit-form" method="POST" action="?/save" class="space-y-3">
           <input type="hidden" name="idempotencyKey" value={data.idempotencyKey} />
           <Unresolved writes={unresolved} kind="save" />
