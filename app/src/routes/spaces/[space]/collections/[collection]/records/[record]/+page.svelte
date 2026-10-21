@@ -21,6 +21,9 @@
   const unresolved=$derived(form?.pending ?? []);
   const editing=$derived(!!data.record || unresolved.length>0 || (form?.raw!==undefined && (!form?.conflict || applyTo!==null)));
   const retryDelete=$derived(!!form?.deleteError);
+  // A delete that meets a missing record may itself have committed earlier: an uncertain
+  // delete retried after its receipt window. Never say that deletion was not applied.
+  const gone=$derived(!!form?.conflict?.deleted && !!form?.deleting);
   const schemaInvalid=$derived(form?.invalid || form?.error?.code==='SCHEMA_INVALID');
   const tone=(state?:string)=>state==='current' ? 'success' : state==='degraded' ? 'danger' : 'warning';
 </script>
@@ -41,19 +44,21 @@
 {#if form?.saved}<p role="status" class="mt-3 text-sm text-success">Saved revision {form.saved.revision} (was {form.saved.beforeRevision}){form.saved.replayed ? ', recovered from an earlier identical request' : ''}. Search projection: {form.saved.projection.state}.</p>{/if}
 {#if form?.conflict}
   <section aria-labelledby="conflict" class="mt-4 rounded-lg border border-warning bg-surface p-4" role="alert">
-    <h2 id="conflict" class="text-lg font-semibold">Edit conflict</h2>
-    {#if form.conflict.deleted}
-      <p class="mt-1">This record was deleted, or is no longer visible to this credential, after revision {form.expectedRevision}. Your {form.deleting ? 'deletion' : 'edit'} was not applied.</p>
+    <h2 id="conflict" class="text-lg font-semibold">{gone ? 'Record is gone' : 'Edit conflict'}</h2>
+    {#if gone}
+      <p class="mt-1">This record no longer exists, or is no longer visible to this credential. This deletion may already have removed it, or another writer did. There is nothing left to delete.</p>
+    {:else if form.conflict.deleted}
+      <p class="mt-1">This record was deleted, or is no longer visible to this credential, after revision {form.expectedRevision}. Your edit was not applied.</p>
     {:else if form.conflict.rereadError}
       <p class="mt-1">Revision {form.expectedRevision} is no longer current, and the current record could not be read to compare. Nothing was overwritten.</p>
       <Notice error={form.conflict.rereadError} title="Current record could not be read" />
     {:else}
       <p class="mt-1">You edited revision {form.expectedRevision}, but revision {form.conflict.revision} is now current. Nothing was overwritten. Compare, then keep the current record or apply your version on top of it.</p>
     {/if}
-    <div class="mt-3 grid gap-3 md:grid-cols-2">
+    {#if !gone}<div class="mt-3 grid gap-3 md:grid-cols-2">
       <div><h3 class="font-semibold">Your {form.deleting ? 'deletion' : 'edit'} (from revision {form.expectedRevision})</h3><pre class="mt-1 whitespace-pre-wrap break-all rounded bg-muted p-2 text-xs">{form.deleting ? 'Delete this record' : form.raw}</pre></div>
       {#if form.conflict.pretty!==null}<div><h3 class="font-semibold">Current revision {form.conflict.revision}</h3><pre class="mt-1 whitespace-pre-wrap break-all rounded bg-muted p-2 text-xs">{form.conflict.pretty}</pre></div>{/if}
-    </div>
+    </div>{/if}
     {#if form.conflict.revision!==null}
       <div class="mt-3 flex flex-wrap gap-2">
         <a class="btn-quiet" href="?">Keep current revision</a>

@@ -54,3 +54,11 @@ it('a filter or sort the authority would refuse is reported on its field before 
   expect(sortProblem(definition as never, ready, 'pending')).toMatch(/still being built/);
   for (const field of ['n', 'hidden']) expect(sortProblem(definition as never, ready, field)).toBeNull();
 });
+
+it('a text value containing U+0000 is reported on its row, as the authority refuses it', () => {
+  for (const [op, value] of [['eq', 'a\0b'], ['in', 'ok,\0'], ['in', '\0']] as const)
+    expect(check('s', op, value)).toEqual({ predicates: [], errors: { 0: expect.stringMatching(/U\+0000/) } });
+  // Empty text and other Unicode, including other control characters, remain valid values.
+  for (const value of ['', '\u0001', '�', '😀']) expect(check('s', 'eq', value).predicates).toEqual([{ field: 's', kind: 'string', operator: 'eq', value }]);
+  expect(check('s', 'in', 'a,,b').predicates).toEqual([{ field: 's', kind: 'string', operator: 'in', value: ['a', '', 'b'] }]);
+});

@@ -154,6 +154,23 @@ test('an edit to a concurrently deleted record keeps the draft', async ({ browse
   await expect(conflict.getByRole('button')).toHaveCount(0);
 });
 
+test('a delete that finds the record gone never claims the deletion was not applied', async ({ browser, page }) => {
+  await signIn(page, ownerToken);
+  const id = await createRecord(page, { title: 'Already gone', state: 'open', rank: 6 });
+  await go(page, `${itemsUrl()}/records/${id}`);
+  const other = await browser.newPage({ storageState: await page.context().storageState() });
+  await go(other, `${itemsUrl()}/records/${id}`);
+  await other.getByRole('button', { name: 'Delete revision 1' }).click();
+  await expect(other).toHaveURL(new RegExp(`${itemsUrl()}$`));
+
+  // Another writer removed it here; an expired retry of this same deletion reads the same way.
+  await page.getByRole('button', { name: 'Delete revision 1' }).click();
+  const gone = page.getByRole('alert', { name: 'Record is gone' });
+  await expect(gone).toContainText('This deletion may already have removed it, or another writer did.');
+  await expect(gone).not.toContainText('not applied');
+  await expect(gone.getByRole('button')).toHaveCount(0);
+});
+
 test('an uncertain delete is replayed with its original request key', async ({ page }) => {
   test.skip(!local, 'Needs the local fault proxy');
   await signIn(page, ownerToken);
@@ -859,6 +876,10 @@ test('a filter or sort the authority would refuse is reported on its field and n
   await expect(page.getByLabel('Value')).toHaveCount(17);
   await go(page, `${checks}?field=note&op=eq&value=${encodeURIComponent('é'.repeat(257))}`);
   await expect(page.getByLabel('Value').first()).toHaveAccessibleDescription(/512 bytes/);
+  // The authority refuses U+0000 in text, so the row says so instead of a refused query.
+  await go(page, `${checks}?field=note&op=in&value=ok,%00`);
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await expect(page.getByLabel('Value').first()).toHaveAccessibleDescription(/U\+0000/);
   await go(page, `${checks}?field=note&op=eq&value=${encodeURIComponent('é'.repeat(256))}&sort=note`);
   await expect(page.getByRole('alert')).toHaveCount(0);
   await expect(page.getByText('No records match these filters.')).toBeVisible();

@@ -20,7 +20,8 @@ export const load:PageServerLoad=async(event)=>{
 };
 
 /** Never resolve a stale write silently: return the current record beside the user's draft.
- * A write to a record loaded on this page that is now NOT_FOUND was deleted concurrently.
+ * A write to a record loaded on this page that is now NOT_FOUND is gone: deleted concurrently,
+ * or for a delete possibly by its own earlier attempt whose receipt has expired.
  * Only a NOT_FOUND reread proves deletion; any other reread failure offers no apply. */
 async function conflict(event:RequestEvent,values:Record<string,unknown>) {
   const current=await api<StoredRecord>(event,'GET',recordPath(event.url));
