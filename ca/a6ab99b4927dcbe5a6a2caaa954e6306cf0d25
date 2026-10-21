@@ -1,0 +1,26 @@
+app/src/lib/components/Unresolved.svelte
+  h_a39f9495f9ec1d 6,15,23,32
+app/src/lib/server/forms.ts
+  h_a39f9495f9ec1d 1-2,5,34-44,46,49,52,56,59,69,82
+app/src/routes/spaces/[space]/collections/[collection]/+page.server.ts
+  h_a39f9495f9ec1d 3,5,59-60
+app/src/routes/spaces/[space]/collections/[collection]/+page.svelte
+  h_a39f9495f9ec1d 83,120
+app/src/routes/spaces/[space]/collections/[collection]/batches/+page.svelte
+  h_a39f9495f9ec1d 27
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.server.ts
+  h_a39f9495f9ec1d 3-4,45
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.svelte
+  h_a39f9495f9ec1d 83,102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "caa6ab99b4927dcbe5a6a2caaa954e6306cf0d25",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
