@@ -1,0 +1,21 @@
+test/e2e/owner.spec.ts
+  s_409c2f10f56e2e::t_a97c31fcde6c5d 1074-1085
+app/src/routes/spaces/[space]/collections/[collection]/+page.server.ts
+  s_409c2f10f56e2e::t_ef1b8fdf3b8efe 6,18-19,24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8cd2f691c55fc59ae8796aa0583986b2874e1e28",
+  "prompts": {},
+  "sessions": {
+    "s_409c2f10f56e2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_409c2f10f56e2e",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
