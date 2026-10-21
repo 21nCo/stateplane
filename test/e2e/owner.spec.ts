@@ -991,6 +991,35 @@ test('a partly failed batch keeps its lines, so failed items can be retried', as
   await expect(page.getByLabel(/Record requests/)).toHaveAccessibleDescription(/enter its exact original lines/);
 });
 
+test('a refused cancel stays on its operation, without pairing its key with other lines', async ({ page, request }) => {
+  test.skip(!local, 'Needs the local fault proxy');
+  await defineCollection(request, 'halted');
+  await signIn(page, ownerToken);
+  await go(page, `${spaceUrl}/collections/halted/batches`);
+  await page.getByLabel('Operation key').first().fill('halt-1');
+  await page.getByLabel(/Record requests/).fill([JSON.stringify({ operation: 'create', data: { title: 'one' } }),
+    JSON.stringify({ operation: 'create', data: { title: 'two' } })].join('\n'));
+  // The first item's transaction fails, so both items stay pending.
+  await refuse('SELECT state FROM batch_operations WHERE');
+  await page.getByRole('button', { name: 'Submit batch' }).click();
+  await expect(page.getByRole('alert')).toContainText('Batch was not accepted');
+  await go(page, `${spaceUrl}/collections/halted/batches?operation=halt-1`);
+  await expect(page.getByRole('status')).toContainText('2 pending');
+
+  await refuse("UPDATE batch_operations SET state='cancelled'");
+  await page.getByRole('button', { name: 'Cancel remaining items' }).click();
+  await expect(page.getByRole('alert')).toContainText('Remaining items were not cancelled');
+  await expect(page.getByRole('alert')).not.toContainText('may have taken effect');
+  await expect(page.getByRole('status')).toContainText('2 pending');
+  await expect(page.getByRole('table')).toContainText('pending');
+  for (const key of await page.getByLabel('Operation key').all()) await expect(key).toHaveValue('halt-1');
+  await expect(page.getByLabel(/Record requests/)).toHaveValue('');
+  await expect(page.getByLabel(/Record requests/)).toHaveAccessibleDescription(/enter its exact original lines/);
+  // The same page cancels it once the authority accepts.
+  await page.getByRole('button', { name: 'Cancel remaining items' }).click();
+  await expect(page.getByRole('status')).toContainText('cancelled');
+});
+
 test('identifiers that differ only by surrounding whitespace stay distinct', async ({ page, request }) => {
   await signIn(page, ownerToken);
   await go(page, `${spaceUrl}/new-collection`);

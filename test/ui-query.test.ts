@@ -1,11 +1,11 @@
 import { expect, it } from 'vitest';
 import { maxPredicates, predicates, sortProblem } from '../app/src/lib/query';
 
-const definition = { slug: 'c', version: 1, unique: [], filterable: ['n', 't', 's', 'built', 'pending'], sortable: ['n', 'hidden', 'pending'],
-  schema: { type: 'object', properties: { n: { type: 'number' }, t: { type: 'string', format: 'date-time' }, s: { type: 'string' },
+const definition = { slug: 'c', version: 1, unique: [], filterable: ['n', 't', 's', 'b', 'built', 'pending'], sortable: ['n', 'hidden', 'pending'],
+  schema: { type: 'object', properties: { n: { type: 'number' }, t: { type: 'string', format: 'date-time' }, s: { type: 'string' }, b: { type: 'boolean' },
     built: { type: 'string' }, pending: { type: 'string' }, hidden: { type: 'string' } } } };
 // "pending" is declared filterable and sortable, but its index is still being built.
-const ready = ['n', 't', 's', 'built', 'hidden'];
+const ready = ['n', 't', 's', 'b', 'built', 'hidden'];
 const check = (field: string, op: string, value: string) => predicates(definition as never, [{ field, op, value }], ready);
 
 it('a filter value is sent only when it is JSON number syntax or a real calendar instant', () => {
@@ -61,4 +61,15 @@ it('a text value containing U+0000 is reported on its row, as the authority refu
   // Empty text and other Unicode, including other control characters, remain valid values.
   for (const value of ['', '\u0001', '�', '😀']) expect(check('s', 'eq', value).predicates).toEqual([{ field: 's', kind: 'string', operator: 'eq', value }]);
   expect(check('s', 'in', 'a,,b').predicates).toEqual([{ field: 's', kind: 'string', operator: 'in', value: ['a', '', 'b'] }]);
+});
+
+it('an "in" filter takes at most 16 values of any kind, and a 17th is reported as the count, not a bad value', () => {
+  const kinds = { s: (index: number) => `v${index}`, n: String, b: (index: number) => String(index % 2 === 0), t: (index: number) => `2026-01-${String(index + 1).padStart(2, '0')}T00:00:00Z` };
+  for (const [field, value] of Object.entries(kinds)) {
+    const list = (length: number) => Array.from({ length }, (_, index) => value(index)).join(',');
+    expect(check(field, 'in', list(16)).predicates).toHaveLength(1);
+    expect(check(field, 'in', list(17))).toEqual({ predicates: [], errors: { 0: 'Enter at most 16 comma-separated values.' } });
+  }
+  // A malformed member of a short list still names its kind.
+  expect(check('n', 'in', '1,x').errors[0]).toBe('Enter a number.');
 });

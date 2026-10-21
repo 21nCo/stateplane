@@ -7,10 +7,11 @@
   import { uncertain as isUncertain } from '$lib/errors';
   let { data, form } = $props();
   const base=$derived(collectionHref(data.spaceId,selectors(page.url).collection));
-  // A submitted batch shows its own progress beside its retained lines.
+  // A submitted batch shows its own progress beside its retained lines; a refused cancel
+  // stays on its operation (the key rides on the action URL) and rereads its progress.
   const progress=$derived(form?.progress ?? data.progress);
-  // Without its retained lines, an operation key is never paired with other lines.
-  const resuming=$derived(!form && !!data.operation);
+  // Without its retained lines (also after a cancel), an operation key is never paired with other lines.
+  const resuming=$derived(form?.items===undefined && !!data.operation);
   const counts=$derived((progress?.items ?? []).reduce<Record<string,number>>((all,item)=>({...all,[item.state]:(all[item.state] ?? 0)+1}),{}));
   const tone=(state:string)=>state==='succeeded' ? 'success' : state==='failed' ? 'danger' : 'warning';
   const uncertain=$derived(isUncertain(form?.error));
@@ -62,7 +63,7 @@
         </tr>{/each}</tbody>
       </table></Scroll>
       {#if progress.state==='active' && progress.items.some(item=>item.state==='pending')}
-        <form method="POST" action="?/cancel"><input type="hidden" name="operationKey" value={carry(progress.operationKey)} /><button class="btn-danger">Cancel remaining items</button></form>
+        <form method="POST" action="?operation={encodeURIComponent(progress.operationKey)}&/cancel"><input type="hidden" name="operationKey" value={carry(progress.operationKey)} /><button class="btn-danger">Cancel remaining items</button></form>
       {/if}
     {:else if !data.operation}
       <p class="hint">Enter an operation key to see its items.</p>

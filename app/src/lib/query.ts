@@ -50,7 +50,7 @@ function scalar(kind:Kind,raw:string):string|number|boolean|undefined {
 
 /** Convert form rows to typed v1 predicates; return a message for each row the user must fix.
  * A row the authority would refuse (an undeclared, unfilterable or unbuilt field, a value
- * past a limit or containing U+0000, or a 17th predicate) is reported here, so no request is sent. */
+ * past a limit or containing U+0000, more than 16 "in" values, or a 17th predicate) is reported here, so no request is sent. */
 export function predicates(definition:Definition,rows:readonly FilterRow[],ready:readonly string[]):{predicates:unknown[];errors:Record<number,string>} {
   const result:unknown[]=[];
   const errors:Record<number,string>={};
@@ -64,11 +64,12 @@ export function predicates(definition:Definition,rows:readonly FilterRow[],ready
     const raw=row.op==='in' ? row.value.split(',') : [row.value];
     // The authority refuses U+0000 in any text value; an instant can never contain it.
     if (kind==='string' && raw.some(item=>item.includes('\0'))) { errors[index]='Remove the NUL (U+0000) character; a text value cannot contain it.'; return; }
+    if (raw.length>maxIn) { errors[index]=`Enter at most ${maxIn} comma-separated values.`; return; }
     const values=raw.map(item=>scalar(kind,item));
-    if (!values.length || values.length>maxIn || values.some(item=>item===undefined)) {
+    if (values.some(item=>item===undefined)) {
       errors[index]=kind==='date-time' ? 'Enter a UTC instant such as 2026-01-31T12:00:00Z.' :
         kind==='number' ? 'Enter a number.' : kind==='boolean' ? 'Enter true or false.' :
-        `Enter ${row.op==='in' ? `at most ${maxIn} comma-separated values` : 'a value'} of at most ${maxBytes} bytes each.`;
+        `Enter ${row.op==='in' ? 'values' : 'a value'} of at most ${maxBytes} bytes each.`;
       return;
     }
     result.push({field:row.field,kind,operator:row.op,value:row.op==='in' ? values : values[0]});
