@@ -1,0 +1,75 @@
+app/src/routes/spaces/[space]/collections/[collection]/schema/+page.server.ts
+  s_92427ff18a8304::t_553c117b10cb2c 1-42
+app/src/routes/spaces/[space]/collections/[collection]/batches/+page.svelte
+  s_92427ff18a8304::t_9143cfa75c201d 1-71
+app/src/routes/spaces/[space]/new-collection/+page.server.ts
+  s_92427ff18a8304::t_e3fe0d9045eec1 1-20
+app/src/routes/spaces/[space]/+layout.svelte
+  s_92427ff18a8304::t_ec2960d5643640 1-28
+test/ui-shell.config.ts
+  s_92427ff18a8304::t_dfcb8d3ec9b410 3
+app/src/routes/spaces/[space]/collections/[collection]/events/+page.svelte
+  s_92427ff18a8304::t_cf12ddbee5808e 1-35
+app/src/routes/spaces/[space]/collections/[collection]/+page.svelte
+  s_92427ff18a8304::t_a5cef6b8c8b937 1-133
+app/src/routes/spaces/[space]/new-collection/+page.svelte
+  s_92427ff18a8304::t_f83146336d56ba 1-28
+app/src/routes/spaces/+page.svelte
+  s_92427ff18a8304::t_5a7ce9082516ab 1-70
+app/src/lib/components/Unresolved.svelte
+  s_92427ff18a8304::t_e8808263673cbf 1-40
+app/src/routes/spaces/[space]/collections/[collection]/+page.server.ts
+  s_92427ff18a8304::t_45c1445cb3142a 1-68
+app/src/lib/server/forms.ts
+  s_92427ff18a8304::t_5c46bb0423e11a 1-72
+test/ui-errors.test.ts
+  s_92427ff18a8304::t_3c2ae1c61519e4 1-79
+app/src/routes/spaces/[space]/+page.server.ts
+  s_92427ff18a8304::t_0638785fa129ee 1-29
+app/src/routes/spaces/[space]/collections/[collection]/batches/+page.server.ts
+  s_92427ff18a8304::t_0c8a8490720ae6 1-46
+app/src/routes/spaces/[space]/audit/+page.server.ts
+  s_92427ff18a8304::t_643a33309f69b6 1-11
+app/src/routes/spaces/[space]/+page.svelte
+  s_92427ff18a8304::t_103efd285565c9 1-70
+app/src/lib/components/DefinitionForm.svelte
+  s_92427ff18a8304::t_69096b28a69623 1-19
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.server.ts
+  s_92427ff18a8304::t_6017c9974e8f3a 1-73
+app/src/routes/spaces/[space]/collections/[collection]/events/+page.server.ts
+  s_92427ff18a8304::t_a3a1923bcf86e6 1-11
+vitest.config.ts
+  s_92427ff18a8304::t_743c17991a08fe 4
+test/e2e/owner.spec.ts
+  s_92427ff18a8304::t_bc7c28bc14758b 1-1105
+app/src/routes/spaces/[space]/collections/[collection]/schema/+page.svelte
+  s_92427ff18a8304::t_bf3da1f899ca6b 1-52
+app/src/routes/spaces/+page.server.ts
+  s_92427ff18a8304::t_a303454cef31d7 1-32
+app/src/routes/spaces/[space]/audit/+page.svelte
+  s_92427ff18a8304::t_c9c44616fc298f 1-29
+test/ui-query.test.ts
+  s_92427ff18a8304::t_57fc95027bb852 1-56
+app/src/routes/spaces/[space]/+layout.server.ts
+  s_92427ff18a8304::t_0dfb5ead602417 1-16
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.svelte
+  s_92427ff18a8304::t_46936543f04784 1-111
+app/src/lib/query.ts
+  s_92427ff18a8304::t_b7ea900ffa409b 1-75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "dc3635e9bd2a3784211b6570495bf7d6745fe1a0",
+  "prompts": {},
+  "sessions": {
+    "s_92427ff18a8304": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26336501-b0e6-4534-a7c2-345f5528a4ba",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
