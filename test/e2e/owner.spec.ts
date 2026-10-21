@@ -1029,6 +1029,50 @@ test('a filter or sort the authority would refuse is reported on its field and n
   await expect(page.getByText('No records match these filters.')).toBeVisible();
 });
 
+test('filters too long for a page address are refused on the page, with and without scripts, never by the transport', async ({ browser, page, request }) => {
+  await defineCollection(request, 'addresses', { ...definition({ note: { type: 'string' } }), filterable: ['note'] });
+  const addresses = `${spaceUrl}/collections/addresses`;
+  expect((await request.post(`/v1${addresses}/indexes/note`, { headers: { authorization: `Bearer ${ownerToken}` } })).status()).toBe(200);
+  await signIn(page, ownerToken);
+  await createRecord(page, { title: 'kept', note: 'x' }, addresses);
+  const native = await (await browser.newContext({ javaScriptEnabled: false })).newPage();
+  await signIn(native, ownerToken);
+  // One legal "in" row of sixteen 510-byte values: a 24 KB address, which Node and Cloudflare refuse before any route.
+  const long = Array(16).fill('漢'.repeat(170)).join(',');
+  for (const viewer of [native, page]) {
+    await go(viewer, `${addresses}?limit=10`);
+    const statuses: number[] = [];
+    viewer.on('response', response => { statuses.push(response.status()); });
+    await viewer.getByLabel('Field').first().selectOption('note');
+    await viewer.getByLabel('Operator').first().selectOption('in');
+    await viewer.getByLabel('Value').first().fill(long);
+    await viewer.getByRole('button', { name: 'Apply' }).click();
+    await expect(viewer.getByText('These filters are too long for a page address (over 12288 bytes once encoded). Remove filters or shorten values.')).toBeVisible();
+    await settle(viewer);
+    // The page's records and the typed filter stay; nothing was refused in transit.
+    await expect(viewer.getByRole('table')).toContainText('kept');
+    await expect(viewer.getByLabel('Value').first()).toHaveValue(long);
+    await expect(viewer.getByLabel('Operator').first()).toHaveValue('in');
+    await expect(viewer.getByLabel('Page size (1–100)')).toHaveValue('10');
+    expect(statuses.filter(status => status === 431 || status >= 500)).toEqual([]);
+    await expect(viewer.getByRole('alert')).toHaveCount(0);
+    // A filter the address can carry is applied as before.
+    await viewer.getByLabel('Value').first().fill('x,y');
+    await viewer.getByRole('button', { name: 'Apply' }).click();
+    await expect(viewer).toHaveURL(/field=note&op=in&value=x%2Cy&limit=10$/);
+    await expect(viewer.getByRole('table')).toContainText('kept');
+    await expect(viewer.getByText(/too long for a page address/)).toHaveCount(0);
+  }
+  // An address within the transport limit but past the budget, as a bookmark might be, is refused before any request,
+  // so the page never offers a next-page or count link that could not be followed.
+  const ascii = Array(16).fill('a'.repeat(512)).join(',');
+  await go(page, `${addresses}?field=note&op=in&value=${ascii}`);
+  await expect(page.getByText(/too long for a page address/)).toBeVisible();
+  await expect(page.getByLabel('Value').first()).toHaveValue(ascii);
+  await expect(page.getByRole('link', { name: 'Count matching records' })).toHaveCount(0);
+  await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
 test('a key granted only changes opens them from the space page, and still reads no records', async ({ browser, request }) => {
   const headers = { authorization: `Bearer ${ownerToken}` };
   const issued = await request.post(`/v1${spaceUrl}/agent-keys`, { headers, data: { expiresAt: new Date(Date.now() + 3_600_000).toISOString(),

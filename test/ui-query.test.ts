@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { maxPredicates, predicates, queryBody, sortProblem } from '../app/src/lib/query';
+import { maxPredicates, predicates, queryBody, searchProblem, sortProblem } from '../app/src/lib/query';
 
 const definition = { slug: 'c', version: 1, unique: [], filterable: ['n', 't', 's', 'b', 'built', 'pending'], sortable: ['n', 'hidden', 'pending'],
   schema: { type: 'object', properties: { n: { type: 'number' }, t: { type: 'string', format: 'date-time' }, s: { type: 'string' }, b: { type: 'boolean' },
@@ -93,4 +93,23 @@ it('a query whose JSON body the authority would refuse as over 32768 bytes is re
   expect([near.error, Buffer.byteLength(JSON.stringify(near.body)) < 32768]).toEqual([null, true]);
   expect(sent([full, full, full, list('a'.repeat(512), 14)], 'c'.repeat(32768 - Buffer.byteLength(JSON.stringify(near.body)))).error).toMatch(/too large/);
   expect(near.body).toEqual({ predicates: expect.any(Array), limit: 25, sort: { field: 'n', direction: 'asc' } });
+});
+
+it('filters too long for a page address, once a next-page cursor and count=1 are added, are refused before any request', () => {
+  // The records form and its links carry each row as field, op and value, then limit.
+  const address = (rows: { field: string; op: string; value: string }[]) =>
+    new URLSearchParams([...rows.flatMap(row => [['field', row.field], ['op', row.op], ['value', row.value]]), ['limit', '25']]).toString();
+  const list = (item: string) => ({ field: 's', op: 'in', value: Array(16).fill(item).join(',') });
+  // One legal "in" row of 510-byte CJK values is 8291 bytes of JSON but over 24 KB percent-encoded.
+  const cjk = list('漢'.repeat(170));
+  expect(predicates(definition as never, [cjk], ready).errors).toEqual({});
+  expect(searchProblem(address([cjk]))).toMatch(/too long for a page address \(over 12288 bytes once encoded\)/);
+  // The longest cursor the authority issues is 4096 characters: a query string that fits on its own is refused
+  // when the next page's cursor would carry it past the budget.
+  const exact = (length: number) => address([{ field: 's', op: 'eq', value: 'a'.repeat(length - address([{ field: 's', op: 'eq', value: '' }]).length) }]);
+  expect(searchProblem(exact(12288 - 4096 - '&cursor=&count=1'.length))).toBeNull();
+  expect(searchProblem(exact(12288 - 4096 - '&cursor=&count=1'.length + 1))).toMatch(/too long/);
+  expect(searchProblem(exact(10_000))).toMatch(/too long/);
+  // Shorter values and several rows stay within the budget.
+  expect(searchProblem(address([list('漢'.repeat(20)), list('a'.repeat(100)), { field: 'n', op: 'gt', value: '1' }]))).toBeNull();
 });

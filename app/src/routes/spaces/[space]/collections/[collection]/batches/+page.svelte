@@ -42,7 +42,7 @@
   <section aria-labelledby="progress" class="panel space-y-3">
     <h2 id="progress" class="text-lg font-semibold">Progress</h2>
     <form method="GET" class="flex items-end gap-2">
-      <div class="grow"><label for="operation">Operation key</label><input id="operation" name="operation" value={form?.progress ? form.operationKey : data.operation} /></div>
+      <div class="grow"><label for="operation">Operation key</label><input id="operation" name="operation" maxlength="256" value={form?.progress ? form.operationKey : data.operation} /></div>
       <button class="btn-quiet">Show progress</button>
     </form>
     {#if !form?.progress}<Notice error={data.error} title="Progress could not be read" />{/if}

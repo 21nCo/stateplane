@@ -5,7 +5,7 @@ export interface FilterRow { field:string; op:string; value:string }
 type Kind='string'|'number'|'boolean'|'date-time';
 // The v1 query limits: predicates per query, values per "in", and UTF-8 bytes per text value.
 export const maxPredicates=16;
-const maxIn=16, maxBytes=512, maxBody=32_768;
+const maxIn=16, maxBytes=512, maxBody=32_768, maxSearch=12_288, maxCursor=4_096;
 // Days with an announced leap second; the authority accepts 23:59:60 UTC only on these.
 const leapDays=new Set(['1972-06-30','1972-12-31','1973-12-31','1974-12-31','1975-12-31','1976-12-31','1977-12-31','1978-12-31','1979-12-31','1981-06-30','1982-06-30','1983-06-30','1985-06-30','1987-12-31','1989-12-31','1990-12-31','1992-06-30','1993-06-30','1994-06-30','1995-12-31','1997-06-30','1998-12-31','2005-12-31','2008-12-31','2012-06-30','2015-06-30','2016-12-31']);
 
@@ -82,3 +82,7 @@ export function queryBody(predicates:unknown[],limit:number,sort?:{field:string;
   const body={predicates,limit,...(sort ? {sort} : {}),...(cursor!==undefined ? {cursor} : {})};
   return {body,error:[body,predicates].some(item=>new TextEncoder().encode(JSON.stringify(item)).length>maxBody) ? `These filters are too large to send (over ${maxBody} bytes). Remove filters or shorten values.` : null};
 }
+
+/** Node and Cloudflare refuse a URL past 16 KiB before any route runs. A records query string, with the longest cursor
+ * the authority issues and count=1, stays within 12,288 bytes, leaving the rest for the path and headers, so every link the page makes can be followed. */
+export const searchProblem=(query:string)=>query.length+`&cursor=${'x'.repeat(maxCursor)}&count=1`.length>maxSearch ? `These filters are too long for a page address (over ${maxSearch} bytes once encoded). Remove filters or shorten values.` : null;

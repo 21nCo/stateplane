@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { fail } from '@sveltejs/kit';
+import { fail, redirect } from '@sveltejs/kit';
 import { api, pageCursor } from '$lib/server/api';
-import { carriedId, selectors } from '$lib/paths';
+import { carriedId, carry, selectors } from '$lib/paths';
 import { given, jsonObject, unresolvedAfter, writeAttempt, writeClock } from '$lib/server/forms';
-import { predicates, queryBody, sortProblem } from '$lib/query';
+import { predicates, queryBody, searchProblem, sortProblem } from '$lib/query';
 import type { FilterRow } from '$lib/query';
 import type { ApiError } from '$lib/errors';
 import type { Collection, Receipt, StoredRecord } from '$lib/types';
@@ -13,28 +13,34 @@ import type { Actions, PageServerLoad } from './$types';
 const defaultLimit=25;
 const path=(url:URL)=>{ const {space,collection}=selectors(url); return ['spaces',space,'collections',collection]; };
 
-export const load:PageServerLoad=async(event)=>{
-  const params=event.url.searchParams;
-  const collection=await api<Collection>(event,'GET',path(event.url));
-  // Field names travel carried in the query, as the form and its links send them.
+// Field names travel carried in the query, as the form and its links send them.
+const filterState=(params:URLSearchParams)=>{
   const rows:FilterRow[]=params.getAll('field').map((field,index)=>({field:carriedId(field),op:params.getAll('op')[index] ?? 'eq',
     value:params.getAll('value')[index] ?? ''})).filter(row=>row.field);
   const requested=Number(params.get('limit') ?? defaultLimit);
   const limit=Number.isInteger(requested) && requested>=1 && requested<=100 ? requested : defaultLimit;
   const sort=params.get('sort') ? {field:carriedId(params.get('sort')!),direction:params.get('dir')==='desc' ? 'desc' : 'asc'} : undefined;
+  const query=new URLSearchParams([...rows.flatMap(row=>[['field',carry(row.field)],['op',row.op],['value',row.value]]),...(sort ? [['sort',carry(sort.field)],['dir',sort.direction]] : []),['limit',String(limit)]]).toString();
+  return {rows,requested,limit,sort,query,error:searchProblem(query)};
+};
+
+export const load:PageServerLoad=async(event)=>{
+  const params=event.url.searchParams;
+  const collection=await api<Collection>(event,'GET',path(event.url));
+  const {rows,requested,limit,sort,query,error:tooLong}=filterState(params);
   const {cursor,paged,rejected}=pageCursor(event.url);
   const filterErrors:Record<number,string>={};
   // An exact count reads every matching record, so it runs only when asked for (count=1),
   // never on page navigation, and its failure leaves the page's records in place.
   const counted=params.get('count')==='1';
-  const view={rows,limit,sort,cursor:cursor ?? null,paged,counted,limitInvalid:limit!==requested,idempotencyKey:`ui-${randomUUID()}`,
+  const view={rows,limit,sort,search:query,cursor:cursor ?? null,paged,counted,limitInvalid:limit!==requested,idempotencyKey:`ui-${randomUUID()}`,
     sortError:null as string|null,queryError:null as string|null,count:null as number|null,countError:null as ApiError|null};
   if (!collection.ok) return {...view,collection:null,error:collection.error,filterErrors,page:null};
   // A query the authority would refuse is reported on its fields and never sent.
   const {definition,ready}=collection.data;
   const built=predicates(definition,rows,ready);
   const sortError=sort ? sortProblem(definition,ready,sort.field) : null;
-  const {body,error:queryError}=queryBody(built.predicates,limit,sort,cursor);
+  const {body,error}=queryBody(built.predicates,limit,sort,cursor), queryError=tooLong ?? error;
   if (Object.keys(built.errors).length || sortError || queryError)
     return {...view,collection:collection.data,error:null,filterErrors:built.errors,sortError,queryError,page:null};
   const [page,count]=rejected ? [rejected,null] : await Promise.all([
@@ -45,6 +51,11 @@ export const load:PageServerLoad=async(event)=>{
 };
 
 export const actions:Actions={
+  filter:async(event)=>{
+    const {rows,requested,limit,sort,query,error}=filterState(new URLSearchParams([...await event.request.formData()].map(([name,value])=>[name,String(value)])));
+    if (!error) redirect(303,`${event.url.pathname}?${query}`);
+    return fail(400,{filter:{rows,limit,sort,limitInvalid:limit!==requested,filterErrors:{} as Record<number,string>,sortError:null,queryError:error}});
+  },
   create:async(event)=>{
     const form=await event.request.formData();
     // The editor's text always stays the draft; a retry resends the unresolved request instead.

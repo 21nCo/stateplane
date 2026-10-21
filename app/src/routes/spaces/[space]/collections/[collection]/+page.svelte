@@ -19,14 +19,8 @@
   const draft=$derived(form?.create ?? form?.draft ?? null);
   const lost=$derived(!!form?.create?.retried && !!form.create.error && definitive(form.create.error));
   const columns=$derived(Object.keys(definition?.schema.properties ?? {}).slice(0,4));
-  const rows=$derived(data.rows.length<maxPredicates ? [...data.rows,{field:'',op:'eq',value:''}] : data.rows);
-  const query=$derived.by(()=>{
-    const params=new URLSearchParams();
-    for (const row of data.rows) { params.append('field',carry(row.field)); params.append('op',row.op); params.append('value',row.value); }
-    if (data.sort) { params.set('sort',carry(data.sort.field)); params.set('dir',data.sort.direction); }
-    params.set('limit',String(data.limit));
-    return params;
-  });
+  const query=$derived(data.search);
+  const filter=$derived(form?.filter ?? data);
   const here=$derived(`${base}?${query}${data.cursor ? `&cursor=${encodeURIComponent(data.cursor)}` : ''}`);
   const next=$derived(data.page?.nextCursor ? `${base}?${query}&cursor=${encodeURIComponent(data.page.nextCursor)}` : null);
   const cell=(record:{canonicalData:string},column:string)=>{ const data=JSON.parse(record.canonicalData) as Record<string,unknown>; return !Object.hasOwn(data,column) ? '—' : typeof data[column]==='string' ? data[column] : JSON.stringify(data[column]); };
@@ -42,42 +36,46 @@
   {#if pending.length}<p class="mt-2 text-sm text-warning" role="status">Indexes pending for {#each pending as field, index (field)}{index ? ', ' : ''}<span class="ident">{shown(field)}</span>{/each}. They cannot be filtered or sorted until built on the schema page.</p>{/if}
   <div class="mt-4 grid gap-6 lg:grid-cols-[1fr_20rem]">
     <section aria-labelledby="results" class="min-w-0 space-y-3">
-      <form method="GET" class="panel space-y-3" aria-labelledby="filter-title">
-        <h2 id="filter-title" class="font-semibold">Filter and sort</h2>
-        {#each rows as row, index (index)}
-          <!-- A field the authority would refuse stays selected, marked, with its reason. -->
-          {@const unavailable=!!row.field && !filterable.includes(row.field)}
-          <fieldset class="grid gap-2 sm:grid-cols-3">
-            <legend class="sr-only">Filter {index+1}</legend>
-            <div><label for="field-{index}">Field</label>
-              <select id="field-{index}" name="field" aria-invalid={unavailable ? 'true' : undefined}
-                aria-describedby={unavailable ? `value-error-${index}` : undefined}><option value="">{index===data.rows.length ? 'Add a filter…' : 'Remove filter'}</option>
-                {#if unavailable}<option value={carry(row.field)} selected>{shown(row.field)} (unavailable)</option>{/if}
-                {#each filterable as field (field)}<option value={carry(field)} selected={field===row.field}>{shown(field)} ({fieldKind(definition,field)})</option>{/each}</select></div>
-            <div><label for="op-{index}">Operator</label>
-              <select id="op-{index}" name="op">{#each operators as op (op)}<option selected={op===row.op}>{op}</option>{/each}</select></div>
-            <div><label for="value-{index}">Value</label>
-              <input id="value-{index}" name="value" value={row.value} aria-invalid={data.filterErrors[index] ? 'true' : undefined}
-                aria-describedby={data.filterErrors[index] ? `value-error-${index}` : undefined} />
-              {#if data.filterErrors[index]}<p id="value-error-{index}" class="mt-1 text-sm text-danger">{data.filterErrors[index]}</p>{/if}</div>
-          </fieldset>
-        {/each}
-        {#if data.queryError}<p id="query-error" class="text-sm text-danger">{data.queryError}</p>{/if}
-        <p class="hint">Use <code>in</code> with comma-separated values; text matches exactly, including spaces after commas; <code>isNull</code> ignores the value.</p>
-        <div class="grid gap-2 sm:grid-cols-3">
-          <div><label for="sort">Sort by</label>
-            <select id="sort" name="sort" aria-invalid={data.sortError ? 'true' : undefined} aria-describedby={data.sortError ? 'sort-error' : undefined}><option value="">Creation order</option>
-              {#if data.sortError && data.sort}<option value={carry(data.sort.field)} selected>{shown(data.sort.field)} (unavailable)</option>{/if}
-              {#each sortable as field (field)}<option value={carry(field)} selected={field===data.sort?.field}>{shown(field)}</option>{/each}</select>
-            {#if data.sortError}<p id="sort-error" class="mt-1 text-sm text-danger">{data.sortError}</p>{/if}</div>
-          <div><label for="dir">Direction</label>
-            <select id="dir" name="dir"><option value="asc">Ascending</option><option value="desc" selected={data.sort?.direction==='desc'}>Descending</option></select></div>
-          <div><label for="limit">Page size (1–100)</label>
-            <input id="limit" name="limit" type="number" min="1" max="100" value={data.limit} aria-invalid={data.limitInvalid ? 'true' : undefined} aria-describedby={data.limitInvalid ? 'limit-error' : undefined} />
-            {#if data.limitInvalid}<p id="limit-error" class="mt-1 text-sm text-danger">Page size must be 1–100; showing {data.limit}.</p>{/if}</div>
-        </div>
-        <div class="flex gap-2"><button class="btn">Apply</button><a class="btn-quiet" href={base}>Reset</a></div>
-      </form>
+      {#snippet filters(data:typeof filter)}
+        <!-- Posted, so filters too long for a page address are refused here, and stay in the form, rather than in transit. -->
+        <form method="POST" action="{here}&/filter" class="panel space-y-3" aria-labelledby="filter-title">
+          <h2 id="filter-title" class="font-semibold">Filter and sort</h2>
+          {#each data.rows.length<maxPredicates ? [...data.rows,{field:'',op:'eq',value:''}] : data.rows as row, index (index)}
+            <!-- A field the authority would refuse stays selected, marked, with its reason. -->
+            {@const unavailable=!!row.field && !filterable.includes(row.field)}
+            <fieldset class="grid gap-2 sm:grid-cols-3">
+              <legend class="sr-only">Filter {index+1}</legend>
+              <div><label for="field-{index}">Field</label>
+                <select id="field-{index}" name="field" aria-invalid={unavailable ? 'true' : undefined}
+                  aria-describedby={unavailable ? `value-error-${index}` : undefined}><option value="">{index===data.rows.length ? 'Add a filter…' : 'Remove filter'}</option>
+                  {#if unavailable}<option value={carry(row.field)} selected>{shown(row.field)} (unavailable)</option>{/if}
+                  {#each filterable as field (field)}<option value={carry(field)} selected={field===row.field}>{shown(field)} ({fieldKind(definition,field)})</option>{/each}</select></div>
+              <div><label for="op-{index}">Operator</label>
+                <select id="op-{index}" name="op">{#each operators as op (op)}<option selected={op===row.op}>{op}</option>{/each}</select></div>
+              <div><label for="value-{index}">Value</label>
+                <input id="value-{index}" name="value" value={row.value} aria-invalid={data.filterErrors[index] ? 'true' : undefined}
+                  aria-describedby={data.filterErrors[index] ? `value-error-${index}` : undefined} />
+                {#if data.filterErrors[index]}<p id="value-error-{index}" class="mt-1 text-sm text-danger">{data.filterErrors[index]}</p>{/if}</div>
+            </fieldset>
+          {/each}
+          {#if data.queryError}<p id="query-error" class="text-sm text-danger">{data.queryError}</p>{/if}
+          <p class="hint">Use <code>in</code> with comma-separated values; text matches exactly, including spaces after commas; <code>isNull</code> ignores the value.</p>
+          <div class="grid gap-2 sm:grid-cols-3">
+            <div><label for="sort">Sort by</label>
+              <select id="sort" name="sort" aria-invalid={data.sortError ? 'true' : undefined} aria-describedby={data.sortError ? 'sort-error' : undefined}><option value="">Creation order</option>
+                {#if data.sortError && data.sort}<option value={carry(data.sort.field)} selected>{shown(data.sort.field)} (unavailable)</option>{/if}
+                {#each sortable as field (field)}<option value={carry(field)} selected={field===data.sort?.field}>{shown(field)}</option>{/each}</select>
+              {#if data.sortError}<p id="sort-error" class="mt-1 text-sm text-danger">{data.sortError}</p>{/if}</div>
+            <div><label for="dir">Direction</label>
+              <select id="dir" name="dir"><option value="asc">Ascending</option><option value="desc" selected={data.sort?.direction==='desc'}>Descending</option></select></div>
+            <div><label for="limit">Page size (1–100)</label>
+              <input id="limit" name="limit" type="number" min="1" max="100" value={data.limit} aria-invalid={data.limitInvalid ? 'true' : undefined} aria-describedby={data.limitInvalid ? 'limit-error' : undefined} />
+              {#if data.limitInvalid}<p id="limit-error" class="mt-1 text-sm text-danger">Page size must be 1–100; showing {data.limit}.</p>{/if}</div>
+          </div>
+          <div class="flex gap-2"><button class="btn">Apply</button><a class="btn-quiet" href={base}>Reset</a></div>
+        </form>
+      {/snippet}
+      {@render filters(filter)}
       <div class="flex flex-wrap items-baseline justify-between gap-2">
         <h2 id="results" class="font-semibold">Results{data.count===null ? '' : ` · ${data.count} matching`}</h2>
         {#if data.page && (!data.counted || data.countError)}<a class="link text-sm" href="{here}&count=1" data-sveltekit-reload={!!data.countError} aria-describedby="count-hint">Count matching records</a>{/if}
@@ -113,6 +111,7 @@
   <!-- A submitted create keeps its draft, error and request key when the reload fails. -->
   <div class="mt-4 max-w-xl">{@render create()}</div>
 {/if}
+
 
 {#snippet create()}
   <section aria-labelledby="create" class="panel h-fit space-y-3">
