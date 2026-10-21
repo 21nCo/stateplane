@@ -1,0 +1,24 @@
+app/src/lib/query.ts
+  h_a39f9495f9ec1d 8,79-84
+app/src/routes/spaces/[space]/collections/[collection]/+page.server.ts
+  h_a39f9495f9ec1d 6,31,37-39,41
+app/src/routes/spaces/[space]/collections/[collection]/+page.svelte
+  h_a39f9495f9ec1d 6,20,32,65,120
+app/src/routes/spaces/[space]/collections/[collection]/records/[record]/+page.svelte
+  h_a39f9495f9ec1d 5,27-28,83
+test/e2e/owner.spec.ts
+  h_a39f9495f9ec1d 298-350
+test/ui-query.test.ts
+  h_a39f9495f9ec1d 2,76-96
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f62099549cf35d032a49adc2007ec1776009a4cb",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
