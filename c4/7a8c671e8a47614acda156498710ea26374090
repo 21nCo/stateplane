@@ -1,0 +1,29 @@
+deployment/workers/jobs.ts
+  s_ea20ba88ffe2ea::t_415f7fdf104e90 2,20-21,23
+docs/durable-outbox.md
+  s_ea20ba88ffe2ea::t_fbf2719cb06503 8,10,23,25,54-55,74,90
+packages/postgres/src/index.ts
+  s_ea20ba88ffe2ea::t_e6bc7b1ce520a3 668-678,756,2037-2043,2047
+packages/postgres/src/outbox.ts
+  s_ea20ba88ffe2ea::t_93f2439bef51f0 3,65,81-83,90,119-120,294-299,309,338-340,342,346,348-350,438-442,450-466
+test/integration/durable-outbox.test.js
+  s_ea20ba88ffe2ea::t_1d5f6254f29279 808-923
+test/operational-worker.test.ts
+  s_ea20ba88ffe2ea::t_89b4685a3393e5 4-6,19,61-71
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c47a8c671e8a47614acda156498710ea26374090",
+  "prompts": {},
+  "sessions": {
+    "s_ea20ba88ffe2ea": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_ea20ba88ffe2ea",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
