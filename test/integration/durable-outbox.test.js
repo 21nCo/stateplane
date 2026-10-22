@@ -16,15 +16,18 @@ const admin = new pg.Client({ connectionString: baseUrl });
 await admin.connect();
 try { await admin.query(`CREATE DATABASE ${name}`); } finally { await admin.end(); }
 const target = new URL(baseUrl); target.pathname = `/${name}`;
-execFileSync(process.execPath, ['scripts/migrate.mjs'], { cwd: fileURLToPath(new URL('../..', import.meta.url)),
-  env: { ...process.env, DATABASE_URL: target.toString() }, stdio: 'ignore' });
-const pool = new pg.Pool({ connectionString: target.toString(), max: 8 });
-test.after(async () => {
-  await pool.end();
+async function dropDatabase() {
   const cleanup = new pg.Client({ connectionString: baseUrl });
   await cleanup.connect();
-  try { await cleanup.query(`DROP DATABASE ${name}`); } finally { await cleanup.end(); }
-});
+  try { await cleanup.query(`DROP DATABASE IF EXISTS ${name}`); } finally { await cleanup.end(); }
+}
+// Root after hooks do not run when module setup throws, so a failed migration drops the database itself.
+try {
+  execFileSync(process.execPath, ['scripts/migrate.mjs'], { cwd: fileURLToPath(new URL('../..', import.meta.url)),
+    env: { ...process.env, DATABASE_URL: target.toString() }, stdio: 'ignore' });
+} catch (error) { await dropDatabase(); throw error; }
+const pool = new pg.Pool({ connectionString: target.toString(), max: 8 });
+test.after(async () => { await pool.end(); await dropDatabase(); });
 
 const authority = new PostgresAuthority(pool, 3600);
 const outbox = new PostgresOutbox(pool, authority);
@@ -905,19 +908,23 @@ test('a client read timeout is a lost session: released uncounted and the sessio
 test('operator retry pages over failed rows: every dead letter, no backoff row, one audit row', async () => {
   const { scope, ids, spaceId } = await space(2);
   const events = [];
-  for (const collectionId of [...ids, ...ids]) {
+  for (const collectionId of [...ids, ...ids, ...ids]) {
     const created = await write(scope(collectionId), 'create', '{"v":1}');
     events.push((await pool.query('SELECT event_id FROM projection_outbox WHERE space_id=$1 AND record_id=$2',
       [spaceId, created.ref.id])).rows[0].event_id);
   }
   await pool.query(`UPDATE projection_outbox SET delivery_state='degraded',failures=8,dead_lettered_at=clock_timestamp(),
-    available_at='infinity',last_error='parked' WHERE event_id=ANY($1)`, [events.slice(0, 3)]);
+    available_at='infinity',last_error='parked' WHERE event_id=ANY($1)`, [events.slice(0, 5)]);
   await pool.query(`UPDATE projection_outbox SET delivery_state='degraded',failures=1,available_at=clock_timestamp()+interval '1 hour',
-    last_error='backoff' WHERE event_id=$1`, [events[3]]);
-  assert.equal(await outbox.retry('operator@example.invalid', spaceId, null, 'embedder restored'), 3);
-  for (const eventId of events.slice(0, 3))
+    last_error='backoff' WHERE event_id=$1`, [events[5]]);
+  // Two-row pages: five dead letters and a backoff row span three pages, so
+  // only a keyset walk that continues past each full page retries them all.
+  const paged = new PostgresOutbox(pool, authority, { retryPage: 2 });
+  assert.equal(await paged.retry('operator@example.invalid', spaceId, null, 'embedder restored'), 5);
+  for (const eventId of events.slice(0, 5))
     assert.deepEqual(await row(eventId), { ...await row(eventId), delivery_state: 'pending', failures: 0, dead_lettered_at: null });
-  assert.deepEqual(await row(events[3]), { ...await row(events[3]), delivery_state: 'degraded', failures: 1, dead_lettered_at: null });
+  assert.deepEqual(await row(events[5]), { ...await row(events[5]), delivery_state: 'degraded', failures: 1, dead_lettered_at: null });
   const audits = await pool.query("SELECT affected FROM outbox_operator_audit WHERE space_id=$1 AND action='retry'", [spaceId]);
-  assert.deepEqual(audits.rows.map(entry => Number(entry.affected)), [3]);
+  assert.deepEqual(audits.rows.map(entry => Number(entry.affected)), [5]);
+  assert.throws(() => new PostgresOutbox(pool, authority, { retryPage: 1_001 }), error => error.code === 'INVALID_ARGUMENT');
 });

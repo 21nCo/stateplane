@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { MAX_DELIVERY_ATTEMPT } from '@stateplane/contracts';
 import type pg from 'pg';
 import { AuthorityError, clientReadTimedOut, CommitOutcomeUnknownError } from './index.js';
 import type { AuthorityScope, OutboxDelivery, PostgresAuthority, ProjectionChange, ProjectionOutcome, ProjectionQuery } from './index.js';
@@ -26,7 +27,7 @@ export interface DispatchLimits { limit?: number; perSpace?: number; pairs?: num
  * consumers to start them.
  */
 export interface ClaimResult { messages: DeliveryMessage[]; scan: 'whole' | 'wrapped' | 'partial'; parked: number; full: boolean }
-export interface OutboxOptions { processingMs?: number }
+export interface OutboxOptions { processingMs?: number; retryPage?: number }
 /**
  * `pending`, `delivering` and lag cover at most the oldest-due
  * `STATUS_SAMPLE` live rows, and `capped` marks them as lower bounds.
@@ -156,14 +157,17 @@ function within<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
  */
 export class PostgresOutbox {
   private readonly processingMs: number;
+  private readonly retryPage: number;
   /**
    * `processingMs` bounds one item's prepare, apply and completion. Its
    * default and maximum is the authority's request budget, so one deadline
    * drives the abort signal, every statement timeout and the stalled-apply
    * backstop, and the worker's own rollback always comes first.
+   * `retryPage` (at most 1,000) sizes operator retry's keyset pages.
    */
   constructor(private readonly pool: PoolLike, private readonly authority: PostgresAuthority, options: OutboxOptions = {}) {
     this.processingMs = bounded(options.processingMs ?? authority.requestBudgetMs, 1, authority.requestBudgetMs);
+    this.retryPage = bounded(options.retryPage ?? RETRY_PAGE, 1, RETRY_PAGE);
   }
 
   /**
@@ -378,7 +382,7 @@ export class PostgresOutbox {
 
   private message(message: DeliveryMessage): DeliveryMessage {
     if (typeof message?.eventId !== 'string' || !EVENT_ID.test(message.eventId)) throw new AuthorityError('INVALID_ARGUMENT');
-    return { eventId: message.eventId, attempt: bounded(message.attempt, 1, 2_147_483_647) };
+    return { eventId: message.eventId, attempt: bounded(message.attempt, 1, MAX_DELIVERY_ATTEMPT) };
   }
 
   /**
@@ -461,9 +465,9 @@ export class PostgresOutbox {
           ) SELECT (SELECT count(*) FROM retried)::int AS retried,(SELECT count(*) FROM page)::int AS scanned,
             last.collection_id,last.event_id
           FROM (SELECT collection_id,event_id FROM page ORDER BY collection_id DESC,event_id DESC LIMIT 1) last`,
-        [space, collection, page?.collection_id ?? null, page?.event_id ?? null, RETRY_PAGE])).rows[0];
+        [space, collection, page?.collection_id ?? null, page?.event_id ?? null, this.retryPage])).rows[0];
         affected += page?.retried ?? 0;
-      } while (page?.scanned === RETRY_PAGE);
+      } while (page?.scanned === this.retryPage);
       await this.audit(db, { space, collection, action: 'retry', who, why, job: null, affected });
       return affected;
     });

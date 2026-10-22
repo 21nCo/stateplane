@@ -1,4 +1,5 @@
 import type { ApplicationPorts } from '@stateplane/application';
+import { MAX_DELIVERY_ATTEMPT } from '@stateplane/contracts';
 import type { RecordRef, Revision } from '@stateplane/contracts';
 export interface ProjectionJob { ref: RecordRef; revision: Revision; generation: number; }
 export interface ProjectionWorker { run(job: ProjectionJob, services: ApplicationPorts): Promise<void>; }
@@ -77,7 +78,7 @@ export function parseDeliveryMessage(body: unknown): DeliveryMessage | null {
   const keys = Object.keys(body);
   const { eventId, attempt } = body as Record<string, unknown>;
   if (keys.length !== 2 || typeof eventId !== 'string' || !/^evt_[0-9a-f-]{36}$/.test(eventId) ||
-    !Number.isSafeInteger(attempt) || (attempt as number) < 1) return null;
+    !Number.isSafeInteger(attempt) || (attempt as number) < 1 || (attempt as number) > MAX_DELIVERY_ATTEMPT) return null;
   return { eventId, attempt: attempt as number };
 }
 

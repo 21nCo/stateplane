@@ -127,6 +127,14 @@ test('consume bounds concurrency and isolates malformed, poison and infrastructu
   await assert.rejects(consume([], async () => 'applied', 0), RangeError);
 });
 
+test('consume acks a hint whose attempt exceeds the stored integer range as malformed without processing it', async () => {
+  const seen = [];
+  const outcomes = await consume([hint(1, 2_147_483_648), hint(2, 2_147_483_647)],
+    async message => { seen.push(message.attempt); return 'applied'; });
+  assert.deepEqual(outcomes, ['malformed', 'applied']);
+  assert.deepEqual(seen, [2_147_483_647]);
+});
+
 test('outbox grants reject an external admin URL without verified TLS before connecting', () => {
   const adminUrl = new URL('postgres://db.example.invalid/stateplane');
   adminUrl.username = 'admin';

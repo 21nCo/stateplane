@@ -44,7 +44,7 @@ Use a digest-approved Postgres image with pgvector available and Railway PITR su
 | Identity/placement directory | Environment's Virginia control service | IDs and destination metadata only; no records, originals, search text or business logs. |
 | Originals and exports | Private R2 bucket per cell, `apac`/`enam`/`weur` location hint | A hint is not a jurisdiction guarantee; verify actual bucket location. |
 | Projection jobs | Cell Queue and DLQ, fed by its job Worker's cron dispatcher and consumed by the same Worker | Delivery is at least once and Queue processing location is not guaranteed. The SQL outbox is the durable job state; Queue messages are only hints. See [durable outbox](durable-outbox.md). |
-| Embedding calls | Disabled pending STA-12 | No text sent to an embedding provider by this ticket. |
+| Embedding calls | Disabled pending STA-14 | No text sent to an embedding provider by this ticket. |
 | Worker execution and logs | Smart placement near the origin, default Cloudflare processing | Placement and telemetry do not guarantee geographic confinement. Avoid contentful global logs. |
 | Backups/PITR | Railway volume snapshots and WAL archive for each service | Confirm region/retention and test recovery; verify the archive bucket's actual location and access separately. |
 
