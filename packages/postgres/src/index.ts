@@ -2023,7 +2023,8 @@ export class AuthorityTransaction {
   }
 
   /**
-   * Complete a still-current lease. The per-ref head only moves forward, so a
+   * Complete a still-current lease. Only the record's latest committed
+   * revision applies, and the per-ref head only moves forward, so a
    * duplicate, late or reordered delivery cannot overwrite newer work, and an
    * update older than a delete cannot resurrect it. Work captured under an
    * earlier placement generation never applies; the latest revision is
@@ -2054,7 +2055,9 @@ export class AuthorityTransaction {
         return 'requeued';
       }
       let outcome: 'applied' | 'superseded' = 'superseded';
-      if (Number(row.generation) === placement) {
+      // A committed newer revision has its own row; applying this one first
+      // would project content its successor replaced or deleted.
+      if (Number(row.generation) === placement && Number(row.latest) === revision) {
         const deleted = row.operation === 'delete';
         // The upsert's row lock serializes completions for one ref until commit.
         await this.query(`SET LOCAL lock_timeout = '${HEAD_LOCK_MS}ms'`);

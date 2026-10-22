@@ -154,6 +154,23 @@ test('reordered and concurrent completions keep the newest revision and never re
   assert.ok(racing.applied.every((entry, index) => index === 0 || entry.revision > racing.applied[index - 1].revision));
 });
 
+test('a revision below the committed latest never applies, even before the latest does', async () => {
+  const { scope, collectionId, spaceId } = await space();
+  const created = await write(scope(collectionId), 'create', '{"label":"secret"}');
+  await write(scope(collectionId), 'delete', undefined, { recordId: created.ref.id, expectedRevision: 1 });
+  const leases = (await outbox.claim()).messages;
+  const revisions = await Promise.all(leases.map(async lease => Number((await pool.query(
+    'SELECT revision FROM projection_outbox WHERE event_id=$1', [lease.eventId])).rows[0].revision)));
+  const projector = recorder();
+  // The create's hint arrives first, after its delete committed: no content is projected.
+  assert.equal(await outbox.process(leases[revisions.indexOf(1)], projector), 'superseded');
+  assert.deepEqual(projector.applied, []);
+  assert.equal(await head(spaceId, created.ref.id), undefined);
+  assert.equal(await outbox.process(leases[revisions.indexOf(2)], projector), 'applied');
+  assert.deepEqual(projector.applied, [{ id: created.ref.id, revision: 2, deleted: true, generation: 1, data: null }]);
+  assert.deepEqual(await head(spaceId, created.ref.id), { generation: 1, revision: 2, deleted: true });
+});
+
 test('worker restart, expired started lease and delayed completion recover once; poison parks without blocking others', async () => {
   const { scope, collectionId, spaceId } = await space();
   const writer = scope(collectionId);
@@ -547,7 +564,14 @@ test('infrastructure faults inside apply release the lease uncounted; a projecto
   const invalid = { apply: async (_change, _prepared, query) => { await query('SELECT $1::text', [{ toPostgres: () => Buffer.from(42) }]); } };
   assert.equal(await outbox.process(misused, invalid), 'failed');
   assert.deepEqual(await row(misused.eventId), { ...await row(misused.eventId), failures: 2 });
-  assert.match((await row(misused.eventId)).last_error, /ERR_INVALID_ARG_TYPE|argument/);
+  assert.equal((await row(misused.eventId)).last_error, 'TypeError ERR_INVALID_ARG_TYPE');
+  // Server errors can quote the rejected value; the diagnostic keeps only the SQLSTATE.
+  await drained();
+  const [quoted] = (await outbox.claim()).messages;
+  const leaky = { apply: async (change, _prepared, query) => { await query('SELECT $1::int', [JSON.parse(change.canonicalData).label + '-secret-value']); } };
+  assert.equal(await outbox.process(quoted, leaky), 'failed');
+  assert.deepEqual(await row(quoted.eventId), { ...await row(quoted.eventId), failures: 3, last_error: 'error 22P02' });
+  assert.doesNotMatch(JSON.stringify(await outbox.status(spaceId)), /secret-value/);
 });
 
 test('a tick reaches due work behind more than a claim window of live pairs with nothing due', async () => {
@@ -720,21 +744,21 @@ test('status reports dead letters and backoff behind more due rows than its samp
 test('a completion queued behind another completion of its ref gives way uncounted', async () => {
   const { scope, collectionId, spaceId } = await space();
   const created = await write(scope(collectionId), 'create', '{"v":1}');
-  await write(scope(collectionId), 'replace', '{"v":2}', { recordId: created.ref.id, expectedRevision: 1 });
-  const leases = new Map();
-  for (const lease of (await outbox.claim()).messages)
-    leases.set(Number((await pool.query('SELECT revision FROM projection_outbox WHERE event_id=$1', [lease.eventId])).rows[0].revision), lease);
+  const [first] = (await outbox.claim()).messages;
   let entered;
   let open;
   const inside = new Promise(resolve => { entered = resolve; });
   const gate = new Promise(resolve => { open = resolve; });
-  const holding = outbox.process(leases.get(1), { apply: async () => { entered(); await gate; } });
+  // Revision 1 is the latest when its apply starts; revision 2 commits while it is held.
+  const holding = outbox.process(first, { apply: async () => { entered(); await gate; } });
   await inside;
-  const started = Date.now();
   try {
-    await assert.rejects(outbox.process(leases.get(2), recorder()), { code: 'BACKPRESSURE' });
+    await write(scope(collectionId), 'replace', '{"v":2}', { recordId: created.ref.id, expectedRevision: 1 });
+    const [second] = (await outbox.claim()).messages;
+    const started = Date.now();
+    await assert.rejects(outbox.process(second, recorder()), { code: 'BACKPRESSURE' });
     assert.ok(Date.now() - started < 4_000, 'the head lock wait is bounded well inside the budget');
-    assert.deepEqual(await row(leases.get(2).eventId), { ...await row(leases.get(2).eventId), delivery_state: 'pending', failures: 0 });
+    assert.deepEqual(await row(second.eventId), { ...await row(second.eventId), delivery_state: 'pending', failures: 0 });
   } finally { open(); }
   assert.equal(await holding, 'applied');
   await drained();

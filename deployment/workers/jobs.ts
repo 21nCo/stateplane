@@ -21,6 +21,9 @@ function cell(env: Env) {
   // them and only catches a silently lost session.
   const pool = new pg.Pool({ connectionString: env.AUTHORITY.connectionString, max: 4,
     connectionTimeoutMillis: 5_000, query_timeout: CLIENT_READ_TIMEOUT_MS });
+  // pg-pool re-emits an idle session's error on the pool; the pool discards
+  // that session, and SQL leases recover its work.
+  pool.on('error', () => {});
   // The worker never issues receipts; retention only satisfies the constructor.
   const outbox = new PostgresOutbox(pool, new PostgresAuthority(pool, 1));
   return { outbox, close: () => pool.end() };

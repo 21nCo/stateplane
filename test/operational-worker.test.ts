@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({ closed: 0, connected: 0, failClose: false, denyGrants: false, denyCatalog: false, ownsObject: false, denyVector: false, wrongIdentity: false }));
-const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[] }));
+const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[], poolInstances: [] as { emit(event: string, error: Error): boolean }[] }));
 vi.mock('@stateplane/postgres', async importOriginal => ({
   CLIENT_READ_TIMEOUT_MS: (await importOriginal<typeof import('@stateplane/postgres')>()).CLIENT_READ_TIMEOUT_MS,
   PostgresAuthority: class {},
@@ -16,7 +16,8 @@ vi.mock('@stateplane/postgres', async importOriginal => ({
     }
   }
 }));
-vi.mock('pg', () => ({ default: { Pool: class { constructor(options: unknown) { cell.pools++; cell.poolOptions.push(options); } async end() { cell.ended++; } } }, Client: class {
+vi.mock('pg', async () => { const { EventEmitter } = await import('node:events'); return { default: { Pool: class extends EventEmitter {
+  constructor(options: unknown) { super(); cell.pools++; cell.poolOptions.push(options); cell.poolInstances.push(this); } async end() { cell.ended++; } } }, Client: class {
   async connect() { state.connected++; }
   async end() { state.closed++; if (state.failClose) throw new Error('close failed'); }
   async query(sql: string) {
@@ -30,7 +31,7 @@ vi.mock('pg', () => ({ default: { Pool: class { constructor(options: unknown) { 
     if (sql.includes('::vector')) return { rows: [{ distance: state.denyVector ? 0 : Math.SQRT2 }] };
     throw new Error('unexpected SQL');
   }
-} }));
+} }; });
 
 import worker from '../deployment/workers/operational-verify';
 import jobs from '../deployment/workers/jobs';
@@ -67,6 +68,11 @@ describe('cell jobs Worker', () => {
     const { query_timeout: readTimeout } = cell.poolOptions.at(-1) as { query_timeout: number };
     expect(readTimeout).toBe(actual.CLIENT_READ_TIMEOUT_MS);
     expect(readTimeout).toBeGreaterThan(serverBound);
+  });
+
+  it('survives an idle pooled session error instead of throwing from the pool emitter', async () => {
+    await jobs.queue(batch([]).value, jobsEnv());
+    expect(() => cell.poolInstances.at(-1)!.emit('error', new Error('idle session terminated'))).not.toThrow();
   });
 
   it('acks settled and malformed hints and redelivers only infrastructure failures', async () => {

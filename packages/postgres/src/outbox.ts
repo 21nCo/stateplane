@@ -133,10 +133,17 @@ function text(value: unknown, maxBytes: number): string {
   return value;
 }
 
-/** Keep a bounded, NUL-free diagnostic. Projectors must not put record content in errors. */
+/**
+ * Keep a bounded, NUL-free diagnostic. Projectors must not put record content
+ * in errors. Postgres and Node errors can quote the values they rejected, so
+ * an error with a SQLSTATE or ERR_* code keeps only its name and code.
+ */
 function diagnostic(error: unknown): string {
   const cause = error instanceof ProjectorFailure ? error.cause : error;
-  const message = cause instanceof Error ? `${cause.name}: ${cause.message}` : 'Projection failed';
+  if (!(cause instanceof Error)) return 'Projection failed';
+  const code = (cause as { code?: unknown }).code;
+  const coded = !(cause instanceof AuthorityError) && typeof code === 'string' && (/^[0-9A-Z]{5}$/.test(code) || code.startsWith('ERR_'));
+  const message = coded ? `${cause.name} ${code}` : `${cause.name}: ${cause.message}`;
   return message.replaceAll('\0', '').slice(0, 1024) || 'Projection failed';
 }
 
