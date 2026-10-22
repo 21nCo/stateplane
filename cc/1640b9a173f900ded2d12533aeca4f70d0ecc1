@@ -1,0 +1,23 @@
+docs/durable-outbox.md
+  s_158653cdb4ab66::t_bacab139a1b910 23,90
+packages/postgres/src/outbox.ts
+  s_158653cdb4ab66::t_f75de7db6c64a4 36-37,71-74,77-78,283,287,303-304,327,346-347,359,383,420,425-427
+test/integration/durable-outbox.test.js
+  s_158653cdb4ab66::t_c12a7cd3b70ecc 818-819,856-858,862-870
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cc1640b9a173f900ded2d12533aeca4f70d0ecc1",
+  "prompts": {},
+  "sessions": {
+    "s_158653cdb4ab66": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_158653cdb4ab66",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
