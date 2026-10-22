@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({ closed: 0, connected: 0, failClose: false, denyGrants: false, denyCatalog: false, ownsObject: false, denyVector: false, wrongIdentity: false }));
-const cell = vi.hoisted(() => ({ pools: 0, ended: 0, claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[] }));
-vi.mock('@stateplane/postgres', () => ({
+const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[] }));
+vi.mock('@stateplane/postgres', async importOriginal => ({
+  CLIENT_READ_TIMEOUT_MS: (await importOriginal<typeof import('@stateplane/postgres')>()).CLIENT_READ_TIMEOUT_MS,
   PostgresAuthority: class {},
   PostgresOutbox: class {
     async claim() { return { messages: cell.claims.shift() ?? [], scan: 'whole' }; }
@@ -15,7 +16,7 @@ vi.mock('@stateplane/postgres', () => ({
     }
   }
 }));
-vi.mock('pg', () => ({ default: { Pool: class { constructor() { cell.pools++; } async end() { cell.ended++; } } }, Client: class {
+vi.mock('pg', () => ({ default: { Pool: class { constructor(options: unknown) { cell.pools++; cell.poolOptions.push(options); } async end() { cell.ended++; } } }, Client: class {
   async connect() { state.connected++; }
   async end() { state.closed++; if (state.failClose) throw new Error('close failed'); }
   async query(sql: string) {
@@ -55,6 +56,17 @@ describe('cell jobs Worker', () => {
     await expect(jobs.queue(delivered.value, {} as never)).rejects.toThrow('Cell authority binding is missing');
     await expect(jobs.scheduled({} as never, {} as never)).rejects.toThrow('Cell authority binding is missing');
     expect(delivered.settled).toEqual([]);
+  });
+
+  it('bounds client reads past every server bound, so only a lost session hits the read timeout', async () => {
+    const actual = await vi.importActual<typeof import('@stateplane/postgres')>('@stateplane/postgres');
+    // The server ends a statement by the request budget and a stalled apply 5 s after it.
+    const serverBound = new actual.PostgresAuthority({ connect: async () => { throw new Error('unused'); } } as never, 1)
+      .requestBudgetMs + 5_000;
+    await jobs.queue(batch([]).value, jobsEnv());
+    const { query_timeout: readTimeout } = cell.poolOptions.at(-1) as { query_timeout: number };
+    expect(readTimeout).toBe(actual.CLIENT_READ_TIMEOUT_MS);
+    expect(readTimeout).toBeGreaterThan(serverBound);
   });
 
   it('acks settled and malformed hints and redelivers only infrastructure failures', async () => {

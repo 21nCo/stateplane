@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
-import { AuthorityError, CommitOutcomeUnknownError } from './index.js';
+import { AuthorityError, clientReadTimedOut, CommitOutcomeUnknownError } from './index.js';
 import type { AuthorityScope, OutboxDelivery, PostgresAuthority, ProjectionChange, ProjectionOutcome, ProjectionQuery } from './index.js';
 import { claimOutboxSql, FAILED_OUTBOX, failOutboxSql, LIVE_OUTBOX } from './outbox-sql.js';
 import { scalarString } from './schema.js';
@@ -62,6 +62,7 @@ const STATUS_ROWS = 1_000;
 const STATUS_PAIRS = 200;
 const STATUS_SAMPLE = 500;
 const PAUSED_STEP_SECONDS = 60;
+const RETRY_PAGE = 1_000;
 // A started lease released uncounted waits this long, so a fault that is
 // misclassified as infrastructure cannot retry in a tight loop.
 const RELEASE_BACKOFF_MS = 5_000;
@@ -77,15 +78,16 @@ class ProjectorFailure extends Error {}
 
 // A lost session, a rolled-back serialization or deadlock, exhausted
 // resources, a lock budget, a server shutdown or a system I/O error, plus the
-// driver's socket and connection errors. A statement timeout is not here: an
-// overrun is the item's.
+// driver's socket, connection and client read errors. A statement timeout is
+// not here: an overrun is the item's. The client read bound sits past every
+// server bound (CLIENT_READ_TIMEOUT_MS), so it fires only on a lost session.
 const INFRASTRUCTURE_SQLSTATE = /^(?:(?:08|40|53|58)[0-9A-Z]{3}|55P03|57P0[0-9])$/;
 function infrastructureFault(error: unknown): boolean {
   if (!(error instanceof Error) || error instanceof AuthorityError) return false;
   const code = (error as { code?: unknown }).code;
   // Socket errnos such as ECONNRESET, not Node's ERR_* programming errors.
   if (typeof code === 'string') return INFRASTRUCTURE_SQLSTATE.test(code) || (/^E[A-Z_]+$/.test(code) && !code.startsWith('ERR_'));
-  return /^Connection terminated|not queryable|^timeout exceeded when trying to connect/.test(error.message);
+  return clientReadTimedOut(error) || /^Connection terminated|not queryable|^timeout exceeded when trying to connect/.test(error.message);
 }
 
 // An error reply from a live session means the server rolled COMMIT back.
@@ -114,7 +116,8 @@ async function inTransaction<T>(pool: PoolLike, fn: (db: pg.PoolClient) => Promi
     catch (error) { discard = true; begun = false; throw new CommitOutcomeUnknownError(error); }
     return result;
   } catch (error) {
-    if (begun) await client.query('ROLLBACK').catch(() => { discard = true; });
+    if (clientReadTimedOut(error)) discard = true;
+    else if (begun) await client.query('ROLLBACK').catch(() => { discard = true; });
     throw error;
   } finally { client.release(discard); client.removeListener?.('error', onError); }
 }
@@ -288,6 +291,12 @@ export class PostgresOutbox {
     const { eventId, attempt: hinted } = this.message(message);
     const deadline = Date.now() + this.processingMs;
     const row = await inTransaction(this.pool, async db => {
+      // Lock the row alone, then read scope and content in a later statement.
+      // A lock wait rechecks only the locked row, so a suspension, delete or
+      // fence that commits while start waits would otherwise go unseen.
+      const locked = await db.query(`SELECT 1 FROM projection_outbox WHERE event_id=$1 AND attempts>=$2
+        AND delivery_state='delivering' AND started_attempt IS DISTINCT FROM attempts FOR UPDATE`, [eventId, hinted]);
+      if (!locked.rows[0]) return null;
       const found = (await db.query(`SELECT o.space_id,o.collection_id,o.record_id,o.revision,o.generation,o.attempts,
           s.policy_version,s.placement_generation,e.operation,
           s.lifecycle IN ('active','readOnly') AND c.lifecycle<>'deleted' AS open,
@@ -297,8 +306,7 @@ export class PostgresOutbox {
         FROM projection_outbox o JOIN spaces s ON s.space_id=o.space_id
         JOIN collections c ON c.space_id=o.space_id AND c.collection_id=o.collection_id
         JOIN record_events e ON e.event_id=o.event_id
-        WHERE o.event_id=$1 AND o.attempts>=$2 AND o.delivery_state='delivering'
-          AND o.started_attempt IS DISTINCT FROM o.attempts FOR UPDATE OF o`, [eventId, hinted])).rows[0];
+        WHERE o.event_id=$1`, [eventId])).rows[0];
       if (!found) return null;
       if (!found.open) await db.query(RELEASE_SQL, [[eventId], [found.attempts], 0, false]);
       else await db.query(`UPDATE projection_outbox SET started_attempt=attempts,
@@ -327,14 +335,19 @@ export class PostgresOutbox {
       }
       const apply = active && (async (current: ProjectionChange, query: ProjectionQuery) => {
         // The transaction is lost once its session faults, whatever apply
-        // does with the error, so the fault decides the outcome.
+        // does with the error: later SQL gets the fault back instead of an
+        // aborted-transaction error, and once apply settles, either way, the
+        // fault decides the outcome.
         let fault: unknown;
-        const port: ProjectionQuery = (sql, values) => query(sql, values).catch(error => {
+        const port: ProjectionQuery = (sql, values) => fault ? Promise.reject(fault) : query(sql, values).catch(error => {
           if (infrastructureFault(error)) fault ??= error;
           throw error;
         });
+        let failure: unknown;
         try { await within(active.apply(current, prepared, port), signal); }
-        catch (error) { throw fault ?? new ProjectorFailure('apply failed', { cause: error }); }
+        catch (error) { failure = new ProjectorFailure('apply failed', { cause: error }); }
+        if (fault) throw fault;
+        if (failure) throw failure;
       });
       return await this.authority.transaction(scope, tx => tx.completeProjection(delivery, apply), deadline, signal);
     } catch (error) {
@@ -422,7 +435,11 @@ export class PostgresOutbox {
     });
   }
 
-  /** Return a space's dead letters to the due queue with a fresh failure budget. Audited. */
+  /**
+   * Return a space's dead letters to the due queue with a fresh failure
+   * budget. Audited once. Keyset pages over failed rows keep each statement
+   * within the statement bound however many dead letters there are.
+   */
   async retry(operator: string, spaceId: string, collectionId: string | null, reason: string): Promise<number> {
     const who = text(operator, 256);
     const why = text(reason, 1024);
@@ -430,11 +447,23 @@ export class PostgresOutbox {
     const collection = collectionId === null ? null : text(collectionId, 512);
     return inTransaction(this.pool, async db => {
       await this.lockSpace(db, space, ['active', 'readOnly', 'suspended']);
-      const retried = await db.query(`UPDATE projection_outbox SET delivery_state='pending',failures=0,started_attempt=NULL,
-          dead_lettered_at=NULL,available_at=clock_timestamp()
-        WHERE space_id=$1 AND ($2::text IS NULL OR collection_id=$2) AND ${LIVE_OUTBOX} AND dead_lettered_at IS NOT NULL`,
-      [space, collection]);
-      const affected = retried.rowCount ?? 0;
+      let affected = 0;
+      let page: { retried: number; scanned: number; collection_id: string; event_id: string } | undefined;
+      do {
+        page = (await db.query(`WITH page AS (
+            SELECT collection_id,event_id FROM projection_outbox
+            WHERE space_id=$1 AND ($2::text IS NULL OR collection_id=$2) AND ${FAILED_OUTBOX}
+              AND ($3::text IS NULL OR (collection_id,event_id)>($3,$4)) ORDER BY collection_id,event_id LIMIT $5
+          ), retried AS (
+            UPDATE projection_outbox o SET delivery_state='pending',failures=0,started_attempt=NULL,
+              dead_lettered_at=NULL,available_at=clock_timestamp()
+            FROM page WHERE o.event_id=page.event_id AND o.dead_lettered_at IS NOT NULL RETURNING 1
+          ) SELECT (SELECT count(*) FROM retried)::int AS retried,(SELECT count(*) FROM page)::int AS scanned,
+            last.collection_id,last.event_id
+          FROM (SELECT collection_id,event_id FROM page ORDER BY collection_id DESC,event_id DESC LIMIT 1) last`,
+        [space, collection, page?.collection_id ?? null, page?.event_id ?? null, RETRY_PAGE])).rows[0];
+        affected += page?.retried ?? 0;
+      } while (page?.scanned === RETRY_PAGE);
       await this.audit(db, { space, collection, action: 'retry', who, why, job: null, affected });
       return affected;
     });

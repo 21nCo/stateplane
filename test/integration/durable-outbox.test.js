@@ -805,3 +805,119 @@ test('completion errors: an error reply to COMMIT is a known rollback, and only 
   assert.deepEqual(await deliver(recorder()), ['applied']);
   assert.deepEqual(await head(spaceId, created.ref.id), { generation: 1, revision: 1, deleted: false });
 });
+
+test('apply cannot hide an infrastructure fault: catching it and returning, or issuing more SQL, still releases uncounted', async () => {
+  const { scope, collectionId, spaceId } = await space();
+  const created = await write(scope(collectionId), 'create', '{"label":"a"}');
+  await pool.query('CREATE TABLE IF NOT EXISTS outbox_test_locks(id integer PRIMARY KEY)');
+  await pool.query('INSERT INTO outbox_test_locks VALUES(1) ON CONFLICT DO NOTHING');
+  const contend = query => query("SET LOCAL lock_timeout = '100ms'")
+    .then(() => query('SELECT id FROM outbox_test_locks WHERE id=1 FOR UPDATE')).catch(() => {});
+  const swallowing = {
+    returned: { apply: async (_change, _prepared, query) => { await contend(query); } },
+    continued: { apply: async (_change, _prepared, query) => { await contend(query); await query('SELECT 1'); } }
+  };
+  const holder = await pool.connect();
+  try {
+    await holder.query('BEGIN');
+    await holder.query('SELECT id FROM outbox_test_locks WHERE id=1 FOR UPDATE');
+    for (const projector of Object.values(swallowing)) {
+      await drained();
+      const [lease] = (await outbox.claim()).messages;
+      await assert.rejects(outbox.process(lease, projector), { code: 'BACKPRESSURE' });
+      assert.deepEqual(await row(lease.eventId), { ...await row(lease.eventId), delivery_state: 'pending', failures: 0, last_error: null });
+    }
+  } finally { await holder.query('ROLLBACK'); holder.release(); }
+  assert.equal(await head(spaceId, created.ref.id), undefined);
+  // The projector's own SQL error, swallowed before more SQL, is still the item's and counts.
+  await drained();
+  const [own] = (await outbox.claim()).messages;
+  const careless = { apply: async (_change, _prepared, query) => {
+    await query('SELECT 1/0').catch(() => {});
+    await query('SELECT 1');
+  } };
+  assert.equal(await outbox.process(own, careless), 'failed');
+  assert.deepEqual(await row(own.eventId), { ...await row(own.eventId), delivery_state: 'degraded', failures: 1 });
+});
+
+test('start reads scope after its row lock, so a change committed during the lock wait reaches no projector', async () => {
+  const seen = [];
+  const spy = { prepare: async change => { seen.push(['prepare', change.canonicalData]); },
+    apply: async change => { seen.push(['apply', change.canonicalData]); } };
+  const waiting = async () => {
+    for (let tries = 0; tries < 250; tries++) {
+      const { count } = (await pool.query(`SELECT count(*)::int AS count FROM pg_stat_activity
+        WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%FROM projection_outbox%FOR UPDATE%'`)).rows[0];
+      if (count > 0) return;
+      await sleep(20);
+    }
+    throw new Error('start never waited for the row lock');
+  };
+  const raced = async (change, setup) => {
+    const { scope, collectionId, spaceId } = await space();
+    await setup?.(spaceId);
+    await write(scope(collectionId), 'create', '{"label":"secret"}');
+    const [lease] = (await outbox.claim()).messages;
+    const blocker = await pool.connect();
+    try {
+      // A reclaiming dispatcher holds the row while the scope change commits.
+      await blocker.query('BEGIN');
+      await blocker.query(`UPDATE projection_outbox SET attempts=attempts+1,available_at=clock_timestamp()+interval '5 minutes'
+        WHERE event_id=$1`, [lease.eventId]);
+      const outcome = outbox.process(lease, spy);
+      await waiting();
+      await change(spaceId, collectionId);
+      await blocker.query('COMMIT');
+      return { outcome: await outcome, row: await row(lease.eventId) };
+    } finally { await blocker.query('ROLLBACK').catch(() => {}); blocker.release(); }
+  };
+
+  const suspended = await raced(spaceId =>
+    pool.query("UPDATE spaces SET lifecycle='suspended',policy_version=policy_version+1 WHERE space_id=$1", [spaceId]));
+  assert.deepEqual([suspended.outcome, suspended.row.delivery_state, suspended.row.failures], ['released', 'pending', 0]);
+  const deleted = await raced((spaceId, collectionId) =>
+    pool.query("UPDATE collections SET lifecycle='deleted' WHERE space_id=$1 AND collection_id=$2", [spaceId, collectionId]));
+  assert.deepEqual([deleted.outcome, deleted.row.delivery_state, deleted.row.failures], ['released', 'pending', 0]);
+  const fenced = await raced(spaceId => fencer().fencePlacement(spaceId, 'cell-a', 1),
+    spaceId => pool.query(`INSERT INTO space_directory(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,lifecycle)
+      VALUES($1,'owner','cell-a','cell-a','target-a','active')`, [spaceId]));
+  assert.deepEqual([fenced.outcome, fenced.row.delivery_state, fenced.row.generation], ['requeued', 'pending', '2']);
+  assert.deepEqual(seen, [], 'no projector callback saw content for a scope that changed before start decided');
+});
+
+test('a client read timeout is a lost session: released uncounted and the session discarded', async () => {
+  const { scope, collectionId, spaceId } = await space();
+  const created = await write(scope(collectionId), 'create', '{"label":"a"}');
+  // Only completion's pool has the short client bound; the lingering server
+  // statement ends after it, and the release then proceeds.
+  const impatient = new pg.Pool({ connectionString: target.toString(), max: 2, query_timeout: 300 });
+  try {
+    const reader = new PostgresOutbox(pool, new PostgresAuthority(impatient, 3600));
+    const [lease] = (await reader.claim()).messages;
+    await assert.rejects(reader.process(lease, { apply: async (_change, _prepared, query) => { await query('SELECT pg_sleep(1)'); } }),
+      /Query read timeout/);
+    assert.deepEqual(await row(lease.eventId), { ...await row(lease.eventId), delivery_state: 'pending', failures: 0 });
+    assert.equal(impatient.totalCount, 0, 'the timed-out session was discarded');
+    assert.equal(await head(spaceId, created.ref.id), undefined);
+  } finally { await impatient.end(); }
+});
+
+test('operator retry pages over failed rows: every dead letter, no backoff row, one audit row', async () => {
+  const { scope, ids, spaceId } = await space(2);
+  const events = [];
+  for (const collectionId of [...ids, ...ids]) {
+    const created = await write(scope(collectionId), 'create', '{"v":1}');
+    events.push((await pool.query('SELECT event_id FROM projection_outbox WHERE space_id=$1 AND record_id=$2',
+      [spaceId, created.ref.id])).rows[0].event_id);
+  }
+  await pool.query(`UPDATE projection_outbox SET delivery_state='degraded',failures=8,dead_lettered_at=clock_timestamp(),
+    available_at='infinity',last_error='parked' WHERE event_id=ANY($1)`, [events.slice(0, 3)]);
+  await pool.query(`UPDATE projection_outbox SET delivery_state='degraded',failures=1,available_at=clock_timestamp()+interval '1 hour',
+    last_error='backoff' WHERE event_id=$1`, [events[3]]);
+  assert.equal(await outbox.retry('operator@example.invalid', spaceId, null, 'embedder restored'), 3);
+  for (const eventId of events.slice(0, 3))
+    assert.deepEqual(await row(eventId), { ...await row(eventId), delivery_state: 'pending', failures: 0, dead_lettered_at: null });
+  assert.deepEqual(await row(events[3]), { ...await row(events[3]), delivery_state: 'degraded', failures: 1, dead_lettered_at: null });
+  const audits = await pool.query("SELECT affected FROM outbox_operator_audit WHERE space_id=$1 AND action='retry'", [spaceId]);
+  assert.deepEqual(audits.rows.map(entry => Number(entry.affected)), [3]);
+});

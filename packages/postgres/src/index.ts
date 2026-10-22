@@ -665,6 +665,17 @@ function pageCandidateSql(options:PageCandidateOptions):string {
 
 // Past the transaction deadline, so the client's own rollback always wins.
 const STALLED_APPLY_MARGIN_MS = 5_000;
+/**
+ * The longest a pg client read bound (`query_timeout`) may wait for a cell
+ * pool used by the authority or outbox. The server ends every statement by
+ * the request budget and a stalled apply by the backstop after it, so a
+ * shorter client bound would cut off work the server still allows.
+ */
+export const CLIENT_READ_TIMEOUT_MS = REQUEST_TIMEOUT_MS + STALLED_APPLY_MARGIN_MS + 5_000;
+/** pg's client read bound fired. The statement may still run, so the session is unusable. */
+export function clientReadTimedOut(error: unknown): boolean {
+  return error instanceof Error && error.message === 'Query read timeout';
+}
 // A completion queued behind another completion's head lock gives way as a
 // lock timeout, which releases its lease uncounted, instead of overrunning
 // its budget and counting a failure. Apply's own lock waits share the bound.
@@ -742,7 +753,7 @@ export class PostgresAuthority {
       return result;
     } catch (error) {
       if (tx) { tx.sealMutations(); await tx.settleMutations(); }
-      if (begun && !commitAmbiguous) { try { await client.query('ROLLBACK'); } catch { discard = true; } }
+      if (begun && !commitAmbiguous && !clientReadTimedOut(error)) { try { await client.query('ROLLBACK'); } catch { discard = true; } }
       else if (beginAttempted) discard = true;
       if ((error as {code?:string}).code==='57014') throw new AuthorityError('RATE_LIMITED','Database statement time limit exceeded');
       if ((error as {code?:string}).code==='55P03') throw new AuthorityError('BACKPRESSURE','Database lock budget exceeded');
@@ -2023,12 +2034,17 @@ export class AuthorityTransaction {
       this.requireDelivery(delivery);
       if (apply !== undefined && typeof apply !== 'function') throw new AuthorityError('INVALID_ARGUMENT');
       const lease = [...scopeIds(this.#scope), delivery.eventId];
+      // Lock the lease alone; the record's latest revision is read by a later
+      // statement, so a write that commits during the lock wait is seen.
+      const locked = await this.query(`SELECT 1 FROM projection_outbox
+        WHERE space_id=$1 AND collection_id=$2 AND event_id=$3 AND attempts=$4 AND revision=$5
+          AND generation=$6 AND delivery_state='delivering' AND available_at>clock_timestamp() FOR UPDATE`,
+      [...lease, delivery.attempt, delivery.revision, delivery.generation]);
+      if (!locked.rows[0]) return 'lost';
       const row = (await this.query(`SELECT o.record_id,o.revision,o.generation,e.operation,e.canonical_data,r.revision AS latest
         FROM projection_outbox o JOIN record_events e ON e.event_id=o.event_id
         JOIN records r ON r.space_id=o.space_id AND r.collection_id=o.collection_id AND r.record_id=o.record_id
-        WHERE o.space_id=$1 AND o.collection_id=$2 AND o.event_id=$3 AND o.attempts=$4 AND o.revision=$5
-          AND o.generation=$6 AND o.delivery_state='delivering' AND o.available_at>clock_timestamp() FOR UPDATE OF o`,
-      [...lease, delivery.attempt, delivery.revision, delivery.generation])).rows[0];
+        WHERE o.space_id=$1 AND o.collection_id=$2 AND o.event_id=$3`, lease)).rows[0];
       if (!row) return 'lost';
       const placement = this.#scope.placementGeneration;
       const revision = Number(row.revision);

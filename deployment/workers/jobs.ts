@@ -1,5 +1,5 @@
 import pg from 'pg';
-import { PostgresAuthority, PostgresOutbox } from '@stateplane/postgres';
+import { CLIENT_READ_TIMEOUT_MS, PostgresAuthority, PostgresOutbox } from '@stateplane/postgres';
 import { consume, dispatch } from '@stateplane/workers';
 import type { DeliveryMessage } from '@stateplane/workers';
 
@@ -17,8 +17,10 @@ const DISPATCH_BUDGET_MS = 20_000;
 const RECONCILE_BUDGET_MS = 10_000;
 function cell(env: Env) {
   if (!env.AUTHORITY?.connectionString) throw new Error('Cell authority binding is missing');
+  // Statement timeouts bound every query; the client read bound sits past
+  // them and only catches a silently lost session.
   const pool = new pg.Pool({ connectionString: env.AUTHORITY.connectionString, max: 4,
-    connectionTimeoutMillis: 5_000, query_timeout: 10_000 });
+    connectionTimeoutMillis: 5_000, query_timeout: CLIENT_READ_TIMEOUT_MS });
   // The worker never issues receipts; retention only satisfies the constructor.
   const outbox = new PostgresOutbox(pool, new PostgresAuthority(pool, 1));
   return { outbox, close: () => pool.end() };
