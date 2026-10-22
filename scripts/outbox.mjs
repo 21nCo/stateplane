@@ -5,25 +5,30 @@ import { PostgresAuthority, PostgresOutbox } from '../packages/postgres/dist/ind
 
 // Product-internal operator access to one cell's outbox. Status is read-only;
 // retry, reconcile and cancel are audited under STATEPLANE_OPERATOR.
-const usage = `Usage: node scripts/outbox.mjs status [spaceId]
+const usage = `Usage: node scripts/outbox.mjs status [spaceId] [--after-space <spaceId> --after-collection <collectionId>]
        node scripts/outbox.mjs job <jobId>
        node scripts/outbox.mjs retry <spaceId> [collectionId] --reason <text>
        node scripts/outbox.mjs reconcile <spaceId> <collectionId> --reason <text>
        node scripts/outbox.mjs cancel <jobId> --reason <text>`;
-const { positionals, values } = parseArgs({ allowPositionals: true, options: { reason: { type: 'string' } } });
+const { positionals, values } = parseArgs({ allowPositionals: true, options: {
+  reason: { type: 'string' }, 'after-space': { type: 'string' }, 'after-collection': { type: 'string' } } });
 const [command, ...rest] = positionals;
 const operator = process.env.STATEPLANE_OPERATOR;
 const mutating = ['retry', 'reconcile', 'cancel'].includes(command);
 const arity = { status: [0, 1], job: [1, 1], retry: [1, 2], reconcile: [2, 2], cancel: [1, 1] }[command];
-if (!arity || rest.length < arity[0] || rest.length > arity[1] || (mutating && (!values.reason || !operator))) {
-  process.stderr.write(`${usage}\nMutations require --reason and STATEPLANE_OPERATOR.\n`);
+// A status page's `next` cursor is passed back as both --after options.
+const cursor = values['after-space'] !== undefined || values['after-collection'] !== undefined;
+if (!arity || rest.length < arity[0] || rest.length > arity[1] || (mutating && (!values.reason || !operator))
+  || (cursor && (command !== 'status' || values['after-space'] === undefined || values['after-collection'] === undefined))) {
+  process.stderr.write(`${usage}\nMutations require --reason and STATEPLANE_OPERATOR. Status continues from a page's next cursor.\n`);
   process.exit(2);
 }
 const pool = new pg.Pool({ ...connectionOptions(process.env.DATABASE_URL), max: 1 });
 try {
   const outbox = new PostgresOutbox(pool, new PostgresAuthority(pool, 1));
   let result;
-  if (command === 'status') result = await outbox.status(rest[0]);
+  if (command === 'status') result = await outbox.status(rest[0],
+    cursor ? { spaceId: values['after-space'], collectionId: values['after-collection'] } : undefined);
   else if (command === 'job') result = await outbox.reconciliation(rest[0]);
   else if (command === 'retry') result = { retried: await outbox.retry(operator, rest[0], rest[1] ?? null, values.reason) };
   else if (command === 'reconcile') result = await outbox.reconcile(operator, rest[0], rest[1], values.reason);

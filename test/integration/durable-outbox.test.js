@@ -171,6 +171,23 @@ test('a revision below the committed latest never applies, even before the lates
   assert.deepEqual(await head(spaceId, created.ref.id), { generation: 1, revision: 2, deleted: true });
 });
 
+test('a revision whose successor committed before start reaches neither prepare nor apply', async () => {
+  const { scope, collectionId, spaceId } = await space();
+  const created = await write(scope(collectionId), 'create', '{"label":"replaced"}');
+  await write(scope(collectionId), 'replace', '{"label":"current"}', { recordId: created.ref.id, expectedRevision: 1 });
+  const leases = (await outbox.claim()).messages;
+  const revisions = await Promise.all(leases.map(async lease => Number((await pool.query(
+    'SELECT revision FROM projection_outbox WHERE event_id=$1', [lease.eventId])).rows[0].revision)));
+  const seen = [];
+  const projector = { prepare: async change => { seen.push(['prepare', change.revision, change.canonicalData]); },
+    apply: async change => { seen.push(['apply', change.revision, change.canonicalData]); } };
+  assert.equal(await outbox.process(leases[revisions.indexOf(1)], projector), 'superseded');
+  assert.deepEqual(seen, []);
+  assert.equal(await outbox.process(leases[revisions.indexOf(2)], projector), 'applied');
+  assert.deepEqual(seen, [['prepare', 2, '{"label":"current"}'], ['apply', 2, '{"label":"current"}']]);
+  assert.deepEqual(await head(spaceId, created.ref.id), { generation: 1, revision: 2, deleted: false });
+});
+
 test('worker restart, expired started lease and delayed completion recover once; poison parks without blocking others', async () => {
   const { scope, collectionId, spaceId } = await space();
   const writer = scope(collectionId);
@@ -738,6 +755,58 @@ test('status reports dead letters and backoff behind more due rows than its samp
       [500, true, 1, 1, false, 'Error: parked']);
   } finally {
     await pool.query('UPDATE projection_outbox SET dead_lettered_at=NULL,available_at=clock_timestamp() WHERE space_id=$1', [spaceId]);
+  }
+});
+
+test('status pages continue from a cursor to every collection, within a space and across spaces', async () => {
+  const first = await space(3);
+  const second = await space(2);
+  const pairs = [];
+  for (const { scope, ids, spaceId } of [first, second]) for (const collectionId of ids) {
+    const created = await write(scope(collectionId), 'create', '{"v":1}');
+    pairs.push({ spaceId, collectionId, recordId: created.ref.id });
+  }
+  // A backoff row in every collection, and a dead letter in each space's last one.
+  for (const { spaceId, recordId } of pairs) await pool.query(`UPDATE projection_outbox SET delivery_state='degraded',failures=1,
+    last_error='Error: backoff',available_at=clock_timestamp()+interval '1 hour' WHERE space_id=$1 AND record_id=$2`, [spaceId, recordId]);
+  for (const { spaceId, ids } of [first, second]) await pool.query(`UPDATE projection_outbox SET failures=8,dead_lettered_at=clock_timestamp(),
+    last_error='Error: parked',available_at='infinity' WHERE space_id=$1 AND collection_id=$2`, [spaceId, ids.at(-1)]);
+  const paged = new PostgresOutbox(pool, authority, { statusPairs: 2 });
+  const walk = async spaceId => {
+    const pages = [];
+    let after;
+    // Bounded, so a page that ignores its cursor fails instead of looping.
+    for (let page = 0; page < 10; page++) {
+      const status = await paged.status(spaceId, after);
+      pages.push(status);
+      if (!status.more) break;
+      after = status.next;
+    }
+    return pages;
+  };
+  const key = entry => [entry.spaceId, entry.collectionId].join('\0');
+  try {
+    const one = await walk(first.spaceId);
+    assert.deepEqual(one.map(page => [page.collections.length, page.more]), [[2, true], [1, false]]);
+    assert.deepEqual(one[0].next, { spaceId: first.spaceId, collectionId: first.ids[1] });
+    assert.equal(one[1].next, null);
+    const [last] = one[1].collections;
+    assert.deepEqual([last.collectionId, last.deadLettered, last.degraded, last.lastError], [first.ids[2], 1, 0, 'Error: parked']);
+    const cell = await walk();
+    assert.deepEqual(cell.map(page => [page.collections.length, page.more]), [[2, true], [2, true], [1, false]]);
+    assert.equal(cell.at(-1).next, null);
+    const seen = cell.flatMap(page => page.collections);
+    assert.deepEqual(seen.map(key), pairs.map(key).sort());
+    assert.ok(new Set(cell[1].collections.map(entry => entry.spaceId)).size === 2, 'the second page crosses a space boundary');
+    for (const entry of seen) {
+      const parked = entry.collectionId === first.ids[2] || entry.collectionId === second.ids[1];
+      assert.deepEqual([entry.deadLettered, entry.degraded, entry.lastError], parked ? [1, 0, 'Error: parked'] : [0, 1, 'Error: backoff']);
+    }
+    await assert.rejects(paged.status(undefined, { spaceId: first.spaceId }), error => error.code === 'INVALID_ARGUMENT');
+    assert.throws(() => new PostgresOutbox(pool, authority, { statusPairs: 201 }), error => error.code === 'INVALID_ARGUMENT');
+  } finally {
+    await pool.query(`UPDATE projection_outbox SET delivery_state='delivered',dead_lettered_at=NULL,available_at=clock_timestamp()
+      WHERE space_id=ANY($1)`, [[first.spaceId, second.spaceId]]);
   }
 });
 
