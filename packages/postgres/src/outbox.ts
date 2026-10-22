@@ -81,7 +81,7 @@ async function inTransaction<T>(pool: PoolLike, fn: (db: pg.PoolClient) => Promi
   // The pool detaches its listener on checkout; a server-ended session must
   // fail this transaction, not the process.
   const onError = () => { discard = true; };
-  client.on('error', onError);
+  client.on?.('error', onError);
   try {
     await client.query('BEGIN'); begun = true; discard = false;
     await client.query(`SET LOCAL statement_timeout = '${STATEMENT_MS}ms'`);
@@ -92,7 +92,7 @@ async function inTransaction<T>(pool: PoolLike, fn: (db: pg.PoolClient) => Promi
   } catch (error) {
     if (begun) await client.query('ROLLBACK').catch(() => { discard = true; });
     throw error;
-  } finally { client.release(discard); client.removeListener('error', onError); }
+  } finally { client.release(discard); client.removeListener?.('error', onError); }
 }
 
 function bounded(value: unknown, min: number, max: number): number {
