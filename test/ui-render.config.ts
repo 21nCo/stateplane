@@ -8,5 +8,5 @@ const { svelte } = await import(app('node_modules/@sveltejs/vite-plugin-svelte/s
 const stub = fileURLToPath(new URL('fixtures/sveltekit-app.ts', import.meta.url));
 // The app is the root, so Svelte resolves from its workspace.
 export default defineConfig({ root: app(''), plugins: [svelte({ configFile: false })],
-  resolve: { alias: [{ find: '$lib', replacement: app('src/lib') }, { find: /^\$app\/(forms|state)$/, replacement: stub }] },
+  resolve: { alias: [{ find: '$lib', replacement: app('src/lib') }, { find: /^\$app\/(forms|navigation|state)$/, replacement: stub }] },
   test: { name: 'ui-render', dir: fileURLToPath(new URL('.', import.meta.url)), include: ['**/ui-render.test.ts'] } });

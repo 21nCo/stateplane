@@ -22,6 +22,9 @@ if (deployed || database) process.env.STATEPLANE_E2E_STATE = '1';
 export default defineConfig({
   testDir: './test/e2e',
   timeout: 60_000,
+  // Every spec shares the host's fault proxy, whose armed faults match SQL text,
+  // so a fault armed beside another file could be consumed by the wrong test.
+  workers: 1,
   use: { baseURL: deployed ?? 'http://127.0.0.1:5743' },
   webServer: deployed ? undefined : {
     command: 'node test/e2e/host.js', url: 'http://127.0.0.1:5743/api/health', reuseExistingServer: false,

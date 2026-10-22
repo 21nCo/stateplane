@@ -255,10 +255,12 @@ test('a revocation whose policy publication fails stays retryable after the prov
   expect((await request.post(`/v1${itemsUrl()}/records/count`, { headers, data: [] })).status()).toBe(200);
 });
 
-test('an uncertain key issuance asks the owner to inspect the key list, never to retry for recovery', async ({ page }) => {
+test('an uncertain key issuance asks the owner to inspect the key list, never to retry for recovery', async ({ page, request }) => {
   test.skip(!local, 'Needs the local fault proxy');
   await signIn(page, ownerToken);
   await go(page, accessUrl());
+  const keyIds = async () => (await (await request.get(`/v1${spaceUrl}/agent-keys`, { headers })).json()).items.map((key: { keyId: string }) => key.keyId);
+  const before = await keyIds();
   await page.getByRole('group', { name: 'Collection items' }).getByLabel('records:read', { exact: true }).check();
   // Issuance completion, its readback and its retry all lose their replies.
   await dropReply('SET completed_at=clock_timestamp()');
@@ -269,6 +271,11 @@ test('an uncertain key issuance asks the owner to inspect the key list, never to
   await expect(issue).toContainText('COMMIT_OUTCOME_UNKNOWN');
   await expect(issue).toContainText('Check the key list');
   await expect(issue).not.toContainText('Retry the identical request');
+  // The key the uncertain issuance created is in the list the owner is sent to, without a reload.
+  const created = (await keyIds()).filter((keyId: string) => !before.includes(keyId));
+  expect(created).toHaveLength(1);
+  await expect(page.getByRole('row').filter({ hasText: created[0] })).toBeVisible();
+  await expect(issue).toBeVisible();
 });
 
 test('identifiers with line breaks travel through the grant form exactly, with and without scripts', async ({ browser, page, request }) => {

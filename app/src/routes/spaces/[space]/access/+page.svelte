@@ -1,5 +1,6 @@
 <script lang="ts">
   import { enhance } from '$app/forms';
+  import { invalidateAll } from '$app/navigation';
   import Notice from '$lib/components/Notice.svelte';
   import Restart from '$lib/components/Restart.svelte';
   import Scroll from '$lib/components/Scroll.svelte';
@@ -35,7 +36,7 @@
     <Notice error={form?.revokeError} title="Revocation did not finish" hint={unconfigured(form?.revokeError) ? notConfigured : undefined}>
       <p class="mt-1">Part of the revocation may have taken effect, whatever the key list shows. {unconfigured(form?.revokeError) ?
         'Finish it from a host where agent keys are configured.' : 'Retry until it finishes.'}</p>
-      {#if form?.revokeKeyId}<form method="POST" action="?/revoke" class="mt-2"><input type="hidden" name="keyId" value={carry(form.revokeKeyId)} />
+      {#if form?.revokeKeyId && !unconfigured(form.revokeError)}<form method="POST" action="?/revoke" class="mt-2"><input type="hidden" name="keyId" value={carry(form.revokeKeyId)} />
         <button class="btn-danger">Retry revocation of <span class="ident">{form.revokeKeyId}</span></button></form>{/if}
     </Notice>
     {#if form?.revoked}<p role="status" class="text-sm text-success">Key {form.revoked} revoked.</p>{/if}
@@ -74,7 +75,8 @@
       </Notice>
       {#if form?.issueInvalid}<p role="alert" class="text-sm text-danger">Choose a lifetime and at least one capability for a named collection.</p>{/if}
       {#if form?.issueTooLarge}<p role="alert" class="text-sm text-danger">These grants need {form.issueTooLarge.bytes} bytes; one key's issuance accepts at most {form.issueTooLarge.limit}. Nothing was sent. Choose fewer collections or capabilities, or issue them to more than one key.</p>{/if}
-      <form method="POST" action="?/issue" class="space-y-3" use:enhance>
+      <!-- A refused issuance may still have created a key, so the key list it points to is reloaded too. -->
+      <form method="POST" action="?/issue" class="space-y-3" use:enhance={()=>async({result,update})=>{await update(); if (result.type==='failure') await invalidateAll();}}>
         <div><label for="days">Lifetime</label>
           <select id="days" name="days">{#each data.lifetimes as days (days)}<option value={days} selected={days===30}>{days} {days===1 ? 'day' : 'days'}</option>{/each}</select></div>
         {#each rows as slug, index (index)}

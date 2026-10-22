@@ -14,10 +14,14 @@ it('a host without agent keys is reported as not configured, never as a retry th
     expect(html).not.toContain('Try again shortly');
     expect(html).not.toContain('Retry until it finishes');
   }
-  expect(body({ revokeError: error(false), revokeKeyId: 'key_1' })).toContain('Finish it from a host where agent keys are configured.');
+  const unconfigured = body({ revokeError: error(false), revokeKeyId: 'key_1' });
+  expect(unconfigured).toContain('Finish it from a host where agent keys are configured.');
+  expect(unconfigured).not.toContain('Retry revocation');
   // A retryable outage keeps the transient guidance.
   expect(body({ issueError: error(true) })).toContain('Try again shortly');
-  expect(body({ revokeError: error(true), revokeKeyId: 'key_1' })).toContain('Retry until it finishes');
+  const transient = body({ revokeError: error(true), revokeKeyId: 'key_1' });
+  expect(transient).toContain('Retry until it finishes');
+  expect(transient).toContain('Retry revocation of <span class="ident">key_1</span>');
 });
 
 it('each grant shows its own deadline, and one past it is marked expired while its key is active', () => {

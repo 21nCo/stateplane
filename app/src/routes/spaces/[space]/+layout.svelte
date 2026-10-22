@@ -3,7 +3,7 @@
   import { carry, shown, spaceHref } from '$lib/paths';
   let { data, children } = $props();
   const base=$derived(spaceHref(data.spaceId));
-  const links=$derived([{href:base,label:'Collections'},{href:`${base}/audit`,label:'Audit'}]);
+  const links=$derived([{href:base,label:'Collections'},{href:`${base}/access`,label:'Agent access'},{href:`${base}/audit`,label:'Audit'}]);
 </script>
 
 <div class="mb-4 flex flex-wrap items-end justify-between gap-3 border-b border-line pb-3">
