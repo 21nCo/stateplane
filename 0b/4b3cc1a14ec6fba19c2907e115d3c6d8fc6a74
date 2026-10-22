@@ -1,0 +1,26 @@
+app/src/routes/spaces/[space]/access/+page.svelte
+  s_e1c5fc1a65c0cf::t_0c07ea2efa20ea 78-79,83
+test/e2e/access.spec.ts
+  s_e1c5fc1a65c0cf::t_28cb38a64e5bf7 281-310
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0b4b3cc1a14ec6fba19c2907e115d3c6d8fc6a74",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_e1c5fc1a65c0cf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a13e18-4241-7662-a24f-782076addabe",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
