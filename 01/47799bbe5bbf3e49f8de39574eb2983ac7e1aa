@@ -1,0 +1,34 @@
+app/src/routes/spaces/[space]/+layout.svelte
+  h_a39f9495f9ec1d 6
+app/src/routes/spaces/[space]/access/+page.svelte
+  s_92427ff18a8304::t_1145af335408df 3,39,78-79
+docs/ui.md
+  s_92427ff18a8304::t_eaadc5e1866b6f 17,26
+playwright.config.ts
+  s_92427ff18a8304::t_91612c0492de98 25-27
+test/e2e/access.spec.ts
+  s_92427ff18a8304::t_79a48263cfebe4 258,262-263,274-278
+test/ui-render.test.ts
+  s_92427ff18a8304::t_92b89a08140e81 17-19,22-24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0147799bbe5bbf3e49f8de39574eb2983ac7e1aa",
+  "prompts": {},
+  "humans": {
+    "h_a39f9495f9ec1d": {
+      "author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_92427ff18a8304": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26336501-b0e6-4534-a7c2-345f5528a4ba",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
