@@ -815,7 +815,8 @@ test('completion errors: an error reply to COMMIT is a known rollback, and only 
     await holder.query('BEGIN');
     await holder.query('SELECT 1 FROM records WHERE space_id=$1 AND record_id=$2 FOR UPDATE', [spaceId, created.ref.id]);
     await assert.rejects(outbox.process(lease, recorder()), error => error.name === 'CommitOutcomeUnknownError' && error.cause?.code === '55P03');
-    assert.deepEqual(await row(lease.eventId), { ...await row(lease.eventId), delivery_state: 'pending', failures: 0 });
+    assert.deepEqual(await row(lease.eventId), { ...await row(lease.eventId), delivery_state: 'pending', failures: 0,
+      last_error: 'error 55P03' });
   } finally { await holder.query('ROLLBACK'); holder.release(); }
   assert.equal(await head(spaceId, created.ref.id), undefined);
 
@@ -852,10 +853,21 @@ test('apply cannot hide an infrastructure fault: catching it and returning, or i
       await drained();
       const [lease] = (await outbox.claim()).messages;
       await assert.rejects(outbox.process(lease, projector), { code: 'BACKPRESSURE' });
-      assert.deepEqual(await row(lease.eventId), { ...await row(lease.eventId), delivery_state: 'pending', failures: 0, last_error: null });
+      // The release records why, as a code only, without spending the failure budget.
+      assert.deepEqual(await row(lease.eventId), { ...await row(lease.eventId), delivery_state: 'pending', failures: 0,
+        last_error: 'error 55P03' });
     }
   } finally { await holder.query('ROLLBACK'); holder.release(); }
   assert.equal(await head(spaceId, created.ref.id), undefined);
+  const [faulted] = (await outbox.status(spaceId)).collections;
+  assert.deepEqual([faulted.pending, faulted.degraded, faulted.deadLettered, faulted.lastError], [1, 0, 0, 'error 55P03']);
+  // A later successful completion clears it.
+  await drained();
+  assert.deepEqual(await deliver(recorder()), ['applied']);
+  const [{ event_id: eventId }] = (await pool.query('SELECT event_id FROM projection_outbox WHERE space_id=$1', [spaceId])).rows;
+  assert.deepEqual(await row(eventId), { ...await row(eventId), delivery_state: 'delivered', last_error: null });
+  assert.deepEqual((await outbox.status(spaceId)).collections, []);
+  await write(scope(collectionId), 'replace', '{"label":"b"}', { recordId: created.ref.id, expectedRevision: 1 });
   // The projector's own SQL error, swallowed before more SQL, is still the item's and counts.
   await drained();
   const [own] = (await outbox.claim()).messages;

@@ -33,7 +33,8 @@ export interface OutboxOptions { processingMs?: number; retryPage?: number }
  * `STATUS_SAMPLE` live rows, and `capped` marks them as lower bounds.
  * `degraded`, `deadLettered` and `lastError` come from a separate sample of
  * up to `STATUS_SAMPLE` failed rows, wherever they are parked;
- * `failuresCapped` marks those counts as lower bounds.
+ * `failuresCapped` marks those counts as lower bounds. Without a failed
+ * row, `lastError` is the live sample's latest uncounted release reason.
  */
 export interface CollectionOutboxStatus {
   spaceId: string; collectionId: string; pending: number; delivering: number; degraded: number; deadLettered: number;
@@ -67,10 +68,14 @@ const RETRY_PAGE = 1_000;
 // A started lease released uncounted waits this long, so a fault that is
 // misclassified as infrastructure cannot retry in a tight loop.
 const RELEASE_BACKOFF_MS = 5_000;
-/** Release leases $1/$2 that are started ($4) or not, due again after $3 ms. */
+/**
+ * Release leases $1/$2 that are started ($4) or not, due again after $3 ms.
+ * A non-null $5 records why, without spending the failure budget.
+ */
 const RELEASE_SQL = `UPDATE projection_outbox o
   SET delivery_state=CASE WHEN o.failures>0 THEN 'degraded' ELSE 'pending' END,
-    started_attempt=NULL,available_at=clock_timestamp()+($3::integer * interval '1 millisecond')
+    started_attempt=NULL,available_at=clock_timestamp()+($3::integer * interval '1 millisecond'),
+    last_error=COALESCE($5::text,o.last_error)
   FROM unnest($1::text[],$2::integer[]) AS m(event_id,attempt)
   WHERE o.event_id=m.event_id AND o.attempts=m.attempt AND o.delivery_state='delivering'
     AND (o.started_attempt IS NOT DISTINCT FROM o.attempts)=$4::boolean`;
@@ -275,11 +280,11 @@ export class PostgresOutbox {
   /** Undo unstarted leases whose hints were not sent. A lease a worker has started is left to it. */
   release(messages: readonly DeliveryMessage[]): Promise<number> { return this.releaseLeases(messages, false); }
 
-  private async releaseLeases(messages: readonly DeliveryMessage[], started: boolean): Promise<number> {
+  private async releaseLeases(messages: readonly DeliveryMessage[], started: boolean, error: string | null = null): Promise<number> {
     const fixed = messages.map(message => this.message(message));
     if (!fixed.length) return 0;
     return inTransaction(this.pool, async db => (await db.query(RELEASE_SQL, [fixed.map(message => message.eventId),
-      fixed.map(message => message.attempt), started ? RELEASE_BACKOFF_MS : 0, started])).rowCount ?? 0);
+      fixed.map(message => message.attempt), started ? RELEASE_BACKOFF_MS : 0, started, error])).rowCount ?? 0);
   }
 
   /**
@@ -295,8 +300,8 @@ export class PostgresOutbox {
    * so a later claim re-runs it under fresh scope. The budget bounds prepare,
    * apply and completion. An infrastructure fault or lock budget with a
    * known rollback, including one from apply's query port or an error reply
-   * to COMMIT, releases the lease uncounted after a short backoff and is
-   * rethrown.
+   * to COMMIT, releases the lease uncounted after a short backoff, records
+   * its bounded diagnostic and is rethrown.
    */
   async process(message: DeliveryMessage, projector?: Projector): Promise<ProcessOutcome> {
     const { eventId, attempt: hinted } = this.message(message);
@@ -319,7 +324,7 @@ export class PostgresOutbox {
         JOIN record_events e ON e.event_id=o.event_id
         WHERE o.event_id=$1`, [eventId])).rows[0];
       if (!found) return null;
-      if (!found.open) await db.query(RELEASE_SQL, [[eventId], [found.attempts], 0, false]);
+      if (!found.open) await db.query(RELEASE_SQL, [[eventId], [found.attempts], 0, false, null]);
       else await db.query(`UPDATE projection_outbox SET started_attempt=attempts,
           available_at=clock_timestamp()+($2::integer * interval '1 millisecond') WHERE event_id=$1`,
       [eventId, PROCESSING_LEASE_MS]);
@@ -338,6 +343,8 @@ export class PostgresOutbox {
     const signal = AbortSignal.timeout(Math.max(1, deadline - Date.now()));
     // Without a current placement, completion only requeues or supersedes.
     const active = row.placed ? projector : undefined;
+    // The first infrastructure fault apply's port saw, before any mapping.
+    let fault: unknown;
     try {
       let prepared: unknown;
       if (active?.prepare) {
@@ -349,7 +356,7 @@ export class PostgresOutbox {
         // does with the error: later SQL gets the fault back instead of an
         // aborted-transaction error, and once apply settles, either way, the
         // fault decides the outcome.
-        let fault: unknown;
+        fault = undefined;
         const port: ProjectionQuery = (sql, values) => fault ? Promise.reject(fault) : query(sql, values).catch(error => {
           if (infrastructureFault(error)) fault ??= error;
           throw error;
@@ -373,7 +380,7 @@ export class PostgresOutbox {
       // Only a positively classified infrastructure failure or lock budget is
       // not the item's fault; everything else spends the failure budget.
       if (infrastructureFault(cause) || (cause instanceof AuthorityError && cause.code === 'BACKPRESSURE')) {
-        await this.releaseLeases([delivery], true).catch(() => 0);
+        await this.releaseLeases([delivery], true, diagnostic(fault ?? cause)).catch(() => 0);
         throw error;
       }
       await this.fail(delivery, diagnostic(cause));
@@ -410,13 +417,14 @@ export class PostgresOutbox {
             ORDER BY space_id,collection_id LIMIT 1) next
           WHERE p.n<=$2)
         SELECT p.space_id,p.collection_id,d.pending,d.delivering,d.capped,f.degraded,f.dead_lettered,f.failures_capped,
-          f.last_error,LEAST(d.oldest,f.oldest) AS oldest,
+          COALESCE(f.last_error,d.last_error) AS last_error,LEAST(d.oldest,f.oldest) AS oldest,
           extract(epoch FROM clock_timestamp()-LEAST(d.oldest,f.oldest))::float8 AS lag
         FROM pairs p CROSS JOIN LATERAL (
           SELECT count(*) FILTER (WHERE o.delivery_state='pending')::int AS pending,
             count(*) FILTER (WHERE o.delivery_state='delivering')::int AS delivering,
-            count(*)>=$3 AS capped, min(e.committed_at) AS oldest
-          FROM (SELECT event_id,delivery_state FROM projection_outbox
+            count(*)>=$3 AS capped, min(e.committed_at) AS oldest,
+            (array_agg(o.last_error ORDER BY e.committed_at DESC) FILTER (WHERE o.last_error IS NOT NULL))[1] AS last_error
+          FROM (SELECT event_id,delivery_state,last_error FROM projection_outbox
             WHERE space_id=p.space_id AND collection_id=p.collection_id AND ${LIVE_OUTBOX}
             ORDER BY available_at,event_id LIMIT $3) o JOIN record_events e ON e.event_id=o.event_id) d
         -- Dead letters and rows in backoff sort after due work, so they are
