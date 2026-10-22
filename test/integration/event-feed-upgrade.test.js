@@ -205,3 +205,53 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     await admin.end();
   }
 });
+
+test('populated durable outbox upgrade requires the drained acknowledgement',async()=>{
+  const name=`stateplane_sta12_outbox_${randomUUID().replaceAll('-','')}`;
+  const url=new URL(baseUrl); url.pathname=`/${name}`;
+  const admin=new pg.Client({connectionString:baseUrl});
+  let upgrade;
+  await admin.connect();
+  try {
+    await admin.query(`CREATE DATABASE ${name}`);
+    upgrade=new pg.Client({connectionString:url.href});
+    await upgrade.connect();
+    await upgrade.query(`CREATE TABLE stateplane_migrations(name text PRIMARY KEY,sha256 text NOT NULL,
+      applied_at timestamptz NOT NULL DEFAULT now())`);
+    const files=(await readdir(new URL('../../migrations/',import.meta.url)))
+      .filter(file=>/^\d{3}_.*\.sql$/.test(file)).sort();
+    for (const file of files.filter(file=>file<'039_'))
+      await applyFixtureMigration(upgrade,file,await readFile(new URL(`../../migrations/${file}`,import.meta.url),'utf8'));
+    await upgrade.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+      VALUES('sta12-outbox','owner','cell-a','cell-a','target-a')`);
+    await upgrade.query('BEGIN');
+    await upgrade.query("INSERT INTO collections(space_id,collection_id) VALUES('sta12-outbox','entries')");
+    await upgrade.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition)
+      VALUES('sta12-outbox','entries',1,'{}')`);
+    await upgrade.query('COMMIT');
+    await upgrade.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,
+      key_mode,normalized_key,canonical_data,data)
+      VALUES('sta12-outbox','entries','record-1',1,1,'generated','record-1','{}','{}'::jsonb)`);
+    await upgrade.query(`INSERT INTO record_events(event_id,space_id,collection_id,record_id,revision,
+      operation,credential_id,schema_version,canonical_data)
+      VALUES('event-1','sta12-outbox','entries','record-1',1,'create','agent',1,'{}')`);
+    await upgrade.query(`INSERT INTO projection_outbox(event_id,space_id,collection_id,record_id,revision,generation)
+      VALUES('event-1','sta12-outbox','entries','record-1',1,1)`);
+    const migrate=drained=>execFileSync(process.execPath,['scripts/migrate.mjs'],{cwd,encoding:'utf8',timeout:15_000,
+      env:{...process.env,DATABASE_URL:url.href,STATEPLANE_POPULATED_INDEX_UPGRADE:drained?'drained':''}});
+    let refused;
+    try { migrate(false); } catch(error) { refused=error; }
+    assert.match(String(refused?.stderr),/Populated durable outbox upgrade requires drained traffic/);
+    assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name='039_durable_outbox.sql'")).rows[0].n,0);
+    assert.equal((await upgrade.query("SELECT to_regclass('public.projection_outbox_failed') AS name")).rows[0].name,null);
+    assert.equal((await upgrade.query("SELECT to_regclass('public.projection_heads') AS name")).rows[0].name,null);
+    migrate(true);
+    assert.equal((await upgrade.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,files.length);
+    assert.notEqual((await upgrade.query("SELECT to_regclass('public.projection_outbox_failed') AS name")).rows[0].name,null);
+    assert.deepEqual((await upgrade.query('SELECT event_id,failures FROM projection_outbox')).rows,[{event_id:'event-1',failures:0}]);
+  } finally {
+    await upgrade?.end().catch(()=>{});
+    await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+    await admin.end();
+  }
+});

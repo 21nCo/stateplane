@@ -83,8 +83,13 @@ try {
   await base.query(`INSERT INTO batch_items(space_id,collection_id,credential_id,operation_key,ordinal,request_text,state,receipt_id,receipt)
     VALUES($1,$2,'restore','checkpoint',0,'{}','succeeded',$3,$4::jsonb)`,[spaceId,collectionId,first.receiptId,JSON.stringify(first)]);
   const worker={...scope,principalId:'system:projection',credentialId:'system:projection',capability:'outbox:worker'};
-  const claimed=await authority.transaction(worker,tx=>tx.claimOutbox(1,30));
-  await authority.transaction(worker,tx=>tx.finishOutbox(claimed[0],true));
+  // Only a record's latest revision applies, so complete every claimed row:
+  // A's create is superseded by its delete, which applies a deleted head.
+  const claimed=await authority.transaction(worker,tx=>tx.claimOutbox(30,30));
+  const outcomes=[];
+  for (const delivery of claimed)
+    outcomes.push(await authority.transaction(worker,tx=>tx.completeProjection(delivery)));
+  assert.deepEqual(outcomes.sort(),['applied','applied','superseded'],'restore seed applies both latest revisions');
   await new PostgresOutbox(base,authority).reconcile('restore-operator',spaceId,collectionId,'restore drill');
   const feedSeed=(await base.query(`SELECT event_id FROM record_events WHERE space_id=$1
     ORDER BY committed_at,event_id LIMIT 1`,[spaceId])).rows[0].event_id;

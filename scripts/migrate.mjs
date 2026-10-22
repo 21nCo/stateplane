@@ -101,6 +101,17 @@ try {
         throw new Error('Populated event feed upgrade requires drained traffic; set STATEPLANE_POPULATED_INDEX_UPGRADE=drained only after stopping record writers');
     }
   };
+  // 039 builds two indexes over projection_outbox while writers queue behind
+  // its locks. Take those locks in 039's own writer order under its bounded
+  // wait, so the emptiness decision holds through commit, and require the
+  // drained acknowledgement before building over existing rows.
+  const preflightDurableOutbox = async () => {
+    await client.query('LOCK TABLE public.spaces, public.collections, public.records IN SHARE ROW EXCLUSIVE MODE');
+    await client.query('LOCK TABLE public.projection_outbox IN ACCESS EXCLUSIVE MODE');
+    const populated = await client.query('SELECT EXISTS (SELECT 1 FROM public.projection_outbox) AS present');
+    if (populated.rows[0].present && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained')
+      throw new Error('Populated durable outbox upgrade requires drained traffic; set STATEPLANE_POPULATED_INDEX_UPGRADE=drained only after stopping record writers, claim workers and long outbox readers');
+  };
   for (const name of files) {
     const sql = await readFile(resolve(directory, name), 'utf8');
     const sha256 = createHash('sha256').update(sql).digest('hex');
@@ -129,8 +140,10 @@ try {
       name === '039_durable_outbox.sql';
     const priorLockTimeout = boundedDdl ? (await client.query('SHOW lock_timeout')).rows[0].lock_timeout : null; // NOSONAR -- migrations run in order within the current transaction
     if (boundedDdl) await client.query("SET LOCAL lock_timeout = '5s'"); // NOSONAR -- set before this step's DDL, never concurrently
-    try { await client.query(sql); } // NOSONAR -- ordered DDL and ledger writes form one migration transaction
-    catch (error) {
+    try {
+      if (name === '039_durable_outbox.sql') await preflightDurableOutbox(); // NOSONAR -- preflight locks must precede this migration step
+      await client.query(sql); // NOSONAR -- ordered DDL and ledger writes form one migration transaction
+    } catch (error) {
       if (receiptDomainCutover && error?.code === '55P03')
         throw new Error('Batch receipt domain upgrade requires drained traffic; stop record writers and retry', { cause:error });
       if (name === '038_drop_superseded_event_cursor.sql' && error?.code === '55P03')
