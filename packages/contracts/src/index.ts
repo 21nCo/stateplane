@@ -11,6 +11,11 @@ export function parseRevision(value: unknown): Revision {
 }
 export interface RecordRef { spaceId: SpaceId; collectionId: CollectionId; id: string; }
 export type Capability = 'schema:write' | 'records:read' | 'records:write' | 'sources:read' | 'sources:write' | 'claims:read' | 'claims:write' | 'claims:review' | 'events:read' | 'export:read' | 'space:admin';
+// A Record over the union fails to compile when a capability is added or removed without it.
+const capabilityMembers: Record<Capability, true> = { 'records:read': true, 'records:write': true, 'events:read': true, 'schema:write': true,
+  'sources:read': true, 'sources:write': true, 'claims:read': true, 'claims:write': true, 'claims:review': true, 'export:read': true, 'space:admin': true };
+/** Every capability a collection grant can hold. */
+export const capabilities: readonly Capability[] = Object.freeze(Object.keys(capabilityMembers) as Capability[]);
 export interface ActorContext { principalId: string; credentialId: string; }
 /** AuthFn proves the credential; Stateplane assigns the principal for agent keys. */
 export type VerifiedCredential =
