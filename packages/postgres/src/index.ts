@@ -1999,8 +1999,8 @@ export class AuthorityTransaction {
         AND ${LIVE_OUTBOX} AND available_at<=clock_timestamp()
         ORDER BY available_at,event_id FOR UPDATE SKIP LOCKED LIMIT $4`,'$3','true'),
     [...scopeIds(this.#scope),leaseSeconds,limit]);
-    return result.rows.map(row => ({ eventId:row.event_id,ref:this.ref(row.record_id),revision:Number(row.revision),
-      generation:Number(row.generation),attempt:row.attempts }));
+    return result.rows.filter(row => !row.parked).map(row => ({ eventId:row.event_id,ref:this.ref(row.record_id),
+      revision:Number(row.revision),generation:Number(row.generation),attempt:row.attempts }));
     },true);
   }
 

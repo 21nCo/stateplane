@@ -399,10 +399,10 @@ test('the processing budget bounds apply: a hung projector fails its lease and c
 test('a rolled-back infrastructure failure after start releases the lease without spending the failure budget', async () => {
   const { scope, collectionId } = await space();
   await write(scope(collectionId), 'create', '{"label":"a"}');
-  const unreachable = new PostgresAuthority({ connect: async () => { throw new Error('connection reset'); } }, 3600);
+  const unreachable = new PostgresAuthority({ connect: async () => { throw Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }); } }, 3600);
   const flapping = new PostgresOutbox(pool, unreachable);
   const [lease] = (await outbox.claim()).messages;
-  await assert.rejects(flapping.process(lease, recorder()), /connection reset/);
+  await assert.rejects(flapping.process(lease, recorder()), /ECONNRESET/);
   assert.deepEqual(await row(lease.eventId), { ...await row(lease.eventId), delivery_state: 'pending', failures: 0 });
   assert.deepEqual((await outbox.claim()).messages, [], 'an uncounted release still backs off briefly');
   await drained();
@@ -737,4 +737,71 @@ test('a completion queued behind another completion of its ref gives way uncount
   await drained();
   assert.deepEqual(await deliver(recorder()), ['applied']);
   assert.deepEqual(await head(spaceId, created.ref.id), { generation: 1, revision: 2, deleted: false });
+});
+
+test('a tick that parks exhausted leases keeps going and leases the due work behind them', async () => {
+  // Expired started leases at the last allowed failure park on their next claim.
+  const exhaust = spaceId => pool.query(`UPDATE projection_outbox SET delivery_state='delivering',attempts=8,started_attempt=8,
+    failures=7,available_at=clock_timestamp()-interval '1 hour' WHERE space_id=$1`, [spaceId]);
+  const eventOf = async recordId => (await pool.query('SELECT event_id FROM projection_outbox WHERE record_id=$1', [recordId])).rows[0].event_id;
+  const tick = async (limits, deadSpaces) => {
+    await pool.query('UPDATE outbox_dispatch_checkpoint SET after_space_id=NULL,after_collection_id=NULL');
+    const sent = [];
+    const result = await dispatch(outbox, { send: async messages => { sent.push(...messages); } }, { budgetMs: 10_000, limits });
+    const dead = await pool.query(`SELECT count(*)::int AS n FROM projection_outbox WHERE space_id=ANY($1) AND dead_lettered_at IS NOT NULL`,
+      [deadSpaces]);
+    return { result, sent, dead: dead.rows[0].n };
+  };
+  // Later fixtures settle every live row, which a dead letter may not be.
+  const revive = spaceIds => pool.query(`UPDATE projection_outbox SET dead_lettered_at=NULL,available_at=clock_timestamp()
+    WHERE space_id=ANY($1)`, [spaceIds]);
+  // More poison rows than one claim's per-space share sit ahead of a healthy row in one collection.
+  const one = await space();
+  for (let n = 0; n < 30; n++) await write(one.scope(one.collectionId), 'create', `{"n":${n}}`);
+  await exhaust(one.spaceId);
+  const healthy = await write(one.scope(one.collectionId), 'create', '{"n":"healthy"}');
+  const single = await tick(undefined, [one.spaceId]);
+  await revive([one.spaceId]);
+  assert.deepEqual([single.result.parked, single.dead, single.sent.map(m => m.eventId)], [30, 30, [await eventOf(healthy.ref.id)]]);
+
+  // Earlier spaces fill whole claims with poison rows when the limit is lowered.
+  const poisoned = [];
+  for (let index = 0; index < 5; index++) poisoned.push(await space(1, `sp_0000000${index}-${randomUUID().slice(9)}`));
+  const later = await space(1, `sp_ffffffff-${randomUUID().slice(9)}`);
+  for (const each of poisoned) {
+    for (let n = 0; n < 3; n++) await write(each.scope(each.collectionId), 'create', `{"n":${n}}`);
+    await exhaust(each.spaceId);
+  }
+  const behind = await write(later.scope(later.collectionId), 'create', '{"n":"healthy"}');
+  const spread = await tick({ limit: 4, perSpace: 2 }, poisoned.map(each => each.spaceId));
+  await revive(poisoned.map(each => each.spaceId));
+  assert.deepEqual([spread.result.parked, spread.dead, spread.sent.map(m => m.eventId)], [15, 15, [await eventOf(behind.ref.id)]]);
+});
+
+test('completion errors: an error reply to COMMIT is a known rollback, and only infrastructure goes uncounted', async () => {
+  const { scope, collectionId, spaceId } = await space();
+  const created = await write(scope(collectionId), 'create', '{"v":1}');
+  const [lease] = (await outbox.claim()).messages;
+  // A writer holds the record past the head's deferred foreign key check at COMMIT.
+  const holder = await pool.connect();
+  try {
+    await holder.query('BEGIN');
+    await holder.query('SELECT 1 FROM records WHERE space_id=$1 AND record_id=$2 FOR UPDATE', [spaceId, created.ref.id]);
+    await assert.rejects(outbox.process(lease, recorder()), error => error.name === 'CommitOutcomeUnknownError' && error.cause?.code === '55P03');
+    assert.deepEqual(await row(lease.eventId), { ...await row(lease.eventId), delivery_state: 'pending', failures: 0 });
+  } finally { await holder.query('ROLLBACK'); holder.release(); }
+  assert.equal(await head(spaceId, created.ref.id), undefined);
+
+  // Any other error from completion spends the failure budget, so a deterministic one reaches the dead letter.
+  await drained();
+  const [broken] = (await outbox.claim()).messages;
+  const faulty = new PostgresOutbox(pool, { requestBudgetMs: authority.requestBudgetMs,
+    transaction: (txScope, fn, ...rest) => authority.transaction(txScope, async tx => { await fn(tx); throw new Error('completion invariant broken'); }, ...rest) });
+  assert.equal(await faulty.process(broken, recorder()), 'failed');
+  assert.deepEqual(await row(broken.eventId), { ...await row(broken.eventId), delivery_state: 'degraded', failures: 1,
+    last_error: 'Error: completion invariant broken' });
+  assert.equal(await head(spaceId, created.ref.id), undefined);
+  await drained();
+  assert.deepEqual(await deliver(recorder()), ['applied']);
+  assert.deepEqual(await head(spaceId, created.ref.id), { generation: 1, revision: 1, deleted: false });
 });

@@ -10,13 +10,13 @@ test('a failed or partial send releases every claimed lease; an empty tick sends
   const store = claims => ({ claim: async () => ({ messages: claims, scan: 'whole' }), release: async messages => { released.push(...messages); return messages.length; },
     stepReconciliations: async () => 0 });
   let sends = 0;
-  assert.deepEqual(await dispatch(store([]), { send: async () => { sends++; } }), { claimed: 0, sent: 0, released: 0, batches: 0 });
+  assert.deepEqual(await dispatch(store([]), { send: async () => { sends++; } }), { claimed: 0, sent: 0, released: 0, parked: 0, batches: 0 });
   assert.equal(sends, 0);
   assert.deepEqual(await dispatch(store([hint(1), hint(2)]), { send: async () => { sends++; } }),
-    { claimed: 2, sent: 2, released: 0, batches: 1 });
+    { claimed: 2, sent: 2, released: 0, parked: 0, batches: 1 });
   const failure = new Error('queue unavailable');
   const result = await dispatch(store([hint(3), hint(4)]), { send: async () => { throw failure; } });
-  assert.deepEqual(result, { claimed: 2, sent: 0, released: 2, batches: 1, error: failure });
+  assert.deepEqual(result, { claimed: 2, sent: 0, released: 2, parked: 0, batches: 1, error: failure });
   assert.deepEqual(released, [hint(3), hint(4)]);
 });
 
@@ -31,7 +31,7 @@ test('a dispatch tick keeps claiming until nothing is due, its budget is spent o
   // A short claim may only mean per-space caps; only an empty claim ends the tick early.
   const drained = queued([hint(1), hint(2)], [hint(3)], [hint(4), hint(5)]);
   assert.deepEqual(await dispatch(drained, transport, { budgetMs: 60_000, limits: { limit: 2 } }),
-    { claimed: 5, sent: 5, released: 0, batches: 3 });
+    { claimed: 5, sent: 5, released: 0, parked: 0, batches: 3 });
   assert.equal(drained.claims.length, 4);
   assert.deepEqual(drained.claims[0], { limit: 2 });
   // Without a budget a tick sends one batch, as before.
@@ -58,7 +58,7 @@ test('an empty claim ends a tick only once the empty run has covered every live 
   // Windows of non-due pairs precede due work; one start crossing is not yet a full pass.
   const behind = walk(empty('partial'), empty('wrapped'), empty('partial'), { messages: [hint(1)], scan: 'partial' },
     empty('wrapped'), empty('partial'), empty('wrapped'), empty('partial'));
-  assert.deepEqual(await dispatch(behind, transport, { budgetMs: 60_000 }), { claimed: 1, sent: 1, released: 0, batches: 1 });
+  assert.deepEqual(await dispatch(behind, transport, { budgetMs: 60_000 }), { claimed: 1, sent: 1, released: 0, parked: 0, batches: 1 });
   assert.equal(behind.seen.length, 7, 'the tick stopped at the second start crossing after the last lease');
   assert.deepEqual(sent, [hint(1)]);
   // A walk that visited every pair ends the tick at once, and so does a busy cursor.
@@ -81,13 +81,27 @@ test('a tick stops once the cell reaches its in-flight bound, with time and due 
   // The claim that reaches the bound is sent, and the tick claims no further.
   assert.deepEqual(await dispatch(store({ messages: [hint(1), hint(2)], scan: 'partial' },
     { messages: [hint(3)], scan: 'partial', full: true }), transport, { budgetMs: 60_000, limits }),
-  { claimed: 3, sent: 3, released: 0, batches: 2 });
+  { claimed: 3, sent: 3, released: 0, parked: 0, batches: 2 });
   assert.equal(claims.length, 2);
   assert.deepEqual(claims[0], limits);
   // An already full cell ends the tick on its first, empty claim.
   claims.length = 0;
   assert.equal((await dispatch(store({ messages: [], scan: 'partial', full: true }), transport, { budgetMs: 60_000 })).claimed, 0);
   assert.equal(claims.length, 1);
+});
+
+test('a claim that only parked dead letters is progress, not an idle pass', async () => {
+  const seen = [];
+  const results = [{ messages: [], scan: 'whole', parked: 25 }, { messages: [], scan: 'whole', parked: 5 },
+    { messages: [hint(1)], scan: 'whole' }, { messages: [], scan: 'whole' }, { messages: [hint(2)], scan: 'whole' }];
+  const store = { claim: async () => { const next = results.shift(); seen.push(next); return next; },
+    release: async () => 0, stepReconciliations: async () => 0 };
+  const sent = [];
+  // Whole walks that only parked rows continue the tick; the first idle walk ends it.
+  assert.deepEqual(await dispatch(store, { send: async messages => { sent.push(...messages); } }, { budgetMs: 60_000 }),
+    { claimed: 1, sent: 1, released: 0, parked: 30, batches: 1 });
+  assert.equal(seen.length, 4);
+  assert.deepEqual(sent, [hint(1)]);
 });
 
 test('delivery hints have one exact shape and grant nothing else', () => {

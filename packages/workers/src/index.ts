@@ -9,10 +9,11 @@ export type DeliveryOutcome = 'applied' | 'superseded' | 'requeued' | 'lost' | '
 /**
  * One claim's leases and how far its walk over live space/collection pairs
  * got: `whole` visited every pair, `wrapped` began at or passed the start of
- * the pair order, `partial` did neither. `full` means the cell's unstarted
- * leases reached their in-flight bound.
+ * the pair order, `partial` did neither. `parked` counts rows moved to the
+ * dead letter instead of leased. `full` means the cell's unstarted leases
+ * reached their in-flight bound.
  */
-export interface ClaimResult { messages: DeliveryMessage[]; scan: 'whole' | 'wrapped' | 'partial'; full?: boolean }
+export interface ClaimResult { messages: DeliveryMessage[]; scan: 'whole' | 'wrapped' | 'partial'; parked?: number; full?: boolean }
 /** The cell's SQL outbox remains the only durable job authority. */
 export interface OutboxStore {
   claim(limits?: { limit?: number; perSpace?: number; pairs?: number; leaseSeconds?: number; inFlight?: number }): Promise<ClaimResult>;
@@ -21,7 +22,7 @@ export interface OutboxStore {
 }
 /** At-least-once transport, such as a Cloudflare Queue producer. */
 export interface DeliveryTransport { send(messages: readonly DeliveryMessage[]): Promise<void> }
-export interface DispatchResult { claimed: number; sent: number; released: number; batches: number; error?: unknown }
+export interface DispatchResult { claimed: number; sent: number; released: number; parked: number; batches: number; error?: unknown }
 export interface DispatchOptions {
   limits?: Parameters<OutboxStore['claim']>[0];
   /** Keep claiming and sending until a full pass finds nothing due or this wall-clock budget is spent. 0 claims once. */
@@ -32,12 +33,13 @@ export interface DispatchOptions {
 /**
  * One dispatcher tick: repeated claim-and-send batches within a bounded
  * budget. Each claim rotates service across spaces, so a long tick cannot
- * serve one backlog ahead of everyone else. An empty claim may only have
- * walked pairs with nothing due, so the tick ends early only once a run of
- * empty claims has covered every pair: one whole scan, or passing the start
- * of the pair order twice. It also ends once the cell's unstarted leases
- * reach their in-flight bound, so dispatch never runs ahead of consumers by
- * more than that, however long a backlog is. A failed send releases every
+ * serve one backlog ahead of everyone else. A claim that leased or parked
+ * rows made progress. One that did neither may only have walked pairs with
+ * nothing due, so the tick ends early only once a run of such claims has
+ * covered every pair: one whole scan, or passing the start of the pair order
+ * twice. It also ends once the cell's unstarted leases reach their in-flight
+ * bound, so dispatch never runs ahead of consumers by more than that,
+ * however long a backlog is. A failed send releases every
  * lease from its batch that no worker has started and ends the tick; a hint
  * that arrives later finds no lease and is fenced as lost. A crash before release leaves
  * unstarted leases to expire and be reclaimed.
@@ -48,15 +50,17 @@ export async function dispatch(store: OutboxStore, transport: DeliveryTransport,
   if (!Number.isSafeInteger(budgetMs) || budgetMs < 0 || budgetMs > 600_000) throw new RangeError('Invalid dispatch budget');
   const now = options.now ?? Date.now;
   const until = now() + budgetMs;
-  const result: DispatchResult = { claimed: 0, sent: 0, released: 0, batches: 0 };
+  const result: DispatchResult = { claimed: 0, sent: 0, released: 0, parked: 0, batches: 0 };
   let starts = 0;
   do {
-    const { messages, scan, full } = await store.claim(options.limits);
+    const { messages, scan, parked = 0, full } = await store.claim(options.limits);
+    result.parked += parked;
+    if (messages.length || parked) starts = 0;
+    else if (scan === 'whole' || (scan === 'wrapped' && ++starts === 2)) break;
     if (!messages.length) {
-      if (full || scan === 'whole' || (scan === 'wrapped' && ++starts === 2)) break;
+      if (full) break;
       continue;
     }
-    starts = 0;
     result.claimed += messages.length;
     result.batches++;
     try { await transport.send(messages); }

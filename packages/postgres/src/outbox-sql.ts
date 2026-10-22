@@ -14,7 +14,8 @@ const parked = `o.failures+${expired}>=${MAX_PROJECTION_FAILURES}`;
 
 /**
  * Lease the locked rows selected by `due` (one `event_id` column). Rows whose
- * failure budget is spent become dead letters and are not returned.
+ * failure budget is spent become dead letters instead; they are returned
+ * with `parked` set, so a caller can tell parking from an idle claim.
  */
 export function claimOutboxSql(due: string, leaseSeconds: string, started: string): string {
   return `WITH due AS (${due}), claimed AS (
@@ -27,8 +28,8 @@ export function claimOutboxSql(due: string, leaseSeconds: string, started: strin
       started_attempt=CASE WHEN ${started}::boolean THEN o.attempts+1 END
     FROM due WHERE o.event_id=due.event_id
     RETURNING o.event_id,o.space_id,o.collection_id,o.record_id,o.revision,o.generation,o.attempts,o.delivery_state)
-  SELECT event_id,space_id,collection_id,record_id,revision,generation,attempts FROM claimed
-  WHERE delivery_state='delivering' ORDER BY event_id`;
+  SELECT event_id,space_id,collection_id,record_id,revision,generation,attempts,delivery_state='degraded' AS parked
+  FROM claimed ORDER BY event_id`;
 }
 
 /**

@@ -19,11 +19,13 @@ export interface DispatchLimits { limit?: number; perSpace?: number; pairs?: num
 /**
  * How far one claim's pair walk got: `whole` visited every live pair,
  * `wrapped` began at or passed the start of the pair order, `partial` did
- * neither. An empty claim alone does not mean nothing is due. `full` means
- * the cell's unstarted dispatch leases reached `inFlight`, so dispatch waits
- * for consumers to start them.
+ * neither. An empty claim alone does not mean nothing is due. `parked`
+ * counts rows the claim moved to the dead letter instead of leasing, so a
+ * claim with no messages may still have made progress. `full` means the
+ * cell's unstarted dispatch leases reached `inFlight`, so dispatch waits for
+ * consumers to start them.
  */
-export interface ClaimResult { messages: DeliveryMessage[]; scan: 'whole' | 'wrapped' | 'partial'; full: boolean }
+export interface ClaimResult { messages: DeliveryMessage[]; scan: 'whole' | 'wrapped' | 'partial'; parked: number; full: boolean }
 export interface OutboxOptions { processingMs?: number }
 /**
  * `pending`, `delivering` and lag cover at most the oldest-due
@@ -83,7 +85,15 @@ function infrastructureFault(error: unknown): boolean {
   const code = (error as { code?: unknown }).code;
   // Socket errnos such as ECONNRESET, not Node's ERR_* programming errors.
   if (typeof code === 'string') return INFRASTRUCTURE_SQLSTATE.test(code) || (/^E[A-Z_]+$/.test(code) && !code.startsWith('ERR_'));
-  return /^Connection terminated|not queryable/.test(error.message);
+  return /^Connection terminated|not queryable|^timeout exceeded when trying to connect/.test(error.message);
+}
+
+// An error reply from a live session means the server rolled COMMIT back.
+// Session loss, shutdown, resource and internal errors may arrive at FATAL or
+// PANIC after the commit record, so they stay ambiguous.
+function rolledBack(error: unknown): boolean {
+  const code = (error as { code?: unknown } | undefined)?.code;
+  return typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) && !/^(?:08|53|57P|58|XX)/.test(code);
 }
 
 /** Run one short cell transaction; a missing COMMIT acknowledgement stays ambiguous. */
@@ -160,7 +170,8 @@ export class PostgresOutbox {
    * cuts a claim short, the cursor moves past the last pair served, so the
    * next claim starts with the pairs that missed out. A dispatch lease is not
    * started: if the hint is lost, the lease expires and is reclaimed without
-   * spending the row's failure budget. While another dispatcher holds the
+   * spending the row's failure budget. A row whose failure budget is spent
+   * is parked instead and counts as served. While another dispatcher holds the
    * cursor, a claim returns nothing as a `whole` scan. At most `inFlight`
    * unexpired dispatch leases stay unstarted per cell, so dispatch cannot
    * outrun its consumers by more than that.
@@ -174,7 +185,7 @@ export class PostgresOutbox {
     return inTransaction(this.pool, async db => {
       const cursor = (await db.query(`SELECT after_space_id,after_collection_id FROM outbox_dispatch_checkpoint
         FOR UPDATE SKIP LOCKED`)).rows[0];
-      if (!cursor) return { messages: [], scan: 'whole', full: false };
+      if (!cursor) return { messages: [], scan: 'whole', parked: 0, full: false };
       // The cursor lock serializes dispatchers, so this bounded count holds for the claim.
       const { unstarted } = (await db.query(`SELECT count(*)::int AS unstarted FROM (SELECT 1 FROM projection_outbox
         WHERE delivery_state='delivering' AND started_attempt IS NULL AND available_at>clock_timestamp() LIMIT $1) o`,
@@ -182,7 +193,7 @@ export class PostgresOutbox {
       const limit = Math.min(most, inFlight - unstarted);
       if (limit < 1) {
         await db.query('UPDATE outbox_dispatch_checkpoint SET dispatched_at=clock_timestamp()');
-        return { messages: [], scan: 'partial', full: true };
+        return { messages: [], scan: 'partial', parked: 0, full: true };
       }
       const after: [string, string] | null = cursor.after_space_id === null ? null : [cursor.after_space_id, cursor.after_collection_id];
       let scanned = await this.scanPairs(db, after, null, pairs);
@@ -220,8 +231,9 @@ export class PostgresOutbox {
       }
       await db.query(`UPDATE outbox_dispatch_checkpoint SET after_space_id=$1,after_collection_id=$2,
         dispatched_at=clock_timestamp()`, [next?.[0] ?? null, next?.[1] ?? null]);
-      return { messages: claimed.rows.map(row => ({ eventId: row.event_id, attempt: row.attempts })), scan,
-        full: unstarted + claimed.rows.length >= inFlight };
+      const leased = claimed.rows.filter(row => !row.parked);
+      return { messages: leased.map(row => ({ eventId: row.event_id, attempt: row.attempts })), scan,
+        parked: claimed.rows.length - leased.length, full: unstarted + leased.length >= inFlight };
     });
   }
 
@@ -264,12 +276,13 @@ export class PostgresOutbox {
    * space, collection and placement before any projector sees content: a
    * closed scope releases the lease, and work from an earlier placement is
    * requeued or superseded without running the projector. A projector
-   * failure or overrun is recorded against the lease; a policy, placement or
-   * lifecycle change at completion releases it so a later claim re-runs it
-   * under fresh scope. The budget bounds prepare, apply and completion. An
-   * infrastructure fault from apply's query port, like any other with a
-   * known rollback, releases the lease uncounted after a short backoff and
-   * is rethrown.
+   * failure, overrun or any unclassified error is recorded against the
+   * lease; a policy, placement or lifecycle change at completion releases it
+   * so a later claim re-runs it under fresh scope. The budget bounds prepare,
+   * apply and completion. An infrastructure fault or lock budget with a
+   * known rollback, including one from apply's query port or an error reply
+   * to COMMIT, releases the lease uncounted after a short backoff and is
+   * rethrown.
    */
   async process(message: DeliveryMessage, projector?: Projector): Promise<ProcessOutcome> {
     const { eventId, attempt: hinted } = this.message(message);
@@ -325,19 +338,22 @@ export class PostgresOutbox {
       });
       return await this.authority.transaction(scope, tx => tx.completeProjection(delivery, apply), deadline, signal);
     } catch (error) {
-      if (error instanceof ProjectorFailure || (error instanceof AuthorityError && error.code === 'RATE_LIMITED')) {
-        await this.fail(delivery, diagnostic(error));
-        return 'failed';
-      }
-      if (error instanceof AuthorityError && ['FORBIDDEN', 'SPACE_UNAVAILABLE', 'NOT_FOUND'].includes(error.code)) {
+      // An unknown COMMIT outcome keeps the lease; if it did not commit, its
+      // expiry counts. A server error reply to COMMIT is a known rollback.
+      const cause = error instanceof CommitOutcomeUnknownError && rolledBack(error.cause) ? error.cause : error;
+      if (cause instanceof CommitOutcomeUnknownError) throw error;
+      if (cause instanceof AuthorityError && ['FORBIDDEN', 'SPACE_UNAVAILABLE', 'NOT_FOUND'].includes(cause.code)) {
         await this.releaseLeases([delivery], true);
         return 'released';
       }
-      // A rolled-back infrastructure failure is not the item's fault, so it
-      // does not spend the failure budget. An unknown COMMIT outcome keeps
-      // the lease; if it did not commit, its expiry counts.
-      if (!(error instanceof CommitOutcomeUnknownError)) await this.releaseLeases([delivery], true).catch(() => 0);
-      throw error;
+      // Only a positively classified infrastructure failure or lock budget is
+      // not the item's fault; everything else spends the failure budget.
+      if (infrastructureFault(cause) || (cause instanceof AuthorityError && cause.code === 'BACKPRESSURE')) {
+        await this.releaseLeases([delivery], true).catch(() => 0);
+        throw error;
+      }
+      await this.fail(delivery, diagnostic(cause));
+      return 'failed';
     }
   }
 
