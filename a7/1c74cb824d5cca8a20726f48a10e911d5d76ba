@@ -1,0 +1,31 @@
+docs/durable-outbox.md
+  s_74d3fe45ebc3a3::t_7fcdc9ef48b1a7 90
+docs/regional-topology.md
+  s_74d3fe45ebc3a3::t_29595722c8b699 47
+packages/contracts/src/index.ts
+  s_74d3fe45ebc3a3::t_2eebb89fe24d76 12-13
+packages/postgres/src/outbox.ts
+  s_74d3fe45ebc3a3::t_cc632a87731156 2,30,160,166,170,385,468,470
+packages/workers/src/index.ts
+  s_74d3fe45ebc3a3::t_da503b4ab1dd09 2,81
+test/integration/durable-outbox.test.js
+  s_74d3fe45ebc3a3::t_357ab0e8295369 19,22-30,911,917,919-924,926,928-929
+test/outbox-runtime.test.js
+  s_74d3fe45ebc3a3::t_92fd6b237a56aa 130-137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a71c74cb824d5cca8a20726f48a10e911d5d76ba",
+  "prompts": {},
+  "sessions": {
+    "s_74d3fe45ebc3a3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_74d3fe45ebc3a3",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
