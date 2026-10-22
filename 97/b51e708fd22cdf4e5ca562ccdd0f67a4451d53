@@ -1,0 +1,25 @@
+docs/durable-outbox.md
+  s_294a8cb42e7044::t_40e5de4ba7b8f3 82,90
+scripts/migrate.mjs
+  s_294a8cb42e7044::t_7bbc2461a702da 104-114,143-146
+scripts/restore-smoke.mjs
+  s_294a8cb42e7044::t_e640e8811e5506 86-92
+test/integration/event-feed-upgrade.test.js
+  s_294a8cb42e7044::t_07780581a26a0c 208-257
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "97b51e708fd22cdf4e5ca562ccdd0f67a4451d53",
+  "prompts": {},
+  "sessions": {
+    "s_294a8cb42e7044": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_294a8cb42e7044",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
