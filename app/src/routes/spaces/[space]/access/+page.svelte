@@ -75,11 +75,12 @@
       </Notice>
       {#if form?.issueInvalid}<p role="alert" class="text-sm text-danger">Choose a lifetime and at least one capability for a named collection.</p>{/if}
       {#if form?.issueTooLarge}<p role="alert" class="text-sm text-danger">These grants need {form.issueTooLarge.bytes} bytes; one key's issuance accepts at most {form.issueTooLarge.limit}. Nothing was sent. Choose fewer collections or capabilities, or issue them to more than one key.</p>{/if}
-      <!-- A refused issuance may still have created a key, so the key list it points to is reloaded too. -->
+      <!-- A refused issuance may still have created a key, so the key list it points to is reloaded too.
+           Groups are keyed by collection ID (no ID is empty), so a reloaded list never moves a choice to another collection. -->
       <form method="POST" action="?/issue" class="space-y-3" use:enhance={()=>async({result,update})=>{await update(); if (result.type==='failure') await invalidateAll();}}>
         <div><label for="days">Lifetime</label>
           <select id="days" name="days">{#each data.lifetimes as days (days)}<option value={days} selected={days===30}>{days} {days===1 ? 'day' : 'days'}</option>{/each}</select></div>
-        {#each rows as slug, index (index)}
+        {#each rows as slug, index (slug)}
           <fieldset class="space-y-1 rounded border border-line p-2">
             <legend class="min-w-0 px-1 text-sm font-medium [overflow-wrap:anywhere]">{slug ? `Collection ${shown(slug)}` : 'Another collection'}</legend>
             {#if slug}<input type="hidden" name="collection" value={carry(slug)} />{:else}

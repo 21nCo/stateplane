@@ -278,6 +278,36 @@ test('an uncertain key issuance asks the owner to inspect the key list, never to
   await expect(issue).toBeVisible();
 });
 
+test('a failed issuance reloads the collections, and each choice stays with the collection it was made for', async ({ page, request }) => {
+  await freshSpace(request);
+  await defineCollection(request, 'zeta');
+  await signIn(page, ownerToken);
+  await go(page, accessUrl());
+  const group = (name: string) => page.getByRole('group', { name });
+  await group('Collection zeta').getByLabel('records:read', { exact: true }).check();
+  // A grant on a collection that does not exist is refused before any key is created.
+  await group('Another collection').getByLabel('Collection name').fill('missing');
+  await group('Another collection').getByLabel('records:write', { exact: true }).check();
+  // Created elsewhere meanwhile, it sorts before every group already on the page.
+  await defineCollection(request, 'aaa');
+  const before = await keyCount(request);
+  await page.getByRole('button', { name: 'Issue key' }).click();
+  await expect(page.getByRole('alert').filter({ hasText: 'Key was not issued' })).toContainText('INVALID_ARGUMENT');
+  await expect(group('Collection aaa')).toBeVisible();
+  expect(await keyCount(request)).toBe(before);
+  for (const name of ['Collection aaa', 'Collection items']) await expect(group(name).locator('input:checked')).toHaveCount(0);
+  await expect(group('Collection zeta').locator('input:checked')).toHaveCount(1);
+  await expect(group('Collection zeta').getByLabel('records:read', { exact: true })).toBeChecked();
+  await expect(group('Another collection').getByLabel('Collection name')).toHaveValue('missing');
+  await expect(group('Another collection').getByLabel('records:write', { exact: true })).toBeChecked();
+  // Corrected, the issuance grants only what was chosen for zeta.
+  await group('Another collection').getByLabel('Collection name').fill('');
+  await page.getByRole('button', { name: 'Issue key' }).click();
+  const keyId = await issuedId(page);
+  const listed = (await (await request.get(`/v1${spaceUrl}/agent-keys`, { headers })).json()).items.find((key: { keyId: string }) => key.keyId === keyId);
+  expect(listed.grants).toEqual([{ collectionId: 'zeta', capabilities: ['records:read'], expiresAt: null }]);
+});
+
 test('identifiers with line breaks travel through the grant form exactly, with and without scripts', async ({ browser, page, request }) => {
   for (const name of ['a\nb', 'a\r\nb']) await defineCollection(request, name);
   // Native form posts submit a line break as CRLF; neither the no-script nor the
