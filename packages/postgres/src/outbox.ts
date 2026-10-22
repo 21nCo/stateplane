@@ -392,7 +392,9 @@ export class PostgresOutbox {
         return 'released';
       }
       // Only a positively classified infrastructure failure or lock budget is
-      // not the item's fault; everything else spends the failure budget.
+      // not the item's fault; everything else spends the failure budget. If
+      // this release cannot commit, the started lease stays and its expiry
+      // counts, like a crash after start.
       if (infrastructureFault(cause) || (cause instanceof AuthorityError && cause.code === 'BACKPRESSURE')) {
         await this.releaseLeases([delivery], true, diagnostic(fault ?? cause)).catch(() => 0);
         throw error;
