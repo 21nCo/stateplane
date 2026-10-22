@@ -3,6 +3,8 @@
 /** Initial poison bound: about ten minutes of backoff before parking. Not a measured provider limit. */
 export const MAX_PROJECTION_FAILURES = 8;
 export const LIVE_OUTBOX = `delivery_state IN ('pending','delivering','degraded')`;
+/** Live rows with a failure, matching the `projection_outbox_failed` partial index. */
+export const FAILED_OUTBOX = `${LIVE_OUTBOX} AND (failures>0 OR delivery_state='degraded')`;
 
 // A lease that was started by a worker and then expired is a failed attempt:
 // the worker crashed or overran. An expired lease that was never started is

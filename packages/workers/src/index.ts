@@ -9,12 +9,13 @@ export type DeliveryOutcome = 'applied' | 'superseded' | 'requeued' | 'lost' | '
 /**
  * One claim's leases and how far its walk over live space/collection pairs
  * got: `whole` visited every pair, `wrapped` began at or passed the start of
- * the pair order, `partial` did neither.
+ * the pair order, `partial` did neither. `full` means the cell's unstarted
+ * leases reached their in-flight bound.
  */
-export interface ClaimResult { messages: DeliveryMessage[]; scan: 'whole' | 'wrapped' | 'partial' }
+export interface ClaimResult { messages: DeliveryMessage[]; scan: 'whole' | 'wrapped' | 'partial'; full?: boolean }
 /** The cell's SQL outbox remains the only durable job authority. */
 export interface OutboxStore {
-  claim(limits?: { limit?: number; perSpace?: number; pairs?: number; leaseSeconds?: number }): Promise<ClaimResult>;
+  claim(limits?: { limit?: number; perSpace?: number; pairs?: number; leaseSeconds?: number; inFlight?: number }): Promise<ClaimResult>;
   release(messages: readonly DeliveryMessage[]): Promise<number>;
   stepReconciliations(jobs?: number, pageSize?: number): Promise<number>;
 }
@@ -34,9 +35,11 @@ export interface DispatchOptions {
  * serve one backlog ahead of everyone else. An empty claim may only have
  * walked pairs with nothing due, so the tick ends early only once a run of
  * empty claims has covered every pair: one whole scan, or passing the start
- * of the pair order twice. A failed send releases every
- * lease from its batch and ends the tick: any hint that did arrive names a
- * released attempt and is fenced as lost. A crash before release leaves
+ * of the pair order twice. It also ends once the cell's unstarted leases
+ * reach their in-flight bound, so dispatch never runs ahead of consumers by
+ * more than that, however long a backlog is. A failed send releases every
+ * lease from its batch that no worker has started and ends the tick; a hint
+ * that arrives later finds no lease and is fenced as lost. A crash before release leaves
  * unstarted leases to expire and be reclaimed.
  */
 export async function dispatch(store: OutboxStore, transport: DeliveryTransport,
@@ -48,9 +51,9 @@ export async function dispatch(store: OutboxStore, transport: DeliveryTransport,
   const result: DispatchResult = { claimed: 0, sent: 0, released: 0, batches: 0 };
   let starts = 0;
   do {
-    const { messages, scan } = await store.claim(options.limits);
+    const { messages, scan, full } = await store.claim(options.limits);
     if (!messages.length) {
-      if (scan === 'whole' || (scan === 'wrapped' && ++starts === 2)) break;
+      if (full || scan === 'whole' || (scan === 'wrapped' && ++starts === 2)) break;
       continue;
     }
     starts = 0;
@@ -59,6 +62,7 @@ export async function dispatch(store: OutboxStore, transport: DeliveryTransport,
     try { await transport.send(messages); }
     catch (error) { result.released += await store.release(messages); return { ...result, error }; }
     result.sent += messages.length;
+    if (full) break;
   } while (now() < until);
   return result;
 }

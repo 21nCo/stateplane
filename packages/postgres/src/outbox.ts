@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
 import { AuthorityError, CommitOutcomeUnknownError } from './index.js';
 import type { AuthorityScope, OutboxDelivery, PostgresAuthority, ProjectionChange, ProjectionOutcome, ProjectionQuery } from './index.js';
-import { claimOutboxSql, failOutboxSql, LIVE_OUTBOX } from './outbox-sql.js';
+import { claimOutboxSql, FAILED_OUTBOX, failOutboxSql, LIVE_OUTBOX } from './outbox-sql.js';
 import { scalarString } from './schema.js';
 
 type PoolLike = Pick<pg.Pool, 'connect'>;
@@ -15,18 +15,26 @@ export interface Projector<P = unknown> {
   apply(change: ProjectionChange, prepared: P | undefined, query: ProjectionQuery): Promise<void>;
 }
 export type ProcessOutcome = ProjectionOutcome | 'failed' | 'released';
-export interface DispatchLimits { limit?: number; perSpace?: number; pairs?: number; leaseSeconds?: number }
+export interface DispatchLimits { limit?: number; perSpace?: number; pairs?: number; leaseSeconds?: number; inFlight?: number }
 /**
  * How far one claim's pair walk got: `whole` visited every live pair,
  * `wrapped` began at or passed the start of the pair order, `partial` did
- * neither. An empty claim alone does not mean nothing is due.
+ * neither. An empty claim alone does not mean nothing is due. `full` means
+ * the cell's unstarted dispatch leases reached `inFlight`, so dispatch waits
+ * for consumers to start them.
  */
-export interface ClaimResult { messages: DeliveryMessage[]; scan: 'whole' | 'wrapped' | 'partial' }
+export interface ClaimResult { messages: DeliveryMessage[]; scan: 'whole' | 'wrapped' | 'partial'; full: boolean }
 export interface OutboxOptions { processingMs?: number }
-/** Counts cover at most the oldest-due `STATUS_SAMPLE` live rows; `capped` marks a lower bound. */
+/**
+ * `pending`, `delivering` and lag cover at most the oldest-due
+ * `STATUS_SAMPLE` live rows, and `capped` marks them as lower bounds.
+ * `degraded`, `deadLettered` and `lastError` come from a separate sample of
+ * up to `STATUS_SAMPLE` failed rows, wherever they are parked;
+ * `failuresCapped` marks those counts as lower bounds.
+ */
 export interface CollectionOutboxStatus {
   spaceId: string; collectionId: string; pending: number; delivering: number; degraded: number; deadLettered: number;
-  capped: boolean; oldestUndeliveredAt: string | null; lagSeconds: number | null; lastError: string | null;
+  capped: boolean; failuresCapped: boolean; oldestUndeliveredAt: string | null; lagSeconds: number | null; lastError: string | null;
 }
 export interface ReconciliationStatus {
   jobId: string; spaceId: string; collectionId: string; state: 'running' | 'completed' | 'cancelled';
@@ -47,16 +55,21 @@ const WORKER = { principalId: 'system:projection', credentialId: 'system:project
 const STATEMENT_MS = 5_000;
 const PROCESSING_LEASE_MS = 60_000;
 const STATUS_ROWS = 1_000;
-// Status reads at most STATUS_PAIRS × STATUS_SAMPLE live rows, so it stays
+// Status reads at most STATUS_PAIRS × 2 × STATUS_SAMPLE live rows, so it stays
 // usable during the backlog it reports. See docs/durable-outbox.md.
 const STATUS_PAIRS = 200;
 const STATUS_SAMPLE = 500;
 const PAUSED_STEP_SECONDS = 60;
+// A started lease released uncounted waits this long, so a fault that is
+// misclassified as infrastructure cannot retry in a tight loop.
+const RELEASE_BACKOFF_MS = 5_000;
+/** Release leases $1/$2 that are started ($4) or not, due again after $3 ms. */
 const RELEASE_SQL = `UPDATE projection_outbox o
   SET delivery_state=CASE WHEN o.failures>0 THEN 'degraded' ELSE 'pending' END,
-    started_attempt=NULL,available_at=clock_timestamp()
+    started_attempt=NULL,available_at=clock_timestamp()+($3::integer * interval '1 millisecond')
   FROM unnest($1::text[],$2::integer[]) AS m(event_id,attempt)
-  WHERE o.event_id=m.event_id AND o.attempts=m.attempt AND o.delivery_state='delivering'`;
+  WHERE o.event_id=m.event_id AND o.attempts=m.attempt AND o.delivery_state='delivering'
+    AND (o.started_attempt IS NOT DISTINCT FROM o.attempts)=$4::boolean`;
 
 class ProjectorFailure extends Error {}
 
@@ -68,7 +81,8 @@ const INFRASTRUCTURE_SQLSTATE = /^(?:(?:08|40|53|58)[0-9A-Z]{3}|55P03|57P0[0-9])
 function infrastructureFault(error: unknown): boolean {
   if (!(error instanceof Error) || error instanceof AuthorityError) return false;
   const code = (error as { code?: unknown }).code;
-  if (typeof code === 'string') return INFRASTRUCTURE_SQLSTATE.test(code) || /^E[A-Z_]+$/.test(code);
+  // Socket errnos such as ECONNRESET, not Node's ERR_* programming errors.
+  if (typeof code === 'string') return INFRASTRUCTURE_SQLSTATE.test(code) || (/^E[A-Z_]+$/.test(code) && !code.startsWith('ERR_'));
   return /^Connection terminated|not queryable/.test(error.message);
 }
 
@@ -147,17 +161,29 @@ export class PostgresOutbox {
    * next claim starts with the pairs that missed out. A dispatch lease is not
    * started: if the hint is lost, the lease expires and is reclaimed without
    * spending the row's failure budget. While another dispatcher holds the
-   * cursor, a claim returns nothing as a `whole` scan.
+   * cursor, a claim returns nothing as a `whole` scan. At most `inFlight`
+   * unexpired dispatch leases stay unstarted per cell, so dispatch cannot
+   * outrun its consumers by more than that.
    */
   async claim(limits: DispatchLimits = {}): Promise<ClaimResult> {
-    const limit = bounded(limits.limit ?? 100, 1, 100);
-    const perSpace = bounded(limits.perSpace ?? Math.min(25, limit), 1, limit);
+    const most = bounded(limits.limit ?? 100, 1, 100);
+    const perSpace = bounded(limits.perSpace ?? Math.min(25, most), 1, most);
     const pairs = bounded(limits.pairs ?? 200, 1, 1_000);
     const leaseSeconds = bounded(limits.leaseSeconds ?? 300, 1, 3_600);
+    const inFlight = bounded(limits.inFlight ?? 5_000, 1, 100_000);
     return inTransaction(this.pool, async db => {
       const cursor = (await db.query(`SELECT after_space_id,after_collection_id FROM outbox_dispatch_checkpoint
         FOR UPDATE SKIP LOCKED`)).rows[0];
-      if (!cursor) return { messages: [], scan: 'whole' };
+      if (!cursor) return { messages: [], scan: 'whole', full: false };
+      // The cursor lock serializes dispatchers, so this bounded count holds for the claim.
+      const { unstarted } = (await db.query(`SELECT count(*)::int AS unstarted FROM (SELECT 1 FROM projection_outbox
+        WHERE delivery_state='delivering' AND started_attempt IS NULL AND available_at>clock_timestamp() LIMIT $1) o`,
+      [inFlight])).rows[0];
+      const limit = Math.min(most, inFlight - unstarted);
+      if (limit < 1) {
+        await db.query('UPDATE outbox_dispatch_checkpoint SET dispatched_at=clock_timestamp()');
+        return { messages: [], scan: 'partial', full: true };
+      }
       const after: [string, string] | null = cursor.after_space_id === null ? null : [cursor.after_space_id, cursor.after_collection_id];
       let scanned = await this.scanPairs(db, after, null, pairs);
       let next = scanned.length === pairs ? scanned.at(-1)! : null;
@@ -194,7 +220,8 @@ export class PostgresOutbox {
       }
       await db.query(`UPDATE outbox_dispatch_checkpoint SET after_space_id=$1,after_collection_id=$2,
         dispatched_at=clock_timestamp()`, [next?.[0] ?? null, next?.[1] ?? null]);
-      return { messages: claimed.rows.map(row => ({ eventId: row.event_id, attempt: row.attempts })), scan };
+      return { messages: claimed.rows.map(row => ({ eventId: row.event_id, attempt: row.attempts })), scan,
+        full: unstarted + claimed.rows.length >= inFlight };
     });
   }
 
@@ -219,17 +246,21 @@ export class PostgresOutbox {
     return rows.rows.map(row => [row.space_id, row.collection_id]);
   }
 
-  /** Undo leases whose hints were not sent, or whose work must re-run under fresh scope. */
-  async release(messages: readonly DeliveryMessage[]): Promise<number> {
+  /** Undo unstarted leases whose hints were not sent. A lease a worker has started is left to it. */
+  release(messages: readonly DeliveryMessage[]): Promise<number> { return this.releaseLeases(messages, false); }
+
+  private async releaseLeases(messages: readonly DeliveryMessage[], started: boolean): Promise<number> {
     const fixed = messages.map(message => this.message(message));
     if (!fixed.length) return 0;
-    return inTransaction(this.pool, async db => (await db.query(RELEASE_SQL,
-      [fixed.map(message => message.eventId), fixed.map(message => message.attempt)])).rowCount ?? 0);
+    return inTransaction(this.pool, async db => (await db.query(RELEASE_SQL, [fixed.map(message => message.eventId),
+      fixed.map(message => message.attempt), started ? RELEASE_BACKOFF_MS : 0, started])).rowCount ?? 0);
   }
 
   /**
-   * Process one hint at least once. Only the first start of a current lease
-   * proceeds, so duplicate and late messages are no-ops. Start fences the
+   * Process one hint at least once. A hint starts the row's current
+   * dispatch lease if no worker has started it, even when the hint is from
+   * an earlier lease, so a backlog converges however late its hints arrive.
+   * Only one start per lease proceeds, so duplicates are no-ops. Start fences the
    * space, collection and placement before any projector sees content: a
    * closed scope releases the lease, and work from an earlier placement is
    * requeued or superseded without running the projector. A projector
@@ -237,13 +268,14 @@ export class PostgresOutbox {
    * lifecycle change at completion releases it so a later claim re-runs it
    * under fresh scope. The budget bounds prepare, apply and completion. An
    * infrastructure fault from apply's query port, like any other with a
-   * known rollback, releases the lease uncounted and is rethrown.
+   * known rollback, releases the lease uncounted after a short backoff and
+   * is rethrown.
    */
   async process(message: DeliveryMessage, projector?: Projector): Promise<ProcessOutcome> {
-    const { eventId, attempt } = this.message(message);
+    const { eventId, attempt: hinted } = this.message(message);
     const deadline = Date.now() + this.processingMs;
     const row = await inTransaction(this.pool, async db => {
-      const found = (await db.query(`SELECT o.space_id,o.collection_id,o.record_id,o.revision,o.generation,
+      const found = (await db.query(`SELECT o.space_id,o.collection_id,o.record_id,o.revision,o.generation,o.attempts,
           s.policy_version,s.placement_generation,e.operation,
           s.lifecycle IN ('active','readOnly') AND c.lifecycle<>'deleted' AS open,
           o.generation=s.placement_generation AS placed,
@@ -252,10 +284,10 @@ export class PostgresOutbox {
         FROM projection_outbox o JOIN spaces s ON s.space_id=o.space_id
         JOIN collections c ON c.space_id=o.space_id AND c.collection_id=o.collection_id
         JOIN record_events e ON e.event_id=o.event_id
-        WHERE o.event_id=$1 AND o.attempts=$2 AND o.delivery_state='delivering' AND o.available_at>clock_timestamp()
-          AND o.started_attempt IS DISTINCT FROM o.attempts FOR UPDATE OF o`, [eventId, attempt])).rows[0];
+        WHERE o.event_id=$1 AND o.attempts>=$2 AND o.delivery_state='delivering'
+          AND o.started_attempt IS DISTINCT FROM o.attempts FOR UPDATE OF o`, [eventId, hinted])).rows[0];
       if (!found) return null;
-      if (!found.open) await db.query(RELEASE_SQL, [[eventId], [attempt]]);
+      if (!found.open) await db.query(RELEASE_SQL, [[eventId], [found.attempts], 0, false]);
       else await db.query(`UPDATE projection_outbox SET started_attempt=attempts,
           available_at=clock_timestamp()+($2::integer * interval '1 millisecond') WHERE event_id=$1`,
       [eventId, PROCESSING_LEASE_MS]);
@@ -263,6 +295,7 @@ export class PostgresOutbox {
     });
     if (!row) return 'lost';
     if (!row.open) return 'released';
+    const attempt = Number(row.attempts);
     const ref = { spaceId: row.space_id, collectionId: row.collection_id, id: row.record_id };
     const delivery: OutboxDelivery = { eventId, ref, revision: Number(row.revision), generation: Number(row.generation), attempt };
     const scope: AuthorityScope = { spaceId: row.space_id, collectionId: row.collection_id, ...WORKER,
@@ -297,13 +330,13 @@ export class PostgresOutbox {
         return 'failed';
       }
       if (error instanceof AuthorityError && ['FORBIDDEN', 'SPACE_UNAVAILABLE', 'NOT_FOUND'].includes(error.code)) {
-        await this.release([message]);
+        await this.releaseLeases([delivery], true);
         return 'released';
       }
       // A rolled-back infrastructure failure is not the item's fault, so it
       // does not spend the failure budget. An unknown COMMIT outcome keeps
       // the lease; if it did not commit, its expiry counts.
-      if (!(error instanceof CommitOutcomeUnknownError)) await this.release([message]).catch(() => 0);
+      if (!(error instanceof CommitOutcomeUnknownError)) await this.releaseLeases([delivery], true).catch(() => 0);
       throw error;
     }
   }
@@ -322,7 +355,7 @@ export class PostgresOutbox {
   /**
    * Report backlog, lag and failures per space/collection, plus the
    * dispatcher's last tick and running or recent reconciliations, including
-   * placement repairs. Work is bounded by STATUS_PAIRS × STATUS_SAMPLE rows.
+   * placement repairs. Work is bounded by STATUS_PAIRS × 2 × STATUS_SAMPLE rows.
    */
   async status(spaceId?: string): Promise<CellOutboxStatus> {
     const space = spaceId === undefined ? null : text(spaceId, 512);
@@ -336,21 +369,27 @@ export class PostgresOutbox {
             WHERE ${scope} AND (space_id,collection_id)>(p.space_id,p.collection_id)
             ORDER BY space_id,collection_id LIMIT 1) next
           WHERE p.n<=$2)
-        SELECT p.space_id,p.collection_id,
-          count(*) FILTER (WHERE o.delivery_state='pending')::int AS pending,
-          count(*) FILTER (WHERE o.delivery_state='delivering')::int AS delivering,
-          count(*) FILTER (WHERE o.delivery_state='degraded' AND o.dead_lettered_at IS NULL)::int AS degraded,
-          count(*) FILTER (WHERE o.dead_lettered_at IS NOT NULL)::int AS dead_lettered,
-          count(*)>=$3 AS capped,
-          min(e.committed_at) AS oldest,
-          extract(epoch FROM clock_timestamp()-min(e.committed_at))::float8 AS lag,
-          (array_agg(o.last_error ORDER BY e.committed_at DESC) FILTER (WHERE o.last_error IS NOT NULL))[1] AS last_error
+        SELECT p.space_id,p.collection_id,d.pending,d.delivering,d.capped,f.degraded,f.dead_lettered,f.failures_capped,
+          f.last_error,LEAST(d.oldest,f.oldest) AS oldest,
+          extract(epoch FROM clock_timestamp()-LEAST(d.oldest,f.oldest))::float8 AS lag
         FROM pairs p CROSS JOIN LATERAL (
-          SELECT event_id,delivery_state,dead_lettered_at,last_error FROM projection_outbox
-          WHERE space_id=p.space_id AND collection_id=p.collection_id AND ${LIVE_OUTBOX}
-          ORDER BY available_at,event_id LIMIT $3) o
-        JOIN record_events e ON e.event_id=o.event_id
-        GROUP BY p.n,p.space_id,p.collection_id ORDER BY p.n`, [space, STATUS_PAIRS, STATUS_SAMPLE]);
+          SELECT count(*) FILTER (WHERE o.delivery_state='pending')::int AS pending,
+            count(*) FILTER (WHERE o.delivery_state='delivering')::int AS delivering,
+            count(*)>=$3 AS capped, min(e.committed_at) AS oldest
+          FROM (SELECT event_id,delivery_state FROM projection_outbox
+            WHERE space_id=p.space_id AND collection_id=p.collection_id AND ${LIVE_OUTBOX}
+            ORDER BY available_at,event_id LIMIT $3) o JOIN record_events e ON e.event_id=o.event_id) d
+        -- Dead letters and rows in backoff sort after due work, so they are
+        -- sampled through their own partial index, wherever they are parked.
+        CROSS JOIN LATERAL (
+          SELECT count(*) FILTER (WHERE o.delivery_state='degraded' AND o.dead_lettered_at IS NULL)::int AS degraded,
+            count(*) FILTER (WHERE o.dead_lettered_at IS NOT NULL)::int AS dead_lettered,
+            count(*)>=$3 AS failures_capped, min(e.committed_at) AS oldest,
+            (array_agg(o.last_error ORDER BY e.committed_at DESC) FILTER (WHERE o.last_error IS NOT NULL))[1] AS last_error
+          FROM (SELECT event_id,delivery_state,dead_lettered_at,last_error FROM projection_outbox
+            WHERE space_id=p.space_id AND collection_id=p.collection_id AND ${FAILED_OUTBOX} LIMIT $3) o
+          JOIN record_events e ON e.event_id=o.event_id) f
+        ORDER BY p.n`, [space, STATUS_PAIRS, STATUS_SAMPLE]);
       const jobs = await db.query(`SELECT * FROM projection_reconciliations
         WHERE ($1::text IS NULL OR space_id=$1) AND (state='running' OR updated_at>clock_timestamp()-interval '1 day')
         ORDER BY created_at DESC,job_id LIMIT ${STATUS_ROWS}`, [space]);
@@ -360,7 +399,7 @@ export class PostgresOutbox {
         more: collections.rows.length > STATUS_PAIRS,
         collections: collections.rows.slice(0, STATUS_PAIRS).map(row => ({ spaceId: row.space_id, collectionId: row.collection_id,
           pending: row.pending, delivering: row.delivering, degraded: row.degraded, deadLettered: row.dead_lettered,
-          capped: row.capped, oldestUndeliveredAt: row.oldest ? new Date(row.oldest).toISOString() : null,
+          capped: row.capped, failuresCapped: row.failures_capped, oldestUndeliveredAt: row.oldest ? new Date(row.oldest).toISOString() : null,
           lagSeconds: row.lag === null ? null : Math.max(0, Math.floor(row.lag)), lastError: row.last_error })),
         reconciliations: jobs.rows.map(row => this.job(row))
       };

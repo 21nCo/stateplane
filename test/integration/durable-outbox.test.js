@@ -101,9 +101,10 @@ test('lost, failed and duplicate hints neither lose committed work nor spend the
   assert.equal(sent[0].attempt, lost.attempt + 1);
   assert.equal((await row(eventId)).failures, 0, 'an unstarted lease expiry is not a processing failure');
   const projector = recorder();
-  // The stale hint from the crashed tick, then a redelivered duplicate.
+  // The late hint from the crashed tick starts the current unstarted lease;
+  // that lease's own hint and a redelivered duplicate are then no-ops.
   assert.deepEqual(await consume([lost, sent[0], sent[0], { ...sent[0], extra: true }], message => outbox.process(message, projector), 1),
-    ['lost', 'applied', 'lost', 'malformed']);
+    ['applied', 'lost', 'lost', 'malformed']);
   assert.deepEqual(projector.applied, [{ id: receipt.ref.id, revision: 1, deleted: false, generation: 1, data: '{"label":"a"}' }]);
   assert.deepEqual(await head(spaceId, receipt.ref.id), { generation: 1, revision: 1, deleted: false });
   assert.equal((await projection(scope(collectionId), receipt.ref.id)).state, 'current');
@@ -233,6 +234,7 @@ test('placement fences and policy changes reject stale leases and requeue only t
   const [lease] = (await outbox.claim()).messages;
   assert.equal(await outbox.process(lease, racing), 'released');
   assert.deepEqual(await row(lease.eventId), { ...await row(lease.eventId), delivery_state: 'pending', failures: 0 });
+  await drained();
   const [fresh] = (await outbox.claim()).messages;
   assert.equal(await outbox.process(fresh, projector), 'applied');
   assert.deepEqual(await head(spaceId, record.ref.id), { generation: 2, revision: 3, deleted: false });
@@ -402,8 +404,10 @@ test('a rolled-back infrastructure failure after start releases the lease withou
   const [lease] = (await outbox.claim()).messages;
   await assert.rejects(flapping.process(lease, recorder()), /connection reset/);
   assert.deepEqual(await row(lease.eventId), { ...await row(lease.eventId), delivery_state: 'pending', failures: 0 });
+  assert.deepEqual((await outbox.claim()).messages, [], 'an uncounted release still backs off briefly');
+  await drained();
   const [next] = (await outbox.claim()).messages;
-  assert.equal(next.eventId, lease.eventId, 'the released row is due again at once');
+  assert.equal(next.eventId, lease.eventId);
   assert.equal((await row(lease.eventId)).failures, 0);
   assert.equal(await outbox.process(next, recorder()), 'applied');
 });
@@ -517,6 +521,7 @@ test('infrastructure faults inside apply release the lease uncounted; a projecto
     assert.deepEqual(await row(locked.eventId), { ...await row(locked.eventId), delivery_state: 'pending', failures: 0 });
   } finally { await holder.query('ROLLBACK'); holder.release(); }
 
+  await drained();
   const [terminated] = (await outbox.claim()).messages;
   const killed = { apply: async (_change, _prepared, query) => {
     const { pid } = (await query('SELECT pg_backend_pid() AS pid')).rows[0];
@@ -529,9 +534,17 @@ test('infrastructure faults inside apply release the lease uncounted; a projecto
   assert.deepEqual(await row(terminated.eventId), { ...await row(terminated.eventId), delivery_state: 'pending', failures: 0 });
   assert.equal(await head(spaceId, created.ref.id), undefined);
 
+  await drained();
   const [poison] = (await outbox.claim()).messages;
   assert.equal(await outbox.process(poison, { apply: async () => { throw new Error('bad document'); } }), 'failed');
   assert.equal((await row(poison.eventId)).failures, 1);
+  // A Node ERR_* programming error raised through the port is the item's, not infrastructure.
+  await drained();
+  const [misused] = (await outbox.claim()).messages;
+  const invalid = { apply: async (_change, _prepared, query) => { await query('SELECT $1::text', [{ toPostgres: () => Buffer.from(42) }]); } };
+  assert.equal(await outbox.process(misused, invalid), 'failed');
+  assert.deepEqual(await row(misused.eventId), { ...await row(misused.eventId), failures: 2 });
+  assert.match((await row(misused.eventId)).last_error, /ERR_INVALID_ARG_TYPE|argument/);
 });
 
 test('a tick reaches due work behind more than a claim window of live pairs with nothing due', async () => {
@@ -651,4 +664,77 @@ test('a first apply held open does not block replace, patch or delete of its rec
   await deliver(projector);
   assert.deepEqual(await head(spaceId, id), { generation: 1, revision: 4, deleted: true });
   assert.equal((await projection({ ...writer, capability: 'records:read' }, id)).state, 'current');
+});
+
+test('dispatch stops at the in-flight bound, and hints that arrive after their lease expired still converge', async () => {
+  const { scope, collectionId, spaceId } = await space();
+  for (let n = 0; n < 12; n++) await write(scope(collectionId), 'create', `{"n":${n}}`);
+  const limits = { limit: 4, perSpace: 4, inFlight: 5 };
+  const unstarted = async () => Number((await pool.query(`SELECT count(*) AS n FROM projection_outbox WHERE space_id=$1
+    AND delivery_state='delivering' AND started_attempt IS NULL AND available_at>clock_timestamp()`, [spaceId])).rows[0].n);
+  const queue = [];
+  const transport = { send: async messages => { queue.push(...messages); } };
+  const first = await dispatch(outbox, transport, { budgetMs: 10_000, limits });
+  assert.deepEqual([first.claimed, first.batches], [5, 2], 'the second claim is cut to the bound and ends the tick');
+  assert.equal(await unstarted(), 5);
+  assert.equal((await dispatch(outbox, transport, { budgetMs: 10_000, limits })).claimed, 0, 'a full cell claims nothing');
+  // Consumers lag so far that every hint arrives after its lease expired and
+  // the row was leased again; each late hint still starts the current lease.
+  const projector = recorder();
+  const outcomes = [];
+  for (let tick = 0; tick < 10 && projector.applied.length < 12; tick++) {
+    const late = queue.splice(0);
+    await drained();
+    await dispatch(outbox, transport, { budgetMs: 10_000, limits });
+    assert.ok(await unstarted() <= 5);
+    outcomes.push(...await Promise.all(late.map(message => outbox.process(message, projector))));
+  }
+  assert.equal(new Set(projector.applied.map(entry => entry.id)).size, 12, 'the backlog converges with no operator');
+  assert.ok(outcomes.includes('lost'), 'hints for rows already started are fenced');
+  assert.deepEqual((await pool.query(`SELECT DISTINCT delivery_state,failures FROM projection_outbox WHERE space_id=$1`,
+    [spaceId])).rows, [{ delivery_state: 'delivered', failures: 0 }]);
+});
+
+test('status reports dead letters and backoff behind more due rows than its sample', async () => {
+  const { scope, collectionId, spaceId } = await space();
+  await Promise.all(Array.from({ length: 8 }, async (_, worker) => {
+    for (let n = worker; n < 502; n += 8) await write(scope(collectionId), 'create', `{"n":${n}}`);
+  }));
+  const parked = await write(scope(collectionId), 'create', '{"n":"parked"}');
+  await pool.query(`UPDATE projection_outbox SET delivery_state='degraded',failures=1,last_error='Error: backoff',
+    available_at=clock_timestamp()+interval '1 hour' WHERE event_id=(SELECT min(event_id) FROM projection_outbox WHERE space_id=$1)`, [spaceId]);
+  await pool.query(`UPDATE projection_outbox SET delivery_state='degraded',failures=8,dead_lettered_at=clock_timestamp(),
+    last_error='Error: parked',available_at='infinity' WHERE space_id=$1 AND record_id=$2`, [spaceId, parked.ref.id]);
+  try {
+    const [status] = (await outbox.status(spaceId)).collections;
+    assert.deepEqual([status.pending, status.capped, status.degraded, status.deadLettered, status.failuresCapped, status.lastError],
+      [500, true, 1, 1, false, 'Error: parked']);
+  } finally {
+    await pool.query('UPDATE projection_outbox SET dead_lettered_at=NULL,available_at=clock_timestamp() WHERE space_id=$1', [spaceId]);
+  }
+});
+
+test('a completion queued behind another completion of its ref gives way uncounted', async () => {
+  const { scope, collectionId, spaceId } = await space();
+  const created = await write(scope(collectionId), 'create', '{"v":1}');
+  await write(scope(collectionId), 'replace', '{"v":2}', { recordId: created.ref.id, expectedRevision: 1 });
+  const leases = new Map();
+  for (const lease of (await outbox.claim()).messages)
+    leases.set(Number((await pool.query('SELECT revision FROM projection_outbox WHERE event_id=$1', [lease.eventId])).rows[0].revision), lease);
+  let entered;
+  let open;
+  const inside = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { open = resolve; });
+  const holding = outbox.process(leases.get(1), { apply: async () => { entered(); await gate; } });
+  await inside;
+  const started = Date.now();
+  try {
+    await assert.rejects(outbox.process(leases.get(2), recorder()), { code: 'BACKPRESSURE' });
+    assert.ok(Date.now() - started < 4_000, 'the head lock wait is bounded well inside the budget');
+    assert.deepEqual(await row(leases.get(2).eventId), { ...await row(leases.get(2).eventId), delivery_state: 'pending', failures: 0 });
+  } finally { open(); }
+  assert.equal(await holding, 'applied');
+  await drained();
+  assert.deepEqual(await deliver(recorder()), ['applied']);
+  assert.deepEqual(await head(spaceId, created.ref.id), { generation: 1, revision: 2, deleted: false });
 });

@@ -72,6 +72,24 @@ test('an empty claim ends a tick only once the empty run has covered every live 
   assert.equal(clock, 3);
 });
 
+test('a tick stops once the cell reaches its in-flight bound, with time and due work left', async () => {
+  const claims = [];
+  const store = (...results) => ({ claim: async limits => { claims.push(limits); return results.shift() ?? { messages: [hint(9)], scan: 'partial' }; },
+    release: async () => 0, stepReconciliations: async () => 0 });
+  const transport = { send: async () => {} };
+  const limits = { inFlight: 3 };
+  // The claim that reaches the bound is sent, and the tick claims no further.
+  assert.deepEqual(await dispatch(store({ messages: [hint(1), hint(2)], scan: 'partial' },
+    { messages: [hint(3)], scan: 'partial', full: true }), transport, { budgetMs: 60_000, limits }),
+  { claimed: 3, sent: 3, released: 0, batches: 2 });
+  assert.equal(claims.length, 2);
+  assert.deepEqual(claims[0], limits);
+  // An already full cell ends the tick on its first, empty claim.
+  claims.length = 0;
+  assert.equal((await dispatch(store({ messages: [], scan: 'partial', full: true }), transport, { budgetMs: 60_000 })).claimed, 0);
+  assert.equal(claims.length, 1);
+});
+
 test('delivery hints have one exact shape and grant nothing else', () => {
   assert.deepEqual(parseDeliveryMessage(hint(1, 3)), hint(1, 3));
   for (const body of [null, [], 'evt', { ...hint(1), spaceId: 'sp_x' }, { eventId: hint(1).eventId }, hint(1, 0), hint(1, 1.5),

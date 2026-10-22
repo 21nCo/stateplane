@@ -19,6 +19,13 @@ ALTER TABLE projection_outbox
   -- claim index until an operator retries it.
   ADD CONSTRAINT projection_outbox_dead_letter CHECK (dead_lettered_at IS NULL OR
     (delivery_state = 'degraded' AND available_at = 'infinity')) NOT VALID;
+-- The dispatcher counts unstarted dispatch leases to bound its lead over
+-- consumers, and status samples failed rows wherever they are parked. Both
+-- partial indexes are built in this drained step with one heap scan each.
+CREATE INDEX projection_outbox_unstarted ON projection_outbox(available_at)
+  WHERE delivery_state = 'delivering' AND started_attempt IS NULL;
+CREATE INDEX projection_outbox_failed ON projection_outbox(space_id, collection_id, event_id)
+  WHERE delivery_state IN ('pending','delivering','degraded') AND (failures>0 OR delivery_state='degraded');
 
 -- The newest applied revision per ref. Work for an older revision, or work
 -- captured under an earlier placement generation, can never move it backward.

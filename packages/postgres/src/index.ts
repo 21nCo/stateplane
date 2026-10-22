@@ -665,6 +665,10 @@ function pageCandidateSql(options:PageCandidateOptions):string {
 
 // Past the transaction deadline, so the client's own rollback always wins.
 const STALLED_APPLY_MARGIN_MS = 5_000;
+// A completion queued behind another completion's head lock gives way as a
+// lock timeout, which releases its lease uncounted, instead of overrunning
+// its budget and counting a failure. Apply's own lock waits share the bound.
+const HEAD_LOCK_MS = 1_000;
 
 export class PostgresAuthority {
   /** Configure the receipt window used by new authority transactions. */
@@ -2037,6 +2041,7 @@ export class AuthorityTransaction {
       if (Number(row.generation) === placement) {
         const deleted = row.operation === 'delete';
         // The upsert's row lock serializes completions for one ref until commit.
+        await this.query(`SET LOCAL lock_timeout = '${HEAD_LOCK_MS}ms'`);
         const head = await this.query(`INSERT INTO projection_heads(space_id,collection_id,record_id,generation,revision,deleted,event_id)
           VALUES($1,$2,$4,$5,$6,$7,$3) ON CONFLICT (space_id,collection_id,record_id) DO UPDATE
           SET generation=EXCLUDED.generation,revision=EXCLUDED.revision,deleted=EXCLUDED.deleted,
