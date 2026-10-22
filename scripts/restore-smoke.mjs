@@ -10,7 +10,7 @@ import pg from 'pg';
 if (process.env.DATABASE_URL) throw new Error('Local restore smoke uses the isolated Docker Compose database only');
 const authorityModule = new URL('../packages/postgres/dist/index.js', import.meta.url);
 if (!existsSync(authorityModule)) throw new Error('Build @stateplane/postgres before db:restore-smoke: pnpm --filter @stateplane/postgres build');
-const { PostgresAuthority } = await import(authorityModule.href);
+const { PostgresAuthority, PostgresOutbox } = await import(authorityModule.href);
 
 const password = (await readFile(new URL('../.data/local-db-password', import.meta.url), 'utf8')).trim();
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -37,7 +37,8 @@ const tables = ['stateplane_migrations','space_directory','space_provisioning_au
   'record_unique_keys','record_index_values','record_events','record_event_feed','record_event_pending',
   'idempotency_receipts','receipt_reservations',
   'receipt_reservation_scopes','schema_commit_fences','collection_write_slots','batch_operations','batch_items',
-  'record_tombstones','projection_outbox','entity_refs'];
+  'record_tombstones','projection_outbox','entity_refs','projection_heads','projection_reconciliations',
+  'outbox_dispatch_checkpoint','outbox_operator_audit'];
 async function snapshot(pool) {
   const entries = await Promise.all(tables.map(async table => {
     const rows = await pool.query(`SELECT to_jsonb(t) AS value FROM ${table} t`);
@@ -84,6 +85,7 @@ try {
   const worker={...scope,principalId:'system:projection',credentialId:'system:projection',capability:'outbox:worker'};
   const claimed=await authority.transaction(worker,tx=>tx.claimOutbox(1,30));
   await authority.transaction(worker,tx=>tx.finishOutbox(claimed[0],true));
+  await new PostgresOutbox(base,authority).reconcile('restore-operator',spaceId,collectionId,'restore drill');
   const feedSeed=(await base.query(`SELECT event_id FROM record_events WHERE space_id=$1
     ORDER BY committed_at,event_id LIMIT 1`,[spaceId])).rows[0].event_id;
   await base.query(`INSERT INTO record_event_feed(event_id,space_id,collection_id)
@@ -95,8 +97,10 @@ try {
     expected.record_event_pending.length>=1 && expected.projection_outbox.length &&
     expected.space_directory.length && expected.agent_key_issuances.length &&
     expected.space_credentials.length && expected.collection_grants.length && expected.batch_items.length &&
-    expected.routing_nonces.length && expected.space_audit.length && expected.space_provisioning_audit.length,
-  'expected this restore smoke seed to populate records, outbox, and owned-space authority');
+    expected.routing_nonces.length && expected.space_audit.length && expected.space_provisioning_audit.length &&
+    expected.projection_heads.length && expected.projection_reconciliations.length &&
+    expected.outbox_dispatch_checkpoint.length && expected.outbox_operator_audit.length,
+  'expected this restore smoke seed to populate records, outbox, projection state and owned-space authority');
   const archive = docker(['pg_dump','-U','stateplane','-Fc',sourceName]);
   docker(['createdb','-U','stateplane',name]);
   execFileSync(dockerExecutable, ['compose','exec','-T','postgres','pg_restore','-U','stateplane','-d',name],
@@ -113,6 +117,9 @@ try {
   try {
     execFileSync(process.execPath,['scripts/grant-control-journal.mjs'],{cwd:root,
       env:{...process.env,STATEPLANE_CONTROL_URL:targetUrl,STATEPLANE_CONTROL_ROLE:journalRole},stdio:'inherit'});
+    // Restored outbox tables need their operational grants reapplied.
+    execFileSync(process.execPath,['scripts/grant-outbox.mjs'],{cwd:root,
+      env:{...process.env,STATEPLANE_CELL_ADMIN_URL:targetUrl,STATEPLANE_CELL_ROLE:journalRole},stdio:'inherit'});
     const operational=await restored.connect();
     const issuance=`iss_restore_${randomBytes(8).toString('hex')}`;
     try {
@@ -122,13 +129,16 @@ try {
       await operational.query('UPDATE agent_key_issuances SET create_failed_at=clock_timestamp() WHERE issuance_id=$1',[issuance]);
       assert.ok((await operational.query('SELECT create_failed_at FROM agent_key_issuances WHERE issuance_id=$1',[issuance]))
         .rows[0]?.create_failed_at,'restored operational role can use the journal');
+      assert.equal((await operational.query(`UPDATE projection_reconciliations SET next_step_at=clock_timestamp()
+        WHERE space_id=$1`,[spaceId])).rowCount,1,'restored operational role can advance reconciliations');
     } finally {
       await operational.query('RESET ROLE').catch(()=>{});
       operational.release();
       await restored.query('DELETE FROM agent_key_issuances WHERE issuance_id=$1',[issuance]).catch(()=>{});
     }
   } finally {
-    await restored.query(`REVOKE ALL ON agent_key_issuances FROM ${journalRole}`).catch(()=>{});
+    await restored.query(`REVOKE ALL ON agent_key_issuances,projection_heads,projection_reconciliations,
+      outbox_dispatch_checkpoint,outbox_operator_audit FROM ${journalRole}`).catch(()=>{});
     await restored.query(`DROP ROLE IF EXISTS ${journalRole}`).catch(()=>{});
   }
   // A reserved-word role proves identifier quoting. Keep its creation and

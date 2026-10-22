@@ -41,3 +41,14 @@ export const failOutboxSql = `UPDATE projection_outbox SET failures=failures+1, 
       ELSE clock_timestamp()+(LEAST(3600, 5 * (1 << LEAST(failures, 10))) * interval '1 second') END
   WHERE space_id=$1 AND collection_id=$2 AND event_id=$3 AND attempts=$4 AND revision=$5 AND generation=$6
     AND delivery_state='delivering' AND available_at>clock_timestamp()`;
+
+/**
+ * Re-project every live collection of space $1 after a placement fence. A
+ * running pass restarts from the first record, because records it already
+ * scanned were checked against the earlier generation.
+ */
+export const schedulePlacementRepairSql = `INSERT INTO projection_reconciliations(job_id,space_id,collection_id,cause)
+    SELECT 'rcn_'||gen_random_uuid(),space_id,collection_id,'placement' FROM collections
+    WHERE space_id=$1 AND lifecycle<>'deleted' ORDER BY collection_id
+  ON CONFLICT (space_id,collection_id) WHERE state='running' DO UPDATE
+  SET after_record_id=NULL,cause='placement',next_step_at='-infinity',updated_at=clock_timestamp()`;

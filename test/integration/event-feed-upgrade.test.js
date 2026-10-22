@@ -169,6 +169,21 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     await reader.query('ROLLBACK');
     await reader.end();
     reader=undefined;
+    // 039 takes its locks in writer order under a bounded wait. A long outbox
+    // reader makes it fail fast with an actionable error and no ledger entry.
+    await writer.end();
+    writer=new pg.Client({connectionString:url.href});
+    await writer.connect();
+    await writer.query('BEGIN');
+    await writer.query('SELECT count(*) FROM projection_outbox');
+    let outboxContention;
+    try { migrate(true,'scripts/migrate.mjs'); } catch(error) { outboxContention=error; }
+    assert.match(String(outboxContention?.stderr),/Durable outbox upgrade requires drained traffic/);
+    assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name='039_durable_outbox.sql'")).rows[0].n,0);
+    assert.equal((await upgrade.query("SELECT to_regclass('public.projection_heads') AS name")).rows[0].name,null);
+    await writer.query('ROLLBACK');
+    await writer.end();
+    writer=undefined;
     migrate(true,'scripts/migrate.mjs');
     assert.equal((await upgrade.query("SELECT to_regclass('public.record_events_scoped_cursor') AS name")).rows[0].name,null);
     assert.equal((await upgrade.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,files.length);

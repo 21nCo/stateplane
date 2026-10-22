@@ -125,7 +125,8 @@ try {
       (name === '036_event_cursor.sql' || recorded.has('036_event_cursor.sql')))
       await preflightEventFeed(); // NOSONAR -- preflight locks must precede this migration step
     const receiptDomainCutover = name === '034_batch_receipt_domain.sql' || name === '035_validate_batch_receipt_domain.sql';
-    const boundedDdl = receiptDomainCutover || name === '038_drop_superseded_event_cursor.sql';
+    const boundedDdl = receiptDomainCutover || name === '038_drop_superseded_event_cursor.sql' ||
+      name === '039_durable_outbox.sql';
     const priorLockTimeout = boundedDdl ? (await client.query('SHOW lock_timeout')).rows[0].lock_timeout : null; // NOSONAR -- migrations run in order within the current transaction
     if (boundedDdl) await client.query("SET LOCAL lock_timeout = '5s'"); // NOSONAR -- set before this step's DDL, never concurrently
     try { await client.query(sql); } // NOSONAR -- ordered DDL and ledger writes form one migration transaction
@@ -134,6 +135,8 @@ try {
         throw new Error('Batch receipt domain upgrade requires drained traffic; stop record writers and retry', { cause:error });
       if (name === '038_drop_superseded_event_cursor.sql' && error?.code === '55P03')
         throw new Error('Event cursor index removal requires drained readers; stop long readers and retry', { cause:error });
+      if (name === '039_durable_outbox.sql' && error?.code === '55P03')
+        throw new Error('Durable outbox upgrade requires drained traffic; stop record writers and long outbox readers, then retry', { cause:error });
       throw error;
     }
     if (boundedDdl) await client.query('SELECT set_config($1,$2,true)', ['lock_timeout',priorLockTimeout]); // NOSONAR -- restore this step's transaction-local timeout before the ledger write

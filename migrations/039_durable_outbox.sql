@@ -1,4 +1,9 @@
 -- STA-12: SQL stays the durable job authority. Queue messages are only hints.
+-- Take every table lock this step needs up front, in record writers' order
+-- (space, collection, record, outbox), so a writer cannot deadlock with it.
+-- The migrator bounds the wait; live writers or long readers fail it fast.
+LOCK TABLE spaces, collections, records IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE projection_outbox IN ACCESS EXCLUSIVE MODE;
 -- New outbox columns have constant defaults or are NULL, so adding them does
 -- not rewrite or scan the table. Their checks are NOT VALID for the same
 -- reason: every existing row already satisfies them, and later writes are checked.
@@ -47,6 +52,8 @@ CREATE TABLE projection_reconciliations (
   space_id text NOT NULL,
   collection_id text NOT NULL,
   state text NOT NULL DEFAULT 'running' CHECK (state IN ('running', 'completed', 'cancelled')),
+  -- A placement fence schedules its own repair; operators start the rest.
+  cause text NOT NULL DEFAULT 'operator' CHECK (cause IN ('operator', 'placement')),
   after_record_id text,
   scanned bigint NOT NULL DEFAULT 0 CHECK (scanned >= 0),
   requeued bigint NOT NULL DEFAULT 0 CHECK (requeued >= 0),
@@ -77,6 +84,8 @@ CREATE TABLE outbox_operator_audit (
 CREATE INDEX outbox_operator_audit_space ON outbox_operator_audit(space_id, recorded_at);
 CREATE TRIGGER outbox_operator_audit_immutable BEFORE UPDATE OR DELETE ON outbox_operator_audit
   FOR EACH ROW EXECUTE FUNCTION reject_space_audit_change();
+CREATE TRIGGER outbox_operator_audit_no_truncate BEFORE TRUNCATE ON outbox_operator_audit
+  FOR EACH STATEMENT EXECUTE FUNCTION reject_space_audit_change();
 
 -- Space erasure removes projection state before the records it references.
 CREATE OR REPLACE FUNCTION stateplane_purge_space(p_space_id text) RETURNS void

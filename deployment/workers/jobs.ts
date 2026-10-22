@@ -11,6 +11,10 @@ interface Env {
 // SQL is the durable job authority. A Queue message is a hint naming one
 // lease; losing or repeating one cannot lose or reapply committed work.
 // Until a search projector exists, completion advances per-ref heads only.
+// Each once-a-minute tick dispatches for up to 20 s and then advances
+// reconciliations for up to 10 s; docs/durable-outbox.md records the bounds.
+const DISPATCH_BUDGET_MS = 20_000;
+const RECONCILE_BUDGET_MS = 10_000;
 function cell(env: Env) {
   if (!env.AUTHORITY?.connectionString) throw new Error('Cell authority binding is missing');
   const pool = new pg.Pool({ connectionString: env.AUTHORITY.connectionString, max: 4,
@@ -26,8 +30,10 @@ export default {
     try {
       const result = await dispatch(outbox, {
         send: async messages => { await env.PROJECTION_JOBS.sendBatch(messages.map(body => ({ body: { ...body } }))); }
-      });
-      await outbox.stepReconciliations();
+      }, { budgetMs: DISPATCH_BUDGET_MS });
+      const until = Date.now() + RECONCILE_BUDGET_MS;
+      let stepped = 1;
+      while (stepped > 0 && Date.now() < until) stepped = await outbox.stepReconciliations();
       if (result.error) throw new Error(`Projection dispatch released ${result.released} leases`, { cause: result.error });
     } finally { await close(); }
   },

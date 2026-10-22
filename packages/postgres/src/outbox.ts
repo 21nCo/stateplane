@@ -16,16 +16,19 @@ export interface Projector<P = unknown> {
 }
 export type ProcessOutcome = ProjectionOutcome | 'failed' | 'released';
 export interface DispatchLimits { limit?: number; perSpace?: number; pairs?: number; leaseSeconds?: number }
+export interface OutboxOptions { processingMs?: number }
+/** Counts cover at most the oldest-due `STATUS_SAMPLE` live rows; `capped` marks a lower bound. */
 export interface CollectionOutboxStatus {
   spaceId: string; collectionId: string; pending: number; delivering: number; degraded: number; deadLettered: number;
-  oldestUndeliveredAt: string | null; lagSeconds: number | null; lastError: string | null;
+  capped: boolean; oldestUndeliveredAt: string | null; lagSeconds: number | null; lastError: string | null;
 }
 export interface ReconciliationStatus {
   jobId: string; spaceId: string; collectionId: string; state: 'running' | 'completed' | 'cancelled';
-  scanned: number; requeued: number; createdAt: string; updatedAt: string;
+  cause: 'operator' | 'placement'; scanned: number; requeued: number; createdAt: string; updatedAt: string;
 }
+/** `more` means further collections with live rows exist beyond the reported page. */
 export interface CellOutboxStatus {
-  lastDispatchAt: string | null; collections: CollectionOutboxStatus[]; reconciliations: ReconciliationStatus[];
+  lastDispatchAt: string | null; collections: CollectionOutboxStatus[]; more: boolean; reconciliations: ReconciliationStatus[];
 }
 
 const EVENT_ID = /^evt_[0-9a-f-]{36}$/;
@@ -37,7 +40,16 @@ const STATEMENT_MS = 5_000;
 const PROCESSING_LEASE_MS = 60_000;
 const PROCESSING_BUDGET_MS = 45_000;
 const STATUS_ROWS = 1_000;
+// Status reads at most STATUS_PAIRS × STATUS_SAMPLE live rows, so it stays
+// usable during the backlog it reports. See docs/durable-outbox.md.
+const STATUS_PAIRS = 200;
+const STATUS_SAMPLE = 500;
 const PAUSED_STEP_SECONDS = 60;
+const RELEASE_SQL = `UPDATE projection_outbox o
+  SET delivery_state=CASE WHEN o.failures>0 THEN 'degraded' ELSE 'pending' END,
+    started_attempt=NULL,available_at=clock_timestamp()
+  FROM unnest($1::text[],$2::integer[]) AS m(event_id,attempt)
+  WHERE o.event_id=m.event_id AND o.attempts=m.attempt AND o.delivery_state='delivering'`;
 
 class ProjectorFailure extends Error {}
 
@@ -93,13 +105,20 @@ function within<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
  * were given; operators read status, retry dead letters and reconcile.
  */
 export class PostgresOutbox {
-  constructor(private readonly pool: PoolLike, private readonly authority: PostgresAuthority) {}
+  private readonly processingMs: number;
+  /** `processingMs` bounds one item's prepare, apply and completion (default and maximum 45 s). */
+  constructor(private readonly pool: PoolLike, private readonly authority: PostgresAuthority, options: OutboxOptions = {}) {
+    this.processingMs = bounded(options.processingMs ?? PROCESSING_BUDGET_MS, 1, PROCESSING_BUDGET_MS);
+  }
 
   /**
    * Lease due work for dispatch. A rotating cursor bounds each scan to
    * `pairs` space/collection pairs and each space to `perSpace` rows per
-   * tick. A dispatch lease is not started: if the hint is lost, the lease
-   * expires and is reclaimed without spending the row's failure budget.
+   * claim. Spaces are served by turn and then in cursor order; when `limit`
+   * cuts a claim short, the cursor moves past the last pair served, so the
+   * next claim starts with the pairs that missed out. A dispatch lease is not
+   * started: if the hint is lost, the lease expires and is reclaimed without
+   * spending the row's failure budget.
    */
   async claim(limits: DispatchLimits = {}): Promise<DeliveryMessage[]> {
     const limit = bounded(limits.limit ?? 100, 1, 100);
@@ -115,7 +134,7 @@ export class PostgresOutbox {
       let next = scanned.length === pairs ? scanned.at(-1)! : null;
       if (after && scanned.length < pairs) {
         // Wrap to the start and stop at the old cursor; a short wrap means
-        // every live pair was visited and the next tick starts over.
+        // every live pair was visited and the next claim starts over.
         const budget = pairs - scanned.length;
         const wrapped = await this.scanPairs(db, null, after, budget);
         scanned = [...scanned, ...wrapped];
@@ -123,21 +142,25 @@ export class PostgresOutbox {
       }
       const due = `SELECT o.event_id FROM projection_outbox o JOIN (
           SELECT event_id FROM (
-            SELECT due.event_id,due.available_at,
+            SELECT due.event_id,due.available_at,p.n,
               row_number() OVER (PARTITION BY p.space_id ORDER BY due.available_at,due.event_id) AS turn
-            FROM unnest($1::text[],$2::text[]) AS p(space_id,collection_id)
+            FROM unnest($1::text[],$2::text[]) WITH ORDINALITY AS p(space_id,collection_id,n)
             JOIN spaces s ON s.space_id=p.space_id AND s.lifecycle IN ('active','readOnly')
             JOIN collections c ON c.space_id=p.space_id AND c.collection_id=p.collection_id AND c.lifecycle<>'deleted'
             CROSS JOIN LATERAL (SELECT event_id,available_at FROM projection_outbox
               WHERE space_id=p.space_id AND collection_id=p.collection_id AND ${LIVE_OUTBOX}
                 AND available_at<=clock_timestamp()
               ORDER BY available_at,event_id LIMIT $3) due
-          ) ranked WHERE turn<=$3 ORDER BY turn,available_at,event_id LIMIT $4
+          ) ranked WHERE turn<=$3 ORDER BY turn,n,available_at,event_id LIMIT $4
         ) picked ON picked.event_id=o.event_id
         WHERE o.${LIVE_OUTBOX} AND o.available_at<=clock_timestamp()
         FOR UPDATE OF o SKIP LOCKED`;
       const claimed = await db.query(claimOutboxSql(due, '$5', 'false'),
         [scanned.map(pair => pair[0]), scanned.map(pair => pair[1]), perSpace, limit, leaseSeconds]);
+      if (claimed.rows.length >= limit) {
+        const served = new Set(claimed.rows.map(row => JSON.stringify([row.space_id, row.collection_id])));
+        next = [...scanned].reverse().find(pair => served.has(JSON.stringify(pair))) ?? next;
+      }
       await db.query(`UPDATE outbox_dispatch_checkpoint SET after_space_id=$1,after_collection_id=$2,
         dispatched_at=clock_timestamp()`, [next?.[0] ?? null, next?.[1] ?? null]);
       return claimed.rows.map(row => ({ eventId: row.event_id, attempt: row.attempts }));
@@ -169,32 +192,44 @@ export class PostgresOutbox {
   async release(messages: readonly DeliveryMessage[]): Promise<number> {
     const fixed = messages.map(message => this.message(message));
     if (!fixed.length) return 0;
-    return inTransaction(this.pool, async db => (await db.query(`UPDATE projection_outbox o
-      SET delivery_state=CASE WHEN o.failures>0 THEN 'degraded' ELSE 'pending' END,
-        started_attempt=NULL,available_at=clock_timestamp()
-      FROM unnest($1::text[],$2::integer[]) AS m(event_id,attempt)
-      WHERE o.event_id=m.event_id AND o.attempts=m.attempt AND o.delivery_state='delivering'`,
-    [fixed.map(message => message.eventId), fixed.map(message => message.attempt)])).rowCount ?? 0);
+    return inTransaction(this.pool, async db => (await db.query(RELEASE_SQL,
+      [fixed.map(message => message.eventId), fixed.map(message => message.attempt)])).rowCount ?? 0);
   }
 
   /**
    * Process one hint at least once. Only the first start of a current lease
-   * proceeds, so duplicate and late messages are no-ops. A projector failure
-   * or overrun is recorded against the lease; a policy, placement or
-   * lifecycle change releases it so a later claim re-runs under fresh scope.
+   * proceeds, so duplicate and late messages are no-ops. Start fences the
+   * space, collection and placement before any projector sees content: a
+   * closed scope releases the lease, and work from an earlier placement is
+   * requeued or superseded without running the projector. A projector
+   * failure or overrun is recorded against the lease; a policy, placement or
+   * lifecycle change at completion releases it so a later claim re-runs it
+   * under fresh scope. The budget bounds prepare, apply and completion.
    */
   async process(message: DeliveryMessage, projector?: Projector): Promise<ProcessOutcome> {
     const { eventId, attempt } = this.message(message);
-    const deadline = Date.now() + PROCESSING_BUDGET_MS;
-    const row = await inTransaction(this.pool, async db => (await db.query(`UPDATE projection_outbox o
-      SET started_attempt=o.attempts,available_at=clock_timestamp()+($3::integer * interval '1 millisecond')
-      FROM spaces s, record_events e
-      WHERE o.event_id=$1 AND o.attempts=$2 AND o.delivery_state='delivering' AND o.available_at>clock_timestamp()
-        AND o.started_attempt IS DISTINCT FROM o.attempts AND s.space_id=o.space_id AND e.event_id=o.event_id
-      RETURNING o.space_id,o.collection_id,o.record_id,o.revision,o.generation,
-        s.policy_version,s.placement_generation,e.operation,e.canonical_data`,
-    [eventId, attempt, PROCESSING_LEASE_MS])).rows[0]);
+    const deadline = Date.now() + this.processingMs;
+    const row = await inTransaction(this.pool, async db => {
+      const found = (await db.query(`SELECT o.space_id,o.collection_id,o.record_id,o.revision,o.generation,
+          s.policy_version,s.placement_generation,e.operation,
+          s.lifecycle IN ('active','readOnly') AND c.lifecycle<>'deleted' AS open,
+          o.generation=s.placement_generation AS placed,
+          CASE WHEN s.lifecycle IN ('active','readOnly') AND c.lifecycle<>'deleted' AND o.generation=s.placement_generation
+            AND e.operation<>'delete' THEN e.canonical_data END AS canonical_data
+        FROM projection_outbox o JOIN spaces s ON s.space_id=o.space_id
+        JOIN collections c ON c.space_id=o.space_id AND c.collection_id=o.collection_id
+        JOIN record_events e ON e.event_id=o.event_id
+        WHERE o.event_id=$1 AND o.attempts=$2 AND o.delivery_state='delivering' AND o.available_at>clock_timestamp()
+          AND o.started_attempt IS DISTINCT FROM o.attempts FOR UPDATE OF o`, [eventId, attempt])).rows[0];
+      if (!found) return null;
+      if (!found.open) await db.query(RELEASE_SQL, [[eventId], [attempt]]);
+      else await db.query(`UPDATE projection_outbox SET started_attempt=attempts,
+          available_at=clock_timestamp()+($2::integer * interval '1 millisecond') WHERE event_id=$1`,
+      [eventId, PROCESSING_LEASE_MS]);
+      return found;
+    });
     if (!row) return 'lost';
+    if (!row.open) return 'released';
     const ref = { spaceId: row.space_id, collectionId: row.collection_id, id: row.record_id };
     const delivery: OutboxDelivery = { eventId, ref, revision: Number(row.revision), generation: Number(row.generation), attempt };
     const scope: AuthorityScope = { spaceId: row.space_id, collectionId: row.collection_id, ...WORKER,
@@ -203,17 +238,19 @@ export class PostgresOutbox {
     const change: ProjectionChange = { ref, revision: delivery.revision, generation: delivery.generation, deleted,
       canonicalData: deleted ? null : row.canonical_data };
     const signal = AbortSignal.timeout(Math.max(1, deadline - Date.now()));
+    // Without a current placement, completion only requeues or supersedes.
+    const active = row.placed ? projector : undefined;
     try {
       let prepared: unknown;
-      if (projector?.prepare) {
-        try { prepared = await within(projector.prepare(change, signal), signal); }
+      if (active?.prepare) {
+        try { prepared = await within(active.prepare(change, signal), signal); }
         catch (error) { throw new ProjectorFailure('prepare failed', { cause: error }); }
       }
-      const apply = projector && (async (current: ProjectionChange, query: ProjectionQuery) => {
-        try { await projector.apply(current, prepared, query); }
+      const apply = active && (async (current: ProjectionChange, query: ProjectionQuery) => {
+        try { await within(active.apply(current, prepared, query), signal); }
         catch (error) { throw new ProjectorFailure('apply failed', { cause: error }); }
       });
-      return await this.authority.transaction(scope, tx => tx.completeProjection(delivery, apply), deadline);
+      return await this.authority.transaction(scope, tx => tx.completeProjection(delivery, apply), deadline, signal);
     } catch (error) {
       if (error instanceof ProjectorFailure || (error instanceof AuthorityError && error.code === 'RATE_LIMITED')) {
         await this.fail(delivery, diagnostic(error));
@@ -223,6 +260,10 @@ export class PostgresOutbox {
         await this.release([message]);
         return 'released';
       }
+      // A rolled-back infrastructure failure is not the item's fault, so it
+      // does not spend the failure budget. An unknown COMMIT outcome keeps
+      // the lease; if it did not commit, its expiry counts.
+      if (!(error instanceof CommitOutcomeUnknownError)) await this.release([message]).catch(() => 0);
       throw error;
     }
   }
@@ -238,30 +279,48 @@ export class PostgresOutbox {
     return { eventId: message.eventId, attempt: bounded(message.attempt, 1, 2_147_483_647) };
   }
 
-  /** Report backlog, lag and failures per space/collection, plus the dispatcher's last tick. */
+  /**
+   * Report backlog, lag and failures per space/collection, plus the
+   * dispatcher's last tick and running or recent reconciliations, including
+   * placement repairs. Work is bounded by STATUS_PAIRS × STATUS_SAMPLE rows.
+   */
   async status(spaceId?: string): Promise<CellOutboxStatus> {
     const space = spaceId === undefined ? null : text(spaceId, 512);
+    const scope = `${LIVE_OUTBOX} AND ($1::text IS NULL OR space_id=$1)`;
     return inTransaction(this.pool, async db => {
-      const collections = await db.query(`SELECT o.space_id,o.collection_id,
+      const collections = await db.query(`WITH RECURSIVE pairs(space_id,collection_id,n) AS (
+          (SELECT space_id,collection_id,1 FROM projection_outbox WHERE ${scope} ORDER BY space_id,collection_id LIMIT 1)
+          UNION ALL
+          SELECT next.space_id,next.collection_id,p.n+1 FROM pairs p CROSS JOIN LATERAL (
+            SELECT space_id,collection_id FROM projection_outbox
+            WHERE ${scope} AND (space_id,collection_id)>(p.space_id,p.collection_id)
+            ORDER BY space_id,collection_id LIMIT 1) next
+          WHERE p.n<=$2)
+        SELECT p.space_id,p.collection_id,
           count(*) FILTER (WHERE o.delivery_state='pending')::int AS pending,
           count(*) FILTER (WHERE o.delivery_state='delivering')::int AS delivering,
           count(*) FILTER (WHERE o.delivery_state='degraded' AND o.dead_lettered_at IS NULL)::int AS degraded,
           count(*) FILTER (WHERE o.dead_lettered_at IS NOT NULL)::int AS dead_lettered,
+          count(*)>=$3 AS capped,
           min(e.committed_at) AS oldest,
           extract(epoch FROM clock_timestamp()-min(e.committed_at))::float8 AS lag,
           (array_agg(o.last_error ORDER BY e.committed_at DESC) FILTER (WHERE o.last_error IS NOT NULL))[1] AS last_error
-        FROM projection_outbox o JOIN record_events e ON e.event_id=o.event_id
-        WHERE o.${LIVE_OUTBOX} AND ($1::text IS NULL OR o.space_id=$1)
-        GROUP BY o.space_id,o.collection_id ORDER BY o.space_id,o.collection_id LIMIT ${STATUS_ROWS}`, [space]);
+        FROM pairs p CROSS JOIN LATERAL (
+          SELECT event_id,delivery_state,dead_lettered_at,last_error FROM projection_outbox
+          WHERE space_id=p.space_id AND collection_id=p.collection_id AND ${LIVE_OUTBOX}
+          ORDER BY available_at,event_id LIMIT $3) o
+        JOIN record_events e ON e.event_id=o.event_id
+        GROUP BY p.n,p.space_id,p.collection_id ORDER BY p.n`, [space, STATUS_PAIRS, STATUS_SAMPLE]);
       const jobs = await db.query(`SELECT * FROM projection_reconciliations
         WHERE ($1::text IS NULL OR space_id=$1) AND (state='running' OR updated_at>clock_timestamp()-interval '1 day')
         ORDER BY created_at DESC,job_id LIMIT ${STATUS_ROWS}`, [space]);
       const checkpoint = (await db.query('SELECT dispatched_at FROM outbox_dispatch_checkpoint')).rows[0];
       return {
         lastDispatchAt: checkpoint?.dispatched_at ? new Date(checkpoint.dispatched_at).toISOString() : null,
-        collections: collections.rows.map(row => ({ spaceId: row.space_id, collectionId: row.collection_id,
+        more: collections.rows.length > STATUS_PAIRS,
+        collections: collections.rows.slice(0, STATUS_PAIRS).map(row => ({ spaceId: row.space_id, collectionId: row.collection_id,
           pending: row.pending, delivering: row.delivering, degraded: row.degraded, deadLettered: row.dead_lettered,
-          oldestUndeliveredAt: row.oldest ? new Date(row.oldest).toISOString() : null,
+          capped: row.capped, oldestUndeliveredAt: row.oldest ? new Date(row.oldest).toISOString() : null,
           lagSeconds: row.lag === null ? null : Math.max(0, Math.floor(row.lag)), lastError: row.last_error })),
         reconciliations: jobs.rows.map(row => this.job(row))
       };
@@ -296,16 +355,20 @@ export class PostgresOutbox {
       await this.lockSpace(db, space, ['active', 'readOnly']);
       const found = await db.query(`SELECT lifecycle FROM collections WHERE space_id=$1 AND collection_id=$2 FOR SHARE`, [space, collection]);
       if (!found.rows[0] || found.rows[0].lifecycle === 'deleted') throw new AuthorityError('NOT_FOUND');
-      const inserted = await db.query(`INSERT INTO projection_reconciliations(job_id,space_id,collection_id) VALUES($1,$2,$3)
-        ON CONFLICT (space_id,collection_id) WHERE state='running' DO NOTHING RETURNING job_id`, [`rcn_${randomUUID()}`, space, collection]);
-      if (!inserted.rows[0]) {
+      // The running job can end between the conflict and the lookup; try again.
+      for (let tries = 0; tries < 3; tries++) {
+        const inserted = await db.query(`INSERT INTO projection_reconciliations(job_id,space_id,collection_id) VALUES($1,$2,$3)
+          ON CONFLICT (space_id,collection_id) WHERE state='running' DO NOTHING RETURNING job_id`, [`rcn_${randomUUID()}`, space, collection]);
+        const jobId = inserted.rows[0]?.job_id;
+        if (jobId) {
+          await this.audit(db, { space, collection, action: 'reconcile', who, why, job: jobId, affected: 0 });
+          return { jobId, created: true };
+        }
         const running = await db.query(`SELECT job_id FROM projection_reconciliations
           WHERE space_id=$1 AND collection_id=$2 AND state='running'`, [space, collection]);
-        return { jobId: running.rows[0].job_id, created: false };
+        if (running.rows[0]) return { jobId: running.rows[0].job_id, created: false };
       }
-      const jobId = inserted.rows[0].job_id;
-      await this.audit(db, { space, collection, action: 'reconcile', who, why, job: jobId, affected: 0 });
-      return { jobId, created: true };
+      throw new AuthorityError('BACKPRESSURE', 'Reconciliation changed concurrently');
     });
   }
 
@@ -408,7 +471,7 @@ export class PostgresOutbox {
 
   private job(row: Record<string, unknown>): ReconciliationStatus {
     return { jobId: String(row.job_id), spaceId: String(row.space_id), collectionId: String(row.collection_id),
-      state: row.state as ReconciliationStatus['state'], scanned: Number(row.scanned), requeued: Number(row.requeued),
+      state: row.state as ReconciliationStatus['state'], cause: row.cause as ReconciliationStatus['cause'], scanned: Number(row.scanned), requeued: Number(row.requeued),
       createdAt: new Date(row.created_at as string).toISOString(), updatedAt: new Date(row.updated_at as string).toISOString() };
   }
 }

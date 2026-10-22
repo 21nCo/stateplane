@@ -5,7 +5,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
-import { PostgresAuthority, PostgresOutbox } from '../../packages/postgres/dist/index.js';
+import { PostgresAuthority, PostgresOutbox, PostgresSpaces } from '../../packages/postgres/dist/index.js';
 import { consume, dispatch } from '../../packages/workers/dist/index.js';
 
 // The cell-wide dispatcher sees every space, so this suite owns its database.
@@ -32,9 +32,8 @@ const digest = value => createHash('sha256').update(value).digest('hex');
 const drained = () => pool.query("UPDATE projection_outbox SET available_at=clock_timestamp()-interval '1 second' WHERE delivery_state<>'delivered' AND dead_lettered_at IS NULL");
 
 /** Each test owns its spaces, so a fresh cursor-wide claim only sees the rows it wrote. */
-async function space(collections = 1) {
+async function space(collections = 1, spaceId = `sp_${randomUUID()}`) {
   await pool.query("UPDATE projection_outbox SET delivery_state='delivered',available_at=clock_timestamp() WHERE delivery_state<>'delivered'");
-  const spaceId = `sp_${randomUUID()}`;
   const ids = Array.from({ length: collections }, (_, index) => `entries_${index}_${randomUUID()}`);
   const client = await pool.connect();
   try {
@@ -194,14 +193,16 @@ test('worker restart, expired started lease and delayed completion recover once;
   assert.deepEqual(await outbox.claim(), [], 'a dead letter is not redelivered without an operator');
   assert.equal((await projection(writer, poison.ref.id)).state, 'degraded');
   const status = await outbox.status(spaceId);
-  assert.deepEqual(status.collections.map(entry => [entry.pending, entry.delivering, entry.degraded, entry.deadLettered, entry.lastError]),
-    [[0, 0, 0, 1, 'Error: embedder unavailable']]);
+  assert.deepEqual(status.collections.map(entry => [entry.pending, entry.delivering, entry.degraded, entry.deadLettered,
+    entry.capped, entry.lastError]), [[0, 0, 0, 1, false, 'Error: embedder unavailable']]);
+  assert.equal(status.more, false);
   assert.ok(status.collections[0].lagSeconds >= 0 && status.lastDispatchAt);
 
   assert.equal(await outbox.retry('operator@example.invalid', spaceId, null, 'embedder restored'), 1);
   const audit = (await pool.query('SELECT action,operator,reason,affected FROM outbox_operator_audit WHERE space_id=$1', [spaceId])).rows;
   assert.deepEqual(audit, [{ action: 'retry', operator: 'operator@example.invalid', reason: 'embedder restored', affected: '1' }]);
   await assert.rejects(pool.query('DELETE FROM outbox_operator_audit WHERE space_id=$1', [spaceId]), /immutable/);
+  await assert.rejects(pool.query('TRUNCATE outbox_operator_audit'), /immutable/);
   const recovered = recorder();
   assert.deepEqual(await Promise.all((await outbox.claim()).map(lease => outbox.process(lease, recovered))), ['applied']);
   assert.equal((await projection(writer, poison.ref.id)).state, 'current');
@@ -321,4 +322,149 @@ test('reconciliation pages are resumable, cancellable, audited and repair missin
   for (const table of ['projection_heads', 'projection_reconciliations', 'projection_outbox'])
     assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`, [spaceId])).rows[0].n, 0, table);
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM outbox_operator_audit WHERE space_id=$1', [spaceId])).rows[0].n, 4);
+});
+
+test('start fences lifecycle, collection and placement before any projector sees content', async () => {
+  const { scope, ids, spaceId } = await space(2);
+  const seen = [];
+  const spy = { prepare: async change => { seen.push(['prepare', change.canonicalData]); },
+    apply: async change => { seen.push(['apply', change.canonicalData]); } };
+  const leases = new Map();
+  const lease = async eventId => {
+    for (const next of await outbox.claim()) leases.set(next.eventId, next);
+    return leases.get(eventId);
+  };
+  const eventOf = async receipt => (await pool.query('SELECT event_id FROM projection_outbox WHERE space_id=$1 AND record_id=$2',
+    [spaceId, receipt.ref.id])).rows[0].event_id;
+
+  // Suspended between claim and processing: released at start, not failed.
+  const first = await write(scope(ids[0]), 'create', '{"secret":1}');
+  const firstEvent = await eventOf(first);
+  const suspended = await lease(firstEvent);
+  await pool.query("UPDATE spaces SET lifecycle='suspended',policy_version=policy_version+1 WHERE space_id=$1", [spaceId]);
+  assert.equal(await outbox.process(suspended, spy), 'released');
+  assert.deepEqual(await row(firstEvent), { ...await row(firstEvent), delivery_state: 'pending', failures: 0 });
+  await pool.query("UPDATE spaces SET lifecycle='active',policy_version=policy_version+1 WHERE space_id=$1", [spaceId]);
+  const writer = collectionId => ({ ...scope(collectionId), policyVersion: 3 });
+
+  // A collection deleted after the claim is released the same way.
+  const second = await write(writer(ids[1]), 'create', '{"secret":2}');
+  const secondEvent = await eventOf(second);
+  // This claim also leases the released first record again.
+  const orphaned = await lease(secondEvent);
+  await pool.query("UPDATE collections SET lifecycle='deleted' WHERE space_id=$1 AND collection_id=$2", [spaceId, ids[1]]);
+  assert.equal(await outbox.process(orphaned, spy), 'released');
+
+  // Work from an earlier placement is requeued under the new one without the projector.
+  const stale = leases.get(firstEvent);
+  await pool.query('UPDATE spaces SET placement_generation=placement_generation+1 WHERE space_id=$1', [spaceId]);
+  assert.equal(await outbox.process(stale, spy), 'requeued');
+  assert.deepEqual(seen, [], 'no projector callback ran for a closed or stale scope');
+  assert.equal((await row(firstEvent)).generation, '2');
+  assert.equal(await outbox.process(await lease(firstEvent), spy), 'applied');
+  assert.deepEqual(seen, [['prepare', '{"secret":1}'], ['apply', '{"secret":1}']]);
+});
+
+test('the processing budget bounds apply: a hung projector fails its lease and cannot commit late', async () => {
+  const { scope, collectionId, spaceId } = await space();
+  const writer = scope(collectionId);
+  const bounded = new PostgresOutbox(pool, authority, { processingMs: 300 });
+  const hung = await write(writer, 'create', '{"label":"hung"}');
+  const [first] = await bounded.claim();
+  const started = Date.now();
+  assert.equal(await bounded.process(first, { apply: () => new Promise(() => {}) }), 'failed');
+  assert.ok(Date.now() - started < 5_000, 'a never-settling apply ends at the budget');
+  assert.deepEqual(await row(first.eventId), { ...await row(first.eventId), delivery_state: 'degraded', failures: 1 });
+  assert.match((await row(first.eventId)).last_error, /time budget/);
+  assert.equal(await head(spaceId, hung.ref.id), undefined, 'the rolled-back completion did not move the head');
+
+  // An apply that wakes after the budget can no longer write through its query handle.
+  await drained();
+  const [second] = await bounded.claim();
+  let late;
+  const sleepy = { apply: async (_change, _prepared, query) => {
+    await new Promise(resolve => setTimeout(resolve, 600));
+    await query("UPDATE projection_outbox SET last_error='late' WHERE event_id=$1", [second.eventId]).catch(error => { late = error; });
+  } };
+  assert.equal(await bounded.process(second, sleepy), 'failed');
+  await new Promise(resolve => setTimeout(resolve, 700));
+  assert.ok(late, 'the late statement was refused');
+  assert.equal((await row(second.eventId)).failures, 2);
+  assert.notEqual((await row(second.eventId)).last_error, 'late');
+  assert.equal(await head(spaceId, hung.ref.id), undefined);
+});
+
+test('a rolled-back infrastructure failure after start releases the lease without spending the failure budget', async () => {
+  const { scope, collectionId } = await space();
+  await write(scope(collectionId), 'create', '{"label":"a"}');
+  const unreachable = new PostgresAuthority({ connect: async () => { throw new Error('connection reset'); } }, 3600);
+  const flapping = new PostgresOutbox(pool, unreachable);
+  const [lease] = await outbox.claim();
+  await assert.rejects(flapping.process(lease, recorder()), /connection reset/);
+  assert.deepEqual(await row(lease.eventId), { ...await row(lease.eventId), delivery_state: 'pending', failures: 0 });
+  const [next] = await outbox.claim();
+  assert.equal(next.eventId, lease.eventId, 'the released row is due again at once');
+  assert.equal((await row(lease.eventId)).failures, 0);
+  assert.equal(await outbox.process(next, recorder()), 'applied');
+});
+
+test('successive claims rotate service across spaces when the limit cuts a claim short', async () => {
+  // The backlog space sorts first, so cursor order alone would serve it every time.
+  const backlog = await space(1, `sp_00000000-${randomUUID().slice(9)}`);
+  const others = [await space(), await space()];
+  await pool.query("UPDATE projection_outbox SET delivery_state='delivered' WHERE delivery_state<>'delivered'");
+  for (let index = 0; index < 3; index++) await write(backlog.scope(backlog.collectionId), 'create', `{"n":${index}}`);
+  for (const other of others) await write(other.scope(other.collectionId), 'create', '{"n":0}');
+  const served = [];
+  for (let claim = 0; claim < 3; claim++) {
+    const [lease] = await outbox.claim({ limit: 1 });
+    served.push((await pool.query('SELECT space_id FROM projection_outbox WHERE event_id=$1', [lease.eventId])).rows[0].space_id);
+  }
+  assert.deepEqual(new Set(served), new Set([backlog.spaceId, ...others.map(other => other.spaceId)]),
+    'the older backlog does not take every claim');
+  // One budgeted tick drains more than one claim's worth of due rows.
+  await pool.query("UPDATE projection_outbox SET delivery_state='delivered' WHERE delivery_state<>'delivered'");
+  for (let index = 0; index < 7; index++) await write(backlog.scope(backlog.collectionId), 'create', `{"m":${index}}`);
+  const tick = await dispatch(outbox, { send: async () => {} }, { budgetMs: 10_000, limits: { limit: 3 } });
+  assert.deepEqual([tick.claimed, tick.batches], [7, 3]);
+});
+
+test('a placement fence schedules re-projection that converges with no operator step, and status shows it', async () => {
+  const { scope, collectionId, spaceId } = await space();
+  await pool.query(`INSERT INTO space_directory(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,lifecycle)
+    VALUES($1,'owner','cell-a','cell-a','target-a','active')`, [spaceId]);
+  const writer = scope(collectionId);
+  const ids = [];
+  for (let index = 0; index < 3; index++) ids.push((await write(writer, 'create', `{"n":${index}}`)).ref.id);
+  await write(writer, 'delete', undefined, { recordId: ids[2], expectedRevision: 1 });
+  const projector = recorder();
+  const tick = async () => {
+    const sent = [];
+    await outbox.stepReconciliations(4, 2);
+    await dispatch(outbox, { send: async messages => { sent.push(...messages); } }, { budgetMs: 1_000 });
+    return Promise.all(sent.map(message => outbox.process(message, projector)));
+  };
+  await tick();
+  assert.deepEqual(await head(spaceId, ids[0]), { generation: 1, revision: 1, deleted: false });
+
+  const spaces = new PostgresSpaces(pool, new Map([['cell-a', { pool, storageTargetId: 'target-a' }]]), 'cell-a',
+    { create: async () => { throw new Error('unexpected provider create'); }, find: async () => null, revoke: async () => {} },
+    { current: async () => true });
+  assert.equal(await spaces.fencePlacement(spaceId, 'cell-a', 1), 2);
+  const fenced = { ...writer, placementGeneration: 2 };
+  assert.equal((await projection(fenced, ids[0])).state, 'pending');
+  const repairing = await outbox.status(spaceId);
+  assert.deepEqual(repairing.reconciliations.map(job => [job.collectionId, job.cause, job.state]), [[collectionId, 'placement', 'running']]);
+
+  for (let round = 0; round < 10 && (await outbox.reconciliation(repairing.reconciliations[0].jobId)).state === 'running'; round++)
+    await tick();
+  await tick();
+  assert.equal((await outbox.reconciliation(repairing.reconciliations[0].jobId)).state, 'completed');
+  for (const id of ids.slice(0, 2)) {
+    assert.equal((await projection(fenced, id)).state, 'current');
+    assert.deepEqual(await head(spaceId, id), { generation: 2, revision: 1, deleted: false });
+  }
+  assert.deepEqual(await head(spaceId, ids[2]), { generation: 2, revision: 2, deleted: true }, 'the delete stays deleted');
+  assert.deepEqual(projector.applied.filter(entry => entry.generation === 2).map(entry => entry.id).sort(), [...ids].sort());
+  assert.deepEqual((await outbox.status(spaceId)).collections, []);
 });

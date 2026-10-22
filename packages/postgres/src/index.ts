@@ -675,8 +675,12 @@ export class PostgresAuthority {
     if (cursorSecret) this.cursorSecret=Buffer.from(cursorSecret);
   }
 
-  /** Callback side effects are never retried. A COMMIT failure is deliberately ambiguous. */
-  async transaction<T>(scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T> | T, deadlineMs?: number): Promise<T> {
+  /**
+   * Callback side effects are never retried. A COMMIT failure is deliberately
+   * ambiguous. Once `signal` aborts, the transaction issues no further SQL.
+   */
+  async transaction<T>(scope: AuthorityScope, fn: (tx: AuthorityTransaction) => Promise<T> | T, deadlineMs?: number,
+    signal?: AbortSignal): Promise<T> {
     const requestDeadline=Date.now()+this.requestTimeoutMs;
     if (deadlineMs!==undefined && !isSafeInteger(deadlineMs)) throw new AuthorityError('INVALID_ARGUMENT');
     deadlineMs=deadlineMs===undefined ? requestDeadline : Math.min(deadlineMs,requestDeadline);
@@ -692,7 +696,7 @@ export class PostgresAuthority {
     try {
       beginAttempted = true;
       await client.query('BEGIN'); begun = true;
-      tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds, undefined, this.cursorSecret, deadlineMs);
+      tx = new AuthorityTransaction(client, fixedScope, this.receiptRetentionSeconds, undefined, this.cursorSecret, deadlineMs, signal);
       await tx.checkScope();
       const result = await fn(tx);
       tx.sealMutations();
@@ -2031,6 +2035,9 @@ export class AuthorityTransaction {
         [...lease, row.record_id, placement, revision, deleted]);
         if (head.rowCount === 1) {
           outcome = 'applied';
+          // A worker that stops mid-apply cannot hold this ref past its budget.
+          if (apply && this.requestDeadlineMs !== undefined) await this.query(`SET LOCAL idle_in_transaction_session_timeout =
+            '${Math.max(1, Math.trunc(this.requestDeadlineMs - Date.now()))}ms'`);
           await apply?.({ ref:this.ref(row.record_id), revision, generation:placement, deleted,
             canonicalData:deleted ? null : row.canonical_data }, (sql, values) => this.query(sql, values));
         }

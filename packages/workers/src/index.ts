@@ -14,23 +14,39 @@ export interface OutboxStore {
 }
 /** At-least-once transport, such as a Cloudflare Queue producer. */
 export interface DeliveryTransport { send(messages: readonly DeliveryMessage[]): Promise<void> }
-export interface DispatchResult { claimed: number; sent: number; released: number; error?: unknown }
+export interface DispatchResult { claimed: number; sent: number; released: number; batches: number; error?: unknown }
+export interface DispatchOptions {
+  limits?: Parameters<OutboxStore['claim']>[0];
+  /** Keep claiming and sending until nothing is due or this wall-clock budget is spent. 0 sends one batch. */
+  budgetMs?: number;
+  now?: () => number;
+}
 
 /**
- * One dispatcher tick. A failed send releases every lease from the batch:
- * any hint that did arrive names a released attempt and is fenced as lost.
- * A crash before release leaves unstarted leases to expire and be reclaimed.
+ * One dispatcher tick: repeated claim-and-send batches within a bounded
+ * budget. Each claim rotates service across spaces, so a long tick cannot
+ * serve one backlog ahead of everyone else. A failed send releases every
+ * lease from its batch and ends the tick: any hint that did arrive names a
+ * released attempt and is fenced as lost. A crash before release leaves
+ * unstarted leases to expire and be reclaimed.
  */
 export async function dispatch(store: OutboxStore, transport: DeliveryTransport,
-  limits?: Parameters<OutboxStore['claim']>[0]): Promise<DispatchResult> {
-  const messages = await store.claim(limits);
-  if (!messages.length) return { claimed: 0, sent: 0, released: 0 };
-  try {
-    await transport.send(messages);
-    return { claimed: messages.length, sent: messages.length, released: 0 };
-  } catch (error) {
-    return { claimed: messages.length, sent: 0, released: await store.release(messages), error };
-  }
+  options: DispatchOptions = {}): Promise<DispatchResult> {
+  const budgetMs = options.budgetMs ?? 0;
+  if (!Number.isSafeInteger(budgetMs) || budgetMs < 0 || budgetMs > 600_000) throw new RangeError('Invalid dispatch budget');
+  const now = options.now ?? Date.now;
+  const until = now() + budgetMs;
+  const result: DispatchResult = { claimed: 0, sent: 0, released: 0, batches: 0 };
+  do {
+    const messages = await store.claim(options.limits);
+    if (!messages.length) break;
+    result.claimed += messages.length;
+    result.batches++;
+    try { await transport.send(messages); }
+    catch (error) { result.released += await store.release(messages); return { ...result, error }; }
+    result.sent += messages.length;
+  } while (now() < until);
+  return result;
 }
 
 /** Accept only the exact hint shape; anything else is dropped, never trusted. */
