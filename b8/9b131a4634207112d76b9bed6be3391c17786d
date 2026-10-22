@@ -1,0 +1,21 @@
+packages/postgres/src/index.ts
+  s_a36c1a798acde1::t_ba67b4d67b1a1e 705,746
+packages/postgres/src/outbox.ts
+  s_a36c1a798acde1::t_4759cf1f6ee576 84,95
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b89b131a4634207112d76b9bed6be3391c17786d",
+  "prompts": {},
+  "sessions": {
+    "s_a36c1a798acde1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9038f549-0927-4c58-8c2b-76f8cf886ad7",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
