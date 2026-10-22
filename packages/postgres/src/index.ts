@@ -663,7 +663,7 @@ function pageCandidateSql(options:PageCandidateOptions):string {
   )`;
 }
 
-// Past the processing budget, so the client's own rollback always wins.
+// Past the transaction deadline, so the client's own rollback always wins.
 const STALLED_APPLY_MARGIN_MS = 5_000;
 
 export class PostgresAuthority {
@@ -677,6 +677,9 @@ export class PostgresAuthority {
       throw new RangeError('Invalid request time budget');
     if (cursorSecret) this.cursorSecret=Buffer.from(cursorSecret);
   }
+
+  /** The longest any one transaction may run; callers derive their own deadlines from it. */
+  get requestBudgetMs(): number { return this.requestTimeoutMs; }
 
   /**
    * Callback side effects are never retried. A COMMIT failure is deliberately
@@ -696,6 +699,10 @@ export class PostgresAuthority {
     let discard = false;
     let commitAmbiguous = false;
     let tx: AuthorityTransaction | undefined;
+    // The pool detaches its listener on checkout. A session the server ends
+    // between statements must fail this transaction, not the process.
+    const onError = () => { discard = true; };
+    client.on('error', onError);
     try {
       beginAttempted = true;
       await client.query('BEGIN'); begun = true;
@@ -736,7 +743,7 @@ export class PostgresAuthority {
       if ((error as {code?:string}).code==='57014') throw new AuthorityError('RATE_LIMITED','Database statement time limit exceeded');
       if ((error as {code?:string}).code==='55P03') throw new AuthorityError('BACKPRESSURE','Database lock budget exceeded');
       throw error;
-    } finally { tx?.close(); client.release(discard); }
+    } finally { tx?.close(); client.release(discard); client.removeListener('error', onError); }
   }
 
   /** Join an already authorized cell transaction; the caller owns COMMIT/ROLLBACK. */

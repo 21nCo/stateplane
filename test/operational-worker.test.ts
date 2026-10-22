@@ -5,7 +5,7 @@ const cell = vi.hoisted(() => ({ pools: 0, ended: 0, claims: [] as unknown[][], 
 vi.mock('@stateplane/postgres', () => ({
   PostgresAuthority: class {},
   PostgresOutbox: class {
-    async claim() { return cell.claims.shift() ?? []; }
+    async claim() { return { messages: cell.claims.shift() ?? [], scan: 'whole' }; }
     async release(messages: unknown[]) { cell.released.push(...messages); return messages.length; }
     async stepReconciliations() { cell.stepped++; return 0; }
     async process(message: { attempt: number }) {

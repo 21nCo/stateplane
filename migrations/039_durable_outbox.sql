@@ -32,7 +32,10 @@ CREATE TABLE projection_heads (
   event_id text NOT NULL,
   applied_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   PRIMARY KEY (space_id, collection_id, record_id),
+  -- Checked at COMMIT, so a ref's first head takes no key-share lock on its
+  -- record while apply runs, and record writes never wait for projection.
   FOREIGN KEY (space_id, collection_id, record_id) REFERENCES records(space_id, collection_id, record_id)
+    DEFERRABLE INITIALLY DEFERRED
 );
 
 -- One cell-local dispatcher cursor rotates claims across space/collection

@@ -6,9 +6,15 @@ export interface ProjectionWorker { run(job: ProjectionJob, services: Applicatio
 /** A delivery hint names one lease. It carries no record content and grants nothing. */
 export interface DeliveryMessage { eventId: string; attempt: number }
 export type DeliveryOutcome = 'applied' | 'superseded' | 'requeued' | 'lost' | 'failed' | 'released';
+/**
+ * One claim's leases and how far its walk over live space/collection pairs
+ * got: `whole` visited every pair, `wrapped` began at or passed the start of
+ * the pair order, `partial` did neither.
+ */
+export interface ClaimResult { messages: DeliveryMessage[]; scan: 'whole' | 'wrapped' | 'partial' }
 /** The cell's SQL outbox remains the only durable job authority. */
 export interface OutboxStore {
-  claim(limits?: { limit?: number; perSpace?: number; pairs?: number; leaseSeconds?: number }): Promise<DeliveryMessage[]>;
+  claim(limits?: { limit?: number; perSpace?: number; pairs?: number; leaseSeconds?: number }): Promise<ClaimResult>;
   release(messages: readonly DeliveryMessage[]): Promise<number>;
   stepReconciliations(jobs?: number, pageSize?: number): Promise<number>;
 }
@@ -17,7 +23,7 @@ export interface DeliveryTransport { send(messages: readonly DeliveryMessage[]):
 export interface DispatchResult { claimed: number; sent: number; released: number; batches: number; error?: unknown }
 export interface DispatchOptions {
   limits?: Parameters<OutboxStore['claim']>[0];
-  /** Keep claiming and sending until nothing is due or this wall-clock budget is spent. 0 sends one batch. */
+  /** Keep claiming and sending until a full pass finds nothing due or this wall-clock budget is spent. 0 claims once. */
   budgetMs?: number;
   now?: () => number;
 }
@@ -25,7 +31,10 @@ export interface DispatchOptions {
 /**
  * One dispatcher tick: repeated claim-and-send batches within a bounded
  * budget. Each claim rotates service across spaces, so a long tick cannot
- * serve one backlog ahead of everyone else. A failed send releases every
+ * serve one backlog ahead of everyone else. An empty claim may only have
+ * walked pairs with nothing due, so the tick ends early only once a run of
+ * empty claims has covered every pair: one whole scan, or passing the start
+ * of the pair order twice. A failed send releases every
  * lease from its batch and ends the tick: any hint that did arrive names a
  * released attempt and is fenced as lost. A crash before release leaves
  * unstarted leases to expire and be reclaimed.
@@ -37,9 +46,14 @@ export async function dispatch(store: OutboxStore, transport: DeliveryTransport,
   const now = options.now ?? Date.now;
   const until = now() + budgetMs;
   const result: DispatchResult = { claimed: 0, sent: 0, released: 0, batches: 0 };
+  let starts = 0;
   do {
-    const messages = await store.claim(options.limits);
-    if (!messages.length) break;
+    const { messages, scan } = await store.claim(options.limits);
+    if (!messages.length) {
+      if (scan === 'whole' || (scan === 'wrapped' && ++starts === 2)) break;
+      continue;
+    }
+    starts = 0;
     result.claimed += messages.length;
     result.batches++;
     try { await transport.send(messages); }

@@ -5,7 +5,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
-import { PostgresAuthority, PostgresOutbox, PostgresSpaces } from '../../packages/postgres/dist/index.js';
+import { CollectionRegistry, PostgresAuthority, PostgresOutbox, PostgresSpaces } from '../../packages/postgres/dist/index.js';
 import { consume, dispatch } from '../../packages/workers/dist/index.js';
 
 // The cell-wide dispatcher sees every space, so this suite owns its database.
@@ -92,9 +92,9 @@ test('lost, failed and duplicate hints neither lose committed work nor spend the
   const [{ eventId }] = (await pool.query('SELECT event_id AS "eventId" FROM projection_outbox WHERE space_id=$1', [spaceId])).rows;
   assert.deepEqual(await row(eventId), { ...await row(eventId), delivery_state: 'pending', failures: 0 });
   // The dispatcher crashes after its claim commits and before any send.
-  const [lost] = await outbox.claim();
+  const [lost] = (await outbox.claim()).messages;
   assert.equal(lost.eventId, eventId);
-  assert.deepEqual(await outbox.claim(), [], 'an unexpired dispatch lease is not reclaimed');
+  assert.deepEqual((await outbox.claim()).messages, [], 'an unexpired dispatch lease is not reclaimed');
   await drained();
   const sent = [];
   assert.equal((await dispatch(outbox, { send: async messages => { sent.push(...messages); } })).sent, 1);
@@ -110,7 +110,7 @@ test('lost, failed and duplicate hints neither lose committed work nor spend the
 
   // Two copies of one hint arriving together start the lease only once.
   await write(scope(collectionId), 'replace', '{"label":"b"}', { recordId: receipt.ref.id, expectedRevision: 1 });
-  const [twice] = await outbox.claim();
+  const [twice] = (await outbox.claim()).messages;
   let prepared = 0;
   const counted = { prepare: async () => { prepared++; await new Promise(resolve => setTimeout(resolve, 50)); }, apply: projector.apply };
   assert.deepEqual((await Promise.all([outbox.process(twice, counted), outbox.process({ ...twice }, counted)])).sort(), ['applied', 'lost']);
@@ -124,7 +124,7 @@ test('reordered and concurrent completions keep the newest revision and never re
   const id = created.ref.id;
   await write(writer, 'replace', '{"label":"b"}', { recordId: id, expectedRevision: 1 });
   await write(writer, 'delete', undefined, { recordId: id, expectedRevision: 2 });
-  const leases = await outbox.claim();
+  const leases = (await outbox.claim()).messages;
   const byRevision = new Map();
   for (const lease of leases) {
     const { revision } = (await pool.query('SELECT revision FROM projection_outbox WHERE event_id=$1', [lease.eventId])).rows[0];
@@ -143,7 +143,7 @@ test('reordered and concurrent completions keep the newest revision and never re
   for (let revision = 1; revision < 6; revision++)
     await write(writer, 'replace', `{"n":${revision + 1}}`, { recordId: second.ref.id, expectedRevision: revision });
   const racing = recorder();
-  const results = await Promise.all((await outbox.claim()).reverse().map(lease => outbox.process(lease, racing)));
+  const results = await Promise.all((await outbox.claim()).messages.reverse().map(lease => outbox.process(lease, racing)));
   assert.ok(results.includes('applied'));
   assert.deepEqual(await head(spaceId, second.ref.id), { generation: 1, revision: 6, deleted: false });
   assert.equal(racing.applied.at(-1).revision, 6, 'the last fenced apply is the newest revision');
@@ -157,7 +157,7 @@ test('worker restart, expired started lease and delayed completion recover once;
   let release;
   const blocked = new Promise(resolve => { release = resolve; });
   const hanging = { prepare: () => blocked, apply: async () => { throw new Error('a delayed worker must not apply'); } };
-  const [first] = await outbox.claim();
+  const [first] = (await outbox.claim()).messages;
   const delayed = outbox.process(first, hanging);
   for (let polls = 0; !(await pool.query('SELECT 1 FROM projection_outbox WHERE event_id=$1 AND started_attempt=attempts',
     [first.eventId])).rows.length; polls++) {
@@ -166,7 +166,7 @@ test('worker restart, expired started lease and delayed completion recover once;
   }
   // The worker is presumed dead once its processing lease expires.
   await drained();
-  const [second] = await outbox.claim();
+  const [second] = (await outbox.claim()).messages;
   assert.equal(second.attempt, first.attempt + 1);
   assert.deepEqual(await row(first.eventId), { ...await row(first.eventId), failures: 1, last_error: 'Processing lease expired' });
   const restarted = recorder();
@@ -181,7 +181,7 @@ test('worker restart, expired started lease and delayed completion recover once;
   const projector = recorder(change => change.ref.id === poison.ref.id);
   for (let attempt = 1; attempt <= 8; attempt++) {
     await drained();
-    const outcomes = await Promise.all((await outbox.claim()).map(lease => outbox.process(lease, projector)));
+    const outcomes = await Promise.all((await outbox.claim()).messages.map(lease => outbox.process(lease, projector)));
     assert.ok(outcomes.includes('failed'));
   }
   assert.deepEqual(projector.applied.map(entry => entry.id), [healthy.ref.id], 'the healthy item is not held behind poison');
@@ -190,7 +190,7 @@ test('worker restart, expired started lease and delayed completion recover once;
     last_error: 'Error: embedder unavailable' });
   assert.ok((await row(parked.event_id)).dead_lettered_at);
   await drained();
-  assert.deepEqual(await outbox.claim(), [], 'a dead letter is not redelivered without an operator');
+  assert.deepEqual((await outbox.claim()).messages, [], 'a dead letter is not redelivered without an operator');
   assert.equal((await projection(writer, poison.ref.id)).state, 'degraded');
   const status = await outbox.status(spaceId);
   assert.deepEqual(status.collections.map(entry => [entry.pending, entry.delivering, entry.degraded, entry.deadLettered,
@@ -204,7 +204,7 @@ test('worker restart, expired started lease and delayed completion recover once;
   await assert.rejects(pool.query('DELETE FROM outbox_operator_audit WHERE space_id=$1', [spaceId]), /immutable/);
   await assert.rejects(pool.query('TRUNCATE outbox_operator_audit'), /immutable/);
   const recovered = recorder();
-  assert.deepEqual(await Promise.all((await outbox.claim()).map(lease => outbox.process(lease, recovered))), ['applied']);
+  assert.deepEqual(await Promise.all((await outbox.claim()).messages.map(lease => outbox.process(lease, recovered))), ['applied']);
   assert.equal((await projection(writer, poison.ref.id)).state, 'current');
 });
 
@@ -213,7 +213,7 @@ test('placement fences and policy changes reject stale leases and requeue only t
   const writer = scope(collectionId);
   const record = await write(writer, 'create', '{"v":1}');
   await write(writer, 'replace', '{"v":2}', { recordId: record.ref.id, expectedRevision: 1 });
-  const leases = await outbox.claim();
+  const leases = (await outbox.claim()).messages;
   await pool.query('UPDATE spaces SET placement_generation=2 WHERE space_id=$1', [spaceId]);
   const projector = recorder();
   // Generation-1 work never applies under generation 2; only revision 2 is current.
@@ -221,7 +221,7 @@ test('placement fences and policy changes reject stale leases and requeue only t
     ['requeued', 'superseded']);
   assert.deepEqual(projector.applied, []);
   assert.equal((await projection({ ...writer, placementGeneration: 2 }, record.ref.id)).state, 'pending');
-  const [requeued] = await outbox.claim();
+  const [requeued] = (await outbox.claim()).messages;
   assert.equal(await outbox.process(requeued, projector), 'applied');
   assert.deepEqual(projector.applied.map(entry => [entry.revision, entry.generation]), [[2, 2]]);
   assert.deepEqual(await head(spaceId, record.ref.id), { generation: 2, revision: 2, deleted: false });
@@ -230,19 +230,19 @@ test('placement fences and policy changes reject stale leases and requeue only t
   await write({ ...writer, placementGeneration: 2 }, 'replace', '{"v":3}', { recordId: record.ref.id, expectedRevision: 2 });
   const racing = { prepare: async () => { await pool.query('UPDATE spaces SET policy_version=policy_version+1 WHERE space_id=$1', [spaceId]); },
     apply: projector.apply };
-  const [lease] = await outbox.claim();
+  const [lease] = (await outbox.claim()).messages;
   assert.equal(await outbox.process(lease, racing), 'released');
   assert.deepEqual(await row(lease.eventId), { ...await row(lease.eventId), delivery_state: 'pending', failures: 0 });
-  const [fresh] = await outbox.claim();
+  const [fresh] = (await outbox.claim()).messages;
   assert.equal(await outbox.process(fresh, projector), 'applied');
   assert.deepEqual(await head(spaceId, record.ref.id), { generation: 2, revision: 3, deleted: false });
 
   // A suspended space is not dispatched; its committed work waits rather than failing.
   await write({ ...writer, placementGeneration: 2, policyVersion: 2 }, 'replace', '{"v":4}', { recordId: record.ref.id, expectedRevision: 3 });
   await pool.query("UPDATE spaces SET lifecycle='suspended',policy_version=policy_version+1 WHERE space_id=$1", [spaceId]);
-  assert.deepEqual(await outbox.claim(), []);
+  assert.deepEqual((await outbox.claim()).messages, []);
   await pool.query("UPDATE spaces SET lifecycle='active',policy_version=policy_version+1 WHERE space_id=$1", [spaceId]);
-  assert.deepEqual(await Promise.all((await outbox.claim()).map(next => outbox.process(next, projector))), ['applied']);
+  assert.deepEqual(await Promise.all((await outbox.claim()).messages.map(next => outbox.process(next, projector))), ['applied']);
 });
 
 test('one busy space cannot monopolize a dispatch tick, and the cursor rotates across pairs', async () => {
@@ -251,7 +251,7 @@ test('one busy space cannot monopolize a dispatch tick, and the cursor rotates a
   // The busy space's work is older and spread over two collections.
   for (let index = 0; index < 12; index++) await write(busy.scope(busy.ids[index % 2]), 'create', `{"n":${index}}`);
   await write(quiet.scope(quiet.collectionId), 'create', '{"n":0}');
-  const leased = await outbox.claim({ limit: 5, perSpace: 3 });
+  const leased = (await outbox.claim({ limit: 5, perSpace: 3 })).messages;
   const spaces = (await pool.query('SELECT space_id,count(*)::int AS n FROM projection_outbox WHERE event_id=ANY($1) GROUP BY space_id',
     [leased.map(lease => lease.eventId)])).rows;
   assert.deepEqual(Object.fromEntries(spaces.map(entry => [entry.space_id, entry.n])), { [busy.spaceId]: 3, [quiet.spaceId]: 1 });
@@ -259,7 +259,7 @@ test('one busy space cannot monopolize a dispatch tick, and the cursor rotates a
   // A one-pair scan budget still reaches every pair over successive ticks.
   const visited = [];
   for (let tick = 0; tick < 3; tick++) {
-    const [lease] = await outbox.claim({ pairs: 1, limit: 1 });
+    const [lease] = (await outbox.claim({ pairs: 1, limit: 1 })).messages;
     visited.push((await pool.query('SELECT collection_id FROM projection_outbox WHERE event_id=$1', [lease.eventId])).rows[0].collection_id);
   }
   assert.deepEqual(new Set(visited), new Set([...busy.ids, quiet.collectionId]));
@@ -270,7 +270,7 @@ test('projection outage degrades search state while authoritative writes and exa
   const writer = scope(collectionId);
   const first = await write(writer, 'create', '{"label":"a"}');
   const down = recorder(() => true);
-  assert.deepEqual(await Promise.all((await outbox.claim()).map(lease => outbox.process(lease, down))), ['failed']);
+  assert.deepEqual(await Promise.all((await outbox.claim()).messages.map(lease => outbox.process(lease, down))), ['failed']);
   const second = await write(writer, 'replace', '{"label":"b"}', { recordId: first.ref.id, expectedRevision: 1 });
   assert.equal(second.revision, 2);
   const read = await authority.transaction({ ...writer, capability: 'records:read' }, tx => tx.getRecord(first.ref.id));
@@ -286,7 +286,7 @@ test('reconciliation pages are resumable, cancellable, audited and repair missin
   const writer = scope(collectionId);
   const ids = [];
   for (let index = 0; index < 5; index++) ids.push((await write(writer, 'create', `{"n":${index}}`)).ref.id);
-  await Promise.all((await outbox.claim()).map(lease => outbox.process(lease)));
+  await Promise.all((await outbox.claim()).messages.map(lease => outbox.process(lease)));
   // Projection state lost for two refs, as after a restore without projections.
   const lost = [...ids].sort().slice(1, 3);
   await pool.query('DELETE FROM projection_heads WHERE space_id=$1 AND record_id=ANY($2)', [spaceId, lost]);
@@ -302,7 +302,7 @@ test('reconciliation pages are resumable, cancellable, audited and repair missin
   assert.deepEqual([done.state, done.scanned, done.requeued], ['completed', 5, 2]);
   assert.equal(await restarted.stepReconciliations(1, 2), 0);
   const repaired = recorder();
-  await Promise.all((await outbox.claim()).map(lease => outbox.process(lease, repaired)));
+  await Promise.all((await outbox.claim()).messages.map(lease => outbox.process(lease, repaired)));
   assert.deepEqual(repaired.applied.map(entry => entry.id).sort(), lost);
   for (const id of ids) assert.equal((await head(spaceId, id)).revision, 1);
 
@@ -331,7 +331,7 @@ test('start fences lifecycle, collection and placement before any projector sees
     apply: async change => { seen.push(['apply', change.canonicalData]); } };
   const leases = new Map();
   const lease = async eventId => {
-    for (const next of await outbox.claim()) leases.set(next.eventId, next);
+    for (const next of (await outbox.claim()).messages) leases.set(next.eventId, next);
     return leases.get(eventId);
   };
   const eventOf = async receipt => (await pool.query('SELECT event_id FROM projection_outbox WHERE space_id=$1 AND record_id=$2',
@@ -370,7 +370,7 @@ test('the processing budget bounds apply: a hung projector fails its lease and c
   const writer = scope(collectionId);
   const bounded = new PostgresOutbox(pool, authority, { processingMs: 300 });
   const hung = await write(writer, 'create', '{"label":"hung"}');
-  const [first] = await bounded.claim();
+  const [first] = (await bounded.claim()).messages;
   const started = Date.now();
   assert.equal(await bounded.process(first, { apply: () => new Promise(() => {}) }), 'failed');
   assert.ok(Date.now() - started < 5_000, 'a never-settling apply ends at the budget');
@@ -380,7 +380,7 @@ test('the processing budget bounds apply: a hung projector fails its lease and c
 
   // An apply that wakes after the budget can no longer write through its query handle.
   await drained();
-  const [second] = await bounded.claim();
+  const [second] = (await bounded.claim()).messages;
   let late;
   const sleepy = { apply: async (_change, _prepared, query) => {
     await new Promise(resolve => setTimeout(resolve, 600));
@@ -399,10 +399,10 @@ test('a rolled-back infrastructure failure after start releases the lease withou
   await write(scope(collectionId), 'create', '{"label":"a"}');
   const unreachable = new PostgresAuthority({ connect: async () => { throw new Error('connection reset'); } }, 3600);
   const flapping = new PostgresOutbox(pool, unreachable);
-  const [lease] = await outbox.claim();
+  const [lease] = (await outbox.claim()).messages;
   await assert.rejects(flapping.process(lease, recorder()), /connection reset/);
   assert.deepEqual(await row(lease.eventId), { ...await row(lease.eventId), delivery_state: 'pending', failures: 0 });
-  const [next] = await outbox.claim();
+  const [next] = (await outbox.claim()).messages;
   assert.equal(next.eventId, lease.eventId, 'the released row is due again at once');
   assert.equal((await row(lease.eventId)).failures, 0);
   assert.equal(await outbox.process(next, recorder()), 'applied');
@@ -417,7 +417,7 @@ test('successive claims rotate service across spaces when the limit cuts a claim
   for (const other of others) await write(other.scope(other.collectionId), 'create', '{"n":0}');
   const served = [];
   for (let claim = 0; claim < 3; claim++) {
-    const [lease] = await outbox.claim({ limit: 1 });
+    const [lease] = (await outbox.claim({ limit: 1 })).messages;
     served.push((await pool.query('SELECT space_id FROM projection_outbox WHERE event_id=$1', [lease.eventId])).rows[0].space_id);
   }
   assert.deepEqual(new Set(served), new Set([backlog.spaceId, ...others.map(other => other.spaceId)]),
@@ -467,4 +467,188 @@ test('a placement fence schedules re-projection that converges with no operator 
   assert.deepEqual(await head(spaceId, ids[2]), { generation: 2, revision: 2, deleted: true }, 'the delete stays deleted');
   assert.deepEqual(projector.applied.filter(entry => entry.generation === 2).map(entry => entry.id).sort(), [...ids].sort());
   assert.deepEqual((await outbox.status(spaceId)).collections, []);
+});
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const fencer = () => new PostgresSpaces(pool, new Map([['cell-a', { pool, storageTargetId: 'target-a' }]]), 'cell-a',
+  { create: async () => { throw new Error('unexpected provider create'); }, find: async () => null, revoke: async () => {} },
+  { current: async () => true });
+async function deliver(projector) {
+  const sent = [];
+  await dispatch(outbox, { send: async messages => { sent.push(...messages); } }, { budgetMs: 1_000 });
+  return Promise.all(sent.map(message => outbox.process(message, projector)));
+}
+
+test('the processing deadline follows the authority budget, so the client rolls back before the server backstop', async () => {
+  const { scope, collectionId, spaceId } = await space();
+  const short = new PostgresAuthority(pool, 3600, undefined, 1_500);
+  const derived = new PostgresOutbox(pool, short);
+  assert.throws(() => new PostgresOutbox(pool, short, { processingMs: 1_501 }), { code: 'INVALID_ARGUMENT' });
+  const created = await write(scope(collectionId), 'create', '{"label":"idle"}');
+  const [lease] = (await derived.claim()).messages;
+  const started = Date.now();
+  assert.equal(await derived.process(lease, { apply: () => new Promise(() => {}) }), 'failed');
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed >= 1_400 && elapsed < 3_000, `the client aborted at the authority deadline (${elapsed} ms)`);
+  assert.deepEqual(await row(lease.eventId), { ...await row(lease.eventId), delivery_state: 'degraded', failures: 1 });
+  assert.match((await row(lease.eventId)).last_error, /time budget/);
+  assert.equal(await head(spaceId, created.ref.id), undefined);
+  // Past the old server-side backstop, the pool's sessions are all healthy.
+  await sleep(5_500);
+  assert.equal((await pool.query('SELECT 1 AS ok')).rows[0].ok, 1);
+});
+
+test('infrastructure faults inside apply release the lease uncounted; a projector error still counts', async () => {
+  const { scope, collectionId, spaceId } = await space();
+  const created = await write(scope(collectionId), 'create', '{"label":"a"}');
+  await pool.query('CREATE TABLE IF NOT EXISTS outbox_test_locks(id integer PRIMARY KEY)');
+  await pool.query('INSERT INTO outbox_test_locks VALUES(1) ON CONFLICT DO NOTHING');
+  const holder = await pool.connect();
+  try {
+    await holder.query('BEGIN');
+    await holder.query('SELECT id FROM outbox_test_locks WHERE id=1 FOR UPDATE');
+    const [locked] = (await outbox.claim()).messages;
+    // The projector swallows the lock timeout and throws its own error; the fault still decides.
+    const contended = { apply: async (_change, _prepared, query) => {
+      await query("SET LOCAL lock_timeout = '100ms'");
+      await query('SELECT id FROM outbox_test_locks WHERE id=1 FOR UPDATE').catch(() => { throw new Error('index busy'); });
+    } };
+    await assert.rejects(outbox.process(locked, contended), { code: 'BACKPRESSURE' });
+    assert.deepEqual(await row(locked.eventId), { ...await row(locked.eventId), delivery_state: 'pending', failures: 0 });
+  } finally { await holder.query('ROLLBACK'); holder.release(); }
+
+  const [terminated] = (await outbox.claim()).messages;
+  const killed = { apply: async (_change, _prepared, query) => {
+    const { pid } = (await query('SELECT pg_backend_pid() AS pid')).rows[0];
+    await pool.query('SELECT pg_terminate_backend($1)', [pid]);
+    // The server ends the session while it is idle in the transaction.
+    await sleep(300);
+    await query('SELECT 1');
+  } };
+  await assert.rejects(outbox.process(terminated, killed), /not queryable|Connection terminated/);
+  assert.deepEqual(await row(terminated.eventId), { ...await row(terminated.eventId), delivery_state: 'pending', failures: 0 });
+  assert.equal(await head(spaceId, created.ref.id), undefined);
+
+  const [poison] = (await outbox.claim()).messages;
+  assert.equal(await outbox.process(poison, { apply: async () => { throw new Error('bad document'); } }), 'failed');
+  assert.equal((await row(poison.eventId)).failures, 1);
+});
+
+test('a tick reaches due work behind more than a claim window of live pairs with nothing due', async () => {
+  const parked = await space(150, `sp_00000000-${randomUUID().slice(9)}`);
+  const paused = await space(60, `sp_00000001-${randomUUID().slice(9)}`);
+  const due = await space(1, `sp_ffffffff-${randomUUID().slice(9)}`);
+  for (const [index, id] of parked.ids.entries()) await write(parked.scope(id), 'create', `{"n":${index}}`);
+  for (const id of paused.ids) await write(paused.scope(id), 'create', '{"n":0}');
+  const target = await write(due.scope(due.collectionId), 'create', '{"n":0}');
+  // Dead letters, rows in backoff and a suspended space keep 210 pairs live with nothing due.
+  await pool.query(`UPDATE projection_outbox SET delivery_state='degraded',failures=8,dead_lettered_at=clock_timestamp(),
+    available_at='infinity' WHERE space_id=$1 AND collection_id=ANY($2)`, [parked.spaceId, parked.ids.filter((_, i) => i % 2 === 0)]);
+  await pool.query(`UPDATE projection_outbox SET delivery_state='degraded',failures=1,available_at=clock_timestamp()+interval '1 hour'
+    WHERE space_id=$1 AND dead_lettered_at IS NULL`, [parked.spaceId]);
+  await pool.query("UPDATE spaces SET lifecycle='suspended',policy_version=policy_version+1 WHERE space_id=$1", [paused.spaceId]);
+  await pool.query('UPDATE outbox_dispatch_checkpoint SET after_space_id=NULL,after_collection_id=NULL');
+  try {
+    const sent = [];
+    const tick = await dispatch(outbox, { send: async messages => { sent.push(...messages); } }, { budgetMs: 10_000 });
+    assert.deepEqual([tick.sent, tick.batches], [1, 1]);
+    const { eventId } = (await pool.query('SELECT event_id AS "eventId" FROM projection_outbox WHERE record_id=$1', [target.ref.id])).rows[0];
+    assert.equal(sent[0].eventId, eventId);
+    // With nothing due anywhere, a tick ends after one full pass instead of spending its budget.
+    const started = Date.now();
+    const idle = await dispatch(outbox, { send: async () => {} }, { budgetMs: 10_000 });
+    assert.equal(idle.claimed, 0);
+    assert.ok(Date.now() - started < 5_000);
+  } finally {
+    await pool.query(`UPDATE projection_outbox SET dead_lettered_at=NULL,available_at=clock_timestamp() WHERE space_id=$1`, [parked.spaceId]);
+  }
+});
+
+test('a placement fence that commits while a step scans for its job is still repaired', async () => {
+  const { scope, collectionId, spaceId } = await space();
+  await pool.query(`INSERT INTO space_directory(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,lifecycle)
+    VALUES($1,'owner','cell-a','cell-a','target-a','active')`, [spaceId]);
+  const writer = scope(collectionId);
+  const ids = [];
+  for (let index = 0; index < 2; index++) ids.push((await write(writer, 'create', `{"n":${index}}`)).ref.id);
+  await deliver(recorder());
+  await pool.query("UPDATE projection_reconciliations SET state='cancelled' WHERE state='running'");
+  const { jobId } = await outbox.reconcile('operator@example.test', spaceId, collectionId, 'race fixture');
+
+  // A role-scoped row policy parks the step's job scan, after its snapshot
+  // and before its row lock, on an advisory lock this test holds.
+  const role = `outbox_paused_${randomUUID().replaceAll('-', '')}`;
+  await pool.query(`CREATE ROLE ${role} NOLOGIN`);
+  await pool.query(`GRANT SELECT,UPDATE ON projection_reconciliations,projection_outbox TO ${role}`);
+  await pool.query(`GRANT SELECT ON spaces,collections,records,record_events,projection_heads TO ${role}`);
+  await pool.query(`CREATE OR REPLACE FUNCTION outbox_test_pause() RETURNS boolean LANGUAGE plpgsql AS $$
+    BEGIN PERFORM pg_advisory_lock_shared(4242); PERFORM pg_advisory_unlock_shared(4242); RETURN true; END $$`);
+  await pool.query(`CREATE POLICY outbox_test_pause ON projection_reconciliations TO ${role} USING (outbox_test_pause())`);
+  await pool.query('ALTER TABLE projection_reconciliations ENABLE ROW LEVEL SECURITY');
+  const pausedPool = new pg.Pool({ connectionString: target.toString(), max: 1, options: `-c role=${role}` });
+  const gate = await pool.connect();
+  try {
+    await gate.query('SELECT pg_advisory_lock(4242)');
+    const stepping = new PostgresOutbox(pausedPool, authority).stepReconciliations(1, 100);
+    for (let polls = 0; ; polls++) {
+      const waiting = await pool.query(`SELECT 1 FROM pg_stat_activity WHERE usename=current_user AND wait_event='advisory'
+        AND query LIKE '%projection_reconciliations%'`);
+      if (waiting.rows.length) break;
+      assert.ok(polls < 100, 'the step reached the paused scan');
+      await sleep(50);
+    }
+    assert.equal(await fencer().fencePlacement(spaceId, 'cell-a', 1), 2);
+    await gate.query('SELECT pg_advisory_unlock(4242)');
+    assert.equal(await stepping, 1);
+  } finally {
+    gate.release();
+    await pausedPool.end();
+    await pool.query('ALTER TABLE projection_reconciliations DISABLE ROW LEVEL SECURITY');
+    await pool.query('DROP POLICY outbox_test_pause ON projection_reconciliations');
+    await pool.query('DROP FUNCTION outbox_test_pause()');
+    await pool.query(`REVOKE ALL ON projection_reconciliations,projection_outbox,spaces,collections,records,record_events,
+      projection_heads FROM ${role}`);
+    await pool.query(`DROP ROLE ${role}`);
+  }
+  const projector = recorder();
+  for (let round = 0; round < 5; round++) { await outbox.stepReconciliations(); await deliver(projector); }
+  assert.equal((await outbox.reconciliation(jobId)).state, 'completed');
+  const fenced = { ...writer, placementGeneration: 2 };
+  for (const id of ids) {
+    assert.equal((await projection(fenced, id)).state, 'current', 'the step paged under the fence generation');
+    assert.deepEqual(await head(spaceId, id), { generation: 2, revision: 1, deleted: false });
+  }
+});
+
+test('a first apply held open does not block replace, patch or delete of its record', async () => {
+  const { spaceId } = await space(0);
+  const collectionId = `entries_${randomUUID()}`;
+  const owner = { spaceId, collectionId, principalId: 'owner', credentialId: 'owner-session', capability: 'schema:write',
+    policyVersion: 1, placementGeneration: 1 };
+  await new CollectionRegistry(pool).define(owner, { slug: collectionId, version: 1, unique: [], filterable: [], sortable: [],
+    schema: { $schema: 'https://json-schema.org/draft/2020-12/schema', type: 'object', additionalProperties: false,
+      properties: { label: { type: 'string' } }, required: ['label'] } });
+  const writer = { ...owner, capability: 'records:write' };
+  const request = body => authority.mutateRequest(writer, { idempotencyKey: randomUUID(), ...body });
+  const created = await request({ operation: 'create', data: { label: 'a' } });
+  const id = created.ref.id;
+  const [lease] = (await outbox.claim()).messages;
+  let entered;
+  let open;
+  const inside = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { open = resolve; });
+  const completing = outbox.process(lease, { apply: async () => { entered(); await gate; } });
+  await inside;
+  const prompt = (work, label) => Promise.race([work, sleep(3_000).then(() => { throw new Error(`${label} waited for projection`); })]);
+  try {
+    await prompt(request({ operation: 'replace', id, expectedRevision: 1, data: { label: 'b' } }), 'replace');
+    await prompt(request({ operation: 'patch', id, expectedRevision: 2, set: { label: 'c' }, unset: [] }), 'patch');
+    await prompt(request({ operation: 'delete', id, expectedRevision: 3 }), 'delete');
+  } finally { open(); }
+  assert.equal(await completing, 'applied');
+  assert.deepEqual(await head(spaceId, id), { generation: 1, revision: 1, deleted: false });
+  const projector = recorder();
+  await deliver(projector);
+  assert.deepEqual(await head(spaceId, id), { generation: 1, revision: 4, deleted: true });
+  assert.equal((await projection({ ...writer, capability: 'records:read' }, id)).state, 'current');
 });

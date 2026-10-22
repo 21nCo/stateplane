@@ -7,7 +7,7 @@ const hint = (n, attempt = 1) => ({ eventId: `evt_${String(n).padStart(8, '0')}-
 
 test('a failed or partial send releases every claimed lease; an empty tick sends nothing', async () => {
   const released = [];
-  const store = claims => ({ claim: async () => claims, release: async messages => { released.push(...messages); return messages.length; },
+  const store = claims => ({ claim: async () => ({ messages: claims, scan: 'whole' }), release: async messages => { released.push(...messages); return messages.length; },
     stepReconciliations: async () => 0 });
   let sends = 0;
   assert.deepEqual(await dispatch(store([]), { send: async () => { sends++; } }), { claimed: 0, sent: 0, released: 0, batches: 0 });
@@ -23,7 +23,7 @@ test('a failed or partial send releases every claimed lease; an empty tick sends
 test('a dispatch tick keeps claiming until nothing is due, its budget is spent or a send fails', async () => {
   const queued = (...batches) => {
     const claims = [];
-    return { claims, claim: async limits => { claims.push(limits); return batches.shift() ?? []; },
+    return { claims, claim: async limits => { claims.push(limits); return { messages: batches.shift() ?? [], scan: 'whole' }; },
       release: async messages => messages.length, stepReconciliations: async () => 0 };
   };
   const sent = [];
@@ -37,13 +37,39 @@ test('a dispatch tick keeps claiming until nothing is due, its budget is spent o
   // Without a budget a tick sends one batch, as before.
   assert.equal((await dispatch(queued([hint(6)], [hint(7)]), transport)).batches, 1);
   let clock = 0;
-  const endless = { claim: async () => [hint(++clock)], release: async () => 0, stepReconciliations: async () => 0 };
+  const endless = { claim: async () => ({ messages: [hint(++clock)], scan: 'partial' }), release: async () => 0, stepReconciliations: async () => 0 };
   assert.equal((await dispatch(endless, transport, { budgetMs: 3, now: () => clock })).batches, 3);
   let calls = 0;
   const flaky = { send: async () => { if (++calls === 2) throw new Error('queue unavailable'); } };
   const partial = await dispatch(queued([hint(8)], [hint(9), hint(10)], [hint(11)]), flaky, { budgetMs: 60_000 });
   assert.deepEqual([partial.claimed, partial.sent, partial.released, partial.batches], [3, 1, 2, 2]);
   for (const budgetMs of [-1, 1.5, 600_001]) await assert.rejects(dispatch(endless, transport, { budgetMs }), RangeError);
+});
+
+test('an empty claim ends a tick only once the empty run has covered every live pair', async () => {
+  const walk = (...claims) => {
+    const seen = [];
+    return { seen, claim: async () => { const next = claims.shift() ?? { messages: [], scan: 'whole' }; seen.push(next); return next; },
+      release: async () => 0, stepReconciliations: async () => 0 };
+  };
+  const empty = scan => ({ messages: [], scan });
+  const sent = [];
+  const transport = { send: async messages => { sent.push(...messages); } };
+  // Windows of non-due pairs precede due work; one start crossing is not yet a full pass.
+  const behind = walk(empty('partial'), empty('wrapped'), empty('partial'), { messages: [hint(1)], scan: 'partial' },
+    empty('wrapped'), empty('partial'), empty('wrapped'), empty('partial'));
+  assert.deepEqual(await dispatch(behind, transport, { budgetMs: 60_000 }), { claimed: 1, sent: 1, released: 0, batches: 1 });
+  assert.equal(behind.seen.length, 7, 'the tick stopped at the second start crossing after the last lease');
+  assert.deepEqual(sent, [hint(1)]);
+  // A walk that visited every pair ends the tick at once, and so does a busy cursor.
+  const whole = walk(empty('whole'), { messages: [hint(2)], scan: 'whole' });
+  assert.equal((await dispatch(whole, transport, { budgetMs: 60_000 })).claimed, 0);
+  assert.equal(whole.seen.length, 1);
+  // The budget still bounds a tick that never completes a pass.
+  let clock = 0;
+  const partial = { claim: async () => { clock++; return empty('partial'); }, release: async () => 0, stepReconciliations: async () => 0 };
+  assert.equal((await dispatch(partial, transport, { budgetMs: 3, now: () => clock })).batches, 0);
+  assert.equal(clock, 3);
 });
 
 test('delivery hints have one exact shape and grant nothing else', () => {

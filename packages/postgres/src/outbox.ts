@@ -16,6 +16,12 @@ export interface Projector<P = unknown> {
 }
 export type ProcessOutcome = ProjectionOutcome | 'failed' | 'released';
 export interface DispatchLimits { limit?: number; perSpace?: number; pairs?: number; leaseSeconds?: number }
+/**
+ * How far one claim's pair walk got: `whole` visited every live pair,
+ * `wrapped` began at or passed the start of the pair order, `partial` did
+ * neither. An empty claim alone does not mean nothing is due.
+ */
+export interface ClaimResult { messages: DeliveryMessage[]; scan: 'whole' | 'wrapped' | 'partial' }
 export interface OutboxOptions { processingMs?: number }
 /** Counts cover at most the oldest-due `STATUS_SAMPLE` live rows; `capped` marks a lower bound. */
 export interface CollectionOutboxStatus {
@@ -35,10 +41,11 @@ const EVENT_ID = /^evt_[0-9a-f-]{36}$/;
 const JOB_ID = /^rcn_[0-9a-f-]{36}$/;
 const WORKER = { principalId: 'system:projection', credentialId: 'system:projection', capability: 'outbox:worker' } as const;
 // Initial protective bounds, not measured provider capacity: one statement
-// stays short, and one started item must finish well inside its lease.
+// stays short, and one started item must finish well inside its lease. The
+// processing budget is the authority's request budget (at most 30 s), and
+// the stalled-apply backstop adds 5 s.
 const STATEMENT_MS = 5_000;
 const PROCESSING_LEASE_MS = 60_000;
-const PROCESSING_BUDGET_MS = 45_000;
 const STATUS_ROWS = 1_000;
 // Status reads at most STATUS_PAIRS × STATUS_SAMPLE live rows, so it stays
 // usable during the backlog it reports. See docs/durable-outbox.md.
@@ -53,12 +60,28 @@ const RELEASE_SQL = `UPDATE projection_outbox o
 
 class ProjectorFailure extends Error {}
 
+// A lost session, a rolled-back serialization or deadlock, exhausted
+// resources, a lock budget, a server shutdown or a system I/O error, plus the
+// driver's socket and connection errors. A statement timeout is not here: an
+// overrun is the item's.
+const INFRASTRUCTURE_SQLSTATE = /^(?:(?:08|40|53|58)[0-9A-Z]{3}|55P03|57P0[0-9])$/;
+function infrastructureFault(error: unknown): boolean {
+  if (!(error instanceof Error) || error instanceof AuthorityError) return false;
+  const code = (error as { code?: unknown }).code;
+  if (typeof code === 'string') return INFRASTRUCTURE_SQLSTATE.test(code) || /^E[A-Z_]+$/.test(code);
+  return /^Connection terminated|not queryable/.test(error.message);
+}
+
 /** Run one short cell transaction; a missing COMMIT acknowledgement stays ambiguous. */
 async function inTransaction<T>(pool: PoolLike, fn: (db: pg.PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();
   let begun = false;
   // An unacknowledged BEGIN or COMMIT leaves the session state unknown.
   let discard = true;
+  // The pool detaches its listener on checkout; a server-ended session must
+  // fail this transaction, not the process.
+  const onError = () => { discard = true; };
+  client.on('error', onError);
   try {
     await client.query('BEGIN'); begun = true; discard = false;
     await client.query(`SET LOCAL statement_timeout = '${STATEMENT_MS}ms'`);
@@ -69,7 +92,7 @@ async function inTransaction<T>(pool: PoolLike, fn: (db: pg.PoolClient) => Promi
   } catch (error) {
     if (begun) await client.query('ROLLBACK').catch(() => { discard = true; });
     throw error;
-  } finally { client.release(discard); }
+  } finally { client.release(discard); client.removeListener('error', onError); }
 }
 
 function bounded(value: unknown, min: number, max: number): number {
@@ -106,9 +129,14 @@ function within<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
  */
 export class PostgresOutbox {
   private readonly processingMs: number;
-  /** `processingMs` bounds one item's prepare, apply and completion (default and maximum 45 s). */
+  /**
+   * `processingMs` bounds one item's prepare, apply and completion. Its
+   * default and maximum is the authority's request budget, so one deadline
+   * drives the abort signal, every statement timeout and the stalled-apply
+   * backstop, and the worker's own rollback always comes first.
+   */
   constructor(private readonly pool: PoolLike, private readonly authority: PostgresAuthority, options: OutboxOptions = {}) {
-    this.processingMs = bounded(options.processingMs ?? PROCESSING_BUDGET_MS, 1, PROCESSING_BUDGET_MS);
+    this.processingMs = bounded(options.processingMs ?? authority.requestBudgetMs, 1, authority.requestBudgetMs);
   }
 
   /**
@@ -118,9 +146,10 @@ export class PostgresOutbox {
    * cuts a claim short, the cursor moves past the last pair served, so the
    * next claim starts with the pairs that missed out. A dispatch lease is not
    * started: if the hint is lost, the lease expires and is reclaimed without
-   * spending the row's failure budget.
+   * spending the row's failure budget. While another dispatcher holds the
+   * cursor, a claim returns nothing as a `whole` scan.
    */
-  async claim(limits: DispatchLimits = {}): Promise<DeliveryMessage[]> {
+  async claim(limits: DispatchLimits = {}): Promise<ClaimResult> {
     const limit = bounded(limits.limit ?? 100, 1, 100);
     const perSpace = bounded(limits.perSpace ?? Math.min(25, limit), 1, limit);
     const pairs = bounded(limits.pairs ?? 200, 1, 1_000);
@@ -128,10 +157,11 @@ export class PostgresOutbox {
     return inTransaction(this.pool, async db => {
       const cursor = (await db.query(`SELECT after_space_id,after_collection_id FROM outbox_dispatch_checkpoint
         FOR UPDATE SKIP LOCKED`)).rows[0];
-      if (!cursor) return [];
+      if (!cursor) return { messages: [], scan: 'whole' };
       const after: [string, string] | null = cursor.after_space_id === null ? null : [cursor.after_space_id, cursor.after_collection_id];
       let scanned = await this.scanPairs(db, after, null, pairs);
       let next = scanned.length === pairs ? scanned.at(-1)! : null;
+      let scan: ClaimResult['scan'] = after ? 'partial' : next ? 'wrapped' : 'whole';
       if (after && scanned.length < pairs) {
         // Wrap to the start and stop at the old cursor; a short wrap means
         // every live pair was visited and the next claim starts over.
@@ -139,6 +169,7 @@ export class PostgresOutbox {
         const wrapped = await this.scanPairs(db, null, after, budget);
         scanned = [...scanned, ...wrapped];
         next = wrapped.length === budget ? wrapped.at(-1)! : null;
+        scan = next ? 'wrapped' : 'whole';
       }
       const due = `SELECT o.event_id FROM projection_outbox o JOIN (
           SELECT event_id FROM (
@@ -163,7 +194,7 @@ export class PostgresOutbox {
       }
       await db.query(`UPDATE outbox_dispatch_checkpoint SET after_space_id=$1,after_collection_id=$2,
         dispatched_at=clock_timestamp()`, [next?.[0] ?? null, next?.[1] ?? null]);
-      return claimed.rows.map(row => ({ eventId: row.event_id, attempt: row.attempts }));
+      return { messages: claimed.rows.map(row => ({ eventId: row.event_id, attempt: row.attempts })), scan };
     });
   }
 
@@ -204,7 +235,9 @@ export class PostgresOutbox {
    * requeued or superseded without running the projector. A projector
    * failure or overrun is recorded against the lease; a policy, placement or
    * lifecycle change at completion releases it so a later claim re-runs it
-   * under fresh scope. The budget bounds prepare, apply and completion.
+   * under fresh scope. The budget bounds prepare, apply and completion. An
+   * infrastructure fault from apply's query port, like any other with a
+   * known rollback, releases the lease uncounted and is rethrown.
    */
   async process(message: DeliveryMessage, projector?: Projector): Promise<ProcessOutcome> {
     const { eventId, attempt } = this.message(message);
@@ -247,8 +280,15 @@ export class PostgresOutbox {
         catch (error) { throw new ProjectorFailure('prepare failed', { cause: error }); }
       }
       const apply = active && (async (current: ProjectionChange, query: ProjectionQuery) => {
-        try { await within(active.apply(current, prepared, query), signal); }
-        catch (error) { throw new ProjectorFailure('apply failed', { cause: error }); }
+        // The transaction is lost once its session faults, whatever apply
+        // does with the error, so the fault decides the outcome.
+        let fault: unknown;
+        const port: ProjectionQuery = (sql, values) => query(sql, values).catch(error => {
+          if (infrastructureFault(error)) fault ??= error;
+          throw error;
+        });
+        try { await within(active.apply(current, prepared, port), signal); }
+        catch (error) { throw fault ?? new ProjectorFailure('apply failed', { cause: error }); }
       });
       return await this.authority.transaction(scope, tx => tx.completeProjection(delivery, apply), deadline, signal);
     } catch (error) {
@@ -400,13 +440,17 @@ export class PostgresOutbox {
     let stepped = 0;
     for (let index = 0; index < jobs; index++) {
       const advanced = await inTransaction(this.pool, async db => {
-        const job = (await db.query(`SELECT j.job_id,j.space_id,j.collection_id,j.after_record_id,
-            s.lifecycle,s.placement_generation,c.lifecycle AS collection_lifecycle
-          FROM projection_reconciliations j JOIN spaces s ON s.space_id=j.space_id
-          JOIN collections c ON c.space_id=j.space_id AND c.collection_id=j.collection_id
-          WHERE j.state='running' AND j.next_step_at<=clock_timestamp()
-          ORDER BY j.next_step_at,j.job_id FOR UPDATE OF j SKIP LOCKED LIMIT 1`)).rows[0];
+        const job = (await db.query(`SELECT job_id,space_id,collection_id,after_record_id FROM projection_reconciliations
+          WHERE state='running' AND next_step_at<=clock_timestamp()
+          ORDER BY next_step_at,job_id FOR UPDATE SKIP LOCKED LIMIT 1`)).rows[0];
         if (!job) return false;
+        // Scope is read by a later statement than the job lock. A fence that
+        // reset this job committed before the lock was granted, so this
+        // snapshot sees its generation; a later fence waits for this step
+        // and then resets the job again.
+        Object.assign(job, (await db.query(`SELECT s.lifecycle,s.placement_generation,c.lifecycle AS collection_lifecycle
+          FROM spaces s JOIN collections c ON c.space_id=s.space_id AND c.collection_id=$2 WHERE s.space_id=$1`,
+        [job.space_id, job.collection_id])).rows[0]);
         if (job.collection_lifecycle === 'deleted') {
           await db.query(`UPDATE projection_reconciliations SET state='cancelled',updated_at=clock_timestamp() WHERE job_id=$1`, [job.job_id]);
           return true;
