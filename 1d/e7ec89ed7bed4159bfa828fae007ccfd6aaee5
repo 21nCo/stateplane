@@ -1,0 +1,21 @@
+docs/durable-outbox.md
+  s_e1c5fc1a65c0cf::t_2fd7add3b12753 12
+packages/postgres/src/index.ts
+  s_e1c5fc1a65c0cf::t_f45942f8548bd4 666-668,2041-2042,2044
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1de7ec89ed7bed4159bfa828fae007ccfd6aaee5",
+  "prompts": {},
+  "sessions": {
+    "s_e1c5fc1a65c0cf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a13e18-4241-7662-a24f-782076addabe",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
