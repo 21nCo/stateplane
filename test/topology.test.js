@@ -259,6 +259,8 @@ test('rendered control, gateways and every cell use isolated names and secret-fr
       assert.equal(regional[1].queues.producers[0].queue, `${env.prefix}-${cell.id}-projection`);
       assert.equal(regional[2].queues.consumers[0].queue, `${env.prefix}-${cell.id}-projection`);
       assert.equal(regional[2].queues.consumers[0].dead_letter_queue, `${env.prefix}-${cell.id}-projection-dlq`);
+      assert.deepEqual(regional[2].queues.producers, [{ binding: 'PROJECTION_JOBS', queue: `${env.prefix}-${cell.id}-projection` }]);
+      assert.deepEqual(regional[2].triggers, { crons: ['* * * * *'] });
     }
     assert.equal(/password|DATABASE_URL|POSTGRES_PASSWORD/i.test(JSON.stringify(rendered)), false);
   }

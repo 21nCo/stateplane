@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { commitBeforeDeadline, CommitNotSentDeadlineExceeded } from './commit-deadline.js';
+import { claimOutboxSql, failOutboxSql, LIVE_OUTBOX } from './outbox-sql.js';
 import { parseRevision } from '@stateplane/contracts';
 import type { Capability, CollectionId, RecordRef, Revision, SpaceId } from '@stateplane/contracts';
 import { acceptsInProcessObjects, canonical, derivedParsedValues, externalKey, fingerprint, isInProcessProxy, MAX_INDEX_PART_BYTES, MAX_INDEX_VALUE_BYTES, plainJson, scalarString as unicodeString, utcInstant, validateParsedValue } from './schema.js';
@@ -46,6 +47,14 @@ export interface AuthorityRecord {
 export interface OutboxDelivery {
   eventId: string; ref: RecordRef; revision: number; generation: number; attempt: number;
 }
+/** One authoritative revision to project; a delete carries no content. */
+export interface ProjectionChange {
+  ref: RecordRef; revision: number; generation: number; deleted: boolean; canonicalData: string | null;
+}
+/** Statements run inside the fenced completion transaction and end with it. */
+export type ProjectionQuery = (sql: string, values?: unknown[]) => Promise<pg.QueryResult>;
+export type ProjectionApply = (change: ProjectionChange, query: ProjectionQuery) => Promise<void>;
+export type ProjectionOutcome = 'applied' | 'superseded' | 'requeued' | 'lost';
 export type ScalarPredicate =
   | { field: string; kind: 'null'; operator: 'isNull' }
   | { field: string; kind: 'string' | 'date-time' | 'number' | 'boolean'; operator: 'eq' | 'lt' | 'lte' | 'gt' | 'gte'; value: string | number | boolean }
@@ -1192,7 +1201,11 @@ export class AuthorityTransaction {
     return this.admitOperation(async()=>{
       if (this.#scope.capability!=='records:read') throw new AuthorityError('FORBIDDEN');
       if (!scalarString(recordId)) throw new AuthorityError('INVALID_ARGUMENT');
-      const rows=await this.query(`SELECT r.revision,o.generation,o.delivery_state FROM records r
+      // Delivery under an earlier placement generation is not current here;
+      // the completing worker requeues the latest revision under the new one.
+      const rows=await this.query(`SELECT r.revision,o.generation,o.delivery_state,
+          o.generation=s.placement_generation AS placed FROM records r
+        JOIN spaces s ON s.space_id=r.space_id
         JOIN projection_outbox o ON o.space_id=r.space_id AND o.collection_id=r.collection_id
           AND o.record_id=r.record_id AND o.revision=r.revision
         WHERE r.space_id=$1 AND r.collection_id=$2 AND r.record_id=$3`,
@@ -1200,7 +1213,7 @@ export class AuthorityTransaction {
       const row=rows.rows[0];
       if (!row) throw new AuthorityError('NOT_FOUND');
       let state:'current'|'degraded'|'pending'='pending';
-      if (row.delivery_state==='delivered') state='current';
+      if (row.delivery_state==='delivered' && row.placed) state='current';
       else if (row.delivery_state==='degraded') state='degraded';
       return {state,
         generation:Number(row.generation),revision:Number(row.revision)};
@@ -1963,12 +1976,10 @@ export class AuthorityTransaction {
     return this.admitOperation(async () => {
     if (this.#scope.capability !== 'outbox:worker') throw new AuthorityError('FORBIDDEN');
     if (!isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE || !isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 3600) throw new AuthorityError('INVALID_ARGUMENT');
-    const result = await this.query(`UPDATE projection_outbox o SET delivery_state='delivering',attempts=o.attempts+1,
-      available_at=clock_timestamp()+($3::integer * interval '1 second')
-      FROM (SELECT event_id FROM projection_outbox WHERE space_id=$1 AND collection_id=$2
-        AND delivery_state IN ('pending','delivering','degraded') AND available_at<=clock_timestamp()
-        ORDER BY available_at,event_id FOR UPDATE SKIP LOCKED LIMIT $4) due
-      WHERE o.event_id=due.event_id RETURNING o.event_id,o.record_id,o.revision,o.generation,o.attempts`,
+    // This claimant processes its own leases, so they start at claim time.
+    const result = await this.query(claimOutboxSql(`SELECT event_id FROM projection_outbox WHERE space_id=$1 AND collection_id=$2
+        AND ${LIVE_OUTBOX} AND available_at<=clock_timestamp()
+        ORDER BY available_at,event_id FOR UPDATE SKIP LOCKED LIMIT $4`,'$3','true'),
     [...scopeIds(this.#scope),leaseSeconds,limit]);
     return result.rows.map(row => ({ eventId:row.event_id,ref:this.ref(row.record_id),revision:Number(row.revision),
       generation:Number(row.generation),attempt:row.attempts }));
@@ -1977,24 +1988,80 @@ export class AuthorityTransaction {
 
   /** Finish only the still-current leased outbox attempt. */
   finishOutbox(delivery: OutboxDelivery, success: boolean, error?: string): Promise<boolean> {
+    if (typeof success !== 'boolean') return Promise.reject(new AuthorityError('INVALID_ARGUMENT'));
+    return success ? this.completeProjection(delivery).then(outcome => outcome !== 'lost')
+      : this.failProjection(delivery, error ?? 'projection failed');
+  }
+
+  /**
+   * Complete a still-current lease. The per-ref head only moves forward, so a
+   * duplicate, late or reordered delivery cannot overwrite newer work, and an
+   * update older than a delete cannot resurrect it. Work captured under an
+   * earlier placement generation never applies; the latest revision is
+   * requeued under the current generation instead of being lost.
+   */
+  completeProjection(delivery: OutboxDelivery, apply?: ProjectionApply): Promise<ProjectionOutcome> {
     return this.admitOperation(async () => {
+      this.requireDelivery(delivery);
+      if (apply !== undefined && typeof apply !== 'function') throw new AuthorityError('INVALID_ARGUMENT');
+      const lease = [...scopeIds(this.#scope), delivery.eventId];
+      const row = (await this.query(`SELECT o.record_id,o.revision,o.generation,e.operation,e.canonical_data,r.revision AS latest
+        FROM projection_outbox o JOIN record_events e ON e.event_id=o.event_id
+        JOIN records r ON r.space_id=o.space_id AND r.collection_id=o.collection_id AND r.record_id=o.record_id
+        WHERE o.space_id=$1 AND o.collection_id=$2 AND o.event_id=$3 AND o.attempts=$4 AND o.revision=$5
+          AND o.generation=$6 AND o.delivery_state='delivering' AND o.available_at>clock_timestamp() FOR UPDATE OF o`,
+      [...lease, delivery.attempt, delivery.revision, delivery.generation])).rows[0];
+      if (!row) return 'lost';
+      const placement = this.#scope.placementGeneration;
+      const revision = Number(row.revision);
+      if (Number(row.generation) !== placement && Number(row.latest) === revision) {
+        await this.query(`UPDATE projection_outbox SET generation=$4,delivery_state='pending',started_attempt=NULL,
+          available_at=clock_timestamp() WHERE space_id=$1 AND collection_id=$2 AND event_id=$3`, [...lease, placement]);
+        return 'requeued';
+      }
+      let outcome: 'applied' | 'superseded' = 'superseded';
+      if (Number(row.generation) === placement) {
+        const deleted = row.operation === 'delete';
+        // The upsert's row lock serializes completions for one ref until commit.
+        const head = await this.query(`INSERT INTO projection_heads(space_id,collection_id,record_id,generation,revision,deleted,event_id)
+          VALUES($1,$2,$4,$5,$6,$7,$3) ON CONFLICT (space_id,collection_id,record_id) DO UPDATE
+          SET generation=EXCLUDED.generation,revision=EXCLUDED.revision,deleted=EXCLUDED.deleted,
+            event_id=EXCLUDED.event_id,applied_at=clock_timestamp()
+          WHERE (projection_heads.generation,projection_heads.revision)<(EXCLUDED.generation,EXCLUDED.revision)`,
+        [...lease, row.record_id, placement, revision, deleted]);
+        if (head.rowCount === 1) {
+          outcome = 'applied';
+          await apply?.({ ref:this.ref(row.record_id), revision, generation:placement, deleted,
+            canonicalData:deleted ? null : row.canonical_data }, (sql, values) => this.query(sql, values));
+        }
+      }
+      await this.query(`UPDATE projection_outbox SET delivery_state='delivered',outcome=$4,delivered_at=clock_timestamp(),
+        available_at=clock_timestamp(),last_error=NULL,started_attempt=NULL
+        WHERE space_id=$1 AND collection_id=$2 AND event_id=$3`, [...lease, outcome]);
+      return outcome;
+    }, true);
+  }
+
+  /** Record a failed current lease with backoff, parking it after the failure budget. */
+  failProjection(delivery: OutboxDelivery, error: string): Promise<boolean> {
+    return this.admitOperation(async () => {
+      this.requireDelivery(delivery);
+      if (typeof error !== 'string' || error.includes('\0') || error.length > 4096) throw new AuthorityError('INVALID_ARGUMENT');
+      const result = await this.query(failOutboxSql, [...scopeIds(this.#scope), delivery.eventId, delivery.attempt,
+        delivery.revision, delivery.generation, error]);
+      return result.rowCount === 1;
+    }, true);
+  }
+
+  /** Only the internal worker may touch delivery state, and only with a well-formed lease. */
+  private requireDelivery(delivery: OutboxDelivery): void {
     if (this.#scope.capability !== 'outbox:worker') throw new AuthorityError('FORBIDDEN');
-    if (!scalarString(delivery.eventId) || typeof success !== 'boolean' || !isSafeInteger(delivery.attempt) || delivery.attempt < 1 ||
-      (error !== undefined && (typeof error !== 'string' || error.includes('\0') || error.length > 4096))) throw new AuthorityError('INVALID_ARGUMENT');
-    const result = await this.query(`UPDATE projection_outbox SET delivery_state=$5,
-      delivered_at=CASE WHEN $5='delivered' THEN clock_timestamp() ELSE NULL END,
-      last_error=$6,available_at=CASE WHEN $5='delivered' THEN clock_timestamp()
-        ELSE clock_timestamp() + (LEAST(3600, 5 * (1 << LEAST(attempts-1, 10))) * interval '1 second') END
-      WHERE space_id=$1 AND collection_id=$2 AND event_id=$3 AND attempts=$4
-        AND revision=$7 AND generation=$8 AND delivery_state='delivering'
-        AND available_at>clock_timestamp()`,
-    [...scopeIds(this.#scope),delivery.eventId,delivery.attempt,success ? 'delivered' : 'degraded',success ? null : (error ?? 'projection failed'),
-      delivery.revision,delivery.generation]);
-    return result.rowCount === 1;
-    },true);
+    if (!scalarString(delivery?.eventId) || [delivery.attempt, delivery.revision, delivery.generation]
+      .some(value => !isSafeInteger(value) || value < 1)) throw new AuthorityError('INVALID_ARGUMENT');
   }
 }
 
 export * from './spaces.js';
+export * from './outbox.js';
 export * from './cell-policy.js';
 export * from './services.js';

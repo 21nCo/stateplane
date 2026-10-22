@@ -254,7 +254,13 @@ export function renderTopology(topology, environment, inventory, counterpart, ou
       vars: { STATEPLANE_ENV: environment, STATEPLANE_ROLE: 'cell-jobs', STATEPLANE_CELL: cell.id },
       hyperdrive: binding(id),
       r2_buckets: [{ binding: 'ORIGINALS', bucket_name: n.bucket }],
-      queues: { consumers: [{ queue: n.queue, max_batch_size: 1, max_retries: 3, dead_letter_queue: n.deadLetterQueue }] }
+      // The cron tick leases due SQL outbox rows and sends hints; the consumer
+      // applies them. Queue retries and the DLQ only carry hints, never state.
+      triggers: { crons: ['* * * * *'] },
+      queues: {
+        producers: [{ binding: 'PROJECTION_JOBS', queue: n.queue }],
+        consumers: [{ queue: n.queue, max_batch_size: 1, max_retries: 3, dead_letter_queue: n.deadLetterQueue }]
+      }
     };
   }
   return output;

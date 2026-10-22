@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { readFile, readdir } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, readdir, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 
@@ -31,6 +31,7 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
   const url=new URL(baseUrl); url.pathname=`/${name}`;
   const admin=new pg.Client({connectionString:baseUrl});
   let upgrade;let writer;let blocker;let reader;let migration;
+  const staged=new URL(`../../.data/event-feed-migrator-${randomUUID()}/`,import.meta.url);
   await admin.connect();
   try {
     await admin.query(`CREATE DATABASE ${name}`);
@@ -63,8 +64,18 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     await upgrade.query(`INSERT INTO record_events(event_id,space_id,collection_id,record_id,revision,
       operation,credential_id,schema_version,canonical_data)
       VALUES('event-1','sta9-event','entries','record-1',1,'create','agent',1,'{}')`);
+    // The scenario reruns 038 as the newest applied step, so it uses a copy of
+    // the migrator whose inventory ends there. Repository-local staging keeps
+    // package resolution; the real migrator applies later files at the end.
+    await mkdir(new URL('scripts/',staged),{recursive:true});
+    await mkdir(new URL('migrations/',staged));
+    for (const file of ['migrate.mjs','db-connection.mjs','migration-order.mjs'])
+      await copyFile(new URL(`../../scripts/${file}`,import.meta.url),new URL(`scripts/${file}`,staged));
+    for (const file of files.filter(file=>file<'039_'))
+      await copyFile(new URL(`../../migrations/${file}`,import.meta.url),new URL(`migrations/${file}`,staged));
+    const migrator=fileURLToPath(new URL('scripts/migrate.mjs',staged));
     const env={...process.env,DATABASE_URL:url.href};
-    const migrate=(drained)=>execFileSync(process.execPath,['scripts/migrate.mjs'],{cwd,encoding:'utf8',timeout:15_000,
+    const migrate=(drained,script=migrator)=>execFileSync(process.execPath,[script],{cwd,encoding:'utf8',timeout:15_000,
       env:{...env,STATEPLANE_POPULATED_INDEX_UPGRADE:drained?'drained':''}});
     let refused;
     try { migrate(false); } catch(error) { refused=error; }
@@ -78,7 +89,7 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     await blocker.connect();
     await blocker.query('BEGIN');
     await blocker.query('LOCK TABLE batch_items IN ACCESS EXCLUSIVE MODE');
-    migration=spawn(process.execPath,['scripts/migrate.mjs'],{cwd,
+    migration=spawn(process.execPath,[migrator],{cwd,
       env:{...env,STATEPLANE_POPULATED_INDEX_UPGRADE:'drained'},stdio:['ignore','pipe','pipe']});
     const migrationClosed=once(migration,'close');
     let migrationError='';
@@ -120,7 +131,7 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     migrate(true);
     assert.deepEqual((await upgrade.query(`SELECT event_id FROM record_event_feed`)).rows,
       [{event_id:'event-1'}]);
-    assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name>='036_'")).rows[0].n,3);
+    assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name>='036_' AND name<'039_'")).rows[0].n,3);
     assert.equal((await upgrade.query("SELECT to_regclass('public.record_events_scoped_cursor') AS name")).rows[0].name,null);
     migrate(false);
 
@@ -133,7 +144,7 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     await reader.connect();
     await reader.query('BEGIN');
     await reader.query('LOCK TABLE record_events IN ACCESS SHARE MODE');
-    migration=spawn(process.execPath,['scripts/migrate.mjs'],{cwd,
+    migration=spawn(process.execPath,[migrator],{cwd,
       env:{...env,STATEPLANE_POPULATED_INDEX_UPGRADE:'drained'},stdio:['ignore','pipe','pipe']});
     const dropClosed=once(migration,'close');
     let dropError='';
@@ -158,8 +169,9 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     await reader.query('ROLLBACK');
     await reader.end();
     reader=undefined;
-    migrate(true);
+    migrate(true,'scripts/migrate.mjs');
     assert.equal((await upgrade.query("SELECT to_regclass('public.record_events_scoped_cursor') AS name")).rows[0].name,null);
+    assert.equal((await upgrade.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,files.length);
   } finally {
     if (migration) {
       migration.kill('SIGTERM');
@@ -173,6 +185,7 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     await reader?.query('ROLLBACK').catch(()=>{});
     await reader?.end().catch(()=>{});
     await upgrade?.end().catch(()=>{});
+    await rm(staged,{recursive:true,force:true});
     await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
     await admin.end();
   }

@@ -1,7 +1,21 @@
 import { describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({ closed: 0, connected: 0, failClose: false, denyGrants: false, denyCatalog: false, ownsObject: false, denyVector: false, wrongIdentity: false }));
-vi.mock('pg', () => ({ Client: class {
+const cell = vi.hoisted(() => ({ pools: 0, ended: 0, claims: [] as unknown[], released: [] as unknown[], stepped: 0, processed: [] as unknown[] }));
+vi.mock('@stateplane/postgres', () => ({
+  PostgresAuthority: class {},
+  PostgresOutbox: class {
+    async claim() { return cell.claims; }
+    async release(messages: unknown[]) { cell.released.push(...messages); return messages.length; }
+    async stepReconciliations() { cell.stepped++; return 0; }
+    async process(message: { attempt: number }) {
+      cell.processed.push(message);
+      if (message.attempt === 9) throw new Error('connection refused');
+      return message.attempt === 2 ? 'failed' : 'applied';
+    }
+  }
+}));
+vi.mock('pg', () => ({ default: { Pool: class { constructor() { cell.pools++; } async end() { cell.ended++; } } }, Client: class {
   async connect() { state.connected++; }
   async end() { state.closed++; if (state.failClose) throw new Error('close failed'); }
   async query(sql: string) {
@@ -26,8 +40,43 @@ const request = (token = 'secret') => new Request('https://preview.example/verif
   method: 'POST', headers: { authorization: `Bearer ${token}` }
 });
 
-it('projection queue rejects its batch so Cloudflare can retry and send it to the DLQ', async () => {
-  await expect(jobs.queue()).rejects.toThrow('Projection worker is not active');
+const hint = (attempt: number) => ({ eventId: 'evt_00000000-0000-4000-8000-000000000000', attempt });
+function batch(bodies: unknown[]) {
+  const settled: string[] = [];
+  const messages = bodies.map((body, index) => ({ body, ack: () => settled.push(`ack:${index}`), retry: () => settled.push(`retry:${index}`) }));
+  return { settled, value: { messages } as never };
+}
+const jobsEnv = (sendBatch = vi.fn(async () => ({}))) => ({ AUTHORITY: { connectionString: 'postgres://example/cell' },
+  PROJECTION_JOBS: { sendBatch } }) as never;
+
+describe('cell jobs Worker', () => {
+  it('fails closed without its authority binding so Cloudflare redelivers the batch', async () => {
+    const delivered = batch([hint(1)]);
+    await expect(jobs.queue(delivered.value, {} as never)).rejects.toThrow('Cell authority binding is missing');
+    await expect(jobs.scheduled({} as never, {} as never)).rejects.toThrow('Cell authority binding is missing');
+    expect(delivered.settled).toEqual([]);
+  });
+
+  it('acks settled and malformed hints and redelivers only infrastructure failures', async () => {
+    const before = { ended: cell.ended, pools: cell.pools };
+    const delivered = batch([hint(1), { eventId: 'evt_x', attempt: 1 }, hint(2), hint(9)]);
+    await jobs.queue(delivered.value, jobsEnv());
+    expect(delivered.settled.sort()).toEqual(['ack:0', 'ack:1', 'ack:2', 'retry:3']);
+    expect(cell.processed).toEqual([hint(1), hint(2), hint(9)]);
+    expect([cell.pools - before.pools, cell.ended - before.ended]).toEqual([1, 1]);
+  });
+
+  it('sends leased hints as plain bodies and releases the batch when the Queue rejects it', async () => {
+    cell.claims = [hint(1)];
+    const sendBatch = vi.fn(async () => ({}));
+    await jobs.scheduled({} as never, jobsEnv(sendBatch));
+    expect(sendBatch).toHaveBeenCalledWith([{ body: hint(1) }]);
+    expect([cell.released, cell.stepped]).toEqual([[], 1]);
+    const ended = cell.ended;
+    await expect(jobs.scheduled({} as never, jobsEnv(vi.fn(async () => { throw new Error('queue unavailable'); }))))
+      .rejects.toThrow('Projection dispatch released 1 leases');
+    expect([cell.released, cell.stepped, cell.ended - ended]).toEqual([[hint(1)], 2, 1]);
+  });
 });
 
 describe('operational Worker connection proof', () => {

@@ -53,6 +53,9 @@ importers:
       '@stateplane/read-model':
         specifier: workspace:*
         version: link:packages/read-model
+      '@stateplane/workers':
+        specifier: workspace:*
+        version: link:packages/workers
       '@superfunctions/db':
         specifier: 0.2.1
         version: 0.2.1(drizzle-orm@0.45.3(@cloudflare/workers-types@5.20260918.1)(@types/pg@8.20.0)(pg@8.22.0))

@@ -61,10 +61,15 @@ const preservedTables = ['spaces','collections','collection_versions','collectio
   'collection_unique_declarations','collection_index_declarations','records','record_unique_keys',
   'record_index_values','record_events','idempotency_receipts','record_tombstones','projection_outbox',
   'entity_refs'];
+// Later migrations may add delivery columns; upgraded rows must keep their
+// original values, and the added columns are checked for defaults separately.
+const preservedColumns = { projection_outbox:`SELECT event_id,space_id,collection_id,record_id,revision,generation,
+  delivery_state,attempts,available_at,delivered_at,last_error FROM projection_outbox` };
 const facts = async client => {
   const result={};
   for (const table of preservedTables) {
-    result[table]=(await client.query(`SELECT row_to_json(t) AS fact FROM ${table} t ORDER BY row_to_json(t)::text`))
+    const source=preservedColumns[table] ? `(${preservedColumns[table]})` : table;
+    result[table]=(await client.query(`SELECT row_to_json(t) AS fact FROM ${source} t ORDER BY row_to_json(t)::text`))
       .rows.map(row=>row.fact);
   }
   return result;
@@ -150,7 +155,10 @@ try {
     assert.match(output,/Applied 027_nul_canonical_records.sql/);
     assert.match(output,/Applied 028_schema_commit_fence.sql/);
     assert.match(output,/Applied 029_external_key_identity.sql/);
+    assert.match(output,/Applied 039_durable_outbox.sql/);
     assert.deepEqual(await facts(upgraded),before);
+    assert.deepEqual((await upgraded.query(`SELECT count(*)::int AS n FROM projection_outbox
+      WHERE failures<>0 OR started_attempt IS NOT NULL OR dead_lettered_at IS NOT NULL OR outcome IS NOT NULL`)).rows[0].n,0);
     const actor={kind:'session',userPrincipalId:'owner',credentialId:'upgrade-session'};
     const pool=new pg.Pool({connectionString:url(names[0])});
     try {
