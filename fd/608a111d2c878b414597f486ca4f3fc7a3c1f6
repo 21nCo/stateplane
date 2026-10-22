@@ -1,0 +1,19 @@
+test/operational-worker.test.ts
+  s_c6fe4ef6c811e2::t_0e835669c9f7c6 4,8,69-70,73-74,76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fd608a111d2c878b414597f486ca4f3fc7a3c1f6",
+  "prompts": {},
+  "sessions": {
+    "s_c6fe4ef6c811e2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_c6fe4ef6c811e2",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
