@@ -87,7 +87,13 @@ test.beforeAll(async ({ request }, testInfo) => {
 
 test('owner grants an agent key, the API enforces it and revocation is verified', async ({ browser, page }) => {
   await signIn(page, ownerToken);
-  await go(page, accessUrl());
+  // The space's section navigation leads to the access page.
+  await go(page, spaceUrl);
+  const sections = page.getByRole('navigation', { name: 'Space sections' });
+  await sections.getByRole('link', { name: 'Agent access' }).click();
+  await page.waitForURL(url => url.pathname === accessUrl());
+  await expect(sections.getByRole('link', { name: 'Agent access' })).toHaveAttribute('aria-current', 'page');
+  await settle(page);
   const items = page.getByRole('group', { name: 'Collection items' });
   await items.getByLabel('records:read', { exact: true }).check();
   await page.getByRole('button', { name: 'Issue key' }).click();
@@ -276,6 +282,35 @@ test('an uncertain key issuance asks the owner to inspect the key list, never to
   expect(created).toHaveLength(1);
   await expect(page.getByRole('row').filter({ hasText: created[0] })).toBeVisible();
   await expect(issue).toBeVisible();
+});
+
+test('an issuance in flight sends no second request on a repeated click or Enter, so one key is issued and its secret stays shown', async ({ page, request }) => {
+  await signIn(page, ownerToken);
+  await go(page, accessUrl());
+  const before = await keyCount(request);
+  // Hold every issuance post until the repeats have been tried.
+  let release = () => {};
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let posts = 0;
+  await page.route(url => url.search === '?/issue', async route => { posts++; await held; await route.continue(); });
+  await page.getByRole('group', { name: 'Collection items' }).getByLabel('records:read', { exact: true }).check();
+  const issue = page.getByRole('button', { name: 'Issue key' });
+  await issue.click();
+  await expect.poll(() => posts).toBe(1);
+  await issue.dblclick({ force: true });
+  await page.getByRole('group', { name: 'Another collection' }).getByLabel('Collection name').press('Enter');
+  await page.waitForTimeout(500); // Time for a repeat to be sent, were one allowed.
+  release();
+  const keyId = await issuedId(page);
+  const secret = await issuedSecret(page);
+  await expect(issue).toBeEnabled();
+  await settle(page);
+  expect(posts).toBe(1);
+  const keys = (await (await request.get(`/v1${spaceUrl}/agent-keys`, { headers })).json()).items;
+  expect(keys).toHaveLength(before + 1);
+  expect(keys.map((key: { keyId: string }) => key.keyId)).toContain(keyId);
+  expect(await issuedId(page)).toBe(keyId);
+  expect(await issuedSecret(page)).toBe(secret);
 });
 
 test('a failed issuance reloads the collections, and each choice stays with the collection it was made for', async ({ page, request }) => {

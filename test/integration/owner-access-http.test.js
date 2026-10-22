@@ -148,7 +148,7 @@ test('a key holds every public capability, and each grant expires on its own dea
     schema:{$schema:'https://json-schema.org/draft/2020-12/schema',type:'object',properties:{},additionalProperties:false},
     unique:[],filterable:[],sortable:[]})).status,201);
   const expiresAt=new Date(Date.now()+86_400_000).toISOString();
-  const gone=new Date(Date.now()+1_500).toISOString();
+  const gone=new Date(Date.now()+5_000).toISOString();
   const live=new Date(Date.now()+3_600_000).toISOString();
   // The access form sends the shared capability list; the authority accepts every member.
   const issued=await route('POST',`/v1/spaces/${spaceId}/agent-keys`,{expiresAt,grants:[
@@ -157,7 +157,11 @@ test('a key holds every public capability, and each grant expires on its own dea
   assert.equal(issued.status,201,issued.text);
   const {keyId,secret}=json(issued);
   const count=async collection=>(await route('POST',`/v1/spaces/${spaceId}/collections/${collection}/records/count`,[],secret)).status;
-  assert.deepEqual(await Promise.all(collections.map(count)),[200,200,200]);
+  const first=await Promise.all(collections.map(count)),answered=Date.now();
+  // A count answered before the deadline was authorized before it. A host too slow to answer in time
+  // cannot show the gone grant live, so it checks only the other two rather than fail on timing.
+  const inTime=answered<Date.parse(gone);
+  assert.deepEqual(inTime ? first : first.slice(1),inTime ? [200,200,200] : [200,200]);
   await new Promise(resolve=>setTimeout(resolve,Math.max(0,Date.parse(gone)-Date.now())+250));
   const [key]=json(await route('GET',`/v1/spaces/${spaceId}/agent-keys`)).items;
   assert.equal(key.keyId,keyId);

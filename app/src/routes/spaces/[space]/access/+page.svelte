@@ -13,6 +13,7 @@
   // A host without a key provider refuses issuance and revocation as a nonretryable PROVIDER_UNAVAILABLE.
   const unconfigured=(error?:ApiError|null)=>error?.code==='PROVIDER_UNAVAILABLE' && !error.retryable;
   const notConfigured='Agent keys are not configured on this host, so no retry here can succeed.';
+  let issuing=$state(false);
 </script>
 
 <svelte:head><title>Agent access · Stateplane</title></svelte:head>
@@ -75,9 +76,8 @@
       </Notice>
       {#if form?.issueInvalid}<p role="alert" class="text-sm text-danger">Choose a lifetime and at least one capability for a named collection.</p>{/if}
       {#if form?.issueTooLarge}<p role="alert" class="text-sm text-danger">These grants need {form.issueTooLarge.bytes} bytes; one key's issuance accepts at most {form.issueTooLarge.limit}. Nothing was sent. Choose fewer collections or capabilities, or issue them to more than one key.</p>{/if}
-      <!-- A refused issuance may still have created a key, so the key list it points to is reloaded too.
-           Groups are keyed by collection ID (no ID is empty), so a reloaded list never moves a choice to another collection. -->
-      <form method="POST" action="?/issue" class="space-y-3" use:enhance={()=>async({result,update})=>{await update(); if (result.type==='failure') await invalidateAll();}}>
+      <!-- Each submission issues a key, so one in flight refuses another. A refused issuance may still have created a key, so the key list is reloaded too; groups are keyed by collection ID (never empty), so a reload never moves a choice to another collection. -->
+      <form method="POST" action="?/issue" class="space-y-3" aria-busy={issuing} use:enhance={({cancel})=>{if (issuing) return cancel(); issuing=true; return async({result,update})=>{try {await update(); if (result.type==='failure') await invalidateAll();} finally {issuing=false;}};}}>
         <div><label for="days">Lifetime</label>
           <select id="days" name="days">{#each data.lifetimes as days (days)}<option value={days} selected={days===30}>{days} {days===1 ? 'day' : 'days'}</option>{/each}</select></div>
         {#each rows as slug, index (slug)}
@@ -91,7 +91,7 @@
           </fieldset>
         {/each}
         {#if data.moreCollections}<p class="hint">Only the first 96 collections are listed; name others in the last group.</p>{/if}
-        <button class="btn">Issue key</button>
+        <button class="btn" disabled={issuing}>Issue key</button>
       </form>
     </section>
     <section aria-labelledby="check" class="panel space-y-3">

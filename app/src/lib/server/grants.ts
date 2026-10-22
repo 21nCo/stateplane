@@ -3,7 +3,7 @@ import type { Capability } from '@stateplane/contracts';
 import { carriedId } from '../paths';
 
 /** The issue form offers every capability the authority grants. */
-export const grantable=capabilities;
+export { capabilities as grantable } from '@stateplane/contracts';
 const grantableSet=new Set<string>(capabilities);
 // Lifetime presets keep issuance simple; the service still validates the instant.
 export const lifetimes=[1,7,30,90];
