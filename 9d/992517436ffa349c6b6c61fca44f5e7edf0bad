@@ -1,0 +1,103 @@
+docs/regional-topology.md
+  s_f3c85c4a41c7b4::t_e45ee8edffa85c 46
+scripts/topology.mjs
+  s_f3c85c4a41c7b4::t_7667ba40a43fb0 257-263
+docs/postgres-authority.md
+  s_f3c85c4a41c7b4::t_d8fe8175209b74 25
+README.md
+  s_f3c85c4a41c7b4::t_d3fb07b97d1ba1 5,43
+test/outbox-runtime.test.js
+  s_f3c85c4a41c7b4::t_afd11a3ea09c4c 1-54
+scripts/grant-outbox.mjs
+  s_63b16eb266e6d0::t_c6db2a34253da2 1-34
+packages/postgres/src/outbox-sql.ts
+  s_f3c85c4a41c7b4::t_7befcfebc5c3a6 1-43
+packages/postgres/src/outbox.ts
+  s_f3c85c4a41c7b4::t_44c0f4087b5c44 1-414
+contracts/decisions.md
+  s_f3c85c4a41c7b4::t_91286e36b2d9bb 100
+packages/postgres/src/index.ts
+  s_f3c85c4a41c7b4::t_d4fe211827528a 4,50-57,1204-1208,1216,1979-1982,1991-2046,2048-2057,2059-2060,2065
+scripts/outbox.mjs
+  s_f3c85c4a41c7b4::t_24a420e4319ddd 1-36
+package.json
+  s_63b16eb266e6d0::t_c6ff8fa5ba51c2 16,18,25,35-36,60
+deployment/workers/jobs.ts
+  s_cc7a919d2876cf::t_61f8ec7c595e9f 1-22,24-42,44
+test/integration/durable-outbox.test.js
+  s_95b3d9e1b6b0b5::t_6acae31afc4686 1-324
+packages/workers/src/index.ts
+  s_16b1ac760f0715::t_9c4c99ed3c165f 5-69
+pnpm-lock.yaml
+  s_16b1ac760f0715::t_8614367f294903 56-58
+packages/postgres/src/spaces.ts
+  s_cc7a919d2876cf::t_f9c8c3ab02d526 796-797
+test/operational-worker.test.ts
+  s_f3c85c4a41c7b4::t_3f2785902aa072 4-18,43-79
+migrations/039_durable_outbox.sql
+  s_f3c85c4a41c7b4::t_83964f2afcfd0f 1-113
+test/topology.test.js
+  s_f3c85c4a41c7b4::t_a595535703c7ab 262-263
+docs/durable-outbox.md
+  s_f3c85c4a41c7b4::t_65cfd02b707b3c 1-74
+test/integration/event-feed-upgrade.test.js
+  s_1786e4c8d6d477::t_14e733f04a08ad 6,34,67-76,78,92,134,147,172,174,188
+scripts/migration-upgrade-smoke.mjs
+  s_f3c85c4a41c7b4::t_7ad05d99cdb725 64-67,71-72,158,160-161
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9d992517436ffa349c6b6c61fca44f5e7edf0bad",
+  "prompts": {},
+  "sessions": {
+    "s_16b1ac760f0715": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a163a1-e97c-7a33-9f84-04e1c85c0a27",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_1786e4c8d6d477": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d3878118-ae2f-4300-8b70-b21e7f41eeb0",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_63b16eb266e6d0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "171de4b3-c70b-4d19-8752-3e78b0549dee",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_95b3d9e1b6b0b5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a16388-9ea5-7f80-a163-5e991f0bc82e",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_cc7a919d2876cf": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9ea19a1f-5cf3-41ff-8ec3-3186bc1d779e",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_f3c85c4a41c7b4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "576ab5f3-7d04-4063-8537-8fe2ce57d4fb",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
