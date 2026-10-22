@@ -663,6 +663,9 @@ function pageCandidateSql(options:PageCandidateOptions):string {
   )`;
 }
 
+// Past the processing budget, so the client's own rollback always wins.
+const STALLED_APPLY_MARGIN_MS = 5_000;
+
 export class PostgresAuthority {
   /** Configure the receipt window used by new authority transactions. */
   constructor(private readonly pool: PoolLike, private readonly receiptRetentionSeconds: number,
@@ -2035,9 +2038,10 @@ export class AuthorityTransaction {
         [...lease, row.record_id, placement, revision, deleted]);
         if (head.rowCount === 1) {
           outcome = 'applied';
-          // A worker that stops mid-apply cannot hold this ref past its budget.
+          // The caller's budget rolls back an abandoned apply first. This is
+          // only a backstop for a stalled worker holding the ref's locks.
           if (apply && this.requestDeadlineMs !== undefined) await this.query(`SET LOCAL idle_in_transaction_session_timeout =
-            '${Math.max(1, Math.trunc(this.requestDeadlineMs - Date.now()))}ms'`);
+            '${Math.max(1, Math.trunc(this.requestDeadlineMs - Date.now())) + STALLED_APPLY_MARGIN_MS}ms'`);
           await apply?.({ ref:this.ref(row.record_id), revision, generation:placement, deleted,
             canonicalData:deleted ? null : row.canonical_data }, (sql, values) => this.query(sql, values));
         }

@@ -9,7 +9,7 @@ Each regional cell's Postgres outbox is the only durable record of projection wo
 3. **Prepare.** An optional projector `prepare` step, such as an embedder call, runs outside any SQL transaction.
 4. **Complete.** `AuthorityTransaction.completeProjection` runs under the `system:projection` worker scope with the policy version and placement generation read at start. Its scope check denies the completion if either changed. It locks the outbox row, rechecks the lease, then advances the per-ref `projection_heads` row only forward by `(generation, revision)` and calls the projector's `apply` in the same transaction. The row becomes `delivered` with outcome `applied` or `superseded`.
 
-One 45-second budget covers prepare, apply and completion. When it expires, a pending `prepare` or `apply` is abandoned, the transaction issues no further SQL and rolls back, and the lease records one failure. Statements are bounded by the remaining budget. During `apply` the transaction also sets `idle_in_transaction_session_timeout` to the remaining budget, so a worker that stops responding cannot hold the ref's locks past it.
+One 45-second budget covers prepare, apply and completion. When it expires, a pending `prepare` or `apply` is abandoned, the transaction issues no further SQL and rolls back, and the lease records one failure. Statements are bounded by the remaining budget. During `apply` the transaction also sets `idle_in_transaction_session_timeout` to the remaining budget plus 5 seconds. A worker that stops responding therefore cannot hold the ref's locks much past its budget, while a live worker's own rollback always comes first.
 
 | Failure | Result |
 | --- | --- |
