@@ -862,6 +862,28 @@ test('status pages continue from a cursor to every collection, within a space an
   }
 });
 
+test('status reports the most recently committed error, whether a failure or an uncounted release', async () => {
+  const { scope, collectionId, spaceId } = await space();
+  const failed = `UPDATE projection_outbox SET delivery_state='degraded',failures=1,last_error='Error: projector broke',
+    available_at=clock_timestamp()+interval '1 hour' WHERE space_id=$1 AND record_id=$2`;
+  const released = `UPDATE projection_outbox SET delivery_state='pending',failures=0,last_error='error 55P03',
+    available_at=clock_timestamp()+interval '1 hour' WHERE space_id=$1 AND record_id=$2`;
+  try {
+    for (const [older, newer, expected] of [[failed, released, 'error 55P03'], [released, failed, 'Error: projector broke']]) {
+      const first = await write(scope(collectionId), 'create', '{"n":1}');
+      const second = await write(scope(collectionId), 'create', '{"n":2}');
+      await pool.query(older, [spaceId, first.ref.id]);
+      await pool.query(newer, [spaceId, second.ref.id]);
+      const [status] = (await outbox.status(spaceId)).collections;
+      assert.deepEqual([status.pending, status.degraded, status.capped, status.failuresCapped, status.lastError],
+        [1, 1, false, false, expected]);
+      await pool.query("UPDATE projection_outbox SET delivery_state='delivered',available_at=clock_timestamp() WHERE space_id=$1", [spaceId]);
+    }
+  } finally {
+    await pool.query("UPDATE projection_outbox SET delivery_state='delivered',available_at=clock_timestamp() WHERE space_id=$1", [spaceId]);
+  }
+});
+
 test('a completion queued behind another completion of its ref gives way uncounted', async () => {
   const { scope, collectionId, spaceId } = await space();
   const created = await write(scope(collectionId), 'create', '{"v":1}');

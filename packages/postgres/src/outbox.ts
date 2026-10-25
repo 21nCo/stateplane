@@ -35,8 +35,9 @@ export interface StatusCursor { spaceId: string; collectionId: string }
  * `STATUS_SAMPLE` live rows, and `capped` marks them as lower bounds.
  * `degraded`, `deadLettered` and `lastError` come from a separate sample of
  * up to `STATUS_SAMPLE` failed rows, wherever they are parked;
- * `failuresCapped` marks those counts as lower bounds. Without a failed
- * row, `lastError` is the live sample's latest uncounted release reason.
+ * `failuresCapped` marks those counts as lower bounds. `lastError` is the
+ * error of the most recently committed row across both samples, so an
+ * uncounted release reason newer than every failure is reported.
  * When either flag is set, `oldestUndeliveredAt` and `lagSeconds` are lower
  * bounds too, and `lastError` is the newest error within the samples, which
  * may not be the collection's newest. The failed sample is in event ID order.
@@ -441,13 +442,15 @@ export class PostgresOutbox {
             ORDER BY space_id,collection_id LIMIT 1) next
           WHERE p.n<=$2)
         SELECT p.space_id,p.collection_id,d.pending,d.delivering,d.capped,f.degraded,f.dead_lettered,f.failures_capped,
-          COALESCE(f.last_error,d.last_error) AS last_error,LEAST(d.oldest,f.oldest) AS oldest,
+          CASE WHEN f.error_at IS NULL OR d.error_at>f.error_at THEN d.last_error ELSE f.last_error END AS last_error,
+          LEAST(d.oldest,f.oldest) AS oldest,
           extract(epoch FROM clock_timestamp()-LEAST(d.oldest,f.oldest))::float8 AS lag
         FROM pairs p CROSS JOIN LATERAL (
           SELECT count(*) FILTER (WHERE o.delivery_state='pending')::int AS pending,
             count(*) FILTER (WHERE o.delivery_state='delivering')::int AS delivering,
             count(*)>=$3 AS capped, min(e.committed_at) AS oldest,
-            (array_agg(o.last_error ORDER BY e.committed_at DESC) FILTER (WHERE o.last_error IS NOT NULL))[1] AS last_error
+            (array_agg(o.last_error ORDER BY e.committed_at DESC) FILTER (WHERE o.last_error IS NOT NULL))[1] AS last_error,
+            max(e.committed_at) FILTER (WHERE o.last_error IS NOT NULL) AS error_at
           FROM (SELECT event_id,delivery_state,last_error FROM projection_outbox
             WHERE space_id=p.space_id AND collection_id=p.collection_id AND ${LIVE_OUTBOX}
             ORDER BY available_at,event_id LIMIT $3) o JOIN record_events e ON e.event_id=o.event_id) d
@@ -457,7 +460,8 @@ export class PostgresOutbox {
           SELECT count(*) FILTER (WHERE o.delivery_state='degraded' AND o.dead_lettered_at IS NULL)::int AS degraded,
             count(*) FILTER (WHERE o.dead_lettered_at IS NOT NULL)::int AS dead_lettered,
             count(*)>=$3 AS failures_capped, min(e.committed_at) AS oldest,
-            (array_agg(o.last_error ORDER BY e.committed_at DESC) FILTER (WHERE o.last_error IS NOT NULL))[1] AS last_error
+            (array_agg(o.last_error ORDER BY e.committed_at DESC) FILTER (WHERE o.last_error IS NOT NULL))[1] AS last_error,
+            max(e.committed_at) FILTER (WHERE o.last_error IS NOT NULL) AS error_at
           FROM (SELECT event_id,delivery_state,dead_lettered_at,last_error FROM projection_outbox
             WHERE space_id=p.space_id AND collection_id=p.collection_id AND ${FAILED_OUTBOX}
             ORDER BY event_id LIMIT $3) o
