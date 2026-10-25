@@ -1,0 +1,29 @@
+docs/durable-outbox.md
+  s_7a3fa740ca5fcf::t_237a3468b706b6 23,90
+package.json
+  s_7a3fa740ca5fcf::t_509aa2ccd8cf3a 11
+packages/postgres/src/outbox.ts
+  s_7a3fa740ca5fcf::t_026cf2b799e828 13-19,106,115-122,247-248,331-334,386,400
+packages/workers/src/index.ts
+  s_7a3fa740ca5fcf::t_884edfe10e8d72 28
+scripts/restore-smoke.mjs
+  s_7a3fa740ca5fcf::t_018b9088dbd94e 92
+test/integration/durable-outbox.test.js
+  s_7a3fa740ca5fcf::t_a1f809c672ed93 504-536,732,735,747-749,850-852
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b89e07f45b632d3edd111ec9c72664fab9de4729",
+  "prompts": {},
+  "sessions": {
+    "s_7a3fa740ca5fcf": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_7a3fa740ca5fcf",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
