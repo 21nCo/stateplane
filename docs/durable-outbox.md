@@ -47,7 +47,7 @@ A claim walks distinct live `(space, collection)` pairs through the existing cla
 | Uncounted release backoff / head lock wait | 5 s / 1 s | A misclassified fault cannot retry in a tight loop; a queued completion gives way inside its budget |
 | Processing lease / budget | 60 s / the authority request budget (30 s) | Crash detection; one item's prepare, apply and completion within one transaction deadline |
 | Failures before dead letter | 8 (5 s → 1 h backoff) | Poison isolation after about ten minutes of retries |
-| Consumer concurrency | 4 per batch (max 16) | Bounded Worker work; Queue `max_batch_size` stays 1 |
+| Jobs consumer invocations | Queue `max_concurrency` ⌊cell `originConnectionLimit` ÷ 2⌋ − 1 (1 at the current 5, 9 at the schema's 20), `max_batch_size` 1, one pooled connection and one item at a time each; the cron tick holds one more connection | Consumers and the tick hold at most half of the cell's Hyperdrive origin connections, so the API and MCP Workers keep the rest (three of five). One invocation keeps up with the 17-a-second hint rate only if an item takes about 60 ms or less; slower consumers converge through late starts. External acceptance measures it |
 | Reconciliation step | 4 jobs × 100 records per call (max 32 × 500), repeated for up to 10 s per tick | Bounded, resumable repair |
 | Status | 200 collections × (the 500 oldest-due live rows + 500 failed rows) each | Status stays usable during the backlog it reports |
 | SQL statements | 5 s | Short cell transactions |

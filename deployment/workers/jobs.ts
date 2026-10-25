@@ -18,8 +18,10 @@ const RECONCILE_BUDGET_MS = 10_000;
 function cell(env: Env) {
   if (!env.AUTHORITY?.connectionString) throw new Error('Cell authority binding is missing');
   // Statement timeouts bound every query; the client read bound sits past
-  // them and only catches a silently lost session.
-  const pool = new pg.Pool({ connectionString: env.AUTHORITY.connectionString, max: 4,
+  // them and only catches a silently lost session. An invocation runs one
+  // transaction at a time, so one connection each keeps the consumer's
+  // max_concurrency (scripts/topology.mjs) within the origin budget.
+  const pool = new pg.Pool({ connectionString: env.AUTHORITY.connectionString, max: 1,
     connectionTimeoutMillis: 5_000, query_timeout: CLIENT_READ_TIMEOUT_MS });
   // pg-pool re-emits an idle session's error on the pool; the pool discards
   // that session, and SQL leases recover its work.
@@ -45,7 +47,7 @@ export default {
   async queue(batch: MessageBatch<unknown>, env: Env): Promise<void> {
     const { outbox, close } = cell(env);
     try {
-      const results = await consume(batch.messages.map(message => message.body), message => outbox.process(message));
+      const results = await consume(batch.messages.map(message => message.body), message => outbox.process(message), 1);
       batch.messages.forEach((message, index) => {
         if (results[index] === 'retry') message.retry();
         else message.ack();

@@ -19,6 +19,10 @@ const dnsLabel = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 // Hyperdrive permits 5-20 origin connections on Free and 5-100 on Paid.
 // The manifest does not attest a Workers plan, so admit only the shared range.
 const validOriginConnectionLimit = value => Number.isSafeInteger(value) && value >= 5 && value <= 20;
+// Each jobs invocation holds one pooled connection and one transaction at a
+// time. Consumers plus the cron tick hold at most half of the cell's origin
+// connections, so API and MCP keep the rest: 1 consumer at the limit of 5.
+export const jobsConsumerConcurrency = originConnectionLimit => Math.max(1, Math.floor(originConnectionLimit / 2) - 1);
 const cellPlacement = {
   'ap-southeast': { railwayRegion: 'asia-southeast1-eqsg3a', r2LocationHint: 'apac' },
   'us-east': { railwayRegion: 'us-east4-eqdc4a', r2LocationHint: 'enam' },
@@ -259,7 +263,8 @@ export function renderTopology(topology, environment, inventory, counterpart, ou
       triggers: { crons: ['* * * * *'] },
       queues: {
         producers: [{ binding: 'PROJECTION_JOBS', queue: n.queue }],
-        consumers: [{ queue: n.queue, max_batch_size: 1, max_retries: 3, dead_letter_queue: n.deadLetterQueue }]
+        consumers: [{ queue: n.queue, max_batch_size: 1, max_concurrency: jobsConsumerConcurrency(cell.originConnectionLimit),
+          max_retries: 3, dead_letter_queue: n.deadLetterQueue }]
       }
     };
   }

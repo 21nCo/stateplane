@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({ closed: 0, connected: 0, failClose: false, denyGrants: false, denyCatalog: false, ownsObject: false, denyVector: false, wrongIdentity: false }));
-const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[], poolInstances: [] as { emit(event: string, error: Error): boolean }[] }));
+const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[], active: 0, peak: 0, poolInstances: [] as { emit(event: string, error: Error): boolean }[] }));
 vi.mock('@stateplane/postgres', async importOriginal => ({
   CLIENT_READ_TIMEOUT_MS: (await importOriginal<typeof import('@stateplane/postgres')>()).CLIENT_READ_TIMEOUT_MS,
   PostgresAuthority: class {},
@@ -11,6 +11,9 @@ vi.mock('@stateplane/postgres', async importOriginal => ({
     async stepReconciliations() { cell.stepped++; return 0; }
     async process(message: { attempt: number }) {
       cell.processed.push(message);
+      cell.peak = Math.max(cell.peak, ++cell.active);
+      await new Promise(resolve => setTimeout(resolve, 1));
+      cell.active--;
       if (message.attempt === 9) throw new Error('connection refused');
       return message.attempt === 2 ? 'failed' : 'applied';
     }
@@ -95,6 +98,15 @@ describe('cell jobs Worker', () => {
     await expect(jobs.scheduled({} as never, jobsEnv(vi.fn(async () => { throw new Error('queue unavailable'); }))))
       .rejects.toThrow('Projection dispatch released 1 leases');
     expect([cell.released, cell.stepped, cell.ended - ended]).toEqual([[hint(1)], 2, 1]);
+  });
+
+  it('holds one pooled connection per invocation and processes a batch one item at a time', async () => {
+    cell.peak = 0;
+    await jobs.queue(batch([hint(1), hint(3), hint(5)]).value, jobsEnv());
+    expect((cell.poolOptions.at(-1) as { max: number }).max).toBe(1);
+    expect(cell.peak).toBe(1);
+    await jobs.scheduled({} as never, jobsEnv());
+    expect((cell.poolOptions.at(-1) as { max: number }).max).toBe(1);
   });
 });
 
