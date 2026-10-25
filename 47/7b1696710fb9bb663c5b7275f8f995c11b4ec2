@@ -1,0 +1,35 @@
+test/operational-worker.test.ts
+  s_e1c5fc1a65c0cf::t_be5fdee33e5a46 4,14-16,102-110
+deployment/workers/jobs.ts
+  s_92427ff18a8304::t_837e387b923f65 21-24,50
+docs/durable-outbox.md
+  s_92427ff18a8304::t_a3c4d53253b335 50
+scripts/topology.mjs
+  s_92427ff18a8304::t_c848ce3c94feb7 22-25,266-267
+test/topology.test.js
+  s_92427ff18a8304::t_495101c2473ddb 7,264-266,272-286
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "477b1696710fb9bb663c5b7275f8f995c11b4ec2",
+  "prompts": {},
+  "sessions": {
+    "s_92427ff18a8304": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26336501-b0e6-4534-a7c2-345f5528a4ba",
+        "model": "unknown"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    },
+    "s_e1c5fc1a65c0cf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a13e18-4241-7662-a24f-782076addabe",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
