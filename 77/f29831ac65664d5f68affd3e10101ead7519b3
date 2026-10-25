@@ -1,0 +1,27 @@
+docs/durable-outbox.md
+  s_e1c5fc1a65c0cf::t_93f061d76ff962 22,73,90
+packages/postgres/src/cell-policy.ts
+  s_e1c5fc1a65c0cf::t_aab551c25213a2 358-359
+packages/postgres/src/index.ts
+  s_e1c5fc1a65c0cf::t_8b7e2b2a8aaf7a 737-738,757-759,962-963,985-991
+packages/postgres/src/outbox.ts
+  s_e1c5fc1a65c0cf::t_d32056e736ba75 40-42,462-463
+test/integration/durable-outbox.test.js
+  s_e1c5fc1a65c0cf::t_d9603855c2ca7c 8,436-487
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "77f29831ac65664d5f68affd3e10101ead7519b3",
+  "prompts": {},
+  "sessions": {
+    "s_e1c5fc1a65c0cf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a13e18-4241-7662-a24f-782076addabe",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "thyaravind <samalaaravind02@gmail.com>"
+    }
+  }
+}
