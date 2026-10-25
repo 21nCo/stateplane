@@ -501,6 +501,39 @@ test('a rolled-back infrastructure failure after start releases the lease withou
   assert.equal(await outbox.process(next, recorder()), 'applied');
 });
 
+test('a provider outage in prepare or apply releases uncounted and never dead-letters; a prepare ERR_* error counts', async () => {
+  const { scope, collectionId, spaceId } = await space();
+  const created = await write(scope(collectionId), 'create', '{"label":"a"}');
+  const reset = () => Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
+  const outages = [{ prepare: async () => { throw reset(); }, apply: async () => {} },
+    { apply: async () => { throw reset(); } }];
+  // More outages than the failure budget, so a counted fault would park the row.
+  let eventId;
+  for (let round = 0; round < 10; round++) {
+    await drained();
+    const { messages: [lease], parked } = await outbox.claim();
+    eventId ??= lease.eventId;
+    assert.deepEqual([lease.eventId, parked], [eventId, 0]);
+    await assert.rejects(outbox.process(lease, outages[round % 2]), /ECONNRESET/);
+    assert.deepEqual(await row(lease.eventId), { ...await row(lease.eventId), delivery_state: 'pending', failures: 0,
+      dead_lettered_at: null, parked: false, last_error: 'Error: read ECONNRESET' });
+  }
+  await drained();
+  const [recovered] = (await outbox.claim()).messages;
+  assert.equal(await outbox.process(recovered, recorder()), 'applied');
+  assert.deepEqual(await head(spaceId, created.ref.id), { generation: 1, revision: 1, deleted: false });
+
+  await write(scope(collectionId), 'create', '{"label":"b"}');
+  await drained();
+  const [misused] = (await outbox.claim()).messages;
+  assert.notEqual(misused.eventId, eventId);
+  const invalid = { prepare: async () => { throw Object.assign(new TypeError('bad argument'), { code: 'ERR_INVALID_ARG_TYPE' }); },
+    apply: async () => {} };
+  assert.equal(await outbox.process(misused, invalid), 'failed');
+  assert.deepEqual(await row(misused.eventId), { ...await row(misused.eventId), delivery_state: 'degraded', failures: 1,
+    last_error: 'TypeError ERR_INVALID_ARG_TYPE' });
+});
+
 test('successive claims rotate service across spaces when the limit cuts a claim short', async () => {
   // The backlog space sorts first, so cursor order alone would serve it every time.
   const backlog = await space(1, `sp_00000000-${randomUUID().slice(9)}`);
@@ -696,9 +729,10 @@ test('a placement fence that commits while a step scans for its job is still rep
   await pool.query('ALTER TABLE projection_reconciliations ENABLE ROW LEVEL SECURITY');
   const pausedPool = new pg.Pool({ connectionString: target.toString(), max: 1, options: `-c role=${role}` });
   const gate = await pool.connect();
+  let stepping;
   try {
     await gate.query('SELECT pg_advisory_lock(4242)');
-    const stepping = new PostgresOutbox(pausedPool, authority).stepReconciliations(1, 100);
+    stepping = new PostgresOutbox(pausedPool, authority).stepReconciliations(1, 100);
     for (let polls = 0; ; polls++) {
       const waiting = await pool.query(`SELECT 1 FROM pg_stat_activity WHERE usename=current_user AND wait_event='advisory'
         AND query LIKE '%projection_reconciliations%'`);
@@ -710,7 +744,9 @@ test('a placement fence that commits while a step scans for its job is still rep
     await gate.query('SELECT pg_advisory_unlock(4242)');
     assert.equal(await stepping, 1);
   } finally {
-    gate.release();
+    // On every path, free a parked step and settle it before closing its pool.
+    await gate.query('SELECT pg_advisory_unlock_all()').finally(() => gate.release());
+    await stepping?.catch(() => {});
     await pausedPool.end();
     await pool.query('ALTER TABLE projection_reconciliations DISABLE ROW LEVEL SECURITY');
     await pool.query('DROP POLICY outbox_test_pause ON projection_reconciliations');
@@ -811,8 +847,9 @@ test('status reports dead letters and backoff behind more due rows than its samp
 });
 
 test('status pages continue from a cursor to every collection, within a space and across spaces', async () => {
-  const first = await space(3);
-  const second = await space(2);
+  // The three-collection space sorts first, so the second two-pair page spans both spaces.
+  const first = await space(3, `sp_00000000-${randomUUID().slice(9)}`);
+  const second = await space(2, `sp_00000001-${randomUUID().slice(9)}`);
   const pairs = [];
   for (const { scope, ids, spaceId } of [first, second]) for (const collectionId of ids) {
     const created = await write(scope(collectionId), 'create', '{"v":1}');

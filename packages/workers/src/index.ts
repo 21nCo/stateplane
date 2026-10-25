@@ -25,7 +25,7 @@ export interface OutboxStore {
 export interface DeliveryTransport { send(messages: readonly DeliveryMessage[]): Promise<void> }
 export interface DispatchResult { claimed: number; sent: number; released: number; parked: number; batches: number; error?: unknown }
 export interface DispatchOptions {
-  limits?: Parameters<OutboxStore['claim']>[0];
+  limits?: NonNullable<Parameters<OutboxStore['claim']>[0]>;
   /** Keep claiming and sending until a full pass finds nothing due or this wall-clock budget is spent. 0 claims once. */
   budgetMs?: number;
   now?: () => number;

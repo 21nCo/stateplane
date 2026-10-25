@@ -89,7 +89,7 @@ try {
   const outcomes=[];
   for (const delivery of claimed)
     outcomes.push(await authority.transaction(worker,tx=>tx.completeProjection(delivery)));
-  assert.deepEqual(outcomes.sort(),['applied','applied','superseded'],'restore seed applies both latest revisions');
+  assert.deepEqual(outcomes.toSorted((a,b)=>a.localeCompare(b)),['applied','applied','superseded'],'restore seed applies both latest revisions');
   await new PostgresOutbox(base,authority).reconcile('restore-operator',spaceId,collectionId,'restore drill');
   const feedSeed=(await base.query(`SELECT event_id FROM record_events WHERE space_id=$1
     ORDER BY committed_at,event_id LIMIT 1`,[spaceId])).rows[0].event_id;

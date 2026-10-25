@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build": "turbo run build",
-    "typecheck": "turbo run typecheck && pnpm exec tsc -p deployment/tsconfig.json",
+    "typecheck": "turbo run typecheck && pnpm --filter @stateplane/postgres... --filter @stateplane/workers... build && pnpm exec tsc -p deployment/tsconfig.json",
     "lint": "eslint packages scripts deployment/workers test/qualification.test.ts test/qualification-worker.test.ts test/qualification-worker-postgres.test.ts test/operational-worker.test.ts test/mcp-host.test.ts test/ui-shell.test.ts && node scripts/check-boundaries.mjs",
     "test": "pnpm test:contracts && pnpm test:qualification",
     "topology:validate": "node scripts/topology.mjs validate",

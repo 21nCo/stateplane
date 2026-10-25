@@ -10,7 +10,13 @@ type PoolLike = Pick<pg.Pool, 'connect'>;
 
 /** A queue message is only a hint; SQL decides whether its lease is still current. */
 export interface DeliveryMessage { eventId: string; attempt: number }
-/** Product-internal projection port. `prepare` runs outside SQL, `apply` inside the fenced completion. */
+/**
+ * Product-internal projection port. `prepare` runs outside SQL, `apply` inside
+ * the fenced completion. An infrastructure fault from either, such as a
+ * provider's ECONNRESET, is an outage and never spends the failure budget, so
+ * a projector must report a provider's rejection of one payload as its own
+ * error.
+ */
 export interface Projector<P = unknown> {
   prepare?(change: ProjectionChange, signal: AbortSignal): Promise<P>;
   apply(change: ProjectionChange, prepared: P | undefined, query: ProjectionQuery): Promise<void>;
@@ -97,13 +103,21 @@ class ProjectorFailure extends Error {}
 // driver's socket, connection and client read errors. A statement timeout is
 // not here: an overrun is the item's. The client read bound sits past every
 // server bound (CLIENT_READ_TIMEOUT_MS), so it fires only on a lost session.
-const INFRASTRUCTURE_SQLSTATE = /^(?:(?:08|40|53|58)[0-9A-Z]{3}|55P03|57P0[0-9])$/;
+const INFRASTRUCTURE_SQLSTATE = /^(?:(?:08|40|53|58)[\dA-Z]{3}|55P03|57P0\d)$/;
 function infrastructureFault(error: unknown): boolean {
   if (!(error instanceof Error) || error instanceof AuthorityError) return false;
   const code = (error as { code?: unknown }).code;
   // Socket errnos such as ECONNRESET, not Node's ERR_* programming errors.
   if (typeof code === 'string') return INFRASTRUCTURE_SQLSTATE.test(code) || (/^E[A-Z_]+$/.test(code) && !code.startsWith('ERR_'));
   return clientReadTimedOut(error) || /^Connection terminated|not queryable|^timeout exceeded when trying to connect/.test(error.message);
+}
+
+// A projector's own error is the item's, except a positively classified
+// infrastructure fault such as a provider's ECONNRESET during an outage, which
+// stays unwrapped so the lease is released uncounted. The budget overrun is
+// an AuthorityError, so it still counts.
+function projectorError(stage: 'prepare' | 'apply', error: unknown): unknown {
+  return infrastructureFault(error) ? error : new ProjectorFailure(`${stage} failed`, { cause: error });
 }
 
 // An error reply from a live session means the server rolled COMMIT back.
@@ -230,7 +244,8 @@ export class PostgresOutbox {
       const after: [string, string] | null = cursor.after_space_id === null ? null : [cursor.after_space_id, cursor.after_collection_id];
       let scanned = await this.scanPairs(db, after, null, pairs);
       let next = scanned.length === pairs ? scanned.at(-1)! : null;
-      let scan: ClaimResult['scan'] = after ? 'partial' : next ? 'wrapped' : 'whole';
+      let scan: ClaimResult['scan'] = 'partial';
+      if (!after) scan = next ? 'wrapped' : 'whole';
       if (after && scanned.length < pairs) {
         // Wrap to the start and stop at the old cursor; a short wrap means
         // every live pair was visited and the next claim starts over.
@@ -313,9 +328,10 @@ export class PostgresOutbox {
    * lease; a policy, placement or lifecycle change at completion releases it
    * so a later claim re-runs it under fresh scope. The budget bounds prepare,
    * apply and completion. An infrastructure fault or lock budget with a
-   * known rollback, including one from apply's query port or an error reply
-   * to COMMIT, releases the lease uncounted after a short backoff, records
-   * its bounded diagnostic and is rethrown.
+   * known rollback, including one from apply's query port, one prepare or
+   * apply raises itself, or an error reply to COMMIT, releases the lease
+   * uncounted after a short backoff, records its bounded diagnostic and is
+   * rethrown.
    */
   async process(message: DeliveryMessage, projector?: Projector): Promise<ProcessOutcome> {
     const { eventId, attempt: hinted } = this.message(message);
@@ -367,7 +383,7 @@ export class PostgresOutbox {
       let prepared: unknown;
       if (active?.prepare) {
         try { prepared = await within(active.prepare(change, signal), signal); }
-        catch (error) { throw new ProjectorFailure('prepare failed', { cause: error }); }
+        catch (error) { throw projectorError('prepare', error); }
       }
       const apply = active && (async (current: ProjectionChange, query: ProjectionQuery) => {
         // The transaction is lost once its session faults, whatever apply
@@ -381,7 +397,7 @@ export class PostgresOutbox {
         });
         let failure: unknown;
         try { await within(active.apply(current, prepared, port), signal); }
-        catch (error) { failure = new ProjectorFailure('apply failed', { cause: error }); }
+        catch (error) { failure = projectorError('apply', error); }
         if (fault) throw fault;
         if (failure) throw failure;
       });
