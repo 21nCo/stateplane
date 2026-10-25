@@ -37,6 +37,9 @@ export interface StatusCursor { spaceId: string; collectionId: string }
  * up to `STATUS_SAMPLE` failed rows, wherever they are parked;
  * `failuresCapped` marks those counts as lower bounds. Without a failed
  * row, `lastError` is the live sample's latest uncounted release reason.
+ * When either flag is set, `oldestUndeliveredAt` and `lagSeconds` are lower
+ * bounds too, and `lastError` is the newest error within the samples, which
+ * may not be the collection's newest. The failed sample is in event ID order.
  */
 export interface CollectionOutboxStatus {
   spaceId: string; collectionId: string; pending: number; delivering: number; degraded: number; deadLettered: number;
@@ -456,7 +459,8 @@ export class PostgresOutbox {
             count(*)>=$3 AS failures_capped, min(e.committed_at) AS oldest,
             (array_agg(o.last_error ORDER BY e.committed_at DESC) FILTER (WHERE o.last_error IS NOT NULL))[1] AS last_error
           FROM (SELECT event_id,delivery_state,dead_lettered_at,last_error FROM projection_outbox
-            WHERE space_id=p.space_id AND collection_id=p.collection_id AND ${FAILED_OUTBOX} LIMIT $3) o
+            WHERE space_id=p.space_id AND collection_id=p.collection_id AND ${FAILED_OUTBOX}
+            ORDER BY event_id LIMIT $3) o
           JOIN record_events e ON e.event_id=o.event_id) f
         ORDER BY p.n`, [space, this.statusPairs, STATUS_SAMPLE, from?.[0] ?? null, from?.[1] ?? null]);
       const jobs = await db.query(`SELECT * FROM projection_reconciliations

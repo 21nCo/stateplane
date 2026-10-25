@@ -5,7 +5,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
-import { CollectionRegistry, PostgresAuthority, PostgresOutbox, PostgresSpaces } from '../../packages/postgres/dist/index.js';
+import { AuthorityError, CollectionRegistry, PostgresAuthority, PostgresOutbox, PostgresSpaces } from '../../packages/postgres/dist/index.js';
 import { consume, dispatch } from '../../packages/workers/dist/index.js';
 
 // The cell-wide dispatcher sees every space, so this suite owns its database.
@@ -431,6 +431,58 @@ test('the processing budget bounds apply: a hung projector fails its lease and c
   assert.equal((await row(second.eventId)).failures, 2);
   assert.notEqual((await row(second.eventId)).last_error, 'late');
   assert.equal(await head(spaceId, hung.ref.id), undefined);
+});
+
+test('a port statement still refreshing its timeout when the transaction ends is refused, never run after ROLLBACK or COMMIT', async () => {
+  await pool.query('CREATE TABLE IF NOT EXISTS stray_port_writes(label text)');
+  // Hold the reply to the port statement's timeout refresh until the owner
+  // queues its ROLLBACK or COMMIT, so the statement itself would follow it.
+  let holdNext = false;
+  const gated = { connect: async () => {
+    const client = await pool.connect();
+    let ended;
+    const end = new Promise(resolve => { ended = resolve; });
+    return new Proxy(client, { get(target, key) {
+      if (key !== 'query') { const value = Reflect.get(target, key); return typeof value === 'function' ? value.bind(target) : value; }
+      return (sql, ...rest) => {
+        if (holdNext && typeof sql === 'string' && sql.startsWith('SET LOCAL statement_timeout')) {
+          holdNext = false;
+          const sent = target.query(sql, ...rest);
+          return sent.then(reply => end.then(() => reply));
+        }
+        const sent = target.query(sql, ...rest);
+        if (sql === 'ROLLBACK' || sql === 'COMMIT') ended();
+        return sent;
+      };
+    } });
+  } };
+  const outbox = new PostgresOutbox(pool, new PostgresAuthority(gated, 3600));
+  const strays = async label => Number((await pool.query('SELECT count(*) FROM stray_port_writes WHERE label=$1', [label])).rows[0].count);
+  for (const ending of ['ROLLBACK', 'COMMIT']) {
+    const { scope, collectionId, spaceId } = await space();
+    const created = await write(scope(collectionId), 'create', `{"label":"${ending}"}`);
+    await drained();
+    const [lease] = (await outbox.claim()).messages;
+    let stray;
+    const projector = { apply: async (_change, _prepared, query) => {
+      holdNext = true;
+      stray = query('INSERT INTO stray_port_writes VALUES($1)', [ending]).then(() => 'ran', error => error);
+      if (ending === 'ROLLBACK') throw new Error('projector broke');
+    } };
+    assert.equal(await outbox.process(lease, projector), ending === 'ROLLBACK' ? 'failed' : 'applied');
+    const refused = await stray;
+    assert.ok(refused instanceof AuthorityError && refused.message === 'Transaction ended', `${ending}: the statement was refused`);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(await strays(ending), 0, `${ending}: nothing ran in autocommit`);
+    if (ending === 'ROLLBACK') {
+      assert.deepEqual(await row(lease.eventId), { ...await row(lease.eventId), delivery_state: 'degraded', failures: 1,
+        last_error: 'Error: projector broke' });
+      assert.equal(await head(spaceId, created.ref.id), undefined);
+    } else {
+      assert.equal((await row(lease.eventId)).delivery_state, 'delivered');
+      assert.equal((await head(spaceId, created.ref.id)).revision, 1);
+    }
+  }
 });
 
 test('a rolled-back infrastructure failure after start releases the lease without spending the failure budget', async () => {

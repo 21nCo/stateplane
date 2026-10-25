@@ -355,6 +355,8 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       }
       if (operationError) throw operationError;
       await this.finishJoined(bounded,claims,deadline,joined,joinedReceipts);
+      // Joined statements end before COMMIT, as the abort below ends them before ROLLBACK.
+      for (const entry of joined) entry.close();
       await client.query(`SET LOCAL statement_timeout = '${this.remaining(deadline)}ms'`);
       this.remaining(deadline);
       try {

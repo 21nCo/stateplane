@@ -734,6 +734,8 @@ export class PostgresAuthority {
       await tx.checkReplayScopes();
       await tx.ensureReceiptsCurrent();
       await this.recheckCredential?.(client);
+      // A statement still awaiting its timeout refresh must not queue behind COMMIT.
+      tx.endStatements();
       // A failure while setting the final timeout is before COMMIT dispatch.
       // Only a missing COMMIT acknowledgement has an ambiguous outcome.
       await client.query(`SET LOCAL statement_timeout = '${Math.max(1,deadlineMs-Date.now())}ms'`);
@@ -752,7 +754,9 @@ export class PostgresAuthority {
       tx.exposeReceipts();
       return result;
     } catch (error) {
-      if (tx) { tx.sealMutations(); await tx.settleMutations(); }
+      // Untracked statements, such as a projector's abandoned port call, are
+      // refused from here on, so none can run after ROLLBACK in autocommit.
+      if (tx) { tx.sealMutations(); await tx.settleMutations(); tx.endStatements(); }
       if (begun && !commitAmbiguous && !clientReadTimedOut(error)) { try { await client.query('ROLLBACK'); } catch { discard = true; } }
       else if (beginAttempted) discard = true;
       if ((error as {code?:string}).code==='57014') throw new AuthorityError('RATE_LIMITED','Database statement time limit exceeded');
@@ -955,6 +959,8 @@ export class AuthorityTransaction {
   assertCommittable() {
     if (this.mutationFailed) throw this.mutationError;
   }
+  /** Refuse further SQL, synchronously, before the owner queues COMMIT or ROLLBACK. */
+  endStatements() { this.active = false; this.admittingMutations = false; }
   /** Stop admission before final policy, receipt, and COMMIT checks. */
   sealMutations() { this.admittingMutations = false; }
   /** Drain admitted operations before the final authorization and commit. */
@@ -976,7 +982,13 @@ export class AuthorityTransaction {
   private async query(sql: string, values: unknown[] = []) {
     if (!this.active) throw new AuthorityError('INVALID_ARGUMENT', 'Transaction ended');
     if (this.signal?.aborted) throw new AuthorityError('RATE_LIMITED', 'Transaction time budget exceeded');
-    if (this.requestDeadlineMs!==undefined) await this.applyStatementTimeout(this.requestDeadlineMs);
+    if (this.requestDeadlineMs!==undefined) {
+      await this.applyStatementTimeout(this.requestDeadlineMs);
+      // The owner may have ended the transaction during that round trip; the
+      // statement would then run after its ROLLBACK or COMMIT, outside it.
+      if (!this.active) throw new AuthorityError('INVALID_ARGUMENT', 'Transaction ended');
+      if (this.signal?.aborted) throw new AuthorityError('RATE_LIMITED', 'Transaction time budget exceeded');
+    }
     return this.client.query(sql, values);
   }
 
