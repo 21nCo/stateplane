@@ -1,14 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({ closed: 0, connected: 0, failClose: false, denyGrants: false, denyCatalog: false, ownsObject: false, denyVector: false, wrongIdentity: false }));
-const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[], active: 0, peak: 0, poolInstances: [] as { emit(event: string, error: Error): boolean }[] }));
+const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[], reconcileError: undefined as Error | undefined, active: 0, peak: 0, poolInstances: [] as { emit(event: string, error: Error): boolean }[] }));
 vi.mock('@stateplane/postgres', async importOriginal => ({
   CLIENT_READ_TIMEOUT_MS: (await importOriginal<typeof import('@stateplane/postgres')>()).CLIENT_READ_TIMEOUT_MS,
   PostgresAuthority: class {},
   PostgresOutbox: class {
     async claim() { return { messages: cell.claims.shift() ?? [], scan: 'whole' }; }
     async release(messages: unknown[]) { cell.released.push(...messages); return messages.length; }
-    async stepReconciliations() { cell.stepped++; return 0; }
+    async stepReconciliations() { cell.stepped++; if (cell.reconcileError) throw cell.reconcileError; return 0; }
     async process(message: { attempt: number }) {
       cell.processed.push(message);
       cell.peak = Math.max(cell.peak, ++cell.active);
@@ -98,6 +98,29 @@ describe('cell jobs Worker', () => {
     await expect(jobs.scheduled({} as never, jobsEnv(vi.fn(async () => { throw new Error('queue unavailable'); }))))
       .rejects.toThrow('Projection dispatch released 1 leases');
     expect([cell.released, cell.stepped, cell.ended - ended]).toEqual([[hint(1)], 2, 1]);
+  });
+
+  it('reports a failed Queue send and a failed reconciliation together, alone or apart, and always ends the pool', async () => {
+    const tick = async (send: Error | undefined, reconcile: Error | undefined) => {
+      cell.claims = [[hint(1)]]; cell.released = []; cell.reconcileError = reconcile;
+      const ended = cell.ended;
+      try {
+        const error = await jobs.scheduled({} as never, jobsEnv(vi.fn(async () => { if (send) throw send; return {}; })))
+          .then(() => undefined, (thrown: unknown) => thrown);
+        return { error: error as (Error & { cause?: unknown }) | undefined, released: cell.released, ended: cell.ended - ended };
+      } finally { cell.reconcileError = undefined; }
+    };
+    const queue = new Error('queue unavailable');
+    const reconcile = new Error('reconcile statement timeout');
+    const both = await tick(queue, reconcile);
+    expect([both.error?.message, both.released, both.ended]).toEqual(['Projection dispatch released 1 leases', [hint(1)], 1]);
+    expect(both.error?.cause).toBeInstanceOf(AggregateError);
+    expect((both.error?.cause as AggregateError).errors).toEqual([queue, reconcile]);
+    const sendOnly = await tick(queue, undefined);
+    expect([sendOnly.error?.message, sendOnly.error?.cause, sendOnly.released, sendOnly.ended])
+      .toEqual(['Projection dispatch released 1 leases', queue, [hint(1)], 1]);
+    const reconcileOnly = await tick(undefined, reconcile);
+    expect([reconcileOnly.error, reconcileOnly.released, reconcileOnly.ended]).toEqual([reconcile, [], 1]);
   });
 
   it('holds one pooled connection per invocation and processes a batch one item at a time', async () => {

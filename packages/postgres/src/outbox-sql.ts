@@ -19,6 +19,8 @@ const parked = `o.failures+${expired}>=${MAX_PROJECTION_FAILURES}`;
  * `carry` column of `due` is returned with its row.
  */
 export function claimOutboxSql(due: string, leaseSeconds: string, started: string, carry: readonly string[] = []): string {
+  const returned = carry.map(column => `,due.${column}`).join('');
+  const selected = carry.map(column => `,${column}`).join('');
   return `WITH due AS (${due}), claimed AS (
     UPDATE projection_outbox o SET attempts=o.attempts+1, failures=o.failures+${expired},
       last_error=CASE WHEN ${expired}=1 THEN 'Processing lease expired' ELSE o.last_error END,
@@ -28,9 +30,9 @@ export function claimOutboxSql(due: string, leaseSeconds: string, started: strin
         ELSE clock_timestamp()+(${leaseSeconds}::integer * interval '1 second') END,
       started_attempt=CASE WHEN ${started}::boolean THEN o.attempts+1 END
     FROM due WHERE o.event_id=due.event_id
-    RETURNING o.event_id,o.space_id,o.collection_id,o.record_id,o.revision,o.generation,o.attempts,o.delivery_state${carry.map(column => `,due.${column}`).join('')})
+    RETURNING o.event_id,o.space_id,o.collection_id,o.record_id,o.revision,o.generation,o.attempts,o.delivery_state${returned})
   SELECT event_id,space_id,collection_id,record_id,revision,generation,attempts,delivery_state='degraded' AS parked
-    ${carry.map(column => `,${column}`).join('')} FROM claimed ORDER BY event_id`;
+    ${selected} FROM claimed ORDER BY event_id`;
 }
 
 /**

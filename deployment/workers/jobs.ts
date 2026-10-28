@@ -40,8 +40,14 @@ export default {
       }, { budgetMs: DISPATCH_BUDGET_MS });
       const until = Date.now() + RECONCILE_BUDGET_MS;
       let stepped = 1;
-      while (stepped > 0 && Date.now() < until) stepped = await outbox.stepReconciliations();
-      if (result.error) throw new Error(`Projection dispatch released ${result.released} leases`, { cause: result.error });
+      // Released leases are uncounted, so the tick error is the only record of
+      // a failed send: a reconciliation failure joins it rather than hiding it.
+      let reconcile: { error: unknown } | undefined;
+      try { while (stepped > 0 && Date.now() < until) stepped = await outbox.stepReconciliations(); }
+      catch (error) { reconcile = { error }; }
+      if (result.error) throw new Error(`Projection dispatch released ${result.released} leases`, {
+        cause: reconcile ? new AggregateError([result.error, reconcile.error], 'Queue send and reconciliation failed') : result.error });
+      if (reconcile) throw reconcile.error;
     } finally { await close(); }
   },
   async queue(batch: MessageBatch<unknown>, env: Env): Promise<void> {
