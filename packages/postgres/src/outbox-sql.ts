@@ -13,11 +13,12 @@ const expired = `(CASE WHEN o.delivery_state='delivering' AND o.started_attempt=
 const parked = `o.failures+${expired}>=${MAX_PROJECTION_FAILURES}`;
 
 /**
- * Lease the locked rows selected by `due` (one `event_id` column). Rows whose
+ * Lease the locked rows selected by `due` (an `event_id` column). Rows whose
  * failure budget is spent become dead letters instead; they are returned
- * with `parked` set, so a caller can tell parking from an idle claim.
+ * with `parked` set, so a caller can tell parking from an idle claim. Each
+ * `carry` column of `due` is returned with its row.
  */
-export function claimOutboxSql(due: string, leaseSeconds: string, started: string): string {
+export function claimOutboxSql(due: string, leaseSeconds: string, started: string, carry: readonly string[] = []): string {
   return `WITH due AS (${due}), claimed AS (
     UPDATE projection_outbox o SET attempts=o.attempts+1, failures=o.failures+${expired},
       last_error=CASE WHEN ${expired}=1 THEN 'Processing lease expired' ELSE o.last_error END,
@@ -27,9 +28,9 @@ export function claimOutboxSql(due: string, leaseSeconds: string, started: strin
         ELSE clock_timestamp()+(${leaseSeconds}::integer * interval '1 second') END,
       started_attempt=CASE WHEN ${started}::boolean THEN o.attempts+1 END
     FROM due WHERE o.event_id=due.event_id
-    RETURNING o.event_id,o.space_id,o.collection_id,o.record_id,o.revision,o.generation,o.attempts,o.delivery_state)
+    RETURNING o.event_id,o.space_id,o.collection_id,o.record_id,o.revision,o.generation,o.attempts,o.delivery_state${carry.map(column => `,due.${column}`).join('')})
   SELECT event_id,space_id,collection_id,record_id,revision,generation,attempts,delivery_state='degraded' AS parked
-  FROM claimed ORDER BY event_id`;
+    ${carry.map(column => `,${column}`).join('')} FROM claimed ORDER BY event_id`;
 }
 
 /**

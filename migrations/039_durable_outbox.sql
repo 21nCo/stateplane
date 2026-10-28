@@ -57,9 +57,11 @@ CREATE TABLE outbox_dispatch_checkpoint (
 INSERT INTO outbox_dispatch_checkpoint DEFAULT VALUES;
 
 -- Within a space's share of one claim, collections take turns starting after
--- the collection the space was last served, so a space with more backlogged
--- collections than its share still serves each of them. One row per space
--- that has been dispatched, written by the claim under the checkpoint lock.
+-- the collection of the space's last claimed turn, so a space with more
+-- backlogged collections than its share still serves each of them in turn.
+-- One row per space that has been dispatched, written by the claim under the
+-- checkpoint lock after it key-share locks the space, as erasure locks the
+-- space before this row and the outbox.
 CREATE TABLE outbox_space_rotation (
   space_id text PRIMARY KEY REFERENCES spaces(space_id),
   after_collection_id text NOT NULL

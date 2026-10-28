@@ -96,7 +96,7 @@ const RELEASE_SQL = `UPDATE projection_outbox o
   WHERE o.event_id=m.event_id AND o.attempts=m.attempt AND o.delivery_state='delivering'
     AND (o.started_attempt IS NOT DISTINCT FROM o.attempts)=$4::boolean`;
 
-// In a space's turn, a collection at or before the one it was last served
+// In a space's turn, a collection at or before that of its last claimed turn
 // waits for the collections after it.
 const ROTATED = '(collection_id<=after_collection_id) IS TRUE';
 
@@ -258,10 +258,11 @@ export class PostgresOutbox {
   /**
    * Lease due work for dispatch. A rotating cursor bounds each scan to
    * `pairs` space/collection pairs and each space to `perSpace` rows per
-   * claim, with its collections taking turns from just after the one the
-   * space was served last. Spaces are served by turn and then in cursor order; when `limit`
-   * cuts a claim short, the cursor moves past the last pair served, so the
-   * next claim starts with the pairs that missed out. A dispatch lease is not
+   * claim, with its collections taking turns from just after the collection
+   * of the space's last claimed turn. Spaces are served by turn and then in
+   * cursor order; when `limit` cuts a claim short, the cursor moves past the
+   * last pair served, so the next claim starts with the pairs that missed
+   * out. A dispatch lease is not
    * started: if the hint is lost, the lease expires and is reclaimed without
    * spending the row's failure budget. A row whose failure budget is spent
    * is parked instead and counts as served. While another dispatcher holds the
@@ -302,13 +303,20 @@ export class PostgresOutbox {
         next = wrapped.length === budget ? wrapped.at(-1)! : null;
         scan = next ? 'wrapped' : 'whole';
       }
+      // Erasure's lock order: the space row, then its rotation row, then its
+      // outbox rows. Key-share locks on the scanned spaces come before any
+      // outbox row lock, so an erasure holding a space makes the claim wait,
+      // and the due statement's fresh snapshot then skips the deleted space.
+      await db.query(`SELECT 1 FROM spaces WHERE space_id=ANY($1::text[]) AND lifecycle IN ('active','readOnly')
+        ORDER BY space_id FOR KEY SHARE`, [[...new Set(scanned.map(pair => pair[0]))]]);
       // A space's collections take turns: each pair's due rows are ranked,
       // and the space's share goes by that rank, then from just after the
-      // collection the space was last served, wrapping, then cursor order.
-      const due = `SELECT o.event_id FROM projection_outbox o JOIN (
-          SELECT event_id FROM (
+      // collection of the space's last claimed turn, wrapping, in the order
+      // that point is compared in.
+      const due = `SELECT o.event_id,picked.turn FROM projection_outbox o JOIN (
+          SELECT event_id,turn FROM (
             SELECT event_id,available_at,n,
-              row_number() OVER (PARTITION BY space_id ORDER BY pair_rank,${ROTATED},n,available_at,event_id) AS turn
+              row_number() OVER (PARTITION BY space_id ORDER BY pair_rank,${ROTATED},collection_id,available_at,event_id) AS turn
             FROM (
               SELECT due.event_id,due.available_at,p.n,p.space_id,p.collection_id,r.after_collection_id,
                 row_number() OVER (PARTITION BY p.space_id,p.collection_id ORDER BY due.available_at,due.event_id) AS pair_rank
@@ -325,20 +333,19 @@ export class PostgresOutbox {
         ) picked ON picked.event_id=o.event_id
         WHERE o.${LIVE_OUTBOX} AND o.available_at<=clock_timestamp()
         FOR UPDATE OF o SKIP LOCKED`;
-      const claimed = await db.query(claimOutboxSql(due, '$5', 'false'),
+      const claimed = await db.query(claimOutboxSql(due, '$5', 'false', ['turn']),
         [scanned.map(pair => pair[0]), scanned.map(pair => pair[1]), perSpace, limit, leaseSeconds]);
       const served = new Set(claimed.rows.map(row => JSON.stringify([row.space_id, row.collection_id])));
       if (claimed.rows.length >= limit) next = [...scanned].reverse().find(pair => served.has(JSON.stringify(pair))) ?? next;
       // Whatever cut a space's share, its next claim starts after the
-      // collection it served last in this claim's turn order.
-      const turns = scanned.flatMap((pair, index) => served.has(JSON.stringify(pair)) ? [[...pair, index + 1] as const] : []);
-      if (turns.length) await db.query(`INSERT INTO outbox_space_rotation(space_id,after_collection_id)
-        SELECT DISTINCT ON (p.space_id) p.space_id,p.collection_id
-        FROM unnest($1::text[],$2::text[],$3::bigint[]) AS p(space_id,collection_id,n)
-        LEFT JOIN outbox_space_rotation r ON r.space_id=p.space_id
-        ORDER BY p.space_id,${ROTATED} DESC,p.n DESC
+      // collection of its last turn claimed here, parked rows included.
+      const last = new Map<string, { turn: number; collection: string }>();
+      for (const row of claimed.rows)
+        if (Number(row.turn) > (last.get(row.space_id)?.turn ?? 0)) last.set(row.space_id, { turn: Number(row.turn), collection: row.collection_id });
+      if (last.size) await db.query(`INSERT INTO outbox_space_rotation(space_id,after_collection_id)
+        SELECT * FROM unnest($1::text[],$2::text[])
         ON CONFLICT (space_id) DO UPDATE SET after_collection_id=EXCLUDED.after_collection_id`,
-      [turns.map(turn => turn[0]), turns.map(turn => turn[1]), turns.map(turn => turn[2])]);
+      [[...last.keys()], [...last.values()].map(entry => entry.collection)]);
       await db.query(`UPDATE outbox_dispatch_checkpoint SET after_space_id=$1,after_collection_id=$2,
         dispatched_at=clock_timestamp()`, [next?.[0] ?? null, next?.[1] ?? null]);
       const leased = claimed.rows.filter(row => !row.parked);

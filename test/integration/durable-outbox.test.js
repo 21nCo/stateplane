@@ -669,6 +669,65 @@ test('a space with more backlogged collections than perSpace serves each of them
   assert.deepEqual(await servedBy(2), new Set(wide.ids));
 });
 
+test('collections alternate a share remainder, and the stored point is the last turn claimed', async () => {
+  const point = async spaceId => (await pool.query('SELECT after_collection_id FROM outbox_space_rotation WHERE space_id=$1',
+    [spaceId])).rows[0]?.after_collection_id;
+  const share = async (one, limits) => {
+    const leased = (await outbox.claim(limits)).messages;
+    const counts = Object.fromEntries(one.ids.map(id => [id, 0]));
+    for (const entry of (await pool.query('SELECT collection_id FROM projection_outbox WHERE event_id=ANY($1)',
+      [leased.map(lease => lease.eventId)])).rows) counts[entry.collection_id]++;
+    return { leased, counts };
+  };
+  // Shares of 3 over 2 collections run X,Y,X: the last turn is the collection served twice.
+  const two = await space(2);
+  for (const id of two.ids) for (let index = 0; index < 15; index++) await write(two.scope(id), 'create', `{"n":${index}}`);
+  const totals = Object.fromEntries(two.ids.map(id => [id, 0]));
+  const extra = [];
+  for (let claim = 1; claim <= 4; claim++) {
+    const { counts } = await share(two, { perSpace: 3 });
+    const twice = two.ids.find(id => counts[id] === 2);
+    extra.push(twice);
+    for (const id of two.ids) totals[id] += counts[id];
+    assert.equal(await point(two.spaceId), twice, `claim ${claim} stores its last turn`);
+    assert.ok(Math.abs(totals[two.ids[0]] - totals[two.ids[1]]) <= (claim % 2), `claim ${claim}: ${JSON.stringify(totals)}`);
+  }
+  assert.deepEqual(extra, [two.ids[0], two.ids[1], two.ids[0], two.ids[1]]);
+  // Shares of 4 over 3 collections serve one collection twice, a different one each claim.
+  const three = await space(3);
+  for (const id of three.ids) for (let index = 0; index < 6; index++) await write(three.scope(id), 'create', `{"n":${index}}`);
+  const twice = [];
+  const sums = Object.fromEntries(three.ids.map(id => [id, 0]));
+  for (let claim = 0; claim < 3; claim++) {
+    const { counts } = await share(three, { perSpace: 4 });
+    twice.push(three.ids.find(id => counts[id] === 2));
+    for (const id of three.ids) sums[id] += counts[id];
+    assert.equal(await point(three.spaceId), twice.at(-1));
+  }
+  assert.deepEqual(new Set(twice), new Set(three.ids));
+  assert.deepEqual(Object.values(sums), [4, 4, 4]);
+  // A row another session holds is skipped, so the last turn claimed is the next one, not the last collection touched.
+  const held = await space(2);
+  for (const id of held.ids) for (let index = 0; index < 5; index++) await write(held.scope(id), 'create', `{"n":${index}}`);
+  const side = await pool.connect();
+  try {
+    await side.query('BEGIN');
+    const oldest = (await side.query(`SELECT event_id FROM projection_outbox WHERE space_id=$1 AND collection_id=$2
+      ORDER BY available_at,event_id LIMIT 1 FOR UPDATE`, [held.spaceId, held.ids[0]])).rows[0].event_id;
+    const { leased, counts } = await share(held, { perSpace: 3 });
+    assert.ok(!leased.some(lease => lease.eventId === oldest));
+    assert.deepEqual(Object.values(counts), [1, 1]);
+    assert.equal(await point(held.spaceId), held.ids[0]);
+  } finally { await side.query('ROLLBACK'); side.release(); }
+  // A share cut by limit stores its last turn too: after the first collection, turns run B,A,B.
+  const cut = await share(held, { limit: 3 });
+  assert.deepEqual(Object.values(cut.counts), [1, 2]);
+  assert.equal(await point(held.spaceId), held.ids[1]);
+  // A cell cursor that wraps inside the space does not reorder its turns: after the last collection comes the first.
+  await pool.query('UPDATE outbox_dispatch_checkpoint SET after_space_id=$1,after_collection_id=$2', [held.spaceId, held.ids[0]]);
+  assert.deepEqual(Object.values((await share(held, { perSpace: 1 })).counts), [1, 0]);
+});
+
 test('successive claims rotate service across spaces when the limit cuts a claim short', async () => {
   // The backlog space sorts first, so cursor order alone would serve it every time.
   const backlog = await space(1, `sp_00000000-${randomUUID().slice(9)}`);
@@ -739,6 +798,83 @@ async function deliver(projector) {
   await dispatch(outbox, { send: async messages => { sent.push(...messages); } }, { budgetMs: 1_000 });
   return Promise.all(sent.map(message => outbox.process(message, projector)));
 }
+
+/** A pool of dedicated sessions that run `before(client)` ahead of any statement containing `marker`. */
+function hooked(marker, before) {
+  return { connect: async () => {
+    const client = new pg.Client({ connectionString: target.toString() });
+    await client.connect();
+    client.release = () => client.end();
+    const query = client.query.bind(client);
+    client.query = async (text, ...rest) => {
+      if (typeof text === 'string' && text.includes(marker)) await before(client);
+      return query(text, ...rest);
+    };
+    return client;
+  } };
+}
+async function untilLockWait(pid, settled = () => false) {
+  for (let wait = 0; wait < 500 && !settled(); wait++) {
+    const { rows } = await pool.query('SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1', [pid]);
+    if (rows[0]?.wait_event_type === 'Lock') return;
+    await sleep(10);
+  }
+  if (!settled()) throw new Error(`session ${pid} never waited on a lock`);
+}
+async function erasing(spaceId) {
+  const purger = new pg.Client({ connectionString: target.toString() });
+  await purger.connect();
+  await purger.query('BEGIN');
+  const pid = purger.processID;
+  const done = purger.query('SELECT stateplane_purge_space($1)', [spaceId]).then(() => purger.query('COMMIT')).then(() => 'committed',
+    async error => { await purger.query('ROLLBACK').catch(() => {}); return `failed ${error.code}`; }).finally(() => purger.end());
+  return { pid, done };
+}
+async function assertErased(spaceId) {
+  for (const table of ['projection_outbox', 'outbox_space_rotation'])
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`, [spaceId])).rows[0].n, 0, table);
+  assert.equal(await fencer().erased(pool, spaceId), true);
+}
+
+for (const rotation of [false, true]) test(`space erasure during a paused claim commits with no deadlock, ${rotation ? 'with' : 'without'} a rotation row`, async () => {
+  const one = await space();
+  for (let index = 0; index < 3; index++) await write(one.scope(one.collectionId), 'create', `{"n":${index}}`);
+  if (rotation) await pool.query('INSERT INTO outbox_space_rotation(space_id,after_collection_id) VALUES($1,$2)', [one.spaceId, 'zzz']);
+  let erasure;
+  // The claim has leased the space's rows; erasure starts and waits before the claim writes its rotation.
+  const claimer = new PostgresOutbox(hooked('INSERT INTO outbox_space_rotation', async () => {
+    await pool.query("UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1", [one.spaceId]);
+    erasure = await erasing(one.spaceId);
+    await untilLockWait(erasure.pid);
+  }), authority);
+  const claimed = await claimer.claim().then(result => result.messages.length, error => `failed ${error.code}`);
+  assert.equal(await erasure.done, 'committed');
+  assert.equal(claimed, 3);
+  await assertErased(one.spaceId);
+});
+
+test('a claim started while erasure holds the space waits, then skips it with no deadlock', async () => {
+  const one = await space();
+  for (let index = 0; index < 3; index++) await write(one.scope(one.collectionId), 'create', `{"n":${index}}`);
+  await pool.query('INSERT INTO outbox_space_rotation(space_id,after_collection_id) VALUES($1,$2)', [one.spaceId, 'zzz']);
+  // As in erasure repair, the space turns deleting and is purged in one open transaction.
+  const purger = new pg.Client({ connectionString: target.toString() });
+  await purger.connect();
+  let claimPid;
+  try {
+    await purger.query('BEGIN');
+    await purger.query("UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1", [one.spaceId]);
+    await purger.query('SELECT stateplane_purge_space($1)', [one.spaceId]);
+    const claimer = new PostgresOutbox(hooked('outbox_dispatch_checkpoint', async client => { claimPid = client.processID; }), authority);
+    let settled = false;
+    const claim = claimer.claim().then(result => result.messages.length, error => `failed ${error.code}`).finally(() => { settled = true; });
+    while (!claimPid) await sleep(5);
+    await untilLockWait(claimPid, () => settled);
+    await purger.query('COMMIT');
+    assert.equal(await claim, 0);
+  } finally { await purger.query('ROLLBACK').catch(() => {}); await purger.end(); }
+  await assertErased(one.spaceId);
+});
 
 test('the processing deadline follows the authority budget, so the client rolls back before the server backstop', async () => {
   const { scope, collectionId, spaceId } = await space();
