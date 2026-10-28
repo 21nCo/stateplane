@@ -104,11 +104,16 @@ class ProjectorFailure extends Error {}
 // not here: an overrun is the item's. The client read bound sits past every
 // server bound (CLIENT_READ_TIMEOUT_MS), so it fires only on a lost session.
 const INFRASTRUCTURE_SQLSTATE = /^(?:(?:08|40|53|58)[\dA-Z]{3}|55P03|57P0\d)$/;
-function infrastructureFault(error: unknown): boolean {
+// Network errnos that clear when a peer, route or resolver recovers. Any other
+// errno is the item's, including ENOTFOUND (a misconfigured host is not an
+// outage), EINVAL, ENOENT and EACCES, so a deterministic failure still parks.
+const TRANSIENT_ERRNOS: ReadonlySet<string> = new Set(['ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'ETIMEDOUT', 'EPIPE',
+  'EHOSTUNREACH', 'ENETUNREACH', 'ENETDOWN', 'EHOSTDOWN', 'EAI_AGAIN']);
+/** The one positive taxonomy for every started-lease fault: true releases uncounted, anything else counts. */
+function infrastructureFault(error: unknown): error is Error {
   if (!(error instanceof Error) || error instanceof AuthorityError) return false;
   const code = (error as { code?: unknown }).code;
-  // Socket errnos such as ECONNRESET, not Node's ERR_* programming errors.
-  if (typeof code === 'string') return INFRASTRUCTURE_SQLSTATE.test(code) || (/^E[A-Z_]+$/.test(code) && !code.startsWith('ERR_'));
+  if (typeof code === 'string') return INFRASTRUCTURE_SQLSTATE.test(code) || TRANSIENT_ERRNOS.has(code);
   return clientReadTimedOut(error) || /^Connection terminated|not queryable|^timeout exceeded when trying to connect/.test(error.message);
 }
 
@@ -164,14 +169,15 @@ function text(value: unknown, maxBytes: number): string {
 
 /**
  * Keep a bounded, NUL-free diagnostic. Projectors must not put record content
- * in errors. Postgres and Node errors can quote the values they rejected, so
- * an error with a SQLSTATE or ERR_* code keeps only its name and code.
+ * in errors. Postgres, Node and socket errors can quote rejected values,
+ * hosts or credentials, so any error with a string code keeps only its name
+ * and code.
  */
 function diagnostic(error: unknown): string {
   const cause = error instanceof ProjectorFailure ? error.cause : error;
   if (!(cause instanceof Error)) return 'Projection failed';
   const code = (cause as { code?: unknown }).code;
-  const coded = !(cause instanceof AuthorityError) && typeof code === 'string' && (/^[0-9A-Z]{5}$/.test(code) || code.startsWith('ERR_'));
+  const coded = !(cause instanceof AuthorityError) && typeof code === 'string';
   const message = coded ? `${cause.name} ${code}` : `${cause.name}: ${cause.message}`;
   return message.replaceAll('\0', '').slice(0, 1024) || 'Projection failed';
 }
@@ -255,17 +261,23 @@ export class PostgresOutbox {
         next = wrapped.length === budget ? wrapped.at(-1)! : null;
         scan = next ? 'wrapped' : 'whole';
       }
+      // A space's collections take turns: each pair's due rows are ranked,
+      // and the space's share goes by that rank before cursor order.
       const due = `SELECT o.event_id FROM projection_outbox o JOIN (
           SELECT event_id FROM (
-            SELECT due.event_id,due.available_at,p.n,
-              row_number() OVER (PARTITION BY p.space_id ORDER BY due.available_at,due.event_id) AS turn
-            FROM unnest($1::text[],$2::text[]) WITH ORDINALITY AS p(space_id,collection_id,n)
-            JOIN spaces s ON s.space_id=p.space_id AND s.lifecycle IN ('active','readOnly')
-            JOIN collections c ON c.space_id=p.space_id AND c.collection_id=p.collection_id AND c.lifecycle<>'deleted'
-            CROSS JOIN LATERAL (SELECT event_id,available_at FROM projection_outbox
-              WHERE space_id=p.space_id AND collection_id=p.collection_id AND ${LIVE_OUTBOX}
-                AND available_at<=clock_timestamp()
-              ORDER BY available_at,event_id LIMIT $3) due
+            SELECT event_id,available_at,n,
+              row_number() OVER (PARTITION BY space_id ORDER BY pair_rank,n,available_at,event_id) AS turn
+            FROM (
+              SELECT due.event_id,due.available_at,p.n,p.space_id,
+                row_number() OVER (PARTITION BY p.space_id,p.collection_id ORDER BY due.available_at,due.event_id) AS pair_rank
+              FROM unnest($1::text[],$2::text[]) WITH ORDINALITY AS p(space_id,collection_id,n)
+              JOIN spaces s ON s.space_id=p.space_id AND s.lifecycle IN ('active','readOnly')
+              JOIN collections c ON c.space_id=p.space_id AND c.collection_id=p.collection_id AND c.lifecycle<>'deleted'
+              CROSS JOIN LATERAL (SELECT event_id,available_at FROM projection_outbox
+                WHERE space_id=p.space_id AND collection_id=p.collection_id AND ${LIVE_OUTBOX}
+                  AND available_at<=clock_timestamp()
+                ORDER BY available_at,event_id LIMIT $3) due
+            ) paired
           ) ranked WHERE turn<=$3 ORDER BY turn,n,available_at,event_id LIMIT $4
         ) picked ON picked.event_id=o.event_id
         WHERE o.${LIVE_OUTBOX} AND o.available_at<=clock_timestamp()
@@ -378,7 +390,7 @@ export class PostgresOutbox {
     // completion then supersedes it.
     const active = row.placed && row.latest ? projector : undefined;
     // The first infrastructure fault apply's port saw, before any mapping.
-    let fault: unknown;
+    let fault: Error | undefined;
     try {
       let prepared: unknown;
       if (active?.prepare) {

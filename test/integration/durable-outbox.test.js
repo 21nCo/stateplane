@@ -501,10 +501,11 @@ test('a rolled-back infrastructure failure after start releases the lease withou
   assert.equal(await outbox.process(next, recorder()), 'applied');
 });
 
-test('a provider outage in prepare or apply releases uncounted and never dead-letters; a prepare ERR_* error counts', async () => {
+test('a provider outage in prepare, apply or the port releases uncounted, never dead-letters and stores only its code', async () => {
   const { scope, collectionId, spaceId } = await space();
   const created = await write(scope(collectionId), 'create', '{"label":"a"}');
-  const reset = () => Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
+  const socket = code => Object.assign(new Error(`${code} https://provider.invalid/v1?api_key=SENTINEL`), { code });
+  const reset = () => socket('ECONNRESET');
   const outages = [{ prepare: async () => { throw reset(); }, apply: async () => {} },
     { apply: async () => { throw reset(); } }];
   // More outages than the failure budget, so a counted fault would park the row.
@@ -516,8 +517,24 @@ test('a provider outage in prepare or apply releases uncounted and never dead-le
     assert.deepEqual([lease.eventId, parked], [eventId, 0]);
     await assert.rejects(outbox.process(lease, outages[round % 2]), /ECONNRESET/);
     assert.deepEqual(await row(lease.eventId), { ...await row(lease.eventId), delivery_state: 'pending', failures: 0,
-      dead_lettered_at: null, parked: false, last_error: 'Error: read ECONNRESET' });
+      dead_lettered_at: null, parked: false, last_error: 'Error ECONNRESET' });
   }
+  // A socket fault the query port raises is masked the same way.
+  const refusing = new PostgresOutbox(pool, new PostgresAuthority({ connect: async () => {
+    const client = await pool.connect();
+    const { query, release } = client;
+    client.query = (sql, ...rest) => String(sql).includes('/* refused */') ? Promise.reject(socket('ECONNREFUSED')) : query.call(client, sql, ...rest);
+    client.release = discard => { Object.assign(client, { query, release }); return release.call(client, discard); };
+    return client;
+  } }, 3600));
+  await drained();
+  const [refused] = (await outbox.claim()).messages;
+  await assert.rejects(refusing.process(refused, { apply: async (_change, _prepared, query) => { await query('SELECT /* refused */ 1'); } }),
+    /ECONNREFUSED/);
+  assert.deepEqual(await row(eventId), { ...await row(eventId), delivery_state: 'pending', failures: 0, last_error: 'Error ECONNREFUSED' });
+  const status = await outbox.status(spaceId);
+  assert.equal(status.collections[0].lastError, 'Error ECONNREFUSED');
+  assert.doesNotMatch(JSON.stringify(status), /SENTINEL/);
   await drained();
   const [recovered] = (await outbox.claim()).messages;
   assert.equal(await outbox.process(recovered, recorder()), 'applied');
@@ -532,6 +549,44 @@ test('a provider outage in prepare or apply releases uncounted and never dead-le
   assert.equal(await outbox.process(misused, invalid), 'failed');
   assert.deepEqual(await row(misused.eventId), { ...await row(misused.eventId), delivery_state: 'degraded', failures: 1,
     last_error: 'TypeError ERR_INVALID_ARG_TYPE' });
+});
+
+test('a deterministic errno from prepare or apply counts and dead-letters at the failure budget', async () => {
+  const { scope, collectionId, spaceId } = await space();
+  await write(scope(collectionId), 'create', '{"label":"a"}');
+  const errno = code => Object.assign(new Error(`${code} /srv/models/SENTINEL`), { code });
+  const poisons = [{ prepare: async () => { throw errno('EINVAL'); }, apply: async () => {} },
+    { apply: async () => { throw errno('ENOENT'); } }];
+  let eventId;
+  for (let round = 0; round < 8; round++) {
+    await drained();
+    const [lease] = (await outbox.claim()).messages;
+    eventId ??= lease.eventId;
+    assert.equal(lease.eventId, eventId);
+    assert.equal(await outbox.process(lease, poisons[round % 2]), 'failed');
+    assert.equal((await row(eventId)).failures, round + 1);
+  }
+  assert.deepEqual(await row(eventId), { ...await row(eventId), delivery_state: 'degraded', failures: 8, parked: true,
+    last_error: 'Error ENOENT' });
+  assert.ok((await row(eventId)).dead_lettered_at);
+  await drained();
+  assert.deepEqual((await outbox.claim()).messages, []);
+  const status = await outbox.status(spaceId);
+  assert.deepEqual(status.collections.map(entry => [entry.pending, entry.deadLettered, entry.lastError]), [[0, 1, 'Error ENOENT']]);
+  assert.doesNotMatch(JSON.stringify(status), /SENTINEL/);
+  assert.equal(await outbox.retry('operator@example.invalid', spaceId, null, 'model restored'), 1);
+  assert.deepEqual(await Promise.all((await outbox.claim()).messages.map(lease => outbox.process(lease, recorder()))), ['applied']);
+});
+
+test('an older collection backlog does not take every slot of its space', async () => {
+  const { scope, ids } = await space(2);
+  for (let index = 0; index < 60; index++) await write(scope(ids[0]), 'create', `{"n":${index}}`);
+  await write(scope(ids[1]), 'create', '{"n":0}');
+  const leased = (await outbox.claim({ perSpace: 25 })).messages;
+  const served = (await pool.query(`SELECT collection_id,count(*)::int AS n FROM projection_outbox
+    WHERE event_id=ANY($1) GROUP BY collection_id`, [leased.map(lease => lease.eventId)])).rows;
+  assert.deepEqual(Object.fromEntries(served.map(entry => [entry.collection_id, entry.n])), { [ids[0]]: 24, [ids[1]]: 1 });
+  await outbox.release(leased);
 });
 
 test('successive claims rotate service across spaces when the limit cuts a claim short', async () => {
