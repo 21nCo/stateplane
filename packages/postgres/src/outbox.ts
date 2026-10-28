@@ -96,6 +96,10 @@ const RELEASE_SQL = `UPDATE projection_outbox o
   WHERE o.event_id=m.event_id AND o.attempts=m.attempt AND o.delivery_state='delivering'
     AND (o.started_attempt IS NOT DISTINCT FROM o.attempts)=$4::boolean`;
 
+// In a space's turn, a collection at or before the one it was last served
+// waits for the collections after it.
+const ROTATED = '(collection_id<=after_collection_id) IS TRUE';
+
 class ProjectorFailure extends Error {}
 
 // A lost session, a rolled-back serialization or deadlock, exhausted
@@ -109,12 +113,44 @@ const INFRASTRUCTURE_SQLSTATE = /^(?:(?:08|40|53|58)[\dA-Z]{3}|55P03|57P0\d)$/;
 // outage), EINVAL, ENOENT and EACCES, so a deterministic failure still parks.
 const TRANSIENT_ERRNOS: ReadonlySet<string> = new Set(['ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'ETIMEDOUT', 'EPIPE',
   'EHOSTUNREACH', 'ENETUNREACH', 'ENETDOWN', 'EHOSTDOWN', 'EAI_AGAIN']);
-/** The one positive taxonomy for every started-lease fault: true releases uncounted, anything else counts. */
-function infrastructureFault(error: unknown): error is Error {
-  if (!(error instanceof Error) || error instanceof AuthorityError) return false;
-  const code = (error as { code?: unknown }).code;
+// Node's fetch reports a socket failure as TypeError('fetch failed') with the
+// errno as its cause, and a multi-address connect as an AggregateError, so a
+// fault is read through its cause and AggregateError links. Those chains are
+// two or three errors deep; the walk stops after eight, so a cyclic or
+// pathological chain still settles promptly, and as the item's.
+const CAUSE_WALK = 8;
+
+/** The errors a bounded, cycle-safe breadth-first walk of cause and AggregateError links reaches. */
+function causes(error: unknown): Error[] {
+  const found: Error[] = [];
+  const queue = [error];
+  for (let next = 0; next < queue.length && found.length < CAUSE_WALK; next++) {
+    const current = queue[next];
+    if (!(current instanceof Error) || found.includes(current)) continue;
+    found.push(current);
+    if (current instanceof AggregateError && Array.isArray(current.errors)) queue.push(...current.errors.slice(0, CAUSE_WALK));
+    queue.push(current.cause);
+  }
+  return found;
+}
+
+function errorCode(error: Error): unknown { return (error as { code?: unknown }).code; }
+
+function transient(error: Error): boolean {
+  if (error instanceof AuthorityError) return false;
+  const code = errorCode(error);
   if (typeof code === 'string') return INFRASTRUCTURE_SQLSTATE.test(code) || TRANSIENT_ERRNOS.has(code);
   return clientReadTimedOut(error) || /^Connection terminated|not queryable|^timeout exceeded when trying to connect/.test(error.message);
+}
+
+/**
+ * The one positive taxonomy for every started-lease fault: true releases
+ * uncounted, anything else counts. A fault is infrastructure when its walk
+ * reaches a transient error and no AuthorityError, such as the budget overrun.
+ */
+function infrastructureFault(error: unknown): error is Error {
+  const walked = causes(error);
+  return walked.some(transient) && !walked.some(entry => entry instanceof AuthorityError);
 }
 
 // A projector's own error is the item's, except a positively classified
@@ -171,14 +207,18 @@ function text(value: unknown, maxBytes: number): string {
  * Keep a bounded, NUL-free diagnostic. Projectors must not put record content
  * in errors. Postgres, Node and socket errors can quote rejected values,
  * hosts or credentials, so any error with a string code keeps only its name
- * and code.
+ * and code. The same walk as the classification picks the error shown: an
+ * AuthorityError, else the transient fault, else the first coded error.
  */
 function diagnostic(error: unknown): string {
-  const cause = error instanceof ProjectorFailure ? error.cause : error;
-  if (!(cause instanceof Error)) return 'Projection failed';
-  const code = (cause as { code?: unknown }).code;
-  const coded = !(cause instanceof AuthorityError) && typeof code === 'string';
-  const message = coded ? `${cause.name} ${code}` : `${cause.name}: ${cause.message}`;
+  const top = error instanceof ProjectorFailure ? error.cause : error;
+  if (!(top instanceof Error)) return 'Projection failed';
+  const walked = causes(top);
+  const shown = walked.find(entry => entry instanceof AuthorityError) ?? walked.find(transient)
+    ?? walked.find(entry => typeof errorCode(entry) === 'string') ?? top;
+  const code = errorCode(shown);
+  const coded = !(shown instanceof AuthorityError) && typeof code === 'string';
+  const message = coded ? `${shown.name} ${code}` : `${shown.name}: ${shown.message}`;
   return message.replaceAll('\0', '').slice(0, 1024) || 'Projection failed';
 }
 
@@ -218,7 +258,8 @@ export class PostgresOutbox {
   /**
    * Lease due work for dispatch. A rotating cursor bounds each scan to
    * `pairs` space/collection pairs and each space to `perSpace` rows per
-   * claim. Spaces are served by turn and then in cursor order; when `limit`
+   * claim, with its collections taking turns from just after the one the
+   * space was served last. Spaces are served by turn and then in cursor order; when `limit`
    * cuts a claim short, the cursor moves past the last pair served, so the
    * next claim starts with the pairs that missed out. A dispatch lease is not
    * started: if the hint is lost, the lease expires and is reclaimed without
@@ -262,15 +303,17 @@ export class PostgresOutbox {
         scan = next ? 'wrapped' : 'whole';
       }
       // A space's collections take turns: each pair's due rows are ranked,
-      // and the space's share goes by that rank before cursor order.
+      // and the space's share goes by that rank, then from just after the
+      // collection the space was last served, wrapping, then cursor order.
       const due = `SELECT o.event_id FROM projection_outbox o JOIN (
           SELECT event_id FROM (
             SELECT event_id,available_at,n,
-              row_number() OVER (PARTITION BY space_id ORDER BY pair_rank,n,available_at,event_id) AS turn
+              row_number() OVER (PARTITION BY space_id ORDER BY pair_rank,${ROTATED},n,available_at,event_id) AS turn
             FROM (
-              SELECT due.event_id,due.available_at,p.n,p.space_id,
+              SELECT due.event_id,due.available_at,p.n,p.space_id,p.collection_id,r.after_collection_id,
                 row_number() OVER (PARTITION BY p.space_id,p.collection_id ORDER BY due.available_at,due.event_id) AS pair_rank
               FROM unnest($1::text[],$2::text[]) WITH ORDINALITY AS p(space_id,collection_id,n)
+              LEFT JOIN outbox_space_rotation r ON r.space_id=p.space_id
               JOIN spaces s ON s.space_id=p.space_id AND s.lifecycle IN ('active','readOnly')
               JOIN collections c ON c.space_id=p.space_id AND c.collection_id=p.collection_id AND c.lifecycle<>'deleted'
               CROSS JOIN LATERAL (SELECT event_id,available_at FROM projection_outbox
@@ -284,10 +327,18 @@ export class PostgresOutbox {
         FOR UPDATE OF o SKIP LOCKED`;
       const claimed = await db.query(claimOutboxSql(due, '$5', 'false'),
         [scanned.map(pair => pair[0]), scanned.map(pair => pair[1]), perSpace, limit, leaseSeconds]);
-      if (claimed.rows.length >= limit) {
-        const served = new Set(claimed.rows.map(row => JSON.stringify([row.space_id, row.collection_id])));
-        next = [...scanned].reverse().find(pair => served.has(JSON.stringify(pair))) ?? next;
-      }
+      const served = new Set(claimed.rows.map(row => JSON.stringify([row.space_id, row.collection_id])));
+      if (claimed.rows.length >= limit) next = [...scanned].reverse().find(pair => served.has(JSON.stringify(pair))) ?? next;
+      // Whatever cut a space's share, its next claim starts after the
+      // collection it served last in this claim's turn order.
+      const turns = scanned.flatMap((pair, index) => served.has(JSON.stringify(pair)) ? [[...pair, index + 1] as const] : []);
+      if (turns.length) await db.query(`INSERT INTO outbox_space_rotation(space_id,after_collection_id)
+        SELECT DISTINCT ON (p.space_id) p.space_id,p.collection_id
+        FROM unnest($1::text[],$2::text[],$3::bigint[]) AS p(space_id,collection_id,n)
+        LEFT JOIN outbox_space_rotation r ON r.space_id=p.space_id
+        ORDER BY p.space_id,${ROTATED} DESC,p.n DESC
+        ON CONFLICT (space_id) DO UPDATE SET after_collection_id=EXCLUDED.after_collection_id`,
+      [turns.map(turn => turn[0]), turns.map(turn => turn[1]), turns.map(turn => turn[2])]);
       await db.query(`UPDATE outbox_dispatch_checkpoint SET after_space_id=$1,after_collection_id=$2,
         dispatched_at=clock_timestamp()`, [next?.[0] ?? null, next?.[1] ?? null]);
       const leased = claimed.rows.filter(row => !row.parked);

@@ -11,6 +11,7 @@ if (!url || !role || !/^(?!pg_)[a-z][a-z0-9_]{0,62}$/.test(role))
 const grants=[
   ['projection_heads','SELECT, INSERT, UPDATE'],
   ['outbox_dispatch_checkpoint','SELECT, UPDATE'],
+  ['outbox_space_rotation','SELECT, INSERT, UPDATE'],
   ['projection_reconciliations','SELECT, INSERT, UPDATE'],
   ['outbox_operator_audit','SELECT, INSERT']
 ];

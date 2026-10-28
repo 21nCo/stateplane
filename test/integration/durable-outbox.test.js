@@ -356,9 +356,10 @@ test('reconciliation pages are resumable, cancellable, audited and repair missin
 
   // Erasure removes projection state and jobs; operator audit facts survive.
   await outbox.reconcile('operator', spaceId, collectionId, 'pending at erasure');
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM outbox_space_rotation WHERE space_id=$1', [spaceId])).rows[0].n, 1);
   await pool.query("UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1", [spaceId]);
   await pool.query('SELECT stateplane_purge_space($1)', [spaceId]);
-  for (const table of ['projection_heads', 'projection_reconciliations', 'projection_outbox'])
+  for (const table of ['projection_heads', 'projection_reconciliations', 'projection_outbox', 'outbox_space_rotation'])
     assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`, [spaceId])).rows[0].n, 0, table);
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM outbox_operator_audit WHERE space_id=$1', [spaceId])).rows[0].n, 4);
 });
@@ -578,6 +579,57 @@ test('a deterministic errno from prepare or apply counts and dead-letters at the
   assert.deepEqual(await Promise.all((await outbox.claim()).messages.map(lease => outbox.process(lease, recorder()))), ['applied']);
 });
 
+test('a transient cause or aggregate member releases uncounted; a deterministic, cyclic or over-deep chain counts', async () => {
+  const { scope, collectionId, spaceId } = await space();
+  const created = await write(scope(collectionId), 'create', '{"label":"a"}');
+  const socket = code => Object.assign(new Error(`${code} https://provider.invalid/v1?api_key=SENTINEL`), { code });
+  // Node's fetch reports a socket failure as TypeError('fetch failed') with the errno as its cause.
+  const fetchFailed = code => new TypeError('fetch failed', { cause: socket(code) });
+  const outages = [
+    [{ prepare: async () => { throw fetchFailed('ECONNRESET'); }, apply: async () => {} }, 'Error ECONNRESET'],
+    [{ apply: async () => { throw fetchFailed('ECONNRESET'); } }, 'Error ECONNRESET'],
+    [{ apply: async () => { throw new AggregateError([new Error('first address'), socket('ECONNREFUSED')], 'connect failed'); } },
+      'Error ECONNREFUSED']];
+  // More outages than the failure budget, so a counted fault would park the row.
+  let eventId;
+  for (let round = 0; round < 9; round++) {
+    const [projector, stored] = outages[round % outages.length];
+    await drained();
+    const { messages: [lease], parked } = await outbox.claim();
+    eventId ??= lease.eventId;
+    assert.deepEqual([lease.eventId, parked], [eventId, 0]);
+    await assert.rejects(outbox.process(lease, projector));
+    assert.deepEqual(await row(eventId), { ...await row(eventId), delivery_state: 'pending', failures: 0,
+      dead_lettered_at: null, parked: false, last_error: stored });
+  }
+  const status = await outbox.status(spaceId);
+  assert.equal(status.collections[0].lastError, 'Error ECONNREFUSED');
+  assert.doesNotMatch(JSON.stringify(status), /SENTINEL/);
+  await drained();
+  const [recovered] = (await outbox.claim()).messages;
+  assert.equal(await outbox.process(recovered, recorder()), 'applied');
+  assert.deepEqual(await head(spaceId, created.ref.id), { generation: 1, revision: 1, deleted: false });
+
+  await write(scope(collectionId), 'create', '{"label":"b"}');
+  const cyclic = new Error('first'); cyclic.cause = new Error('second', { cause: cyclic });
+  // The transient errno sits one past the eight errors the walk visits.
+  let deep = socket('ECONNRESET');
+  for (let depth = 0; depth < 8; depth++) deep = new Error(`wrapper ${depth}`, { cause: deep });
+  const counted = [
+    [() => fetchFailed('EINVAL'), 'Error EINVAL'],
+    [() => cyclic, 'Error: first'],
+    [() => deep, 'Error: wrapper 7'],
+    [() => new AggregateError([new AuthorityError('RATE_LIMITED', 'budget'), socket('ECONNRESET')]), 'AuthorityError: budget']];
+  for (const [index, [thrown, stored]] of counted.entries()) {
+    await drained();
+    const [lease] = (await outbox.claim()).messages;
+    assert.notEqual(lease.eventId, eventId);
+    assert.equal(await outbox.process(lease, { apply: async () => { throw thrown(); } }), 'failed');
+    assert.deepEqual(await row(lease.eventId), { ...await row(lease.eventId), delivery_state: 'degraded', failures: index + 1,
+      last_error: stored });
+  }
+});
+
 test('an older collection backlog does not take every slot of its space', async () => {
   const { scope, ids } = await space(2);
   for (let index = 0; index < 60; index++) await write(scope(ids[0]), 'create', `{"n":${index}}`);
@@ -587,6 +639,34 @@ test('an older collection backlog does not take every slot of its space', async 
     WHERE event_id=ANY($1) GROUP BY collection_id`, [leased.map(lease => lease.eventId)])).rows;
   assert.deepEqual(Object.fromEntries(served.map(entry => [entry.collection_id, entry.n])), { [ids[0]]: 24, [ids[1]]: 1 });
   await outbox.release(leased);
+});
+
+test('a space with more backlogged collections than perSpace serves each of them within two claims', async () => {
+  const servedBy = async (claims, limits) => {
+    const served = new Set();
+    for (let claim = 0; claim < claims; claim++) {
+      const leased = (await outbox.claim(limits)).messages;
+      for (const entry of (await pool.query('SELECT collection_id FROM projection_outbox WHERE event_id=ANY($1)',
+        [leased.map(lease => lease.eventId)])).rows) served.add(entry.collection_id);
+    }
+    return served;
+  };
+  const backlog = async (spaces, rows) => {
+    for (const { scope, ids } of spaces) for (const id of ids) for (let index = 0; index < rows; index++)
+      await write(scope(id), 'create', `{"n":${index}}`);
+  };
+  const one = await space(3);
+  await backlog([one], 6);
+  assert.deepEqual(await servedBy(2, { perSpace: 2 }), new Set(one.ids));
+  // Each space keeps its own rotation, so two cut spaces both reach their third collection.
+  const first = await space(3);
+  const second = await space(3);
+  await backlog([first, second], 6);
+  assert.deepEqual(await servedBy(2, { perSpace: 2, limit: 100 }), new Set([...first.ids, ...second.ids]));
+  // At the defaults, the 26th collection waits one claim, not for the other backlogs to drain.
+  const wide = await space(26);
+  await backlog([wide], 2);
+  assert.deepEqual(await servedBy(2), new Set(wide.ids));
 });
 
 test('successive claims rotate service across spaces when the limit cuts a claim short', async () => {

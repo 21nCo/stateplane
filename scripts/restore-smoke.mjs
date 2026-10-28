@@ -38,7 +38,7 @@ const tables = ['stateplane_migrations','space_directory','space_provisioning_au
   'idempotency_receipts','receipt_reservations',
   'receipt_reservation_scopes','schema_commit_fences','collection_write_slots','batch_operations','batch_items',
   'record_tombstones','projection_outbox','entity_refs','projection_heads','projection_reconciliations',
-  'outbox_dispatch_checkpoint','outbox_operator_audit'];
+  'outbox_dispatch_checkpoint','outbox_space_rotation','outbox_operator_audit'];
 async function snapshot(pool) {
   const entries = await Promise.all(tables.map(async table => {
     const rows = await pool.query(`SELECT to_jsonb(t) AS value FROM ${table} t`);
@@ -91,6 +91,7 @@ try {
     outcomes.push(await authority.transaction(worker,tx=>tx.completeProjection(delivery)));
   assert.deepEqual(outcomes.toSorted((a,b)=>a.localeCompare(b)),['applied','applied','superseded'],'restore seed applies both latest revisions');
   await new PostgresOutbox(base,authority).reconcile('restore-operator',spaceId,collectionId,'restore drill');
+  await base.query('INSERT INTO outbox_space_rotation(space_id,after_collection_id) VALUES($1,$2)',[spaceId,collectionId]);
   const feedSeed=(await base.query(`SELECT event_id FROM record_events WHERE space_id=$1
     ORDER BY committed_at,event_id LIMIT 1`,[spaceId])).rows[0].event_id;
   await base.query(`INSERT INTO record_event_feed(event_id,space_id,collection_id)
@@ -104,7 +105,7 @@ try {
     expected.space_credentials.length && expected.collection_grants.length && expected.batch_items.length &&
     expected.routing_nonces.length && expected.space_audit.length && expected.space_provisioning_audit.length &&
     expected.projection_heads.length && expected.projection_reconciliations.length &&
-    expected.outbox_dispatch_checkpoint.length && expected.outbox_operator_audit.length,
+    expected.outbox_dispatch_checkpoint.length && expected.outbox_space_rotation.length && expected.outbox_operator_audit.length,
   'expected this restore smoke seed to populate records, outbox, projection state and owned-space authority');
   const archive = docker(['pg_dump','-U','stateplane','-Fc',sourceName]);
   docker(['createdb','-U','stateplane',name]);
@@ -136,6 +137,8 @@ try {
         .rows[0]?.create_failed_at,'restored operational role can use the journal');
       assert.equal((await operational.query(`UPDATE projection_reconciliations SET next_step_at=clock_timestamp()
         WHERE space_id=$1`,[spaceId])).rowCount,1,'restored operational role can advance reconciliations');
+      assert.equal((await operational.query(`UPDATE outbox_space_rotation SET after_collection_id=$2
+        WHERE space_id=$1`,[spaceId,collectionId])).rowCount,1,'restored operational role can rotate collection turns');
     } finally {
       await operational.query('RESET ROLE').catch(()=>{});
       operational.release();
@@ -143,7 +146,7 @@ try {
     }
   } finally {
     await restored.query(`REVOKE ALL ON agent_key_issuances,projection_heads,projection_reconciliations,
-      outbox_dispatch_checkpoint,outbox_operator_audit FROM ${journalRole}`).catch(()=>{});
+      outbox_dispatch_checkpoint,outbox_space_rotation,outbox_operator_audit FROM ${journalRole}`).catch(()=>{});
     await restored.query(`DROP ROLE IF EXISTS ${journalRole}`).catch(()=>{});
   }
   // A reserved-word role proves identifier quoting. Keep its creation and

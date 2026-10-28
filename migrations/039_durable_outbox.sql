@@ -56,6 +56,15 @@ CREATE TABLE outbox_dispatch_checkpoint (
 );
 INSERT INTO outbox_dispatch_checkpoint DEFAULT VALUES;
 
+-- Within a space's share of one claim, collections take turns starting after
+-- the collection the space was last served, so a space with more backlogged
+-- collections than its share still serves each of them. One row per space
+-- that has been dispatched, written by the claim under the checkpoint lock.
+CREATE TABLE outbox_space_rotation (
+  space_id text PRIMARY KEY REFERENCES spaces(space_id),
+  after_collection_id text NOT NULL
+);
+
 -- Resumable, cancellable repair of one collection's projection heads.
 CREATE TABLE projection_reconciliations (
   job_id text PRIMARY KEY CHECK (job_id ~ '^rcn_[0-9a-f-]{36}$'),
@@ -110,6 +119,7 @@ BEGIN
   DELETE FROM public.batch_operations WHERE space_id=p_space_id;
   DELETE FROM public.projection_reconciliations WHERE space_id=p_space_id;
   DELETE FROM public.projection_heads WHERE space_id=p_space_id;
+  DELETE FROM public.outbox_space_rotation WHERE space_id=p_space_id;
   DELETE FROM public.projection_outbox WHERE space_id=p_space_id;
   DELETE FROM public.receipt_reservation_scopes WHERE space_id=p_space_id;
   DELETE FROM public.receipt_reservations WHERE space_id=p_space_id;
