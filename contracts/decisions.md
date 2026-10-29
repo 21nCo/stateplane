@@ -97,7 +97,7 @@ The reference cursor checks canonical wire bytes and binding, then validates a f
 | Numeric row/depth/key/query/byte/rate quotas, future bulk operation contract/bounds and receipt/cursor/snapshot retention; test concurrency and conditional writes against real Postgres | STA-5, STA-7, STA-8 |
 | Schema index-declaration revisions, version backfill/index readiness mechanics and fixtures before/after readiness, permitted future breaking migrations and tombstone erasure/reuse policy | STA-7 schema/index revisions; STA-8 indexed queries; STA-17 erasure |
 | Referential integrity of claim source refs distinct from links, source-byte erasure timing, and mixed link-policy deletion/create-race adapter fixtures | STA-13 evidence/links; STA-17 erasure |
-| Job lease/retries/dead letters and projection generation cutover proof | STA-12; STA-14 |
+| Projection generation cutover proof and measured job bounds (STA-12 implements leases, retries, dead letters, per-ref heads and placement fencing in [durable outbox](../docs/durable-outbox.md)) | STA-14; STA-19 |
 | Source MIME/extraction limits, original/backup retention, permission/declassification rules and blob residency | STA-13; STA-17 |
 | Embedder model/version/dimensions, processing location, quality/recall evaluation and failure behavior under real load | STA-14; STA-19 |
 | Snapshot isolation implementation, export manifest retention/cancel and analytical resource budget | STA-15; STA-17 |

@@ -9,6 +9,8 @@ export function parseRevision(value: unknown): Revision {
   }
   return value as Revision;
 }
+/** Delivery attempts are stored as a Postgres integer, so hints above this are forged. */
+export const MAX_DELIVERY_ATTEMPT = 2_147_483_647;
 export interface RecordRef { spaceId: SpaceId; collectionId: CollectionId; id: string; }
 export type Capability = 'schema:write' | 'records:read' | 'records:write' | 'sources:read' | 'sources:write' | 'claims:read' | 'claims:write' | 'claims:review' | 'events:read' | 'export:read' | 'space:admin';
 // A Record over the union fails to compile when a capability is added or removed without it.

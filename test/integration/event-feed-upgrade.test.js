@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { readFile, readdir } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, readdir, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 
@@ -31,6 +31,7 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
   const url=new URL(baseUrl); url.pathname=`/${name}`;
   const admin=new pg.Client({connectionString:baseUrl});
   let upgrade;let writer;let blocker;let reader;let migration;
+  const staged=new URL(`../../.data/event-feed-migrator-${randomUUID()}/`,import.meta.url);
   await admin.connect();
   try {
     await admin.query(`CREATE DATABASE ${name}`);
@@ -63,8 +64,18 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     await upgrade.query(`INSERT INTO record_events(event_id,space_id,collection_id,record_id,revision,
       operation,credential_id,schema_version,canonical_data)
       VALUES('event-1','sta9-event','entries','record-1',1,'create','agent',1,'{}')`);
+    // The scenario reruns 038 as the newest applied step, so it uses a copy of
+    // the migrator whose inventory ends there. Repository-local staging keeps
+    // package resolution; the real migrator applies later files at the end.
+    await mkdir(new URL('scripts/',staged),{recursive:true});
+    await mkdir(new URL('migrations/',staged));
+    for (const file of ['migrate.mjs','db-connection.mjs','migration-order.mjs'])
+      await copyFile(new URL(`../../scripts/${file}`,import.meta.url),new URL(`scripts/${file}`,staged));
+    for (const file of files.filter(file=>file<'039_'))
+      await copyFile(new URL(`../../migrations/${file}`,import.meta.url),new URL(`migrations/${file}`,staged));
+    const migrator=fileURLToPath(new URL('scripts/migrate.mjs',staged));
     const env={...process.env,DATABASE_URL:url.href};
-    const migrate=(drained)=>execFileSync(process.execPath,['scripts/migrate.mjs'],{cwd,encoding:'utf8',timeout:15_000,
+    const migrate=(drained,script=migrator)=>execFileSync(process.execPath,[script],{cwd,encoding:'utf8',timeout:15_000,
       env:{...env,STATEPLANE_POPULATED_INDEX_UPGRADE:drained?'drained':''}});
     let refused;
     try { migrate(false); } catch(error) { refused=error; }
@@ -78,7 +89,7 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     await blocker.connect();
     await blocker.query('BEGIN');
     await blocker.query('LOCK TABLE batch_items IN ACCESS EXCLUSIVE MODE');
-    migration=spawn(process.execPath,['scripts/migrate.mjs'],{cwd,
+    migration=spawn(process.execPath,[migrator],{cwd,
       env:{...env,STATEPLANE_POPULATED_INDEX_UPGRADE:'drained'},stdio:['ignore','pipe','pipe']});
     const migrationClosed=once(migration,'close');
     let migrationError='';
@@ -120,7 +131,7 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     migrate(true);
     assert.deepEqual((await upgrade.query(`SELECT event_id FROM record_event_feed`)).rows,
       [{event_id:'event-1'}]);
-    assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name>='036_'")).rows[0].n,3);
+    assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name>='036_' AND name<'039_'")).rows[0].n,3);
     assert.equal((await upgrade.query("SELECT to_regclass('public.record_events_scoped_cursor') AS name")).rows[0].name,null);
     migrate(false);
 
@@ -133,7 +144,7 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     await reader.connect();
     await reader.query('BEGIN');
     await reader.query('LOCK TABLE record_events IN ACCESS SHARE MODE');
-    migration=spawn(process.execPath,['scripts/migrate.mjs'],{cwd,
+    migration=spawn(process.execPath,[migrator],{cwd,
       env:{...env,STATEPLANE_POPULATED_INDEX_UPGRADE:'drained'},stdio:['ignore','pipe','pipe']});
     const dropClosed=once(migration,'close');
     let dropError='';
@@ -158,8 +169,24 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     await reader.query('ROLLBACK');
     await reader.end();
     reader=undefined;
-    migrate(true);
+    // 039 takes its locks in writer order under a bounded wait. A long outbox
+    // reader makes it fail fast with an actionable error and no ledger entry.
+    await writer.end();
+    writer=new pg.Client({connectionString:url.href});
+    await writer.connect();
+    await writer.query('BEGIN');
+    await writer.query('SELECT count(*) FROM projection_outbox');
+    let outboxContention;
+    try { migrate(true,'scripts/migrate.mjs'); } catch(error) { outboxContention=error; }
+    assert.match(String(outboxContention?.stderr),/Durable outbox upgrade requires drained traffic/);
+    assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name='039_durable_outbox.sql'")).rows[0].n,0);
+    assert.equal((await upgrade.query("SELECT to_regclass('public.projection_heads') AS name")).rows[0].name,null);
+    await writer.query('ROLLBACK');
+    await writer.end();
+    writer=undefined;
+    migrate(true,'scripts/migrate.mjs');
     assert.equal((await upgrade.query("SELECT to_regclass('public.record_events_scoped_cursor') AS name")).rows[0].name,null);
+    assert.equal((await upgrade.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,files.length);
   } finally {
     if (migration) {
       migration.kill('SIGTERM');
@@ -172,6 +199,57 @@ test('populated event-feed upgrade refuses live traffic and replays after a drai
     await writer?.end().catch(()=>{});
     await reader?.query('ROLLBACK').catch(()=>{});
     await reader?.end().catch(()=>{});
+    await upgrade?.end().catch(()=>{});
+    await rm(staged,{recursive:true,force:true});
+    await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+    await admin.end();
+  }
+});
+
+test('populated durable outbox upgrade requires the drained acknowledgement',async()=>{
+  const name=`stateplane_sta12_outbox_${randomUUID().replaceAll('-','')}`;
+  const url=new URL(baseUrl); url.pathname=`/${name}`;
+  const admin=new pg.Client({connectionString:baseUrl});
+  let upgrade;
+  await admin.connect();
+  try {
+    await admin.query(`CREATE DATABASE ${name}`);
+    upgrade=new pg.Client({connectionString:url.href});
+    await upgrade.connect();
+    await upgrade.query(`CREATE TABLE stateplane_migrations(name text PRIMARY KEY,sha256 text NOT NULL,
+      applied_at timestamptz NOT NULL DEFAULT now())`);
+    const files=(await readdir(new URL('../../migrations/',import.meta.url)))
+      .filter(file=>/^\d{3}_.*\.sql$/.test(file)).sort();
+    for (const file of files.filter(file=>file<'039_'))
+      await applyFixtureMigration(upgrade,file,await readFile(new URL(`../../migrations/${file}`,import.meta.url),'utf8'));
+    await upgrade.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+      VALUES('sta12-outbox','owner','cell-a','cell-a','target-a')`);
+    await upgrade.query('BEGIN');
+    await upgrade.query("INSERT INTO collections(space_id,collection_id) VALUES('sta12-outbox','entries')");
+    await upgrade.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition)
+      VALUES('sta12-outbox','entries',1,'{}')`);
+    await upgrade.query('COMMIT');
+    await upgrade.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,
+      key_mode,normalized_key,canonical_data,data)
+      VALUES('sta12-outbox','entries','record-1',1,1,'generated','record-1','{}','{}'::jsonb)`);
+    await upgrade.query(`INSERT INTO record_events(event_id,space_id,collection_id,record_id,revision,
+      operation,credential_id,schema_version,canonical_data)
+      VALUES('event-1','sta12-outbox','entries','record-1',1,'create','agent',1,'{}')`);
+    await upgrade.query(`INSERT INTO projection_outbox(event_id,space_id,collection_id,record_id,revision,generation)
+      VALUES('event-1','sta12-outbox','entries','record-1',1,1)`);
+    const migrate=drained=>execFileSync(process.execPath,['scripts/migrate.mjs'],{cwd,encoding:'utf8',timeout:15_000,
+      env:{...process.env,DATABASE_URL:url.href,STATEPLANE_POPULATED_INDEX_UPGRADE:drained?'drained':''}});
+    let refused;
+    try { migrate(false); } catch(error) { refused=error; }
+    assert.match(String(refused?.stderr),/Populated durable outbox upgrade requires drained traffic/);
+    assert.equal((await upgrade.query("SELECT count(*)::int AS n FROM stateplane_migrations WHERE name='039_durable_outbox.sql'")).rows[0].n,0);
+    assert.equal((await upgrade.query("SELECT to_regclass('public.projection_outbox_failed') AS name")).rows[0].name,null);
+    assert.equal((await upgrade.query("SELECT to_regclass('public.projection_heads') AS name")).rows[0].name,null);
+    migrate(true);
+    assert.equal((await upgrade.query('SELECT count(*)::int AS n FROM stateplane_migrations')).rows[0].n,files.length);
+    assert.notEqual((await upgrade.query("SELECT to_regclass('public.projection_outbox_failed') AS name")).rows[0].name,null);
+    assert.deepEqual((await upgrade.query('SELECT event_id,failures FROM projection_outbox')).rows,[{event_id:'event-1',failures:0}]);
+  } finally {
     await upgrade?.end().catch(()=>{});
     await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
     await admin.end();

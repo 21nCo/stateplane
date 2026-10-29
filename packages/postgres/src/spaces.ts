@@ -6,6 +6,7 @@ import type { Capability, CollectionId, SpaceId, VerifiedCredential } from '@sta
 import { AuthorityError, CommitOutcomeUnknownError } from './index.js';
 import type { AuthorityScope } from './index.js';
 import type { CurrentCredential } from './cell-policy.js';
+import { schedulePlacementRepairSql } from './outbox-sql.js';
 
 type PoolLike = Pick<pg.Pool, 'connect' | 'query'>;
 export interface CellDatabase { pool: PoolLike; storageTargetId: string }
@@ -793,6 +794,9 @@ export class PostgresSpaces {
   private async erased(db: Pick<pg.Pool, 'query'>, spaceId: string): Promise<boolean> {
     const result = await db.query(`SELECT lifecycle='deleted' AND
       NOT EXISTS (SELECT 1 FROM projection_outbox WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM projection_heads WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM outbox_space_rotation WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM projection_reconciliations WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM receipt_reservation_scopes WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM receipt_reservations WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM idempotency_receipts WHERE space_id=$1) AND
@@ -915,6 +919,9 @@ export class PostgresSpaces {
         WHERE space_id=$1 AND cell_id=$2 AND placement_generation=$3 RETURNING placement_generation,policy_version,lifecycle`,
       [spaceId,expectedCellId,expectedGeneration]);
       if (!changed.rows[0]) throw new AuthorityError('STALE_PLACEMENT');
+      // Delivered projections are now from an earlier generation. Schedule
+      // their repair with the fence so no operator step is needed.
+      await db.query(schedulePlacementRepairSql,[spaceId]);
       await db.query(`INSERT INTO space_audit(audit_id,space_id,actor_principal_id,action,policy_version,placement_generation)
         VALUES($1,$2,'system:placement','placement:fence',$3,$4)`,[`aud_${randomUUID()}`,spaceId,
         changed.rows[0].policy_version,changed.rows[0].placement_generation]);

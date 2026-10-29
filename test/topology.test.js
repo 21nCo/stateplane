@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile, chmod, mkdir, copyFile, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { validateTopology, validateInventory, validateDeploymentInventories, renderTopology, cellDatabaseName, railwayServiceName, validateRailwayServiceName, readProtectedDeploymentInventory } from '../scripts/topology.mjs';
+import { validateTopology, validateInventory, validateDeploymentInventories, renderTopology, jobsConsumerConcurrency, cellDatabaseName, railwayServiceName, validateRailwayServiceName, readProtectedDeploymentInventory } from '../scripts/topology.mjs';
 import { assertLiveResources } from '../scripts/topology-live.mjs';
 import { readProtectedSqlUrls, verifySqlIdentity } from '../scripts/topology-sql.mjs';
 import { dryRunTopology, syntheticInventories } from '../scripts/topology-dry-run.mjs';
@@ -259,8 +259,28 @@ test('rendered control, gateways and every cell use isolated names and secret-fr
       assert.equal(regional[1].queues.producers[0].queue, `${env.prefix}-${cell.id}-projection`);
       assert.equal(regional[2].queues.consumers[0].queue, `${env.prefix}-${cell.id}-projection`);
       assert.equal(regional[2].queues.consumers[0].dead_letter_queue, `${env.prefix}-${cell.id}-projection-dlq`);
+      assert.deepEqual(regional[2].queues.producers, [{ binding: 'PROJECTION_JOBS', queue: `${env.prefix}-${cell.id}-projection` }]);
+      assert.deepEqual(regional[2].triggers, { crons: ['* * * * *'] });
+      // Consumers plus the cron tick, one connection each, stay within half the origin budget.
+      assert.equal(regional[2].queues.consumers[0].max_concurrency, 1);
+      assert.ok(regional[2].queues.consumers[0].max_concurrency + 1 <= cell.originConnectionLimit / 2);
     }
     assert.equal(/password|DATABASE_URL|POSTGRES_PASSWORD/i.test(JSON.stringify(rendered)), false);
+  }
+});
+
+test('jobs consumer concurrency follows each cell origin budget and leaves API and MCP the larger share', () => {
+  const sized = copy(topology);
+  sized.environments.development.cells[0].originConnectionLimit = 20;
+  sized.environments.development.cells[1].originConnectionLimit = 7;
+  const inventories = syntheticInventories(sized);
+  const rendered = renderTopology(sized, 'development', inventories.development, inventories.production, '/tmp/stateplane-topology');
+  const consumer = cell => rendered[`${cell.id}-jobs.json`].queues.consumers[0];
+  assert.deepEqual(sized.environments.development.cells.map(cell => consumer(cell).max_concurrency), [9, 2, 1]);
+  assert.deepEqual(sized.environments.development.cells.map(cell => consumer(cell).max_batch_size), [1, 1, 1]);
+  for (let limit = 5; limit <= 20; limit++) {
+    const jobs = jobsConsumerConcurrency(limit) + 1;
+    assert.ok(jobs >= 2 && limit - jobs >= Math.ceil(limit / 2), `limit ${limit}`);
   }
 });
 
