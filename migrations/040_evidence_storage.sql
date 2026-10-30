@@ -285,6 +285,73 @@ CREATE TRIGGER claim_evidence_immutable BEFORE UPDATE OR DELETE ON claim_evidenc
 CREATE TRIGGER claim_evidence_no_truncate BEFORE TRUNCATE ON claim_evidence
   FOR EACH STATEMENT EXECUTE FUNCTION reject_evidence_fact_change();
 
+-- A reference-only original discloses that no bytes were fetched, so its
+-- source must say where the evidence lives. Sources are immutable and the
+-- source row exists before its original, so checking at insert is final.
+CREATE FUNCTION stateplane_check_reference_locator() RETURNS trigger LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  IF NEW.reference_only AND EXISTS (SELECT 1 FROM public.sources WHERE space_id = NEW.space_id
+      AND collection_id = NEW.collection_id AND source_id = NEW.source_id AND locator IS NULL) THEN
+    RAISE EXCEPTION 'a reference-only source needs a locator'
+      USING ERRCODE = 'check_violation', CONSTRAINT = 'original_objects_reference_locator';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+REVOKE ALL ON FUNCTION stateplane_check_reference_locator() FROM PUBLIC;
+CREATE TRIGGER original_objects_reference_locator BEFORE INSERT ON original_objects
+  FOR EACH ROW EXECUTE FUNCTION stateplane_check_reference_locator();
+
+-- The upload ledger moves forward only. A grant's binding never changes; it
+-- ends exactly once, revoked or finalized, and then stays as it is. An
+-- attempt's staging key never changes, it never returns to `receiving`, and a
+-- committed or failed attempt keeps its state and observations. Observed
+-- digest, size, MIME type, failure code and staging removal are each set at
+-- most once; only `updated_at` moves freely.
+CREATE FUNCTION stateplane_guard_upload_ledger() RETURNS trigger LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  set_once text[];
+  name text;
+BEGIN
+  IF TG_TABLE_NAME = 'source_upload_grants' THEN
+    set_once := ARRAY['revoked_at', 'finalized_at', 'source_id'];
+    IF (OLD.revoked_at IS NOT NULL OR OLD.finalized_at IS NOT NULL) AND NEW IS DISTINCT FROM OLD THEN
+      RAISE EXCEPTION 'a revoked or finalized upload grant is final'
+        USING ERRCODE = 'check_violation', CONSTRAINT = 'source_upload_grants_transition';
+    END IF;
+  ELSE
+    -- A committed or failed attempt may still record its staging removal.
+    set_once := CASE WHEN OLD.state IN ('committed', 'failed') THEN ARRAY['staging_removed_at']
+      ELSE ARRAY['observed_sha256', 'observed_bytes', 'observed_mime_type', 'failure_code', 'staging_removed_at'] END;
+    IF (OLD.state IN ('committed', 'failed') AND NEW.state <> OLD.state)
+      OR (OLD.state = 'verified' AND NEW.state = 'receiving') THEN
+      RAISE EXCEPTION 'upload attempt cannot move from % to %', OLD.state, NEW.state
+        USING ERRCODE = 'check_violation', CONSTRAINT = 'source_upload_attempts_transition';
+    END IF;
+  END IF;
+  IF (to_jsonb(NEW) - set_once - 'state' - 'updated_at') IS DISTINCT FROM (to_jsonb(OLD) - set_once - 'state' - 'updated_at') THEN
+    RAISE EXCEPTION '% binding columns are immutable', TG_TABLE_NAME
+      USING ERRCODE = 'check_violation', CONSTRAINT = TG_TABLE_NAME || '_transition';
+  END IF;
+  FOREACH name IN ARRAY set_once LOOP
+    IF to_jsonb(OLD) -> name <> 'null'::jsonb AND to_jsonb(NEW) -> name IS DISTINCT FROM to_jsonb(OLD) -> name THEN
+      RAISE EXCEPTION '%.% is set at most once', TG_TABLE_NAME, name
+        USING ERRCODE = 'check_violation', CONSTRAINT = TG_TABLE_NAME || '_transition';
+    END IF;
+  END LOOP;
+  RETURN NEW;
+END;
+$$;
+REVOKE ALL ON FUNCTION stateplane_guard_upload_ledger() FROM PUBLIC;
+CREATE TRIGGER source_upload_grants_transition BEFORE UPDATE ON source_upload_grants
+  FOR EACH ROW EXECUTE FUNCTION stateplane_guard_upload_ledger();
+CREATE TRIGGER source_upload_attempts_transition BEFORE UPDATE ON source_upload_attempts
+  FOR EACH ROW EXECUTE FUNCTION stateplane_guard_upload_ledger();
+
 -- A link never changes its endpoints, type, policy or owner and is never
 -- resurrected: the only update tombstones a live link at the next revision.
 -- Like the facts above, links are removed only by space erasure. Generated

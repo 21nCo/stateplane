@@ -186,17 +186,26 @@ test('originals record verified bytes or an explicit reference-only marker', asy
     [false, digest('x'), 1, 'text/plain; charset=utf-8', now, now],
     [false, digest('x'), 1, 'text/plain', new Date(now.getTime() + 1000), now] // captured after observed
   ];
-  for (const values of rows) {
+  const commit = (values, locator) => {
     const sourceId = `src_${randomUUID()}`;
-    await assert.rejects(inTransaction(async db => {
+    return inTransaction(async db => {
       await db.query(`INSERT INTO entity_refs(space_id,collection_id,kind,entity_id) VALUES($1,$2,'source',$3)`, [spaceId, alpha, sourceId]);
-      await db.query(`INSERT INTO sources(space_id,collection_id,source_id,principal_id,credential_id) VALUES($1,$2,$3,'owner','s')`, [spaceId, alpha, sourceId]);
+      await db.query(`INSERT INTO sources(space_id,collection_id,source_id,locator,principal_id,credential_id) VALUES($1,$2,$3,$4,'owner','s')`,
+        [spaceId, alpha, sourceId, locator]);
       await insert([spaceId, alpha, sourceId, ...values], db);
-    }), code('23514'), JSON.stringify(values));
-  }
-  const referenceOnly = await source(spaceId, alpha, { referenceOnly: true });
-  assert.deepEqual((await pool.query('SELECT reference_only,sha256,byte_size FROM original_objects WHERE source_id=$1', [referenceOnly])).rows,
-    [{ reference_only: true, sha256: null, byte_size: null }]);
+      return sourceId;
+    });
+  };
+  for (const values of rows)
+    await assert.rejects(commit(values, 'https://example.invalid/evidence'), code('23514'), JSON.stringify(values));
+  // Without bytes, the locator is the only pointer to the evidence; stored bytes need none.
+  await assert.rejects(commit([true, null, null, null, now, now], null), code('23514', 'original_objects_reference_locator'));
+  const stored = await commit([false, digest('x'), 1, 'text/plain', now, now], null);
+  const referenceOnly = await commit([true, null, null, null, now, now], 'https://example.invalid/evidence');
+  assert.deepEqual((await pool.query(`SELECT source_id,reference_only,sha256,byte_size,locator FROM original_objects JOIN sources USING (space_id,collection_id,source_id)
+    WHERE space_id=$1 ORDER BY reference_only`, [spaceId])).rows,
+  [{ source_id: stored, reference_only: false, sha256: digest('x'), byte_size: '1', locator: null },
+    { source_id: referenceOnly, reference_only: true, sha256: null, byte_size: null, locator: 'https://example.invalid/evidence' }]);
 });
 
 test('claim revisions and their evidence are immutable history with explicit review', async () => {
@@ -536,9 +545,27 @@ test('upload grants and attempts keep finalize, revocation and staging cleanup u
   const grantId = `upl_${randomUUID()}`;
   await grant(grantId, 1024, 300_000);
   const sourceId = await source(spaceId, alpha);
-  await assert.rejects(pool.query(`UPDATE source_upload_grants SET finalized_at=clock_timestamp() WHERE grant_id=$1`, [grantId]), code('23514'));
-  await pool.query(`UPDATE source_upload_grants SET finalized_at=clock_timestamp(),source_id=$2 WHERE grant_id=$1`, [grantId, sourceId]);
-  await assert.rejects(pool.query(`UPDATE source_upload_grants SET revoked_at=clock_timestamp() WHERE grant_id=$1`, [grantId]), code('23514'));
+  const grantTransition = code('23514', 'source_upload_grants_transition');
+  const updateGrant = (id, change, values = []) => pool.query(`UPDATE source_upload_grants SET ${change} WHERE space_id=$1 AND grant_id=$2`,
+    [spaceId, id, ...values]);
+  // A live grant's binding never changes.
+  for (const change of [`principal_id='other'`, `credential_id='other'`, `mime_type='application/pdf'`, 'max_bytes=max_bytes+1',
+    `expected_sha256='${digest('other')}'`, `issued_at=issued_at-interval '1 minute'`, `expires_at=expires_at+interval '1 day'`, `grant_id='other'`])
+    await assert.rejects(updateGrant(grantId, change), grantTransition, change);
+  await assert.rejects(updateGrant(grantId, 'finalized_at=clock_timestamp()'), code('23514'));
+  await updateGrant(grantId, 'finalized_at=clock_timestamp(),source_id=$3', [sourceId]);
+  // Finalization is final: no revocation, unfinalizing or other source.
+  for (const change of ['revoked_at=clock_timestamp()', 'finalized_at=NULL,source_id=NULL', 'finalized_at=clock_timestamp()',
+    `source_id='${await source(spaceId, alpha)}'`, 'max_bytes=max_bytes+1'])
+    await assert.rejects(updateGrant(grantId, change), grantTransition, change);
+  const revoked = `upl_${randomUUID()}`;
+  await grant(revoked, 1024, 300_000);
+  await updateGrant(revoked, 'revoked_at=clock_timestamp()');
+  for (const change of ['revoked_at=NULL', 'revoked_at=clock_timestamp()', 'revoked_at=NULL,finalized_at=clock_timestamp(),source_id=$3'])
+    await assert.rejects(updateGrant(revoked, change, change.includes('$3') ? [sourceId] : []), grantTransition, change);
+  assert.deepEqual((await pool.query(`SELECT grant_id,revoked_at IS NOT NULL AS revoked,source_id FROM source_upload_grants
+    WHERE space_id=$1 ORDER BY revoked`, [spaceId])).rows, [{ grant_id: grantId, revoked: false, source_id: sourceId },
+    { grant_id: revoked, revoked: true, source_id: null }]);
   const attempt = (attemptId, staging, state = 'receiving', observed = null, failure = null) => pool.query(`INSERT INTO source_upload_attempts(
       space_id,collection_id,grant_id,attempt_id,staging_key,state,observed_sha256,observed_bytes,failure_code)
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [spaceId, alpha, grantId, attemptId, staging, state, observed, observed && 14, failure]);
@@ -550,6 +577,36 @@ test('upload grants and attempts keep finalize, revocation and staging cleanup u
   await assert.rejects(attempt('a3', `staging/${grantId}/a3`, 'committed', digest('original bytes')), code('23505'));
   assert.deepEqual((await pool.query(`SELECT attempt_id FROM source_upload_attempts WHERE grant_id=$1 AND staging_removed_at IS NULL ORDER BY attempt_id`,
     [grantId])).rows.map(row => row.attempt_id), ['a1', 'a2']);
+
+  // Attempts move forward only, and observations are set once.
+  const attemptTransition = code('23514', 'source_upload_attempts_transition');
+  const updateAttempt = (attemptId, change) => pool.query(`UPDATE source_upload_attempts SET ${change}
+    WHERE space_id=$1 AND grant_id=$2 AND attempt_id=$3`, [spaceId, grantId, attemptId]);
+  await attempt('a3', `staging/${grantId}/a3`);
+  await updateAttempt('a3', `observed_mime_type='text/plain',updated_at=clock_timestamp()`);
+  for (const change of [`staging_key='staging/other'`, `started_at=started_at-interval '1 minute'`, `observed_mime_type='text/html'`])
+    await assert.rejects(updateAttempt('a3', change), attemptTransition, change);
+  await updateAttempt('a3', `state='verified',observed_sha256='${digest('original bytes')}',observed_bytes=14`);
+  for (const change of [`state='receiving'`, `observed_sha256='${digest('other')}'`, 'observed_bytes=15', 'observed_bytes=NULL'])
+    await assert.rejects(updateAttempt('a3', change), attemptTransition, change);
+  await updateAttempt('a3', `state='failed',failure_code='SOURCE_COMMIT_FAILED',updated_at=clock_timestamp()`);
+  // A committed or failed attempt keeps its state and observations; only staging removal is recorded later.
+  for (const [attemptId, changes] of [
+    ['a1', [`state='receiving'`, `state='committed',failure_code=NULL,observed_sha256='${digest('original bytes')}',observed_bytes=14`,
+      `failure_code='OTHER'`, `observed_mime_type='text/plain'`]],
+    ['a2', [`state='verified'`, `state='failed',failure_code='LATE'`, `observed_sha256='${digest('other')}'`, `observed_mime_type='text/plain'`]],
+    ['a3', [`state='receiving'`, `failure_code='OTHER'`]]
+  ]) {
+    for (const change of changes) await assert.rejects(updateAttempt(attemptId, change), attemptTransition, `${attemptId} ${change}`);
+    await updateAttempt(attemptId, 'staging_removed_at=clock_timestamp(),updated_at=clock_timestamp()');
+    await assert.rejects(updateAttempt(attemptId, 'staging_removed_at=NULL'), attemptTransition);
+    await assert.rejects(updateAttempt(attemptId, `staging_removed_at=staging_removed_at+interval '1 second'`), attemptTransition);
+  }
+  assert.deepEqual((await pool.query(`SELECT attempt_id,state,failure_code,observed_bytes::int,staging_removed_at IS NOT NULL AS removed
+    FROM source_upload_attempts WHERE space_id=$1 AND grant_id=$2 ORDER BY attempt_id`, [spaceId, grantId])).rows, [
+    { attempt_id: 'a1', state: 'failed', failure_code: 'DIGEST_MISMATCH', observed_bytes: null, removed: true },
+    { attempt_id: 'a2', state: 'committed', failure_code: null, observed_bytes: 14, removed: true },
+    { attempt_id: 'a3', state: 'failed', failure_code: 'SOURCE_COMMIT_FAILED', observed_bytes: 14, removed: true }]);
 });
 
 /** Seed one row in every evidence table for a space. */
