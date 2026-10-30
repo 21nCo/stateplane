@@ -58,19 +58,25 @@ const pgCode = (error: unknown) => (error as { code?: unknown })?.code;
 function invalid(message?: string): never { throw new AuthorityError('INVALID_ARGUMENT', message); }
 /** True for an object the runtime cannot inspect without running caller code: any proxy, or every object without a detector. */
 const untrusted = (value: object) => !acceptsInProcessObjects || isInProcessProxy(value);
-/** Snapshot a plain request's own data fields; a proxy is refused before any reflective read can run its traps. */
+/**
+ * Snapshot a request: a plain object (prototype `Object.prototype` or null)
+ * whose own members are all enumerable data fields with allowed string keys.
+ * A proxy is refused before any reflective read can run its traps, and no
+ * accessor is invoked. A field given as `undefined` is supplied, not omitted,
+ * so it is refused like any other invalid value.
+ */
 function fields(value: unknown, allowed: readonly string[], required: readonly string[]): Record<string, unknown> {
-  if (!value || typeof value !== 'object' || untrusted(value) || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype ||
-    Object.keys(value).some(key => !allowed.includes(key)))
-    invalid();
-  const copy: Record<string, unknown> = {};
-  for (const key of allowed) {
+  if (!value || typeof value !== 'object' || untrusted(value) || Array.isArray(value)) invalid();
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) invalid();
+  const copy: Record<string, unknown> = Object.create(null);
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== 'string' || !allowed.includes(key)) invalid();
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (descriptor && !('value' in descriptor)) invalid();
-    if (descriptor && descriptor.value !== undefined) copy[key] = descriptor.value;
-    // A required field present as `undefined` is as absent as a missing one.
-    else if (required.includes(key)) invalid();
+    if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value') || descriptor.value === undefined) invalid();
+    copy[key] = descriptor.value;
   }
+  if (required.some(key => !Object.hasOwn(copy, key))) invalid();
   return copy;
 }
 /** Well-formed UTF-8 text without NUL, within a byte bound. */
@@ -199,10 +205,14 @@ async function ensureOriginal(blobs: BlobStore, spaceId: string, sha256: string,
   // The store rechecks length and digest, so corrupted staging stores nothing.
   await blobs.put(key, staged, { bytes, sha256, contentType: mimeType, signal });
 }
-/** A deterministic or refused failure ends the attempt now; a transient one leaves it for retry. */
+/**
+ * A deterministic or refused failure ends the attempt now; a transient one
+ * leaves it for retry. A copy whose staging read was interrupted is transient.
+ */
 function settlesNow(error: unknown): boolean {
   if (error instanceof CommitOutcomeUnknownError) return false;
-  if (error instanceof BlobWriteError || pgCode(error) === '23505') return true;
+  if (error instanceof BlobWriteError) return error.reason !== 'interrupted';
+  if (pgCode(error) === '23505') return true;
   return !classifyError(error, false).retryable;
 }
 /** Text bodies must be well-formed UTF-8; a refused body fails the write. */
@@ -237,10 +247,16 @@ const failureCodes: Record<BlobWriteError['reason'], string> = {
   length: 'length_mismatch', digest: 'digest_mismatch', content: 'content_rejected',
   interrupted: 'interrupted', deadline: 'grant_expired'
 };
-/** Promotion copies already verified bytes, so only expiry is the caller's failure. */
+/**
+ * Promotion copies already verified bytes, so only expiry is the caller's
+ * failure; an interrupted read of staging may be retried, and anything else
+ * means staging no longer matches its verification.
+ */
 function promotionFailure(error: unknown): unknown {
   if (!(error instanceof BlobWriteError)) return error;
   if (error.reason === 'deadline') return new AuthorityError('FORBIDDEN', 'Upload grant expired');
+  if (error.reason === 'interrupted')
+    return new AuthorityError('PROVIDER_UNAVAILABLE', 'Reading staged upload bytes failed; retry the request', undefined, true);
   return new AuthorityError('PROVIDER_UNAVAILABLE', 'Staged upload bytes failed verification', undefined, false);
 }
 function uploadFailure(error: unknown): unknown {
@@ -447,7 +463,12 @@ export class PostgresSources {
     }) };
   }
 
-  /** Stream a source's original bytes, verified against the recorded digest; null body when reference-only. */
+  /**
+   * Stream a source's original bytes, verified against the recorded digest;
+   * null body when reference-only. Authorization is evaluated when the
+   * response starts: the caller's authority and the source are checked again
+   * once the object is open, but a body already streaming is not cut off.
+   */
   async content(actor: VerifiedCredential, spaceId: string, collectionId: string, sourceId: string):
     Promise<{ source: SourceView; body: ReadableStream<Uint8Array> | null }> {
     const { admitted, source } = await this.read(actor, spaceId, collectionId, sourceId);
@@ -455,9 +476,13 @@ export class PostgresSources {
     if (referenceOnly || sha256 === null || byteSize === null) return { source, body: null };
     const stored = await admitted.cell.originals.get(originalKey(spaceId, sha256));
     if (!stored) throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Original bytes are missing', undefined, false);
-    if (stored.bytes !== byteSize || (stored.sha256 !== null && stored.sha256 !== sha256)) {
-      await stored.body.cancel().catch(() => {});
-      throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Original bytes failed verification', undefined, false);
+    try {
+      if (stored.bytes !== byteSize || (stored.sha256 !== null && stored.sha256 !== sha256))
+        throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Original bytes failed verification', undefined, false);
+      await this.actorTx(actor, admitted, db => readSource(db, admitted.scope, sourceId, false));
+    } catch (error) {
+      await stored.body.cancel(error).catch(() => {});
+      throw error;
     }
     return { source, body: verified(stored.body, sha256, byteSize) };
   }
@@ -600,10 +625,15 @@ export class PostgresSources {
             if (attempt?.state === 'receiving') await failAttempt(db, key, problem);
             return problem;
           }
-          await db.query(`UPDATE source_upload_attempts SET state='verified',observed_sha256=$5,observed_bytes=$6,
-              observed_mime_type=$7,updated_at=clock_timestamp()
-            WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND attempt_id=$4`, [...key, stored.sha256, stored.bytes, mimeType]);
-          return null;
+          // Expiry is checked again by the transition itself, after the lock waits above.
+          const verifiedNow = await db.query(`UPDATE source_upload_attempts a SET state='verified',observed_sha256=$5,
+              observed_bytes=$6,observed_mime_type=$7,updated_at=clock_timestamp()
+            WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND attempt_id=$4 AND EXISTS (SELECT 1
+              FROM source_upload_grants g WHERE g.space_id=a.space_id AND g.collection_id=a.collection_id
+                AND g.grant_id=a.grant_id AND g.expires_at>clock_timestamp())`, [...key, stored.sha256, stored.bytes, mimeType]);
+          if (verifiedNow.rowCount === 1) return null;
+          await failAttempt(db, key, 'grant_expired');
+          return 'grant_expired';
         });
       } catch (error) {
         if (settlesNow(error)) await abandon(admitted.cell, key, refusalCode(error)).catch(() => {});
@@ -665,9 +695,11 @@ export class PostgresSources {
   /**
    * Promote a verified attempt's bytes to the original location, then commit
    * the source metadata. Bytes are always verified and present before the
-   * metadata commits, which rechecks them under the digest's shared lock. A deterministic failure abandons the attempt at once; a
-   * transient one leaves it verified for retry until reconciliation. The
-   * request is parsed only after the first transaction authorizes it.
+   * metadata commits, which rechecks them under the digest's shared lock and
+   * finalizes the grant only if it has not expired. A deterministic failure
+   * abandons the attempt at once; a transient one leaves it verified for
+   * retry until reconciliation. The request is parsed only after the first
+   * transaction authorizes it.
    */
   private async complete(actor: VerifiedCredential, admitted: Admitted, grantId: string,
     prepare: () => { attemptId: string; wanted: Wanted }, content: Uint8Array | null): Promise<SourceView> {
@@ -727,8 +759,11 @@ export class PostgresSources {
         await db.query(`UPDATE source_upload_attempts SET state='committed',updated_at=clock_timestamp()${content ?
           ',staging_removed_at=clock_timestamp()' : ''}
           WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND attempt_id=$4`, key);
-        await db.query(`UPDATE source_upload_grants SET finalized_at=clock_timestamp(),source_id=$4
-          WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3`, [...key.slice(0, 3), wanted.sourceId]);
+        // Expiry is checked again by the transition itself, after the lock waits and the head above.
+        const finalized = await db.query(`UPDATE source_upload_grants SET finalized_at=clock_timestamp(),source_id=$4
+          WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND expires_at>clock_timestamp()`,
+        [...key.slice(0, 3), wanted.sourceId]);
+        if (finalized.rowCount !== 1) throw new AuthorityError('FORBIDDEN', 'Upload grant expired');
         return { source };
       });
       if ('replay' in committed) {

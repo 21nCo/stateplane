@@ -208,8 +208,10 @@ test('bounded text ingestion stores verified original bytes once and replays a r
   assert.deepEqual({ ...replay, replayed: false }, created);
   assert.equal(replay.replayed, true);
   await rejects(f.sources.ingestText(f.agent, f.spaceId, 'alpha', { ...request, text: 'changed' }), 'IDEMPOTENCY_MISMATCH');
-  await rejects(f.sources.ingestText(f.agent, f.spaceId, 'alpha', { ...request, capturedAt: undefined }), 'IDEMPOTENCY_MISMATCH');
-  await rejects(f.sources.ingestText(f.agent, f.spaceId, 'alpha', { ...request, locator: undefined }), 'IDEMPOTENCY_MISMATCH');
+  const { capturedAt: _capturedAt, ...uncaptured } = request;
+  const { locator: _locator, ...unlocated } = request;
+  await rejects(f.sources.ingestText(f.agent, f.spaceId, 'alpha', uncaptured), 'IDEMPOTENCY_MISMATCH');
+  await rejects(f.sources.ingestText(f.agent, f.spaceId, 'alpha', unlocated), 'IDEMPOTENCY_MISMATCH');
   // Another credential's identical key is a different request identity.
   const other = await f.sources.ingestText(f.other, f.spaceId, 'alpha', request);
   assert.notEqual(other.sourceId, created.sourceId);
@@ -820,32 +822,65 @@ test('attempts that keep failing to settle cannot hold the oldest reconciliation
   assert.equal((await attempts(f.spaceId, grant.grantId)).every(row => row.removed), true, 'and settle once they can');
 });
 
-test('source requests and upload bodies that are proxies are refused before any trap runs, with no effects', async () => {
+test('a malformed source request or upload body is refused before any trap or getter runs, with no effects', async () => {
   const f = await fixture();
   const declared = { bytes: 4, mimeType: 'application/octet-stream' };
   const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: declared.mimeType, maxBytes: 64 });
   const attempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(Buffer.from('four')), declared);
   const before = await effects(f);
-  let traps = 0;
+  let calls = 0;
+  const counted = value => { calls++; return value; };
+  const proxies = {
+    transparentProxy: target => new Proxy(target, new Proxy({}, { get(_, trap) { calls++; return Reflect[trap]; } })),
+    throwingProxy: target => new Proxy(target, new Proxy({}, { get() { calls++; return () => { throw new Error('proxy trap'); }; } })),
+    revokedProxy: target => { const { proxy, revoke } = Proxy.revocable(target, {}); revoke(); return proxy; }
+  };
+  // Each kind changes one valid request in one way; `required` and `optional` name one field of each.
   const kinds = {
-    transparent: target => new Proxy(target, new Proxy({}, { get(_, trap) { traps++; return Reflect[trap]; } })),
-    throwing: target => new Proxy(target, new Proxy({}, { get() { traps++; return () => { throw new Error('proxy trap'); }; } })),
-    revoked: target => { const { proxy, revoke } = Proxy.revocable(target, {}); revoke(); return proxy; }
+    ...proxies,
+    accessor: (base, { required }) => Object.defineProperty({ ...base }, required,
+      { enumerable: true, get: () => counted(base[required]) }),
+    symbolMember: base => ({ ...base, [Symbol('extra')]: 1 }),
+    hiddenUnknown: base => Object.defineProperty({ ...base }, 'extra', { value: 1, enumerable: false }),
+    hiddenAllowed: (base, { required }) => Object.defineProperty({ ...base }, required, { value: base[required], enumerable: false }),
+    unknown: base => ({ ...base, extra: 1 }),
+    inheritedRequired: (base, { required }) => {
+      const { [required]: value, ...rest } = base;
+      return Object.assign(Object.create({ get [required]() { return counted(value); } }), rest);
+    },
+    decorated: base => Object.assign(Object.create({ decorated: true }), base),
+    array: base => Object.assign([], base),
+    missingRequired: (base, { required }) => { const { [required]: _, ...rest } = base; return rest; },
+    requiredUndefined: (base, { required }) => ({ ...base, [required]: undefined }),
+    optionalUndefined: (base, { optional }) => ({ ...base, [optional]: undefined })
   };
-  const calls = {
-    ingestText: wrap => f.sources.ingestText(f.agent, f.spaceId, 'alpha', wrap({ idempotencyKey: 'proxy', text: 'proxied text' })),
-    ingestReference: wrap => f.sources.ingestReference(f.agent, f.spaceId, 'alpha', wrap({ idempotencyKey: 'proxy', locator: 'https://example.invalid/a' })),
-    createUpload: wrap => f.sources.createUpload(f.agent, f.spaceId, 'alpha', wrap({ mimeType: 'text/plain', maxBytes: 8 })),
-    uploadDeclaration: wrap => f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(Buffer.from('four')), wrap({ ...declared })),
-    uploadBody: wrap => f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, wrap(chunked(Buffer.from('four'))), declared),
-    finalizeUpload: wrap => f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, wrap({ attemptId: attempt.attemptId }))
+  const entrypoints = {
+    ingestText: { required: 'text', optional: 'locator', base: { idempotencyKey: 'malformed', text: 'malformed text' },
+      run: request => f.sources.ingestText(f.agent, f.spaceId, 'alpha', request) },
+    ingestReference: { required: 'locator', optional: 'mimeType', base: { idempotencyKey: 'malformed', locator: 'https://example.invalid/a' },
+      run: request => f.sources.ingestReference(f.agent, f.spaceId, 'alpha', request) },
+    createUpload: { required: 'maxBytes', optional: 'sha256', base: { mimeType: 'text/plain', maxBytes: 8 },
+      run: request => f.sources.createUpload(f.agent, f.spaceId, 'alpha', request) },
+    uploadDeclaration: { required: 'bytes', optional: 'sha256', base: { ...declared },
+      run: request => f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(Buffer.from('four')), request) },
+    finalizeUpload: { required: 'attemptId', optional: 'capturedAt', base: { attemptId: attempt.attemptId },
+      run: request => f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, request) }
   };
-  for (const [call, run] of Object.entries(calls)) for (const [kind, wrap] of Object.entries(kinds)) {
-    traps = 0;
-    await rejects(run(wrap), 'INVALID_ARGUMENT', `${call} with a ${kind} proxy`);
-    assert.equal(traps, 0, `${call} ran no ${kind} proxy trap`);
+  for (const [entrypoint, { run, base, ...names }] of Object.entries(entrypoints)) for (const [kind, malform] of Object.entries(kinds)) {
+    calls = 0;
+    await rejects(run(malform(base, names)), 'INVALID_ARGUMENT', `${entrypoint} with ${kind}`);
+    assert.equal(calls, 0, `${entrypoint} ran no ${kind} trap or getter`);
+  }
+  for (const [kind, wrap] of Object.entries(proxies)) {
+    calls = 0;
+    await rejects(f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, wrap(chunked(Buffer.from('four'))), declared),
+      'INVALID_ARGUMENT', `upload body as a ${kind}`);
+    assert.equal(calls, 0, `the upload body ran no ${kind} trap`);
   }
   assert.deepEqual(await effects(f), before, 'no grant, attempt, source or blob changed');
+  // A plain request without a prototype is still accepted.
+  const plain = Object.assign(Object.create(null), { idempotencyKey: 'null-prototype', locator: 'https://example.invalid/b' });
+  assert.equal((await f.sources.ingestReference(f.agent, f.spaceId, 'alpha', plain)).locator, 'https://example.invalid/b');
 });
 
 test('a cleanup that rolls back after failing an attempt never strands a finalize of that attempt that commits', async () => {
@@ -913,26 +948,6 @@ test('a metadata commit refuses an original that disappeared after promotion, an
   assert.deepEqual(await read((await f.sources.content(f.agent, f.spaceId, 'alpha', source.sourceId)).body), bytes);
 });
 
-test('a required source field given as undefined is INVALID_ARGUMENT, like a missing one, with no effects', async () => {
-  const f = await fixture();
-  const declared = { bytes: 4, mimeType: 'application/octet-stream' };
-  const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: declared.mimeType, maxBytes: 64 });
-  const attempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(Buffer.from('four')), declared);
-  const before = await effects(f);
-  await rejects(f.sources.ingestReference(f.agent, f.spaceId, 'alpha', { idempotencyKey: 'undefined-locator', locator: undefined }),
-    'INVALID_ARGUMENT', 'ingestReference locator');
-  await rejects(f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, { attemptId: undefined }),
-    'INVALID_ARGUMENT', 'finalizeUpload attemptId');
-  await rejects(f.sources.ingestText(f.agent, f.spaceId, 'alpha', { idempotencyKey: undefined, text: 'text' }),
-    'INVALID_ARGUMENT', 'ingestText idempotencyKey');
-  await rejects(f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: 'text/plain', maxBytes: undefined }),
-    'INVALID_ARGUMENT', 'createUpload maxBytes');
-  await rejects(f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(Buffer.from('four')), { ...declared, bytes: undefined }),
-    'INVALID_ARGUMENT', 'upload bytes');
-  assert.deepEqual(await effects(f), before, 'no grant, attempt, source or blob changed');
-  assert.equal((await attempts(f.spaceId, grant.grantId)).find(row => row.attempt_id === attempt.attemptId).state, 'verified');
-});
-
 test('a refused or failed blob write cancels its input, including through the UTF-8 check', async () => {
   const bytes = Buffer.from('a body longer than its declaration');
   const watched = () => {
@@ -967,4 +982,111 @@ test('a refused or failed blob write cancels its input, including through the UT
   await sleep(10);
   assert.equal(text.state.cancelled, true, 'cancellation reaches a text body through its UTF-8 check');
   assert.deepEqual(f.r2.keys(''), []);
+});
+
+test('a source read rechecks the caller and the source once its original is open, and cancels the body on refusal', async () => {
+  const f = await fixture();
+  /** Hold the next get of `key` until released; its body records whether it was cancelled. */
+  const holdGet = key => {
+    let release, reached;
+    const held = new Promise(resolve => { release = resolve; });
+    const atGet = new Promise(resolve => { reached = resolve; });
+    const state = { cancelled: false };
+    const get = f.r2.get.bind(f.r2);
+    f.r2.get = async target => {
+      if (target !== key) return get(target);
+      f.r2.get = get;
+      reached();
+      await held;
+      const object = await get(target);
+      const reader = object.body.getReader();
+      return { ...object, body: new ReadableStream({ pull: async controller => {
+        const { done, value } = await reader.read();
+        if (done) controller.close(); else controller.enqueue(value);
+      }, cancel: reason => { state.cancelled = true; return reader.cancel(reason); } }) };
+    };
+    return { atGet, release, state };
+  };
+  const readAcross = async (actor, collectionId, text, change, code) => {
+    const source = await f.sources.ingestText(actor, f.spaceId, collectionId, { idempotencyKey: text, text });
+    const { atGet, release, state } = holdGet(originalKey(f.spaceId, sha(Buffer.from(text))));
+    const content = f.sources.content(actor, f.spaceId, collectionId, source.sourceId);
+    await atGet;
+    await change();
+    release();
+    await rejects(content, code, text);
+    assert.equal(state.cancelled, true, `${text}: the opened body is cancelled`);
+  };
+  const key = await spaces.issueAgentKey(f.owner, f.spaceId, new Date(Date.now() + 3_600_000),
+    [{ collectionId: 'alpha', capabilities: ['sources:read', 'sources:write'] }]);
+  await readAcross(await verify(key.secret), 'alpha', 'read across an agent key revocation',
+    () => spaces.revokeAgentKey(f.owner, f.spaceId, key.id), 'FORBIDDEN');
+  const session = await issueSession(config, {}, { userId: f.user.id, methods: ['password'] });
+  await readAcross(await verify(session.sessionToken), 'beta', 'read across the end of the owner session',
+    () => revokeSessionById(config, session.session.id, { userId: f.user.id }), 'FORBIDDEN');
+  await readAcross(f.agent, 'alpha', 'read across a space suspension',
+    () => spaces.update(f.owner, f.spaceId, 'suspended'), 'FORBIDDEN');
+});
+
+test('grant expiry is checked again by the verify and finalize transitions, after their lock waits', async () => {
+  const f = await fixture();
+  const declared = { mimeType: 'application/octet-stream' };
+  const untilExpired = grant => sleep(Math.max(0, Date.parse(grant.expiresAt) - Date.now()) + 150);
+
+  // Verification waits on the digest's intent lock, held here by a removal, until the grant has expired.
+  const lateVerify = Buffer.from('verified after expiry');
+  const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { ...declared, maxBytes: 64, expiresInSeconds: 1 });
+  const holder = await pool.connect();
+  try {
+    await holder.query('BEGIN');
+    await holder.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',
+      [JSON.stringify(['stateplane:original', f.spaceId, sha(lateVerify)])]);
+    const upload = f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(lateVerify), { ...declared, bytes: lateVerify.length });
+    await untilExpired(grant);
+    await holder.query('COMMIT');
+    await rejects(upload, 'FORBIDDEN', 'an upload verified only after expiry');
+  } finally { holder.release(); }
+  assert.deepEqual((await attempts(f.spaceId, grant.grantId)).map(row => [row.state, row.failure_code, row.removed]),
+    [['failed', 'grant_expired', true]]);
+
+  // The metadata commit's head of the original returns only after the grant has expired.
+  const lateFinalize = Buffer.from('finalized after expiry');
+  const late = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { ...declared, maxBytes: 64, expiresInSeconds: 1 });
+  const attempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', late.grantId, chunked(lateFinalize), { ...declared, bytes: lateFinalize.length });
+  const key = originalKey(f.spaceId, sha(lateFinalize));
+  const head = f.r2.head.bind(f.r2);
+  let heads = 0;
+  f.r2.head = async target => {
+    if (target === key && ++heads === 2) { f.r2.head = head; await untilExpired(late); }
+    return head(target);
+  };
+  await rejects(f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', late.grantId, { attemptId: attempt.attemptId }),
+    'FORBIDDEN', 'a finalize whose commit reaches the grant only after expiry');
+  assert.equal(heads, 2, 'the metadata commit headed the original');
+  assert.deepEqual(await sourceRows(f.spaceId), { sources: 0, originals: 0, refs: 0 }, 'no source commits after expiry');
+  assert.equal((await pool.query(`SELECT finalized_at FROM source_upload_grants WHERE space_id=$1 AND grant_id=$2`,
+    [f.spaceId, late.grantId])).rows[0].finalized_at, null);
+  assert.deepEqual((await attempts(f.spaceId, late.grantId)).map(row => [row.state, row.failure_code]), [['failed', 'commit_failed']]);
+  assert.equal(f.r2.objects.has(key), false, 'its unreferenced original is removed');
+  assert.deepEqual(staging(f.r2, f.spaceId), [], 'and so is its staging');
+});
+
+test('a promotion whose staging read is interrupted leaves its attempt verified and retryable', async () => {
+  const f = await fixture();
+  const bytes = Buffer.from('staging read cut short');
+  const declared = { bytes: bytes.length, mimeType: 'application/octet-stream' };
+  const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: declared.mimeType, maxBytes: 64 });
+  const attempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(bytes), declared);
+  const get = f.r2.get.bind(f.r2);
+  f.r2.get = async target => {
+    f.r2.get = get;
+    const object = await get(target);
+    return { ...object, body: chunked(object && bytes, { fail: 6 }) };
+  };
+  await assert.rejects(f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, { attemptId: attempt.attemptId }),
+    error => error.code === 'PROVIDER_UNAVAILABLE' && error.retryable === true);
+  assert.deepEqual((await attempts(f.spaceId, grant.grantId)).map(row => row.state), ['verified']);
+  assert.equal(f.r2.objects.has(originalKey(f.spaceId, sha(bytes))), false, 'nothing was stored');
+  const source = await f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, { attemptId: attempt.attemptId });
+  assert.deepEqual(await read((await f.sources.content(f.agent, f.spaceId, 'alpha', source.sourceId)).body), bytes);
 });
