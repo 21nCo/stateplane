@@ -14,3 +14,24 @@ ALTER TABLE original_objects ADD CONSTRAINT original_objects_object_key
   CHECK (reference_only = (object_key IS NULL)) NOT VALID;
 -- Two originals never share stored bytes.
 CREATE UNIQUE INDEX original_objects_key ON original_objects(space_id, object_key) WHERE object_key IS NOT NULL;
+-- An attempt becomes verified, or commits with its grant's source, only in a
+-- transaction that commits before the grant expires. The check runs at COMMIT,
+-- after the service's last authority statement, so no wait before COMMIT can
+-- carry either transition past expiry; a refused COMMIT rolls back both.
+CREATE FUNCTION stateplane_check_upload_expiry() RETURNS trigger LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM public.source_upload_grants g WHERE g.space_id = NEW.space_id
+      AND g.collection_id = NEW.collection_id AND g.grant_id = NEW.grant_id AND g.expires_at > clock_timestamp()) THEN
+    RAISE EXCEPTION 'upload grant expired before the attempt''s transition committed'
+      USING ERRCODE = 'check_violation', CONSTRAINT = 'source_upload_attempts_expiry';
+  END IF;
+  RETURN NULL;
+END;
+$$;
+REVOKE ALL ON FUNCTION stateplane_check_upload_expiry() FROM PUBLIC;
+CREATE CONSTRAINT TRIGGER source_upload_attempts_expiry AFTER UPDATE OF state ON source_upload_attempts
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+  WHEN (NEW.state IN ('verified', 'committed') AND NEW.state IS DISTINCT FROM OLD.state)
+  EXECUTE FUNCTION stateplane_check_upload_expiry();

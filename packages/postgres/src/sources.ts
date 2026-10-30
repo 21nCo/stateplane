@@ -174,6 +174,8 @@ async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promi
     catch (error) {
       discard = true;
       if (error instanceof CommitNotSentDeadlineExceeded) throw new AuthorityError('RATE_LIMITED', 'Request time budget exceeded');
+      // Migration 041's commit-time check: the transition reached COMMIT after its grant expired, so it rolled back.
+      if (error instanceof pg.DatabaseError && error.constraint === 'source_upload_attempts_expiry') throw grantExpired();
       if (error instanceof pg.DatabaseError && matches(/^(?:23|40)/, error.code ?? '')) throw error;
       throw new CommitOutcomeUnknownError(error);
     }
@@ -211,8 +213,9 @@ async function capturedNotFuture(db: Db, capturedAt: string | null): Promise<voi
  * A revocation can fail an attempt while its promotion is still writing, so
  * the write may land after the removal. Promotion therefore stops at its
  * grant's expiry, the finalize that promoted removes its original again
- * whenever it fails, and a failed attempt that held a digest stays due for
- * reconciliation, which removes it once more after no promotion can be running.
+ * whenever it fails, a failed attempt that held a digest stays due for
+ * reconciliation, which removes it once more after the grace period, and the
+ * sweep removes a copy that R2 confirms later still.
  */
 const attemptOriginal = (key: Key) => originalKey(key[0], key[2], key[3]);
 const removeOriginal = (cell: SourceCell, key: Key) => cell.originals.delete(attemptOriginal(key));
@@ -431,8 +434,9 @@ async function failAttempt(db: Db, key: Key, code: string): Promise<void> {
  * promotion window has closed (`settled`), by reconciliation. Removal
  * precedes the record, so a crash only repeats it.
  */
-async function removeStaging(cell: SourceCell, key: Key, staging: string, settled = false): Promise<void> {
-  await cell.originals.delete(staging);
+async function removeStaging(cell: SourceCell, key: Key, staging: string, settled = false,
+  bounded: (pending: Promise<void>) => Promise<void> = pending => pending): Promise<void> {
+  await bounded(cell.originals.delete(staging));
   await transact(cell.pool, db => db.query(`UPDATE source_upload_attempts
     SET staging_removed_at=clock_timestamp(),updated_at=clock_timestamp()
     WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND attempt_id=$4 AND staging_removed_at IS NULL
@@ -462,8 +466,9 @@ async function abandon(cell: SourceCell, key: Key, code: string | null, revokeGr
   if (ended?.promoted) await removeOriginal(cell, key);
   if (ended?.staging) await removeStaging(cell, key, ended.staging);
 }
-/** The attempt failure code for a caller whose authority ended mid-request. */
-const refusalCode = (error: unknown) => error instanceof AuthorityError ? `refused_${error.code.toLowerCase()}` : 'commit_failed';
+/** The attempt failure code for a caller whose authority or grant ended mid-request. */
+const refusalCode = (error: unknown) => isGrantExpired(error) ? 'grant_expired' :
+  error instanceof AuthorityError ? `refused_${error.code.toLowerCase()}` : 'commit_failed';
 
 /**
  * Sources and short-lived upload grants for one owning collection. Every call
@@ -864,10 +869,39 @@ const duplicate = Symbol('duplicate source');
 const duplicateSource = () => Object.assign(new AuthorityError('IDEMPOTENCY_MISMATCH',
   'A source with this identity already exists', undefined, false), { [duplicate]: true });
 const isDuplicateSource = (error: unknown) => (error as { [duplicate]?: unknown } | null)?.[duplicate] === true;
+const expired = Symbol('grant expired at commit');
+const grantExpired = () => Object.assign(new AuthorityError('FORBIDDEN', 'Upload grant expired'), { [expired]: true });
+const isGrantExpired = (error: unknown) => (error as { [expired]?: unknown } | null)?.[expired] === true;
 /** Serialize on the source identity, which a retry in another collection would share. */
 async function sourceExists(db: Db, spaceId: string, sourceId: string): Promise<boolean> {
   await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [lockKey(['stateplane:source', spaceId, sourceId])]);
   return (await db.query('SELECT 1 FROM sources WHERE space_id=$1 AND source_id=$2', [spaceId, sourceId])).rows.length > 0;
+}
+
+/** Each provider call during cleanup gets at most this long, so one stalled call cannot hold a page. */
+const CLEANUP_CALL_MS = 2_000;
+const SWEEP_CURSOR = 'reconcile/sweep-cursor';
+/**
+ * Settle with `pending`, or fail once `CLEANUP_CALL_MS` or the budget ending at
+ * `until` (a `performance.now` instant) has passed. A call that settles later
+ * is ignored: every cleanup call is safe to land late.
+ */
+function within<T>(until: number, pending: Promise<T>): Promise<T> {
+  void pending.catch(() => {});
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('Upload cleanup call timed out')),
+      Math.max(0, Math.min(until - performance.now(), CLEANUP_CALL_MS)));
+  });
+  return Promise.race([pending, timeout]).finally(() => clearTimeout(timer));
+}
+/** The attempt a stored key belongs to: its space and staging key, and whether it is the original. */
+function storedAttempt(key: string): { spaceId: string; stagingKey: string; original: boolean } | null {
+  const parts = key.split('/');
+  if (parts.length !== 4 || (parts[0] !== 'staging' && parts[0] !== 'originals') || !parts[2] || !parts[3]) return null;
+  const spaceId = Buffer.from(parts[1], 'base64url').toString('utf8');
+  if (!spaceId || spaceSegment(spaceId) !== parts[1]) return null;
+  return { spaceId, stagingKey: stagingKey(spaceId, parts[2], parts[3]), original: parts[0] === 'originals' };
 }
 
 /**
@@ -877,15 +911,23 @@ async function sourceExists(db: Db, spaceId: string, sourceId: string): Promise<
  * and recorded. Each attempt settles in its own transaction, and one failure
  * does not stop the rest. A failing attempt's `updated_at` is advanced, so it
  * moves behind every due attempt not tried since and cannot hold the oldest page.
+ * `sweep` then finds bytes that landed after their attempt was settled.
  */
 export class SourceUploadReconciler {
   constructor(private readonly cell: SourceCell, private readonly graceSeconds = sourceBounds.reconcileGraceSeconds) {
     if (!isSafeInteger(graceSeconds) || graceSeconds < 0) throw new RangeError('Invalid reconciliation grace');
   }
 
-  /** Settle up to `limit` due attempts; returns how many were due. */
-  async step(limit = 25): Promise<number> {
+  /**
+   * Settle up to `limit` due attempts within `budgetMs`; returns how many were
+   * due, so a page cut short by the budget still reads as unfinished. No
+   * attempt starts after the budget, and each store call is bounded; a call
+   * that times out leaves its attempt due and is safe to land later.
+   */
+  async step(limit = 25, budgetMs = 10_000): Promise<number> {
     if (!isSafeInteger(limit) || limit < 1 || limit > 500) throw new RangeError('Invalid reconciliation limit');
+    if (!isSafeInteger(budgetMs) || budgetMs < 1) throw new RangeError('Invalid reconciliation budget');
+    const until = performance.now() + budgetMs;
     const due = await transact(this.cell.pool, db => db.query(`SELECT a.space_id,a.collection_id,a.grant_id,a.attempt_id
       FROM source_upload_attempts a JOIN source_upload_grants g USING (space_id,collection_id,grant_id)
       WHERE a.staging_removed_at IS NULL AND g.expires_at < clock_timestamp()-make_interval(secs=>$2)
@@ -893,6 +935,7 @@ export class SourceUploadReconciler {
     const errors: unknown[] = [];
     let failed = 0;
     for (const row of due.rows) {
+      if (performance.now() >= until) break;
       const key: Key = [row.space_id, row.collection_id, row.grant_id, row.attempt_id];
       try {
         const attempt = await transact(this.cell.pool, async db => {
@@ -904,12 +947,10 @@ export class SourceUploadReconciler {
         });
         if (!attempt) continue;
         // No write starts after the grant's expiry, and one refused at it
-        // reports failure only after the store answered, so a copy that
-        // landed late was already removed by its finalize unless that
-        // worker died; the grace is assumed to cover that copy's landing
-        // (docs/evidence-storage.md records the assumption).
-        if (attempt.state !== 'committed' && attempt.observed_sha256) await removeOriginal(this.cell, key);
-        await removeStaging(this.cell, key, String(attempt.staging_key), true);
+        // reports failure promptly, so a copy can still land after this
+        // removal; `sweep` finds it once the attempt has settled.
+        if (attempt.state !== 'committed' && attempt.observed_sha256) await within(until, removeOriginal(this.cell, key));
+        await removeStaging(this.cell, key, String(attempt.staging_key), true, pending => within(until, pending));
       } catch (error) {
         failed++;
         errors.push(error);
@@ -920,5 +961,50 @@ export class SourceUploadReconciler {
     }
     if (errors.length) throw new AggregateError(errors, `${failed} upload attempts did not settle`);
     return due.rows.length;
+  }
+
+  /**
+   * Delete stored bytes no attempt needs any more, found by listing the bucket
+   * rather than by the ledger, so a write R2 confirmed after its attempt
+   * settled is found on a later pass however late it landed. A failed
+   * attempt's staging and original and a committed attempt's staging are
+   * deleted; a committed original, a live attempt's bytes and keys the ledger
+   * does not know are kept. Both states are final, so a delete that lands
+   * late is safe. Each call examines up to `limit` keys after a cursor kept in
+   * the bucket, within `budgetMs`; a lost cursor restarts the pass. Returns
+   * how many keys it examined.
+   */
+  async sweep(limit = 100, budgetMs = 5_000): Promise<number> {
+    if (!isSafeInteger(limit) || limit < 1 || limit > 1000) throw new RangeError('Invalid sweep limit');
+    if (!isSafeInteger(budgetMs) || budgetMs < 1) throw new RangeError('Invalid sweep budget');
+    const until = performance.now() + budgetMs;
+    const blobs = this.cell.originals;
+    const stored = await within(until, blobs.get(SWEEP_CURSOR));
+    const cursor = stored ? await within(until, new Response(stored.body).text()) : '';
+    const page = await within(until, blobs.list(cursor, limit));
+    const owners = page.keys.map(storedAttempt);
+    const known = owners.flatMap((owner, index) => owner ? [{ ...owner, index }] : []);
+    const ended = new Set((await transact(this.cell.pool, db => db.query(`SELECT k.index FROM
+      unnest($1::text[],$2::text[],$3::boolean[],$4::int[]) AS k(space_id,staging_key,original,index)
+      JOIN source_upload_attempts a ON a.space_id=k.space_id AND a.staging_key=k.staging_key
+      WHERE a.state='failed' OR (a.state='committed' AND NOT k.original)`,
+    [known.map(k => k.spaceId), known.map(k => k.stagingKey), known.map(k => k.original), known.map(k => k.index)])))
+      .rows.map(row => Number(row.index)));
+    const errors: unknown[] = [];
+    let examined = 0;
+    for (const [index, key] of page.keys.entries()) {
+      if (performance.now() >= until) break;
+      if (ended.has(index)) await within(until, blobs.delete(key)).catch((error: unknown) => { errors.push(error); });
+      examined++;
+    }
+    // A finished pass starts over; a failed delete is retried on the next pass.
+    const next = page.done && examined === page.keys.length ? '' : page.keys[examined - 1] ?? cursor;
+    if (next !== cursor) {
+      const bytes = Buffer.from(next, 'utf8');
+      await within(until, blobs.put(SWEEP_CURSOR, bytes, { bytes: bytes.byteLength, contentType: 'text/plain' }))
+        .catch((error: unknown) => { errors.push(error); });
+    }
+    if (errors.length) throw new AggregateError(errors, 'Stored upload bytes sweep did not finish');
+    return examined;
   }
 }

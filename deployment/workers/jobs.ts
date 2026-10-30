@@ -14,12 +14,15 @@ interface Env {
 // lease; losing or repeating one cannot lose or reapply committed work.
 // Until a search projector exists, completion advances per-ref heads only.
 // Each once-a-minute tick dispatches for up to 20 s, advances reconciliations
-// for up to 10 s, then settles ended upload attempts for up to 10 s;
+// for up to 10 s, settles ended upload attempts for up to 10 s, then sweeps
+// one page of stored upload bytes for up to 5 s;
 // docs/durable-outbox.md and docs/evidence-storage.md record the bounds.
 const DISPATCH_BUDGET_MS = 20_000;
 const RECONCILE_BUDGET_MS = 10_000;
 const UPLOAD_BUDGET_MS = 10_000;
 const UPLOAD_PAGE = 25;
+const SWEEP_BUDGET_MS = 5_000;
+const SWEEP_PAGE = 100;
 function cell(env: Env, originals = false) {
   if (!env.AUTHORITY?.connectionString) throw new Error('Cell authority binding is missing');
   if (originals && !env.ORIGINALS) throw new Error('Cell originals binding is missing');
@@ -52,10 +55,12 @@ export default {
       const failures: unknown[] = [];
       try { while (stepped > 0 && Date.now() < until) stepped = await outbox.stepReconciliations(); }
       catch (error) { failures.push(error); }
-      // A full page means more ended attempts may be due.
+      // A full page means more ended attempts may be due; each step stops at the budget's end.
       const uploadsUntil = Date.now() + UPLOAD_BUDGET_MS;
       let due = UPLOAD_PAGE;
-      try { while (due === UPLOAD_PAGE && Date.now() < uploadsUntil) due = await uploads!.step(UPLOAD_PAGE); }
+      try { while (due === UPLOAD_PAGE && Date.now() < uploadsUntil) due = await uploads!.step(UPLOAD_PAGE, Math.max(1, uploadsUntil - Date.now())); }
+      catch (error) { failures.push(error); }
+      try { await uploads!.sweep(SWEEP_PAGE, SWEEP_BUDGET_MS); }
       catch (error) { failures.push(error); }
       if (result.error) throw new Error(`Projection dispatch released ${result.released} leases`, {
         cause: failures.length ? new AggregateError([result.error, ...failures], 'Queue send and reconciliation failed') : result.error });

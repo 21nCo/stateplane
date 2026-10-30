@@ -1,13 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({ closed: 0, connected: 0, failClose: false, denyGrants: false, denyCatalog: false, ownsObject: false, denyVector: false, wrongIdentity: false }));
-const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[], reconcileError: undefined as Error | undefined, uploadPages: [] as number[], uploadSteps: [] as number[], uploadError: undefined as Error | undefined, originals: [] as unknown[], active: 0, peak: 0, poolInstances: [] as { emit(event: string, error: Error): boolean }[] }));
+const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[], reconcileError: undefined as Error | undefined, uploadPages: [] as number[], uploadSteps: [] as number[], uploadError: undefined as Error | undefined, uploadBudgets: [] as number[], sweeps: [] as number[][], originals: [] as unknown[], active: 0, peak: 0, poolInstances: [] as { emit(event: string, error: Error): boolean }[] }));
 vi.mock('@stateplane/postgres', async importOriginal => ({
   CLIENT_READ_TIMEOUT_MS: (await importOriginal<typeof import('@stateplane/postgres')>()).CLIENT_READ_TIMEOUT_MS,
   PostgresAuthority: class {},
   SourceUploadReconciler: class {
     constructor(sourceCell: { originals: unknown }) { cell.originals.push(sourceCell.originals); }
-    async step(limit: number) { cell.uploadSteps.push(limit); if (cell.uploadError) throw cell.uploadError; return cell.uploadPages.shift() ?? 0; }
+    async step(limit: number, budgetMs: number) { cell.uploadSteps.push(limit); cell.uploadBudgets.push(budgetMs); if (cell.uploadError) throw cell.uploadError; return cell.uploadPages.shift() ?? 0; }
+    async sweep(limit: number, budgetMs: number) { cell.sweeps.push([limit, budgetMs]); return 0; }
   },
   PostgresOutbox: class {
     async claim() { return { messages: cell.claims.shift() ?? [], scan: 'whole' }; }
@@ -128,9 +129,12 @@ describe('cell jobs Worker', () => {
   });
 
   it('settles ended upload attempts after projection work, page by page, and reports their failure with the tick', async () => {
-    cell.claims = []; cell.uploadSteps = []; cell.uploadPages = [25, 25, 3];
+    cell.claims = []; cell.uploadSteps = []; cell.uploadBudgets = []; cell.sweeps = []; cell.uploadPages = [25, 25, 3];
     await jobs.scheduled({} as never, jobsEnv());
     expect(cell.uploadSteps).toEqual([25, 25, 25]);
+    // Each step gets what remains of the 10 s allocation, and one sweep page follows within its own 5 s.
+    expect(cell.uploadBudgets.every((budget, i) => budget > 0 && budget <= 10_000 && (i === 0 || budget <= cell.uploadBudgets[i - 1]))).toBe(true);
+    expect(cell.sweeps).toEqual([[100, 5_000]]);
     cell.uploadSteps = []; cell.uploadPages = [0];
     await jobs.scheduled({} as never, jobsEnv());
     expect(cell.uploadSteps).toEqual([25]);

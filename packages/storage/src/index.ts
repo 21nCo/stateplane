@@ -9,6 +9,7 @@ export interface R2BucketLike {
   head(key: string): Promise<R2ObjectLike | null>;
   get(key: string): Promise<(R2ObjectLike & { body: ReadableStream<Uint8Array> }) | null>;
   delete(key: string): Promise<void>;
+  list(options: { startAfter?: string; limit?: number }): Promise<{ objects: { key: string }[]; truncated: boolean }>;
 }
 /** Give a stream the known length R2 requires; Workers provide FixedLengthStream. */
 export type KnownLength = (stream: ReadableStream<Uint8Array>, bytes: number) => ReadableStream<Uint8Array>;
@@ -70,12 +71,22 @@ export class R2BlobStore implements BlobStore {
       },
       cancel(reason) { return reader.cancel(reason); }
     });
-    const abort = () => { void reader.cancel(new BlobWriteError('deadline')).catch(() => {}); };
+    // Once the body has ended, cancelling it cannot stop the store's answer, so
+    // the abort also ends the wait for it; the store may still land the write.
+    let abandon: (reason: BlobWriteError) => void = () => {};
+    const abandoned = new Promise<never>((_, reject) => { abandon = reject; });
+    abandoned.catch(() => {});
+    const abort = () => {
+      void reader.cancel(new BlobWriteError('deadline')).catch(() => {});
+      abandon(new BlobWriteError('deadline'));
+    };
     signal?.addEventListener('abort', abort, { once: true });
     let written = false;
     try {
-      const stored = await this.bucket.put(key, this.knownLength(checked, bytes),
+      const pending = this.bucket.put(key, this.knownLength(checked, bytes),
         { ...(sha256 === undefined ? {} : { sha256 }), ...(contentType === undefined ? {} : { httpMetadata: { contentType } }) });
+      pending.catch(() => {});
+      const stored = await Promise.race([pending, abandoned]);
       if (failure) throw failure;
       // The body ended in time, but the store confirmed only after the deadline.
       if (signal?.aborted) fail('deadline');
@@ -106,4 +117,9 @@ export class R2BlobStore implements BlobStore {
   }
 
   async delete(key: string): Promise<void> { await this.bucket.delete(key); }
+
+  async list(startAfter: string, limit: number): Promise<{ keys: string[]; done: boolean }> {
+    const page = await this.bucket.list({ ...(startAfter ? { startAfter } : {}), limit });
+    return { keys: page.objects.map(object => object.key), done: !page.truncated };
+  }
 }

@@ -62,6 +62,10 @@ class MemoryR2 {
     if (this.failDelete(key)) throw new Error('delete: provider unavailable');
     this.objects.delete(key);
   }
+  async list({ startAfter = '', limit = 1000 } = {}) {
+    const after = [...this.objects.keys()].sort().filter(key => key > startAfter);
+    return { objects: after.slice(0, limit).map(key => ({ key })), truncated: after.length > limit };
+  }
   keys(prefix) { return [...this.objects.keys()].filter(key => key.startsWith(prefix)); }
 }
 const chunked = (bytes, { size = 3, fail, stallMs } = {}) => {
@@ -677,11 +681,12 @@ test('a finalize copy still running at its grant expiry stores nothing', async (
   const attempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(bytes), declared);
   const key = originalKey(f.spaceId, grant.grantId, attempt.attemptId);
   const { atPut, release } = holdPut(f.r2, key);
-  const finalize = f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, { attemptId: attempt.attemptId });
+  const finalize = rejects(f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, { attemptId: attempt.attemptId }), 'FORBIDDEN');
   await atPut;
   await sleep(1200);
   release();
-  await rejects(finalize, 'FORBIDDEN');
+  await finalize;
+  await sleep(20);
   assert.equal(f.r2.stored.includes(key), false, 'the copy was cut off at expiry, so no write can land after reconciliation');
   assert.deepEqual((await attempts(f.spaceId, grant.grantId)).map(row => [row.state, row.failure_code]), [['failed', 'commit_failed']]);
 });
@@ -766,18 +771,23 @@ test('revocation while the digest commits elsewhere, and same-key ingestion, sta
   }
 });
 
-test('a blob write never starts after its deadline and reports one the store confirmed after it', async () => {
+test('a blob write never starts after its deadline and reports one whose confirmation stalls past it at once', async () => {
   const r2 = new MemoryR2();
   const blobs = new R2BlobStore(r2);
   const bytes = Buffer.from('confirmed too late');
   const isDeadline = error => error instanceof BlobWriteError && error.reason === 'deadline';
   await assert.rejects(blobs.put('k/expired', chunked(bytes), { bytes: bytes.length, signal: AbortSignal.abort() }), isDeadline);
   assert.deepEqual(r2.started, [], 'no write starts once the deadline has passed');
-  // The body ends before the deadline; the store confirms only after it.
+  // The body ends before the deadline; the store's confirmation stalls past it.
   const deadline = new AbortController();
-  r2.afterBody = async () => { deadline.abort(); await sleep(20); };
+  let confirm;
+  const confirmation = new Promise(resolve => { confirm = resolve; });
+  r2.afterBody = async () => { deadline.abort(); await confirmation; };
   await assert.rejects(blobs.put('k/late', chunked(bytes), { bytes: bytes.length, sha256: sha(bytes), signal: deadline.signal }),
-    isDeadline, 'a write confirmed after its deadline is not reported as a success');
+    isDeadline, 'a write whose confirmation stalls past its deadline is reported at once, not as a success');
+  assert.equal(r2.objects.has('k/late'), false, 'reported before the store answered');
+  confirm();
+  await sleep(10);
   assert.equal(r2.objects.has('k/late'), true, 'the caller must treat the key as possibly written');
 });
 
@@ -808,41 +818,167 @@ test('a grant deadline is fixed when the grant is read, so no upload or promotio
   assert.deepEqual(f.r2.keys(''), []);
 });
 
-test('a promotion the store confirms after expiry is removed, at once or by reconciliation', async () => {
+/** Hold the store's answer to the next put whose key matches, after it has read the whole body, until released. */
+function holdConfirmation(r2, matches) {
+  let release, reached;
+  const held = new Promise(resolve => { release = resolve; });
+  const atConfirm = new Promise(resolve => { reached = resolve; });
+  r2.afterBody = async target => { if (matches(target)) { r2.afterBody = async () => {}; reached(); await held; } };
+  return { atConfirm, release };
+}
+const untilExpired = grant => sleep(Math.max(0, Date.parse(grant.expiresAt) - Date.now()) + 150);
+
+test('bytes the store confirms after their attempt settled are found and removed by the sweep, never a committed original', async () => {
   const f = await fixture();
   const declared = { mimeType: 'application/octet-stream' };
-  const lateCopy = async (text, sources, beforeConfirm = () => {}) => {
-    const bytes = Buffer.from(text);
-    const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { ...declared, maxBytes: 64, expiresInSeconds: 1 });
-    const attempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(bytes), { ...declared, bytes: bytes.length });
-    const key = originalKey(f.spaceId, grant.grantId, attempt.attemptId);
-    f.r2.afterBody = async target => {
-      if (target !== key) return;
-      f.r2.afterBody = async () => {};
-      beforeConfirm();
-      await sleep(1300);
-    };
-    await rejects(sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, { attemptId: attempt.attemptId }), 'FORBIDDEN');
-    assert.equal(f.r2.stored.includes(key), true, 'the copy landed after expiry');
-    return { key, grant };
-  };
-  const checked = await lateCopy('confirmed after expiry', f.sources);
-  assert.equal(f.r2.objects.has(checked.key), false, 'the finalize removed its original after the store answered');
-  // The worker loses its connection before its own removal.
-  const crashed = await lateCopy('confirmed after expiry, then the worker died', f.faulty, () => {
-    faults = [{ match: 'SELECT state,staging_key,observed_sha256,observed_bytes,staging_removed_at',
-      error: Object.assign(new Error('connection reset'), { code: 'ECONNRESET' }) }];
-  });
-  faults = [];
-  assert.equal(f.r2.objects.has(crashed.key), true);
-  assert.deepEqual((await attempts(f.spaceId, checked.grant.grantId)).map(row => [row.state, row.failure_code, row.removed]),
-    [['failed', 'commit_failed', false]], 'an attempt that held a digest stays due');
+  const promptly = (request, grant) => Promise.race([request.then(() => 'succeeded', error => error.code),
+    untilExpired(grant).then(() => sleep(500)).then(() => 'still waiting on the store')]);
+  const keptBytes = Buffer.from('committed and kept');
+  const keptGrant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { ...declared, maxBytes: 64 });
+  const keptAttempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', keptGrant.grantId, chunked(keptBytes),
+    { ...declared, bytes: keptBytes.length });
+  const kept = await f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', keptGrant.grantId, { attemptId: keptAttempt.attemptId });
+
+  // An upload's staging write ends its body before expiry; the store answers only much later.
+  const staged = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { ...declared, maxBytes: 64, expiresInSeconds: 1 });
+  const stagedBytes = Buffer.from('staging confirmed late');
+  const stagingHold = holdConfirmation(f.r2, key => key.startsWith('staging/') && key.includes(staged.grantId));
+  const upload = f.sources.upload(f.agent, f.spaceId, 'alpha', staged.grantId, chunked(stagedBytes), { ...declared, bytes: stagedBytes.length });
+  await stagingHold.atConfirm;
+  assert.equal(await promptly(upload, staged), 'FORBIDDEN', 'the upload reports expiry without waiting for the store');
+  // So does a finalize's promotion.
+  const promoted = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { ...declared, maxBytes: 64, expiresInSeconds: 1 });
+  const promotedBytes = Buffer.from('original confirmed late');
+  const promotedAttempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', promoted.grantId, chunked(promotedBytes),
+    { ...declared, bytes: promotedBytes.length });
+  const promotedKey = originalKey(f.spaceId, promoted.grantId, promotedAttempt.attemptId);
+  const promotionHold = holdConfirmation(f.r2, key => key === promotedKey);
+  const finalize = f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', promoted.grantId, { attemptId: promotedAttempt.attemptId });
+  await promotionHold.atConfirm;
+  assert.equal(await promptly(finalize, promoted), 'FORBIDDEN', 'the finalize reports expiry without waiting for the store');
+
+  // The writers' own cleanup has run, and reconciliation settles both attempts; only then do both writes land.
   while (await f.reconciler(0).step(500) === 500);
-  assert.equal(f.r2.objects.has(crashed.key), false, 'reconciliation removes the failed attempt\'s original');
-  for (const grant of [checked.grant, crashed.grant])
-    assert.equal((await attempts(f.spaceId, grant.grantId))[0].removed, true);
-  assert.deepEqual(f.r2.keys(''), []);
-  assert.deepEqual(await sourceRows(f.spaceId), { sources: 0, originals: 0, refs: 0 });
+  for (const grant of [staged, promoted])
+    assert.deepEqual((await attempts(f.spaceId, grant.grantId)).map(row => [row.state, row.removed]), [['failed', true]]);
+  stagingHold.release();
+  promotionHold.release();
+  await sleep(50);
+  const late = () => f.r2.keys('').filter(key => key.includes(staged.grantId) || key.includes(promoted.grantId)).sort();
+  assert.equal(late().length, 2, 'both writes landed after their attempts settled');
+  while (await f.reconciler(0).step(500) === 500);
+  assert.equal(late().length, 2, 'the ledger no longer lists them');
+  await f.reconciler(0).sweep(1000);
+  assert.deepEqual(late(), [], 'the sweep finds and removes them');
+  assert.deepEqual(f.r2.keys(''), [await sourceKey(f, kept.sourceId)]);
+  assert.deepEqual(await read((await f.sources.content(f.agent, f.spaceId, 'alpha', kept.sourceId)).body), keptBytes);
+});
+
+test('the sweep keeps live and unknown bytes and continues across pages from its cursor', async () => {
+  const f = await fixture();
+  const declared = { mimeType: 'application/octet-stream' };
+  const bytes = Buffer.from('a failed attempt left bytes');
+  const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { ...declared, maxBytes: 64 });
+  for (let i = 0; i < 3; i++)
+    await rejects(f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(bytes.subarray(1)), { ...declared, bytes: bytes.length }),
+      'INVALID_ARGUMENT');
+  // Bytes that landed for each failed attempt after its cleanup, at its staging and original keys.
+  const failed = (await attempts(f.spaceId, grant.grantId)).map(row => row.attempt_id);
+  for (const attemptId of failed) for (const key of [originalKey(f.spaceId, grant.grantId, attemptId),
+    originalKey(f.spaceId, grant.grantId, attemptId).replace(/^originals\//, 'staging/')]) f.r2.objects.set(key, { bytes });
+  const live = await f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(bytes), { ...declared, bytes: bytes.length });
+  for (const key of ['misc/other', 'staging/not base64/upl_x/att_y', 'originals/x/y']) f.r2.objects.set(key, { bytes });
+  const before = f.r2.keys('').sort();
+  const sweeper = f.reconciler(0);
+  assert.equal(await sweeper.sweep(3), 3);
+  assert.equal(f.r2.objects.has('reconcile/sweep-cursor'), true, 'an unfinished pass records its cursor');
+  assert.equal(failed.some(id => f.r2.keys('').some(key => key.endsWith(id))), true, 'one page does not finish the pass');
+  for (let page = 0; page < 10 && failed.some(id => f.r2.keys('').some(key => key.endsWith(id))); page++) await sweeper.sweep(3);
+  assert.deepEqual(f.r2.keys('').filter(key => key !== 'reconcile/sweep-cursor').sort(),
+    before.filter(key => !failed.some(id => key.endsWith(id))), 'only the failed attempts\' bytes are removed');
+  const source = await f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, { attemptId: live.attemptId });
+  assert.deepEqual(await read((await f.sources.content(f.agent, f.spaceId, 'alpha', source.sourceId)).body), bytes);
+});
+
+test('an attempt verifies, and a grant finalizes, only in a transaction that commits before the grant expires', async () => {
+  const f = await fixture();
+  const declared = { mimeType: 'application/octet-stream' };
+  const current = spaces.assertScopeCurrent;
+  let delayUntil = null;
+  let delayed = 0;
+  // The final authority check runs after the guarded UPDATE and before COMMIT; hold it until the grant has expired.
+  spaces.assertScopeCurrent = async function (...args) {
+    if (delayUntil !== null) { const grant = delayUntil; delayUntil = null; delayed++; await untilExpired(grant); }
+    return current.apply(this, args);
+  };
+  try {
+    const verifyBytes = Buffer.from('verified at commit after expiry');
+    const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { ...declared, maxBytes: 64, expiresInSeconds: 1 });
+    f.r2.afterBody = async () => { f.r2.afterBody = async () => {}; delayUntil = grant; };
+    await rejects(f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(verifyBytes), { ...declared, bytes: verifyBytes.length }),
+      'FORBIDDEN', 'a verification that commits after expiry');
+    assert.equal(delayed, 1);
+    assert.deepEqual((await attempts(f.spaceId, grant.grantId)).map(row => [row.state, row.failure_code, row.removed]),
+      [['failed', 'grant_expired', true]]);
+    assert.deepEqual(staging(f.r2, f.spaceId), []);
+
+    const finalBytes = Buffer.from('finalized at commit after expiry');
+    const late = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { ...declared, maxBytes: 64, expiresInSeconds: 2 });
+    const attempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', late.grantId, chunked(finalBytes), { ...declared, bytes: finalBytes.length });
+    const key = originalKey(f.spaceId, late.grantId, attempt.attemptId);
+    f.r2.afterBody = async target => { if (target === key) { f.r2.afterBody = async () => {}; delayUntil = late; } };
+    await rejects(f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', late.grantId, { attemptId: attempt.attemptId }),
+      'FORBIDDEN', 'a finalize that commits after expiry');
+    assert.equal(delayed, 2);
+    assert.deepEqual(await sourceRows(f.spaceId), { sources: 0, originals: 0, refs: 0 }, 'no source commits after expiry');
+    assert.equal((await pool.query(`SELECT finalized_at FROM source_upload_grants WHERE space_id=$1 AND grant_id=$2`,
+      [f.spaceId, late.grantId])).rows[0].finalized_at, null);
+    assert.deepEqual((await attempts(f.spaceId, late.grantId)).map(row => [row.state, row.failure_code]), [['failed', 'commit_failed']]);
+    assert.equal(f.r2.objects.has(key), false, 'its original is removed');
+    assert.deepEqual(staging(f.r2, f.spaceId), [], 'and so is its staging');
+  } finally { spaces.assertScopeCurrent = current; }
+});
+
+test('reconciliation bounds each store call and its budget, so a stalled delete or slow statement holds no healthy attempt', async () => {
+  const f = await fixture();
+  const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: 'application/octet-stream', maxBytes: 64,
+    expiresInSeconds: 1 });
+  const prefix = `staging/${Buffer.from(f.spaceId).toString('base64url')}/${grant.grantId}/`;
+  // Oldest first, so these lead the cell-wide page.
+  for (const [i, attemptId] of ['att_a_stalled', 'att_b_healthy', 'att_c_slow', 'att_d_next'].entries()) {
+    await pool.query(`INSERT INTO source_upload_attempts(space_id,collection_id,grant_id,attempt_id,staging_key,updated_at)
+      VALUES($1,'alpha',$2,$3,$4,timestamptz '2000-01-01'+make_interval(days=>$5))`, [f.spaceId, grant.grantId, attemptId, `${prefix}${attemptId}`, i]);
+    f.r2.objects.set(`${prefix}${attemptId}`, { bytes: Buffer.from(attemptId) });
+  }
+  const row = async attemptId => (await pool.query(`SELECT staging_removed_at IS NOT NULL AS removed, updated_at
+    FROM source_upload_attempts WHERE space_id=$1 AND attempt_id=$2`, [f.spaceId, attemptId])).rows[0];
+  await untilExpired(grant);
+  let releaseStall;
+  const stalled = new Promise(resolve => { releaseStall = resolve; });
+  f.r2.beforeDelete = async key => { if (key.endsWith('att_a_stalled')) await stalled; };
+  const started = performance.now();
+  const outcome = await Promise.race([f.reconciler(0).step(2).then(() => 'settled', error => error),
+    sleep(5000).then(() => 'still held by the stalled delete')]);
+  assert.equal(outcome instanceof AggregateError, true, String(outcome));
+  assert.equal(performance.now() - started < 4000, true, 'the stalled call is bounded');
+  assert.equal((await row('att_b_healthy')).removed, true, 'the healthy attempt behind it settles');
+  const deferred = await row('att_a_stalled');
+  assert.equal(deferred.removed, false, 'the stalled attempt stays due');
+  assert.equal(deferred.updated_at > new Date('2001-01-01'), true, 'and moves behind due attempts not tried since');
+  releaseStall();
+  await sleep(20);
+  assert.equal(f.r2.objects.has(`${prefix}att_a_stalled`), false, 'its delete landed late, safely');
+
+  // A slow statement uses the budget: the page stops there, still reported as unfinished.
+  f.r2.beforeDelete = async () => {};
+  hooks = [{ match: 'FOR UPDATE SKIP LOCKED', run: () => sleep(400) }];
+  const slow = new SourceUploadReconciler({ pool: faulty, originals: f.blobs }, 0);
+  assert.equal(await slow.step(2, 300), 2, 'an unfinished page still reports its due attempts');
+  assert.deepEqual([(await row('att_c_slow')).removed, (await row('att_d_next')).removed], [true, false]);
+  hooks = [];
+  while (await f.reconciler(0).step(500) === 500);
+  for (const attemptId of ['att_a_stalled', 'att_d_next']) assert.equal((await row(attemptId)).removed, true, attemptId);
+  assert.deepEqual(f.r2.keys(prefix), []);
 });
 
 test('attempts that keep failing to settle cannot hold the oldest reconciliation page', async () => {
@@ -1079,7 +1215,6 @@ test('a source read rechecks the caller and the source once its original is open
 test('grant expiry is checked again by the verify and finalize transitions, after their lock waits', async () => {
   const f = await fixture();
   const declared = { mimeType: 'application/octet-stream' };
-  const untilExpired = grant => sleep(Math.max(0, Date.parse(grant.expiresAt) - Date.now()) + 150);
 
   // Verification waits on the grant row, locked here after the body began streaming, until the grant has expired.
   const lateVerify = Buffer.from('verified after expiry');
