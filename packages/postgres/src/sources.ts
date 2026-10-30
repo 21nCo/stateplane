@@ -755,9 +755,10 @@ export class PostgresSources {
    * Promote a verified attempt's bytes to its original key, then commit the
    * source metadata. Bytes are always verified and present before the
    * metadata commits, which finalizes the grant only if it has not expired;
-   * no store call runs while it holds locks. A deterministic failure
-   * abandons the attempt at once; a transient one leaves it verified for
-   * retry until reconciliation. The request is parsed only after the first
+   * no store call runs while it holds locks. A refusal by the first
+   * transaction leaves the attempt verified until reconciliation; a later
+   * deterministic failure abandons it at once; a transient one leaves it
+   * verified for retry until reconciliation. The request is parsed only after the first
    * transaction authorizes it.
    */
   private async complete(actor: VerifiedCredential, admitted: Admitted, grantId: string,
