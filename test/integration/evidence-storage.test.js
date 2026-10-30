@@ -5,6 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
+import { PostgresAuthority, PostgresSpaces } from '../../packages/postgres/dist/index.js';
 
 // STA-32 storage only: no service writes these tables yet, so fixtures use SQL.
 const root = fileURLToPath(new URL('../..', import.meta.url));
@@ -138,6 +139,11 @@ test('original objects cannot change once committed, and a corrected extraction 
   await assert.rejects(pool.query('DELETE FROM original_objects WHERE space_id=$1 AND collection_id=$2 AND source_id=$3', where), immutable);
   await assert.rejects(pool.query('TRUNCATE original_objects CASCADE'), immutable);
   assert.deepEqual((await pool.query('SELECT to_jsonb(o) AS row FROM original_objects o WHERE space_id=$1 AND collection_id=$2 AND source_id=$3', where)).rows[0].row, before);
+  // Source provenance is fixed too; lifecycle lives in entity_refs.
+  for (const change of [`locator='https://example.invalid/other'`, `principal_id='other'`, `credential_id='other'`, `created_at=created_at-interval '1 day'`])
+    await assert.rejects(pool.query(`UPDATE sources SET ${change} WHERE space_id=$1 AND collection_id=$2 AND source_id=$3`, where), immutable);
+  await assert.rejects(pool.query('DELETE FROM sources WHERE space_id=$1 AND collection_id=$2 AND source_id=$3', where), immutable);
+  await assert.rejects(pool.query('TRUNCATE sources CASCADE'), immutable);
 
   await extraction(spaceId, alpha, sourceId, 1, 'first parse');
   await assert.rejects(pool.query(`UPDATE extraction_versions SET content='corrected' WHERE space_id=$1 AND collection_id=$2 AND source_id=$3`, where), immutable);
@@ -197,6 +203,9 @@ test('claim revisions and their evidence are immutable history with explicit rev
     WHERE space_id=$1 AND collection_id=$2 AND claim_id=$3`, where), immutable);
   await assert.rejects(pool.query('UPDATE claim_evidence SET end_offset=6 WHERE claim_id=$1', [claimId]), immutable);
   await assert.rejects(pool.query('DELETE FROM claim_revisions WHERE claim_id=$1', [claimId]), immutable);
+  for (const change of [`principal_id='other'`, `credential_id='other'`, `created_at=created_at-interval '1 day'`])
+    await assert.rejects(pool.query(`UPDATE claims SET ${change} WHERE space_id=$1 AND collection_id=$2 AND claim_id=$3`, where), immutable);
+  await assert.rejects(pool.query('DELETE FROM claims WHERE space_id=$1 AND collection_id=$2 AND claim_id=$3', where), immutable);
   // Review is a new revision that names its reviewer; the current pointer moves with it.
   await inTransaction(async db => {
     await db.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,review_status,reviewed_by,reviewed_at)
@@ -332,72 +341,104 @@ async function blocked(pid) {
   throw new Error('session never waited for the competing lock');
 }
 
-test('a link racing its endpoint deletion cannot leave a live dangling link', async () => {
-  for (const kind of ['record', 'source']) {
-    for (const first of ['link', 'delete']) {
-      const { spaceId, alpha, beta } = await space();
-      const endpoint = kind === 'record' ? { kind, collectionId: beta, id: 'rec_beta' }
-        : { kind, collectionId: beta, id: await source(spaceId, beta) };
-      const anchor = { kind: 'record', collectionId: alpha, id: 'rec_alpha' };
-      const linker = await pool.connect();
-      const deleter = await pool.connect();
-      try {
-        await linker.query('BEGIN');
-        await deleter.query('BEGIN');
-        const deleterPid = (await deleter.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
-        const linkerPid = (await linker.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
-        if (first === 'link') {
-          await link(spaceId, anchor, endpoint, 'detach', { db: linker });
-          const deletion = tombstone(deleter, spaceId, endpoint).then(() => 'deleted', error => error);
-          await blocked(deleterPid);
-          await linker.query('COMMIT');
-          const outcome = await deletion;
-          assert.ok(outcome instanceof Error, `${kind}: deletion must see the committed link`);
-          code('23503', 'links_detach')(outcome);
-          await deleter.query('ROLLBACK');
-          assert.equal(await live(spaceId, endpoint), true);
-        } else {
-          await tombstone(deleter, spaceId, endpoint);
-          const creation = link(spaceId, anchor, endpoint, 'detach', { db: linker }).then(() => 'linked', error => error);
-          await blocked(linkerPid);
-          await deleter.query('COMMIT');
-          const outcome = await creation;
-          assert.ok(outcome instanceof Error, `${kind}: link creation must see the committed deletion`);
-          code('23503', 'links_live_endpoint')(outcome);
-          await linker.query('ROLLBACK');
-          assert.equal(await live(spaceId, endpoint), false);
+const isolations = { rc: 'READ COMMITTED', rr: 'REPEATABLE READ', ser: 'SERIALIZABLE' };
+const danglingLinks = async spaceId => (await pool.query(`SELECT count(*)::int AS n FROM links l
+  LEFT JOIN records r ON l.to_kind='record' AND r.space_id=l.space_id AND r.collection_id=l.to_collection_id AND r.record_id=l.to_id
+  LEFT JOIN entity_refs e ON l.to_kind<>'record' AND e.space_id=l.space_id AND e.collection_id=l.to_collection_id
+    AND e.kind=l.to_kind AND e.entity_id=l.to_id
+  WHERE l.space_id=$1 AND NOT l.tombstone AND coalesce(r.tombstone,e.tombstone)`, [spaceId])).rows[0].n;
+
+test('a link racing its endpoint deletion cannot leave a live dangling link at any isolation level', async () => {
+  // [deleter, linker] isolation pairs, including snapshot-isolated writers
+  // racing READ COMMITTED ones in both roles.
+  const pairs = [['rc', 'rc'], ['ser', 'rc'], ['rr', 'rc'], ['rc', 'rr'], ['rc', 'ser'], ['ser', 'ser']];
+  for (const kind of ['record', 'source', 'claim']) {
+    for (const [deleterLevel, linkerLevel] of pairs) {
+      for (const first of ['link', 'delete']) {
+        const label = `${kind} ${first} first, deleter ${deleterLevel}, linker ${linkerLevel}`;
+        const { spaceId, alpha, beta } = await space();
+        const endpoint = kind === 'record' ? { kind, collectionId: beta, id: 'rec_beta' }
+          : { kind, collectionId: beta, id: kind === 'source' ? await source(spaceId, beta) : await claim(spaceId, beta) };
+        const anchor = { kind: 'record', collectionId: alpha, id: 'rec_alpha' };
+        const linker = await pool.connect();
+        const deleter = await pool.connect();
+        try {
+          // Each first statement fixes a snapshot-isolated transaction's snapshot
+          // before the other side commits.
+          await linker.query(`BEGIN ISOLATION LEVEL ${isolations[linkerLevel]}`);
+          await deleter.query(`BEGIN ISOLATION LEVEL ${isolations[deleterLevel]}`);
+          const deleterPid = (await deleter.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+          const linkerPid = (await linker.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+          if (first === 'link') {
+            await link(spaceId, anchor, endpoint, 'detach', { db: linker });
+            const deletion = tombstone(deleter, spaceId, endpoint).then(() => deleter.query('COMMIT')).then(() => 'deleted', error => error);
+            await blocked(deleterPid);
+            await linker.query('COMMIT');
+            const outcome = await deletion;
+            assert.ok(outcome instanceof Error, `${label}: deletion must fail`);
+            if (deleterLevel === 'rc') code('23503', 'links_detach')(outcome); else code('40001')(outcome);
+            assert.equal(await live(spaceId, endpoint), true, label);
+          } else {
+            await tombstone(deleter, spaceId, endpoint);
+            const creation = link(spaceId, anchor, endpoint, 'detach', { db: linker }).then(() => linker.query('COMMIT'))
+              .then(() => 'linked', error => error);
+            await blocked(linkerPid);
+            await deleter.query('COMMIT');
+            const outcome = await creation;
+            assert.ok(outcome instanceof Error, `${label}: link creation must fail`);
+            if (linkerLevel === 'rc') code('23503', 'links_live_endpoint')(outcome); else code('40001')(outcome);
+            assert.equal(await live(spaceId, endpoint), false, label);
+          }
+        } finally {
+          await linker.query('ROLLBACK').catch(() => {});
+          await deleter.query('ROLLBACK').catch(() => {});
+          linker.release(); deleter.release();
         }
-      } finally {
-        await linker.query('ROLLBACK').catch(() => {});
-        await deleter.query('ROLLBACK').catch(() => {});
-        linker.release(); deleter.release();
+        assert.equal(await danglingLinks(spaceId), 0, label);
       }
-      assert.equal((await pool.query(`SELECT count(*)::int AS n FROM links l JOIN records r ON r.space_id=l.space_id
-        AND r.collection_id=l.to_collection_id AND r.record_id=l.to_record_id
-        WHERE l.space_id=$1 AND NOT l.tombstone AND r.tombstone`, [spaceId])).rows[0].n, 0);
     }
   }
-  // A REPEATABLE READ snapshot could miss a concurrently committed link.
-  const { spaceId, beta } = await space();
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
-    await assert.rejects(tombstone(client, spaceId, { kind: 'record', collectionId: beta, id: 'rec_beta' }), code('0A000'));
-  } finally { await client.query('ROLLBACK'); client.release(); }
-  await inTransaction(async db => {
-    await db.query('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
-    await tombstone(db, spaceId, { kind: 'record', collectionId: beta, id: 'rec_beta' });
-  });
+});
+
+test('authority record deletes work under snapshot isolation defaults and still honor links', async () => {
+  for (const level of ['repeatable read', 'serializable']) {
+    const sessionPool = new pg.Pool({ connectionString: urlFor(names[0]), max: 2,
+      options: `-c default_transaction_isolation=${level.replace(' ', '\\ ')}` });
+    try {
+      assert.equal((await sessionPool.query('SHOW default_transaction_isolation')).rows[0].default_transaction_isolation, level);
+      const { spaceId, alpha } = await space();
+      const authority = new PostgresAuthority(sessionPool, 3600);
+      const scope = { spaceId, collectionId: alpha, principalId: 'owner', credentialId: 'owner-session', capability: 'records:write',
+        policyVersion: 1, placementGeneration: 1 };
+      let n = 0;
+      const mutate = change => authority.mutate(scope, { idempotencyKey: `k${n}`, requestDigest: digest(String(n++)), ...change });
+      const create = async () => (await mutate({ operation: 'create', canonicalData: '{}', unique: [], indexes: [] })).ref.id;
+      const remove = recordId => mutate({ operation: 'delete', recordId, expectedRevision: 1 });
+      const unlinked = await create();
+      await remove(unlinked);
+      assert.equal(await live(spaceId, { kind: 'record', collectionId: alpha, id: unlinked }), false, level);
+      const linked = await create();
+      const restricting = await link(spaceId, { kind: 'record', collectionId: alpha, id: 'rec_alpha' },
+        { kind: 'record', collectionId: alpha, id: linked }, 'restrict');
+      await assert.rejects(remove(linked), level);
+      assert.equal(await live(spaceId, { kind: 'record', collectionId: alpha, id: linked }), true, level);
+      await detach(pool, spaceId, alpha, restricting);
+      await remove(linked);
+      assert.equal(await live(spaceId, { kind: 'record', collectionId: alpha, id: linked }), false, level);
+    } finally { await sessionPool.end(); }
+  }
 });
 
 test('upload grants and attempts keep finalize, revocation and staging cleanup unambiguous', async () => {
   const { spaceId, alpha } = await space();
-  const grant = (grantId, maxBytes, lifetime) => pool.query(`INSERT INTO source_upload_grants(space_id,collection_id,grant_id,principal_id,credential_id,mime_type,max_bytes,expires_at)
-    VALUES($1,$2,$3,'owner','owner-session','text/plain',$4,clock_timestamp()+$5::interval)`, [spaceId, alpha, grantId, maxBytes, lifetime]);
-  await assert.rejects(grant('empty', 0, '5 minutes'), code('23514'));
-  await assert.rejects(grant('expired', 1, '0 seconds'), code('23514'));
+  const issued = new Date();
+  const grant = (grantId, maxBytes, lifetimeMs) => pool.query(`INSERT INTO source_upload_grants(space_id,collection_id,grant_id,principal_id,credential_id,mime_type,max_bytes,issued_at,expires_at)
+    VALUES($1,$2,$3,'owner','owner-session','text/plain',$4,$5,$6)`, [spaceId, alpha, grantId, maxBytes, issued, new Date(issued.getTime() + lifetimeMs)]);
+  await assert.rejects(grant('empty', 0, 300_000), code('23514'));
+  await assert.rejects(grant('expired', 1, 0), code('23514'));
+  await assert.rejects(grant('inverted', 1, -1), code('23514'));
   const grantId = `upl_${randomUUID()}`;
-  await grant(grantId, 1024, '5 minutes');
+  await grant(grantId, 1024, 300_000);
   const sourceId = await source(spaceId, alpha);
   await assert.rejects(pool.query(`UPDATE source_upload_grants SET finalized_at=clock_timestamp() WHERE grant_id=$1`, [grantId]), code('23514'));
   await pool.query(`UPDATE source_upload_grants SET finalized_at=clock_timestamp(),source_id=$2 WHERE grant_id=$1`, [grantId, sourceId]);
@@ -467,6 +508,58 @@ test('space erasure removes every evidence row of that space only', async () => 
   assert.deepEqual(await counts(erased.spaceId), Object.fromEntries(evidenceTables.map(table => [table, 0])));
   assert.deepEqual(await counts(kept.spaceId), keptBefore);
   assert.equal((await pool.query('SELECT lifecycle FROM spaces WHERE space_id=$1', [erased.spaceId])).rows[0].lifecycle, 'deleted');
+});
+
+test('a nonowner cell role proves evidence erasure only with the evidence grants', async () => {
+  const actor = { kind: 'session', credentialId: 'session', userPrincipalId: 'erasure-owner' };
+  const keys = { create: async () => { throw new Error('unexpected key'); }, find: async () => null, revoke: async () => {} };
+  const identity = { current: async () => true };
+  const spacesFor = cellPool => new PostgresSpaces(pool, new Map([['cell-a', { pool: cellPool, storageTargetId: 'target-a' }]]),
+    'cell-a', keys, identity);
+  const { spaceId } = await spacesFor(pool).create(actor);
+  await inTransaction(async db => {
+    for (const collectionId of ['alpha', 'beta']) {
+      await db.query('INSERT INTO collections(space_id,collection_id) VALUES($1,$2)', [spaceId, collectionId]);
+      await db.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition) VALUES($1,$2,1,'{}')`,
+        [spaceId, collectionId]);
+    }
+  });
+  await evidence(spaceId, 'alpha', 'beta');
+  await spacesFor(pool).archive(actor, spaceId);
+  // Stand-in for the role's pre-040 provisioning: every other table, the
+  // purge routine, and nothing on the evidence tables.
+  const role = `sta32_cell_${randomUUID().replaceAll('-', '')}`;
+  const evidenceGrants = evidenceTables.filter(table => table !== 'entity_refs');
+  await pool.query(`CREATE ROLE ${role} NOLOGIN`);
+  const cellPool = new pg.Pool({ connectionString: urlFor(names[0]), max: 2, options: `-c role=${role}` });
+  try {
+    await pool.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${role}`);
+    await pool.query(`REVOKE ALL ON ${evidenceGrants.join(',')} FROM ${role}`);
+    await pool.query(`GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO ${role}`);
+    await pool.query(`GRANT EXECUTE ON FUNCTION stateplane_purge_space(text) TO ${role}`);
+    const spaces = spacesFor(cellPool);
+    // Without the evidence grants the purge commits, but erasure cannot be proven or published.
+    await assert.rejects(spaces.delete(actor, spaceId), code('42501'));
+    assert.equal((await pool.query('SELECT lifecycle FROM spaces WHERE space_id=$1', [spaceId])).rows[0].lifecycle, 'deleted');
+    assert.equal((await pool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1', [spaceId])).rows[0].lifecycle, 'deleting');
+    await assert.rejects(spaces.reconcile(spaceId), code('42501'));
+
+    execFileSync(process.execPath, ['scripts/grant-evidence.mjs'], { cwd: root, stdio: 'pipe',
+      env: { ...process.env, STATEPLANE_CELL_ADMIN_URL: urlFor(names[0]), STATEPLANE_CELL_ROLE: role } });
+    const privileges = (await pool.query(`SELECT t, has_table_privilege($1,t,'SELECT') AS can_read,
+        has_table_privilege($1,t,'INSERT,UPDATE,DELETE,TRUNCATE') AS can_write FROM unnest($2::text[]) t`, [role, evidenceGrants])).rows;
+    assert.deepEqual(privileges.filter(row => !row.can_read || row.can_write), [], 'the grant is read-only');
+    await spaces.delete(actor, spaceId);
+    await spaces.delete(actor, spaceId);
+    await spaces.reconcile(spaceId);
+    await spaces.repairDeletedErasure(actor, spaceId);
+    assert.equal((await pool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1', [spaceId])).rows[0].lifecycle, 'deleted');
+    assert.deepEqual(await counts(spaceId), Object.fromEntries(evidenceTables.map(table => [table, 0])));
+  } finally {
+    await cellPool.end();
+    await pool.query(`DROP OWNED BY ${role}`);
+    await pool.query(`DROP ROLE ${role}`);
+  }
 });
 
 test('migration 040 rolls back atomically while record writers hold locks, then applies to a populated database', { timeout: 60000 }, async () => {

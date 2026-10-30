@@ -241,7 +241,8 @@ CREATE INDEX links_live_from ON links(space_id, from_collection_id, from_kind, f
 CREATE INDEX links_live_to ON links(space_id, to_collection_id, to_kind, to_id) WHERE NOT tombstone;
 
 
--- Originals, extraction versions and claim history cannot be rewritten. Only
+-- Source and claim provenance, originals, extraction versions and claim
+-- history cannot be rewritten; lifecycle lives in `entity_refs`. Only
 -- the table owner, inside the scoped SECURITY DEFINER erasure routine, may
 -- delete one erasing space's rows; ordinary DML and TRUNCATE always fail.
 CREATE FUNCTION reject_evidence_fact_change() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -257,6 +258,14 @@ BEGIN
 END;
 $$;
 REVOKE ALL ON FUNCTION reject_evidence_fact_change() FROM PUBLIC;
+CREATE TRIGGER sources_immutable BEFORE UPDATE OR DELETE ON sources
+  FOR EACH ROW EXECUTE FUNCTION reject_evidence_fact_change();
+CREATE TRIGGER sources_no_truncate BEFORE TRUNCATE ON sources
+  FOR EACH STATEMENT EXECUTE FUNCTION reject_evidence_fact_change();
+CREATE TRIGGER claims_immutable BEFORE UPDATE OR DELETE ON claims
+  FOR EACH ROW EXECUTE FUNCTION reject_evidence_fact_change();
+CREATE TRIGGER claims_no_truncate BEFORE TRUNCATE ON claims
+  FOR EACH STATEMENT EXECUTE FUNCTION reject_evidence_fact_change();
 CREATE TRIGGER original_objects_immutable BEFORE UPDATE OR DELETE ON original_objects
   FOR EACH ROW EXECUTE FUNCTION reject_evidence_fact_change();
 CREATE TRIGGER original_objects_no_truncate BEFORE TRUNCATE ON original_objects
@@ -298,10 +307,13 @@ CREATE TRIGGER links_immutable BEFORE DELETE ON links
 CREATE TRIGGER links_no_truncate BEFORE TRUNCATE ON links
   FOR EACH STATEMENT EXECUTE FUNCTION reject_evidence_fact_change();
 
--- No live link may reference a tombstoned endpoint. A new link share-locks
--- both live endpoints, which conflicts with the update that tombstones one;
--- under READ COMMITTED the later of the two then sees the other's commit.
--- Owner rights let operational roles delete records without link grants.
+-- No live link may reference a tombstoned endpoint. A new link rewrites both
+-- live endpoint rows in place, a real write rather than a row lock, so the
+-- endpoint's tombstone update and the link's creation conflict at every
+-- isolation level. Under READ COMMITTED the later of the two waits and then
+-- sees the other's commit; a REPEATABLE READ or SERIALIZABLE writer whose
+-- snapshot predates the other's commit fails with 40001 instead. Owner rights
+-- let operational roles delete records without link grants.
 CREATE FUNCTION stateplane_guard_link_insert() RETURNS trigger LANGUAGE plpgsql
 SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
@@ -314,15 +326,17 @@ BEGIN
   END IF;
   FOR endpoint IN SELECT * FROM (VALUES (NEW.from_kind, NEW.from_collection_id, NEW.from_id),
       (NEW.to_kind, NEW.to_collection_id, NEW.to_id)) AS e(kind, collection_id, id) LOOP
+    -- `revision` is outside every column-specific trigger, so this rewrite
+    -- changes no value and fires no record or identity side effects.
     IF endpoint.kind = 'record' THEN
-      SELECT tombstone INTO deleted FROM public.records
+      UPDATE public.records SET revision = revision
         WHERE space_id = NEW.space_id AND collection_id = endpoint.collection_id AND record_id = endpoint.id
-        FOR SHARE;
+        RETURNING tombstone INTO deleted;
     ELSE
-      SELECT tombstone INTO deleted FROM public.entity_refs
+      UPDATE public.entity_refs SET revision = revision
         WHERE space_id = NEW.space_id AND collection_id = endpoint.collection_id
           AND kind = endpoint.kind AND entity_id = endpoint.id
-        FOR SHARE;
+        RETURNING tombstone INTO deleted;
     END IF;
     -- A missing endpoint is reported by its foreign key.
     IF FOUND AND deleted THEN
@@ -339,8 +353,9 @@ CREATE TRIGGER links_live_endpoints BEFORE INSERT ON links
 -- Tombstoning an endpoint fails with restrict_violation while a live
 -- `restrict` link touches it, and with foreign_key_violation while a live
 -- `detach` link does: the writer tombstones detach links first, with their
--- events, in the same transaction. A REPEATABLE READ snapshot could miss a
--- link committed after it began, so that isolation level is refused.
+-- events, in the same transaction. A link committed after this transaction's
+-- snapshot rewrote the endpoint row, so the tombstone update either waits and
+-- rereads (READ COMMITTED) or fails with 40001 before reaching this check.
 CREATE FUNCTION stateplane_guard_endpoint_tombstone() RETURNS trigger LANGUAGE plpgsql
 SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
@@ -354,10 +369,6 @@ BEGIN
   ELSE
     endpoint_kind := NEW.kind;
     endpoint_id := NEW.entity_id;
-  END IF;
-  IF current_setting('transaction_isolation') = 'repeatable read' THEN
-    RAISE EXCEPTION 'endpoint deletion requires read committed or serializable isolation'
-      USING ERRCODE = 'feature_not_supported';
   END IF;
   IF EXISTS (SELECT 1 FROM public.links l WHERE l.space_id = NEW.space_id AND NOT l.tombstone
       AND l.deletion_policy = 'restrict'

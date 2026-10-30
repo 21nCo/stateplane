@@ -163,6 +163,9 @@ try {
     // Restored outbox tables need their operational grants reapplied.
     execFileSync(process.execPath,['scripts/grant-outbox.mjs'],{cwd:root,
       env:{...process.env,STATEPLANE_CELL_ADMIN_URL:targetUrl,STATEPLANE_CELL_ROLE:journalRole},stdio:'inherit'});
+    // So do the evidence tables that space deletion reads to prove erasure.
+    execFileSync(process.execPath,['scripts/grant-evidence.mjs'],{cwd:root,
+      env:{...process.env,STATEPLANE_CELL_ADMIN_URL:targetUrl,STATEPLANE_CELL_ROLE:journalRole},stdio:'inherit'});
     const operational=await restored.connect();
     const issuance=`iss_restore_${randomBytes(8).toString('hex')}`;
     try {
@@ -176,6 +179,9 @@ try {
         WHERE space_id=$1`,[spaceId])).rowCount,1,'restored operational role can advance reconciliations');
       assert.equal((await operational.query(`UPDATE outbox_space_rotation SET after_collection_id=$2
         WHERE space_id=$1`,[spaceId,collectionId])).rowCount,1,'restored operational role can rotate collection turns');
+      for (const table of tables.slice(-9))
+        assert.ok((await operational.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[spaceId])).rows[0].n>0,
+          `restored operational role can read ${table} for erasure proof`);
     } finally {
       await operational.query('RESET ROLE').catch(()=>{});
       operational.release();
@@ -183,7 +189,8 @@ try {
     }
   } finally {
     await restored.query(`REVOKE ALL ON agent_key_issuances,projection_heads,projection_reconciliations,
-      outbox_dispatch_checkpoint,outbox_space_rotation,outbox_operator_audit FROM ${journalRole}`).catch(()=>{});
+      outbox_dispatch_checkpoint,outbox_space_rotation,outbox_operator_audit,${tables.slice(-9).join(',')}
+      FROM ${journalRole}`).catch(()=>{});
     await restored.query(`DROP ROLE IF EXISTS ${journalRole}`).catch(()=>{});
   }
   // A reserved-word role proves identifier quoting. Keep its creation and
