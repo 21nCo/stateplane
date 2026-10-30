@@ -6,7 +6,7 @@ import type { Capability, VerifiedCredential } from '@stateplane/contracts';
 import { commitBeforeDeadline, CommitNotSentDeadlineExceeded } from './commit-deadline.js';
 import { AuthorityError, AuthorityTransaction, CommitOutcomeUnknownError } from './index.js';
 import type { AuthorityScope } from './index.js';
-import { utcInstant } from './schema.js';
+import { acceptsInProcessObjects, isInProcessProxy, utcInstant } from './schema.js';
 import type { PostgresSpaces } from './spaces.js';
 
 /** One cell's authority pool and original-bytes store. */
@@ -56,8 +56,11 @@ const iso = (value: unknown) => value === null || value === undefined ? null : n
 const pgCode = (error: unknown) => (error as { code?: unknown })?.code;
 
 function invalid(message?: string): never { throw new AuthorityError('INVALID_ARGUMENT', message); }
+/** True for an object the runtime cannot inspect without running caller code: any proxy, or every object without a detector. */
+const untrusted = (value: object) => !acceptsInProcessObjects || isInProcessProxy(value);
+/** Snapshot a plain request's own data fields; a proxy is refused before any reflective read can run its traps. */
 function fields(value: unknown, allowed: readonly string[], required: readonly string[]): Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype ||
+  if (!value || typeof value !== 'object' || untrusted(value) || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype ||
     Object.keys(value).some(key => !allowed.includes(key)) || required.some(key => !Object.hasOwn(value, key)))
     invalid();
   const copy: Record<string, unknown> = {};
@@ -183,6 +186,10 @@ async function ensureOriginal(blobs: BlobStore, spaceId: string, sha256: string,
   if (existing && existing.bytes === bytes && existing.sha256 === sha256) return;
   const staged = typeof from === 'string' ? (await blobs.get(from))?.body : from;
   if (!staged) throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Staged upload bytes are missing', undefined, false);
+  if (signal.aborted) {
+    if (!(staged instanceof Uint8Array)) await staged.cancel().catch(() => {});
+    throw new BlobWriteError('deadline');
+  }
   // The store rechecks length and digest, so corrupted staging stores nothing.
   await blobs.put(key, staged, { bytes, sha256, contentType: mimeType, signal });
 }
@@ -308,7 +315,13 @@ async function insertGrant(db: Db, scope: AuthorityScope, grantId: string, mimeT
     SELECT $1,$2,$3,$4,$5,$6,$7,$8,stamp.at,stamp.at+make_interval(secs=>$9) FROM stamp RETURNING *`,
   [...grantKey(scope, grantId), scope.principalId, scope.credentialId, mimeType, maxBytes, sha256, seconds])).rows[0];
 }
+/**
+ * Lock a grant. Its `deadline` is a local monotonic instant (`performance.now`)
+ * no later than its expiry: the remaining lifetime the database computes is
+ * added to a reading taken before the query was sent.
+ */
 async function lockGrant(db: Db, scope: AuthorityScope, grantId: string, ownerPrincipalId?: string): Promise<Record<string, unknown>> {
+  const sent = performance.now();
   const row = (await db.query(`SELECT *,expires_at<=clock_timestamp() AS expired,
       GREATEST(0,EXTRACT(EPOCH FROM expires_at-clock_timestamp())*1000) AS remaining_ms
     FROM source_upload_grants WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 FOR UPDATE`,
@@ -316,8 +329,21 @@ async function lockGrant(db: Db, scope: AuthorityScope, grantId: string, ownerPr
   // Another credential's grant is not disclosed; the space owner may revoke any.
   if (!row || (row.credential_id !== scope.credentialId && scope.principalId !== ownerPrincipalId))
     throw new AuthorityError('NOT_FOUND');
-  return row;
+  return { ...row, deadline: sent + Number(row.remaining_ms) };
 }
+/**
+ * A signal that aborts at a grant's deadline. Writes must not start once it
+ * has aborted; the countdown is never restarted from a later reading.
+ */
+function writeWindow(deadline: number): { signal: AbortSignal; close: () => void } {
+  const controller = new AbortController();
+  const remaining = deadline - performance.now();
+  if (remaining <= 0) { controller.abort(); return { signal: controller.signal, close: () => {} }; }
+  const timer = setTimeout(() => controller.abort(), Math.floor(remaining));
+  return { signal: controller.signal, close: () => clearTimeout(timer) };
+}
+const stream = (value: unknown): value is ReadableStream<Uint8Array> =>
+  typeof value === 'object' && value !== null && !untrusted(value) && value instanceof ReadableStream;
 function usable(grant: Record<string, unknown>): void {
   if (grant.revoked_at) throw new AuthorityError('FORBIDDEN', 'Upload grant revoked');
   if (grant.finalized_at) throw new AuthorityError('FORBIDDEN', 'Upload grant already finalized');
@@ -514,7 +540,7 @@ export class PostgresSources {
       const staging = stagingKey(spaceId, grantId, attemptId);
       const grant = await this.actorTx(actor, admitted, async db => {
         if (!reference(grantId)) throw new AuthorityError('NOT_FOUND');
-        if (!(body instanceof ReadableStream)) invalid();
+        if (!stream(body)) invalid();
         const input = fields(declared, ['bytes', 'mimeType', 'sha256'], ['bytes', 'mimeType']);
         if (!Number.isSafeInteger(input.bytes) || (input.bytes as number) < 0) invalid('Upload size must be declared');
         const bytes = input.bytes as number;
@@ -529,21 +555,25 @@ export class PostgresSources {
         await db.query(`INSERT INTO source_upload_attempts(space_id,collection_id,grant_id,attempt_id,staging_key)
           VALUES($1,$2,$3,$4,$5)`, [...key, staging]);
         return { bytes, mimeType, sha256: claimed ?? (row.expected_sha256 as string | null) ?? undefined,
-          remainingMs: Number(row.remaining_ms) };
+          deadline: Number(row.deadline) };
       });
       consumed = true;
       const { bytes, mimeType } = grant;
-      const expiry = new AbortController();
-      const timer = setTimeout(() => expiry.abort(), Math.max(0, Math.floor(grant.remainingMs)));
+      const expiry = writeWindow(grant.deadline);
       let stored: { sha256: string; bytes: number };
       try {
+        if (expiry.signal.aborted) {
+          await body.cancel().catch(() => {});
+          throw new BlobWriteError('deadline');
+        }
         stored = await admitted.cell.originals.put(staging, mimeType.startsWith('text/') ? utf8Checked(body) : body,
           { bytes, sha256: grant.sha256, contentType: mimeType, signal: expiry.signal });
       } catch (error) {
+        // A write refused at its deadline may still have landed, so the staging key is always deleted.
         const code = error instanceof BlobWriteError ? failureCodes[error.reason] : 'store_failed';
         await abandon(admitted.cell, key, code).catch(() => {});
         throw uploadFailure(error);
-      } finally { clearTimeout(timer); }
+      } finally { expiry.close(); }
       // Verification is the commit intent for the digest, under its shared
       // lock, and needs the caller's authority to be current after the stream.
       let refused: string | null;
@@ -578,7 +608,7 @@ export class PostgresSources {
       }
       return { grantId, attemptId, sha256: stored.sha256, bytes: stored.bytes, mimeType };
     } finally {
-      if (!consumed) await body?.cancel?.().catch(() => {});
+      if (!consumed && stream(body)) await body.cancel().catch(() => {});
     }
   }
 
@@ -642,7 +672,7 @@ export class PostgresSources {
       return prepared;
     };
     const check = async (db: Db): Promise<{ replay: SourceView } |
-      { attempt: Record<string, unknown>; mimeType: string; remainingMs: number }> => {
+      { attempt: Record<string, unknown>; mimeType: string; deadline: number }> => {
       const { key, wanted } = request();
       const grant = await lockGrant(db, scope, grantId);
       if (grant.finalized_at) {
@@ -662,7 +692,7 @@ export class PostgresSources {
       if (attempt.state !== 'verified') invalid('Upload attempt is not verified');
       await writable(db, scope);
       await capturedNotFuture(db, wanted.capturedAt);
-      return { attempt, mimeType: String(grant.mime_type), remainingMs: Number(grant.remaining_ms) };
+      return { attempt, mimeType: String(grant.mime_type), deadline: Number(grant.deadline) };
     };
     const first = await this.actorTx(actor, admitted, check);
     if ('replay' in first) return first.replay;
@@ -670,12 +700,11 @@ export class PostgresSources {
     const sha256 = String(first.attempt.observed_sha256);
     const bytes = Number(first.attempt.observed_bytes);
     const staging = String(first.attempt.staging_key);
-    const expiry = new AbortController();
-    const timer = setTimeout(() => expiry.abort(), Math.max(0, Math.floor(first.remainingMs)));
+    const expiry = writeWindow(first.deadline);
     try {
       try {
         await ensureOriginal(admitted.cell.originals, scope.spaceId, sha256, bytes, first.mimeType, content ?? staging, expiry.signal);
-      } finally { clearTimeout(timer); }
+      } finally { expiry.close(); }
       const committed = await this.actorTx(actor, admitted, async db => {
         const current = await check(db);
         if ('replay' in current) return current;
@@ -732,8 +761,9 @@ async function sourceExists(db: Db, spaceId: string, sourceId: string): Promise<
  * Settles upload attempts whose grant ended more than the grace period ago:
  * an interrupted or abandoned attempt fails, an original only a failed
  * attempt referenced is removed, and every remaining staging blob is removed
- * and recorded. Each
- * attempt settles in its own transaction, and one failure does not stop the rest.
+ * and recorded. Each attempt settles in its own transaction, and one failure
+ * does not stop the rest. A failing attempt's `updated_at` is advanced, so it
+ * moves behind every due attempt not tried since and cannot hold the oldest page.
  */
 export class SourceUploadReconciler {
   constructor(private readonly cell: SourceCell, private readonly graceSeconds = sourceBounds.reconcileGraceSeconds) {
@@ -748,6 +778,7 @@ export class SourceUploadReconciler {
       WHERE a.staging_removed_at IS NULL AND g.expires_at < clock_timestamp()-make_interval(secs=>$2)
       ORDER BY a.updated_at LIMIT $1`, [limit, this.graceSeconds]));
     const errors: unknown[] = [];
+    let failed = 0;
     for (const row of due.rows) {
       const key: Key = [row.space_id, row.collection_id, row.grant_id, row.attempt_id];
       try {
@@ -757,15 +788,25 @@ export class SourceUploadReconciler {
             FOR UPDATE SKIP LOCKED`, key)).rows[0];
           if (!attempt) return null;
           if (attempt.state === 'receiving' || attempt.state === 'verified') await failAttempt(db, key, 'abandoned');
-          // No promotion runs past its grant's expiry, so this recheck is final.
+          // No write starts after the grant's expiry, and one refused at it
+          // reports failure only after the store answered, so a copy that
+          // landed late was already rechecked by its finalize unless that
+          // worker died; the grace is assumed to cover that copy's landing
+          // (docs/evidence-storage.md records the assumption).
           if (attempt.state !== 'committed' && attempt.observed_sha256)
             await removeUnreferencedOriginal(db, this.cell.originals, key[0], String(attempt.observed_sha256));
           return String(attempt.staging_key);
         });
         if (staging) await removeStaging(this.cell, key, staging, true);
-      } catch (error) { errors.push(error); }
+      } catch (error) {
+        failed++;
+        errors.push(error);
+        await transact(this.cell.pool, db => db.query(`UPDATE source_upload_attempts SET updated_at=clock_timestamp()
+          WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND attempt_id=$4 AND staging_removed_at IS NULL`, key))
+          .catch((deferral: unknown) => { errors.push(deferral); });
+      }
     }
-    if (errors.length) throw new AggregateError(errors, `${errors.length} upload attempts did not settle`);
+    if (errors.length) throw new AggregateError(errors, `${failed} upload attempts did not settle`);
     return due.rows.length;
   }
 }

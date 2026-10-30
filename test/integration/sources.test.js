@@ -23,16 +23,21 @@ const sha = value => createHash('sha256').update(value).digest('hex');
  * as a checksum, and an idempotent delete. Faults are injectable per key. */
 class MemoryR2 {
   objects = new Map();
+  started = [];
   stored = [];
   failPut = () => false;
   failDelete = () => false;
   /** Runs before a put reads its body, so a test can hold a write in flight. */
   beforePut = async () => {};
+  /** Runs after a put has read its whole body and before it stores and confirms. */
+  afterBody = async () => {};
   async put(key, body, options = {}) {
+    this.started.push(key);
     await this.beforePut(key);
     const chunks = [];
     const reader = body.getReader();
     for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(Buffer.from(value)); }
+    await this.afterBody(key);
     const bytes = Buffer.concat(chunks);
     if (options.sha256 !== undefined && options.sha256 !== sha(bytes)) throw new Error('put: checksum mismatch');
     if (this.failPut(key)) throw new Error('put: provider unavailable');
@@ -75,8 +80,10 @@ const rejects = (promise, code, message) => assert.rejects(promise, error => {
   return true;
 }, message);
 
-// One fault-injecting pool for metadata-commit failures; other code uses the real pool.
+// One fault-injecting pool for metadata-commit failures and slow statements;
+// other code uses the real pool. Each fault or delay applies once.
 let faults = [];
+let delays = [];
 const faulty = { connect: async () => {
   const client = await pool.connect();
   return new Proxy(client, { get(target, property) {
@@ -84,6 +91,8 @@ const faulty = { connect: async () => {
     return (sql, ...rest) => {
       const fault = typeof sql === 'string' ? faults.find(item => sql.includes(item.match)) : undefined;
       if (fault) { faults = faults.filter(item => item !== fault); return Promise.reject(fault.error); }
+      const delay = typeof sql === 'string' ? delays.find(item => sql === item.match) : undefined;
+      if (delay) { delays = delays.filter(item => item !== delay); return sleep(delay.ms).then(() => target.query(sql, ...rest)); }
       return target.query(sql, ...rest);
     };
   } });
@@ -677,4 +686,140 @@ test('original removal and same-key ingestion stay correct under snapshot isolat
       assert.equal(results.filter(result => !result.value.replayed).length, 1, level);
     } finally { await sessionPool.end(); }
   }
+});
+
+test('a blob write never starts after its deadline and reports one the store confirmed after it', async () => {
+  const r2 = new MemoryR2();
+  const blobs = new R2BlobStore(r2);
+  const bytes = Buffer.from('confirmed too late');
+  const isDeadline = error => error instanceof BlobWriteError && error.reason === 'deadline';
+  await assert.rejects(blobs.put('k/expired', chunked(bytes), { bytes: bytes.length, signal: AbortSignal.abort() }), isDeadline);
+  assert.deepEqual(r2.started, [], 'no write starts once the deadline has passed');
+  // The body ends before the deadline; the store confirms only after it.
+  const deadline = new AbortController();
+  r2.afterBody = async () => { deadline.abort(); await sleep(20); };
+  await assert.rejects(blobs.put('k/late', chunked(bytes), { bytes: bytes.length, sha256: sha(bytes), signal: deadline.signal }),
+    isDeadline, 'a write confirmed after its deadline is not reported as a success');
+  assert.equal(r2.objects.has('k/late'), true, 'the caller must treat the key as possibly written');
+});
+
+test('a grant deadline is fixed when the grant is read, so no upload or promotion write starts after expiry', async () => {
+  const f = await fixture();
+  const declared = { mimeType: 'application/octet-stream' };
+  const prefix = grantId => `staging/${Buffer.from(f.spaceId).toString('base64url')}/${grantId}/`;
+  // The authorizing transaction samples the grant, then its COMMIT stalls past expiry.
+  const uploadBytes = Buffer.from('upload after a slow commit');
+  const uploading = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { ...declared, maxBytes: 64, expiresInSeconds: 1 });
+  delays = [{ match: 'COMMIT', ms: 1300 }];
+  await rejects(f.faulty.upload(f.agent, f.spaceId, 'alpha', uploading.grantId, chunked(uploadBytes),
+    { ...declared, bytes: uploadBytes.length }), 'FORBIDDEN');
+  assert.deepEqual(f.r2.started.filter(key => key.startsWith(prefix(uploading.grantId))), [], 'no staging write started');
+  assert.deepEqual((await attempts(f.spaceId, uploading.grantId)).map(row => [row.state, row.failure_code, row.removed]),
+    [['failed', 'grant_expired', true]]);
+
+  const promoteBytes = Buffer.from('promotion after a slow commit');
+  const promoting = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { ...declared, maxBytes: 64, expiresInSeconds: 1 });
+  const attempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', promoting.grantId, chunked(promoteBytes),
+    { ...declared, bytes: promoteBytes.length });
+  delays = [{ match: 'COMMIT', ms: 1300 }];
+  await rejects(f.faulty.finalizeUpload(f.agent, f.spaceId, 'alpha', promoting.grantId, { attemptId: attempt.attemptId }), 'FORBIDDEN');
+  delays = [];
+  assert.equal(f.r2.started.includes(originalKey(f.spaceId, sha(promoteBytes))), false, 'no promotion write started');
+  assert.deepEqual((await attempts(f.spaceId, promoting.grantId)).map(row => [row.state, row.failure_code, row.removed]),
+    [['failed', 'commit_failed', false]], 'the attempt that held a digest stays due');
+  assert.deepEqual(f.r2.keys(''), []);
+});
+
+test('a promotion the store confirms after expiry is rechecked, at once or by reconciliation', async () => {
+  const f = await fixture();
+  const declared = { mimeType: 'application/octet-stream' };
+  const lateCopy = async (text, sources, beforeConfirm = () => {}) => {
+    const bytes = Buffer.from(text);
+    const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { ...declared, maxBytes: 64, expiresInSeconds: 1 });
+    const attempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(bytes), { ...declared, bytes: bytes.length });
+    const key = originalKey(f.spaceId, sha(bytes));
+    f.r2.afterBody = async target => {
+      if (target !== key) return;
+      f.r2.afterBody = async () => {};
+      beforeConfirm();
+      await sleep(1300);
+    };
+    await rejects(sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, { attemptId: attempt.attemptId }), 'FORBIDDEN');
+    assert.equal(f.r2.stored.includes(key), true, 'the copy landed after expiry');
+    return { key, grant };
+  };
+  const checked = await lateCopy('confirmed after expiry', f.sources);
+  assert.equal(f.r2.objects.has(checked.key), false, 'the finalize rechecked its digest after the store answered');
+  // The worker loses its connection before its own recheck.
+  const crashed = await lateCopy('confirmed after expiry, then the worker died', f.faulty, () => {
+    faults = [{ match: 'SELECT state,staging_key,observed_sha256,observed_bytes,staging_removed_at',
+      error: Object.assign(new Error('connection reset'), { code: 'ECONNRESET' }) }];
+  });
+  faults = [];
+  assert.equal(f.r2.objects.has(crashed.key), true);
+  assert.deepEqual((await attempts(f.spaceId, checked.grant.grantId)).map(row => [row.state, row.failure_code, row.removed]),
+    [['failed', 'commit_failed', false]], 'an attempt that held a digest stays due');
+  while (await f.reconciler(0).step(500) === 500);
+  assert.equal(f.r2.objects.has(crashed.key), false, 'reconciliation removes the unreferenced original');
+  for (const grant of [checked.grant, crashed.grant])
+    assert.equal((await attempts(f.spaceId, grant.grantId))[0].removed, true);
+  assert.deepEqual(f.r2.keys(''), []);
+  assert.deepEqual(await sourceRows(f.spaceId), { sources: 0, originals: 0, refs: 0 });
+});
+
+test('attempts that keep failing to settle cannot hold the oldest reconciliation page', async () => {
+  const f = await fixture();
+  const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: 'application/octet-stream', maxBytes: 64,
+    expiresInSeconds: 1 });
+  const prefix = `staging/${Buffer.from(f.spaceId).toString('base64url')}/${grant.grantId}/`;
+  const insert = attemptId => pool.query(`INSERT INTO source_upload_attempts(space_id,collection_id,grant_id,attempt_id,staging_key)
+    VALUES($1,'alpha',$2,$3,$4)`, [f.spaceId, grant.grantId, attemptId, `${prefix}${attemptId}`]);
+  // Already failed attempts whose staging delete keeps failing change nothing when they fail again.
+  for (let i = 0; i < 26; i++) await insert(`att_failing_${String(i).padStart(2, '0')}`);
+  await pool.query(`UPDATE source_upload_attempts SET state='failed',failure_code='interrupted' WHERE space_id=$1 AND grant_id=$2`,
+    [f.spaceId, grant.grantId]);
+  await insert('att_healthy');
+  f.r2.failDelete = key => key.startsWith(`${prefix}att_failing_`);
+  await sleep(1100);
+  const healthySettled = async () => (await attempts(f.spaceId, grant.grantId)).find(row => row.attempt_id === 'att_healthy').removed;
+  // Other spaces' ended attempts may share a page, so allow a few more pages.
+  for (let page = 0; page < 4 && !await healthySettled(); page++) await f.reconciler(0).step(25).catch(() => {});
+  assert.equal(await healthySettled(), true, 'an attempt beyond a page of failing ones settles');
+  const failing = (await attempts(f.spaceId, grant.grantId)).filter(row => row.attempt_id !== 'att_healthy');
+  assert.equal(failing.every(row => row.state === 'failed' && !row.removed), true, 'failing attempts stay due');
+  f.r2.failDelete = () => false;
+  while (await f.reconciler(0).step(500) === 500);
+  assert.equal((await attempts(f.spaceId, grant.grantId)).every(row => row.removed), true, 'and settle once they can');
+});
+
+test('source requests and upload bodies that are proxies are refused before any trap runs, with no effects', async () => {
+  const f = await fixture();
+  const declared = { bytes: 4, mimeType: 'application/octet-stream' };
+  const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: declared.mimeType, maxBytes: 64 });
+  const attempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(Buffer.from('four')), declared);
+  const effects = async () => ({ ...(await sourceRows(f.spaceId)), keys: f.r2.keys('').sort(), ledger: (await pool.query(
+    `SELECT (SELECT count(*)::int FROM source_upload_grants WHERE space_id=$1) AS grants,
+      (SELECT json_agg(json_build_array(attempt_id,state) ORDER BY attempt_id) FROM source_upload_attempts WHERE space_id=$1) AS attempts`,
+    [f.spaceId])).rows[0] });
+  const before = await effects();
+  let traps = 0;
+  const kinds = {
+    transparent: target => new Proxy(target, new Proxy({}, { get(_, trap) { traps++; return Reflect[trap]; } })),
+    throwing: target => new Proxy(target, new Proxy({}, { get() { traps++; return () => { throw new Error('proxy trap'); }; } })),
+    revoked: target => { const { proxy, revoke } = Proxy.revocable(target, {}); revoke(); return proxy; }
+  };
+  const calls = {
+    ingestText: wrap => f.sources.ingestText(f.agent, f.spaceId, 'alpha', wrap({ idempotencyKey: 'proxy', text: 'proxied text' })),
+    ingestReference: wrap => f.sources.ingestReference(f.agent, f.spaceId, 'alpha', wrap({ idempotencyKey: 'proxy', locator: 'https://example.invalid/a' })),
+    createUpload: wrap => f.sources.createUpload(f.agent, f.spaceId, 'alpha', wrap({ mimeType: 'text/plain', maxBytes: 8 })),
+    uploadDeclaration: wrap => f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(Buffer.from('four')), wrap({ ...declared })),
+    uploadBody: wrap => f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, wrap(chunked(Buffer.from('four'))), declared),
+    finalizeUpload: wrap => f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, wrap({ attemptId: attempt.attemptId }))
+  };
+  for (const [call, run] of Object.entries(calls)) for (const [kind, wrap] of Object.entries(kinds)) {
+    traps = 0;
+    await rejects(run(wrap), 'INVALID_ARGUMENT', `${call} with a ${kind} proxy`);
+    assert.equal(traps, 0, `${call} ran no ${kind} proxy trap`);
+  }
+  assert.deepEqual(await effects(), before, 'no grant, attempt, source or blob changed');
 });

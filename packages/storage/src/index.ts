@@ -33,6 +33,10 @@ export class R2BlobStore implements BlobStore {
     const { bytes, sha256, contentType, signal } = options;
     if (!Number.isSafeInteger(bytes) || bytes < 0 || (sha256 !== undefined && !sha256Pattern.test(sha256)))
       throw new RangeError('Invalid blob write');
+    if (signal?.aborted) {
+      if (!(body instanceof Uint8Array)) await body.cancel().catch(() => {});
+      throw new BlobWriteError('deadline');
+    }
     const source = body instanceof Uint8Array ? new Blob([new Uint8Array(body)]).stream() : body;
     const reader = source.getReader();
     const hash = createHash('sha256');
@@ -72,6 +76,8 @@ export class R2BlobStore implements BlobStore {
       const stored = await this.bucket.put(key, this.knownLength(checked, bytes),
         { ...(sha256 === undefined ? {} : { sha256 }), ...(contentType === undefined ? {} : { httpMetadata: { contentType } }) });
       if (failure) throw failure;
+      // The body ended in time, but the store confirmed only after the deadline.
+      if (signal?.aborted) fail('deadline');
       if (!stored || digest === undefined || stored.size !== bytes) throw new Error('Blob store did not confirm the write');
       return { sha256: digest, bytes };
     } catch (error) {

@@ -1,7 +1,10 @@
-/** Why a blob write stored nothing. `length`: the body was longer or shorter
- * than declared. `digest`: its SHA-256 differs from the expected one.
- * `content`: a caller-supplied body check refused it. `interrupted`: reading
- * the body failed. `deadline`: the write's signal aborted first. */
+/** Why a blob write failed. `length`: the body was longer or shorter than
+ * declared. `digest`: its SHA-256 differs from the expected one. `content`: a
+ * caller-supplied body check refused it. `interrupted`: reading the body
+ * failed. These store nothing. `deadline`: the signal aborted before the store
+ * confirmed the write. No write starts after the abort, and the body errors at
+ * its next chunk or its end, but a body that had already ended may have been
+ * stored: the caller must treat the key as possibly written. */
 export type BlobWriteFailure = 'length' | 'digest' | 'content' | 'interrupted' | 'deadline';
 export class BlobWriteError extends Error {
   constructor(readonly reason: BlobWriteFailure, options?: { cause?: unknown }) {
