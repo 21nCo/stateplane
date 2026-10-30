@@ -1230,3 +1230,121 @@ test('oversized text is refused before it is encoded', async () => {
   assert.equal(encoded, 0);
   assert.deepEqual(await effects(f), before, 'no effects');
 });
+
+test('source request decisions use intrinsics captured at load, so later prototype or global changes alter none', async () => {
+  const f = await fixture();
+  const octet = 'application/octet-stream';
+  const badMime = 'Not A Mime';
+  const nonIntegers = new Set([1.5, 2.5, 3.5]);
+  const fieldNames = new Set(['maxBytes', 'attemptId', 'locator', 'bytes', 'text']);
+  // Each replacement lies only for this test's sentinels, so the rest of the process keeps working.
+  const replace = (target, name, make) => {
+    const native = target[name];
+    target[name] = make(native);
+    return () => { target[name] = native; };
+  };
+  const replacements = {
+    arrayIterator: () => replace(Array.prototype, Symbol.iterator, native => function () {
+      const inner = native.call(this);
+      return { next() { for (;;) { const step = inner.next(); if (step.done || (step.value !== 'sha256' && step.value !== 'extra')) return step; } },
+        [Symbol.iterator]() { return this; } };
+    }),
+    arrayIncludes: () => replace(Array.prototype, 'includes', native => function (value, ...rest) {
+      return value === 'extra' || native.call(this, value, ...rest);
+    }),
+    arraySome: () => replace(Array.prototype, 'some', native => function (...args) {
+      return native.call(this, value => typeof value === 'string' && fieldNames.has(value)) ? false : native.apply(this, args);
+    }),
+    stringSplit: () => replace(String.prototype, 'split', native => function (...args) {
+      return String(this) === badMime ? ['text/plain'] : native.apply(this, args);
+    }),
+    stringTrim: () => replace(String.prototype, 'trim', native => function () { return String(this) === badMime ? 'text/plain' : native.call(this); }),
+    stringToLowerCase: () => replace(String.prototype, 'toLowerCase', native => function () {
+      return String(this) === badMime ? 'text/plain' : native.call(this);
+    }),
+    stringIncludes: () => replace(String.prototype, 'includes', native => function (value, ...rest) {
+      return value === '\0' ? false : native.call(this, value, ...rest);
+    }),
+    stringStartsWith: () => replace(String.prototype, 'startsWith', native => function (value, ...rest) {
+      return (String(this) === 'application/json' && value === 'text/') || native.call(this, value, ...rest);
+    }),
+    regexTest: () => replace(RegExp.prototype, 'test', native => function (value) {
+      return value === badMime.toLowerCase() || value === 'not-a-digest' || native.call(this, value);
+    }),
+    numberIsSafeInteger: () => replace(Number, 'isSafeInteger', native => value => nonIntegers.has(value) || native(value)),
+    jsonStringify: () => replace(JSON, 'stringify', native => (value, ...rest) =>
+      Array.isArray(value) && value[0] === 'text' ? '"same"' : native(value, ...rest))
+  };
+  const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: octet, maxBytes: 64 });
+  const verified = await f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(Buffer.from('four')),
+    { bytes: 4, mimeType: octet });
+  let round = 0;
+  const probe = async label => {
+    round++;
+    // A supplied digest stays bound to the grant, so a different body fails verification.
+    const bound = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: octet, maxBytes: 64, sha256: sha('expected') });
+    assert.equal(bound.sha256, sha('expected'), `${label}: the grant keeps its digest`);
+    await rejects(f.sources.upload(f.agent, f.spaceId, 'alpha', bound.grantId, chunked(Buffer.from('different')),
+      { bytes: 9, mimeType: octet }), 'INVALID_ARGUMENT', `${label}: a different body`);
+    // Two text sources with different keys stay distinct.
+    const one = await f.sources.ingestText(f.agent, f.spaceId, 'alpha', { idempotencyKey: `one-${round}`, text: 'one' });
+    const two = await f.sources.ingestText(f.agent, f.spaceId, 'alpha', { idempotencyKey: `two-${round}`, text: 'two' });
+    assert.notEqual(one.sourceId, two.sourceId, `${label}: distinct keys derive distinct sources`);
+    const before = await effects(f);
+    const refused = {
+      unknownReference: () => f.sources.ingestReference(f.agent, f.spaceId, 'alpha', { idempotencyKey: 'k', locator: 'https://example.invalid/r', extra: 1 }),
+      missingLocator: () => f.sources.ingestReference(f.agent, f.spaceId, 'alpha', { idempotencyKey: 'k' }),
+      nulLocator: () => f.sources.ingestReference(f.agent, f.spaceId, 'alpha', { idempotencyKey: 'k', locator: 'https://example.invalid/\0' }),
+      nonTextMime: () => f.sources.ingestText(f.agent, f.spaceId, 'alpha', { idempotencyKey: 'k', text: '{}', mimeType: 'application/json' }),
+      missingMaxBytes: () => f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: octet }),
+      badMime: () => f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: badMime, maxBytes: 8 }),
+      badDigest: () => f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: octet, maxBytes: 8, sha256: 'not-a-digest' }),
+      fractionalMaxBytes: () => f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: octet, maxBytes: 1.5 }),
+      fractionalLifetime: () => f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: octet, maxBytes: 8, expiresInSeconds: 2.5 }),
+      fractionalDeclaration: () => f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(Buffer.from('four')),
+        { bytes: 3.5, mimeType: octet }),
+      unknownFinalize: () => f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, { attemptId: verified.attemptId, extra: 1 }),
+      missingAttempt: () => f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, {})
+    };
+    for (const [name, run] of Object.entries(refused)) await rejects(run(), 'INVALID_ARGUMENT', `${label}: ${name}`);
+    assert.deepEqual(await effects(f), before, `${label}: refused requests have no effects`);
+  };
+  await probe('control');
+  for (const [name, install] of Object.entries(replacements)) {
+    const restore = install();
+    try { await probe(name); } finally { restore(); }
+  }
+});
+
+test('a database read timeout before COMMIT is retryable and leaves the attempt as it was', async () => {
+  const f = await fixture();
+  const bytes = Buffer.from('read timeout before commit');
+  const declared = { bytes: bytes.length, mimeType: 'application/octet-stream' };
+  const timedOut = () => new Error('Query read timeout');
+  const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: declared.mimeType, maxBytes: 64 });
+  faults = [{ match: "SET state='verified'", error: timedOut() }];
+  await assert.rejects(f.faulty.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(bytes), declared),
+    error => error.code === 'PROVIDER_UNAVAILABLE' && error.retryable === true);
+  assert.deepEqual((await attempts(f.spaceId, grant.grantId)).map(row => row.state), ['receiving'],
+    'the attempt is left for reconciliation, not failed');
+  const other = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: declared.mimeType, maxBytes: 64 });
+  const attempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', other.grantId, chunked(bytes), declared);
+  faults = [{ match: 'INSERT INTO entity_refs', error: timedOut() }];
+  await assert.rejects(f.faulty.finalizeUpload(f.agent, f.spaceId, 'alpha', other.grantId, { attemptId: attempt.attemptId }),
+    error => error.code === 'PROVIDER_UNAVAILABLE' && error.retryable === true);
+  assert.equal(faults.length, 0, 'the fault fired');
+  assert.deepEqual((await attempts(f.spaceId, other.grantId)).map(row => row.state), ['verified']);
+  assert.equal(f.r2.objects.has(originalKey(f.spaceId, other.grantId, attempt.attemptId)), true, 'the original is kept');
+  const source = await f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', other.grantId, { attemptId: attempt.attemptId });
+  assert.deepEqual(await read((await f.sources.content(f.agent, f.spaceId, 'alpha', source.sourceId)).body), bytes);
+});
+
+test('an upload grant defaults its lifetime only when none is supplied', async () => {
+  const f = await fixture();
+  const before = await effects(f);
+  await rejects(f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: 'text/plain', maxBytes: 8, expiresInSeconds: null }),
+    'INVALID_ARGUMENT');
+  assert.deepEqual(await effects(f), before, 'no grant');
+  const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: 'text/plain', maxBytes: 8 });
+  assert.equal(Date.parse(grant.expiresAt) - Date.parse(grant.issuedAt), sourceBounds.grantSeconds * 1000);
+});

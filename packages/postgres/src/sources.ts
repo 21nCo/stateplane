@@ -6,7 +6,7 @@ import type { Capability, VerifiedCredential } from '@stateplane/contracts';
 import { commitBeforeDeadline, CommitNotSentDeadlineExceeded } from './commit-deadline.js';
 import { AuthorityError, AuthorityTransaction, clientReadTimedOut, CommitOutcomeUnknownError } from './index.js';
 import type { AuthorityScope } from './index.js';
-import { acceptsInProcessObjects, isInProcessProxy, utcInstant } from './schema.js';
+import { acceptsInProcessObjects, includes, isInProcessProxy, scalarString, utcInstant } from './schema.js';
 import type { PostgresSpaces } from './spaces.js';
 
 /** One cell's authority pool and original-bytes store. */
@@ -36,6 +36,25 @@ const STATEMENT_MS = 5_000;
 const LOCK_MS = 2_000;
 const sha256Pattern = /^[0-9a-f]{64}$/;
 const mimePattern = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/;
+// Decisions on caller input use intrinsics captured at module load, so a later
+// change to an inherited method or a global cannot alter what a request means.
+const apply = Reflect.apply;
+const isSafeInteger = Number.isSafeInteger;
+const stringify = JSON.stringify;
+const nativeIndexOf = String.prototype.indexOf;
+const nativeSlice = String.prototype.slice;
+const nativeTrim = String.prototype.trim;
+const nativeLowerCase = String.prototype.toLowerCase;
+const nativeStartsWith = String.prototype.startsWith;
+const nativeRegexExec = RegExp.prototype.exec;
+const matches = (pattern: RegExp, value: string) => apply(nativeRegexExec, pattern, [value]) !== null;
+const startsWith = (value: string, prefix: string) => apply(nativeStartsWith, value, [prefix]) as boolean;
+/** `JSON.stringify` of a string list, read by own index rather than through the array's iterator or `toJSON`. */
+function serialized(parts: readonly string[]): string {
+  let text = '[';
+  for (let i = 0; i < parts.length; i++) text += (i ? ',' : '') + stringify(Object.getOwnPropertyDescriptor(parts, i)!.value);
+  return `${text}]`;
+}
 type Db = pg.PoolClient;
 type Key = [spaceId: string, collectionId: string, grantId: string, attemptId: string];
 interface Admitted { cell: SourceCell; ownerPrincipalId: string; scope: AuthorityScope; capability: Capability }
@@ -54,8 +73,8 @@ export const originalKey = (spaceId: string, grantId: string, attemptId: string)
 const stagingKey = (spaceId: string, grantId: string, attemptId: string) =>
   `staging/${spaceSegment(spaceId)}/${grantId}/${attemptId}`;
 const digest = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
-const derivedSourceId = (parts: readonly string[]) => `src_${digest(JSON.stringify(parts))}`;
-const lockKey = (parts: readonly string[]) => JSON.stringify(parts);
+const derivedSourceId = (parts: readonly string[]) => `src_${digest(serialized(parts))}`;
+const lockKey = (parts: readonly string[]) => serialized(parts);
 const iso = (value: unknown) => value === null || value === undefined ? null : new Date(value as string).toISOString();
 const pgCode = (error: unknown) => (error as { code?: unknown })?.code;
 
@@ -67,38 +86,43 @@ const untrusted = (value: object) => !acceptsInProcessObjects || isInProcessProx
  * whose own members are all enumerable data fields with allowed string keys.
  * A proxy is refused before any reflective read can run its traps, and no
  * accessor is invoked. A field given as `undefined` is supplied, not omitted,
- * so it is refused like any other invalid value.
+ * so it is refused like any other invalid value. Keys and lists are read by
+ * own index, never through an inherited iterator or array method.
  */
 function fields(value: unknown, allowed: readonly string[], required: readonly string[]): Record<string, unknown> {
   if (!value || typeof value !== 'object' || untrusted(value) || Array.isArray(value)) invalid();
   const prototype = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) invalid();
   const copy: Record<string, unknown> = Object.create(null);
-  for (const key of Reflect.ownKeys(value)) {
-    if (typeof key !== 'string' || !allowed.includes(key)) invalid();
+  const keys = Reflect.ownKeys(value);
+  for (let i = 0; i < keys.length; i++) {
+    const key = Object.getOwnPropertyDescriptor(keys, i)!.value as PropertyKey;
+    if (typeof key !== 'string' || !includes(allowed, key)) invalid();
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value') || descriptor.value === undefined) invalid();
     copy[key] = descriptor.value;
   }
-  if (required.some(key => !Object.hasOwn(copy, key))) invalid();
+  for (let i = 0; i < required.length; i++) if (!Object.hasOwn(copy, Object.getOwnPropertyDescriptor(required, i)!.value)) invalid();
   return copy;
 }
-/** Well-formed UTF-8 text without NUL, within a byte bound. */
+/** Well-formed Unicode text without NUL, within a UTF-8 byte bound. */
 function boundedText(value: unknown, maxBytes: number): value is string {
-  return typeof value === 'string' && value.length > 0 && !value.includes('\0') &&
-    Buffer.byteLength(value) <= maxBytes && Buffer.from(value, 'utf8').toString('utf8') === value;
+  return typeof value === 'string' && value.length > 0 && value.length <= maxBytes && scalarString(value) &&
+    Buffer.byteLength(value) <= maxBytes;
 }
 const reference = (value: unknown): value is string => boundedText(value, 256);
 /** The lowercase type/subtype essence of a media type; parameters are dropped. */
 function mimeEssence(value: unknown): string {
   if (typeof value !== 'string' || value.length > 512) invalid('Invalid MIME type');
-  const essence = value.split(';', 1)[0].trim().toLowerCase();
-  if (!mimePattern.test(essence)) invalid('Invalid MIME type');
+  const end = apply(nativeIndexOf, value, [';']) as number;
+  const type = end < 0 ? value : apply(nativeSlice, value, [0, end]) as string;
+  const essence = apply(nativeLowerCase, apply(nativeTrim, type, []), []) as string;
+  if (!matches(mimePattern, essence)) invalid('Invalid MIME type');
   return essence;
 }
 function optionalDigest(value: unknown): string | null {
   if (value === undefined) return null;
-  if (typeof value !== 'string' || !sha256Pattern.test(value)) invalid('Invalid SHA-256 digest');
+  if (typeof value !== 'string' || !matches(sha256Pattern, value)) invalid('Invalid SHA-256 digest');
   return value;
 }
 function optionalLocator(value: unknown): string | null {
@@ -125,6 +149,8 @@ function idempotencyKey(value: unknown): string {
  * A session that may still hold an open transaction or an unanswered
  * statement, after a BEGIN without a reply, a read timeout or an
  * unacknowledged COMMIT, is discarded rather than returned to the pool.
+ * A read timeout or lost session before COMMIT is sent committed nothing,
+ * so it is a retryable provider failure, never an unknown outcome.
  */
 async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promise<T>): Promise<T> {
   const deadline = Date.now() + REQUEST_BUDGET_MS;
@@ -132,7 +158,9 @@ async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promi
   let beginAttempted = false;
   let begun = false;
   let discard = false;
-  const onError = () => { discard = true; };
+  let lost = false;
+  let commitSent = false;
+  const onError = () => { discard = true; lost = true; };
   client.on?.('error', onError);
   try {
     beginAttempted = true;
@@ -141,11 +169,12 @@ async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promi
     await client.query(`SET LOCAL lock_timeout = '${LOCK_MS}ms'`);
     const result = await fn(client);
     begun = false;
+    commitSent = true;
     try { await commitBeforeDeadline(client, deadline); }
     catch (error) {
       discard = true;
       if (error instanceof CommitNotSentDeadlineExceeded) throw new AuthorityError('RATE_LIMITED', 'Request time budget exceeded');
-      if (error instanceof pg.DatabaseError && /^(?:23|40)/.test(error.code ?? '')) throw error;
+      if (error instanceof pg.DatabaseError && matches(/^(?:23|40)/, error.code ?? '')) throw error;
       throw new CommitOutcomeUnknownError(error);
     }
     return result;
@@ -154,6 +183,9 @@ async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promi
     else if (beginAttempted) discard = true;
     if (pgCode(error) === '57014') throw new AuthorityError('RATE_LIMITED', 'Database statement time limit exceeded');
     if (pgCode(error) === '55P03') throw new AuthorityError('BACKPRESSURE', 'Database lock budget exceeded');
+    if (!commitSent && !(error instanceof AuthorityError) && !(error instanceof pg.DatabaseError) &&
+      (lost || clientReadTimedOut(error) || (error instanceof Error && error.name === 'HostProviderTimeoutError')))
+      throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Database session failed before commit; retry the request', undefined, true);
     throw error;
   } finally { client.release(discard); client.removeListener?.('error', onError); }
 }
@@ -557,10 +589,11 @@ export class PostgresSources {
       const input = fields(request, ['mimeType', 'maxBytes', 'sha256', 'expiresInSeconds'], ['mimeType', 'maxBytes']);
       const mimeType = mimeEssence(input.mimeType);
       const maxBytes = input.maxBytes;
-      if (!Number.isSafeInteger(maxBytes) || (maxBytes as number) < 1 || (maxBytes as number) > sourceBounds.uploadBytes)
+      if (!isSafeInteger(maxBytes) || (maxBytes as number) < 1 || (maxBytes as number) > sourceBounds.uploadBytes)
         invalid('maxBytes is outside the upload bound');
-      const seconds = input.expiresInSeconds ?? sourceBounds.grantSeconds;
-      if (!Number.isSafeInteger(seconds) || (seconds as number) < 1 || (seconds as number) > sourceBounds.maxGrantSeconds)
+      // A supplied field is never undefined, so only an absent lifetime takes the default; a supplied null is refused.
+      const seconds = input.expiresInSeconds === undefined ? sourceBounds.grantSeconds : input.expiresInSeconds;
+      if (!isSafeInteger(seconds) || (seconds as number) < 1 || (seconds as number) > sourceBounds.maxGrantSeconds)
         invalid('expiresInSeconds is outside the grant lifetime bound');
       const sha256 = optionalDigest(input.sha256);
       await writable(db, scope);
@@ -588,7 +621,7 @@ export class PostgresSources {
         if (!reference(grantId)) throw new AuthorityError('NOT_FOUND');
         if (!stream(body)) invalid();
         const input = fields(declared, ['bytes', 'mimeType', 'sha256'], ['bytes', 'mimeType']);
-        if (!Number.isSafeInteger(input.bytes) || (input.bytes as number) < 0) invalid('Upload size must be declared');
+        if (!isSafeInteger(input.bytes) || (input.bytes as number) < 0) invalid('Upload size must be declared');
         const bytes = input.bytes as number;
         const mimeType = mimeEssence(input.mimeType);
         const claimed = optionalDigest(input.sha256);
@@ -616,7 +649,7 @@ export class PostgresSources {
           await body.cancel().catch(() => {});
           throw new BlobWriteError('deadline');
         }
-        stored = await admitted.cell.originals.put(staging, mimeType.startsWith('text/') ? utf8Checked(body) : body,
+        stored = await admitted.cell.originals.put(staging, startsWith(mimeType, 'text/') ? utf8Checked(body) : body,
           { bytes, sha256: grant.sha256, contentType: mimeType, signal: expiry.signal });
       } catch (error) {
         // A write refused at its deadline may still have landed, so the staging key is always deleted.
@@ -806,11 +839,11 @@ function textRequest(request: unknown, scope: AuthorityScope): { wanted: Wanted;
   if (typeof input.text !== 'string') invalid('Text must be well-formed Unicode');
   // UTF-8 needs at least one byte per UTF-16 code unit, so a longer string is refused before it is encoded.
   if (input.text.length > sourceBounds.textBytes) invalid('Text size is outside the ingestion bound');
-  if (Buffer.from(input.text, 'utf8').toString('utf8') !== input.text) invalid('Text must be well-formed Unicode');
+  if (!scalarString(input.text, true)) invalid('Text must be well-formed Unicode');
   const content = Buffer.from(input.text, 'utf8');
   if (content.byteLength < 1 || content.byteLength > sourceBounds.textBytes) invalid('Text size is outside the ingestion bound');
   const mimeType = input.mimeType === undefined ? 'text/plain' : mimeEssence(input.mimeType);
-  if (!mimeType.startsWith('text/')) invalid('Text ingestion requires a text/* MIME type');
+  if (!startsWith(mimeType, 'text/')) invalid('Text ingestion requires a text/* MIME type');
   return { content, wanted: { sourceId: derivedSourceId(['text', scope.credentialId, key]), locator: optionalLocator(input.locator),
     capturedAt: optionalInstant(input.capturedAt), referenceOnly: false, sha256: digest(content), mimeType } };
 }
@@ -836,12 +869,12 @@ async function sourceExists(db: Db, spaceId: string, sourceId: string): Promise<
  */
 export class SourceUploadReconciler {
   constructor(private readonly cell: SourceCell, private readonly graceSeconds = sourceBounds.reconcileGraceSeconds) {
-    if (!Number.isSafeInteger(graceSeconds) || graceSeconds < 0) throw new RangeError('Invalid reconciliation grace');
+    if (!isSafeInteger(graceSeconds) || graceSeconds < 0) throw new RangeError('Invalid reconciliation grace');
   }
 
   /** Settle up to `limit` due attempts; returns how many were due. */
   async step(limit = 25): Promise<number> {
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new RangeError('Invalid reconciliation limit');
+    if (!isSafeInteger(limit) || limit < 1 || limit > 500) throw new RangeError('Invalid reconciliation limit');
     const due = await transact(this.cell.pool, db => db.query(`SELECT a.space_id,a.collection_id,a.grant_id,a.attempt_id
       FROM source_upload_attempts a JOIN source_upload_grants g USING (space_id,collection_id,grant_id)
       WHERE a.staging_removed_at IS NULL AND g.expires_at < clock_timestamp()-make_interval(secs=>$2)
