@@ -6,7 +6,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import pg from 'pg';
 import { memoryAdapter } from '@superfunctions/db/testing';
 import { createAuthFn, createUser, issueSession, revokeSessionById } from '@authfn/core';
-import { BlobWriteError } from '../../packages/application/dist/index.js';
+import { BlobWriteError, classifyError } from '../../packages/application/dist/index.js';
 import { AuthFnAgentKeys, AuthFnIdentityVerifier } from '../../packages/auth/dist/index.js';
 import { PostgresSources, PostgresSpaces, SourceUploadReconciler, originalKey, postgresServices, sourceBounds }
   from '../../packages/postgres/dist/index.js';
@@ -101,7 +101,12 @@ const faulty = { connect: async () => {
       const hook = typeof sql === 'string' ? hooks.find(matches) : undefined;
       if (hook) { hooks = hooks.filter(item => item !== hook); await hook.run(); }
       const fault = typeof sql === 'string' ? faults.find(matches) : undefined;
-      if (fault) { faults = faults.filter(item => item !== fault); return Promise.reject(fault.error); }
+      if (fault) {
+        faults = faults.filter(item => item !== fault);
+        // A lost fault runs its statement, then loses the reply.
+        if (fault.lost) await target.query(sql, ...rest);
+        return Promise.reject(fault.error);
+      }
       const delay = typeof sql === 'string' ? delays.find(item => sql === item.match) : undefined;
       if (delay) { delays = delays.filter(item => item !== delay); return sleep(delay.ms).then(() => target.query(sql, ...rest)); }
       return target.query(sql, ...rest);
@@ -1316,27 +1321,53 @@ test('source request decisions use intrinsics captured at load, so later prototy
   }
 });
 
-test('a database read timeout before COMMIT is retryable and leaves the attempt as it was', async () => {
+test('a database read timeout before COMMIT leaves a finalize verified for a retry', async () => {
   const f = await fixture();
   const bytes = Buffer.from('read timeout before commit');
   const declared = { bytes: bytes.length, mimeType: 'application/octet-stream' };
-  const timedOut = () => new Error('Query read timeout');
   const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: declared.mimeType, maxBytes: 64 });
-  faults = [{ match: "SET state='verified'", error: timedOut() }];
-  await assert.rejects(f.faulty.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(bytes), declared),
-    error => error.code === 'PROVIDER_UNAVAILABLE' && error.retryable === true);
-  assert.deepEqual((await attempts(f.spaceId, grant.grantId)).map(row => row.state), ['receiving'],
-    'the attempt is left for reconciliation, not failed');
-  const other = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: declared.mimeType, maxBytes: 64 });
-  const attempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', other.grantId, chunked(bytes), declared);
-  faults = [{ match: 'INSERT INTO entity_refs', error: timedOut() }];
-  await assert.rejects(f.faulty.finalizeUpload(f.agent, f.spaceId, 'alpha', other.grantId, { attemptId: attempt.attemptId }),
+  const attempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(bytes), declared);
+  faults = [{ match: 'INSERT INTO entity_refs', error: new Error('Query read timeout') }];
+  await assert.rejects(f.faulty.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, { attemptId: attempt.attemptId }),
     error => error.code === 'PROVIDER_UNAVAILABLE' && error.retryable === true);
   assert.equal(faults.length, 0, 'the fault fired');
-  assert.deepEqual((await attempts(f.spaceId, other.grantId)).map(row => row.state), ['verified']);
-  assert.equal(f.r2.objects.has(originalKey(f.spaceId, other.grantId, attempt.attemptId)), true, 'the original is kept');
-  const source = await f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', other.grantId, { attemptId: attempt.attemptId });
+  assert.deepEqual((await attempts(f.spaceId, grant.grantId)).map(row => row.state), ['verified']);
+  assert.equal(f.r2.objects.has(originalKey(f.spaceId, grant.grantId, attempt.attemptId)), true, 'the original is kept');
+  const source = await f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, { attemptId: attempt.attemptId });
   assert.deepEqual(await read((await f.sources.content(f.agent, f.spaceId, 'alpha', source.sourceId)).body), bytes);
+});
+
+test('an upload whose verification fails for any reason releases its attempt, so the same grant takes a retry', async () => {
+  const f = await fixture();
+  const declared = { bytes: 0, mimeType: 'application/octet-stream' };
+  const timedOut = () => [{ match: "SET state='verified'", error: new Error('Query read timeout') }];
+  const coded = code => () => [{ match: "SET state='verified'", error: Object.assign(new Error(`injected ${code}`), { code }) }];
+  // An unacknowledged COMMIT, whether or not the server ran it, is installed once verification has reached its update.
+  const unacknowledged = lost => () => {
+    hooks = [{ match: "SET state='verified'", run: () => { faults = [{ match: 'COMMIT', exact: true, lost, error: new Error('Connection terminated') }]; } }];
+    return [];
+  };
+  const cases = {
+    readTimeout: { install: timedOut, code: 'PROVIDER_UNAVAILABLE' },
+    lockTimeout: { install: coded('55P03'), code: 'BACKPRESSURE' },
+    serialization: { install: coded('40001'), code: '40001' },
+    commitNotRun: { install: unacknowledged(false), code: 'PROVIDER_UNAVAILABLE' },
+    commitLost: { install: unacknowledged(true), code: 'PROVIDER_UNAVAILABLE' }
+  };
+  for (const [name, { install, code }] of Object.entries(cases)) {
+    const bytes = Buffer.from(`verification ${name}`);
+    const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: declared.mimeType, maxBytes: 64 });
+    faults = install();
+    await assert.rejects(f.faulty.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(bytes), { ...declared, bytes: bytes.length }),
+      error => error.code === code && classifyError(error, false).retryable, name);
+    assert.deepEqual([faults.length, hooks.length], [0, 0], `${name}: the fault fired`);
+    const failed = await attempts(f.spaceId, grant.grantId);
+    assert.deepEqual(failed.map(row => [row.state, row.failure_code]), [['failed', 'verify_failed']], `${name}: the attempt is released`);
+    assert.deepEqual(staging(f.r2, f.spaceId).filter(key => key.includes(`/${grant.grantId}/`)), [], `${name}: its staging is removed`);
+    const attempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(bytes), { ...declared, bytes: bytes.length });
+    const source = await f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, { attemptId: attempt.attemptId });
+    assert.deepEqual(await read((await f.sources.content(f.agent, f.spaceId, 'alpha', source.sourceId)).body), bytes, name);
+  }
 });
 
 test('an upload grant defaults its lifetime only when none is supplied', async () => {

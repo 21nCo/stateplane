@@ -684,7 +684,17 @@ export class PostgresSources {
           return 'grant_expired';
         });
       } catch (error) {
-        if (settlesNow(error)) await abandon(admitted.cell, key, refusalCode(error)).catch(() => {});
+        // The body is consumed, so no later call can verify this attempt, and the caller
+        // never learned its ID: whatever failed, it is released so the grant takes a new one.
+        const transient = !settlesNow(error);
+        try { await abandon(admitted.cell, key, transient ? 'verify_failed' : refusalCode(error)); }
+        catch {
+          if (transient) throw new AuthorityError('PROVIDER_UNAVAILABLE',
+            'Upload verification failed and its attempt could not be released; request a new upload grant', undefined, false);
+        }
+        if (error instanceof CommitOutcomeUnknownError)
+          throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Upload verification was not confirmed; its attempt was released, retry the upload',
+            undefined, true);
         throw error;
       }
       if (refused) {
