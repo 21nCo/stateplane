@@ -141,6 +141,30 @@ function idempotencyKey(value: unknown): string {
 }
 
 /**
+ * Each provider call or transaction during cleanup gets at most this long, so
+ * one stalled call cannot hold a page.
+ */
+const CLEANUP_CALL_MS = 2_000;
+class CleanupTimeout extends Error {
+  constructor() { super('Upload cleanup call timed out'); }
+}
+/**
+ * Settle with `pending`, or fail once `CLEANUP_CALL_MS` or the budget ending at
+ * `until` (a `performance.now` instant) has passed. A value that arrives later
+ * is passed to `late` to release it; every cleanup call is safe to land late.
+ */
+function within<T>(until: number, pending: Promise<T>, late: (value: T) => void = () => {}): Promise<T> {
+  let timedOut = false;
+  void pending.then(value => { if (timedOut) late(value); }, () => {});
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => { timedOut = true; reject(new CleanupTimeout()); },
+      Math.max(0, Math.min(until - performance.now(), CLEANUP_CALL_MS)));
+  });
+  return Promise.race([pending, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
  * Run one transaction under the authority's budget. A COMMIT the server
  * refused for a constraint or serialization error rolled back; any other
  * missing acknowledgement leaves the outcome unknown. Every read that follows
@@ -151,10 +175,18 @@ function idempotencyKey(value: unknown): string {
  * unacknowledged COMMIT, is discarded rather than returned to the pool.
  * A read timeout or lost session before COMMIT is sent committed nothing,
  * so it is a retryable provider failure, never an unknown outcome.
+ *
+ * A cleanup transaction passes its page's `until` instead: it is one cleanup
+ * call, so none starts after `until`, and acquiring its session, its
+ * statements and its COMMIT all end by `until` or `CLEANUP_CALL_MS`. A
+ * session cut off mid-statement is discarded.
  */
-async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promise<T>): Promise<T> {
-  const deadline = Date.now() + REQUEST_BUDGET_MS;
-  const client = await pool.connect();
+async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promise<T>, until?: number): Promise<T> {
+  const end = until === undefined ? undefined : Math.min(until, performance.now() + CLEANUP_CALL_MS);
+  const remaining = () => end === undefined ? REQUEST_BUDGET_MS : Math.max(1, Math.floor(end - performance.now()));
+  if (end !== undefined && performance.now() >= end) throw new CleanupTimeout();
+  const deadline = Date.now() + remaining();
+  const client = end === undefined ? await pool.connect() : await within(end, pool.connect(), late => late.release());
   let beginAttempted = false;
   let begun = false;
   let discard = false;
@@ -164,10 +196,13 @@ async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promi
   client.on?.('error', onError);
   try {
     beginAttempted = true;
-    await client.query('BEGIN ISOLATION LEVEL READ COMMITTED'); begun = true;
-    await client.query(`SET LOCAL statement_timeout = '${STATEMENT_MS}ms'`);
-    await client.query(`SET LOCAL lock_timeout = '${LOCK_MS}ms'`);
-    const result = await fn(client);
+    const work = async () => {
+      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED'); begun = true;
+      await client.query(`SET LOCAL statement_timeout = '${Math.min(STATEMENT_MS, remaining())}ms'`);
+      await client.query(`SET LOCAL lock_timeout = '${Math.min(LOCK_MS, remaining())}ms'`);
+      return fn(client);
+    };
+    const result = end === undefined ? await work() : await within(end, work());
     begun = false;
     commitSent = true;
     try { await commitBeforeDeadline(client, deadline); }
@@ -181,7 +216,9 @@ async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promi
     }
     return result;
   } catch (error) {
-    if (begun && !clientReadTimedOut(error)) { try { await client.query('ROLLBACK'); } catch { discard = true; } }
+    if (begun && !clientReadTimedOut(error) && !(error instanceof CleanupTimeout)) {
+      try { await client.query('ROLLBACK'); } catch { discard = true; }
+    }
     else if (beginAttempted) discard = true;
     if (pgCode(error) === '57014') throw new AuthorityError('RATE_LIMITED', 'Database statement time limit exceeded');
     if (pgCode(error) === '55P03') throw new AuthorityError('BACKPRESSURE', 'Database lock budget exceeded');
@@ -432,15 +469,16 @@ async function failAttempt(db: Db, key: Key, code: string): Promise<void> {
  * Remove an attempt's staging blob, then record that the attempt holds no
  * bytes. A failed attempt that held a digest is recorded only once its
  * promotion window has closed (`settled`), by reconciliation. Removal
- * precedes the record, so a crash only repeats it.
+ * precedes the record, so a crash only repeats it. Reconciliation passes its
+ * page's `until`, which bounds both steps.
  */
-async function removeStaging(cell: SourceCell, key: Key, staging: string, settled = false,
-  bounded: (pending: Promise<void>) => Promise<void> = pending => pending): Promise<void> {
-  await bounded(cell.originals.delete(staging));
+async function removeStaging(cell: SourceCell, key: Key, staging: string, settled = false, until?: number): Promise<void> {
+  const deleted = cell.originals.delete(staging);
+  await (until === undefined ? deleted : within(until, deleted));
   await transact(cell.pool, db => db.query(`UPDATE source_upload_attempts
     SET staging_removed_at=clock_timestamp(),updated_at=clock_timestamp()
     WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND attempt_id=$4 AND staging_removed_at IS NULL
-      AND (state='committed' OR (state='failed' AND (observed_sha256 IS NULL OR $5::boolean)))`, [...key, settled]));
+      AND (state='committed' OR (state='failed' AND (observed_sha256 IS NULL OR $5::boolean)))`, [...key, settled]), until);
 }
 /**
  * Cleanup for an attempt that cannot commit now. With a code, a receiving or
@@ -878,23 +916,7 @@ async function sourceExists(db: Db, spaceId: string, sourceId: string): Promise<
   return (await db.query('SELECT 1 FROM sources WHERE space_id=$1 AND source_id=$2', [spaceId, sourceId])).rows.length > 0;
 }
 
-/** Each provider call during cleanup gets at most this long, so one stalled call cannot hold a page. */
-const CLEANUP_CALL_MS = 2_000;
 const SWEEP_CURSOR = 'reconcile/sweep-cursor';
-/**
- * Settle with `pending`, or fail once `CLEANUP_CALL_MS` or the budget ending at
- * `until` (a `performance.now` instant) has passed. A call that settles later
- * is ignored: every cleanup call is safe to land late.
- */
-function within<T>(until: number, pending: Promise<T>): Promise<T> {
-  void pending.catch(() => {});
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error('Upload cleanup call timed out')),
-      Math.max(0, Math.min(until - performance.now(), CLEANUP_CALL_MS)));
-  });
-  return Promise.race([pending, timeout]).finally(() => clearTimeout(timer));
-}
 /** The attempt a stored key belongs to: its space and staging key, and whether it is the original. */
 function storedAttempt(key: string): { spaceId: string; stagingKey: string; original: boolean } | null {
   const parts = key.split('/');
@@ -921,8 +943,9 @@ export class SourceUploadReconciler {
   /**
    * Settle up to `limit` due attempts within `budgetMs`; returns how many were
    * due, so a page cut short by the budget still reads as unfinished. No
-   * attempt starts after the budget, and each store call is bounded; a call
-   * that times out leaves its attempt due and is safe to land later.
+   * attempt, transaction or store call starts after the budget, and each is
+   * bounded by it; one that times out leaves its attempt due and is safe to
+   * land later.
    */
   async step(limit = 25, budgetMs = 10_000): Promise<number> {
     if (!isSafeInteger(limit) || limit < 1 || limit > 500) throw new RangeError('Invalid reconciliation limit');
@@ -931,7 +954,7 @@ export class SourceUploadReconciler {
     const due = await transact(this.cell.pool, db => db.query(`SELECT a.space_id,a.collection_id,a.grant_id,a.attempt_id
       FROM source_upload_attempts a JOIN source_upload_grants g USING (space_id,collection_id,grant_id)
       WHERE a.staging_removed_at IS NULL AND g.expires_at < clock_timestamp()-make_interval(secs=>$2)
-      ORDER BY a.updated_at LIMIT $1`, [limit, this.graceSeconds]));
+      ORDER BY a.updated_at LIMIT $1`, [limit, this.graceSeconds]), until);
     const errors: unknown[] = [];
     let failed = 0;
     for (const row of due.rows) {
@@ -944,18 +967,20 @@ export class SourceUploadReconciler {
             FOR UPDATE SKIP LOCKED`, key)).rows[0];
           if (row && (row.state === 'receiving' || row.state === 'verified')) await failAttempt(db, key, 'abandoned');
           return row;
-        });
+        }, until);
         if (!attempt) continue;
         // No write starts after the grant's expiry, and one refused at it
         // reports failure promptly, so a copy can still land after this
         // removal; `sweep` finds it once the attempt has settled.
         if (attempt.state !== 'committed' && attempt.observed_sha256) await within(until, removeOriginal(this.cell, key));
-        await removeStaging(this.cell, key, String(attempt.staging_key), true, pending => within(until, pending));
+        await removeStaging(this.cell, key, String(attempt.staging_key), true, until);
       } catch (error) {
         failed++;
         errors.push(error);
+        // No deferral starts after the budget; the attempt is retried on a later tick.
+        if (performance.now() >= until) break;
         await transact(this.cell.pool, db => db.query(`UPDATE source_upload_attempts SET updated_at=clock_timestamp()
-          WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND attempt_id=$4 AND staging_removed_at IS NULL`, key))
+          WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND attempt_id=$4 AND staging_removed_at IS NULL`, key), until)
           .catch((deferral: unknown) => { errors.push(deferral); });
       }
     }
@@ -988,7 +1013,7 @@ export class SourceUploadReconciler {
       unnest($1::text[],$2::text[],$3::boolean[],$4::int[]) AS k(space_id,staging_key,original,index)
       JOIN source_upload_attempts a ON a.space_id=k.space_id AND a.staging_key=k.staging_key
       WHERE a.state='failed' OR (a.state='committed' AND NOT k.original)`,
-    [known.map(k => k.spaceId), known.map(k => k.stagingKey), known.map(k => k.original), known.map(k => k.index)])))
+    [known.map(k => k.spaceId), known.map(k => k.stagingKey), known.map(k => k.original), known.map(k => k.index)]), until))
       .rows.map(row => Number(row.index)));
     const errors: unknown[] = [];
     let examined = 0;

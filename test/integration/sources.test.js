@@ -969,15 +969,87 @@ test('reconciliation bounds each store call and its budget, so a stalled delete 
   await sleep(20);
   assert.equal(f.r2.objects.has(`${prefix}att_a_stalled`), false, 'its delete landed late, safely');
 
-  // A slow statement uses the budget: the page stops there, still reported as unfinished.
+  // A statement still running when the budget ends is cut off there; its attempt and the next stay due.
   f.r2.beforeDelete = async () => {};
   hooks = [{ match: 'FOR UPDATE SKIP LOCKED', run: () => sleep(400) }];
   const slow = new SourceUploadReconciler({ pool: faulty, originals: f.blobs }, 0);
-  assert.equal(await slow.step(2, 300), 2, 'an unfinished page still reports its due attempts');
-  assert.deepEqual([(await row('att_c_slow')).removed, (await row('att_d_next')).removed], [true, false]);
+  const cutOff = performance.now();
+  await assert.rejects(slow.step(2, 300), AggregateError);
+  assert.equal(performance.now() - cutOff < 400, true, 'the slow statement does not overrun the budget');
+  assert.deepEqual([(await row('att_c_slow')).removed, (await row('att_d_next')).removed], [false, false]);
   hooks = [];
   while (await f.reconciler(0).step(500) === 500);
   for (const attemptId of ['att_a_stalled', 'att_d_next']) assert.equal((await row(attemptId)).removed, true, attemptId);
+  assert.deepEqual(f.r2.keys(prefix), []);
+});
+
+test('cleanup transactions end by the page budget: a late connection, slow statements, deferral and the sweep query', async () => {
+  const f = await fixture();
+  const reconciler = cell => new SourceUploadReconciler({ originals: f.blobs, ...cell }, 0);
+  const endsBy = async (label, budget, run) => {
+    const started = performance.now();
+    const outcome = await Promise.race([run().then(() => 'settled', () => 'rejected'), sleep(3000).then(() => 'still waiting')]);
+    assert.equal(outcome, 'rejected', label);
+    assert.equal(performance.now() - started < budget + 100, true, `${label} ends by its budget`);
+  };
+  // A connection that arrives after the budget is released, not kept.
+  const released = [];
+  const late = { connect: () => sleep(600).then(() => ({ release: discard => { released.push(discard); } })) };
+  await endsBy('a step waiting for a connection', 300, () => reconciler({ pool: late }).step(25, 300));
+  await endsBy('a sweep waiting for a connection', 300, () => reconciler({ pool: late }).sweep(100, 300));
+  await sleep(700);
+  assert.equal(released.length, 2, 'each late connection is released');
+
+  // A pool whose statements can be slowed, logging when each starts and whether each session is discarded.
+  const log = [];
+  const discarded = [];
+  const slowed = (ms, match = () => true) => ({ connect: async () => {
+    const client = await pool.connect();
+    return new Proxy(client, { get(target, property) {
+      if (property === 'release') return discard => { discarded.push(discard === true); target.release(discard); };
+      if (property !== 'query') return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
+      return async (sql, ...rest) => {
+        log.push(performance.now());
+        if (match(String(sql))) await sleep(ms);
+        return target.query(sql, ...rest);
+      };
+    } });
+  } });
+  const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: 'application/octet-stream', maxBytes: 64,
+    expiresInSeconds: 1 });
+  const prefix = `staging/${Buffer.from(f.spaceId).toString('base64url')}/${grant.grantId}/`;
+  // Older than any other test's attempts, so these lead the cell-wide page.
+  for (const [i, attemptId] of ['att_a', 'att_b', 'att_c'].entries()) {
+    await pool.query(`INSERT INTO source_upload_attempts(space_id,collection_id,grant_id,attempt_id,staging_key,updated_at)
+      VALUES($1,'alpha',$2,$3,$4,timestamptz '1990-01-01'+make_interval(days=>$5))`, [f.spaceId, grant.grantId, attemptId, `${prefix}${attemptId}`, i]);
+    f.r2.objects.set(`${prefix}${attemptId}`, { bytes: Buffer.from(attemptId) });
+  }
+  await untilExpired(grant);
+  // Slow statements add up: the transaction in flight when the budget ends is cut off and its session discarded.
+  await endsBy('a step whose statements are slow', 500, () => reconciler({ pool: slowed(80) }).step(25, 500));
+  assert.equal(discarded.includes(true), true, 'the cut-off session is discarded');
+  assert.equal((await attempts(f.spaceId, grant.grantId)).every(row => !row.removed), true, 'no attempt settles past the budget');
+
+  // A store call that fails at the budget's end starts no deferral after it; the attempt stays due.
+  let releaseStall;
+  const stalled = new Promise(resolve => { releaseStall = resolve; });
+  f.r2.beforeDelete = async key => { if (key.endsWith('att_a')) await stalled; };
+  log.length = 0;
+  const started = performance.now();
+  await assert.rejects(reconciler({ pool: slowed(0) }).step(25, 400), AggregateError);
+  assert.deepEqual(log.filter(at => at >= started + 400), [], 'no statement starts after the budget');
+  assert.deepEqual((await attempts(f.spaceId, grant.grantId)).find(row => row.attempt_id === 'att_a'),
+    { attempt_id: 'att_a', state: 'failed', failure_code: 'abandoned', observed_sha256: null, removed: false });
+  releaseStall();
+  f.r2.beforeDelete = async () => {};
+
+  // A slow ownership query ends the sweep at its budget, deleting nothing and keeping its cursor.
+  await pool.query(`UPDATE source_upload_attempts SET state='failed',failure_code='abandoned' WHERE space_id=$1 AND grant_id=$2`,
+    [f.spaceId, grant.grantId]);
+  await endsBy('a sweep whose ownership query is slow', 300, () => reconciler({ pool: slowed(1500, sql => sql.includes('unnest')) }).sweep(100, 300));
+  assert.equal(f.r2.objects.has(`${prefix}att_b`), true, 'nothing is deleted');
+  assert.equal(f.r2.objects.has('reconcile/sweep-cursor'), false, 'the cursor does not move');
+  while (await f.reconciler(0).step(500) === 500);
   assert.deepEqual(f.r2.keys(prefix), []);
 });
 
