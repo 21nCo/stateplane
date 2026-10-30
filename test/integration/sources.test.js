@@ -1099,7 +1099,7 @@ test('a failed cleanup transaction ends by the page budget even when its ROLLBAC
     f.r2.objects.set(`${prefix}${attemptId}`, { bytes: Buffer.from(attemptId) });
   }
   const calls = [];
-  f.r2.beforeDelete = async key => { calls.push(performance.now()); await sleep(1000); };
+  f.r2.beforeDelete = async () => { calls.push(performance.now()); await sleep(1000); };
   f.r2.beforePut = async () => { calls.push(performance.now()); };
   const started = performance.now();
   await assert.rejects(reconciler({ pool }).sweep(100, 300), AggregateError);
@@ -1109,6 +1109,29 @@ test('a failed cleanup transaction ends by the page budget even when its ROLLBAC
   await sleep(1000);
   f.r2.beforeDelete = async () => {};
   f.r2.beforePut = async () => {};
+});
+
+test('a sweep cut off while reading its cursor cancels the provider body, releases it and starts nothing after', async () => {
+  for (const [label, pull] of [['stalls', () => new Promise(() => {})],
+    ['trickles', async controller => { await sleep(20); controller.enqueue(new Uint8Array([0x61])); }]]) {
+    const calls = [];
+    let body;
+    let cancelled = 0;
+    const originals = {
+      get: async () => { body = new ReadableStream({ pull, cancel() { cancelled++; } }); return { body }; },
+      list: async () => { calls.push('list'); return { keys: [], done: true }; },
+      delete: async () => { calls.push('delete'); },
+      put: async () => { calls.push('put'); },
+    };
+    const cell = { originals, pool: { connect: async () => { calls.push('connect'); throw new Error('unreachable'); } } };
+    const started = performance.now();
+    await assert.rejects(new SourceUploadReconciler(cell, 0).sweep(100, 200), /timed out/, label);
+    assert.equal(performance.now() - started < 300, true, `a cursor that ${label} ends by the budget`);
+    await sleep(300);
+    assert.equal(cancelled, 1, `a cursor that ${label} is cancelled through the provider`);
+    assert.equal(body.locked, false, `a cursor that ${label} is released`);
+    assert.deepEqual(calls, [], `a cursor that ${label} starts nothing after it`);
+  }
 });
 
 test('attempts that keep failing to settle cannot hold the oldest reconciliation page', async () => {

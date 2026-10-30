@@ -922,6 +922,28 @@ async function sourceExists(db: Db, spaceId: string, sourceId: string): Promise<
 }
 
 const SWEEP_CURSOR = 'reconcile/sweep-cursor';
+/**
+ * Read the stored sweep cursor through a reader the sweep owns, each read
+ * bounded by `until`. On a timeout or failure the reader cancels the provider
+ * body, without waiting on that cancel, and releases its lock.
+ */
+async function readCursor(body: ReadableStream<Uint8Array>, until: number): Promise<string> {
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  try {
+    for (;;) {
+      const { done, value } = await within(until, () => reader.read());
+      if (done) return Buffer.concat(chunks).toString('utf8');
+      chunks.push(value);
+    }
+  } catch (error) {
+    void reader.cancel(error).catch(() => {});
+    throw error;
+  } finally {
+    // A runtime that still counts the cancelled read refuses the release; the body is cancelled either way.
+    try { reader.releaseLock(); } catch { /* keep the read's own error */ }
+  }
+}
 /** The attempt a stored key belongs to: its space and staging key, and whether it is the original. */
 function storedAttempt(key: string): { spaceId: string; stagingKey: string; original: boolean } | null {
   const parts = key.split('/');
@@ -1001,7 +1023,8 @@ export class SourceUploadReconciler {
    * deleted; a committed original, a live attempt's bytes and keys the ledger
    * does not know are kept. Both states are final, so a delete that lands
    * late is safe. Each call examines up to `limit` keys after a cursor kept in
-   * the bucket, within `budgetMs`; a lost cursor restarts the pass. No store
+   * the bucket, within `budgetMs`; a lost cursor restarts the pass, and a
+   * cursor body cut off by the budget is cancelled. No store
    * call or transaction starts after the budget, and deletes stop a fifth of
    * it early so the cursor can still advance past slow keys. Returns how many
    * keys it examined.
@@ -1012,8 +1035,7 @@ export class SourceUploadReconciler {
     const until = performance.now() + budgetMs;
     const blobs = this.cell.originals;
     const stored = await within(until, () => blobs.get(SWEEP_CURSOR), late => void late?.body.cancel().catch(() => {}));
-    const cursor = stored ? await within(until, () => new Response(stored.body).text())
-      .catch((error: unknown) => { void stored.body.cancel().catch(() => {}); throw error; }) : '';
+    const cursor = stored ? await readCursor(stored.body, until) : '';
     const page = await within(until, () => blobs.list(cursor, limit));
     const owners = page.keys.map(storedAttempt);
     const known = owners.flatMap((owner, index) => owner ? [{ ...owner, index }] : []);
