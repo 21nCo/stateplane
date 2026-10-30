@@ -359,27 +359,32 @@ test('grant expiry and revocation stop uploads and finalization with determinist
   const bytes = Buffer.from('expiring bytes');
   const declared = { bytes: bytes.length, mimeType: 'application/octet-stream' };
   const expired = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: declared.mimeType, maxBytes: 64, expiresInSeconds: 1 });
+  const cutOff = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: declared.mimeType, maxBytes: 64, expiresInSeconds: 1 });
   const early = await f.sources.upload(f.agent, f.spaceId, 'alpha', expired.grantId, chunked(bytes), declared);
-  const stalled = f.sources.upload(f.agent, f.spaceId, 'alpha', expired.grantId, chunked(bytes, { stallMs: 1500 }), declared);
+  const stalled = f.sources.upload(f.agent, f.spaceId, 'alpha', cutOff.grantId, chunked(bytes, { stallMs: 1500 }), declared);
   await rejects(stalled, 'FORBIDDEN', 'a stream still open at expiry is cut off');
   await rejects(f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', expired.grantId, { attemptId: early.attemptId }), 'FORBIDDEN');
-  await rejects(f.sources.upload(f.agent, f.spaceId, 'alpha', expired.grantId, chunked(bytes), declared), 'FORBIDDEN');
-  assert.deepEqual((await attempts(f.spaceId, expired.grantId)).map(row => [row.state, row.failure_code]),
-    [['verified', null], ['failed', 'grant_expired']]);
+  await rejects(f.sources.upload(f.agent, f.spaceId, 'alpha', cutOff.grantId, chunked(bytes), declared), 'FORBIDDEN');
+  assert.deepEqual((await attempts(f.spaceId, expired.grantId)).map(row => [row.state, row.failure_code]), [['verified', null]]);
+  assert.deepEqual((await attempts(f.spaceId, cutOff.grantId)).map(row => [row.state, row.failure_code]), [['failed', 'grant_expired']]);
 
   const revoked = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: declared.mimeType, maxBytes: 64 });
+  const streaming = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: declared.mimeType, maxBytes: 64 });
   const verifiedAttempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', revoked.grantId, chunked(bytes), declared);
-  const inFlight = f.sources.upload(f.agent, f.spaceId, 'alpha', revoked.grantId, chunked(bytes, { stallMs: 300 }), declared);
+  const inFlight = f.sources.upload(f.agent, f.spaceId, 'alpha', streaming.grantId, chunked(bytes, { stallMs: 300 }), declared);
   await sleep(100);
   await rejects(f.sources.revokeUpload(f.other, f.spaceId, 'alpha', revoked.grantId), 'NOT_FOUND', 'another agent cannot revoke');
   const view = await f.sources.revokeUpload(f.agent, f.spaceId, 'alpha', revoked.grantId);
   assert.ok(view.revokedAt);
   assert.equal((await f.sources.revokeUpload(f.agent, f.spaceId, 'alpha', revoked.grantId)).revokedAt, view.revokedAt, 'revocation is idempotent');
+  assert.ok((await f.sources.revokeUpload(f.agent, f.spaceId, 'alpha', streaming.grantId)).revokedAt);
   await rejects(inFlight, 'FORBIDDEN', 'a writer still streaming at revocation is refused');
   await rejects(f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', revoked.grantId, { attemptId: verifiedAttempt.attemptId }), 'FORBIDDEN');
   // The verified attempt's staging is gone, but it stays due until reconciliation rechecks its digest.
   assert.deepEqual((await attempts(f.spaceId, revoked.grantId)).map(row => [row.state, row.failure_code, row.removed]),
-    [['failed', 'grant_revoked', false], ['failed', 'grant_revoked', true]]);
+    [['failed', 'grant_revoked', false]]);
+  assert.deepEqual((await attempts(f.spaceId, streaming.grantId)).map(row => [row.state, row.failure_code, row.removed]),
+    [['failed', 'grant_revoked', true]]);
   assert.deepEqual(staging(f.r2, f.spaceId).length, 1, 'only the expired grant still holds staging, until reconciliation');
 
   const ownerRevokes = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: declared.mimeType, maxBytes: 64 });
@@ -965,20 +970,20 @@ test('a cleanup that rolls back after failing an attempt never strands a finaliz
   });
 });
 
-test('a metadata commit refuses an original that disappeared after promotion, and a retry copies it again', async () => {
+test('finalize refuses an original that disappeared after promotion, before its metadata commit, and a retry copies it again', async () => {
   const f = await fixture();
   const bytes = Buffer.from('deleted behind the finalize');
   const declared = { bytes: bytes.length, mimeType: 'application/octet-stream' };
   const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: declared.mimeType, maxBytes: 64 });
   const attempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(bytes), declared);
   const key = originalKey(f.spaceId, grant.grantId, attempt.attemptId);
-  const paused = pauseAtBegin(2);
-  const finalize = new PostgresSources(spaces, new Map([['cell-a', { pool: paused.pool, originals: f.blobs }]]))
-    .finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, { attemptId: attempt.attemptId });
-  await paused.at;
-  // The object vanishes outside the service after the promotion.
-  f.r2.objects.delete(key);
-  paused.release();
+  // The object vanishes outside the service after the promotion stored it.
+  const head = f.r2.head.bind(f.r2);
+  f.r2.head = async name => {
+    if (name === key && f.r2.stored.includes(key)) { f.r2.head = head; f.r2.objects.delete(key); }
+    return head(name);
+  };
+  const finalize = f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, { attemptId: attempt.attemptId });
   await assert.rejects(finalize, error => error.code === 'PROVIDER_UNAVAILABLE' && error.retryable === true);
   assert.deepEqual(await sourceRows(f.spaceId), { sources: 0, originals: 0, refs: 0 }, 'no metadata commits without bytes');
   assert.deepEqual((await attempts(f.spaceId, grant.grantId)).map(row => row.state), ['verified'], 'the attempt stays retryable');
@@ -1097,20 +1102,16 @@ test('grant expiry is checked again by the verify and finalize transitions, afte
   assert.deepEqual((await attempts(f.spaceId, grant.grantId)).map(row => [row.state, row.failure_code, row.removed]),
     [['failed', 'grant_expired', true]]);
 
-  // The metadata commit's head of the original returns only after the grant has expired.
+  // The metadata transaction has locked the unexpired grant and attempt, then stalls until the grant has expired.
   const lateFinalize = Buffer.from('finalized after expiry');
   const late = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { ...declared, maxBytes: 64, expiresInSeconds: 1 });
   const attempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', late.grantId, chunked(lateFinalize), { ...declared, bytes: lateFinalize.length });
   const key = originalKey(f.spaceId, late.grantId, attempt.attemptId);
-  const head = f.r2.head.bind(f.r2);
-  let heads = 0;
-  f.r2.head = async target => {
-    if (target === key && ++heads === 2) { f.r2.head = head; await untilExpired(late); }
-    return head(target);
-  };
-  await rejects(f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', late.grantId, { attemptId: attempt.attemptId }),
+  let stalled = false;
+  hooks = [{ match: 'INSERT INTO entity_refs', run: async () => { stalled = true; await untilExpired(late); } }];
+  await rejects(f.faulty.finalizeUpload(f.agent, f.spaceId, 'alpha', late.grantId, { attemptId: attempt.attemptId }),
     'FORBIDDEN', 'a finalize whose commit reaches the grant only after expiry');
-  assert.equal(heads, 2, 'the metadata commit headed the original');
+  assert.equal(stalled, true, 'the metadata transaction stalled after its checks');
   assert.deepEqual(await sourceRows(f.spaceId), { sources: 0, originals: 0, refs: 0 }, 'no source commits after expiry');
   assert.equal((await pool.query(`SELECT finalized_at FROM source_upload_grants WHERE space_id=$1 AND grant_id=$2`,
     [f.spaceId, late.grantId])).rows[0].finalized_at, null);
@@ -1137,4 +1138,95 @@ test('a promotion whose staging read is interrupted leaves its attempt verified 
   assert.equal(f.r2.objects.has(originalKey(f.spaceId, grant.grantId, attempt.attemptId)), false, 'nothing was stored');
   const source = await f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, { attemptId: attempt.attemptId });
   assert.deepEqual(await read((await f.sources.content(f.agent, f.spaceId, 'alpha', source.sourceId)).body), bytes);
+});
+
+test('a sources transaction whose BEGIN got no reply, or whose read timed out, discards its session', async () => {
+  const run = async failing => {
+    const sent = [];
+    const released = [];
+    const client = { on() {}, removeListener() {}, release: discard => { released.push(discard); },
+      query: async sql => {
+        sent.push(sql);
+        const error = failing(sql);
+        if (error) throw error;
+        return { rows: [], rowCount: 0 };
+      } };
+    await assert.rejects(new SourceUploadReconciler({ pool: { connect: async () => client }, originals: new R2BlobStore(new MemoryR2()) }).step());
+    return { sent, released };
+  };
+  const timedOut = () => new Error('Query read timeout');
+  const lostBegin = await run(sql => sql.startsWith('BEGIN') ? timedOut() : null);
+  assert.deepEqual(lostBegin.released, [true], 'a BEGIN that may have opened a transaction never returns to the pool');
+  const lostRead = await run(sql => sql.includes('FROM source_upload_attempts') ? timedOut() : null);
+  assert.deepEqual(lostRead.released, [true], 'a session with an unanswered statement never returns to the pool');
+  assert.equal(lostRead.sent.includes('ROLLBACK'), false, 'no ROLLBACK queues behind the unanswered statement');
+  const refused = await run(sql => sql.includes('FROM source_upload_attempts') ? Object.assign(new Error('relation missing'), { code: '42P01' }) : null);
+  assert.deepEqual(refused.released, [false], 'a statement the server refused rolls back and keeps its session');
+  assert.equal(refused.sent.at(-1), 'ROLLBACK');
+});
+
+test('finalize checks its original before the metadata transaction, so a stalled store holds no lock', async () => {
+  const f = await fixture();
+  const bytes = Buffer.from('head that never answers');
+  const declared = { bytes: bytes.length, mimeType: 'application/octet-stream' };
+  const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: declared.mimeType, maxBytes: 64, expiresInSeconds: 4 });
+  const attempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(bytes), declared);
+  const key = originalKey(f.spaceId, grant.grantId, attempt.attemptId);
+  const head = f.r2.head.bind(f.r2);
+  let stalled, unblock;
+  const reached = new Promise(resolve => { stalled = resolve; });
+  const blocked = new Promise(resolve => { unblock = resolve; });
+  f.r2.head = async name => {
+    if (name !== key || !f.r2.stored.includes(key)) return head(name);
+    stalled();
+    await blocked;
+    return head(name);
+  };
+  try {
+    const finalize = f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, { attemptId: attempt.attemptId });
+    await reached;
+    const started = Date.now();
+    assert.ok((await f.sources.revokeUpload(f.agent, f.spaceId, 'alpha', grant.grantId)).revokedAt,
+      'revocation does not wait on a finalize whose store call is stalled');
+    assert.ok(Date.now() - started < 1_500, 'revocation waited on no lock');
+    await rejects(finalize, 'FORBIDDEN', 'the stalled check is cut off at the grant deadline');
+    assert.deepEqual(await sourceRows(f.spaceId), { sources: 0, originals: 0, refs: 0 }, 'nothing commits without its bytes');
+    assert.deepEqual((await attempts(f.spaceId, grant.grantId)).map(row => [row.state, row.failure_code]), [['failed', 'grant_revoked']]);
+    assert.equal(f.r2.objects.has(key), false, 'the failed attempt\'s original is removed');
+  } finally { f.r2.head = head; unblock(); }
+});
+
+test('a grant takes one live attempt at a time, so it stages at most one body of its bound', async () => {
+  const f = await fixture();
+  const bytes = Buffer.from('one attempt at a time');
+  const declared = { bytes: bytes.length, mimeType: 'application/octet-stream' };
+  const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: declared.mimeType, maxBytes: 64 });
+  const raced = await Promise.allSettled([1, 2].map(() =>
+    f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(bytes, { stallMs: 50 }), declared)));
+  assert.deepEqual(raced.map(result => result.status).sort(), ['fulfilled', 'rejected']);
+  assert.equal(raced.find(result => result.status === 'rejected').reason.code, 'FORBIDDEN');
+  assert.equal(f.r2.started.length, 1, 'the refused attempt writes no staging');
+  await rejects(f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(bytes), declared), 'FORBIDDEN',
+    'a verified attempt still blocks another');
+  assert.deepEqual((await attempts(f.spaceId, grant.grantId)).map(row => row.state), ['verified']);
+  assert.deepEqual(staging(f.r2, f.spaceId).length, 1);
+  const verified = raced.find(result => result.status === 'fulfilled').value;
+  assert.equal((await f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, { attemptId: verified.attemptId })).original.sha256,
+    sha(bytes));
+});
+
+test('oversized text is refused before it is encoded', async () => {
+  const f = await fixture();
+  const text = 'x'.repeat(sourceBounds.textBytes + 1);
+  const before = await effects(f);
+  const from = Buffer.from;
+  const byteLength = Buffer.byteLength;
+  let encoded = 0;
+  Buffer.from = function (value, ...rest) { if (value === text) encoded++; return from.call(this, value, ...rest); };
+  Buffer.byteLength = function (value, ...rest) { if (value === text) encoded++; return byteLength.call(this, value, ...rest); };
+  try {
+    await rejects(f.sources.ingestText(f.agent, f.spaceId, 'alpha', { idempotencyKey: 'huge', text }), 'INVALID_ARGUMENT');
+  } finally { Buffer.from = from; Buffer.byteLength = byteLength; }
+  assert.equal(encoded, 0);
+  assert.deepEqual(await effects(f), before, 'no effects');
 });

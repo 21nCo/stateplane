@@ -4,7 +4,7 @@ import { BlobWriteError, classifyError } from '@stateplane/application';
 import type { BlobStore } from '@stateplane/application';
 import type { Capability, VerifiedCredential } from '@stateplane/contracts';
 import { commitBeforeDeadline, CommitNotSentDeadlineExceeded } from './commit-deadline.js';
-import { AuthorityError, AuthorityTransaction, CommitOutcomeUnknownError } from './index.js';
+import { AuthorityError, AuthorityTransaction, clientReadTimedOut, CommitOutcomeUnknownError } from './index.js';
 import type { AuthorityScope } from './index.js';
 import { acceptsInProcessObjects, isInProcessProxy, utcInstant } from './schema.js';
 import type { PostgresSpaces } from './spaces.js';
@@ -122,15 +122,20 @@ function idempotencyKey(value: unknown): string {
  * missing acknowledgement leaves the outcome unknown. Every read that follows
  * an advisory or row lock here must see rows committed before that lock was
  * granted, so the isolation level is fixed rather than the session default.
+ * A session that may still hold an open transaction or an unanswered
+ * statement, after a BEGIN without a reply, a read timeout or an
+ * unacknowledged COMMIT, is discarded rather than returned to the pool.
  */
 async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promise<T>): Promise<T> {
   const deadline = Date.now() + REQUEST_BUDGET_MS;
   const client = await pool.connect();
+  let beginAttempted = false;
   let begun = false;
   let discard = false;
   const onError = () => { discard = true; };
   client.on?.('error', onError);
   try {
+    beginAttempted = true;
     await client.query('BEGIN ISOLATION LEVEL READ COMMITTED'); begun = true;
     await client.query(`SET LOCAL statement_timeout = '${STATEMENT_MS}ms'`);
     await client.query(`SET LOCAL lock_timeout = '${LOCK_MS}ms'`);
@@ -145,7 +150,8 @@ async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promi
     }
     return result;
   } catch (error) {
-    if (begun) { try { await client.query('ROLLBACK'); } catch { discard = true; } }
+    if (begun && !clientReadTimedOut(error)) { try { await client.query('ROLLBACK'); } catch { discard = true; } }
+    else if (beginAttempted) discard = true;
     if (pgCode(error) === '57014') throw new AuthorityError('RATE_LIMITED', 'Database statement time limit exceeded');
     if (pgCode(error) === '55P03') throw new AuthorityError('BACKPRESSURE', 'Database lock budget exceeded');
     throw error;
@@ -181,9 +187,10 @@ const removeOriginal = (cell: SourceCell, key: Key) => cell.originals.delete(att
 /** Make an attempt's original present, copying its verified bytes when absent, before `signal` aborts. */
 async function ensureOriginal(blobs: BlobStore, key: string, sha256: string, bytes: number,
   mimeType: string, from: string | Uint8Array, signal: AbortSignal): Promise<void> {
-  const existing = await blobs.head(key);
+  const existing = await beforeAbort(blobs.head(key), signal);
   if (existing && existing.bytes === bytes && existing.sha256 === sha256) return;
-  const staged = typeof from === 'string' ? (await blobs.get(from))?.body : from;
+  const staged = typeof from === 'string' ? (await beforeAbort(blobs.get(from), signal,
+    late => void late?.body.cancel().catch(() => {})))?.body : from;
   if (!staged) throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Staged upload bytes are missing', undefined, false);
   if (signal.aborted) {
     if (!(staged instanceof Uint8Array)) await staged.cancel().catch(() => {});
@@ -191,6 +198,21 @@ async function ensureOriginal(blobs: BlobStore, key: string, sha256: string, byt
   }
   // The store rechecks length and digest, so corrupted staging stores nothing.
   await blobs.put(key, staged, { bytes, sha256, contentType: mimeType, signal });
+}
+/**
+ * Settle with `pending`, or fail with a deadline error once `signal` aborts
+ * first; a value that arrives after that is passed to `late` to release it.
+ */
+function beforeAbort<T>(pending: Promise<T>, signal: AbortSignal, late: (value: T) => void = () => {}): Promise<T> {
+  let settled = false;
+  const abandoned = () => { void pending.then(value => { if (!settled) late(value); }, () => {}); };
+  if (signal.aborted) { abandoned(); return Promise.reject(new BlobWriteError('deadline')); }
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => { abandoned(); reject(new BlobWriteError('deadline')); };
+    signal.addEventListener('abort', abort, { once: true });
+    pending.then(value => { settled = !signal.aborted; resolve(value); }, reject)
+      .finally(() => signal.removeEventListener('abort', abort));
+  });
 }
 /**
  * A deterministic or refused failure ends the attempt now; a transient one
@@ -550,7 +572,8 @@ export class PostgresSources {
    * Stream one upload attempt into staging. The declared size, MIME type and
    * any digest must fit the grant; the body is hashed and counted as it
    * streams, text must be UTF-8, and the write stops at the grant's expiry.
-   * A refused or interrupted body leaves a failed attempt and no bytes.
+   * A refused or interrupted body leaves a failed attempt and no bytes. A
+   * grant takes a new attempt only once every earlier one has failed.
    */
   async upload(actor: VerifiedCredential, spaceId: string, collectionId: string, grantId: string,
     body: ReadableStream<Uint8Array>, declared: unknown): Promise<UploadAttemptView> {
@@ -574,6 +597,10 @@ export class PostgresSources {
         if (row.mime_type !== mimeType) invalid('Upload MIME type differs from its grant');
         if (bytes > Number(row.max_bytes)) invalid('Upload size exceeds its grant');
         if (claimed && row.expected_sha256 && claimed !== row.expected_sha256) invalid('Upload digest differs from its grant');
+        // The grant row lock serializes attempts, so a grant stages at most one live attempt's bytes.
+        const live = await db.query(`SELECT 1 FROM source_upload_attempts WHERE space_id=$1 AND collection_id=$2
+          AND grant_id=$3 AND state IN ('receiving','verified') LIMIT 1`, grantKey(scope, grantId));
+        if (live.rows.length) throw new AuthorityError('FORBIDDEN', 'Upload grant already has an attempt in progress or verified');
         await writable(db, scope);
         await db.query(`INSERT INTO source_upload_attempts(space_id,collection_id,grant_id,attempt_id,staging_key)
           VALUES($1,$2,$3,$4,$5)`, [...key, staging]);
@@ -684,8 +711,8 @@ export class PostgresSources {
   /**
    * Promote a verified attempt's bytes to its original key, then commit the
    * source metadata. Bytes are always verified and present before the
-   * metadata commits, which rechecks them and finalizes the grant only if it
-   * has not expired. A deterministic failure
+   * metadata commits, which finalizes the grant only if it has not expired;
+   * no store call runs while it holds locks. A deterministic failure
    * abandons the attempt at once; a transient one leaves it verified for
    * retry until reconciliation. The request is parsed only after the first
    * transaction authorizes it.
@@ -735,20 +762,22 @@ export class PostgresSources {
     try {
       try {
         await ensureOriginal(admitted.cell.originals, objectKey, sha256, bytes, first.mimeType, content ?? staging, expiry.signal);
+        // Checked before the metadata transaction, so no lock waits on the store. Only a
+        // removal deletes this key, and only after the attempt's failure commits, which is
+        // final: the commit below finds the attempt verified only if no removal ever started.
+        const present = await beforeAbort(admitted.cell.originals.head(objectKey), expiry.signal);
+        if (present?.bytes !== bytes || present.sha256 !== sha256)
+          throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Original bytes are not present; retry the request', undefined, true);
       } finally { expiry.close(); }
       const committed = await this.actorTx(actor, admitted, async db => {
         const current = await check(db);
         if ('replay' in current) return current;
-        // The attempt is locked and still verified, so no removal of its original can start before this commits.
-        const present = await admitted.cell.originals.head(objectKey);
-        if (present?.bytes !== bytes || present.sha256 !== sha256)
-          throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Original bytes are not present; retry the request', undefined, true);
         if (await sourceExists(db, scope.spaceId, wanted.sourceId)) throw duplicateSource();
         const source = await insertSource(db, scope, { ...wanted, sha256, mimeType: current.mimeType }, bytes, objectKey);
         await db.query(`UPDATE source_upload_attempts SET state='committed',updated_at=clock_timestamp()${content ?
           ',staging_removed_at=clock_timestamp()' : ''}
           WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND attempt_id=$4`, key);
-        // Expiry is checked again by the transition itself, after the lock waits and the head above.
+        // Expiry is checked again by the transition itself, after the lock waits above.
         const finalized = await db.query(`UPDATE source_upload_grants SET finalized_at=clock_timestamp(),source_id=$4
           WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND expires_at>clock_timestamp()`,
         [...key.slice(0, 3), wanted.sourceId]);
@@ -774,8 +803,10 @@ export class PostgresSources {
 function textRequest(request: unknown, scope: AuthorityScope): { wanted: Wanted; content: Buffer } {
   const input = fields(request, ['idempotencyKey', 'text', 'mimeType', 'locator', 'capturedAt'], ['idempotencyKey', 'text']);
   const key = idempotencyKey(input.idempotencyKey);
-  if (typeof input.text !== 'string' || Buffer.from(input.text, 'utf8').toString('utf8') !== input.text)
-    invalid('Text must be well-formed Unicode');
+  if (typeof input.text !== 'string') invalid('Text must be well-formed Unicode');
+  // UTF-8 needs at least one byte per UTF-16 code unit, so a longer string is refused before it is encoded.
+  if (input.text.length > sourceBounds.textBytes) invalid('Text size is outside the ingestion bound');
+  if (Buffer.from(input.text, 'utf8').toString('utf8') !== input.text) invalid('Text must be well-formed Unicode');
   const content = Buffer.from(input.text, 'utf8');
   if (content.byteLength < 1 || content.byteLength > sourceBounds.textBytes) invalid('Text size is outside the ingestion bound');
   const mimeType = input.mimeType === undefined ? 'text/plain' : mimeEssence(input.mimeType);
