@@ -104,7 +104,9 @@ function idempotencyKey(value: unknown): string {
 /**
  * Run one transaction under the authority's budget. A COMMIT the server
  * refused for a constraint or serialization error rolled back; any other
- * missing acknowledgement leaves the outcome unknown.
+ * missing acknowledgement leaves the outcome unknown. Every read that follows
+ * an advisory or row lock here must see rows committed before that lock was
+ * granted, so the isolation level is fixed rather than the session default.
  */
 async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promise<T>): Promise<T> {
   const deadline = Date.now() + REQUEST_BUDGET_MS;
@@ -114,7 +116,7 @@ async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promi
   const onError = () => { discard = true; };
   client.on?.('error', onError);
   try {
-    await client.query('BEGIN'); begun = true;
+    await client.query('BEGIN ISOLATION LEVEL READ COMMITTED'); begun = true;
     await client.query(`SET LOCAL statement_timeout = '${STATEMENT_MS}ms'`);
     await client.query(`SET LOCAL lock_timeout = '${LOCK_MS}ms'`);
     const result = await fn(client);
@@ -154,6 +156,12 @@ async function capturedNotFuture(db: Db, capturedAt: string | null): Promise<voi
  * digest no original row and no verified attempt references. Promotion
  * happens after the intent commits, so a removal can never interleave with a
  * commit that relies on bytes it saw.
+ *
+ * A revocation can fail an attempt while its promotion is still writing, so
+ * the write may land after the removal. Promotion therefore stops at its
+ * grant's expiry, the finalize that promoted rechecks its digest whenever it
+ * fails, and a failed attempt that held a digest stays due for
+ * reconciliation, which rechecks it again once no promotion can be running.
  */
 const intentLock = (db: Db, spaceId: string, sha256: string) =>
   db.query('SELECT pg_advisory_xact_lock_shared(hashtextextended($1,0))', [lockKey(['stateplane:original', spaceId, sha256])]);
@@ -167,16 +175,16 @@ async function removeUnreferencedOriginal(db: Db, blobs: BlobStore, spaceId: str
   await blobs.delete(originalKey(spaceId, sha256));
   return true;
 }
-/** Make the original for a digest present, copying verified bytes when absent. */
+/** Make the original for a digest present, copying verified bytes when absent, before `signal` aborts. */
 async function ensureOriginal(blobs: BlobStore, spaceId: string, sha256: string, bytes: number,
-  mimeType: string, from: string | Uint8Array): Promise<void> {
+  mimeType: string, from: string | Uint8Array, signal: AbortSignal): Promise<void> {
   const key = originalKey(spaceId, sha256);
   const existing = await blobs.head(key);
   if (existing && existing.bytes === bytes && existing.sha256 === sha256) return;
   const staged = typeof from === 'string' ? (await blobs.get(from))?.body : from;
   if (!staged) throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Staged upload bytes are missing', undefined, false);
   // The store rechecks length and digest, so corrupted staging stores nothing.
-  await blobs.put(key, staged, { bytes, sha256, contentType: mimeType });
+  await blobs.put(key, staged, { bytes, sha256, contentType: mimeType, signal });
 }
 /** A deterministic or refused failure ends the attempt now; a transient one leaves it for retry. */
 function settlesNow(error: unknown): boolean {
@@ -216,6 +224,12 @@ const failureCodes: Record<BlobWriteError['reason'], string> = {
   length: 'length_mismatch', digest: 'digest_mismatch', content: 'content_rejected',
   interrupted: 'interrupted', deadline: 'grant_expired'
 };
+/** Promotion copies already verified bytes, so only expiry is the caller's failure. */
+function promotionFailure(error: unknown): unknown {
+  if (!(error instanceof BlobWriteError)) return error;
+  if (error.reason === 'deadline') return new AuthorityError('FORBIDDEN', 'Upload grant expired');
+  return new AuthorityError('PROVIDER_UNAVAILABLE', 'Staged upload bytes failed verification', undefined, false);
+}
 function uploadFailure(error: unknown): unknown {
   if (!(error instanceof BlobWriteError)) return error;
   if (error.reason === 'deadline') return new AuthorityError('FORBIDDEN', 'Upload grant expired');
@@ -317,31 +331,44 @@ async function failAttempt(db: Db, key: Key, code: string): Promise<void> {
   await db.query(`UPDATE source_upload_attempts SET state='failed',failure_code=$5,updated_at=clock_timestamp()
     WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND attempt_id=$4`, [...key, code]);
 }
-/** Record a removed staging blob. Removal precedes this, so a crash only repeats it. */
-async function removeStaging(cell: SourceCell, key: Key, staging: string): Promise<void> {
+/**
+ * Remove an attempt's staging blob, then record that the attempt holds no
+ * bytes. A failed attempt that held a digest is recorded only once its
+ * promotion window has closed (`settled`), by reconciliation. Removal
+ * precedes the record, so a crash only repeats it.
+ */
+async function removeStaging(cell: SourceCell, key: Key, staging: string, settled = false): Promise<void> {
   await cell.originals.delete(staging);
   await transact(cell.pool, db => db.query(`UPDATE source_upload_attempts
     SET staging_removed_at=clock_timestamp(),updated_at=clock_timestamp()
-    WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND attempt_id=$4
-      AND staging_removed_at IS NULL AND state IN ('committed','failed')`, key));
+    WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND attempt_id=$4 AND staging_removed_at IS NULL
+      AND (state='committed' OR (state='failed' AND (observed_sha256 IS NULL OR $5::boolean)))`, [...key, settled]));
 }
 /**
- * Deterministic cleanup for an attempt that cannot commit: mark it failed,
- * remove its original if nothing else references the digest, then remove its
- * staging blob. A one-shot text grant is revoked with it.
+ * Cleanup for an attempt that cannot commit now. With a code, a receiving or
+ * verified attempt fails, and a one-shot text grant is revoked with it.
+ * Whatever its state, the original for its digest is removed when nothing
+ * references it, which also catches a promotion that landed after a
+ * revocation removed it. A failed attempt's staging blob is removed.
  */
-async function abandon(cell: SourceCell, key: Key, code: string, revokeGrant = false): Promise<void> {
+async function abandon(cell: SourceCell, key: Key, code: string | null, revokeGrant = false): Promise<void> {
   const staging = await transact(cell.pool, async db => {
     const attempt = await lockAttempt(db, key);
-    if (!attempt || attempt.staging_removed_at) return null;
-    if (attempt.state === 'receiving' || attempt.state === 'verified') await failAttempt(db, key, code);
-    if (revokeGrant) await db.query(`UPDATE source_upload_grants SET revoked_at=clock_timestamp()
-      WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND revoked_at IS NULL AND finalized_at IS NULL`, key.slice(0, 3));
-    if (attempt.state === 'verified') await removeUnreferencedOriginal(db, cell.originals, key[0], String(attempt.observed_sha256));
-    return String(attempt.staging_key);
+    if (!attempt) return null;
+    let state = attempt.state;
+    if (code !== null && (state === 'receiving' || state === 'verified')) {
+      await failAttempt(db, key, code);
+      state = 'failed';
+      if (revokeGrant) await db.query(`UPDATE source_upload_grants SET revoked_at=clock_timestamp()
+        WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND revoked_at IS NULL AND finalized_at IS NULL`, key.slice(0, 3));
+    }
+    if (attempt.observed_sha256) await removeUnreferencedOriginal(db, cell.originals, key[0], String(attempt.observed_sha256));
+    return state === 'failed' && !attempt.staging_removed_at ? String(attempt.staging_key) : null;
   });
   if (staging) await removeStaging(cell, key, staging);
 }
+/** The attempt failure code for a caller whose authority ended mid-request. */
+const refusalCode = (error: unknown) => error instanceof AuthorityError ? `refused_${error.code.toLowerCase()}` : 'commit_failed';
 
 /**
  * Sources and short-lived upload grants for one owning collection. Every call
@@ -517,26 +544,33 @@ export class PostgresSources {
         await abandon(admitted.cell, key, code).catch(() => {});
         throw uploadFailure(error);
       } finally { clearTimeout(timer); }
-      // Verification is the commit intent for the digest, under its shared lock.
-      const refused = await transact(admitted.cell.pool, async db => {
-        const row = (await db.query(`SELECT revoked_at,finalized_at,expires_at<=clock_timestamp() AS expired
-          FROM source_upload_grants WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 FOR UPDATE`, key.slice(0, 3))).rows[0];
-        await intentLock(db, spaceId, stored.sha256);
-        const attempt = await lockAttempt(db, key);
-        let problem: string | null = null;
-        if (row?.revoked_at) problem = 'grant_revoked';
-        else if (row?.finalized_at) problem = 'grant_finalized';
-        else if (!row || row.expired) problem = 'grant_expired';
-        else if (attempt?.state !== 'receiving') problem = 'superseded';
-        if (problem) {
-          if (attempt?.state === 'receiving') await failAttempt(db, key, problem);
-          return problem;
-        }
-        await db.query(`UPDATE source_upload_attempts SET state='verified',observed_sha256=$5,observed_bytes=$6,
-            observed_mime_type=$7,updated_at=clock_timestamp()
-          WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND attempt_id=$4`, [...key, stored.sha256, stored.bytes, mimeType]);
-        return null;
-      });
+      // Verification is the commit intent for the digest, under its shared
+      // lock, and needs the caller's authority to be current after the stream.
+      let refused: string | null;
+      try {
+        refused = await this.actorTx(actor, admitted, async db => {
+          const row = (await db.query(`SELECT revoked_at,finalized_at,expires_at<=clock_timestamp() AS expired
+            FROM source_upload_grants WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 FOR UPDATE`, key.slice(0, 3))).rows[0];
+          await intentLock(db, spaceId, stored.sha256);
+          const attempt = await lockAttempt(db, key);
+          let problem: string | null = null;
+          if (row?.revoked_at) problem = 'grant_revoked';
+          else if (row?.finalized_at) problem = 'grant_finalized';
+          else if (!row || row.expired) problem = 'grant_expired';
+          else if (attempt?.state !== 'receiving') problem = 'superseded';
+          if (problem) {
+            if (attempt?.state === 'receiving') await failAttempt(db, key, problem);
+            return problem;
+          }
+          await db.query(`UPDATE source_upload_attempts SET state='verified',observed_sha256=$5,observed_bytes=$6,
+              observed_mime_type=$7,updated_at=clock_timestamp()
+            WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND attempt_id=$4`, [...key, stored.sha256, stored.bytes, mimeType]);
+          return null;
+        });
+      } catch (error) {
+        if (settlesNow(error)) await abandon(admitted.cell, key, refusalCode(error)).catch(() => {});
+        throw error;
+      }
       if (refused) {
         await removeStaging(admitted.cell, key, staging).catch(() => {});
         throw new AuthorityError('FORBIDDEN', refused === 'grant_expired' ? 'Upload grant expired' :
@@ -565,6 +599,7 @@ export class PostgresSources {
    * Revoke an unfinalized grant. Its in-progress and verified attempts fail
    * at once, an original only they referenced is removed, and verified
    * staging bytes are removed; a still-streaming writer removes its own.
+   * Reconciliation records the verified ones as settled after the grant ends.
    */
   async revokeUpload(actor: VerifiedCredential, spaceId: string, collectionId: string, grantId: string): Promise<UploadGrantView> {
     const admitted = await this.admit(actor, spaceId, collectionId, 'sources:write');
@@ -606,7 +641,8 @@ export class PostgresSources {
       prepared = { key: [scope.spaceId, scope.collectionId, grantId, attemptId], wanted };
       return prepared;
     };
-    const check = async (db: Db): Promise<{ replay: SourceView } | { attempt: Record<string, unknown>; mimeType: string }> => {
+    const check = async (db: Db): Promise<{ replay: SourceView } |
+      { attempt: Record<string, unknown>; mimeType: string; remainingMs: number }> => {
       const { key, wanted } = request();
       const grant = await lockGrant(db, scope, grantId);
       if (grant.finalized_at) {
@@ -626,7 +662,7 @@ export class PostgresSources {
       if (attempt.state !== 'verified') invalid('Upload attempt is not verified');
       await writable(db, scope);
       await capturedNotFuture(db, wanted.capturedAt);
-      return { attempt, mimeType: String(grant.mime_type) };
+      return { attempt, mimeType: String(grant.mime_type), remainingMs: Number(grant.remaining_ms) };
     };
     const first = await this.actorTx(actor, admitted, check);
     if ('replay' in first) return first.replay;
@@ -634,8 +670,12 @@ export class PostgresSources {
     const sha256 = String(first.attempt.observed_sha256);
     const bytes = Number(first.attempt.observed_bytes);
     const staging = String(first.attempt.staging_key);
+    const expiry = new AbortController();
+    const timer = setTimeout(() => expiry.abort(), Math.max(0, Math.floor(first.remainingMs)));
     try {
-      await ensureOriginal(admitted.cell.originals, scope.spaceId, sha256, bytes, first.mimeType, content ?? staging);
+      try {
+        await ensureOriginal(admitted.cell.originals, scope.spaceId, sha256, bytes, first.mimeType, content ?? staging, expiry.signal);
+      } finally { clearTimeout(timer); }
       const committed = await this.actorTx(actor, admitted, async db => {
         const current = await check(db);
         if ('replay' in current) return current;
@@ -655,8 +695,10 @@ export class PostgresSources {
       if (!content) await removeStaging(admitted.cell, key, staging).catch(() => {});
       return committed.source;
     } catch (error) {
-      if (settlesNow(error)) await abandon(admitted.cell, key, 'commit_failed', content !== null).catch(() => {});
-      throw error;
+      // Recheck the digest after any failure: a revocation may have removed
+      // the original while this promotion was still writing it.
+      await abandon(admitted.cell, key, settlesNow(error) ? 'commit_failed' : null, content !== null).catch(() => {});
+      throw promotionFailure(error);
     }
   }
 }
@@ -688,8 +730,9 @@ async function sourceExists(db: Db, spaceId: string, sourceId: string): Promise<
 
 /**
  * Settles upload attempts whose grant ended more than the grace period ago:
- * an interrupted or abandoned attempt fails, an original only it referenced
- * is removed, and every remaining staging blob is removed and recorded. Each
+ * an interrupted or abandoned attempt fails, an original only a failed
+ * attempt referenced is removed, and every remaining staging blob is removed
+ * and recorded. Each
  * attempt settles in its own transaction, and one failure does not stop the rest.
  */
 export class SourceUploadReconciler {
@@ -714,11 +757,12 @@ export class SourceUploadReconciler {
             FOR UPDATE SKIP LOCKED`, key)).rows[0];
           if (!attempt) return null;
           if (attempt.state === 'receiving' || attempt.state === 'verified') await failAttempt(db, key, 'abandoned');
-          if (attempt.state === 'verified')
+          // No promotion runs past its grant's expiry, so this recheck is final.
+          if (attempt.state !== 'committed' && attempt.observed_sha256)
             await removeUnreferencedOriginal(db, this.cell.originals, key[0], String(attempt.observed_sha256));
           return String(attempt.staging_key);
         });
-        if (staging) await removeStaging(this.cell, key, staging);
+        if (staging) await removeStaging(this.cell, key, staging, true);
       } catch (error) { errors.push(error); }
     }
     if (errors.length) throw new AggregateError(errors, `${errors.length} upload attempts did not settle`);
