@@ -245,7 +245,9 @@ CREATE INDEX links_live_to ON links(space_id, to_collection_id, to_kind, to_id) 
 -- history cannot be rewritten; lifecycle lives in `entity_refs`. Only
 -- the table owner, inside the scoped SECURITY DEFINER erasure routine, may
 -- delete one erasing space's rows; ordinary DML and TRUNCATE always fail.
-CREATE FUNCTION reject_evidence_fact_change() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION reject_evidence_fact_change() RETURNS trigger LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
 BEGIN
   IF TG_OP = 'DELETE' THEN
     IF current_user = pg_catalog.pg_get_userbyid(
@@ -287,7 +289,9 @@ CREATE TRIGGER claim_evidence_no_truncate BEFORE TRUNCATE ON claim_evidence
 -- resurrected: the only update tombstones a live link at the next revision.
 -- Like the facts above, links are removed only by space erasure. Generated
 -- endpoint columns are not yet computed in NEW and follow the compared ones.
-CREATE FUNCTION stateplane_guard_link_change() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION stateplane_guard_link_change() RETURNS trigger LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
 DECLARE
   mutable text[] := ARRAY['revision','tombstone','tombstoned_at','from_record_id','from_entity_kind',
     'from_entity_id','to_record_id','to_entity_kind','to_entity_id'];
@@ -307,13 +311,18 @@ CREATE TRIGGER links_immutable BEFORE DELETE ON links
 CREATE TRIGGER links_no_truncate BEFORE TRUNCATE ON links
   FOR EACH STATEMENT EXECUTE FUNCTION reject_evidence_fact_change();
 
--- No live link may reference a tombstoned endpoint. A new link rewrites both
--- live endpoint rows in place, a real write rather than a row lock, so the
--- endpoint's tombstone update and the link's creation conflict at every
+-- No live link may reference a missing or tombstoned endpoint. A new link
+-- rewrites both endpoint rows in place, a real write rather than a row lock,
+-- so the endpoint's tombstone update and the link's creation conflict at every
 -- isolation level. Under READ COMMITTED the later of the two waits and then
 -- sees the other's commit; a REPEATABLE READ or SERIALIZABLE writer whose
--- snapshot predates the other's commit fails with 40001 instead. Owner rights
--- let operational roles delete records without link grants.
+-- snapshot predates the other's commit fails with 40001 instead. An endpoint
+-- the rewrite cannot see is refused here rather than left to its foreign key,
+-- which checks only existence and would accept an endpoint created and
+-- tombstoned while this insert waited. Endpoints are rewritten in a fixed
+-- order, so links created in opposite directions queue instead of
+-- deadlocking. Owner rights let operational roles delete records without
+-- link grants.
 CREATE FUNCTION stateplane_guard_link_insert() RETURNS trigger LANGUAGE plpgsql
 SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
@@ -325,9 +334,13 @@ BEGIN
     RAISE EXCEPTION 'links are created live at revision 1';
   END IF;
   FOR endpoint IN SELECT * FROM (VALUES (NEW.from_kind, NEW.from_collection_id, NEW.from_id),
-      (NEW.to_kind, NEW.to_collection_id, NEW.to_id)) AS e(kind, collection_id, id) LOOP
+      (NEW.to_kind, NEW.to_collection_id, NEW.to_id)) AS e(kind, collection_id, id)
+      ORDER BY kind COLLATE "C", collection_id COLLATE "C", id COLLATE "C" LOOP
+    -- The endpoint kind check rejects any other kind after this trigger.
+    CONTINUE WHEN endpoint.kind NOT IN ('record', 'source', 'claim');
     -- `revision` is outside every column-specific trigger, so this rewrite
-    -- changes no value and fires no record or identity side effects.
+    -- changes no value and emits no record events. It does queue the
+    -- deferred `entity_refs_payload` check, which the unchanged row passes.
     IF endpoint.kind = 'record' THEN
       UPDATE public.records SET revision = revision
         WHERE space_id = NEW.space_id AND collection_id = endpoint.collection_id AND record_id = endpoint.id
@@ -338,8 +351,10 @@ BEGIN
           AND kind = endpoint.kind AND entity_id = endpoint.id
         RETURNING tombstone INTO deleted;
     END IF;
-    -- A missing endpoint is reported by its foreign key.
-    IF FOUND AND deleted THEN
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'link endpoint does not exist' USING ERRCODE = 'foreign_key_violation', CONSTRAINT = 'links_live_endpoint';
+    END IF;
+    IF deleted THEN
       RAISE EXCEPTION 'link endpoint is deleted' USING ERRCODE = 'foreign_key_violation', CONSTRAINT = 'links_live_endpoint';
     END IF;
   END LOOP;

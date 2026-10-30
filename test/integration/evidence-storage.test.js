@@ -68,17 +68,32 @@ async function space() {
   return { spaceId, alpha: 'alpha', beta: 'beta' };
 }
 
-async function source(spaceId, collectionId, { referenceOnly = false, bytes = 'original bytes' } = {}) {
-  const sourceId = `src_${randomUUID()}`;
-  await inTransaction(async db => {
-    await db.query(`INSERT INTO entity_refs(space_id,collection_id,kind,entity_id) VALUES($1,$2,'source',$3)`, [spaceId, collectionId, sourceId]);
+/** Insert one endpoint's rows inside the caller's open transaction. */
+async function insertEndpoint(db, spaceId, { kind, collectionId, id }, { referenceOnly = false, bytes = 'original bytes' } = {}) {
+  if (kind === 'record') {
+    await db.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+      VALUES($1,$2,$3,1,1,'generated',$3,'{}','{}'::jsonb)`, [spaceId, collectionId, id]);
+    return;
+  }
+  await db.query('INSERT INTO entity_refs(space_id,collection_id,kind,entity_id) VALUES($1,$2,$3,$4)', [spaceId, collectionId, kind, id]);
+  if (kind === 'source') {
     await db.query(`INSERT INTO sources(space_id,collection_id,source_id,locator,principal_id,credential_id)
-      VALUES($1,$2,$3,'https://example.invalid/evidence','owner','owner-session')`, [spaceId, collectionId, sourceId]);
+      VALUES($1,$2,$3,'https://example.invalid/evidence','owner','owner-session')`, [spaceId, collectionId, id]);
     await db.query(`INSERT INTO original_objects(space_id,collection_id,source_id,reference_only,sha256,byte_size,mime_type,captured_at)
       VALUES($1,$2,$3,$4,$5,$6,$7,clock_timestamp()-interval '1 minute')`,
-    [spaceId, collectionId, sourceId, referenceOnly, referenceOnly ? null : digest(bytes),
+    [spaceId, collectionId, id, referenceOnly, referenceOnly ? null : digest(bytes),
       referenceOnly ? null : Buffer.byteLength(bytes), referenceOnly ? null : 'text/plain']);
-  });
+  } else {
+    await db.query(`INSERT INTO claims(space_id,collection_id,claim_id,principal_id,credential_id) VALUES($1,$2,$3,'owner','owner-session')`,
+      [spaceId, collectionId, id]);
+    await db.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id)
+      VALUES($1,$2,$3,1,$4,'principal:owner','owner-session')`, [spaceId, collectionId, id, bytes]);
+  }
+}
+
+async function source(spaceId, collectionId, options) {
+  const sourceId = `src_${randomUUID()}`;
+  await inTransaction(db => insertEndpoint(db, spaceId, { kind: 'source', collectionId, id: sourceId }, options));
   return sourceId;
 }
 
@@ -90,13 +105,7 @@ async function extraction(spaceId, collectionId, sourceId, version, content, sha
 
 async function claim(spaceId, collectionId, statement = 'a generic assertion') {
   const claimId = `clm_${randomUUID()}`;
-  await inTransaction(async db => {
-    await db.query(`INSERT INTO entity_refs(space_id,collection_id,kind,entity_id) VALUES($1,$2,'claim',$3)`, [spaceId, collectionId, claimId]);
-    await db.query(`INSERT INTO claims(space_id,collection_id,claim_id,principal_id,credential_id) VALUES($1,$2,$3,'owner','owner-session')`,
-      [spaceId, collectionId, claimId]);
-    await db.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id)
-      VALUES($1,$2,$3,1,$4,'principal:owner','owner-session')`, [spaceId, collectionId, claimId, statement]);
-  });
+  await inTransaction(db => insertEndpoint(db, spaceId, { kind: 'claim', collectionId, id: claimId }, { bytes: statement }));
   return claimId;
 }
 
@@ -400,6 +409,93 @@ test('a link racing its endpoint deletion cannot leave a live dangling link at a
   }
 });
 
+/** Resolve once `promise` settles or session `pid` waits on another session's lock. */
+async function settledOrBlocked(promise, pid) {
+  let settled = false;
+  promise.then(() => { settled = true; }, () => { settled = true; });
+  for (let attempt = 0; attempt < 100 && !settled; attempt++) {
+    if ((await pool.query('SELECT cardinality(pg_blocking_pids($1)) > 0 AS waiting', [pid])).rows[0].waiting) return;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  if (!settled) throw new Error('session neither finished nor waited for the competing lock');
+}
+
+test('a link endpoint created by a concurrent transaction while the link waits is never accepted unfenced', async () => {
+  // Endpoints are rewritten in (kind, collection, id) order. A held source in
+  // beta sorts after any endpoint in alpha, and a held claim in alpha sorts
+  // before any endpoint in beta, so the new endpoint is reached first or second.
+  for (const kind of ['record', 'source', 'claim']) {
+    for (const [order, created] of [['first', 'tombstoned'], ['first', 'live'], ['second', 'tombstoned'], ['second', 'live']]) {
+      for (const linkerLevel of ['rc', 'ser']) {
+        const label = `${kind} reached ${order}, created ${created}, linker ${linkerLevel}`;
+        const { spaceId, alpha, beta } = await space();
+        const held = order === 'first' ? { kind: 'source', collectionId: beta, id: await source(spaceId, beta) }
+          : { kind: 'claim', collectionId: alpha, id: await claim(spaceId, alpha) };
+        const fresh = { kind, collectionId: order === 'first' ? alpha : beta, id: `new_${randomUUID()}` };
+        const writer = await pool.connect();
+        const linker = await pool.connect();
+        try {
+          await writer.query('BEGIN');
+          await writer.query(`SELECT 1 FROM entity_refs WHERE space_id=$1 AND collection_id=$2 AND kind=$3 AND entity_id=$4 FOR UPDATE`,
+            [spaceId, held.collectionId, held.kind, held.id]);
+          await linker.query(`BEGIN ISOLATION LEVEL ${isolations[linkerLevel]}`);
+          const linkerPid = (await linker.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+          const creation = link(spaceId, fresh, held, 'restrict', { owner: held.collectionId, db: linker })
+            .then(() => linker.query('COMMIT')).then(() => 'linked', error => error);
+          await settledOrBlocked(creation, linkerPid);
+          await insertEndpoint(writer, spaceId, fresh);
+          if (created === 'tombstoned') await tombstone(writer, spaceId, fresh);
+          await writer.query('COMMIT');
+          const outcome = await creation;
+          if (order === 'second' && created === 'live' && linkerLevel === 'rc') assert.equal(outcome, 'linked', label);
+          else {
+            // Absent from the linker's view when reached, or committed tombstoned.
+            assert.ok(outcome instanceof Error, `${label}: link creation must fail`);
+            code('23503', 'links_live_endpoint')(outcome);
+          }
+          assert.equal(await live(spaceId, fresh), created === 'live', label);
+        } finally {
+          await writer.query('ROLLBACK').catch(() => {});
+          await linker.query('ROLLBACK').catch(() => {});
+          writer.release(); linker.release();
+        }
+        const dangling = (await pool.query(`SELECT count(*)::int AS n FROM links l
+          LEFT JOIN records r ON l.from_kind='record' AND r.space_id=l.space_id AND r.collection_id=l.from_collection_id AND r.record_id=l.from_id
+          LEFT JOIN entity_refs e ON l.from_kind<>'record' AND e.space_id=l.space_id AND e.collection_id=l.from_collection_id
+            AND e.kind=l.from_kind AND e.entity_id=l.from_id
+          WHERE l.space_id=$1 AND NOT l.tombstone AND coalesce(r.tombstone,e.tombstone,true)`, [spaceId])).rows[0].n;
+        assert.equal(dangling, 0, label);
+      }
+    }
+  }
+});
+
+test('links created in opposite directions between the same endpoints queue instead of deadlocking', async () => {
+  const { spaceId, alpha, beta } = await space();
+  const first = { kind: 'record', collectionId: alpha, id: 'rec_alpha' };
+  const second = { kind: 'record', collectionId: beta, id: 'rec_beta' };
+  const [holder, forward, backward] = await Promise.all([pool.connect(), pool.connect(), pool.connect()]);
+  try {
+    // Hold the endpoint both links reach first, so both creations queue on it.
+    // Rewriting in from/to order instead would let the reverse link take the
+    // other endpoint meanwhile and deadlock once the holder commits.
+    await holder.query('BEGIN');
+    await holder.query('SELECT 1 FROM records WHERE space_id=$1 AND collection_id=$2 AND record_id=$3 FOR UPDATE', [spaceId, alpha, first.id]);
+    const creations = [];
+    for (const [db, from, to] of [[forward, first, second], [backward, second, first]]) {
+      await db.query('BEGIN');
+      const pid = (await db.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+      creations.push(link(spaceId, from, to, 'detach', { db }).then(() => db.query('COMMIT')).then(() => 'linked', error => error));
+      await blocked(pid);
+    }
+    await holder.query('COMMIT');
+    assert.deepEqual(await Promise.all(creations), ['linked', 'linked']);
+  } finally {
+    for (const db of [holder, forward, backward]) { await db.query('ROLLBACK').catch(() => {}); db.release(); }
+  }
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM links WHERE space_id=$1 AND NOT tombstone', [spaceId])).rows[0].n, 2);
+});
+
 test('authority record deletes work under snapshot isolation defaults and still honor links', async () => {
   for (const level of ['repeatable read', 'serializable']) {
     const sessionPool = new pg.Pool({ connectionString: urlFor(names[0]), max: 2,
@@ -420,7 +516,7 @@ test('authority record deletes work under snapshot isolation defaults and still 
       const linked = await create();
       const restricting = await link(spaceId, { kind: 'record', collectionId: alpha, id: 'rec_alpha' },
         { kind: 'record', collectionId: alpha, id: linked }, 'restrict');
-      await assert.rejects(remove(linked), level);
+      await assert.rejects(remove(linked), code('23001', 'links_restrict'));
       assert.equal(await live(spaceId, { kind: 'record', collectionId: alpha, id: linked }), true, level);
       await detach(pool, spaceId, alpha, restricting);
       await remove(linked);
@@ -559,6 +655,27 @@ test('a nonowner cell role proves evidence erasure only with the evidence grants
     await cellPool.end();
     await pool.query(`DROP OWNED BY ${role}`);
     await pool.query(`DROP ROLE ${role}`);
+  }
+});
+
+test('evidence grants refuse an invalid or missing role and an unverified external URL without leaking secrets', () => {
+  const grant = env => spawnSync(process.execPath, ['scripts/grant-evidence.mjs'], { cwd: root, encoding: 'utf8', timeout: 10000,
+    env: { ...process.env, ...env } });
+  const external = new URL('postgres://db.example.invalid/stateplane');
+  external.username = 'admin';
+  external.password = ['private', 'fixture'].join('-');
+  const cases = [
+    [{ STATEPLANE_CELL_ADMIN_URL: urlFor(names[0]), STATEPLANE_CELL_ROLE: 'Bad"role' }, /valid STATEPLANE_CELL_ROLE/],
+    [{ STATEPLANE_CELL_ADMIN_URL: urlFor(names[0]), STATEPLANE_CELL_ROLE: 'pg_read_all_data' }, /valid STATEPLANE_CELL_ROLE/],
+    [{ STATEPLANE_CELL_ADMIN_URL: urlFor(names[0]), STATEPLANE_CELL_ROLE: `missing_${randomUUID().slice(0, 8)}` }, /Cell operational role does not exist/],
+    [{ STATEPLANE_CELL_ADMIN_URL: external.href, STATEPLANE_CELL_ROLE: 'cell_reader' }, /External DATABASE_URL requires sslmode=verify-full/],
+  ];
+  for (const [env, expected] of cases) {
+    const result = grant(env);
+    assert.equal(result.status, 1, env.STATEPLANE_CELL_ROLE);
+    assert.match(result.stderr, expected);
+    assert.doesNotMatch(result.stdout + result.stderr, /private-fixture|Evidence erasure grants verified/);
+    if (password) assert.ok(!(result.stdout + result.stderr).includes(password));
   }
 });
 
