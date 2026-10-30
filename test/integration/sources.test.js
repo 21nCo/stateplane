@@ -1053,6 +1053,64 @@ test('cleanup transactions end by the page budget: a late connection, slow state
   assert.deepEqual(f.r2.keys(prefix), []);
 });
 
+test('a failed cleanup transaction ends by the page budget even when its ROLLBACK stalls, and no store call starts after it', async () => {
+  const f = await fixture();
+  const reconciler = cell => new SourceUploadReconciler({ originals: f.blobs, ...cell }, 0);
+  const endsBy = async (label, budget, run) => {
+    const started = performance.now();
+    await assert.rejects(run(), label);
+    assert.equal(performance.now() - started < budget + 100, true, `${label} ends by its budget`);
+  };
+  // A pool whose matching statement fails with a SQL error and whose ROLLBACK then stalls, recording each release.
+  const released = [];
+  const failing = match => ({ connect: async () => {
+    const client = await pool.connect();
+    let gone = false;
+    return new Proxy(client, { get(target, property) {
+      if (property === 'release') return discard => { gone = true; released.push(discard === true); target.release(discard); };
+      if (property !== 'query') return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
+      return async (sql, ...rest) => {
+        if (String(sql).includes(match)) return target.query('SELECT 1/0');
+        if (sql === 'ROLLBACK') { await sleep(600); return gone ? { rows: [] } : target.query(sql); }
+        return target.query(sql, ...rest);
+      };
+    } });
+  } });
+  await endsBy('a step whose due query fails', 300, () => reconciler({ pool: failing('SELECT a.space_id') }).step(25, 300));
+  await endsBy('a sweep whose ownership query fails', 300, () => reconciler({ pool: failing('unnest') }).sweep(100, 300));
+  assert.deepEqual(released, [true, true], 'each session cut off mid-ROLLBACK is discarded');
+
+  // A statement still waiting on the server when the budget ends is cut off there too.
+  const locker = await pool.connect();
+  await locker.query('BEGIN');
+  await locker.query('LOCK TABLE source_upload_attempts IN ACCESS EXCLUSIVE MODE');
+  try {
+    await endsBy('a step whose due query waits on a lock', 300, () => reconciler({ pool }).step(25, 300));
+    await endsBy('a sweep whose ownership query waits on a lock', 300, () => reconciler({ pool }).sweep(100, 300));
+  } finally { await locker.query('ROLLBACK'); locker.release(); }
+
+  // A sweep whose deletes stall starts no store call after its budget and still advances its cursor.
+  const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: 'application/octet-stream', maxBytes: 64,
+    expiresInSeconds: 1 });
+  const prefix = `staging/${Buffer.from(f.spaceId).toString('base64url')}/${grant.grantId}/`;
+  for (const attemptId of ['att_a', 'att_b', 'att_c']) {
+    await pool.query(`INSERT INTO source_upload_attempts(space_id,collection_id,grant_id,attempt_id,staging_key,state,failure_code)
+      VALUES($1,'alpha',$2,$3,$4,'failed','abandoned')`, [f.spaceId, grant.grantId, attemptId, `${prefix}${attemptId}`]);
+    f.r2.objects.set(`${prefix}${attemptId}`, { bytes: Buffer.from(attemptId) });
+  }
+  const calls = [];
+  f.r2.beforeDelete = async key => { calls.push(performance.now()); await sleep(1000); };
+  f.r2.beforePut = async () => { calls.push(performance.now()); };
+  const started = performance.now();
+  await assert.rejects(reconciler({ pool }).sweep(100, 300), AggregateError);
+  assert.equal(calls.length > 0, true);
+  assert.deepEqual(calls.filter(at => at >= started + 300), [], 'no store call starts after the budget');
+  assert.equal(f.r2.objects.has('reconcile/sweep-cursor'), true, 'the cursor advances past the slow key');
+  await sleep(1000);
+  f.r2.beforeDelete = async () => {};
+  f.r2.beforePut = async () => {};
+});
+
 test('attempts that keep failing to settle cannot hold the oldest reconciliation page', async () => {
   const f = await fixture();
   const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: 'application/octet-stream', maxBytes: 64,

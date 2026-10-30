@@ -149,11 +149,14 @@ class CleanupTimeout extends Error {
   constructor() { super('Upload cleanup call timed out'); }
 }
 /**
- * Settle with `pending`, or fail once `CLEANUP_CALL_MS` or the budget ending at
- * `until` (a `performance.now` instant) has passed. A value that arrives later
- * is passed to `late` to release it; every cleanup call is safe to land late.
+ * Start a cleanup call and settle with it, or fail once `CLEANUP_CALL_MS` or
+ * the budget ending at `until` (a `performance.now` instant) has passed. A call
+ * is never started once the budget has passed. A value that arrives later is
+ * passed to `late` to release it; every cleanup call is safe to land late.
  */
-function within<T>(until: number, pending: Promise<T>, late: (value: T) => void = () => {}): Promise<T> {
+async function within<T>(until: number, start: () => Promise<T>, late: (value: T) => void = () => {}): Promise<T> {
+  if (performance.now() >= until) throw new CleanupTimeout();
+  const pending = start();
   let timedOut = false;
   void pending.then(value => { if (timedOut) late(value); }, () => {});
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -161,7 +164,7 @@ function within<T>(until: number, pending: Promise<T>, late: (value: T) => void 
     timer = setTimeout(() => { timedOut = true; reject(new CleanupTimeout()); },
       Math.max(0, Math.min(until - performance.now(), CLEANUP_CALL_MS)));
   });
-  return Promise.race([pending, timeout]).finally(() => clearTimeout(timer));
+  try { return await Promise.race([pending, timeout]); } finally { clearTimeout(timer); }
 }
 
 /**
@@ -178,15 +181,16 @@ function within<T>(until: number, pending: Promise<T>, late: (value: T) => void 
  *
  * A cleanup transaction passes its page's `until` instead: it is one cleanup
  * call, so none starts after `until`, and acquiring its session, its
- * statements and its COMMIT all end by `until` or `CLEANUP_CALL_MS`. A
- * session cut off mid-statement is discarded.
+ * statements, its COMMIT and any ROLLBACK all end by `until` or
+ * `CLEANUP_CALL_MS`. A session cut off mid-statement or mid-ROLLBACK, or whose
+ * ROLLBACK could not start before `until`, is discarded.
  */
 async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promise<T>, until?: number): Promise<T> {
   const end = until === undefined ? undefined : Math.min(until, performance.now() + CLEANUP_CALL_MS);
   const remaining = () => end === undefined ? REQUEST_BUDGET_MS : Math.max(1, Math.floor(end - performance.now()));
   if (end !== undefined && performance.now() >= end) throw new CleanupTimeout();
   const deadline = Date.now() + remaining();
-  const client = end === undefined ? await pool.connect() : await within(end, pool.connect(), late => late.release());
+  const client = end === undefined ? await pool.connect() : await within(end, () => pool.connect(), late => late.release());
   let beginAttempted = false;
   let begun = false;
   let discard = false;
@@ -202,7 +206,7 @@ async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promi
       await client.query(`SET LOCAL lock_timeout = '${Math.min(LOCK_MS, remaining())}ms'`);
       return fn(client);
     };
-    const result = end === undefined ? await work() : await within(end, work());
+    const result = end === undefined ? await work() : await within(end, work);
     begun = false;
     commitSent = true;
     try { await commitBeforeDeadline(client, deadline); }
@@ -217,7 +221,8 @@ async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promi
     return result;
   } catch (error) {
     if (begun && !clientReadTimedOut(error) && !(error instanceof CleanupTimeout)) {
-      try { await client.query('ROLLBACK'); } catch { discard = true; }
+      const rollback = () => client.query('ROLLBACK');
+      try { await (end === undefined ? rollback() : within(end, rollback)); } catch { discard = true; }
     }
     else if (beginAttempted) discard = true;
     if (pgCode(error) === '57014') throw new AuthorityError('RATE_LIMITED', 'Database statement time limit exceeded');
@@ -473,8 +478,8 @@ async function failAttempt(db: Db, key: Key, code: string): Promise<void> {
  * page's `until`, which bounds both steps.
  */
 async function removeStaging(cell: SourceCell, key: Key, staging: string, settled = false, until?: number): Promise<void> {
-  const deleted = cell.originals.delete(staging);
-  await (until === undefined ? deleted : within(until, deleted));
+  const deleted = () => cell.originals.delete(staging);
+  await (until === undefined ? deleted() : within(until, deleted));
   await transact(cell.pool, db => db.query(`UPDATE source_upload_attempts
     SET staging_removed_at=clock_timestamp(),updated_at=clock_timestamp()
     WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND attempt_id=$4 AND staging_removed_at IS NULL
@@ -972,7 +977,7 @@ export class SourceUploadReconciler {
         // No write starts after the grant's expiry, and one refused at it
         // reports failure promptly, so a copy can still land after this
         // removal; `sweep` finds it once the attempt has settled.
-        if (attempt.state !== 'committed' && attempt.observed_sha256) await within(until, removeOriginal(this.cell, key));
+        if (attempt.state !== 'committed' && attempt.observed_sha256) await within(until, () => removeOriginal(this.cell, key));
         await removeStaging(this.cell, key, String(attempt.staging_key), true, until);
       } catch (error) {
         failed++;
@@ -996,17 +1001,20 @@ export class SourceUploadReconciler {
    * deleted; a committed original, a live attempt's bytes and keys the ledger
    * does not know are kept. Both states are final, so a delete that lands
    * late is safe. Each call examines up to `limit` keys after a cursor kept in
-   * the bucket, within `budgetMs`; a lost cursor restarts the pass. Returns
-   * how many keys it examined.
+   * the bucket, within `budgetMs`; a lost cursor restarts the pass. No store
+   * call or transaction starts after the budget, and deletes stop a fifth of
+   * it early so the cursor can still advance past slow keys. Returns how many
+   * keys it examined.
    */
   async sweep(limit = 100, budgetMs = 5_000): Promise<number> {
     if (!isSafeInteger(limit) || limit < 1 || limit > 1000) throw new RangeError('Invalid sweep limit');
     if (!isSafeInteger(budgetMs) || budgetMs < 1) throw new RangeError('Invalid sweep budget');
     const until = performance.now() + budgetMs;
     const blobs = this.cell.originals;
-    const stored = await within(until, blobs.get(SWEEP_CURSOR));
-    const cursor = stored ? await within(until, new Response(stored.body).text()) : '';
-    const page = await within(until, blobs.list(cursor, limit));
+    const stored = await within(until, () => blobs.get(SWEEP_CURSOR), late => void late?.body.cancel().catch(() => {}));
+    const cursor = stored ? await within(until, () => new Response(stored.body).text())
+      .catch((error: unknown) => { void stored.body.cancel().catch(() => {}); throw error; }) : '';
+    const page = await within(until, () => blobs.list(cursor, limit));
     const owners = page.keys.map(storedAttempt);
     const known = owners.flatMap((owner, index) => owner ? [{ ...owner, index }] : []);
     const ended = new Set((await transact(this.cell.pool, db => db.query(`SELECT k.index FROM
@@ -1016,17 +1024,18 @@ export class SourceUploadReconciler {
     [known.map(k => k.spaceId), known.map(k => k.stagingKey), known.map(k => k.original), known.map(k => k.index)]), until))
       .rows.map(row => Number(row.index)));
     const errors: unknown[] = [];
+    const deletesUntil = until - budgetMs / 5;
     let examined = 0;
     for (const [index, key] of page.keys.entries()) {
-      if (performance.now() >= until) break;
-      if (ended.has(index)) await within(until, blobs.delete(key)).catch((error: unknown) => { errors.push(error); });
+      if (performance.now() >= deletesUntil) break;
+      if (ended.has(index)) await within(deletesUntil, () => blobs.delete(key)).catch((error: unknown) => { errors.push(error); });
       examined++;
     }
     // A finished pass starts over; a failed delete is retried on the next pass.
     const next = page.done && examined === page.keys.length ? '' : page.keys[examined - 1] ?? cursor;
     if (next !== cursor) {
       const bytes = Buffer.from(next, 'utf8');
-      await within(until, blobs.put(SWEEP_CURSOR, bytes, { bytes: bytes.byteLength, contentType: 'text/plain' }))
+      await within(until, () => blobs.put(SWEEP_CURSOR, bytes, { bytes: bytes.byteLength, contentType: 'text/plain' }))
         .catch((error: unknown) => { errors.push(error); });
     }
     if (errors.length) throw new AggregateError(errors, 'Stored upload bytes sweep did not finish');
