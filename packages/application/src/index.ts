@@ -7,3 +7,4 @@ export function createApplication(ports: ApplicationPorts): ApplicationPorts { r
 export * from './routing.js';
 export * from './errors.js';
 export type { StateplaneServices } from './services.js';
+export * from './blobs.js';

@@ -9,7 +9,7 @@ const requireFromApp = createRequire(join(root, 'app/package.json'));
 const { parse: parseSvelte } = requireFromApp('svelte/compiler');
 const roles = new Map([
   ['contracts', []], ['application', ['contracts']], ['postgres', ['contracts', 'application']],
-  ['auth', ['contracts']], ['storage', ['contracts']], ['retrieval', ['contracts']],
+  ['auth', ['contracts']], ['storage', ['application', 'contracts']], ['retrieval', ['contracts']],
   ['workers', ['application', 'contracts']], ['api', ['application', 'auth', 'contracts']],
   ['mcp', ['application', 'auth', 'contracts']], ['cli', ['contracts']], ['testing', ['contracts']],
   ['read-model', []]

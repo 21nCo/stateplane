@@ -708,9 +708,15 @@ test('a nonowner cell role proves evidence erasure only with the evidence grants
 
     execFileSync(process.execPath, ['scripts/grant-evidence.mjs'], { cwd: root, stdio: 'pipe',
       env: { ...process.env, STATEPLANE_CELL_ADMIN_URL: urlFor(names[0]), STATEPLANE_CELL_ROLE: role } });
-    const privileges = (await pool.query(`SELECT t, has_table_privilege($1,t,'SELECT') AS can_read,
-        has_table_privilege($1,t,'INSERT,UPDATE,DELETE,TRUNCATE') AS can_write FROM unnest($2::text[]) t`, [role, evidenceGrants])).rows;
-    assert.deepEqual(privileges.filter(row => !row.can_read || row.can_write), [], 'the grant is read-only');
+    const privileges = Object.fromEntries((await pool.query(`SELECT t, has_table_privilege($1,t,'SELECT') AS can_read,
+        has_table_privilege($1,t,'INSERT') AS can_insert, has_table_privilege($1,t,'UPDATE') AS can_update,
+        has_table_privilege($1,t,'DELETE,TRUNCATE') AS can_remove FROM unnest($2::text[]) t`, [role, evidenceGrants])).rows
+      .map(({ t, ...row }) => [t, row]));
+    // STA-33 writes sources, originals and the upload ledger; the rest stays read-only, and nothing is removable.
+    const writes = { sources: [true, false], original_objects: [true, false], source_upload_grants: [true, true],
+      source_upload_attempts: [true, true] };
+    assert.deepEqual(privileges, Object.fromEntries(evidenceGrants.map(table => [table, { can_read: true,
+      can_insert: writes[table]?.[0] ?? false, can_update: writes[table]?.[1] ?? false, can_remove: false }])));
     await spaces.delete(actor, spaceId);
     await spaces.delete(actor, spaceId);
     await spaces.reconcile(spaceId);
@@ -740,7 +746,7 @@ test('evidence grants refuse an invalid or missing role and an unverified extern
     const result = grant(env);
     assert.equal(result.status, 1, env.STATEPLANE_CELL_ROLE);
     assert.match(result.stderr, expected);
-    assert.doesNotMatch(result.stdout + result.stderr, /private-fixture|Evidence erasure grants verified/);
+    assert.doesNotMatch(result.stdout + result.stderr, /private-fixture|Evidence grants verified/);
     if (password) assert.ok(!(result.stdout + result.stderr).includes(password));
   }
 });

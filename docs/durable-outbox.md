@@ -41,7 +41,7 @@ A claim walks distinct live `(space, collection)` pairs through the existing cla
 | Bound | Initial value | Purpose |
 | --- | --- | --- |
 | Claim `limit` / `perSpace` / `pairs` | 100 / 25 / 200 (max 100 / limit / 1,000) | One transaction's locks; one Queue `sendBatch` (Cloudflare's 100-message cap); scan work per claim |
-| Dispatch tick | Once a minute; claim and send for up to 20 s, then reconciliation steps for up to 10 s | Throughput per cell without overlapping ticks. A tick can overrun by one claim and send. |
+| Dispatch tick | Once a minute; claim and send for up to 20 s, then reconciliation steps for up to 10 s, then [upload reconciliation](evidence-storage.md#reconciliation) for up to 10 s | Throughput per cell without overlapping ticks. A tick can overrun by one claim and send. |
 | Dispatch lease | 300 s (1–3,600) | Hint transit before an unstarted lease is reclaimed |
 | Unstarted dispatch leases (`inFlight`) | 5,000 per cell (1–100,000) | Dispatch's lead over consumers. Every hint starts within its lease while consumers start about 17 a second (5,000 ÷ 300 s); slower consumers still converge through late starts. |
 | Uncounted release backoff / head lock wait | 5 s / 1 s | A misclassified fault cannot retry in a tight loop; a queued completion gives way inside its budget |

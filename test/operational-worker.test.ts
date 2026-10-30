@@ -1,10 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({ closed: 0, connected: 0, failClose: false, denyGrants: false, denyCatalog: false, ownsObject: false, denyVector: false, wrongIdentity: false }));
-const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[], reconcileError: undefined as Error | undefined, active: 0, peak: 0, poolInstances: [] as { emit(event: string, error: Error): boolean }[] }));
+const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[], reconcileError: undefined as Error | undefined, uploadPages: [] as number[], uploadSteps: [] as number[], uploadError: undefined as Error | undefined, originals: [] as unknown[], active: 0, peak: 0, poolInstances: [] as { emit(event: string, error: Error): boolean }[] }));
 vi.mock('@stateplane/postgres', async importOriginal => ({
   CLIENT_READ_TIMEOUT_MS: (await importOriginal<typeof import('@stateplane/postgres')>()).CLIENT_READ_TIMEOUT_MS,
   PostgresAuthority: class {},
+  SourceUploadReconciler: class {
+    constructor(sourceCell: { originals: unknown }) { cell.originals.push(sourceCell.originals); }
+    async step(limit: number) { cell.uploadSteps.push(limit); if (cell.uploadError) throw cell.uploadError; return cell.uploadPages.shift() ?? 0; }
+  },
   PostgresOutbox: class {
     async claim() { return { messages: cell.claims.shift() ?? [], scan: 'whole' }; }
     async release(messages: unknown[]) { cell.released.push(...messages); return messages.length; }
@@ -52,7 +56,7 @@ function batch(bodies: unknown[]) {
   return { settled, value: { messages } as never };
 }
 const jobsEnv = (sendBatch = vi.fn(async () => ({}))) => ({ AUTHORITY: { connectionString: 'postgres://example/cell' },
-  PROJECTION_JOBS: { sendBatch } }) as never;
+  PROJECTION_JOBS: { sendBatch }, ORIGINALS: { head: vi.fn() } }) as never;
 
 describe('cell jobs Worker', () => {
   it('fails closed without its authority binding so Cloudflare redelivers the batch', async () => {
@@ -121,6 +125,36 @@ describe('cell jobs Worker', () => {
       .toEqual(['Projection dispatch released 1 leases', queue, [hint(1)], 1]);
     const reconcileOnly = await tick(undefined, reconcile);
     expect([reconcileOnly.error, reconcileOnly.released, reconcileOnly.ended]).toEqual([reconcile, [], 1]);
+  });
+
+  it('settles ended upload attempts after projection work, page by page, and reports their failure with the tick', async () => {
+    cell.claims = []; cell.uploadSteps = []; cell.uploadPages = [25, 25, 3];
+    await jobs.scheduled({} as never, jobsEnv());
+    expect(cell.uploadSteps).toEqual([25, 25, 25]);
+    cell.uploadSteps = []; cell.uploadPages = [0];
+    await jobs.scheduled({} as never, jobsEnv());
+    expect(cell.uploadSteps).toEqual([25]);
+    const uploads = new Error('R2 delete failed');
+    const reconcile = new Error('reconcile statement timeout');
+    cell.uploadError = uploads;
+    try {
+      await expect(jobs.scheduled({} as never, jobsEnv())).rejects.toBe(uploads);
+      cell.reconcileError = reconcile;
+      const both = await jobs.scheduled({} as never, jobsEnv()).then(() => undefined, (error: unknown) => error);
+      expect((both as AggregateError).errors).toEqual([reconcile, uploads]);
+      cell.claims = [[hint(1)]]; cell.released = [];
+      const send = await jobs.scheduled({} as never, jobsEnv(vi.fn(async () => { throw new Error('queue unavailable'); })))
+        .then(() => undefined, (error: unknown) => error as Error & { cause?: unknown });
+      expect(send?.message).toBe('Projection dispatch released 1 leases');
+      expect(((send?.cause as AggregateError).errors).slice(1)).toEqual([reconcile, uploads]);
+    } finally { cell.uploadError = undefined; cell.reconcileError = undefined; }
+  });
+
+  it('fails a tick closed without its originals binding, before opening the pool', async () => {
+    const pools = cell.pools;
+    const env = { AUTHORITY: { connectionString: 'postgres://example/cell' }, PROJECTION_JOBS: { sendBatch: vi.fn() } } as never;
+    await expect(jobs.scheduled({} as never, env)).rejects.toThrow('Cell originals binding is missing');
+    expect(cell.pools).toBe(pools);
   });
 
   it('holds one pooled connection per invocation and processes a batch one item at a time', async () => {
