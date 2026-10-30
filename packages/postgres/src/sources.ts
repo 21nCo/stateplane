@@ -45,8 +45,12 @@ interface Wanted {
 }
 
 const spaceSegment = (spaceId: string) => Buffer.from(spaceId, 'utf8').toString('base64url');
-/** Originals are content-addressed within a space: (space, digest) is the pointer. */
-export const originalKey = (spaceId: string, sha256: string) => `originals/${spaceSegment(spaceId)}/${sha256}`;
+/**
+ * Each attempt promotes its bytes to a key of its own, which `original_objects`
+ * records when the attempt commits. No other attempt ever writes or deletes it.
+ */
+export const originalKey = (spaceId: string, grantId: string, attemptId: string) =>
+  `originals/${spaceSegment(spaceId)}/${grantId}/${attemptId}`;
 const stagingKey = (spaceId: string, grantId: string, attemptId: string) =>
   `staging/${spaceSegment(spaceId)}/${grantId}/${attemptId}`;
 const digest = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
@@ -161,39 +165,22 @@ async function capturedNotFuture(db: Db, capturedAt: string | null): Promise<voi
 }
 
 /**
- * Original blobs are shared by digest within a space. A verified upload
- * attempt is the durable intent to commit one, and takes the shared lock when
- * it records that intent; removal takes the exclusive lock and deletes only a
- * digest no original row and no verified attempt references. Promotion
- * happens after the intent commits, so a removal can never interleave with a
- * commit that relies on bytes it saw. A deleted object cannot be restored by
- * a rollback, so removal runs in its own transaction, only after the end of
- * the intent it follows has committed; the metadata commit also rechecks the
- * object under the shared lock.
+ * An attempt's original key is referenced only once the attempt commits, and
+ * removed only once it has failed. Both states are final, so a removal can
+ * never target bytes a commit relies on, however late its delete lands, and
+ * it needs no lock. It must run only after the failure has committed.
  *
  * A revocation can fail an attempt while its promotion is still writing, so
  * the write may land after the removal. Promotion therefore stops at its
- * grant's expiry, the finalize that promoted rechecks its digest whenever it
- * fails, and a failed attempt that held a digest stays due for
- * reconciliation, which rechecks it again once no promotion can be running.
+ * grant's expiry, the finalize that promoted removes its original again
+ * whenever it fails, and a failed attempt that held a digest stays due for
+ * reconciliation, which removes it once more after no promotion can be running.
  */
-const intentLock = (db: Db, spaceId: string, sha256: string) =>
-  db.query('SELECT pg_advisory_xact_lock_shared(hashtextextended($1,0))', [lockKey(['stateplane:original', spaceId, sha256])]);
-/** Remove a digest's original when nothing references it. Call only after the caller's end of intent committed. */
-function removeUnreferencedOriginal(cell: SourceCell, spaceId: string, sha256: string): Promise<void> {
-  return transact(cell.pool, async db => {
-    await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [lockKey(['stateplane:original', spaceId, sha256])]);
-    // Verified attempts keep their staging blob, so the staged partial index finds them.
-    const row = (await db.query(`SELECT EXISTS (SELECT 1 FROM original_objects WHERE space_id=$1 AND sha256=$2)
-        OR EXISTS (SELECT 1 FROM source_upload_attempts WHERE staging_removed_at IS NULL AND space_id=$1
-          AND observed_sha256=$2 AND state='verified') AS referenced`, [spaceId, sha256])).rows[0];
-    if (row?.referenced === false) await cell.originals.delete(originalKey(spaceId, sha256));
-  });
-}
-/** Make the original for a digest present, copying verified bytes when absent, before `signal` aborts. */
-async function ensureOriginal(blobs: BlobStore, spaceId: string, sha256: string, bytes: number,
+const attemptOriginal = (key: Key) => originalKey(key[0], key[2], key[3]);
+const removeOriginal = (cell: SourceCell, key: Key) => cell.originals.delete(attemptOriginal(key));
+/** Make an attempt's original present, copying its verified bytes when absent, before `signal` aborts. */
+async function ensureOriginal(blobs: BlobStore, key: string, sha256: string, bytes: number,
   mimeType: string, from: string | Uint8Array, signal: AbortSignal): Promise<void> {
-  const key = originalKey(spaceId, sha256);
   const existing = await blobs.head(key);
   if (existing && existing.bytes === bytes && existing.sha256 === sha256) return;
   const staged = typeof from === 'string' ? (await blobs.get(from))?.body : from;
@@ -269,7 +256,7 @@ function uploadFailure(error: unknown): unknown {
 }
 
 const viewColumns = `s.collection_id,s.source_id,s.locator,s.principal_id,s.created_at,o.reference_only,o.sha256,
-  o.byte_size,o.mime_type,o.captured_at,o.observed_at,e.tombstone`;
+  o.byte_size,o.mime_type,o.captured_at,o.observed_at,o.object_key,e.tombstone`;
 const viewSources = `FROM sources s JOIN original_objects o USING (space_id,collection_id,source_id)
   JOIN entity_refs e ON e.space_id=s.space_id AND e.collection_id=s.collection_id AND e.kind='source' AND e.entity_id=s.source_id`;
 function sourceView(row: Record<string, unknown>, replayed: boolean): SourceView {
@@ -285,12 +272,16 @@ function grantView(row: Record<string, unknown>): UploadGrantView {
     expiresAt: iso(row.expires_at)!, revokedAt: iso(row.revoked_at), finalizedAt: iso(row.finalized_at),
     sourceId: row.source_id as string | null };
 }
-async function readSource(db: Db, scope: AuthorityScope, sourceId: string, replayed: boolean): Promise<SourceView> {
+/** A live source in the scope's collection, with the key of its original bytes, which the view does not disclose. */
+async function readSourceKey(db: Db, scope: AuthorityScope, sourceId: string, replayed: boolean):
+  Promise<{ source: SourceView; objectKey: string | null }> {
   const row = (await db.query(`SELECT ${viewColumns} ${viewSources} WHERE s.space_id=$1 AND s.collection_id=$2 AND s.source_id=$3`,
     [scope.spaceId, scope.collectionId, sourceId])).rows[0];
   if (!row || row.tombstone) throw new AuthorityError('NOT_FOUND');
-  return sourceView(row, replayed);
+  return { source: sourceView(row, replayed), objectKey: row.object_key as string | null };
 }
+const readSource = async (db: Db, scope: AuthorityScope, sourceId: string, replayed: boolean) =>
+  (await readSourceKey(db, scope, sourceId, replayed)).source;
 /**
  * A request's source ID is derived from its credential and idempotency key, so
  * a retry finds the committed source. A different payload, or the same key
@@ -314,7 +305,8 @@ async function replay(db: Db, scope: AuthorityScope, wanted: Wanted): Promise<So
   return sourceView(row, true);
 }
 /** Insert a source's identity, payload and original together, after `replay` found none. */
-async function insertSource(db: Db, scope: AuthorityScope, wanted: Wanted, byteSize: number | null): Promise<SourceView> {
+async function insertSource(db: Db, scope: AuthorityScope, wanted: Wanted, byteSize: number | null,
+  objectKey: string | null): Promise<SourceView> {
   await capturedNotFuture(db, wanted.capturedAt);
   const ids = [scope.spaceId, scope.collectionId, wanted.sourceId];
   await db.query(`INSERT INTO entity_refs(space_id,collection_id,kind,entity_id) VALUES($1,$2,'source',$3)`, ids);
@@ -322,9 +314,9 @@ async function insertSource(db: Db, scope: AuthorityScope, wanted: Wanted, byteS
     VALUES($1,$2,$3,$4,$5,$6)`, [...ids, wanted.locator, scope.principalId, scope.credentialId]);
   // One clock reading marks an unstated capture time as the observation time.
   await db.query(`WITH stamp AS (SELECT clock_timestamp() AS at)
-    INSERT INTO original_objects(space_id,collection_id,source_id,reference_only,sha256,byte_size,mime_type,captured_at,observed_at)
-    SELECT $1,$2,$3,$4,$5,$6,$7,COALESCE($8::timestamptz,stamp.at),stamp.at FROM stamp`,
-  [...ids, wanted.referenceOnly, wanted.sha256, byteSize, wanted.mimeType, wanted.capturedAt]);
+    INSERT INTO original_objects(space_id,collection_id,source_id,reference_only,sha256,byte_size,mime_type,captured_at,observed_at,
+      object_key) SELECT $1,$2,$3,$4,$5,$6,$7,COALESCE($8::timestamptz,stamp.at),stamp.at,$9 FROM stamp`,
+  [...ids, wanted.referenceOnly, wanted.sha256, byteSize, wanted.mimeType, wanted.capturedAt, objectKey]);
   return readSource(db, scope, wanted.sourceId, false);
 }
 const grantKey = (scope: AuthorityScope, grantId: string) => [scope.spaceId, scope.collectionId, grantId];
@@ -395,9 +387,9 @@ async function removeStaging(cell: SourceCell, key: Key, staging: string, settle
 /**
  * Cleanup for an attempt that cannot commit now. With a code, a receiving or
  * verified attempt fails, and a one-shot text grant is revoked with it. Once
- * the attempt is durably failed, the original for its digest is removed when
- * nothing references it, which also catches a promotion that landed after a
- * revocation removed it, and its staging blob is removed.
+ * the attempt is durably failed, its original is removed, which also catches
+ * a promotion that landed after a revocation removed it, and so is its
+ * staging blob.
  */
 async function abandon(cell: SourceCell, key: Key, code: string | null, revokeGrant = false): Promise<void> {
   const ended = await transact(cell.pool, async db => {
@@ -411,10 +403,9 @@ async function abandon(cell: SourceCell, key: Key, code: string | null, revokeGr
         WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND revoked_at IS NULL AND finalized_at IS NULL`, key.slice(0, 3));
     }
     if (state !== 'failed') return null;
-    return { sha256: attempt.observed_sha256 ? String(attempt.observed_sha256) : null,
-      staging: attempt.staging_removed_at ? null : String(attempt.staging_key) };
+    return { promoted: attempt.observed_sha256 !== null, staging: attempt.staging_removed_at ? null : String(attempt.staging_key) };
   });
-  if (ended?.sha256) await removeUnreferencedOriginal(cell, key[0], ended.sha256);
+  if (ended?.promoted) await removeOriginal(cell, key);
   if (ended?.staging) await removeStaging(cell, key, ended.staging);
 }
 /** The attempt failure code for a caller whose authority ended mid-request. */
@@ -455,11 +446,11 @@ export class PostgresSources {
   }
 
   private async read(actor: VerifiedCredential, spaceId: string, collectionId: string, sourceId: string):
-    Promise<{ admitted: Admitted; source: SourceView }> {
+    Promise<{ admitted: Admitted; source: SourceView; objectKey: string | null }> {
     const admitted = await this.admit(actor, spaceId, collectionId, 'sources:read');
-    return { admitted, source: await this.actorTx(actor, admitted, db => {
+    return { admitted, ...await this.actorTx(actor, admitted, db => {
       if (!reference(sourceId)) throw new AuthorityError('NOT_FOUND');
-      return readSource(db, admitted.scope, sourceId, false);
+      return readSourceKey(db, admitted.scope, sourceId, false);
     }) };
   }
 
@@ -471,10 +462,10 @@ export class PostgresSources {
    */
   async content(actor: VerifiedCredential, spaceId: string, collectionId: string, sourceId: string):
     Promise<{ source: SourceView; body: ReadableStream<Uint8Array> | null }> {
-    const { admitted, source } = await this.read(actor, spaceId, collectionId, sourceId);
+    const { admitted, source, objectKey } = await this.read(actor, spaceId, collectionId, sourceId);
     const { referenceOnly, sha256, byteSize } = source.original;
     if (referenceOnly || sha256 === null || byteSize === null) return { source, body: null };
-    const stored = await admitted.cell.originals.get(originalKey(spaceId, sha256));
+    const stored = objectKey === null ? null : await admitted.cell.originals.get(objectKey);
     if (!stored) throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Original bytes are missing', undefined, false);
     try {
       if (stored.bytes !== byteSize || (stored.sha256 !== null && stored.sha256 !== sha256))
@@ -504,7 +495,6 @@ export class PostgresSources {
       await writable(db, scope);
       await capturedNotFuture(db, wanted.capturedAt);
       await insertGrant(db, scope, grantId, wanted.mimeType!, content.byteLength, wanted.sha256, sourceBounds.textGrantSeconds);
-      await intentLock(db, scope.spaceId, wanted.sha256!);
       await db.query(`INSERT INTO source_upload_attempts(space_id,collection_id,grant_id,attempt_id,staging_key,state,
           observed_sha256,observed_bytes,observed_mime_type) VALUES($1,$2,$3,$4,$5,'verified',$6,$7,$8)`,
       [...grantKey(scope, grantId), attemptId, stagingKey(spaceId, grantId, attemptId), wanted.sha256, content.byteLength,
@@ -533,7 +523,7 @@ export class PostgresSources {
       const existing = await replay(db, scope, wanted);
       if (existing) return existing;
       await writable(db, scope);
-      return insertSource(db, scope, wanted, null);
+      return insertSource(db, scope, wanted, null, null);
     });
   }
 
@@ -607,14 +597,12 @@ export class PostgresSources {
         await abandon(admitted.cell, key, code).catch(() => {});
         throw uploadFailure(error);
       } finally { expiry.close(); }
-      // Verification is the commit intent for the digest, under its shared
-      // lock, and needs the caller's authority to be current after the stream.
+      // Verification needs the caller's authority to be current after the stream.
       let refused: string | null;
       try {
         refused = await this.actorTx(actor, admitted, async db => {
           const row = (await db.query(`SELECT revoked_at,finalized_at,expires_at<=clock_timestamp() AS expired
             FROM source_upload_grants WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 FOR UPDATE`, key.slice(0, 3))).rows[0];
-          await intentLock(db, spaceId, stored.sha256);
           const attempt = await lockAttempt(db, key);
           let problem: string | null = null;
           if (row?.revoked_at) problem = 'grant_revoked';
@@ -665,8 +653,8 @@ export class PostgresSources {
 
   /**
    * Revoke an unfinalized grant. Its in-progress and verified attempts fail
-   * at once; after that commits, an original only they referenced is removed,
-   * and verified staging bytes are removed; a still-streaming writer removes its own.
+   * at once; after that commits, the verified ones' originals and staging
+   * bytes are removed; a still-streaming writer removes its own.
    * Reconciliation records the verified ones as settled after the grant ends.
    */
   async revokeUpload(actor: VerifiedCredential, spaceId: string, collectionId: string, grantId: string): Promise<UploadGrantView> {
@@ -685,18 +673,19 @@ export class PostgresSources {
       return { view: grantView(row), staged: attempts.filter(a => a.state === 'verified') };
     });
     // The failed attempts are durable now; reconciliation repeats whatever this misses.
-    for (const sha256 of [...new Set(staged.map(a => String(a.observed_sha256)))].sort())
-      await removeUnreferencedOriginal(admitted.cell, spaceId, sha256).catch(() => {});
-    for (const attempt of staged)
-      await removeStaging(admitted.cell, [spaceId, collectionId, grantId, attempt.attempt_id], attempt.staging_key).catch(() => {});
+    for (const attempt of staged) {
+      const key: Key = [spaceId, collectionId, grantId, attempt.attempt_id];
+      await removeOriginal(admitted.cell, key).catch(() => {});
+      await removeStaging(admitted.cell, key, attempt.staging_key).catch(() => {});
+    }
     return view;
   }
 
   /**
-   * Promote a verified attempt's bytes to the original location, then commit
-   * the source metadata. Bytes are always verified and present before the
-   * metadata commits, which rechecks them under the digest's shared lock and
-   * finalizes the grant only if it has not expired. A deterministic failure
+   * Promote a verified attempt's bytes to its original key, then commit the
+   * source metadata. Bytes are always verified and present before the
+   * metadata commits, which rechecks them and finalizes the grant only if it
+   * has not expired. A deterministic failure
    * abandons the attempt at once; a transient one leaves it verified for
    * retry until reconciliation. The request is parsed only after the first
    * transaction authorizes it.
@@ -741,21 +730,21 @@ export class PostgresSources {
     const sha256 = String(first.attempt.observed_sha256);
     const bytes = Number(first.attempt.observed_bytes);
     const staging = String(first.attempt.staging_key);
+    const objectKey = attemptOriginal(key);
     const expiry = writeWindow(first.deadline);
     try {
       try {
-        await ensureOriginal(admitted.cell.originals, scope.spaceId, sha256, bytes, first.mimeType, content ?? staging, expiry.signal);
+        await ensureOriginal(admitted.cell.originals, objectKey, sha256, bytes, first.mimeType, content ?? staging, expiry.signal);
       } finally { expiry.close(); }
       const committed = await this.actorTx(actor, admitted, async db => {
         const current = await check(db);
         if ('replay' in current) return current;
-        // No removal can run while the shared lock is held, so bytes present now stay.
-        await intentLock(db, scope.spaceId, sha256);
-        const present = await admitted.cell.originals.head(originalKey(scope.spaceId, sha256));
+        // The attempt is locked and still verified, so no removal of its original can start before this commits.
+        const present = await admitted.cell.originals.head(objectKey);
         if (present?.bytes !== bytes || present.sha256 !== sha256)
           throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Original bytes are not present; retry the request', undefined, true);
         if (await sourceExists(db, scope.spaceId, wanted.sourceId)) throw duplicateSource();
-        const source = await insertSource(db, scope, { ...wanted, sha256, mimeType: current.mimeType }, bytes);
+        const source = await insertSource(db, scope, { ...wanted, sha256, mimeType: current.mimeType }, bytes, objectKey);
         await db.query(`UPDATE source_upload_attempts SET state='committed',updated_at=clock_timestamp()${content ?
           ',staging_removed_at=clock_timestamp()' : ''}
           WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND attempt_id=$4`, key);
@@ -773,8 +762,8 @@ export class PostgresSources {
       if (!content) await removeStaging(admitted.cell, key, staging).catch(() => {});
       return committed.source;
     } catch (error) {
-      // Recheck the digest after any failure: a revocation may have removed
-      // the original while this promotion was still writing it.
+      // After any failure that leaves the attempt failed, remove its original:
+      // a revocation may have removed it while this promotion was still writing it.
       await abandon(admitted.cell, key, settlesNow(error) ? 'commit_failed' : null, content !== null).catch(() => {});
       throw promotionFailure(error);
     }
@@ -808,8 +797,8 @@ async function sourceExists(db: Db, spaceId: string, sourceId: string): Promise<
 
 /**
  * Settles upload attempts whose grant ended more than the grace period ago:
- * an interrupted or abandoned attempt fails, an original only a failed
- * attempt referenced is removed, and every remaining staging blob is removed
+ * an interrupted or abandoned attempt fails, a failed attempt's original is
+ * removed, and every remaining staging blob is removed
  * and recorded. Each attempt settles in its own transaction, and one failure
  * does not stop the rest. A failing attempt's `updated_at` is advanced, so it
  * moves behind every due attempt not tried since and cannot hold the oldest page.
@@ -841,11 +830,10 @@ export class SourceUploadReconciler {
         if (!attempt) continue;
         // No write starts after the grant's expiry, and one refused at it
         // reports failure only after the store answered, so a copy that
-        // landed late was already rechecked by its finalize unless that
+        // landed late was already removed by its finalize unless that
         // worker died; the grace is assumed to cover that copy's landing
         // (docs/evidence-storage.md records the assumption).
-        if (attempt.state !== 'committed' && attempt.observed_sha256)
-          await removeUnreferencedOriginal(this.cell, key[0], String(attempt.observed_sha256));
+        if (attempt.state !== 'committed' && attempt.observed_sha256) await removeOriginal(this.cell, key);
         await removeStaging(this.cell, key, String(attempt.staging_key), true);
       } catch (error) {
         failed++;

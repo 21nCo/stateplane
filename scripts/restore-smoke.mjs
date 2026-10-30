@@ -104,8 +104,8 @@ try {
       VALUES($1,$2,'source','src_restore'),($1,$2,'claim','clm_restore')`,[spaceId,collectionId]);
     await evidence.query(`INSERT INTO sources(space_id,collection_id,source_id,locator,principal_id,credential_id)
       VALUES($1,$2,'src_restore','https://example.invalid/restore','owner','restore')`,[spaceId,collectionId]);
-    await evidence.query(`INSERT INTO original_objects(space_id,collection_id,source_id,reference_only,sha256,byte_size,mime_type,captured_at)
-      VALUES($1,$2,'src_restore',false,$3,7,'text/plain',clock_timestamp())`,[spaceId,collectionId,originalDigest]);
+    await evidence.query(`INSERT INTO original_objects(space_id,collection_id,source_id,reference_only,sha256,byte_size,mime_type,captured_at,object_key)
+      VALUES($1,$2,'src_restore',false,$3,7,'text/plain',clock_timestamp(),'originals/restore')`,[spaceId,collectionId,originalDigest]);
     await evidence.query(`INSERT INTO extraction_versions(space_id,collection_id,source_id,version,source_sha256,parser,parser_version,content,credential_id)
       VALUES($1,$2,'src_restore',1,$3,'text','1','restore','restore')`,[spaceId,collectionId,originalDigest]);
     await evidence.query(`INSERT INTO claims(space_id,collection_id,claim_id,principal_id,credential_id)
