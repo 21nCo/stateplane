@@ -72,6 +72,7 @@ export class R2BlobStore implements BlobStore {
     });
     const abort = () => { void reader.cancel(new BlobWriteError('deadline')).catch(() => {}); };
     signal?.addEventListener('abort', abort, { once: true });
+    let written = false;
     try {
       const stored = await this.bucket.put(key, this.knownLength(checked, bytes),
         { ...(sha256 === undefined ? {} : { sha256 }), ...(contentType === undefined ? {} : { httpMetadata: { contentType } }) });
@@ -79,6 +80,7 @@ export class R2BlobStore implements BlobStore {
       // The body ended in time, but the store confirmed only after the deadline.
       if (signal?.aborted) fail('deadline');
       if (!stored || digest === undefined || stored.size !== bytes) throw new Error('Blob store did not confirm the write');
+      written = true;
       return { sha256: digest, bytes };
     } catch (error) {
       if (failure) throw failure;
@@ -86,6 +88,9 @@ export class R2BlobStore implements BlobStore {
       throw error;
     } finally {
       signal?.removeEventListener('abort', abort);
+      // A failed write cancels what remains of its input, so the caller's source
+      // stops too; the caller's cancel is not awaited, so it cannot hold the failure.
+      if (!written) void reader.cancel(failure ?? new Error('Blob write failed')).catch(() => {});
       reader.releaseLock?.();
     }
   }
