@@ -542,6 +542,12 @@ test('upload grants and attempts keep finalize, revocation and staging cleanup u
   await assert.rejects(grant('empty', 0, 300_000), code('23514'));
   await assert.rejects(grant('expired', 1, 0), code('23514'));
   await assert.rejects(grant('inverted', 1, -1), code('23514'));
+  // Required text is never empty; PostgreSQL keeps '' distinct from NULL.
+  const textColumns = ['grant_id', 'principal_id', 'credential_id'];
+  for (const column of textColumns)
+    await assert.rejects(pool.query(`INSERT INTO source_upload_grants(space_id,collection_id,grant_id,principal_id,credential_id,mime_type,max_bytes,issued_at,expires_at)
+      VALUES($1,$2,$3,$4,$5,'text/plain',1,$6,$7)`, [spaceId, alpha, ...textColumns.map(name => name === column ? '' : `x_${randomUUID()}`),
+      issued, new Date(issued.getTime() + 300_000)]), code('23514', `source_upload_grants_${column}_check`), column);
   const grantId = `upl_${randomUUID()}`;
   await grant(grantId, 1024, 300_000);
   const sourceId = await source(spaceId, alpha);
@@ -571,6 +577,9 @@ test('upload grants and attempts keep finalize, revocation and staging cleanup u
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [spaceId, alpha, grantId, attemptId, staging, state, observed, observed && 14, failure]);
   await attempt('a1', `staging/${grantId}/a1`, 'failed', null, 'DIGEST_MISMATCH');
   await assert.rejects(attempt('a2', `staging/${grantId}/a1`), code('23505'));
+  await assert.rejects(attempt('', `staging/${grantId}/empty`), code('23514', 'source_upload_attempts_attempt_id_check'));
+  await assert.rejects(attempt('a2', ''), code('23514', 'source_upload_attempts_staging_key_check'));
+  await assert.rejects(attempt('a2', `staging/${grantId}/a2`, 'failed', null, ''), code('23514', 'source_upload_attempts_failure_code_check'));
   await assert.rejects(attempt('a2', `staging/${grantId}/a2`, 'committed'), code('23514'));
   await assert.rejects(attempt('a2', `staging/${grantId}/a2`, 'failed'), code('23514'));
   await attempt('a2', `staging/${grantId}/a2`, 'committed', digest('original bytes'));
@@ -739,7 +748,9 @@ test('evidence grants refuse an invalid or missing role and an unverified extern
 test('migration 040 rolls back atomically while record writers hold locks, then applies to a populated database', { timeout: 60000 }, async () => {
   const name = names[1];
   const files = (await readdir(new URL('../../migrations/', import.meta.url))).filter(file => file.endsWith('.sql')).sort();
-  assert.equal(files.at(-1), '040_evidence_storage.sql');
+  // Later migrations may follow 040; the migrator applies 040 and all of them.
+  const target = files.indexOf('040_evidence_storage.sql');
+  assert.ok(target > 0, 'migration 040 exists');
   const db = new pg.Client({ connectionString: urlFor(name) });
   const writer = new pg.Client({ connectionString: urlFor(name) });
   await db.connect();
@@ -747,7 +758,7 @@ test('migration 040 rolls back atomically while record writers hold locks, then 
   try {
     await db.query('BEGIN');
     await db.query('CREATE TABLE stateplane_migrations (name text PRIMARY KEY, sha256 text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())');
-    for (const file of files.slice(0, -1)) {
+    for (const file of files.slice(0, target)) {
       const sql = await readFile(new URL(`../../migrations/${file}`, import.meta.url), 'utf8');
       await db.query(sql);
       await db.query('INSERT INTO stateplane_migrations(name,sha256) VALUES($1,$2)', [file, digest(sql)]);
