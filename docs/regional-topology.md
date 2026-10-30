@@ -2,7 +2,7 @@
 
 Status: definitions and a disposable qualification harness. No cell is operational until its connected provider and Cloudflare observations pass. The amended [STA-4 issue](https://linear.app/21n/issue/STA-4/03-provision-full-regional-cloudflare-topology-and-postgres) supersedes the former AWS RDS plan. Skillplane's control/cell split is retained; its historical region choices are not deployment requirements.
 
-STA-6 space erasure also requires a cell-only grant after migration: `GRANT EXECUTE ON FUNCTION public.stateplane_purge_space(text) TO <cell_operational_role>`. Grant it to each intended cell operational role only, never a control, settings or disposable probe role; the function has no default `PUBLIC` execution. The role must still pass the operational admission checks. See [owned spaces](owned-spaces.md) for deletion and retry semantics.
+STA-6 space erasure also requires a cell-only grant after migration: `GRANT EXECUTE ON FUNCTION public.stateplane_purge_space(text) TO <cell_operational_role>`. Grant it to each intended cell operational role only, never a control, settings or disposable probe role; the function has no default `PUBLIC` execution. The role must still pass the operational admission checks. See [owned spaces](owned-spaces.md) for deletion and retry semantics. After migration 040 and after every restore, also run `pnpm db:grant-evidence` for that same cell operational role. It grants only `SELECT` on the evidence tables and reads each privilege back; space deletion reads them to prove erasure, so without it the purge commits but deletion fails with `42501` before publishing `deleted`. See [evidence storage](evidence-storage.md).
 
 ## Provider, regions and budget (2026-09-28)
 

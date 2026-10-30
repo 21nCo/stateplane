@@ -800,6 +800,15 @@ export class PostgresSpaces {
       NOT EXISTS (SELECT 1 FROM receipt_reservation_scopes WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM receipt_reservations WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM idempotency_receipts WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM links WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM claim_evidence WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM claim_revisions WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM claims WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM source_upload_attempts WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM source_upload_grants WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM extraction_versions WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM original_objects WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM sources WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM record_tombstones WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM record_unique_keys WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM record_index_values WHERE space_id=$1) AND

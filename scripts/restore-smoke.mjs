@@ -38,7 +38,9 @@ const tables = ['stateplane_migrations','space_directory','space_provisioning_au
   'idempotency_receipts','receipt_reservations',
   'receipt_reservation_scopes','schema_commit_fences','collection_write_slots','batch_operations','batch_items',
   'record_tombstones','projection_outbox','entity_refs','projection_heads','projection_reconciliations',
-  'outbox_dispatch_checkpoint','outbox_space_rotation','outbox_operator_audit'];
+  'outbox_dispatch_checkpoint','outbox_space_rotation','outbox_operator_audit',
+  'sources','original_objects','source_upload_grants','source_upload_attempts','extraction_versions',
+  'claims','claim_revisions','claim_evidence','links'];
 async function snapshot(pool) {
   const entries = await Promise.all(tables.map(async table => {
     const rows = await pool.query(`SELECT to_jsonb(t) AS value FROM ${table} t`);
@@ -92,6 +94,35 @@ try {
   assert.deepEqual(outcomes.toSorted((a,b)=>a.localeCompare(b)),['applied','applied','superseded'],'restore seed applies both latest revisions');
   await new PostgresOutbox(base,authority).reconcile('restore-operator',spaceId,collectionId,'restore drill');
   await base.query('INSERT INTO outbox_space_rotation(space_id,after_collection_id) VALUES($1,$2)',[spaceId,collectionId]);
+  // Evidence storage: one row in every table, with a claim restricting a live record.
+  const liveRecord=(await base.query('SELECT record_id FROM records WHERE space_id=$1 AND NOT tombstone',[spaceId])).rows[0].record_id;
+  const originalDigest='e'.repeat(64);
+  const evidence=await base.connect();
+  try {
+    await evidence.query('BEGIN');
+    await evidence.query(`INSERT INTO entity_refs(space_id,collection_id,kind,entity_id)
+      VALUES($1,$2,'source','src_restore'),($1,$2,'claim','clm_restore')`,[spaceId,collectionId]);
+    await evidence.query(`INSERT INTO sources(space_id,collection_id,source_id,locator,principal_id,credential_id)
+      VALUES($1,$2,'src_restore','https://example.invalid/restore','owner','restore')`,[spaceId,collectionId]);
+    await evidence.query(`INSERT INTO original_objects(space_id,collection_id,source_id,reference_only,sha256,byte_size,mime_type,captured_at)
+      VALUES($1,$2,'src_restore',false,$3,7,'text/plain',clock_timestamp())`,[spaceId,collectionId,originalDigest]);
+    await evidence.query(`INSERT INTO extraction_versions(space_id,collection_id,source_id,version,source_sha256,parser,parser_version,content,credential_id)
+      VALUES($1,$2,'src_restore',1,$3,'text','1','restore','restore')`,[spaceId,collectionId,originalDigest]);
+    await evidence.query(`INSERT INTO claims(space_id,collection_id,claim_id,principal_id,credential_id)
+      VALUES($1,$2,'clm_restore','owner','restore')`,[spaceId,collectionId]);
+    await evidence.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id)
+      VALUES($1,$2,'clm_restore',1,'restored assertion','principal:owner','restore')`,[spaceId,collectionId]);
+    await evidence.query(`INSERT INTO claim_evidence(space_id,collection_id,claim_id,revision,ordinal,source_collection_id,source_id,extraction_version,start_offset,end_offset)
+      VALUES($1,$2,'clm_restore',1,0,$2,'src_restore',1,0,7)`,[spaceId,collectionId]);
+    await evidence.query(`INSERT INTO source_upload_grants(space_id,collection_id,grant_id,principal_id,credential_id,mime_type,max_bytes,expires_at,finalized_at,source_id)
+      VALUES($1,$2,'upl_restore','owner','restore','text/plain',64,clock_timestamp()+interval '5 minutes',clock_timestamp(),'src_restore')`,[spaceId,collectionId]);
+    await evidence.query(`INSERT INTO source_upload_attempts(space_id,collection_id,grant_id,attempt_id,staging_key,state,observed_sha256,observed_bytes)
+      VALUES($1,$2,'upl_restore','a1','staging/upl_restore/a1','committed',$3,7)`,[spaceId,collectionId,originalDigest]);
+    await evidence.query(`INSERT INTO links(space_id,collection_id,link_id,link_type,deletion_policy,from_kind,from_collection_id,from_id,to_kind,to_collection_id,to_id,credential_id)
+      VALUES($1,$2,'lnk_restore','cites','restrict','claim',$2,'clm_restore','record',$2,$3,'restore')`,[spaceId,collectionId,liveRecord]);
+    await evidence.query('COMMIT');
+  } catch (error) { await evidence.query('ROLLBACK'); throw error; }
+  finally { evidence.release(); }
   const feedSeed=(await base.query(`SELECT event_id FROM record_events WHERE space_id=$1
     ORDER BY committed_at,event_id LIMIT 1`,[spaceId])).rows[0].event_id;
   await base.query(`INSERT INTO record_event_feed(event_id,space_id,collection_id)
@@ -105,13 +136,19 @@ try {
     expected.space_credentials.length && expected.collection_grants.length && expected.batch_items.length &&
     expected.routing_nonces.length && expected.space_audit.length && expected.space_provisioning_audit.length &&
     expected.projection_heads.length && expected.projection_reconciliations.length &&
-    expected.outbox_dispatch_checkpoint.length && expected.outbox_space_rotation.length && expected.outbox_operator_audit.length,
-  'expected this restore smoke seed to populate records, outbox, projection state and owned-space authority');
+    expected.outbox_dispatch_checkpoint.length && expected.outbox_space_rotation.length && expected.outbox_operator_audit.length &&
+    tables.slice(-9).every(table=>expected[table].length),
+  'expected this restore smoke seed to populate records, outbox, projection state, evidence and owned-space authority');
   const archive = docker(['pg_dump','-U','stateplane','-Fc',sourceName]);
   docker(['createdb','-U','stateplane',name]);
   execFileSync(dockerExecutable, ['compose','exec','-T','postgres','pg_restore','-U','stateplane','-d',name],
     { cwd:root, input:archive, maxBuffer:64 * 1024 * 1024 });
   assert.deepEqual(await snapshot(restored),expected);
+  // Evidence guards are post-data objects; prove the restore recreated them.
+  await assert.rejects(restored.query("UPDATE original_objects SET mime_type='text/html' WHERE space_id=$1",[spaceId]),
+    /evidence facts are immutable/);
+  await assert.rejects(restored.query('UPDATE records SET tombstone=true,revision=revision+1 WHERE space_id=$1 AND record_id=$2',
+    [spaceId,liveRecord]),error=>error.code==='23001');
   const restoredAuthority=new PostgresAuthority(restored,3600);
   const resumed=await restoredAuthority.transaction({...scope,capability:'events:read'},tx=>tx.events(feedSeed));
   assert.equal(resumed.events.length,expected.record_event_pending.length,
@@ -126,6 +163,9 @@ try {
     // Restored outbox tables need their operational grants reapplied.
     execFileSync(process.execPath,['scripts/grant-outbox.mjs'],{cwd:root,
       env:{...process.env,STATEPLANE_CELL_ADMIN_URL:targetUrl,STATEPLANE_CELL_ROLE:journalRole},stdio:'inherit'});
+    // So do the evidence tables that space deletion reads to prove erasure.
+    execFileSync(process.execPath,['scripts/grant-evidence.mjs'],{cwd:root,
+      env:{...process.env,STATEPLANE_CELL_ADMIN_URL:targetUrl,STATEPLANE_CELL_ROLE:journalRole},stdio:'inherit'});
     const operational=await restored.connect();
     const issuance=`iss_restore_${randomBytes(8).toString('hex')}`;
     try {
@@ -139,6 +179,9 @@ try {
         WHERE space_id=$1`,[spaceId])).rowCount,1,'restored operational role can advance reconciliations');
       assert.equal((await operational.query(`UPDATE outbox_space_rotation SET after_collection_id=$2
         WHERE space_id=$1`,[spaceId,collectionId])).rowCount,1,'restored operational role can rotate collection turns');
+      for (const table of tables.slice(-9))
+        assert.ok((await operational.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[spaceId])).rows[0].n>0,
+          `restored operational role can read ${table} for erasure proof`);
     } finally {
       await operational.query('RESET ROLE').catch(()=>{});
       operational.release();
@@ -146,7 +189,8 @@ try {
     }
   } finally {
     await restored.query(`REVOKE ALL ON agent_key_issuances,projection_heads,projection_reconciliations,
-      outbox_dispatch_checkpoint,outbox_space_rotation,outbox_operator_audit FROM ${journalRole}`).catch(()=>{});
+      outbox_dispatch_checkpoint,outbox_space_rotation,outbox_operator_audit,${tables.slice(-9).join(',')}
+      FROM ${journalRole}`).catch(()=>{});
     await restored.query(`DROP ROLE IF EXISTS ${journalRole}`).catch(()=>{});
   }
   // A reserved-word role proves identifier quoting. Keep its creation and

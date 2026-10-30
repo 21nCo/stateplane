@@ -156,6 +156,7 @@ try {
     assert.match(output,/Applied 028_schema_commit_fence.sql/);
     assert.match(output,/Applied 029_external_key_identity.sql/);
     assert.match(output,/Applied 039_durable_outbox.sql/);
+    assert.match(output,/Applied 040_evidence_storage.sql/);
     assert.deepEqual(await facts(upgraded),before);
     assert.deepEqual((await upgraded.query(`SELECT count(*)::int AS n FROM projection_outbox
       WHERE failures<>0 OR started_attempt IS NOT NULL OR dead_lettered_at IS NOT NULL OR outcome IS NOT NULL`)).rows[0].n,0);
