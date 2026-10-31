@@ -45,14 +45,14 @@ const rejects = (promise, code, message) => assert.rejects(promise, error => {
   return true;
 }, message);
 
-/** A pool whose hooks run once before the first statement containing their text. */
+/** A pool whose hooks run once before the first statement containing their text, or equal to it when `exact`. */
 let hooks = [];
 const hooked = { connect: async () => {
   const client = await pool.connect();
   return new Proxy(client, { get(target, property) {
     if (property !== 'query') return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
     return async (sql, ...rest) => {
-      const hook = typeof sql === 'string' ? hooks.find(item => sql.includes(item.match)) : undefined;
+      const hook = typeof sql === 'string' ? hooks.find(item => item.exact ? sql === item.match : sql.includes(item.match)) : undefined;
       if (hook) { hooks = hooks.filter(item => item !== hook); await hook.run(); }
       return target.query(sql, ...rest);
     };
@@ -82,7 +82,7 @@ async function fixture() {
   await spaces.create(owner, 'cell-a', spaceId);
   for (const id of ['alpha', 'beta']) await services.collections.define(owner, spaceId, id, definition(id));
   const agent = async (grants, expiresAt) => {
-    const key = await spaces.issueAgentKey(owner, spaceId, new Date(Date.now() + 3_600_000),
+    const key = await spaces.issueAgentKey(owner, spaceId, expiresAt?.key ?? new Date(Date.now() + 3_600_000),
       grants.map(([collectionId, capabilities]) => ({ collectionId, capabilities, ...(expiresAt?.[collectionId] ? { expiresAt: expiresAt[collectionId] } : {}) })));
     return Object.assign(await verify(key.secret), { keyId: key.id });
   };
@@ -458,6 +458,53 @@ test('an owning or evidence grant that lapses before the final check refuses the
     assert.deepEqual(await claimRows(f.spaceId), before);
   }
   assert.equal((await claims.get(f.both, f.spaceId, 'alpha', derived.claimId)).revision, 1, 'no review committed');
+});
+
+test('a grant or key that lapses after the final check, before COMMIT, rolls the write back', async () => {
+  const f = await fixture();
+  const derived = await claims.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: 'derived', ...statement(),
+    evidence: [{ collectionId: 'beta', sourceId: f.betaSource }] });
+  const capabilities = { create: ['claims:write', 'sources:read'], revise: ['claims:write', 'claims:read', 'sources:read'],
+    review: ['claims:review', 'claims:read', 'sources:read'] };
+  const cite = [{ collectionId: 'beta', sourceId: f.betaSource }];
+  for (const [call, lapsed] of [['create', 'alpha'], ['create', 'beta'], ['create', 'key'], ['revise', 'beta'], ['review', 'alpha'],
+    ['review', 'key']]) {
+    const expires = Date.now() + 3_000;
+    const lapsing = await f.agent([['alpha', capabilities[call]], ['beta', ['sources:read']]], { [lapsed]: new Date(expires) });
+    const run = () => call === 'create' ? hookedClaims.create(lapsing, f.spaceId, 'alpha', { idempotencyKey: 'cites-beta', ...statement(), evidence: cite })
+      : call === 'revise' ? hookedClaims.revise(lapsing, f.spaceId, 'alpha', derived.claimId, { baseRevision: 1, ...statement(2), evidence: cite })
+        : hookedClaims.review(lapsing, f.spaceId, 'alpha', derived.claimId, { baseRevision: 1, status: 'accepted' });
+    const before = await claimRows(f.spaceId);
+    // Every in-transaction check, the final grant statement included, has passed; only COMMIT is held past expiry.
+    hooks.push({ match: 'COMMIT', exact: true, run: () => sleep(Math.max(0, expires + 300 - Date.now())) });
+    await rejects(run(), 'FORBIDDEN', `${call} with ${lapsed} lapsed before COMMIT`);
+    assert.equal(hooks.length, 0, 'the hook ran');
+    assert.deepEqual(await claimRows(f.spaceId), before, `${call} with ${lapsed} lapsed wrote nothing`);
+  }
+  const unchanged = await claims.get(f.both, f.spaceId, 'alpha', derived.claimId);
+  assert.deepEqual([unchanged.revision, unchanged.latestRevision], [1, 1], 'no revision or review committed');
+  // The same held COMMIT succeeds while every grant is still live.
+  const live = await f.agent([['alpha', capabilities.create], ['beta', ['sources:read']]]);
+  hooks.push({ match: 'COMMIT', exact: true, run: () => sleep(300) });
+  assert.equal((await hookedClaims.create(live, f.spaceId, 'alpha', { idempotencyKey: 'live', ...statement(), evidence: cite })).revision, 1);
+  assert.equal(hooks.length, 0, 'the hook ran');
+});
+
+test('claim times refuse leap seconds, which timestamptz cannot store as themselves', async () => {
+  const f = await fixture();
+  const created = await claims.create(f.writer, f.spaceId, 'alpha', { idempotencyKey: 'base', ...statement() });
+  const before = await claimRows(f.spaceId);
+  for (const value of ['2016-12-31T23:59:60Z', '2016-12-31T23:59:60.500Z']) for (const name of ['observedAt', 'validFrom', 'validUntil']) {
+    await rejects(claims.create(f.writer, f.spaceId, 'alpha', { idempotencyKey: `${name} ${value}`, ...statement(), [name]: value }),
+      'INVALID_ARGUMENT', `create ${name} ${value}`);
+    await rejects(claims.revise(f.writer, f.spaceId, 'alpha', created.claimId, { baseRevision: 1, ...statement(2), [name]: value }),
+      'INVALID_ARGUMENT', `revise ${name} ${value}`);
+  }
+  assert.deepEqual(await claimRows(f.spaceId), before, 'a refused time writes nothing');
+  const edge = await claims.revise(f.writer, f.spaceId, 'alpha', created.claimId, { baseRevision: 1, ...statement(2),
+    observedAt: '2016-12-31T23:59:59.999Z', validFrom: '2016-12-31T23:59:59Z', validUntil: '2017-01-01T00:00:00Z' });
+  assert.deepEqual([edge.observedAt, edge.validFrom, edge.validUntil],
+    ['2016-12-31T23:59:59.999Z', '2016-12-31T23:59:59.000Z', '2017-01-01T00:00:00.000Z'], 'the instants around it are kept');
 });
 
 test('the claim past a list page that decides next is authorized up to the final check', async () => {

@@ -66,6 +66,8 @@ const derivedClaimId = (credentialId: string, key: string) => `clm_${digest(seri
  * A UTC instant of at most millisecond precision, which views report
  * exactly. `utcInstant` drops trailing zeros, so a normalized instant has
  * at most three fraction digits when it is at most 24 characters long.
+ * `utcInstant` also accepts an announced leap second, which `timestamptz`
+ * cannot store as itself, so a claim time refuses second 60.
  */
 function optionalInstant(value: unknown, name: string): string | null {
   if (value === undefined) return null;
@@ -73,6 +75,7 @@ function optionalInstant(value: unknown, name: string): string | null {
   let instant: string;
   try { instant = utcInstant(value); } catch { return invalid(`Invalid ${name}`); }
   if (instant.length > 24) invalid(`${name} has more than millisecond precision`);
+  if (instant[17] === '6') invalid(`${name} is a leap second, which claim times cannot represent`);
   return instant;
 }
 const positive = (value: unknown): value is number => isSafeInteger(value) && (value as number) >= 1;
@@ -379,7 +382,16 @@ export class PostgresClaims {
     return { cell, ownerPrincipalId: admitted.ownerPrincipalId, scope: admitted.scope, capability, also };
   }
 
-  private tx<T>(actor: VerifiedCredential, admitted: Admitted, fn: (db: Db, access: SourceAccess) => Promise<T>): Promise<T> {
+  private async tx<T>(actor: VerifiedCredential, admitted: Admitted, fn: (db: Db, access: SourceAccess) => Promise<T>): Promise<T> {
+    try { return await this.checkedTx(actor, admitted, fn); }
+    catch (error) {
+      // Migration 043's commit-time check: a grant or key lapsed after the final statement, so COMMIT rolled back.
+      if ((error as { constraint?: unknown })?.constraint === 'claim_revisions_authority') throw new AuthorityError('FORBIDDEN');
+      throw error;
+    }
+  }
+
+  private checkedTx<T>(actor: VerifiedCredential, admitted: Admitted, fn: (db: Db, access: SourceAccess) => Promise<T>): Promise<T> {
     const { scope, ownerPrincipalId } = admitted;
     return transact(admitted.cell.pool, async db => {
       // Direct calls, not iteration, so a later change to Array.prototype cannot skip a check.
