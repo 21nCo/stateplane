@@ -217,14 +217,19 @@ async function within<T>(until: number, start: () => Promise<T>, late: (value: T
  * A cleanup transaction passes its page's `until` instead: it is one cleanup
  * call, so none starts after `until`, and acquiring its session, its
  * statements, its COMMIT and any ROLLBACK all end by `until` or
- * `CLEANUP_CALL_MS`. A session cut off mid-statement or mid-ROLLBACK, or whose
- * ROLLBACK could not start before `until`, is discarded.
+ * `CLEANUP_CALL_MS`, on the one `performance.now` clock its caller's phase
+ * deadlines use. A session cut off mid-statement or mid-ROLLBACK, or whose
+ * ROLLBACK could not start before `until`, is discarded. So is one whose
+ * COMMIT could not be sent, or was not acknowledged, by then: every cleanup
+ * statement is safe to land late, so that is a `CleanupTimeout`, unfinished
+ * when `until` ended it and a reported stall when `CLEANUP_CALL_MS` did.
+ * Its server timeouts round up, so they never fire before `until` does.
  */
 export async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promise<T>, until?: number): Promise<T> {
   const end = until === undefined ? undefined : Math.min(until, performance.now() + CLEANUP_CALL_MS);
-  const remaining = () => end === undefined ? REQUEST_BUDGET_MS : Math.max(1, Math.floor(end - performance.now()));
+  const remaining = () => end === undefined ? REQUEST_BUDGET_MS : Math.max(1, Math.ceil(end - performance.now()));
   if (end !== undefined && performance.now() >= end) throw new CleanupTimeout(performance.now() >= until!);
-  const deadline = Date.now() + remaining();
+  const deadline = Date.now() + REQUEST_BUDGET_MS;
   const client = end === undefined ? await pool.connect() :
     await within(end, () => pool.connect(), late => late.release(), until);
   let beginAttempted = false;
@@ -246,9 +251,12 @@ export async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) =
     const result = end === undefined ? await work() : await within(end, work, () => {}, until);
     begun = false;
     commitSent = true;
-    try { await commitBeforeDeadline(client, deadline); }
-    catch (error) {
+    try {
+      if (end === undefined) await commitBeforeDeadline(client, deadline);
+      else await within(end, () => client.query('COMMIT'), () => {}, until);
+    } catch (error) {
       discard = true;
+      if (error instanceof CleanupTimeout) throw error;
       if (error instanceof CommitNotSentDeadlineExceeded) throw new AuthorityError('RATE_LIMITED', 'Request time budget exceeded');
       // Migration 041's commit-time check: the transition reached COMMIT after its grant expired, so it rolled back.
       if (error instanceof pg.DatabaseError && error.constraint === 'source_upload_attempts_expiry') throw grantExpired();

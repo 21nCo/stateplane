@@ -1094,6 +1094,94 @@ test('a space page that cannot be read is reported with earlier source failures,
   assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', sourceId)).erasure.originalBytes, 'removed');
 });
 
+test('a cleanup transaction that ends at its phase deadline is unfinished, however late its COMMIT is answered', async () => {
+  // At erase(25, 5000): the source page ends by 2000 ms, source transactions by 3200 ms (after a page read of 900 ms or
+  // more) and space records by 5000 ms. `holdTo` keeps a statement's answer until that instant after the tick started,
+  // just inside its phase deadline, so COMMIT is sent at the edge; `commitTo` answers that COMMIT only at that instant.
+  const page = 'ORDER BY x.next_attempt_at';
+  const retry = 'UPDATE original_erasures SET next_attempt_at=clock_timestamp()';
+  const spaceRecord = 'UPDATE space_erasures SET next_attempt_at=CASE';
+  // A slow page and retry turn start the spaces' phase late enough that its record's transaction is bounded by the budget.
+  const late = [{ match: page, holdTo: 900 }, { match: retry, holdTo: 3150 }];
+  const cases = [
+    ['source page answered 0.1 ms before its deadline', [{ match: page, holdTo: 1999.9 }]],
+    ['source retry turn answered 0.1 ms before its deadline', [{ match: page, holdTo: 900 }, { match: retry, holdTo: 3199.9 }]],
+    ['space record answered 0.1 ms before the budget', [...late, { match: spaceRecord, holdTo: 4999.9 }]],
+    ['space record whose COMMIT is acknowledged after the budget', [...late, { match: spaceRecord, holdTo: 4900, commitTo: 5200 }]],
+  ];
+  for (const [label, rules] of cases) {
+    const f = await fixture();
+    await drain(f);
+    const sourceId = await f.source('alpha');
+    const key = await objectKey(f, sourceId);
+    f.r2.failDelete = candidate => candidate === key;
+    assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', sourceId)).erasure.originalBytes, 'pending');
+    f.r2.failDelete = () => false;
+    await settle(f);
+    const space = await deletedSpace(f, 0);
+    // The source's delete stalls, so its erasure stays due and takes its retry turn; the space's listing finds keys.
+    f.r2.deleteDelay = candidate => candidate === key ? Infinity : 0;
+    const edge = { rules, started: 0, spacePages: 0, discarded: 0 };
+    const edgePool = { connect: async () => {
+      const client = await pool.connect();
+      let ruled;
+      return new Proxy(client, { get(target, property) {
+        if (property === 'release') return discard => { if (discard) edge.discarded++; return target.release(discard); };
+        if (property !== 'query') return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
+        return async (sql, ...rest) => {
+          const text = typeof sql === 'string' ? sql : '';
+          if (text.includes('FROM space_erasures WHERE originals_removed_at IS NULL')) edge.spacePages++;
+          const result = await target.query(sql, ...rest);
+          const rule = edge.rules.find(item => text.includes(item.match));
+          if (rule) { ruled = rule; while (performance.now() < edge.started + rule.holdTo); }
+          if (text === 'COMMIT' && ruled?.commitTo) await sleep(edge.started + ruled.commitTo - performance.now());
+          return result;
+        };
+      } });
+    } };
+    const reconciler = new SourceUploadReconciler({ pool: edgePool, originals: f.cell.originals }, 0);
+    edge.started = performance.now();
+    await reconciler.erase(25, 5000);
+    const took = Math.round(performance.now() - edge.started);
+    assert.ok(took < 5000 + 25, `${label}: the tick ended within its budget (${took} ms)`);
+    assert.equal(edge.spacePages, 1, `${label}: the spaces' phase still ran`);
+    assert.equal((await erasureLeft(f, sourceId)).removed, false, `${label}: the source erasure stays due`);
+    assert.equal((await spaces.erasure(space.owner, space.spaceId)).originalBytes, 'pending', `${label}: so does the space`);
+    if (rules.some(rule => rule.commitTo)) assert.ok(edge.discarded > 0, `${label}: the unacknowledged session was discarded`);
+    // The next ticks, through the same pool, complete both.
+    edge.rules = [];
+    f.r2.deleteDelay = () => 0;
+    for (let i = 0; i < 5 && (!(await erasureLeft(f, sourceId)).removed ||
+      (await spaces.erasure(space.owner, space.spaceId)).originalBytes === 'pending'); i++) await reconciler.erase(25, 5000);
+    assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', sourceId)).erasure.originalBytes, 'removed', label);
+    assert.equal((await spaces.erasure(space.owner, space.spaceId)).originalBytes, 'erased', label);
+    assert.deepEqual(spaceKeys(f, space), [], label);
+  }
+});
+
+test('a cleanup COMMIT unanswered at the call bound with budget left is reported, not taken as unfinished', async () => {
+  const f = await fixture();
+  await drain(f);
+  // The source page's transaction gets 2 s of its 4 s phase at erase(25, 10000); its COMMIT is answered after 2.5 s.
+  let held = false;
+  const stalled = { connect: async () => {
+    const client = await pool.connect();
+    let paged = false;
+    return new Proxy(client, { get(target, property) {
+      if (property !== 'query') return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
+      return async (sql, ...rest) => {
+        const result = await target.query(sql, ...rest);
+        if (typeof sql === 'string' && sql.includes('ORDER BY x.next_attempt_at')) paged = true;
+        if (sql === 'COMMIT' && paged && !held) { held = true; await sleep(2500); }
+        return result;
+      };
+    } });
+  } };
+  await assert.rejects(new SourceUploadReconciler({ pool: stalled, originals: f.cell.originals }, 0).erase(25, 10_000),
+    error => error instanceof AggregateError && error.errors.some(item => item.message === 'Upload cleanup call timed out'));
+  assert.equal(held, true);
+});
+
 /** Whether `promise` settles first or a backend waits on a lock in a statement containing `text`. */
 async function settlesOrWaits(promise, text) {
   let settled = false;
