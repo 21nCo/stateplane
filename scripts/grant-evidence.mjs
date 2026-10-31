@@ -5,9 +5,10 @@ import { connectionOptions } from './db-connection.mjs';
 // connection. The role is supplied by the protected deployment inventory.
 // Space deletion proves erasure by reading every evidence table. Source
 // ingestion, upload grants and upload reconciliation (STA-33) insert sources
-// and originals and advance the upload ledger; later evidence writes get
-// their grants with the service slices that perform them. No grant allows
-// DELETE or TRUNCATE: removal stays with the scoped purge routine.
+// and originals and advance the upload ledger; extraction (STA-34) inserts
+// extraction versions. Later evidence writes get their grants with the
+// service slices that perform them. No grant allows DELETE or TRUNCATE:
+// removal stays with the scoped purge routine.
 const url=process.env.STATEPLANE_CELL_ADMIN_URL;
 const role=process.env.STATEPLANE_CELL_ROLE;
 if (!url || !role || !/^(?!pg_)[a-z][a-z0-9_]{0,62}$/.test(role))
@@ -18,7 +19,7 @@ const grants=[
   ['original_objects','SELECT, INSERT'],
   ['source_upload_grants','SELECT, INSERT, UPDATE'],
   ['source_upload_attempts','SELECT, INSERT, UPDATE'],
-  ['extraction_versions','SELECT'],
+  ['extraction_versions','SELECT, INSERT'],
   ['claims','SELECT'],
   ['claim_revisions','SELECT'],
   ['claim_evidence','SELECT'],
