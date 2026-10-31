@@ -58,7 +58,8 @@ export const acceptsInProcessObjects=proxyDetector!==null;
 export const isInProcessProxy = (value:unknown):boolean => proxyDetector ? proxyDetector(value) : true;
 const compare = (a: string,b: string) => Buffer.compare(Buffer.from(a),Buffer.from(b));
 const append = <T>(values:T[],value:T):void => { Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
-const includes = <T>(values:readonly T[],value:T):boolean => {
+/** Compare own array slots without invoking a replaced iterator or includes method. */
+export const includes = <T>(values:readonly T[],value:T):boolean => {
   for (let i=0;i<values.length;i++) if (Object.getOwnPropertyDescriptor(values,i)?.value===value) return true;
   return false;
 };

@@ -79,10 +79,10 @@ async function insertEndpoint(db, spaceId, { kind, collectionId, id }, { referen
   if (kind === 'source') {
     await db.query(`INSERT INTO sources(space_id,collection_id,source_id,locator,principal_id,credential_id)
       VALUES($1,$2,$3,'https://example.invalid/evidence','owner','owner-session')`, [spaceId, collectionId, id]);
-    await db.query(`INSERT INTO original_objects(space_id,collection_id,source_id,reference_only,sha256,byte_size,mime_type,captured_at)
-      VALUES($1,$2,$3,$4,$5,$6,$7,clock_timestamp()-interval '1 minute')`,
+    await db.query(`INSERT INTO original_objects(space_id,collection_id,source_id,reference_only,sha256,byte_size,mime_type,captured_at,
+      object_key) VALUES($1,$2,$3,$4,$5,$6,$7,clock_timestamp()-interval '1 minute',$8)`,
     [spaceId, collectionId, id, referenceOnly, referenceOnly ? null : digest(bytes),
-      referenceOnly ? null : Buffer.byteLength(bytes), referenceOnly ? null : 'text/plain']);
+      referenceOnly ? null : Buffer.byteLength(bytes), referenceOnly ? null : 'text/plain', referenceOnly ? null : `originals/${id}`]);
   } else {
     await db.query(`INSERT INTO claims(space_id,collection_id,claim_id,principal_id,credential_id) VALUES($1,$2,$3,'owner','owner-session')`,
       [spaceId, collectionId, id]);
@@ -172,19 +172,23 @@ test('original objects cannot change once committed, and a corrected extraction 
 
 test('originals record verified bytes or an explicit reference-only marker', async () => {
   const { spaceId, alpha } = await space();
-  const insert = (values, db) => db.query(`INSERT INTO original_objects(space_id,collection_id,source_id,reference_only,sha256,byte_size,mime_type,captured_at,observed_at)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, values);
+  const insert = (values, db) => db.query(`INSERT INTO original_objects(space_id,collection_id,source_id,reference_only,sha256,byte_size,mime_type,captured_at,observed_at,
+    object_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, values);
   const now = new Date();
+  const key = `originals/${randomUUID()}`;
   const rows = [
-    [true, digest('x'), 1, 'text/plain', now, now],        // reference-only cannot claim bytes
-    [false, null, null, 'text/plain', now, now],           // stored original needs a digest
-    [false, digest('x'), null, 'text/plain', now, now],    // and a size
-    [false, digest('x'), 1, null, now, now],               // and a MIME type
-    [false, digest('x'), -1, 'text/plain', now, now],
-    [false, 'ABC', 1, 'text/plain', now, now],
-    [false, digest('x'), 1, 'Text/Plain', now, now],
-    [false, digest('x'), 1, 'text/plain; charset=utf-8', now, now],
-    [false, digest('x'), 1, 'text/plain', new Date(now.getTime() + 1000), now] // captured after observed
+    [true, digest('x'), 1, 'text/plain', now, now, null],        // reference-only cannot claim bytes
+    [true, null, null, null, now, now, key],                     // or a blob key
+    [false, null, null, 'text/plain', now, now, key],            // stored original needs a digest
+    [false, digest('x'), null, 'text/plain', now, now, key],     // and a size
+    [false, digest('x'), 1, null, now, now, key],                // and a MIME type
+    [false, digest('x'), 1, 'text/plain', now, now, null],       // and a blob key
+    [false, digest('x'), 1, 'text/plain', now, now, ''],
+    [false, digest('x'), -1, 'text/plain', now, now, key],
+    [false, 'ABC', 1, 'text/plain', now, now, key],
+    [false, digest('x'), 1, 'Text/Plain', now, now, key],
+    [false, digest('x'), 1, 'text/plain; charset=utf-8', now, now, key],
+    [false, digest('x'), 1, 'text/plain', new Date(now.getTime() + 1000), now, key] // captured after observed
   ];
   const commit = (values, locator) => {
     const sourceId = `src_${randomUUID()}`;
@@ -199,9 +203,11 @@ test('originals record verified bytes or an explicit reference-only marker', asy
   for (const values of rows)
     await assert.rejects(commit(values, 'https://example.invalid/evidence'), code('23514'), JSON.stringify(values));
   // Without bytes, the locator is the only pointer to the evidence; stored bytes need none.
-  await assert.rejects(commit([true, null, null, null, now, now], null), code('23514', 'original_objects_reference_locator'));
-  const stored = await commit([false, digest('x'), 1, 'text/plain', now, now], null);
-  const referenceOnly = await commit([true, null, null, null, now, now], 'https://example.invalid/evidence');
+  await assert.rejects(commit([true, null, null, null, now, now, null], null), code('23514', 'original_objects_reference_locator'));
+  const stored = await commit([false, digest('x'), 1, 'text/plain', now, now, key], null);
+  const referenceOnly = await commit([true, null, null, null, now, now, null], 'https://example.invalid/evidence');
+  // Two originals never share stored bytes, even with the same digest.
+  await assert.rejects(commit([false, digest('x'), 1, 'text/plain', now, now, key], null), code('23505', 'original_objects_key'));
   assert.deepEqual((await pool.query(`SELECT source_id,reference_only,sha256,byte_size,locator FROM original_objects JOIN sources USING (space_id,collection_id,source_id)
     WHERE space_id=$1 ORDER BY reference_only`, [spaceId])).rows,
   [{ source_id: stored, reference_only: false, sha256: digest('x'), byte_size: '1', locator: null },
@@ -708,9 +714,15 @@ test('a nonowner cell role proves evidence erasure only with the evidence grants
 
     execFileSync(process.execPath, ['scripts/grant-evidence.mjs'], { cwd: root, stdio: 'pipe',
       env: { ...process.env, STATEPLANE_CELL_ADMIN_URL: urlFor(names[0]), STATEPLANE_CELL_ROLE: role } });
-    const privileges = (await pool.query(`SELECT t, has_table_privilege($1,t,'SELECT') AS can_read,
-        has_table_privilege($1,t,'INSERT,UPDATE,DELETE,TRUNCATE') AS can_write FROM unnest($2::text[]) t`, [role, evidenceGrants])).rows;
-    assert.deepEqual(privileges.filter(row => !row.can_read || row.can_write), [], 'the grant is read-only');
+    const privileges = Object.fromEntries((await pool.query(`SELECT t, has_table_privilege($1,t,'SELECT') AS can_read,
+        has_table_privilege($1,t,'INSERT') AS can_insert, has_table_privilege($1,t,'UPDATE') AS can_update,
+        has_table_privilege($1,t,'DELETE,TRUNCATE') AS can_remove FROM unnest($2::text[]) t`, [role, evidenceGrants])).rows
+      .map(({ t, ...row }) => [t, row]));
+    // STA-33 writes sources, originals and the upload ledger; the rest stays read-only, and nothing is removable.
+    const writes = { sources: [true, false], original_objects: [true, false], source_upload_grants: [true, true],
+      source_upload_attempts: [true, true] };
+    assert.deepEqual(privileges, Object.fromEntries(evidenceGrants.map(table => [table, { can_read: true,
+      can_insert: writes[table]?.[0] ?? false, can_update: writes[table]?.[1] ?? false, can_remove: false }])));
     await spaces.delete(actor, spaceId);
     await spaces.delete(actor, spaceId);
     await spaces.reconcile(spaceId);
@@ -740,7 +752,7 @@ test('evidence grants refuse an invalid or missing role and an unverified extern
     const result = grant(env);
     assert.equal(result.status, 1, env.STATEPLANE_CELL_ROLE);
     assert.match(result.stderr, expected);
-    assert.doesNotMatch(result.stdout + result.stderr, /private-fixture|Evidence erasure grants verified/);
+    assert.doesNotMatch(result.stdout + result.stderr, /private-fixture|Evidence grants verified/);
     if (password) assert.ok(!(result.stdout + result.stderr).includes(password));
   }
 });
