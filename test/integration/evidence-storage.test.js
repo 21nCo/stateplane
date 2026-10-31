@@ -344,13 +344,15 @@ test('restrict and detach links govern deletion of every endpoint kind', async (
     }), code('23001', 'links_restrict'), kind);
     assert.equal((await pool.query('SELECT tombstone FROM links WHERE link_id=$1', [detaching])).rows[0].tombstone, false);
     await detach(pool, spaceId, beta, restricting);
-    // A live detach link must be tombstoned with its endpoint, never left dangling.
-    await assert.rejects(inTransaction(db => tombstone(db, spaceId, endpoint)), code('23503', 'links_detach'), kind);
-    await inTransaction(async db => {
-      await detach(db, spaceId, alpha, detaching);
-      await tombstone(db, spaceId, endpoint);
-    });
+    // Migration 044: the endpoint's own tombstoning detaches a live detach link, with a detach event and outbox entry.
+    await inTransaction(db => tombstone(db, spaceId, endpoint));
     assert.equal(await live(spaceId, endpoint), false);
+    assert.deepEqual((await pool.query('SELECT tombstone,revision FROM links WHERE link_id=$1', [detaching])).rows[0],
+      { tombstone: true, revision: '2' }, kind);
+    assert.deepEqual((await pool.query(`SELECT e.collection_id,e.revision,e.operation,e.credential_id,o.delivery_state,o.generation
+      FROM evidence_events e JOIN evidence_outbox o USING (event_id) WHERE e.space_id=$1 AND e.kind='link' AND e.entity_id=$2`,
+    [spaceId, detaching])).rows, [{ collection_id: alpha, revision: '2', operation: 'detach', credential_id: null,
+      delivery_state: 'pending', generation: '1' }], kind);
     await assert.rejects(link(spaceId, anchor, endpoint, 'detach'), code('23503', 'links_live_endpoint'), kind);
     assert.equal((await pool.query(`SELECT count(*)::int AS n FROM links l WHERE l.space_id=$1 AND NOT l.tombstone`, [spaceId])).rows[0].n, 0);
   }
@@ -399,9 +401,17 @@ test('a link racing its endpoint deletion cannot leave a live dangling link at a
             await blocked(deleterPid);
             await linker.query('COMMIT');
             const outcome = await deletion;
-            assert.ok(outcome instanceof Error, `${label}: deletion must fail`);
-            if (deleterLevel === 'rc') code('23503', 'links_detach')(outcome); else code('40001')(outcome);
-            assert.equal(await live(spaceId, endpoint), true, label);
+            // READ COMMITTED sees the committed link and detaches it with the endpoint; an older snapshot must retry.
+            if (deleterLevel === 'rc') {
+              assert.equal(outcome, 'deleted', label);
+              assert.equal(await live(spaceId, endpoint), false, label);
+              assert.equal((await pool.query(`SELECT count(*)::int AS n FROM links WHERE space_id=$1 AND tombstone`, [spaceId]))
+                .rows[0].n, 1, label);
+            } else {
+              assert.ok(outcome instanceof Error, `${label}: deletion must fail`);
+              code('40001')(outcome);
+              assert.equal(await live(spaceId, endpoint), true, label);
+            }
           } else {
             await tombstone(deleter, spaceId, endpoint);
             const creation = link(spaceId, anchor, endpoint, 'detach', { db: linker }).then(() => linker.query('COMMIT'))
@@ -531,7 +541,7 @@ test('authority record deletes work under snapshot isolation defaults and still 
       const linked = await create();
       const restricting = await link(spaceId, { kind: 'record', collectionId: alpha, id: 'rec_alpha' },
         { kind: 'record', collectionId: alpha, id: linked }, 'restrict');
-      await assert.rejects(remove(linked), code('23001', 'links_restrict'));
+      await assert.rejects(remove(linked), error => error.code === 'LINK_RESTRICTED' && error.retryable === false);
       assert.equal(await live(spaceId, { kind: 'record', collectionId: alpha, id: linked }), true, level);
       await detach(pool, spaceId, alpha, restricting);
       await remove(linked);
@@ -637,9 +647,16 @@ async function evidence(spaceId, alpha, beta) {
     VALUES($1,$2,$3,'owner','s','text/plain',64,clock_timestamp()+interval '5 minutes',clock_timestamp(),$4)`, [spaceId, beta, grantId, sourceId]);
   await pool.query(`INSERT INTO source_upload_attempts(space_id,collection_id,grant_id,attempt_id,staging_key,state,observed_sha256,observed_bytes)
     VALUES($1,$2,$3,'a1',$4,'committed',$5,14)`, [spaceId, beta, grantId, `staging/${grantId}`, digest('original bytes')]);
+  // A deleted stored source queues its original's erasure and records a deletion event and its outbox entry.
+  const deleted = await source(spaceId, beta);
+  await inTransaction(async db => {
+    await tombstone(db, spaceId, { kind: 'source', collectionId: beta, id: deleted });
+    await db.query(`INSERT INTO evidence_events(event_id,space_id,collection_id,kind,entity_id,revision,operation,credential_id)
+      VALUES($1,$2,$3,'source',$4,1,'delete','owner-session')`, [`eev_${randomUUID()}`, spaceId, beta, deleted]);
+  });
 }
 const evidenceTables = ['sources', 'original_objects', 'source_upload_grants', 'source_upload_attempts', 'extraction_versions',
-  'claims', 'claim_revisions', 'claim_evidence', 'links', 'entity_refs'];
+  'claims', 'claim_revisions', 'claim_evidence', 'links', 'evidence_events', 'evidence_outbox', 'original_erasures', 'entity_refs'];
 const counts = async spaceId => Object.fromEntries(await Promise.all(evidenceTables.map(async table =>
   [table, (await pool.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`, [spaceId])).rows[0].n])));
 
@@ -676,6 +693,10 @@ test('space erasure removes every evidence row of that space only', async () => 
   assert.deepEqual(await counts(erased.spaceId), Object.fromEntries(evidenceTables.map(table => [table, 0])));
   assert.deepEqual(await counts(kept.spaceId), keptBefore);
   assert.equal((await pool.query('SELECT lifecycle FROM spaces WHERE space_id=$1', [erased.spaceId])).rows[0].lifecycle, 'deleted');
+  // The purge asks for the space's blob-store bytes to be erased; the request outlives the purge, the kept space has none.
+  assert.equal((await pool.query('SELECT originals_removed_at FROM space_erasures WHERE space_id=$1', [erased.spaceId])).rows[0]
+    .originals_removed_at, null);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM space_erasures WHERE space_id=$1', [kept.spaceId])).rows[0].n, 0);
 });
 
 test('a nonowner cell role proves evidence erasure only with the evidence grants', async () => {
@@ -718,11 +739,13 @@ test('a nonowner cell role proves evidence erasure only with the evidence grants
         has_table_privilege($1,t,'INSERT') AS can_insert, has_table_privilege($1,t,'UPDATE') AS can_update,
         has_table_privilege($1,t,'DELETE,TRUNCATE') AS can_remove FROM unnest($2::text[]) t`, [role, evidenceGrants])).rows
       .map(({ t, ...row }) => [t, row]));
-    // STA-33 writes sources, originals and the upload ledger, STA-34 extraction versions and STA-35 claims,
-    // their revisions and evidence; links stay read-only, and nothing is removable.
+    // STA-33 writes sources, originals and the upload ledger, STA-34 extraction versions, STA-35 claims, their
+    // revisions and evidence, and STA-36 links, evidence events and erasure progress; the outbox entry is the
+    // event trigger's, and nothing is removable.
     const writes = { sources: [true, false], original_objects: [true, false], source_upload_grants: [true, true],
       source_upload_attempts: [true, true], extraction_versions: [true, false], claims: [true, false],
-      claim_revisions: [true, false], claim_evidence: [true, false] };
+      claim_revisions: [true, false], claim_evidence: [true, false], links: [true, true], evidence_events: [true, false],
+      original_erasures: [false, true] };
     assert.deepEqual(privileges, Object.fromEntries(evidenceGrants.map(table => [table, { can_read: true,
       can_insert: writes[table]?.[0] ?? false, can_update: writes[table]?.[1] ?? false, can_remove: false }])));
     await spaces.delete(actor, spaceId);

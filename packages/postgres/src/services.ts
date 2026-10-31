@@ -108,7 +108,8 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
       list:(actor,cursor)=>spaces.listPage(actor,cursor), create:(actor,cellId,spaceId)=>spaces.create(actor,cellId,spaceId),
       get:(actor,id)=>spaces.get(actor,id),
       update:(actor,id,lifecycle)=>spaces.update(actor,id,lifecycle),
-      delete:async(actor,id)=>{ await spaces.delete(actor,id); return {spaceId:id,deleted:true}; },
+      // Deleted is not erased: the report says what the cell's blob store and backups may still hold.
+      delete:async(actor,id)=>{ await spaces.delete(actor,id); return {spaceId:id,deleted:true,erasure:await spaces.erasure(actor,id)}; },
       audit:(actor,id,cursor)=>spaces.audit(actor,id,cursor)
     },
     agents: {

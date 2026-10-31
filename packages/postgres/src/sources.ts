@@ -4,7 +4,7 @@ import { BlobWriteError, checkExtraction, classifyError, ExtractionError, extrac
 import type { BlobStore, ExtractionSegment, TextExtraction, TextParser } from '@stateplane/application';
 import type { Capability, VerifiedCredential } from '@stateplane/contracts';
 import { commitBeforeDeadline, CommitNotSentDeadlineExceeded } from './commit-deadline.js';
-import { AuthorityError, AuthorityTransaction, clientReadTimedOut, CommitOutcomeUnknownError } from './index.js';
+import { AuthorityError, AuthorityTransaction, clientReadTimedOut, CommitOutcomeUnknownError, linkRestricted } from './index.js';
 import type { AuthorityScope } from './index.js';
 import { acceptsInProcessObjects, includes, isInProcessProxy, scalarString, utcInstant } from './schema.js';
 import type { PostgresSpaces } from './spaces.js';
@@ -30,6 +30,19 @@ export interface ExtractionView {
   sourceId: string; collectionId: string; version: number; latestVersion: number; previousVersion: number | null;
   sourceSha256: string; parser: string; parserVersion: string; content: string; sourceOffsets: ExtractionSegment[];
   createdAt: string; replayed: boolean;
+}
+
+/**
+ * What a deletion erased. `originalBytes`: `none` when no bytes were ever
+ * held, `pending` until the blob store confirms their removal (the
+ * reconciler retries it), `removed` once it has. A deleted source's metadata,
+ * extraction text and the claims that cite it stay in the database,
+ * unreadable through the source, until the space is erased; database and
+ * blob-store backups keep earlier copies until their own retention ends.
+ */
+export interface DeletionErasure { originalBytes: 'none' | 'pending' | 'removed'; metadata: 'retained'; backups: 'retained' }
+export interface SourceDeletion {
+  sourceId: string; collectionId: string; deletedAt: string; replayed: boolean; erasure: DeletionErasure;
 }
 
 /** Initial bounds; docs/evidence-storage.md records the evidence for each. */
@@ -251,6 +264,23 @@ async function capturedNotFuture(db: Db, capturedAt: string | null): Promise<voi
   if (capturedAt === null) return;
   const row = (await db.query('SELECT $1::timestamptz <= clock_timestamp() AS past', [capturedAt])).rows[0];
   if (row?.past !== true) invalid('capturedAt is in the future');
+}
+
+/**
+ * Record one evidence lifecycle event; migration 044's trigger enqueues its
+ * projection invalidation in the same transaction. Returns its commit time.
+ */
+export async function evidenceEvent(db: Db, scope: AuthorityScope, kind: 'source' | 'claim' | 'link', entityId: string,
+  revision: number, operation: 'create' | 'delete'): Promise<string> {
+  const row = (await db.query(`INSERT INTO evidence_events(event_id,space_id,collection_id,kind,entity_id,revision,operation,
+      credential_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING committed_at`,
+  [`eev_${randomUUID()}`, scope.spaceId, scope.collectionId, kind, entityId, revision, operation, scope.credentialId])).rows[0];
+  return iso(row.committed_at)!;
+}
+/** Migration 044's endpoint guard: a live restrict link touches the endpoint being deleted. */
+export function restricted(error: unknown): unknown {
+  return linkRestricted(error) ? new AuthorityError('LINK_RESTRICTED', 'A restricting link prevents this deletion', undefined, false)
+    : error;
 }
 
 /**
@@ -911,6 +941,53 @@ export class PostgresSources {
   }
 
   /**
+   * Delete a live source: tombstone it, with every incident `detach` link, a
+   * deletion event and its projection invalidation, in one transaction. A
+   * live `restrict` link on it is `LINK_RESTRICTED` and changes nothing.
+   * Needs `sources:write` and `sources:read`. Claims citing the source are
+   * not changed. After the commit the original's bytes are removed from the
+   * blob store; `erasure` reports what remains. Deleting a deleted source
+   * replays its deletion.
+   */
+  async delete(actor: VerifiedCredential, spaceId: string, collectionId: string, sourceId: string): Promise<SourceDeletion> {
+    const admitted = await this.admit(actor, spaceId, collectionId, 'sources:write', 'sources:read');
+    const scope = admitted.scope;
+    let outcome: { deletedAt: string; replayed: boolean; objectKey: string | null; removed: boolean };
+    try {
+      outcome = await this.actorTx(actor, admitted, async db => {
+        if (!reference(sourceId)) throw new AuthorityError('NOT_FOUND');
+        const ids = [scope.spaceId, scope.collectionId, sourceId];
+        // Extraction's lock, so no version commits after the source is deleted.
+        await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',
+          [lockKey(['stateplane:extraction', scope.spaceId, scope.collectionId, sourceId])]);
+        const row = (await db.query(`SELECT e.tombstone,o.object_key,x.removed_at IS NOT NULL AS removed,
+            (SELECT v.committed_at FROM evidence_events v WHERE v.space_id=e.space_id AND v.collection_id=e.collection_id
+              AND v.kind='source' AND v.entity_id=e.entity_id AND v.operation='delete') AS deleted_at
+          FROM entity_refs e JOIN original_objects o ON o.space_id=e.space_id AND o.collection_id=e.collection_id
+            AND o.source_id=e.entity_id
+          LEFT JOIN original_erasures x ON x.space_id=e.space_id AND x.collection_id=e.collection_id AND x.source_id=e.entity_id
+          WHERE e.space_id=$1 AND e.collection_id=$2 AND e.kind='source' AND e.entity_id=$3`, ids)).rows[0];
+        if (!row || (row.tombstone && !row.deleted_at)) throw new AuthorityError('NOT_FOUND');
+        const objectKey = row.object_key as string | null;
+        if (row.tombstone) return { deletedAt: iso(row.deleted_at)!, replayed: true, objectKey, removed: row.removed === true };
+        await writable(db, scope);
+        // Migration 044's guards refuse a restrict link, detach the rest and queue the original's erasure.
+        await db.query(`UPDATE entity_refs SET tombstone=true WHERE space_id=$1 AND collection_id=$2 AND kind='source'
+          AND entity_id=$3 AND NOT tombstone`, ids);
+        return { deletedAt: await evidenceEvent(db, scope, 'source', sourceId, 1, 'delete'), replayed: false, objectKey,
+          removed: false };
+      });
+    } catch (error) { throw restricted(error); }
+    let removed = outcome.removed;
+    if (outcome.objectKey !== null && !removed)
+      removed = await eraseOriginal(admitted.cell, [scope.spaceId, scope.collectionId, sourceId], outcome.objectKey,
+        performance.now() + CLEANUP_CALL_MS).then(() => true, () => false);
+    return { sourceId, collectionId: scope.collectionId, deletedAt: outcome.deletedAt, replayed: outcome.replayed,
+      erasure: { originalBytes: outcome.objectKey === null ? 'none' : removed ? 'removed' : 'pending', metadata: 'retained',
+        backups: 'retained' } };
+  }
+
+  /**
    * Promote a verified attempt's bytes to its original key, then commit the
    * source metadata. Bytes are always verified and present before the
    * metadata commits, which finalizes the grant only if it has not expired;
@@ -1159,6 +1236,19 @@ async function sourceExists(db: Db, spaceId: string, sourceId: string): Promise<
   return (await db.query('SELECT 1 FROM sources WHERE space_id=$1 AND source_id=$2', [spaceId, sourceId])).rows.length > 0;
 }
 
+/**
+ * Remove a deleted source's original bytes, then record that the store
+ * confirmed it. The source's tombstone is final and its attempt committed,
+ * so nothing writes that key again except a promotion the store confirms
+ * late, which the sweep removes.
+ */
+async function eraseOriginal(cell: SourceCell, ids: readonly string[], objectKey: string, until: number): Promise<void> {
+  await within(until, () => cell.originals.delete(objectKey));
+  await transact(cell.pool, db => db.query(`UPDATE original_erasures SET removed_at=clock_timestamp()
+    WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL`, [...ids]), until);
+}
+const keyPrefixes = (spaceId: string) => [`originals/${spaceSegment(spaceId)}/`, `staging/${spaceSegment(spaceId)}/`];
+
 const SWEEP_CURSOR = 'reconcile/sweep-cursor';
 /**
  * Read the stored sweep cursor through a reader the sweep owns, each read
@@ -1254,6 +1344,50 @@ export class SourceUploadReconciler {
   }
 
   /**
+   * Enforce retention for deletions within `budgetMs`: remove the original
+   * bytes of up to `limit` deleted sources, then, for up to `limit` erased
+   * spaces, delete a page of each one's original and staging keys. A space's
+   * erasure is recorded complete only when a listing finds no key under
+   * either prefix. Returns how many erasures were due. Failures are
+   * reported together; each erasure is retried on a later call.
+   */
+  async erase(limit = 25, budgetMs = 10_000): Promise<number> {
+    if (!isSafeInteger(limit) || limit < 1 || limit > 500) throw new RangeError('Invalid erasure limit');
+    if (!isSafeInteger(budgetMs) || budgetMs < 1) throw new RangeError('Invalid erasure budget');
+    const until = performance.now() + budgetMs;
+    const errors: unknown[] = [];
+    const sources = (await transact(this.cell.pool, db => db.query(`SELECT x.space_id,x.collection_id,x.source_id,o.object_key
+      FROM original_erasures x JOIN original_objects o USING (space_id,collection_id,source_id)
+      WHERE x.removed_at IS NULL ORDER BY x.requested_at,x.space_id,x.collection_id,x.source_id LIMIT $1`, [limit]), until)).rows;
+    for (const row of sources) {
+      if (performance.now() >= until) break;
+      await eraseOriginal(this.cell, [row.space_id, row.collection_id, row.source_id], String(row.object_key), until)
+        .catch((error: unknown) => { errors.push(error); });
+    }
+    const spaces = performance.now() >= until ? [] : (await transact(this.cell.pool, db => db.query(`SELECT space_id,requested_at::text AS requested
+      FROM space_erasures WHERE originals_removed_at IS NULL ORDER BY requested_at,space_id LIMIT $1`, [limit]), until)).rows;
+    for (const row of spaces) {
+      if (performance.now() >= until) break;
+      try {
+        let found = 0;
+        for (const prefix of keyPrefixes(String(row.space_id))) {
+          const page = await within(until, () => this.cell.originals.list(prefix, 100));
+          for (const key of page.keys) {
+            if (!startsWith(key, prefix)) break;
+            found++;
+            await within(until, () => this.cell.originals.delete(key));
+          }
+        }
+        // Only a listing that found nothing left records completion, against the request it saw.
+        if (found === 0) await transact(this.cell.pool, db => db.query(`UPDATE space_erasures SET originals_removed_at=clock_timestamp()
+          WHERE space_id=$1 AND requested_at::text=$2 AND originals_removed_at IS NULL`, [row.space_id, row.requested]), until);
+      } catch (error) { errors.push(error); }
+    }
+    if (errors.length) throw new AggregateError(errors, 'Deleted evidence bytes were not all erased');
+    return sources.length + spaces.length;
+  }
+
+  /**
    * Delete stored bytes no attempt needs any more, found by listing the bucket
    * rather than by the ledger, so a write R2 confirmed after its attempt
    * settled is found on a later pass however late it landed. A failed
@@ -1277,10 +1411,15 @@ export class SourceUploadReconciler {
     const page = await within(until, () => blobs.list(cursor, limit));
     const owners = page.keys.map(storedAttempt);
     const known = owners.flatMap((owner, index) => owner ? [{ ...owner, index }] : []);
+    // A deleted source's original and every key of an erased space are final too, so they go as well.
     const ended = new Set((await transact(this.cell.pool, db => db.query(`SELECT k.index FROM
       unnest($1::text[],$2::text[],$3::boolean[],$4::int[]) AS k(space_id,staging_key,original,index)
-      JOIN source_upload_attempts a ON a.space_id=k.space_id AND a.staging_key=k.staging_key
-      WHERE a.state='failed' OR (a.state='committed' AND NOT k.original)`,
+      LEFT JOIN source_upload_attempts a ON a.space_id=k.space_id AND a.staging_key=k.staging_key
+      LEFT JOIN source_upload_grants g ON g.space_id=a.space_id AND g.collection_id=a.collection_id AND g.grant_id=a.grant_id
+      LEFT JOIN entity_refs e ON e.space_id=g.space_id AND e.collection_id=g.collection_id AND e.kind='source'
+        AND e.entity_id=g.source_id
+      WHERE a.state='failed' OR (a.state='committed' AND (NOT k.original OR e.tombstone))
+        OR EXISTS (SELECT 1 FROM spaces s WHERE s.space_id=k.space_id AND s.lifecycle='deleted')`,
     [known.map(k => k.spaceId), known.map(k => k.stagingKey), known.map(k => k.original), known.map(k => k.index)]), until))
       .rows.map(row => Number(row.index)));
     const errors: unknown[] = [];

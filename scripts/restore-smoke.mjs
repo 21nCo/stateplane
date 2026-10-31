@@ -40,7 +40,8 @@ const tables = ['stateplane_migrations','space_directory','space_provisioning_au
   'record_tombstones','projection_outbox','entity_refs','projection_heads','projection_reconciliations',
   'outbox_dispatch_checkpoint','outbox_space_rotation','outbox_operator_audit',
   'sources','original_objects','source_upload_grants','source_upload_attempts','extraction_versions',
-  'claims','claim_revisions','claim_evidence','links'];
+  'claims','claim_revisions','claim_evidence','links','evidence_events','evidence_outbox','original_erasures'];
+const evidenceTables=tables.slice(-12);
 async function snapshot(pool) {
   const entries = await Promise.all(tables.map(async table => {
     const rows = await pool.query(`SELECT to_jsonb(t) AS value FROM ${table} t`);
@@ -120,6 +121,18 @@ try {
       VALUES($1,$2,'upl_restore','a1','staging/upl_restore/a1','committed',$3,7)`,[spaceId,collectionId,originalDigest]);
     await evidence.query(`INSERT INTO links(space_id,collection_id,link_id,link_type,deletion_policy,from_kind,from_collection_id,from_id,to_kind,to_collection_id,to_id,credential_id)
       VALUES($1,$2,'lnk_restore','cites','restrict','claim',$2,'clm_restore','record',$2,$3,'restore')`,[spaceId,collectionId,liveRecord]);
+    // Migration 044: a link event enqueues its outbox entry, and a deleted stored source queues its original's erasure.
+    await evidence.query(`INSERT INTO evidence_events(event_id,space_id,collection_id,kind,entity_id,revision,operation,credential_id)
+      VALUES('eev_00000000-0000-4000-8000-000000000001',$1,$2,'link','lnk_restore',1,'create','restore')`,[spaceId,collectionId]);
+    await evidence.query(`INSERT INTO entity_refs(space_id,collection_id,kind,entity_id) VALUES($1,$2,'source','src_restore_deleted')`,
+      [spaceId,collectionId]);
+    await evidence.query(`INSERT INTO sources(space_id,collection_id,source_id,locator,principal_id,credential_id)
+      VALUES($1,$2,'src_restore_deleted',NULL,'owner','restore')`,[spaceId,collectionId]);
+    await evidence.query(`INSERT INTO original_objects(space_id,collection_id,source_id,reference_only,sha256,byte_size,mime_type,captured_at,object_key)
+      VALUES($1,$2,'src_restore_deleted',false,$3,7,'text/plain',clock_timestamp(),'originals/restore-deleted')`,
+    [spaceId,collectionId,originalDigest]);
+    await evidence.query(`UPDATE entity_refs SET tombstone=true WHERE space_id=$1 AND collection_id=$2 AND entity_id='src_restore_deleted'`,
+      [spaceId,collectionId]);
     await evidence.query('COMMIT');
   } catch (error) { await evidence.query('ROLLBACK'); throw error; }
   finally { evidence.release(); }
@@ -137,7 +150,7 @@ try {
     expected.routing_nonces.length && expected.space_audit.length && expected.space_provisioning_audit.length &&
     expected.projection_heads.length && expected.projection_reconciliations.length &&
     expected.outbox_dispatch_checkpoint.length && expected.outbox_space_rotation.length && expected.outbox_operator_audit.length &&
-    tables.slice(-9).every(table=>expected[table].length),
+    evidenceTables.every(table=>expected[table].length),
   'expected this restore smoke seed to populate records, outbox, projection state, evidence and owned-space authority');
   const archive = docker(['pg_dump','-U','stateplane','-Fc',sourceName]);
   docker(['createdb','-U','stateplane',name]);
@@ -149,6 +162,12 @@ try {
     /evidence facts are immutable/);
   await assert.rejects(restored.query('UPDATE records SET tombstone=true,revision=revision+1 WHERE space_id=$1 AND record_id=$2',
     [spaceId,liveRecord]),error=>error.code==='23001');
+  // Migration 044's triggers are recreated: a new event enqueues its invalidation, and the endpoint guard detaches.
+  await restored.query(`INSERT INTO evidence_events(event_id,space_id,collection_id,kind,entity_id,revision,operation,credential_id)
+    VALUES('eev_00000000-0000-4000-8000-000000000002',$1,$2,'link','lnk_restore',2,'delete','restore')`,[spaceId,collectionId]);
+  assert.equal((await restored.query(`SELECT count(*)::int AS n FROM evidence_outbox WHERE event_id=$1`,
+    ['eev_00000000-0000-4000-8000-000000000002'])).rows[0].n,1,'the restored event trigger enqueues an outbox entry');
+  await assert.rejects(restored.query('UPDATE evidence_events SET revision=3 WHERE space_id=$1',[spaceId]),/evidence facts are immutable/);
   // The NOT VALID recorder rule is dumped apart from its table; it still binds new revisions.
   assert.ok(expected.claim_revisions.every(row=>JSON.parse(row).recorded_by==='owner'),'the restore seed names its recorder');
   await assert.rejects(restored.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id)
@@ -184,7 +203,7 @@ try {
         WHERE space_id=$1`,[spaceId])).rowCount,1,'restored operational role can advance reconciliations');
       assert.equal((await operational.query(`UPDATE outbox_space_rotation SET after_collection_id=$2
         WHERE space_id=$1`,[spaceId,collectionId])).rowCount,1,'restored operational role can rotate collection turns');
-      for (const table of tables.slice(-9))
+      for (const table of evidenceTables)
         assert.ok((await operational.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[spaceId])).rows[0].n>0,
           `restored operational role can read ${table} for erasure proof`);
     } finally {
@@ -194,7 +213,7 @@ try {
     }
   } finally {
     await restored.query(`REVOKE ALL ON agent_key_issuances,projection_heads,projection_reconciliations,
-      outbox_dispatch_checkpoint,outbox_space_rotation,outbox_operator_audit,${tables.slice(-9).join(',')}
+      outbox_dispatch_checkpoint,outbox_space_rotation,outbox_operator_audit,${evidenceTables.join(',')}
       FROM ${journalRole}`).catch(()=>{});
     await restored.query(`DROP ROLE IF EXISTS ${journalRole}`).catch(()=>{});
   }
