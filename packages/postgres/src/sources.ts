@@ -1439,9 +1439,11 @@ export class SourceUploadReconciler {
     const failed = (error: unknown) => { if (!(error instanceof CleanupTimeout && error.atBudget)) errors.push(error); };
     const pool = this.cell.pool;
     const grace = this.graceSeconds;
-    const sources = (await transact(pool, db => db.query(`SELECT space_id,collection_id,source_id FROM original_erasures
+    // A source page that cannot be read still leaves the spaces their turn.
+    const sources = await transact(pool, db => db.query(`SELECT space_id,collection_id,source_id FROM original_erasures
       WHERE removed_at IS NULL AND next_attempt_at<=clock_timestamp()
-      ORDER BY next_attempt_at,space_id,collection_id,source_id LIMIT $1`, [limit]), sourcesEnd)).rows;
+      ORDER BY next_attempt_at,space_id,collection_id,source_id LIMIT $1`, [limit]), sourcesEnd)
+      .then(result => result.rows, (error: unknown) => { failed(error); return []; });
     for (const row of sources) {
       if (performance.now() >= sourcesStop) break;
       const ids = [row.space_id, row.collection_id, row.source_id];
