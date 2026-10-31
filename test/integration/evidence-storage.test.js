@@ -718,9 +718,10 @@ test('a nonowner cell role proves evidence erasure only with the evidence grants
         has_table_privilege($1,t,'INSERT') AS can_insert, has_table_privilege($1,t,'UPDATE') AS can_update,
         has_table_privilege($1,t,'DELETE,TRUNCATE') AS can_remove FROM unnest($2::text[]) t`, [role, evidenceGrants])).rows
       .map(({ t, ...row }) => [t, row]));
-    // STA-33 writes sources, originals and the upload ledger; the rest stays read-only, and nothing is removable.
+    // STA-33 writes sources, originals and the upload ledger and STA-34 extraction versions; the rest stays
+    // read-only, and nothing is removable.
     const writes = { sources: [true, false], original_objects: [true, false], source_upload_grants: [true, true],
-      source_upload_attempts: [true, true] };
+      source_upload_attempts: [true, true], extraction_versions: [true, false] };
     assert.deepEqual(privileges, Object.fromEntries(evidenceGrants.map(table => [table, { can_read: true,
       can_insert: writes[table]?.[0] ?? false, can_update: writes[table]?.[1] ?? false, can_remove: false }])));
     await spaces.delete(actor, spaceId);

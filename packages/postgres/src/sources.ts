@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import pg from 'pg';
-import { BlobWriteError, classifyError } from '@stateplane/application';
-import type { BlobStore } from '@stateplane/application';
+import { BlobWriteError, checkExtraction, classifyError, ExtractionError, extractionBounds, parserFor } from '@stateplane/application';
+import type { BlobStore, ExtractionSegment, TextExtraction, TextParser } from '@stateplane/application';
 import type { Capability, VerifiedCredential } from '@stateplane/contracts';
 import { commitBeforeDeadline, CommitNotSentDeadlineExceeded } from './commit-deadline.js';
 import { AuthorityError, AuthorityTransaction, clientReadTimedOut, CommitOutcomeUnknownError } from './index.js';
@@ -25,6 +25,12 @@ export interface UploadGrantView {
   issuedAt: string; expiresAt: string; revokedAt: string | null; finalizedAt: string | null; sourceId: string | null;
 }
 export interface UploadAttemptView { grantId: string; attemptId: string; sha256: string; bytes: number; mimeType: string }
+/** One immutable extraction version; `sourceSha256` is the original digest it was parsed from. */
+export interface ExtractionView {
+  sourceId: string; collectionId: string; version: number; latestVersion: number; previousVersion: number | null;
+  sourceSha256: string; parser: string; parserVersion: string; content: string; sourceOffsets: ExtractionSegment[];
+  createdAt: string; replayed: boolean;
+}
 
 /** Initial bounds; docs/evidence-storage.md records the evidence for each. */
 export const sourceBounds = Object.freeze({
@@ -57,7 +63,8 @@ function serialized(parts: readonly string[]): string {
 }
 type Db = pg.PoolClient;
 type Key = [spaceId: string, collectionId: string, grantId: string, attemptId: string];
-interface Admitted { cell: SourceCell; ownerPrincipalId: string; scope: AuthorityScope; capability: Capability }
+/** `also` is a second capability the call needs on the same collection, checked like the first. */
+interface Admitted { cell: SourceCell; ownerPrincipalId: string; scope: AuthorityScope; capability: Capability; also?: Capability }
 interface Wanted {
   sourceId: string; locator: string | null; capturedAt: string | null;
   referenceOnly: boolean; sha256: string | null; mimeType: string | null;
@@ -521,24 +528,27 @@ const refusalCode = (error: unknown) => isGrantExpired(error) ? 'grant_expired' 
 export class PostgresSources {
   constructor(private readonly spaces: PostgresSpaces, private readonly cells: ReadonlyMap<string, SourceCell>) {}
 
-  private async admit(actor: VerifiedCredential, spaceId: string, collectionId: string, capability: Capability): Promise<Admitted> {
+  private async admit(actor: VerifiedCredential, spaceId: string, collectionId: string, capability: Capability,
+    also?: Capability): Promise<Admitted> {
     const admitted = await this.spaces.scope(actor, spaceId, collectionId, capability);
     const cell = this.cells.get(admitted.cellId);
     if (!cell) throw new AuthorityError('STALE_PLACEMENT');
-    return { cell, ownerPrincipalId: admitted.ownerPrincipalId, scope: admitted.scope, capability };
+    return { cell, ownerPrincipalId: admitted.ownerPrincipalId, scope: admitted.scope, capability, also };
   }
 
   private actorTx<T>(actor: VerifiedCredential, admitted: Admitted, fn: (db: Db) => Promise<T>): Promise<T> {
     return transact(admitted.cell.pool, async db => {
-      const fence = new AuthorityTransaction(db, admitted.scope, 1);
+      const capabilities = admitted.also ? [admitted.capability, admitted.also] : [admitted.capability];
+      const fences = capabilities.map(capability => new AuthorityTransaction(db, { ...admitted.scope, capability }, 1));
       try {
-        await fence.checkScope();
+        for (const fence of fences) await fence.checkScope();
         const result = await fn(db);
-        await fence.checkScope();
-        await this.spaces.assertScopeCurrent(actor, admitted.ownerPrincipalId, admitted.scope, db,
-          admitted.scope.collectionId, [admitted.capability]);
+        for (const fence of fences) await fence.checkScope();
+        // A grant matches when it holds any listed capability, so each one is checked on its own.
+        for (const capability of capabilities) await this.spaces.assertScopeCurrent(actor, admitted.ownerPrincipalId,
+          admitted.scope, db, admitted.scope.collectionId, [capability]);
         return result;
-      } finally { fence.close(); }
+      } finally { for (const fence of fences) fence.close(); }
     });
   }
 
@@ -800,6 +810,100 @@ export class PostgresSources {
   }
 
   /**
+   * Extract a source's text with the parser for its MIME type as the next
+   * extraction version. Extraction reads the source, so it needs
+   * `sources:read` as well as `sources:write`. The original is read and
+   * verified outside any transaction; nothing is written unless the parser
+   * accepts all of it. The same parser and version replays its version.
+   */
+  async extract(actor: VerifiedCredential, spaceId: string, collectionId: string, sourceId: string): Promise<ExtractionView> {
+    const admitted = await this.admit(actor, spaceId, collectionId, 'sources:write', 'sources:read');
+    const scope = admitted.scope;
+    const plan = await this.actorTx(actor, admitted, async (db): Promise<{ replay: ExtractionView } |
+      { parser: TextParser; sha256: string; bytes: number; objectKey: string | null }> => {
+      if (!reference(sourceId)) throw new AuthorityError('NOT_FOUND');
+      const original = await lockExtractable(db, scope, sourceId);
+      const parser = parserFor(original.mime_type as string | null);
+      const existing = parser && await parsedVersion(db, scope, sourceId, parser.name, parser.version);
+      if (existing) return { replay: extractionView(scope, sourceId, existing, Number(original.latest), true) };
+      if (original.reference_only) invalid('A reference-only source has no bytes to extract');
+      if (!parser) throw refusedExtraction(new ExtractionError('unsupported'));
+      if (Number(original.byte_size) > extractionBounds.sourceBytes) throw refusedExtraction(new ExtractionError('size'));
+      await writable(db, scope);
+      return { parser, sha256: String(original.sha256), bytes: Number(original.byte_size), objectKey: original.object_key as string | null };
+    });
+    if ('replay' in plan) return plan.replay;
+    const bytes = await originalBytes(admitted.cell.originals, plan.objectKey, plan.sha256, plan.bytes);
+    let output: TextExtraction;
+    try { output = plan.parser.parse(bytes); } catch (error) { throw refusedExtraction(error); }
+    return this.actorTx(actor, admitted, async db => {
+      const original = await lockExtractable(db, scope, sourceId);
+      const latest = Number(original.latest);
+      // A concurrent extraction with the same parser committed first.
+      const existing = await parsedVersion(db, scope, sourceId, plan.parser.name, plan.parser.version);
+      if (existing) return extractionView(scope, sourceId, existing, latest, true);
+      await writable(db, scope);
+      const row = await insertExtraction(db, scope, sourceId, latest + 1, plan.sha256, plan.parser.name, plan.parser.version,
+        output);
+      return extractionView(scope, sourceId, row, latest + 1, false);
+    });
+  }
+
+  /**
+   * Record a corrected extraction as the version after `baseVersion`, which
+   * must be the latest; earlier versions stay as they are. The correction is
+   * checked against the same contract as parser output. Repeating it with
+   * the same credential, content and offsets replays it; any other version
+   * after the base is a REVISION_CONFLICT.
+   */
+  async correctExtraction(actor: VerifiedCredential, spaceId: string, collectionId: string, sourceId: string,
+    request: unknown): Promise<ExtractionView> {
+    const admitted = await this.admit(actor, spaceId, collectionId, 'sources:write', 'sources:read');
+    const scope = admitted.scope;
+    return this.actorTx(actor, admitted, async db => {
+      if (!reference(sourceId)) throw new AuthorityError('NOT_FOUND');
+      const { baseVersion, output } = correctionRequest(request);
+      const original = await lockExtractable(db, scope, sourceId);
+      const latest = Number(original.latest);
+      if (baseVersion > latest) throw new AuthorityError('NOT_FOUND');
+      try { checkExtraction(output, Number(original.byte_size)); } catch (error) { throw refusedExtraction(error); }
+      const offsets = offsetsJson(output.sourceOffsets);
+      if (baseVersion < latest) {
+        const next = (await db.query(`SELECT ${extractionColumns},credential_id,source_offsets=$5::jsonb AS same_offsets
+          FROM extraction_versions WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND version=$4`,
+        [scope.spaceId, scope.collectionId, sourceId, baseVersion + 1, offsets])).rows[0];
+        if (next?.parser === correctionParser.name && next.parser_version === correctionParser.version &&
+          next.credential_id === scope.credentialId && next.content === output.content && next.same_offsets === true)
+          return extractionView(scope, sourceId, next, latest, true);
+        throw new AuthorityError('REVISION_CONFLICT', 'A later extraction version exists', latest);
+      }
+      await writable(db, scope);
+      const row = await insertExtraction(db, scope, sourceId, latest + 1, String(original.sha256), correctionParser.name,
+        correctionParser.version, output);
+      return extractionView(scope, sourceId, row, latest + 1, false);
+    });
+  }
+
+  /** Read one extraction version of a live source in the collection, the latest when `version` is omitted. */
+  async extraction(actor: VerifiedCredential, spaceId: string, collectionId: string, sourceId: string,
+    version?: number): Promise<ExtractionView> {
+    const admitted = await this.admit(actor, spaceId, collectionId, 'sources:read');
+    const scope = admitted.scope;
+    return this.actorTx(actor, admitted, async db => {
+      if (!reference(sourceId)) throw new AuthorityError('NOT_FOUND');
+      if (version !== undefined && (!isSafeInteger(version) || version < 1)) invalid('version must be a positive integer');
+      await readSource(db, scope, sourceId, false);
+      const row = (await db.query(`WITH latest AS (SELECT max(version) AS latest FROM extraction_versions
+          WHERE space_id=$1 AND collection_id=$2 AND source_id=$3)
+        SELECT ${extractionColumns},latest FROM extraction_versions,latest
+        WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND version=COALESCE($4::bigint,latest)`,
+      [scope.spaceId, scope.collectionId, sourceId, version ?? null])).rows[0];
+      if (!row) throw new AuthorityError('NOT_FOUND');
+      return extractionView(scope, sourceId, row, Number(row.latest), false);
+    });
+  }
+
+  /**
    * Promote a verified attempt's bytes to its original key, then commit the
    * source metadata. Bytes are always verified and present before the
    * metadata commits, which finalizes the grant only if it has not expired;
@@ -905,6 +1009,131 @@ function textRequest(request: unknown, scope: AuthorityScope): { wanted: Wanted;
   if (!startsWith(mimeType, 'text/')) invalid('Text ingestion requires a text/* MIME type');
   return { content, wanted: { sourceId: derivedSourceId(['text', scope.credentialId, key]), locator: optionalLocator(input.locator),
     capturedAt: optionalInstant(input.capturedAt), referenceOnly: false, sha256: digest(content), mimeType } };
+}
+
+/** A correction records this parser name and contract version; `stateplane.` names are reserved for built-in parsers. */
+const correctionParser = Object.freeze({ name: 'stateplane.correction', version: '1' });
+/** An extraction's read of its original ends after this long; docs/evidence-storage.md records the bound. */
+const EXTRACT_READ_MS = 10_000;
+const segmentKeys = ['start', 'end', 'sourceStart', 'sourceEnd'] as const;
+const extractionFailures: Record<ExtractionError['reason'], string> = {
+  unsupported: 'Source MIME type is not supported for extraction', size: 'Source exceeds the extraction size bound',
+  encoding: 'Source is not well-formed UTF-8', content: 'Extraction content is not storable text within its bound',
+  offsets: 'Extraction source offsets are invalid'
+};
+const refusedExtraction = (error: unknown) => error instanceof ExtractionError ?
+  new AuthorityError('INVALID_ARGUMENT', extractionFailures[error.reason], undefined, false) : error;
+const extractionColumns = 'version,previous_version,source_sha256,parser,parser_version,content,source_offsets,created_at';
+function extractionView(scope: AuthorityScope, sourceId: string, row: Record<string, unknown>, latest: number,
+  replayed: boolean): ExtractionView {
+  return { sourceId, collectionId: scope.collectionId, version: Number(row.version), latestVersion: latest,
+    previousVersion: row.previous_version === null ? null : Number(row.previous_version), sourceSha256: String(row.source_sha256),
+    parser: String(row.parser), parserVersion: String(row.parser_version), content: String(row.content),
+    sourceOffsets: (row.source_offsets as ExtractionSegment[]).map(segment => ({ start: Number(segment.start),
+      end: Number(segment.end), sourceStart: Number(segment.sourceStart), sourceEnd: Number(segment.sourceEnd) })),
+    createdAt: iso(row.created_at)!, replayed };
+}
+/** Segments as JSON with a fixed key order, read by own index; every value is a checked safe integer. */
+function offsetsJson(segments: readonly ExtractionSegment[]): string {
+  let text = '[';
+  for (let i = 0; i < segments.length; i++) {
+    const { start, end, sourceStart, sourceEnd } = Object.getOwnPropertyDescriptor(segments, i)!.value as ExtractionSegment;
+    text += `${i ? ',' : ''}{"start":${start},"end":${end},"sourceStart":${sourceStart},"sourceEnd":${sourceEnd}}`;
+  }
+  return `${text}]`;
+}
+/**
+ * Serialize extraction writers on one source, then read its live original and
+ * latest version. Source deletion (STA-36) must take the same lock before it
+ * tombstones the source, so no version commits after its source's deletion.
+ */
+async function lockExtractable(db: Db, scope: AuthorityScope, sourceId: string): Promise<Record<string, unknown>> {
+  const ids = [scope.spaceId, scope.collectionId, sourceId];
+  await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [lockKey(['stateplane:extraction', ...ids])]);
+  const row = (await db.query(`SELECT o.reference_only,o.sha256,o.byte_size,o.mime_type,o.object_key,e.tombstone,
+      COALESCE((SELECT max(v.version) FROM extraction_versions v WHERE v.space_id=o.space_id AND v.collection_id=o.collection_id
+        AND v.source_id=o.source_id),0) AS latest
+    FROM original_objects o JOIN entity_refs e ON e.space_id=o.space_id AND e.collection_id=o.collection_id
+      AND e.kind='source' AND e.entity_id=o.source_id
+    WHERE o.space_id=$1 AND o.collection_id=$2 AND o.source_id=$3`, ids)).rows[0];
+  if (!row || row.tombstone) throw new AuthorityError('NOT_FOUND');
+  return row;
+}
+/** The first version a parser produced from this source, if any. */
+async function parsedVersion(db: Db, scope: AuthorityScope, sourceId: string, parser: string, version: string):
+  Promise<Record<string, unknown> | undefined> {
+  return (await db.query(`SELECT ${extractionColumns} FROM extraction_versions WHERE space_id=$1 AND collection_id=$2
+    AND source_id=$3 AND parser=$4 AND parser_version=$5 ORDER BY version LIMIT 1`,
+  [scope.spaceId, scope.collectionId, sourceId, parser, version])).rows[0];
+}
+async function insertExtraction(db: Db, scope: AuthorityScope, sourceId: string, version: number, sha256: string,
+  parser: string, parserVersion: string, output: TextExtraction): Promise<Record<string, unknown>> {
+  return (await db.query(`INSERT INTO extraction_versions(space_id,collection_id,source_id,version,source_sha256,parser,
+      parser_version,content,source_offsets,credential_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)
+    RETURNING ${extractionColumns}`, [scope.spaceId, scope.collectionId, sourceId, version, sha256, parser, parserVersion,
+    output.content, offsetsJson(output.sourceOffsets), scope.credentialId])).rows[0];
+}
+/**
+ * The whole original, verified against its recorded size and digest and read
+ * within `EXTRACT_READ_MS`. On any failure the store's body is cancelled.
+ */
+async function originalBytes(blobs: BlobStore, objectKey: string | null, sha256: string, bytes: number): Promise<Uint8Array> {
+  const window = writeWindow(performance.now() + EXTRACT_READ_MS);
+  try {
+    const stored = objectKey === null ? null : await beforeAbort(blobs.get(objectKey), window.signal,
+      late => void late?.body.cancel().catch(() => {}));
+    if (!stored) throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Original bytes are missing', undefined, false);
+    if (stored.bytes !== bytes || (stored.sha256 !== null && stored.sha256 !== sha256)) {
+      await stored.body.cancel().catch(() => {});
+      throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Original bytes failed verification', undefined, false);
+    }
+    // The verified stream errors before more than `bytes` arrive, so the buffer never overflows.
+    const reader = verified(stored.body, sha256, bytes).getReader();
+    const content = new Uint8Array(bytes);
+    let at = 0;
+    try {
+      for (;;) {
+        const { done, value } = await beforeAbort(reader.read(), window.signal);
+        if (done) return content;
+        content.set(value, at);
+        at += value.byteLength;
+      }
+    } catch (error) {
+      void reader.cancel(error).catch(() => {});
+      throw error;
+    }
+  } catch (error) {
+    if (error instanceof AuthorityError) throw error;
+    throw new AuthorityError('PROVIDER_UNAVAILABLE', error instanceof BlobWriteError ?
+      'Reading original bytes timed out; retry the request' : 'Reading original bytes failed; retry the request', undefined, true);
+  } finally { window.close(); }
+}
+/**
+ * Validate a correction after its transaction has authorized the caller. The
+ * offsets must be a plain array, read by own index, of plain segment objects;
+ * their ranges are checked against the content and the original afterwards.
+ */
+function correctionRequest(request: unknown): { baseVersion: number; output: TextExtraction } {
+  const input = fields(request, ['baseVersion', 'content', 'sourceOffsets'], ['baseVersion', 'content', 'sourceOffsets']);
+  if (!isSafeInteger(input.baseVersion) || (input.baseVersion as number) < 1) invalid('baseVersion must be a positive integer');
+  if (typeof input.content !== 'string') invalid('Extraction content must be text');
+  const list = input.sourceOffsets;
+  if (!list || typeof list !== 'object' || untrusted(list) || !Array.isArray(list) || Object.getPrototypeOf(list) !== Array.prototype)
+    invalid('sourceOffsets must be an array');
+  const length = Object.getOwnPropertyDescriptor(list, 'length')!.value as number;
+  if (length > extractionBounds.segments) throw refusedExtraction(new ExtractionError('offsets'));
+  // Every index is checked below, so a count of exactly `length` indices plus `length` admits no other member.
+  if (Reflect.ownKeys(list).length !== length + 1) invalid('sourceOffsets must be a plain array');
+  const sourceOffsets: ExtractionSegment[] = [];
+  for (let i = 0; i < length; i++) {
+    const item = Object.getOwnPropertyDescriptor(list, i);
+    if (!item?.enumerable || !Object.hasOwn(item, 'value')) invalid('sourceOffsets must be a plain array');
+    const segment = fields(item.value, segmentKeys, segmentKeys);
+    for (let k = 0; k < segmentKeys.length; k++) if (!isSafeInteger(segment[segmentKeys[k]])) invalid('Extraction source offsets are invalid');
+    Object.defineProperty(sourceOffsets, i, { value: { start: segment.start, end: segment.end, sourceStart: segment.sourceStart,
+      sourceEnd: segment.sourceEnd }, writable: true, enumerable: true, configurable: true });
+  }
+  return { baseVersion: input.baseVersion as number, output: { content: input.content, sourceOffsets } };
 }
 
 // sources.js loads inside index.js's export list, so it cannot subclass at module load.

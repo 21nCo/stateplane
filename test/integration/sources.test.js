@@ -1571,6 +1571,11 @@ test('source request decisions use intrinsics captured at load, so later prototy
   const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: octet, maxBytes: 64 });
   const verified = await f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(Buffer.from('four')),
     { bytes: 4, mimeType: octet });
+  const extracted = await f.sources.ingestText(f.agent, f.spaceId, 'alpha', { idempotencyKey: 'extracted', text: 'three' });
+  await f.sources.extract(f.agent, f.spaceId, 'alpha', extracted.sourceId);
+  const segment = { start: 0, end: 5, sourceStart: 0, sourceEnd: 5 };
+  const correct = request => () => f.sources.correctExtraction(f.agent, f.spaceId, 'alpha', extracted.sourceId,
+    { baseVersion: 1, content: 'three', sourceOffsets: [segment], ...request });
   let round = 0;
   const probe = async label => {
     round++;
@@ -1597,10 +1602,16 @@ test('source request decisions use intrinsics captured at load, so later prototy
       fractionalDeclaration: () => f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(Buffer.from('four')),
         { bytes: 3.5, mimeType: octet }),
       unknownFinalize: () => f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, { attemptId: verified.attemptId, extra: 1 }),
-      missingAttempt: () => f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, {})
+      missingAttempt: () => f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, {}),
+      unknownCorrection: correct({ extra: 1 }),
+      fractionalBase: correct({ baseVersion: 2.5 }),
+      fractionalOffset: correct({ sourceOffsets: [{ ...segment, end: 3.5 }] }),
+      unknownSegmentKey: correct({ sourceOffsets: [{ ...segment, extra: 1 }] }),
+      nulCorrection: correct({ content: 'thr\0e', sourceOffsets: [] })
     };
     for (const [name, run] of Object.entries(refused)) await rejects(run(), 'INVALID_ARGUMENT', `${label}: ${name}`);
     assert.deepEqual(await effects(f), before, `${label}: refused requests have no effects`);
+    assert.deepEqual((await extractionRows(f.spaceId)).map(row => row.version), [1], `${label}: no refused correction wrote a version`);
   };
   await probe('control');
   for (const [name, install] of Object.entries(replacements)) {
@@ -1666,4 +1677,260 @@ test('an upload grant defaults its lifetime only when none is supplied', async (
   assert.deepEqual(await effects(f), before, 'no grant');
   const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType: 'text/plain', maxBytes: 8 });
   assert.equal(Date.parse(grant.expiresAt) - Date.parse(grant.issuedAt), sourceBounds.grantSeconds * 1000);
+});
+
+// STA-34: versioned text extraction.
+const extractionRows = async spaceId => (await pool.query(`SELECT source_id,version::int,parser,content FROM extraction_versions
+  WHERE space_id=$1 ORDER BY source_id,version`, [spaceId])).rows;
+/** Commit an uploaded original of `bytes` with `mimeType`. */
+async function uploadSource(f, bytes, mimeType) {
+  const grant = await f.sources.createUpload(f.agent, f.spaceId, 'alpha', { mimeType, maxBytes: Math.max(1, bytes.length) });
+  const attempt = await f.sources.upload(f.agent, f.spaceId, 'alpha', grant.grantId, chunked(bytes, { size: 65536 }),
+    { bytes: bytes.length, mimeType });
+  return f.sources.finalizeUpload(f.agent, f.spaceId, 'alpha', grant.grantId, { attemptId: attempt.attemptId });
+}
+/** Record every R2 get, so a test can tell whether an original was read. */
+function countGets(r2) {
+  const gets = [];
+  const get = r2.get.bind(r2);
+  r2.get = async key => { gets.push(key); return get(key); };
+  return gets;
+}
+
+test('a corrected extraction is the next version, and every earlier version stays readable', async () => {
+  const f = await fixture();
+  const source = await f.sources.ingestText(f.agent, f.spaceId, 'alpha',
+    { idempotencyKey: 'notes', text: '﻿First line\nSecond lnie\n', mimeType: 'text/markdown' });
+  await rejects(f.sources.extraction(f.agent, f.spaceId, 'alpha', source.sourceId), 'NOT_FOUND', 'nothing extracted yet');
+  const first = await f.sources.extract(f.agent, f.spaceId, 'alpha', source.sourceId);
+  assert.match(first.createdAt, /Z$/);
+  assert.deepEqual({ ...first, createdAt: null }, { sourceId: source.sourceId, collectionId: 'alpha', version: 1, latestVersion: 1,
+    previousVersion: null, sourceSha256: source.original.sha256, parser: 'stateplane.text', parserVersion: '1',
+    content: 'First line\nSecond lnie\n', sourceOffsets: [{ start: 0, end: 23, sourceStart: 3, sourceEnd: 26 }], createdAt: null,
+    replayed: false });
+  assert.deepEqual(await f.sources.extract(f.agent, f.spaceId, 'alpha', source.sourceId), { ...first, replayed: true },
+    'the same parser and version replays its version');
+
+  const corrected = { baseVersion: 1, content: 'First line\nSecond line\n', sourceOffsets: [
+    { start: 0, end: 11, sourceStart: 3, sourceEnd: 14 }, { start: 11, end: 23, sourceStart: 14, sourceEnd: 26 }] };
+  const second = await f.sources.correctExtraction(f.agent, f.spaceId, 'alpha', source.sourceId, corrected);
+  assert.deepEqual({ ...second, createdAt: null }, { ...first, version: 2, latestVersion: 2, previousVersion: 1,
+    parser: 'stateplane.correction', parserVersion: '1', content: corrected.content, sourceOffsets: corrected.sourceOffsets,
+    createdAt: null });
+  assert.deepEqual(await f.sources.correctExtraction(f.agent, f.spaceId, 'alpha', source.sourceId, corrected),
+    { ...second, replayed: true }, 'repeating a committed correction replays it');
+  // Any other version after the base conflicts: different text, or the same text from another credential.
+  await rejects(f.sources.correctExtraction(f.agent, f.spaceId, 'alpha', source.sourceId,
+    { ...corrected, content: 'First line\nSecond line!\n' }), 'REVISION_CONFLICT');
+  await rejects(f.sources.correctExtraction(f.other, f.spaceId, 'alpha', source.sourceId, corrected), 'REVISION_CONFLICT');
+  await rejects(f.sources.correctExtraction(f.agent, f.spaceId, 'alpha', source.sourceId, { ...corrected, baseVersion: 3 }), 'NOT_FOUND');
+
+  assert.deepEqual(await f.sources.extraction(f.agent, f.spaceId, 'alpha', source.sourceId, 1), { ...first, latestVersion: 2 },
+    'the corrected version is unchanged and still readable');
+  assert.deepEqual(await f.sources.extraction(f.other, f.spaceId, 'alpha', source.sourceId), second, 'the latest is the correction');
+  assert.deepEqual(await f.sources.extract(f.agent, f.spaceId, 'alpha', source.sourceId), { ...first, latestVersion: 2, replayed: true },
+    'extracting again does not undo the correction');
+  const third = await f.sources.correctExtraction(f.other, f.spaceId, 'alpha', source.sourceId,
+    { baseVersion: 2, content: 'Second line\n', sourceOffsets: [{ start: 0, end: 12, sourceStart: 14, sourceEnd: 26 }] });
+  assert.deepEqual([third.version, third.previousVersion], [3, 2]);
+  assert.deepEqual((await extractionRows(f.spaceId)).map(row => [row.version, row.parser, row.content]), [
+    [1, 'stateplane.text', 'First line\nSecond lnie\n'], [2, 'stateplane.correction', corrected.content],
+    [3, 'stateplane.correction', 'Second line\n']]);
+  for (const version of [0, -1, 1.5, '1', null, 2 ** 53])
+    await rejects(f.sources.extraction(f.agent, f.spaceId, 'alpha', source.sourceId, version), 'INVALID_ARGUMENT', String(version));
+  await rejects(f.sources.extraction(f.agent, f.spaceId, 'alpha', source.sourceId, 4), 'NOT_FOUND');
+});
+
+test('unsupported, reference-only and oversized sources are refused before their bytes are read, and leave no extraction', async () => {
+  const f = await fixture();
+  const gets = countGets(f.r2);
+  const refused = [
+    await f.sources.ingestText(f.agent, f.spaceId, 'alpha', { idempotencyKey: 'html', text: '<p>markup</p>', mimeType: 'text/html' }),
+    await f.sources.ingestReference(f.agent, f.spaceId, 'alpha', { idempotencyKey: 'ref', locator: 'https://example.invalid/a.txt',
+      mimeType: 'text/plain' }),
+    await uploadSource(f, Buffer.from('%PDF-1.7 binary'), 'application/pdf'),
+    await uploadSource(f, Buffer.alloc(1_048_577, 0x61), 'text/plain')
+  ];
+  gets.length = 0;
+  for (const source of refused)
+    await rejects(f.sources.extract(f.agent, f.spaceId, 'alpha', source.sourceId), 'INVALID_ARGUMENT', source.original.mimeType);
+  assert.deepEqual(gets, [], 'no original was read');
+  assert.deepEqual(await extractionRows(f.spaceId), []);
+  // A correction needs an extraction to correct, which these sources cannot have.
+  for (const source of refused) await rejects(f.sources.correctExtraction(f.agent, f.spaceId, 'alpha', source.sourceId,
+    { baseVersion: 1, content: 'x', sourceOffsets: [] }), 'NOT_FOUND');
+  const limit = await uploadSource(f, Buffer.alloc(1_048_576, 0x61), 'text/csv');
+  const extracted = await f.sources.extract(f.agent, f.spaceId, 'alpha', limit.sourceId);
+  assert.deepEqual(extracted.sourceOffsets, [{ start: 0, end: 1_048_576, sourceStart: 0, sourceEnd: 1_048_576 }], 'exactly the bound is extracted');
+  assert.deepEqual((await extractionRows(f.spaceId)).map(row => row.source_id), [limit.sourceId]);
+});
+
+test('malformed, corrupted or unreadable originals are refused without a partial extraction', async () => {
+  const f = await fixture();
+  const ingest = (key, text) => f.sources.ingestText(f.agent, f.spaceId, 'alpha', { idempotencyKey: key, text });
+  // Text ingestion accepts NUL, which extraction content cannot hold.
+  const nul = await ingest('nul', 'a\u0000b');
+  await rejects(f.sources.extract(f.agent, f.spaceId, 'alpha', nul.sourceId), 'INVALID_ARGUMENT', 'NUL');
+  const swapped = await ingest('swapped', 'original text');
+  const stored = f.r2.objects.get(await sourceKey(f, swapped.sourceId));
+  stored.bytes = Buffer.from('replaced text');
+  await rejects(f.sources.extract(f.agent, f.spaceId, 'alpha', swapped.sourceId), 'PROVIDER_UNAVAILABLE', 'same size, other digest');
+  const longer = await ingest('longer', 'short');
+  f.r2.objects.get(await sourceKey(f, longer.sourceId)).bytes = Buffer.from('shorter');
+  await rejects(f.sources.extract(f.agent, f.spaceId, 'alpha', longer.sourceId), 'PROVIDER_UNAVAILABLE', 'other size');
+  const missing = await ingest('missing', 'gone');
+  f.r2.objects.delete(await sourceKey(f, missing.sourceId));
+  await assert.rejects(f.sources.extract(f.agent, f.spaceId, 'alpha', missing.sourceId),
+    error => error.code === 'PROVIDER_UNAVAILABLE' && error.retryable === false);
+  assert.deepEqual(await extractionRows(f.spaceId), []);
+
+  // A body that fails mid-read is a retryable provider failure; the retry extracts.
+  const interrupted = await ingest('interrupted', 'x'.repeat(64));
+  const key = await sourceKey(f, interrupted.sourceId);
+  const get = f.r2.get.bind(f.r2);
+  f.r2.get = async target => {
+    const object = await get(target);
+    if (target !== key) return object;
+    f.r2.get = get;
+    return { ...object, body: new ReadableStream({ start(controller) { controller.error(new Error('socket closed')); } }) };
+  };
+  await assert.rejects(f.sources.extract(f.agent, f.spaceId, 'alpha', interrupted.sourceId), error =>
+    error.code === 'PROVIDER_UNAVAILABLE' && classifyError(error, false).retryable === true);
+  assert.deepEqual(await extractionRows(f.spaceId), []);
+  assert.equal((await f.sources.extract(f.agent, f.spaceId, 'alpha', interrupted.sourceId)).version, 1);
+});
+
+test('a correction is validated against the contract and its original only after the caller is authorized', async () => {
+  const f = await fixture();
+  const source = await f.sources.ingestText(f.agent, f.spaceId, 'alpha', { idempotencyKey: 'base', text: 'abcdef' });
+  await f.sources.extract(f.agent, f.spaceId, 'alpha', source.sourceId);
+  await rejects(f.sources.correctExtraction(f.agent, f.spaceId, 'beta', source.sourceId, { unknown: true }), 'FORBIDDEN',
+    'an unauthorized caller learns nothing from its input');
+  const segment = { start: 0, end: 6, sourceStart: 0, sourceEnd: 6 };
+  const valid = { baseVersion: 1, content: 'abcdef', sourceOffsets: [segment] };
+  const extra = Object.assign([segment], { note: 'x' });
+  const holey = [segment, , segment]; // eslint-disable-line no-sparse-arrays
+  const accessor = Object.defineProperty({ ...segment }, 'end', { get: () => 6, enumerable: true });
+  const subclass = class extends Array {};
+  const hidden = Object.defineProperty([], '0', { value: segment, enumerable: false });
+  for (const [name, request] of [
+    ['an array request', [valid]], ['a proxy request', new Proxy({ ...valid }, {})], ['an unknown field', { ...valid, parser: 'x' }],
+    ['a missing field', { baseVersion: 1, content: 'abcdef' }], ['an undefined field', { ...valid, sourceOffsets: undefined }],
+    ['a zero base', { ...valid, baseVersion: 0 }], ['a fractional base', { ...valid, baseVersion: 1.5 }],
+    ['a string base', { ...valid, baseVersion: '1' }], ['numeric content', { ...valid, content: 7 }],
+    ['content with NUL', { ...valid, content: 'abc\u0000ef' }], ['content with a lone surrogate', { ...valid, content: 'abc\uD800ef' }],
+    ['content over the bound', { ...valid, content: 'é'.repeat(524_289), sourceOffsets: [] }],
+    ['offsets that are not an array', { ...valid, sourceOffsets: { 0: segment, length: 1 } }],
+    ['a proxy offsets array', { ...valid, sourceOffsets: new Proxy([segment], {}) }],
+    ['an offsets array with another member', { ...valid, sourceOffsets: extra }],
+    ['an offsets array with a hole', { ...valid, sourceOffsets: holey }],
+    ['an offsets array of another class', { ...valid, sourceOffsets: subclass.from([segment]) }],
+    ['a hidden offsets item', { ...valid, sourceOffsets: hidden }],
+    ['a segment with an unknown key', { ...valid, sourceOffsets: [{ ...segment, kind: 'x' }] }],
+    ['a segment with a missing key', { ...valid, sourceOffsets: [{ start: 0, end: 6, sourceStart: 0 }] }],
+    ['a segment accessor', { ...valid, sourceOffsets: [accessor] }],
+    ['a proxy segment', { ...valid, sourceOffsets: [new Proxy({ ...segment }, {})] }],
+    ['a fractional offset', { ...valid, sourceOffsets: [{ ...segment, end: 5.5 }] }],
+    ['a content range past the content', { ...valid, sourceOffsets: [{ ...segment, end: 7 }] }],
+    ['a byte range past the original', { ...valid, sourceOffsets: [{ ...segment, sourceEnd: 7 }] }],
+    ['overlapping segments', { ...valid, sourceOffsets: [segment, { ...segment, start: 5 }] }],
+    ['too many segments', { ...valid, content: 'a'.repeat(4097), sourceOffsets: Array.from({ length: 4097 },
+      (_, i) => ({ start: i, end: i + 1, sourceStart: 0, sourceEnd: 0 })) }]
+  ]) await rejects(f.sources.correctExtraction(f.agent, f.spaceId, 'alpha', source.sourceId, request), 'INVALID_ARGUMENT', name);
+  assert.deepEqual((await extractionRows(f.spaceId)).map(row => row.version), [1], 'no refused correction wrote a version');
+  assert.equal((await f.sources.correctExtraction(f.agent, f.spaceId, 'alpha', source.sourceId, valid)).version, 2);
+});
+
+test('extraction needs sources:read and sources:write on the owning collection, and a read-only space only replays', async () => {
+  const f = await fixture();
+  const reader = await verify((await spaces.issueAgentKey(f.owner, f.spaceId, new Date(Date.now() + 3_600_000),
+    [{ collectionId: 'alpha', capabilities: ['sources:read'] }])).secret);
+  const source = await f.sources.ingestText(f.agent, f.spaceId, 'alpha', { idempotencyKey: 'scoped', text: 'scoped text' });
+  const correction = { baseVersion: 1, content: 'scoped', sourceOffsets: [] };
+  // Extraction returns the source's text, so a writer without read access cannot extract.
+  await rejects(f.sources.extract(f.writer, f.spaceId, 'alpha', source.sourceId), 'FORBIDDEN', 'writer only');
+  await rejects(f.sources.extract(reader, f.spaceId, 'alpha', source.sourceId), 'FORBIDDEN', 'reader only');
+  await rejects(f.sources.extract(f.agent, f.spaceId, 'beta', source.sourceId), 'FORBIDDEN', 'ungranted collection');
+  assert.deepEqual(await extractionRows(f.spaceId), []);
+  const first = await f.sources.extract(f.agent, f.spaceId, 'alpha', source.sourceId);
+  await rejects(f.sources.extraction(f.writer, f.spaceId, 'alpha', source.sourceId), 'FORBIDDEN', 'writer reads');
+  assert.equal((await f.sources.extraction(reader, f.spaceId, 'alpha', source.sourceId)).content, 'scoped text');
+  await rejects(f.sources.correctExtraction(reader, f.spaceId, 'alpha', source.sourceId, correction), 'FORBIDDEN', 'reader corrects');
+  await rejects(f.sources.correctExtraction(f.writer, f.spaceId, 'alpha', source.sourceId, correction), 'FORBIDDEN', 'writer corrects');
+  // A source is reached only through its owning collection, even by the owner.
+  const betaSource = await f.sources.ingestText(f.owner, f.spaceId, 'beta', { idempotencyKey: 'beta', text: 'beta text' });
+  await rejects(f.sources.extract(f.owner, f.spaceId, 'alpha', betaSource.sourceId), 'NOT_FOUND');
+  await rejects(f.sources.extraction(f.agent, f.spaceId, 'alpha', betaSource.sourceId), 'NOT_FOUND');
+  await rejects(f.sources.correctExtraction(f.agent, f.spaceId, 'alpha', betaSource.sourceId, correction), 'NOT_FOUND');
+  assert.equal((await f.sources.extract(f.owner, f.spaceId, 'beta', betaSource.sourceId)).collectionId, 'beta');
+  const corrected = await f.sources.correctExtraction(f.agent, f.spaceId, 'alpha', source.sourceId, correction);
+
+  const unextracted = await f.sources.ingestText(f.agent, f.spaceId, 'alpha', { idempotencyKey: 'later', text: 'later text' });
+  await spaces.update(f.owner, f.spaceId, 'readOnly');
+  await rejects(f.sources.extract(f.agent, f.spaceId, 'alpha', unextracted.sourceId), 'SPACE_UNAVAILABLE');
+  await rejects(f.sources.correctExtraction(f.agent, f.spaceId, 'alpha', source.sourceId, { ...correction, baseVersion: 2 }),
+    'SPACE_UNAVAILABLE');
+  assert.equal((await f.sources.extract(f.agent, f.spaceId, 'alpha', source.sourceId)).replayed, true);
+  assert.deepEqual(await f.sources.correctExtraction(f.agent, f.spaceId, 'alpha', source.sourceId, correction),
+    { ...corrected, replayed: true });
+  assert.equal((await f.sources.extraction(f.agent, f.spaceId, 'alpha', source.sourceId, 1)).content, first.content);
+  await spaces.update(f.owner, f.spaceId, 'suspended');
+  await rejects(f.sources.extraction(f.agent, f.spaceId, 'alpha', source.sourceId), 'SPACE_UNAVAILABLE');
+  await rejects(f.sources.extract(f.agent, f.spaceId, 'alpha', source.sourceId), 'SPACE_UNAVAILABLE');
+});
+
+test('concurrent extractions commit one version, and concurrent corrections of one base commit one', async () => {
+  const f = await fixture();
+  const source = await f.sources.ingestText(f.agent, f.spaceId, 'alpha', { idempotencyKey: 'race', text: 'race text' });
+  const extracted = await Promise.all(Array.from({ length: 4 }, () => f.sources.extract(f.agent, f.spaceId, 'alpha', source.sourceId)));
+  assert.deepEqual(extracted.map(view => view.version), [1, 1, 1, 1]);
+  assert.equal(extracted.filter(view => !view.replayed).length, 1);
+  const settled = await Promise.allSettled(['race text!', 'race text?'].map(content =>
+    f.sources.correctExtraction(f.agent, f.spaceId, 'alpha', source.sourceId, { baseVersion: 1, content, sourceOffsets: [] })));
+  assert.deepEqual(settled.map(result => result.status).sort(), ['fulfilled', 'rejected']);
+  assert.equal(settled.find(result => result.status === 'rejected').reason.code, 'REVISION_CONFLICT');
+  assert.deepEqual((await extractionRows(f.spaceId)).map(row => row.version), [1, 2]);
+});
+
+test('an extraction rechecks its caller after reading the original, and a stalled read ends at its bound', { timeout: 30_000 }, async () => {
+  const f = await fixture();
+  const holdGet = (key, stall = false) => {
+    let release, reached;
+    const held = new Promise(resolve => { release = resolve; });
+    const atGet = new Promise(resolve => { reached = resolve; });
+    const state = { cancelled: false };
+    const get = f.r2.get.bind(f.r2);
+    f.r2.get = async target => {
+      if (target !== key) return get(target);
+      f.r2.get = get;
+      reached();
+      await held;
+      const object = await get(target);
+      return stall ? { ...object, body: new ReadableStream({ pull: () => new Promise(() => {}),
+        cancel: () => { state.cancelled = true; } }) } : object;
+    };
+    return { atGet, release, state };
+  };
+  const key = await spaces.issueAgentKey(f.owner, f.spaceId, new Date(Date.now() + 3_600_000),
+    [{ collectionId: 'alpha', capabilities: ['sources:read', 'sources:write'] }]);
+  const actor = await verify(key.secret);
+  const source = await f.sources.ingestText(actor, f.spaceId, 'alpha', { idempotencyKey: 'revoked', text: 'revoked text' });
+  const hold = holdGet(await sourceKey(f, source.sourceId));
+  const extracting = f.sources.extract(actor, f.spaceId, 'alpha', source.sourceId);
+  await hold.atGet;
+  await spaces.revokeAgentKey(f.owner, f.spaceId, key.id);
+  hold.release();
+  await rejects(extracting, 'FORBIDDEN');
+  assert.deepEqual(await extractionRows(f.spaceId), []);
+
+  const stalled = await f.sources.ingestText(f.agent, f.spaceId, 'alpha', { idempotencyKey: 'stalled', text: 'stalled text' });
+  const stall = holdGet(await sourceKey(f, stalled.sourceId), true);
+  stall.release();
+  const started = performance.now();
+  await assert.rejects(f.sources.extract(f.agent, f.spaceId, 'alpha', stalled.sourceId), error =>
+    error.code === 'PROVIDER_UNAVAILABLE' && error.retryable === true);
+  assert.ok(performance.now() - started < 12_000, 'the read ends at its 10-second bound');
+  await sleep(10);
+  assert.equal(stall.state.cancelled, true, 'the stalled body is cancelled');
+  assert.deepEqual(await extractionRows(f.spaceId), []);
 });
