@@ -86,8 +86,8 @@ async function insertEndpoint(db, spaceId, { kind, collectionId, id }, { referen
   } else {
     await db.query(`INSERT INTO claims(space_id,collection_id,claim_id,principal_id,credential_id) VALUES($1,$2,$3,'owner','owner-session')`,
       [spaceId, collectionId, id]);
-    await db.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id)
-      VALUES($1,$2,$3,1,$4,'principal:owner','owner-session')`, [spaceId, collectionId, id, bytes]);
+    await db.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,recorded_by)
+      VALUES($1,$2,$3,1,$4,'principal:owner','owner-session','owner')`, [spaceId, collectionId, id, bytes]);
   }
 }
 
@@ -232,14 +232,14 @@ test('claim revisions and their evidence are immutable history with explicit rev
   await assert.rejects(pool.query('DELETE FROM claims WHERE space_id=$1 AND collection_id=$2 AND claim_id=$3', where), immutable);
   // Review is a new revision that names its reviewer; the current pointer moves with it.
   await inTransaction(async db => {
-    await db.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,review_status,reviewed_by,reviewed_at)
-      VALUES($1,$2,$3,2,'a generic assertion','principal:owner','reviewer','accepted','reviewer',clock_timestamp())`, where);
+    await db.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,review_status,reviewed_by,reviewed_at,recorded_by)
+      VALUES($1,$2,$3,2,'a generic assertion','principal:owner','reviewer','accepted','reviewer',clock_timestamp(),'reviewer')`, where);
     await db.query(`UPDATE entity_refs SET revision=2 WHERE space_id=$1 AND collection_id=$2 AND kind='claim' AND entity_id=$3`, where);
   });
-  await assert.rejects(pool.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,review_status)
-    VALUES($1,$2,$3,3,'unattributed review','principal:owner','s','accepted')`, where), code('23514'));
-  await assert.rejects(pool.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id)
-    VALUES($1,$2,$3,5,'gap','principal:owner','s')`, where), code('23503'));
+  await assert.rejects(pool.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,review_status,recorded_by)
+    VALUES($1,$2,$3,3,'unattributed review','principal:owner','s','accepted','s')`, where), code('23514'));
+  await assert.rejects(pool.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,recorded_by)
+    VALUES($1,$2,$3,5,'gap','principal:owner','s','s')`, where), code('23503'));
   // The current pointer cannot name a revision that does not exist.
   await assert.rejects(pool.query(`UPDATE entity_refs SET revision=3 WHERE space_id=$1 AND collection_id=$2 AND kind='claim' AND entity_id=$3`, where),
     code('23503', 'entity_refs_payload'));
@@ -718,10 +718,11 @@ test('a nonowner cell role proves evidence erasure only with the evidence grants
         has_table_privilege($1,t,'INSERT') AS can_insert, has_table_privilege($1,t,'UPDATE') AS can_update,
         has_table_privilege($1,t,'DELETE,TRUNCATE') AS can_remove FROM unnest($2::text[]) t`, [role, evidenceGrants])).rows
       .map(({ t, ...row }) => [t, row]));
-    // STA-33 writes sources, originals and the upload ledger and STA-34 extraction versions; the rest stays
-    // read-only, and nothing is removable.
+    // STA-33 writes sources, originals and the upload ledger, STA-34 extraction versions and STA-35 claims,
+    // their revisions and evidence; links stay read-only, and nothing is removable.
     const writes = { sources: [true, false], original_objects: [true, false], source_upload_grants: [true, true],
-      source_upload_attempts: [true, true], extraction_versions: [true, false] };
+      source_upload_attempts: [true, true], extraction_versions: [true, false], claims: [true, false],
+      claim_revisions: [true, false], claim_evidence: [true, false] };
     assert.deepEqual(privileges, Object.fromEntries(evidenceGrants.map(table => [table, { can_read: true,
       can_insert: writes[table]?.[0] ?? false, can_update: writes[table]?.[1] ?? false, can_remove: false }])));
     await spaces.delete(actor, spaceId);

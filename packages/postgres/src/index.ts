@@ -2119,4 +2119,7 @@ export * from './spaces.js';
 export * from './outbox.js';
 export * from './cell-policy.js';
 export * from './services.js';
-export * from './sources.js';
+// Only the sources service's public surface; claims.ts shares its internal helpers.
+export { originalKey, PostgresSources, sourceBounds, SourceUploadReconciler } from './sources.js';
+export type { ExtractionView, OriginalView, SourceCell, SourceView, UploadAttemptView, UploadGrantView } from './sources.js';
+export * from './claims.js';

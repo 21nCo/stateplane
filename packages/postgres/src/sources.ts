@@ -56,12 +56,12 @@ const nativeRegexExec = RegExp.prototype.exec;
 const matches = (pattern: RegExp, value: string) => apply(nativeRegexExec, pattern, [value]) !== null;
 const startsWith = (value: string, prefix: string) => apply(nativeStartsWith, value, [prefix]) as boolean;
 /** `JSON.stringify` of a string list, read by own index rather than through the array's iterator or `toJSON`. */
-function serialized(parts: readonly string[]): string {
+export function serialized(parts: readonly string[]): string {
   let text = '[';
   for (let i = 0; i < parts.length; i++) text += (i ? ',' : '') + stringify(Object.getOwnPropertyDescriptor(parts, i)!.value);
   return `${text}]`;
 }
-type Db = pg.PoolClient;
+export type Db = pg.PoolClient;
 type Key = [spaceId: string, collectionId: string, grantId: string, attemptId: string];
 /** `also` is a second capability the call needs on the same collection, checked like the first. */
 interface Admitted { cell: SourceCell; ownerPrincipalId: string; scope: AuthorityScope; capability: Capability; also?: Capability }
@@ -79,15 +79,15 @@ export const originalKey = (spaceId: string, grantId: string, attemptId: string)
   `originals/${spaceSegment(spaceId)}/${grantId}/${attemptId}`;
 const stagingKey = (spaceId: string, grantId: string, attemptId: string) =>
   `staging/${spaceSegment(spaceId)}/${grantId}/${attemptId}`;
-const digest = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
+export const digest = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
 const derivedSourceId = (parts: readonly string[]) => `src_${digest(serialized(parts))}`;
-const lockKey = (parts: readonly string[]) => serialized(parts);
-const iso = (value: unknown) => value === null || value === undefined ? null : new Date(value as string).toISOString();
+export const lockKey = (parts: readonly string[]) => serialized(parts);
+export const iso = (value: unknown) => value === null || value === undefined ? null : new Date(value as string).toISOString();
 const pgCode = (error: unknown) => (error as { code?: unknown })?.code;
 
-function invalid(message?: string): never { throw new AuthorityError('INVALID_ARGUMENT', message); }
+export function invalid(message?: string): never { throw new AuthorityError('INVALID_ARGUMENT', message); }
 /** True for an object the runtime cannot inspect without running caller code: any proxy, or every object without a detector. */
-const untrusted = (value: object) => !acceptsInProcessObjects || isInProcessProxy(value);
+export const untrusted = (value: object) => !acceptsInProcessObjects || isInProcessProxy(value);
 /**
  * Snapshot a request: a plain object (prototype `Object.prototype` or null)
  * whose own members are all enumerable data fields with allowed string keys.
@@ -96,7 +96,7 @@ const untrusted = (value: object) => !acceptsInProcessObjects || isInProcessProx
  * so it is refused like any other invalid value. Keys and lists are read by
  * own index, never through an inherited iterator or array method.
  */
-function fields(value: unknown, allowed: readonly string[], required: readonly string[]): Record<string, unknown> {
+export function fields(value: unknown, allowed: readonly string[], required: readonly string[]): Record<string, unknown> {
   if (!value || typeof value !== 'object' || untrusted(value) || Array.isArray(value)) invalid();
   const prototype = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) invalid();
@@ -113,11 +113,11 @@ function fields(value: unknown, allowed: readonly string[], required: readonly s
   return copy;
 }
 /** Well-formed Unicode text without NUL, within a UTF-8 byte bound. */
-function boundedText(value: unknown, maxBytes: number): value is string {
+export function boundedText(value: unknown, maxBytes: number): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= maxBytes && scalarString(value) &&
     Buffer.byteLength(value) <= maxBytes;
 }
-const reference = (value: unknown): value is string => boundedText(value, 256);
+export const reference = (value: unknown): value is string => boundedText(value, 256);
 /** The lowercase type/subtype essence of a media type; parameters are dropped. */
 function mimeEssence(value: unknown): string {
   if (typeof value !== 'string' || value.length > 512) invalid('Invalid MIME type');
@@ -142,7 +142,7 @@ function optionalInstant(value: unknown): string | null {
   if (typeof value !== 'string') invalid('Invalid capturedAt');
   try { return utcInstant(value); } catch { return invalid('Invalid capturedAt'); }
 }
-function idempotencyKey(value: unknown): string {
+export function idempotencyKey(value: unknown): string {
   if (!boundedText(value, 512)) invalid('Invalid idempotency key');
   return value;
 }
@@ -192,7 +192,7 @@ async function within<T>(until: number, start: () => Promise<T>, late: (value: T
  * `CLEANUP_CALL_MS`. A session cut off mid-statement or mid-ROLLBACK, or whose
  * ROLLBACK could not start before `until`, is discarded.
  */
-async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promise<T>, until?: number): Promise<T> {
+export async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promise<T>, until?: number): Promise<T> {
   const end = until === undefined ? undefined : Math.min(until, performance.now() + CLEANUP_CALL_MS);
   const remaining = () => end === undefined ? REQUEST_BUDGET_MS : Math.max(1, Math.floor(end - performance.now()));
   if (end !== undefined && performance.now() >= end) throw new CleanupTimeout();
@@ -241,7 +241,7 @@ async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promi
   } finally { client.release(discard); client.removeListener?.('error', onError); }
 }
 
-async function writable(db: Db, scope: AuthorityScope): Promise<void> {
+export async function writable(db: Db, scope: AuthorityScope): Promise<void> {
   const row = (await db.query(`SELECT s.lifecycle,c.lifecycle AS collection_lifecycle FROM spaces s
     JOIN collections c ON c.space_id=s.space_id WHERE s.space_id=$1 AND c.collection_id=$2`,
   [scope.spaceId, scope.collectionId])).rows[0];

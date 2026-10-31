@@ -110,8 +110,8 @@ try {
       VALUES($1,$2,'src_restore',1,$3,'text','1','restore','restore')`,[spaceId,collectionId,originalDigest]);
     await evidence.query(`INSERT INTO claims(space_id,collection_id,claim_id,principal_id,credential_id)
       VALUES($1,$2,'clm_restore','owner','restore')`,[spaceId,collectionId]);
-    await evidence.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id)
-      VALUES($1,$2,'clm_restore',1,'restored assertion','principal:owner','restore')`,[spaceId,collectionId]);
+    await evidence.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,recorded_by)
+      VALUES($1,$2,'clm_restore',1,'restored assertion','principal:owner','restore','owner')`,[spaceId,collectionId]);
     await evidence.query(`INSERT INTO claim_evidence(space_id,collection_id,claim_id,revision,ordinal,source_collection_id,source_id,extraction_version,start_offset,end_offset)
       VALUES($1,$2,'clm_restore',1,0,$2,'src_restore',1,0,7)`,[spaceId,collectionId]);
     await evidence.query(`INSERT INTO source_upload_grants(space_id,collection_id,grant_id,principal_id,credential_id,mime_type,max_bytes,expires_at,finalized_at,source_id)
@@ -149,6 +149,11 @@ try {
     /evidence facts are immutable/);
   await assert.rejects(restored.query('UPDATE records SET tombstone=true,revision=revision+1 WHERE space_id=$1 AND record_id=$2',
     [spaceId,liveRecord]),error=>error.code==='23001');
+  // The NOT VALID recorder rule is dumped apart from its table; it still binds new revisions.
+  assert.ok(expected.claim_revisions.every(row=>JSON.parse(row).recorded_by==='owner'),'the restore seed names its recorder');
+  await assert.rejects(restored.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id)
+    VALUES($1,$2,'clm_restore',2,'unrecorded','principal:owner','restore')`,[spaceId,collectionId]),
+  error=>error.code==='23514'&&error.constraint==='claim_revisions_recorded_by');
   const restoredAuthority=new PostgresAuthority(restored,3600);
   const resumed=await restoredAuthority.transaction({...scope,capability:'events:read'},tx=>tx.events(feedSeed));
   assert.equal(resumed.events.length,expected.record_event_pending.length,

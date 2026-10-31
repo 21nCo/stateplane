@@ -6,7 +6,8 @@ import { connectionOptions } from './db-connection.mjs';
 // Space deletion proves erasure by reading every evidence table. Source
 // ingestion, upload grants and upload reconciliation (STA-33) insert sources
 // and originals and advance the upload ledger; extraction (STA-34) inserts
-// extraction versions. Later evidence writes get their grants with the
+// extraction versions; claims (STA-35) insert claims, revisions and their
+// evidence. Later evidence writes get their grants with the
 // service slices that perform them. No grant allows DELETE or TRUNCATE:
 // removal stays with the scoped purge routine.
 const url=process.env.STATEPLANE_CELL_ADMIN_URL;
@@ -20,9 +21,9 @@ const grants=[
   ['source_upload_grants','SELECT, INSERT, UPDATE'],
   ['source_upload_attempts','SELECT, INSERT, UPDATE'],
   ['extraction_versions','SELECT, INSERT'],
-  ['claims','SELECT'],
-  ['claim_revisions','SELECT'],
-  ['claim_evidence','SELECT'],
+  ['claims','SELECT, INSERT'],
+  ['claim_revisions','SELECT, INSERT'],
+  ['claim_evidence','SELECT, INSERT'],
   ['links','SELECT']
 ];
 const client=new pg.Client(connectionOptions(url));
