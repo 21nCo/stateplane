@@ -377,7 +377,7 @@ test('an owning or evidence grant that lapses before the final check refuses the
   const derived = await claims.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: 'derived', ...statement(),
     evidence: [{ collectionId: 'beta', sourceId: f.betaSource }] });
   for (const lapsed of ['alpha', 'beta']) for (const call of ['get', 'review']) {
-    const expires = Date.now() + 1_500;
+    const expires = Date.now() + 3_000;
     const capabilities = call === 'get' ? ['claims:read', 'sources:read'] : ['claims:review', 'claims:read', 'sources:read'];
     const lapsing = await f.agent([['alpha', capabilities], ['beta', ['sources:read']]], { [lapsed]: new Date(expires) });
     const run = () => call === 'get' ? hookedClaims.get(lapsing, f.spaceId, 'alpha', derived.claimId)
@@ -391,6 +391,28 @@ test('an owning or evidence grant that lapses before the final check refuses the
     assert.deepEqual(await claimRows(f.spaceId), before);
   }
   assert.equal((await claims.get(f.both, f.spaceId, 'alpha', derived.claimId)).revision, 1, 'no review committed');
+});
+
+test('the claim past a list page that decides next is authorized up to the final check', async () => {
+  const f = await fixture();
+  const derived = await claims.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: 'derived', ...statement(),
+    evidence: [{ collectionId: 'beta', sourceId: f.betaSource }] });
+  // A claim without evidence that sorts before the derived one, so only the lookahead row cites beta.
+  let plain;
+  for (let n = 0; !plain; n++) {
+    const created = await claims.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: `plain-${n}`, ...statement(n) });
+    if (Buffer.compare(Buffer.from(created.claimId), Buffer.from(derived.claimId)) < 0) plain = created;
+  }
+  const expires = Date.now() + 3_000;
+  const lapsing = await f.agent([['alpha', ['claims:read', 'sources:read']], ['beta', ['sources:read']]], { beta: new Date(expires) });
+  const page = await hookedClaims.list(lapsing, f.spaceId, 'alpha', { limit: 1 });
+  assert.deepEqual(page.claims.map(view => view.claimId), [plain.claimId]);
+  assert.equal(page.next, plain.claimId, 'the derived claim past the page makes a next page');
+  hooks.push({ match: finalCheck, run: () => sleep(Math.max(0, expires + 300 - Date.now())) });
+  await rejects(hookedClaims.list(lapsing, f.spaceId, 'alpha', { limit: 1 }), 'FORBIDDEN', 'list with beta lapsed');
+  assert.equal(hooks.length, 0, 'the hook ran');
+  assert.ok(!(await claims.list(lapsing, f.spaceId, 'alpha')).claims.some(view => view.claimId === derived.claimId),
+    'once beta has lapsed the derived claim is omitted');
 });
 
 test('a nonowner cell role with the evidence grants creates, revises, reviews and reads claims', async () => {

@@ -545,9 +545,12 @@ export class PostgresClaims {
         ORDER BY c.claim_id COLLATE "C" LIMIT $8`,
       [scope.spaceId, scope.collectionId, after, status, citing?.collectionId ?? null, citing?.sourceId ?? null, readable,
         limit + 1])).rows;
+      // The row past the page decides `next`, so it is admitted and fenced like the page's own rows.
+      const admitted: ClaimView[] = [];
+      for (let i = 0; i < rows.length; i++) put(admitted, await access.admit(rows[i], false));
       const claims: ClaimView[] = [];
-      for (let i = 0; i < rows.length && i < limit; i++) put(claims, await access.admit(rows[i], false));
-      const next = rows.length > limit ? at(claims, limit - 1).claimId : null;
+      for (let i = 0; i < admitted.length && i < limit; i++) put(claims, at(admitted, i));
+      const next = admitted.length > limit ? at(claims, limit - 1).claimId : null;
       return { claims, next };
     });
   }
