@@ -40,8 +40,10 @@ const tables = ['stateplane_migrations','space_directory','space_provisioning_au
   'record_tombstones','projection_outbox','entity_refs','projection_heads','projection_reconciliations',
   'outbox_dispatch_checkpoint','outbox_space_rotation','outbox_operator_audit',
   'sources','original_objects','source_upload_grants','source_upload_attempts','extraction_versions',
-  'claims','claim_revisions','claim_evidence','links','evidence_events','evidence_outbox','original_erasures'];
-const evidenceTables=tables.slice(-12);
+  'claims','claim_revisions','claim_evidence','links','evidence_events','evidence_outbox','original_erasures','space_erasures'];
+const evidenceTables=tables.slice(-13);
+// A space erased before the dump, whose blob-store erasure is still pending.
+const erasedSpaceId='sp_restore_erased';
 async function snapshot(pool) {
   const entries = await Promise.all(tables.map(async table => {
     const rows = await pool.query(`SELECT to_jsonb(t) AS value FROM ${table} t`);
@@ -53,6 +55,7 @@ try {
   docker(['createdb','-U','stateplane',sourceName]);
   execFileSync(process.execPath,['scripts/migrate.mjs'],{cwd:root,env:{...process.env,DATABASE_URL:sourceUrl},stdio:'inherit'});
   const spaceId=`sp_restore_${randomBytes(6).toString('hex')}`;
+  const evidenceSpace=table=>table==='space_erasures'?erasedSpaceId:spaceId;
   const retiredSpaceId=`sp_retired_${randomBytes(6).toString('hex')}`;
   const collectionId='entries';
   const seed=await base.connect();
@@ -133,6 +136,9 @@ try {
     [spaceId,collectionId,originalDigest]);
     await evidence.query(`UPDATE entity_refs SET tombstone=true WHERE space_id=$1 AND collection_id=$2 AND entity_id='src_restore_deleted'`,
       [spaceId,collectionId]);
+    await evidence.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,lifecycle)
+      VALUES($1,'owner','cell-a','cell-a','target-a','deleted')`,[erasedSpaceId]);
+    await evidence.query('INSERT INTO space_erasures(space_id) VALUES($1)',[erasedSpaceId]);
     await evidence.query('COMMIT');
   } catch (error) { await evidence.query('ROLLBACK'); throw error; }
   finally { evidence.release(); }
@@ -168,6 +174,8 @@ try {
   assert.equal((await restored.query(`SELECT count(*)::int AS n FROM evidence_outbox WHERE event_id=$1`,
     ['eev_00000000-0000-4000-8000-000000000002'])).rows[0].n,1,'the restored event trigger enqueues an outbox entry');
   await assert.rejects(restored.query('UPDATE evidence_events SET revision=3 WHERE space_id=$1',[spaceId]),/evidence facts are immutable/);
+  await assert.rejects(restored.query(`UPDATE space_erasures SET requested_at=requested_at-interval '1 day' WHERE space_id=$1`,
+    [erasedSpaceId]),error=>error.code==='23514'&&error.constraint==='space_erasures_transition','the restored erasure guard binds');
   // The NOT VALID recorder rule is dumped apart from its table; it still binds new revisions.
   assert.ok(expected.claim_revisions.every(row=>JSON.parse(row).recorded_by==='owner'),'the restore seed names its recorder');
   await assert.rejects(restored.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id)
@@ -204,8 +212,11 @@ try {
       assert.equal((await operational.query(`UPDATE outbox_space_rotation SET after_collection_id=$2
         WHERE space_id=$1`,[spaceId,collectionId])).rowCount,1,'restored operational role can rotate collection turns');
       for (const table of evidenceTables)
-        assert.ok((await operational.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[spaceId])).rows[0].n>0,
+        assert.ok((await operational.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[evidenceSpace(table)])).rows[0].n>0,
           `restored operational role can read ${table} for erasure proof`);
+      assert.equal((await operational.query(`UPDATE space_erasures SET next_attempt_at=clock_timestamp()
+        WHERE space_id=$1 AND originals_removed_at IS NULL`,[erasedSpaceId])).rowCount,1,
+      'restored operational role can record space erasure progress');
     } finally {
       await operational.query('RESET ROLE').catch(()=>{});
       operational.release();

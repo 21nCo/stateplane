@@ -5,7 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
-import { PostgresAuthority, PostgresSpaces } from '../../packages/postgres/dist/index.js';
+import { PostgresAuthority, PostgresSpaces, SourceUploadReconciler } from '../../packages/postgres/dist/index.js';
 
 // STA-32 storage only: no service writes these tables yet, so fixtures use SQL.
 const root = fileURLToPath(new URL('../..', import.meta.url));
@@ -754,6 +754,18 @@ test('a nonowner cell role proves evidence erasure only with the evidence grants
     await spaces.repairDeletedErasure(actor, spaceId);
     assert.equal((await pool.query('SELECT lifecycle FROM space_directory WHERE space_id=$1', [spaceId])).rows[0].lifecycle, 'deleted');
     assert.deepEqual(await counts(spaceId), Object.fromEntries(evidenceTables.map(table => [table, 0])));
+    // The role reads the erasure report and runs erase's space step, which lists, deletes and records progress.
+    // The fixture's upload grant has not ended, so the step reschedules rather than completes.
+    assert.deepEqual(await spaces.erasure(actor, spaceId), { spaceId, database: 'erased', originalBytes: 'pending', backups: 'retained' });
+    const scheduled = async () => (await pool.query('SELECT next_attempt_at FROM space_erasures WHERE space_id=$1', [spaceId])).rows[0]
+      .next_attempt_at;
+    const before = await scheduled();
+    const listed = [];
+    const store = { list: async prefix => { listed.push(prefix); return { keys: [], done: true }; }, delete: async () => {} };
+    await new SourceUploadReconciler({ pool: cellPool, originals: store }, 0).erase(500, 5000);
+    assert.ok(listed.some(prefix => prefix.startsWith('originals/')) && listed.some(prefix => prefix.startsWith('staging/')));
+    assert.ok((await scheduled()) > before, 'its next attempt waits for the grant to end');
+    assert.equal((await spaces.erasure(actor, spaceId)).originalBytes, 'pending');
   } finally {
     await cellPool.end();
     await pool.query(`DROP OWNED BY ${role}`);
@@ -802,6 +814,9 @@ test('migration 040 rolls back atomically while record writers hold locks, then 
     }
     await db.query('COMMIT');
     await db.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id) VALUES('sp_upgrade','owner','cell-a','cell-a','target-a')`);
+    // A space deleted before migration 044 never requested its blob-store erasure.
+    await db.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,lifecycle)
+      VALUES('sp_gone','owner','cell-a','cell-a','target-a','deleted')`);
     await db.query('BEGIN');
     await db.query(`INSERT INTO collections(space_id,collection_id) VALUES('sp_upgrade','entries')`);
     await db.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition) VALUES('sp_upgrade','entries',1,'{}')`);
@@ -835,6 +850,9 @@ test('migration 040 rolls back atomically while record writers hold locks, then 
       FROM pg_constraint WHERE connamespace='public'::regnamespace ORDER BY relation,conname`)).rows;
     const fresh = await pool.connect();
     try { assert.deepEqual(await constraints(db), await constraints(fresh)); } finally { fresh.release(); }
+    // Migration 044 requests erasure for the space deleted before it, and only for that one.
+    assert.deepEqual((await db.query('SELECT space_id,originals_removed_at FROM space_erasures')).rows,
+      [{ space_id: 'sp_gone', originals_removed_at: null }]);
     // Existing records remain deletable once 040 is in place.
     await db.query(`UPDATE records SET tombstone=true,revision=2 WHERE record_id='rec_2'`);
     assert.equal(migrate(name).status, 0, 'a recorded 040 is skipped');

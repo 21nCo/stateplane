@@ -16,10 +16,12 @@ const pool = new pg.Pool({ connectionString: url, max: 10 });
 test.after(() => pool.end());
 const sha = value => createHash('sha256').update(value).digest('hex');
 
-/** An in-memory R2 bucket: atomic put with its checksum, ordered list and an injectable delete fault. */
+/** An in-memory R2 bucket: atomic put with its checksum, ordered list and injectable delete faults and delays. */
 class MemoryR2 {
   objects = new Map();
   failDelete = () => false;
+  /** Milliseconds a delete of the key takes, or Infinity for one that never answers. */
+  deleteDelay = () => 0;
   async put(key, body, options = {}) {
     const chunks = [];
     const reader = body.getReader();
@@ -35,7 +37,13 @@ class MemoryR2 {
   }
   async head(key) { return this.meta(key); }
   async get(key) { const meta = this.meta(key); return meta && { ...meta, body: new Blob([this.objects.get(key).bytes]).stream() }; }
-  async delete(key) { if (this.failDelete(key)) throw new Error('delete: provider unavailable'); this.objects.delete(key); }
+  async delete(key) {
+    const delay = this.deleteDelay(key);
+    if (delay === Infinity) return new Promise(() => {});
+    if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+    if (this.failDelete(key)) throw new Error('delete: provider unavailable');
+    this.objects.delete(key);
+  }
   async list({ startAfter = '', limit = 1000 } = {}) {
     const after = [...this.objects.keys()].sort().filter(key => key > startAfter);
     return { objects: after.slice(0, limit).map(key => ({ key })), truncated: after.length > limit };
@@ -47,14 +55,14 @@ const rejects = (promise, code, message) => assert.rejects(promise, error => {
   return true;
 }, message);
 
-/** A pool whose hooks run once before the first statement containing their text. */
+/** A pool whose hooks run once before the first statement containing their text, or equal to it when `exact`. */
 let hooks = [];
 const hooked = { connect: async () => {
   const client = await pool.connect();
   return new Proxy(client, { get(target, property) {
     if (property !== 'query') return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
     return async (sql, ...rest) => {
-      const hook = typeof sql === 'string' ? hooks.find(item => sql.includes(item.match)) : undefined;
+      const hook = typeof sql === 'string' ? hooks.find(item => item.exact ? sql === item.match : sql.includes(item.match)) : undefined;
       if (hook) { hooks = hooks.filter(item => item !== hook); await hook.run(); }
       return target.query(sql, ...rest);
     };
@@ -78,6 +86,8 @@ const services = postgresServices(spaces, new Map([['cell-a', { pool, cursorSecr
 const links = new PostgresLinks(spaces, new Map([['cell-a', { pool }]]));
 const hookedLinks = new PostgresLinks(spaces, new Map([['cell-a', { pool: hooked }]]));
 const claims = new PostgresClaims(spaces, new Map([['cell-a', { pool }]]));
+const hookedClaims = new PostgresClaims(spaces, new Map([['cell-a', { pool: hooked }]]));
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const verify = token => identity.verify(new Request('https://h.invalid', { headers: { authorization: `Bearer ${token}` } }));
 const definition = slug => JSON.stringify({ slug, version: 1, schema: { $schema: 'https://json-schema.org/draft/2020-12/schema',
   type: 'object', properties: { label: { type: 'string' } }, additionalProperties: false }, unique: [], filterable: [], sortable: [] });
@@ -90,8 +100,10 @@ async function fixture() {
   const spaceId = `sp_${randomUUID()}`;
   await spaces.create(owner, 'cell-a', spaceId);
   for (const id of ['alpha', 'beta']) await services.collections.define(owner, spaceId, id, definition(id));
-  const agent = async grants => verify((await spaces.issueAgentKey(owner, spaceId, new Date(Date.now() + 3_600_000),
-    grants.map(([collectionId, capabilities]) => ({ collectionId, capabilities })))).secret);
+  // `expiresAt` may end the key (`key`) or one collection's grant early.
+  const agent = async (grants, expiresAt) => verify((await spaces.issueAgentKey(owner, spaceId,
+    expiresAt?.key ?? new Date(Date.now() + 3_600_000), grants.map(([collectionId, capabilities]) => ({ collectionId, capabilities,
+      ...(expiresAt?.[collectionId] ? { expiresAt: expiresAt[collectionId] } : {}) })))).secret);
   const r2 = new MemoryR2();
   const cell = { pool, originals: new R2BlobStore(r2) };
   const sources = new PostgresSources(spaces, new Map([['cell-a', cell]]));
@@ -119,6 +131,33 @@ const events = async spaceId => (await pool.query(`SELECT e.kind,e.entity_id,e.r
   WHERE e.space_id=$1 ORDER BY e.committed_at,e.event_id`, [spaceId])).rows;
 const deleteRecord = (actor, f, collectionId, id, revision = 1) => services.records.mutate(actor, f.spaceId, collectionId,
   JSON.stringify({ operation: 'delete', idempotencyKey: `del-${randomUUID()}`, id, expectedRevision: revision }));
+/**
+ * As if an hour passed for the space's writers: every upload grant, and every
+ * erasure's writer bound and next attempt, moves an hour back. Only the clock
+ * is simulated, so the guards that forbid such changes are bypassed for it.
+ */
+async function settle(f) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SET LOCAL session_replication_role = replica');
+    await client.query(`UPDATE source_upload_grants SET issued_at=issued_at-interval '1 hour',expires_at=expires_at-interval '1 hour'
+      WHERE space_id=$1`, [f.spaceId]);
+    for (const table of ['original_erasures', 'space_erasures'])
+      await client.query(`UPDATE ${table} SET writers_end_at=writers_end_at-interval '1 hour',
+        next_attempt_at=next_attempt_at-interval '1 hour' WHERE space_id=$1`, [f.spaceId]);
+    await client.query('COMMIT');
+  } finally { client.release(); }
+}
+const objectKey = async (f, sourceId) => (await pool.query('SELECT object_key FROM original_objects WHERE space_id=$1 AND source_id=$2',
+  [f.spaceId, sourceId])).rows[0].object_key;
+const erasures = async spaceId => (await pool.query('SELECT count(*)::int AS n FROM original_erasures WHERE space_id=$1',
+  [spaceId])).rows[0].n;
+/** Complete every due erasure left by earlier tests, so a test's own erasures are the only ones due. */
+async function drain(f) {
+  for (let i = 0; i < 20 && await f.reconciler().erase(500, 5000) > 0;) i++;
+}
+const retained = { originalBytes: 'none', metadata: 'retained', backups: 'retained' };
 const recordLive = async (f, id) => (await pool.query('SELECT NOT tombstone AS live FROM records WHERE space_id=$1 AND record_id=$2',
   [f.spaceId, id])).rows[0].live;
 
@@ -235,8 +274,8 @@ test('record deletion follows its links: restrict refuses it whole, detach tombs
     { kind: 'link', entity_id: restricting.linkId, revision: 2, operation: 'delete', by_request: true, delivery_state: 'pending' },
     { kind: 'link', entity_id: detaching.linkId, revision: 2, operation: 'detach', by_request: false, delivery_state: 'pending' }]);
   const replayed = await links.delete(f.owner, f.spaceId, 'alpha', detaching.linkId);
-  assert.deepEqual({ ...replayed, deletedAt: null }, { ...detaching, revision: 2, deleted: true, deletedAt: null, replayed: true },
-    'deleting a detached link replays');
+  assert.deepEqual({ ...replayed, deletedAt: null }, { ...detaching, revision: 2, deleted: true, deletedAt: null, replayed: true,
+    erasure: retained }, 'deleting a detached link replays, and its row is retained');
   assert.ok(replayed.deletedAt);
   await rejects(links.get(f.owner, f.spaceId, 'alpha', detaching.linkId), 'NOT_FOUND');
   await rejects(create(f.owner, f, 'alpha', ref('record', 'alpha', f.alphaRecord), target), 'NOT_FOUND', 'a deleted endpoint');
@@ -245,8 +284,7 @@ test('record deletion follows its links: restrict refuses it whole, detach tombs
 test('source deletion detaches links, erases the original bytes and reports what remains', async () => {
   const f = await fixture();
   const sourceRef = ref('source', 'alpha', f.alphaSource);
-  const key = (await pool.query('SELECT object_key FROM original_objects WHERE space_id=$1 AND source_id=$2',
-    [f.spaceId, f.alphaSource])).rows[0].object_key;
+  const key = await objectKey(f, f.alphaSource);
   assert.equal(f.r2.objects.has(key), true);
   const citing = await claims.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: 'cites', statement: 'The alpha report.',
     attributedTo: 'archive', evidence: [{ collectionId: 'alpha', sourceId: f.alphaSource }] });
@@ -258,9 +296,11 @@ test('source deletion detaches links, erases the original bytes and reports what
   await rejects(f.sources.delete(deleter, f.spaceId, 'alpha', f.alphaSource), 'LINK_RESTRICTED');
   assert.equal((await f.sources.get(f.owner, f.spaceId, 'alpha', f.alphaSource)).sourceId, f.alphaSource);
   await links.delete(f.owner, f.spaceId, 'alpha', restricting.linkId);
+  // The grant that wrote the original has not ended, so a copy it started could still land: the bytes are
+  // removed at once, but the erasure is pending.
   const deleted = await f.sources.delete(deleter, f.spaceId, 'alpha', f.alphaSource);
   assert.deepEqual({ ...deleted, deletedAt: null }, { sourceId: f.alphaSource, collectionId: 'alpha', deletedAt: null, replayed: false,
-    erasure: { originalBytes: 'removed', metadata: 'retained', backups: 'retained' } });
+    erasure: { originalBytes: 'pending', metadata: 'retained', backups: 'retained' } });
   assert.equal(f.r2.objects.has(key), false, 'the original bytes are gone from the store');
   for (const read of [() => f.sources.get(f.owner, f.spaceId, 'alpha', f.alphaSource),
     () => f.sources.content(f.owner, f.spaceId, 'alpha', f.alphaSource),
@@ -277,26 +317,107 @@ test('source deletion detaches links, erases the original bytes and reports what
   assert.deepEqual(await f.sources.delete(deleter, f.spaceId, 'alpha', f.alphaSource), { ...deleted, replayed: true });
   await rejects(f.sources.delete(deleter, f.spaceId, 'alpha', 'src_missing'), 'NOT_FOUND');
 
-  // A blob store that cannot delete leaves the erasure pending until the reconciler removes the bytes.
+  // A copy the grant started lands after the removal. The erasure is not due again until the grant's writers ended.
+  f.r2.objects.set(key, { bytes: Buffer.from('late copy') });
+  await f.reconciler().erase(500);
+  assert.equal(f.r2.objects.has(key), true, 'not due while the grant could still write');
+  assert.equal((await f.sources.delete(deleter, f.spaceId, 'alpha', f.alphaSource)).erasure.originalBytes, 'pending');
+  await settle(f);
+  await f.reconciler().erase(500);
+  assert.equal(f.r2.objects.has(key), false);
+  assert.equal((await f.sources.delete(deleter, f.spaceId, 'alpha', f.alphaSource)).erasure.originalBytes, 'removed');
+  // A copy the store confirms later still is found by the sweep, which reopens the erasure before deleting it, so
+  // the report reads pending until the key is gone, also when the sweep's own delete fails.
+  f.r2.objects.set(key, { bytes: Buffer.from('later copy') });
+  f.r2.failDelete = candidate => candidate === key;
+  await assert.rejects(f.reconciler().sweep(1000), AggregateError);
+  assert.equal(f.r2.objects.has(key), true);
+  assert.equal((await f.sources.delete(deleter, f.spaceId, 'alpha', f.alphaSource)).erasure.originalBytes, 'pending');
+  f.r2.failDelete = () => false;
+  await f.reconciler().erase(500);
+  assert.equal(f.r2.objects.has(key), false);
+  assert.equal((await f.sources.delete(deleter, f.spaceId, 'alpha', f.alphaSource)).erasure.originalBytes, 'removed');
+
+  // Once its writers ended, a deletion whose removal fails is pending until the reconciler removes the bytes.
   const other = await f.source('alpha');
-  const otherKey = (await pool.query('SELECT object_key FROM original_objects WHERE space_id=$1 AND source_id=$2',
-    [f.spaceId, other])).rows[0].object_key;
+  const otherKey = await objectKey(f, other);
+  await settle(f);
   f.r2.failDelete = candidate => candidate === otherKey;
   const pending = await f.sources.delete(f.owner, f.spaceId, 'alpha', other);
   assert.equal(pending.erasure.originalBytes, 'pending');
   assert.equal(f.r2.objects.has(otherKey), true);
-  await assert.rejects(f.reconciler().erase(), AggregateError, 'a failing erasure is reported');
+  await assert.rejects(f.reconciler().erase(500), AggregateError, 'a failing erasure is reported');
   assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', other)).erasure.originalBytes, 'pending', 'and stays pending');
   f.r2.failDelete = () => false;
-  await f.reconciler().erase();
+  assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', other)).erasure.originalBytes, 'removed',
+    'a settled removal at deletion is complete');
   assert.equal(f.r2.objects.has(otherKey), false);
-  assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', other)).erasure.originalBytes, 'removed');
-  // A copy that lands after the erasure is found by the sweep, since the source's deletion is final.
-  f.r2.objects.set(otherKey, { bytes: Buffer.from('late copy') });
-  for (let page = 0; page < 20 && f.r2.objects.has(otherKey); page++) await f.reconciler().sweep(1000);
-  assert.equal(f.r2.objects.has(otherKey), false);
-  assert.equal(f.r2.objects.has((await pool.query('SELECT object_key FROM original_objects WHERE space_id=$1 AND source_id=$2',
-    [f.spaceId, f.betaSource])).rows[0].object_key), true, 'a live source keeps its bytes');
+  assert.equal(f.r2.objects.has(await objectKey(f, f.betaSource)), true, 'a live source keeps its bytes');
+
+  // A reference-only source held no bytes: nothing is queued and none is reported.
+  const reference = (await f.sources.ingestReference(f.owner, f.spaceId, 'alpha', { idempotencyKey: 'ref',
+    locator: 'https://example.invalid/report', mimeType: 'text/html' })).sourceId;
+  const queued = await erasures(f.spaceId);
+  assert.deepEqual((await f.sources.delete(deleter, f.spaceId, 'alpha', reference)).erasure,
+    { originalBytes: 'none', metadata: 'retained', backups: 'retained' });
+  assert.equal(await erasures(f.spaceId), queued, 'no erasure is queued for a reference');
+});
+
+test('erasure retries move behind later requests, share the budget and stop short of it without failing', async () => {
+  const f = await fixture();
+  await drain(f);
+  const first = await f.source('alpha');
+  const second = await f.source('alpha');
+  const [firstKey, secondKey] = [await objectKey(f, first), await objectKey(f, second)];
+  await settle(f);
+  // Both removals fail at deletion, so both erasures are due, the first one oldest.
+  f.r2.failDelete = key => key === firstKey || key === secondKey;
+  for (const id of [first, second]) assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', id)).erasure.originalBytes, 'pending');
+  f.r2.failDelete = key => key === firstKey;
+  // Only this file deletes sources in the shared database, so these two are the only source erasures due.
+  await assert.rejects(f.reconciler().erase(1, 5000), AggregateError, 'the oldest erasure fails');
+  await f.reconciler().erase(1, 5000);
+  assert.equal(f.r2.objects.has(secondKey), false, 'the failed one moved behind the later request');
+  assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', second)).erasure.originalBytes, 'removed');
+  // A source erasure whose delete never answers takes at most its half of the budget; the space still gets its turn.
+  f.r2.failDelete = () => false;
+  f.r2.deleteDelay = key => key === firstKey ? Infinity : 0;
+  const erased = await fixture();
+  await services.spaces.update(erased.owner, erased.spaceId, 'readOnly');
+  await services.spaces.delete(erased.owner, erased.spaceId);
+  await settle(erased);
+  const segment = Buffer.from(erased.spaceId).toString('base64url');
+  // The other fixture's keys are listed through this store, as one cell's bucket.
+  for (let i = 0; i < 3; i++) f.r2.objects.set(`originals/${segment}/upl_${i}/att_${i}`, { bytes: Buffer.from('x') });
+  // Other test files delete spaces in the shared database, so the page bound leaves room for theirs.
+  await assert.rejects(f.reconciler().erase(500, 5000), AggregateError, 'the stalled delete is reported');
+  assert.deepEqual(f.r2.keys(`originals/${segment}/`), [], 'the space was erased in the same call');
+  assert.equal((await spaces.erasure(erased.owner, erased.spaceId)).originalBytes, 'pending', 'until a listing finds nothing');
+  f.r2.deleteDelay = () => 0;
+  await f.reconciler().erase(500, 5000);
+  assert.equal((await spaces.erasure(erased.owner, erased.spaceId)).originalBytes, 'erased');
+  assert.equal(f.r2.objects.has(firstKey), false, 'and the stalled source was retried');
+  // A slow store cuts a space's page short: no failure, and completion still waits for an empty listing.
+  f.r2.deleteDelay = () => 40;
+  const slow = await fixture();
+  await services.spaces.update(slow.owner, slow.spaceId, 'readOnly');
+  await services.spaces.delete(slow.owner, slow.spaceId);
+  await settle(slow);
+  const slowSegment = Buffer.from(slow.spaceId).toString('base64url');
+  for (let i = 0; i < 60; i++) f.r2.objects.set(`staging/${slowSegment}/upl_${i}/att_${i}`, { bytes: Buffer.from('x') });
+  let left = 60;
+  // Each call must resolve; a page cut short by the budget is unfinished work, not a failure.
+  for (let i = 0; i < 5 && left === 60; i++) {
+    await f.reconciler().erase(500, 1000);
+    left = f.r2.keys(`staging/${slowSegment}/`).length;
+  }
+  assert.ok(left > 0 && left < 60, `the page was cut short after some deletes (${left} left)`);
+  assert.equal((await spaces.erasure(slow.owner, slow.spaceId)).originalBytes, 'pending');
+  f.r2.deleteDelay = () => 0;
+  for (let i = 0; i < 5 && (await spaces.erasure(slow.owner, slow.spaceId)).originalBytes === 'pending'; i++)
+    await f.reconciler().erase(500, 5000);
+  assert.deepEqual(f.r2.keys(`staging/${slowSegment}/`), []);
+  assert.equal((await spaces.erasure(slow.owner, slow.spaceId)).originalBytes, 'erased');
 });
 
 test('claim deletion follows the claim revision and read rules and its links', async () => {
@@ -319,7 +440,7 @@ test('claim deletion follows the claim revision and read rules and its links', a
   await links.delete(f.owner, f.spaceId, 'alpha', restricting.linkId);
   const deleted = await claims.delete(writer, f.spaceId, 'alpha', plain.claimId, { baseRevision: 2 });
   assert.deepEqual({ ...deleted, deletedAt: null }, { claimId: plain.claimId, collectionId: 'alpha', revision: 2, deletedAt: null,
-    replayed: false });
+    replayed: false, erasure: retained }, 'its revisions are retained, and no bytes were held');
   await rejects(claims.get(writer, f.spaceId, 'alpha', plain.claimId), 'NOT_FOUND');
   assert.equal((await claims.list(writer, f.spaceId, 'alpha')).claims.length, 0);
   assert.deepEqual(await claims.delete(writer, f.spaceId, 'alpha', plain.claimId, { baseRevision: 2 }), { ...deleted, replayed: true });
@@ -388,19 +509,92 @@ test('space deletion reports its blob-store erasure as pending until every origi
   const deleted = await services.spaces.delete(f.owner, f.spaceId);
   assert.deepEqual(deleted, { spaceId: f.spaceId, deleted: true,
     erasure: { spaceId: f.spaceId, database: 'erased', originalBytes: 'pending', backups: 'retained' } });
-  await f.reconciler().erase(25, 5000);
+  // The space's upload grants have not ended, so a write they started could still land: keys are deleted, and
+  // even an empty listing does not complete the erasure.
+  await f.reconciler().erase(500, 5000);
   assert.deepEqual(f.r2.keys(`originals/${segment}/`), []);
   assert.deepEqual(f.r2.keys(`staging/${segment}/`), []);
+  await f.reconciler().erase(500, 5000);
+  assert.equal((await spaces.erasure(f.owner, f.spaceId)).originalBytes, 'pending', 'writers could still land');
+  f.r2.objects.set(`staging/${segment}/upl_z/att_z`, { bytes: Buffer.from('late') });
+  await settle(f);
+  await f.reconciler().erase(500, 5000);
+  assert.deepEqual(f.r2.keys(`staging/${segment}/`), [], 'the late write was deleted');
   assert.equal((await spaces.erasure(f.owner, f.spaceId)).originalBytes, 'pending', 'completion needs a listing that finds nothing');
-  await f.reconciler().erase(25, 5000);
+  await f.reconciler().erase(500, 5000);
   assert.deepEqual(await spaces.erasure(f.owner, f.spaceId), { spaceId: f.spaceId, database: 'erased', originalBytes: 'erased',
     backups: 'retained' });
-  // A write that lands after completion is still found: the sweep removes any key of a deleted space.
-  f.r2.objects.set(`originals/${segment}/upl_y/att_y`, { bytes: Buffer.from('late') });
-  for (let page = 0; page < 20 && f.r2.keys(`originals/${segment}/`).length; page++) await f.reconciler().sweep(1000);
+  // A write the store confirms after completion is found by the sweep, which reopens the erasure first, so the
+  // report reads pending until the key is gone, also when the sweep's delete fails.
+  const late = `originals/${segment}/upl_y/att_y`;
+  f.r2.objects.set(late, { bytes: Buffer.from('late') });
+  f.r2.failDelete = key => key === late;
+  await assert.rejects(f.reconciler().sweep(1000), AggregateError);
+  assert.equal(f.r2.objects.has(late), true);
+  assert.equal((await spaces.erasure(f.owner, f.spaceId)).originalBytes, 'pending');
+  f.r2.failDelete = () => false;
+  for (let i = 0; i < 3 && (await spaces.erasure(f.owner, f.spaceId)).originalBytes === 'pending'; i++)
+    await f.reconciler().erase(500, 5000);
   assert.deepEqual(f.r2.keys(`originals/${segment}/`), []);
+  assert.equal((await spaces.erasure(f.owner, f.spaceId)).originalBytes, 'erased');
   assert.equal(f.r2.objects.has(keptKey), true, 'another space keeps its bytes');
   await rejects(spaces.erasure(kept.owner, f.spaceId), 'NOT_FOUND', 'only the owner reads the report');
   assert.deepEqual(await spaces.erasure(kept.owner, kept.spaceId), { spaceId: kept.spaceId, database: 'pending',
     originalBytes: 'pending', backups: 'retained' }, 'a live space is not erased');
+});
+
+test('an evidence mutation whose key or grant lapses after the final check, before COMMIT, rolls back whole', async () => {
+  const f = await fixture();
+  const claim = await claims.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: 'cites-beta', statement: 'From beta.',
+    attributedTo: 'archive', evidence: [{ collectionId: 'beta', sourceId: f.betaSource }] });
+  const existing = await create(f.owner, f, 'alpha', ref('record', 'alpha', f.alphaRecord), ref('source', 'beta', f.betaSource));
+  // Each deletion would also detach a link, so a rollback must take the detach with it.
+  await create(f.owner, f, 'alpha', ref('claim', 'alpha', claim.claimId), ref('record', 'beta', f.betaRecord));
+  await create(f.owner, f, 'alpha', ref('source', 'alpha', f.alphaSource), ref('record', 'beta', f.betaRecord));
+  const sourceKey = await objectKey(f, f.alphaSource);
+  const state = async () => ({ links: await linkRows(f.spaceId), events: await events(f.spaceId), erasures: await erasures(f.spaceId),
+    live: (await pool.query(`SELECT kind,entity_id FROM entity_refs WHERE space_id=$1 AND NOT tombstone ORDER BY kind,entity_id`,
+      [f.spaceId])).rows });
+  const calls = {
+    'link create': [[['alpha', all], ['beta', all]], actor => hookedLinks.create(actor, f.spaceId, 'alpha', { idempotencyKey: 'held',
+      type: 'cites', policy: 'detach', from: ref('record', 'alpha', f.alphaRecord), to: ref('source', 'beta', f.betaSource) })],
+    'link delete': [[['alpha', all], ['beta', all]], actor => hookedLinks.delete(actor, f.spaceId, 'alpha', existing.linkId)],
+    'claim delete': [[['alpha', ['claims:read', 'claims:write']], ['beta', ['sources:read']]],
+      actor => hookedClaims.delete(actor, f.spaceId, 'alpha', claim.claimId, { baseRevision: 1 })],
+    'source delete': [[['alpha', ['sources:read', 'sources:write']], ['beta', []]],
+      actor => f.hookedSources.delete(actor, f.spaceId, 'alpha', f.alphaSource)]
+  };
+  for (const [call, [grants, run]] of Object.entries(calls)) for (const lapsed of ['key', call === 'source delete' ? 'alpha' : 'beta']) {
+    const expires = Date.now() + 3_000;
+    const lapsing = await f.agent(grants.filter(([, capabilities]) => capabilities.length), { [lapsed]: new Date(expires) });
+    const before = await state();
+    // Every in-transaction check, the final grant statement included, has passed; only COMMIT is held past expiry.
+    hooks.push({ match: 'COMMIT', exact: true, run: () => sleep(Math.max(0, expires + 300 - Date.now())) });
+    await rejects(run(lapsing), 'FORBIDDEN', `${call} with ${lapsed} lapsed before COMMIT`);
+    assert.equal(hooks.length, 0, 'the hook ran');
+    assert.deepEqual(await state(), before, `${call} with ${lapsed} lapsed changed nothing`);
+    assert.equal(f.r2.objects.has(sourceKey), true, 'no byte removal started');
+  }
+  // The same held COMMIT succeeds while every grant is still live.
+  const live = await f.agent(calls['source delete'][0].filter(([, capabilities]) => capabilities.length));
+  hooks.push({ match: 'COMMIT', exact: true, run: () => sleep(300) });
+  assert.equal((await calls['source delete'][1](live)).replayed, false);
+  assert.equal(hooks.length, 0, 'the hook ran');
+});
+
+test('a link replay is authorized against the stored link before its content is compared', async () => {
+  const f = await fixture();
+  const expires = Date.now() + 1_500;
+  const linker = await f.agent([['alpha', all], ['beta', all]], { beta: new Date(expires) });
+  const request = { idempotencyKey: 'stored', type: 'cites', policy: 'detach', from: ref('record', 'alpha', f.alphaRecord),
+    to: ref('source', 'beta', f.betaSource) };
+  const stored = await links.create(linker, f.spaceId, 'alpha', request);
+  assert.deepEqual(await links.create(linker, f.spaceId, 'alpha', request), { ...stored, replayed: true });
+  await rejects(links.create(linker, f.spaceId, 'alpha', { ...request, to: ref('source', 'alpha', f.alphaSource) }),
+    'IDEMPOTENCY_MISMATCH', 'while the stored link is visible');
+  await sleep(Math.max(0, expires + 200 - Date.now()));
+  // The changed retry names only alpha endpoints, but the stored link reaches beta, which the key can no longer read.
+  await rejects(links.create(linker, f.spaceId, 'alpha', { ...request, to: ref('source', 'alpha', f.alphaSource) }), 'NOT_FOUND',
+    'an inaccessible stored link stays hidden from a changed retry');
+  await rejects(links.get(linker, f.spaceId, 'alpha', stored.linkId), 'NOT_FOUND');
 });

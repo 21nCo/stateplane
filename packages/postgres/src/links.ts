@@ -5,9 +5,9 @@ import { AuthorityError, AuthorityTransaction } from './index.js';
 import type { AuthorityScope } from './index.js';
 import { includes } from './schema.js';
 import type { PostgresSpaces } from './spaces.js';
-import { boundedText, digest, evidenceEvent, fields, idempotencyKey, invalid, iso, lockKey, reference, restricted, serialized,
-  transact, writable } from './sources.js';
-import type { Db } from './sources.js';
+import { boundedText, digest, evidenceEvent, evidenceRefusal, fields, idempotencyKey, invalid, iso, lockKey, reference, rowsRetained,
+  serialized, transact, writable } from './sources.js';
+import type { Db, DeletionErasure } from './sources.js';
 
 /** One cell's authority pool. */
 export interface LinkCell { pool: Pick<pg.Pool, 'connect'> }
@@ -23,6 +23,8 @@ export interface LinkView {
   linkId: string; collectionId: string; type: string; policy: LinkPolicy; from: LinkEndpoint; to: LinkEndpoint;
   revision: number; deleted: boolean; createdAt: string; deletedAt: string | null; replayed: boolean;
 }
+/** A deleted link and what remains: its row stays, unreadable, until the space is erased, and backups keep earlier copies. */
+export interface LinkDeletion extends LinkView { erasure: DeletionErasure }
 /** `next` is the `after` value for the following page, or null on the last page. */
 export interface LinkPage { links: LinkView[]; next: string | null }
 
@@ -254,7 +256,7 @@ export class PostgresLinks {
     } catch (error) {
       // An endpoint deleted after it was checked: the link guard refused it.
       if (linkLiveEndpoint(error)) throw new AuthorityError('NOT_FOUND', 'Link endpoint not found');
-      throw restricted(error);
+      throw evidenceRefusal(error);
     }
   }
 
@@ -286,15 +288,14 @@ export class PostgresLinks {
       await lockLink(db, scope.spaceId, linkId);
       const existing = (await db.query(`${linkSelect} WHERE l.space_id=$1 AND l.link_id=$2`, [scope.spaceId, linkId])).rows[0];
       if (existing) {
-        if (existing.collection_id !== scope.collectionId) {
-          await access.enter(String(existing.collection_id));
-          throw new AuthorityError('IDEMPOTENCY_MISMATCH');
-        }
-        const [storedFrom, storedTo] = endpointsOf(existing);
-        if (existing.link_type !== type || existing.deletion_policy !== policy || !sameEndpoint(storedFrom, from) ||
-          !sameEndpoint(storedTo, to)) throw new AuthorityError('IDEMPOTENCY_MISMATCH');
-        await access.see(from, existing.from_cited as string[]);
-        await access.see(to, existing.to_cited as string[]);
+        // The stored link is authorized as delete would authorize it before its content is compared, so a
+        // credential that lost access to it learns nothing from a changed retry.
+        const stored = endpointsOf(existing);
+        await access.see(stored[0], existing.from_cited as string[]);
+        await access.see(stored[1], existing.to_cited as string[]);
+        for (let i = 0; i < 2; i++) await access.require(at(stored, i).collectionId, writeOf(at(stored, i).kind), 'FORBIDDEN');
+        if (existing.collection_id !== scope.collectionId || existing.link_type !== type || existing.deletion_policy !== policy ||
+          !sameEndpoint(stored[0], from) || !sameEndpoint(stored[1], to)) throw new AuthorityError('IDEMPOTENCY_MISMATCH');
         return linkView(existing, true);
       }
       await writable(db, scope);
@@ -334,7 +335,7 @@ export class PostgresLinks {
    * read is NOT_FOUND. Deleting a deleted link, including one detached with
    * its endpoint, replays.
    */
-  async delete(actor: VerifiedCredential, spaceId: string, collectionId: string, linkId: string): Promise<LinkView> {
+  async delete(actor: VerifiedCredential, spaceId: string, collectionId: string, linkId: string): Promise<LinkDeletion> {
     return this.tx(actor, spaceId, collectionId, async (db, access, scope) => {
       if (!reference(linkId)) throw new AuthorityError('NOT_FOUND');
       await lockLink(db, scope.spaceId, linkId);
@@ -344,7 +345,7 @@ export class PostgresLinks {
       await access.see(sides[0], row.from_cited as string[]);
       await access.see(sides[1], row.to_cited as string[]);
       for (let i = 0; i < 2; i++) await access.require(at(sides, i).collectionId, writeOf(at(sides, i).kind), 'FORBIDDEN');
-      if (row.tombstone) return linkView(row, true);
+      if (row.tombstone) return { ...linkView(row, true), erasure: { ...rowsRetained } };
       await writable(db, scope);
       for (let i = 0; i < 2; i++)
         await writable(db, { ...scope, collectionId: at(sides, i).collectionId as AuthorityScope['collectionId'] });
@@ -352,9 +353,9 @@ export class PostgresLinks {
         WHERE space_id=$1 AND collection_id=$2 AND link_id=$3 AND NOT tombstone RETURNING revision`,
       [scope.spaceId, scope.collectionId, linkId]);
       // An endpoint deletion detached it first.
-      if (tombstoned.rowCount !== 1) return linkView((await readLink(db, scope, linkId))!, true);
+      if (tombstoned.rowCount !== 1) return { ...linkView((await readLink(db, scope, linkId))!, true), erasure: { ...rowsRetained } };
       await evidenceEvent(db, scope, 'link', linkId, Number(tombstoned.rows[0].revision), 'delete');
-      return linkView((await readLink(db, scope, linkId))!, false);
+      return { ...linkView((await readLink(db, scope, linkId))!, false), erasure: { ...rowsRetained } };
     });
   }
 

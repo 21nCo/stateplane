@@ -4,9 +4,9 @@ import { AuthorityError, AuthorityTransaction } from './index.js';
 import type { AuthorityScope } from './index.js';
 import { includes, utcInstant } from './schema.js';
 import type { PostgresSpaces } from './spaces.js';
-import { boundedText, digest, evidenceEvent, fields, idempotencyKey, invalid, iso, lockKey, reference, restricted, serialized,
-  transact, untrusted, writable } from './sources.js';
-import type { Db } from './sources.js';
+import { boundedText, digest, evidenceEvent, evidenceRefusal, fields, idempotencyKey, invalid, iso, lockKey, reference, rowsRetained,
+  serialized, transact, untrusted, writable } from './sources.js';
+import type { Db, DeletionErasure } from './sources.js';
 
 /** One cell's authority pool. */
 export interface ClaimCell { pool: Pick<pg.Pool, 'connect'> }
@@ -29,8 +29,14 @@ export interface ClaimView {
   evidence: ClaimEvidenceView[]; createdBy: string; recordedBy: string | null; createdAt: string; committedAt: string;
   replayed: boolean;
 }
-/** A deleted claim: its last revision and when the deletion committed. */
-export interface ClaimDeletion { claimId: string; collectionId: string; revision: number; deletedAt: string; replayed: boolean }
+/**
+ * A deleted claim: its last revision, when the deletion committed, and what
+ * remains: its revisions and evidence stay in the database, unreadable, until
+ * the space is erased, and backups keep earlier copies.
+ */
+export interface ClaimDeletion {
+  claimId: string; collectionId: string; revision: number; deletedAt: string; replayed: boolean; erasure: DeletionErasure;
+}
 /** `next` is the `after` value for the following page, or null on the last page. */
 export interface ClaimPage { claims: ClaimView[]; next: string | null }
 
@@ -550,7 +556,8 @@ export class PostgresClaims {
         const latest = Number(row.revision);
         if (row.tombstone) {
           if (row.deleted_at && base === latest)
-            return { claimId, collectionId: scope.collectionId, revision: latest, deletedAt: iso(row.deleted_at)!, replayed: true };
+            return { claimId, collectionId: scope.collectionId, revision: latest, deletedAt: iso(row.deleted_at)!, replayed: true,
+              erasure: { ...rowsRetained } };
           throw new AuthorityError('NOT_FOUND');
         }
         if (base > latest) throw new AuthorityError('NOT_FOUND');
@@ -560,9 +567,9 @@ export class PostgresClaims {
         await db.query(`UPDATE entity_refs SET tombstone=true WHERE space_id=$1 AND collection_id=$2 AND kind='claim'
           AND entity_id=$3 AND revision=$4 AND NOT tombstone`, [scope.spaceId, scope.collectionId, claimId, base]);
         const deletedAt = await evidenceEvent(db, scope, 'claim', claimId, base, 'delete');
-        return { claimId, collectionId: scope.collectionId, revision: base, deletedAt, replayed: false };
+        return { claimId, collectionId: scope.collectionId, revision: base, deletedAt, replayed: false, erasure: { ...rowsRetained } };
       });
-    } catch (error) { throw restricted(error); }
+    } catch (error) { throw evidenceRefusal(error); }
   }
 
   /** Read one revision of a live claim in the collection, the latest when `revision` is omitted. */
