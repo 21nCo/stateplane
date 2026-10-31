@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { memoryAdapter } from '@superfunctions/db/testing';
 import { createAuthFn, createUser, issueSession } from '@authfn/core';
@@ -13,6 +15,7 @@ import { R2BlobStore } from '../../packages/storage/dist/index.js';
 const password = process.env.DATABASE_URL ? null : (await readFile(new URL('../../.data/local-db-password', import.meta.url), 'utf8')).trim();
 const url = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT ?? '55432'}/stateplane`;
 const pool = new pg.Pool({ connectionString: url, max: 8 });
+const root = fileURLToPath(new URL('../..', import.meta.url));
 test.after(() => pool.end());
 const sha = value => createHash('sha256').update(value).digest('hex');
 
@@ -172,6 +175,50 @@ test('a claim is created unreviewed with attribution, times and evidence, revise
   await rejects(claims.get(f.reader, f.spaceId, 'alpha', 'clm_missing'), 'NOT_FOUND');
 });
 
+test('a review copies the reviewed revision exactly, and times finer than a millisecond are refused', async () => {
+  const f = await fixture();
+  const stored = async claimId => (await pool.query(`SELECT revision,to_char(observed_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US') AS o,
+      to_char(valid_from AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US') AS f,to_char(valid_until AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US') AS u,
+      statement,attributed_to,(SELECT json_agg(json_build_array(source_collection_id,source_id,extraction_version,start_offset,end_offset)
+        ORDER BY ordinal) FROM claim_evidence v WHERE v.space_id=r.space_id AND v.claim_id=r.claim_id AND v.revision=r.revision) AS evidence
+    FROM claim_revisions r WHERE space_id=$1 AND claim_id=$2 ORDER BY revision`, [f.spaceId, claimId])).rows;
+  const before = await claimRows(f.spaceId);
+  for (const [name, value] of [['observedAt', '2026-03-04T05:06:07.1234Z'], ['validFrom', '2026-03-04T05:06:07.123456Z'],
+    ['validUntil', '2999-01-01T00:00:00.0001Z']])
+    await rejects(claims.create(f.writer, f.spaceId, 'alpha', { idempotencyKey: name, ...statement(), [name]: value }),
+      'INVALID_ARGUMENT', `${name} ${value}`);
+  assert.deepEqual(await claimRows(f.spaceId), before, 'a refused time writes nothing');
+  // Trailing zeros carry no precision, so they are accepted.
+  const created = await claims.create(f.writer, f.spaceId, 'alpha', { idempotencyKey: 'ms', ...statement(),
+    observedAt: '2026-03-04T05:06:07.123000Z', validFrom: '2026-03-04T05:06:07.001Z', validUntil: '2026-03-04T05:06:07.999Z',
+    evidence: [{ collectionId: 'alpha', sourceId: f.alphaSource, extractionVersion: 1, start: 1, end: 5 }] });
+  assert.deepEqual([created.observedAt, created.validFrom, created.validUntil],
+    ['2026-03-04T05:06:07.123Z', '2026-03-04T05:06:07.001Z', '2026-03-04T05:06:07.999Z'], 'views report stored times exactly');
+  // A revision stored with microseconds, such as one written before this bound, is reviewed without losing them.
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,
+        observed_at,valid_from,valid_until) VALUES($1,'alpha',$2,2,'Precise.','a lab',$3,'2026-03-04T05:06:07.123456Z',
+        '2026-03-04T05:06:07.123456Z','2026-03-04T05:06:07.123457Z')`, [f.spaceId, created.claimId, f.writer.credentialId]);
+    await client.query(`INSERT INTO claim_evidence(space_id,collection_id,claim_id,revision,ordinal,source_collection_id,source_id,
+        extraction_version,start_offset,end_offset) VALUES($1,'alpha',$2,2,0,'alpha',$3,1,2,9)`, [f.spaceId, created.claimId, f.alphaSource]);
+    await client.query(`UPDATE entity_refs SET revision=2 WHERE space_id=$1 AND kind='claim' AND entity_id=$2`, [f.spaceId, created.claimId]);
+    await client.query('COMMIT');
+  } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
+  const accepted = await claims.review(f.reviewer, f.spaceId, 'alpha', created.claimId, { baseRevision: 2, status: 'accepted' });
+  const [, base, review] = await stored(created.claimId);
+  assert.equal(review.revision, '3');
+  assert.deepEqual({ ...review, revision: null }, { ...base, revision: null }, 'content, times and evidence are copied exactly');
+  assert.equal(review.u, '2026-03-04T05:06:07.123457');
+  assert.equal(accepted.review.status, 'accepted');
+  assert.deepEqual(await claims.review(f.reviewer, f.spaceId, 'alpha', created.claimId, { baseRevision: 2, status: 'accepted' }),
+    { ...accepted, replayed: true }, 'a retried review replays against the stored base');
+  await rejects(claims.review(f.reviewer, f.spaceId, 'alpha', created.claimId, { baseRevision: 2, status: 'rejected' }),
+    'REVISION_CONFLICT');
+  assert.equal((await stored(created.claimId)).length, 3);
+});
+
 test('only claims:review accepts or rejects a claim, and writes cannot set a review status', async () => {
   const f = await fixture();
   const created = await claims.create(f.writer, f.spaceId, 'alpha', { idempotencyKey: 'c', ...statement() });
@@ -299,8 +346,9 @@ test('a claim and its evidence are visible only to callers who may read every ci
     'a reviewer cannot accept evidence they cannot read');
   const claimsOnly = await f.agent([['alpha', ['claims:read']]]);
   await rejects(claims.get(claimsOnly, f.spaceId, 'alpha', derived.claimId), 'NOT_FOUND', 'claims:read alone reads no evidence');
-  assert.equal((await claims.get(claimsOnly, f.spaceId, 'alpha', (await claims.create(f.owner, f.spaceId, 'alpha',
-    { idempotencyKey: 'bare', ...statement() })).claimId)).evidence.length, 0, 'a claim without evidence needs no source access');
+  const bare = await claims.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: 'bare', ...statement() });
+  assert.equal((await claims.get(claimsOnly, f.spaceId, 'alpha', bare.claimId)).evidence.length, 0,
+    'a claim without evidence needs no source access');
 
   // A caller who may read both collections sees it whole.
   assert.deepEqual(await claims.get(f.both, f.spaceId, 'alpha', derived.claimId), derived);
@@ -313,24 +361,68 @@ test('a claim and its evidence are visible only to callers who may read every ci
   const inBeta = await claims.create(f.owner, f.spaceId, 'beta', { idempotencyKey: 'beta', ...statement(), evidence: [beta] });
   await rejects(claims.get(f.both, f.spaceId, 'alpha', inBeta.claimId), 'NOT_FOUND');
   await rejects(claims.get(f.both, f.spaceId, 'beta', inBeta.claimId), 'FORBIDDEN');
-  // Revoking the beta source grant withholds the claim again.
-  await spaces.revokeAgentKey(f.owner, f.spaceId, f.both.keyId);
-  const fresh = await f.agent([['alpha', ['claims:read', 'sources:read']]]);
-  await rejects(claims.get(fresh, f.spaceId, 'alpha', derived.claimId), 'NOT_FOUND');
+  // Removing only the beta source grant from the same credential withholds the claim again; alpha still answers.
+  await pool.query(`DELETE FROM collection_grants WHERE space_id=$1 AND credential_id=$2 AND collection_id='beta'`,
+    [f.spaceId, f.both.credentialId]);
+  await rejects(claims.get(f.both, f.spaceId, 'alpha', derived.claimId), 'NOT_FOUND');
+  assert.deepEqual((await claims.list(f.both, f.spaceId, 'alpha')).claims.map(view => view.claimId).sort(),
+    [local.claimId, bare.claimId].sort());
+  await rejects(claims.list(f.both, f.spaceId, 'alpha', { citing: beta }), 'FORBIDDEN');
 });
 
-test('an evidence grant that lapses during a claim read refuses the read', async () => {
+/** The final grant statement, which runs after the last provider call. */
+const finalCheck = 'live AS (SELECT g.collection_id';
+test('an owning or evidence grant that lapses before the final check refuses the call and writes nothing', async () => {
   const f = await fixture();
   const derived = await claims.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: 'derived', ...statement(),
     evidence: [{ collectionId: 'beta', sourceId: f.betaSource }] });
-  const expires = Date.now() + 1_500;
-  const lapsing = await f.agent([['alpha', ['claims:read', 'sources:read']], ['beta', ['sources:read']]],
-    { beta: new Date(expires) });
-  assert.equal((await hookedClaims.get(lapsing, f.spaceId, 'alpha', derived.claimId)).claimId, derived.claimId);
-  // Hold the alpha credential check, after every fence passed, until the beta grant has expired.
-  hooks.push({ match: 'SELECT 1 FROM space_credentials sc', run: () => sleep(Math.max(0, expires + 300 - Date.now())) });
-  await rejects(hookedClaims.get(lapsing, f.spaceId, 'alpha', derived.claimId), 'FORBIDDEN');
-  hooks = [];
+  for (const lapsed of ['alpha', 'beta']) for (const call of ['get', 'review']) {
+    const expires = Date.now() + 1_500;
+    const capabilities = call === 'get' ? ['claims:read', 'sources:read'] : ['claims:review', 'claims:read', 'sources:read'];
+    const lapsing = await f.agent([['alpha', capabilities], ['beta', ['sources:read']]], { [lapsed]: new Date(expires) });
+    const run = () => call === 'get' ? hookedClaims.get(lapsing, f.spaceId, 'alpha', derived.claimId)
+      : hookedClaims.review(lapsing, f.spaceId, 'alpha', derived.claimId, { baseRevision: 1, status: 'accepted' });
+    if (call === 'get') assert.equal((await run()).claimId, derived.claimId, 'the grants admit the call before they lapse');
+    const before = await claimRows(f.spaceId);
+    // Hold the final check, after every fence passed and the provider answered, until one grant has expired.
+    hooks.push({ match: finalCheck, run: () => sleep(Math.max(0, expires + 300 - Date.now())) });
+    await rejects(run(), 'FORBIDDEN', `${call} with ${lapsed} lapsed`);
+    assert.equal(hooks.length, 0, 'the hook ran');
+    assert.deepEqual(await claimRows(f.spaceId), before);
+  }
+  assert.equal((await claims.get(f.both, f.spaceId, 'alpha', derived.claimId)).revision, 1, 'no review committed');
+});
+
+test('a nonowner cell role with the evidence grants creates, revises, reviews and reads claims', async () => {
+  const f = await fixture();
+  // Stand-in for the role's pre-040 provisioning: every other table, and nothing on the evidence tables until the script.
+  const role = `sta35_cell_${randomUUID().replaceAll('-', '')}`;
+  const evidenceTables = ['sources', 'original_objects', 'source_upload_grants', 'source_upload_attempts', 'extraction_versions',
+    'claims', 'claim_revisions', 'claim_evidence', 'links'];
+  await pool.query(`CREATE ROLE ${role} NOLOGIN`);
+  const cellPool = new pg.Pool({ connectionString: url, max: 2, options: `-c role=${role}` });
+  try {
+    await pool.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${role}`);
+    await pool.query(`REVOKE ALL ON ${evidenceTables.join(',')} FROM ${role}`);
+    await pool.query(`GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO ${role}`);
+    const roleClaims = new PostgresClaims(spaces, new Map([['cell-a', { pool: cellPool }]]));
+    await assert.rejects(roleClaims.create(f.writer, f.spaceId, 'alpha', { idempotencyKey: 'before', ...statement() }),
+      error => error.code === '42501', 'claims need the evidence grants');
+    execFileSync(process.execPath, ['scripts/grant-evidence.mjs'], { cwd: root, stdio: 'pipe',
+      env: { ...process.env, STATEPLANE_CELL_ADMIN_URL: url, STATEPLANE_CELL_ROLE: role } });
+    const cite = [{ collectionId: 'alpha', sourceId: f.alphaSource, extractionVersion: 1, start: 0, end: 3 }];
+    const created = await roleClaims.create(f.writer, f.spaceId, 'alpha', { idempotencyKey: 'role', ...statement(), evidence: cite });
+    const revised = await roleClaims.revise(f.writer, f.spaceId, 'alpha', created.claimId, { baseRevision: 1, ...statement(2), evidence: cite });
+    const accepted = await roleClaims.review(f.reviewer, f.spaceId, 'alpha', created.claimId, { baseRevision: 2, status: 'accepted' });
+    assert.deepEqual([revised.revision, accepted.revision, accepted.review.status, accepted.evidence], [2, 3, 'accepted', revised.evidence]);
+    assert.deepEqual(await roleClaims.get(f.reader, f.spaceId, 'alpha', created.claimId), accepted);
+    assert.deepEqual((await roleClaims.list(f.reader, f.spaceId, 'alpha')).claims, [accepted]);
+    assert.equal((await cellPool.query('SELECT current_user AS who')).rows[0].who, role, 'the calls ran as the nonowner role');
+  } finally {
+    await cellPool.end();
+    await pool.query(`DROP OWNED BY ${role}`);
+    await pool.query(`DROP ROLE ${role}`);
+  }
 });
 
 test('malformed claims are refused after authorization and write nothing', async () => {
