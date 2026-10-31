@@ -22,6 +22,8 @@ class MemoryR2 {
   failDelete = () => false;
   /** Milliseconds a delete of the key takes, or Infinity for one that never answers. */
   deleteDelay = () => 0;
+  /** Milliseconds a listing after the cursor takes. */
+  listDelay = () => 0;
   async put(key, body, options = {}) {
     const chunks = [];
     const reader = body.getReader();
@@ -45,6 +47,8 @@ class MemoryR2 {
     this.objects.delete(key);
   }
   async list({ startAfter = '', limit = 1000 } = {}) {
+    const delay = this.listDelay(startAfter);
+    if (delay) await new Promise(resolve => setTimeout(resolve, delay));
     const after = [...this.objects.keys()].sort().filter(key => key > startAfter);
     return { objects: after.slice(0, limit).map(key => ({ key })), truncated: after.length > limit };
   }
@@ -251,6 +255,26 @@ test('creating a link needs read and write on both endpoints, refused before any
   await pool.query(`UPDATE collections SET lifecycle='active' WHERE space_id=$1 AND collection_id='beta'`, [f.spaceId]);
   assert.deepEqual(await events(f.spaceId), [{ kind: 'link', entity_id: first.linkId, revision: 1, operation: 'create', by_request: true,
     delivery_state: 'pending' }]);
+  // Replays follow each endpoint kind's readOnly rule: a record endpoint's read-only collection refuses even a replay,
+  // as record receipts do, while source and claim endpoints still replay a committed create or delete.
+  const claim = await claims.create(f.owner, f.spaceId, 'beta', { idempotencyKey: 'ro', statement: 'ro', attributedTo: 'a' });
+  const plain = { idempotencyKey: 'plain', type: 'cites', policy: 'detach', from: ref('source', 'alpha', f.alphaSource),
+    to: ref('claim', 'beta', claim.claimId) };
+  const kept = await links.create(linker, f.spaceId, 'alpha', plain);
+  const gone = await links.delete(linker, f.spaceId, 'alpha',
+    (await links.create(linker, f.spaceId, 'alpha', { ...plain, idempotencyKey: 'plain-gone' })).linkId);
+  const recordGone = await links.delete(linker, f.spaceId, 'alpha', (await links.create(linker, f.spaceId, 'alpha',
+    { ...request, idempotencyKey: 'record-gone', policy: 'detach' })).linkId);
+  await pool.query(`UPDATE collections SET lifecycle='readOnly' WHERE space_id=$1`, [f.spaceId]);
+  assert.deepEqual(await links.create(linker, f.spaceId, 'alpha', plain), { ...kept, replayed: true });
+  assert.deepEqual(await links.delete(linker, f.spaceId, 'alpha', gone.linkId), { ...gone, replayed: true });
+  await rejects(links.create(linker, f.spaceId, 'alpha', { ...plain, idempotencyKey: 'plain-new' }), 'SPACE_UNAVAILABLE',
+    'but takes no new source or claim link');
+  await rejects(links.create(linker, f.spaceId, 'alpha', request), 'SPACE_UNAVAILABLE', 'a record endpoint refuses a create replay');
+  await rejects(links.delete(linker, f.spaceId, 'alpha', recordGone.linkId), 'SPACE_UNAVAILABLE',
+    'and a delete replay');
+  await pool.query(`UPDATE collections SET lifecycle='active' WHERE space_id=$1`, [f.spaceId]);
+  assert.equal((await links.delete(linker, f.spaceId, 'alpha', recordGone.linkId)).replayed, true);
 });
 
 test('record deletion follows its links: restrict refuses it whole, detach tombstones links with events and outbox', async () => {
@@ -433,6 +457,49 @@ test('erasure retries move behind later requests, share the budget and stop shor
     await f.reconciler().erase(500, 5000);
   assert.deepEqual(f.r2.keys(`staging/${slowSegment}/`), []);
   assert.equal((await spaces.erasure(slow.owner, slow.spaceId)).originalBytes, 'erased');
+});
+
+test('a slow space at the head of the erasure page is moved behind every production tick, so the next space completes', async () => {
+  const f = await fixture();
+  await drain(f);
+  const [slow, healthy] = [await fixture(), await fixture()];
+  const segment = g => Buffer.from(g.spaceId).toString('base64url');
+  for (const g of [slow, healthy]) {
+    await services.spaces.update(g.owner, g.spaceId, 'readOnly');
+    await services.spaces.delete(g.owner, g.spaceId);
+    await settle(g);
+  }
+  // The slow space is due first. Both of its listings take 1.6 s and its staging delete never answers, so its store
+  // calls would run into the budget's last fifth; the healthy space's keys are behind it.
+  await pool.query(`UPDATE space_erasures SET next_attempt_at=clock_timestamp()-interval '3 hours' WHERE space_id=$1`,
+    [slow.spaceId]);
+  f.r2.objects.set(`staging/${segment(slow)}/upl_s/att_s`, { bytes: Buffer.from('x') });
+  for (let i = 0; i < 3; i++) f.r2.objects.set(`originals/${segment(healthy)}/upl_${i}/att_${i}`, { bytes: Buffer.from('x') });
+  f.r2.listDelay = after => after.includes(segment(slow)) ? 1600 : 0;
+  f.r2.deleteDelay = key => key.includes(segment(slow)) ? Infinity : 0;
+  const due = async g => (await pool.query(`SELECT extract(epoch FROM next_attempt_at)::float8 AS at FROM space_erasures WHERE space_id=$1`,
+    [g.spaceId])).rows[0].at;
+  const ticks = [];
+  for (let tick = 0; tick < 4 && (await spaces.erasure(healthy.owner, healthy.spaceId)).originalBytes === 'pending'; tick++) {
+    const before = await due(slow);
+    const started = performance.now();
+    // A call the budget cut short is unfinished, so the tick resolves.
+    await f.reconciler().erase(25, 5000);
+    const took = performance.now() - started;
+    assert.ok(took < 5000, `tick ${tick + 1} ended within its budget (${Math.round(took)} ms)`);
+    assert.ok(await due(slow) > before, `tick ${tick + 1} moved the slow space behind the due ones`);
+    ticks.push(Math.round(took));
+  }
+  assert.deepEqual(f.r2.keys(`originals/${segment(healthy)}/`), []);
+  assert.equal((await spaces.erasure(healthy.owner, healthy.spaceId)).originalBytes, 'erased',
+    `the space behind it completed within bounded ticks (${ticks.join(', ')} ms)`);
+  assert.equal(f.r2.objects.has(`staging/${segment(slow)}/upl_s/att_s`), true);
+  assert.equal((await spaces.erasure(slow.owner, slow.spaceId)).originalBytes, 'pending');
+  f.r2.listDelay = () => 0;
+  f.r2.deleteDelay = () => 0;
+  for (let i = 0; i < 4 && (await spaces.erasure(slow.owner, slow.spaceId)).originalBytes === 'pending'; i++)
+    await f.reconciler().erase(25, 5000);
+  assert.equal((await spaces.erasure(slow.owner, slow.spaceId)).originalBytes, 'erased', 'and the slow one once the store answers');
 });
 
 test('claim deletion follows the claim revision and read rules and its links', async () => {
@@ -887,5 +954,35 @@ test('a claim citing a source serializes with its deletion, for create and revis
         AND claim_id=$3) AS after`, [f.spaceId, second, claim.claimId])).rows[0];
     assert.equal(order.after, true, `${name}: the claim committed before the deletion`);
   }
+  assert.equal(hooks.length, 0);
+});
+
+test('a claim revision and a link joining the claim and a cited source queue in either order, never deadlocking', async () => {
+  const f = await fixture();
+  const claim = await claims.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: 'locks', statement: 'r1', attributedTo: 'a' });
+  const join = key => ({ idempotencyKey: key, type: 'cites', policy: 'detach', from: ref('claim', 'alpha', claim.claimId),
+    to: ref('source', 'alpha', f.alphaSource) });
+  const revise = (pooled, baseRevision) => pooled.revise(f.owner, f.spaceId, 'alpha', claim.claimId,
+    { baseRevision, ...citing(f, f.alphaSource, `r${baseRevision + 1}`) });
+
+  // The revision holds its locks first: the link waits for it, then both commit.
+  const checked = hold('INSERT INTO claim_revisions');
+  const revising = revise(hookedClaims, 1);
+  await checked.at;
+  const linking = links.create(f.owner, f.spaceId, 'alpha', join('first'));
+  assert.equal(await settlesOrWaits(linking, 'INSERT INTO links'), 'waits', 'the link waits for the revision');
+  checked.release();
+  assert.equal((await revising).revision, 2);
+  assert.equal((await linking).replayed, false);
+
+  // The link holds its locks first: the revision waits for it, then both commit.
+  const linked = hold('INSERT INTO evidence_events', params => params[3] === 'link');
+  const second = hookedLinks.create(f.owner, f.spaceId, 'alpha', join('second'));
+  await linked.at;
+  const revisingAgain = revise(claims, 2);
+  assert.equal(await settlesOrWaits(revisingAgain, 'entity_refs'), 'waits', 'the revision waits for the link');
+  linked.release();
+  assert.equal((await second).replayed, false);
+  assert.equal((await revisingAgain).revision, 3);
   assert.equal(hooks.length, 0);
 });

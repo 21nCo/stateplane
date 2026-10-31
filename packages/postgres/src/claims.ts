@@ -152,7 +152,10 @@ async function lockClaim(db: Db, spaceId: string, claimId: string): Promise<void
  * source and range exists. The cited sources' identities are share-locked
  * first, in one order, so a source deletion, which tombstones that row,
  * either committed before the check, which then finds the source deleted, or
- * waits for this claim to commit and finds it cited.
+ * waits for this claim to commit and finds it cited. A revision locks its
+ * claim's row before calling this, so its locks follow migration 040's link
+ * guard order (kind, collection, id: claim before source); a new claim's row
+ * does not exist yet, so no link can lock it first.
  */
 async function checkContent(db: Db, scope: AuthorityScope, content: Content): Promise<void> {
   const times = (await db.query(`SELECT ($1::timestamptz IS NULL OR $1::timestamptz<=clock_timestamp()) AS observed,
@@ -496,6 +499,10 @@ export class PostgresClaims {
         throw new AuthorityError('REVISION_CONFLICT', 'A later claim revision exists', latest);
       }
       await writable(db, scope);
+      // The claim's own identity row is locked before the cited sources', the order a link's guard locks them in,
+      // so a revision and a link joining this claim and a cited source queue instead of deadlocking.
+      await db.query(`SELECT 1 FROM entity_refs WHERE space_id=$1 AND collection_id=$2 AND kind='claim' AND entity_id=$3
+        FOR NO KEY UPDATE`, [scope.spaceId, scope.collectionId, claimId]);
       await checkContent(db, scope, content);
       await insertRevision(db, scope, claimId, latest + 1, content);
       return readClaim(db, access, scope, claimId, latest + 1, false);

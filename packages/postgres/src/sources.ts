@@ -1438,9 +1438,11 @@ export class SourceUploadReconciler {
   /**
    * Enforce retention for deletions within `budgetMs`: remove the bytes of
    * up to `limit` deleted sources, then, for up to `limit` erased spaces,
-   * delete a page of each one's original and staging keys. Store calls stop
-   * a fifth of the budget early. Source store calls end by half of that, and
-   * their transactions a tenth later, so spaces always get a share. Erasure
+   * delete a page of each one's original and staging keys. Store calls end,
+   * not only start, a fifth of the budget early, so every erasure attempted
+   * still records its progress or its retry turn. Source store calls end by
+   * half of that, and their transactions a tenth later, so spaces always get
+   * a share. Erasure
    * is recorded complete only by a removal, or for a space an empty listing,
    * that started after every write to its keys could have landed (the last
    * grant's end plus the grace) and before the sweep last found one of its
@@ -1491,12 +1493,13 @@ export class SourceUploadReconciler {
       try {
         for (const prefix of keyPrefixes(spaceId)) {
           if (performance.now() >= stop) { finished = false; break; }
-          const page = await within(until, () => this.cell.originals.list(prefix, 100));
+          // Store calls end by `stop`, so the fifth after it records this space's progress or retry turn.
+          const page = await within(stop, () => this.cell.originals.list(prefix, 100));
           for (const key of page.keys) {
             if (!startsWith(key, prefix)) break;
             found = true;
             if (performance.now() >= stop) break;
-            await within(until, () => this.cell.originals.delete(key));
+            await within(stop, () => this.cell.originals.delete(key));
           }
         }
         // Only a listing that found nothing, after the space's writers ended, records completion against the request it
