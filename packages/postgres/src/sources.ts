@@ -1463,11 +1463,18 @@ export class SourceUploadReconciler {
    * up to `limit` deleted sources, then, for up to `limit` erased spaces,
    * delete a page of each one's original and staging keys. Store calls end,
    * not only start, a fifth of the budget early, so every erasure attempted
-   * still records its progress or its retry turn. The source page, which
-   * reads each erasure's state, ends by six tenths of that span; source store
-   * calls end half of it after that page was read (never past the span), so a
-   * slow read still leaves them a store call, and their transactions a tenth
-   * later; spaces get the rest of the span, all of it when no source is due.
+   * still records its progress or its retry turn. Within the span before
+   * that fifth, phase deadlines are fixed from the call's start, never from
+   * how long a source call took: the source page, which reads each erasure's
+   * state, ends by half the span; source store calls end half the span after
+   * that page was read but by seven tenths of it at the latest, so a slow read
+   * still leaves them a store call; source transactions (checkpoints and
+   * retry turns) end a tenth later, by eight tenths. The last fifth of the
+   * span is the spaces' alone: no source call runs into it, so their page
+   * read and a store call always fit, and they get all of the span from
+   * whenever the sources end. At `erase(25, 5000)`: source page by 2000 ms,
+   * source store calls by 2800 ms, source transactions by 3200 ms, space store
+   * calls from then (or earlier) until 4000 ms, space records by 5000 ms.
    * Erasure
    * is recorded complete only by a removal, or for a space an empty listing,
    * that started after every write to its keys could have landed (the last
@@ -1483,7 +1490,10 @@ export class SourceUploadReconciler {
     const start = performance.now();
     const until = start + budgetMs;
     const stop = until - budgetMs / 5;
-    const share = (stop - start) / 2;
+    const span = stop - start;
+    // Fixed from the start: the source page's end, the latest source store and transaction ends, and so the spaces' window.
+    const pageEnd = start + span / 2;
+    const sourcesLatest = start + span * 7 / 10;
     const errors: unknown[] = [];
     // A call its phase's budget cut short is unfinished work, not a failure.
     const failed = (error: unknown) => { if (!(error instanceof CleanupTimeout && error.atBudget)) errors.push(error); };
@@ -1492,11 +1502,12 @@ export class SourceUploadReconciler {
     // A source page that cannot be read still leaves the spaces their turn. It reads each erasure's state too.
     const sources = await transact(pool, db => db.query(`${ERASURE_STATE}
       WHERE x.removed_at IS NULL AND x.next_attempt_at<=clock_timestamp()
-      ORDER BY x.next_attempt_at,x.space_id,x.collection_id,x.source_id LIMIT $2`, [grace, limit]), start + share + (stop - start) / 10)
+      ORDER BY x.next_attempt_at,x.space_id,x.collection_id,x.source_id LIMIT $2`, [grace, limit]), pageEnd)
       .then(result => result.rows, (error: unknown) => { failed(error); return []; });
-    // The sources' share of store time starts once their page is read, so a slow read still leaves them a store call.
-    const sourcesStop = Math.min(stop, performance.now() + share);
-    const sourcesEnd = sourcesStop + (stop - start) / 10;
+    // Their store time starts once their page is read, so a slow read still leaves them a store call, but it never
+    // moves past its fixed latest end: the spaces' window starts by `sourcesEnd` however slow the source calls are.
+    const sourcesStop = Math.min(sourcesLatest, performance.now() + span / 2);
+    const sourcesEnd = sourcesStop + span / 10;
     for (const row of sources) {
       if (performance.now() >= sourcesStop) break;
       const ids = [row.space_id, row.collection_id, row.source_id];

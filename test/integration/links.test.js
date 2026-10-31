@@ -101,8 +101,11 @@ const definition = slug => JSON.stringify({ slug, version: 1, schema: { $schema:
   type: 'object', properties: { label: { type: 'string' } }, additionalProperties: false }, unique: [], filterable: [], sortable: [] });
 const all = ['records:read', 'records:write', 'sources:read', 'sources:write', 'claims:read', 'claims:write'];
 
-/** A space with collections alpha and beta, a record and a stored text source in each, and an agent factory. */
-async function fixture() {
+/**
+ * A space with collections alpha and beta, a record and a stored text source in each, and an agent factory. Its
+ * bytes go to `r2`, so a fixture given another's store shares that cell's bucket.
+ */
+async function fixture(r2 = new MemoryR2()) {
   const user = await createUser(config, { primaryEmail: `owner-${randomUUID()}@example.invalid` });
   const owner = await verify((await issueSession(config, {}, { userId: user.id, methods: ['password'] })).sessionToken);
   const spaceId = `sp_${randomUUID()}`;
@@ -112,7 +115,6 @@ async function fixture() {
   const agent = async (grants, expiresAt) => verify((await spaces.issueAgentKey(owner, spaceId,
     expiresAt?.key ?? new Date(Date.now() + 3_600_000), grants.map(([collectionId, capabilities]) => ({ collectionId, capabilities,
       ...(expiresAt?.[collectionId] ? { expiresAt: expiresAt[collectionId] } : {}) })))).secret);
-  const r2 = new MemoryR2();
   const cell = { pool, originals: new R2BlobStore(r2) };
   const sources = new PostgresSources(spaces, new Map([['cell-a', cell]]));
   const hookedSources = new PostgresSources(spaces, new Map([['cell-a', { pool: hooked, originals: cell.originals }]]));
@@ -940,14 +942,22 @@ async function slowErasure(f) {
   f.r2.failDelete = () => false;
   await settle(f, false);
   assert.deepEqual(await erasureLeft(f, upload.sourceId), { left: 6, removed: false }, 'the original, its staging copy and four stray keys');
-  const space = await fixture();
+  // The deleted space's own originals and three more keys are in the reconciler's bucket.
+  const space = await deletedSpace(f, 3);
+  return { ...upload, keys, segment, space };
+}
+/** A space deleted after storing its two sources in `f`'s bucket, with `extra` more original keys there, due now. */
+async function deletedSpace(f, extra) {
+  const space = await fixture(f.r2);
   await services.spaces.update(space.owner, space.spaceId, 'readOnly');
   await services.spaces.delete(space.owner, space.spaceId);
   await settle(space);
-  for (let i = 0; i < 3; i++) f.r2.objects.set(`originals/${Buffer.from(space.spaceId).toString('base64url')}/upl_${i}/att_${i}`,
-    { bytes: Buffer.from('x') });
-  return { ...upload, keys, segment, space };
+  space.prefixes = ['originals', 'staging'].map(kind => `${kind}/${Buffer.from(space.spaceId).toString('base64url')}/`);
+  assert.equal(f.r2.keys(space.prefixes[0]).length, 2, 'its sources\' originals are in the shared bucket');
+  for (let i = 0; i < extra; i++) f.r2.objects.set(`${space.prefixes[0]}upl_${i}/att_${i}`, { bytes: Buffer.from('x') });
+  return space;
 }
+const spaceKeys = (f, space) => space.prefixes.flatMap(prefix => f.r2.keys(prefix));
 /** Run production ticks until the source and the space are erased: each ends in budget and records a source delete. */
 async function ticks(f, erasure, reconciler, most) {
   const lefts = [(await erasureLeft(f, erasure.sourceId)).left];
@@ -969,6 +979,7 @@ async function ticks(f, erasure, reconciler, most) {
   assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', erasure.sourceId)).erasure.originalBytes, 'removed');
   assert.equal((await spaces.erasure(erasure.space.owner, erasure.space.spaceId)).originalBytes, 'erased',
     `the space behind it completed meanwhile (${took.join(', ')} ms)`);
+  assert.deepEqual(spaceKeys(f, erasure.space), [], 'and none of its original or staging keys is left');
   return lefts;
 }
 
@@ -998,6 +1009,69 @@ test('an erasure whose page reads are slow still gets its store calls every prod
     } });
   } };
   await ticks(f, erasure, new SourceUploadReconciler({ pool: slow, originals: f.cell.originals }, 0), 4);
+});
+
+test('a slow source page, a stalled source delete and a slow retry never reach the spaces\' window of a production tick', async () => {
+  // A 1.9 s page read, and one that reaches the page's 2 s deadline (half of the 4 s before the budget's last fifth).
+  for (const pageMs of [1900, 2000]) {
+    const f = await fixture();
+    await drain(f);
+    const sourceId = await f.source('alpha');
+    const key = await objectKey(f, sourceId);
+    f.r2.failDelete = candidate => candidate === key;
+    assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', sourceId)).erasure.originalBytes, 'pending');
+    f.r2.failDelete = () => false;
+    await settle(f);
+    // 150 more keys: listings of 100 take the space over several ticks.
+    const space = await deletedSpace(f, 150);
+    f.r2.deleteDelay = candidate => candidate === key ? Infinity : 0;
+    // Each statement's end, by phase: the source page and retry turn are slow; the spaces' page read marks their window.
+    let marks = { source: [], space: [] };
+    let retries = 0;
+    const timed = { connect: async () => {
+      const client = await pool.connect();
+      let phase;
+      return new Proxy(client, { get(target, property) {
+        if (property !== 'query') return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
+        return async (sql, ...rest) => {
+          const text = typeof sql === 'string' ? sql : '';
+          if (text.includes('original_erasures')) phase = 'source';
+          if (text.includes('FROM space_erasures WHERE originals_removed_at IS NULL')) { phase = 'space'; marks.space.push(performance.now()); }
+          if (text.includes('ORDER BY x.next_attempt_at')) await sleep(pageMs);
+          if (/^UPDATE original_erasures SET next_attempt_at=clock_timestamp\(\)\s/.test(text)) { retries++; await sleep(300); }
+          const result = await target.query(sql, ...rest);
+          if (phase === 'source') marks.source.push(performance.now());
+          return result;
+        };
+      } });
+    } };
+    const reconciler = new SourceUploadReconciler({ pool: timed, originals: f.cell.originals }, 0);
+    const took = [];
+    for (let tick = 0; tick < 5 && (await spaces.erasure(space.owner, space.spaceId)).originalBytes === 'pending'; tick++) {
+      const before = spaceKeys(f, space).length;
+      marks = { source: [], space: [] };
+      const started = performance.now();
+      await reconciler.erase(25, 5000);
+      took.push(Math.round(performance.now() - started));
+      const label = `${pageMs} ms page, tick ${tick + 1} (${took.join(', ')} ms)`;
+      assert.ok(took.at(-1) < 5000, `${label} ended within its budget`);
+      assert.equal(marks.space.length, 1, `${label} read the space page`);
+      // Source transactions end by eight tenths of the 4 s span; a timer may settle a few milliseconds late.
+      const latest = Math.max(started, ...marks.source);
+      assert.ok(latest <= marks.space[0] && latest - started <= 3200 + 25,
+        `${label}: the last source statement ended at ${Math.round(latest - started)} ms, before the spaces' window`);
+      assert.ok(spaceKeys(f, space).length < before ||
+        (await spaces.erasure(space.owner, space.spaceId)).originalBytes === 'erased', `${label} advanced the space`);
+    }
+    assert.equal((await spaces.erasure(space.owner, space.spaceId)).originalBytes, 'erased',
+      `the space completed within bounded ticks (${took.join(', ')} ms)`);
+    assert.deepEqual(spaceKeys(f, space), []);
+    if (pageMs < 2000) assert.ok(retries > 0, 'the stalled source was attempted and given its retry turn');
+    assert.equal(f.r2.objects.has(key), true);
+    f.r2.deleteDelay = () => 0;
+    for (let i = 0; i < 5 && !(await erasureLeft(f, sourceId)).removed; i++) await f.reconciler().erase(25, 5000);
+    assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', sourceId)).erasure.originalBytes, 'removed');
+  }
 });
 
 test('a space page that cannot be read is reported with earlier source failures, and one cut at the budget is unfinished', async () => {
