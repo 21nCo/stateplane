@@ -1049,6 +1049,30 @@ test('cleanup transactions end by the page budget: a late connection, slow state
   await endsBy('a sweep whose ownership query is slow', 300, () => reconciler({ pool: slowed(1500, sql => sql.includes('unnest')) }).sweep(100, 300));
   assert.equal(f.r2.objects.has(`${prefix}att_b`), true, 'nothing is deleted');
   assert.equal(f.r2.objects.has('reconcile/sweep-cursor'), false, 'the cursor does not move');
+
+  // A timer that fires before its fractional deadline still ends the stalled call only at the budget, so nothing starts
+  // after the store call, not even a deferral just before the budget's end.
+  let releaseEarly;
+  const statements = [];
+  f.r2.beforeDelete = async key => {
+    if (!key.startsWith(prefix)) return;
+    f.r2.beforeDelete = async () => {};
+    statements.length = 0;
+    await new Promise(resolve => { releaseEarly = resolve; });
+  };
+  const logging = { connect: async () => {
+    const client = await pool.connect();
+    return new Proxy(client, { get(target, property) {
+      if (property !== 'query') return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
+      return (sql, ...rest) => { statements.push(String(sql)); return target.query(sql, ...rest); };
+    } });
+  } };
+  const nativeSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, ms, ...args) => nativeSetTimeout(fn, Math.max(0, (ms ?? 0) - 20), ...args);
+  try { await assert.rejects(reconciler({ pool: logging }).step(25, 400), AggregateError); }
+  finally { globalThis.setTimeout = nativeSetTimeout; }
+  releaseEarly();
+  assert.deepEqual(statements, [], 'no statement starts after the stalled store call');
   while (await f.reconciler(0).step(500) === 500);
   assert.deepEqual(f.r2.keys(prefix), []);
 });

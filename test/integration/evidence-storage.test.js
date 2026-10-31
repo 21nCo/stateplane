@@ -697,6 +697,9 @@ test('space erasure removes every evidence row of that space only', async () => 
   assert.equal((await pool.query('SELECT originals_removed_at FROM space_erasures WHERE space_id=$1', [erased.spaceId])).rows[0]
     .originals_removed_at, null);
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM space_erasures WHERE space_id=$1', [kept.spaceId])).rows[0].n, 0);
+  // Neither erasure ledger can be truncated away, so the request is kept.
+  for (const table of ['space_erasures', 'original_erasures']) await assert.rejects(pool.query(`TRUNCATE ${table}`), immutable, table);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM space_erasures WHERE space_id=$1', [erased.spaceId])).rows[0].n, 1);
 });
 
 test('a nonowner cell role proves evidence erasure only with the evidence grants', async () => {

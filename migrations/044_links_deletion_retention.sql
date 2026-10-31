@@ -260,6 +260,8 @@ CREATE TRIGGER original_erasures_no_truncate BEFORE TRUNCATE ON original_erasure
   FOR EACH STATEMENT EXECUTE FUNCTION reject_evidence_fact_change();
 CREATE TRIGGER space_erasures_kept BEFORE DELETE ON space_erasures
   FOR EACH ROW EXECUTE FUNCTION reject_evidence_fact_change();
+CREATE TRIGGER space_erasures_no_truncate BEFORE TRUNCATE ON space_erasures
+  FOR EACH STATEMENT EXECUTE FUNCTION reject_evidence_fact_change();
 
 -- Spaces deleted before this migration never requested erasure of their
 -- bytes; request it now, so `erase` lists them and their report can complete.

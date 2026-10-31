@@ -178,6 +178,9 @@ class CleanupTimeout extends Error {
  * is never started once the budget has passed. A value that arrives later is
  * passed to `late` to release it; every cleanup call is safe to land late.
  * `budget` is the caller's own budget when `until` is a tighter bound of its own.
+ * A timer can fire up to a millisecond before a fractional deadline, so the
+ * call times out only once `performance.now` has reached it, and a caller that
+ * then checks its budget sees it ended.
  */
 async function within<T>(until: number, start: () => Promise<T>, late: (value: T) => void = () => {},
   budget = until): Promise<T> {
@@ -186,10 +189,15 @@ async function within<T>(until: number, start: () => Promise<T>, late: (value: T
   let timedOut = false;
   void pending.then(value => { if (timedOut) late(value); }, () => {});
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const delay = Math.max(0, Math.min(until - performance.now(), CLEANUP_CALL_MS));
-  const atBudget = budget - performance.now() <= delay;
+  const deadline = Math.min(until, performance.now() + CLEANUP_CALL_MS);
+  const atBudget = budget <= deadline;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => { timedOut = true; reject(new CleanupTimeout(atBudget)); }, delay);
+    const expire = () => {
+      const left = deadline - performance.now();
+      if (left > 0) timer = setTimeout(expire, Math.ceil(left));
+      else { timedOut = true; reject(new CleanupTimeout(atBudget)); }
+    };
+    timer = setTimeout(expire, Math.max(0, deadline - performance.now()));
   });
   try { return await Promise.race([pending, timeout]); } finally { clearTimeout(timer); }
 }
@@ -1254,6 +1262,18 @@ async function sourceExists(db: Db, spaceId: string, sourceId: string): Promise<
 const ERASE_ATTEMPTS = 20;
 const ERASE_FOUND = 40;
 /**
+ * A source erasure's state, `$1` the grace in seconds: read with its due page,
+ * so a removal starts its store calls with no read of its own.
+ */
+const ERASURE_STATE = `SELECT x.space_id,x.collection_id,x.source_id,x.observed::text AS observed,x.removed_at IS NOT NULL AS removed,
+    x.removal_observed IS NOT DISTINCT FROM x.observed AS original_removed,x.found_keys[1:${ERASE_FOUND}] AS found,
+    clock_timestamp()>=x.writers_end_at+make_interval(secs=>$1) AS settled,o.object_key,
+    ARRAY(SELECT a.staging_key FROM source_upload_attempts a JOIN source_upload_grants g USING (space_id,collection_id,grant_id)
+      WHERE g.space_id=x.space_id AND g.collection_id=x.collection_id AND g.source_id=x.source_id
+        AND a.staging_removed_at IS NULL ORDER BY a.staging_key LIMIT ${ERASE_ATTEMPTS}) AS staged
+  FROM original_erasures x JOIN original_objects o USING (space_id,collection_id,source_id)`;
+type ErasureState = Record<string, unknown>;
+/**
  * Remove a deleted source's bytes: its original, every key its grant's
  * attempts wrote that the attempt ledger does not record removed (a staging
  * copy whose cleanup failed, another attempt's promoted copy), and the keys
@@ -1263,30 +1283,25 @@ const ERASE_FOUND = 40;
  * once per removal, and a settled removal records each confirmed delete as it
  * lands, so a removal the budget cuts short keeps its progress and the next
  * one resumes: an attempt is recorded removed (failed first if it never
- * ended), a found key leaves `found_keys`, and the original's removal is
- * recorded as `removal_observed`. A found key and the original are recorded
- * only against the sweep's finding count (`observed`) read before their
- * delete, so a key the sweep finds meanwhile is removed again. Completion
- * needs the original removed at the current count, and no found key or
- * attempt left. An unsettled removal records nothing and schedules the next
- * one for when its writers have ended. A copy the store confirms even later
- * is found by the sweep, which reopens the erasure. Store calls end by
- * `storeUntil`, transactions by `recordUntil`. Returns whether the erasure is
- * recorded complete.
+ * ended) once its staging copy is gone, its promoted copy, unless it is the
+ * original, joining `found_keys` in the same transaction; a found key leaves
+ * `found_keys`; and the original's removal is recorded as `removal_observed`.
+ * A found key and the original are recorded only against the sweep's finding
+ * count (`observed`) read before their delete, so a key the sweep finds
+ * meanwhile is removed again. Completion needs the original removed at the
+ * current count, and no found key or attempt left. An unsettled removal
+ * records nothing and schedules the next one for when its writers have ended.
+ * A copy the store confirms even later is found by the sweep, which reopens
+ * the erasure. `state` is the erasure as its due page read it, or else read
+ * here. Store calls end by `storeUntil`, transactions by `recordUntil`.
+ * Returns whether the erasure is recorded complete.
  */
 async function eraseOriginal(cell: SourceCell, ids: readonly string[], storeUntil: number, recordUntil: number,
-  graceSeconds: number): Promise<boolean> {
+  graceSeconds: number, read?: ErasureState): Promise<boolean> {
   const params = [ids[0], ids[1], ids[2]];
   const record = (sql: string, values: unknown[]) => transact(cell.pool, db => db.query(sql, values), recordUntil);
-  const state = (await record(`SELECT x.observed::text AS observed,x.removed_at IS NOT NULL AS removed,
-      x.removal_observed IS NOT DISTINCT FROM x.observed AS original_removed,x.found_keys[1:$6] AS found,
-      clock_timestamp()>=x.writers_end_at+make_interval(secs=>$4) AS settled,o.object_key,
-      ARRAY(SELECT a.staging_key FROM source_upload_attempts a JOIN source_upload_grants g USING (space_id,collection_id,grant_id)
-        WHERE g.space_id=x.space_id AND g.collection_id=x.collection_id AND g.source_id=x.source_id
-          AND a.staging_removed_at IS NULL ORDER BY a.staging_key LIMIT $5) AS staged
-    FROM original_erasures x JOIN original_objects o USING (space_id,collection_id,source_id)
-    WHERE x.space_id=$1 AND x.collection_id=$2 AND x.source_id=$3`,
-  [...params, graceSeconds, ERASE_ATTEMPTS, ERASE_FOUND])).rows[0];
+  const state = read ?? (await record(`${ERASURE_STATE} WHERE x.space_id=$2 AND x.collection_id=$3 AND x.source_id=$4`,
+    [graceSeconds, ...params])).rows[0];
   if (!state) return false;
   if (state.removed === true) return true;
   const settled = state.settled === true;
@@ -1310,18 +1325,26 @@ async function eraseOriginal(cell: SourceCell, ids: readonly string[], storeUnti
   if (state.original_removed !== true) await fenced(`UPDATE original_erasures SET removal_observed=$4::bigint WHERE space_id=$1 AND collection_id=$2 AND source_id=$3
     AND removed_at IS NULL AND observed=$4::bigint AND removal_observed IS DISTINCT FROM $4::bigint`, [...params, observed]);
   const staged = state.staged as string[];
+  const found = [...state.found as string[]];
   for (let i = 0; i < staged.length && current; i++) {
     const staging = String(staged[i]);
-    await remove(staging);
     // The attempt's promoted copy: its key differs from the staging key only in the prefix.
-    if (startsWith(staging, 'staging/')) await remove(`originals/${staging.slice('staging/'.length)}`);
+    const promoted = startsWith(staging, 'staging/') ? `originals/${staging.slice('staging/'.length)}` : original;
+    await remove(staging);
+    if (!settled) { await remove(promoted); continue; }
     // Its grant ended, so an attempt that never ended writes nothing more; it fails as reconciliation would fail it.
-    if (settled) await record(`UPDATE source_upload_attempts SET state=CASE WHEN state IN ('receiving','verified') THEN 'failed'
-        ELSE state END,failure_code=CASE WHEN state IN ('receiving','verified') THEN 'abandoned' ELSE failure_code END,
-        staging_removed_at=clock_timestamp(),updated_at=clock_timestamp()
-      WHERE space_id=$1 AND collection_id=$2 AND staging_key=$3 AND staging_removed_at IS NULL`, [ids[0], ids[1], staging]);
+    // Its promoted copy is then a found key, so each of its two keys is recorded as its own delete lands.
+    await transact(cell.pool, async db => {
+      await db.query(`UPDATE source_upload_attempts SET state=CASE WHEN state IN ('receiving','verified') THEN 'failed'
+          ELSE state END,failure_code=CASE WHEN state IN ('receiving','verified') THEN 'abandoned' ELSE failure_code END,
+          staging_removed_at=clock_timestamp(),updated_at=clock_timestamp()
+        WHERE space_id=$1 AND collection_id=$2 AND staging_key=$3 AND staging_removed_at IS NULL`, [ids[0], ids[1], staging]);
+      if (promoted !== original) await db.query(`UPDATE original_erasures SET found_keys=CASE WHEN $4=ANY(found_keys)
+          THEN found_keys ELSE array_append(found_keys,$4) END
+        WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL`, [...params, promoted]);
+    }, recordUntil);
+    if (promoted !== original && !found.includes(promoted)) found.push(promoted);
   }
-  const found = state.found as string[];
   for (let i = 0; i < found.length && current; i++) {
     const key = String(found[i]);
     await remove(key);
@@ -1440,9 +1463,12 @@ export class SourceUploadReconciler {
    * up to `limit` deleted sources, then, for up to `limit` erased spaces,
    * delete a page of each one's original and staging keys. Store calls end,
    * not only start, a fifth of the budget early, so every erasure attempted
-   * still records its progress or its retry turn. Source store calls end by
-   * half of that, and their transactions a tenth later, so spaces always get
-   * a share. Erasure
+   * still records its progress or its retry turn. The source page, which
+   * reads each erasure's state, ends by six tenths of that span; source store
+   * calls end half of it after that page was read (never past the span), so a
+   * slow read still leaves them a store call, and their transactions a tenth
+   * later; spaces get the rest of the span, all of it when no source is due.
+   * Erasure
    * is recorded complete only by a removal, or for a space an empty listing,
    * that started after every write to its keys could have landed (the last
    * grant's end plus the grace) and before the sweep last found one of its
@@ -1457,22 +1483,24 @@ export class SourceUploadReconciler {
     const start = performance.now();
     const until = start + budgetMs;
     const stop = until - budgetMs / 5;
-    const sourcesStop = start + (stop - start) / 2;
-    const sourcesEnd = sourcesStop + (stop - start) / 10;
+    const share = (stop - start) / 2;
     const errors: unknown[] = [];
     // A call its phase's budget cut short is unfinished work, not a failure.
     const failed = (error: unknown) => { if (!(error instanceof CleanupTimeout && error.atBudget)) errors.push(error); };
     const pool = this.cell.pool;
     const grace = this.graceSeconds;
-    // A source page that cannot be read still leaves the spaces their turn.
-    const sources = await transact(pool, db => db.query(`SELECT space_id,collection_id,source_id FROM original_erasures
-      WHERE removed_at IS NULL AND next_attempt_at<=clock_timestamp()
-      ORDER BY next_attempt_at,space_id,collection_id,source_id LIMIT $1`, [limit]), sourcesEnd)
+    // A source page that cannot be read still leaves the spaces their turn. It reads each erasure's state too.
+    const sources = await transact(pool, db => db.query(`${ERASURE_STATE}
+      WHERE x.removed_at IS NULL AND x.next_attempt_at<=clock_timestamp()
+      ORDER BY x.next_attempt_at,x.space_id,x.collection_id,x.source_id LIMIT $2`, [grace, limit]), start + share + (stop - start) / 10)
       .then(result => result.rows, (error: unknown) => { failed(error); return []; });
+    // The sources' share of store time starts once their page is read, so a slow read still leaves them a store call.
+    const sourcesStop = Math.min(stop, performance.now() + share);
+    const sourcesEnd = sourcesStop + (stop - start) / 10;
     for (const row of sources) {
       if (performance.now() >= sourcesStop) break;
       const ids = [row.space_id, row.collection_id, row.source_id];
-      try { await eraseOriginal(this.cell, ids, sourcesStop, sourcesEnd, grace); }
+      try { await eraseOriginal(this.cell, ids, sourcesStop, sourcesEnd, grace, row); }
       catch (error) {
         failed(error);
         await transact(pool, db => db.query(`UPDATE original_erasures SET next_attempt_at=clock_timestamp()
@@ -1480,11 +1508,13 @@ export class SourceUploadReconciler {
           .catch(failed);
       }
     }
-    const spaces = performance.now() >= stop ? [] : (await transact(pool, db => db.query(`SELECT space_id,observed::text AS observed,
+    // A space page that cannot be read is reported with the sources' failures; one the budget cut short is unfinished.
+    const spaces = performance.now() >= stop ? [] : await transact(pool, db => db.query(`SELECT space_id,observed::text AS observed,
         to_char(requested_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS requested,
         clock_timestamp()>=writers_end_at+make_interval(secs=>$2) AS settled
       FROM space_erasures WHERE originals_removed_at IS NULL AND next_attempt_at<=clock_timestamp()
-      ORDER BY next_attempt_at,space_id LIMIT $1`, [limit, grace]), until)).rows;
+      ORDER BY next_attempt_at,space_id LIMIT $1`, [limit, grace]), until)
+      .then(result => result.rows, (error: unknown) => { failed(error); return []; });
     for (const row of spaces) {
       if (performance.now() >= stop) break;
       const spaceId = String(row.space_id);

@@ -143,14 +143,17 @@ const deleteRecord = (actor, f, collectionId, id, revision = 1) => services.reco
  * As if an hour passed for the space's writers: every upload grant, and every
  * erasure's writer bound and next attempt, moves an hour back. Only the clock
  * is simulated, so the guards that forbid such changes are bypassed for it.
+ * With `grants` false only the erasures move, so the cell-wide upload
+ * reconciler of other test files, each with its own store, leaves the
+ * space's attempts alone.
  */
-async function settle(f) {
+async function settle(f, grants = true) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     await client.query('SET LOCAL session_replication_role = replica');
-    await client.query(`UPDATE source_upload_grants SET issued_at=issued_at-interval '1 hour',expires_at=expires_at-interval '1 hour'
-      WHERE space_id=$1`, [f.spaceId]);
+    if (grants) await client.query(`UPDATE source_upload_grants SET issued_at=issued_at-interval '1 hour',
+      expires_at=expires_at-interval '1 hour' WHERE space_id=$1`, [f.spaceId]);
     for (const table of ['original_erasures', 'space_erasures'])
       await client.query(`UPDATE ${table} SET writers_end_at=writers_end_at-interval '1 hour',
         next_attempt_at=next_attempt_at-interval '1 hour' WHERE space_id=$1`, [f.spaceId]);
@@ -833,14 +836,19 @@ test('link reads and writes still authorize each endpoint after array intrinsics
   assert.equal((await links.get(f.owner, f.spaceId, 'alpha', hidden.linkId)).deleted, false);
 });
 
-/** The erasure's work left: the original unless removed at the current count, unremoved attempts and found keys. */
+/**
+ * The erasure's keys left: the original unless removed at the current count, each unremoved attempt's staging copy and
+ * its promoted copy unless that is the original, and found keys.
+ */
 async function erasureLeft(f, sourceId) {
   const row = (await pool.query(`SELECT x.removal_observed IS NOT DISTINCT FROM x.observed AS original_removed,
       cardinality(x.found_keys)::int AS found,x.removed_at IS NOT NULL AS removed,
-      (SELECT count(*)::int FROM source_upload_attempts a JOIN source_upload_grants g USING (space_id,collection_id,grant_id)
+      (SELECT coalesce(sum(CASE WHEN 'originals/'||substr(a.staging_key,9)=o.object_key THEN 1 ELSE 2 END),0)::int
+        FROM source_upload_attempts a JOIN source_upload_grants g USING (space_id,collection_id,grant_id)
         WHERE g.space_id=x.space_id AND g.collection_id=x.collection_id AND g.source_id=x.source_id
           AND a.staging_removed_at IS NULL) AS attempts
-    FROM original_erasures x WHERE x.space_id=$1 AND x.source_id=$2`, [f.spaceId, sourceId])).rows[0];
+    FROM original_erasures x JOIN original_objects o USING (space_id,collection_id,source_id)
+    WHERE x.space_id=$1 AND x.source_id=$2`, [f.spaceId, sourceId])).rows[0];
   return { left: (row.original_removed ? 0 : 1) + row.attempts + row.found, removed: row.removed };
 }
 
@@ -901,12 +909,115 @@ test('an erase transaction that stalls past its call bound with budget left is r
   const f = await fixture();
   await drain(f);
   const reconciler = new SourceUploadReconciler({ pool: hooked, originals: f.cell.originals }, 0);
-  const page = hold('SELECT space_id,collection_id,source_id FROM original_erasures');
+  const page = hold('ORDER BY x.next_attempt_at,x.space_id');
   const erasing = reconciler.erase(25, 10_000);
   await page.at;
   await assert.rejects(erasing, error => error instanceof AggregateError &&
     error.errors.some(item => item.message === 'Upload cleanup call timed out'));
   page.release();
+});
+
+/**
+ * A deleted upload source whose committed attempt kept its staging copy and whose grant has two failed attempts the
+ * ledger does not record removed, each with a staging and a promoted copy; and a deleted space with three keys behind it.
+ */
+async function slowErasure(f) {
+  f.r2.failDelete = key => key.startsWith('staging/');
+  const upload = await uploaded(f, randomBytes(200));
+  const [, segment, grantId] = upload.staging.split('/');
+  const keys = [upload.original, upload.staging];
+  for (const attemptId of ['att_x', 'att_y']) {
+    const staging = `staging/${segment}/${grantId}/${attemptId}`;
+    await pool.query(`INSERT INTO source_upload_attempts(space_id,collection_id,grant_id,attempt_id,staging_key,state,failure_code)
+      VALUES($1,'alpha',$2,$3,$4,'failed','abandoned')`, [f.spaceId, grantId, attemptId, staging]);
+    for (const key of [staging, `originals/${segment}/${grantId}/${attemptId}`]) {
+      f.r2.objects.set(key, { bytes: Buffer.from('stray') });
+      keys.push(key);
+    }
+  }
+  f.r2.failDelete = () => true;
+  assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', upload.sourceId)).erasure.originalBytes, 'pending');
+  f.r2.failDelete = () => false;
+  await settle(f, false);
+  assert.deepEqual(await erasureLeft(f, upload.sourceId), { left: 6, removed: false }, 'the original, its staging copy and four stray keys');
+  const space = await fixture();
+  await services.spaces.update(space.owner, space.spaceId, 'readOnly');
+  await services.spaces.delete(space.owner, space.spaceId);
+  await settle(space);
+  for (let i = 0; i < 3; i++) f.r2.objects.set(`originals/${Buffer.from(space.spaceId).toString('base64url')}/upl_${i}/att_${i}`,
+    { bytes: Buffer.from('x') });
+  return { ...upload, keys, segment, space };
+}
+/** Run production ticks until the source and the space are erased: each ends in budget and records a source delete. */
+async function ticks(f, erasure, reconciler, most) {
+  const lefts = [(await erasureLeft(f, erasure.sourceId)).left];
+  const took = [];
+  const pending = async () => !(await erasureLeft(f, erasure.sourceId)).removed ||
+    (await spaces.erasure(erasure.space.owner, erasure.space.spaceId)).originalBytes === 'pending';
+  for (let tick = 0; tick < most && await pending(); tick++) {
+    const started = performance.now();
+    await reconciler.erase(25, 5000);
+    took.push(Math.round(performance.now() - started));
+    assert.ok(took.at(-1) < 5000, `tick ${tick + 1} ended within its budget (${took.join(', ')} ms)`);
+    const { left } = await erasureLeft(f, erasure.sourceId);
+    if (lefts.at(-1) > 0) assert.ok(left < lefts.at(-1), `tick ${tick + 1} recorded a delete (${lefts.join(' > ')} > ${left})`);
+    lefts.push(left);
+  }
+  f.r2.deleteDelay = () => 0;
+  assert.equal((await erasureLeft(f, erasure.sourceId)).removed, true, `completed within bounded ticks (${lefts.join(' > ')})`);
+  for (const key of erasure.keys) assert.equal(f.r2.objects.has(key), false, key);
+  assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', erasure.sourceId)).erasure.originalBytes, 'removed');
+  assert.equal((await spaces.erasure(erasure.space.owner, erasure.space.spaceId)).originalBytes, 'erased',
+    `the space behind it completed meanwhile (${took.join(', ')} ms)`);
+  return lefts;
+}
+
+test('every production tick records a delete of an erasure whose attempts have two slow keys each', async () => {
+  const f = await fixture();
+  await drain(f);
+  const erasure = await slowErasure(f);
+  // Each delete takes 1.1 s, so two do not fit the sources' store share; each key's delete is recorded on its own.
+  f.r2.deleteDelay = key => key.includes(erasure.segment) ? 1100 : 0;
+  const lefts = await ticks(f, erasure, f.reconciler(), 10);
+  assert.ok(lefts.length > 4, `over several ticks (${lefts.join(' > ')})`);
+});
+
+test('an erasure whose page reads are slow still gets its store calls every production tick', async () => {
+  const f = await fixture();
+  await drain(f);
+  const erasure = await slowErasure(f);
+  // Every read of source erasure state takes 1.1 s; the store answers at once.
+  const slow = { connect: async () => {
+    const client = await pool.connect();
+    return new Proxy(client, { get(target, property) {
+      if (property !== 'query') return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
+      return async (sql, ...rest) => {
+        if (typeof sql === 'string' && /^SELECT[\s\S]*FROM original_erasures/.test(sql)) await sleep(1100);
+        return target.query(sql, ...rest);
+      };
+    } });
+  } };
+  await ticks(f, erasure, new SourceUploadReconciler({ pool: slow, originals: f.cell.originals }, 0), 4);
+});
+
+test('a space page that cannot be read is reported with earlier source failures, and one cut at the budget is unfinished', async () => {
+  const f = await fixture();
+  await drain(f);
+  const reconciler = new SourceUploadReconciler({ pool: hooked, originals: f.cell.originals }, 0);
+  const sourceId = await f.source('alpha');
+  const key = await objectKey(f, sourceId);
+  f.r2.failDelete = candidate => candidate === key;
+  assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', sourceId)).erasure.originalBytes, 'pending');
+  await settle(f);
+  const spacePage = 'FROM space_erasures WHERE originals_removed_at IS NULL';
+  hooks.push({ match: spacePage, run: async () => { throw new Error('space page unavailable'); } });
+  await assert.rejects(reconciler.erase(25, 5000), error => error instanceof AggregateError && error.errors.length === 2 &&
+    error.errors.some(item => item.message === 'space page unavailable'));
+  f.r2.failDelete = () => false;
+  hooks.push({ match: spacePage, run: () => sleep(1500) });
+  await reconciler.erase(25, 1000);
+  assert.equal(hooks.length, 0, 'the space page was read');
+  assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', sourceId)).erasure.originalBytes, 'removed');
 });
 
 /** Whether `promise` settles first or a backend waits on a lock in a statement containing `text`. */

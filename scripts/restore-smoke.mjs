@@ -176,6 +176,8 @@ try {
   await assert.rejects(restored.query('UPDATE evidence_events SET revision=3 WHERE space_id=$1',[spaceId]),/evidence facts are immutable/);
   await assert.rejects(restored.query(`UPDATE space_erasures SET requested_at=requested_at-interval '1 day' WHERE space_id=$1`,
     [erasedSpaceId]),error=>error.code==='23514'&&error.constraint==='space_erasures_transition','the restored erasure guard binds');
+  await assert.rejects(restored.query('TRUNCATE space_erasures'),/evidence facts are immutable/,'the restored truncate guard binds');
+  assert.equal((await restored.query('SELECT count(*)::int AS n FROM space_erasures WHERE space_id=$1',[erasedSpaceId])).rows[0].n,1);
   // The NOT VALID recorder rule is dumped apart from its table; it still binds new revisions.
   assert.ok(expected.claim_revisions.every(row=>JSON.parse(row).recorded_by==='owner'),'the restore seed names its recorder');
   await assert.rejects(restored.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id)
