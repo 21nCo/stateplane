@@ -70,7 +70,8 @@ function linkView(row: Record<string, unknown>, replayed: boolean): LinkView {
     revision: Number(row.revision), deleted: row.tombstone === true, createdAt: iso(row.created_at)!,
     deletedAt: iso(row.tombstoned_at), replayed };
 }
-const endpointsOf = (row: Record<string, unknown>): [LinkEndpoint, LinkEndpoint] => {
+/** A stored link's endpoints, read by own index (`at`), never through an array iterator. */
+const endpointsOf = (row: Record<string, unknown>): readonly LinkEndpoint[] => {
   const view = linkView(row, false);
   return [view.from, view.to];
 };
@@ -206,14 +207,13 @@ async function lockLink(db: Db, spaceId: string, linkId: string): Promise<void> 
 }
 /** A live endpoint and, for a claim, the collections its revisions cite; null when missing or deleted. */
 async function liveEndpoint(db: Db, spaceId: string, endpoint: LinkEndpoint): Promise<string[] | null> {
-  const ids = [spaceId, endpoint.collectionId, endpoint.id];
   const row = endpoint.kind === 'record'
     ? (await db.query(`SELECT tombstone,'{}'::text[] AS cited FROM records WHERE space_id=$1 AND collection_id=$2
-        AND record_id=$3`, ids)).rows[0]
+        AND record_id=$3`, [spaceId, endpoint.collectionId, endpoint.id])).rows[0]
     : (await db.query(`SELECT e.tombstone,ARRAY(SELECT DISTINCT a.source_collection_id FROM claim_evidence a
           WHERE a.space_id=e.space_id AND a.collection_id=e.collection_id AND a.claim_id=e.entity_id) AS cited
         FROM entity_refs e WHERE e.space_id=$1 AND e.collection_id=$2 AND e.kind=$4 AND e.entity_id=$3`,
-    [...ids, endpoint.kind])).rows[0];
+    [spaceId, endpoint.collectionId, endpoint.id, endpoint.kind])).rows[0];
   return !row || row.tombstone ? null : row.cited as string[];
 }
 async function readLink(db: Db, scope: AuthorityScope, linkId: string): Promise<Record<string, unknown> | undefined> {
@@ -291,11 +291,11 @@ export class PostgresLinks {
         // The stored link is authorized as delete would authorize it before its content is compared, so a
         // credential that lost access to it learns nothing from a changed retry.
         const stored = endpointsOf(existing);
-        await access.see(stored[0], existing.from_cited as string[]);
-        await access.see(stored[1], existing.to_cited as string[]);
+        await access.see(at(stored, 0), existing.from_cited as string[]);
+        await access.see(at(stored, 1), existing.to_cited as string[]);
         for (let i = 0; i < 2; i++) await access.require(at(stored, i).collectionId, writeOf(at(stored, i).kind), 'FORBIDDEN');
         if (existing.collection_id !== scope.collectionId || existing.link_type !== type || existing.deletion_policy !== policy ||
-          !sameEndpoint(stored[0], from) || !sameEndpoint(stored[1], to)) throw new AuthorityError('IDEMPOTENCY_MISMATCH');
+          !sameEndpoint(at(stored, 0), from) || !sameEndpoint(at(stored, 1), to)) throw new AuthorityError('IDEMPOTENCY_MISMATCH');
         return linkView(existing, true);
       }
       await writable(db, scope);
@@ -322,9 +322,9 @@ export class PostgresLinks {
       if (!reference(linkId)) throw new AuthorityError('NOT_FOUND');
       const row = await readLink(db, scope, linkId);
       if (!row || row.tombstone) throw new AuthorityError('NOT_FOUND');
-      const [from, to] = endpointsOf(row);
-      await access.see(from, row.from_cited as string[]);
-      await access.see(to, row.to_cited as string[]);
+      const sides = endpointsOf(row);
+      await access.see(at(sides, 0), row.from_cited as string[]);
+      await access.see(at(sides, 1), row.to_cited as string[]);
       return linkView(row, false);
     });
   }
@@ -342,8 +342,8 @@ export class PostgresLinks {
       const row = await readLink(db, scope, linkId);
       if (!row) throw new AuthorityError('NOT_FOUND');
       const sides = endpointsOf(row);
-      await access.see(sides[0], row.from_cited as string[]);
-      await access.see(sides[1], row.to_cited as string[]);
+      await access.see(at(sides, 0), row.from_cited as string[]);
+      await access.see(at(sides, 1), row.to_cited as string[]);
       for (let i = 0; i < 2; i++) await access.require(at(sides, i).collectionId, writeOf(at(sides, i).kind), 'FORBIDDEN');
       if (row.tombstone) return { ...linkView(row, true), erasure: { ...rowsRetained } };
       await writable(db, scope);
@@ -392,9 +392,9 @@ export class PostgresLinks {
       // The row past the page decides `next`, so it is admitted and fenced like the page's own rows.
       const admitted: LinkView[] = [];
       for (let i = 0; i < rows.length; i++) {
-        const [from, to] = endpointsOf(rows[i]);
-        await access.see(from, rows[i].from_cited as string[]);
-        await access.see(to, rows[i].to_cited as string[]);
+        const sides = endpointsOf(rows[i]);
+        await access.see(at(sides, 0), rows[i].from_cited as string[]);
+        await access.see(at(sides, 1), rows[i].to_cited as string[]);
         put(admitted, linkView(rows[i], false));
       }
       const links: LinkView[] = [];

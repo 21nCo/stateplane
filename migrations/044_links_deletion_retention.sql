@@ -162,10 +162,18 @@ CREATE CONSTRAINT TRIGGER evidence_events_authority AFTER INSERT ON evidence_eve
 
 -- A deleted source's stored original is erased from the blob store. The row
 -- is queued by the tombstoning statement itself, so no deletion path can skip
--- it. `writers_end_at` is when the last grant that could write the key ended;
--- a write started before it can still land, so removal is recorded complete
--- only by a removal that starts after it plus the reconciliation grace, and
--- the sweep reopens a completed erasure whose key it finds again.
+-- it. Its bytes are every key its committing grant's attempts wrote: the
+-- original, and each attempt's staging and promoted copy until the attempt
+-- records them removed. `writers_end_at` is when the last grant that could
+-- write those keys ended; a write started before it can still land, so
+-- removal is recorded complete only by a removal that starts after it plus
+-- the reconciliation grace. `observed` counts the sweep's findings of the
+-- erasure's keys: the sweep advances it, reopens the erasure and adds the key
+-- to `found_keys` whenever it finds one, and completion is recorded only
+-- against the count read before the removal started, so a key found during a
+-- removal keeps it pending. A removal deletes the found keys too, since the
+-- attempt ledger records each removal once and cannot name a key that came
+-- back; completion empties them.
 -- `next_attempt_at` orders retries: a failed or unsettled erasure moves behind
 -- the others, so it cannot hold the oldest page.
 CREATE TABLE original_erasures (
@@ -175,6 +183,8 @@ CREATE TABLE original_erasures (
   requested_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   writers_end_at timestamptz NOT NULL,
   next_attempt_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  observed bigint NOT NULL DEFAULT 0 CHECK (observed >= 0),
+  found_keys text[] NOT NULL DEFAULT '{}',
   removed_at timestamptz,
   PRIMARY KEY (space_id, collection_id, source_id),
   FOREIGN KEY (space_id, collection_id, source_id) REFERENCES sources(space_id, collection_id, source_id),
@@ -187,30 +197,36 @@ CREATE INDEX original_erasures_pending ON original_erasures(next_attempt_at, spa
 -- outlives the purge like the `spaces` row, so erasure can be reported after.
 -- `writers_end_at` is when the space's last upload grant ended (the purge,
 -- when it had none); completion needs an empty listing that starts after it
--- plus the grace.
+-- plus the grace, and that no key the sweep found since it began, as
+-- `observed` counts for source erasures.
 CREATE TABLE space_erasures (
   space_id text PRIMARY KEY REFERENCES spaces(space_id),
   requested_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   writers_end_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   next_attempt_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  observed bigint NOT NULL DEFAULT 0 CHECK (observed >= 0),
   originals_removed_at timestamptz,
   CHECK (originals_removed_at IS NULL OR originals_removed_at >= requested_at)
 );
 CREATE INDEX space_erasures_pending ON space_erasures(next_attempt_at, space_id) WHERE originals_removed_at IS NULL;
 
 -- An erasure's identity never changes. Completion and its reopening by the
--- sweep, and retry scheduling, are its only changes; a purge may request a
--- space's erasure again, never earlier, and completion is recorded only
--- against the request that the completing listing saw.
+-- sweep, and retry scheduling, are its only changes; the sweep's finding
+-- count only grows; a purge may request a space's erasure again, never
+-- earlier, and completion is recorded only against the request that the
+-- completing listing saw.
 CREATE FUNCTION stateplane_guard_erasure() RETURNS trigger LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
   IF TG_TABLE_NAME = 'original_erasures' THEN
-    IF (to_jsonb(NEW) - 'removed_at' - 'next_attempt_at') = (to_jsonb(OLD) - 'removed_at' - 'next_attempt_at') THEN
+    IF (to_jsonb(NEW) - 'removed_at' - 'next_attempt_at' - 'observed' - 'found_keys')
+        = (to_jsonb(OLD) - 'removed_at' - 'next_attempt_at' - 'observed' - 'found_keys')
+        AND NEW.observed >= OLD.observed AND (NEW.removed_at IS NULL OR cardinality(NEW.found_keys) = 0) THEN
       RETURN NEW;
     END IF;
   ELSIF NEW.space_id = OLD.space_id AND NEW.requested_at >= OLD.requested_at AND NEW.writers_end_at >= OLD.writers_end_at
+      AND NEW.observed >= OLD.observed
       AND (NEW.originals_removed_at IS NULL OR OLD.originals_removed_at IS NOT NULL OR NEW.requested_at = OLD.requested_at) THEN
     RETURN NEW;
   END IF;
@@ -231,8 +247,10 @@ CREATE TRIGGER space_erasures_kept BEFORE DELETE ON space_erasures
 
 -- Spaces deleted before this migration never requested erasure of their
 -- bytes; request it now, so `erase` lists them and their report can complete.
--- Their grants are gone with the purge, so their writers ended no later than now.
-INSERT INTO space_erasures(space_id) SELECT space_id FROM spaces WHERE lifecycle = 'deleted'
+-- Their grants went with the purge, so their ends are unknown; none outlives
+-- its issue by more than the longest grant (900 seconds) after this point.
+INSERT INTO space_erasures(space_id, writers_end_at)
+  SELECT space_id, clock_timestamp() + interval '900 seconds' FROM spaces WHERE lifecycle = 'deleted'
   ON CONFLICT (space_id) DO NOTHING;
 
 CREATE FUNCTION stateplane_queue_original_erasure() RETURNS trigger LANGUAGE plpgsql

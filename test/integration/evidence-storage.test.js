@@ -853,6 +853,9 @@ test('migration 040 rolls back atomically while record writers hold locks, then 
     // Migration 044 requests erasure for the space deleted before it, and only for that one.
     assert.deepEqual((await db.query('SELECT space_id,originals_removed_at FROM space_erasures')).rows,
       [{ space_id: 'sp_gone', originals_removed_at: null }]);
+    // Its grants went with the purge, so its writers are taken to end no sooner than the longest grant after 044.
+    assert.equal((await db.query(`SELECT writers_end_at>=clock_timestamp()+interval '890 seconds' AS later FROM space_erasures`))
+      .rows[0].later, true);
     // Existing records remain deletable once 040 is in place.
     await db.query(`UPDATE records SET tombstone=true,revision=2 WHERE record_id='rec_2'`);
     assert.equal(migrate(name).status, 0, 'a recorded 040 is skipped');
