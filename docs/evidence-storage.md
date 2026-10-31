@@ -145,6 +145,8 @@ Source offsets are segments `{ start, end, sourceStart, sourceEnd }`. `start` an
 - each content range is nonempty, lies within the content and starts at or after the previous segment's end;
 - each byte range lies within the original. It may be empty, for text that has no source position.
 
+`checkExtraction` refuses a hole, an accessor or a non-object segment like any other malformed one. `extract` checks every parser's output itself, so a parser that skips the check cannot store an extraction outside the contract.
+
 `stateplane.text` version `1` is the only parser. It accepts `text/plain`, `text/markdown`, `text/csv` and `text/tab-separated-values`. It decodes the original as UTF-8 and keeps it verbatim apart from one leading byte order mark. It does no newline, whitespace or Unicode normalization, so its single segment maps the content to the original byte for byte (`sourceStart` is 3 after a byte order mark). Markdown, CSV and TSV are kept as written; their markup is not interpreted. Every other type is refused, with no format sniffing and no fallback. That includes `text/html` and `text/xml`, whose markup would need a real parser, and every binary format. A stored MIME type is an essence without parameters, so no charset can be declared. `text/*` uploads are already checked as UTF-8 while streaming, and the parser checks again.
 
 ### Versions
@@ -166,7 +168,7 @@ The original is read and parsed between two transactions. Nothing is written unt
 | Unsupported MIME type, reference-only source, or original over 1 MiB | `INVALID_ARGUMENT`, decided from the recorded metadata before any byte is read |
 | Original that is not well-formed UTF-8 or contains NUL | `INVALID_ARGUMENT` after the read |
 | Malformed correction: request shape, offsets out of range, out of order or over 4,096 segments, or content that is invalid or over the bound | `INVALID_ARGUMENT`, after the collection is authorized |
-| Original missing, or its size or stored checksum differs from the record, or its streamed digest or length differs | `PROVIDER_UNAVAILABLE`, not retryable |
+| Original missing, or its size or stored checksum differs from the record, or its streamed digest or length differs | `PROVIDER_UNAVAILABLE`, not retryable; an opened body is cancelled without waiting for the store to acknowledge it |
 | Read of the original fails or does not finish within 10 seconds | `PROVIDER_UNAVAILABLE`, retryable; the body is cancelled |
 | Caller's authority changes while the original is read | The final transaction's refusal (`FORBIDDEN`, `SPACE_UNAVAILABLE`, …) |
 
@@ -191,6 +193,7 @@ These are initial bounds with the evidence for each, not measured capacity. STA-
 - every malformed correction shape, refused after authorization;
 - the read-and-write capability rule, collection scoping, and read-only and suspended spaces;
 - concurrent extractions and corrections;
-- a credential revoked while the original is read, and a stalled read cut off at its bound.
+- a credential revoked while the original is read, a stalled read cut off at its bound, and a mismatched original refused at once although its body's cancel never settles;
+- collection grants and the read-and-write rule still deciding every source call, extraction and correction after `Array.prototype[Symbol.iterator]` is replaced.
 
 The real R2 binding and Hyperdrive are not exercised locally; Cloudflare Preview and Railway Postgres acceptance is recorded separately.

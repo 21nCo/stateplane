@@ -1565,6 +1565,13 @@ test('source request decisions use intrinsics captured at load, so later prototy
       return value === badMime.toLowerCase() || value === 'not-a-digest' || native.call(this, value);
     }),
     numberIsSafeInteger: () => replace(Number, 'isSafeInteger', native => value => nonIntegers.has(value) || native(value)),
+    // Drops authority fences and capability names, so a check iterated over an array would be skipped.
+    arrayIteratorAuthority: () => replace(Array.prototype, Symbol.iterator, native => function () {
+      const inner = native.call(this);
+      const dropped = value => typeof value?.checkScope === 'function' || (typeof value === 'string' && value.startsWith('sources:'));
+      return { next() { for (;;) { const step = inner.next(); if (step.done || !dropped(step.value)) return step; } },
+        [Symbol.iterator]() { return this; } };
+    }),
     jsonStringify: () => replace(JSON, 'stringify', native => (value, ...rest) =>
       Array.isArray(value) && value[0] === 'text' ? '"same"' : native(value, ...rest))
   };
@@ -1574,8 +1581,10 @@ test('source request decisions use intrinsics captured at load, so later prototy
   const extracted = await f.sources.ingestText(f.agent, f.spaceId, 'alpha', { idempotencyKey: 'extracted', text: 'three' });
   await f.sources.extract(f.agent, f.spaceId, 'alpha', extracted.sourceId);
   const segment = { start: 0, end: 5, sourceStart: 0, sourceEnd: 5 };
-  const correct = request => () => f.sources.correctExtraction(f.agent, f.spaceId, 'alpha', extracted.sourceId,
+  const correct = (request, actor = f.agent) => () => f.sources.correctExtraction(actor, f.spaceId, 'alpha', extracted.sourceId,
     { baseVersion: 1, content: 'three', sourceOffsets: [segment], ...request });
+  const unextracted = await f.sources.ingestText(f.agent, f.spaceId, 'alpha', { idempotencyKey: 'unextracted', text: 'unextracted' });
+  const beta = await f.sources.ingestText(f.owner, f.spaceId, 'beta', { idempotencyKey: 'beta', text: 'beta' });
   let round = 0;
   const probe = async label => {
     round++;
@@ -1612,6 +1621,12 @@ test('source request decisions use intrinsics captured at load, so later prototy
     for (const [name, run] of Object.entries(refused)) await rejects(run(), 'INVALID_ARGUMENT', `${label}: ${name}`);
     assert.deepEqual(await effects(f), before, `${label}: refused requests have no effects`);
     assert.deepEqual((await extractionRows(f.spaceId)).map(row => row.version), [1], `${label}: no refused correction wrote a version`);
+    // Collection grants still decide every call.
+    await rejects(f.sources.get(f.agent, f.spaceId, 'beta', beta.sourceId), 'FORBIDDEN', `${label}: an ungranted collection`);
+    await rejects(f.sources.get(f.writer, f.spaceId, 'alpha', extracted.sourceId), 'FORBIDDEN', `${label}: a writer reads`);
+    await rejects(f.sources.extract(f.writer, f.spaceId, 'alpha', unextracted.sourceId), 'FORBIDDEN', `${label}: a writer extracts`);
+    await rejects(correct({ baseVersion: 1 }, f.writer)(), 'FORBIDDEN', `${label}: a writer corrects`);
+    assert.deepEqual((await extractionRows(f.spaceId)).map(row => row.version), [1], `${label}: no refused call wrote a version`);
   };
   await probe('control');
   for (const [name, install] of Object.entries(replacements)) {
@@ -1932,5 +1947,21 @@ test('an extraction rechecks its caller after reading the original, and a stalle
   assert.ok(performance.now() - started < 12_000, 'the read ends at its 10-second bound');
   await sleep(10);
   assert.equal(stall.state.cancelled, true, 'the stalled body is cancelled');
+  assert.deepEqual(await extractionRows(f.spaceId), []);
+
+  // An original that fails verification is refused at once, even when its body's cancel never settles.
+  const mismatched = await f.sources.ingestText(f.agent, f.spaceId, 'alpha', { idempotencyKey: 'mismatched', text: 'mismatched' });
+  const mismatchedKey = await sourceKey(f, mismatched.sourceId);
+  const blobGet = f.blobs.get.bind(f.blobs);
+  let cancelling = false;
+  f.blobs.get = async target => target !== mismatchedKey ? blobGet(target) : { bytes: 1, sha256: null,
+    body: new ReadableStream({ cancel: () => { cancelling = true; return new Promise(() => {}); } }) };
+  try {
+    const refusedAt = performance.now();
+    await assert.rejects(f.sources.extract(f.agent, f.spaceId, 'alpha', mismatched.sourceId), error =>
+      error.code === 'PROVIDER_UNAVAILABLE' && error.retryable === false);
+    assert.ok(performance.now() - refusedAt < 2_000, 'the refusal does not wait for the cancel');
+    assert.equal(cancelling, true, 'the body is still cancelled');
+  } finally { f.blobs.get = blobGet; }
   assert.deepEqual(await extractionRows(f.spaceId), []);
 });

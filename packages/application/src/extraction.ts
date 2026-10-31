@@ -33,6 +33,8 @@ export class ExtractionError extends Error {
 const codeUnit = String.prototype.charCodeAt;
 const isSafeInteger = Number.isSafeInteger;
 const isArray = Array.isArray;
+const hasOwn = Object.hasOwn;
+const ownDescriptor = Object.getOwnPropertyDescriptor;
 const Decoder = TextDecoder;
 /**
  * Code points and UTF-8 bytes of well-formed text without NUL, read by code
@@ -69,7 +71,11 @@ export function checkExtraction(output: TextExtraction, sourceBytes: number): vo
   if (!isArray(sourceOffsets) || sourceOffsets.length > extractionBounds.segments) throw new ExtractionError('offsets');
   let previousEnd = 0;
   for (let i = 0; i < sourceOffsets.length; i++) {
-    const { start, end, sourceStart, sourceEnd } = Object.getOwnPropertyDescriptor(sourceOffsets, i)!.value as ExtractionSegment;
+    // A hole, an accessor or a non-object segment is refused like any other malformed one.
+    const descriptor = ownDescriptor(sourceOffsets, i);
+    const segment: unknown = descriptor && hasOwn(descriptor, 'value') ? descriptor.value : undefined;
+    if (typeof segment !== 'object' || segment === null) throw new ExtractionError('offsets');
+    const { start, end, sourceStart, sourceEnd } = segment as ExtractionSegment;
     if (!isSafeInteger(start) || !isSafeInteger(end) || !isSafeInteger(sourceStart) || !isSafeInteger(sourceEnd) ||
       start < previousEnd || end <= start || end > measured.codePoints ||
       sourceStart < 0 || sourceEnd < sourceStart || sourceEnd > sourceBytes) throw new ExtractionError('offsets');

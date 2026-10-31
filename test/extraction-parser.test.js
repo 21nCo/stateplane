@@ -58,6 +58,10 @@ test('every extraction, parsed or corrected, must satisfy the bounded offset con
     ['a fractional offset', 'ab', [{ ...segment, end: 1.5 }]],
     ['an unsafe integer', 'ab', [{ ...segment, sourceStart: 2 ** 53 }]],
     ['a string offset', 'ab', [{ ...segment, end: '1' }]],
+    ['a hole', 'ab', new Array(1)],
+    ['a null segment', 'ab', [null]],
+    ['a primitive segment', 'ab', [1]],
+    ['an accessor segment', 'ab', Object.defineProperty([], 0, { get: () => segment, enumerable: true })],
     ['too many segments', 'a'.repeat(extractionBounds.segments + 1),
       Array.from({ length: extractionBounds.segments + 1 }, (_, i) => ({ start: i, end: i + 1, sourceStart: 0, sourceEnd: 0 }))]
   ]) refused(() => ok(content, sourceOffsets), 'offsets', name);

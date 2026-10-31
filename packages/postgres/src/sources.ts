@@ -538,17 +538,21 @@ export class PostgresSources {
 
   private actorTx<T>(actor: VerifiedCredential, admitted: Admitted, fn: (db: Db) => Promise<T>): Promise<T> {
     return transact(admitted.cell.pool, async db => {
-      const capabilities = admitted.also ? [admitted.capability, admitted.also] : [admitted.capability];
-      const fences = capabilities.map(capability => new AuthorityTransaction(db, { ...admitted.scope, capability }, 1));
+      // Direct calls, not iteration, so a later change to Array.prototype cannot skip a check.
+      const fence = new AuthorityTransaction(db, admitted.scope, 1);
+      const also = admitted.also ? new AuthorityTransaction(db, { ...admitted.scope, capability: admitted.also }, 1) : null;
+      const checkScope = async () => { await fence.checkScope(); if (also) await also.checkScope(); };
       try {
-        for (const fence of fences) await fence.checkScope();
+        await checkScope();
         const result = await fn(db);
-        for (const fence of fences) await fence.checkScope();
+        await checkScope();
         // A grant matches when it holds any listed capability, so each one is checked on its own.
-        for (const capability of capabilities) await this.spaces.assertScopeCurrent(actor, admitted.ownerPrincipalId,
-          admitted.scope, db, admitted.scope.collectionId, [capability]);
+        await this.spaces.assertScopeCurrent(actor, admitted.ownerPrincipalId, admitted.scope, db,
+          admitted.scope.collectionId, [admitted.capability]);
+        if (admitted.also) await this.spaces.assertScopeCurrent(actor, admitted.ownerPrincipalId, admitted.scope, db,
+          admitted.scope.collectionId, [admitted.also]);
         return result;
-      } finally { for (const fence of fences) fence.close(); }
+      } finally { fence.close(); also?.close(); }
     });
   }
 
@@ -835,7 +839,10 @@ export class PostgresSources {
     if ('replay' in plan) return plan.replay;
     const bytes = await originalBytes(admitted.cell.originals, plan.objectKey, plan.sha256, plan.bytes);
     let output: TextExtraction;
-    try { output = plan.parser.parse(bytes); } catch (error) { throw refusedExtraction(error); }
+    try {
+      output = plan.parser.parse(bytes);
+      checkExtraction(output, bytes.byteLength);
+    } catch (error) { throw refusedExtraction(error); }
     return this.actorTx(actor, admitted, async db => {
       const original = await lockExtractable(db, scope, sourceId);
       const latest = Number(original.latest);
@@ -1049,7 +1056,8 @@ function offsetsJson(segments: readonly ExtractionSegment[]): string {
  */
 async function lockExtractable(db: Db, scope: AuthorityScope, sourceId: string): Promise<Record<string, unknown>> {
   const ids = [scope.spaceId, scope.collectionId, sourceId];
-  await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [lockKey(['stateplane:extraction', ...ids])]);
+  await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',
+    [lockKey(['stateplane:extraction', scope.spaceId, scope.collectionId, sourceId])]);
   const row = (await db.query(`SELECT o.reference_only,o.sha256,o.byte_size,o.mime_type,o.object_key,e.tombstone,
       COALESCE((SELECT max(v.version) FROM extraction_versions v WHERE v.space_id=o.space_id AND v.collection_id=o.collection_id
         AND v.source_id=o.source_id),0) AS latest
@@ -1084,7 +1092,8 @@ async function originalBytes(blobs: BlobStore, objectKey: string | null, sha256:
       late => void late?.body.cancel().catch(() => {}));
     if (!stored) throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Original bytes are missing', undefined, false);
     if (stored.bytes !== bytes || (stored.sha256 !== null && stored.sha256 !== sha256)) {
-      await stored.body.cancel().catch(() => {});
+      // Not awaited: a store whose cancel never settles must not hold the refusal past the read bound.
+      void stored.body.cancel().catch(() => {});
       throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Original bytes failed verification', undefined, false);
     }
     // The verified stream errors before more than `bytes` arrive, so the buffer never overflows.
