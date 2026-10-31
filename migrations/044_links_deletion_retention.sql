@@ -173,7 +173,13 @@ CREATE CONSTRAINT TRIGGER evidence_events_authority AFTER INSERT ON evidence_eve
 -- against the count read before the removal started, so a key found during a
 -- removal keeps it pending. A removal deletes the found keys too, since the
 -- attempt ledger records each removal once and cannot name a key that came
--- back; completion empties them.
+-- back. Progress is recorded key by key, so a slow store still advances it:
+-- each settled attempt's removal in the ledger, each found key's removal by
+-- dropping it from `found_keys` under the count read before its delete, and
+-- the original's removal as `removal_observed`, the count read before that
+-- delete. A later finding advances the count past it, so the original is
+-- removed again. Completion needs the original removed at the current count,
+-- no found key and no attempt left.
 -- `next_attempt_at` orders retries: a failed or unsettled erasure moves behind
 -- the others, so it cannot hold the oldest page.
 CREATE TABLE original_erasures (
@@ -185,6 +191,7 @@ CREATE TABLE original_erasures (
   next_attempt_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   observed bigint NOT NULL DEFAULT 0 CHECK (observed >= 0),
   found_keys text[] NOT NULL DEFAULT '{}',
+  removal_observed bigint CHECK (removal_observed >= 0 AND removal_observed <= observed),
   removed_at timestamptz,
   PRIMARY KEY (space_id, collection_id, source_id),
   FOREIGN KEY (space_id, collection_id, source_id) REFERENCES sources(space_id, collection_id, source_id),
@@ -220,9 +227,11 @@ SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
   IF TG_TABLE_NAME = 'original_erasures' THEN
-    IF (to_jsonb(NEW) - 'removed_at' - 'next_attempt_at' - 'observed' - 'found_keys')
-        = (to_jsonb(OLD) - 'removed_at' - 'next_attempt_at' - 'observed' - 'found_keys')
-        AND NEW.observed >= OLD.observed AND (NEW.removed_at IS NULL OR cardinality(NEW.found_keys) = 0) THEN
+    IF (to_jsonb(NEW) - 'removed_at' - 'next_attempt_at' - 'observed' - 'found_keys' - 'removal_observed')
+        = (to_jsonb(OLD) - 'removed_at' - 'next_attempt_at' - 'observed' - 'found_keys' - 'removal_observed')
+        AND NEW.observed >= OLD.observed
+        AND (OLD.removal_observed IS NULL OR NEW.removal_observed >= OLD.removal_observed)
+        AND (NEW.removed_at IS NULL OR (cardinality(NEW.found_keys) = 0 AND NEW.removal_observed = NEW.observed)) THEN
       RETURN NEW;
     END IF;
   ELSIF NEW.space_id = OLD.space_id AND NEW.requested_at >= OLD.requested_at AND NEW.writers_end_at >= OLD.writers_end_at

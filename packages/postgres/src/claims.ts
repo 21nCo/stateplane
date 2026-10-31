@@ -147,7 +147,13 @@ function evidenceJson(evidence: readonly ClaimEvidenceView[]): string {
 async function lockClaim(db: Db, spaceId: string, claimId: string): Promise<void> {
   await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [lockKey(['stateplane:claim', spaceId, claimId])]);
 }
-/** Times are in order and the observation is not in the future; every cited source and range exists. */
+/**
+ * Times are in order and the observation is not in the future; every cited
+ * source and range exists. The cited sources' identities are share-locked
+ * first, in one order, so a source deletion, which tombstones that row,
+ * either committed before the check, which then finds the source deleted, or
+ * waits for this claim to commit and finds it cited.
+ */
 async function checkContent(db: Db, scope: AuthorityScope, content: Content): Promise<void> {
   const times = (await db.query(`SELECT ($1::timestamptz IS NULL OR $1::timestamptz<=clock_timestamp()) AS observed,
     ($2::timestamptz IS NULL OR $3::timestamptz IS NULL OR $2::timestamptz<=$3::timestamptz) AS ordered`,
@@ -155,6 +161,9 @@ async function checkContent(db: Db, scope: AuthorityScope, content: Content): Pr
   if (times?.observed !== true) invalid('observedAt is in the future');
   if (times.ordered !== true) invalid('validFrom is after validUntil');
   if (!content.evidence.length) return;
+  await db.query(`SELECT 1 FROM entity_refs r WHERE r.space_id=$1 AND r.kind='source'
+      AND (r.collection_id,r.entity_id) IN (SELECT e.item->>0,e.item->>1 FROM jsonb_array_elements($2::jsonb) AS e(item))
+    ORDER BY r.collection_id,r.entity_id FOR SHARE`, [scope.spaceId, evidenceJson(content.evidence)]);
   const rows = (await db.query(`SELECT e.ordinal,r.tombstone IS FALSE AS live,
       (e.item->>2) IS NULL OR v.version IS NOT NULL AS has_version,char_length(v.content) AS length
     FROM jsonb_array_elements($2::jsonb) WITH ORDINALITY AS e(item,ordinal)

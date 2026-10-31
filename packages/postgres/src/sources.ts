@@ -215,7 +215,7 @@ async function within<T>(until: number, start: () => Promise<T>, late: (value: T
 export async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promise<T>, until?: number): Promise<T> {
   const end = until === undefined ? undefined : Math.min(until, performance.now() + CLEANUP_CALL_MS);
   const remaining = () => end === undefined ? REQUEST_BUDGET_MS : Math.max(1, Math.floor(end - performance.now()));
-  if (end !== undefined && performance.now() >= end) throw new CleanupTimeout();
+  if (end !== undefined && performance.now() >= end) throw new CleanupTimeout(performance.now() >= until!);
   const deadline = Date.now() + remaining();
   const client = end === undefined ? await pool.connect() :
     await within(end, () => pool.connect(), late => late.release(), until);
@@ -234,7 +234,8 @@ export async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) =
       await client.query(`SET LOCAL lock_timeout = '${Math.min(LOCK_MS, remaining())}ms'`);
       return fn(client);
     };
-    const result = end === undefined ? await work() : await within(end, work);
+    // Only the caller's own budget makes a cut-off call unfinished; the per-call bound is a stall.
+    const result = end === undefined ? await work() : await within(end, work, () => {}, until);
     begun = false;
     commitSent = true;
     try { await commitBeforeDeadline(client, deadline); }
@@ -250,7 +251,7 @@ export async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) =
   } catch (error) {
     if (begun && !clientReadTimedOut(error) && !(error instanceof CleanupTimeout)) {
       const rollback = () => client.query('ROLLBACK');
-      try { await (end === undefined ? rollback() : within(end, rollback)); } catch { discard = true; }
+      try { await (end === undefined ? rollback() : within(end, rollback, () => {}, until)); } catch { discard = true; }
     }
     else if (beginAttempted) discard = true;
     if (pgCode(error) === '57014') throw new AuthorityError('RATE_LIMITED', 'Database statement time limit exceeded');
@@ -1249,72 +1250,94 @@ async function sourceExists(db: Db, spaceId: string, sourceId: string): Promise<
   return (await db.query('SELECT 1 FROM sources WHERE space_id=$1 AND source_id=$2', [spaceId, sourceId])).rows.length > 0;
 }
 
-/** Attempts of a source's grant, and keys the sweep found, that one removal deletes; more remain for the next one. */
+/** Attempts of a source's grant, and keys the sweep found, that one removal takes; more remain for the next one. */
 const ERASE_ATTEMPTS = 20;
 const ERASE_FOUND = 40;
 /**
- * Remove a deleted source's bytes: its original, and every key its grant's
+ * Remove a deleted source's bytes: its original, every key its grant's
  * attempts wrote that the attempt ledger does not record removed (a staging
- * copy whose cleanup failed, another attempt's promoted copy). Its tombstone
- * is final and the grant's attempts ended, so only a write the grant started
- * before it ended can still land. A removal that started after that, plus
- * the grace, is settled: once the store confirms every delete, the attempts
- * are recorded removed and, when none remain, so is the erasure, but only
- * if the sweep found none of its keys since the removal began (`observed`).
- * An unsettled removal schedules the next attempt for then. A copy the store
- * confirms even later is found by the sweep, which reopens the erasure.
- * Store calls end by `storeUntil`, transactions by `recordUntil`. Returns
- * whether the erasure is recorded complete.
+ * copy whose cleanup failed, another attempt's promoted copy), and the keys
+ * the sweep found. Its tombstone is final and the grant's attempts ended, so
+ * only a write the grant started before it ended can still land. A removal
+ * that started after that, plus the grace, is settled. Each key is deleted
+ * once per removal, and a settled removal records each confirmed delete as it
+ * lands, so a removal the budget cuts short keeps its progress and the next
+ * one resumes: an attempt is recorded removed (failed first if it never
+ * ended), a found key leaves `found_keys`, and the original's removal is
+ * recorded as `removal_observed`. A found key and the original are recorded
+ * only against the sweep's finding count (`observed`) read before their
+ * delete, so a key the sweep finds meanwhile is removed again. Completion
+ * needs the original removed at the current count, and no found key or
+ * attempt left. An unsettled removal records nothing and schedules the next
+ * one for when its writers have ended. A copy the store confirms even later
+ * is found by the sweep, which reopens the erasure. Store calls end by
+ * `storeUntil`, transactions by `recordUntil`. Returns whether the erasure is
+ * recorded complete.
  */
 async function eraseOriginal(cell: SourceCell, ids: readonly string[], storeUntil: number, recordUntil: number,
   graceSeconds: number): Promise<boolean> {
   const params = [ids[0], ids[1], ids[2]];
-  const state = (await transact(cell.pool, db => db.query(`SELECT x.observed::text AS observed,x.removed_at IS NOT NULL AS removed,
-      x.found_keys[1:$6] AS found,cardinality(x.found_keys)>$6 AS more_found,
+  const record = (sql: string, values: unknown[]) => transact(cell.pool, db => db.query(sql, values), recordUntil);
+  const state = (await record(`SELECT x.observed::text AS observed,x.removed_at IS NOT NULL AS removed,
+      x.removal_observed IS NOT DISTINCT FROM x.observed AS original_removed,x.found_keys[1:$6] AS found,
       clock_timestamp()>=x.writers_end_at+make_interval(secs=>$4) AS settled,o.object_key,
       ARRAY(SELECT a.staging_key FROM source_upload_attempts a JOIN source_upload_grants g USING (space_id,collection_id,grant_id)
         WHERE g.space_id=x.space_id AND g.collection_id=x.collection_id AND g.source_id=x.source_id
           AND a.staging_removed_at IS NULL ORDER BY a.staging_key LIMIT $5) AS staged
     FROM original_erasures x JOIN original_objects o USING (space_id,collection_id,source_id)
     WHERE x.space_id=$1 AND x.collection_id=$2 AND x.source_id=$3`,
-  [ids[0], ids[1], ids[2], graceSeconds, ERASE_ATTEMPTS + 1, ERASE_FOUND]),
-  recordUntil)).rows[0];
+  [...params, graceSeconds, ERASE_ATTEMPTS, ERASE_FOUND])).rows[0];
   if (!state) return false;
   if (state.removed === true) return true;
+  const settled = state.settled === true;
+  const observed = String(state.observed);
+  const original = String(state.object_key);
+  // Each key is deleted once: the committing attempt's promoted key is the original, and the sweep may find either.
+  const deleted = new Set<string>();
+  // An original already removed at the current count needs no delete; its removal stands until the sweep finds a key.
+  if (settled && state.original_removed === true) deleted.add(original);
+  const remove = async (key: string) => {
+    if (deleted.has(key)) return;
+    await within(storeUntil, () => cell.originals.delete(key));
+    deleted.add(key);
+  };
+  // A fenced record that finds the count advanced stops the removal: the sweep found a key, so it starts over.
+  let current = true;
+  const fenced = async (sql: string, values: unknown[]) => {
+    if (settled && current && (await record(sql, values)).rowCount !== 1) current = false;
+  };
+  await remove(original);
+  if (state.original_removed !== true) await fenced(`UPDATE original_erasures SET removal_observed=$4::bigint WHERE space_id=$1 AND collection_id=$2 AND source_id=$3
+    AND removed_at IS NULL AND observed=$4::bigint AND removal_observed IS DISTINCT FROM $4::bigint`, [...params, observed]);
   const staged = state.staged as string[];
-  const attempts: string[] = [];
-  const keys = [String(state.object_key)];
-  for (let i = 0; i < staged.length && i < ERASE_ATTEMPTS; i++) {
+  for (let i = 0; i < staged.length && current; i++) {
     const staging = String(staged[i]);
-    attempts.push(staging);
-    keys.push(staging);
+    await remove(staging);
     // The attempt's promoted copy: its key differs from the staging key only in the prefix.
-    if (startsWith(staging, 'staging/')) keys.push(`originals/${staging.slice('staging/'.length)}`);
+    if (startsWith(staging, 'staging/')) await remove(`originals/${staging.slice('staging/'.length)}`);
+    // Its grant ended, so an attempt that never ended writes nothing more; it fails as reconciliation would fail it.
+    if (settled) await record(`UPDATE source_upload_attempts SET state=CASE WHEN state IN ('receiving','verified') THEN 'failed'
+        ELSE state END,failure_code=CASE WHEN state IN ('receiving','verified') THEN 'abandoned' ELSE failure_code END,
+        staging_removed_at=clock_timestamp(),updated_at=clock_timestamp()
+      WHERE space_id=$1 AND collection_id=$2 AND staging_key=$3 AND staging_removed_at IS NULL`, [ids[0], ids[1], staging]);
   }
   const found = state.found as string[];
-  for (let i = 0; i < found.length; i++) keys.push(String(found[i]));
-  for (let i = 0; i < keys.length; i++) await within(storeUntil, () => cell.originals.delete(keys[i]));
-  const settled = state.settled === true;
-  const complete = settled && staged.length <= ERASE_ATTEMPTS && state.more_found !== true;
-  return transact(cell.pool, async db => {
-    // A committed or failed attempt writes nothing more, so once settled its deleted keys are its record of removal.
-    if (settled) await db.query(`UPDATE source_upload_attempts SET staging_removed_at=clock_timestamp(),updated_at=clock_timestamp()
-      WHERE space_id=$1 AND collection_id=$2 AND staging_key=ANY($3::text[]) AND staging_removed_at IS NULL
-        AND state IN ('committed','failed')`, [ids[0], ids[1], attempts]);
-    if (complete && (await db.query(`UPDATE original_erasures SET removed_at=clock_timestamp(),found_keys='{}'
-      WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL AND observed=$4::bigint`,
-    [...params, state.observed])).rowCount === 1) return true;
-    // Found keys this removal deleted are done, unless the sweep found more since: then it may have found them again.
-    if (found.length) await db.query(`UPDATE original_erasures SET found_keys=ARRAY(SELECT k FROM unnest(found_keys) AS k
-        WHERE k<>ALL($5::text[]))
-      WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL AND observed=$4::bigint`,
-    [...params, state.observed, found]);
-    // Unsettled: due once its writers ended. Attempts left over or a key found meanwhile: due now.
-    await db.query(`UPDATE original_erasures SET next_attempt_at=CASE WHEN $4 THEN clock_timestamp()
-        ELSE greatest(clock_timestamp(),writers_end_at+make_interval(secs=>$5)) END
-      WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL`, [...params, settled, graceSeconds]);
-    return false;
-  }, recordUntil);
+  for (let i = 0; i < found.length && current; i++) {
+    const key = String(found[i]);
+    await remove(key);
+    await fenced(`UPDATE original_erasures SET found_keys=array_remove(found_keys,$5) WHERE space_id=$1 AND collection_id=$2
+      AND source_id=$3 AND removed_at IS NULL AND observed=$4::bigint AND $5=ANY(found_keys)`, [...params, observed, key]);
+  }
+  if (settled && current && (await record(`UPDATE original_erasures SET removed_at=clock_timestamp()
+    WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL AND observed=$4::bigint
+      AND removal_observed=observed AND cardinality(found_keys)=0
+      AND NOT EXISTS (SELECT 1 FROM source_upload_attempts a JOIN source_upload_grants g USING (space_id,collection_id,grant_id)
+        WHERE g.space_id=$1 AND g.collection_id=$2 AND g.source_id=$3 AND a.staging_removed_at IS NULL)`, [...params, observed])).rowCount === 1) return true;
+  // Unsettled: due once its writers ended. Keys left over or a key found meanwhile: due now.
+  await record(`UPDATE original_erasures SET next_attempt_at=CASE WHEN $4 THEN clock_timestamp()
+      ELSE greatest(clock_timestamp(),writers_end_at+make_interval(secs=>$5)) END
+    WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL`, [...params, settled, graceSeconds]);
+  return false;
 }
 const keyPrefixes = (spaceId: string) => [`originals/${spaceSegment(spaceId)}/`, `staging/${spaceSegment(spaceId)}/`];
 

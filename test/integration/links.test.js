@@ -753,3 +753,139 @@ test('link reads and writes still authorize each endpoint after array intrinsics
   }
   assert.equal((await links.get(f.owner, f.spaceId, 'alpha', hidden.linkId)).deleted, false);
 });
+
+/** The erasure's work left: the original unless removed at the current count, unremoved attempts and found keys. */
+async function erasureLeft(f, sourceId) {
+  const row = (await pool.query(`SELECT x.removal_observed IS NOT DISTINCT FROM x.observed AS original_removed,
+      cardinality(x.found_keys)::int AS found,x.removed_at IS NOT NULL AS removed,
+      (SELECT count(*)::int FROM source_upload_attempts a JOIN source_upload_grants g USING (space_id,collection_id,grant_id)
+        WHERE g.space_id=x.space_id AND g.collection_id=x.collection_id AND g.source_id=x.source_id
+          AND a.staging_removed_at IS NULL) AS attempts
+    FROM original_erasures x WHERE x.space_id=$1 AND x.source_id=$2`, [f.spaceId, sourceId])).rows[0];
+  return { left: (row.original_removed ? 0 : 1) + row.attempts + row.found, removed: row.removed };
+}
+
+test('a removal against a slow store records each delete, so every production tick advances it until it completes', async () => {
+  const f = await fixture();
+  await drain(f);
+  // The committed attempt keeps its staging copy; two failed attempts of the same grant left copies too.
+  f.r2.failDelete = key => key.startsWith('staging/');
+  const upload = await uploaded(f, randomBytes(200));
+  const [, , grantId] = upload.staging.split('/');
+  const segment = Buffer.from(f.spaceId).toString('base64url');
+  const strays = [];
+  for (const attemptId of ['att_x', 'att_y']) {
+    const staging = `staging/${segment}/${grantId}/${attemptId}`;
+    await pool.query(`INSERT INTO source_upload_attempts(space_id,collection_id,grant_id,attempt_id,staging_key,state,failure_code,
+        staging_removed_at) VALUES($1,'alpha',$2,$3,$4,'failed','abandoned',clock_timestamp())`, [f.spaceId, grantId, attemptId, staging]);
+    for (const key of [staging, `originals/${segment}/${grantId}/${attemptId}`]) {
+      f.r2.objects.set(key, { bytes: Buffer.from('stray') });
+      strays.push(key);
+    }
+  }
+  await settle(f);
+  f.r2.failDelete = () => true;
+  assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', upload.sourceId)).erasure.originalBytes, 'pending');
+  // The sweep finds every key of the deleted source's grant, and its deletes fail.
+  await assert.rejects(f.reconciler().sweep(1000), AggregateError);
+  assert.deepEqual(await erasureLeft(f, upload.sourceId), { left: 8, removed: false }, 'original, attempt and six found keys');
+  f.r2.failDelete = () => false;
+  f.r2.deleteDelay = () => 800;
+  const lefts = [8];
+  for (let tick = 0; tick < 6 && !(await erasureLeft(f, upload.sourceId)).removed; tick++) {
+    await f.reconciler().erase(25, 5000);
+    const { left } = await erasureLeft(f, upload.sourceId);
+    assert.ok(left < lefts.at(-1), `tick ${tick + 1} recorded progress (${lefts.join(' > ')} > ${left})`);
+    lefts.push(left);
+    if (tick === 0) {
+      // Between checkpointed ticks a late copy of the original lands; the sweep finds it and cannot delete it.
+      assert.equal(f.r2.objects.has(upload.original), false);
+      f.r2.objects.set(upload.original, { bytes: Buffer.from('late copy') });
+      f.r2.deleteDelay = () => 0;
+      f.r2.failDelete = key => key === upload.original;
+      await assert.rejects(f.reconciler().sweep(1000), AggregateError);
+      assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', upload.sourceId)).erasure.originalBytes, 'pending');
+      lefts.push((await erasureLeft(f, upload.sourceId)).left);
+      assert.ok(lefts.at(-1) > lefts.at(-2), 'the finding undid the original\'s recorded removal');
+      f.r2.failDelete = () => false;
+      f.r2.deleteDelay = () => 800;
+    }
+  }
+  f.r2.deleteDelay = () => 0;
+  assert.equal((await erasureLeft(f, upload.sourceId)).removed, true, `completed within bounded ticks (${lefts.join(' > ')})`);
+  assert.ok(lefts.length > 3, 'over more than one tick');
+  for (const key of [upload.original, upload.staging, ...strays]) assert.equal(f.r2.objects.has(key), false, key);
+  assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', upload.sourceId)).erasure.originalBytes, 'removed');
+});
+
+test('an erase transaction that stalls past its call bound with budget left is reported, not taken as unfinished', async () => {
+  const f = await fixture();
+  await drain(f);
+  const reconciler = new SourceUploadReconciler({ pool: hooked, originals: f.cell.originals }, 0);
+  const page = hold('SELECT space_id,collection_id,source_id FROM original_erasures');
+  const erasing = reconciler.erase(25, 10_000);
+  await page.at;
+  await assert.rejects(erasing, error => error instanceof AggregateError &&
+    error.errors.some(item => item.message === 'Upload cleanup call timed out'));
+  page.release();
+});
+
+/** Whether `promise` settles first or a backend waits on a lock in a statement containing `text`. */
+async function settlesOrWaits(promise, text) {
+  let settled = false;
+  promise.then(() => { settled = true; }, () => { settled = true; });
+  for (let i = 0; i < 250; i++) {
+    if (settled) return 'settled';
+    const waiting = (await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type='Lock'
+      AND position($1 in query)>0`, [text])).rows[0].n;
+    if (waiting) return 'waits';
+    await sleep(20);
+  }
+  return 'neither';
+}
+const citing = (f, sourceId, statement) => ({ statement, attributedTo: 'archive',
+  evidence: [{ collectionId: 'alpha', sourceId }] });
+const revisions = async (f, statement) => (await pool.query(`SELECT count(*)::int AS n FROM claim_revisions
+  WHERE space_id=$1 AND statement=$2`, [f.spaceId, statement])).rows[0].n;
+
+test('a claim citing a source serializes with its deletion, for create and revise, in both orders', async () => {
+  const f = await fixture();
+  const base = await claims.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: 'base', statement: 'base', attributedTo: 'a' });
+  const writes = {
+    create: (pooled, sourceId, statement) => pooled.create(f.owner, f.spaceId, 'alpha',
+      { idempotencyKey: `c-${randomUUID()}`, ...citing(f, sourceId, statement) }),
+    revise: (pooled, sourceId, statement) => pooled.revise(f.owner, f.spaceId, 'alpha', base.claimId,
+      { baseRevision: 1, ...citing(f, sourceId, statement) }),
+  };
+  for (const [name, write] of Object.entries(writes)) {
+    // The deletion commits first: the claim waits on the source's identity, then finds it deleted and writes nothing.
+    const first = await f.source('alpha');
+    const tombstoned = hold('INSERT INTO evidence_events', params => params[3] === 'source' && params[4] === first);
+    const deleting = f.hookedSources.delete(f.owner, f.spaceId, 'alpha', first);
+    await tombstoned.at;
+    const refused = write(claims, first, `${name} after deletion`);
+    assert.equal(await settlesOrWaits(refused, 'FOR SHARE'), 'waits', `${name}: the claim waits for the deletion`);
+    tombstoned.release();
+    await deleting;
+    await rejects(refused, 'NOT_FOUND', `${name}: a source deleted first cannot be cited`);
+    assert.equal(await revisions(f, `${name} after deletion`), 0);
+
+    // The claim locks first: the deletion waits until the claim commits, and then finds it cited.
+    const second = await f.source('alpha');
+    const checked = hold('INSERT INTO claim_revisions');
+    const writing = write(hookedClaims, second, `${name} before deletion`);
+    await checked.at;
+    const deleted = f.sources.delete(f.owner, f.spaceId, 'alpha', second);
+    assert.equal(await settlesOrWaits(deleted, 'UPDATE entity_refs SET tombstone=true'), 'waits',
+      `${name}: the deletion waits for the claim`);
+    checked.release();
+    const claim = await writing;
+    assert.equal((await deleted).replayed, false);
+    assert.equal(await revisions(f, `${name} before deletion`), 1);
+    const order = (await pool.query(`SELECT (SELECT committed_at FROM evidence_events WHERE space_id=$1 AND kind='source'
+        AND entity_id=$2 AND operation='delete') > (SELECT max(committed_at) FROM claim_revisions WHERE space_id=$1
+        AND claim_id=$3) AS after`, [f.spaceId, second, claim.claimId])).rows[0];
+    assert.equal(order.after, true, `${name}: the claim committed before the deletion`);
+  }
+  assert.equal(hooks.length, 0);
+});
