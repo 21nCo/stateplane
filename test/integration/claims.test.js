@@ -121,7 +121,7 @@ test('a claim is created unreviewed with attribution, times and evidence, revise
     review: { status: 'unreviewed', reviewedBy: null, reviewedAt: null },
     evidence: [{ collectionId: 'alpha', sourceId: f.alphaSource, extractionVersion: null, start: null, end: null },
       { collectionId: 'alpha', sourceId: f.alphaSource, extractionVersion: 1, start: 4, end: 16 }],
-    createdBy: created.createdBy, createdAt: null, committedAt: null, replayed: false });
+    createdBy: created.createdBy, recordedBy: created.createdBy, createdAt: null, committedAt: null, replayed: false });
   assert.match(created.claimId, /^clm_[0-9a-f]{64}$/);
 
   // A retry replays revision 1; another payload or collection under the key is a mismatch.
@@ -150,7 +150,7 @@ test('a claim is created unreviewed with attribution, times and evidence, revise
   // Review is a new revision with the same content, the reviewer and the review time.
   const accepted = await claims.review(f.reviewer, f.spaceId, 'alpha', created.claimId, { baseRevision: 2, status: 'accepted' });
   assert.deepEqual({ ...accepted, review: { ...accepted.review, reviewedAt: null }, committedAt: null }, {
-    ...revised, revision: 3, previousRevision: 2, latestRevision: 3, committedAt: null,
+    ...revised, revision: 3, previousRevision: 2, latestRevision: 3, committedAt: null, recordedBy: await principal(f.reviewer),
     review: { status: 'accepted', reviewedBy: await principal(f.reviewer), reviewedAt: null } });
   assert.equal(created.createdBy, await principal(f.writer));
   assert.notEqual(accepted.review.reviewedBy, created.createdBy);
@@ -173,6 +173,31 @@ test('a claim is created unreviewed with attribution, times and evidence, revise
   assert.equal((await claims.get(f.reader, f.spaceId, 'alpha', created.claimId)).revision, 5);
   await rejects(claims.get(f.reader, f.spaceId, 'alpha', created.claimId, 6), 'NOT_FOUND');
   await rejects(claims.get(f.reader, f.spaceId, 'alpha', 'clm_missing'), 'NOT_FOUND');
+});
+
+test('each revision names the principal that recorded it, and the claim keeps its creator', async () => {
+  const f = await fixture();
+  const second = await f.agent([['alpha', ['claims:write', 'claims:read']]]);
+  const created = await claims.create(f.writer, f.spaceId, 'alpha', { idempotencyKey: 'by', ...statement() });
+  const revised = await claims.revise(second, f.spaceId, 'alpha', created.claimId, { baseRevision: 1, ...statement(2) });
+  await claims.review(f.reviewer, f.spaceId, 'alpha', created.claimId, { baseRevision: 2, status: 'accepted' });
+  await claims.review(f.owner, f.spaceId, 'alpha', created.claimId, { baseRevision: 3, status: 'rejected' });
+  const [writer, other, reviewer] = [await principal(f.writer), await principal(second), await principal(f.reviewer)];
+  assert.equal(new Set([writer, other, reviewer, f.owner.userPrincipalId]).size, 4, 'four distinct principals');
+  const history = await Promise.all([1, 2, 3, 4].map(n => claims.get(f.reader, f.spaceId, 'alpha', created.claimId, n)));
+  assert.deepEqual(history.map(view => [view.createdBy, view.recordedBy, view.review.reviewedBy]), [
+    [writer, writer, null], [writer, other, null], [writer, reviewer, reviewer],
+    [writer, f.owner.userPrincipalId, f.owner.userPrincipalId]]);
+  assert.equal(revised.recordedBy, other, 'the revise response names its writer');
+  // A replay names the original recorder; the same content from another writer is not that revision.
+  assert.equal((await claims.revise(second, f.spaceId, 'alpha', created.claimId, { baseRevision: 1, ...statement(2) })).recordedBy, other);
+  await rejects(claims.revise(f.writer, f.spaceId, 'alpha', created.claimId, { baseRevision: 1, ...statement(2) }), 'REVISION_CONFLICT');
+  // The schema binds the recorder: a revision without one, or a review recorded by someone other than its reviewer, is refused.
+  const where = [f.spaceId, 'alpha', created.claimId];
+  for (const [recorder, status, reviewedBy] of [[null, 'unreviewed', null], ['', 'unreviewed', null], ['other', 'accepted', 'reviewer']])
+    await rejects(pool.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,
+      recorded_by,review_status,reviewed_by,reviewed_at) VALUES($1,$2,$3,5,'s','a','c',$4,$5,$6,$7)`,
+    [...where, recorder, status, reviewedBy, reviewedBy && new Date()]), '23514', `recorder ${recorder}`);
 });
 
 test('a review copies the reviewed revision exactly, and times finer than a millisecond are refused', async () => {
@@ -199,8 +224,9 @@ test('a review copies the reviewed revision exactly, and times finer than a mill
   try {
     await client.query('BEGIN');
     await client.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,
-        observed_at,valid_from,valid_until) VALUES($1,'alpha',$2,2,'Precise.','a lab',$3,'2026-03-04T05:06:07.123456Z',
-        '2026-03-04T05:06:07.123456Z','2026-03-04T05:06:07.123457Z')`, [f.spaceId, created.claimId, f.writer.credentialId]);
+        recorded_by,observed_at,valid_from,valid_until) VALUES($1,'alpha',$2,2,'Precise.','a lab',$3,$4,'2026-03-04T05:06:07.123456Z',
+        '2026-03-04T05:06:07.123456Z','2026-03-04T05:06:07.123457Z')`,
+    [f.spaceId, created.claimId, f.writer.credentialId, created.createdBy]);
     await client.query(`INSERT INTO claim_evidence(space_id,collection_id,claim_id,revision,ordinal,source_collection_id,source_id,
         extraction_version,start_offset,end_offset) VALUES($1,'alpha',$2,2,0,'alpha',$3,1,2,9)`, [f.spaceId, created.claimId, f.alphaSource]);
     await client.query(`UPDATE entity_refs SET revision=2 WHERE space_id=$1 AND kind='claim' AND entity_id=$2`, [f.spaceId, created.claimId]);
@@ -370,18 +396,59 @@ test('a claim and its evidence are visible only to callers who may read every ci
   await rejects(claims.list(f.both, f.spaceId, 'alpha', { citing: beta }), 'FORBIDDEN');
 });
 
+test('evidence ranges count code points, so a character outside the BMP is one position', async () => {
+  const f = await fixture();
+  const text = 'The bridge \u{1F309} opened in 1932.';
+  const created = await f.sources.ingestText(f.owner, f.spaceId, 'alpha', { idempotencyKey: 'astral', text });
+  await f.sources.extract(f.owner, f.spaceId, 'alpha', created.sourceId);
+  const { content } = (await pool.query(`SELECT content FROM extraction_versions WHERE space_id=$1 AND collection_id='alpha'
+    AND source_id=$2 AND version=1`, [f.spaceId, created.sourceId])).rows[0];
+  const points = [...content].length;
+  assert.equal(content.length, points + 1, 'the content has one surrogate pair');
+  const cite = (key, start, end) => claims.create(f.writer, f.spaceId, 'alpha', { idempotencyKey: key, ...statement(),
+    evidence: [{ collectionId: 'alpha', sourceId: created.sourceId, extractionVersion: 1, start, end }] });
+  const before = await claimRows(f.spaceId);
+  await rejects(cite('utf16', 0, content.length), 'INVALID_ARGUMENT', 'a UTF-16 length is past the last code point');
+  assert.deepEqual(await claimRows(f.spaceId), before);
+  const whole = await cite('points', 0, points);
+  assert.deepEqual([whole.evidence[0].start, whole.evidence[0].end], [0, points]);
+  const bridge = content.indexOf('\u{1F309}');
+  const emoji = await cite('emoji', bridge, bridge + 1);
+  assert.equal([...content].slice(emoji.evidence[0].start, emoji.evidence[0].end).join(''), '\u{1F309}',
+    'one position selects the whole character');
+});
+
+test('a claim citing a deleted collection is withheld from every caller, the owner included', async () => {
+  const f = await fixture();
+  const derived = await claims.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: 'derived', ...statement(),
+    evidence: [{ collectionId: 'beta', sourceId: f.betaSource }] });
+  const plain = await claims.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: 'plain', ...statement() });
+  assert.equal((await claims.get(f.both, f.spaceId, 'alpha', derived.claimId)).claimId, derived.claimId);
+  await pool.query("UPDATE collections SET lifecycle='deleted' WHERE space_id=$1 AND collection_id='beta'", [f.spaceId]);
+  for (const actor of [f.owner, f.both]) {
+    await rejects(claims.get(actor, f.spaceId, 'alpha', derived.claimId), 'NOT_FOUND');
+    await rejects(claims.get(actor, f.spaceId, 'alpha', derived.claimId, 1), 'NOT_FOUND');
+    assert.deepEqual((await claims.list(actor, f.spaceId, 'alpha')).claims.map(view => view.claimId), [plain.claimId]);
+  }
+  await rejects(claims.review(f.owner, f.spaceId, 'alpha', derived.claimId, { baseRevision: 1, status: 'accepted' }), 'NOT_FOUND');
+  await rejects(claims.revise(f.owner, f.spaceId, 'alpha', derived.claimId, { baseRevision: 1, ...statement(2) }), 'NOT_FOUND');
+});
+
 /** The final grant statement, which runs after the last provider call. */
 const finalCheck = 'live AS (SELECT g.collection_id';
 test('an owning or evidence grant that lapses before the final check refuses the call and writes nothing', async () => {
   const f = await fixture();
   const derived = await claims.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: 'derived', ...statement(),
     evidence: [{ collectionId: 'beta', sourceId: f.betaSource }] });
-  for (const lapsed of ['alpha', 'beta']) for (const call of ['get', 'review']) {
+  const capabilities = { get: ['claims:read', 'sources:read'], review: ['claims:review', 'claims:read', 'sources:read'],
+    create: ['claims:write', 'sources:read'] };
+  for (const lapsed of ['alpha', 'beta']) for (const call of ['get', 'review', 'create']) {
     const expires = Date.now() + 3_000;
-    const capabilities = call === 'get' ? ['claims:read', 'sources:read'] : ['claims:review', 'claims:read', 'sources:read'];
-    const lapsing = await f.agent([['alpha', capabilities], ['beta', ['sources:read']]], { [lapsed]: new Date(expires) });
+    const lapsing = await f.agent([['alpha', capabilities[call]], ['beta', ['sources:read']]], { [lapsed]: new Date(expires) });
     const run = () => call === 'get' ? hookedClaims.get(lapsing, f.spaceId, 'alpha', derived.claimId)
-      : hookedClaims.review(lapsing, f.spaceId, 'alpha', derived.claimId, { baseRevision: 1, status: 'accepted' });
+      : call === 'review' ? hookedClaims.review(lapsing, f.spaceId, 'alpha', derived.claimId, { baseRevision: 1, status: 'accepted' })
+        : hookedClaims.create(lapsing, f.spaceId, 'alpha', { idempotencyKey: 'cites-beta', ...statement(),
+          evidence: [{ collectionId: 'beta', sourceId: f.betaSource }] });
     if (call === 'get') assert.equal((await run()).claimId, derived.claimId, 'the grants admit the call before they lapse');
     const before = await claimRows(f.spaceId);
     // Hold the final check, after every fence passed and the provider answered, until one grant has expired.

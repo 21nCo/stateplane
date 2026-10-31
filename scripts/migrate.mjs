@@ -137,7 +137,8 @@ try {
       await preflightEventFeed(); // NOSONAR -- preflight locks must precede this migration step
     const receiptDomainCutover = name === '034_batch_receipt_domain.sql' || name === '035_validate_batch_receipt_domain.sql';
     const boundedDdl = receiptDomainCutover || name === '038_drop_superseded_event_cursor.sql' ||
-      name === '039_durable_outbox.sql' || name === '040_evidence_storage.sql' || name === '041_original_object_keys.sql';
+      name === '039_durable_outbox.sql' || name === '040_evidence_storage.sql' || name === '041_original_object_keys.sql' ||
+      name === '042_claim_revision_recorder.sql';
     const priorLockTimeout = boundedDdl ? (await client.query('SHOW lock_timeout')).rows[0].lock_timeout : null; // NOSONAR -- migrations run in order within the current transaction
     if (boundedDdl) await client.query("SET LOCAL lock_timeout = '5s'"); // NOSONAR -- set before this step's DDL, never concurrently
     try {
@@ -154,6 +155,8 @@ try {
         throw new Error('Evidence storage upgrade waits for record writers; retry when long record transactions finish', { cause:error });
       if (name === '041_original_object_keys.sql' && error?.code === '55P03')
         throw new Error('Original object key upgrade waits for source writers; retry when long source transactions finish', { cause:error });
+      if (name === '042_claim_revision_recorder.sql' && error?.code === '55P03')
+        throw new Error('Claim recorder upgrade waits for claim transactions; retry when long claim transactions finish', { cause:error });
       throw error;
     }
     if (boundedDdl) await client.query('SELECT set_config($1,$2,true)', ['lock_timeout',priorLockTimeout]); // NOSONAR -- restore this step's transaction-local timeout before the ledger write

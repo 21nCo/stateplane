@@ -86,8 +86,8 @@ async function insertEndpoint(db, spaceId, { kind, collectionId, id }, { referen
   } else {
     await db.query(`INSERT INTO claims(space_id,collection_id,claim_id,principal_id,credential_id) VALUES($1,$2,$3,'owner','owner-session')`,
       [spaceId, collectionId, id]);
-    await db.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id)
-      VALUES($1,$2,$3,1,$4,'principal:owner','owner-session')`, [spaceId, collectionId, id, bytes]);
+    await db.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,recorded_by)
+      VALUES($1,$2,$3,1,$4,'principal:owner','owner-session','owner')`, [spaceId, collectionId, id, bytes]);
   }
 }
 
@@ -232,14 +232,14 @@ test('claim revisions and their evidence are immutable history with explicit rev
   await assert.rejects(pool.query('DELETE FROM claims WHERE space_id=$1 AND collection_id=$2 AND claim_id=$3', where), immutable);
   // Review is a new revision that names its reviewer; the current pointer moves with it.
   await inTransaction(async db => {
-    await db.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,review_status,reviewed_by,reviewed_at)
-      VALUES($1,$2,$3,2,'a generic assertion','principal:owner','reviewer','accepted','reviewer',clock_timestamp())`, where);
+    await db.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,review_status,reviewed_by,reviewed_at,recorded_by)
+      VALUES($1,$2,$3,2,'a generic assertion','principal:owner','reviewer','accepted','reviewer',clock_timestamp(),'reviewer')`, where);
     await db.query(`UPDATE entity_refs SET revision=2 WHERE space_id=$1 AND collection_id=$2 AND kind='claim' AND entity_id=$3`, where);
   });
-  await assert.rejects(pool.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,review_status)
-    VALUES($1,$2,$3,3,'unattributed review','principal:owner','s','accepted')`, where), code('23514'));
-  await assert.rejects(pool.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id)
-    VALUES($1,$2,$3,5,'gap','principal:owner','s')`, where), code('23503'));
+  await assert.rejects(pool.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,review_status,recorded_by)
+    VALUES($1,$2,$3,3,'unattributed review','principal:owner','s','accepted','s')`, where), code('23514'));
+  await assert.rejects(pool.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,recorded_by)
+    VALUES($1,$2,$3,5,'gap','principal:owner','s','s')`, where), code('23503'));
   // The current pointer cannot name a revision that does not exist.
   await assert.rejects(pool.query(`UPDATE entity_refs SET revision=3 WHERE space_id=$1 AND collection_id=$2 AND kind='claim' AND entity_id=$3`, where),
     code('23503', 'entity_refs_payload'));

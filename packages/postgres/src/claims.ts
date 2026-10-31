@@ -15,12 +15,19 @@ export type ClaimReviewStatus = 'unreviewed' | 'accepted' | 'rejected';
 export interface ClaimEvidenceView {
   collectionId: string; sourceId: string; extractionVersion: number | null; start: number | null; end: number | null;
 }
-/** One immutable claim revision. Review status belongs to the revision, so a new revision starts unreviewed. */
+/**
+ * One immutable claim revision. Review status belongs to the revision, so a
+ * new revision starts unreviewed. `createdBy` is the principal that created
+ * the claim, and `recordedBy` the principal that recorded this revision: its
+ * writer, or for a review its reviewer. `recordedBy` is null only for a
+ * revision stored before migration 042, which no service wrote.
+ */
 export interface ClaimView {
   claimId: string; collectionId: string; revision: number; latestRevision: number; previousRevision: number | null;
   statement: string; attributedTo: string; observedAt: string | null; validFrom: string | null; validUntil: string | null;
   review: { status: ClaimReviewStatus; reviewedBy: string | null; reviewedAt: string | null };
-  evidence: ClaimEvidenceView[]; createdBy: string; createdAt: string; committedAt: string; replayed: boolean;
+  evidence: ClaimEvidenceView[]; createdBy: string; recordedBy: string | null; createdAt: string; committedAt: string;
+  replayed: boolean;
 }
 /** `next` is the `after` value for the following page, or null on the last page. */
 export interface ClaimPage { claims: ClaimView[]; next: string | null }
@@ -165,9 +172,9 @@ async function advance(db: Db, scope: AuthorityScope, claimId: string, revision:
 async function insertRevision(db: Db, scope: AuthorityScope, claimId: string, revision: number, content: Content): Promise<void> {
   const { spaceId, collectionId } = scope;
   await db.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,
-      observed_at,valid_from,valid_until) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-  [spaceId, collectionId, claimId, revision, content.statement, content.attributedTo, scope.credentialId, content.observedAt, content.validFrom,
-    content.validUntil]);
+      recorded_by,observed_at,valid_from,valid_until) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+  [spaceId, collectionId, claimId, revision, content.statement, content.attributedTo, scope.credentialId, scope.principalId,
+    content.observedAt, content.validFrom, content.validUntil]);
   if (content.evidence.length) await db.query(`INSERT INTO claim_evidence(space_id,collection_id,claim_id,revision,ordinal,
       source_collection_id,source_id,extraction_version,start_offset,end_offset)
     SELECT $1,$2,$3,$4,e.ordinal-1,e.item->>0,e.item->>1,(e.item->>2)::bigint,(e.item->>3)::bigint,(e.item->>4)::bigint
@@ -183,8 +190,8 @@ async function insertReview(db: Db, scope: AuthorityScope, claimId: string, base
   status: ClaimReviewStatus): Promise<void> {
   const key = [scope.spaceId, scope.collectionId, claimId, base];
   const copied = await db.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,
-      credential_id,observed_at,valid_from,valid_until,review_status,reviewed_by,reviewed_at)
-    SELECT space_id,collection_id,claim_id,revision+1,statement,attributed_to,$5,observed_at,valid_from,valid_until,$6,$7,
+      credential_id,recorded_by,observed_at,valid_from,valid_until,review_status,reviewed_by,reviewed_at)
+    SELECT space_id,collection_id,claim_id,revision+1,statement,attributed_to,$5,$7,observed_at,valid_from,valid_until,$6,$7,
       clock_timestamp()
     FROM claim_revisions WHERE space_id=$1 AND collection_id=$2 AND claim_id=$3 AND revision=$4`,
   [...key, scope.credentialId, status, scope.principalId]);
@@ -203,12 +210,13 @@ async function insertReview(db: Db, scope: AuthorityScope, claimId: string, base
 async function sameRevision(db: Db, scope: AuthorityScope, claimId: string, revision: number,
   content: Content): Promise<boolean> {
   const row = (await db.query(`SELECT r.statement=$5 AND r.attributed_to=$6 AND r.credential_id=$7
-      AND r.review_status='unreviewed' AND r.observed_at IS NOT DISTINCT FROM $8::timestamptz
+      AND r.recorded_by IS NOT DISTINCT FROM $12 AND r.review_status='unreviewed'
+      AND r.observed_at IS NOT DISTINCT FROM $8::timestamptz
       AND r.valid_from IS NOT DISTINCT FROM $9::timestamptz AND r.valid_until IS NOT DISTINCT FROM $10::timestamptz
       AND ${evidenceOf('r')}=$11::jsonb AS same
     FROM claim_revisions r WHERE r.space_id=$1 AND r.collection_id=$2 AND r.claim_id=$3 AND r.revision=$4`,
   [scope.spaceId, scope.collectionId, claimId, revision, content.statement, content.attributedTo, scope.credentialId,
-    content.observedAt, content.validFrom, content.validUntil, evidenceJson(content.evidence)])).rows[0];
+    content.observedAt, content.validFrom, content.validUntil, evidenceJson(content.evidence), scope.principalId])).rows[0];
   return row?.same === true;
 }
 /**
@@ -219,13 +227,13 @@ async function sameRevision(db: Db, scope: AuthorityScope, claimId: string, revi
 async function sameReview(db: Db, scope: AuthorityScope, claimId: string, base: number,
   status: ClaimReviewStatus): Promise<boolean> {
   const row = (await db.query(`SELECT n.statement=b.statement AND n.attributed_to=b.attributed_to AND n.credential_id=$5
-      AND n.review_status=$6 AND n.observed_at IS NOT DISTINCT FROM b.observed_at
+      AND n.review_status=$6 AND n.recorded_by IS NOT DISTINCT FROM $7 AND n.observed_at IS NOT DISTINCT FROM b.observed_at
       AND n.valid_from IS NOT DISTINCT FROM b.valid_from AND n.valid_until IS NOT DISTINCT FROM b.valid_until
       AND ${evidenceOf('n')}=${evidenceOf('b')} AS same
     FROM claim_revisions b JOIN claim_revisions n ON n.space_id=b.space_id AND n.collection_id=b.collection_id
       AND n.claim_id=b.claim_id AND n.revision=b.revision+1
     WHERE b.space_id=$1 AND b.collection_id=$2 AND b.claim_id=$3 AND b.revision=$4`,
-  [scope.spaceId, scope.collectionId, claimId, base, scope.credentialId, status])).rows[0];
+  [scope.spaceId, scope.collectionId, claimId, base, scope.credentialId, status, scope.principalId])).rows[0];
   return row?.same === true;
 }
 /**
@@ -257,7 +265,7 @@ async function assertGrantsCurrent(db: Db, scope: AuthorityScope, ownerPrincipal
  */
 const viewSelect = `SELECT c.claim_id,c.collection_id,c.principal_id,c.created_at,e.revision AS latest,e.tombstone,r.revision,
     r.previous_revision,r.statement,r.attributed_to,r.observed_at,r.valid_from,r.valid_until,r.review_status,r.reviewed_by,
-    r.reviewed_at,r.committed_at,
+    r.reviewed_at,r.recorded_by,r.committed_at,
     ${evidenceOf('r')} AS evidence,
     ARRAY(SELECT DISTINCT a.source_collection_id FROM claim_evidence a WHERE a.space_id=c.space_id
       AND a.collection_id=c.collection_id AND a.claim_id=c.claim_id) AS cited
@@ -277,7 +285,8 @@ function claimView(row: Record<string, unknown>, replayed: boolean): ClaimView {
     attributedTo: String(row.attributed_to), observedAt: iso(row.observed_at), validFrom: iso(row.valid_from),
     validUntil: iso(row.valid_until), review: { status: row.review_status as ClaimReviewStatus,
       reviewedBy: row.reviewed_by as string | null, reviewedAt: iso(row.reviewed_at) },
-    evidence, createdBy: String(row.principal_id), createdAt: iso(row.created_at)!, committedAt: iso(row.committed_at)!, replayed };
+    evidence, createdBy: String(row.principal_id), recordedBy: row.recorded_by === null ? null : String(row.recorded_by),
+    createdAt: iso(row.created_at)!, committedAt: iso(row.committed_at)!, replayed };
 }
 
 /**
