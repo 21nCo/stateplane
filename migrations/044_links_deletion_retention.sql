@@ -89,6 +89,13 @@ BEGIN
     RAISE EXCEPTION 'a live restrict link blocks endpoint deletion'
       USING ERRCODE = 'restrict_violation', CONSTRAINT = 'links_restrict';
   END IF;
+  -- The links are locked in one order (collection, id, in byte order) before
+  -- the detach, so two endpoint deletions that share more than one link
+  -- queue instead of deadlocking on them.
+  PERFORM 1 FROM public.links l WHERE l.space_id = NEW.space_id AND NOT l.tombstone
+      AND ((l.from_collection_id = NEW.collection_id AND l.from_kind = endpoint_kind AND l.from_id = endpoint_id)
+        OR (l.to_collection_id = NEW.collection_id AND l.to_kind = endpoint_kind AND l.to_id = endpoint_id))
+    ORDER BY l.collection_id COLLATE "C", l.link_id COLLATE "C" FOR NO KEY UPDATE;
   WITH detached AS (
     UPDATE public.links l SET revision = l.revision + 1, tombstone = true, tombstoned_at = clock_timestamp()
     WHERE l.space_id = NEW.space_id AND NOT l.tombstone

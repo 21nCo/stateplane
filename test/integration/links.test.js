@@ -625,6 +625,18 @@ test('space deletion reports its blob-store erasure as pending until every origi
     originalBytes: 'pending', backups: 'retained' }, 'a live space is not erased');
 });
 
+test('a committed space deletion whose erasure report cannot be read is reported deleted with its erasure pending', async () => {
+  const f = await fixture();
+  await services.spaces.update(f.owner, f.spaceId, 'readOnly');
+  const erasure = spaces.erasure;
+  spaces.erasure = async () => { throw new Error('cell unavailable'); };
+  let deleted;
+  try { deleted = await services.spaces.delete(f.owner, f.spaceId); } finally { spaces.erasure = erasure; }
+  assert.deepEqual(deleted, { spaceId: f.spaceId, deleted: true,
+    erasure: { spaceId: f.spaceId, database: 'pending', originalBytes: 'pending', backups: 'retained' } });
+  assert.equal((await spaces.erasure(f.owner, f.spaceId)).database, 'erased', 'the deletion committed');
+});
+
 test('an evidence mutation whose key or grant lapses after the final check, before COMMIT, rolls back whole', async () => {
   const f = await fixture();
   const claim = await claims.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: 'cites-beta', statement: 'From beta.',
@@ -984,5 +996,54 @@ test('a claim revision and a link joining the claim and a cited source queue in 
   linked.release();
   assert.equal((await second).replayed, false);
   assert.equal((await revisingAgain).revision, 3);
+  assert.equal(hooks.length, 0);
+});
+
+test('claims citing sources lock them in the link guard\'s byte order, so a link between them never deadlocks', async () => {
+  const f = await fixture();
+  // The database's default collation must order the two collections differently from byte order, or this fixture
+  // would not distinguish an order taken from the default collation from the guard's.
+  const order = (await pool.query(`SELECT 'alpha'<'Beta' AS by_default,'alpha'<'Beta' COLLATE "C" AS by_bytes`)).rows[0];
+  assert.deepEqual(order, { by_default: true, by_bytes: false });
+  await services.collections.define(f.owner, f.spaceId, 'Beta', definition('Beta'));
+  const upper = await f.source('Beta');
+  const both = statement => ({ statement, attributedTo: 'archive',
+    evidence: [{ collectionId: 'alpha', sourceId: f.alphaSource }, { collectionId: 'Beta', sourceId: upper }] });
+  const base = await claims.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: 'order-base', statement: 'r1', attributedTo: 'a' });
+  const writes = {
+    create: (pooled, statement) => pooled.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: `o-${randomUUID()}`,
+      ...both(statement) }),
+    revise: async (pooled, statement) => pooled.revise(f.owner, f.spaceId, 'alpha', base.claimId,
+      { baseRevision: (await claims.get(f.owner, f.spaceId, 'alpha', base.claimId)).revision, ...both(statement) })
+  };
+  const join = () => links.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: `j-${randomUUID()}`, type: 'cites',
+    policy: 'detach', from: ref('source', 'alpha', f.alphaSource), to: ref('source', 'Beta', upper) });
+  for (const [name, write] of Object.entries(writes)) {
+    // The link rewrites Beta's row and waits for alpha's behind a share lock no one else conflicts with. A claim that
+    // share-locked alpha before Beta would hold alpha against the link while it waits for Beta: a deadlock.
+    const blocker = await pool.connect();
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query(`SELECT 1 FROM entity_refs WHERE space_id=$1 AND collection_id='alpha' AND kind='source'
+        AND entity_id=$2 FOR SHARE`, [f.spaceId, f.alphaSource]);
+      const linking = join();
+      assert.equal(await settlesOrWaits(linking, 'INSERT INTO links'), 'waits', `${name}: the link waits for alpha`);
+      const writing = write(claims, `${name} while linking`);
+      assert.equal(await settlesOrWaits(writing, 'FOR SHARE'), 'waits', `${name}: the claim waits for the link`);
+      await blocker.query('COMMIT');
+      assert.equal((await linking).replayed, false, `${name}: the link commits`);
+      assert.equal((await writing).statement, `${name} while linking`, `${name}: the claim commits`);
+    } finally { blocker.release(); }
+
+    // The claim holds both locks first: the link waits for it, then both commit.
+    const checked = hold('INSERT INTO claim_revisions');
+    const first = write(hookedClaims, `${name} before linking`);
+    await checked.at;
+    const linked = join();
+    assert.equal(await settlesOrWaits(linked, 'INSERT INTO links'), 'waits', `${name}: the link waits for the claim`);
+    checked.release();
+    assert.equal((await first).statement, `${name} before linking`);
+    assert.equal((await linked).replayed, false);
+  }
   assert.equal(hooks.length, 0);
 });

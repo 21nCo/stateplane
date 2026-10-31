@@ -150,12 +150,13 @@ async function lockClaim(db: Db, spaceId: string, claimId: string): Promise<void
 /**
  * Times are in order and the observation is not in the future; every cited
  * source and range exists. The cited sources' identities are share-locked
- * first, in one order, so a source deletion, which tombstones that row,
- * either committed before the check, which then finds the source deleted, or
- * waits for this claim to commit and finds it cited. A revision locks its
- * claim's row before calling this, so its locks follow migration 040's link
- * guard order (kind, collection, id: claim before source); a new claim's row
- * does not exist yet, so no link can lock it first.
+ * first, so a source deletion, which tombstones that row, either committed
+ * before the check, which then finds the source deleted, or waits for this
+ * claim to commit and finds it cited. A revision locks its claim's row before
+ * calling this, so its locks follow migration 040's link guard order (kind,
+ * collection, id, each in byte order: claim before source, then sources by
+ * `COLLATE "C"`, which a non-C database collation would otherwise reorder); a
+ * new claim's row does not exist yet, so no link can lock it first.
  */
 async function checkContent(db: Db, scope: AuthorityScope, content: Content): Promise<void> {
   const times = (await db.query(`SELECT ($1::timestamptz IS NULL OR $1::timestamptz<=clock_timestamp()) AS observed,
@@ -166,7 +167,7 @@ async function checkContent(db: Db, scope: AuthorityScope, content: Content): Pr
   if (!content.evidence.length) return;
   await db.query(`SELECT 1 FROM entity_refs r WHERE r.space_id=$1 AND r.kind='source'
       AND (r.collection_id,r.entity_id) IN (SELECT e.item->>0,e.item->>1 FROM jsonb_array_elements($2::jsonb) AS e(item))
-    ORDER BY r.collection_id,r.entity_id FOR SHARE`, [scope.spaceId, evidenceJson(content.evidence)]);
+    ORDER BY r.collection_id COLLATE "C",r.entity_id COLLATE "C" FOR SHARE`, [scope.spaceId, evidenceJson(content.evidence)]);
   const rows = (await db.query(`SELECT e.ordinal,r.tombstone IS FALSE AS live,
       (e.item->>2) IS NULL OR v.version IS NOT NULL AS has_version,char_length(v.content) AS length
     FROM jsonb_array_elements($2::jsonb) WITH ORDINALITY AS e(item,ordinal)
