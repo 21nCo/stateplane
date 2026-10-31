@@ -15,6 +15,10 @@ export interface AgentKeyProvider {
   find(ownerPrincipalId: string, issuanceId: string): Promise<string | null>;
   revoke(id: string, ownerPrincipalId: string): Promise<void>;
 }
+/** How far a space's erasure has gone; see `PostgresSpaces.erasure`. */
+export interface SpaceErasure {
+  spaceId: string; database: 'erased' | 'pending'; originalBytes: 'erased' | 'pending'; backups: 'retained';
+}
 export interface SpaceInfo extends DirectoryPlacement {
   ownerPrincipalId: string; homeCellId: string; storageTargetId: string;
   createdAt: string; updatedAt: string;
@@ -791,6 +795,24 @@ export class PostgresSpaces {
     return this.changeLifecycle(actor,spaceId,lifecycle);
   }
 
+  /**
+   * Report how far a deleted space's erasure has gone. `database` is `erased`
+   * once the cell holds no content row; `originalBytes` once the cell's blob
+   * store listed no original or staging key of the space after the purge.
+   * Backups are outside Stateplane's control and keep earlier copies until
+   * their own retention ends, so erasure is never reported beyond them.
+   */
+  async erasure(actor: VerifiedCredential, spaceId: string): Promise<SpaceErasure> {
+    actor = snapshotOwner(actor);
+    const space = await this.owned(actor,spaceId,true);
+    const cell = this.cell(space.cellId);
+    const database = space.lifecycle === 'deleted' && await this.erased(cell.pool,spaceId);
+    const bytes = (await cell.pool.query('SELECT originals_removed_at FROM space_erasures WHERE space_id=$1',[spaceId])).rows[0];
+    await this.current(actor);
+    return { spaceId, database: database ? 'erased' : 'pending',
+      originalBytes: database && bytes?.originals_removed_at ? 'erased' : 'pending', backups: 'retained' };
+  }
+
   private async erased(db: Pick<pg.Pool, 'query'>, spaceId: string): Promise<boolean> {
     const result = await db.query(`SELECT lifecycle='deleted' AND
       NOT EXISTS (SELECT 1 FROM projection_outbox WHERE space_id=$1) AND
@@ -800,6 +822,9 @@ export class PostgresSpaces {
       NOT EXISTS (SELECT 1 FROM receipt_reservation_scopes WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM receipt_reservations WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM idempotency_receipts WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM evidence_outbox WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM evidence_events WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM original_erasures WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM links WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM claim_evidence WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM claim_revisions WHERE space_id=$1) AND

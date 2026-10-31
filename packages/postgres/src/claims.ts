@@ -4,9 +4,9 @@ import { AuthorityError, AuthorityTransaction } from './index.js';
 import type { AuthorityScope } from './index.js';
 import { includes, utcInstant } from './schema.js';
 import type { PostgresSpaces } from './spaces.js';
-import { boundedText, digest, fields, idempotencyKey, invalid, iso, lockKey, reference, serialized, transact, untrusted,
-  writable } from './sources.js';
-import type { Db } from './sources.js';
+import { boundedText, digest, evidenceEvent, evidenceRefusal, fields, idempotencyKey, invalid, iso, lockKey, reference, rowsRetained,
+  serialized, transact, untrusted, writable } from './sources.js';
+import type { Db, DeletionErasure } from './sources.js';
 
 /** One cell's authority pool. */
 export interface ClaimCell { pool: Pick<pg.Pool, 'connect'> }
@@ -29,6 +29,14 @@ export interface ClaimView {
   evidence: ClaimEvidenceView[]; createdBy: string; recordedBy: string | null; createdAt: string; committedAt: string;
   replayed: boolean;
 }
+/**
+ * A deleted claim: its last revision, when the deletion committed, and what
+ * remains: its revisions and evidence stay in the database, unreadable, until
+ * the space is erased, and backups keep earlier copies.
+ */
+export interface ClaimDeletion {
+  claimId: string; collectionId: string; revision: number; deletedAt: string; replayed: boolean; erasure: DeletionErasure;
+}
 /** `next` is the `after` value for the following page, or null on the last page. */
 export interface ClaimPage { claims: ClaimView[]; next: string | null }
 
@@ -46,6 +54,7 @@ const reviseFields = Object.freeze(['baseRevision', 'statement', 'attributedTo',
 const createRequired = Object.freeze(['idempotencyKey', 'statement', 'attributedTo']);
 const reviseRequired = Object.freeze(['baseRevision', 'statement', 'attributedTo']);
 const reviewFields = Object.freeze(['baseRevision', 'status']);
+const deleteFields = Object.freeze(['baseRevision']);
 const listFields = Object.freeze(['citing', 'status', 'after', 'limit']);
 const sourceFields = Object.freeze(['collectionId', 'sourceId']);
 const evidenceFields = Object.freeze(['collectionId', 'sourceId', 'extractionVersion', 'start', 'end']);
@@ -138,7 +147,17 @@ function evidenceJson(evidence: readonly ClaimEvidenceView[]): string {
 async function lockClaim(db: Db, spaceId: string, claimId: string): Promise<void> {
   await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [lockKey(['stateplane:claim', spaceId, claimId])]);
 }
-/** Times are in order and the observation is not in the future; every cited source and range exists. */
+/**
+ * Times are in order and the observation is not in the future; every cited
+ * source and range exists. The cited sources' identities are share-locked
+ * first, so a source deletion, which tombstones that row, either committed
+ * before the check, which then finds the source deleted, or waits for this
+ * claim to commit and finds it cited. A revision locks its claim's row before
+ * calling this, so its locks follow migration 040's link guard order (kind,
+ * collection, id, each in byte order: claim before source, then sources by
+ * `COLLATE "C"`, which a non-C database collation would otherwise reorder); a
+ * new claim's row does not exist yet, so no link can lock it first.
+ */
 async function checkContent(db: Db, scope: AuthorityScope, content: Content): Promise<void> {
   const times = (await db.query(`SELECT ($1::timestamptz IS NULL OR $1::timestamptz<=clock_timestamp()) AS observed,
     ($2::timestamptz IS NULL OR $3::timestamptz IS NULL OR $2::timestamptz<=$3::timestamptz) AS ordered`,
@@ -146,6 +165,9 @@ async function checkContent(db: Db, scope: AuthorityScope, content: Content): Pr
   if (times?.observed !== true) invalid('observedAt is in the future');
   if (times.ordered !== true) invalid('validFrom is after validUntil');
   if (!content.evidence.length) return;
+  await db.query(`SELECT 1 FROM entity_refs r WHERE r.space_id=$1 AND r.kind='source'
+      AND (r.collection_id,r.entity_id) IN (SELECT e.item->>0,e.item->>1 FROM jsonb_array_elements($2::jsonb) AS e(item))
+    ORDER BY r.collection_id COLLATE "C",r.entity_id COLLATE "C" FOR SHARE`, [scope.spaceId, evidenceJson(content.evidence)]);
   const rows = (await db.query(`SELECT e.ordinal,r.tombstone IS FALSE AS live,
       (e.item->>2) IS NULL OR v.version IS NOT NULL AS has_version,char_length(v.content) AS length
     FROM jsonb_array_elements($2::jsonb) WITH ORDINALITY AS e(item,ordinal)
@@ -478,6 +500,10 @@ export class PostgresClaims {
         throw new AuthorityError('REVISION_CONFLICT', 'A later claim revision exists', latest);
       }
       await writable(db, scope);
+      // The claim's own identity row is locked before the cited sources', the order a link's guard locks them in,
+      // so a revision and a link joining this claim and a cited source queue instead of deadlocking.
+      await db.query(`SELECT 1 FROM entity_refs WHERE space_id=$1 AND collection_id=$2 AND kind='claim' AND entity_id=$3
+        FOR NO KEY UPDATE`, [scope.spaceId, scope.collectionId, claimId]);
       await checkContent(db, scope, content);
       await insertRevision(db, scope, claimId, latest + 1, content);
       return readClaim(db, access, scope, claimId, latest + 1, false);
@@ -512,6 +538,55 @@ export class PostgresClaims {
       await insertReview(db, scope, claimId, base, status);
       return readClaim(db, access, scope, claimId, latest + 1, false);
     });
+  }
+
+  /**
+   * Delete a claim at `baseRevision`, which must be its latest: tombstone it,
+   * with every incident `detach` link, a deletion event and its projection
+   * invalidation. A live `restrict` link on it is `LINK_RESTRICTED` and
+   * changes nothing. Needs `claims:write` and `claims:read`, and the claim
+   * must be visible to the caller. Its revisions stay in the database,
+   * unreadable, until the space is erased. Deleting it again at the same base
+   * replays the deletion.
+   */
+  async delete(actor: VerifiedCredential, spaceId: string, collectionId: string, claimId: string,
+    request: unknown): Promise<ClaimDeletion> {
+    const admitted = await this.admit(actor, spaceId, collectionId, 'claims:write', 'claims:read');
+    const scope = admitted.scope;
+    try {
+      return await this.tx(actor, admitted, async (db, access) => {
+        if (!reference(claimId)) throw new AuthorityError('NOT_FOUND');
+        const input = fields(request, deleteFields, deleteFields);
+        if (!positive(input.baseRevision)) invalid('baseRevision must be a positive integer');
+        const base = input.baseRevision;
+        await lockClaim(db, scope.spaceId, claimId);
+        const row = (await db.query(`SELECT e.revision,e.tombstone,
+            ARRAY(SELECT DISTINCT a.source_collection_id FROM claim_evidence a WHERE a.space_id=e.space_id
+              AND a.collection_id=e.collection_id AND a.claim_id=e.entity_id) AS cited,
+            (SELECT v.committed_at FROM evidence_events v WHERE v.space_id=e.space_id AND v.collection_id=e.collection_id
+              AND v.kind='claim' AND v.entity_id=e.entity_id AND v.operation='delete') AS deleted_at
+          FROM entity_refs e WHERE e.space_id=$1 AND e.collection_id=$2 AND e.kind='claim' AND e.entity_id=$3`,
+        [scope.spaceId, scope.collectionId, claimId])).rows[0];
+        // The claim read rule: a claim citing a collection the caller cannot read does not exist for it.
+        if (!row || !await access.canRead(row.cited as string[])) throw new AuthorityError('NOT_FOUND');
+        await access.fence(row.cited as string[]);
+        const latest = Number(row.revision);
+        if (row.tombstone) {
+          if (row.deleted_at && base === latest)
+            return { claimId, collectionId: scope.collectionId, revision: latest, deletedAt: iso(row.deleted_at)!, replayed: true,
+              erasure: { ...rowsRetained } };
+          throw new AuthorityError('NOT_FOUND');
+        }
+        if (base > latest) throw new AuthorityError('NOT_FOUND');
+        if (base < latest) throw new AuthorityError('REVISION_CONFLICT', 'A later claim revision exists', latest);
+        await writable(db, scope);
+        // Migration 044's guard refuses a restrict link and detaches the rest.
+        await db.query(`UPDATE entity_refs SET tombstone=true WHERE space_id=$1 AND collection_id=$2 AND kind='claim'
+          AND entity_id=$3 AND revision=$4 AND NOT tombstone`, [scope.spaceId, scope.collectionId, claimId, base]);
+        const deletedAt = await evidenceEvent(db, scope, 'claim', claimId, base, 'delete');
+        return { claimId, collectionId: scope.collectionId, revision: base, deletedAt, replayed: false, erasure: { ...rowsRetained } };
+      });
+    } catch (error) { throw evidenceRefusal(error); }
   }
 
   /** Read one revision of a live claim in the collection, the latest when `revision` is omitted. */
