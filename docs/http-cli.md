@@ -347,7 +347,11 @@ writes the original to a new file and prints its metadata, so stdout stays one
 JSON value. It asks for the bytes unencoded, requires `Repr-Digest` and checks
 the bytes against it, compares their length only when the response states
 `Content-Length` (a chunked body has none), and reports the file only once every
-byte is written and it has closed; otherwise it removes the file. A body
+byte is written and it has closed. When it reports a failure, it removes the
+file. A process killed or interrupted mid-download can leave a partial,
+unverified file at `--output`; only a printed result means a verified file, and
+the leftover must be deleted before a rerun because an existing file is never
+overwritten. A body
 stream that fails or is aborted fails retryable `PROVIDER_UNAVAILABLE`; a digest
 or length mismatch, or a local write or close failure, fails nonretryable
 `PROVIDER_UNAVAILABLE`. `--timeout` bounds the whole download, body included
