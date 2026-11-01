@@ -1469,23 +1469,23 @@ export class SourceUploadReconciler {
   /**
    * Enforce retention for deletions within `budgetMs`: remove the bytes of
    * up to `limit` deleted sources, then, for up to `limit` erased spaces,
-   * delete a page of each one's original and staging keys. Store calls end,
-   * not only start, a fifth of the budget early, so every erasure attempted
-   * still records its progress or its retry turn. Within the span before
-   * that fifth, phase deadlines are fixed from the call's start, never from
-   * how long a source call took: the source page, which reads each erasure's
-   * state, ends by half the span; source store calls end half the span after
-   * that page was read but by seven tenths of it at the latest, so a slow read
-   * still leaves them a store call; source transactions (checkpoints and
-   * retry turns) end a tenth later, by eight tenths. The last fifth of the
-   * span is the spaces' alone: no source call runs into it, so their page
-   * read and a store call always fit, and they get all of the span from
-   * whenever the sources end. At `erase(25, 5000)`: source page by 2000 ms,
-   * source store calls by 2800 ms, source transactions by 3200 ms, space store
-   * calls from then (or earlier) until 4000 ms, space records by 5000 ms.
-   * Erasure
-   * is recorded complete only by a removal, or for a space an empty listing,
-   * that started after every write to its keys could have landed (the last
+   * delete a page of each one's original and staging keys. Every phase
+   * deadline is fixed from the call's start, in fiftieths of the budget, never
+   * from how long an earlier call took, so no phase can take a later one's
+   * slice. The source page, which reads each erasure's state, ends by 20/50;
+   * source store calls end 20/50 after that page was read but by 28/50 at the
+   * latest, so a slow read still leaves them a store call; source
+   * transactions (checkpoints and retry turns) end 4/50 later, by 32/50. No
+   * source call runs past that. The space page then has until 42/50, a
+   * fifth of the budget or more of its own, and space store calls end by
+   * 45/50, so once the space page is read there are always 3/50 of the budget
+   * left for a store call, and the last tenth records each attempted space's
+   * progress or retry turn. At `erase(25, 5000)`: source page by 2000 ms,
+   * source store calls by 2800 ms, source transactions by 3200 ms, space page
+   * by 4200 ms (1000 ms after the sources' latest end), space store calls by
+   * 4500 ms (300 ms after the page's), space records by 5000 ms.
+   * Erasure is recorded complete only by a removal, or for a space an empty
+   * listing, that started after every write to its keys could have landed (the last
    * grant's end plus the grace) and before the sweep last found one of its
    * keys. Each erasure attempted moves behind every due one not tried since,
    * so a failing one cannot hold the oldest page. A call cut short by its
@@ -1497,11 +1497,13 @@ export class SourceUploadReconciler {
     if (!isSafeInteger(budgetMs) || budgetMs < 1) throw new RangeError('Invalid erasure budget');
     const start = performance.now();
     const until = start + budgetMs;
-    const stop = until - budgetMs / 5;
-    const span = stop - start;
-    // Fixed from the start: the source page's end, the latest source store and transaction ends, and so the spaces' window.
-    const pageEnd = start + span / 2;
-    const sourcesLatest = start + span * 7 / 10;
+    // Fixed from the start: the source page's end, the latest source store end, the space page's end and the space
+    // store calls' end, so no slow call moves a later phase's window.
+    const by = (fiftieths: number) => start + budgetMs * fiftieths / 50;
+    const pageEnd = by(20);
+    const sourcesLatest = by(28);
+    const spacePageEnd = by(42);
+    const spacesStop = by(45);
     const errors: unknown[] = [];
     // A call its phase's budget cut short is unfinished work, not a failure.
     const failed = (error: unknown) => { if (!(error instanceof CleanupTimeout && error.atBudget)) errors.push(error); };
@@ -1514,8 +1516,8 @@ export class SourceUploadReconciler {
       .then(result => result.rows, (error: unknown) => { failed(error); return []; });
     // Their store time starts once their page is read, so a slow read still leaves them a store call, but it never
     // moves past its fixed latest end: the spaces' window starts by `sourcesEnd` however slow the source calls are.
-    const sourcesStop = Math.min(sourcesLatest, performance.now() + span / 2);
-    const sourcesEnd = sourcesStop + span / 10;
+    const sourcesStop = Math.min(sourcesLatest, performance.now() + budgetMs * 20 / 50);
+    const sourcesEnd = sourcesStop + budgetMs * 4 / 50;
     for (const row of sources) {
       if (performance.now() >= sourcesStop) break;
       const ids = [row.space_id, row.collection_id, row.source_id];
@@ -1527,28 +1529,29 @@ export class SourceUploadReconciler {
           .catch(failed);
       }
     }
-    // A space page that cannot be read is reported with the sources' failures; one the budget cut short is unfinished.
-    const spaces = performance.now() >= stop ? [] : await transact(pool, db => db.query(`SELECT space_id,observed::text AS observed,
+    // A space page that cannot be read is reported with the sources' failures; one its deadline cut short is
+    // unfinished, and the spaces keep their place.
+    const spaces = performance.now() >= spacePageEnd ? [] : await transact(pool, db => db.query(`SELECT space_id,observed::text AS observed,
         to_char(requested_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS requested,
         clock_timestamp()>=writers_end_at+make_interval(secs=>$2) AS settled
       FROM space_erasures WHERE originals_removed_at IS NULL AND next_attempt_at<=clock_timestamp()
-      ORDER BY next_attempt_at,space_id LIMIT $1`, [limit, grace]), until)
+      ORDER BY next_attempt_at,space_id LIMIT $1`, [limit, grace]), spacePageEnd)
       .then(result => result.rows, (error: unknown) => { failed(error); return []; });
     for (const row of spaces) {
-      if (performance.now() >= stop) break;
+      if (performance.now() >= spacesStop) break;
       const spaceId = String(row.space_id);
       let found = false;
       let finished = true;
       try {
         for (const prefix of keyPrefixes(spaceId)) {
-          if (performance.now() >= stop) { finished = false; break; }
-          // Store calls end by `stop`, so the fifth after it records this space's progress or retry turn.
-          const page = await within(stop, () => this.cell.originals.list(prefix, 100));
+          if (performance.now() >= spacesStop) { finished = false; break; }
+          // Store calls end by `spacesStop`, so the tenth after it records this space's progress or retry turn.
+          const page = await within(spacesStop, () => this.cell.originals.list(prefix, 100));
           for (const key of page.keys) {
             if (!startsWith(key, prefix)) break;
             found = true;
-            if (performance.now() >= stop) break;
-            await within(stop, () => this.cell.originals.delete(key));
+            if (performance.now() >= spacesStop) break;
+            await within(spacesStop, () => this.cell.originals.delete(key));
           }
         }
         // Only a listing that found nothing, after the space's writers ended, records completion against the request it

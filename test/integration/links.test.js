@@ -220,6 +220,53 @@ test('links reach no endpoint the caller could not read directly, from either si
   assert.equal(await recordLive(f, f.alphaRecord), true);
 });
 
+test('a link page over many collections and citations is authorized with as many statements as a page over one', async () => {
+  const f = await fixture();
+  // 25 more collections: the alpha record links to a record and to a claim in each, and each claim cites the next's source.
+  const wide = Array.from({ length: 25 }, (_, i) => `wide${String(i).padStart(2, '0')}`);
+  for (const id of wide) await services.collections.define(f.owner, f.spaceId, id, definition(id));
+  const alpha = ref('record', 'alpha', f.alphaRecord);
+  for (let i = 0; i < wide.length; i++) {
+    const cited = wide[(i + 1) % wide.length];
+    const claim = await claims.create(f.owner, f.spaceId, wide[i], { idempotencyKey: `wide-${i}`, statement: `Claim ${i}.`,
+      attributedTo: 'archive', evidence: [{ collectionId: cited, sourceId: await f.source(cited) }] });
+    await create(f.owner, f, 'alpha', alpha, ref('record', wide[i], await f.record(wide[i])));
+    await create(f.owner, f, 'alpha', alpha, ref('claim', wide[i], claim.claimId));
+  }
+  await create(f.owner, f, 'beta', ref('record', 'beta', f.betaRecord), alpha);
+  const reader = await f.agent([['alpha', ['records:read']], ['beta', ['records:read']],
+    ...wide.map(id => [id, ['records:read', 'sources:read', 'claims:read']])]);
+  const statements = [];
+  let counting = false;
+  const counted = { connect: async () => {
+    const client = await pool.connect();
+    return new Proxy(client, { get(target, property) {
+      if (property !== 'query') return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
+      return (sql, ...rest) => { if (counting) statements.push(sql); return target.query(sql, ...rest); };
+    } });
+  } };
+  const countedLinks = new PostgresLinks(spaces, new Map([['cell-a', { pool: counted }]]));
+  const list = async (collectionId, id) => {
+    statements.length = 0;
+    counting = true;
+    try { return { page: await countedLinks.list(reader, f.spaceId, collectionId, { endpoint: { kind: 'record', id } }),
+      count: statements.length, fences: statements.filter(sql => String(sql).includes('FOR SHARE')).length };
+    } finally { counting = false; }
+  };
+  const narrow = await list('beta', f.betaRecord);
+  assert.equal(narrow.page.links.length, 1);
+  // 51 links touch the alpha record: a full page of 50, and the row past it, over 77 (collection, capability) pairs.
+  const full = await list('alpha', f.alphaRecord);
+  assert.equal(full.page.links.length, 50);
+  assert.notEqual(full.page.next, null);
+  assert.equal(full.count, narrow.count, `the full page took ${full.count} statements, one link took ${narrow.count}`);
+  assert.ok(full.fences <= 3, `the full page's fences and recheck took ${full.fences} statements`);
+  const rest = await countedLinks.list(reader, f.spaceId, 'alpha', { endpoint: { kind: 'record', id: f.alphaRecord },
+    after: full.page.next });
+  assert.equal(rest.links.length, 1);
+  assert.equal(rest.next, null);
+});
+
 test('creating a link needs read and write on both endpoints, refused before any lookup', async () => {
   const f = await fixture();
   const alpha = ref('record', 'alpha', f.alphaRecord);
@@ -475,7 +522,7 @@ test('a slow space at the head of the erasure page is moved behind every product
     await settle(g);
   }
   // The slow space is due first. Both of its listings take 1.6 s and its staging delete never answers, so its store
-  // calls would run into the budget's last fifth; the healthy space's keys are behind it.
+  // calls would run into the budget's last tenth; the healthy space's keys are behind it.
   await pool.query(`UPDATE space_erasures SET next_attempt_at=clock_timestamp()-interval '3 hours' WHERE space_id=$1`,
     [slow.spaceId]);
   f.r2.objects.set(`staging/${segment(slow)}/upl_s/att_s`, { bytes: Buffer.from('x') });
@@ -1012,7 +1059,7 @@ test('an erasure whose page reads are slow still gets its store calls every prod
 });
 
 test('a slow source page, a stalled source delete and a slow retry never reach the spaces\' window of a production tick', async () => {
-  // A 1.9 s page read, and one that reaches the page's 2 s deadline (half of the 4 s before the budget's last fifth).
+  // A 1.9 s page read, and one that reaches the page's 2 s deadline (two fifths of the 5 s budget).
   for (const pageMs of [1900, 2000]) {
     const f = await fixture();
     await drain(f);
@@ -1056,7 +1103,7 @@ test('a slow source page, a stalled source delete and a slow retry never reach t
       const label = `${pageMs} ms page, tick ${tick + 1} (${took.join(', ')} ms)`;
       assert.ok(took.at(-1) < 5000, `${label} ended within its budget`);
       assert.equal(marks.space.length, 1, `${label} read the space page`);
-      // Source transactions end by eight tenths of the 4 s span; a timer may settle a few milliseconds late.
+      // Source transactions end by 32/50 of the budget, 3.2 s; a timer may settle a few milliseconds late.
       const latest = Math.max(started, ...marks.source);
       assert.ok(latest <= marks.space[0] && latest - started <= 3200 + 25,
         `${label}: the last source statement ended at ${Math.round(latest - started)} ms, before the spaces' window`);
@@ -1180,6 +1227,98 @@ test('a cleanup COMMIT unanswered at the call bound with budget left is reported
   await assert.rejects(new SourceUploadReconciler({ pool: stalled, originals: f.cell.originals }, 0).erase(25, 10_000),
     error => error instanceof AggregateError && error.errors.some(item => item.message === 'Upload cleanup call timed out'));
   assert.equal(held, true);
+});
+
+test('a slow space page after the sources\' latest phases still leaves the space a store call and a record every production tick', async () => {
+  // At erase(25, 5000) source transactions end by 3200 ms, the space page by 4200 ms and space store calls by 4500 ms.
+  const spacePage = 'FROM space_erasures WHERE originals_removed_at IS NULL';
+  const cases = [
+    ['a 900 ms space page', { delay: 900 }],
+    ['a space page answered 50 ms before its 4200 ms deadline', { holdTo: 4150 }],
+  ];
+  for (const [label, slow] of cases) {
+    const f = await fixture();
+    await drain(f);
+    const sourceId = await f.source('alpha');
+    const key = await objectKey(f, sourceId);
+    f.r2.failDelete = candidate => candidate === key;
+    assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', sourceId)).erasure.originalBytes, 'pending');
+    f.r2.failDelete = () => false;
+    await settle(f);
+    // 150 more keys: listings of 100 take the space over several ticks.
+    const space = await deletedSpace(f, 150);
+    // The source's delete stalls to its 2800 ms store deadline and its retry turn is held to 3150 ms, after a 900 ms page.
+    f.r2.deleteDelay = candidate => candidate === key ? Infinity : 0;
+    const mark = { started: 0, sources: [], spacePages: [], spaceStore: [], records: 0 };
+    for (const call of ['list', 'delete']) {
+      const original = f.r2[call].bind(f.r2);
+      f.r2[call] = async (...args) => {
+        const result = await original(...args);
+        const subject = call === 'list' ? args[0]?.startAfter ?? '' : args[0];
+        if (space.prefixes.some(prefix => subject.startsWith(prefix))) mark.spaceStore.push(performance.now() - mark.started);
+        return result;
+      };
+    }
+    const rules = [{ match: 'ORDER BY x.next_attempt_at', holdTo: 900 },
+      { match: 'UPDATE original_erasures SET next_attempt_at=clock_timestamp()', holdTo: 3150 }, { match: spacePage, ...slow }];
+    const timed = { connect: async () => {
+      const client = await pool.connect();
+      let phase;
+      return new Proxy(client, { get(target, property) {
+        if (property !== 'query') return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
+        return async (sql, ...rest) => {
+          const text = typeof sql === 'string' ? sql : '';
+          if (text.includes('original_erasures')) phase = 'source';
+          if (text.includes(spacePage)) { phase = 'space'; mark.spacePages.push(performance.now() - mark.started); }
+          if (text.startsWith('UPDATE space_erasures') && rest[0]?.[0] === space.spaceId) mark.records++;
+          const result = await target.query(sql, ...rest);
+          const rule = rules.find(item => text.includes(item.match));
+          if (rule?.delay) await sleep(rule.delay);
+          if (rule?.holdTo) while (performance.now() < mark.started + rule.holdTo);
+          if (phase === 'source') mark.sources.push(performance.now() - mark.started);
+          return result;
+        };
+      } });
+    } };
+    const reconciler = new SourceUploadReconciler({ pool: timed, originals: f.cell.originals }, 0);
+    const took = [];
+    for (let tick = 0; tick < 5 && (await spaces.erasure(space.owner, space.spaceId)).originalBytes === 'pending'; tick++) {
+      const before = spaceKeys(f, space).length;
+      Object.assign(mark, { sources: [], spacePages: [], spaceStore: [], records: 0 });
+      mark.started = performance.now();
+      await reconciler.erase(25, 5000);
+      took.push(Math.round(performance.now() - mark.started));
+      const at = `${label}, tick ${tick + 1} (${took.join(', ')} ms)`;
+      assert.ok(took.at(-1) < 5000 + 25, `${at} ended within its budget`);
+      assert.equal(mark.spacePages.length, 1, `${at} read the space page`);
+      assert.ok(Math.max(0, ...mark.sources) <= mark.spacePages[0], `${at}: no source statement ended after the space page started`);
+      assert.ok(mark.spaceStore.length > 0, `${at} made a space store call`);
+      assert.ok(Math.max(...mark.spaceStore) <= 4500 + 25, `${at}: space store calls ended by ${Math.round(Math.max(...mark.spaceStore))} ms`);
+      assert.ok(mark.records > 0, `${at} recorded the space's progress`);
+      assert.ok(spaceKeys(f, space).length < before ||
+        (await spaces.erasure(space.owner, space.spaceId)).originalBytes === 'erased', `${at} advanced the space`);
+    }
+    assert.equal((await spaces.erasure(space.owner, space.spaceId)).originalBytes, 'erased',
+      `${label}: the space completed within bounded ticks (${took.join(', ')} ms)`);
+    assert.deepEqual(spaceKeys(f, space), []);
+    // A space page that runs past its deadline is unfinished: the tick resolves and the space it would have read stays due.
+    // The source phases still run to their latest, so the page's own deadline, not its 2 s call bound, cuts it.
+    const late = await deletedSpace(f, 0);
+    const lateKeys = spaceKeys(f, late).length;
+    rules.splice(2, 1, { match: spacePage, delay: 4500 });
+    mark.started = performance.now();
+    await reconciler.erase(25, 5000);
+    assert.ok(performance.now() - mark.started < 5000 + 25, `${label}: a late space page ends within the budget`);
+    assert.equal((await spaces.erasure(late.owner, late.spaceId)).originalBytes, 'pending');
+    assert.equal(spaceKeys(f, late).length, lateKeys, `${label}: a space page cut at its deadline erased nothing`);
+    rules.length = 0;
+    f.r2.deleteDelay = () => 0;
+    for (let i = 0; i < 5 && ((await spaces.erasure(late.owner, late.spaceId)).originalBytes === 'pending' ||
+      !(await erasureLeft(f, sourceId)).removed); i++) await reconciler.erase(25, 5000);
+    assert.equal((await spaces.erasure(late.owner, late.spaceId)).originalBytes, 'erased', `${label}: the next ticks complete it`);
+    assert.deepEqual(spaceKeys(f, late), []);
+    assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', sourceId)).erasure.originalBytes, 'removed');
+  }
 });
 
 /** Whether `promise` settles first or a backend waits on a lock in a statement containing `text`. */

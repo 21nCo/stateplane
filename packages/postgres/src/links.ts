@@ -1,7 +1,7 @@
 import type pg from 'pg';
 import { capabilities } from '@stateplane/contracts';
 import type { Capability, VerifiedCredential } from '@stateplane/contracts';
-import { AuthorityError, AuthorityTransaction } from './index.js';
+import { AuthorityError } from './index.js';
 import type { AuthorityScope } from './index.js';
 import { includes } from './schema.js';
 import type { PostgresSpaces } from './spaces.js';
@@ -93,17 +93,56 @@ const visibleSql = (side: 'from' | 'to') => `((l.${side}_kind='record' AND l.${s
       AND NOT (a.source_collection_id=ANY($7::text[])))))`;
 
 /**
+ * `AuthorityTransaction.checkScope` for many (collection, capability) pairs
+ * in one statement: the space, each collection and the caller's grant on it
+ * are share-locked through COMMIT, collections and then grants in byte order
+ * of their IDs, and the first pair, in the given order, that checkScope
+ * would refuse is refused the same way.
+ */
+async function checkScopes(db: Db, scope: AuthorityScope, collections: readonly string[],
+  wanted: readonly Capability[]): Promise<void> {
+  const rows = (await db.query(`WITH locked AS MATERIALIZED (SELECT c.collection_id,s.owner_principal_id,s.lifecycle,
+        s.policy_version,s.placement_generation,c.lifecycle AS collection_lifecycle
+      FROM spaces s JOIN collections c ON c.space_id=s.space_id WHERE s.space_id=$1 AND c.collection_id=ANY($2::text[])
+      ORDER BY c.collection_id COLLATE "C" FOR SHARE OF s,c),
+    held AS MATERIALIZED (SELECT g.collection_id,g.capabilities,g.expires_at,g.expires_at>clock_timestamp() AS grant_current
+      FROM collection_grants g WHERE g.space_id=$1 AND g.collection_id=ANY($2::text[]) AND g.credential_id=$4
+        AND NOT EXISTS (SELECT 1 FROM locked WHERE locked.owner_principal_id=$5)
+      ORDER BY g.collection_id COLLATE "C" FOR SHARE)
+    SELECT l.collection_id,l.owner_principal_id,l.lifecycle,l.policy_version,l.placement_generation,l.collection_lifecycle,
+      h.capabilities,h.expires_at,h.grant_current
+    FROM unnest($2::text[],$3::text[]) WITH ORDINALITY AS x(collection_id,capability,n)
+    LEFT JOIN locked l ON l.collection_id=x.collection_id LEFT JOIN held h ON h.collection_id=x.collection_id
+    ORDER BY x.n`, [scope.spaceId, collections, wanted, scope.credentialId, scope.principalId])).rows;
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const capability = at(wanted, i);
+    if (row.collection_id === null) throw new AuthorityError('NOT_FOUND');
+    if (Number(row.policy_version) !== scope.policyVersion || Number(row.placement_generation) !== scope.placementGeneration)
+      throw new AuthorityError('FORBIDDEN', 'Policy or placement changed');
+    if (includes(['suspended', 'deleting', 'deleted'], row.lifecycle)) throw new AuthorityError('SPACE_UNAVAILABLE');
+    if (row.collection_lifecycle === 'deleted') throw new AuthorityError('NOT_FOUND');
+    if (row.owner_principal_id !== scope.principalId && (!Array.isArray(row.capabilities) ||
+      !includes(row.capabilities as string[], capability) || (row.expires_at && !row.grant_current)))
+      throw new AuthorityError('FORBIDDEN');
+    if (row.collection_lifecycle === 'readOnly' && (capability === 'records:write' || capability === 'claims:review'))
+      throw new AuthorityError('SPACE_UNAVAILABLE');
+  }
+}
+
+/**
  * The caller's grants across the space, read once per transaction, and a
  * fence for every (collection, capability) the call relies on: its grant,
  * lifecycle, policy version and placement are share-locked and checked again
- * before COMMIT and in the final grant statement. A link widens nothing: each
- * endpoint is authorized on its own collection, exactly as if read directly.
+ * before COMMIT and in the final grant statement. Each fence and the recheck
+ * take one statement for however many pairs they cover. A link widens
+ * nothing: each endpoint is authorized on its own collection, exactly as if
+ * read directly.
  */
 class Access {
   private granted: { collections: string[]; capabilities: string[][] } | null = null;
   readonly collections: string[] = [];
-  readonly capabilities: string[] = [];
-  private readonly fences: AuthorityTransaction[] = [];
+  readonly capabilities: Capability[] = [];
   constructor(private readonly db: Db, private readonly scope: AuthorityScope) {}
 
   private async load(): Promise<{ collections: string[]; capabilities: string[][] }> {
@@ -137,17 +176,35 @@ class Access {
       if (includes(at(granted.capabilities, i), capability)) put(held, at(granted.collections, i));
     return held;
   }
+  private fenced(collectionId: string, capability: Capability, collections: readonly string[],
+    wanted: readonly Capability[]): boolean {
+    for (let i = 0; i < collections.length; i++)
+      if (at(collections, i) === collectionId && at(wanted, i) === capability) return true;
+    return false;
+  }
+  /** Fence, in one statement, every pair not fenced yet. */
+  private async fence(collections: readonly string[], wanted: readonly Capability[]): Promise<void> {
+    const newCollections: string[] = [];
+    const newCapabilities: Capability[] = [];
+    for (let i = 0; i < collections.length; i++) {
+      const collectionId = at(collections, i);
+      const capability = at(wanted, i);
+      if (this.fenced(collectionId, capability, this.collections, this.capabilities) ||
+        this.fenced(collectionId, capability, newCollections, newCapabilities)) continue;
+      put(newCollections, collectionId);
+      put(newCapabilities, capability);
+    }
+    if (!newCollections.length) return;
+    await checkScopes(this.db, this.scope, newCollections, newCapabilities);
+    for (let i = 0; i < newCollections.length; i++) {
+      put(this.collections, at(newCollections, i));
+      put(this.capabilities, at(newCapabilities, i));
+    }
+  }
   /** Fail with `refusal`, before anything in the collection is read, unless the caller holds the capability; then fence it. */
   async require(collectionId: string, capability: Capability, refusal: 'FORBIDDEN' | 'NOT_FOUND'): Promise<void> {
     if (!await this.has(collectionId, capability)) throw new AuthorityError(refusal);
-    for (let i = 0; i < this.collections.length; i++)
-      if (at(this.collections, i) === collectionId && at(this.capabilities, i) === capability) return;
-    const fence = new AuthorityTransaction(this.db, { ...this.scope, collectionId: collectionId as AuthorityScope['collectionId'],
-      capability }, 1);
-    put(this.fences, fence);
-    put(this.collections, collectionId);
-    put(this.capabilities, capability);
-    await fence.checkScope();
+    await this.fence([collectionId], [capability]);
   }
   /** Admit the owning collection: FORBIDDEN unless the caller may read something in it. */
   async enter(collectionId: string): Promise<void> {
@@ -167,16 +224,31 @@ class Access {
     for (let i = 0; i < cited.length; i++) if (!await this.has(at(cited, i), 'sources:read')) return false;
     return true;
   }
-  /** Fence what `visible` relied on; NOT_FOUND when the endpoint is not visible. */
-  async see(endpoint: LinkEndpoint, cited: readonly string[]): Promise<void> {
-    if (!await this.visible(endpoint, cited)) throw new AuthorityError('NOT_FOUND');
-    await this.require(endpoint.collectionId, readOf(endpoint.kind), 'NOT_FOUND');
-    for (let i = 0; i < cited.length; i++) await this.require(at(cited, i), 'sources:read', 'NOT_FOUND');
+  /**
+   * NOT_FOUND unless every endpoint is visible, with `cited[i]` the
+   * collections endpoint `i` cites; then fence, in one statement, what
+   * `visible` relied on for all of them.
+   */
+  async see(endpoints: readonly LinkEndpoint[], cited: readonly (readonly string[])[]): Promise<void> {
+    const collections: string[] = [];
+    const wanted: Capability[] = [];
+    for (let i = 0; i < endpoints.length; i++) {
+      const endpoint = at(endpoints, i);
+      const its = at(cited, i);
+      if (!await this.visible(endpoint, its)) throw new AuthorityError('NOT_FOUND');
+      put(collections, endpoint.collectionId);
+      put(wanted, readOf(endpoint.kind));
+      for (let j = 0; j < its.length; j++) {
+        put(collections, at(its, j));
+        put(wanted, 'sources:read');
+      }
+    }
+    await this.fence(collections, wanted);
   }
+  /** Check every fence again, in one statement. */
   async recheck(): Promise<void> {
-    for (let i = 0; i < this.fences.length; i++) await at(this.fences, i).checkScope();
+    if (this.collections.length) await checkScopes(this.db, this.scope, this.collections, this.capabilities);
   }
-  close(): void { for (let i = 0; i < this.fences.length; i++) at(this.fences, i).close(); }
 }
 
 /**
@@ -243,15 +315,13 @@ export class PostgresLinks {
     try {
       return await transact(cell.pool, async db => {
         const access = new Access(db, scope);
-        try {
-          await access.enter(scope.collectionId);
-          const result = await fn(db, access, scope);
-          await access.recheck();
-          // The provider is asked last, then every grant is checked in one statement with no await between them.
-          await this.spaces.assertCurrent(actor, admitted.ownerPrincipalId);
-          if (actor.kind === 'api-key') await assertGrantsCurrent(db, scope, admitted.ownerPrincipalId, access);
-          return result;
-        } finally { access.close(); }
+        await access.enter(scope.collectionId);
+        const result = await fn(db, access, scope);
+        await access.recheck();
+        // The provider is asked last, then every grant is checked in one statement with no await between them.
+        await this.spaces.assertCurrent(actor, admitted.ownerPrincipalId);
+        if (actor.kind === 'api-key') await assertGrantsCurrent(db, scope, admitted.ownerPrincipalId, access);
+        return result;
       });
     } catch (error) {
       // An endpoint deleted after it was checked: the link guard refused it.
@@ -291,8 +361,7 @@ export class PostgresLinks {
         // The stored link is authorized as delete would authorize it before its content is compared, so a
         // credential that lost access to it learns nothing from a changed retry.
         const stored = endpointsOf(existing);
-        await access.see(at(stored, 0), existing.from_cited as string[]);
-        await access.see(at(stored, 1), existing.to_cited as string[]);
+        await access.see(stored, [existing.from_cited as string[], existing.to_cited as string[]]);
         for (let i = 0; i < 2; i++) await access.require(at(stored, i).collectionId, writeOf(at(stored, i).kind), 'FORBIDDEN');
         if (existing.collection_id !== scope.collectionId || existing.link_type !== type || existing.deletion_policy !== policy ||
           !sameEndpoint(at(stored, 0), from) || !sameEndpoint(at(stored, 1), to)) throw new AuthorityError('IDEMPOTENCY_MISMATCH');
@@ -304,7 +373,7 @@ export class PostgresLinks {
         await writable(db, { ...scope, collectionId: side.collectionId as AuthorityScope['collectionId'] });
         const cited = await liveEndpoint(db, scope.spaceId, side);
         if (!cited) throw new AuthorityError('NOT_FOUND', 'Link endpoint not found');
-        await access.see(side, cited);
+        await access.see([side], [cited]);
       }
       // Migration 040's guard rewrites both endpoints, so a concurrent deletion conflicts with this insert.
       await db.query(`INSERT INTO links(space_id,collection_id,link_id,link_type,deletion_policy,from_kind,from_collection_id,
@@ -323,8 +392,7 @@ export class PostgresLinks {
       const row = await readLink(db, scope, linkId);
       if (!row || row.tombstone) throw new AuthorityError('NOT_FOUND');
       const sides = endpointsOf(row);
-      await access.see(at(sides, 0), row.from_cited as string[]);
-      await access.see(at(sides, 1), row.to_cited as string[]);
+      await access.see(sides, [row.from_cited as string[], row.to_cited as string[]]);
       return linkView(row, false);
     });
   }
@@ -342,8 +410,7 @@ export class PostgresLinks {
       const row = await readLink(db, scope, linkId);
       if (!row) throw new AuthorityError('NOT_FOUND');
       const sides = endpointsOf(row);
-      await access.see(at(sides, 0), row.from_cited as string[]);
-      await access.see(at(sides, 1), row.to_cited as string[]);
+      await access.see(sides, [row.from_cited as string[], row.to_cited as string[]]);
       for (let i = 0; i < 2; i++) await access.require(at(sides, i).collectionId, writeOf(at(sides, i).kind), 'FORBIDDEN');
       if (row.tombstone) return { ...linkView(row, true), erasure: { ...rowsRetained } };
       await writable(db, scope);
@@ -381,7 +448,7 @@ export class PostgresLinks {
       await access.require(self.collectionId, readOf(kind), 'FORBIDDEN');
       const cited = await liveEndpoint(db, scope.spaceId, self);
       if (!cited) throw new AuthorityError('NOT_FOUND');
-      await access.see(self, cited);
+      await access.see([self], [cited]);
       // Only links the caller could read are selected, so a page never reports, counts or skips past the others.
       const rows = (await db.query(`${linkSelect} WHERE l.space_id=$1 AND NOT l.tombstone
           AND ((l.from_collection_id=$2 AND l.from_kind=$3 AND l.from_id=$4) OR (l.to_collection_id=$2 AND l.to_kind=$3 AND l.to_id=$4))
@@ -389,14 +456,18 @@ export class PostgresLinks {
         ORDER BY l.link_id COLLATE "C" LIMIT $9`, [scope.spaceId, self.collectionId, kind, self.id, after,
         await access.holding('records:read'), await access.holding('sources:read'), await access.holding('claims:read'),
         (limit as number) + 1])).rows;
-      // The row past the page decides `next`, so it is admitted and fenced like the page's own rows.
+      // The row past the page decides `next`, so it is admitted and fenced like the page's own rows, all in one statement.
       const admitted: LinkView[] = [];
+      const endpoints: LinkEndpoint[] = [];
+      const cites: string[][] = [];
       for (let i = 0; i < rows.length; i++) {
         const sides = endpointsOf(rows[i]);
-        await access.see(at(sides, 0), rows[i].from_cited as string[]);
-        await access.see(at(sides, 1), rows[i].to_cited as string[]);
+        for (let j = 0; j < 2; j++) put(endpoints, at(sides, j));
+        put(cites, rows[i].from_cited as string[]);
+        put(cites, rows[i].to_cited as string[]);
         put(admitted, linkView(rows[i], false));
       }
+      await access.see(endpoints, cites);
       const links: LinkView[] = [];
       for (let i = 0; i < admitted.length && i < (limit as number); i++) put(links, at(admitted, i));
       const next = admitted.length > (limit as number) ? at(links, (limit as number) - 1).linkId : null;
