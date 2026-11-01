@@ -176,12 +176,16 @@ try {
   // The restored space index finds a space's outbox entries, delivered or pending, for the erasure check and the purge.
   await restored.query(`UPDATE evidence_outbox SET delivery_state='delivered',delivered_at=clock_timestamp() WHERE event_id=$1`,
     ['eev_00000000-0000-4000-8000-000000000001']);
+  // The setting is local to one transaction, so the session goes back to the pool without it.
   const planner=await restored.connect();
   try {
-    await planner.query('SET enable_seqscan=off');
+    await planner.query('BEGIN');
+    await planner.query('SET LOCAL enable_seqscan=off');
     for (const sql of ['SELECT 1 FROM evidence_outbox WHERE space_id=$1','DELETE FROM evidence_outbox WHERE space_id=$1'])
       assert.match((await planner.query(`EXPLAIN ${sql}`,[spaceId])).rows.map(row=>row['QUERY PLAN']).join('\n'),
         /(?:using|on) evidence_outbox_space\b/,sql);
+    await planner.query('ROLLBACK');
+    assert.equal((await planner.query('SHOW enable_seqscan')).rows[0].enable_seqscan,'on','the probe leaves no setting behind');
   } finally { planner.release(); }
   await assert.rejects(restored.query('UPDATE evidence_events SET revision=3 WHERE space_id=$1',[spaceId]),/evidence facts are immutable/);
   await assert.rejects(restored.query(`UPDATE space_erasures SET requested_at=requested_at-interval '1 day' WHERE space_id=$1`,

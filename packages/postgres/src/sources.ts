@@ -1266,7 +1266,11 @@ async function sourceExists(db: Db, spaceId: string, sourceId: string): Promise<
   return (await db.query('SELECT 1 FROM sources WHERE space_id=$1 AND source_id=$2', [spaceId, sourceId])).rows.length > 0;
 }
 
-/** Attempts of a source's grant, and keys the sweep found, that one removal takes; more remain for the next one. */
+/**
+ * Attempts of a source's grant, and keys the sweep found, that one removal takes; more remain for the next one. Each
+ * page is ranked before it is cut: keys never deferred first (staging keys by key, found keys in the order found),
+ * then deferred keys in the order they were deferred, so keys that keep failing cannot fill every page.
+ */
 const ERASE_ATTEMPTS = 20;
 const ERASE_FOUND = 40;
 /**
@@ -1276,13 +1280,16 @@ const ERASE_FOUND = 40;
  * windows this call.
  */
 const ERASURE_STATE = `SELECT x.space_id,x.collection_id,x.source_id,x.observed::text AS observed,x.removed_at IS NOT NULL AS removed,
-    x.removal_observed IS NOT DISTINCT FROM x.observed AS original_removed,x.found_keys[1:${ERASE_FOUND}] AS found,
+    x.removal_observed IS NOT DISTINCT FROM x.observed AS original_removed,
+    ARRAY(SELECT f.k FROM unnest(x.found_keys) WITH ORDINALITY AS f(k,n)
+      ORDER BY array_position(x.deferred_keys,f.k) NULLS FIRST,f.n LIMIT ${ERASE_FOUND}) AS found,
     x.deferred_keys AS deferred,EXISTS (SELECT 1 FROM space_erasures s WHERE s.originals_removed_at IS NULL
       AND s.next_attempt_at<=clock_timestamp()) AS spaces_due,
     clock_timestamp()>=x.writers_end_at+make_interval(secs=>$1) AS settled,o.object_key,
     ARRAY(SELECT a.staging_key FROM source_upload_attempts a JOIN source_upload_grants g USING (space_id,collection_id,grant_id)
       WHERE g.space_id=x.space_id AND g.collection_id=x.collection_id AND g.source_id=x.source_id
-        AND a.staging_removed_at IS NULL ORDER BY a.staging_key LIMIT ${ERASE_ATTEMPTS}) AS staged
+        AND a.staging_removed_at IS NULL
+      ORDER BY array_position(x.deferred_keys,a.staging_key) NULLS FIRST,a.staging_key LIMIT ${ERASE_ATTEMPTS}) AS staged
   FROM original_erasures x JOIN original_objects o USING (space_id,collection_id,source_id)`;
 type ErasureState = Record<string, unknown>;
 /**
@@ -1306,8 +1313,14 @@ type ErasureState = Record<string, unknown>;
  * A copy the store confirms even later is found by the sweep, which reopens
  * the erasure. Keys are isolated: a delete that fails or is cut short does not
  * end the removal, the other keys still get their store calls, and a settled
- * removal records the key in `deferred_keys`, so later removals try it after
- * every other key and it cannot hold the head. A failure is still thrown once
+ * removal records the key at the end of `deferred_keys`, so later removals
+ * select and try it after every key never deferred, and it cannot hold the
+ * head of a page; the statement that records a key removed drops it from
+ * `deferred_keys` too, so the list holds only keys still left. Behind `k` keys
+ * that reject, a healthy key is tried within `ceil(k / page) + 1` settled
+ * removals (a page is 40 found keys or 20 attempts); behind `k` keys that
+ * stall or are cut, within `k + 1`, since each such removal defers at least
+ * the key that ended it. A failure is still thrown once
  * the other keys were tried; a key cut by `storeUntil` is unfinished. `state`
  * is the erasure as its due page read it, or else read here. Store calls end
  * by `storeUntil`, transactions by `recordUntil`.
@@ -1353,17 +1366,21 @@ async function eraseOriginal(cell: SourceCell, ids: readonly string[], storeUnti
     return true;
   };
   const found = [...state.found as string[]];
+  // Keys whose last delete failed or was cut go last, in the order they moved there.
+  const deferred = (state.deferred as string[] | null ?? []).map(String);
   const removeFound = (key: string) => async () => {
-    if (await remove(key)) await fenced(`UPDATE original_erasures SET found_keys=array_remove(found_keys,$5) WHERE space_id=$1
+    if (await remove(key)) await fenced(`UPDATE original_erasures SET found_keys=array_remove(found_keys,$5),
+      deferred_keys=array_remove(deferred_keys,$5) WHERE space_id=$1
       AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL AND observed=$4::bigint AND $5=ANY(found_keys)`, [...params, observed, key]);
   };
   type Unit = { key: string; run: () => Promise<void> };
   // The keys in the order they are tried; a promoted copy recorded as found during this removal joins the end.
   const queue: Unit[] = [];
   const units: Unit[] = [{ key: original, run: async () => {
-    if (await remove(original) && state.original_removed !== true) await fenced(`UPDATE original_erasures SET removal_observed=$4::bigint
+    if (await remove(original) && state.original_removed !== true) await fenced(`UPDATE original_erasures SET removal_observed=$4::bigint,
+        deferred_keys=array_remove(deferred_keys,$5)
       WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL AND observed=$4::bigint
-        AND removal_observed IS DISTINCT FROM $4::bigint`, [...params, observed]);
+        AND removal_observed IS DISTINCT FROM $4::bigint`, [...params, observed, original]);
   } }];
   for (const value of state.staged as string[]) {
     const staging = String(value);
@@ -1379,16 +1396,17 @@ async function eraseOriginal(cell: SourceCell, ids: readonly string[], storeUnti
             ELSE state END,failure_code=CASE WHEN state IN ('receiving','verified') THEN 'abandoned' ELSE failure_code END,
             staging_removed_at=clock_timestamp(),updated_at=clock_timestamp()
           WHERE space_id=$1 AND collection_id=$2 AND staging_key=$3 AND staging_removed_at IS NULL`, [ids[0], ids[1], staging]);
-        if (promoted !== original) await db.query(`UPDATE original_erasures SET found_keys=CASE WHEN $4=ANY(found_keys)
-            THEN found_keys ELSE array_append(found_keys,$4) END
-          WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL`, [...params, promoted]);
+        if (promoted !== original || deferred.includes(staging)) await db.query(`UPDATE original_erasures
+            SET found_keys=CASE WHEN $4::text IS NULL OR $4=ANY(found_keys) THEN found_keys ELSE array_append(found_keys,$4) END,
+              deferred_keys=array_remove(deferred_keys,$5)
+          WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL`,
+        [...params, promoted !== original ? promoted : null, staging]);
       }, recordUntil);
       if (promoted !== original && !found.includes(promoted)) { found.push(promoted); queue.push({ key: promoted, run: removeFound(promoted) }); }
     } });
   }
   for (const key of found) units.push({ key: String(key), run: removeFound(String(key)) });
-  // Keys whose last delete failed or was cut go last, in the order they moved there.
-  const deferred = (state.deferred as string[] | null ?? []).map(String);
+  // The pages arrive ranked; this orders the original and the two pages together by the same rule.
   const rank = (key: string) => deferred.indexOf(key);
   queue.push(...units.filter(unit => rank(unit.key) < 0),
     ...units.filter(unit => rank(unit.key) >= 0).sort((x, y) => rank(x.key) - rank(y.key)));
@@ -1399,7 +1417,7 @@ async function eraseOriginal(cell: SourceCell, ids: readonly string[], storeUnti
     if (!(error instanceof CleanupTimeout && error.atBudget)) failures.push(error);
   }
   if (failures.length) throw failures.length === 1 ? failures[0] : new AggregateError(failures, 'Some of a deleted source\'s bytes were not erased');
-  if (settled && current && !cut && (await record(`UPDATE original_erasures SET removed_at=clock_timestamp()
+  if (settled && current && !cut && (await record(`UPDATE original_erasures SET removed_at=clock_timestamp(),deferred_keys='{}'
     WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL AND observed=$4::bigint
       AND removal_observed=observed AND cardinality(found_keys)=0
       AND NOT EXISTS (SELECT 1 FROM source_upload_attempts a JOIN source_upload_grants g USING (space_id,collection_id,grant_id)
@@ -1535,8 +1553,10 @@ export class SourceUploadReconciler {
    * grant's end plus the grace) and before the sweep last found one of its
    * keys. Each erasure attempted moves behind every due one not tried since,
    * so a failing one cannot hold the oldest page; within a source erasure, a
-   * key whose delete failed or was cut is tried after its other keys, so it
-   * cannot hold them either. A call cut short by its phase's deadline is
+   * key whose delete failed or was cut is selected and tried after its other
+   * keys, so it cannot hold them either, and a healthy key is tried within the
+   * bound `eraseOriginal` states: one tick per stalled key ahead of it with a
+   * space due, and at least two stalled keys a tick with none. A call cut short by its phase's deadline is
    * unfinished, not a failure. Returns how many erasures were due. Failures
    * are reported together; each erasure is retried later.
    */
