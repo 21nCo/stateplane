@@ -450,6 +450,37 @@ test('CLI evidence payloads from --file are bounded by their route body budget, 
   }
 });
 
+test('CLI JSON input with a number that overflows to Infinity is refused before any request', async t => {
+  const state = fixture();
+  const { server, origin } = await serve(createHttpHandler(state));
+  t.after(() => server.close());
+  const { root, cli } = await configuredCli(t, origin);
+  const cl = ['--collection', 'c'];
+  // JSON.stringify would send Infinity as null, and a null extractionVersion is an unversioned citation.
+  const body = number => `{"statement":"S","attributedTo":"A","evidence":[{"collectionId":"c","sourceId":"src_1","extractionVersion":${number}}]}`;
+  const file = join(root, 'claim.json');
+  for (const number of ['1e400', '-1e400']) {
+    await writeFile(file, body(number));
+    for (const argv of [
+      ['claims', 'create', ...cl, '--idempotency-key', 'k', '--data', body(number)],
+      ['claims', 'create', ...cl, '--idempotency-key', 'k', '--file', file],
+      ['claims', 'revise', ...cl, '--id', 'clm_1', '--base-revision', '1', '--data', body(number)],
+      ['claims', 'revise', ...cl, '--id', 'clm_1', '--base-revision', '1', '--file', file],
+      ['records', 'query', ...cl, '--predicates', `[{"field":"n","op":"eq","value":${number}}]`]
+    ]) {
+      state.calls.length = 0;
+      const run = await cli(argv);
+      assert.deepEqual(JSON.parse(run.stderr).error, { code: 'INVALID_ARGUMENT', message: 'INVALID_ARGUMENT', retryable: false, requestId: null },
+        `${argv.join(' ')} ${number}`);
+      assert.equal(state.calls.length, 0, `${argv.join(' ')} ${number} sends no request`);
+    }
+  }
+  // A large finite number is still sent as written.
+  state.calls.length = 0;
+  assert.equal((await cli(['claims', 'create', ...cl, '--idempotency-key', 'k', '--data', body('1e300')])).status, 0);
+  assert.equal(state.calls[0].args.at(-1).evidence[0].extractionVersion, 1e300);
+});
+
 test('CLI content is saved from a chunked body by its digest, written in full, and removed when a write or close fails', async t => {
   const bytes = Buffer.from('chunked original');
   let digest = createHash('sha256').update(bytes).digest('base64');
@@ -504,6 +535,33 @@ proto.write = function (buffer, offset = 0, length = buffer.byteLength - offset,
   const mismatch = join(root, 'mismatch.txt');
   assert.equal(JSON.parse((await cli([...content, mismatch])).stderr).error.code, 'PROVIDER_UNAVAILABLE');
   await assert.rejects(readFile(mismatch), { code: 'ENOENT' });
+});
+
+test('CLI content whose body stalls past --timeout or breaks mid-stream fails retryable and leaves no file', async t => {
+  const bytes = Buffer.from('an original that never finishes');
+  const digest = createHash('sha256').update(bytes).digest('base64');
+  let mode = 'stall';
+  const sockets = new Set();
+  const server = createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain', 'repr-digest': `sha-256=:${digest}:`, 'content-length': String(bytes.length) });
+    res.write(bytes.subarray(0, 5));
+    // A stall keeps the connection open with the rest unsent; a break drops it after the first bytes.
+    if (mode === 'break') setTimeout(() => res.socket.destroy(), 20);
+  });
+  server.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  t.after(() => { for (const socket of sockets) socket.destroy(); server.close(); });
+  const { root, cli } = await configuredCli(t, `http://127.0.0.1:${server.address().port}`);
+  for (const next of ['stall', 'break']) {
+    mode = next;
+    const output = join(root, `${next}.txt`);
+    const started = Date.now();
+    const run = await cli(['sources', 'content', '--collection', 'c', '--id', 'src_1', '--output', output, '--timeout', '500']);
+    assert.deepEqual(JSON.parse(run.stderr).error, { code: 'PROVIDER_UNAVAILABLE', message: 'PROVIDER_UNAVAILABLE', retryable: true, requestId: null }, next);
+    assert.equal(run.stdout, '', next);
+    await assert.rejects(readFile(output), { code: 'ENOENT' }, next);
+    if (next === 'stall') assert.ok(Date.now() - started >= 500, 'the timeout bounds the body, not only the headers');
+  }
 });
 
 test('HTTP, CLI and MCP report one service refusal with the same code and retryability', async t => {

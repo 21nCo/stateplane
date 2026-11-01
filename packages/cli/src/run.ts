@@ -119,8 +119,15 @@ function integer(value:string):number {
   if (!Number.isSafeInteger(number) || number<1) throw new StateplaneCliError('INVALID_ARGUMENT');
   return number;
 }
+/** Parse CLI JSON input. A number that overflows to Infinity is refused: JSON
+ * would send it as null, which is a different request from the one given. */
 function parsed(value:string):unknown {
-  try { return JSON.parse(value); } catch { throw new StateplaneCliError('INVALID_ARGUMENT'); }
+  try {
+    return JSON.parse(value,(_key,item:unknown)=>{
+      if (typeof item==='number' && !Number.isFinite(item)) throw new StateplaneCliError('INVALID_ARGUMENT');
+      return item;
+    });
+  } catch { throw new StateplaneCliError('INVALID_ARGUMENT'); }
 }
 /** The UTF-8 text of a file or stdin. keepBom keeps a leading byte order mark
  * so text stored as an original keeps every byte of the file; JSON and tokens
@@ -344,10 +351,12 @@ async function writeAll(file: FileHandle, chunk: Uint8Array): Promise<void> {
  * Save a source's original to a new file and report it as JSON; stdout stays
  * one JSON value. The file must not exist. The bytes are hashed as they are
  * written, and the file counts as saved only once every byte is written and it
- * has closed. A body that errors, a write or close that fails, a digest that
- * differs from Repr-Digest (which is required), or a length that differs from
- * the Content-Length of an unencoded response removes the file and fails
- * nonretryable PROVIDER_UNAVAILABLE. A response without Content-Length (a
+ * has closed. Any failure removes the file. A body whose stream fails or is
+ * aborted, including by the client timeout that bounds the whole download, fails
+ * retryable PROVIDER_UNAVAILABLE: the same read may succeed again. A write or
+ * close that fails, a digest that differs from Repr-Digest (which is required),
+ * or a length that differs from the Content-Length of an unencoded response
+ * fails nonretryable PROVIDER_UNAVAILABLE. A response without Content-Length (a
  * chunked body) is verified by its digest alone.
  */
 async function saveContent(client: StateplaneHttpClient, path: string, output: string): Promise<unknown> {
@@ -371,18 +380,23 @@ async function saveContent(client: StateplaneHttpClient, path: string, output: s
   }
   const hash = createHash('sha256');
   let bytes = 0;
-  let complete: boolean;
-  try {
-    for await (const chunk of response.body ?? []) {
-      await writeAll(file, chunk);
-      hash.update(chunk); bytes += chunk.byteLength;
-    }
-    complete = digest !== undefined && hash.digest('base64') === digest && (length === null || bytes === length);
-  } catch { complete = false; }
+  let complete = true;
+  let interrupted = false;
+  const reader = response.body?.getReader();
+  while (reader && complete) {
+    let next: ReadableStreamReadResult<Uint8Array>;
+    try { next = await reader.read(); }
+    catch { interrupted = true; complete = false; break; }
+    if (next.done) break;
+    try { await writeAll(file, next.value); }
+    catch { complete = false; await reader.cancel().catch(() => {}); break; }
+    hash.update(next.value); bytes += next.value.byteLength;
+  }
+  complete &&= digest !== undefined && hash.digest('base64') === digest && (length === null || bytes === length);
   try { await file.close(); } catch { complete = false; }
   if (!complete) {
     await unlink(output).catch(() => {});
-    throw new StateplaneCliError('PROVIDER_UNAVAILABLE', undefined, undefined, false);
+    throw new StateplaneCliError('PROVIDER_UNAVAILABLE', undefined, undefined, interrupted);
   }
   return { referenceOnly: false, output, bytes, sha256: Buffer.from(digest!, 'base64').toString('hex'),
     mimeType: response.headers.get('content-type') };
