@@ -354,8 +354,12 @@ the leftover must be deleted before a rerun because an existing file is never
 overwritten. A body
 stream that fails or is aborted fails retryable `PROVIDER_UNAVAILABLE`; a digest
 or length mismatch, or a local write or close failure, fails nonretryable
-`PROVIDER_UNAVAILABLE`. `--timeout` bounds the whole download, body included
-(a 25 MiB original needs about 0.87 MB/s at the 30-second default). The file is
+`PROVIDER_UNAVAILABLE`. `--timeout` bounds the whole download with one
+deadline: every repeated request, each pause before a repeat and the body
+(a 25 MiB original needs about 0.87 MB/s at the 30-second default). A repeat
+or `Retry-After` pause that cannot finish before the deadline is not attempted;
+the CLI reports the last failure instead. A reference-only source writes no
+file, needs no `Repr-Digest` and prints `{referenceOnly: true, output: null}`. The file is
 mode 0600 on POSIX systems; on Windows it inherits the destination directory's
 ACL, so choose a private directory. Flag names are lowercase letters, digits and hyphens, such as
 `--sha256`.

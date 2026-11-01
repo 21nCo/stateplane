@@ -564,6 +564,34 @@ test('CLI content whose body stalls past --timeout or breaks mid-stream fails re
   }
 });
 
+test('CLI content --timeout bounds the whole download: repeats and their pauses share one deadline', async t => {
+  // silent never answers; busy answers 503 with a Retry-After longer than the deadline.
+  let mode = 'silent';
+  let requests = 0;
+  const sockets = new Set();
+  const server = createServer((req, res) => {
+    requests++;
+    if (mode === 'busy') {
+      res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '1' });
+      res.end(JSON.stringify({ error: { code: 'BACKPRESSURE', message: 'BACKPRESSURE', retryable: true } }));
+    }
+  });
+  server.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  t.after(() => { for (const socket of sockets) socket.destroy(); server.close(); });
+  const { root, cli } = await configuredCli(t, `http://127.0.0.1:${server.address().port}`);
+  for (const [next, code] of [['silent', 'PROVIDER_UNAVAILABLE'], ['busy', 'BACKPRESSURE']]) {
+    mode = next; requests = 0;
+    const output = join(root, `${next}.txt`);
+    const run = await cli(['sources', 'content', '--collection', 'c', '--id', 'src_1', '--output', output, '--timeout', '500']);
+    assert.deepEqual(JSON.parse(run.stderr).error, { code, message: code, retryable: true, requestId: null }, next);
+    // Each repeat would get a fresh timeout or wait past the deadline, so the deadline allows only the first request.
+    assert.equal(requests, 1, `${next}: no repeat once the deadline cannot be met`);
+    assert.equal(run.stdout, '', next);
+    await assert.rejects(readFile(output), { code: 'ENOENT' }, next);
+  }
+});
+
 test('HTTP, CLI and MCP report one service refusal with the same code and retryability', async t => {
   const state = fixture();
   const http = createHttpHandler(state);

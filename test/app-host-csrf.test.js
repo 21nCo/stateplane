@@ -22,13 +22,17 @@ before(async ()=>{
   await server.init({ env:{} });
 },{ timeout:200_000 });
 
-const send=async (path,{ method='POST',type,from,body='hello' }={})=>{
-  const headers={ ...(type ? { 'content-type':type } : {}), ...(from===undefined ? {} : { origin:from }) };
+// A request without a type has no body, since a string body would get text/plain.
+const send=async (path,{ method='POST',type,from,site,body=type ? 'a=1' : null }={})=>{
+  const headers={ ...(type ? { 'content-type':type } : {}), ...(from===undefined ? {} : { origin:from }),
+    ...(site ? { 'sec-fetch-site':site } : {}) };
   const response=await server.respond(new Request(origin+path,{ method,headers,body }),
     { getClientAddress:()=>'127.0.0.1',platform:{ env:{} } });
-  return { status:response.status,text:await response.text() };
+  return { status:response.status,text:await response.text(),location:response.headers.get('location') };
 };
-const forms=['text/plain','text/plain;charset=utf-8','multipart/form-data; boundary=x','application/x-www-form-urlencoded','Application/X-SvelteKit-FormData'];
+// undefined sends no Content-Type, as a bodyless no-cors fetch does.
+const forms=[undefined,'text/plain','text/plain;charset=utf-8','multipart/form-data; boundary=x','application/x-www-form-urlencoded','Application/X-SvelteKit-FormData'];
+const redirect=({ status,location })=>({ status,location });
 const forbidden=/^Cross-site (POST|PUT|PATCH|DELETE) form submissions are forbidden$/;
 
 test('a raw /v1 upload of any form MIME type reaches the bearer-only API handler however its Origin is set', async ()=>{
@@ -46,16 +50,23 @@ test('a raw /v1 upload of any form MIME type reaches the bearer-only API handler
 test('a cross-site form post to a page action, sign-out or any other route is still refused before it runs', async ()=>{
   for (const path of ['/spaces/s1?/create','/spaces/s1/collections/c1/records/r1?/update','/signout','/','/v1x','/v2/spaces'])
     for (const type of forms)
-      for (const from of [undefined,'null','https://elsewhere.example']) {
-        const { status,text }=await send(path,{ type,from });
-        assert.equal(status,403,`${path} ${type} ${from}`);
-        assert.match(text,forbidden);
-      }
+      for (const from of [undefined,'null','https://elsewhere.example'])
+        for (const site of [undefined,'cross-site','same-site']) {
+          const { status,text }=await send(path,{ type,from,site });
+          assert.equal(status,403,`${path} ${type} ${from} ${site}`);
+          assert.match(text,forbidden);
+        }
   // The same post from the app's own origin reaches the route; without a
-  // session the action answers with its sign-in redirect.
-  const own=await send('/spaces/s1?/create',{ type:'application/x-www-form-urlencoded',from:origin,body:'a=1' });
-  assert.equal(own.status,200);
-  assert.deepEqual(JSON.parse(own.text),{ type:'redirect',status:303,location:'/' });
-  // A JSON body is not a form submission, so the check leaves it alone, as SvelteKit's did.
-  assert.notEqual((await send('/signout',{ type:'application/json',from:'https://elsewhere.example',body:'{}' })).status,403);
+  // session the action answers with its sign-in redirect. Under the pages'
+  // no-referrer policy a browser's own form post sends Origin: null with
+  // Sec-Fetch-Site: same-origin, and is the app's own post too.
+  for (const own of [{ from:origin },{ from:'null',site:'same-origin' },{ site:'same-origin' }]) {
+    const action=await send('/spaces/s1?/create',{ type:'application/x-www-form-urlencoded',...own });
+    assert.equal(action.status,200,JSON.stringify(own));
+    assert.deepEqual(JSON.parse(action.text),{ type:'redirect',status:303,location:'/' });
+    for (const type of [undefined,'application/x-www-form-urlencoded'])
+      assert.deepEqual(redirect(await send('/signout',{ type,...own })),{ status:303,location:'/' },`${type} ${JSON.stringify(own)}`);
+  }
+  // A JSON body is not a form submission, so the check leaves it alone, as SvelteKit's did: sign-out runs.
+  assert.deepEqual(redirect(await send('/signout',{ type:'application/json',from:'https://elsewhere.example',body:'{}' })),{ status:303,location:'/' });
 });
