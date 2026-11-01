@@ -4,7 +4,7 @@
 `createMcpHandler({ services, identity, resource, authorizationServers })`
 takes the same `StateplaneServices` and `IdentityVerifier` as
 `createHttpHandler`, so every tool reaches the same space, collection, record,
-batch and event services, the same directory placement lookup and the same cell
+batch, event, source, claim and link services, the same directory placement lookup and the same cell
 policy checks as HTTP and the CLI. MCP adds no authorization authority, data
 path or per-collection state. `createMcpEndpoint({ resource,
 authorizationServers })` builds the declaration, schema validators and
@@ -14,8 +14,9 @@ scope.
 
 ## Fixed tool registry
 
-`stateplaneMcpDeclaration()` is a side-effect-free McpFn declaration with 19
-fixed tools and one guidance resource. Defining a collection inserts registry
+`stateplaneMcpDeclaration()` is a side-effect-free McpFn declaration with 42
+fixed tools and one guidance resource: 19 for spaces, collections, records,
+batches and events, and 23 for evidence storage (STA-37). Defining a collection inserts registry
 data; it never adds a tool. Every credential sees the same list, and access is
 decided per call by the shared services. The public manifest is committed in
 [contracts/mcp-manifest.json](../contracts/mcp-manifest.json); review a change
@@ -60,11 +61,26 @@ and the authority.
 | `batches_ingest`, `batches_cancel` | `batches.ingest`, `batches.cancel` | destructive |
 | `batches_status` | `batches.progress` | read-only |
 | `events_list`, `projection_status` | `events.list`, `events.projection` | read-only |
+| `spaces_erasure` | `spaces.erasure` (owner sessions only) | read-only |
+| `sources_get`, `sources_content`, `sources_extraction` | `sources.get`, `sources.content`, `sources.extraction` | read-only |
+| `sources_ingest_text`, `sources_ingest_reference`, `sources_extract`, `sources_correct_extraction` | `sources.ingestText`, `sources.ingestReference`, `sources.extract`, `sources.correctExtraction` | write, not destructive |
+| `uploads_create`, `uploads_send` | `sources.createUpload`, `sources.upload` | write, not destructive, not idempotent |
+| `uploads_finalize` | `sources.finalizeUpload` | write, not destructive |
+| `sources_delete`, `uploads_revoke` | `sources.delete`, `sources.revokeUpload` | destructive |
+| `claims_get`, `claims_list` | `claims.get`, `claims.list` | read-only |
+| `claims_create`, `claims_revise`, `claims_review` | `claims.create`, `claims.revise`, `claims.review` | write, not destructive |
+| `claims_delete` | `claims.delete` | destructive |
+| `links_get`, `links_list` | `links.get`, `links.list` | read-only |
+| `links_create` | `links.create` | write, not destructive |
+| `links_delete` | `links.delete` | destructive |
 
 All tools are `openWorldHint: false`. Writes are `idempotentHint: true`
 because an identical repeat has no additional effect: record writes replay
-their receipt, batches resume by operation key, and a repeated define or
-revision fails without changing state. Space creation, lifecycle changes,
+their receipt, batches resume by operation key, a repeated define or
+revision fails without changing state, and every evidence write but two
+replays. `uploads_create` issues a new grant and `uploads_send` a new attempt
+on every call, so they are `idempotentHint: false`. A claim revision or review
+leaves the earlier revisions readable, so neither is destructive. Space creation, lifecycle changes,
 deletion and agent-key issuance stay on the owner HTTP/CLI surface; a model
 cannot mint or revoke credentials through MCP.
 
@@ -78,13 +94,18 @@ the JSON an HTTP client receives, in `structuredContent` and as JSON text;
 ## Arguments and precedence
 
 - Selectors (`spaceId`, `collectionId`, record `id` for reads, `key`,
-  `operationKey`) follow the HTTP path-segment rules: a nonempty string of at
+  `operationKey`, `sourceId`, `grantId`, `claimId`, `linkId`) follow the HTTP
+  path-segment rules: a nonempty string of at
   most 512 UTF-16 code units without NUL. A missing or invalid selector returns
   `INVALID_ARGUMENT` before any service call. The authority further limits
   `operationKey` to 256 UTF-8 bytes of Unicode scalars.
 - Record mutations and `records_query` forward every argument except the two
   scope selectors into the serialized authority request, exactly like an HTTP
-  body. The authority therefore authorizes the requested collection before it
+  body. Evidence body tools (ingestion, upload grant and finalize, correction,
+  claim writes and lists, link creation and lists) do the same: they re-encode
+  every argument except their selectors, within the HTTP body bound, and pass
+  the parsed request to the service, which authorizes the owning collection
+  before it refuses a field. The authority therefore authorizes the requested collection before it
   rejects an undeclared field: a revoked or hidden collection still returns its
   access error rather than `INVALID_ARGUMENT`. A tool cannot override the
   operation. Other tools reject undeclared arguments before contacting a
@@ -172,10 +193,19 @@ used: `scopes_supported` is omitted and authorization is the space grant model.
   cancel never settles or rejects cannot delay a `413` or the deadline answer,
   and a throwing or rejecting `onTimeout` is contained.
 
+- Original bytes travel as canonical padded base64, at most 2 MiB decoded, so
+  an upload's base64 (2,796,204 characters) leaves more than 1.3 MiB of the
+  4 MiB body for framing. `sources_content` refuses a larger original with
+  nonretryable `RATE_LIMITED` from its recorded size, without reading it, and
+  reads and verifies a smaller one completely before answering. Malformed or
+  oversized base64 in `uploads_send` is `INVALID_ARGUMENT` before any service
+  call. HTTP and the CLI carry originals up to the 25 MiB upload bound.
+
 These bounds reuse STA-8/9 limits or protocol framing; none is a measured
-Cloudflare or Railway capacity. The committed manifest publishes 19 tools in a
-41,961-byte compact `tools/list` result (41,995 bytes on the wire) plus 1,334
-characters of instructions.
+Cloudflare or Railway capacity. The committed manifest publishes 42 tools in an
+81,166-byte compact `tools/list` result (81,206 bytes on the wire) plus 1,527
+characters of instructions; STA-37's 23 evidence tools roughly doubled it from
+41,961 bytes for 19 tools.
 McpFn bundles the official SDK and schema validators: the app Worker dry-run
 grew from 834.94 KiB (178.06 KiB gzip) at the STA-9 base to 1,905.65 KiB
 (375.36 KiB gzip). This is a local bundle observation, not a deployed limit.
@@ -191,6 +221,13 @@ status, membership and counts come from exact reads; and writes are recovered
 as each write tool's recovery step names: record writes by repeating the
 identical request with the same idempotency key, collection writes by reading
 `collections_get`, and batches by their operation key and `batches_status`.
+The guide also describes evidence: sources are immutable and their locators
+are never fetched, extractions and claims are evidence and never records,
+citing or linking grants no access and declassification is not supported, a
+`restrict` link refuses an endpoint's deletion, and each evidence write's
+recovery (an idempotency key for ingestion, claim creation and link creation;
+the base version or revision for corrections and claim changes; a new grant
+after an unanswered upload).
 
 ## Local stdio proxy
 
@@ -231,6 +268,8 @@ transport and belongs to regional acceptance (STA-21).
 
 | Command | Boundary | Needs |
 | --- | --- | --- |
+| `node --test test/evidence-transport.test.js` (in `pnpm test:contracts`) | Evidence tools: OpenAPI request-body parity for every body tool, HTTP/CLI/MCP error parity for one service refusal, base64 transfer and its 2 MiB bound, malformed base64 refused before the service | Node |
+| `test/integration/evidence-transport.test.js` (in `pnpm test:postgres`) | Upload, extraction, claim review, linking and deletion across HTTP, the CLI and MCP with real AuthFn keys and Postgres, every view checked against OpenAPI ([details](evidence-storage.md#verification-for-transports)) | Local Postgres |
 | `node --test test/mcp.test.js` (in `pnpm test:contracts`) | Registry, OpenAPI parity (mutations, predicates and both definition tools), x- inventory by tool and pointer, service mapping, error parity with HTTP, precedence, re-encoding, OAuth challenges and metadata, origins, McpFn API-key regression matrix, body bounds, one deadline over stalled verification, unfinished body and dispatched reads and writes, one endpoint serving concurrent requests with their own services and equal JSON-RPC IDs, recovery guidance against write schemas | Node |
 | `test/mcp-host.test.ts` (in `pnpm test:qualification`) | The app host builds one MCP endpoint per isolate and resource while each Worker request passes its own services, identity and pool; a Preview without `STATEPLANE_MCP_RESOURCE` and a local non-loopback `Host` with a matching `Origin` fail closed | Node |
 | `node --test test/mcp-acceptance-cleanup.test.js` (in `pnpm test:contracts`) | Gate cleanup: reverse-order finalizers; a client that cannot spawn, stalls before ready or answers not ready fails the gate, is terminated and awaited, and backend cleanup still runs; a persisted record is passed only when every finalizer succeeds; evidence mode is the backend that ran | Node |
@@ -305,4 +344,5 @@ UI/health. Clean up every disposable resource.
 | Two clients | Inconsistent IDs, revisions, conflicts, receipts or revocation across implementations | TypeScript and Python SDK gate in-process and through the app host |
 | Resource origin | A request `Host` becomes the trusted origin, defeating the rebinding check | Configured resource outside local loopback; host fail-closed tests |
 | Gate cleanup | A failed start leaves a credential-bearing client, app process or space behind while evidence reports complete; a stalled host holds cleanup | Spawn-error, stalled-init, not-ready and stalled-host tests; every finalizer counted in `cleanupSteps` |
+| Evidence tools | A tool widens access, refuses shape before authorization, or carries bytes past the body bound | Same services as HTTP; outsider and precedence cases on all transports against Postgres; 2 MiB base64 bound refused without reading |
 | Forwarder | A compressed or relabelled body, a masked rebinding origin, or the runner's own origin refused on the hosted path | gzip upstream that rejects foreign origins; runner-shaped requests through the real credential proxy |

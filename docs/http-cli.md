@@ -4,7 +4,8 @@
 handler accepts standard `Request` objects and returns standard `Response`
 objects. `postgresServices(spaces, cells, receiptRetentionSeconds)` in
 `@stateplane/postgres` composes the existing `PostgresSpaces`,
-`CollectionRegistry`, and `PostgresAuthority` implementations. Supply the
+`CollectionRegistry`, and `PostgresAuthority` implementations, and the
+evidence services `PostgresSources`, `PostgresClaims` and `PostgresLinks`. Supply the
 same private, at least 32-byte cursor secret to every process serving one
 cell. The HTTP host owns the AuthFn config, control/cell database bindings,
 and `IdentityVerifier`; it must not expose a direct database endpoint to CLI
@@ -308,6 +309,41 @@ and feed row count, and measure the index build lock and feed plans on
 disposable Railway before increasing the page limit. Event cursors
 are page positions, not export snapshots. The event `nextCursor` is the last
 observed event even on a short page; an empty poll retains the input cursor.
+
+## Sources, uploads, claims and links
+
+The evidence operations of STA-33 to STA-36 share these routes, errors and
+retry rules. The [transport reference](evidence-storage.md#transports-sta-37)
+lists every HTTP route, CLI command and MCP tool with its capabilities, and
+describes access, provenance, original bytes, deletion and erasure, bounds and
+recovery. `postgresServices` takes each cell's blob store as
+`ServiceCell.originals`; the opt-in host binds the cell's R2 `ORIGINALS`.
+
+```sh
+stateplane uploads create --collection evidence --mime-type text/plain --max-bytes 1048576
+stateplane uploads send --collection evidence --grant '<grantId>' --file ./report.txt --mime-type text/plain
+stateplane uploads finalize --collection evidence --grant '<grantId>' --attempt '<attemptId>' --locator https://example.invalid/report
+stateplane sources ingest-text --collection evidence --idempotency-key note-1 --file ./note.md --mime-type text/markdown
+stateplane sources content --collection evidence --id '<sourceId>' --output ./original.txt
+stateplane sources extract --collection evidence --id '<sourceId>'
+stateplane claims create --collection findings --idempotency-key claim-1 \
+  --data '{"statement":"The beacon was lit.","attributedTo":"Field report","evidence":[{"collectionId":"evidence","sourceId":"<sourceId>"}]}'
+stateplane claims review --collection findings --id '<claimId>' --base-revision 1 --status accepted
+stateplane links create --collection entries --idempotency-key link-1 \
+  --data '{"type":"evidence","policy":"restrict","from":{"kind":"record","collectionId":"entries","id":"<recordId>"},"to":{"kind":"source","collectionId":"evidence","id":"<sourceId>"}}'
+stateplane links list --collection entries --endpoint-kind record --endpoint-id '<recordId>'
+stateplane sources delete --collection evidence --id '<sourceId>'
+stateplane spaces erasure
+```
+
+`--data` and `--file` give the JSON request of `claims create`, `claims
+revise`, `sources correct` and `links create`, without the field a flag
+supplies (`idempotencyKey`, `baseRevision` or `baseVersion`); a payload that
+sets that field too is refused locally. `sources ingest-text` takes exactly
+one of `--text` and `--file`, whose bytes must be UTF-8. `sources content`
+writes the original to a new file and prints its metadata, so stdout stays one
+JSON value. Flag names are lowercase letters, digits and hyphens, such as
+`--sha256`.
 
 ## Acceptance boundaries
 

@@ -159,6 +159,8 @@ async function dispatch(services:StateplaneServices,actor:VerifiedCredential,req
   if (p.length===2) return selectedSpace(services,actor,space,request);
   if (p[2]==='audit' && p.length===3 && request.method==='GET')
     return json(await services.spaces.audit(actor,space,singleCursor(url)));
+  if (p[2]==='erasure' && p.length===3 && request.method==='GET')
+    return json(await services.spaces.erasure(actor,space));
   if (p[2]==='agent-keys') return agentKeysRoute(services,actor,space,p,request,url);
   if (p[2]!=='collections') return fail('NOT_FOUND');
   if (p.length===3 && request.method==='GET') return collectionDiscovery(services,actor,space,url);
@@ -177,8 +179,148 @@ async function collectionRoute(services:StateplaneServices,actor:VerifiedCredent
     return json(await services.collections.backfill(...prefix,p[5]));
   if (p[4]==='events' && p.length===5 && request.method==='GET')
     return json(await services.events.list(...prefix,url.searchParams.get('cursor')??undefined));
+  return evidenceRoute(services,p,request,url,prefix);
+}
+type Prefix = readonly [VerifiedCredential, string, string];
+/* Body budgets. A text, claim or correction holds up to 1 MiB of text plus its
+ * fields, and JSON escaping can grow it, so it takes the 3 MiB envelope the
+ * batch route already uses. Every other evidence request is a few bounded
+ * fields (IDs and types of at most 256 bytes, locators of at most 4,096). */
+const largeBody = 3_145_728;
+const smallBody = 32_768;
+const digits = /^(?:0|[1-9]\d*)$/;
+
+/** Parse a JSON body. Unparseable JSON becomes null, which the service refuses
+ * after it has authorized the collection, as the authority does for records. */
+async function request(req: Request, limit: number): Promise<unknown> {
+  const text = await body(req, limit);
+  try { return JSON.parse(text) as unknown; } catch { return null; }
+}
+/** One query parameter: absent, its value, or every value when repeated, which
+ * the service then refuses after authorization like any malformed field. */
+function param(url: URL, name: string): string | string[] | undefined {
+  const values = url.searchParams.getAll(name);
+  return values.length > 1 ? values : values[0];
+}
+/** A canonical decimal integer becomes a number; anything else stays as sent, for the service to refuse. */
+const integer = (value: string | string[] | undefined): unknown =>
+  typeof value === 'string' && digits.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : value;
+/** An optional version or revision selector. A malformed one is NaN, which the service refuses after authorization. */
+function selected(url: URL, name: string): number | undefined {
+  const value = integer(param(url, name));
+  return value === undefined ? undefined : typeof value === 'number' && value > 0 ? value : Number.NaN;
+}
+/** Build a query object from the parameters that were supplied. */
+function query(fields: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(fields)) if (value !== undefined) out[key] = value;
+  return out;
+}
+
+/** Base64 of a lowercase hex digest, without Node's Buffer. */
+const base64 = (hex: string) => btoa(String.fromCharCode(...(hex.match(/../g) ?? []).map(pair => Number.parseInt(pair, 16))));
+
+/** Original bytes are untrusted content served from the API origin: never rendered, sniffed or cached. */
+async function content(services: StateplaneServices, prefix: Prefix, sourceId: string): Promise<Response> {
+  const { source, body: stream } = await services.sources.content(...prefix, sourceId);
+  const headers = new Headers({ 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
+    'Content-Security-Policy': "default-src 'none'; sandbox", 'Content-Disposition': 'attachment' });
+  if (!stream) {
+    headers.set('X-Stateplane-Reference-Only', 'true');
+    return new Response(null, { status: 204, headers });
+  }
+  const { mimeType, byteSize, sha256 } = source.original;
+  headers.set('Content-Type', mimeType ?? 'application/octet-stream');
+  if (byteSize !== null) headers.set('Content-Length', String(byteSize));
+  if (sha256) headers.set('Repr-Digest', `sha-256=:${base64(sha256)}:`);
+  return new Response(stream, { status: 200, headers });
+}
+
+/** Stream one upload attempt: Content-Length declares its size, Content-Type its MIME type, `sha256` an optional digest. */
+async function upload(services: StateplaneServices, prefix: Prefix, grantId: string, req: Request, url: URL): Promise<Response> {
+  const declared: Record<string, unknown> = {};
+  const length = req.headers.get('content-length');
+  if (length !== null) declared.bytes = integer(length);
+  const type = req.headers.get('content-type');
+  if (type !== null) declared.mimeType = type;
+  const sha256 = param(url, 'sha256');
+  if (sha256 !== undefined) declared.sha256 = sha256;
+  const stream = req.body ?? new ReadableStream<Uint8Array>({ start: controller => controller.close() });
+  return json(await services.sources.upload(...prefix, grantId, stream, declared));
+}
+
+async function sourcesRoute(services: StateplaneServices, p: string[], req: Request, url: URL, prefix: Prefix): Promise<Response> {
+  const method = req.method;
+  const id = p[5];
+  if (p.length === 6 && method === 'POST' && id === 'text')
+    return json(await services.sources.ingestText(...prefix, await request(req, largeBody)));
+  if (p.length === 6 && method === 'POST' && id === 'reference')
+    return json(await services.sources.ingestReference(...prefix, await request(req, smallBody)));
+  if (p.length === 6 && method === 'GET') return json(await services.sources.get(...prefix, id));
+  if (p.length === 6 && method === 'DELETE') return json(await services.sources.delete(...prefix, id));
+  if (p.length === 7 && p[6] === 'content' && method === 'GET') return content(services, prefix, id);
+  if (p.length === 7 && p[6] === 'extraction' && method === 'GET')
+    return json(await services.sources.extraction(...prefix, id, selected(url, 'version')));
+  if (p.length === 7 && p[6] === 'extraction' && method === 'POST') return json(await services.sources.extract(...prefix, id));
+  if (p.length === 8 && p[6] === 'extraction' && p[7] === 'corrections' && method === 'POST')
+    return json(await services.sources.correctExtraction(...prefix, id, await request(req, largeBody)));
   return fail('NOT_FOUND');
 }
+
+async function uploadsRoute(services: StateplaneServices, p: string[], req: Request, url: URL, prefix: Prefix): Promise<Response> {
+  if (p.length === 5 && req.method === 'POST')
+    return json(await services.sources.createUpload(...prefix, await request(req, smallBody)), 201);
+  if (p.length === 6 && req.method === 'DELETE') return json(await services.sources.revokeUpload(...prefix, p[5]));
+  if (p.length === 7 && p[6] === 'attempts' && req.method === 'POST') return upload(services, prefix, p[5], req, url);
+  if (p.length === 7 && p[6] === 'finalize' && req.method === 'POST')
+    return json(await services.sources.finalizeUpload(...prefix, p[5], await request(req, smallBody)));
+  return fail('NOT_FOUND');
+}
+
+async function claimsRoute(services: StateplaneServices, p: string[], req: Request, url: URL, prefix: Prefix): Promise<Response> {
+  const method = req.method;
+  if (p.length === 5 && method === 'POST') return json(await services.claims.create(...prefix, await request(req, largeBody)));
+  if (p.length === 5 && method === 'GET') {
+    const collectionId = param(url, 'citingCollection');
+    const sourceId = param(url, 'citingSource');
+    const citing = collectionId === undefined && sourceId === undefined ? undefined : query({ collectionId, sourceId });
+    return json(await services.claims.list(...prefix, query({ citing, status: param(url, 'status'),
+      after: param(url, 'after'), limit: integer(param(url, 'limit')) })));
+  }
+  if (p.length === 6 && method === 'GET') return json(await services.claims.get(...prefix, p[5], selected(url, 'revision')));
+  if (p.length === 6 && method === 'DELETE')
+    return json(await services.claims.delete(...prefix, p[5], query({ baseRevision: integer(param(url, 'baseRevision')) })));
+  if (p.length === 7 && p[6] === 'revisions' && method === 'POST')
+    return json(await services.claims.revise(...prefix, p[5], await request(req, largeBody)));
+  if (p.length === 7 && p[6] === 'reviews' && method === 'POST')
+    return json(await services.claims.review(...prefix, p[5], await request(req, smallBody)));
+  return fail('NOT_FOUND');
+}
+
+async function linksRoute(services: StateplaneServices, p: string[], req: Request, url: URL, prefix: Prefix): Promise<Response> {
+  if (p.length === 5 && req.method === 'POST') return json(await services.links.create(...prefix, await request(req, smallBody)));
+  if (p.length === 5 && req.method === 'GET') {
+    const kind = param(url, 'endpointKind');
+    const id = param(url, 'endpointId');
+    const endpoint = kind === undefined && id === undefined ? undefined : query({ kind, id });
+    return json(await services.links.list(...prefix, query({ endpoint, after: param(url, 'after'),
+      limit: integer(param(url, 'limit')) })));
+  }
+  if (p.length === 6 && req.method === 'GET') return json(await services.links.get(...prefix, p[5]));
+  if (p.length === 6 && req.method === 'DELETE') return json(await services.links.delete(...prefix, p[5]));
+  return fail('NOT_FOUND');
+}
+
+/** Sources, uploads, extractions, claims and links below one collection. The
+ * services decide every permission; a route only frames the request. */
+export async function evidenceRoute(services: StateplaneServices, p: string[], req: Request, url: URL, prefix: Prefix): Promise<Response> {
+  if (p[4] === 'sources' && p.length >= 6) return sourcesRoute(services, p, req, url, prefix);
+  if (p[4] === 'uploads') return uploadsRoute(services, p, req, url, prefix);
+  if (p[4] === 'claims') return claimsRoute(services, p, req, url, prefix);
+  if (p[4] === 'links') return linksRoute(services, p, req, url, prefix);
+  return fail('NOT_FOUND');
+}
+
 function singleCursor(url:URL):string|undefined {
   if (url.searchParams.getAll('cursor').length>1) fail('CURSOR_INVALID');
   return url.searchParams.get('cursor')??undefined;

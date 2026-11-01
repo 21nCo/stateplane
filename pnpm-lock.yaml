@@ -122,6 +122,9 @@ importers:
       '@stateplane/postgres':
         specifier: workspace:*
         version: link:../packages/postgres
+      '@stateplane/storage':
+        specifier: workspace:*
+        version: link:../packages/storage
       pg:
         specifier: 8.22.0
         version: 8.22.0

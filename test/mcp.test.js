@@ -40,8 +40,24 @@ function fixture() {
       query:record('records.query',{records:[],nextCursor:null,schemaVersion:1}),count:record('records.count',3)},
     batches:{ingest:record('batches.ingest',{state:'complete',items:[]}),progress:record('batches.progress',{state:'complete'}),
       cancel:record('batches.cancel',{state:'cancelled'})},
-    events:{list:record('events.list',{events:[],nextCursor:'c'}),projection:record('events.projection',{state:'pending',generation:1})}
+    events:{list:record('events.list',{events:[],nextCursor:'c'}),projection:record('events.projection',{state:'pending',generation:1})},
+    sources:{get:record('sources.get',{sourceId:'src_1'}),
+      content:record('sources.content',(_a,_s,_c,id)=>id==='src_ref'?{source:{sourceId:id,original:{referenceOnly:true,byteSize:null}},body:null}:
+        {source:{sourceId:id,original:{referenceOnly:false,byteSize:id==='src_big'?2_097_153:3}},body:new Blob([id==='src_big'?'':'abc']).stream()}),
+      ingestText:record('sources.ingestText',{sourceId:'src_1'}),ingestReference:record('sources.ingestReference',{sourceId:'src_2'}),
+      createUpload:record('sources.createUpload',{grantId:'upl_1'}),
+      upload:record('sources.upload',async(_a,_s,_c,grantId,body,declared)=>({grantId,declared,
+        received:Buffer.from(await new Response(body).arrayBuffer()).toString()})),
+      finalizeUpload:record('sources.finalizeUpload',{sourceId:'src_3'}),revokeUpload:record('sources.revokeUpload',{grantId:'upl_1'}),
+      delete:record('sources.delete',{sourceId:'src_1'}),extract:record('sources.extract',{version:1}),
+      correctExtraction:record('sources.correctExtraction',{version:2}),extraction:record('sources.extraction',{version:1})},
+    claims:{create:record('claims.create',{claimId:'clm_1'}),revise:record('claims.revise',{revision:2}),
+      review:record('claims.review',{revision:3}),delete:record('claims.delete',{claimId:'clm_1'}),
+      get:record('claims.get',{claimId:'clm_1'}),list:record('claims.list',{claims:[],next:null})},
+    links:{create:record('links.create',{linkId:'lnk_1'}),get:record('links.get',{linkId:'lnk_1'}),
+      delete:record('links.delete',{linkId:'lnk_1'}),list:record('links.list',{links:[],next:null})}
   };
+  services.spaces.erasure=record('spaces.erasure',{spaceId:'sp_a',database:'pending',originalBytes:'pending',backups:'retained'});
   let providerDown=false;
   const identity={verify:async request=>{
     if (providerDown) throw new Error(`provider failure ${request.headers.get('authorization')}`);
@@ -88,7 +104,7 @@ test('the fixed registry publishes the committed manifest and annotations',async
   assert.equal(manifest.hash,committed.hash);
   const names=manifest.tools.map(tool=>tool.name);
   assert.deepEqual(names,[...names].sort());
-  assert.ok(names.length<=20,'the registry is bounded');
+  assert.equal(names.length,42,'the registry is fixed; a new tool is a reviewed contract change');
   for (const tool of manifest.tools) {
     const own=tools.find(item=>item.name===tool.name);
     assert.equal(tool.annotations.readOnlyHint,own.read,`${tool.name} read annotation matches its error mapping`);
@@ -96,8 +112,12 @@ test('the fixed registry publishes the committed manifest and annotations',async
     assert.equal(tool.inputSchema.additionalProperties,false);
     if (own.read) assert.equal(tool.annotations.destructiveHint,false);
   }
-  for (const name of ['records_replace','records_patch','records_delete','batches_ingest','batches_cancel'])
+  for (const name of ['records_replace','records_patch','records_delete','batches_ingest','batches_cancel',
+    'sources_delete','uploads_revoke','claims_delete','links_delete'])
     assert.equal(manifest.tools.find(tool=>tool.name===name).annotations.destructiveHint,true,name);
+  // Each call issues a new grant or attempt, so an identical repeat is not free of effects.
+  for (const name of names) assert.equal(manifest.tools.find(tool=>tool.name===name).annotations.idempotentHint,
+    !['uploads_create','uploads_send'].includes(name),name);
   assert.ok(!names.some(name=>/entries|collection_[a-z]/.test(name)),'no tool is named after a collection');
   assert.equal(manifest.resources[0].uri,guidanceUri);
   assert.match(manifest.server.instructions,/untrusted data/);
@@ -210,7 +230,12 @@ test('every published x- extension is checked against OpenAPI or the authority',
   const each=(tools,pointer,value)=>{ for (const tool of tools) expected.push(`${tool} ${pointer}=${value}`); };
   // Authority parity: the selector test below and test/integration/mcp-services.test.js.
   each(names.filter(name=>name!=='spaces_list'),'/properties/spaceId/x-utf16MaxLength',512);
-  each(names.filter(name=>!['spaces_list','spaces_get','collections_list'].includes(name)),'/properties/collectionId/x-utf16MaxLength',512);
+  each(names.filter(name=>!['spaces_list','spaces_get','spaces_erasure','collections_list'].includes(name)),'/properties/collectionId/x-utf16MaxLength',512);
+  // Evidence selectors are HTTP path segments, like record IDs.
+  each(names.filter(name=>name.startsWith('sources_') && !name.startsWith('sources_ingest')),'/properties/sourceId/x-utf16MaxLength',512);
+  each(['uploads_send','uploads_finalize','uploads_revoke'],'/properties/grantId/x-utf16MaxLength',512);
+  each(['claims_revise','claims_review','claims_delete','claims_get'],'/properties/claimId/x-utf16MaxLength',512);
+  each(['links_get','links_delete'],'/properties/linkId/x-utf16MaxLength',512);
   each(['records_get','projection_status'],'/properties/id/x-utf16MaxLength',512);
   each(['records_get_by_key'],'/properties/key/x-utf16MaxLength',512);
   each(['batches_ingest','batches_status','batches_cancel'],'/properties/operationKey/x-utf8MaxBytes',256);
@@ -265,7 +290,38 @@ test('two credentials use one fixed tool list and every tool reaches the shared 
     ['batches_status',{...s,operationKey:'op'},'batches.progress',['sp_a','entries','op']],
     ['batches_cancel',{...s,operationKey:'op'},'batches.cancel',['sp_a','entries','op']],
     ['events_list',{...s,cursor:'c1'},'events.list',['sp_a','entries','c1']],
-    ['projection_status',{...s,id:'rec_1'},'events.projection',['sp_a','entries','rec_1']]
+    ['projection_status',{...s,id:'rec_1'},'events.projection',['sp_a','entries','rec_1']],
+    ['spaces_erasure',{spaceId:'sp_a'},'spaces.erasure',['sp_a']],
+    ['sources_get',{...s,sourceId:'src_1'},'sources.get',['sp_a','entries','src_1']],
+    ['sources_content',{...s,sourceId:'src_1'},'sources.content',['sp_a','entries','src_1']],
+    ['sources_ingest_text',{...s,idempotencyKey:'k',text:'Hello'},'sources.ingestText',['sp_a','entries',{idempotencyKey:'k',text:'Hello'}]],
+    ['sources_ingest_reference',{...s,idempotencyKey:'k',locator:'https://example.invalid/a'},'sources.ingestReference',
+      ['sp_a','entries',{idempotencyKey:'k',locator:'https://example.invalid/a'}]],
+    ['sources_delete',{...s,sourceId:'src_1'},'sources.delete',['sp_a','entries','src_1']],
+    ['sources_extract',{...s,sourceId:'src_1'},'sources.extract',['sp_a','entries','src_1']],
+    ['sources_extraction',{...s,sourceId:'src_1',version:2},'sources.extraction',['sp_a','entries','src_1',2]],
+    ['sources_correct_extraction',{...s,sourceId:'src_1',baseVersion:1,content:'A',sourceOffsets:[]},'sources.correctExtraction',
+      ['sp_a','entries','src_1',{baseVersion:1,content:'A',sourceOffsets:[]}]],
+    ['uploads_create',{...s,mimeType:'text/plain',maxBytes:3},'sources.createUpload',['sp_a','entries',{mimeType:'text/plain',maxBytes:3}]],
+    ['uploads_send',{...s,grantId:'upl_1',mimeType:'text/plain',contentBase64:'YWJj'},'sources.upload',
+      ['sp_a','entries','upl_1',undefined,{bytes:3,mimeType:'text/plain'}]],
+    ['uploads_finalize',{...s,grantId:'upl_1',attemptId:'att_1'},'sources.finalizeUpload',['sp_a','entries','upl_1',{attemptId:'att_1'}]],
+    ['uploads_revoke',{...s,grantId:'upl_1'},'sources.revokeUpload',['sp_a','entries','upl_1']],
+    ['claims_create',{...s,idempotencyKey:'k',statement:'S',attributedTo:'A'},'claims.create',
+      ['sp_a','entries',{idempotencyKey:'k',statement:'S',attributedTo:'A'}]],
+    ['claims_revise',{...s,claimId:'clm_1',baseRevision:1,statement:'S',attributedTo:'A'},'claims.revise',
+      ['sp_a','entries','clm_1',{baseRevision:1,statement:'S',attributedTo:'A'}]],
+    ['claims_review',{...s,claimId:'clm_1',baseRevision:2,status:'accepted'},'claims.review',
+      ['sp_a','entries','clm_1',{baseRevision:2,status:'accepted'}]],
+    ['claims_delete',{...s,claimId:'clm_1',baseRevision:3},'claims.delete',['sp_a','entries','clm_1',{baseRevision:3}]],
+    ['claims_get',{...s,claimId:'clm_1'},'claims.get',['sp_a','entries','clm_1',undefined]],
+    ['claims_list',{...s,status:'accepted',limit:5},'claims.list',['sp_a','entries',{status:'accepted',limit:5}]],
+    ['links_create',{...s,idempotencyKey:'k',type:'cites',policy:'detach',from:{kind:'record',collectionId:'entries',id:'r'},
+      to:{kind:'source',collectionId:'entries',id:'src_1'}},'links.create',['sp_a','entries',{idempotencyKey:'k',type:'cites',
+      policy:'detach',from:{kind:'record',collectionId:'entries',id:'r'},to:{kind:'source',collectionId:'entries',id:'src_1'}}]],
+    ['links_get',{...s,linkId:'lnk_1'},'links.get',['sp_a','entries','lnk_1']],
+    ['links_list',{...s,endpoint:{kind:'record',id:'r'}},'links.list',['sp_a','entries',{endpoint:{kind:'record',id:'r'}}]],
+    ['links_delete',{...s,linkId:'lnk_1'},'links.delete',['sp_a','entries','lnk_1']]
   ];
   assert.deepEqual(cases.map(([name])=>name).sort(),listed.map(tool=>tool.name).sort(),'every tool is exercised');
   for (const [tool,args,service,expected] of cases) {
@@ -273,7 +329,8 @@ test('two credentials use one fixed tool list and every tool reaches the shared 
     const result=await second.callTool(tool,args);
     assert.equal(result.isError,undefined,`${tool}: ${result.content?.[0]?.text}`);
     assert.deepEqual(state.calls.map(call=>call.name),[service],tool);
-    assert.deepEqual(state.calls[0].args,expected,tool);
+    // An upload's body is a stream; the fixture reports what it received instead.
+    assert.deepEqual(state.calls[0].args.map(arg=>arg instanceof ReadableStream?undefined:arg),expected,tool);
     assert.deepEqual(state.calls[0].actor,agent,`${tool} uses the verified credential, never an argument`);
     assert.deepEqual(JSON.parse(result.content[0].text),result.structuredContent,`${tool} structured/text parity`);
   }
@@ -685,7 +742,8 @@ test('recovery guidance matches each write tool schema',async()=>{
   assert.ok(writes.length>0);
   for (const tool of writes) {
     const keyed=Object.hasOwn(manifest.tools.find(item=>item.name===tool.name).inputSchema.properties,'idempotencyKey');
-    assert.equal(keyed,tool.name.startsWith('records_'),`${tool.name}: only record mutations take idempotencyKey`);
+    assert.equal(keyed,tool.name.startsWith('records_') || ['sources_ingest_text','sources_ingest_reference',
+      'claims_create','links_create'].includes(tool.name),`${tool.name}: only record mutations and evidence creation take idempotencyKey`);
     assert.ok(tool.recovery,`${tool.name} names its COMMIT_OUTCOME_UNKNOWN recovery`);
     assert.equal(/idempotencyKey/.test(tool.recovery),keyed,`${tool.name} recovery matches its schema`);
     if (tool.name.startsWith('batches_')) assert.match(tool.recovery,/batches_status/);

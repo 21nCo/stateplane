@@ -1,15 +1,24 @@
 import type pg from 'pg';
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import type { StateplaneServices } from '@stateplane/application';
+import type { BlobStore, StateplaneServices } from '@stateplane/application';
 import type { Capability, VerifiedCredential } from '@stateplane/contracts';
 import { AuthorityError, PostgresAuthority } from './index.js';
+import { PostgresClaims } from './claims.js';
+import { PostgresLinks } from './links.js';
+import { PostgresSources } from './sources.js';
 import type { AuthorityScope } from './index.js';
 import { CollectionRegistry, discoveryGrants } from './collections.js';
 import { PostgresSpaces } from './spaces.js';
 import { utcInstant } from './schema.js';
 import type { CollectionGrant } from './spaces.js';
 
-export interface ServiceCell { pool: Pick<pg.Pool,'connect'>; cursorSecret: Uint8Array }
+/** `originals` is the cell's blob store, such as its R2 `ORIGINALS` binding. Without it, source
+ * metadata, claims and links still work, and every operation that needs original bytes fails
+ * with nonretryable PROVIDER_UNAVAILABLE. */
+export interface ServiceCell { pool: Pick<pg.Pool,'connect'>; cursorSecret: Uint8Array; originals?: BlobStore }
+const unconfigured=():Promise<never>=>Promise.reject(new AuthorityError('PROVIDER_UNAVAILABLE',
+  'Original storage is not configured',undefined,false));
+const noOriginals:BlobStore={put:unconfigured,head:unconfigured,get:unconfigured,delete:unconfigured,list:unconfigured};
 const collectionPageSize=8;
 const cursorMac=(space:string,credential:string,after:string,secret:Uint8Array):string=>
   createHmac('sha256',secret).update(JSON.stringify({space,credential,after})).digest('hex');
@@ -103,6 +112,11 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
   }
   const authority=(cell:ServiceCell,recheck:(db:pg.PoolClient,result?:unknown)=>Promise<void>)=>
     new PostgresAuthority(cell.pool,receiptRetentionSeconds,cell.cursorSecret,30_000,recheck);
+  // Evidence services admit, authorize and recheck every call themselves, as their direct callers do.
+  const evidenceCells=new Map([...cells].map(([id,cell])=>[id,{pool:cell.pool,originals:cell.originals??noOriginals}]));
+  const sources=new PostgresSources(spaces,evidenceCells);
+  const claims=new PostgresClaims(spaces,evidenceCells);
+  const links=new PostgresLinks(spaces,evidenceCells);
   return {
     spaces: {
       list:(actor,cursor)=>spaces.listPage(actor,cursor), create:(actor,cellId,spaceId)=>spaces.create(actor,cellId,spaceId),
@@ -116,7 +130,31 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
           originalBytes:'pending' as const,backups:'retained' as const}));
         return {spaceId:id,deleted:true,erasure};
       },
-      audit:(actor,id,cursor)=>spaces.audit(actor,id,cursor)
+      audit:(actor,id,cursor)=>spaces.audit(actor,id,cursor),
+      erasure:(actor,id)=>spaces.erasure(actor,id)
+    },
+    sources: {
+      get:(actor,s,c,id)=>sources.get(actor,s,c,id), content:(actor,s,c,id)=>sources.content(actor,s,c,id),
+      ingestText:(actor,s,c,request)=>sources.ingestText(actor,s,c,request),
+      ingestReference:(actor,s,c,request)=>sources.ingestReference(actor,s,c,request),
+      createUpload:(actor,s,c,request)=>sources.createUpload(actor,s,c,request),
+      upload:(actor,s,c,grantId,body,declared)=>sources.upload(actor,s,c,grantId,body,declared),
+      finalizeUpload:(actor,s,c,grantId,request)=>sources.finalizeUpload(actor,s,c,grantId,request),
+      revokeUpload:(actor,s,c,grantId)=>sources.revokeUpload(actor,s,c,grantId),
+      delete:(actor,s,c,id)=>sources.delete(actor,s,c,id), extract:(actor,s,c,id)=>sources.extract(actor,s,c,id),
+      correctExtraction:(actor,s,c,id,request)=>sources.correctExtraction(actor,s,c,id,request),
+      extraction:(actor,s,c,id,version)=>sources.extraction(actor,s,c,id,version)
+    },
+    claims: {
+      create:(actor,s,c,request)=>claims.create(actor,s,c,request),
+      revise:(actor,s,c,id,request)=>claims.revise(actor,s,c,id,request),
+      review:(actor,s,c,id,request)=>claims.review(actor,s,c,id,request),
+      delete:(actor,s,c,id,request)=>claims.delete(actor,s,c,id,request),
+      get:(actor,s,c,id,revision)=>claims.get(actor,s,c,id,revision), list:(actor,s,c,query)=>claims.list(actor,s,c,query)
+    },
+    links: {
+      create:(actor,s,c,request)=>links.create(actor,s,c,request), get:(actor,s,c,id)=>links.get(actor,s,c,id),
+      delete:(actor,s,c,id)=>links.delete(actor,s,c,id), list:(actor,s,c,query)=>links.list(actor,s,c,query)
     },
     agents: {
       list:(actor,spaceId,cursor)=>spaces.agentKeys(actor,spaceId,cursor),

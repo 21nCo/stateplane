@@ -87,19 +87,21 @@ export class StateplaneHttpClient {
       throw new StateplaneCliError('INVALID_CONFIGURATION');
     this.sleep=options.sleep??(ms=>new Promise(resolve=>setTimeout(resolve,ms)));
   }
-  /** One wire attempt; only an explicit safe-read response can request a repeat. */
-  private async exchange(method:string,url:URL,serialized:string|undefined,
-    headers:Readonly<Record<string,string>>,safeRead:boolean,attempt:number):
+  /** One wire attempt; only an explicit safe-read response can request a repeat. A raw
+   * exchange returns a successful response unread, for a byte stream. */
+  private async exchange(method:string,url:URL,payload:string|Uint8Array|undefined,
+    headers:Readonly<Record<string,string>>,safeRead:boolean,attempt:number,raw=false):
     Promise<{retry:true}|{retry:false;value:unknown}> {
     const response=await wireFetch(this.fetcher,url,{method,redirect:'error',signal:AbortSignal.timeout(this.timeoutMs),
       headers,
-      body:serialized});
+      body:payload as BodyInit|undefined});
     const after=retryAfter(response);
     if (safeRead && attempt<2 && [429,503].includes(response.status) && after!==undefined) {
       await response.body?.cancel().catch(()=>{});
       await this.sleep(after*1000);
       return {retry:true};
     }
+    if (raw && response.ok) return {retry:false,value:response};
     const value=await wireJson(response);
     if (!response.ok) throw serverError(value,after);
     return {retry:false,value};
@@ -123,13 +125,32 @@ export class StateplaneHttpClient {
   /** Validate the route once, then bound retries to read-only operations. */
   async request(method:'GET'|'POST'|'PUT'|'PATCH'|'DELETE',path:string,body?:unknown,
     extraHeaders?:Record<string,string>):Promise<unknown> {
-    const {url,segments}=this.route(path);
-    const safeRead=isSafeHttpRead(method,segments);
+    const route=this.route(path);
     const serialized=serializeBody(body);
-    const headers=requestHeaders(this.token,serialized,extraHeaders);
+    return this.send(method,route,serialized,requestHeaders(this.token,serialized,extraHeaders),false);
+  }
+  /** Read a byte stream, such as a source's original. The response is returned
+   * unread once its status is successful; an error response is a CLI error. */
+  async download(path:string):Promise<Response> {
+    return await this.send('GET',this.route(path),undefined,
+      Object.freeze({Authorization:`Bearer ${this.token}`,Accept:'*/*'}),true) as Response;
+  }
+  /** Send exact bytes with their media type, such as one upload attempt. Never repeated. */
+  async upload(path:string,bytes:Uint8Array,contentType:string):Promise<unknown> {
+    const route=this.route(path);
+    let headers:Readonly<Record<string,string>>;
+    try {
+      new Headers([['content-type',contentType]]); // validate before a write can reach the transport
+      headers=Object.freeze({Authorization:`Bearer ${this.token}`,Accept:'application/json','Content-Type':contentType});
+    } catch { throw new StateplaneCliError('INVALID_ARGUMENT'); }
+    return this.send('POST',route,bytes,headers,false);
+  }
+  private async send(method:string,{url,segments}:{url:URL;segments:string[]},payload:string|Uint8Array|undefined,
+    headers:Readonly<Record<string,string>>,raw:boolean):Promise<unknown> {
+    const safeRead=isSafeHttpRead(method,segments);
     for (let attempt=0;attempt<(safeRead?3:1);attempt++) {
       try {
-        const result=await this.exchange(method,url,serialized,headers,safeRead,attempt); // NOSONAR -- each retry depends on the preceding response
+        const result=await this.exchange(method,url,payload,headers,safeRead,attempt,raw); // NOSONAR -- each retry depends on the preceding response
         if (result.retry) continue;
         return result.value;
       } catch(error) {
