@@ -63,10 +63,15 @@ async function wireJson(response:Response):Promise<unknown> {
   catch { throw new WireFailure(); }
 }
 
-/** A download's single deadline: the signal aborts every attempt and the body at `end`. */
-interface Deadline { signal:AbortSignal; end:number }
+/** A download's single deadline: the signal aborts every attempt and the body at `end`;
+ * the consumer of the body checks `expired` around each local write and before success. */
+export interface Deadline { signal:AbortSignal; end:number; expired():boolean }
+function deadlineOf(ms:number):Deadline {
+  const signal=AbortSignal.timeout(ms); const end=Date.now()+ms;
+  return {signal,end,expired:()=>signal.aborted || Date.now()>=end};
+}
 /** Whether a pause of `ms` ends before the deadline, so a repeat can still run. */
-const fits=(ms:number,deadline?:Deadline)=>!deadline || (!deadline.signal.aborted && Date.now()+ms<deadline.end);
+const fits=(ms:number,deadline?:Deadline)=>!deadline || (!deadline.expired() && Date.now()+ms<deadline.end);
 
 /** A thin HTTP client. Only read requests may be repeated automatically. */
 export class StateplaneHttpClient {
@@ -135,14 +140,17 @@ export class StateplaneHttpClient {
     extraHeaders?:Record<string,string>):Promise<unknown> {
     const route=this.route(path);
     const serialized=serializeBody(body);
-    return this.send(method,route,serialized,requestHeaders(this.token,serialized,extraHeaders),false);
+    return this.send(method,route,serialized,requestHeaders(this.token,serialized,extraHeaders));
   }
   /** Read a byte stream, such as a source's original, asking for it unencoded.
-   * The response is returned unread once its status is successful; an error
-   * response is a CLI error. */
-  async download(path:string):Promise<Response> {
-    return await this.send('GET',this.route(path),undefined,
-      Object.freeze({Authorization:`Bearer ${this.token}`,Accept:'*/*','Accept-Encoding':'identity'}),true) as Response;
+   * The response is returned unread once its status is successful, with the
+   * deadline that bounds the whole download, including how its body is consumed;
+   * an error response is a CLI error. */
+  async download(path:string):Promise<{response:Response;deadline:Deadline}> {
+    const deadline=deadlineOf(this.timeoutMs);
+    const response=await this.send('GET',this.route(path),undefined,
+      Object.freeze({Authorization:`Bearer ${this.token}`,Accept:'*/*','Accept-Encoding':'identity'}),deadline) as Response;
+    return {response,deadline};
   }
   /** Send exact bytes with their media type, such as one upload attempt. Never repeated. */
   async upload(path:string,bytes:Uint8Array,contentType:string):Promise<unknown> {
@@ -152,13 +160,13 @@ export class StateplaneHttpClient {
       new Headers([['content-type',contentType]]); // validate before a write can reach the transport
       headers=Object.freeze({Authorization:`Bearer ${this.token}`,Accept:'application/json','Content-Type':contentType});
     } catch { throw new StateplaneCliError('INVALID_ARGUMENT'); }
-    return this.send('POST',route,bytes,headers,false);
+    return this.send('POST',route,bytes,headers);
   }
+  /** A download passes its deadline: every attempt, each pause and the body share it.
+   * Any other request gives each attempt its own --timeout. */
   private async send(method:string,{url,segments}:{url:URL;segments:string[]},payload:string|Uint8Array|undefined,
-    headers:Readonly<Record<string,string>>,raw:boolean):Promise<unknown> {
+    headers:Readonly<Record<string,string>>,deadline?:Deadline):Promise<unknown> {
     const safeRead=isSafeHttpRead(method,segments);
-    // --timeout bounds a whole download: every attempt, each pause and the body share one deadline.
-    const deadline=raw ? {signal:AbortSignal.timeout(this.timeoutMs),end:Date.now()+this.timeoutMs} : undefined;
     for (let attempt=0;attempt<(safeRead?3:1);attempt++) {
       try {
         const result=await this.exchange(method,url,payload,headers,safeRead,attempt,deadline); // NOSONAR -- each retry depends on the preceding response

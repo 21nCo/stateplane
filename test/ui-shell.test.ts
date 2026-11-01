@@ -31,8 +31,8 @@ it('a Worker host without a key provider refuses issuance and revocation with a 
 it('a page request without a session goes to sign-in as a document, data, remote or form action request, however its path is encoded', async () => {
   const { isRedirect } = await import('../app/node_modules/@sveltejs/kit');
   const { handle } = await import('../app/src/hooks.server');
-  const request = (path: string, init: { method?: string; isDataRequest?: boolean; isRemoteRequest?: boolean } = {}) => handle({
-    event: { url: new URL(path, 'http://127.0.0.1'), request: new Request(new URL(path, 'http://127.0.0.1'), { method: init.method ?? 'GET' }),
+  const request = (path: string, init: { method?: string; headers?: Record<string, string>; isDataRequest?: boolean; isRemoteRequest?: boolean } = {}) => handle({
+    event: { url: new URL(path, 'http://127.0.0.1'), request: new Request(new URL(path, 'http://127.0.0.1'), { method: init.method ?? 'GET', headers: init.headers }),
       cookies: { get: () => undefined }, locals: {}, isDataRequest: init.isDataRequest ?? false, isRemoteRequest: init.isRemoteRequest ?? false },
     resolve: async () => new Response('page')
   } as never);
@@ -41,8 +41,13 @@ it('a page request without a session goes to sign-in as a document, data, remote
     expect([document.status, document.headers.get('location'), document.headers.get('cache-control')]).toEqual([303, '/', 'no-store']);
   }
   // SvelteKit turns a thrown redirect into the JSON redirect each of these clients follows.
-  for (const init of [{ isDataRequest: true }, { isRemoteRequest: true }, { method: 'POST' }])
+  // A form action is the app's own: it carries this origin, or Sec-Fetch-Site under no-referrer.
+  for (const init of [{ isDataRequest: true }, { isRemoteRequest: true }, { method: 'POST', headers: { origin: 'http://127.0.0.1' } },
+    { method: 'POST', headers: { origin: 'null', 'sec-fetch-site': 'same-origin' } }])
     expect(await request('/spaces/s1', init).then(() => null, (error: unknown) => isRedirect(error) && [error.status, error.location])).toEqual([303, '/']);
+  // The same bodyless POST without this origin is refused before any session check.
+  for (const headers of [{}, { origin: 'null' }, { origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' }])
+    expect((await request('/spaces/s1', { method: 'POST', headers })).status).toBe(403);
   expect(await (await request('/%2Fspaces')).text()).toBe('page');
 });
 

@@ -17,8 +17,9 @@ const routed=(url:URL)=>{
 // cross-site form post cannot act as anyone there; it takes raw uploads of any
 // MIME type, from clients that send no Origin.
 const bearerOnly='/v1/[...path]';
-// The content types a cross-site request can send without a CORS preflight: the
-// form types SvelteKit lists, and none at all, as a bodyless no-cors fetch sends.
+// The form types SvelteKit checks, and none at all, as a bodyless no-cors fetch
+// sends. All but application/x-sveltekit-formdata can be sent cross-site without
+// a CORS preflight; that one needs a preflight and is kept only to match SvelteKit.
 const formTypes=new Set(['','application/x-www-form-urlencoded','multipart/form-data','text/plain','application/x-sveltekit-formdata']);
 /** Whether a browser sent the request from this origin. Pages are served with
  * Referrer-Policy: no-referrer, under which a browser's own form post carries

@@ -5,6 +5,7 @@ import type { FileHandle } from 'node:fs/promises';
 import { readConfig, saveConfig, configureToken, loadToken, logoutConfig, removeTrackedTokens, withConfigMutation } from './config.js';
 import type { CliConfig } from './config.js';
 import { StateplaneCliError, StateplaneHttpClient } from './transport.js';
+import type { Deadline } from './transport.js';
 
 type Flags=Record<string,string|boolean>;
 const encoded=(value:string)=>value==='.' || value==='..' ? `;${value}` : encodeURIComponent(value);
@@ -337,10 +338,12 @@ async function fileBytes(path: string, maxBytes: number): Promise<Uint8Array> {
   return new Uint8Array(Buffer.concat(chunks));
 }
 
-/** Write all of one chunk at the file's current position; no progress is a failure. */
-async function writeAll(file: FileHandle, chunk: Uint8Array): Promise<void> {
+/** Write all of one chunk at the file's current position; no progress is a
+ * failure, and no write starts once the download's deadline has passed. */
+async function writeAll(file: FileHandle, chunk: Uint8Array, deadline: Deadline): Promise<void> {
   let offset = 0;
   while (offset < chunk.byteLength) {
+    if (deadline.expired()) throw new Error('deadline passed');
     const { bytesWritten } = await file.write(chunk, offset, chunk.byteLength - offset); // NOSONAR -- writes keep stream order
     if (!(bytesWritten > 0)) throw new Error('short write');
     offset += bytesWritten;
@@ -351,16 +354,19 @@ async function writeAll(file: FileHandle, chunk: Uint8Array): Promise<void> {
  * Save a source's original to a new file and report it as JSON; stdout stays
  * one JSON value. The file must not exist. The bytes are hashed as they are
  * written, and the file counts as saved only once every byte is written and it
- * has closed. Any failure removes the file. A body whose stream fails or is
- * aborted, including by the client timeout that bounds the whole download, fails
- * retryable PROVIDER_UNAVAILABLE: the same read may succeed again. A write or
- * close that fails, a digest that differs from Repr-Digest (which is required),
+ * has closed, all before the download's deadline. Any failure removes the file,
+ * once the pending write or close has settled, so cleanup never races a write.
+ * A body whose stream fails or is aborted, or a download that ends past its
+ * deadline (--timeout bounds the requests, the body, every local write and the
+ * close), fails retryable PROVIDER_UNAVAILABLE: the same read may succeed again,
+ * and no success is reported once the deadline has passed. Within the deadline, a
+ * write or close that fails, a digest that differs from Repr-Digest (which is required),
  * or a length that differs from the Content-Length of an unencoded response
  * fails nonretryable PROVIDER_UNAVAILABLE. A response without Content-Length (a
  * chunked body) is verified by its digest alone.
  */
 async function saveContent(client: StateplaneHttpClient, path: string, output: string): Promise<unknown> {
-  const response = await client.download(path);
+  const { response, deadline } = await client.download(path);
   if (response.status === 204) {
     await response.body?.cancel().catch(() => {});
     return { referenceOnly: true, output: null };
@@ -388,15 +394,17 @@ async function saveContent(client: StateplaneHttpClient, path: string, output: s
     try { next = await reader.read(); }
     catch { interrupted = true; complete = false; break; }
     if (next.done) break;
-    try { await writeAll(file, next.value); }
+    try { await writeAll(file, next.value, deadline); }
     catch { complete = false; await reader.cancel().catch(() => {}); break; }
     hash.update(next.value); bytes += next.value.byteLength;
   }
   complete &&= digest !== undefined && hash.digest('base64') === digest && (length === null || bytes === length);
   try { await file.close(); } catch { complete = false; }
-  if (!complete) {
+  // Every write and the close have settled: a download that ended past its deadline is not saved.
+  const late = deadline.expired();
+  if (!complete || late) {
     await unlink(output).catch(() => {});
-    throw new StateplaneCliError('PROVIDER_UNAVAILABLE', undefined, undefined, interrupted);
+    throw new StateplaneCliError('PROVIDER_UNAVAILABLE', undefined, undefined, interrupted || late);
   }
   return { referenceOnly: false, output, bytes, sha256: Buffer.from(digest!, 'base64').toString('hex'),
     mimeType: response.headers.get('content-type') };

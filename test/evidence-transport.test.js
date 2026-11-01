@@ -592,6 +592,41 @@ test('CLI content --timeout bounds the whole download: repeats and their pauses 
   }
 });
 
+test('CLI content --timeout also bounds local writes and the close: nothing finished past it is reported saved', async t => {
+  const bytes = Buffer.from('an original written to a slow disk');
+  const digest = createHash('sha256').update(bytes).digest('base64');
+  const server = createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain', 'repr-digest': `sha-256=:${digest}:`, 'content-length': String(bytes.length) });
+    res.end(bytes);
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  t.after(() => server.close());
+  const { root, cli } = await configuredCli(t, `http://127.0.0.1:${server.address().port}`);
+  // The child's first write, or the close of a handle written to, takes 1 s and then completes or fails.
+  const faults = join(root, 'slow-disk.mjs');
+  await writeFile(faults, `import { open } from 'node:fs/promises';
+const probe = await open(process.execPath, 'r'); const proto = Object.getPrototypeOf(probe); await probe.close();
+const { write } = proto; const [stage, outcome] = process.env.STATEPLANE_TEST_FS_SLOW.split(':');
+const slow = async run => { await new Promise(resolve => setTimeout(resolve, 1000)); if (outcome === 'fails') throw new Error('EIO'); return run(); };
+proto.write = function (...args) {
+  if (stage === 'close' && !Object.hasOwn(this, 'slowed')) { const close = this.close; this.slowed = true; this.close = () => slow(close); }
+  return stage === 'write' ? slow(() => write.apply(this, args)) : write.apply(this, args);
+};
+`);
+  for (const mode of ['write:completes', 'write:fails', 'close:completes', 'close:fails']) {
+    const output = join(root, `${mode.replace(':', '-')}.txt`);
+    const started = Date.now();
+    const run = await cli(['sources', 'content', '--collection', 'c', '--id', 'src_1', '--output', output, '--timeout', '500'],
+      { nodeArgs: ['--import', pathToFileURL(faults).href], env: { STATEPLANE_TEST_FS_SLOW: mode } });
+    // The deadline passed during the write or close: a retryable timeout, never a saved result or a local failure.
+    assert.deepEqual(JSON.parse(run.stderr).error, { code: 'PROVIDER_UNAVAILABLE', message: 'PROVIDER_UNAVAILABLE', retryable: true, requestId: null }, mode);
+    assert.equal(run.stdout, '', mode);
+    // The file is removed only after the pending write or close has returned.
+    assert.ok(Date.now() - started >= 1000, `${mode}: cleanup waits for the pending operation`);
+    await assert.rejects(readFile(output), { code: 'ENOENT' }, mode);
+  }
+});
+
 test('HTTP, CLI and MCP report one service refusal with the same code and retryability', async t => {
   const state = fixture();
   const http = createHttpHandler(state);
@@ -604,8 +639,8 @@ test('HTTP, CLI and MCP report one service refusal with the same code and retrya
   t.after(() => client.close());
   const root = await mkdtemp(join(tmpdir(), 'stateplane-evidence-parity-'));
   t.after(() => rm(root, { recursive: true, force: true }));
-  await cliProcess(root, ['config', 'endpoint', '--url', `${origin}/`]);
-  await cliProcess(root, ['auth', 'import', '--token-stdin', '--store', 'file'], 'secret-test-token\n');
+  assert.equal((await cliProcess(root, ['config', 'endpoint', '--url', `${origin}/`])).status, 0);
+  assert.equal((await cliProcess(root, ['auth', 'import', '--token-stdin', '--store', 'file'], 'secret-test-token\n')).status, 0);
   const s = { spaceId: 'sp_a', collectionId: 'c' };
   for (const [code, retryable] of [['FORBIDDEN', false], ['NOT_FOUND', false], ['LINK_RESTRICTED', false],
     ['REVISION_CONFLICT', false], ['IDEMPOTENCY_MISMATCH', false], ['SPACE_UNAVAILABLE', false]]) {
