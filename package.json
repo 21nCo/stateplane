@@ -22,7 +22,7 @@
     "mcp:manifest": "pnpm --filter @stateplane/mcp... build && node scripts/mcp-manifest.mjs",
     "test:mcp-conformance": "pnpm --filter @stateplane/postgres... --filter @stateplane/api... --filter @stateplane/mcp... build && node scripts/test-mcp-conformance.mjs",
     "test:mcp-workerd": "pnpm --filter @stateplane/postgres... --filter @stateplane/api... --filter @stateplane/mcp... build && node scripts/test-mcp-clients.mjs --host --workerd",
-    "test:postgres": "pnpm --filter @stateplane/api... --filter @stateplane/storage... --filter @stateplane/postgres... --filter @stateplane/workers... --filter @stateplane/mcp... build && node --test test/integration/*.test.js",
+    "test:postgres": "pnpm --filter @stateplane/api... --filter @stateplane/storage... --filter @stateplane/postgres... --filter @stateplane/workers... --filter @stateplane/cli... --filter @stateplane/mcp... build && node --test test/integration/*.test.js",
     "test:e2e": "playwright test",
     "db:up": "node scripts/local-db.mjs up",
     "db:down": "node scripts/local-db.mjs down",
