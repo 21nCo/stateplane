@@ -35,6 +35,9 @@ CREATE TABLE evidence_outbox (
 );
 CREATE INDEX evidence_outbox_pending ON evidence_outbox(space_id, collection_id, available_at, event_id)
   WHERE delivery_state = 'pending';
+-- Delivered entries stay until their space is purged, so the purge and the
+-- space-erasure check find a space's entries, in either state, by this index.
+CREATE INDEX evidence_outbox_space ON evidence_outbox(space_id);
 
 CREATE TRIGGER evidence_events_immutable BEFORE UPDATE OR DELETE ON evidence_events
   FOR EACH ROW EXECUTE FUNCTION reject_evidence_fact_change();
@@ -188,7 +191,9 @@ CREATE CONSTRAINT TRIGGER evidence_events_authority AFTER INSERT ON evidence_eve
 -- removed again. Completion needs the original removed at the current count,
 -- no found key and no attempt left.
 -- `next_attempt_at` orders retries: a failed or unsettled erasure moves behind
--- the others, so it cannot hold the oldest page.
+-- the others, so it cannot hold the oldest page. `deferred_keys` orders keys
+-- the same way within an erasure: a key whose delete failed or was cut short
+-- moves to its end and is tried after every other key, so it cannot hold them.
 CREATE TABLE original_erasures (
   space_id text NOT NULL,
   collection_id text NOT NULL,
@@ -198,6 +203,7 @@ CREATE TABLE original_erasures (
   next_attempt_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   observed bigint NOT NULL DEFAULT 0 CHECK (observed >= 0),
   found_keys text[] NOT NULL DEFAULT '{}',
+  deferred_keys text[] NOT NULL DEFAULT '{}',
   removal_observed bigint CHECK (removal_observed >= 0 AND removal_observed <= observed),
   removed_at timestamptz,
   PRIMARY KEY (space_id, collection_id, source_id),
@@ -234,8 +240,8 @@ SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
   IF TG_TABLE_NAME = 'original_erasures' THEN
-    IF (to_jsonb(NEW) - 'removed_at' - 'next_attempt_at' - 'observed' - 'found_keys' - 'removal_observed')
-        = (to_jsonb(OLD) - 'removed_at' - 'next_attempt_at' - 'observed' - 'found_keys' - 'removal_observed')
+    IF (to_jsonb(NEW) - 'removed_at' - 'next_attempt_at' - 'observed' - 'found_keys' - 'deferred_keys' - 'removal_observed')
+        = (to_jsonb(OLD) - 'removed_at' - 'next_attempt_at' - 'observed' - 'found_keys' - 'deferred_keys' - 'removal_observed')
         AND NEW.observed >= OLD.observed
         AND (OLD.removal_observed IS NULL OR NEW.removal_observed >= OLD.removal_observed)
         AND (NEW.removed_at IS NULL OR (cardinality(NEW.found_keys) = 0 AND NEW.removal_observed = NEW.observed)) THEN

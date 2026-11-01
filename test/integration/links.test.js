@@ -109,6 +109,7 @@ async function fixture(r2 = new MemoryR2()) {
   const user = await createUser(config, { primaryEmail: `owner-${randomUUID()}@example.invalid` });
   const owner = await verify((await issueSession(config, {}, { userId: user.id, methods: ['password'] })).sessionToken);
   const spaceId = `sp_${randomUUID()}`;
+  buckets.set(Buffer.from(spaceId).toString('base64url'), r2);
   await spaces.create(owner, 'cell-a', spaceId);
   for (const id of ['alpha', 'beta']) await services.collections.define(owner, spaceId, id, definition(id));
   // `expiresAt` may end the key (`key`) or one collection's grant early.
@@ -166,9 +167,45 @@ const objectKey = async (f, sourceId) => (await pool.query('SELECT object_key FR
   [f.spaceId, sourceId])).rows[0].object_key;
 const erasures = async spaceId => (await pool.query('SELECT count(*)::int AS n FROM original_erasures WHERE space_id=$1',
   [spaceId])).rows[0].n;
-/** Complete every due erasure left by earlier tests, so a test's own erasures are the only ones due. */
-async function drain(f) {
-  for (let i = 0; i < 20 && await f.reconciler().erase(500, 5000) > 0;) i++;
+/** Each fixture's bucket by its space's key segment: the bytes of this file's spaces are only ever there. */
+const buckets = new Map();
+/** This file's erasures, due or else complete, with their bytes: a source's original key, or a space's (`key` null). */
+const ownErasures = async complete => (await pool.query(`SELECT x.space_id,x.source_id AS id,o.object_key AS key
+    FROM original_erasures x JOIN original_objects o USING (space_id,collection_id,source_id)
+    WHERE x.space_id=ANY($1) AND CASE WHEN $2 THEN x.removed_at IS NOT NULL
+      ELSE x.removed_at IS NULL AND x.next_attempt_at<=clock_timestamp() END
+  UNION ALL SELECT space_id,space_id,NULL FROM space_erasures WHERE space_id=ANY($1) AND CASE WHEN $2
+    THEN originals_removed_at IS NOT NULL ELSE originals_removed_at IS NULL AND next_attempt_at<=clock_timestamp() END`,
+[[...buckets.keys()].map(segment => Buffer.from(segment, 'base64url').toString()), complete])).rows;
+/**
+ * Complete every due erasure earlier tests of this file left, so a test's own erasures are the only ones of this file
+ * due. Each key is erased from the bucket of the fixture that wrote it, past any fault a test left injected; another
+ * file's space keeps its bytes in its own bucket, so its listing here fails and it is never recorded erased.
+ */
+async function drain() {
+  const owner = key => {
+    const r2 = buckets.get(String(key).split('/')[1]);
+    if (!r2) throw new Error('drain: not this file\'s key');
+    return r2;
+  };
+  const store = {
+    async delete(key) { owner(key).objects.delete(key); },
+    async list({ startAfter = '', limit = 1000 } = {}) {
+      const after = [...owner(startAfter).objects.keys()].sort().filter(key => key > startAfter);
+      return { objects: after.slice(0, limit).map(key => ({ key })), truncated: after.length > limit };
+    },
+  };
+  const reconciler = new SourceUploadReconciler({ pool, originals: new R2BlobStore(store) }, 0);
+  const due = await ownErasures(false);
+  for (let i = 0; i < 20 && (await ownErasures(false)).length; i++) await reconciler.erase(500, 5000).catch(() => {});
+  // What it recorded erased has no bytes left in its own bucket.
+  const complete = new Set((await ownErasures(true)).map(row => row.id));
+  for (const { space_id: spaceId, key } of due.filter(row => complete.has(row.id))) {
+    const segment = Buffer.from(spaceId).toString('base64url');
+    const r2 = buckets.get(segment);
+    const left = key ? [key].filter(item => r2.objects.has(item)) : [...r2.keys(`originals/${segment}/`), ...r2.keys(`staging/${segment}/`)];
+    assert.deepEqual(left, [], `drain recorded ${key ?? spaceId} erased only with its bytes gone`);
+  }
 }
 const retained = { originalBytes: 'none', metadata: 'retained', backups: 'retained' };
 const recordLive = async (f, id) => (await pool.query('SELECT NOT tombstone AS live FROM records WHERE space_id=$1 AND record_id=$2',
@@ -940,9 +977,11 @@ test('a removal against a slow store records each delete, so every production ti
       f.r2.deleteDelay = () => 0;
       f.r2.failDelete = key => key === upload.original;
       await assert.rejects(f.reconciler().sweep(1000), AggregateError);
-      assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', upload.sourceId)).erasure.originalBytes, 'pending');
       lefts.push((await erasureLeft(f, upload.sourceId)).left);
       assert.ok(lefts.at(-1) > lefts.at(-2), 'the finding undid the original\'s recorded removal');
+      // The deletion's replay cannot delete the original, but its failure no longer stops the erasure's other keys.
+      assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', upload.sourceId)).erasure.originalBytes, 'pending');
+      lefts.push((await erasureLeft(f, upload.sourceId)).left);
       f.r2.failDelete = () => false;
       f.r2.deleteDelay = () => 800;
     }
@@ -1037,7 +1076,8 @@ test('every production tick records a delete of an erasure whose attempts have t
   // Each delete takes 1.1 s, so two do not fit the sources' store share; each key's delete is recorded on its own.
   f.r2.deleteDelay = key => key.includes(erasure.segment) ? 1100 : 0;
   const lefts = await ticks(f, erasure, f.reconciler(), 10);
-  assert.ok(lefts.length > 4, `over several ticks (${lefts.join(' > ')})`);
+  // Once the space behind it is erased, no space is due and the source's deletes may use the spaces' windows too.
+  assert.ok(lefts.length > 3, `over several ticks (${lefts.join(' > ')})`);
 });
 
 test('an erasure whose page reads are slow still gets its store calls every production tick', async () => {
@@ -1085,7 +1125,7 @@ test('a slow source page, a stalled source delete and a slow retry never reach t
           if (text.includes('original_erasures')) phase = 'source';
           if (text.includes('FROM space_erasures WHERE originals_removed_at IS NULL')) { phase = 'space'; marks.space.push(performance.now()); }
           if (text.includes('ORDER BY x.next_attempt_at')) await sleep(pageMs);
-          if (/^UPDATE original_erasures SET next_attempt_at=clock_timestamp\(\)\s/.test(text)) { retries++; await sleep(300); }
+          if (/^UPDATE original_erasures SET next_attempt_at=/.test(text)) { retries++; await sleep(300); }
           const result = await target.query(sql, ...rest);
           if (phase === 'source') marks.source.push(performance.now());
           return result;
@@ -1146,7 +1186,8 @@ test('a cleanup transaction that ends at its phase deadline is unfinished, howev
   // more) and space records by 5000 ms. `holdTo` keeps a statement's answer until that instant after the tick started,
   // just inside its phase deadline, so COMMIT is sent at the edge; `commitTo` answers that COMMIT only at that instant.
   const page = 'ORDER BY x.next_attempt_at';
-  const retry = 'UPDATE original_erasures SET next_attempt_at=clock_timestamp()';
+  // A stalled delete cut at its deadline records the source's retry turn itself; a failure's turn is taken by `erase`.
+  const retry = 'UPDATE original_erasures SET next_attempt_at=';
   const spaceRecord = 'UPDATE space_erasures SET next_attempt_at=CASE';
   // A slow page and retry turn start the spaces' phase late enough that its record's transaction is bounded by the budget.
   const late = [{ match: page, holdTo: 900 }, { match: retry, holdTo: 3150 }];
@@ -1260,7 +1301,7 @@ test('a slow space page after the sources\' latest phases still leaves the space
       };
     }
     const rules = [{ match: 'ORDER BY x.next_attempt_at', holdTo: 900 },
-      { match: 'UPDATE original_erasures SET next_attempt_at=clock_timestamp()', holdTo: 3150 }, { match: spacePage, ...slow }];
+      { match: 'UPDATE original_erasures SET next_attempt_at=', holdTo: 3150 }, { match: spacePage, ...slow }];
     const timed = { connect: async () => {
       const client = await pool.connect();
       let phase;
@@ -1318,6 +1359,114 @@ test('a slow space page after the sources\' latest phases still leaves the space
     assert.equal((await spaces.erasure(late.owner, late.spaceId)).originalBytes, 'erased', `${label}: the next ticks complete it`);
     assert.deepEqual(spaceKeys(f, late), []);
     assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', sourceId)).erasure.originalBytes, 'removed');
+  }
+});
+
+/** Reopen a settled source erasure as the sweep would on finding `keys`, which are put in `f`'s bucket. */
+async function found(f, sourceId, keys) {
+  for (const key of keys) f.r2.objects.set(key, { bytes: Buffer.from('found') });
+  await pool.query(`UPDATE original_erasures SET removed_at=NULL,observed=observed+1,next_attempt_at=clock_timestamp(),
+    found_keys=$3 WHERE space_id=$1 AND source_id=$2`, [f.spaceId, sourceId, keys]);
+}
+const foundKeys = async (f, sourceId) => (await pool.query(`SELECT found_keys FROM original_erasures WHERE space_id=$1
+  AND source_id=$2`, [f.spaceId, sourceId])).rows[0].found_keys;
+/** A deleted source whose original's delete failed, settled, and keys named `names` under its space's prefix. */
+async function failedErasure(f, names) {
+  const sourceId = await f.source('alpha');
+  const original = await objectKey(f, sourceId);
+  f.r2.failDelete = () => true;
+  assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', sourceId)).erasure.originalBytes, 'pending');
+  f.r2.failDelete = () => false;
+  await settle(f);
+  const keys = names.map(name => `originals/${Buffer.from(f.spaceId).toString('base64url')}/upl_found/${name}`);
+  return { sourceId, original, keys };
+}
+
+test('with no space due, a slow source page and slow deletes use the spaces\' windows and record progress every tick', async () => {
+  const f = await fixture();
+  await drain(f);
+  const { sourceId, original, keys } = await failedErasure(f, ['att_a']);
+  await found(f, sourceId, keys);
+  // Other test files delete spaces in the shared database; this pool shows the ticks none due.
+  const none = sql => typeof sql === 'string' ? sql.replace(/FROM space_erasures (s )?WHERE/g, 'FROM space_erasures $1WHERE false AND') : sql;
+  let removalRecorded = 0;
+  let started = 0;
+  // The source page is answered 1.9 s after the tick started, inside its 2 s deadline.
+  const slow = { connect: async () => {
+    const client = await pool.connect();
+    return new Proxy(client, { get(target, property) {
+      if (property !== 'query') return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
+      return async (sql, ...rest) => {
+        const result = await target.query(none(sql), ...rest);
+        if (typeof sql === 'string' && sql.includes('ORDER BY x.next_attempt_at')) await sleep(started + 1900 - performance.now());
+        if (typeof sql === 'string' && sql.includes('SET removal_observed=') && rest[0]?.[2] === sourceId) removalRecorded += result.rowCount;
+        return result;
+      };
+    } });
+  } };
+  f.r2.deleteDelay = () => 1100;
+  const reconciler = new SourceUploadReconciler({ pool: slow, originals: f.cell.originals }, 0);
+  const took = [];
+  for (let tick = 0; tick < 3 && !(await erasureLeft(f, sourceId)).removed; tick++) {
+    started = performance.now();
+    await reconciler.erase(25, 5000);
+    took.push(Math.round(performance.now() - started));
+    assert.ok(took.at(-1) < 5000 + 25, `tick ${tick + 1} ended within its budget (${took.join(', ')} ms)`);
+    if (tick === 0) assert.equal(removalRecorded, 1, `tick 1 (${took[0]} ms) recorded the original's removal`);
+  }
+  f.r2.deleteDelay = () => 0;
+  assert.equal((await erasureLeft(f, sourceId)).removed, true, `completed within 3 ticks (${took.join(', ')} ms)`);
+  for (const key of [original, ...keys]) assert.equal(f.r2.objects.has(key), false, key);
+});
+
+test('a source key whose delete fails does not stop its erasure\'s other keys, and stays until it is deleted', async () => {
+  const f = await fixture();
+  await drain(f);
+  const { sourceId, original, keys } = await failedErasure(f, ['att_a', 'att_b', 'att_c']);
+  const [bad, ...good] = keys;
+  await found(f, sourceId, keys);
+  f.r2.failDelete = key => key === bad;
+  await assert.rejects(f.reconciler().erase(25, 5000), error => error instanceof AggregateError &&
+    error.errors.some(item => item.message === 'delete: provider unavailable'), 'the failure is reported');
+  for (const key of [original, ...good]) assert.equal(f.r2.objects.has(key), false, `${key} was deleted in the same tick`);
+  assert.deepEqual(await foundKeys(f, sourceId), [bad], 'and its delete recorded; the failed key remains');
+  assert.equal((await erasureLeft(f, sourceId)).removed, false);
+  assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', sourceId)).erasure.originalBytes, 'pending');
+  f.r2.failDelete = () => false;
+  await f.reconciler().erase(25, 5000);
+  assert.equal(f.r2.objects.has(bad), false);
+  assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', sourceId)).erasure.originalBytes, 'removed');
+});
+
+test('a stalled source key, found or original, moves behind the erasure\'s other keys, which are deleted within two ticks', async () => {
+  for (const stalls of ['found', 'original']) {
+    const f = await fixture();
+    await drain(f);
+    const { sourceId, original, keys } = await failedErasure(f, stalls === 'found' ? ['att_a', 'att_b', 'att_c'] : ['att_b', 'att_c']);
+    await found(f, sourceId, keys);
+    const stalled = stalls === 'found' ? keys[0] : original;
+    const healthy = [original, ...keys].filter(key => key !== stalled);
+    // A space due through both ticks, its 150 keys listed 100 at a time, keeps the sources to their own window.
+    const space = await deletedSpace(f, 150);
+    f.r2.deleteDelay = key => key === stalled ? Infinity : 0;
+    const took = [];
+    for (let tick = 0; tick < 2 && healthy.some(key => f.r2.objects.has(key)); tick++) {
+      const started = performance.now();
+      await f.reconciler().erase(25, 5000);
+      took.push(Math.round(performance.now() - started));
+      assert.ok(took.at(-1) < 5000 + 25, `${stalls}: tick ${tick + 1} ended within its budget (${took.join(', ')} ms)`);
+      assert.equal((await erasureLeft(f, sourceId)).removed, false, `${stalls}: never complete while the stalled key remains`);
+    }
+    for (const key of healthy) assert.equal(f.r2.objects.has(key), false, `${stalls}: ${key} deleted within 2 ticks`);
+    const left = await erasureLeft(f, sourceId);
+    assert.deepEqual(await foundKeys(f, sourceId), stalls === 'found' ? [stalled] : [], `${stalls}: and recorded`);
+    assert.equal(left.left, 1, `${stalls}: only the stalled key is left`);
+    f.r2.deleteDelay = () => 0;
+    for (let i = 0; i < 5 && (!(await erasureLeft(f, sourceId)).removed ||
+      (await spaces.erasure(space.owner, space.spaceId)).originalBytes === 'pending'); i++) await f.reconciler().erase(25, 5000);
+    assert.equal((await f.sources.delete(f.owner, f.spaceId, 'alpha', sourceId)).erasure.originalBytes, 'removed', stalls);
+    assert.equal(f.r2.objects.has(stalled), false);
+    assert.deepEqual(spaceKeys(f, space), []);
   }
 });
 

@@ -1271,10 +1271,14 @@ const ERASE_ATTEMPTS = 20;
 const ERASE_FOUND = 40;
 /**
  * A source erasure's state, `$1` the grace in seconds: read with its due page,
- * so a removal starts its store calls with no read of its own.
+ * so a removal starts its store calls with no read of its own, and whether a
+ * space erasure is due too, so `erase` knows whether the spaces need their
+ * windows this call.
  */
 const ERASURE_STATE = `SELECT x.space_id,x.collection_id,x.source_id,x.observed::text AS observed,x.removed_at IS NOT NULL AS removed,
     x.removal_observed IS NOT DISTINCT FROM x.observed AS original_removed,x.found_keys[1:${ERASE_FOUND}] AS found,
+    x.deferred_keys AS deferred,EXISTS (SELECT 1 FROM space_erasures s WHERE s.originals_removed_at IS NULL
+      AND s.next_attempt_at<=clock_timestamp()) AS spaces_due,
     clock_timestamp()>=x.writers_end_at+make_interval(secs=>$1) AS settled,o.object_key,
     ARRAY(SELECT a.staging_key FROM source_upload_attempts a JOIN source_upload_grants g USING (space_id,collection_id,grant_id)
       WHERE g.space_id=x.space_id AND g.collection_id=x.collection_id AND g.source_id=x.source_id
@@ -1300,8 +1304,13 @@ type ErasureState = Record<string, unknown>;
  * current count, and no found key or attempt left. An unsettled removal
  * records nothing and schedules the next one for when its writers have ended.
  * A copy the store confirms even later is found by the sweep, which reopens
- * the erasure. `state` is the erasure as its due page read it, or else read
- * here. Store calls end by `storeUntil`, transactions by `recordUntil`.
+ * the erasure. Keys are isolated: a delete that fails or is cut short does not
+ * end the removal, the other keys still get their store calls, and a settled
+ * removal records the key in `deferred_keys`, so later removals try it after
+ * every other key and it cannot hold the head. A failure is still thrown once
+ * the other keys were tried; a key cut by `storeUntil` is unfinished. `state`
+ * is the erasure as its due page read it, or else read here. Store calls end
+ * by `storeUntil`, transactions by `recordUntil`.
  * Returns whether the erasure is recorded complete.
  */
 async function eraseOriginal(cell: SourceCell, ids: readonly string[], storeUntil: number, recordUntil: number,
@@ -1319,55 +1328,86 @@ async function eraseOriginal(cell: SourceCell, ids: readonly string[], storeUnti
   const deleted = new Set<string>();
   // An original already removed at the current count needs no delete; its removal stands until the sweep finds a key.
   if (settled && state.original_removed === true) deleted.add(original);
-  const remove = async (key: string) => {
-    if (deleted.has(key)) return;
-    await within(storeUntil, () => cell.originals.delete(key));
-    deleted.add(key);
-  };
   // A fenced record that finds the count advanced stops the removal: the sweep found a key, so it starts over.
   let current = true;
   const fenced = async (sql: string, values: unknown[]) => {
     if (settled && current && (await record(sql, values)).rowCount !== 1) current = false;
   };
-  await remove(original);
-  if (state.original_removed !== true) await fenced(`UPDATE original_erasures SET removal_observed=$4::bigint WHERE space_id=$1 AND collection_id=$2 AND source_id=$3
-    AND removed_at IS NULL AND observed=$4::bigint AND removal_observed IS DISTINCT FROM $4::bigint`, [...params, observed]);
-  const staged = state.staged as string[];
+  const failures: unknown[] = [];
+  const missed = new Set<string>();
+  let cut = false;
+  // Whether the key is gone. A failed or cut delete is not retried in this removal and moves behind every other key.
+  const remove = async (key: string): Promise<boolean> => {
+    if (deleted.has(key)) return true;
+    if (missed.has(key)) return false;
+    if (performance.now() >= storeUntil) { cut = true; return false; }
+    try { await within(storeUntil, () => cell.originals.delete(key)); }
+    catch (error) {
+      missed.add(key);
+      if (error instanceof CleanupTimeout && error.atBudget) cut = true; else failures.push(error);
+      if (settled && current) await record(`UPDATE original_erasures SET deferred_keys=array_append(array_remove(deferred_keys,$4),$4)
+        WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL`, [...params, key]);
+      return false;
+    }
+    deleted.add(key);
+    return true;
+  };
   const found = [...state.found as string[]];
-  for (let i = 0; i < staged.length && current; i++) {
-    const staging = String(staged[i]);
+  const removeFound = (key: string) => async () => {
+    if (await remove(key)) await fenced(`UPDATE original_erasures SET found_keys=array_remove(found_keys,$5) WHERE space_id=$1
+      AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL AND observed=$4::bigint AND $5=ANY(found_keys)`, [...params, observed, key]);
+  };
+  type Unit = { key: string; run: () => Promise<void> };
+  // The keys in the order they are tried; a promoted copy recorded as found during this removal joins the end.
+  const queue: Unit[] = [];
+  const units: Unit[] = [{ key: original, run: async () => {
+    if (await remove(original) && state.original_removed !== true) await fenced(`UPDATE original_erasures SET removal_observed=$4::bigint
+      WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL AND observed=$4::bigint
+        AND removal_observed IS DISTINCT FROM $4::bigint`, [...params, observed]);
+  } }];
+  for (const value of state.staged as string[]) {
+    const staging = String(value);
     // The attempt's promoted copy: its key differs from the staging key only in the prefix.
     const promoted = startsWith(staging, 'staging/') ? `originals/${staging.slice('staging/'.length)}` : original;
-    await remove(staging);
-    if (!settled) { await remove(promoted); continue; }
-    // Its grant ended, so an attempt that never ended writes nothing more; it fails as reconciliation would fail it.
-    // Its promoted copy is then a found key, so each of its two keys is recorded as its own delete lands.
-    await transact(cell.pool, async db => {
-      await db.query(`UPDATE source_upload_attempts SET state=CASE WHEN state IN ('receiving','verified') THEN 'failed'
-          ELSE state END,failure_code=CASE WHEN state IN ('receiving','verified') THEN 'abandoned' ELSE failure_code END,
-          staging_removed_at=clock_timestamp(),updated_at=clock_timestamp()
-        WHERE space_id=$1 AND collection_id=$2 AND staging_key=$3 AND staging_removed_at IS NULL`, [ids[0], ids[1], staging]);
-      if (promoted !== original) await db.query(`UPDATE original_erasures SET found_keys=CASE WHEN $4=ANY(found_keys)
-          THEN found_keys ELSE array_append(found_keys,$4) END
-        WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL`, [...params, promoted]);
-    }, recordUntil);
-    if (promoted !== original && !found.includes(promoted)) found.push(promoted);
+    units.push({ key: staging, run: async () => {
+      if (!await remove(staging)) return;
+      if (!settled) { await remove(promoted); return; }
+      // Its grant ended, so an attempt that never ended writes nothing more; it fails as reconciliation would fail it.
+      // Its promoted copy is then a found key, so each of its two keys is recorded as its own delete lands.
+      await transact(cell.pool, async db => {
+        await db.query(`UPDATE source_upload_attempts SET state=CASE WHEN state IN ('receiving','verified') THEN 'failed'
+            ELSE state END,failure_code=CASE WHEN state IN ('receiving','verified') THEN 'abandoned' ELSE failure_code END,
+            staging_removed_at=clock_timestamp(),updated_at=clock_timestamp()
+          WHERE space_id=$1 AND collection_id=$2 AND staging_key=$3 AND staging_removed_at IS NULL`, [ids[0], ids[1], staging]);
+        if (promoted !== original) await db.query(`UPDATE original_erasures SET found_keys=CASE WHEN $4=ANY(found_keys)
+            THEN found_keys ELSE array_append(found_keys,$4) END
+          WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL`, [...params, promoted]);
+      }, recordUntil);
+      if (promoted !== original && !found.includes(promoted)) { found.push(promoted); queue.push({ key: promoted, run: removeFound(promoted) }); }
+    } });
   }
-  for (let i = 0; i < found.length && current; i++) {
-    const key = String(found[i]);
-    await remove(key);
-    await fenced(`UPDATE original_erasures SET found_keys=array_remove(found_keys,$5) WHERE space_id=$1 AND collection_id=$2
-      AND source_id=$3 AND removed_at IS NULL AND observed=$4::bigint AND $5=ANY(found_keys)`, [...params, observed, key]);
+  for (const key of found) units.push({ key: String(key), run: removeFound(String(key)) });
+  // Keys whose last delete failed or was cut go last, in the order they moved there.
+  const deferred = (state.deferred as string[] | null ?? []).map(String);
+  const rank = (key: string) => deferred.indexOf(key);
+  queue.push(...units.filter(unit => rank(unit.key) < 0),
+    ...units.filter(unit => rank(unit.key) >= 0).sort((x, y) => rank(x.key) - rank(y.key)));
+  try { for (let i = 0; i < queue.length && current && !cut; i++) await queue[i].run(); }
+  catch (error) {
+    // A record that fails after a key's failure is reported with it; one cut by `recordUntil` is unfinished.
+    if (!failures.length) throw error;
+    if (!(error instanceof CleanupTimeout && error.atBudget)) failures.push(error);
   }
-  if (settled && current && (await record(`UPDATE original_erasures SET removed_at=clock_timestamp()
+  if (failures.length) throw failures.length === 1 ? failures[0] : new AggregateError(failures, 'Some of a deleted source\'s bytes were not erased');
+  if (settled && current && !cut && (await record(`UPDATE original_erasures SET removed_at=clock_timestamp()
     WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL AND observed=$4::bigint
       AND removal_observed=observed AND cardinality(found_keys)=0
       AND NOT EXISTS (SELECT 1 FROM source_upload_attempts a JOIN source_upload_grants g USING (space_id,collection_id,grant_id)
         WHERE g.space_id=$1 AND g.collection_id=$2 AND g.source_id=$3 AND a.staging_removed_at IS NULL)`, [...params, observed])).rowCount === 1) return true;
-  // Unsettled: due once its writers ended. Keys left over or a key found meanwhile: due now.
+  // Unsettled: due once its writers ended. Keys left over, cut short, or a key found meanwhile: due now.
   await record(`UPDATE original_erasures SET next_attempt_at=CASE WHEN $4 THEN clock_timestamp()
       ELSE greatest(clock_timestamp(),writers_end_at+make_interval(secs=>$5)) END
-    WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL`, [...params, settled, graceSeconds]);
+    WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL`, [...params, settled || cut, graceSeconds]);
   return false;
 }
 const keyPrefixes = (spaceId: string) => [`originals/${spaceSegment(spaceId)}/`, `staging/${spaceSegment(spaceId)}/`];
@@ -1472,25 +1512,33 @@ export class SourceUploadReconciler {
    * delete a page of each one's original and staging keys. Every phase
    * deadline is fixed from the call's start, in fiftieths of the budget, never
    * from how long an earlier call took, so no phase can take a later one's
-   * slice. The source page, which reads each erasure's state, ends by 20/50;
-   * source store calls end 20/50 after that page was read but by 28/50 at the
-   * latest, so a slow read still leaves them a store call; source
-   * transactions (checkpoints and retry turns) end 4/50 later, by 32/50. No
-   * source call runs past that. The space page then has until 42/50, a
-   * fifth of the budget or more of its own, and space store calls end by
-   * 45/50, so once the space page is read there are always 3/50 of the budget
-   * left for a store call, and the last tenth records each attempted space's
-   * progress or retry turn. At `erase(25, 5000)`: source page by 2000 ms,
-   * source store calls by 2800 ms, source transactions by 3200 ms, space page
-   * by 4200 ms (1000 ms after the sources' latest end), space store calls by
-   * 4500 ms (300 ms after the page's), space records by 5000 ms.
+   * slice. The source page, which reads each erasure's state and whether a
+   * space erasure is due, ends by 20/50. With a space due, source store calls
+   * end 20/50 after that page was read but by 28/50 at the latest, so a slow
+   * read still leaves them at least 8/50 (800 ms at 5 s) for store calls, and
+   * a call longer than that is cut as unfinished; source transactions
+   * (checkpoints and retry turns) end 4/50 later, by 32/50, and no source call
+   * runs past that. With none due, nothing waits for the spaces' windows, so
+   * the sources use them: store calls end by 45/50 and transactions by the
+   * budget, and a space found due by then still gets any time left. The space
+   * page has until 42/50, a fifth of the budget or more of its own when a
+   * space was due, and space store calls end by 45/50, so once the space page
+   * is read there are always 3/50 of the budget left for a store call, and
+   * the last tenth records each attempted space's progress or retry turn. At
+   * `erase(25, 5000)` with a space due: source page by 2000 ms, source store
+   * calls by 2800 ms, source transactions by 3200 ms, space page by 4200 ms
+   * (1000 ms after the sources' latest end), space store calls by 4500 ms
+   * (300 ms after the page's), space records by 5000 ms; with none due,
+   * source store calls by 4500 ms and source transactions by 5000 ms.
    * Erasure is recorded complete only by a removal, or for a space an empty
    * listing, that started after every write to its keys could have landed (the last
    * grant's end plus the grace) and before the sweep last found one of its
    * keys. Each erasure attempted moves behind every due one not tried since,
-   * so a failing one cannot hold the oldest page. A call cut short by its
-   * phase's deadline is unfinished, not a failure. Returns how many erasures
-   * were due. Failures are reported together; each erasure is retried later.
+   * so a failing one cannot hold the oldest page; within a source erasure, a
+   * key whose delete failed or was cut is tried after its other keys, so it
+   * cannot hold them either. A call cut short by its phase's deadline is
+   * unfinished, not a failure. Returns how many erasures were due. Failures
+   * are reported together; each erasure is retried later.
    */
   async erase(limit = 25, budgetMs = 10_000): Promise<number> {
     if (!isSafeInteger(limit) || limit < 1 || limit > 500) throw new RangeError('Invalid erasure limit');
@@ -1514,10 +1562,12 @@ export class SourceUploadReconciler {
       WHERE x.removed_at IS NULL AND x.next_attempt_at<=clock_timestamp()
       ORDER BY x.next_attempt_at,x.space_id,x.collection_id,x.source_id LIMIT $2`, [grace, limit]), pageEnd)
       .then(result => result.rows, (error: unknown) => { failed(error); return []; });
-    // Their store time starts once their page is read, so a slow read still leaves them a store call, but it never
-    // moves past its fixed latest end: the spaces' window starts by `sourcesEnd` however slow the source calls are.
-    const sourcesStop = Math.min(sourcesLatest, performance.now() + budgetMs * 20 / 50);
-    const sourcesEnd = sourcesStop + budgetMs * 4 / 50;
+    // With a space due, their store time starts once their page is read, so a slow read still leaves them a store
+    // call, but it never moves past its fixed latest end: the spaces' window starts by `sourcesEnd` however slow the
+    // source calls are. With none due, the spaces' windows are theirs: store calls by `spacesStop`, records by `until`.
+    const spacesDue = sources.some(row => row.spaces_due !== false);
+    const sourcesStop = spacesDue ? Math.min(sourcesLatest, performance.now() + budgetMs * 20 / 50) : spacesStop;
+    const sourcesEnd = spacesDue ? sourcesStop + budgetMs * 4 / 50 : until;
     for (const row of sources) {
       if (performance.now() >= sourcesStop) break;
       const ids = [row.space_id, row.collection_id, row.source_id];

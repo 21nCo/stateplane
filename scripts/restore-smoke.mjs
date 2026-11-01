@@ -173,6 +173,16 @@ try {
     VALUES('eev_00000000-0000-4000-8000-000000000002',$1,$2,'link','lnk_restore',2,'delete','restore')`,[spaceId,collectionId]);
   assert.equal((await restored.query(`SELECT count(*)::int AS n FROM evidence_outbox WHERE event_id=$1`,
     ['eev_00000000-0000-4000-8000-000000000002'])).rows[0].n,1,'the restored event trigger enqueues an outbox entry');
+  // The restored space index finds a space's outbox entries, delivered or pending, for the erasure check and the purge.
+  await restored.query(`UPDATE evidence_outbox SET delivery_state='delivered',delivered_at=clock_timestamp() WHERE event_id=$1`,
+    ['eev_00000000-0000-4000-8000-000000000001']);
+  const planner=await restored.connect();
+  try {
+    await planner.query('SET enable_seqscan=off');
+    for (const sql of ['SELECT 1 FROM evidence_outbox WHERE space_id=$1','DELETE FROM evidence_outbox WHERE space_id=$1'])
+      assert.match((await planner.query(`EXPLAIN ${sql}`,[spaceId])).rows.map(row=>row['QUERY PLAN']).join('\n'),
+        /(?:using|on) evidence_outbox_space\b/,sql);
+  } finally { planner.release(); }
   await assert.rejects(restored.query('UPDATE evidence_events SET revision=3 WHERE space_id=$1',[spaceId]),/evidence facts are immutable/);
   await assert.rejects(restored.query(`UPDATE space_erasures SET requested_at=requested_at-interval '1 day' WHERE space_id=$1`,
     [erasedSpaceId]),error=>error.code==='23514'&&error.constraint==='space_erasures_transition','the restored erasure guard binds');
