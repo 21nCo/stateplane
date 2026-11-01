@@ -122,7 +122,10 @@ function integer(value:string):number {
 function parsed(value:string):unknown {
   try { return JSON.parse(value); } catch { throw new StateplaneCliError('INVALID_ARGUMENT'); }
 }
-async function input(path:string,maxBytes:number):Promise<string> {
+/** The UTF-8 text of a file or stdin. keepBom keeps a leading byte order mark
+ * so text stored as an original keeps every byte of the file; JSON and tokens
+ * drop it. */
+async function input(path:string,maxBytes:number,keepBom=false):Promise<string> {
   const source=path==='-'?process.stdin:createReadStream(path);
   const chunks:Buffer[]=[];let size=0;
   try {
@@ -136,7 +139,7 @@ async function input(path:string,maxBytes:number):Promise<string> {
     if (error instanceof StateplaneCliError) throw error;
     throw new StateplaneCliError('INVALID_ARGUMENT');
   }
-  try { return new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(chunks)); }
+  try { return new TextDecoder('utf-8',{fatal:true,ignoreBOM:keepBom}).decode(Buffer.concat(chunks)); }
   catch { throw new StateplaneCliError('INVALID_ARGUMENT'); }
 }
 /** The JSON of --data or --file, at most maxBytes: by default the record and
@@ -389,7 +392,7 @@ async function runSources(client: StateplaneHttpClient, action: string, flags: F
   const sources = `${base}/sources`;
   if (action === 'ingest-text') {
     if ((flags.text === undefined) === (flags.file === undefined)) throw new StateplaneCliError('INVALID_ARGUMENT');
-    const text = flags.file !== undefined ? await input(required(flags, 'file'), textBytes) : required(flags, 'text');
+    const text = flags.file !== undefined ? await input(required(flags, 'file'), textBytes, true) : required(flags, 'text');
     return client.request('POST', `${sources}/text`, withinWireBudget({ idempotencyKey: required(flags, 'idempotency-key'), text,
       ...optional(flags, { 'mime-type': 'mimeType', locator: 'locator', 'captured-at': 'capturedAt' }) }, largeBody));
   }

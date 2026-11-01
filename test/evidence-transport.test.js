@@ -320,6 +320,11 @@ test('every evidence CLI command sends its HTTP route; content is saved, verifie
   assert.equal((await cli(['spaces', 'select', '--space', 'sp_a'])).status, 0);
   const text = join(root, 'text.md');
   await writeFile(text, 'From a file');
+  const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+  const bomText = join(root, 'bom.md');
+  await writeFile(bomText, Buffer.concat([bom, Buffer.from('From a file')]));
+  const bomOnly = join(root, 'bom-only.md');
+  await writeFile(bomOnly, bom);
   const bytes = join(root, 'bytes.txt');
   await writeFile(bytes, 'abc');
   const digest = sha('abc');
@@ -330,6 +335,10 @@ test('every evidence CLI command sends its HTTP route; content is saved, verifie
     [['sources', 'ingest-text', ...cl, '--idempotency-key', 'k', '--text', 'T', '--mime-type', 'text/markdown', '--captured-at', '2026-01-01T00:00:00Z'],
       'sources.ingestText', scoped({ idempotencyKey: 'k', text: 'T', mimeType: 'text/markdown', capturedAt: '2026-01-01T00:00:00Z' })],
     [['sources', 'ingest-text', ...cl, '--idempotency-key', 'k', '--file', text], 'sources.ingestText', scoped({ idempotencyKey: 'k', text: 'From a file' })],
+    // Text from a file is sent byte for byte: a leading byte order mark is part of the original.
+    [['sources', 'ingest-text', ...cl, '--idempotency-key', 'k', '--file', bomText], 'sources.ingestText',
+      scoped({ idempotencyKey: 'k', text: '\uFEFFFrom a file' })],
+    [['sources', 'ingest-text', ...cl, '--idempotency-key', 'k', '--file', bomOnly], 'sources.ingestText', scoped({ idempotencyKey: 'k', text: '\uFEFF' })],
     [['sources', 'ingest-reference', ...cl, '--idempotency-key', 'k', '--locator', 'https://example.invalid/a'], 'sources.ingestReference',
       scoped({ idempotencyKey: 'k', locator: 'https://example.invalid/a' })],
     [['sources', 'delete', ...cl, '--id', 'src_1'], 'sources.delete', scoped('src_1')],
@@ -537,7 +546,14 @@ test('HTTP, CLI and MCP report one service refusal with the same code and retrya
 
 test('MCP carries original bytes as bounded base64 and refuses what it cannot carry', async t => {
   const state = fixture();
-  const { server, origin } = await serve(request => mcp(request));
+  // Record each MCP response's size on the wire.
+  const responseBytes = [];
+  const { server, origin } = await serve(async request => {
+    const response = await mcp(request);
+    const body = Buffer.from(await response.arrayBuffer());
+    responseBytes.push(body.length);
+    return new Response(body, { status: response.status, headers: response.headers });
+  });
   t.after(() => server.close());
   const mcp = createMcpHandler({ services: state.services, identity: state.identity, resource: `${origin}/mcp`,
     authorizationServers: ['http://127.0.0.1:9/'], allowInsecureLoopback: true });
@@ -548,6 +564,17 @@ test('MCP carries original bytes as bounded base64 and refuses what it cannot ca
   const content = await client.callTool('sources_content', { ...s, sourceId: 'src_1' });
   assert.equal(Buffer.from(content.structuredContent.contentBase64, 'base64').toString(), 'abc');
   assert.equal((await client.callTool('sources_content', { ...s, sourceId: 'src_ref' })).structuredContent.contentBase64, null);
+  // Exactly 2 MiB is read in full. MCP carries the result twice (structuredContent and its JSON text), so the
+  // response is about 5.3 MiB: inside the 5.5 MiB the docs record for it.
+  const most = Buffer.alloc(2_097_152, 7);
+  state.services.sources.content = async () => ({ source: { sourceId: 'src_2m', original: { referenceOnly: false, byteSize: most.length } },
+    body: new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(most)); controller.close(); } }) });
+  responseBytes.length = 0;
+  const largest = await client.callTool('sources_content', { ...s, sourceId: 'src_2m' });
+  assert.equal(largest.isError, undefined, JSON.stringify(largest.structuredContent?.error));
+  assert.deepEqual(Buffer.from(largest.structuredContent.contentBase64, 'base64'), most);
+  assert.equal(responseBytes.length, 1);
+  assert.ok(responseBytes[0] > 2 * 2_796_204 && responseBytes[0] <= 5_767_168, `a 2 MiB read answers ${responseBytes[0]} bytes`);
   // An original over 2 MiB is refused from its recorded size, without reading it, and cannot succeed by retrying.
   state.services.sources.content = async () => ({ source: { sourceId: 'src_big', original: { referenceOnly: false, byteSize: 2_097_153 } },
     body: new ReadableStream({ pull() { assert.fail('the body is not read'); } }) });
@@ -565,7 +592,6 @@ test('MCP carries original bytes as bounded base64 and refuses what it cannot ca
   assert.deepEqual(state.calls[0].args[4], { bytes: 3, mimeType: 'text/plain', sha256: sha('abc') });
   assert.equal(state.calls[0].received, 'abc');
   // Exactly 2 MiB decoded is carried; one byte more, or base64 with nonzero pad bits, is refused before the service.
-  const most = Buffer.alloc(2_097_152, 7);
   state.calls.length = 0;
   const full = await client.callTool('uploads_send', { ...s, grantId: 'upl_1', mimeType: 'text/plain', contentBase64: most.toString('base64') });
   assert.equal(full.isError, undefined, JSON.stringify(full.structuredContent?.error));

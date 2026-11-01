@@ -258,6 +258,24 @@ test('upload, extraction, claim review, linking and deletion over HTTP, CLI and 
   assert.equal((await api(writer, 'GET', `${alpha}/sources/${reference.sourceId}/content`)).status, 204);
   assert.equal((await writerMcp('sources_content', { collectionId: 'alpha', sourceId: reference.sourceId })).contentBase64, null);
 
+  // Text from a file is stored byte for byte, so the CLI, HTTP and MCP record one original for the same text,
+  // a leading byte order mark included; a file holding only the mark is a three-byte original.
+  const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+  for (const [name, bytes] of [['bom.txt', Buffer.concat([bom, Buffer.from('Beacon log.\n')])], ['bom-only.txt', bom]]) {
+    const path = join(temp, name);
+    await writeFile(path, bytes);
+    const stored = conforms('Source', await writerCli(['sources', 'ingest-text', '--collection', 'alpha', '--idempotency-key', name,
+      '--file', path]));
+    assert.deepEqual([stored.original.byteSize, stored.original.sha256, stored.replayed], [bytes.length, sha(bytes), false], name);
+    const viaHttp = conforms('Source', (await api(writer, 'POST', `${alpha}/sources/text`, { idempotencyKey: name,
+      text: bytes.toString('utf8') })).body);
+    assert.deepEqual([viaHttp.sourceId, viaHttp.replayed], [stored.sourceId, true], `${name}: HTTP replays the same original`);
+    const viaMcp = await writerMcp('sources_ingest_text', { collectionId: 'alpha', idempotencyKey: name, text: bytes.toString('utf8') });
+    assert.deepEqual([viaMcp.sourceId, viaMcp.replayed], [stored.sourceId, true], `${name}: MCP replays the same original`);
+    assert.deepEqual(Buffer.from((await writerMcp('sources_content', { collectionId: 'alpha', sourceId: stored.sourceId })).contentBase64,
+      'base64'), bytes, `${name}: the served original is the file`);
+  }
+
   // Space deletion reports what remains; the owner reads the report again over the CLI. Agents cannot.
   assert.equal(code(await api(writer, 'GET', `/v1/spaces/${spaceId}/erasure`)), 'FORBIDDEN', 'owner sessions only, as for the audit');
   assert.equal((await api(ownerToken, 'PATCH', `/v1/spaces/${spaceId}`, { lifecycle: 'suspended' })).status, 200, 'suspend before deletion');

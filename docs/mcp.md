@@ -201,6 +201,11 @@ used: `scopes_supported` is omitted and authorization is the space grant model.
   noncanonical (nonzero pad bits) or oversized base64 in `uploads_send`,
   including any that decodes to more than 2 MiB, is `INVALID_ARGUMENT` before
   any service call. HTTP and the CLI carry originals up to the 25 MiB upload bound.
+  A tool result carries its value twice (`structuredContent` and its JSON
+  text), so a 2 MiB `sources_content` answer is about 5.3 MiB on the wire
+  (5,592,728 bytes measured with a minimal source view) and at most 5.5 MiB.
+  No response bound applies; a deployed Worker and clients other than the
+  TypeScript SDK are checked in external acceptance.
 
 These bounds reuse STA-8/9 limits or protocol framing; none is a measured
 Cloudflare or Railway capacity. The committed manifest publishes 42 tools in an
