@@ -188,6 +188,10 @@ try {
       ORDER BY available_at,event_id LIMIT 100 FOR UPDATE SKIP LOCKED`)).rows.map(row=>row['QUERY PLAN']).join('\n');
     assert.match(plan,/Index Scan using projection_outbox_claim/);
     assert.doesNotMatch(plan,/\bSort\b/);
+    // Migration 044's erasure check and purge find a space's evidence outbox entries, in either state, by index.
+    for (const sql of ['SELECT 1 FROM evidence_outbox WHERE space_id=$1','DELETE FROM evidence_outbox WHERE space_id=$1'])
+      assert.match((await upgraded.query(`EXPLAIN ${sql}`,['sp_upgrade'])).rows.map(row=>row['QUERY PLAN']).join('\n'),
+        /(?:using|on) evidence_outbox_space\b/,sql);
     runMigrator(names[1]);
     await fresh.connect();
     assert.equal(await index(upgraded),await index(fresh));

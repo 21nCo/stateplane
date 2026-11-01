@@ -7,9 +7,11 @@ import { connectionOptions } from './db-connection.mjs';
 // ingestion, upload grants and upload reconciliation (STA-33) insert sources
 // and originals and advance the upload ledger; extraction (STA-34) inserts
 // extraction versions; claims (STA-35) insert claims, revisions and their
-// evidence. Later evidence writes get their grants with the
-// service slices that perform them. No grant allows DELETE or TRUNCATE:
-// removal stays with the scoped purge routine.
+// evidence; links, deletion and retention (STA-36) insert and tombstone
+// links, insert evidence events and record erasure progress. Migration 044's
+// owner-rights triggers enqueue each event's outbox entry and each deleted
+// original's erasure, so the role needs no write on those. No grant allows
+// DELETE or TRUNCATE: removal stays with the scoped purge routine.
 const url=process.env.STATEPLANE_CELL_ADMIN_URL;
 const role=process.env.STATEPLANE_CELL_ROLE;
 if (!url || !role || !/^(?!pg_)[a-z][a-z0-9_]{0,62}$/.test(role))
@@ -24,7 +26,11 @@ const grants=[
   ['claims','SELECT, INSERT'],
   ['claim_revisions','SELECT, INSERT'],
   ['claim_evidence','SELECT, INSERT'],
-  ['links','SELECT']
+  ['links','SELECT, INSERT, UPDATE'],
+  ['evidence_events','SELECT, INSERT'],
+  ['evidence_outbox','SELECT'],
+  ['original_erasures','SELECT, UPDATE'],
+  ['space_erasures','SELECT, UPDATE']
 ];
 const client=new pg.Client(connectionOptions(url));
 await client.connect();

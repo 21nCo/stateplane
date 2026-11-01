@@ -14,13 +14,16 @@ interface Env {
 // lease; losing or repeating one cannot lose or reapply committed work.
 // Until a search projector exists, completion advances per-ref heads only.
 // Each once-a-minute tick dispatches for up to 20 s, advances reconciliations
-// for up to 10 s, settles ended upload attempts for up to 10 s, then sweeps
+// for up to 10 s, settles ended upload attempts for up to 10 s, erases the
+// bytes of deleted sources and erased spaces for up to 5 s, then sweeps
 // one page of stored upload bytes for up to 5 s;
 // docs/durable-outbox.md and docs/evidence-storage.md record the bounds.
 const DISPATCH_BUDGET_MS = 20_000;
 const RECONCILE_BUDGET_MS = 10_000;
 const UPLOAD_BUDGET_MS = 10_000;
 const UPLOAD_PAGE = 25;
+const ERASE_BUDGET_MS = 5_000;
+const ERASE_PAGE = 25;
 const SWEEP_BUDGET_MS = 5_000;
 const SWEEP_PAGE = 100;
 function cell(env: Env, originals = false) {
@@ -59,6 +62,8 @@ export default {
       const uploadsUntil = Date.now() + UPLOAD_BUDGET_MS;
       let due = UPLOAD_PAGE;
       try { while (due === UPLOAD_PAGE && Date.now() < uploadsUntil) due = await uploads!.step(UPLOAD_PAGE, Math.max(1, uploadsUntil - Date.now())); }
+      catch (error) { failures.push(error); }
+      try { await uploads!.erase(ERASE_PAGE, ERASE_BUDGET_MS); }
       catch (error) { failures.push(error); }
       try { await uploads!.sweep(SWEEP_PAGE, SWEEP_BUDGET_MS); }
       catch (error) { failures.push(error); }

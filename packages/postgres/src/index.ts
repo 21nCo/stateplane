@@ -104,6 +104,14 @@ function validPredicateValue(kind:string,value:unknown):boolean {
   return false;
 }
 
+/** Migration 044's endpoint guard refused a deletion: a live restrict link touches the endpoint. */
+export const linkRestricted = (error: unknown) => (error as { code?: unknown })?.code === '23001' &&
+  (error as { constraint?: unknown }).constraint === 'links_restrict';
+const linkConstraint = (error: unknown) => {
+  const constraint = (error as { constraint?: unknown })?.constraint;
+  return typeof constraint === 'string' && constraint.startsWith('links_');
+};
+
 export class AuthorityError extends Error {
   /** Carry a safe current revision for caller-visible conflicts. */
   constructor(public readonly code: string, message = code, public readonly currentRevision?: number,
@@ -1083,7 +1091,7 @@ export class AuthorityTransaction {
         try { receipt=await this.mutateBatchSerializedRequest(request); }
         catch (error) {
           if (error instanceof AuthorityError && arrayHas(['INVALID_ARGUMENT','SCHEMA_INVALID','SCHEMA_CONFLICT',
-            'REVISION_CONFLICT','UNIQUE_CONFLICT','KEY_RESERVED','NOT_FOUND'],error.code))
+            'REVISION_CONFLICT','UNIQUE_CONFLICT','KEY_RESERVED','LINK_RESTRICTED','NOT_FOUND'],error.code))
             throw new BatchItemFailure(error.code);
           throw error;
         }
@@ -1794,7 +1802,10 @@ export class AuthorityTransaction {
         const constraint = (error as { constraint?: string }).constraint;
         throw new AuthorityError(constraint === 'records_space_id_collection_id_key_mode_normalized_key_key' ? 'KEY_RESERVED' : 'UNIQUE_CONFLICT');
       }
-      if ((error as { code?: string }).code === '23503') throw new AuthorityError('SCHEMA_CONFLICT');
+      // Migration 044: deleting an endpoint of a live restrict link rejects the whole deletion.
+      if (linkRestricted(error)) throw new AuthorityError('LINK_RESTRICTED','A restricting link prevents this deletion',undefined,false);
+      // A link guard's foreign-key error is never a schema conflict; it surfaces unmapped.
+      if ((error as { code?: string }).code === '23503' && !linkConstraint(error)) throw new AuthorityError('SCHEMA_CONFLICT');
       throw error;
     }
   }
@@ -2121,5 +2132,7 @@ export * from './cell-policy.js';
 export * from './services.js';
 // Only the sources service's public surface; claims.ts shares its internal helpers.
 export { originalKey, PostgresSources, sourceBounds, SourceUploadReconciler } from './sources.js';
-export type { ExtractionView, OriginalView, SourceCell, SourceView, UploadAttemptView, UploadGrantView } from './sources.js';
+export type { DeletionErasure, ExtractionView, OriginalView, SourceCell, SourceDeletion, SourceView, UploadAttemptView,
+  UploadGrantView } from './sources.js';
 export * from './claims.js';
+export * from './links.js';

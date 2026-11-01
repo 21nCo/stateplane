@@ -4,7 +4,7 @@ import { BlobWriteError, checkExtraction, classifyError, ExtractionError, extrac
 import type { BlobStore, ExtractionSegment, TextExtraction, TextParser } from '@stateplane/application';
 import type { Capability, VerifiedCredential } from '@stateplane/contracts';
 import { commitBeforeDeadline, CommitNotSentDeadlineExceeded } from './commit-deadline.js';
-import { AuthorityError, AuthorityTransaction, clientReadTimedOut, CommitOutcomeUnknownError } from './index.js';
+import { AuthorityError, AuthorityTransaction, clientReadTimedOut, CommitOutcomeUnknownError, linkRestricted } from './index.js';
 import type { AuthorityScope } from './index.js';
 import { acceptsInProcessObjects, includes, isInProcessProxy, scalarString, utcInstant } from './schema.js';
 import type { PostgresSpaces } from './spaces.js';
@@ -30,6 +30,22 @@ export interface ExtractionView {
   sourceId: string; collectionId: string; version: number; latestVersion: number; previousVersion: number | null;
   sourceSha256: string; parser: string; parserVersion: string; content: string; sourceOffsets: ExtractionSegment[];
   createdAt: string; replayed: boolean;
+}
+
+/**
+ * What a deletion erased. `originalBytes`: `none` when no bytes were ever
+ * held, `pending` until the blob store confirms a removal that started after
+ * every write to the key could have landed (the reconciler retries it),
+ * `removed` once it has. Database rows (a source's metadata, extraction text
+ * and citing claims; a claim's revisions; a link's row) stay, unreadable,
+ * until the space is erased; database and blob-store backups keep earlier
+ * copies until their own retention ends.
+ */
+export interface DeletionErasure { originalBytes: 'none' | 'pending' | 'removed'; metadata: 'retained'; backups: 'retained' }
+/** The report of a deletion that held no blob-store bytes: a claim's or a link's. */
+export const rowsRetained: Readonly<DeletionErasure> = Object.freeze({ originalBytes: 'none', metadata: 'retained', backups: 'retained' });
+export interface SourceDeletion {
+  sourceId: string; collectionId: string; deletedAt: string; replayed: boolean; erasure: DeletionErasure;
 }
 
 /** Initial bounds; docs/evidence-storage.md records the evidence for each. */
@@ -152,24 +168,36 @@ export function idempotencyKey(value: unknown): string {
  * one stalled call cannot hold a page.
  */
 const CLEANUP_CALL_MS = 2_000;
+/** `atBudget`: the caller's budget ended the call, not the per-call bound, so the work is unfinished rather than failed. */
 class CleanupTimeout extends Error {
-  constructor() { super('Upload cleanup call timed out'); }
+  constructor(readonly atBudget = true) { super('Upload cleanup call timed out'); }
 }
 /**
  * Start a cleanup call and settle with it, or fail once `CLEANUP_CALL_MS` or
  * the budget ending at `until` (a `performance.now` instant) has passed. A call
  * is never started once the budget has passed. A value that arrives later is
  * passed to `late` to release it; every cleanup call is safe to land late.
+ * `budget` is the caller's own budget when `until` is a tighter bound of its own.
+ * A timer can fire up to a millisecond before a fractional deadline, so the
+ * call times out only once `performance.now` has reached it, and a caller that
+ * then checks its budget sees it ended.
  */
-async function within<T>(until: number, start: () => Promise<T>, late: (value: T) => void = () => {}): Promise<T> {
-  if (performance.now() >= until) throw new CleanupTimeout();
+async function within<T>(until: number, start: () => Promise<T>, late: (value: T) => void = () => {},
+  budget = until): Promise<T> {
+  if (performance.now() >= until) throw new CleanupTimeout(performance.now() >= budget);
   const pending = start();
   let timedOut = false;
   void pending.then(value => { if (timedOut) late(value); }, () => {});
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = Math.min(until, performance.now() + CLEANUP_CALL_MS);
+  const atBudget = budget <= deadline;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => { timedOut = true; reject(new CleanupTimeout()); },
-      Math.max(0, Math.min(until - performance.now(), CLEANUP_CALL_MS)));
+    const expire = () => {
+      const left = deadline - performance.now();
+      if (left > 0) timer = setTimeout(expire, Math.ceil(left));
+      else { timedOut = true; reject(new CleanupTimeout(atBudget)); }
+    };
+    timer = setTimeout(expire, Math.max(0, deadline - performance.now()));
   });
   try { return await Promise.race([pending, timeout]); } finally { clearTimeout(timer); }
 }
@@ -189,15 +217,21 @@ async function within<T>(until: number, start: () => Promise<T>, late: (value: T
  * A cleanup transaction passes its page's `until` instead: it is one cleanup
  * call, so none starts after `until`, and acquiring its session, its
  * statements, its COMMIT and any ROLLBACK all end by `until` or
- * `CLEANUP_CALL_MS`. A session cut off mid-statement or mid-ROLLBACK, or whose
- * ROLLBACK could not start before `until`, is discarded.
+ * `CLEANUP_CALL_MS`, on the one `performance.now` clock its caller's phase
+ * deadlines use. A session cut off mid-statement or mid-ROLLBACK, or whose
+ * ROLLBACK could not start before `until`, is discarded. So is one whose
+ * COMMIT could not be sent, or was not acknowledged, by then: every cleanup
+ * statement is safe to land late, so that is a `CleanupTimeout`, unfinished
+ * when `until` ended it and a reported stall when `CLEANUP_CALL_MS` did.
+ * Its server timeouts round up, so they never fire before `until` does.
  */
 export async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promise<T>, until?: number): Promise<T> {
   const end = until === undefined ? undefined : Math.min(until, performance.now() + CLEANUP_CALL_MS);
-  const remaining = () => end === undefined ? REQUEST_BUDGET_MS : Math.max(1, Math.floor(end - performance.now()));
-  if (end !== undefined && performance.now() >= end) throw new CleanupTimeout();
-  const deadline = Date.now() + remaining();
-  const client = end === undefined ? await pool.connect() : await within(end, () => pool.connect(), late => late.release());
+  const remaining = () => end === undefined ? REQUEST_BUDGET_MS : Math.max(1, Math.ceil(end - performance.now()));
+  if (end !== undefined && performance.now() >= end) throw new CleanupTimeout(performance.now() >= until!);
+  const deadline = Date.now() + REQUEST_BUDGET_MS;
+  const client = end === undefined ? await pool.connect() :
+    await within(end, () => pool.connect(), late => late.release(), until);
   let beginAttempted = false;
   let begun = false;
   let discard = false;
@@ -213,12 +247,16 @@ export async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) =
       await client.query(`SET LOCAL lock_timeout = '${Math.min(LOCK_MS, remaining())}ms'`);
       return fn(client);
     };
-    const result = end === undefined ? await work() : await within(end, work);
+    // Only the caller's own budget makes a cut-off call unfinished; the per-call bound is a stall.
+    const result = end === undefined ? await work() : await within(end, work, () => {}, until);
     begun = false;
     commitSent = true;
-    try { await commitBeforeDeadline(client, deadline); }
-    catch (error) {
+    try {
+      if (end === undefined) await commitBeforeDeadline(client, deadline);
+      else await within(end, () => client.query('COMMIT'), () => {}, until);
+    } catch (error) {
       discard = true;
+      if (error instanceof CleanupTimeout) throw error;
       if (error instanceof CommitNotSentDeadlineExceeded) throw new AuthorityError('RATE_LIMITED', 'Request time budget exceeded');
       // Migration 041's commit-time check: the transition reached COMMIT after its grant expired, so it rolled back.
       if (error instanceof pg.DatabaseError && error.constraint === 'source_upload_attempts_expiry') throw grantExpired();
@@ -229,7 +267,7 @@ export async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) =
   } catch (error) {
     if (begun && !clientReadTimedOut(error) && !(error instanceof CleanupTimeout)) {
       const rollback = () => client.query('ROLLBACK');
-      try { await (end === undefined ? rollback() : within(end, rollback)); } catch { discard = true; }
+      try { await (end === undefined ? rollback() : within(end, rollback, () => {}, until)); } catch { discard = true; }
     }
     else if (beginAttempted) discard = true;
     if (pgCode(error) === '57014') throw new AuthorityError('RATE_LIMITED', 'Database statement time limit exceeded');
@@ -251,6 +289,28 @@ async function capturedNotFuture(db: Db, capturedAt: string | null): Promise<voi
   if (capturedAt === null) return;
   const row = (await db.query('SELECT $1::timestamptz <= clock_timestamp() AS past', [capturedAt])).rows[0];
   if (row?.past !== true) invalid('capturedAt is in the future');
+}
+
+/**
+ * Record one evidence lifecycle event; migration 044's trigger enqueues its
+ * projection invalidation in the same transaction. Returns its commit time.
+ */
+export async function evidenceEvent(db: Db, scope: AuthorityScope, kind: 'source' | 'claim' | 'link', entityId: string,
+  revision: number, operation: 'create' | 'delete'): Promise<string> {
+  const row = (await db.query(`INSERT INTO evidence_events(event_id,space_id,collection_id,kind,entity_id,revision,operation,
+      credential_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING committed_at`,
+  [`eev_${randomUUID()}`, scope.spaceId, scope.collectionId, kind, entityId, revision, operation, scope.credentialId])).rows[0];
+  return iso(row.committed_at)!;
+}
+/**
+ * Migration 044's refusals of an evidence mutation: its endpoint guard found
+ * a live restrict link, or its COMMIT-time check found the key's grants
+ * lapsed after the final statement, so COMMIT rolled everything back.
+ */
+export function evidenceRefusal(error: unknown): unknown {
+  if (linkRestricted(error)) return new AuthorityError('LINK_RESTRICTED', 'A restricting link prevents this deletion', undefined, false);
+  if ((error as { constraint?: unknown })?.constraint === 'evidence_events_authority') return new AuthorityError('FORBIDDEN');
+  return error;
 }
 
 /**
@@ -911,6 +971,53 @@ export class PostgresSources {
   }
 
   /**
+   * Delete a live source: tombstone it, with every incident `detach` link, a
+   * deletion event and its projection invalidation, in one transaction. A
+   * live `restrict` link on it is `LINK_RESTRICTED` and changes nothing.
+   * Needs `sources:write` and `sources:read`. Claims citing the source are
+   * not changed. After the commit the original's bytes are removed from the
+   * blob store; `erasure` reports what remains. Deleting a deleted source
+   * replays its deletion.
+   */
+  async delete(actor: VerifiedCredential, spaceId: string, collectionId: string, sourceId: string): Promise<SourceDeletion> {
+    const admitted = await this.admit(actor, spaceId, collectionId, 'sources:write', 'sources:read');
+    const scope = admitted.scope;
+    let outcome: { deletedAt: string; replayed: boolean; stored: boolean };
+    try {
+      outcome = await this.actorTx(actor, admitted, async db => {
+        if (!reference(sourceId)) throw new AuthorityError('NOT_FOUND');
+        const ids = [scope.spaceId, scope.collectionId, sourceId];
+        // Extraction's lock, so no version commits after the source is deleted.
+        await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',
+          [lockKey(['stateplane:extraction', scope.spaceId, scope.collectionId, sourceId])]);
+        const row = (await db.query(`SELECT e.tombstone,o.object_key,
+            (SELECT v.committed_at FROM evidence_events v WHERE v.space_id=e.space_id AND v.collection_id=e.collection_id
+              AND v.kind='source' AND v.entity_id=e.entity_id AND v.operation='delete') AS deleted_at
+          FROM entity_refs e JOIN original_objects o ON o.space_id=e.space_id AND o.collection_id=e.collection_id
+            AND o.source_id=e.entity_id
+          WHERE e.space_id=$1 AND e.collection_id=$2 AND e.kind='source' AND e.entity_id=$3`, ids)).rows[0];
+        if (!row || (row.tombstone && !row.deleted_at)) throw new AuthorityError('NOT_FOUND');
+        let deletedAt = iso(row.deleted_at);
+        if (!row.tombstone) {
+          await writable(db, scope);
+          // Migration 044's guards refuse a restrict link, detach the rest and queue the original's erasure.
+          await db.query(`UPDATE entity_refs SET tombstone=true WHERE space_id=$1 AND collection_id=$2 AND kind='source'
+            AND entity_id=$3 AND NOT tombstone`, ids);
+          deletedAt = await evidenceEvent(db, scope, 'source', sourceId, 1, 'delete');
+        }
+        return { deletedAt: deletedAt!, replayed: row.tombstone === true, stored: row.object_key !== null };
+      });
+    } catch (error) { throw evidenceRefusal(error); }
+    // Bytes are removed only once the deletion committed, so a refused COMMIT never starts a removal.
+    const until = performance.now() + CLEANUP_CALL_MS;
+    const removed = outcome.stored && await eraseOriginal(admitted.cell, [scope.spaceId, scope.collectionId, sourceId], until,
+      until + CLEANUP_CALL_MS, sourceBounds.reconcileGraceSeconds).catch(() => false);
+    return { sourceId, collectionId: scope.collectionId, deletedAt: outcome.deletedAt, replayed: outcome.replayed,
+      erasure: { originalBytes: !outcome.stored ? 'none' : removed ? 'removed' : 'pending', metadata: 'retained',
+        backups: 'retained' } };
+  }
+
+  /**
    * Promote a verified attempt's bytes to its original key, then commit the
    * source metadata. Bytes are always verified and present before the
    * metadata commits, which finalizes the grant only if it has not expired;
@@ -1159,6 +1266,170 @@ async function sourceExists(db: Db, spaceId: string, sourceId: string): Promise<
   return (await db.query('SELECT 1 FROM sources WHERE space_id=$1 AND source_id=$2', [spaceId, sourceId])).rows.length > 0;
 }
 
+/**
+ * Attempts of a source's grant, and keys the sweep found, that one removal takes; more remain for the next one. Each
+ * page is ranked before it is cut: keys never deferred first (staging keys by key, found keys in the order found),
+ * then deferred keys in the order they were deferred, so keys that keep failing cannot fill every page.
+ */
+const ERASE_ATTEMPTS = 20;
+const ERASE_FOUND = 40;
+/**
+ * A source erasure's state, `$1` the grace in seconds: read with its due page,
+ * so a removal starts its store calls with no read of its own, and whether a
+ * space erasure is due too, so `erase` knows whether the spaces need their
+ * windows this call.
+ */
+const ERASURE_STATE = `SELECT x.space_id,x.collection_id,x.source_id,x.observed::text AS observed,x.removed_at IS NOT NULL AS removed,
+    x.removal_observed IS NOT DISTINCT FROM x.observed AS original_removed,
+    ARRAY(SELECT f.k FROM unnest(x.found_keys) WITH ORDINALITY AS f(k,n)
+      ORDER BY array_position(x.deferred_keys,f.k) NULLS FIRST,f.n LIMIT ${ERASE_FOUND}) AS found,
+    x.deferred_keys AS deferred,EXISTS (SELECT 1 FROM space_erasures s WHERE s.originals_removed_at IS NULL
+      AND s.next_attempt_at<=clock_timestamp()) AS spaces_due,
+    clock_timestamp()>=x.writers_end_at+make_interval(secs=>$1) AS settled,o.object_key,
+    ARRAY(SELECT a.staging_key FROM source_upload_attempts a JOIN source_upload_grants g USING (space_id,collection_id,grant_id)
+      WHERE g.space_id=x.space_id AND g.collection_id=x.collection_id AND g.source_id=x.source_id
+        AND a.staging_removed_at IS NULL
+      ORDER BY array_position(x.deferred_keys,a.staging_key) NULLS FIRST,a.staging_key LIMIT ${ERASE_ATTEMPTS}) AS staged
+  FROM original_erasures x JOIN original_objects o USING (space_id,collection_id,source_id)`;
+type ErasureState = Record<string, unknown>;
+/**
+ * Remove a deleted source's bytes: its original, every key its grant's
+ * attempts wrote that the attempt ledger does not record removed (a staging
+ * copy whose cleanup failed, another attempt's promoted copy), and the keys
+ * the sweep found. Its tombstone is final and the grant's attempts ended, so
+ * only a write the grant started before it ended can still land. A removal
+ * that started after that, plus the grace, is settled. Each key is deleted
+ * once per removal, and a settled removal records each confirmed delete as it
+ * lands, so a removal the budget cuts short keeps its progress and the next
+ * one resumes: an attempt is recorded removed (failed first if it never
+ * ended) once its staging copy is gone, its promoted copy, unless it is the
+ * original, joining `found_keys` in the same transaction; a found key leaves
+ * `found_keys`; and the original's removal is recorded as `removal_observed`.
+ * A found key and the original are recorded only against the sweep's finding
+ * count (`observed`) read before their delete, so a key the sweep finds
+ * meanwhile is removed again. Completion needs the original removed at the
+ * current count, and no found key or attempt left. An unsettled removal
+ * records nothing and schedules the next one for when its writers have ended.
+ * A copy the store confirms even later is found by the sweep, which reopens
+ * the erasure. Keys are isolated: a delete that fails or is cut short does not
+ * end the removal, the other keys still get their store calls, and a settled
+ * removal records the key at the end of `deferred_keys`, so later removals
+ * select and try it after every key never deferred, and it cannot hold the
+ * head of a page; the statement that records a key removed drops it from
+ * `deferred_keys` too, so the list holds only keys still left. Behind `k` keys
+ * that reject, a healthy key is tried within `ceil(k / page) + 1` settled
+ * removals (a page is 40 found keys or 20 attempts); behind `k` keys that
+ * stall or are cut, within `k + 1`, since each such removal defers at least
+ * the key that ended it. A failure is still thrown once
+ * the other keys were tried; a key cut by `storeUntil` is unfinished. `state`
+ * is the erasure as its due page read it, or else read here. Store calls end
+ * by `storeUntil`, transactions by `recordUntil`.
+ * Returns whether the erasure is recorded complete.
+ */
+async function eraseOriginal(cell: SourceCell, ids: readonly string[], storeUntil: number, recordUntil: number,
+  graceSeconds: number, read?: ErasureState): Promise<boolean> {
+  const params = [ids[0], ids[1], ids[2]];
+  const record = (sql: string, values: unknown[]) => transact(cell.pool, db => db.query(sql, values), recordUntil);
+  const state = read ?? (await record(`${ERASURE_STATE} WHERE x.space_id=$2 AND x.collection_id=$3 AND x.source_id=$4`,
+    [graceSeconds, ...params])).rows[0];
+  if (!state) return false;
+  if (state.removed === true) return true;
+  const settled = state.settled === true;
+  const observed = String(state.observed);
+  const original = String(state.object_key);
+  // Each key is deleted once: the committing attempt's promoted key is the original, and the sweep may find either.
+  const deleted = new Set<string>();
+  // An original already removed at the current count needs no delete; its removal stands until the sweep finds a key.
+  if (settled && state.original_removed === true) deleted.add(original);
+  // A fenced record that finds the count advanced stops the removal: the sweep found a key, so it starts over.
+  let current = true;
+  const fenced = async (sql: string, values: unknown[]) => {
+    if (settled && current && (await record(sql, values)).rowCount !== 1) current = false;
+  };
+  const failures: unknown[] = [];
+  const missed = new Set<string>();
+  let cut = false;
+  // Whether the key is gone. A failed or cut delete is not retried in this removal and moves behind every other key.
+  const remove = async (key: string): Promise<boolean> => {
+    if (deleted.has(key)) return true;
+    if (missed.has(key)) return false;
+    if (performance.now() >= storeUntil) { cut = true; return false; }
+    try { await within(storeUntil, () => cell.originals.delete(key)); }
+    catch (error) {
+      missed.add(key);
+      if (error instanceof CleanupTimeout && error.atBudget) cut = true; else failures.push(error);
+      if (settled && current) await record(`UPDATE original_erasures SET deferred_keys=array_append(array_remove(deferred_keys,$4),$4)
+        WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL`, [...params, key]);
+      return false;
+    }
+    deleted.add(key);
+    return true;
+  };
+  const found = [...state.found as string[]];
+  // Keys whose last delete failed or was cut go last, in the order they moved there.
+  const deferred = (state.deferred as string[] | null ?? []).map(String);
+  const removeFound = (key: string) => async () => {
+    if (await remove(key)) await fenced(`UPDATE original_erasures SET found_keys=array_remove(found_keys,$5),
+      deferred_keys=array_remove(deferred_keys,$5) WHERE space_id=$1
+      AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL AND observed=$4::bigint AND $5=ANY(found_keys)`, [...params, observed, key]);
+  };
+  type Unit = { key: string; run: () => Promise<void> };
+  // The keys in the order they are tried; a promoted copy recorded as found during this removal joins the end.
+  const queue: Unit[] = [];
+  const units: Unit[] = [{ key: original, run: async () => {
+    if (await remove(original) && state.original_removed !== true) await fenced(`UPDATE original_erasures SET removal_observed=$4::bigint,
+        deferred_keys=array_remove(deferred_keys,$5)
+      WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL AND observed=$4::bigint
+        AND removal_observed IS DISTINCT FROM $4::bigint`, [...params, observed, original]);
+  } }];
+  for (const value of state.staged as string[]) {
+    const staging = String(value);
+    // The attempt's promoted copy: its key differs from the staging key only in the prefix.
+    const promoted = startsWith(staging, 'staging/') ? `originals/${staging.slice('staging/'.length)}` : original;
+    units.push({ key: staging, run: async () => {
+      if (!await remove(staging)) return;
+      if (!settled) { await remove(promoted); return; }
+      // Its grant ended, so an attempt that never ended writes nothing more; it fails as reconciliation would fail it.
+      // Its promoted copy is then a found key, so each of its two keys is recorded as its own delete lands.
+      await transact(cell.pool, async db => {
+        await db.query(`UPDATE source_upload_attempts SET state=CASE WHEN state IN ('receiving','verified') THEN 'failed'
+            ELSE state END,failure_code=CASE WHEN state IN ('receiving','verified') THEN 'abandoned' ELSE failure_code END,
+            staging_removed_at=clock_timestamp(),updated_at=clock_timestamp()
+          WHERE space_id=$1 AND collection_id=$2 AND staging_key=$3 AND staging_removed_at IS NULL`, [ids[0], ids[1], staging]);
+        if (promoted !== original || deferred.includes(staging)) await db.query(`UPDATE original_erasures
+            SET found_keys=CASE WHEN $4::text IS NULL OR $4=ANY(found_keys) THEN found_keys ELSE array_append(found_keys,$4) END,
+              deferred_keys=array_remove(deferred_keys,$5)
+          WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL`,
+        [...params, promoted !== original ? promoted : null, staging]);
+      }, recordUntil);
+      if (promoted !== original && !found.includes(promoted)) { found.push(promoted); queue.push({ key: promoted, run: removeFound(promoted) }); }
+    } });
+  }
+  for (const key of found) units.push({ key: String(key), run: removeFound(String(key)) });
+  // The pages arrive ranked; this orders the original and the two pages together by the same rule.
+  const rank = (key: string) => deferred.indexOf(key);
+  queue.push(...units.filter(unit => rank(unit.key) < 0),
+    ...units.filter(unit => rank(unit.key) >= 0).sort((x, y) => rank(x.key) - rank(y.key)));
+  try { for (let i = 0; i < queue.length && current && !cut; i++) await queue[i].run(); }
+  catch (error) {
+    // A record that fails after a key's failure is reported with it; one cut by `recordUntil` is unfinished.
+    if (!failures.length) throw error;
+    if (!(error instanceof CleanupTimeout && error.atBudget)) failures.push(error);
+  }
+  if (failures.length) throw failures.length === 1 ? failures[0] : new AggregateError(failures, 'Some of a deleted source\'s bytes were not erased');
+  if (settled && current && !cut && (await record(`UPDATE original_erasures SET removed_at=clock_timestamp(),deferred_keys='{}'
+    WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL AND observed=$4::bigint
+      AND removal_observed=observed AND cardinality(found_keys)=0
+      AND NOT EXISTS (SELECT 1 FROM source_upload_attempts a JOIN source_upload_grants g USING (space_id,collection_id,grant_id)
+        WHERE g.space_id=$1 AND g.collection_id=$2 AND g.source_id=$3 AND a.staging_removed_at IS NULL)`, [...params, observed])).rowCount === 1) return true;
+  // Unsettled: due once its writers ended. Keys left over, cut short, or a key found meanwhile: due now.
+  await record(`UPDATE original_erasures SET next_attempt_at=CASE WHEN $4 THEN clock_timestamp()
+      ELSE greatest(clock_timestamp(),writers_end_at+make_interval(secs=>$5)) END
+    WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL`, [...params, settled || cut, graceSeconds]);
+  return false;
+}
+const keyPrefixes = (spaceId: string) => [`originals/${spaceSegment(spaceId)}/`, `staging/${spaceSegment(spaceId)}/`];
+
 const SWEEP_CURSOR = 'reconcile/sweep-cursor';
 /**
  * Read the stored sweep cursor through a reader the sweep owns, each read
@@ -1254,6 +1525,126 @@ export class SourceUploadReconciler {
   }
 
   /**
+   * Enforce retention for deletions within `budgetMs`: remove the bytes of
+   * up to `limit` deleted sources, then, for up to `limit` erased spaces,
+   * delete a page of each one's original and staging keys. Every phase
+   * deadline is fixed from the call's start, in fiftieths of the budget, never
+   * from how long an earlier call took, so no phase can take a later one's
+   * slice. The source page, which reads each erasure's state and whether a
+   * space erasure is due, ends by 20/50. With a space due, source store calls
+   * end 20/50 after that page was read but by 28/50 at the latest, so a slow
+   * read still leaves them at least 8/50 (800 ms at 5 s) for store calls, and
+   * a call longer than that is cut as unfinished; source transactions
+   * (checkpoints and retry turns) end 4/50 later, by 32/50, and no source call
+   * runs past that. With none due, nothing waits for the spaces' windows, so
+   * the sources use them: store calls end by 45/50 and transactions by the
+   * budget, and a space found due by then still gets any time left. The space
+   * page has until 42/50, a fifth of the budget or more of its own when a
+   * space was due, and space store calls end by 45/50, so once the space page
+   * is read there are always 3/50 of the budget left for a store call, and
+   * the last tenth records each attempted space's progress or retry turn. At
+   * `erase(25, 5000)` with a space due: source page by 2000 ms, source store
+   * calls by 2800 ms, source transactions by 3200 ms, space page by 4200 ms
+   * (1000 ms after the sources' latest end), space store calls by 4500 ms
+   * (300 ms after the page's), space records by 5000 ms; with none due,
+   * source store calls by 4500 ms and source transactions by 5000 ms.
+   * Erasure is recorded complete only by a removal, or for a space an empty
+   * listing, that started after every write to its keys could have landed (the last
+   * grant's end plus the grace) and before the sweep last found one of its
+   * keys. Each erasure attempted moves behind every due one not tried since,
+   * so a failing one cannot hold the oldest page; within a source erasure, a
+   * key whose delete failed or was cut is selected and tried after its other
+   * keys, so it cannot hold them either, and a healthy key is tried within the
+   * bound `eraseOriginal` states: one tick per stalled key ahead of it with a
+   * space due, and at least two stalled keys a tick with none. A call cut short by its phase's deadline is
+   * unfinished, not a failure. Returns how many erasures were due. Failures
+   * are reported together; each erasure is retried later.
+   */
+  async erase(limit = 25, budgetMs = 10_000): Promise<number> {
+    if (!isSafeInteger(limit) || limit < 1 || limit > 500) throw new RangeError('Invalid erasure limit');
+    if (!isSafeInteger(budgetMs) || budgetMs < 1) throw new RangeError('Invalid erasure budget');
+    const start = performance.now();
+    const until = start + budgetMs;
+    // Fixed from the start: the source page's end, the latest source store end, the space page's end and the space
+    // store calls' end, so no slow call moves a later phase's window.
+    const by = (fiftieths: number) => start + budgetMs * fiftieths / 50;
+    const pageEnd = by(20);
+    const sourcesLatest = by(28);
+    const spacePageEnd = by(42);
+    const spacesStop = by(45);
+    const errors: unknown[] = [];
+    // A call its phase's budget cut short is unfinished work, not a failure.
+    const failed = (error: unknown) => { if (!(error instanceof CleanupTimeout && error.atBudget)) errors.push(error); };
+    const pool = this.cell.pool;
+    const grace = this.graceSeconds;
+    // A source page that cannot be read still leaves the spaces their turn. It reads each erasure's state too.
+    const sources = await transact(pool, db => db.query(`${ERASURE_STATE}
+      WHERE x.removed_at IS NULL AND x.next_attempt_at<=clock_timestamp()
+      ORDER BY x.next_attempt_at,x.space_id,x.collection_id,x.source_id LIMIT $2`, [grace, limit]), pageEnd)
+      .then(result => result.rows, (error: unknown) => { failed(error); return []; });
+    // With a space due, their store time starts once their page is read, so a slow read still leaves them a store
+    // call, but it never moves past its fixed latest end: the spaces' window starts by `sourcesEnd` however slow the
+    // source calls are. With none due, the spaces' windows are theirs: store calls by `spacesStop`, records by `until`.
+    const spacesDue = sources.some(row => row.spaces_due !== false);
+    const sourcesStop = spacesDue ? Math.min(sourcesLatest, performance.now() + budgetMs * 20 / 50) : spacesStop;
+    const sourcesEnd = spacesDue ? sourcesStop + budgetMs * 4 / 50 : until;
+    for (const row of sources) {
+      if (performance.now() >= sourcesStop) break;
+      const ids = [row.space_id, row.collection_id, row.source_id];
+      try { await eraseOriginal(this.cell, ids, sourcesStop, sourcesEnd, grace, row); }
+      catch (error) {
+        failed(error);
+        await transact(pool, db => db.query(`UPDATE original_erasures SET next_attempt_at=clock_timestamp()
+          WHERE space_id=$1 AND collection_id=$2 AND source_id=$3 AND removed_at IS NULL`, ids), sourcesEnd)
+          .catch(failed);
+      }
+    }
+    // A space page that cannot be read is reported with the sources' failures; one its deadline cut short is
+    // unfinished, and the spaces keep their place.
+    const spaces = performance.now() >= spacePageEnd ? [] : await transact(pool, db => db.query(`SELECT space_id,observed::text AS observed,
+        to_char(requested_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS requested,
+        clock_timestamp()>=writers_end_at+make_interval(secs=>$2) AS settled
+      FROM space_erasures WHERE originals_removed_at IS NULL AND next_attempt_at<=clock_timestamp()
+      ORDER BY next_attempt_at,space_id LIMIT $1`, [limit, grace]), spacePageEnd)
+      .then(result => result.rows, (error: unknown) => { failed(error); return []; });
+    for (const row of spaces) {
+      if (performance.now() >= spacesStop) break;
+      const spaceId = String(row.space_id);
+      let found = false;
+      let finished = true;
+      try {
+        for (const prefix of keyPrefixes(spaceId)) {
+          if (performance.now() >= spacesStop) { finished = false; break; }
+          // Store calls end by `spacesStop`, so the tenth after it records this space's progress or retry turn.
+          const page = await within(spacesStop, () => this.cell.originals.list(prefix, 100));
+          for (const key of page.keys) {
+            if (!startsWith(key, prefix)) break;
+            found = true;
+            if (performance.now() >= spacesStop) break;
+            await within(spacesStop, () => this.cell.originals.delete(key));
+          }
+        }
+        // Only a listing that found nothing, after the space's writers ended, records completion against the request it
+        // saw, and only if the sweep found none of the space's keys since that request was read.
+        const complete = finished && !found && row.settled === true;
+        await transact(pool, db => complete
+          ? db.query(`UPDATE space_erasures SET originals_removed_at=clock_timestamp()
+            WHERE space_id=$1 AND requested_at=$2::timestamptz AND observed=$3::bigint AND originals_removed_at IS NULL`,
+          [spaceId, row.requested, row.observed])
+          : db.query(`UPDATE space_erasures SET next_attempt_at=CASE WHEN $2 THEN clock_timestamp()
+              ELSE greatest(clock_timestamp(),writers_end_at+make_interval(secs=>$3)) END
+            WHERE space_id=$1 AND originals_removed_at IS NULL`, [spaceId, found || !finished, grace]), until);
+      } catch (error) {
+        failed(error);
+        await transact(pool, db => db.query(`UPDATE space_erasures SET next_attempt_at=clock_timestamp()
+          WHERE space_id=$1 AND originals_removed_at IS NULL`, [spaceId]), until).catch(failed);
+      }
+    }
+    if (errors.length) throw new AggregateError(errors, 'Deleted evidence bytes were not all erased');
+    return sources.length + spaces.length;
+  }
+
+  /**
    * Delete stored bytes no attempt needs any more, found by listing the bucket
    * rather than by the ledger, so a write R2 confirmed after its attempt
    * settled is found on a later pass however late it landed. A failed
@@ -1277,11 +1668,31 @@ export class SourceUploadReconciler {
     const page = await within(until, () => blobs.list(cursor, limit));
     const owners = page.keys.map(storedAttempt);
     const known = owners.flatMap((owner, index) => owner ? [{ ...owner, index }] : []);
-    const ended = new Set((await transact(this.cell.pool, db => db.query(`SELECT k.index FROM
-      unnest($1::text[],$2::text[],$3::boolean[],$4::int[]) AS k(space_id,staging_key,original,index)
-      JOIN source_upload_attempts a ON a.space_id=k.space_id AND a.staging_key=k.staging_key
-      WHERE a.state='failed' OR (a.state='committed' AND NOT k.original)`,
-    [known.map(k => k.spaceId), known.map(k => k.stagingKey), known.map(k => k.original), known.map(k => k.index)]), until))
+    // A deleted source's original and every key of an erased space are final too, so they go as well. Finding
+    // any key of a deleted source's grant, or of an erased space, counts against its erasure and reopens it in
+    // this statement, before the delete: the erasure reads pending until `erase` removes the key again, or lists
+    // the space empty, after this finding, so neither a failed delete here nor a completion already in flight
+    // can record it erased.
+    const ended = new Set((await transact(this.cell.pool, db => db.query(`WITH m AS (SELECT k.index,k.space_id,k.original,k.key,
+        a.state,g.collection_id,g.source_id,COALESCE(e.tombstone,false) AS source_deleted,
+        EXISTS (SELECT 1 FROM spaces s WHERE s.space_id=k.space_id AND s.lifecycle='deleted') AS space_deleted
+      FROM unnest($1::text[],$2::text[],$3::boolean[],$4::int[],$5::text[]) AS k(space_id,staging_key,original,index,key)
+      LEFT JOIN source_upload_attempts a ON a.space_id=k.space_id AND a.staging_key=k.staging_key
+      LEFT JOIN source_upload_grants g ON g.space_id=a.space_id AND g.collection_id=a.collection_id AND g.grant_id=a.grant_id
+      LEFT JOIN entity_refs e ON e.space_id=g.space_id AND e.collection_id=g.collection_id AND e.kind='source'
+        AND e.entity_id=g.source_id),
+    spaces_reopened AS (UPDATE space_erasures x SET originals_removed_at=NULL,observed=x.observed+1,
+        next_attempt_at=clock_timestamp()
+      WHERE x.space_id IN (SELECT m.space_id FROM m WHERE m.space_deleted) RETURNING 1),
+    sources_reopened AS (UPDATE original_erasures x SET removed_at=NULL,observed=x.observed+1,next_attempt_at=clock_timestamp(),
+        found_keys=ARRAY(SELECT DISTINCT k FROM unnest(x.found_keys||f.keys) AS k ORDER BY k)
+      FROM (SELECT m.space_id,m.collection_id,m.source_id,array_agg(m.key) AS keys FROM m WHERE m.source_deleted
+        GROUP BY m.space_id,m.collection_id,m.source_id) f
+      WHERE x.space_id=f.space_id AND x.collection_id=f.collection_id AND x.source_id=f.source_id RETURNING 1)
+    SELECT m.index FROM m WHERE m.state='failed' OR (m.state='committed' AND (NOT m.original OR m.source_deleted))
+      OR m.space_deleted`,
+    [known.map(k => k.spaceId), known.map(k => k.stagingKey), known.map(k => k.original), known.map(k => k.index),
+      known.map(k => page.keys[k.index])]), until))
       .rows.map(row => Number(row.index)));
     const errors: unknown[] = [];
     const deletesUntil = until - budgetMs / 5;
