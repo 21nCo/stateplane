@@ -223,7 +223,8 @@ const base64 = (hex: string) => btoa(String.fromCharCode(...(hex.match(/../g) ??
 /** Original bytes are untrusted content served from the API origin: never rendered, sniffed or cached. */
 async function content(services: StateplaneServices, prefix: Prefix, sourceId: string): Promise<Response> {
   const { source, body: stream } = await services.sources.content(...prefix, sourceId);
-  const headers = new Headers({ 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
+  // no-transform keeps an intermediary from compressing the bytes Repr-Digest describes.
+  const headers = new Headers({ 'Cache-Control': 'no-store, no-transform', 'X-Content-Type-Options': 'nosniff',
     'Content-Security-Policy': "default-src 'none'; sandbox", 'Content-Disposition': 'attachment' });
   if (!stream) {
     headers.set('X-Stateplane-Reference-Only', 'true');

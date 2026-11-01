@@ -197,9 +197,10 @@ used: `scopes_supported` is omitted and authorization is the space grant model.
   an upload's base64 (2,796,204 characters) leaves more than 1.3 MiB of the
   4 MiB body for framing. `sources_content` refuses a larger original with
   nonretryable `RATE_LIMITED` from its recorded size, without reading it, and
-  reads and verifies a smaller one completely before answering. Malformed or
-  oversized base64 in `uploads_send` is `INVALID_ARGUMENT` before any service
-  call. HTTP and the CLI carry originals up to the 25 MiB upload bound.
+  reads and verifies a smaller one completely before answering. Malformed,
+  noncanonical (nonzero pad bits) or oversized base64 in `uploads_send`,
+  including any that decodes to more than 2 MiB, is `INVALID_ARGUMENT` before
+  any service call. HTTP and the CLI carry originals up to the 25 MiB upload bound.
 
 These bounds reuse STA-8/9 limits or protocol framing; none is a measured
 Cloudflare or Railway capacity. The committed manifest publishes 42 tools in an

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { open, unlink } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import { readConfig, saveConfig, configureToken, loadToken, logoutConfig, removeTrackedTokens, withConfigMutation } from './config.js';
 import type { CliConfig } from './config.js';
 import { StateplaneCliError, StateplaneHttpClient } from './transport.js';
@@ -35,7 +36,7 @@ function parse(argv:string[]):{words:string[];flags:Flags} {
   }
   return {words,flags};
 }
-/* HTTP body budgets of the evidence routes (see packages/api/src/evidence.ts). */
+/* HTTP body budgets of the evidence routes (largeBody and smallBody in packages/api/src/http.ts). */
 const largeBody = 3_145_728;
 const smallBody = 32_768;
 /** The service's upload bound (sourceBounds.uploadBytes, 25 MiB). */
@@ -138,10 +139,12 @@ async function input(path:string,maxBytes:number):Promise<string> {
   try { return new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(chunks)); }
   catch { throw new StateplaneCliError('INVALID_ARGUMENT'); }
 }
-async function payload(flags:Flags):Promise<unknown> {
+/** The JSON of --data or --file, at most maxBytes: by default the record and
+ * schema budget; an evidence command passes its route's body budget. */
+async function payload(flags:Flags,maxBytes=1_048_576):Promise<unknown> {
   if (flags.data!==undefined && flags.file!==undefined) throw new StateplaneCliError('INVALID_ARGUMENT');
-  const text=flags.file!==undefined ? await input(required(flags,'file'),1_048_576) : required(flags,'data');
-  if (Buffer.byteLength(text)>1_048_576) throw new StateplaneCliError('RATE_LIMITED',undefined,undefined,false);
+  const text=flags.file!==undefined ? await input(required(flags,'file'),maxBytes) : required(flags,'data');
+  if (Buffer.byteLength(text)>maxBytes) throw new StateplaneCliError('RATE_LIMITED',undefined,undefined,false);
   return parsed(text);
 }
 function withinWireBudget<T>(value:T,maxBytes:number):T {
@@ -294,9 +297,10 @@ function optional(flags: Flags, names: Record<string, string>): Record<string, s
   for (const [flag, field] of Object.entries(names)) if (flags[flag] !== undefined) out[field] = required(flags, flag);
   return out;
 }
-/** A JSON object payload extended with one field taken from a flag; the payload may not set it too. */
-async function objectWith(flags: Flags, field: string, value: unknown): Promise<Record<string, unknown>> {
-  const data = await payload(flags);
+/** A JSON object payload extended with one field taken from a flag; the payload may not set it too.
+ * The payload is read within the route's body budget, which the caller checks again with the field added. */
+async function objectWith(flags: Flags, field: string, value: unknown, maxBytes: number): Promise<Record<string, unknown>> {
+  const data = await payload(flags, maxBytes);
   if (!data || typeof data !== 'object' || Array.isArray(data) || Object.hasOwn(data, field))
     throw new StateplaneCliError('INVALID_ARGUMENT');
   return { [field]: value, ...data };
@@ -323,11 +327,25 @@ async function fileBytes(path: string, maxBytes: number): Promise<Uint8Array> {
   return new Uint8Array(Buffer.concat(chunks));
 }
 
+/** Write all of one chunk at the file's current position; no progress is a failure. */
+async function writeAll(file: FileHandle, chunk: Uint8Array): Promise<void> {
+  let offset = 0;
+  while (offset < chunk.byteLength) {
+    const { bytesWritten } = await file.write(chunk, offset, chunk.byteLength - offset); // NOSONAR -- writes keep stream order
+    if (!(bytesWritten > 0)) throw new Error('short write');
+    offset += bytesWritten;
+  }
+}
+
 /**
  * Save a source's original to a new file and report it as JSON; stdout stays
  * one JSON value. The file must not exist. The bytes are hashed as they are
- * written, and a body that errors, or whose digest or length differs from the
- * response headers, removes the file and fails nonretryable PROVIDER_UNAVAILABLE.
+ * written, and the file counts as saved only once every byte is written and it
+ * has closed. A body that errors, a write or close that fails, a digest that
+ * differs from Repr-Digest (which is required), or a length that differs from
+ * the Content-Length of an unencoded response removes the file and fails
+ * nonretryable PROVIDER_UNAVAILABLE. A response without Content-Length (a
+ * chunked body) is verified by its digest alone.
  */
 async function saveContent(client: StateplaneHttpClient, path: string, output: string): Promise<unknown> {
   const response = await client.download(path);
@@ -336,7 +354,12 @@ async function saveContent(client: StateplaneHttpClient, path: string, output: s
     return { referenceOnly: true, output: null };
   }
   const digest = /^sha-256=:([A-Za-z0-9+/]{43}=):$/.exec(response.headers.get('repr-digest') ?? '')?.[1];
-  const length = Number(response.headers.get('content-length'));
+  const declared = response.headers.get('content-length');
+  const encoding = response.headers.get('content-encoding');
+  // The Content-Length of a content coding counts encoded bytes, which fetch has already decoded.
+  const encoded = encoding !== null && encoding.trim().toLowerCase() !== 'identity';
+  let length: number | null = null;
+  if (declared !== null && !encoded) length = /^(?:0|[1-9]\d*)$/.test(declared) ? Number(declared) : Number.NaN;
   let file;
   try { file = await open(output, 'wx', 0o600); }
   catch {
@@ -348,12 +371,12 @@ async function saveContent(client: StateplaneHttpClient, path: string, output: s
   let complete: boolean;
   try {
     for await (const chunk of response.body ?? []) {
+      await writeAll(file, chunk);
       hash.update(chunk); bytes += chunk.byteLength;
-      await file.write(chunk); // NOSONAR -- writes keep stream order
     }
-    complete = digest !== undefined && hash.digest('base64') === digest && (!Number.isSafeInteger(length) || bytes === length);
+    complete = digest !== undefined && hash.digest('base64') === digest && (length === null || bytes === length);
   } catch { complete = false; }
-  finally { await file.close(); }
+  try { await file.close(); } catch { complete = false; }
   if (!complete) {
     await unlink(output).catch(() => {});
     throw new StateplaneCliError('PROVIDER_UNAVAILABLE', undefined, undefined, false);
@@ -382,7 +405,7 @@ async function runSources(client: StateplaneHttpClient, action: string, flags: F
     version: flags.version === undefined ? undefined : String(integer(required(flags, 'version'))) })}`);
   if (action === 'correct')
     return client.request('POST', `${source}/extraction/corrections`, withinWireBudget(await objectWith(flags, 'baseVersion',
-      integer(required(flags, 'base-version'))), largeBody));
+      integer(required(flags, 'base-version')), largeBody), largeBody));
   throw new StateplaneCliError('INVALID_ARGUMENT');
 }
 
@@ -410,7 +433,7 @@ async function runClaims(client: StateplaneHttpClient, action: string, flags: Fl
   const claims = `${base}/claims`;
   if (action === 'create')
     return client.request('POST', claims, withinWireBudget(await objectWith(flags, 'idempotencyKey',
-      required(flags, 'idempotency-key')), largeBody));
+      required(flags, 'idempotency-key'), largeBody), largeBody));
   if (action === 'list')
     return client.request('GET', `${claims}${search({ status: flags.status === undefined ? undefined : required(flags, 'status'),
       citingCollection: flags['citing-collection'] === undefined ? undefined : required(flags, 'citing-collection'),
@@ -422,7 +445,7 @@ async function runClaims(client: StateplaneHttpClient, action: string, flags: Fl
     revision: flags.revision === undefined ? undefined : String(integer(required(flags, 'revision'))) })}`);
   const baseRevision = integer(required(flags, 'base-revision'));
   if (action === 'revise')
-    return client.request('POST', `${claim}/revisions`, withinWireBudget(await objectWith(flags, 'baseRevision', baseRevision), largeBody));
+    return client.request('POST', `${claim}/revisions`, withinWireBudget(await objectWith(flags, 'baseRevision', baseRevision, largeBody), largeBody));
   if (action === 'review')
     return client.request('POST', `${claim}/reviews`, withinWireBudget({ baseRevision, status: required(flags, 'status') }, smallBody));
   if (action === 'delete') return client.request('DELETE', `${claim}${search({ baseRevision: String(baseRevision) })}`);
@@ -433,7 +456,7 @@ async function runLinks(client: StateplaneHttpClient, action: string, flags: Fla
   const links = `${base}/links`;
   if (action === 'create')
     return client.request('POST', links, withinWireBudget(await objectWith(flags, 'idempotencyKey',
-      required(flags, 'idempotency-key')), smallBody));
+      required(flags, 'idempotency-key'), smallBody), smallBody));
   if (action === 'list')
     return client.request('GET', `${links}${search({ endpointKind: required(flags, 'endpoint-kind'),
       endpointId: required(flags, 'endpoint-id'), after: flags.after === undefined ? undefined : required(flags, 'after'),

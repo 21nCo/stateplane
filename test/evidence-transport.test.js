@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import YAML from 'yaml';
 import { McpFnTestClient, authenticatedHttpTarget } from '@mcpfn/testing';
 import { createHttpHandler } from '../packages/api/dist/index.js';
@@ -171,7 +172,7 @@ test('original bytes are served as a verified, uncached, unrendered attachment a
   assert.equal(response.headers.get('content-disposition'), 'attachment');
   assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(response.headers.get('content-security-policy'), "default-src 'none'; sandbox");
-  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal(response.headers.get('cache-control'), 'no-store, no-transform');
   assert.equal(response.headers.get('repr-digest'), `sha-256=:${Buffer.from(sha('abc'), 'hex').toString('base64')}:`);
   const reference = await send(handler, 'GET', `${c}/sources/src_ref/content`);
   assert.equal(reference.status, 204);
@@ -296,9 +297,9 @@ async function serve(handler) {
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   return { server, origin: `http://127.0.0.1:${server.address().port}` };
 }
-async function cliProcess(root, argv, input = '') {
-  const child = spawn(process.execPath, ['packages/cli/bin/stateplane.js', ...argv], {
-    cwd: process.cwd(), env: { ...process.env, STATEPLANE_CONFIG_DIR: root, STATEPLANE_TOKEN: '' }, stdio: ['pipe', 'pipe', 'pipe'] });
+async function cliProcess(root, argv, input = '', { nodeArgs = [], env = {} } = {}) {
+  const child = spawn(process.execPath, [...nodeArgs, 'packages/cli/bin/stateplane.js', ...argv], {
+    cwd: process.cwd(), env: { ...process.env, STATEPLANE_CONFIG_DIR: root, STATEPLANE_TOKEN: '', ...env }, stdio: ['pipe', 'pipe', 'pipe'] });
   let stdout = '', stderr = '';
   child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
   child.stdout.on('data', chunk => { stdout += chunk; }); child.stderr.on('data', chunk => { stderr += chunk; });
@@ -398,6 +399,104 @@ test('every evidence CLI command sends its HTTP route; content is saved, verifie
   await assert.rejects(readFile(corrupt), { code: 'ENOENT' });
 });
 
+/** A CLI configured for an endpoint, with its config in a temporary directory. */
+async function configuredCli(t, origin) {
+  const root = await mkdtemp(join(tmpdir(), 'stateplane-evidence-cli-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  assert.equal((await cliProcess(root, ['config', 'endpoint', '--url', `${origin}/`])).status, 0);
+  assert.equal((await cliProcess(root, ['auth', 'import', '--token-stdin', '--store', 'file'], 'secret-test-token\n')).status, 0);
+  assert.equal((await cliProcess(root, ['spaces', 'select', '--space', 'sp_a'])).status, 0);
+  return { root, cli: (argv, options) => cliProcess(root, argv, '', options) };
+}
+
+test('CLI evidence payloads from --file are bounded by their route body budget, not the record budget', async t => {
+  const state = fixture();
+  const { server, origin } = await serve(createHttpHandler(state));
+  t.after(() => server.close());
+  const { root, cli } = await configuredCli(t, origin);
+  const cl = ['--collection', 'c'];
+  // Each command adds one flag field before the payload; the body on the wire is exactly the budget, then one byte over.
+  for (const [argv, field, value, filler, budget, service] of [
+    [['claims', 'create', ...cl, '--idempotency-key', 'k'], 'idempotencyKey', 'k', 'statement', 3_145_728, 'claims.create'],
+    [['claims', 'revise', ...cl, '--id', 'clm_1', '--base-revision', '1'], 'baseRevision', 1, 'statement', 3_145_728, 'claims.revise'],
+    [['sources', 'correct', ...cl, '--id', 'src_1', '--base-version', '1'], 'baseVersion', 1, 'content', 3_145_728, 'sources.correctExtraction'],
+    [['links', 'create', ...cl, '--idempotency-key', 'k'], 'idempotencyKey', 'k', 'type', 32_768, 'links.create']
+  ]) {
+    const data = size => ({ [filler]: 'x'.repeat(size), attributedTo: 'A' });
+    const overhead = Buffer.byteLength(JSON.stringify({ [field]: value, ...data(0) }));
+    for (const [extra, accepted] of [[0, true], [1, false]]) {
+      const file = join(root, 'payload.json');
+      await writeFile(file, JSON.stringify(data(budget - overhead + extra)));
+      state.calls.length = 0;
+      const run = await cli([...argv, '--file', file]);
+      if (accepted) {
+        assert.equal(run.status, 0, `${argv.join(' ')}: ${run.stderr}`);
+        assert.deepEqual(state.calls.map(call => call.name), [service]);
+        assert.equal(Buffer.byteLength(JSON.stringify(state.calls[0].args.at(-1))), budget, argv.join(' '));
+      } else {
+        assert.deepEqual(JSON.parse(run.stderr).error, { code: 'RATE_LIMITED', message: 'RATE_LIMITED', retryable: false, requestId: null });
+        assert.equal(state.calls.length, 0, `${argv.join(' ')} over budget is refused before any request`);
+      }
+    }
+  }
+});
+
+test('CLI content is saved from a chunked body by its digest, written in full, and removed when a write or close fails', async t => {
+  const bytes = Buffer.from('chunked original');
+  let digest = createHash('sha256').update(bytes).digest('base64');
+  const encodings = [];
+  const server = createServer((req, res) => {
+    encodings.push(req.headers['accept-encoding']);
+    // No Content-Length: Node sends the body chunked, as a streamed Worker or edge-compressed response would.
+    res.writeHead(200, { 'content-type': 'text/plain', 'repr-digest': `sha-256=:${digest}:`, 'cache-control': 'no-store, no-transform' });
+    res.write(bytes.subarray(0, 5));
+    setTimeout(() => res.end(bytes.subarray(5)), 10);
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  t.after(() => server.close());
+  const { root, cli } = await configuredCli(t, `http://127.0.0.1:${server.address().port}`);
+  const content = ['sources', 'content', '--collection', 'c', '--id', 'src_1', '--output'];
+  const output = join(root, 'chunked.txt');
+  const saved = await cli([...content, output]);
+  assert.equal(saved.status, 0, saved.stderr);
+  assert.deepEqual(JSON.parse(saved.stdout), { referenceOnly: false, output, bytes: bytes.length, sha256: sha(bytes), mimeType: 'text/plain' });
+  assert.deepEqual(await readFile(output), bytes);
+  assert.deepEqual(encodings, ['identity'], 'the CLI asks for the bytes unencoded');
+
+  // The child's file handles write at most one byte per call (short writes), make no progress, or fail to close.
+  const faults = join(root, 'faults.mjs');
+  await writeFile(faults, `import { open } from 'node:fs/promises';
+const probe = await open(process.execPath, 'r'); const proto = Object.getPrototypeOf(probe); await probe.close();
+const { write } = proto; const mode = process.env.STATEPLANE_TEST_FS_FAULT;
+proto.write = function (buffer, offset = 0, length = buffer.byteLength - offset, position = null) {
+  // close is an own property of each handle; only a handle that was written to fails to close.
+  if (mode === 'close' && !Object.hasOwn(this, 'faulted')) {
+    const close = this.close; this.faulted = true;
+    this.close = async () => { await close(); throw new Error('close failed'); };
+  }
+  if (mode === 'zero') return Promise.resolve({ bytesWritten: 0, buffer });
+  return write.call(this, buffer, offset, mode === 'short' ? Math.min(length, 1) : length, position);
+};
+`);
+  const nodeArgs = ['--import', pathToFileURL(faults).href];
+  const short = join(root, 'short.txt');
+  const partial = await cli([...content, short], { nodeArgs, env: { STATEPLANE_TEST_FS_FAULT: 'short' } });
+  assert.equal(partial.status, 0, partial.stderr);
+  assert.deepEqual(await readFile(short), bytes, 'every chunk is written in full across short writes');
+  for (const mode of ['zero', 'close']) {
+    const failed = join(root, `${mode}.txt`);
+    const run = await cli([...content, failed], { nodeArgs, env: { STATEPLANE_TEST_FS_FAULT: mode } });
+    assert.deepEqual(JSON.parse(run.stderr).error, { code: 'PROVIDER_UNAVAILABLE', message: 'PROVIDER_UNAVAILABLE', retryable: false, requestId: null }, mode);
+    assert.equal(run.stdout, '', mode);
+    await assert.rejects(readFile(failed), { code: 'ENOENT' }, mode);
+  }
+  // Repr-Digest stays mandatory without Content-Length: a mismatch removes the file.
+  digest = createHash('sha256').update('other').digest('base64');
+  const mismatch = join(root, 'mismatch.txt');
+  assert.equal(JSON.parse((await cli([...content, mismatch])).stderr).error.code, 'PROVIDER_UNAVAILABLE');
+  await assert.rejects(readFile(mismatch), { code: 'ENOENT' });
+});
+
 test('HTTP, CLI and MCP report one service refusal with the same code and retryability', async t => {
   const state = fixture();
   const http = createHttpHandler(state);
@@ -465,7 +564,13 @@ test('MCP carries original bytes as bounded base64 and refuses what it cannot ca
   assert.equal(sent.isError, undefined);
   assert.deepEqual(state.calls[0].args[4], { bytes: 3, mimeType: 'text/plain', sha256: sha('abc') });
   assert.equal(state.calls[0].received, 'abc');
-  for (const contentBase64 of ['YWJ', 'YW=j', 'YWJj\n', 'Y'.repeat(2_796_204) + 'AAAA']) {
+  // Exactly 2 MiB decoded is carried; one byte more, or base64 with nonzero pad bits, is refused before the service.
+  const most = Buffer.alloc(2_097_152, 7);
+  state.calls.length = 0;
+  const full = await client.callTool('uploads_send', { ...s, grantId: 'upl_1', mimeType: 'text/plain', contentBase64: most.toString('base64') });
+  assert.equal(full.isError, undefined, JSON.stringify(full.structuredContent?.error));
+  assert.equal(state.calls[0].args[4].bytes, 2_097_152);
+  for (const contentBase64 of ['YWJ', 'YW=j', 'YWJj\n', 'Y'.repeat(2_796_204) + 'AAAA', Buffer.alloc(2_097_153).toString('base64'), 'YR==', 'YWJ=']) {
     state.calls.length = 0;
     const result = await client.callTool('uploads_send', { ...s, grantId: 'upl_1', mimeType: 'text/plain', contentBase64 });
     assert.equal(result.structuredContent.error.code, 'INVALID_ARGUMENT', JSON.stringify(contentBase64.slice(0, 8)));

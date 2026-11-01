@@ -129,11 +129,12 @@ export class StateplaneHttpClient {
     const serialized=serializeBody(body);
     return this.send(method,route,serialized,requestHeaders(this.token,serialized,extraHeaders),false);
   }
-  /** Read a byte stream, such as a source's original. The response is returned
-   * unread once its status is successful; an error response is a CLI error. */
+  /** Read a byte stream, such as a source's original, asking for it unencoded.
+   * The response is returned unread once its status is successful; an error
+   * response is a CLI error. */
   async download(path:string):Promise<Response> {
     return await this.send('GET',this.route(path),undefined,
-      Object.freeze({Authorization:`Bearer ${this.token}`,Accept:'*/*'}),true) as Response;
+      Object.freeze({Authorization:`Bearer ${this.token}`,Accept:'*/*','Accept-Encoding':'identity'}),true) as Response;
   }
   /** Send exact bytes with their media type, such as one upload attempt. Never repeated. */
   async upload(path:string,bytes:Uint8Array,contentType:string):Promise<unknown> {

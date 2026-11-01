@@ -307,8 +307,10 @@ paths:
       operationId: getSourceContent
       description: >-
         Requires sources:read. Streams the original bytes as an attachment with
-        the stored MIME type, nosniff and a sandbox CSP, never cached. The
-        authorization is evaluated when the response starts. The stream errors
+        the stored MIME type, nosniff and a sandbox CSP, never cached or
+        transformed (no-store, no-transform). Content-Length may be absent on
+        a chunked body; Repr-Digest is always present and is what a client
+        verifies. The authorization is evaluated when the response starts. The stream errors
         at its end if the bytes' length or SHA-256 differs from the record; a
         client must treat that as corruption and discard what it read.
       responses:

@@ -216,7 +216,8 @@ it('a JSON field with a number JSON cannot carry is rejected instead of sent as 
 
 it('a Worker page render shares one host and pool, which the hook retires after the response', async () => {
   const before = { pools: state.pools, ended: state.ended };
-  const event = { url: new URL('https://preview.example/spaces/sp/access'), cookies: { get: () => 'o'.repeat(32) },
+  const url = new URL('https://preview.example/spaces/sp/access');
+  const event = { url, request: new Request(url), cookies: { get: () => 'o'.repeat(32) },
     platform: { env }, locals: {} as App.Locals };
   const response = await handle({ event: event as never, resolve: async () => {
     for (let call = 0; call < 3; call++) expect((await api(event as never, 'GET', ['spaces'])).ok).toBe(true);

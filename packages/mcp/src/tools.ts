@@ -306,6 +306,8 @@ const evidenceTools: readonly StateplaneTool[] = [
       const encoded = present(args, 'contentBase64');
       if (typeof encoded !== 'string' || encoded.length > Math.ceil(mcpBytes / 3) * 4 || !base64Pattern.test(encoded)) return invalid();
       const bytes = Buffer.from(encoded, 'base64');
+      // Only canonical base64 re-encodes to itself (unused pad bits are zero); the decoded bound is exact.
+      if (bytes.byteLength > mcpBytes || bytes.toString('base64') !== encoded) return invalid();
       const declared: Args = { bytes: bytes.byteLength };
       if (Object.hasOwn(args, 'mimeType')) declared.mimeType = args.mimeType;
       if (Object.hasOwn(args, 'sha256')) declared.sha256 = args.sha256;

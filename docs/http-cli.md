@@ -339,10 +339,16 @@ stateplane spaces erasure
 `--data` and `--file` give the JSON request of `claims create`, `claims
 revise`, `sources correct` and `links create`, without the field a flag
 supplies (`idempotencyKey`, `baseRevision` or `baseVersion`); a payload that
-sets that field too is refused locally. `sources ingest-text` takes exactly
+sets that field too is refused locally. Their payload is bounded by the
+route's body budget (3 MiB for claims and corrections, 32 KiB for links), not
+the 1 MiB record budget. `sources ingest-text` takes exactly
 one of `--text` and `--file`, whose bytes must be UTF-8. `sources content`
 writes the original to a new file and prints its metadata, so stdout stays one
-JSON value. Flag names are lowercase letters, digits and hyphens, such as
+JSON value. It asks for the bytes unencoded, requires `Repr-Digest` and checks
+the bytes against it, compares their length only when the response states
+`Content-Length` (a chunked body has none), and reports the file only once every
+byte is written and it has closed; otherwise it removes the file and fails
+nonretryable `PROVIDER_UNAVAILABLE`. Flag names are lowercase letters, digits and hyphens, such as
 `--sha256`.
 
 ## Acceptance boundaries
