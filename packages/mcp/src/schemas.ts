@@ -127,7 +127,98 @@ const scoped = (properties: Record<string, McpFnJsonSchema> = {}, required: stri
 const operationKey: McpFnJsonSchema = { type: 'string', minLength: 1, maxLength: 256, 'x-utf8MaxBytes': 256, pattern: scalarPattern,
   description: 'Immutable batch operation key: a nonempty Unicode-scalar string of at most 256 UTF-8 bytes (x-utf8MaxBytes; clients must enforce it).' };
 
+/* Evidence requests (STA-37) follow the OpenAPI request bodies of the same
+ * operations; test/mcp.test.js compares them. Their bounds are the services':
+ * the descriptions name byte limits that JSON Schema cannot express. */
+const evidenceKey: McpFnJsonSchema = { type: 'string', minLength: 1, pattern: scalarPattern,
+  description: 'Idempotency key: a nonempty Unicode-scalar string of at most 512 UTF-8 bytes. Repeat the identical request with the same key and credential to replay a committed write; a changed request fails IDEMPOTENCY_MISMATCH.' };
+const reference = (description: string): McpFnJsonSchema => ({ type: 'string', minLength: 1,
+  description: `${description} At most 256 UTF-8 bytes.` });
+const utcTime = (description: string): McpFnJsonSchema => ({ type: 'string', minLength: 1,
+  description: `${description} A UTC instant such as 2026-01-31T12:00:00.5Z.` });
+const mimeType = (description: string): McpFnJsonSchema => ({ type: 'string', minLength: 1,
+  description: `${description} A media type; parameters are dropped and the type/subtype essence is compared lowercase.` });
+const sha256: McpFnJsonSchema = { type: 'string', pattern: '^[0-9a-f]{64}$', description: 'Lowercase hex SHA-256 the bytes must have.' };
+const locator: McpFnJsonSchema = { type: 'string', minLength: 1,
+  description: 'Where the evidence came from, such as a URL; at most 4,096 UTF-8 bytes. It is stored, never fetched, and never proof of the bytes.' };
+const offset: McpFnJsonSchema = { type: 'integer', minimum: 0, maximum: 9007199254740991 };
+const segment: McpFnJsonSchema = { type: 'object', required: ['start', 'end', 'sourceStart', 'sourceEnd'], additionalProperties: false,
+  properties: { start: offset, end: offset, sourceStart: offset, sourceEnd: offset },
+  description: 'start and end: a nonempty half-open range of the content in Unicode code points; sourceStart and sourceEnd: a half-open byte range of the original.' };
+const citation: McpFnJsonSchema = { type: 'object', required: ['collectionId', 'sourceId'], additionalProperties: false,
+  properties: { collectionId: reference('Collection of the cited source.'), sourceId: reference('Cited source ID.'),
+    extractionVersion: positive('Optional cited extraction version.'), start: offset, end: offset },
+  description: 'A cited live source, optionally one extraction version and a nonempty half-open code-point range of its content (start and end). Citing needs sources:read on the cited collection and grants no access.' };
+const claimContent = {
+  statement: { type: 'string', minLength: 1, description: 'The asserted statement: 1 to 1,048,576 UTF-8 bytes.' },
+  attributedTo: { type: 'string', minLength: 1, description: 'Who asserts the statement, such as a person, publication or agent: at most 1,024 UTF-8 bytes. Separate from the principal that records it.' },
+  observedAt: utcTime('When the asserted fact was observed; not in the future, at most millisecond precision.'),
+  validFrom: utcTime('Start of the time the statement holds; at most millisecond precision.'),
+  validUntil: utcTime('End of the time the statement holds, after validFrom; at most millisecond precision.'),
+  evidence: { type: 'array', maxItems: 32, items: citation, description: 'Up to 32 cited sources.' }
+} satisfies Record<string, McpFnJsonSchema>;
+const baseRevision = positive('The claim\'s latest revision. A later one fails REVISION_CONFLICT.');
+const endpoint: McpFnJsonSchema = { type: 'object', required: ['kind', 'collectionId', 'id'], additionalProperties: false,
+  properties: { kind: { enum: ['record', 'source', 'claim'] }, collectionId: reference('Endpoint collection.'), id: reference('Record, source or claim ID.') },
+  description: 'A link endpoint in this space. The caller needs the read and write capability of its kind on its collection.' };
+const pageLimit = (maximum: number): McpFnJsonSchema => ({ type: 'integer', minimum: 1, maximum, description: `Page size, at most ${maximum}.` });
+const after = reference('The previous page\'s next value; omit it for the first page.');
+const sourceId = selector('Source ID.');
+const claimId = selector('Claim ID.');
+const grantId = selector('Upload grant ID.');
+const linkId = selector('Link ID.');
+
+export const evidenceInputs = {
+  spaces_erasure: object({ spaceId }, ['spaceId']),
+  sources_get: scoped({ sourceId }, ['sourceId']),
+  sources_content: scoped({ sourceId }, ['sourceId']),
+  sources_ingest_text: scoped({ idempotencyKey: evidenceKey,
+    text: { type: 'string', minLength: 1, description: 'Well-formed Unicode text of 1 to 1,048,576 UTF-8 bytes, stored verbatim as the original.' },
+    mimeType: mimeType('A text/* type; text/plain when omitted.'), locator,
+    capturedAt: utcTime('When the text was captured; not in the future. The observation time when omitted.') }, ['idempotencyKey', 'text']),
+  sources_ingest_reference: scoped({ idempotencyKey: evidenceKey, locator, mimeType: mimeType('Optional type of the referenced evidence.'),
+    capturedAt: utcTime('When the reference was captured; not in the future.') }, ['idempotencyKey', 'locator']),
+  sources_delete: scoped({ sourceId }, ['sourceId']),
+  sources_extract: scoped({ sourceId }, ['sourceId']),
+  sources_extraction: scoped({ sourceId, version: positive('Extraction version; the latest when omitted.') }, ['sourceId']),
+  sources_correct_extraction: scoped({ sourceId, baseVersion: positive('The latest extraction version, which the correction follows.'),
+    content: { type: 'string', description: 'Corrected text: well-formed Unicode without NUL, at most 1,048,576 UTF-8 bytes.' },
+    sourceOffsets: { type: 'array', maxItems: 4096, items: segment, description: 'Up to 4,096 segments in content order.' } },
+  ['sourceId', 'baseVersion', 'content', 'sourceOffsets']),
+  uploads_create: scoped({ mimeType: mimeType('The one type the upload may have.'),
+    maxBytes: { type: 'integer', minimum: 1, maximum: 26214400, description: 'Largest accepted upload, at most 25 MiB.' },
+    sha256, expiresInSeconds: { type: 'integer', minimum: 1, maximum: 900, description: 'Grant lifetime; 300 seconds when omitted.' } },
+  ['mimeType', 'maxBytes']),
+  uploads_send: scoped({ grantId, mimeType: mimeType('Must equal the grant\'s type.'),
+    contentBase64: { type: 'string', maxLength: 2796204, pattern: '^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$',
+      description: 'The bytes in canonical padded base64, at most 2 MiB decoded over MCP; use HTTP or the CLI for larger uploads.' },
+    sha256 }, ['grantId', 'mimeType', 'contentBase64']),
+  uploads_finalize: scoped({ grantId, attemptId: reference('The verified attempt from uploads_send.'), locator,
+    capturedAt: utcTime('When the bytes were captured; not in the future.') }, ['grantId', 'attemptId']),
+  uploads_revoke: scoped({ grantId }, ['grantId']),
+  claims_create: scoped({ idempotencyKey: evidenceKey, ...claimContent }, ['idempotencyKey', 'statement', 'attributedTo']),
+  claims_revise: scoped({ claimId, baseRevision, ...claimContent }, ['claimId', 'baseRevision', 'statement', 'attributedTo']),
+  claims_review: scoped({ claimId, baseRevision, status: { enum: ['accepted', 'rejected'], description: 'The review decision. Needs claims:review.' } },
+    ['claimId', 'baseRevision', 'status']),
+  claims_delete: scoped({ claimId, baseRevision }, ['claimId', 'baseRevision']),
+  claims_get: scoped({ claimId, revision: positive('Claim revision; the latest when omitted.') }, ['claimId']),
+  claims_list: scoped({ citing: { type: 'object', required: ['collectionId', 'sourceId'], additionalProperties: false,
+    properties: { collectionId: reference('Collection of the cited source.'), sourceId: reference('Cited source ID.') },
+    description: 'Keep claims whose current revision cites this source.' },
+  status: { enum: ['unreviewed', 'accepted', 'rejected'], description: 'Keep one review status.' }, after, limit: pageLimit(25) }),
+  links_create: scoped({ idempotencyKey: evidenceKey,
+    type: { type: 'string', minLength: 1, description: 'Link type: 1 to 256 UTF-8 bytes.' },
+    policy: { enum: ['restrict', 'detach'], description: 'restrict refuses deleting either endpoint while the link is live; detach tombstones the link with the endpoint.' },
+    from: endpoint, to: endpoint }, ['idempotencyKey', 'type', 'policy', 'from', 'to']),
+  links_get: scoped({ linkId }, ['linkId']),
+  links_list: scoped({ endpoint: { type: 'object', required: ['kind', 'id'], additionalProperties: false,
+    properties: { kind: { enum: ['record', 'source', 'claim'] }, id: reference('Record, source or claim ID in this collection.') },
+    description: 'The endpoint in this collection whose live links to list.' }, after, limit: pageLimit(50) }, ['endpoint']),
+  links_delete: scoped({ linkId }, ['linkId'])
+} satisfies Record<string, McpFnObjectSchema>;
+
 export const inputs = {
+  ...evidenceInputs,
   spaces_list: object({ cursor: cursor('Opaque cursor from a previous spaces_list page.') }, []),
   spaces_get: object({ spaceId }, ['spaceId']),
   collections_list: object({ spaceId, cursor: cursor('Opaque cursor from a previous collections_list page.') }, ['spaceId']),

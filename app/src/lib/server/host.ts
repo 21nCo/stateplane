@@ -6,6 +6,7 @@ import { isSafeHttpRead, parseV1Path } from '@stateplane/contracts';
 import { createMcpEndpoint } from '@stateplane/mcp';
 import type { McpEndpoint } from '@stateplane/mcp';
 import { PostgresSpaces, postgresServices } from '@stateplane/postgres';
+import { R2BlobStore } from '@stateplane/storage';
 import { receiptRetentionSeconds } from './receipts';
 
 export type Bindings = App.Platform['env'];
@@ -207,7 +208,9 @@ export function stateplaneHost(env:Bindings,lease?:(lease:HostLease)=>void):Host
   const spaces=new PostgresSpaces(pool,cells,cellId,keys?.provider ?? {
     create:unconfigured,find:()=>Promise.resolve(null),revoke:unconfigured
   },identity,Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex'));
-  const services=postgresServices(spaces,new Map([[cellId,{pool,cursorSecret:Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex')}]]),receiptRetentionSeconds);
+  // Source bytes go to the cell's R2 binding; without it, operations on original bytes fail closed.
+  const services=postgresServices(spaces,new Map([[cellId,{pool,cursorSecret:Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex'),
+    originals:env.ORIGINALS ? new R2BlobStore(env.ORIGINALS) : undefined}]]),receiptRetentionSeconds);
   const serve=createHttpHandler({services,identity});
   let active=0;let retired=false;let ended=false;
   const closeIfIdle=()=>{

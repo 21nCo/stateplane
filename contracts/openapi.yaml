@@ -4,7 +4,9 @@ info:
   version: 1.0.0
   description: >-
     Version 1 authority operations. All content operations reauthorize the current
-    credential, space placement, collection grant and lifecycle. Mutations retain
+    credential, space placement, collection grant and lifecycle. Sources, claims
+    and links are evidence beside records: citing or linking grants no access,
+    and a caller sees only what it could read directly. Mutations retain
     caller idempotency keys. Query cursors traverse live pages, not snapshots.
     Encode each path selector as one URI component. Encoded slashes (%2F) and
     backslashes (%5C) remain part of the selector. Because URL parsers remove
@@ -252,6 +254,232 @@ paths:
       description: Feed positions are assigned after writer commit. Poll nextCursor even after a short or empty page to observe later commits.
       parameters: [ { name: cursor, in: query, schema: { type: string } } ]
       responses: { '200': { $ref: '#/components/responses/Json' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/erasure:
+    parameters: [ { $ref: '#/components/parameters/spaceId' } ]
+    get:
+      operationId: getSpaceErasure
+      description: >-
+        Owner only. What a space deletion has erased so far. database is erased
+        once the cell holds no content row of the space; originalBytes is erased
+        only once a listing of its blob-store prefixes that started after every
+        upload grant's writers ended found no key; backups are always retained.
+      responses:
+        '200': { description: Erasure report, content: { application/json: { schema: { $ref: '#/components/schemas/SpaceErasure' } } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/spaces/{spaceId}/collections/{collectionId}/sources/text:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
+    post:
+      operationId: ingestTextSource
+      description: >-
+        Requires sources:write. Stores the text verbatim as a new source's
+        original. The source ID derives from the credential and idempotency key;
+        a retry with the same request replays it (replayed true), a changed one
+        fails IDEMPOTENCY_MISMATCH. The body is at most 3,145,728 bytes; text
+        whose JSON escaping exceeds that can be uploaded instead.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/IngestText' } } } }
+      responses: { '200': { $ref: '#/components/responses/Source' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/sources/reference:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
+    post:
+      operationId: ingestReferenceSource
+      description: Requires sources:write. Records a source whose bytes were not fetched; the locator is stored and never fetched. Replays like ingestTextSource.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/IngestReference' } } } }
+      responses: { '200': { $ref: '#/components/responses/Source' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/sources/{sourceId}:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { $ref: '#/components/parameters/sourceId' } ]
+    get:
+      operationId: getSource
+      description: Requires sources:read on the owning collection. A source of another collection is NOT_FOUND.
+      responses: { '200': { $ref: '#/components/responses/Source' }, default: { $ref: '#/components/responses/Error' } }
+    delete:
+      operationId: deleteSource
+      description: >-
+        Requires sources:write and sources:read. A live restrict link refuses
+        the deletion with LINK_RESTRICTED; otherwise live detach links are
+        tombstoned with the source. Citing claims are unchanged. Deleting a
+        deleted source replays the deletion with its current erasure state.
+      responses:
+        '200': { description: Deletion and erasure report, content: { application/json: { schema: { $ref: '#/components/schemas/SourceDeletion' } } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/spaces/{spaceId}/collections/{collectionId}/sources/{sourceId}/content:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { $ref: '#/components/parameters/sourceId' } ]
+    get:
+      operationId: getSourceContent
+      description: >-
+        Requires sources:read. Streams the original bytes as an attachment with
+        the stored MIME type, nosniff and a sandbox CSP, never cached or
+        transformed (no-store, no-transform). Content-Length may be absent on
+        a chunked body; Repr-Digest is always present and is what a client
+        verifies. The authorization is evaluated when the response starts. The stream errors
+        at its end if the bytes' length or SHA-256 differs from the record; a
+        client must treat that as corruption and discard what it read.
+      responses:
+        '200':
+          description: The verified original bytes
+          headers:
+            Repr-Digest: { description: 'RFC 9530 digest of the bytes, sha-256=:<base64>:', schema: { type: string } }
+            Content-Disposition: { schema: { const: attachment } }
+          content: { '*/*': { schema: { type: string, contentMediaType: application/octet-stream } } }
+        '204':
+          description: Reference-only source; no bytes were fetched
+          headers: { X-Stateplane-Reference-Only: { schema: { const: 'true' } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/spaces/{spaceId}/collections/{collectionId}/sources/{sourceId}/extraction:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { $ref: '#/components/parameters/sourceId' } ]
+    get:
+      operationId: getExtraction
+      description: Requires sources:read. One immutable extraction version, the latest when version is omitted.
+      parameters: [ { name: version, in: query, schema: { type: integer, minimum: 1 } } ]
+      responses: { '200': { $ref: '#/components/responses/Extraction' }, default: { $ref: '#/components/responses/Error' } }
+    post:
+      operationId: extractSource
+      description: >-
+        Requires sources:write and sources:read. Parses a stored text original
+        (text/plain, text/markdown, text/csv, text/tab-separated-values, at most
+        1 MiB) into the next version, or replays the version this parser version
+        already wrote. No body.
+      responses: { '200': { $ref: '#/components/responses/Extraction' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/sources/{sourceId}/extraction/corrections:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { $ref: '#/components/parameters/sourceId' } ]
+    post:
+      operationId: correctExtraction
+      description: >-
+        Requires sources:write and sources:read. Records the version after
+        baseVersion, which must be the latest; a later version is
+        REVISION_CONFLICT unless it is this identical correction, which replays.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExtractionCorrection' } } } }
+      responses: { '200': { $ref: '#/components/responses/Extraction' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/uploads:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
+    post:
+      operationId: createUpload
+      description: Requires sources:write. Issues a new short-lived grant on every call; an unused grant expires.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UploadGrantRequest' } } } }
+      responses: { '201': { $ref: '#/components/responses/UploadGrant' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/uploads/{grantId}:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { $ref: '#/components/parameters/grantId' } ]
+    delete:
+      operationId: revokeUpload
+      description: Requires sources:write. Revokes an unfinalized grant; its attempts fail and their bytes are removed.
+      responses: { '200': { $ref: '#/components/responses/UploadGrant' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/uploads/{grantId}/attempts:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { $ref: '#/components/parameters/grantId' } ]
+    post:
+      operationId: sendUploadAttempt
+      description: >-
+        Requires sources:write and the grant's own credential. The body is the
+        raw bytes. Content-Length declares their exact size, Content-Type their
+        MIME type, and the sha256 query parameter an optional lowercase hex
+        digest; each must fit the grant. The bytes are counted and hashed as
+        they stream, text/* must be UTF-8, and the write stops at the grant's
+        expiry. A grant takes a new attempt only after every earlier one failed.
+        Never repeated automatically.
+      parameters:
+        - { name: Content-Length, in: header, required: true, schema: { type: integer, minimum: 0, maximum: 26214400 } }
+        - { name: sha256, in: query, schema: { $ref: '#/components/schemas/Sha256' } }
+      requestBody: { required: true, content: { '*/*': { schema: { type: string, contentMediaType: application/octet-stream } } } }
+      responses:
+        '200': { description: The verified attempt, content: { application/json: { schema: { $ref: '#/components/schemas/UploadAttempt' } } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/spaces/{spaceId}/collections/{collectionId}/uploads/{grantId}/finalize:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { $ref: '#/components/parameters/grantId' } ]
+    post:
+      operationId: finalizeUpload
+      description: Requires sources:write. Commits a verified attempt as the grant's one source; repeating the same finalize replays it.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UploadFinalize' } } } }
+      responses: { '200': { $ref: '#/components/responses/Source' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/claims:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
+    post:
+      operationId: createClaim
+      description: >-
+        Requires claims:write, and sources:read on every cited collection
+        (FORBIDDEN before any source is looked up otherwise). Writes revision 1,
+        unreviewed. A claim never writes a record. Replays like ingestTextSource.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ClaimCreate' } } } }
+      responses: { '200': { $ref: '#/components/responses/Claim' }, default: { $ref: '#/components/responses/Error' } }
+    get:
+      operationId: listClaims
+      description: >-
+        Requires claims:read. Current revisions of live claims in claim ID
+        order, whatever their review status. citingCollection and citingSource
+        together keep claims citing that source; claims citing a collection the
+        caller cannot read are omitted. Pass next as after for the next page.
+      parameters:
+        - { name: status, in: query, schema: { enum: [unreviewed, accepted, rejected] } }
+        - { name: citingCollection, in: query, schema: { type: string } }
+        - { name: citingSource, in: query, schema: { type: string } }
+        - { name: after, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 25 } }
+      responses:
+        '200': { description: One page, content: { application/json: { schema: { $ref: '#/components/schemas/ClaimPage' } } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/spaces/{spaceId}/collections/{collectionId}/claims/{claimId}:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { $ref: '#/components/parameters/claimId' } ]
+    get:
+      operationId: getClaim
+      description: Requires claims:read and sources:read on every collection any revision cites; otherwise NOT_FOUND, as for a missing claim.
+      parameters: [ { name: revision, in: query, schema: { type: integer, minimum: 1 } } ]
+      responses: { '200': { $ref: '#/components/responses/Claim' }, default: { $ref: '#/components/responses/Error' } }
+    delete:
+      operationId: deleteClaim
+      description: Requires claims:write and claims:read. baseRevision must be the latest. Restrict and detach links apply as for sources; repeating at the same base replays.
+      parameters: [ { name: baseRevision, in: query, required: true, schema: { type: integer, minimum: 1 } } ]
+      responses:
+        '200': { description: Deletion and erasure report, content: { application/json: { schema: { $ref: '#/components/schemas/ClaimDeletion' } } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/spaces/{spaceId}/collections/{collectionId}/claims/{claimId}/revisions:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { $ref: '#/components/parameters/claimId' } ]
+    post:
+      operationId: reviseClaim
+      description: Requires claims:write and claims:read. Replaces the content as the revision after baseRevision, unreviewed; an identical retry replays.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ClaimRevision' } } } }
+      responses: { '200': { $ref: '#/components/responses/Claim' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/claims/{claimId}/reviews:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { $ref: '#/components/parameters/claimId' } ]
+    post:
+      operationId: reviewClaim
+      description: Requires claims:review and claims:read. Records the review as a new revision with the same content; an identical retry replays.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ClaimReview' } } } }
+      responses: { '200': { $ref: '#/components/responses/Claim' }, default: { $ref: '#/components/responses/Error' } }
+  /v1/spaces/{spaceId}/collections/{collectionId}/links:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
+    post:
+      operationId: createLink
+      description: >-
+        This collection owns the link and must be one endpoint's collection.
+        Requires the read and write capability of each endpoint's kind on its
+        collection (FORBIDDEN before any lookup otherwise). A link grants no
+        access. Replays like ingestTextSource.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/LinkCreate' } } } }
+      responses: { '200': { $ref: '#/components/responses/Link' }, default: { $ref: '#/components/responses/Error' } }
+    get:
+      operationId: listLinks
+      description: >-
+        Requires the endpoint kind's read capability. Live links touching the
+        endpoint of this collection, from either side and whichever collection
+        owns them, in link ID order; links whose other endpoint the caller
+        cannot read are omitted.
+      parameters:
+        - { name: endpointKind, in: query, required: true, schema: { enum: [record, source, claim] } }
+        - { name: endpointId, in: query, required: true, schema: { type: string } }
+        - { name: after, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50 } }
+      responses:
+        '200': { description: One page, content: { application/json: { schema: { $ref: '#/components/schemas/LinkPage' } } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/spaces/{spaceId}/collections/{collectionId}/links/{linkId}:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { $ref: '#/components/parameters/linkId' } ]
+    get:
+      operationId: getLink
+      description: Visible only to a caller who could read both endpoints directly; otherwise NOT_FOUND.
+      responses: { '200': { $ref: '#/components/responses/Link' }, default: { $ref: '#/components/responses/Error' } }
+    delete:
+      operationId: deleteLink
+      description: Requires what createLink requires. Deleting a deleted link replays it.
+      responses:
+        '200': { description: Deleted link and erasure report, content: { application/json: { schema: { $ref: '#/components/schemas/LinkDeletion' } } } }
+        default: { $ref: '#/components/responses/Error' }
 components:
   schemas:
     SpaceLifecycle:
@@ -528,12 +756,347 @@ components:
         records: { type: array, items: { type: object } }
         nextCursor: { type: [string, 'null'] }
         schemaVersion: { type: integer }
+    EvidenceKey:
+      type: string
+      minLength: 1
+      pattern: '^(?:[^\u0000\uD800-\uDFFF]|[\uD800-\uDBFF][\uDC00-\uDFFF])+$'
+      description: A nonempty Unicode-scalar idempotency key of at most 512 UTF-8 bytes.
+    EvidenceId: { type: string, minLength: 1, description: 'A source, claim, link, attempt or collection ID of at most 256 UTF-8 bytes.' }
+    UtcTime: { type: string, minLength: 1, description: 'A UTC instant such as 2026-01-31T12:00:00.5Z. Claim times allow at most millisecond precision and no leap second.' }
+    MediaType: { type: string, minLength: 1, description: A media type; parameters are dropped and the lowercase type/subtype essence is used. }
+    Sha256: { type: string, pattern: '^[0-9a-f]{64}$', description: Lowercase hex SHA-256. }
+    Locator: { type: string, minLength: 1, description: 'Where the evidence came from, at most 4,096 UTF-8 bytes. Stored, never fetched, never proof of bytes.' }
+    Offset: { type: integer, minimum: 0, maximum: 9007199254740991 }
+    Positive: { type: integer, minimum: 1, maximum: 9007199254740991 }
+    Segment:
+      type: object
+      required: [start, end, sourceStart, sourceEnd]
+      additionalProperties: false
+      properties:
+        start: { $ref: '#/components/schemas/Offset' }
+        end: { $ref: '#/components/schemas/Offset' }
+        sourceStart: { $ref: '#/components/schemas/Offset' }
+        sourceEnd: { $ref: '#/components/schemas/Offset' }
+      description: start and end are a nonempty half-open code-point range of the content; sourceStart and sourceEnd a half-open byte range of the original.
+    Citation:
+      type: object
+      required: [collectionId, sourceId]
+      additionalProperties: false
+      properties:
+        collectionId: { $ref: '#/components/schemas/EvidenceId' }
+        sourceId: { $ref: '#/components/schemas/EvidenceId' }
+        extractionVersion: { $ref: '#/components/schemas/Positive' }
+        start: { $ref: '#/components/schemas/Offset' }
+        end: { $ref: '#/components/schemas/Offset' }
+      description: A cited live source; citing needs sources:read on its collection and grants no access.
+    Endpoint:
+      type: object
+      required: [kind, collectionId, id]
+      additionalProperties: false
+      properties:
+        kind: { enum: [record, source, claim] }
+        collectionId: { $ref: '#/components/schemas/EvidenceId' }
+        id: { $ref: '#/components/schemas/EvidenceId' }
+    IngestText:
+      type: object
+      required: [idempotencyKey, text]
+      additionalProperties: false
+      properties:
+        idempotencyKey: { $ref: '#/components/schemas/EvidenceKey' }
+        text: { type: string, minLength: 1, description: '1 to 1,048,576 UTF-8 bytes of well-formed Unicode.' }
+        mimeType: { $ref: '#/components/schemas/MediaType' }
+        locator: { $ref: '#/components/schemas/Locator' }
+        capturedAt: { $ref: '#/components/schemas/UtcTime' }
+    IngestReference:
+      type: object
+      required: [idempotencyKey, locator]
+      additionalProperties: false
+      properties:
+        idempotencyKey: { $ref: '#/components/schemas/EvidenceKey' }
+        locator: { $ref: '#/components/schemas/Locator' }
+        mimeType: { $ref: '#/components/schemas/MediaType' }
+        capturedAt: { $ref: '#/components/schemas/UtcTime' }
+    ExtractionCorrection:
+      type: object
+      required: [baseVersion, content, sourceOffsets]
+      additionalProperties: false
+      properties:
+        baseVersion: { $ref: '#/components/schemas/Positive' }
+        content: { type: string, description: 'Well-formed Unicode without NUL, at most 1,048,576 UTF-8 bytes.' }
+        sourceOffsets: { type: array, maxItems: 4096, items: { $ref: '#/components/schemas/Segment' } }
+    UploadGrantRequest:
+      type: object
+      required: [mimeType, maxBytes]
+      additionalProperties: false
+      properties:
+        mimeType: { $ref: '#/components/schemas/MediaType' }
+        maxBytes: { type: integer, minimum: 1, maximum: 26214400 }
+        sha256: { $ref: '#/components/schemas/Sha256' }
+        expiresInSeconds: { type: integer, minimum: 1, maximum: 900, description: 300 when omitted. }
+    UploadFinalize:
+      type: object
+      required: [attemptId]
+      additionalProperties: false
+      properties:
+        attemptId: { $ref: '#/components/schemas/EvidenceId' }
+        locator: { $ref: '#/components/schemas/Locator' }
+        capturedAt: { $ref: '#/components/schemas/UtcTime' }
+    ClaimCreate:
+      type: object
+      required: [idempotencyKey, statement, attributedTo]
+      additionalProperties: false
+      properties:
+        idempotencyKey: { $ref: '#/components/schemas/EvidenceKey' }
+        statement: &statement { type: string, minLength: 1, description: '1 to 1,048,576 UTF-8 bytes.' }
+        attributedTo: &attributedTo { type: string, minLength: 1, description: 'Who asserts the statement; at most 1,024 UTF-8 bytes.' }
+        observedAt: { $ref: '#/components/schemas/UtcTime' }
+        validFrom: { $ref: '#/components/schemas/UtcTime' }
+        validUntil: { $ref: '#/components/schemas/UtcTime' }
+        evidence: &evidence { type: array, maxItems: 32, items: { $ref: '#/components/schemas/Citation' } }
+    ClaimRevision:
+      type: object
+      required: [baseRevision, statement, attributedTo]
+      additionalProperties: false
+      properties:
+        baseRevision: { $ref: '#/components/schemas/Positive' }
+        statement: *statement
+        attributedTo: *attributedTo
+        observedAt: { $ref: '#/components/schemas/UtcTime' }
+        validFrom: { $ref: '#/components/schemas/UtcTime' }
+        validUntil: { $ref: '#/components/schemas/UtcTime' }
+        evidence: *evidence
+    ClaimReview:
+      type: object
+      required: [baseRevision, status]
+      additionalProperties: false
+      properties:
+        baseRevision: { $ref: '#/components/schemas/Positive' }
+        status: { enum: [accepted, rejected] }
+    LinkCreate:
+      type: object
+      required: [idempotencyKey, type, policy, from, to]
+      additionalProperties: false
+      properties:
+        idempotencyKey: { $ref: '#/components/schemas/EvidenceKey' }
+        type: { type: string, minLength: 1, description: 1 to 256 UTF-8 bytes. }
+        policy: { enum: [restrict, detach] }
+        from: { $ref: '#/components/schemas/Endpoint' }
+        to: { $ref: '#/components/schemas/Endpoint' }
+    Instant: { type: string, format: date-time }
+    NullableInstant: { type: [string, 'null'], format: date-time }
+    DeletionErasure:
+      type: object
+      required: [originalBytes, metadata, backups]
+      additionalProperties: false
+      properties:
+        originalBytes: { enum: [none, pending, removed] }
+        metadata: { const: retained }
+        backups: { const: retained }
+      description: >-
+        none when no bytes were ever held; pending until a removal that started
+        after every write to the key could have landed is confirmed; removed
+        once it is. Database rows stay, unreadable, until the space is erased,
+        and backups keep earlier copies.
+    SpaceErasure:
+      type: object
+      required: [spaceId, database, originalBytes, backups]
+      additionalProperties: false
+      properties:
+        spaceId: { type: string }
+        database: { enum: [erased, pending] }
+        originalBytes: { enum: [erased, pending] }
+        backups: { const: retained }
+    Original:
+      type: object
+      required: [referenceOnly, sha256, byteSize, mimeType, capturedAt, observedAt]
+      additionalProperties: false
+      properties:
+        referenceOnly: { type: boolean }
+        sha256: { type: [string, 'null'], pattern: '^[0-9a-f]{64}$' }
+        byteSize: { type: [integer, 'null'], minimum: 0 }
+        mimeType: { type: [string, 'null'] }
+        capturedAt: { $ref: '#/components/schemas/Instant' }
+        observedAt: { $ref: '#/components/schemas/Instant' }
+    Source:
+      type: object
+      required: [sourceId, collectionId, locator, createdBy, createdAt, original, replayed]
+      additionalProperties: false
+      properties:
+        sourceId: { type: string }
+        collectionId: { type: string }
+        locator: { type: [string, 'null'] }
+        createdBy: { type: string }
+        createdAt: { $ref: '#/components/schemas/Instant' }
+        original: { $ref: '#/components/schemas/Original' }
+        replayed: { type: boolean }
+    SourceDeletion:
+      type: object
+      required: [sourceId, collectionId, deletedAt, replayed, erasure]
+      additionalProperties: false
+      properties:
+        sourceId: { type: string }
+        collectionId: { type: string }
+        deletedAt: { $ref: '#/components/schemas/Instant' }
+        replayed: { type: boolean }
+        erasure: { $ref: '#/components/schemas/DeletionErasure' }
+    UploadGrant:
+      type: object
+      required: [grantId, collectionId, mimeType, maxBytes, sha256, issuedAt, expiresAt, revokedAt, finalizedAt, sourceId]
+      additionalProperties: false
+      properties:
+        grantId: { type: string }
+        collectionId: { type: string }
+        mimeType: { type: string }
+        maxBytes: { type: integer }
+        sha256: { type: [string, 'null'] }
+        issuedAt: { $ref: '#/components/schemas/Instant' }
+        expiresAt: { $ref: '#/components/schemas/Instant' }
+        revokedAt: { $ref: '#/components/schemas/NullableInstant' }
+        finalizedAt: { $ref: '#/components/schemas/NullableInstant' }
+        sourceId: { type: [string, 'null'] }
+    UploadAttempt:
+      type: object
+      required: [grantId, attemptId, sha256, bytes, mimeType]
+      additionalProperties: false
+      properties:
+        grantId: { type: string }
+        attemptId: { type: string }
+        sha256: { type: string }
+        bytes: { type: integer }
+        mimeType: { type: string }
+    Extraction:
+      type: object
+      required: [sourceId, collectionId, version, latestVersion, previousVersion, sourceSha256, parser, parserVersion, content, sourceOffsets, createdAt, replayed]
+      additionalProperties: false
+      properties:
+        sourceId: { type: string }
+        collectionId: { type: string }
+        version: { type: integer, minimum: 1 }
+        latestVersion: { type: integer, minimum: 1 }
+        previousVersion: { type: [integer, 'null'] }
+        sourceSha256: { type: string }
+        parser: { type: string }
+        parserVersion: { type: string }
+        content: { type: string }
+        sourceOffsets: { type: array, items: { $ref: '#/components/schemas/Segment' } }
+        createdAt: { $ref: '#/components/schemas/Instant' }
+        replayed: { type: boolean }
+    ClaimEvidence:
+      type: object
+      required: [collectionId, sourceId, extractionVersion, start, end]
+      additionalProperties: false
+      properties:
+        collectionId: { type: string }
+        sourceId: { type: string }
+        extractionVersion: { type: [integer, 'null'] }
+        start: { type: [integer, 'null'] }
+        end: { type: [integer, 'null'] }
+    Claim:
+      type: object
+      required: [claimId, collectionId, revision, latestRevision, previousRevision, statement, attributedTo, observedAt, validFrom, validUntil, review, evidence, createdBy, recordedBy, createdAt, committedAt, replayed]
+      additionalProperties: false
+      properties:
+        claimId: { type: string }
+        collectionId: { type: string }
+        revision: { type: integer, minimum: 1 }
+        latestRevision: { type: integer, minimum: 1 }
+        previousRevision: { type: [integer, 'null'] }
+        statement: { type: string }
+        attributedTo: { type: string }
+        observedAt: { $ref: '#/components/schemas/NullableInstant' }
+        validFrom: { $ref: '#/components/schemas/NullableInstant' }
+        validUntil: { $ref: '#/components/schemas/NullableInstant' }
+        review:
+          type: object
+          required: [status, reviewedBy, reviewedAt]
+          additionalProperties: false
+          properties:
+            status: { enum: [unreviewed, accepted, rejected] }
+            reviewedBy: { type: [string, 'null'] }
+            reviewedAt: { $ref: '#/components/schemas/NullableInstant' }
+        evidence: { type: array, items: { $ref: '#/components/schemas/ClaimEvidence' } }
+        createdBy: { type: string }
+        recordedBy: { type: [string, 'null'] }
+        createdAt: { $ref: '#/components/schemas/Instant' }
+        committedAt: { $ref: '#/components/schemas/Instant' }
+        replayed: { type: boolean }
+    ClaimPage:
+      type: object
+      required: [claims, next]
+      additionalProperties: false
+      properties:
+        claims: { type: array, maxItems: 25, items: { $ref: '#/components/schemas/Claim' } }
+        next: { type: [string, 'null'] }
+    ClaimDeletion:
+      type: object
+      required: [claimId, collectionId, revision, deletedAt, replayed, erasure]
+      additionalProperties: false
+      properties:
+        claimId: { type: string }
+        collectionId: { type: string }
+        revision: { type: integer, minimum: 1 }
+        deletedAt: { $ref: '#/components/schemas/Instant' }
+        replayed: { type: boolean }
+        erasure: { $ref: '#/components/schemas/DeletionErasure' }
+    LinkEndpoint:
+      type: object
+      required: [kind, collectionId, id]
+      additionalProperties: false
+      properties:
+        kind: { enum: [record, source, claim] }
+        collectionId: { type: string }
+        id: { type: string }
+    Link:
+      type: object
+      required: [linkId, collectionId, type, policy, from, to, revision, deleted, createdAt, deletedAt, replayed]
+      additionalProperties: false
+      properties:
+        linkId: { type: string }
+        collectionId: { type: string }
+        type: { type: string }
+        policy: { enum: [restrict, detach] }
+        from: { $ref: '#/components/schemas/LinkEndpoint' }
+        to: { $ref: '#/components/schemas/LinkEndpoint' }
+        revision: { type: integer, minimum: 1 }
+        deleted: { type: boolean }
+        createdAt: { $ref: '#/components/schemas/Instant' }
+        deletedAt: { $ref: '#/components/schemas/NullableInstant' }
+        replayed: { type: boolean }
+      description: References only; never endpoint content, the creating credential or a principal.
+    LinkDeletion:
+      type: object
+      required: [linkId, collectionId, type, policy, from, to, revision, deleted, createdAt, deletedAt, replayed, erasure]
+      additionalProperties: false
+      properties:
+        linkId: { type: string }
+        collectionId: { type: string }
+        type: { type: string }
+        policy: { enum: [restrict, detach] }
+        from: { $ref: '#/components/schemas/LinkEndpoint' }
+        to: { $ref: '#/components/schemas/LinkEndpoint' }
+        revision: { type: integer, minimum: 1 }
+        deleted: { type: boolean }
+        createdAt: { $ref: '#/components/schemas/Instant' }
+        deletedAt: { $ref: '#/components/schemas/NullableInstant' }
+        replayed: { type: boolean }
+        erasure: { $ref: '#/components/schemas/DeletionErasure' }
+    LinkPage:
+      type: object
+      required: [links, next]
+      additionalProperties: false
+      properties:
+        links: { type: array, maxItems: 50, items: { $ref: '#/components/schemas/Link' } }
+        next: { type: [string, 'null'] }
   securitySchemes:
     bearer: { type: http, scheme: bearer }
   parameters:
     spaceId: { name: spaceId, in: path, required: true, schema: { type: string } }
     collectionId: { name: collectionId, in: path, required: true, schema: { type: string } }
     recordId: { name: recordId, in: path, required: true, schema: { type: string } }
+    sourceId: { name: sourceId, in: path, required: true, schema: { type: string } }
+    grantId: { name: grantId, in: path, required: true, schema: { type: string } }
+    claimId: { name: claimId, in: path, required: true, schema: { type: string } }
+    linkId: { name: linkId, in: path, required: true, schema: { type: string } }
   requestBodies:
     SpaceLifecycle:
       required: true
@@ -544,6 +1107,21 @@ components:
       content:
         application/json: { schema: { $ref: '#/components/schemas/CollectionDefinition' } }
   responses:
+    Source:
+      description: A source view; replayed is true for a committed retry
+      content: { application/json: { schema: { $ref: '#/components/schemas/Source' } } }
+    UploadGrant:
+      description: An upload grant
+      content: { application/json: { schema: { $ref: '#/components/schemas/UploadGrant' } } }
+    Extraction:
+      description: One immutable extraction version
+      content: { application/json: { schema: { $ref: '#/components/schemas/Extraction' } } }
+    Claim:
+      description: One immutable claim revision
+      content: { application/json: { schema: { $ref: '#/components/schemas/Claim' } } }
+    Link:
+      description: A link view
+      content: { application/json: { schema: { $ref: '#/components/schemas/Link' } } }
     Receipt:
       description: Canonical committed or replayed authority receipt
       content:

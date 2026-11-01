@@ -63,6 +63,16 @@ async function wireJson(response:Response):Promise<unknown> {
   catch { throw new WireFailure(); }
 }
 
+/** A download's single deadline: the signal aborts every attempt and the body at `end`;
+ * the consumer of the body checks `expired` around each local write and before success. */
+export interface Deadline { signal:AbortSignal; end:number; expired():boolean }
+function deadlineOf(ms:number):Deadline {
+  const signal=AbortSignal.timeout(ms); const end=Date.now()+ms;
+  return {signal,end,expired:()=>signal.aborted || Date.now()>=end};
+}
+/** Whether a pause of `ms` ends before the deadline, so a repeat can still run. */
+const fits=(ms:number,deadline?:Deadline)=>!deadline || (!deadline.expired() && Date.now()+ms<deadline.end);
+
 /** A thin HTTP client. Only read requests may be repeated automatically. */
 export class StateplaneHttpClient {
   private readonly endpoint:URL;
@@ -87,19 +97,23 @@ export class StateplaneHttpClient {
       throw new StateplaneCliError('INVALID_CONFIGURATION');
     this.sleep=options.sleep??(ms=>new Promise(resolve=>setTimeout(resolve,ms)));
   }
-  /** One wire attempt; only an explicit safe-read response can request a repeat. */
-  private async exchange(method:string,url:URL,serialized:string|undefined,
-    headers:Readonly<Record<string,string>>,safeRead:boolean,attempt:number):
+  /** One wire attempt; only an explicit safe-read response can request a repeat. A raw
+   * exchange returns a successful response unread, for a byte stream, and runs
+   * under the download's deadline, which never waits past its end. */
+  private async exchange(method:string,url:URL,payload:string|Uint8Array|undefined,
+    headers:Readonly<Record<string,string>>,safeRead:boolean,attempt:number,deadline?:Deadline):
     Promise<{retry:true}|{retry:false;value:unknown}> {
-    const response=await wireFetch(this.fetcher,url,{method,redirect:'error',signal:AbortSignal.timeout(this.timeoutMs),
+    const response=await wireFetch(this.fetcher,url,{method,redirect:'error',
+      signal:deadline?.signal ?? AbortSignal.timeout(this.timeoutMs),
       headers,
-      body:serialized});
+      body:payload as BodyInit|undefined});
     const after=retryAfter(response);
-    if (safeRead && attempt<2 && [429,503].includes(response.status) && after!==undefined) {
+    if (safeRead && attempt<2 && [429,503].includes(response.status) && after!==undefined && fits(after*1000,deadline)) {
       await response.body?.cancel().catch(()=>{});
       await this.sleep(after*1000);
       return {retry:true};
     }
+    if (deadline && response.ok) return {retry:false,value:response};
     const value=await wireJson(response);
     if (!response.ok) throw serverError(value,after);
     return {retry:false,value};
@@ -114,27 +128,53 @@ export class StateplaneHttpClient {
     if (url.origin!==this.endpoint.origin || !segments) throw new StateplaneCliError('INVALID_ARGUMENT');
     return {url,segments};
   }
-  /** A wire failure is ambiguous for writes, but a read can be repeated twice. */
-  private async recoverWireFailure(safeRead:boolean,attempt:number):Promise<void> {
+  /** A wire failure is ambiguous for writes, but a read can be repeated twice,
+   * within a download's deadline. */
+  private async recoverWireFailure(safeRead:boolean,attempt:number,deadline?:Deadline):Promise<void> {
     if (!safeRead) throw new StateplaneCliError('OUTCOME_UNKNOWN');
-    if (attempt>=2) throw new StateplaneCliError('PROVIDER_UNAVAILABLE');
+    if (attempt>=2 || !fits(250*(attempt+1),deadline)) throw new StateplaneCliError('PROVIDER_UNAVAILABLE');
     await this.sleep(250*(attempt+1));
   }
   /** Validate the route once, then bound retries to read-only operations. */
   async request(method:'GET'|'POST'|'PUT'|'PATCH'|'DELETE',path:string,body?:unknown,
     extraHeaders?:Record<string,string>):Promise<unknown> {
-    const {url,segments}=this.route(path);
-    const safeRead=isSafeHttpRead(method,segments);
+    const route=this.route(path);
     const serialized=serializeBody(body);
-    const headers=requestHeaders(this.token,serialized,extraHeaders);
+    return this.send(method,route,serialized,requestHeaders(this.token,serialized,extraHeaders));
+  }
+  /** Read a byte stream, such as a source's original, asking for it unencoded.
+   * The response is returned unread once its status is successful, with the
+   * deadline that bounds the whole download, including how its body is consumed;
+   * an error response is a CLI error. */
+  async download(path:string):Promise<{response:Response;deadline:Deadline}> {
+    const deadline=deadlineOf(this.timeoutMs);
+    const response=await this.send('GET',this.route(path),undefined,
+      Object.freeze({Authorization:`Bearer ${this.token}`,Accept:'*/*','Accept-Encoding':'identity'}),deadline) as Response;
+    return {response,deadline};
+  }
+  /** Send exact bytes with their media type, such as one upload attempt. Never repeated. */
+  async upload(path:string,bytes:Uint8Array,contentType:string):Promise<unknown> {
+    const route=this.route(path);
+    let headers:Readonly<Record<string,string>>;
+    try {
+      new Headers([['content-type',contentType]]); // validate before a write can reach the transport
+      headers=Object.freeze({Authorization:`Bearer ${this.token}`,Accept:'application/json','Content-Type':contentType});
+    } catch { throw new StateplaneCliError('INVALID_ARGUMENT'); }
+    return this.send('POST',route,bytes,headers);
+  }
+  /** A download passes its deadline: every attempt, each pause and the body share it.
+   * Any other request gives each attempt its own --timeout. */
+  private async send(method:string,{url,segments}:{url:URL;segments:string[]},payload:string|Uint8Array|undefined,
+    headers:Readonly<Record<string,string>>,deadline?:Deadline):Promise<unknown> {
+    const safeRead=isSafeHttpRead(method,segments);
     for (let attempt=0;attempt<(safeRead?3:1);attempt++) {
       try {
-        const result=await this.exchange(method,url,serialized,headers,safeRead,attempt); // NOSONAR -- each retry depends on the preceding response
+        const result=await this.exchange(method,url,payload,headers,safeRead,attempt,deadline); // NOSONAR -- each retry depends on the preceding response
         if (result.retry) continue;
         return result.value;
       } catch(error) {
         if (!(error instanceof WireFailure)) throw error;
-        await this.recoverWireFailure(safeRead,attempt); // NOSONAR -- bounded read retries must remain sequential
+        await this.recoverWireFailure(safeRead,attempt,deadline); // NOSONAR -- bounded read retries must remain sequential
       }
     }
     throw new StateplaneCliError('PROVIDER_UNAVAILABLE');

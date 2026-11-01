@@ -13,6 +13,7 @@
     "@stateplane/contracts": "workspace:*",
     "@stateplane/mcp": "workspace:*",
     "@stateplane/postgres": "workspace:*",
+    "@stateplane/storage": "workspace:*",
     "pg": "8.22.0"
   },
   "devDependencies": {

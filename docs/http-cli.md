@@ -4,7 +4,8 @@
 handler accepts standard `Request` objects and returns standard `Response`
 objects. `postgresServices(spaces, cells, receiptRetentionSeconds)` in
 `@stateplane/postgres` composes the existing `PostgresSpaces`,
-`CollectionRegistry`, and `PostgresAuthority` implementations. Supply the
+`CollectionRegistry`, and `PostgresAuthority` implementations, and the
+evidence services `PostgresSources`, `PostgresClaims` and `PostgresLinks`. Supply the
 same private, at least 32-byte cursor secret to every process serving one
 cell. The HTTP host owns the AuthFn config, control/cell database bindings,
 and `IdentityVerifier`; it must not expose a direct database endpoint to CLI
@@ -308,6 +309,64 @@ and feed row count, and measure the index build lock and feed plans on
 disposable Railway before increasing the page limit. Event cursors
 are page positions, not export snapshots. The event `nextCursor` is the last
 observed event even on a short page; an empty poll retains the input cursor.
+
+## Sources, uploads, claims and links
+
+The evidence operations of STA-33 to STA-36 share these routes, errors and
+retry rules. The [transport reference](evidence-storage.md#transports-sta-37)
+lists every HTTP route, CLI command and MCP tool with its capabilities, and
+describes access, provenance, original bytes, deletion and erasure, bounds and
+recovery. `postgresServices` takes each cell's blob store as
+`ServiceCell.originals`; the opt-in host binds the cell's R2 `ORIGINALS`.
+
+```sh
+stateplane uploads create --collection evidence --mime-type text/plain --max-bytes 1048576
+stateplane uploads send --collection evidence --grant '<grantId>' --file ./report.txt --mime-type text/plain
+stateplane uploads finalize --collection evidence --grant '<grantId>' --attempt '<attemptId>' --locator https://example.invalid/report
+stateplane sources ingest-text --collection evidence --idempotency-key note-1 --file ./note.md --mime-type text/markdown
+stateplane sources content --collection evidence --id '<sourceId>' --output ./original.txt
+stateplane sources extract --collection evidence --id '<sourceId>'
+stateplane claims create --collection findings --idempotency-key claim-1 \
+  --data '{"statement":"The beacon was lit.","attributedTo":"Field report","evidence":[{"collectionId":"evidence","sourceId":"<sourceId>"}]}'
+stateplane claims review --collection findings --id '<claimId>' --base-revision 1 --status accepted
+stateplane links create --collection entries --idempotency-key link-1 \
+  --data '{"type":"evidence","policy":"restrict","from":{"kind":"record","collectionId":"entries","id":"<recordId>"},"to":{"kind":"source","collectionId":"evidence","id":"<sourceId>"}}'
+stateplane links list --collection entries --endpoint-kind record --endpoint-id '<recordId>'
+stateplane sources delete --collection evidence --id '<sourceId>'
+stateplane spaces erasure
+```
+
+`--data` and `--file` give the JSON request of `claims create`, `claims
+revise`, `sources correct` and `links create`, without the field a flag
+supplies (`idempotencyKey`, `baseRevision` or `baseVersion`); a payload that
+sets that field too is refused locally. Their payload is bounded by the
+route's body budget (3 MiB for claims and corrections, 32 KiB for links), not
+the 1 MiB record budget. `sources ingest-text` takes exactly
+one of `--text` and `--file`, whose bytes must be UTF-8. `sources content`
+writes the original to a new file and prints its metadata, so stdout stays one
+JSON value. It asks for the bytes unencoded, requires `Repr-Digest` and checks
+the bytes against it, compares their length only when the response states
+`Content-Length` (a chunked body has none), and reports the file only once every
+byte is written and it has closed. When it reports a failure, it removes the
+file. A process killed or interrupted mid-download can leave a partial,
+unverified file at `--output`; only a printed result means a verified file, and
+the leftover must be deleted before a rerun because an existing file is never
+overwritten. A body
+stream that fails or is aborted fails retryable `PROVIDER_UNAVAILABLE`; a digest
+or length mismatch, or a local write or close failure, fails nonretryable
+`PROVIDER_UNAVAILABLE`. `--timeout` bounds the whole download with one
+deadline: every repeated request, each pause before a repeat, the body, every
+local write and the close (a 25 MiB original needs about 0.87 MB/s at the
+30-second default). A repeat or `Retry-After` pause that cannot finish before
+the deadline is not attempted; the CLI reports the last failure instead. A
+download that ends past the deadline, including one whose write or close
+returns late or fails late, fails retryable `PROVIDER_UNAVAILABLE` and is never
+reported saved. The CLI cannot interrupt a local write in progress: it waits
+for that write or close to return, then removes the file and reports. A reference-only source writes no
+file, needs no `Repr-Digest` and prints `{referenceOnly: true, output: null}`. The file is
+mode 0600 on POSIX systems; on Windows it inherits the destination directory's
+ACL, so choose a private directory. Flag names are lowercase letters, digits and hyphens, such as
+`--sha256`.
 
 ## Acceptance boundaries
 
