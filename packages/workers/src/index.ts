@@ -15,11 +15,18 @@ export type DeliveryOutcome = 'applied' | 'superseded' | 'requeued' | 'lost' | '
  * reached their in-flight bound.
  */
 export interface ClaimResult { messages: DeliveryMessage[]; scan: 'whole' | 'wrapped' | 'partial'; parked?: number; full?: boolean }
+/**
+ * A hard end for one store call, in epoch ms (`Date.now`): the store sends
+ * no statement after it, abandons one still running then and rejects.
+ */
+export interface StoreBound { deadline: number }
 /** The cell's SQL outbox remains the only durable job authority. */
 export interface OutboxStore {
-  claim(limits?: { limit?: number; perSpace?: number; pairs?: number; leaseSeconds?: number; inFlight?: number }): Promise<ClaimResult>;
-  release(messages: readonly DeliveryMessage[]): Promise<number>;
-  stepReconciliations(jobs?: number, pageSize?: number): Promise<number>;
+  claim(limits?: { limit?: number; perSpace?: number; pairs?: number; leaseSeconds?: number; inFlight?: number },
+    bound?: StoreBound): Promise<ClaimResult>;
+  release(messages: readonly DeliveryMessage[], bound?: StoreBound): Promise<number>;
+  /** Bounded, a step the deadline cuts short ends the call instead of failing it. */
+  stepReconciliations(jobs?: number, pageSize?: number, bound?: StoreBound): Promise<number>;
 }
 /** At-least-once transport, such as a Cloudflare Queue producer. */
 export interface DeliveryTransport { send(messages: readonly DeliveryMessage[]): Promise<void> }
@@ -28,7 +35,29 @@ export interface DispatchOptions {
   limits?: NonNullable<Parameters<OutboxStore['claim']>[0]>;
   /** Keep claiming and sending until a full pass finds nothing due or this wall-clock budget is spent. 0 claims once. */
   budgetMs?: number;
+  /**
+   * A hard end, in epoch ms (`Date.now`), for the batch in flight: claims and
+   * releases are bounded by it, a claim it cuts short ends dispatch, and a
+   * send still running then is abandoned with its leases kept.
+   */
+  deadline?: number;
   now?: () => number;
+}
+
+/** A send the dispatch deadline cut short: it may still arrive, so its leases are kept, to be started or to expire. */
+export class DispatchDeadlineError extends Error {
+  constructor() { super('Queue send outlived the dispatch deadline'); this.name = 'DispatchDeadlineError'; }
+}
+
+/** Settle with `pending`, or reject at `bound`'s deadline, leaving `pending` to run on unobserved. */
+function within<T>(pending: Promise<T>, bound: StoreBound | undefined): Promise<T> {
+  if (!bound) return pending;
+  pending.catch(() => {});
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new DispatchDeadlineError()), Math.max(0, bound.deadline - Date.now()));
+  });
+  return Promise.race([pending, expired]).finally(() => clearTimeout(timer));
 }
 
 /**
@@ -43,7 +72,10 @@ export interface DispatchOptions {
  * however long a backlog is. A failed send releases every
  * lease from its batch that no worker has started and ends the tick; a hint
  * that arrives later finds no lease and is fenced as lost. A crash before release leaves
- * unstarted leases to expire and be reclaimed.
+ * unstarted leases to expire and be reclaimed. With a `deadline`, nothing
+ * outlives it: a claim cut short ends the tick, a send cut short keeps its
+ * leases (its hints may still arrive) and fails the tick, and a release cut
+ * short leaves its leases to expire.
  */
 export async function dispatch(store: OutboxStore, transport: DeliveryTransport,
   options: DispatchOptions = {}): Promise<DispatchResult> {
@@ -52,9 +84,16 @@ export async function dispatch(store: OutboxStore, transport: DeliveryTransport,
   const now = options.now ?? Date.now;
   const until = now() + budgetMs;
   const result: DispatchResult = { claimed: 0, sent: 0, released: 0, parked: 0, batches: 0 };
+  const bound = options.deadline === undefined ? undefined : { deadline: options.deadline };
+  const over = () => bound !== undefined && Date.now() >= bound.deadline;
   let starts = 0;
   do {
-    const { messages, scan, parked = 0, full } = await store.claim(options.limits);
+    if (over()) break;
+    let claim: ClaimResult;
+    // Leases a claim cut short may have committed expire unstarted.
+    try { claim = await store.claim(options.limits, bound); }
+    catch (error) { if (over()) break; throw error; }
+    const { messages, scan, parked = 0, full } = claim;
     result.parked += parked;
     if (messages.length || parked) starts = 0;
     else if (scan === 'whole' || (scan === 'wrapped' && ++starts === 2)) break;
@@ -64,8 +103,13 @@ export async function dispatch(store: OutboxStore, transport: DeliveryTransport,
     }
     result.claimed += messages.length;
     result.batches++;
-    try { await transport.send(messages); }
-    catch (error) { result.released += await store.release(messages); return { ...result, error }; }
+    try { await within(transport.send(messages), bound); }
+    catch (error) {
+      if (error instanceof DispatchDeadlineError) return { ...result, error };
+      try { result.released += await store.release(messages, bound); }
+      catch (releaseError) { if (!over()) throw releaseError; }
+      return { ...result, error };
+    }
     result.sent += messages.length;
     if (full) break;
   } while (now() < until);

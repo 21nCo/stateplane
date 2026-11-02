@@ -86,8 +86,49 @@ test('the registry keeps what it validated: changing a profile afterwards change
   assert.ok(Object.isFrozen(resolved) && Object.isFrozen(resolved.profile));
   assert.throws(() => { resolved.profile.region = 'us-east'; }, TypeError);
   await assert.rejects(embedBatch(resolved, ['a', 'b', 'c'], never), RangeError, 'the validated batch limit still applies');
+  // The adapter's own profile no longer matches what was authorized, so it is not called at all.
+  await assert.rejects(embedBatch(resolved, ['a', 'b'], never, []), EmbedderUnavailableError);
+  assert.deepEqual(calls, []);
+  Object.assign(source, local.profile);
   assert.equal((await embedBatch(resolved, ['a', 'b'], never)).length, 2);
-  assert.deepEqual(calls, [true], 'embed runs on the registered embedder');
+  assert.deepEqual(calls, [true], 'embed runs on the registered embedder once its profile matches again');
+});
+
+test('an adapter whose own profile changes after registration is refused before it is called', async () => {
+  const needs = { regions: ['eu-west'], dimensions: [384], inputCodePoints: 1000 };
+  // An adapter that, like a real provider client, sends whatever its own profile says.
+  const adapter = () => {
+    const local = profile({ embedder: 'self-reading', region: 'eu-west' });
+    const seen = [];
+    const embedder = { profile: { ...local.profile },
+      embed(texts, signal) { seen.push(`${this.profile.region}/${this.profile.modelVersion}`); return local.embed(texts, signal); } };
+    return { local, seen, embedder, resolved: new EmbeddingRegistry([embedder]).select(needs) };
+  };
+  const refused = error => error instanceof EmbedderUnavailableError && error.cause === undefined;
+  // (a) The original profile is edited to another region and model version.
+  const edited = adapter();
+  Object.assign(edited.embedder.profile, { region: 'us-east', modelVersion: '2' });
+  assert.deepEqual(edited.resolved.profile, edited.local.profile, 'the authorized snapshot is unchanged');
+  await assert.rejects(embedBatch(edited.resolved, ['a'], never, []), refused);
+  assert.deepEqual(edited.seen, [], 'the adapter never ran under the edited profile');
+  // (b) The profile object is replaced; then (c) a getter that throws.
+  const replaced = adapter();
+  replaced.embedder.profile = { ...replaced.local.profile, region: 'us-east' };
+  await assert.rejects(embedBatch(replaced.resolved, ['a'], never, []), refused);
+  assert.deepEqual(replaced.seen, []);
+  const throwing = adapter();
+  Object.defineProperty(throwing.embedder, 'profile', { get() { throw new Error('profile unavailable'); } });
+  await assert.rejects(embedBatch(throwing.resolved, ['a'], never, []), refused);
+  assert.deepEqual(throwing.seen, []);
+  // Every field counts, a limit as much as the region.
+  const limit = adapter();
+  limit.embedder.profile.maxBatch = 7;
+  await assert.rejects(embedBatch(limit.resolved, ['a'], never, []), refused);
+  assert.deepEqual(limit.seen, []);
+  // An adapter left as registered embeds under the authorized profile.
+  const kept = adapter();
+  assert.equal((await embedBatch(kept.resolved, ['a', 'b'], never, [])).length, 2);
+  assert.deepEqual(kept.seen, ['eu-west/1']);
 });
 
 test('a batch retries an outage within bounds and rejects malformed vectors as the input', async () => {

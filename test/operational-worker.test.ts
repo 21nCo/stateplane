@@ -1,24 +1,38 @@
 import { describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({ closed: 0, connected: 0, failClose: false, denyGrants: false, denyCatalog: false, ownsObject: false, denyVector: false, wrongIdentity: false }));
-const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[], reconcileError: undefined as Error | undefined, uploadPages: [] as number[], uploadSteps: [] as number[], uploadError: undefined as Error | undefined, uploadBudgets: [] as number[], sweeps: [] as number[][], erasures: [] as number[][], originals: [] as unknown[], active: 0, peak: 0, poolInstances: [] as { emit(event: string, error: Error): boolean }[], projectors: [] as unknown[], retrievalSteps: [] as unknown[], retrievalError: undefined as Error | undefined, skew: 0, lag: {} as Record<string, number> }));
+const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[], reconcileError: undefined as Error | undefined, uploadPages: [] as number[], uploadSteps: [] as number[], uploadError: undefined as Error | undefined, uploadBudgets: [] as number[], sweeps: [] as number[][], erasures: [] as number[][], originals: [] as unknown[], active: 0, peak: 0, poolInstances: [] as { emit(event: string, error: Error): boolean }[], projectors: [] as unknown[], retrievalSteps: [] as unknown[], retrievalError: undefined as Error | undefined, skew: 0, lag: {} as Record<string, number>, bounds: [] as [string, number][], hangEnd: false }));
+// A simulated step: it takes `cell.lag[step]` ms of the simulated clock, but never past `until`, where its store cuts it short.
+const spend = (step: string, until: number) => {
+  const cut = Date.now() + (cell.lag[step] ?? 0) > until;
+  cell.skew += Math.max(0, Math.min(cell.lag[step] ?? 0, until - Date.now()));
+  return cut;
+};
 vi.mock('@stateplane/postgres', async importOriginal => ({
   CLIENT_READ_TIMEOUT_MS: (await importOriginal<typeof import('@stateplane/postgres')>()).CLIENT_READ_TIMEOUT_MS,
   PostgresAuthority: class {},
   RecordRetrievalProjector: class { constructor(pool: unknown) { cell.projectors.push(pool); } },
   PostgresRetrievalWorker: class {
-    async step(options: unknown) { cell.retrievalSteps.push(options); cell.skew += cell.lag.retrieval ?? 0; if (cell.retrievalError) throw cell.retrievalError; return {}; }
+    async step(options: { budgetMs: number }) { cell.retrievalSteps.push(options); spend('retrieval', Date.now() + options.budgetMs + 1_000); if (cell.retrievalError) throw cell.retrievalError; return {}; }
   },
   SourceUploadReconciler: class {
     constructor(sourceCell: { originals: unknown }) { cell.originals.push(sourceCell.originals); }
-    async step(limit: number, budgetMs: number) { cell.uploadSteps.push(limit); cell.uploadBudgets.push(budgetMs); cell.skew += cell.lag.upload ?? 0; if (cell.uploadError) throw cell.uploadError; return cell.uploadPages.shift() ?? 0; }
-    async erase(limit: number, budgetMs: number) { cell.erasures.push([limit, budgetMs]); cell.skew += cell.lag.erase ?? 0; return 0; }
-    async sweep(limit: number, budgetMs: number) { cell.sweeps.push([limit, budgetMs]); cell.skew += cell.lag.sweep ?? 0; return 0; }
+    async step(limit: number, budgetMs: number) { cell.uploadSteps.push(limit); cell.uploadBudgets.push(budgetMs); spend('upload', Date.now() + budgetMs); if (cell.uploadError) throw cell.uploadError; return cell.uploadPages.shift() ?? 0; }
+    async erase(limit: number, budgetMs: number) { cell.erasures.push([limit, budgetMs]); spend('erase', Date.now() + budgetMs); return 0; }
+    async sweep(limit: number, budgetMs: number) { cell.sweeps.push([limit, budgetMs]); spend('sweep', Date.now() + budgetMs); return 0; }
   },
   PostgresOutbox: class {
-    async claim() { cell.skew += cell.lag.claim ?? 0; return { messages: cell.claims.shift() ?? [], scan: 'whole' }; }
-    async release(messages: unknown[]) { cell.released.push(...messages); return messages.length; }
-    async stepReconciliations() { cell.stepped++; cell.skew += cell.lag.reconcile ?? 0; if (cell.reconcileError) throw cell.reconcileError; return 0; }
+    async claim(_limits: unknown, bound: { deadline: number }) {
+      cell.bounds.push(['claim', bound.deadline]);
+      if (spend('claim', bound.deadline)) throw new Error('The time budget ended during the transaction');
+      return { messages: cell.claims.shift() ?? [], scan: 'whole' };
+    }
+    async release(messages: unknown[], bound: { deadline: number }) { cell.bounds.push(['release', bound.deadline]); cell.released.push(...messages); return messages.length; }
+    async stepReconciliations(_jobs: number, _page: number, bound: { deadline: number }) {
+      cell.stepped++; cell.bounds.push(['reconcile', bound.deadline]); spend('reconcile', bound.deadline);
+      if (cell.reconcileError) throw cell.reconcileError;
+      return 0;
+    }
     async process(message: { attempt: number }, projector: unknown) {
       if (!projector) throw new Error('record completion needs the retrieval projector');
       cell.processed.push(message);
@@ -31,7 +45,8 @@ vi.mock('@stateplane/postgres', async importOriginal => ({
   }
 }));
 vi.mock('pg', async () => { const { EventEmitter } = await import('node:events'); return { default: { Pool: class extends EventEmitter {
-  constructor(options: unknown) { super(); cell.pools++; cell.poolOptions.push(options); cell.poolInstances.push(this); } async end() { cell.ended++; } } }, Client: class {
+  constructor(options: unknown) { super(); cell.pools++; cell.poolOptions.push(options); cell.poolInstances.push(this); }
+  async end() { cell.ended++; if (cell.hangEnd) await new Promise(() => {}); } } }, Client: class {
   async connect() { state.connected++; }
   async end() { state.closed++; if (state.failClose) throw new Error('close failed'); }
   async query(sql: string) {
@@ -161,10 +176,10 @@ describe('cell jobs Worker', () => {
     } finally { cell.uploadError = undefined; cell.reconcileError = undefined; }
   });
 
-  it('projects source and claim work within 10 s and reports a failed claim with the tick', async () => {
+  it('projects source and claim work within 8 s and reports a failed claim with the tick', async () => {
     cell.claims = []; cell.retrievalSteps = []; cell.sweeps = [];
     await jobs.scheduled({} as never, jobsEnv());
-    expect([cell.sweeps.length, cell.retrievalSteps]).toEqual([1, [{ budgetMs: 10_000 }]]);
+    expect([cell.sweeps.length, cell.retrievalSteps]).toEqual([1, [{ budgetMs: 8_000 }]]);
     const claim = new Error('retrieval claim statement timeout');
     cell.retrievalError = claim;
     try { await expect(jobs.scheduled({} as never, jobsEnv())).rejects.toBe(claim); }
@@ -172,32 +187,58 @@ describe('cell jobs Worker', () => {
     expect(cell.retrievalSteps).toHaveLength(2);
   });
 
-  it('fits every step in one 50 s tick budget, cutting later steps to what is left, so ticks leave slack in their minute', async () => {
-    // A simulated clock: each mocked step takes `cell.lag[step]` ms.
+  it('gives every step its whole budget on every tick, however busy the earlier steps, and ends each tick inside its minute', async () => {
+    // A simulated clock: each mocked step takes `cell.lag[step]` ms, cut at the hard end its store or budget sets.
     const real = Date.now.bind(Date);
     const clock = vi.spyOn(Date, 'now').mockImplementation(() => real() + cell.skew);
     const near = (value: number, expected: number) => value <= expected && value > expected - 500;
     try {
-      // Dispatch overruns its 20 s by 3 s; reconciliation, uploads and erasure use their whole budgets.
-      cell.claims = []; cell.uploadPages = []; cell.uploadBudgets = []; cell.erasures = []; cell.sweeps = []; cell.retrievalSteps = [];
-      cell.skew = 0; cell.lag = { claim: 23_000, reconcile: 10_000, upload: 10_000, erase: 5_000, sweep: 500 };
-      await jobs.scheduled({} as never, jobsEnv());
-      expect(near(cell.uploadBudgets[0], 10_000)).toBe(true);
-      expect(cell.erasures.map(([, ms]) => near(ms, 5_000))).toEqual([true]);
-      expect(cell.sweeps.map(([, ms]) => near(ms, 2_000))).toEqual([true]);
-      expect((cell.retrievalSteps as { budgetMs: number }[]).map(({ budgetMs }) => near(budgetMs, 1_500))).toEqual([true]);
-      // With under a second of the tick left, the retrieval step waits for a later tick.
-      cell.uploadBudgets = []; cell.erasures = []; cell.sweeps = []; cell.retrievalSteps = [];
-      cell.skew = 0; cell.lag = { ...cell.lag, sweep: 2_000 };
-      await jobs.scheduled({} as never, jobsEnv());
-      expect([cell.sweeps.length, cell.retrievalSteps]).toEqual([1, []]);
-      expect(cell.skew).toBeLessThanOrEqual(50_000);
-      // Dispatch alone past the tick budget skips every later step.
-      cell.uploadSteps = []; cell.erasures = []; cell.sweeps = []; cell.stepped = 0;
-      cell.skew = 0; cell.lag = { claim: 50_000 };
-      await jobs.scheduled({} as never, jobsEnv());
-      expect([cell.stepped, cell.uploadSteps, cell.erasures, cell.sweeps, cell.retrievalSteps]).toEqual([0, [], [], [], []]);
+      // Every step stalls on every tick: a claim and a reconciliation transaction that never finish, uploads,
+      // erasure, sweep and the retrieval step using all of their time.
+      cell.lag = { claim: 1e9, reconcile: 1e9, upload: 1e9, erase: 1e9, sweep: 1e9, retrieval: 1e9 };
+      for (let tick = 0; tick < 3; tick++) {
+        cell.claims = []; cell.uploadPages = []; cell.uploadBudgets = []; cell.erasures = []; cell.sweeps = []; cell.retrievalSteps = [];
+        cell.bounds = []; cell.skew = 0;
+        const start = Date.now();
+        await jobs.scheduled({} as never, jobsEnv());
+        // The claim is bounded by the end of dispatch's 15 s and the reconciliation transaction by its 7 s after.
+        const after = (ms: number, expected: number) => ms >= expected && ms < expected + 500;
+        expect(cell.bounds.map(([step, deadline]) => [step, after(deadline - start, step === 'claim' ? 15_000 : 22_000)]))
+          .toEqual([['claim', true], ['reconcile', true]]);
+        expect(cell.uploadBudgets.map(ms => near(ms, 10_000))).toEqual([true]);
+        expect(cell.erasures.map(([, ms]) => near(ms, 5_000))).toEqual([true]);
+        expect(cell.sweeps.map(([, ms]) => near(ms, 5_000))).toEqual([true]);
+        // The retrieval step keeps its whole 8 s: well above an item's 1 s minimum plus its claim.
+        expect((cell.retrievalSteps as { budgetMs: number }[]).map(({ budgetMs }) => near(budgetMs, 8_000))).toEqual([true]);
+        // Steps end by 50 s, plus the retrieval step's 1 s cleanup: inside the minute, before the next tick.
+        expect(Date.now() - start).toBeLessThanOrEqual(51_500);
+      }
     } finally { clock.mockRestore(); cell.skew = 0; cell.lag = {}; }
+  });
+
+  it('abandons a Queue send still running at dispatch\'s end, keeping its leases, and a teardown that hangs', async () => {
+    vi.useFakeTimers();
+    try {
+      cell.claims = [[hint(1)]]; cell.released = []; cell.retrievalSteps = []; cell.bounds = []; cell.hangEnd = true;
+      const start = Date.now();
+      let settled: unknown = 'running';
+      // The send and the pool's teardown never finish.
+      const tick = jobs.scheduled({} as never, jobsEnv(vi.fn(() => new Promise<never>(() => {}))))
+        .then(() => undefined, (error: unknown) => error);
+      void tick.then(value => { settled = value; });
+      await vi.advanceTimersByTimeAsync(14_999);
+      expect([settled, cell.retrievalSteps]).toEqual(['running', []]);
+      await vi.advanceTimersByTimeAsync(1);
+      // The later steps ran on; only teardown is left, and it is given up after 5 s.
+      expect(cell.retrievalSteps).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(settled).toBe('running');
+      await vi.advanceTimersByTimeAsync(1);
+      const error = await tick as Error & { cause?: Error };
+      expect([error.message, error.cause?.name, cell.released]).toEqual(['Projection dispatch released 0 leases',
+        'DispatchDeadlineError', []]);
+      expect(Date.now() - start).toBe(20_000);
+    } finally { vi.useRealTimers(); cell.hangEnd = false; }
   });
 
   it('fails a tick closed without its originals binding, before opening the pool', async () => {

@@ -1442,4 +1442,30 @@ test('status reports the oldest pending evidence over all of it and a failed rec
   assert.deepEqual([status.evidence.pending, status.evidence.capped], [500, true]);
   assert.deepEqual(status.records, { pending: 500, degraded: 1, capped: true, lastError: 'Error: projector failed' });
   assert.equal(status.state, 'degraded');
+  // The oldest pending item is one row through its index, not a scan of the backlog.
+  const plan = (await pool.query(`EXPLAIN (FORMAT JSON) SELECT enqueued_at FROM retrieval_outbox
+    WHERE space_id=$1 AND collection_id=$2 AND delivery_state='pending' ORDER BY enqueued_at LIMIT 1`, [spaceId, collectionId]))
+    .rows[0]['QUERY PLAN'][0].Plan;
+  assert.equal(plan.Plans?.[0]?.['Index Name'], 'retrieval_outbox_age', JSON.stringify(plan));
+  // An older error in the oldest-due sample does not hide the failed row's newer one.
+  await pool.query(`UPDATE projection_outbox SET last_error='Error: older live error' WHERE event_id=(SELECT event_id
+    FROM projection_outbox WHERE space_id=$1 AND failures=0 ORDER BY available_at,event_id LIMIT 1)`, [spaceId]);
+  assert.deepEqual((await worker.status(spaceId, collectionId)).records,
+    { pending: 499, degraded: 1, capped: true, lastError: 'Error: projector failed' });
+});
+
+test('status samples over 500 failed records in event order, the same rows and error on every call', async () => {
+  const { spaceId, collectionId, scope } = await space();
+  const worker = new PostgresRetrievalWorker(pool);
+  for (let n = 0; n < 1001; n++) await write(scope, 'create', `{"title":"record ${n}"}`);
+  // 500 records stay due without an error; the other 501 failed, each later than the one before it in event order,
+  // so the newest error belongs to the last event, which is outside the first 500 failed rows.
+  await pool.query(`WITH ranked AS (SELECT event_id,row_number() OVER (ORDER BY event_id) AS n FROM projection_outbox
+      WHERE space_id=$1 AND event_id NOT IN (SELECT event_id FROM projection_outbox WHERE space_id=$1 ORDER BY event_id LIMIT 500))
+    UPDATE projection_outbox o SET failures=1,last_error='error ' || ranked.n,
+      available_at=clock_timestamp()+interval '1 day'+ranked.n * interval '1 second'
+    FROM ranked WHERE o.event_id=ranked.event_id`, [spaceId]);
+  for (let call = 0; call < 3; call++)
+    assert.deepEqual((await worker.status(spaceId, collectionId)).records,
+      { pending: 500, degraded: 500, capped: true, lastError: 'error 500' }, `call ${call}`);
 });

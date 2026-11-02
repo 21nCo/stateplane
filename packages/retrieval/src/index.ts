@@ -72,6 +72,13 @@ export function validProfile(profile: EmbedderProfile): boolean {
 export const sameIdentity = (a: EmbedderIdentity, b: EmbedderIdentity) => a.embedder === b.embedder && a.model === b.model
   && a.modelVersion === b.modelVersion && a.dimensions === b.dimensions;
 
+// Every field of a profile: the registry's snapshot and the adapter's own profile must agree on all of them.
+const PROFILE_FIELDS = ['embedder', 'model', 'modelVersion', 'dimensions', 'region', 'quality', 'costPerMillionCodePoints',
+  'maxBatch', 'maxInputCodePoints'] as const satisfies readonly (keyof EmbedderProfile)[];
+function liveProfile(embedder: Embedder): EmbedderProfile | undefined {
+  try { return embedder.profile ?? undefined; } catch { return undefined; }
+}
+
 /** What a new vector generation needs from its embedder. */
 export interface EmbedderRequirements {
   /** Regions the collection's policy allows, in preference order. */
@@ -91,10 +98,13 @@ export interface EmbedderRequirements {
 export class EmbeddingRegistry {
   readonly #embedders: readonly Embedder[];
   /**
-   * Each embedder is kept as a frozen snapshot of its validated profile and
-   * its `embed` bound to it, and selection returns that snapshot: changing
-   * the original profile afterwards never changes which identity, region or
-   * limits are authorized or used.
+   * Each embedder is kept as a frozen snapshot of its validated profile, and
+   * selection returns that snapshot: changing the original profile
+   * afterwards never changes which identity, region or limits are
+   * authorized or used. The snapshot's `embed` rereads the adapter's own
+   * profile before every call and refuses, without calling it, unless that
+   * profile still matches the snapshot in every field, so an adapter never
+   * runs under an identity, region or limit other than the one authorized.
    */
   constructor(embedders: readonly Embedder[] = []) {
     const seen = new Set<string>();
@@ -103,15 +113,18 @@ export class EmbeddingRegistry {
       const source = embedder?.profile;
       const embed = embedder?.embed;
       if (!source || typeof source !== 'object' || typeof embed !== 'function') throw new RangeError('Invalid embedder profile');
-      const profile: EmbedderProfile = Object.freeze({ embedder: source.embedder, model: source.model,
-        modelVersion: source.modelVersion, dimensions: source.dimensions, region: source.region, quality: source.quality,
-        costPerMillionCodePoints: source.costPerMillionCodePoints, maxBatch: source.maxBatch,
-        maxInputCodePoints: source.maxInputCodePoints });
+      const profile: EmbedderProfile = Object.freeze(Object.fromEntries(PROFILE_FIELDS.map(field => [field, source[field]])) as never);
       if (!validProfile(profile)) throw new RangeError('Invalid embedder profile');
       const key = JSON.stringify([profile.embedder, profile.model, profile.modelVersion, profile.dimensions, profile.region]);
       if (seen.has(key)) throw new RangeError('Duplicate embedder in one region');
       seen.add(key);
-      snapshots.push(Object.freeze({ profile, embed: embed.bind(embedder) }));
+      snapshots.push(Object.freeze({ profile, embed: (texts: readonly string[], signal: AbortSignal) => {
+        // The adapter's profile as it is now: a replaced object or a throwing getter included.
+        const live = liveProfile(embedder);
+        if (!live || PROFILE_FIELDS.some(field => live[field] !== profile[field]))
+          return Promise.reject(new EmbedderUnavailableError('Embedder profile changed after registration'));
+        return embed.call(embedder, texts, signal);
+      } }));
     }
     this.#embedders = Object.freeze(snapshots);
   }

@@ -642,6 +642,10 @@ async function currentTarget(query: Query, job: EvidenceRef): Promise<{ open: bo
     deleted: false, content } };
 }
 
+/** The newer of two samples' newest errors; the first on a tie. */
+const newer = (a: { last_error: string | null; error_at: Date | null }, b: typeof a) =>
+  b.error_at !== null && (a.error_at === null || b.error_at > a.error_at) ? b.last_error : a.last_error;
+
 /** A step's settling and releasing: `CLEANUP_MS`, ending at the latest that long after the step's budget `until`. */
 const cleanup = (until: number): Limit => ({ deadline: Math.min(Date.now(), until) + CLEANUP_MS });
 
@@ -912,25 +916,31 @@ export class PostgresRetrievalWorker {
     const space = text(spaceId, 512);
     const collection = text(collectionId, 512);
     return inTransaction(this.pool, async db => {
+      // Each sample's newest error and its time; status reports the newer of the two record samples'.
+      const newest = `(array_agg(last_error ORDER BY available_at DESC) FILTER (WHERE last_error IS NOT NULL))[1] AS last_error,
+          max(available_at) FILTER (WHERE last_error IS NOT NULL) AS error_at`;
       const records = (await db.query(`SELECT count(*)::int AS live,
           count(*) FILTER (WHERE failures>0 OR delivery_state='degraded' OR last_error IS NOT NULL)::int AS degraded,
-          (array_agg(last_error ORDER BY available_at DESC) FILTER (WHERE last_error IS NOT NULL))[1] AS last_error
+          ${newest}
         FROM (SELECT failures,delivery_state,last_error,available_at FROM projection_outbox
           WHERE space_id=$1 AND collection_id=$2 AND ${LIVE_OUTBOX} ORDER BY available_at,event_id LIMIT $3) o`,
       [space, collection, STATUS_SAMPLE])).rows[0];
-      const failed = (await db.query(`SELECT count(*)::int AS degraded,
-          (array_agg(last_error ORDER BY available_at DESC) FILTER (WHERE last_error IS NOT NULL))[1] AS last_error
+      // Failed rows in the order of their partial index, so the same rows are sampled on every call.
+      const failed = (await db.query(`SELECT count(*)::int AS degraded,${newest}
         FROM (SELECT last_error,available_at FROM projection_outbox
-          WHERE space_id=$1 AND collection_id=$2 AND ${FAILED_OUTBOX} LIMIT $3) f`, [space, collection, STATUS_SAMPLE])).rows[0];
+          WHERE space_id=$1 AND collection_id=$2 AND ${FAILED_OUTBOX} ORDER BY event_id LIMIT $3) f`,
+      [space, collection, STATUS_SAMPLE])).rows[0];
       const evidence = (await db.query(`SELECT count(*)::int AS live,
           count(*) FILTER (WHERE last_error IS NOT NULL)::int AS degraded,
           (array_agg(last_error ORDER BY available_at DESC) FILTER (WHERE last_error IS NOT NULL))[1] AS last_error
         FROM (SELECT last_error,available_at FROM retrieval_outbox
           WHERE space_id=$1 AND collection_id=$2 AND delivery_state='pending' ORDER BY available_at,job_id LIMIT $3) o`,
       [space, collection, STATUS_SAMPLE])).rows[0];
-      // The oldest pending item over all of them, not only the sample: one backed off behind newer work still counts.
-      const oldest = (await db.query(`SELECT min(enqueued_at) AS oldest FROM retrieval_outbox
-        WHERE space_id=$1 AND collection_id=$2 AND delivery_state='pending'`, [space, collection])).rows[0].oldest;
+      // The oldest pending item over all of them, not only the sample: one backed off behind newer work still
+      // counts. One row through retrieval_outbox_age, however long the backlog.
+      const oldest = (await db.query(`SELECT enqueued_at FROM retrieval_outbox
+        WHERE space_id=$1 AND collection_id=$2 AND delivery_state='pending' ORDER BY enqueued_at LIMIT 1`,
+      [space, collection])).rows[0]?.enqueued_at;
       const views = (await loadGenerations(db.query.bind(db), space, collection)).map(entry => ({
         generation: entry.generation, state: entry.state, policyVersion: entry.policyVersion, lexical: entry.lexical,
         vector: entry.vector, embedder: entry.identity, embedderAvailable: entry.identity
@@ -938,7 +948,7 @@ export class PostgresRetrievalWorker {
       const recordsDegraded = Math.max(records.degraded, failed.degraded);
       const view: ProjectionStatus = { spaceId: space, collectionId: collection, state: 'current',
         records: { pending: records.live - records.degraded, degraded: recordsDegraded,
-          capped: records.live >= STATUS_SAMPLE || failed.degraded >= STATUS_SAMPLE, lastError: records.last_error ?? failed.last_error },
+          capped: records.live >= STATUS_SAMPLE || failed.degraded >= STATUS_SAMPLE, lastError: newer(records, failed) },
         evidence: { pending: evidence.live - evidence.degraded, degraded: evidence.degraded, capped: evidence.live >= STATUS_SAMPLE,
           oldestPendingAt: oldest ? new Date(oldest).toISOString() : null, lastError: evidence.last_error },
         generations: views };

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { AuthorityError, CollectionRegistry, PostgresAuthority, PostgresOutbox, PostgresSpaces } from '../../packages/postgres/dist/index.js';
 import { consume, dispatch } from '../../packages/workers/dist/index.js';
+import { DeadlineExceededError } from '../../packages/postgres/dist/faults.js';
 
 // The cell-wide dispatcher sees every space, so this suite owns its database.
 const password = process.env.DATABASE_URL ? null : (await readFile(new URL('../../.data/local-db-password', import.meta.url), 'utf8')).trim();
@@ -318,6 +319,46 @@ test('projection outage degrades search state while authoritative writes and exa
   const status = await outbox.status(spaceId);
   assert.deepEqual(status.collections.map(entry => [entry.pending, entry.degraded, entry.lastError]), [[1, 1, 'Error: embedder unavailable']]);
   assert.ok(status.collections[0].oldestUndeliveredAt);
+});
+
+test('bounded claim, release and reconciliation steps end by their deadline on a one-session pool, freeing the session and committing nothing', async () => {
+  const { scope, collectionId, spaceId } = await space();
+  await write(scope(collectionId), 'create', '{"n":1}');
+  const job = await outbox.reconcile('operator', spaceId, collectionId, 'deadline drill');
+  const single = new pg.Pool({ connectionString: target.toString(), max: 1 });
+  const holder = await pool.connect();
+  try {
+    const bounded = new PostgresOutbox(single, authority);
+    const free = async () => { const at = Date.now(); await single.query('SELECT 1'); return Date.now() - at; };
+    // Another session holds what each call needs, so its statement stalls on the server.
+    await holder.query('BEGIN');
+    await holder.query('LOCK TABLE projection_outbox, projection_reconciliations IN ACCESS EXCLUSIVE MODE');
+    let deadline = Date.now() + 300;
+    await assert.rejects(bounded.claim({}, { deadline }), DeadlineExceededError);
+    assert.ok(Date.now() - deadline < 1_000, 'the claim ended at its deadline');
+    assert.ok(await free() < 1_000, 'the only session is free while the lock is still held');
+    deadline = Date.now() + 300;
+    assert.equal(await bounded.stepReconciliations(4, 100, { deadline }), 0, 'a step cut short ends the call');
+    assert.ok(Date.now() - deadline < 1_000);
+    assert.ok(await free() < 1_000);
+    deadline = Date.now() + 300;
+    await assert.rejects(bounded.release([{ eventId: `evt_${randomUUID()}`, attempt: 1 }], { deadline }),
+      DeadlineExceededError);
+    assert.ok(await free() < 1_000);
+    // Dispatch with that store ends at its deadline, quietly, with nothing claimed.
+    deadline = Date.now() + 300;
+    assert.deepEqual(await dispatch(bounded, { send: async () => assert.fail('nothing was claimed') }, { budgetMs: 60_000, deadline }),
+      { claimed: 0, sent: 0, released: 0, parked: 0, batches: 0 });
+    assert.ok(Date.now() - deadline < 1_000);
+    await holder.query('ROLLBACK');
+    const after = await outbox.reconciliation(job.jobId);
+    assert.deepEqual([after.state, after.scanned], ['running', 0], 'the cut step committed nothing');
+    assert.equal(await bounded.stepReconciliations(4, 100, { deadline: Date.now() + 5_000 }), 1, 'and runs once the lock is gone');
+  } finally {
+    await holder.query('ROLLBACK').catch(() => {});
+    holder.release();
+    await single.end();
+  }
 });
 
 test('reconciliation pages are resumable, cancellable, audited and repair missing heads', async () => {

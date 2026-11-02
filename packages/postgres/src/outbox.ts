@@ -4,8 +4,9 @@ import type pg from 'pg';
 import { AuthorityError, CommitOutcomeUnknownError } from './index.js';
 import type { AuthorityScope, OutboxDelivery, PostgresAuthority, ProjectionChange, ProjectionOutcome, ProjectionQuery } from './index.js';
 import { claimOutboxSql, FAILED_OUTBOX, failOutboxSql, LIVE_OUTBOX } from './outbox-sql.js';
-import { bounded, diagnostic, inTransaction, infrastructureFault, projectorError, rolledBack, text, within } from './faults.js';
-import type { PoolLike } from './faults.js';
+import { bounded, DeadlineExceededError, diagnostic, inTransaction, infrastructureFault, projectorError, rolledBack, text,
+  within } from './faults.js';
+import type { Limit, PoolLike, Session } from './faults.js';
 
 /** A queue message is only a hint; SQL decides whether its lease is still current. */
 export interface DeliveryMessage { eventId: string; attempt: number }
@@ -135,15 +136,16 @@ export class PostgresOutbox {
    * is parked instead and counts as served. While another dispatcher holds the
    * cursor, a claim returns nothing as a `whole` scan. At most `inFlight`
    * unexpired dispatch leases stay unstarted per cell, so dispatch cannot
-   * outrun its consumers by more than that.
+   * outrun its consumers by more than that. With `bound`, the claim's
+   * transaction ends by its deadline (`inTransaction`'s limit).
    */
-  async claim(limits: DispatchLimits = {}): Promise<ClaimResult> {
+  async claim(limits: DispatchLimits = {}, bound?: Limit): Promise<ClaimResult> {
     const most = bounded(limits.limit ?? 100, 1, 100);
     const perSpace = bounded(limits.perSpace ?? Math.min(25, most), 1, most);
     const pairs = bounded(limits.pairs ?? 200, 1, 1_000);
     const leaseSeconds = bounded(limits.leaseSeconds ?? 300, 1, 3_600);
     const inFlight = bounded(limits.inFlight ?? 5_000, 1, 100_000);
-    return inTransaction(this.pool, async db => {
+    return this.transact(async db => {
       const cursor = (await db.query(`SELECT after_space_id,after_collection_id FROM outbox_dispatch_checkpoint
         FOR UPDATE SKIP LOCKED`)).rows[0];
       if (!cursor) return { messages: [], scan: 'whole', parked: 0, full: false };
@@ -218,11 +220,16 @@ export class PostgresOutbox {
       const leased = claimed.rows.filter(row => !row.parked);
       return { messages: leased.map(row => ({ eventId: row.event_id, attempt: row.attempts })), scan,
         parked: claimed.rows.length - leased.length, full: unstarted + leased.length >= inFlight };
-    });
+    }, bound);
+  }
+
+  /** One transaction, bounded by `bound`'s deadline when there is one. */
+  private transact<T>(fn: (db: Session) => Promise<T>, bound?: Limit): Promise<T> {
+    return bound ? inTransaction(this.pool, fn, bound) : inTransaction(this.pool, fn);
   }
 
   /** Walk distinct live pairs through the claim index, after one bound and up to another. */
-  private async scanPairs(db: pg.PoolClient, after: [string, string] | null, through: [string, string] | null,
+  private async scanPairs(db: Session, after: [string, string] | null, through: [string, string] | null,
     count: number): Promise<[string, string][]> {
     if (count < 1) return [];
     const values: unknown[] = [count];
@@ -242,14 +249,17 @@ export class PostgresOutbox {
     return rows.rows.map(row => [row.space_id, row.collection_id]);
   }
 
-  /** Undo unstarted leases whose hints were not sent. A lease a worker has started is left to it. */
-  release(messages: readonly DeliveryMessage[]): Promise<number> { return this.releaseLeases(messages, false); }
+  /** Undo unstarted leases whose hints were not sent, by `bound`'s deadline if given. A lease a worker has started is left to it. */
+  release(messages: readonly DeliveryMessage[], bound?: Limit): Promise<number> {
+    return this.releaseLeases(messages, false, null, bound);
+  }
 
-  private async releaseLeases(messages: readonly DeliveryMessage[], started: boolean, error: string | null = null): Promise<number> {
+  private async releaseLeases(messages: readonly DeliveryMessage[], started: boolean, error: string | null = null,
+    bound?: Limit): Promise<number> {
     const fixed = messages.map(message => this.message(message));
     if (!fixed.length) return 0;
-    return inTransaction(this.pool, async db => (await db.query(RELEASE_SQL, [fixed.map(message => message.eventId),
-      fixed.map(message => message.attempt), started ? RELEASE_BACKOFF_MS : 0, started, error])).rowCount ?? 0);
+    return this.transact(async db => (await db.query(RELEASE_SQL, [fixed.map(message => message.eventId),
+      fixed.map(message => message.attempt), started ? RELEASE_BACKOFF_MS : 0, started, error])).rowCount ?? 0, bound);
   }
 
   /**
@@ -520,13 +530,16 @@ export class PostgresOutbox {
    * first. A record is requeued when its latest revision was delivered but
    * its head is missing, behind, or from an earlier placement generation.
    * Live and dead-lettered rows are left to delivery and operator retry.
+   * With `bound`, each step's transaction ends by its deadline, and one cut
+   * short ends the call: it rolled back, or committed a page that is safe to
+   * scan again.
    */
-  async stepReconciliations(jobs = 4, pageSize = 100): Promise<number> {
+  async stepReconciliations(jobs = 4, pageSize = 100, bound?: Limit): Promise<number> {
     bounded(jobs, 1, 32);
     bounded(pageSize, 1, 500);
     let stepped = 0;
     for (let index = 0; index < jobs; index++) {
-      const advanced = await inTransaction(this.pool, async db => {
+      const advanced = await this.transact(async db => {
         const job = (await db.query(`SELECT job_id,space_id,collection_id,after_record_id FROM projection_reconciliations
           WHERE state='running' AND next_step_at<=clock_timestamp()
           ORDER BY next_step_at,job_id FOR UPDATE SKIP LOCKED LIMIT 1`)).rows[0];
@@ -569,6 +582,10 @@ export class PostgresOutbox {
             next_step_at=clock_timestamp(),updated_at=clock_timestamp()
           WHERE job_id=$1`, [job.job_id, page.last, page.scanned, page.requeued, pageSize]);
         return true;
+      }, bound).catch((error: unknown) => {
+        if (error instanceof DeadlineExceededError
+          || error instanceof CommitOutcomeUnknownError && error.cause instanceof DeadlineExceededError) return false;
+        throw error;
       });
       if (!advanced) break;
       stepped++;
