@@ -93,13 +93,13 @@ REVOKE ALL ON FUNCTION stateplane_check_retrieval_policy() FROM PUBLIC;
 CREATE TRIGGER retrieval_policies_valid BEFORE INSERT ON retrieval_policies
   FOR EACH ROW EXECUTE FUNCTION stateplane_check_retrieval_policy();
 
--- One mutable row per collection with a policy: its current policy version
--- and the highest generation number it has allocated. Only owner-rights
--- triggers write it. Publishing a policy and starting a generation both write
--- this row, and a vector chunk or checkpoint share locks it to read the current
--- policy, so they serialize: a writer whose snapshot predates a committed
--- change of the row fails with a serialization error under REPEATABLE READ,
--- and under READ COMMITTED waits and checks the committed row.
+-- One mutable row per collection with a policy: its current (highest) policy
+-- version and the highest generation number it has allocated. Only
+-- owner-rights triggers write it. Publishing a policy and starting a generation
+-- both update lock this row, and a vector chunk or checkpoint share locks it to
+-- read the current policy, so they serialize: a writer whose snapshot predates
+-- a committed change of the row fails with a serialization error under
+-- REPEATABLE READ, and under READ COMMITTED waits and checks the committed row.
 CREATE TABLE retrieval_collection_heads (
   space_id text NOT NULL,
   collection_id text NOT NULL,
@@ -109,13 +109,31 @@ CREATE TABLE retrieval_collection_heads (
   FOREIGN KEY (space_id, collection_id, policy_version) REFERENCES retrieval_policies(space_id, collection_id, version)
 );
 
+-- Versions are published one at a time in order, whatever the statement's
+-- shape: each inserted row must be the successor of the head's version when
+-- its trigger runs (rows of one statement run in their insertion order), so
+-- the head only advances and always names the highest version. The
+-- self-referencing key alone is checked at statement end, so it would accept
+-- versions 3 then 2 in one statement.
 CREATE FUNCTION stateplane_publish_retrieval_policy() RETURNS trigger LANGUAGE plpgsql
 SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
+DECLARE
+  current_version bigint;
 BEGIN
-  INSERT INTO public.retrieval_collection_heads(space_id, collection_id, policy_version)
-    VALUES (NEW.space_id, NEW.collection_id, NEW.version)
-    ON CONFLICT (space_id, collection_id) DO UPDATE SET policy_version = EXCLUDED.policy_version;
+  SELECT h.policy_version INTO current_version FROM public.retrieval_collection_heads h
+    WHERE h.space_id = NEW.space_id AND h.collection_id = NEW.collection_id FOR UPDATE;
+  IF NEW.version <> COALESCE(current_version, 0) + 1 THEN
+    RAISE EXCEPTION 'retrieval policy version % does not follow the current version %', NEW.version, COALESCE(current_version, 0)
+      USING ERRCODE = 'check_violation', CONSTRAINT = 'retrieval_policies_order';
+  END IF;
+  IF current_version IS NULL THEN
+    INSERT INTO public.retrieval_collection_heads(space_id, collection_id, policy_version)
+      VALUES (NEW.space_id, NEW.collection_id, NEW.version);
+  ELSE
+    UPDATE public.retrieval_collection_heads h SET policy_version = NEW.version
+      WHERE h.space_id = NEW.space_id AND h.collection_id = NEW.collection_id;
+  END IF;
   RETURN NULL;
 END;
 $$;
@@ -676,11 +694,21 @@ CREATE TRIGGER entity_refs_retrieval AFTER UPDATE OF tombstone ON entity_refs
 -- nothing to project: a purge already running migration 044's routine (whose
 -- space is committed `deleting`, or `deleted` for an erasure repair) resumes
 -- after this step with that routine, which removes no retrieval work, so no
--- work may reference its identities. Each statement reads
+-- work may reference its identities. A purge runs only once its space has
+-- committed `deleting`, so the spaces the backfill enqueues for are first
+-- share locked: an update of one of them (its lifecycle, policy or placement)
+-- waits until this step commits, so its purge then runs the routine below, and
+-- a change committed while this lock waited is seen by the recheck and the
+-- backfill's snapshot, which skip the space. Those updates touch no table this
+-- step locks, and a purge holds its space only once committed `deleting`,
+-- which is skipped unlocked, so the wait cannot deadlock. Each statement reads
 -- the identities once and, per live identity, one primary-key probe of its
 -- latest extraction or current revision (a LATERAL ... LIMIT 1 is never
 -- flattened into a scan), so extraction and claim history is never read; the
 -- migrator bounds the identities read (scripts/migrate.mjs).
+SELECT count(*) FROM (SELECT 1 FROM spaces s WHERE s.lifecycle NOT IN ('deleting', 'deleted')
+  AND EXISTS (SELECT 1 FROM entity_refs e WHERE e.space_id = s.space_id AND e.kind IN ('source', 'claim') AND NOT e.tombstone)
+  FOR SHARE OF s) locked;
 INSERT INTO retrieval_outbox(space_id, collection_id, ref_kind, ref_id, revision, extraction_version, operation, placement_generation)
   SELECT e.space_id, e.collection_id, 'source', e.entity_id, e.revision, x.version, 'upsert', s.placement_generation
   FROM entity_refs e

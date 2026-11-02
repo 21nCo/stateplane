@@ -244,6 +244,50 @@ test('retrieval policies are immutable gapless versions of valid configured cont
   await assert.rejects(pool.query('TRUNCATE retrieval_policies CASCADE'), check());
 });
 
+/** Publish policy versions of collection alpha in one multirow INSERT, in the given order: [version, regions] each. */
+async function publishAll(spaceId, versions, db = pool) {
+  const rows = versions.map((_, i) => `($1,'alpha',$${2 * i + 2}::bigint,'{/title}',true,$${2 * i + 3}::text[],'owner-session')`);
+  await db.query(`INSERT INTO retrieval_policies(space_id,collection_id,version,record_fields,vector,processing_regions,credential_id)
+    VALUES ${rows.join(',')}`, [spaceId, ...versions.flat()]);
+}
+const headPolicy = async spaceId => (await pool.query(`SELECT policy_version::int AS version FROM retrieval_collection_heads
+  WHERE space_id=$1 AND collection_id='alpha'`, [spaceId])).rows[0]?.version ?? null;
+
+test('policy versions are published in order, so the collection head names the highest version whatever the statement', async () => {
+  const spaceId = await space();
+  await assert.rejects(publishAll(spaceId, [[2, ['apac']], [1, ['apac']]]), check('retrieval_policies_order'), 'version 2 before 1');
+  assert.equal(await headPolicy(spaceId), null);
+  await publishAll(spaceId, [[1, ['apac', 'weur']]]);
+  await generation(spaceId, 'alpha', 1, 1);
+  await projectRef(spaceId, 1, 'record', 'rec_1', 1);
+  // The self-referencing key alone is checked at statement end, so it would accept 3 before 2 and leave 2 as the head.
+  await assert.rejects(publishAll(spaceId, [[3, ['apac']], [2, ['apac', 'weur']]]), check('retrieval_policies_order'), 'versions 3 then 2');
+  assert.equal(await headPolicy(spaceId), 1);
+  await publishAll(spaceId, [[2, ['apac', 'weur']], [3, ['apac']]]);
+  assert.equal(await headPolicy(spaceId), 3);
+  await assert.rejects(vectorChunk(spaceId, 1, 'record', 'rec_1', 1, { region: 'weur' }), check('vector_chunks_region'));
+  await assert.rejects(vectorChunk(spaceId, 1, 'record', 'rec_1', 2, { table: 'embedding_checkpoints', region: 'weur' }),
+    check('embedding_checkpoints_region'));
+  await vectorChunk(spaceId, 1, 'record', 'rec_1', 1);
+  await moveGeneration(spaceId, 'alpha', 1, 'retired');
+  await assert.rejects(generation(spaceId, 'alpha', 2, 2), check('projection_generations_policy'), 'a superseded policy');
+  await generation(spaceId, 'alpha', 2, 3);
+});
+
+for (const isolation of ['READ COMMITTED', 'REPEATABLE READ']) {
+  test(`under ${isolation}, concurrent policy publications leave the head at the highest version`, async () => {
+    const spaceId = await space();
+    await policy(spaceId, 'alpha', 1);
+    const publish = version => db => policy(spaceId, 'alpha', version, {}, db);
+    refused('23505')(await race(isolation, { first: publish(2), second: publish(2) }) ?? assert.fail('a version was published twice'));
+    const stale = await race(isolation, { first: publish(3), second: publish(4), committed: true });
+    if (isolation === 'READ COMMITTED') assert.equal(stale, null, stale?.message);
+    // Its snapshot cannot see its predecessor, so the predecessor key refuses it before it reaches the head.
+    else missing(stale ?? assert.fail('a publication from a stale snapshot committed'));
+    assert.equal(await headPolicy(spaceId), isolation === 'READ COMMITTED' ? 4 : 3);
+  });
+}
+
 test('generations start under the current policy and move forward one state at a time, one active at once', async () => {
   const spaceId = await space();
   await policy(spaceId, 'alpha', 1);
@@ -1038,8 +1082,8 @@ async function applyMigrationsBefore(client, migration) {
 
 test('migration 045 rolls back atomically when claim writers hold or cross its locks, applies after a revision, and enqueues existing evidence', { timeout: 60000 }, async () => {
   const name = upgradeDatabase;
-  const [db, writer, purger] = [0, 1, 2].map(() => new pg.Client({ connectionString: urlFor(name) }));
-  await Promise.all([db, writer, purger].map(client => client.connect()));
+  const [db, writer, purger, ledger, deleter] = [0, 1, 2, 3, 4].map(() => new pg.Client({ connectionString: urlFor(name) }));
+  await Promise.all([db, writer, purger, ledger, deleter].map(client => client.connect()));
   try {
     await applyMigrationsBefore(db, '045_retrieval_projections.sql');
     // Evidence written before 045: a source with two extractions, a claim at revision 2 and a deleted claim.
@@ -1073,6 +1117,16 @@ test('migration 045 rolls back atomically when claim writers hold or cross its l
       VALUES('sp_doomed','entries','clm_doomed','owner','owner-session')`);
     await db.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,recorded_by)
       VALUES('sp_doomed','entries','clm_doomed',1,'Doomed.','principal:owner','owner-session','owner')`);
+    // An archived space with a live claim whose deletion starts while 045 is applying, after its backfill.
+    await db.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id,lifecycle)
+      VALUES('sp_late','owner','cell-a','cell-a','target-a','readOnly')`);
+    await db.query(`INSERT INTO collections(space_id,collection_id) VALUES('sp_late','entries')`);
+    await db.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition) VALUES('sp_late','entries',1,'{}')`);
+    await db.query(`INSERT INTO entity_refs(space_id,collection_id,kind,entity_id) VALUES('sp_late','entries','claim','clm_late')`);
+    await db.query(`INSERT INTO claims(space_id,collection_id,claim_id,principal_id,credential_id)
+      VALUES('sp_late','entries','clm_late','owner','owner-session')`);
+    await db.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,recorded_by)
+      VALUES('sp_late','entries','clm_late',1,'Late.','principal:owner','owner-session','owner')`);
     await db.query('COMMIT');
     await db.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id='sp_doomed'`);
     await db.query(`UPDATE entity_refs SET tombstone=true WHERE space_id='sp_upgrade' AND entity_id='clm_gone'`);
@@ -1148,6 +1202,9 @@ test('migration 045 rolls back atomically when claim writers hold or cross its l
     await writer.query('BEGIN');
     await writer.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,recorded_by)
       VALUES('sp_upgrade','entries','clm_live',3,'Third.','principal:owner','owner-session','owner')`);
+    // Hold the step's ledger row, so the step stops after all of its SQL, backfill included, before it commits.
+    await ledger.query('BEGIN');
+    await ledger.query(`INSERT INTO stateplane_migrations(name,sha256) VALUES('045_retrieval_projections.sql','held')`);
     const applying = migrating({ STATEPLANE_POPULATED_INDEX_UPGRADE: 'drained' });
     await waitingFor('claim_revisions');
     // An erasure already inside migration 044's purge routine queues behind the step on claim revisions. It resumes with
@@ -1158,13 +1215,43 @@ test('migration 045 rolls back atomically when claim writers hold or cross its l
     await waitsOnLock(purgerPid);
     await writer.query(`UPDATE entity_refs SET revision=3 WHERE space_id='sp_upgrade' AND kind='claim' AND entity_id='clm_live'`);
     await writer.query('COMMIT');
+    for (let attempt = 0; !(await db.query(`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock'
+      AND query LIKE 'INSERT INTO stateplane_migrations%') AS waiting`)).rows[0].waiting; attempt += 1) {
+      assert.ok(attempt < 3000, 'migration 045 never reached its ledger write');
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    // The archived space's deletion starts after the backfill enqueued its claim. Its lifecycle change waits for the
+    // step, so the purge that follows it runs 045's routine; had the change committed now, a purge started before the
+    // step committed would run 044's routine and fail on the claim's retrieval work.
+    const deleterPid = (await deleter.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+    let lifecycleDone = false;
+    const deleting = deleter.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id='sp_late'`).finally(() => { lifecycleDone = true; });
+    let lifecycleWaited = false;
+    for (let attempt = 0; attempt < 200 && !lifecycleDone && !lifecycleWaited; attempt += 1) {
+      lifecycleWaited = (await db.query('SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1', [deleterPid])).rows[0]?.wait_event_type === 'Lock';
+      if (!lifecycleWaited) await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    let latePurge = null;
+    if (lifecycleDone) {
+      await deleting;
+      latePurge = deleter.query(`SELECT stateplane_purge_space('sp_late')`).then(() => null, error => error);
+      await waitsOnLock(deleterPid);
+    }
+    await ledger.query('ROLLBACK');
     const applied = await applying;
     assert.equal(applied.status, 0, applied.stderr);
     assert.match(applied.stdout, /Applied 045_retrieval_projections.sql/);
     assert.equal(await purging, null);
     await purger.query('COMMIT');
-    assert.deepEqual((await db.query(`SELECT lifecycle, (SELECT count(*)::int FROM entity_refs WHERE space_id='sp_doomed') AS identities
-      FROM spaces WHERE space_id='sp_doomed'`)).rows[0], { lifecycle: 'deleted', identities: 0 });
+    await deleting;
+    latePurge ??= deleter.query(`SELECT stateplane_purge_space('sp_late')`).then(() => null, error => error);
+    assert.equal(await latePurge, null);
+    assert.ok(lifecycleWaited, 'the lifecycle change waited for migration 045');
+    for (const spaceId of ['sp_doomed', 'sp_late']) {
+      assert.deepEqual((await db.query(`SELECT lifecycle, (SELECT count(*)::int FROM entity_refs WHERE space_id=$1) AS identities,
+        (SELECT count(*)::int FROM retrieval_outbox WHERE space_id=$1) AS work FROM spaces WHERE space_id=$1`, [spaceId])).rows[0],
+      { lifecycle: 'deleted', identities: 0, work: 0 });
+    }
     // Each live source's latest extraction and each live claim's current revision are enqueued once.
     assert.deepEqual((await db.query(`SELECT ref_kind,ref_id,revision::int,extraction_version::int,operation,placement_generation::int
       FROM retrieval_outbox ORDER BY ref_kind,ref_id`)).rows.map(row => ({ ...row })), [
@@ -1183,6 +1270,7 @@ test('migration 045 rolls back atomically when claim writers hold or cross its l
   } finally {
     await writer.query('ROLLBACK').catch(() => {});
     await purger.query('ROLLBACK').catch(() => {});
-    await Promise.allSettled([db.end(), writer.end(), purger.end()]);
+    await ledger.query('ROLLBACK').catch(() => {});
+    await Promise.allSettled([db, writer, purger, ledger, deleter].map(client => client.end()));
   }
 });
