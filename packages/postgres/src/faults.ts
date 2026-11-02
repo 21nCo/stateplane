@@ -80,10 +80,14 @@ export function projectorError(stage: 'prepare' | 'apply', error: unknown): unkn
 
 // An error reply from a live session means the server rolled COMMIT back.
 // Session loss, shutdown, resource and internal errors may arrive at FATAL or
-// PANIC after the commit record, so they stay ambiguous.
+// PANIC after the commit record, so they stay ambiguous. A Node system error
+// (a socket's EPIPE or EPERM, which also has five capitals) is no reply at
+// all: it carries `errno` or `syscall`, and no PostgreSQL class starts with E.
 export function rolledBack(error: unknown): boolean {
-  const code = (error as { code?: unknown } | undefined)?.code;
-  return typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) && !/^(?:08|53|57P|58|XX)/.test(code);
+  const fields = error as { code?: unknown; errno?: unknown; syscall?: unknown } | null | undefined;
+  const code = fields?.code;
+  return typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) && !/^(?:08|53|57P|58|XX|E)/.test(code)
+    && fields?.errno === undefined && fields?.syscall === undefined;
 }
 
 /** The caller's budget ended before COMMIT was sent; the transaction rolled back. */

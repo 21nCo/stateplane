@@ -40,6 +40,11 @@ test('only configured record fields, source content and claim statements are chu
   assert.equal(pointer({ list: ['x'] }, '/list/01'), undefined);
   assert.equal(pointer({ constructor: 1 }, '/toString'), undefined, 'inherited properties are not fields');
   assert.equal(pointer({ title: 'x' }, 'title'), undefined, 'a pointer without its leading slash is malformed');
+  // Every ~ must start ~0 or ~1; ~01 decodes to ~1, not /.
+  for (const malformed of ['/a~2', '/a~', '/~', '/a~/b', '/a~~0']) assert.equal(pointer({ 'a~2': 'x', 'a~': 'y', '~': 'z', a: { b: 'w' } }, malformed), undefined, malformed);
+  assert.equal(pointer({ 'a~1': 'x' }, '/a~01'), 'x');
+  assert.equal(pointer({ 'a/b': 'x' }, '/a~1b'), 'x');
+  assert.deepEqual(pointer({ a: 1 }, ''), { a: 1 }, 'the empty pointer is the whole document');
 });
 
 test('the registry selects only allowed regions, then by limits, quality and cost, and resolves exact identities', () => {
@@ -48,16 +53,41 @@ test('the registry selects only allowed regions, then by limits, quality and cos
   const euBetter = profile({ embedder: 'eu-better', region: 'eu-west', costPerMillionCodePoints: 5, quality: 0.95 });
   const euShort = profile({ embedder: 'eu-short', region: 'eu-west', costPerMillionCodePoints: 0, maxInputCodePoints: 500 });
   const registry = new EmbeddingRegistry([cheapUs, eu, euBetter, euShort]);
+  // The registry hands out snapshots of what it validated, so compare by name.
+  const name = embedder => embedder?.profile.embedder ?? null;
   const needs = { regions: ['eu-west'], dimensions: [384], inputCodePoints: 1000 };
-  assert.equal(registry.select(needs), euBetter, 'the cheaper US embedder is outside the policy; the short one cannot take a chunk');
+  assert.equal(name(registry.select(needs)), 'eu-better', 'the cheaper US embedder is outside the policy; the short one cannot take a chunk');
   assert.equal(registry.select({ ...needs, minQuality: 0.99 }), null);
   assert.equal(registry.select({ ...needs, dimensions: [768] }), null);
-  assert.equal(registry.select({ ...needs, regions: ['us-east', 'eu-west'] }), cheapUs);
-  assert.equal(registry.resolve(eu.profile, ['us-east', 'eu-west'], 1000), eu);
+  assert.equal(name(registry.select({ ...needs, regions: ['us-east', 'eu-west'] })), 'cheap');
+  assert.equal(name(registry.resolve(eu.profile, ['us-east', 'eu-west'], 1000)), 'eu-model');
+  assert.equal(registry.resolve(eu.profile, ['eu-west'], 1000), registry.resolve(eu.profile, ['eu-west'], 1000), 'one snapshot per embedder');
   assert.equal(registry.resolve(eu.profile, ['us-east'], 1000), null);
   assert.equal(registry.resolve({ ...eu.profile, modelVersion: '2' }, ['eu-west'], 1000), null);
   assert.throws(() => new EmbeddingRegistry([eu, profile({ embedder: 'eu-model', region: 'eu-west' })]), /Duplicate/);
   assert.throws(() => new EmbeddingRegistry([{ profile: { ...eu.profile, region: 'EU' }, embed: eu.embed }]), /Invalid/);
+});
+
+test('the registry keeps what it validated: changing a profile afterwards changes no selection, region or limit', async () => {
+  const local = profile({ embedder: 'mutable', region: 'eu-west', maxBatch: 2 });
+  const source = { ...local.profile };
+  const calls = [];
+  const mutable = { profile: source, embed(texts, signal) { calls.push(this === mutable); return local.embed(texts, signal); } };
+  const registry = new EmbeddingRegistry([mutable]);
+  const needs = { regions: ['eu-west'], dimensions: [384], inputCodePoints: 1000 };
+  const chosen = registry.select(needs);
+  // A later edit of the original object: another region, model, batch size and dimensions.
+  Object.assign(source, { region: 'us-east', modelVersion: '9', maxBatch: 2048, dimensions: 768, maxInputCodePoints: 10 });
+  assert.equal(registry.resolve(local.profile, ['us-east'], 1000), null, 'the edited region is not authorized');
+  assert.equal(registry.select({ ...needs, regions: ['us-east'] }), null);
+  const resolved = registry.resolve(local.profile, ['eu-west'], 1000);
+  assert.equal(resolved, chosen, 'the validated identity, region and input limit still resolve');
+  assert.deepEqual(resolved.profile, local.profile);
+  assert.ok(Object.isFrozen(resolved) && Object.isFrozen(resolved.profile));
+  assert.throws(() => { resolved.profile.region = 'us-east'; }, TypeError);
+  await assert.rejects(embedBatch(resolved, ['a', 'b', 'c'], never), RangeError, 'the validated batch limit still applies');
+  assert.equal((await embedBatch(resolved, ['a', 'b'], never)).length, 2);
+  assert.deepEqual(calls, [true], 'embed runs on the registered embedder');
 });
 
 test('a batch retries an outage within bounds and rejects malformed vectors as the input', async () => {

@@ -902,9 +902,11 @@ export class PostgresRetrievalWorker {
    * A collection's projection state: `degraded` when sampled record or
    * evidence work has failed or a vector generation has no configured
    * embedder in a region its policies allow, `pending` when work is waiting,
-   * otherwise `current`. Each queue's counts cover at most its 500
-   * oldest-due rows; `capped` marks them as lower bounds. Exact reads and
-   * writes never depend on this state.
+   * otherwise `current`. Each queue's counts and newest error cover at most
+   * its 500 oldest-due rows (records also their first 500 failed ones);
+   * `capped` marks the counts as lower bounds. The oldest pending evidence
+   * item is read over all of them. Exact reads and writes never depend on
+   * this state.
    */
   async status(spaceId: string, collectionId: string): Promise<ProjectionStatus> {
     const space = text(spaceId, 512);
@@ -916,14 +918,19 @@ export class PostgresRetrievalWorker {
         FROM (SELECT failures,delivery_state,last_error,available_at FROM projection_outbox
           WHERE space_id=$1 AND collection_id=$2 AND ${LIVE_OUTBOX} ORDER BY available_at,event_id LIMIT $3) o`,
       [space, collection, STATUS_SAMPLE])).rows[0];
-      const failed = (await db.query(`SELECT count(*)::int AS degraded FROM (SELECT 1 FROM projection_outbox
+      const failed = (await db.query(`SELECT count(*)::int AS degraded,
+          (array_agg(last_error ORDER BY available_at DESC) FILTER (WHERE last_error IS NOT NULL))[1] AS last_error
+        FROM (SELECT last_error,available_at FROM projection_outbox
           WHERE space_id=$1 AND collection_id=$2 AND ${FAILED_OUTBOX} LIMIT $3) f`, [space, collection, STATUS_SAMPLE])).rows[0];
       const evidence = (await db.query(`SELECT count(*)::int AS live,
-          count(*) FILTER (WHERE last_error IS NOT NULL)::int AS degraded, min(enqueued_at) AS oldest,
+          count(*) FILTER (WHERE last_error IS NOT NULL)::int AS degraded,
           (array_agg(last_error ORDER BY available_at DESC) FILTER (WHERE last_error IS NOT NULL))[1] AS last_error
-        FROM (SELECT last_error,available_at,enqueued_at FROM retrieval_outbox
+        FROM (SELECT last_error,available_at FROM retrieval_outbox
           WHERE space_id=$1 AND collection_id=$2 AND delivery_state='pending' ORDER BY available_at,job_id LIMIT $3) o`,
       [space, collection, STATUS_SAMPLE])).rows[0];
+      // The oldest pending item over all of them, not only the sample: one backed off behind newer work still counts.
+      const oldest = (await db.query(`SELECT min(enqueued_at) AS oldest FROM retrieval_outbox
+        WHERE space_id=$1 AND collection_id=$2 AND delivery_state='pending'`, [space, collection])).rows[0].oldest;
       const views = (await loadGenerations(db.query.bind(db), space, collection)).map(entry => ({
         generation: entry.generation, state: entry.state, policyVersion: entry.policyVersion, lexical: entry.lexical,
         vector: entry.vector, embedder: entry.identity, embedderAvailable: entry.identity
@@ -931,9 +938,9 @@ export class PostgresRetrievalWorker {
       const recordsDegraded = Math.max(records.degraded, failed.degraded);
       const view: ProjectionStatus = { spaceId: space, collectionId: collection, state: 'current',
         records: { pending: records.live - records.degraded, degraded: recordsDegraded,
-          capped: records.live >= STATUS_SAMPLE || failed.degraded >= STATUS_SAMPLE, lastError: records.last_error },
+          capped: records.live >= STATUS_SAMPLE || failed.degraded >= STATUS_SAMPLE, lastError: records.last_error ?? failed.last_error },
         evidence: { pending: evidence.live - evidence.degraded, degraded: evidence.degraded, capped: evidence.live >= STATUS_SAMPLE,
-          oldestPendingAt: evidence.oldest ? new Date(evidence.oldest).toISOString() : null, lastError: evidence.last_error },
+          oldestPendingAt: oldest ? new Date(oldest).toISOString() : null, lastError: evidence.last_error },
         generations: views };
       if (recordsDegraded || evidence.degraded || views.some(entry => entry.embedderAvailable === false)) view.state = 'degraded';
       else if (records.live || evidence.live) view.state = 'pending';

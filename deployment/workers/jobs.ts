@@ -20,7 +20,15 @@ interface Env {
 // bytes of deleted sources and erased spaces for up to 5 s, sweeps one page
 // of stored upload bytes for up to 5 s, then projects source and claim work
 // for up to 10 s; docs/durable-outbox.md, docs/evidence-storage.md and
-// docs/retrieval-projections.md record the bounds.
+// docs/retrieval-projections.md record the bounds. The steps share one 50 s
+// tick budget from the invocation's start: each gets the lesser of its own
+// budget and what is left, and one with under a second left is skipped. The
+// other 10 s of the minute are slack for the last step's overrun (one claim
+// and send, or the retrieval step's 1 s cleanup), the connection wait and
+// teardown, so ticks do not overlap and a tick holds only the one origin
+// connection scripts/topology.mjs allows it.
+const TICK_BUDGET_MS = 50_000;
+const MIN_STEP_MS = 1_000;
 const DISPATCH_BUDGET_MS = 20_000;
 const RECONCILE_BUDGET_MS = 10_000;
 const UPLOAD_BUDGET_MS = 10_000;
@@ -56,12 +64,18 @@ function cell(env: Env, originals = false) {
 
 export default {
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    const tickEnd = Date.now() + TICK_BUDGET_MS;
+    // A step's budget: its own, cut to what is left of the tick's; 0 skips the step.
+    const left = (budgetMs: number) => {
+      const ms = Math.min(budgetMs, tickEnd - Date.now());
+      return ms >= MIN_STEP_MS ? ms : 0;
+    };
     const { outbox, uploads, retrieval, close } = cell(env, true);
     try {
       const result = await dispatch(outbox, {
         send: async messages => { await env.PROJECTION_JOBS.sendBatch(messages.map(body => ({ body: { ...body } }))); }
-      }, { budgetMs: DISPATCH_BUDGET_MS });
-      const until = Date.now() + RECONCILE_BUDGET_MS;
+      }, { budgetMs: left(DISPATCH_BUDGET_MS) });
+      const until = Date.now() + left(RECONCILE_BUDGET_MS);
       let stepped = 1;
       // Released leases are uncounted, so the tick error is the only record of
       // a failed send: a reconciliation failure joins it rather than hiding it.
@@ -69,16 +83,19 @@ export default {
       try { while (stepped > 0 && Date.now() < until) stepped = await outbox.stepReconciliations(); }
       catch (error) { failures.push(error); }
       // A full page means more ended attempts may be due; each step stops at the budget's end.
-      const uploadsUntil = Date.now() + UPLOAD_BUDGET_MS;
+      const uploadsUntil = Date.now() + left(UPLOAD_BUDGET_MS);
       let due = UPLOAD_PAGE;
       try { while (due === UPLOAD_PAGE && Date.now() < uploadsUntil) due = await uploads!.step(UPLOAD_PAGE, Math.max(1, uploadsUntil - Date.now())); }
       catch (error) { failures.push(error); }
-      try { await uploads!.erase(ERASE_PAGE, ERASE_BUDGET_MS); }
+      const eraseMs = left(ERASE_BUDGET_MS);
+      try { if (eraseMs) await uploads!.erase(ERASE_PAGE, eraseMs); }
       catch (error) { failures.push(error); }
-      try { await uploads!.sweep(SWEEP_PAGE, SWEEP_BUDGET_MS); }
+      const sweepMs = left(SWEEP_BUDGET_MS);
+      try { if (sweepMs) await uploads!.sweep(SWEEP_PAGE, sweepMs); }
       catch (error) { failures.push(error); }
       // Each item settles its own failure; only a failed claim reaches the tick.
-      try { await retrieval.step({ budgetMs: RETRIEVAL_BUDGET_MS }); }
+      const retrievalMs = left(RETRIEVAL_BUDGET_MS);
+      try { if (retrievalMs) await retrieval.step({ budgetMs: retrievalMs }); }
       catch (error) { failures.push(error); }
       if (result.error) throw new Error(`Projection dispatch released ${result.released} leases`, {
         cause: failures.length ? new AggregateError([result.error, ...failures], 'Queue send and reconciliation failed') : result.error });

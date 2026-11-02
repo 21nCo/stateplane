@@ -1,24 +1,24 @@
 import { describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({ closed: 0, connected: 0, failClose: false, denyGrants: false, denyCatalog: false, ownsObject: false, denyVector: false, wrongIdentity: false }));
-const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[], reconcileError: undefined as Error | undefined, uploadPages: [] as number[], uploadSteps: [] as number[], uploadError: undefined as Error | undefined, uploadBudgets: [] as number[], sweeps: [] as number[][], erasures: [] as number[][], originals: [] as unknown[], active: 0, peak: 0, poolInstances: [] as { emit(event: string, error: Error): boolean }[], projectors: [] as unknown[], retrievalSteps: [] as unknown[], retrievalError: undefined as Error | undefined }));
+const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[], reconcileError: undefined as Error | undefined, uploadPages: [] as number[], uploadSteps: [] as number[], uploadError: undefined as Error | undefined, uploadBudgets: [] as number[], sweeps: [] as number[][], erasures: [] as number[][], originals: [] as unknown[], active: 0, peak: 0, poolInstances: [] as { emit(event: string, error: Error): boolean }[], projectors: [] as unknown[], retrievalSteps: [] as unknown[], retrievalError: undefined as Error | undefined, skew: 0, lag: {} as Record<string, number> }));
 vi.mock('@stateplane/postgres', async importOriginal => ({
   CLIENT_READ_TIMEOUT_MS: (await importOriginal<typeof import('@stateplane/postgres')>()).CLIENT_READ_TIMEOUT_MS,
   PostgresAuthority: class {},
   RecordRetrievalProjector: class { constructor(pool: unknown) { cell.projectors.push(pool); } },
   PostgresRetrievalWorker: class {
-    async step(options: unknown) { cell.retrievalSteps.push(options); if (cell.retrievalError) throw cell.retrievalError; return {}; }
+    async step(options: unknown) { cell.retrievalSteps.push(options); cell.skew += cell.lag.retrieval ?? 0; if (cell.retrievalError) throw cell.retrievalError; return {}; }
   },
   SourceUploadReconciler: class {
     constructor(sourceCell: { originals: unknown }) { cell.originals.push(sourceCell.originals); }
-    async step(limit: number, budgetMs: number) { cell.uploadSteps.push(limit); cell.uploadBudgets.push(budgetMs); if (cell.uploadError) throw cell.uploadError; return cell.uploadPages.shift() ?? 0; }
-    async erase(limit: number, budgetMs: number) { cell.erasures.push([limit, budgetMs]); return 0; }
-    async sweep(limit: number, budgetMs: number) { cell.sweeps.push([limit, budgetMs]); return 0; }
+    async step(limit: number, budgetMs: number) { cell.uploadSteps.push(limit); cell.uploadBudgets.push(budgetMs); cell.skew += cell.lag.upload ?? 0; if (cell.uploadError) throw cell.uploadError; return cell.uploadPages.shift() ?? 0; }
+    async erase(limit: number, budgetMs: number) { cell.erasures.push([limit, budgetMs]); cell.skew += cell.lag.erase ?? 0; return 0; }
+    async sweep(limit: number, budgetMs: number) { cell.sweeps.push([limit, budgetMs]); cell.skew += cell.lag.sweep ?? 0; return 0; }
   },
   PostgresOutbox: class {
-    async claim() { return { messages: cell.claims.shift() ?? [], scan: 'whole' }; }
+    async claim() { cell.skew += cell.lag.claim ?? 0; return { messages: cell.claims.shift() ?? [], scan: 'whole' }; }
     async release(messages: unknown[]) { cell.released.push(...messages); return messages.length; }
-    async stepReconciliations() { cell.stepped++; if (cell.reconcileError) throw cell.reconcileError; return 0; }
+    async stepReconciliations() { cell.stepped++; cell.skew += cell.lag.reconcile ?? 0; if (cell.reconcileError) throw cell.reconcileError; return 0; }
     async process(message: { attempt: number }, projector: unknown) {
       if (!projector) throw new Error('record completion needs the retrieval projector');
       cell.processed.push(message);
@@ -170,6 +170,34 @@ describe('cell jobs Worker', () => {
     try { await expect(jobs.scheduled({} as never, jobsEnv())).rejects.toBe(claim); }
     finally { cell.retrievalError = undefined; }
     expect(cell.retrievalSteps).toHaveLength(2);
+  });
+
+  it('fits every step in one 50 s tick budget, cutting later steps to what is left, so ticks leave slack in their minute', async () => {
+    // A simulated clock: each mocked step takes `cell.lag[step]` ms.
+    const real = Date.now.bind(Date);
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => real() + cell.skew);
+    const near = (value: number, expected: number) => value <= expected && value > expected - 500;
+    try {
+      // Dispatch overruns its 20 s by 3 s; reconciliation, uploads and erasure use their whole budgets.
+      cell.claims = []; cell.uploadPages = []; cell.uploadBudgets = []; cell.erasures = []; cell.sweeps = []; cell.retrievalSteps = [];
+      cell.skew = 0; cell.lag = { claim: 23_000, reconcile: 10_000, upload: 10_000, erase: 5_000, sweep: 500 };
+      await jobs.scheduled({} as never, jobsEnv());
+      expect(near(cell.uploadBudgets[0], 10_000)).toBe(true);
+      expect(cell.erasures.map(([, ms]) => near(ms, 5_000))).toEqual([true]);
+      expect(cell.sweeps.map(([, ms]) => near(ms, 2_000))).toEqual([true]);
+      expect((cell.retrievalSteps as { budgetMs: number }[]).map(({ budgetMs }) => near(budgetMs, 1_500))).toEqual([true]);
+      // With under a second of the tick left, the retrieval step waits for a later tick.
+      cell.uploadBudgets = []; cell.erasures = []; cell.sweeps = []; cell.retrievalSteps = [];
+      cell.skew = 0; cell.lag = { ...cell.lag, sweep: 2_000 };
+      await jobs.scheduled({} as never, jobsEnv());
+      expect([cell.sweeps.length, cell.retrievalSteps]).toEqual([1, []]);
+      expect(cell.skew).toBeLessThanOrEqual(50_000);
+      // Dispatch alone past the tick budget skips every later step.
+      cell.uploadSteps = []; cell.erasures = []; cell.sweeps = []; cell.stepped = 0;
+      cell.skew = 0; cell.lag = { claim: 50_000 };
+      await jobs.scheduled({} as never, jobsEnv());
+      expect([cell.stepped, cell.uploadSteps, cell.erasures, cell.sweeps, cell.retrievalSteps]).toEqual([0, [], [], [], []]);
+    } finally { clock.mockRestore(); cell.skew = 0; cell.lag = {}; }
   });
 
   it('fails a tick closed without its originals binding, before opening the pool', async () => {

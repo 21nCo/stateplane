@@ -1394,3 +1394,52 @@ test('an item whose start rolls back is released under its claim, recording the 
   assert.equal(applied.delivery_state, 'delivered');
   assert.equal((await worker.status(spaceId, collectionId)).state, 'degraded');
 });
+
+test('a socket error on COMMIT keeps the record delivery\'s outcome unknown; a server reply to COMMIT is a known rollback', async () => {
+  const { spaceId, scope } = await space();
+  await write(scope, 'create', '{"title":"commit"}');
+  const projector = new RecordRetrievalProjector(pool);
+  // Completion's COMMIT fails with `cause`, as the authority reports a missing acknowledgement.
+  const committing = cause => new PostgresOutbox(pool, { requestBudgetMs: authority.requestBudgetMs,
+    transaction: async () => { throw new CommitOutcomeUnknownError(cause); } });
+  const row = async () => (await pool.query(`SELECT delivery_state,failures,started_attempt IS NOT NULL AS started
+    FROM projection_outbox WHERE space_id=$1`, [spaceId])).rows[0];
+  // Node system errors whose code has five capitals, as a SQLSTATE does: the session, not the server, failed.
+  const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE', errno: -32, syscall: 'write' });
+  const eperm = Object.assign(new Error('connect EPERM'), { code: 'EPERM' });
+  for (const cause of [epipe, eperm]) {
+    await pool.query("UPDATE projection_outbox SET delivery_state='pending',started_attempt=NULL WHERE space_id=$1", [spaceId]);
+    const [lease] = await hints();
+    await assert.rejects(committing(cause).process(lease, projector),
+      error => error instanceof CommitOutcomeUnknownError && error.cause === cause, cause.code);
+    assert.deepEqual(await row(), { delivery_state: 'delivering', failures: 0, started: true }, `${cause.code}: the lease is kept`);
+  }
+  // A server's error reply to COMMIT (a deferred check, 23514) rolled it back: the delivery's own failure.
+  await pool.query("UPDATE projection_outbox SET delivery_state='pending',started_attempt=NULL WHERE space_id=$1", [spaceId]);
+  const [lease] = await hints();
+  const check = Object.assign(new Error('deferred check failed'), { code: '23514', severity: 'ERROR' });
+  assert.equal(await committing(check).process(lease, projector), 'failed');
+  assert.deepEqual(await row(), { delivery_state: 'degraded', failures: 1, started: false });
+});
+
+test('status reports the oldest pending evidence over all of it and a failed record\'s error outside the oldest-due sample', async () => {
+  const { spaceId, collectionId, scope } = await space();
+  const worker = new PostgresRetrievalWorker(pool);
+  await evidence(spaceId);
+  const first = (await pool.query('SELECT job_id,enqueued_at FROM retrieval_outbox WHERE space_id=$1 ORDER BY enqueued_at LIMIT 1',
+    [spaceId])).rows[0];
+  // 501 newer items are due first; the oldest backs off for a day, and the other older one is due after them.
+  await pool.query(`INSERT INTO retrieval_outbox(space_id,collection_id,ref_kind,ref_id,revision,operation,placement_generation,available_at)
+    SELECT $1,'alpha','claim','clm_1',g,'upsert',1,clock_timestamp()-interval '1 hour' FROM generate_series(2,502) g`, [spaceId]);
+  await pool.query(`UPDATE retrieval_outbox SET available_at=clock_timestamp()+interval '1 day',attempts=1,last_error='error 40001'
+    WHERE job_id=$1`, [first.job_id]);
+  // 501 records are due; the first one's delivery failed and backs off for a day.
+  for (let n = 0; n < 501; n++) await write(scope, 'create', `{"title":"record ${n}"}`);
+  await pool.query(`UPDATE projection_outbox SET failures=1,last_error='Error: projector failed',available_at=clock_timestamp()+interval '1 day'
+    WHERE event_id=(SELECT event_id FROM projection_outbox WHERE space_id=$1 ORDER BY revision,event_id LIMIT 1)`, [spaceId]);
+  const status = await worker.status(spaceId, collectionId);
+  assert.equal(status.evidence.oldestPendingAt, first.enqueued_at.toISOString(), 'the backed-off item is the oldest');
+  assert.deepEqual([status.evidence.pending, status.evidence.capped], [500, true]);
+  assert.deepEqual(status.records, { pending: 500, degraded: 1, capped: true, lastError: 'Error: projector failed' });
+  assert.equal(status.state, 'degraded');
+});

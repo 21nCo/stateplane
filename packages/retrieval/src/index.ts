@@ -90,16 +90,30 @@ export interface EmbedderRequirements {
  */
 export class EmbeddingRegistry {
   readonly #embedders: readonly Embedder[];
+  /**
+   * Each embedder is kept as a frozen snapshot of its validated profile and
+   * its `embed` bound to it, and selection returns that snapshot: changing
+   * the original profile afterwards never changes which identity, region or
+   * limits are authorized or used.
+   */
   constructor(embedders: readonly Embedder[] = []) {
     const seen = new Set<string>();
+    const snapshots: Embedder[] = [];
     for (const embedder of embedders) {
-      const profile = embedder?.profile;
-      if (!profile || !validProfile(profile) || typeof embedder.embed !== 'function') throw new RangeError('Invalid embedder profile');
+      const source = embedder?.profile;
+      const embed = embedder?.embed;
+      if (!source || typeof source !== 'object' || typeof embed !== 'function') throw new RangeError('Invalid embedder profile');
+      const profile: EmbedderProfile = Object.freeze({ embedder: source.embedder, model: source.model,
+        modelVersion: source.modelVersion, dimensions: source.dimensions, region: source.region, quality: source.quality,
+        costPerMillionCodePoints: source.costPerMillionCodePoints, maxBatch: source.maxBatch,
+        maxInputCodePoints: source.maxInputCodePoints });
+      if (!validProfile(profile)) throw new RangeError('Invalid embedder profile');
       const key = JSON.stringify([profile.embedder, profile.model, profile.modelVersion, profile.dimensions, profile.region]);
       if (seen.has(key)) throw new RangeError('Duplicate embedder in one region');
       seen.add(key);
+      snapshots.push(Object.freeze({ profile, embed: embed.bind(embedder) }));
     }
-    this.#embedders = Object.freeze([...embedders]);
+    this.#embedders = Object.freeze(snapshots);
   }
 
   get size(): number { return this.#embedders.length; }
@@ -256,7 +270,8 @@ export interface ContentPolicy { recordFields: readonly string[]; sourceContent:
 
 /** Resolve an RFC 6901 JSON Pointer; undefined when any step is missing or the pointer is malformed. */
 export function pointer(document: unknown, path: string): unknown {
-  if (path !== '' && !path.startsWith('/')) return undefined;
+  // Every `~` must start a `~0` or `~1` escape, a trailing one included.
+  if ((path !== '' && !path.startsWith('/')) || /~(?![01])/u.test(path)) return undefined;
   let current = document;
   for (const raw of path.split('/').slice(1)) {
     const token = raw.replaceAll('~1', '/').replaceAll('~0', '~');
