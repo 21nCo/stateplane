@@ -12,14 +12,13 @@ CREATE TABLE retrieval_dispatch_checkpoint (
 );
 INSERT INTO retrieval_dispatch_checkpoint DEFAULT VALUES;
 
--- Status reads a collection's oldest pending evidence item through this one
--- row, however long its backlog.
-CREATE INDEX retrieval_outbox_age ON retrieval_outbox(space_id, collection_id, enqueued_at)
-  WHERE delivery_state = 'pending';
-
 -- When each row's last_error was recorded. available_at is a schedule, not
 -- an error time: a lease moves it and parking sets it to infinity. Rows that
 -- held an error before this step keep a NULL time and rank as the oldest.
+-- Each ALTER waits briefly for, then excludes, that table's users. They lock
+-- projection_outbox before retrieval_outbox, the order space purges and
+-- status reads use, and nothing here locks either earlier, so a purge in
+-- flight finishes instead of forming a cycle with this step.
 ALTER TABLE projection_outbox ADD COLUMN last_error_at timestamptz;
 ALTER TABLE retrieval_outbox ADD COLUMN last_error_at timestamptz;
 

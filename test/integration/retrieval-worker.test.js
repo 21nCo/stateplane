@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readdir, readFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { CommitOutcomeUnknownError, PostgresAuthority, PostgresOutbox, PostgresRetrievalWorker, RecordRetrievalProjector } from '../../packages/postgres/dist/index.js';
@@ -1545,10 +1545,12 @@ test('an embedder whose profile field can no longer be read is refused as an out
   assert.equal(spy.inTransaction.length, 0, 'the adapter was never called');
 });
 
-test('a cell that applied main\'s migration 045 upgrades without drift and gains migration 046', { timeout: 60_000 }, async () => {
-  // The checksum every cell recorded for 045 as it shipped on main; 045 must stay byte-identical.
-  const SHIPPED_045 = 'bfb72a343f14d90c94b9c48ee9b981b37933a25fa128d46ff07cabc0ad239064';
-  const upgrade = `${name}_u`;
+// The checksum every cell recorded for 045 as it shipped on main; 045 must stay byte-identical.
+const SHIPPED_045 = 'bfb72a343f14d90c94b9c48ee9b981b37933a25fa128d46ff07cabc0ad239064';
+const root = fileURLToPath(new URL('../..', import.meta.url));
+// A database migrated through main's 045, recorded with its shipped checksum, for the test to upgrade.
+async function atMain045(suffix, body) {
+  const upgrade = `${name}_${suffix}`;
   const admin = new pg.Client({ connectionString: baseUrl });
   await admin.connect();
   try {
@@ -1560,22 +1562,129 @@ test('a cell that applied main\'s migration 045 upgrades without drift and gains
       const directory = new URL('../../migrations/', import.meta.url);
       const files = (await readdir(directory)).filter(file => file.endsWith('.sql')).sort();
       await db.query('BEGIN; CREATE TABLE stateplane_migrations (name text PRIMARY KEY, sha256 text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())');
-      for (const file of files.slice(0, files.indexOf('046_retrieval_dispatch_checkpoint.sql'))) {
+      for (const file of files.slice(0, files.indexOf('045_retrieval_projections.sql') + 1)) {
         const sql = await readFile(new URL(file, directory), 'utf8');
         await db.query(sql); // NOSONAR -- migrations apply in order
         await db.query('INSERT INTO stateplane_migrations(name,sha256) VALUES($1,$2)', // NOSONAR -- recorded with its file
           [file, file === '045_retrieval_projections.sql' ? SHIPPED_045 : digest(sql)]);
       }
       await db.query('COMMIT');
-      const output = execFileSync(process.execPath, ['scripts/migrate.mjs'], { cwd: fileURLToPath(new URL('../..', import.meta.url)),
-        env: { ...process.env, DATABASE_URL: url.toString() }, encoding: 'utf8' });
-      assert.match(output, /Applied 046_retrieval_dispatch_checkpoint.sql/);
-      assert.deepEqual((await db.query(`SELECT (SELECT count(*)::int FROM pg_indexes WHERE indexname='retrieval_outbox_age') AS age,
-        (SELECT count(*)::int FROM information_schema.columns WHERE column_name='last_error_at'
-          AND table_name IN ('projection_outbox','retrieval_outbox')) AS columns`)).rows[0], { age: 1, columns: 2 });
+      await body(db, url.toString());
     } finally { await db.end(); }
   } finally {
-    await admin.query(`DROP DATABASE IF EXISTS ${upgrade}`).catch(() => {});
+    await admin.query(`DROP DATABASE IF EXISTS ${upgrade} WITH (FORCE)`).catch(() => {});
     await admin.end();
   }
+}
+const migrateAsync = url => new Promise(resolve => {
+  const child = spawn(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: url } });
+  let stdout = ''; let stderr = '';
+  child.stdout.on('data', chunk => { stdout += chunk; });
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  child.on('close', status => resolve({ status, stdout, stderr }));
+});
+async function until(db, sql, what) {
+  for (let attempt = 0; !(await db.query(sql)).rows[0]?.ok; attempt += 1) {
+    assert.ok(attempt < 1000, what);
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+const upgraded = async db => (await db.query(`SELECT (SELECT indisvalid FROM pg_index WHERE indexrelid=to_regclass('public.retrieval_outbox_age')) AS age,
+  (SELECT count(*)::int FROM information_schema.columns WHERE column_name='last_error_at'
+    AND table_name IN ('projection_outbox','retrieval_outbox')) AS columns,
+  (SELECT array_agg(name ORDER BY name) FROM stateplane_migrations WHERE name >= '046') AS recorded`)).rows[0];
+const AFTER_045 = ['046_retrieval_dispatch_checkpoint.sql', '047_retrieval_outbox_age.sql'];
+
+test('a cell that applied main\'s migration 045 upgrades without drift and gains migrations 046 and 047', { timeout: 60_000 }, async () => {
+  await atMain045('u', async (db, url) => {
+    const output = execFileSync(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: url }, encoding: 'utf8' });
+    assert.match(output, /Applied 046_retrieval_dispatch_checkpoint.sql\nApplied 047_retrieval_outbox_age.sql/);
+    assert.deepEqual(await upgraded(db), { age: true, columns: 2, recorded: AFTER_045 });
+    assert.equal(execFileSync(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: url }, encoding: 'utf8' }), '');
+  });
+});
+
+test('a space purge in flight during the upgrade finishes, and the upgrade waits for it rather than deadlocking', { timeout: 60_000 }, async () => {
+  await atMain045('p', async (db, url) => {
+    const purge = new pg.Client({ connectionString: url });
+    await purge.connect();
+    try {
+      // A purge's order: the record outbox, then the evidence outbox.
+      await purge.query("BEGIN; SET LOCAL lock_timeout = '10s'");
+      await purge.query("DELETE FROM projection_outbox WHERE space_id='sp_gone'");
+      const migrating = migrateAsync(url);
+      await until(db, `SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid=l.relation
+        WHERE NOT l.granted AND c.relname='projection_outbox') AS ok`, 'the upgrade never waited for the purge');
+      await purge.query("DELETE FROM retrieval_outbox WHERE space_id='sp_gone'");
+      await purge.query('COMMIT');
+      const result = await migrating;
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(await upgraded(db), { age: true, columns: 2, recorded: AFTER_045 });
+    } finally { await purge.end(); }
+  });
+});
+
+test('a writer holding the outboxes the other way round fails the upgrade with retry guidance and no partial schema', { timeout: 60_000 }, async () => {
+  await atMain045('d', async (db, url) => {
+    const writer = new pg.Client({ connectionString: url });
+    await writer.connect();
+    try {
+      await writer.query("BEGIN; SET LOCAL lock_timeout = '10s'");
+      await writer.query("DELETE FROM retrieval_outbox WHERE space_id='sp_gone'");
+      const migrating = migrateAsync(url);
+      await until(db, `SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid=l.relation
+        WHERE NOT l.granted AND c.relname='retrieval_outbox') AS ok`, 'the upgrade never waited for the writer');
+      // The step holds the record outbox and waits for this writer, which now waits for it: PostgreSQL aborts the step.
+      await writer.query("DELETE FROM projection_outbox WHERE space_id='sp_gone'");
+      await writer.query('COMMIT');
+      const failed = await migrating;
+      assert.equal(failed.status, 1);
+      assert.match(failed.stderr, /^Projection outbox upgrade waits for record writers, outbox workers and space purges; retry/);
+      assert.deepEqual(await upgraded(db), { age: null, columns: 0, recorded: null });
+      const retried = await migrateAsync(url);
+      assert.equal(retried.status, 0, retried.stderr);
+      assert.deepEqual(await upgraded(db), { age: true, columns: 2, recorded: AFTER_045 });
+    } finally { await writer.end(); }
+  });
+});
+
+test('the evidence outbox age index builds concurrently over a populated outbox, and an interrupted build is rebuilt', { timeout: 60_000 }, async () => {
+  await atMain045('c', async (db, url) => {
+    await db.query("BEGIN; SET LOCAL session_replication_role = replica");
+    await db.query(`INSERT INTO retrieval_outbox(space_id,collection_id,ref_kind,ref_id,revision,operation,placement_generation,delivery_state,delivered_at)
+      SELECT 'sp_busy','entries','claim','clm_'||n,1,'upsert',1,CASE WHEN n % 3 = 0 THEN 'delivered' ELSE 'pending' END,
+        CASE WHEN n % 3 = 0 THEN clock_timestamp() END FROM generate_series(1,2000) n`);
+    await db.query('COMMIT');
+    const snapshot = new pg.Client({ connectionString: url });
+    const writer = new pg.Client({ connectionString: url });
+    await snapshot.connect();
+    await writer.connect();
+    try {
+      // An older snapshot keeps the build in progress, so writes are tried while it runs.
+      await snapshot.query('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM spaces');
+      const migrating = migrateAsync(url);
+      const building = `SELECT pid AS ok FROM pg_stat_activity WHERE datname=current_database()
+        AND pid<>pg_backend_pid() AND query LIKE '%CREATE INDEX CONCURRENTLY%' AND wait_event_type='Lock'`;
+      await until(db, building, 'the index never built outside the schema transaction');
+      const pid = (await db.query(building)).rows[0].ok;
+      await writer.query("BEGIN; SET LOCAL lock_timeout = '1s'; SET LOCAL session_replication_role = replica");
+      await writer.query(`INSERT INTO retrieval_outbox(space_id,collection_id,ref_kind,ref_id,revision,operation,placement_generation)
+        VALUES('sp_busy','entries','claim','clm_new',1,'upsert',1)`);
+      await writer.query(`UPDATE retrieval_outbox SET available_at=clock_timestamp()+interval '1 minute',last_error='Error: released',
+        last_error_at=clock_timestamp() WHERE ref_id='clm_1'`);
+      await writer.query('COMMIT');
+      // Interrupted mid-build: the invalid index stays, 047 is not recorded, and 046 kept its commit.
+      await db.query('SELECT pg_terminate_backend($1)', [pid]);
+      const interrupted = await migrating;
+      assert.notEqual(interrupted.status, 0);
+      assert.deepEqual(await upgraded(db), { age: false, columns: 2, recorded: [AFTER_045[0]] });
+      await snapshot.query('COMMIT');
+      const retried = await migrateAsync(url);
+      assert.equal(retried.status, 0, retried.stderr);
+      assert.equal(retried.stdout, 'Applied 047_retrieval_outbox_age.sql\n');
+      assert.deepEqual(await upgraded(db), { age: true, columns: 2, recorded: AFTER_045 });
+      assert.equal((await db.query(`SELECT count(*)::int AS n FROM retrieval_outbox WHERE delivery_state='pending'`)).rows[0].n, 1335);
+      assert.deepEqual(await migrateAsync(url), { status: 0, stdout: '', stderr: '' });
+    } finally { await writer.end(); await snapshot.end(); }
+  });
 });
