@@ -593,6 +593,84 @@ for (const isolation of ['READ COMMITTED', 'REPEATABLE READ']) for (const scenar
   });
 }
 
+// Retirement and a chunk or checkpoint writer meet on the generation row: a writer share locks it, so retiring waits for a
+// writer already in the generation, and a writer that reaches it during or after a retirement is refused.
+const retirementWriters = {
+  'lexical chunk': (db, spaceId) => lexical(spaceId, 1, 'record', 'rec_1', 1, { db }),
+  'vector chunk': (db, spaceId) => vectorChunk(spaceId, 1, 'record', 'rec_1', 1, { db }),
+  'embedding checkpoint': (db, spaceId) => vectorChunk(spaceId, 1, 'record', 'rec_1', 1, { table: 'embedding_checkpoints', db }) };
+const retire = (db, spaceId) => moveGeneration(spaceId, 'alpha', 1, 'retired', db);
+async function waitsOnLock(pid) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const row = (await pool.query('SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1', [pid])).rows[0];
+    if (row?.wait_event_type === 'Lock') return;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  assert.fail(`backend ${pid} never waited on a lock`);
+}
+const generationRows = async spaceId => (await pool.query(`SELECT (SELECT state FROM projection_generations WHERE space_id=$1) AS state,
+    (SELECT count(*)::int FROM lexical_chunks WHERE space_id=$1) + (SELECT count(*)::int FROM vector_chunks WHERE space_id=$1)
+      + (SELECT count(*)::int FROM embedding_checkpoints WHERE space_id=$1) AS rows`, [spaceId])).rows[0];
+
+for (const isolation of ['READ COMMITTED', 'REPEATABLE READ']) for (const [writerName, write] of Object.entries(retirementWriters)) {
+  test(`under ${isolation}, retiring a generation waits for an in-flight ${writerName} writer`, async () => {
+    const spaceId = await space();
+    await policy(spaceId, 'alpha', 1);
+    await generation(spaceId, 'alpha', 1, 1);
+    await projectRef(spaceId, 1, 'record', 'rec_1', 1);
+    const writer = await pool.connect();
+    const retirer = await pool.connect();
+    try {
+      await writer.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+      await write(writer, spaceId);
+      await retirer.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+      const pid = (await retirer.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+      const retiring = retire(retirer, spaceId);
+      await waitsOnLock(pid);
+      await writer.query('COMMIT');
+      await retiring;
+      await retirer.query('COMMIT');
+    } finally {
+      await writer.query('ROLLBACK').catch(() => {});
+      await retirer.query('ROLLBACK').catch(() => {});
+      writer.release();
+      retirer.release();
+    }
+    assert.deepEqual({ ...(await generationRows(spaceId)) }, { state: 'retired', rows: 1 });
+  });
+
+  test(`under ${isolation}, a ${writerName} writer that meets an in-flight retirement is refused`, async () => {
+    const spaceId = await space();
+    await policy(spaceId, 'alpha', 1);
+    await generation(spaceId, 'alpha', 1, 1);
+    await projectRef(spaceId, 1, 'record', 'rec_1', 1);
+    const writer = await pool.connect();
+    const retirer = await pool.connect();
+    let outcome = null;
+    try {
+      // The writer's snapshot is taken before the retirement commits.
+      await writer.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+      await writer.query('SELECT count(*) FROM projection_generations WHERE space_id=$1', [spaceId]);
+      await retirer.query('BEGIN');
+      await retire(retirer, spaceId);
+      const pid = (await writer.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+      const writing = write(writer, spaceId).then(() => null, error => error);
+      await waitsOnLock(pid);
+      await retirer.query('COMMIT');
+      const error = await writing;
+      outcome = error && error.code;
+      if (outcome === '23514') assert.equal(error.constraint, 'projection_generations_retired');
+    } finally {
+      await writer.query('ROLLBACK').catch(() => {});
+      await retirer.query('ROLLBACK').catch(() => {});
+      writer.release();
+      retirer.release();
+    }
+    assert.equal(outcome, isolation === 'READ COMMITTED' ? '23514' : '40001');
+    assert.deepEqual({ ...(await generationRows(spaceId)) }, { state: 'retired', rows: 0 });
+  });
+}
+
 test('each recorded HNSW dimension has a partial expression index that a filtered nearest-neighbour query uses', async () => {
   const strategies = (await pool.query('SELECT dimensions,method,index_name,hnsw_m,hnsw_ef_construction FROM vector_index_strategies ORDER BY dimensions')).rows;
   assert.deepEqual(strategies.map(row => [row.dimensions, row.method]), [[384, 'hnsw'], [768, 'hnsw'], [1024, 'hnsw'], [1536, 'hnsw'], [3072, 'exact']]);
@@ -692,6 +770,64 @@ test('space erasure removes every retrieval row of that space only', async () =>
   assert.deepEqual(await counts(erased), Object.fromEntries(retrievalTables.map(table => [table, 0])));
   assert.deepEqual(await counts(kept), keptBefore);
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM vector_index_strategies')).rows[0].n, 5, 'cell strategies are not space data');
+});
+
+// PostgreSQL checks a deleted record's or identity's foreign keys from projection_refs with these queries (as
+// ri_triggers.c builds them), once per deleted row at commit, so the space purge runs one per record and identity.
+const riLookups = {
+  record: { index: 'projection_refs_record', params: ['alpha', 'rec_00017'], sql: `SELECT 1 FROM ONLY public.projection_refs x
+    WHERE $1 OPERATOR(pg_catalog.=) space_id AND $2 OPERATOR(pg_catalog.=) collection_id AND $3 OPERATOR(pg_catalog.=) record_id
+    FOR KEY SHARE OF x` },
+  identity: { index: 'projection_refs_entity', params: ['alpha', 'claim', 'clm_00017'], sql: `SELECT 1 FROM ONLY public.projection_refs x
+    WHERE $1 OPERATOR(pg_catalog.=) space_id AND $2 OPERATOR(pg_catalog.=) collection_id AND $3 OPERATOR(pg_catalog.=) entity_kind
+      AND $4 OPERATOR(pg_catalog.=) entity_id FOR KEY SHARE OF x` } };
+
+test('deleting a projected record or identity checks projection_refs by index, so a populated space purges in time', { timeout: 120000 }, async t => {
+  const spaceId = await space();
+  const refs = 4000;
+  await inTransaction(async db => {
+    await db.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+      SELECT $1,'alpha',id,1,1,'generated',id,'{"title":"bridge"}','{"title":"bridge"}'::jsonb
+      FROM (SELECT 'rec_' || lpad(n::text, 5, '0') AS id FROM generate_series(1, $2) n) ids`, [spaceId, refs]);
+    await db.query(`INSERT INTO entity_refs(space_id,collection_id,kind,entity_id)
+      SELECT $1,'alpha','claim','clm_' || lpad(n::text, 5, '0') FROM generate_series(1, $2) n`, [spaceId, refs]);
+    await db.query(`INSERT INTO claims(space_id,collection_id,claim_id,principal_id,credential_id)
+      SELECT $1,'alpha','clm_' || lpad(n::text, 5, '0'),'owner','owner-session' FROM generate_series(1, $2) n`, [spaceId, refs]);
+    await db.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,recorded_by)
+      SELECT $1,'alpha','clm_' || lpad(n::text, 5, '0'),1,'The bridge opened in 1932.','principal:owner','owner-session','owner'
+      FROM generate_series(1, $2) n`, [spaceId, refs]);
+    await policy(spaceId, 'alpha', 1, { vector: false, regions: [] }, db);
+    // Three generations of one collection (active, retired and building), each projecting every record and claim.
+    for (const [number, states] of [[1, ['verifying', 'active']], [2, ['retired']], [3, []]]) {
+      await generation(spaceId, 'alpha', number, 1, null, db);
+      await db.query(`INSERT INTO projection_refs(space_id,collection_id,generation,ref_kind,ref_id,revision)
+        SELECT $1,'alpha',$2,kind,(CASE kind WHEN 'record' THEN 'rec_' ELSE 'clm_' END) || lpad(n::text, 5, '0'),1
+        FROM generate_series(1, $3) n CROSS JOIN (VALUES ('record'),('claim')) kinds(kind)`, [spaceId, number, refs]);
+      for (const state of states) await moveGeneration(spaceId, 'alpha', number, state, db);
+    }
+  });
+  await pool.query('ANALYZE projection_refs');
+  const client = new pg.Client({ connectionString: urlFor(names[0]) });
+  await client.connect();
+  try {
+    for (const [name, lookup] of Object.entries(riLookups)) {
+      await client.query(`PREPARE ri_${name} AS ${lookup.sql}`);
+      const args = [spaceId, ...lookup.params].map(value => `'${value}'`).join(',');
+      // RI checks run as saved plans, custom at first and then generic; both read the referencing index.
+      for (const mode of ['force_custom_plan', 'force_generic_plan']) {
+        await client.query(`SET plan_cache_mode = ${mode}`);
+        const plan = (await client.query(`EXPLAIN EXECUTE ri_${name}(${args})`)).rows.map(row => row['QUERY PLAN']).join('\n');
+        assert.match(plan, new RegExp(`Index (?:Only )?Scan using ${lookup.index}\\b`), `${name} ${mode}\n${plan}`);
+      }
+    }
+  } finally { await client.end(); }
+  await pool.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1`, [spaceId]);
+  const started = performance.now();
+  await pool.query('SELECT stateplane_purge_space($1)', [spaceId]);
+  const elapsed = performance.now() - started;
+  t.diagnostic(`purged ${refs * 2} records and claims with ${refs * 6} projected Refs in ${Math.round(elapsed)} ms`);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM projection_refs WHERE space_id=$1', [spaceId])).rows[0].n, 0);
+  assert.ok(elapsed < 60000, `purging ${refs * 6} projected Refs took ${Math.round(elapsed)} ms`);
 });
 
 test('a nonowner cell role writes projections and proves erasure only with the retrieval grants', async () => {

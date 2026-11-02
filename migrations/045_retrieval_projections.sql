@@ -244,6 +244,14 @@ CREATE TABLE projection_refs (
   CHECK (ref_kind = 'source' OR extraction_version IS NULL),
   CHECK (ref_kind <> 'source' OR deleted OR extraction_version IS NOT NULL)
 );
+-- Deleting a record or identity checks these foreign keys from the
+-- referencing side, once per deleted row (the space purge deletes every one
+-- at commit); without an index on the referencing columns each check scans the
+-- whole table.
+CREATE INDEX projection_refs_record ON projection_refs(space_id, collection_id, record_id)
+  WHERE record_id IS NOT NULL;
+CREATE INDEX projection_refs_entity ON projection_refs(space_id, collection_id, entity_kind, entity_id)
+  WHERE entity_kind IS NOT NULL;
 CREATE TRIGGER projection_refs_kept BEFORE DELETE ON projection_refs
   FOR EACH ROW EXECUTE FUNCTION reject_retrieval_fact_change();
 CREATE TRIGGER projection_refs_no_truncate BEFORE TRUNCATE ON projection_refs

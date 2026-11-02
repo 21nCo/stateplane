@@ -240,6 +240,13 @@ try {
   assert.equal((await restored.query(`SELECT count(*)::int AS n FROM retrieval_outbox WHERE space_id=$1 AND ref_id='clm_restore'
     AND revision=2 AND operation='upsert'`,[spaceId])).rows[0].n,1,'the restored claim trigger enqueues retrieval work');
   assert.deepEqual(expected.lexical_chunks.map(row=>JSON.parse(row).tsv),["'two':1"]);
+  // A chunk written after the restore gets a tsvector derived from its content by the policy's configuration (the default `simple`), not the
+  // one its writer sends.
+  const restoredChunk=(await restored.query(`INSERT INTO lexical_chunks(space_id,collection_id,generation,ref_kind,ref_id,revision,
+    policy_version,chunk_index,field,content_start,content_end,content,tsv) VALUES($1,$2,1,'record',$3,1,1,1,'/label',0,14,
+    'bridges opened','forged'::tsvector) RETURNING tsv::text,tsv=to_tsvector('pg_catalog.simple',content) AS derived`,
+  [spaceId,collectionId,liveRecord])).rows[0];
+  assert.deepEqual({...restoredChunk},{tsv:"'bridges':1 'opened':2",derived:true},'the restored chunk trigger derives the tsvector');
   await assert.rejects(restored.query(`UPDATE projection_refs SET revision=1 WHERE space_id=$1`,[spaceId]),
     error=>error.code==='23514'&&error.constraint==='projection_refs_order');
   await assert.rejects(restored.query(`UPDATE projection_refs SET deleted=false,extraction_version=1
