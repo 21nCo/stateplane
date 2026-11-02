@@ -227,29 +227,45 @@ type Outages = Set<Embedder>;
  * Prepare a live target outside any transaction: for each vector generation,
  * embed its missing chunks in the first allowed region that has its embedder,
  * batch by batch, saving each batch as checkpoints in its own short
- * transaction. No connection is held while the embedder runs. A generation
- * that cannot be prepared does not stop the others; after trying them all,
- * the first error that is the target's own is thrown, else the first outage.
+ * transaction. No connection is held while the embedder runs. Each
+ * generation with work gets an equal share of the time left (the last one
+ * all of it), so an embedder that fails or hangs never keeps another
+ * generation from preparing. One cut by its share before saving anything is
+ * an outage for the rest of the step, like one that failed. After trying
+ * them all, the first error that is the target's own is thrown, else the
+ * first outage.
  */
 async function prepareTarget(pool: PoolLike, registry: EmbeddingRegistry, target: Target, signal: AbortSignal,
-  progress: { saved: number }, outages?: Outages): Promise<void> {
+  progress: { saved: number }, deadline: number, outages?: Outages): Promise<void> {
   if (target.deleted) return;
   const errors: unknown[] = [];
-  for (const generation of await inTransaction(pool, db => loadGenerations(db.query.bind(db), target.spaceId, target.collectionId))) {
-    if (!generation.vector || !generation.identity) continue;
-    try { await prepareGeneration(pool, registry, target, generation, signal, progress, outages); }
-    catch (error) { errors.push(error); }
+  const work = (await inTransaction(pool, db => loadGenerations(db.query.bind(db), target.spaceId, target.collectionId)))
+    .flatMap(generation => generation.vector && generation.identity ? [{ generation, chunks: chunksFor(generation, target) }] : [])
+    .filter(entry => entry.chunks.length);
+  for (const [index, { generation, chunks }] of work.entries()) {
+    const embedder = registry.resolve(generation.identity!, generation.regions, CHUNK_CODE_POINTS);
+    if (signal.aborted || !embedder || outages?.has(embedder)) {
+      errors.push(new EmbedderUnavailableError(signal.aborted ? 'Embedding budget ended' : embedder
+        ? 'Embedder unavailable earlier in this step' : `No configured embedder for generation ${generation.generation} in a region its policies allow`));
+      continue;
+    }
+    const run = (own: AbortSignal, mine: { saved: number }) => prepareGeneration(pool, target, generation, chunks, embedder, own,
+      saved => { mine.saved += saved; progress.saved += saved; });
+    const share = Math.max(1, Math.floor((deadline - Date.now()) / (work.length - index)));
+    try {
+      await (index === work.length - 1 ? run(signal, { saved: 0 })
+        : budgeted(run, signal, share, Math.min(GRACE_MS, Math.floor(share / 4))));
+    } catch (error) {
+      // A call cut short by the whole budget says nothing about the provider.
+      if (error instanceof EmbedderUnavailableError && !signal.aborted) outages?.add(embedder);
+      errors.push(error);
+    }
   }
   if (errors.length) throw errors.find(error => !infrastructureFault(error)) ?? errors[0];
 }
 
-async function prepareGeneration(pool: PoolLike, registry: EmbeddingRegistry, target: Target, generation: Generation,
-  signal: AbortSignal, progress: { saved: number }, outages?: Outages): Promise<void> {
-  const chunks = chunksFor(generation, target);
-  if (!chunks.length) return;
-  const embedder = registry.resolve(generation.identity!, generation.regions, CHUNK_CODE_POINTS);
-  if (!embedder) throw new EmbedderUnavailableError(`No configured embedder for generation ${generation.generation} in a region its policies allow`);
-  if (outages?.has(embedder)) throw new EmbedderUnavailableError('Embedder unavailable earlier in this step');
+async function prepareGeneration(pool: PoolLike, target: Target, generation: Generation, chunks: Chunk[], embedder: Embedder,
+  signal: AbortSignal, tally: (saved: number) => void): Promise<void> {
   const plan = await inTransaction(pool, db => planEmbeddings(db.query.bind(db), target, generation, chunks));
   if (!plan) return;
   const save = (saved: Saved[]) => inTransaction(pool, db => saveCheckpoints(db.query.bind(db), target, generation,
@@ -276,17 +292,11 @@ async function prepareGeneration(pool: PoolLike, registry: EmbeddingRegistry, ta
   const outage = (error: unknown) => error instanceof EmbedderUnavailableError || infrastructureFault(error);
   for (let start = 0; start < plan.missing.length; start += embedder.profile.maxBatch) {
     const batch = plan.missing.slice(start, start + embedder.profile.maxBatch);
-    let vectors: number[][];
-    try { vectors = await embedBatch(embedder, batch.map(chunk => chunk.content), signal, EMBED_RETRY_DELAYS_MS, admit, outage); }
-    catch (error) {
-      // A call cut short by the budget says nothing about the provider.
-      if (error instanceof EmbedderUnavailableError && !signal.aborted) outages?.add(embedder);
-      throw error;
-    }
+    const vectors = await embedBatch(embedder, batch.map(chunk => chunk.content), signal, EMBED_RETRY_DELAYS_MS, admit, outage);
     const saved = batch.map((chunk, index) => ({ index: chunk.index, sha256: chunk.sha256, region: embedder.profile.region,
       embedding: vectorText(vectors[index]) }));
     if (!await save(saved)) return;
-    progress.saved += saved.length;
+    tally(saved.length);
   }
 }
 
@@ -300,9 +310,10 @@ async function prepareGeneration(pool: PoolLike, registry: EmbeddingRegistry, ta
  * grace period succeeds. The caller's budget ending first stops it at once
  * with the same outcome, so running out of time is never the work's failure.
  */
-async function budgeted(run: (signal: AbortSignal, progress: { saved: number }) => Promise<void>, parent: AbortSignal,
-  ms: number, graceMs = GRACE_MS): Promise<void> {
+async function budgeted(run: (signal: AbortSignal, progress: { saved: number }, deadline: number) => Promise<void>,
+  parent: AbortSignal, ms: number, graceMs = GRACE_MS): Promise<void> {
   const controller = new AbortController();
+  const deadline = Date.now() + ms;
   const progress = { saved: 0 };
   const expired = () => progress.saved ? new ProjectionIncompleteError()
     : new EmbedderUnavailableError('Embedding exceeded its time budget');
@@ -318,7 +329,7 @@ async function budgeted(run: (signal: AbortSignal, progress: { saved: number }) 
   if (parent.aborted) forward();
   else parent.addEventListener('abort', forward, { once: true });
   try {
-    const work = run(controller.signal, progress);
+    const work = run(controller.signal, progress, deadline);
     work.catch(() => {});
     await Promise.race([work, stopped]);
   } catch (error) {
@@ -501,7 +512,8 @@ export class RecordRetrievalProjector implements Projector<void> {
     if (change.deleted) return;
     const target = recordTarget(change);
     try {
-      await budgeted((budget, progress) => prepareTarget(this.pool, this.#embedders, target, budget, progress), signal, this.#prepareMs);
+      await budgeted((budget, progress, deadline) => prepareTarget(this.pool, this.#embedders, target, budget, progress, deadline),
+        signal, this.#prepareMs);
     } catch (error) {
       const blocked = await inTransaction(this.pool, db => this.applyAvailable(db.query.bind(db), target, change.generation),
         { deadline: Date.now() + FALLBACK_APPLY_MS, signal }).catch(() => null);
@@ -724,16 +736,19 @@ export class PostgresRetrievalWorker {
           WHERE job_id=$1 AND available_at=$2::timestamptz AND available_at>clock_timestamp() AND delivery_state='pending'
           RETURNING attempts,available_at::text AS lease`, [job.jobId, job.lease, LEASE_MS])).rows[0];
         if (!started) return null;
-        job = { ...job, attempt: started.attempts, lease: started.lease };
-        return currentTarget(db.query.bind(db), job);
+        const next = { ...job, attempt: started.attempts, lease: started.lease };
+        return { next, read: await currentTarget(db.query.bind(db), next) };
       });
       if (!begun) return 'lost';
-      const read = begun;
+      // Adopted only once committed: a start that rolled back settles under the claim's lease.
+      job = begun.next;
+      const { read } = begun;
       if (!read.open) return await this.settle(job, 'release', null, 0);
       let failure: unknown = null;
       if (read.target && !read.target.deleted) {
         try {
-          await budgeted((budget, progress) => prepareTarget(this.pool, this.#embedders, read.target!, budget, progress, outages),
+          await budgeted((budget, progress, deadline) => prepareTarget(this.pool, this.#embedders, read.target!, budget, progress,
+            deadline, outages),
             signal, Math.max(1, Math.min(this.#prepareMs, Math.floor(budgetMs / 2))), Math.min(GRACE_MS, Math.floor(budgetMs / 4)));
         } catch (error) { failure = error; }
       }

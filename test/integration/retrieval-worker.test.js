@@ -1067,3 +1067,75 @@ test('a deletion or newer revision committed between batches stops further calls
   assert.deepEqual((await deliver(await hints(), projector)).sort(), ['applied', 'superseded']);
   assert.deepEqual((await projected(second.spaceId, 'record', created.ref.id)).lexical, [[1, 2, '/title', 'Short']]);
 });
+
+test('a vector generation whose embedder hangs never keeps a healthy one from preparing, on record and evidence work', async () => {
+  const { spaceId, scope, collectionId } = await space();
+  // Generation 1's embedder waits for its signal; generation 2's is healthy and distinct.
+  const hung = new Spy({ modelVersion: 'hung' }, { before: (call, signal) => untilAborted(signal) });
+  const healthy = new Spy({ modelVersion: 'healthy' });
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(hung));
+  await policy(spaceId, 2);
+  await generation(spaceId, 2, 2, identity(healthy), 'building');
+  const registry = new EmbeddingRegistry([hung, healthy]);
+  const created = await write(scope, 'create', '{"title":"Hung neighbour"}');
+
+  // Generation 1 gets half the 3 s and gives way; generation 2 prepares and applies, the delivery stays due, uncounted.
+  assert.deepEqual(await deliver(await hints(), new RecordRetrievalProjector(pool, { embedders: registry, prepareMs: 3_000 })), ['retry']);
+  const record = await projected(spaceId, 'record', created.ref.id);
+  assert.deepEqual([record.lexical, record.vector], [[[2, 1, '/title', 'Hung neighbour']], [[2, 1, 'eu-west', digest('Hung neighbour')]]]);
+  assert.deepEqual((await pool.query('SELECT delivery_state,failures,last_error FROM projection_outbox WHERE space_id=$1', [spaceId])).rows,
+    [{ delivery_state: 'pending', failures: 0, last_error: 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE' }]);
+  assert.equal(hung.inTransaction.length, 1);
+
+  // Evidence, with a call that ignores its signal: the first item gives the
+  // hung embedder its share and marks it an outage; the second item in the
+  // same step never calls it. Generation 2 has both.
+  let release = () => {};
+  hung.behavior.before = () => new Promise((_, reject) => { release = () => reject(new EmbedderUnavailableError('released')); });
+  await evidence(spaceId);
+  const worker = new PostgresRetrievalWorker(pool, { embedders: registry, prepareMs: 3_000 });
+  const step = await worker.step();
+  release();
+  assert.deepEqual([step.claimed, step.applied, step.retried], [2, 0, 2]);
+  assert.equal(hung.inTransaction.length, 2, 'one call for the step');
+  assert.deepEqual((await projected(spaceId, 'claim', 'clm_1')).vector, [[2, 1, 'eu-west', digest('The bridge opened in 1932.')]]);
+  assert.deepEqual((await projected(spaceId, 'source', 'src_1')).vector,
+    [[2, 1, 'eu-west', digest('The bridge opened in 1932 after four years.')]]);
+  for (const row of await work(spaceId)) assert.deepEqual([row.delivery_state, row.attempts, row.last_error, row.waiting],
+    ['pending', 1, 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE', true]);
+  assert.equal((await worker.status(spaceId, collectionId)).state, 'degraded');
+});
+
+test('an item whose start rolls back is released under its claim, recording the error as degraded', async () => {
+  const { spaceId, collectionId } = await space();
+  await policy(spaceId, 1, { vector: false, regions: [] });
+  await generation(spaceId, 1, 1);
+  await evidence(spaceId);
+  // The first read of current authority, inside the start transaction, fails once.
+  let armed = true;
+  const failing = { connect: async () => {
+    const client = await pool.connect();
+    const { query, release } = client;
+    client.query = function (sql, ...rest) {
+      if (armed && typeof sql === 'string' && sql.includes('LEFT JOIN LATERAL (SELECT v.version')) {
+        armed = false;
+        return Promise.reject(new Error('injected read failure'));
+      }
+      return query.call(this, sql, ...rest);
+    };
+    client.release = function (...args) { client.query = query; client.release = release; return release.apply(this, args); };
+    return client;
+  } };
+  const worker = new PostgresRetrievalWorker(failing);
+  const step = await worker.step();
+  assert.equal(armed, false);
+  assert.deepEqual([step.retried, step.applied], [1, 1]);
+  const rows = await work(spaceId);
+  const failed = rows.find(row => row.delivery_state === 'pending');
+  const applied = rows.find(row => row !== failed);
+  assert.deepEqual([failed.delivery_state, failed.attempts, failed.waiting], ['pending', 0, true], 'the uncommitted attempt never counted');
+  assert.ok(failed.last_error, 'the error is recorded');
+  assert.equal(applied.delivery_state, 'delivered');
+  assert.equal((await worker.status(spaceId, collectionId)).state, 'degraded');
+});
