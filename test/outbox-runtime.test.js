@@ -82,6 +82,15 @@ test('with a deadline, dispatch bounds every store call by it, ends quietly when
   const late = store({ claim: async () => ({ messages: [hint(3)], scan: 'partial' }) });
   assert.equal((await dispatch(late, transport, { budgetMs: 60_000, deadline: Date.now() - 1 })).batches, 0);
   assert.deepEqual(late.calls, []);
+  // A claim that returns just after the deadline sends nothing and releases nothing: its leases expire unstarted.
+  deadline = Date.now() + 50;
+  let sent = 0;
+  const overran = { calls: [], claim: async () => { while (Date.now() <= deadline) await new Promise(resolve => setTimeout(resolve, 5));
+    return { messages: [hint(4)], scan: 'partial' }; },
+  release: async messages => { overran.calls.push('release'); return messages.length; }, stepReconciliations: async () => 0 };
+  const unsent = await dispatch(overran, { send: async () => { sent++; } }, { budgetMs: 60_000, deadline });
+  assert.ok(unsent.error instanceof DispatchDeadlineError);
+  assert.deepEqual([unsent.claimed, unsent.sent, unsent.released, sent, overran.calls], [1, 0, 0, 0, []]);
 });
 
 test('an empty claim ends a tick only once the empty run has covered every live pair', async () => {

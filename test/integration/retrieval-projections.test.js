@@ -1238,11 +1238,12 @@ test('migration 045 rolls back atomically when claim writers hold or cross its l
       await waitsOnLock(deleterPid);
     }
     await ledger.query('ROLLBACK');
+    // The purge completes once 045 commits; 046, which alters the record outbox the purge wrote, then waits for it.
+    assert.equal(await purging, null);
+    await purger.query('COMMIT');
     const applied = await applying;
     assert.equal(applied.status, 0, applied.stderr);
     assert.match(applied.stdout, /Applied 045_retrieval_projections.sql/);
-    assert.equal(await purging, null);
-    await purger.query('COMMIT');
     await deleting;
     latePurge ??= deleter.query(`SELECT stateplane_purge_space('sp_late')`).then(() => null, error => error);
     assert.equal(await latePurge, null);

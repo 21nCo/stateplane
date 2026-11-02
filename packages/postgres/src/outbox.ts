@@ -91,7 +91,8 @@ const RELEASE_BACKOFF_MS = 5_000;
 const RELEASE_SQL = `UPDATE projection_outbox o
   SET delivery_state=CASE WHEN o.failures>0 THEN 'degraded' ELSE 'pending' END,
     started_attempt=NULL,available_at=clock_timestamp()+($3::integer * interval '1 millisecond'),
-    last_error=COALESCE($5::text,o.last_error)
+    last_error=COALESCE($5::text,o.last_error),
+    last_error_at=CASE WHEN $5::text IS NULL THEN o.last_error_at ELSE clock_timestamp() END
   FROM unnest($1::text[],$2::integer[]) AS m(event_id,attempt)
   WHERE o.event_id=m.event_id AND o.attempts=m.attempt AND o.delivery_state='delivering'
     AND (o.started_attempt IS NOT DISTINCT FROM o.attempts)=$4::boolean`;
@@ -571,7 +572,7 @@ export class PostgresOutbox {
             WHERE o.delivery_state='delivered' AND (h.record_id IS NULL OR h.generation<>$5 OR h.revision<p.revision)
           ), requeued AS (
             UPDATE projection_outbox o SET delivery_state='pending',generation=$5,outcome=NULL,delivered_at=NULL,
-              failures=0,started_attempt=NULL,last_error=NULL,available_at=clock_timestamp()
+              failures=0,started_attempt=NULL,last_error=NULL,last_error_at=NULL,available_at=clock_timestamp()
             FROM stale WHERE o.event_id=stale.event_id AND o.delivery_state='delivered' RETURNING 1
           )
           SELECT (SELECT count(*) FROM page)::int AS scanned,(SELECT count(*) FROM requeued)::int AS requeued,

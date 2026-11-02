@@ -20,15 +20,18 @@ interface Env {
 // bytes of deleted sources and erased spaces for up to 5 s, sweeps one page
 // of stored upload bytes for up to 5 s, then projects source and claim work
 // for up to 8 s; docs/durable-outbox.md, docs/evidence-storage.md and
-// docs/retrieval-projections.md record the bounds. Each budget is a hard end
-// for its step's SQL and sends (a call in flight then is abandoned), and the
-// budgets sum to the 50 s tick budget, so every step gets its whole budget
-// on every tick however busy the steps before it are. A step is also cut to
-// what is left of the tick and skipped with under 2 s left (more than a
+// docs/retrieval-projections.md record the bounds. Each budget is a maximum
+// and a hard end for its step's SQL and sends (a call in flight then is
+// abandoned; cancelling its statement takes at most 1 s more, on the same
+// connection). The budgets sum to the 50 s tick budget, so each step gets its
+// whole budget however busy the steps before it are, less any time a
+// cancellation or a step's own setup took, as every step is also cut to what
+// is left of the tick, and skipped with under 2 s left (more than a
 // retrieval item's 1 s minimum plus its claim). The retrieval step may take
-// 1 s past its budget to settle, and teardown at most 5 s, so the
-// invocation ends inside its minute: ticks do not overlap, and a tick holds
-// only the one origin connection scripts/topology.mjs allows it.
+// 1 s past its budget to settle, and teardown at most 5 s, after which every
+// connection still open is ended, so the invocation ends inside its minute:
+// ticks do not overlap, and a tick holds only the one origin connection
+// scripts/topology.mjs allows it.
 const TICK_BUDGET_MS = 50_000;
 const MIN_STEP_MS = 2_000;
 const CLOSE_MS = 5_000;
@@ -53,6 +56,20 @@ function cell(env: Env, originals = false) {
   // pg-pool re-emits an idle session's error on the pool; the pool discards
   // that session, and SQL leases recover its work.
   pool.on('error', () => {});
+  // Every session the pool opened and has not removed, so teardown can end any still checked out.
+  const clients = new Set<pg.PoolClient>();
+  pool.on('connect', client => clients.add(client));
+  pool.on('remove', client => clients.delete(client));
+  // end() marks the session ending, so its socket closing is no error event, and then the socket is destroyed
+  // outright: an idle session's goodbye cannot hang on a stalled peer either.
+  const abandon = () => {
+    for (const client of clients) {
+      // A pooled session is a pg Client underneath; its pool type hides end().
+      const session = client as unknown as { end(): Promise<void>; connection?: { stream?: { destroy?(): void } } };
+      session.end().catch(() => {});
+      session.connection?.stream?.destroy?.();
+    }
+  };
   // The worker never issues receipts; retention only satisfies the constructor.
   const outbox = new PostgresOutbox(pool, new PostgresAuthority(pool, 1));
   const uploads = originals ? new SourceUploadReconciler({ pool, originals: new R2BlobStore(env.ORIGINALS) }) : undefined;
@@ -62,7 +79,7 @@ function cell(env: Env, originals = false) {
   // its work due and reported degraded, never holding back the others.
   const projector = new RecordRetrievalProjector(pool);
   const retrieval = new PostgresRetrievalWorker(pool);
-  return { outbox, uploads, projector, retrieval, close: () => pool.end() };
+  return { outbox, uploads, projector, retrieval, close: () => pool.end(), abandon };
 }
 
 export default {
@@ -73,7 +90,7 @@ export default {
       const ms = Math.min(budgetMs, tickEnd - Date.now());
       return ms >= MIN_STEP_MS ? ms : 0;
     };
-    const { outbox, uploads, retrieval, close } = cell(env, true);
+    const { outbox, uploads, retrieval, close, abandon } = cell(env, true);
     try {
       const dispatchMs = left(DISPATCH_BUDGET_MS);
       const result = await dispatch(outbox, {
@@ -106,10 +123,11 @@ export default {
       if (failures.length > 1) throw new AggregateError(failures, 'Reconciliation steps failed');
       if (failures.length) throw failures[0];
     } finally {
-      // Teardown that cannot end in time is dropped with the invocation.
+      // Teardown that cannot end in time is given up, and every session still open is ended with it.
       let timer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([close(), new Promise(resolve => { timer = setTimeout(resolve, CLOSE_MS); })])
-        .finally(() => clearTimeout(timer));
+      const closed = await Promise.race([close().then(() => true),
+        new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), CLOSE_MS); })]).finally(() => clearTimeout(timer));
+      if (!closed) abandon();
     }
   },
   async queue(batch: MessageBatch<unknown>, env: Env): Promise<void> {

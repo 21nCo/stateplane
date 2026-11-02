@@ -642,9 +642,10 @@ async function currentTarget(query: Query, job: EvidenceRef): Promise<{ open: bo
     deleted: false, content } };
 }
 
-/** The newer of two samples' newest errors; the first on a tie. */
+/** The more recently recorded of two samples' newest errors; one without a time is older; the first on a tie. */
 const newer = (a: { last_error: string | null; error_at: Date | null }, b: typeof a) =>
-  b.error_at !== null && (a.error_at === null || b.error_at > a.error_at) ? b.last_error : a.last_error;
+  b.last_error !== null && (a.last_error === null || (b.error_at !== null && (a.error_at === null || b.error_at > a.error_at)))
+    ? b.last_error : a.last_error;
 
 /** A step's settling and releasing: `CLEANUP_MS`, ending at the latest that long after the step's budget `until`. */
 const cleanup = (until: number): Limit => ({ deadline: Math.min(Date.now(), until) + CLEANUP_MS });
@@ -859,7 +860,7 @@ export class PostgresRetrievalWorker {
           return 'retried';
         }
         await query(`UPDATE retrieval_outbox SET delivery_state='delivered',delivered_at=clock_timestamp(),
-          available_at=clock_timestamp(),last_error=NULL WHERE job_id=$1`, [job.jobId]);
+          available_at=clock_timestamp(),last_error=NULL,last_error_at=NULL WHERE job_id=$1`, [job.jobId]);
         return 'applied';
       }, { deadline });
     } catch (error) {
@@ -880,7 +881,8 @@ export class PostgresRetrievalWorker {
   /** Return a still-current lease to the due queue after `delayMs`, recording `error` when given. */
   private async release(query: Query, job: Job, delayMs: number, error: string | null): Promise<void> {
     await query(`UPDATE retrieval_outbox SET available_at=clock_timestamp()+($4::integer * interval '1 millisecond'),
-        last_error=COALESCE($5::text,last_error)
+        last_error=COALESCE($5::text,last_error),
+        last_error_at=CASE WHEN $5::text IS NULL THEN last_error_at ELSE clock_timestamp() END
       WHERE job_id=$1 AND attempts=$2 AND available_at=$3::timestamptz AND delivery_state='pending'`,
     [job.jobId, job.attempt, job.lease, delayMs, error]);
   }
@@ -907,7 +909,8 @@ export class PostgresRetrievalWorker {
    * evidence work has failed or a vector generation has no configured
    * embedder in a region its policies allow, `pending` when work is waiting,
    * otherwise `current`. Each queue's counts and newest error cover at most
-   * its 500 oldest-due rows (records also their first 500 failed ones);
+   * its 500 oldest-due rows (records also their first 500 failed ones),
+   * the newest error being the one most recently recorded among them;
    * `capped` marks the counts as lower bounds. The oldest pending evidence
    * item is read over all of them. Exact reads and writes never depend on
    * this state.
@@ -916,24 +919,24 @@ export class PostgresRetrievalWorker {
     const space = text(spaceId, 512);
     const collection = text(collectionId, 512);
     return inTransaction(this.pool, async db => {
-      // Each sample's newest error and its time; status reports the newer of the two record samples'.
-      const newest = `(array_agg(last_error ORDER BY available_at DESC) FILTER (WHERE last_error IS NOT NULL))[1] AS last_error,
-          max(available_at) FILTER (WHERE last_error IS NOT NULL) AS error_at`;
+      // Each sample's newest error by when it was recorded (last_error_at; one recorded before migration 046 has
+      // none and ranks oldest), ties broken by event, and its time; status reports the newer of the two record samples'.
+      const newest = (key: string) => `(array_agg(last_error ORDER BY last_error_at DESC NULLS LAST,${key} DESC)
+          FILTER (WHERE last_error IS NOT NULL))[1] AS last_error, max(last_error_at) FILTER (WHERE last_error IS NOT NULL) AS error_at`;
       const records = (await db.query(`SELECT count(*)::int AS live,
           count(*) FILTER (WHERE failures>0 OR delivery_state='degraded' OR last_error IS NOT NULL)::int AS degraded,
-          ${newest}
-        FROM (SELECT failures,delivery_state,last_error,available_at FROM projection_outbox
+          ${newest('event_id')}
+        FROM (SELECT event_id,failures,delivery_state,last_error,last_error_at FROM projection_outbox
           WHERE space_id=$1 AND collection_id=$2 AND ${LIVE_OUTBOX} ORDER BY available_at,event_id LIMIT $3) o`,
       [space, collection, STATUS_SAMPLE])).rows[0];
       // Failed rows in the order of their partial index, so the same rows are sampled on every call.
-      const failed = (await db.query(`SELECT count(*)::int AS degraded,${newest}
-        FROM (SELECT last_error,available_at FROM projection_outbox
+      const failed = (await db.query(`SELECT count(*)::int AS degraded,${newest('event_id')}
+        FROM (SELECT event_id,last_error,last_error_at FROM projection_outbox
           WHERE space_id=$1 AND collection_id=$2 AND ${FAILED_OUTBOX} ORDER BY event_id LIMIT $3) f`,
       [space, collection, STATUS_SAMPLE])).rows[0];
       const evidence = (await db.query(`SELECT count(*)::int AS live,
-          count(*) FILTER (WHERE last_error IS NOT NULL)::int AS degraded,
-          (array_agg(last_error ORDER BY available_at DESC) FILTER (WHERE last_error IS NOT NULL))[1] AS last_error
-        FROM (SELECT last_error,available_at FROM retrieval_outbox
+          count(*) FILTER (WHERE last_error IS NOT NULL)::int AS degraded,${newest('job_id')}
+        FROM (SELECT job_id,last_error,last_error_at FROM retrieval_outbox
           WHERE space_id=$1 AND collection_id=$2 AND delivery_state='pending' ORDER BY available_at,job_id LIMIT $3) o`,
       [space, collection, STATUS_SAMPLE])).rows[0];
       // The oldest pending item over all of them, not only the sample: one backed off behind newer work still

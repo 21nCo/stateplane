@@ -628,9 +628,6 @@ CREATE UNIQUE INDEX retrieval_outbox_work ON retrieval_outbox(space_id, collecti
   COALESCE(extraction_version, 0), operation);
 CREATE INDEX retrieval_outbox_pending ON retrieval_outbox(space_id, collection_id, available_at, job_id)
   WHERE delivery_state = 'pending';
--- Status reads a collection's oldest pending item through this one row, however long its backlog.
-CREATE INDEX retrieval_outbox_age ON retrieval_outbox(space_id, collection_id, enqueued_at)
-  WHERE delivery_state = 'pending';
 
 CREATE FUNCTION stateplane_guard_retrieval_outbox() RETURNS trigger LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp

@@ -46,7 +46,7 @@ export interface DispatchOptions {
 
 /** A send the dispatch deadline cut short: it may still arrive, so its leases are kept, to be started or to expire. */
 export class DispatchDeadlineError extends Error {
-  constructor() { super('Queue send outlived the dispatch deadline'); this.name = 'DispatchDeadlineError'; }
+  constructor(message = 'Queue send outlived the dispatch deadline') { super(message); this.name = 'DispatchDeadlineError'; }
 }
 
 /** Settle with `pending`, or reject at `bound`'s deadline, leaving `pending` to run on unobserved. */
@@ -73,9 +73,10 @@ function within<T>(pending: Promise<T>, bound: StoreBound | undefined): Promise<
  * lease from its batch that no worker has started and ends the tick; a hint
  * that arrives later finds no lease and is fenced as lost. A crash before release leaves
  * unstarted leases to expire and be reclaimed. With a `deadline`, nothing
- * outlives it: a claim cut short ends the tick, a send cut short keeps its
- * leases (its hints may still arrive) and fails the tick, and a release cut
- * short leaves its leases to expire.
+ * outlives it: a claim cut short ends the tick, a claim that returns after
+ * it sends nothing and fails the tick with its leases kept, a send cut short
+ * keeps its leases (its hints may still arrive) and fails the tick, and a
+ * release cut short leaves its leases to expire.
  */
 export async function dispatch(store: OutboxStore, transport: DeliveryTransport,
   options: DispatchOptions = {}): Promise<DispatchResult> {
@@ -103,6 +104,8 @@ export async function dispatch(store: OutboxStore, transport: DeliveryTransport,
     }
     result.claimed += messages.length;
     result.batches++;
+    // A claim that returned after the deadline sends nothing: its leases are kept, to expire unstarted.
+    if (over()) return { ...result, error: new DispatchDeadlineError('Claimed leases reached the dispatch deadline unsent') };
     try { await within(transport.send(messages), bound); }
     catch (error) {
       if (error instanceof DispatchDeadlineError) return { ...result, error };

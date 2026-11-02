@@ -120,6 +120,18 @@ test('an adapter whose own profile changes after registration is refused before 
   Object.defineProperty(throwing.embedder, 'profile', { get() { throw new Error('profile unavailable'); } });
   await assert.rejects(embedBatch(throwing.resolved, ['a'], never, []), refused);
   assert.deepEqual(throwing.seen, []);
+  // A field getter or a proxy trap that throws refuses the same way, always as a rejection, never as the input's failure.
+  for (const unreadable of [
+    embedder => Object.defineProperty(embedder.profile, 'region', { get() { throw new Error('boom'); } }),
+    embedder => { embedder.profile = new Proxy({ ...embedder.profile }, { get() { throw new Error('trap'); } }); }]) {
+    const broken = adapter();
+    unreadable(broken.embedder);
+    let pending;
+    assert.doesNotThrow(() => { pending = broken.resolved.embed(['a'], never); });
+    await assert.rejects(pending, error => error instanceof EmbedderUnavailableError);
+    await assert.rejects(embedBatch(broken.resolved, ['a'], never, []), refused);
+    assert.deepEqual(broken.seen, []);
+  }
   // Every field counts, a limit as much as the region.
   const limit = adapter();
   limit.embedder.profile.maxBatch = 7;

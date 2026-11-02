@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -1435,7 +1435,8 @@ test('status reports the oldest pending evidence over all of it and a failed rec
     WHERE job_id=$1`, [first.job_id]);
   // 501 records are due; the first one's delivery failed and backs off for a day.
   for (let n = 0; n < 501; n++) await write(scope, 'create', `{"title":"record ${n}"}`);
-  await pool.query(`UPDATE projection_outbox SET failures=1,last_error='Error: projector failed',available_at=clock_timestamp()+interval '1 day'
+  await pool.query(`UPDATE projection_outbox SET failures=1,last_error='Error: projector failed',last_error_at=clock_timestamp(),
+    available_at=clock_timestamp()+interval '1 day'
     WHERE event_id=(SELECT event_id FROM projection_outbox WHERE space_id=$1 ORDER BY revision,event_id LIMIT 1)`, [spaceId]);
   const status = await worker.status(spaceId, collectionId);
   assert.equal(status.evidence.oldestPendingAt, first.enqueued_at.toISOString(), 'the backed-off item is the oldest');
@@ -1448,7 +1449,8 @@ test('status reports the oldest pending evidence over all of it and a failed rec
     .rows[0]['QUERY PLAN'][0].Plan;
   assert.equal(plan.Plans?.[0]?.['Index Name'], 'retrieval_outbox_age', JSON.stringify(plan));
   // An older error in the oldest-due sample does not hide the failed row's newer one.
-  await pool.query(`UPDATE projection_outbox SET last_error='Error: older live error' WHERE event_id=(SELECT event_id
+  await pool.query(`UPDATE projection_outbox SET last_error='Error: older live error',
+    last_error_at=clock_timestamp()-interval '1 hour' WHERE event_id=(SELECT event_id
     FROM projection_outbox WHERE space_id=$1 AND failures=0 ORDER BY available_at,event_id LIMIT 1)`, [spaceId]);
   assert.deepEqual((await worker.status(spaceId, collectionId)).records,
     { pending: 499, degraded: 1, capped: true, lastError: 'Error: projector failed' });
@@ -1468,4 +1470,112 @@ test('status samples over 500 failed records in event order, the same rows and e
   for (let call = 0; call < 3; call++)
     assert.deepEqual((await worker.status(spaceId, collectionId)).records,
       { pending: 500, degraded: 500, capped: true, lastError: 'error 500' }, `call ${call}`);
+});
+
+test('a stalled cancellation holds a one-session pool for at most its bound, then the next transaction gets the session', async () => {
+  const single = new pg.Pool({ connectionString: target.toString(), max: 1 });
+  try {
+    // The cancel statement runs at once on the server, but its reply never arrives in time.
+    const slowly = stalling(/pg_cancel_backend/, 5_000, single);
+    const cut = Date.now() + 200;
+    await assert.rejects(inTransaction(slowly, db => db.query('SELECT pg_sleep(3)'), { deadline: cut }), DeadlineExceededError);
+    // The cancellation takes the freed session (pg-pool lets a caller arriving before then take it first).
+    await sleep(100);
+    assert.equal(slowly.log.filter(entry => /pg_cancel_backend/.test(entry.sql)).length, 1, 'the cancellation holds the session');
+    const next = Date.now();
+    const row = await inTransaction(slowly, async db => (await db.query('SELECT 1 AS one')).rows[0], { deadline: next + 1_500 });
+    assert.deepEqual(row, { one: 1 });
+    assert.ok(Date.now() - cut < 1_400, `${Date.now() - cut} ms from the cut to the next transaction's result`);
+    // Both the cut transaction's session and the unanswered cancellation's were discarded.
+    assert.deepEqual(slowly.released, [true, true, false]);
+  } finally { await single.end(); }
+});
+
+test('status reports the most recently recorded error, whatever a lease, a backoff or parking did to available_at', async () => {
+  const { spaceId, collectionId, scope } = await space();
+  const spy = new Spy({}, { before: () => { throw new Error('rejected input'); } });
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(spy));
+  const projector = new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([spy]) });
+  const worker = new PostgresRetrievalWorker(pool);
+  for (const title of ['parked', 'later']) await write(scope, 'create', `{"title":"${title}"}`);
+  const [parked, later] = (await pool.query('SELECT event_id FROM projection_outbox WHERE space_id=$1 ORDER BY revision,event_id',
+    [spaceId])).rows.map(row => row.event_id);
+  // The first record is one failure from its dead letter; both fail as the input's, so it parks (available_at infinity).
+  await pool.query('UPDATE projection_outbox SET failures=7 WHERE event_id=$1', [parked]);
+  assert.deepEqual(await deliver(await hints(), projector), ['failed', 'failed']);
+  // Later, the second record's retry meets an outage and is released uncounted with a newer error.
+  spy.behavior = { down: true };
+  await pool.query('UPDATE projection_outbox SET available_at=clock_timestamp() WHERE event_id=$1', [later]);
+  assert.deepEqual(await deliver(await hints(false), projector), ['retry']);
+  const rows = (await pool.query(`SELECT event_id,available_at='infinity' AS parked,last_error FROM projection_outbox
+    WHERE space_id=$1 ORDER BY event_id=$2 DESC`, [spaceId, parked])).rows;
+  assert.deepEqual(rows.map(row => [row.parked, row.last_error]), [[true, 'EmbedderFailedError: The embedder failed for this input'],
+    [false, 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE']]);
+  const newest = 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE';
+  assert.equal((await worker.status(spaceId, collectionId)).records.lastError, newest);
+  // A lease moves the newer row's available_at without a new error: the newest error is unchanged.
+  await pool.query('UPDATE projection_outbox SET available_at=clock_timestamp() WHERE event_id=$1', [later]);
+  assert.equal((await hints(false)).length, 1);
+  for (let call = 0; call < 2; call++) assert.equal((await worker.status(spaceId, collectionId)).records.lastError, newest);
+  // Evidence: the error recorded later wins over one whose item backs off longer.
+  await evidence(spaceId);
+  const jobs = (await pool.query('SELECT job_id FROM retrieval_outbox WHERE space_id=$1 ORDER BY job_id', [spaceId])).rows.map(row => row.job_id);
+  await pool.query(`UPDATE retrieval_outbox SET last_error='Error: older',last_error_at=clock_timestamp()-interval '1 hour',
+    available_at=clock_timestamp()+interval '1 day' WHERE job_id=$1`, [jobs[0]]);
+  await pool.query(`UPDATE retrieval_outbox SET last_error='Error: newer',last_error_at=clock_timestamp() WHERE job_id=$1`, [jobs[1]]);
+  assert.equal((await worker.status(spaceId, collectionId)).evidence.lastError, 'Error: newer');
+  // Later tests' setup marks every live row delivered, which a dead letter refuses: retry it as an operator would.
+  await pool.query(`UPDATE projection_outbox SET dead_lettered_at=NULL,failures=0,delivery_state='pending',
+    available_at=clock_timestamp() WHERE event_id=$1`, [parked]);
+});
+
+test('an embedder whose profile field can no longer be read is refused as an outage: never called, released uncounted', async () => {
+  const { spaceId, scope } = await space();
+  const spy = new Spy();
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(spy));
+  const projector = new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([spy]) });
+  Object.defineProperty(spy, 'profile', { configurable: true,
+    value: { ...spy.profile, get region() { throw new Error('profile field unreadable'); } } });
+  await write(scope, 'create', '{"title":"unreadable"}');
+  assert.deepEqual(await deliver(await hints(), projector), ['retry']);
+  assert.deepEqual((await pool.query('SELECT delivery_state,failures,last_error FROM projection_outbox WHERE space_id=$1', [spaceId])).rows,
+    [{ delivery_state: 'pending', failures: 0, last_error: 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE' }]);
+  assert.equal(spy.inTransaction.length, 0, 'the adapter was never called');
+});
+
+test('a cell that applied main\'s migration 045 upgrades without drift and gains migration 046', { timeout: 60_000 }, async () => {
+  // The checksum every cell recorded for 045 as it shipped on main; 045 must stay byte-identical.
+  const SHIPPED_045 = 'bfb72a343f14d90c94b9c48ee9b981b37933a25fa128d46ff07cabc0ad239064';
+  const upgrade = `${name}_u`;
+  const admin = new pg.Client({ connectionString: baseUrl });
+  await admin.connect();
+  try {
+    await admin.query(`CREATE DATABASE ${upgrade}`);
+    const url = new URL(baseUrl); url.pathname = `/${upgrade}`;
+    const db = new pg.Client({ connectionString: url.toString() });
+    await db.connect();
+    try {
+      const directory = new URL('../../migrations/', import.meta.url);
+      const files = (await readdir(directory)).filter(file => file.endsWith('.sql')).sort();
+      await db.query('BEGIN; CREATE TABLE stateplane_migrations (name text PRIMARY KEY, sha256 text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())');
+      for (const file of files.slice(0, files.indexOf('046_retrieval_dispatch_checkpoint.sql'))) {
+        const sql = await readFile(new URL(file, directory), 'utf8');
+        await db.query(sql); // NOSONAR -- migrations apply in order
+        await db.query('INSERT INTO stateplane_migrations(name,sha256) VALUES($1,$2)', // NOSONAR -- recorded with its file
+          [file, file === '045_retrieval_projections.sql' ? SHIPPED_045 : digest(sql)]);
+      }
+      await db.query('COMMIT');
+      const output = execFileSync(process.execPath, ['scripts/migrate.mjs'], { cwd: fileURLToPath(new URL('../..', import.meta.url)),
+        env: { ...process.env, DATABASE_URL: url.toString() }, encoding: 'utf8' });
+      assert.match(output, /Applied 046_retrieval_dispatch_checkpoint.sql/);
+      assert.deepEqual((await db.query(`SELECT (SELECT count(*)::int FROM pg_indexes WHERE indexname='retrieval_outbox_age') AS age,
+        (SELECT count(*)::int FROM information_schema.columns WHERE column_name='last_error_at'
+          AND table_name IN ('projection_outbox','retrieval_outbox')) AS columns`)).rows[0], { age: 1, columns: 2 });
+    } finally { await db.end(); }
+  } finally {
+    await admin.query(`DROP DATABASE IF EXISTS ${upgrade}`).catch(() => {});
+    await admin.end();
+  }
 });

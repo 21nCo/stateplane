@@ -75,8 +75,12 @@ export const sameIdentity = (a: EmbedderIdentity, b: EmbedderIdentity) => a.embe
 // Every field of a profile: the registry's snapshot and the adapter's own profile must agree on all of them.
 const PROFILE_FIELDS = ['embedder', 'model', 'modelVersion', 'dimensions', 'region', 'quality', 'costPerMillionCodePoints',
   'maxBatch', 'maxInputCodePoints'] as const satisfies readonly (keyof EmbedderProfile)[];
-function liveProfile(embedder: Embedder): EmbedderProfile | undefined {
-  try { return embedder.profile ?? undefined; } catch { return undefined; }
+/** Whether the adapter's profile, read now, still matches `profile` in every field; an unreadable one does not. */
+function unchanged(embedder: Embedder, profile: EmbedderProfile): boolean {
+  try {
+    const live = embedder.profile;
+    return !!live && PROFILE_FIELDS.every(field => live[field] === profile[field]);
+  } catch { return false; }
 }
 
 /** What a new vector generation needs from its embedder. */
@@ -103,8 +107,9 @@ export class EmbeddingRegistry {
    * afterwards never changes which identity, region or limits are
    * authorized or used. The snapshot's `embed` rereads the adapter's own
    * profile before every call and refuses, without calling it, unless that
-   * profile still matches the snapshot in every field, so an adapter never
-   * runs under an identity, region or limit other than the one authorized.
+   * profile can be read and still matches the snapshot in every field, so an
+   * adapter never runs under an identity, region or limit other than the one
+   * authorized. A refusal is always a rejected `EmbedderUnavailableError`.
    */
   constructor(embedders: readonly Embedder[] = []) {
     const seen = new Set<string>();
@@ -118,12 +123,11 @@ export class EmbeddingRegistry {
       const key = JSON.stringify([profile.embedder, profile.model, profile.modelVersion, profile.dimensions, profile.region]);
       if (seen.has(key)) throw new RangeError('Duplicate embedder in one region');
       seen.add(key);
-      snapshots.push(Object.freeze({ profile, embed: (texts: readonly string[], signal: AbortSignal) => {
-        // The adapter's profile as it is now: a replaced object or a throwing getter included.
-        const live = liveProfile(embedder);
-        if (!live || PROFILE_FIELDS.some(field => live[field] !== profile[field]))
-          return Promise.reject(new EmbedderUnavailableError('Embedder profile changed after registration'));
-        return embed.call(embedder, texts, signal);
+      snapshots.push(Object.freeze({ profile, embed: async (texts: readonly string[], signal: AbortSignal) => {
+        // The adapter's profile as it is now: a replaced object, a throwing profile or field getter, or a proxy
+        // trap refuses as an outage, always by rejecting, and never runs the adapter.
+        if (!unchanged(embedder, profile)) throw new EmbedderUnavailableError('Embedder profile changed after registration');
+        return await embed.call(embedder, texts, signal);
       } }));
     }
     this.#embedders = Object.freeze(snapshots);

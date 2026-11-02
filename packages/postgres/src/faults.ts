@@ -13,6 +13,8 @@ export const STATEMENT_MS = 5_000;
 // left before it is lowered: a cancellation ends a statement at the deadline,
 // so this only spares a round trip per statement.
 export const STATEMENT_SLACK_MS = 100;
+// How long the cancellation of a statement a deadline cut short may take, checkout included.
+export const CANCEL_MS = 1_000;
 
 export class ProjectorFailure extends Error {}
 
@@ -216,16 +218,25 @@ async function checkout(pool: PoolLike, limit: Limit): Promise<pg.PoolClient> {
  * Cancel an abandoned transaction's statement from another session, best
  * effort and unawaited. Only while that backend is still in the same
  * transaction: a reused pid, or a pooled backend now serving another
- * transaction, is left alone.
+ * transaction, is left alone. The whole attempt, checkout included, ends
+ * within `CANCEL_MS` of the cut: a session that arrives later goes back
+ * unused, and one whose cancel has not answered by then, or failed, is
+ * discarded, so on a one-session pool a stalled cancellation holds the
+ * session for at most that long.
  */
 function cancelBackend(pool: PoolLike, backend: { pid: number; began: string }): void {
+  const limit = { deadline: Date.now() + CANCEL_MS };
   void (async () => {
-    const other = await pool.connect();
-    let broken = false;
+    const other = await checkout(pool, limit);
+    let broken = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await other.query(`SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE pid=$1 AND xact_start=$2::timestamptz`,
+      const cancel = other.query(`SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE pid=$1 AND xact_start=$2::timestamptz`,
         [backend.pid, backend.began]);
-    } catch { broken = true; } finally { other.release(broken); }
+      cancel.catch(() => {});
+      await Promise.race([cancel, new Promise((_, reject) => { timer = setTimeout(reject, Math.max(0, limit.deadline - Date.now())); })]);
+      broken = false;
+    } catch { /* discarded below */ } finally { clearTimeout(timer); other.release(broken); }
   })().catch(() => {});
 }
 

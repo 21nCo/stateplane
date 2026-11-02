@@ -2101,7 +2101,7 @@ export class AuthorityTransaction {
         }
       }
       await this.query(`UPDATE projection_outbox SET delivery_state='delivered',outcome=$4,delivered_at=clock_timestamp(),
-        available_at=clock_timestamp(),last_error=NULL,started_attempt=NULL
+        available_at=clock_timestamp(),last_error=NULL,last_error_at=NULL,started_attempt=NULL
         WHERE space_id=$1 AND collection_id=$2 AND event_id=$3`, [...lease, outcome]);
       return outcome;
     }, true);

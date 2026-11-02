@@ -216,7 +216,7 @@ describe('cell jobs Worker', () => {
     } finally { clock.mockRestore(); cell.skew = 0; cell.lag = {}; }
   });
 
-  it('abandons a Queue send still running at dispatch\'s end, keeping its leases, and a teardown that hangs', async () => {
+  it('abandons a Queue send still running at dispatch\'s end, keeping its leases, and a teardown that hangs, ending its open sessions', async () => {
     vi.useFakeTimers();
     try {
       cell.claims = [[hint(1)]]; cell.released = []; cell.retrievalSteps = []; cell.bounds = []; cell.hangEnd = true;
@@ -226,14 +226,23 @@ describe('cell jobs Worker', () => {
       const tick = jobs.scheduled({} as never, jobsEnv(vi.fn(() => new Promise<never>(() => {}))))
         .then(() => undefined, (error: unknown) => error);
       void tick.then(value => { settled = value; });
+      // A session still checked out when teardown is given up, and one the pool already removed.
+      const session = () => ({ end: vi.fn(async () => {}), connection: { stream: { destroy: vi.fn() } } });
+      const [open, removed] = [session(), session()];
+      const pool = cell.poolInstances.at(-1) as unknown as { emit(event: string, client: unknown): boolean };
+      for (const client of [open, removed]) pool.emit('connect', client);
+      pool.emit('remove', removed);
       await vi.advanceTimersByTimeAsync(14_999);
       expect([settled, cell.retrievalSteps]).toEqual(['running', []]);
       await vi.advanceTimersByTimeAsync(1);
       // The later steps ran on; only teardown is left, and it is given up after 5 s.
       expect(cell.retrievalSteps).toHaveLength(1);
       await vi.advanceTimersByTimeAsync(4_999);
-      expect(settled).toBe('running');
+      expect([settled, open.end.mock.calls.length]).toEqual(['running', 0]);
       await vi.advanceTimersByTimeAsync(1);
+      // Then every session still open is ended and its socket destroyed; a removed one is left alone.
+      expect([open.end.mock.calls.length, open.connection.stream.destroy.mock.calls.length,
+        removed.end.mock.calls.length, removed.connection.stream.destroy.mock.calls.length]).toEqual([1, 1, 0, 0]);
       const error = await tick as Error & { cause?: Error };
       expect([error.message, error.cause?.name, cell.released]).toEqual(['Projection dispatch released 0 leases',
         'DispatchDeadlineError', []]);
