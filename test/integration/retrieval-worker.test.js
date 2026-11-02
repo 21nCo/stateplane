@@ -838,6 +838,41 @@ test('pairs with due work take turns across claims, steps and workers, however l
     [{ after_space_id: b, after_collection_id: 'alpha' }]);
 });
 
+test('pairs whose claimed items never started keep their turn: the cursor moves back to the last pair that started', async () => {
+  const spaces = [];
+  for (let i = 0; i < 3; i++) spaces.push((await space()).spaceId);
+  const [a, b, c] = spaces.toSorted();
+  // The first pair's embedder waits for its signal; the others are healthy.
+  const hung = new Spy({ modelVersion: 'hung' }, { before: (call, signal) => untilAborted(signal) });
+  const healthy = new Spy({ modelVersion: 'healthy' });
+  for (const id of spaces) {
+    await policy(id, 1);
+    await generation(id, 1, 1, identity(id === a ? hung : healthy));
+    await evidence(id);
+  }
+  // A sustained due backlog in the hung pair.
+  for (let revision = 2; revision <= 6; revision++) await revise(a, revision, `Statement ${revision}.`);
+  const worker = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([hung, healthy]) });
+  const cursor = async () => (await pool.query('SELECT after_space_id FROM retrieval_dispatch_checkpoint')).rows[0].after_space_id;
+  const started = async () => (await pool.query(`SELECT space_id FROM retrieval_outbox WHERE space_id=ANY($1) AND attempts>0
+    OR space_id=ANY($1) AND delivery_state='delivered' GROUP BY space_id ORDER BY space_id`, [spaces])).rows.map(row => row.space_id);
+  await pool.query('UPDATE retrieval_dispatch_checkpoint SET after_space_id=NULL,after_collection_id=NULL');
+  const options = { budgetMs: 1_200, limit: 3, perPair: 1 };
+
+  // The hung pair's item spends the step; the other two are released and keep their turn.
+  const first = await worker.step(options);
+  assert.deepEqual([first.claimed, first.retried, first.released], [3, 1, 2]);
+  assert.deepEqual(await started(), [a]);
+  assert.equal(await cursor(), a, 'the cursor names only the pair whose item started');
+  assert.equal(healthy.inTransaction.length, 0);
+
+  // The next step serves them before the hung pair's backlog comes round again.
+  const second = await worker.step(options);
+  assert.equal(second.applied, 2);
+  assert.deepEqual(await started(), [a, b, c]);
+  assert.ok(healthy.inTransaction.length > 0);
+});
+
 test('a preparation that starts after a newer position without configured content applied records nothing and saves nothing', async () => {
   // A record: revision 2 drops the only configured field and applies before revision 1's preparation begins.
   const { spaceId, scope } = await space();

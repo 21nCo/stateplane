@@ -592,6 +592,8 @@ export interface RetrievalStepOptions {
  * complete or release the item.
  */
 interface Job { jobId: string; spaceId: string; collectionId: string; kind: 'source' | 'claim'; id: string; attempt: number; lease: string }
+/** The ring position a claim found (`before`) and the one it stored. */
+interface Cursor { before: [string, string] | null; stored: [string, string] | null }
 type EvidenceRef = Pick<Job, 'spaceId' | 'collectionId' | 'kind' | 'id'>;
 
 /** Read the current authoritative state of a source or claim and whether its space and collection are open. */
@@ -659,8 +661,10 @@ export class PostgresRetrievalWorker {
    * taking at most `perPair` items from each, so a due pair is served within
    * as many claims as there are due pairs ahead of it, however long their
    * backlogs. Items the step has no time left to start are released due at
-   * once, with no attempt spent, and the step ends. Only a failed claim
-   * throws; each item settles itself.
+   * once, with no attempt spent, the cursor goes back to the last pair whose
+   * item started (or where the claim found it), so pairs that never started
+   * keep their turn, and the step ends. Only a failed claim throws; each item
+   * settles itself.
    */
   async step(settings: RetrievalStepOptions = {}): Promise<RetrievalStep> {
     const budgetMs = bounded(settings.budgetMs ?? 10_000, MIN_ITEM_MS, 60_000);
@@ -687,7 +691,9 @@ export class PostgresRetrievalWorker {
         result[await this.process(claim.jobs[next], Math.min(ITEM_MS, until - Date.now()), outages)]++;
       if (next < claim.jobs.length) {
         const unstarted = claim.jobs.slice(next);
-        await this.releaseUnstarted(unstarted).catch(() => {});
+        const started = claim.jobs[next - 1];
+        await this.releaseUnstarted(unstarted, claim.cursor,
+          started ? [started.spaceId, started.collectionId] : claim.cursor.before).catch(() => {});
         result.released += unstarted.length;
         break;
       }
@@ -698,9 +704,11 @@ export class PostgresRetrievalWorker {
   /**
    * Lease due items from up to `pairs` pairs in ring order after the cursor,
    * and move the cursor to the last pair served, or past the pairs walked
-   * when none was. `wrapped` says the walk covered every pair with pending work.
+   * when none was. `wrapped` says the walk covered every pair with pending
+   * work; `cursor` holds the position found and the one stored.
    */
-  private async claim(pairs: number, perPair: number, limit: number): Promise<{ jobs: Job[]; walked: number; wrapped: boolean }> {
+  private async claim(pairs: number, perPair: number, limit: number): Promise<{ jobs: Job[]; walked: number; wrapped: boolean;
+    cursor: Cursor }> {
     return inTransaction(this.pool, async db => {
       // One claim at a time moves the cursor; claims are short.
       const cursor = (await db.query(`SELECT after_space_id,after_collection_id FROM retrieval_dispatch_checkpoint
@@ -723,7 +731,7 @@ export class PostgresRetrievalWorker {
       const ring = await walk(after, null, pairs);
       if (after) ring.push(...await walk(null, after, pairs - ring.length));
       const wrapped = ring.length < pairs;
-      if (!ring.length) return { jobs: [], walked: 0, wrapped };
+      if (!ring.length) return { jobs: [], walked: 0, wrapped, cursor: { before: after, stored: after } };
       const claimed = (await db.query(`WITH due AS (
           SELECT d.job_id,p.n FROM unnest($1::text[],$2::text[]) WITH ORDINALITY AS p(space_id,collection_id,n)
           JOIN spaces s ON s.space_id=p.space_id AND s.lifecycle IN ('active','readOnly')
@@ -740,7 +748,8 @@ export class PostgresRetrievalWorker {
       const last = claimed.at(-1) ?? (wrapped ? null : ring.at(-1)!);
       if (last) await db.query(`UPDATE retrieval_dispatch_checkpoint SET after_space_id=$1,after_collection_id=$2`,
         [last.space_id, last.collection_id]);
-      return { walked: ring.length, wrapped, jobs: claimed.map(row => ({ jobId: row.job_id, spaceId: row.space_id,
+      const stored: [string, string] | null = last ? [last.space_id, last.collection_id] : after;
+      return { walked: ring.length, wrapped, cursor: { before: after, stored }, jobs: claimed.map(row => ({ jobId: row.job_id, spaceId: row.space_id,
         collectionId: row.collection_id, kind: row.ref_kind, id: row.ref_id, attempt: row.attempts, lease: row.lease })) };
     });
   }
@@ -831,11 +840,21 @@ export class PostgresRetrievalWorker {
   }
 
   /** Make claimed items the step could not start due again at once; their attempts are unchanged. */
-  private async releaseUnstarted(jobs: Job[]): Promise<void> {
-    await inTransaction(this.pool, db => db.query(`UPDATE retrieval_outbox o SET available_at=clock_timestamp()
-      FROM unnest($1::text[],$2::text[]) AS j(job_id,lease)
-      WHERE o.job_id=j.job_id AND o.available_at=j.lease::timestamptz AND o.delivery_state='pending'`,
-    [jobs.map(job => job.jobId), jobs.map(job => job.lease)]));
+  /**
+   * Release claimed items that never started, due at once with no attempt
+   * spent, and move the cursor back to `to` unless another claim has moved
+   * it since this one stored its position.
+   */
+  private async releaseUnstarted(jobs: Job[], cursor: Cursor, to: [string, string] | null): Promise<void> {
+    await inTransaction(this.pool, async db => {
+      await db.query(`UPDATE retrieval_outbox o SET available_at=clock_timestamp()
+        FROM unnest($1::text[],$2::text[]) AS j(job_id,lease)
+        WHERE o.job_id=j.job_id AND o.available_at=j.lease::timestamptz AND o.delivery_state='pending'`,
+      [jobs.map(job => job.jobId), jobs.map(job => job.lease)]);
+      await db.query(`UPDATE retrieval_dispatch_checkpoint SET after_space_id=$3,after_collection_id=$4
+        WHERE after_space_id IS NOT DISTINCT FROM $1 AND after_collection_id IS NOT DISTINCT FROM $2`,
+      [cursor.stored?.[0] ?? null, cursor.stored?.[1] ?? null, to?.[0] ?? null, to?.[1] ?? null]);
+    });
   }
 
   /**
