@@ -22,6 +22,10 @@ export interface EmbedderProfile extends EmbedderIdentity {
  * inside a database transaction. It returns one vector per input, in order.
  * A provider that cannot be reached or is overloaded throws
  * `EmbedderUnavailableError`; anything else it throws is the input's.
+ * Errors may quote the input, so `embedBatch` keeps only their category:
+ * whatever `embed` throws reaches the caller as an `EmbedderUnavailableError`
+ * or an `EmbedderFailedError` with a fixed message and no cause, and no
+ * provider text is ever recorded.
  */
 export interface Embedder {
   readonly profile: EmbedderProfile;
@@ -41,6 +45,10 @@ export class EmbedderUnavailableError extends Error {
 export class ProjectionIncompleteError extends Error {
   readonly code = PROJECTION_INCOMPLETE;
   constructor(message = 'Projection preparation incomplete') { super(message); this.name = 'ProjectionIncompleteError'; }
+}
+/** The embedder failed for the input, for a reason it does not disclose. Counts as the input's. */
+export class EmbedderFailedError extends Error {
+  constructor() { super('The embedder failed for this input'); this.name = 'EmbedderFailedError'; }
 }
 /** The provider answered with something that is not one finite vector of its dimensions per input. Counts as the input's. */
 export class EmbeddingRejectedError extends Error {
@@ -147,14 +155,21 @@ function wait(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+const isUnavailable = (error: unknown) => error instanceof EmbedderUnavailableError;
+
 /**
  * Call one batch, retrying only an outage, and check the answer's shape.
  * `admit` runs before every call, including each retry, and stops the batch
  * by throwing: the caller rechecks there that content may still be sent to
  * this embedder (for example its processing region), outside any transaction.
+ * `outage` says which errors from `embed` are an outage (by default an
+ * `EmbedderUnavailableError`). An error from `embed` is never passed on: an
+ * outage becomes a fresh `EmbedderUnavailableError`, anything else an
+ * `EmbedderFailedError`, so text a provider quotes stays out of every record.
  */
 export async function embedBatch(embedder: Embedder, texts: readonly string[], signal: AbortSignal,
-  delays: readonly number[] = EMBED_RETRY_DELAYS_MS, admit?: () => Promise<void>): Promise<number[][]> {
+  delays: readonly number[] = EMBED_RETRY_DELAYS_MS, admit?: () => Promise<void>,
+  outage: (error: unknown) => boolean = isUnavailable): Promise<number[][]> {
   const { maxBatch, maxInputCodePoints, dimensions } = embedder.profile;
   if (texts.length < 1 || texts.length > maxBatch || texts.some(text => codePoints(text).length > maxInputCodePoints))
     throw new RangeError('Embedding batch exceeds the embedder limits');
@@ -165,8 +180,10 @@ export async function embedBatch(embedder: Embedder, texts: readonly string[], s
     let vectors: unknown;
     try { vectors = await embedder.embed(texts, signal); }
     catch (error) {
-      if (!(error instanceof EmbedderUnavailableError) || attempt >= delays.length) throw error;
-      try { await wait(delays[attempt], signal); } catch { throw error; }
+      if (!outage(error)) throw new EmbedderFailedError();
+      const unavailable = new EmbedderUnavailableError();
+      if (attempt >= delays.length) throw unavailable;
+      try { await wait(delays[attempt], signal); } catch { throw unavailable; }
       continue;
     }
     if (!Array.isArray(vectors) || vectors.length !== texts.length || vectors.some(vector => !Array.isArray(vector)

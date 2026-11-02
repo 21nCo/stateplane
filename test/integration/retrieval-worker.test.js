@@ -8,6 +8,7 @@ import pg from 'pg';
 import { PostgresAuthority, PostgresOutbox, PostgresRetrievalWorker, RecordRetrievalProjector } from '../../packages/postgres/dist/index.js';
 import { DeterministicEmbedder, EmbedderUnavailableError, EmbeddingRegistry } from '../../packages/retrieval/dist/index.js';
 import { consume, dispatch } from '../../packages/workers/dist/index.js';
+import { DeadlineExceededError, diagnostic, inTransaction } from '../../packages/postgres/dist/faults.js';
 
 // STA-45: the record projector and the evidence worker against real
 // PostgreSQL with pgvector. The record dispatcher is cell-wide, so this suite
@@ -914,18 +915,155 @@ test('concurrent first applies of one Ref converge, neither counted as a failure
     [[1, 2, null, 'The second statement.']]]);
 });
 
-test('a provider error with a long multibyte message is recorded within the diagnostic bound', async () => {
-  const { spaceId, collectionId } = await space();
-  const broken = new Spy({}, { before: () => { throw new Error('é'.repeat(2_000)); } });
-  await policy(spaceId, 1, { claimStatements: false });
-  await generation(spaceId, 1, 1, identity(broken));
-  await evidence(spaceId);
-  const worker = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([broken]) });
+test('a provider error that quotes the input is recorded only by its category, on record and evidence work', async () => {
+  const secret = 'Confidential bridge tender';
+  const { spaceId, scope, collectionId } = await space();
+  const quoting = new Spy({}, { before: () => { throw new Error(`model refused input: ${secret}`); } });
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(quoting));
+  await evidence(spaceId, { extraction: `${secret} opened.`, statement: `${secret} was signed.` });
+  const projector = new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([quoting]) });
+  const worker = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([quoting]) });
+  await write(scope, 'create', JSON.stringify({ title: secret }));
+  assert.deepEqual(await deliver(await hints(), projector), ['failed']);
   await worker.step();
-  const [source] = await work(spaceId);
-  assert.equal(source.delivery_state, 'pending');
-  assert.ok(source.last_error.startsWith('Error: éé'), source.last_error.slice(0, 40));
-  const bytes = Buffer.byteLength(source.last_error);
-  assert.ok(bytes <= 1_024 && bytes > 1_020, `${bytes} bytes`);
-  assert.equal((await worker.status(spaceId, collectionId)).state, 'degraded');
+  const failed = 'EmbedderFailedError: The embedder failed for this input';
+  const record = (await pool.query('SELECT failures,last_error FROM projection_outbox WHERE space_id=$1', [spaceId])).rows[0];
+  assert.deepEqual(record, { failures: 1, last_error: failed }, 'the input\'s own failure, without its text');
+  assert.deepEqual((await work(spaceId)).map(row => [row.ref_kind, row.delivery_state, row.last_error]),
+    [['source', 'pending', failed], ['claim', 'pending', failed]]);
+  const status = await worker.status(spaceId, collectionId);
+  assert.ok(!JSON.stringify(status).includes(secret), 'status discloses no input');
+
+  // A coded transient error from the provider is an outage, and keeps no text either.
+  quoting.behavior.before = () => { throw Object.assign(new Error(`socket reset sending ${secret}`), { code: 'ECONNRESET' }); };
+  await due('retrieval_outbox');
+  await worker.step();
+  assert.deepEqual((await work(spaceId)).map(row => row.last_error),
+    ['EmbedderUnavailableError EMBEDDER_UNAVAILABLE', 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE']);
+
+  // Other diagnostics stay within 1,024 UTF-8 bytes, cut on a code point.
+  const long = diagnostic(new Error('é'.repeat(2_000)));
+  assert.ok(Buffer.byteLength(long) <= 1_024 && Buffer.byteLength(long) > 1_020 && !long.includes('�'));
+});
+
+test('a bounded transaction issues nothing after its deadline, and an abort or deadline ends the statement in flight', async () => {
+  await pool.query('CREATE TABLE IF NOT EXISTS deadline_probe(n integer)');
+  const log = [];
+  const logged = { connect: async () => {
+    const client = await pool.connect();
+    return { query: (sql, values) => { log.push({ at: Date.now(), sql }); return client.query(sql, values); },
+      release: discard => client.release(discard), on: (...args) => client.on(...args),
+      removeListener: (...args) => client.removeListener(...args) };
+  } };
+  const running = async sleep => (await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity
+    WHERE datname=current_database() AND state='active' AND query LIKE $1`, [`%pg_sleep(${sleep})%`])).rows[0].n;
+  const settled = async sleep => {
+    for (let tries = 0; await running(sleep); tries++) {
+      assert.ok(tries < 40, `pg_sleep(${sleep}) still running`);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  };
+
+  // Several statements, each shorter than the budget, together longer: none starts after the deadline.
+  const deadline = Date.now() + 200;
+  await assert.rejects(inTransaction(logged, async db => {
+    for (let n = 0; n < 10; n++) {
+      await db.query('INSERT INTO deadline_probe VALUES($1)', [n]);
+      await db.query('SELECT pg_sleep(0.04)');
+    }
+  }, { deadline }), DeadlineExceededError);
+  const ended = Date.now();
+  const late = log.filter(entry => entry.at >= deadline && entry.sql !== 'ROLLBACK');
+  assert.deepEqual(late, [], 'no statement after the deadline');
+  assert.ok(ended - deadline < 150, `rejected ${ended - deadline} ms after the deadline`);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM deadline_probe')).rows[0].n, 0, 'nothing committed');
+
+  // One statement longer than the time left is ended at the deadline, on the server too.
+  let started = Date.now();
+  await assert.rejects(inTransaction(logged, db => db.query('SELECT pg_sleep(3.1)'), { deadline: started + 150 }),
+    DeadlineExceededError);
+  assert.ok(Date.now() - started < 400, `${Date.now() - started} ms`);
+  await settled('3.1');
+
+  // An abort ends the statement in flight at once, well before its bound or the deadline, and cancels it.
+  const controller = new AbortController();
+  started = Date.now();
+  setTimeout(() => controller.abort(), 100);
+  await assert.rejects(inTransaction(logged, db => db.query('SELECT pg_sleep(3.2)'),
+    { deadline: started + 4_000, signal: controller.signal }), DeadlineExceededError);
+  assert.ok(Date.now() - started < 400, `${Date.now() - started} ms`);
+  await settled('3.2');
+  await pool.query('DROP TABLE deadline_probe');
+});
+
+test('a record fallback apply whose delivery aborts commits nothing, frees its locks and reports the outage', async () => {
+  const { spaceId, collectionId, scope } = await space();
+  // Generation 1 is lexical; generation 2 needs vectors and has no embedder, so preparation fails at once.
+  await policy(spaceId, 1, { vector: false, regions: [] });
+  await generation(spaceId, 1, 1);
+  await policy(spaceId, 2);
+  await generation(spaceId, 2, 2, identity(new Spy()), 'building');
+  const created = await write(scope, 'create', '{"title":"Aborted"}');
+  const change = { ref: { spaceId, collectionId, kind: 'record', id: created.ref.id }, revision: 1, generation: 1, deleted: false, canonicalData: '{"title":"Aborted"}' };
+  const writer = await pool.connect();
+  try {
+    await writer.query('BEGIN');
+    // As a record write does: it blocks the authority fence's share lock, not the key share of a projection's foreign key.
+    await writer.query('SELECT 1 FROM records WHERE space_id=$1 AND record_id=$2 FOR NO KEY UPDATE', [spaceId, created.ref.id]);
+    const controller = new AbortController();
+    const prepared = new RecordRetrievalProjector(pool).prepare(change, controller.signal);
+    prepared.catch(() => {});
+    // The fallback apply waits on the record row the writer holds; the delivery's budget then ends.
+    await waitingOnLock('FROM records WHERE');
+    const aborted = Date.now();
+    controller.abort();
+    await assert.rejects(prepared, error => error.code === 'EMBEDDER_UNAVAILABLE');
+    assert.ok(Date.now() - aborted < 300, `${Date.now() - aborted} ms`);
+    // Its lock wait was cancelled, not left to its 1 s lock timeout, while the writer still holds the row.
+    const waiting = async () => (await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity
+      WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%FROM records WHERE%'`)).rows[0].n;
+    for (let tries = 0; await waiting(); tries++) {
+      assert.ok(tries < 30 && Date.now() - aborted < 600, 'the fallback still waits on the record row');
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    await writer.query('COMMIT');
+  } finally { writer.release(); }
+  const record = await projected(spaceId, 'record', created.ref.id);
+  assert.deepEqual([record.refs, record.lexical], [[], []], 'nothing committed');
+});
+
+test('a deletion or newer revision committed between batches stops further calls for the superseded text', async () => {
+  const words = Array.from({ length: 600 }, (_, i) => `w${i}`).join(' ');
+  // Evidence: the source is deleted, as its service does, during the first of several one-chunk calls.
+  const first = await space();
+  const spy = new Spy({ maxBatch: 1 }, { before: async call => { if (call === 1) await deleteEvidence(first.spaceId, 'source', 'src_1'); } });
+  await policy(first.spaceId, 1, { claimStatements: false });
+  await generation(first.spaceId, 1, 1, identity(spy));
+  await evidence(first.spaceId, { extraction: words });
+  const worker = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([spy]) });
+  await worker.step();
+  assert.equal(spy.inTransaction.length, 1, 'no call after the deletion committed');
+  await due('retrieval_outbox');
+  await worker.step();
+  const source = await projected(first.spaceId, 'source', 'src_1');
+  assert.deepEqual([source.refs.map(ref => ref.deleted), source.vector, source.checkpoints], [[true], [], 0]);
+  assert.ok((await work(first.spaceId)).every(row => row.delivery_state === 'delivered' && row.last_error === null));
+
+  // A record: revision 2 commits during the first call preparing revision 1.
+  const second = await space();
+  let created;
+  const recordSpy = new Spy({ maxBatch: 1 }, { before: async call => {
+    if (call === 1) await write(second.scope, 'replace', '{"title":"Short"}', { recordId: created.ref.id, expectedRevision: 1 });
+  } });
+  await policy(second.spaceId, 1);
+  await generation(second.spaceId, 1, 1, identity(recordSpy));
+  created = await write(second.scope, 'create', JSON.stringify({ title: words }));
+  const projector = new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([recordSpy]) });
+  const [outcome] = await deliver(await hints(), projector);
+  assert.equal(recordSpy.inTransaction.length, 1, 'no call for revision 1 after revision 2 committed');
+  assert.equal(outcome, 'retry');
+  assert.equal((await pool.query('SELECT max(failures)::int AS n FROM projection_outbox WHERE space_id=$1', [second.spaceId])).rows[0].n, 0);
+  assert.deepEqual((await deliver(await hints(), projector)).sort(), ['applied', 'superseded']);
+  assert.deepEqual((await projected(second.spaceId, 'record', created.ref.id)).lexical, [[1, 2, '/title', 'Short']]);
 });

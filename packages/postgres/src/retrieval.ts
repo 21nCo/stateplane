@@ -256,24 +256,28 @@ async function prepareGeneration(pool: PoolLike, registry: EmbeddingRegistry, ta
     chunks.length, saved));
   if (plan.reused.length && !await save(plan.reused)) return;
   // Before every provider call, a retry included, the space and collection
-  // must still be open, the generation live, and both its policy and the
-  // collection's current one must still allow the embedder's region. A
-  // suspension, deletion or narrower policy committed since stops the
+  // must still be open, the generation live, both its policy and the
+  // collection's current one must still allow the embedder's region, and
+  // authority must still hold the target. A suspension, deletion, narrower
+  // policy, newer revision or extraction committed since stops the
   // generation's preparation before any more content leaves.
   const admit = async () => {
     const current = await inTransaction(pool, async db => {
       const query: Query = db.query.bind(db);
       if (!await scopeOpen(query, target.spaceId, target.collectionId))
         throw new ScopeClosedError('The space or collection closed during preparation');
+      if (!await authorityAt(query, target)) throw new ProjectionIncompleteError('The Ref changed during preparation');
       return (await loadGenerations(query, target.spaceId, target.collectionId)).find(entry => entry.generation === generation.generation);
     });
     if (!current?.regions.includes(embedder.profile.region))
       throw new ProjectionIncompleteError('The processing policy changed during preparation');
   };
+  // A provider's own transient errors (a reset socket, a refused connection) are an outage like EmbedderUnavailableError.
+  const outage = (error: unknown) => error instanceof EmbedderUnavailableError || infrastructureFault(error);
   for (let start = 0; start < plan.missing.length; start += embedder.profile.maxBatch) {
     const batch = plan.missing.slice(start, start + embedder.profile.maxBatch);
     let vectors: number[][];
-    try { vectors = await embedBatch(embedder, batch.map(chunk => chunk.content), signal, EMBED_RETRY_DELAYS_MS, admit); }
+    try { vectors = await embedBatch(embedder, batch.map(chunk => chunk.content), signal, EMBED_RETRY_DELAYS_MS, admit, outage); }
     catch (error) {
       // A call cut short by the budget says nothing about the provider.
       if (error instanceof EmbedderUnavailableError && !signal.aborted) outages?.add(embedder);
@@ -435,16 +439,24 @@ async function applyTarget(query: Query, target: Target): Promise<number[]> {
  * row; source extractions and deletions hold the source's extraction lock.
  */
 async function authorityHolds(query: Query, target: Target): Promise<boolean> {
+  return authorityAt(query, target, true);
+}
+
+/** Whether authority holds `target` now; with `lock`, as `authorityHolds` locks it. */
+async function authorityAt(query: Query, target: Target, lock = false): Promise<boolean> {
   const ids = [target.spaceId, target.collectionId, target.id];
+  const share = lock ? 'FOR SHARE' : '';
   if (target.kind === 'record') {
     const row = (await query(`SELECT revision,tombstone FROM records WHERE space_id=$1 AND collection_id=$2 AND record_id=$3
-      FOR SHARE`, ids)).rows[0];
+      ${share}`, ids)).rows[0];
     return row !== undefined && Number(row.revision) === target.revision && row.tombstone === target.deleted;
   }
-  if (target.kind === 'source') await query('SELECT pg_advisory_xact_lock_shared(hashtextextended($1,0))',
-    [lockKey(['stateplane:extraction', ...ids])]);
-  if (!(await query(`SELECT 1 FROM entity_refs WHERE space_id=$1 AND collection_id=$2 AND kind=$3 AND entity_id=$4 FOR SHARE`,
-    [target.spaceId, target.collectionId, target.kind, target.id])).rows[0]) return false;
+  if (lock) {
+    if (target.kind === 'source') await query('SELECT pg_advisory_xact_lock_shared(hashtextextended($1,0))',
+      [lockKey(['stateplane:extraction', ...ids])]);
+    if (!(await query(`SELECT 1 FROM entity_refs WHERE space_id=$1 AND collection_id=$2 AND kind=$3 AND entity_id=$4 FOR SHARE`,
+      [target.spaceId, target.collectionId, target.kind, target.id])).rows[0]) return false;
+  }
   // A later statement, so it reads what the lock waited for.
   const now = await currentTarget(query, { spaceId: target.spaceId, collectionId: target.collectionId, kind: target.kind, id: target.id });
   return now.open && sameTarget(now.target, target);

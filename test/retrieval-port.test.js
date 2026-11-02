@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chunkText, configuredChunks, DeterministicEmbedder, embedBatch, EmbedderUnavailableError, EmbeddingRegistry,
+import { chunkText, configuredChunks, DeterministicEmbedder, embedBatch, EmbedderFailedError, EmbedderUnavailableError, EmbeddingRegistry,
   EmbeddingRejectedError, pointer } from '../packages/retrieval/dist/index.js';
 
 const never = new AbortController().signal;
@@ -73,9 +73,20 @@ test('a batch retries an outage within bounds and rejects malformed vectors as t
   await assert.rejects(embedBatch(down, ['a'], never, [1, 1]), EmbedderUnavailableError);
   assert.equal(calls, 3, 'three tries, then the outage surfaces');
   calls = 0;
-  const rejecting = { profile: local.profile, embed: async () => { calls++; throw new Error('payload refused'); } };
-  await assert.rejects(embedBatch(rejecting, ['a'], never, [1, 1]), /payload refused/);
+  const rejecting = { profile: local.profile, embed: async texts => { calls++; throw new Error(`payload refused: ${texts[0]}`); } };
+  await assert.rejects(embedBatch(rejecting, ['secret text'], never, [1, 1]), error => error instanceof EmbedderFailedError
+    && !error.message.includes('secret') && error.cause === undefined);
   assert.equal(calls, 1, 'an input error is not retried');
+  // An outage keeps only its category too, and the caller decides what else is an outage.
+  const quoting = { profile: local.profile, embed: async texts => { calls++;
+    throw Object.assign(new Error(`socket reset sending ${texts[0]}`), { code: 'ECONNRESET' }); } };
+  calls = 0;
+  await assert.rejects(embedBatch(quoting, ['secret text'], never, [1, 1], undefined, error => error.code === 'ECONNRESET'),
+    error => error instanceof EmbedderUnavailableError && !error.message.includes('secret') && error.cause === undefined);
+  assert.equal(calls, 3, 'an outage by the caller\'s classification is retried');
+  calls = 0;
+  await assert.rejects(embedBatch(quoting, ['secret text'], never, [1, 1]), EmbedderFailedError);
+  assert.equal(calls, 1, 'by default only EmbedderUnavailableError is an outage');
   for (const answer of [[[1, 0, 0]], [[1, 0, 0, Number.NaN]], [[0, 0, 0, 0]], []]) {
     await assert.rejects(embedBatch({ profile: local.profile, embed: async () => answer }, ['a'], never), EmbeddingRejectedError);
   }
