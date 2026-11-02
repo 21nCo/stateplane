@@ -42,6 +42,10 @@ const tables = ['stateplane_migrations','space_directory','space_provisioning_au
   'sources','original_objects','source_upload_grants','source_upload_attempts','extraction_versions',
   'claims','claim_revisions','claim_evidence','links','evidence_events','evidence_outbox','original_erasures','space_erasures'];
 const evidenceTables=tables.slice(-13);
+const retrievalTables=['retrieval_policies','retrieval_collection_heads','vector_index_strategies','projection_generations','projection_refs',
+  'projection_deletion_receipts','lexical_chunks','vector_chunks','embedding_checkpoints','retrieval_outbox'];
+tables.push(...retrievalTables);
+const embedding=seed=>`[${Array.from({length:384},(_,i)=>Math.sin(seed*31+i*7)||0.5).join(',')}]`;
 // A space erased before the dump, whose blob-store erasure is still pending.
 const erasedSpaceId='sp_restore_erased';
 async function snapshot(pool) {
@@ -142,6 +146,37 @@ try {
     await evidence.query('COMMIT');
   } catch (error) { await evidence.query('ROLLBACK'); throw error; }
   finally { evidence.release(); }
+  // Retrieval projections (migration 045): one row in every table. The evidence above already enqueued the
+  // extraction, the claim revision and the deleted source, whose deletion receipt is recorded here.
+  const projection=await base.connect();
+  try {
+    await projection.query('BEGIN');
+    await projection.query(`INSERT INTO retrieval_policies(space_id,collection_id,version,record_fields,source_content,claim_statements,
+      vector,processing_regions,credential_id) VALUES($1,$2,1,ARRAY['/label'],true,true,true,ARRAY['apac'],'restore')`,[spaceId,collectionId]);
+    await projection.query(`INSERT INTO projection_generations(space_id,collection_id,generation,policy_version,embedder,embedding_model,
+      model_version,dimensions) VALUES($1,$2,1,1,'local-test','hash-embedder','1',384)`,[spaceId,collectionId]);
+    await projection.query(`INSERT INTO projection_refs(space_id,collection_id,generation,ref_kind,ref_id,revision)
+      VALUES($1,$2,1,'record',$3,1)`,[spaceId,collectionId,liveRecord]);
+    await projection.query(`INSERT INTO lexical_chunks(space_id,collection_id,generation,ref_kind,ref_id,revision,policy_version,chunk_index,
+      field,content_start,content_end,content) VALUES($1,$2,1,'record',$3,1,1,0,'/label',0,3,'two')`,[spaceId,collectionId,liveRecord]);
+    await projection.query(`INSERT INTO vector_chunks(space_id,collection_id,generation,ref_kind,ref_id,revision,policy_version,chunk_index,
+      field,content_start,content_end,content_sha256,embedder,embedding_model,model_version,dimensions,processing_region,embedding)
+      VALUES($1,$2,1,'record',$3,1,1,0,'/label',0,3,$4,'local-test','hash-embedder','1',384,'apac',$5::vector)`,
+    [spaceId,collectionId,liveRecord,'f'.repeat(64),embedding(1)]);
+    // A checkpoint references its Ref's live row in the generation; this claim's chunks are still being prepared.
+    await projection.query(`INSERT INTO projection_refs(space_id,collection_id,generation,ref_kind,ref_id,revision)
+      VALUES($1,$2,1,'claim','clm_restore',1)`,[spaceId,collectionId]);
+    await projection.query(`INSERT INTO embedding_checkpoints(space_id,collection_id,generation,ref_kind,ref_id,revision,chunk_index,
+      content_sha256,embedder,embedding_model,model_version,dimensions,processing_region,embedding)
+      VALUES($1,$2,1,'claim','clm_restore',1,0,$3,'local-test','hash-embedder','1',384,'apac',$4::vector)`,
+    [spaceId,collectionId,'f'.repeat(64),embedding(2)]);
+    await projection.query(`INSERT INTO projection_refs(space_id,collection_id,generation,ref_kind,ref_id,revision,deleted)
+      VALUES($1,$2,1,'source','src_restore_deleted',1,true)`,[spaceId,collectionId]);
+    await projection.query(`INSERT INTO projection_deletion_receipts(space_id,collection_id,generation,ref_kind,ref_id,revision,chunks_removed)
+      VALUES($1,$2,1,'source','src_restore_deleted',1,0)`,[spaceId,collectionId]);
+    await projection.query('COMMIT');
+  } catch (error) { await projection.query('ROLLBACK'); throw error; }
+  finally { projection.release(); }
   const feedSeed=(await base.query(`SELECT event_id FROM record_events WHERE space_id=$1
     ORDER BY committed_at,event_id LIMIT 1`,[spaceId])).rows[0].event_id;
   await base.query(`INSERT INTO record_event_feed(event_id,space_id,collection_id)
@@ -156,7 +191,7 @@ try {
     expected.routing_nonces.length && expected.space_audit.length && expected.space_provisioning_audit.length &&
     expected.projection_heads.length && expected.projection_reconciliations.length &&
     expected.outbox_dispatch_checkpoint.length && expected.outbox_space_rotation.length && expected.outbox_operator_audit.length &&
-    evidenceTables.every(table=>expected[table].length),
+    evidenceTables.every(table=>expected[table].length) && retrievalTables.every(table=>expected[table].length),
   'expected this restore smoke seed to populate records, outbox, projection state, evidence and owned-space authority');
   const archive = docker(['pg_dump','-U','stateplane','-Fc',sourceName]);
   docker(['createdb','-U','stateplane',name]);
@@ -197,6 +232,30 @@ try {
   await assert.rejects(restored.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id)
     VALUES($1,$2,'clm_restore',2,'unrecorded','principal:owner','restore')`,[spaceId,collectionId]),
   error=>error.code==='23514'&&error.constraint==='claim_revisions_recorded_by');
+  // Migration 045's triggers and indexes are post-data objects too. A new claim revision enqueues its work, a lexical
+  // chunk's tsvector is derived from its content, the Ref fence, the checkpoint fence and the deletion receipt still bind, and the
+  // per-dimension HNSW index is back.
+  await restored.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,recorded_by)
+    VALUES($1,$2,'clm_restore',2,'restored revision','principal:owner','restore','owner')`,[spaceId,collectionId]);
+  assert.equal((await restored.query(`SELECT count(*)::int AS n FROM retrieval_outbox WHERE space_id=$1 AND ref_id='clm_restore'
+    AND revision=2 AND operation='upsert'`,[spaceId])).rows[0].n,1,'the restored claim trigger enqueues retrieval work');
+  assert.deepEqual(expected.lexical_chunks.map(row=>JSON.parse(row).tsv),["'two':1"]);
+  // A chunk written after the restore gets a tsvector derived from its content by the policy's configuration (the default `simple`), not the
+  // one its writer sends.
+  const restoredChunk=(await restored.query(`INSERT INTO lexical_chunks(space_id,collection_id,generation,ref_kind,ref_id,revision,
+    policy_version,chunk_index,field,content_start,content_end,content,tsv) VALUES($1,$2,1,'record',$3,1,1,1,'/label',0,14,
+    'bridges opened','forged'::tsvector) RETURNING tsv::text,tsv=to_tsvector('pg_catalog.simple',content) AS derived`,
+  [spaceId,collectionId,liveRecord])).rows[0];
+  assert.deepEqual({...restoredChunk},{tsv:"'bridges':1 'opened':2",derived:true},'the restored chunk trigger derives the tsvector');
+  await assert.rejects(restored.query(`UPDATE projection_refs SET revision=1 WHERE space_id=$1`,[spaceId]),
+    error=>error.code==='23514'&&error.constraint==='projection_refs_order');
+  await assert.rejects(restored.query(`UPDATE projection_refs SET deleted=false,extraction_version=1
+    WHERE space_id=$1 AND ref_id='src_restore_deleted'`,[spaceId]),
+  error=>error.code==='23514'&&error.constraint==='projection_refs_order');
+  await assert.rejects(restored.query(`UPDATE projection_refs SET deleted=true WHERE space_id=$1 AND ref_id='clm_restore'`,[spaceId]),
+    error=>error.code==='23503'&&error.constraint==='embedding_checkpoints_live_ref','a checkpoint still blocks deleting its Ref');
+  assert.equal((await restored.query(`SELECT count(*)::int AS n FROM pg_indexes WHERE tablename='vector_chunks'
+    AND indexname IN (SELECT index_name FROM vector_index_strategies WHERE method='hnsw')`)).rows[0].n,4);
   const restoredAuthority=new PostgresAuthority(restored,3600);
   const resumed=await restoredAuthority.transaction({...scope,capability:'events:read'},tx=>tx.events(feedSeed));
   assert.equal(resumed.events.length,expected.record_event_pending.length,
@@ -214,6 +273,9 @@ try {
     // So do the evidence tables that space deletion reads to prove erasure.
     execFileSync(process.execPath,['scripts/grant-evidence.mjs'],{cwd:root,
       env:{...process.env,STATEPLANE_CELL_ADMIN_URL:targetUrl,STATEPLANE_CELL_ROLE:journalRole},stdio:'inherit'});
+    // And the retrieval tables, which space deletion also reads.
+    execFileSync(process.execPath,['scripts/grant-retrieval.mjs'],{cwd:root,
+      env:{...process.env,STATEPLANE_CELL_ADMIN_URL:targetUrl,STATEPLANE_CELL_ROLE:journalRole},stdio:'inherit'});
     const operational=await restored.connect();
     const issuance=`iss_restore_${randomBytes(8).toString('hex')}`;
     try {
@@ -230,6 +292,11 @@ try {
       for (const table of evidenceTables)
         assert.ok((await operational.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[evidenceSpace(table)])).rows[0].n>0,
           `restored operational role can read ${table} for erasure proof`);
+      for (const table of retrievalTables)
+        assert.ok((await operational.query(`SELECT count(*)::int AS n FROM ${table}${table==='vector_index_strategies'?'':' WHERE space_id=$1'}`,
+          table==='vector_index_strategies'?[]:[spaceId])).rows[0].n>0,`restored operational role can read ${table} for erasure proof`);
+      assert.equal((await operational.query(`UPDATE retrieval_outbox SET attempts=attempts+1 WHERE space_id=$1 AND ref_id='clm_restore'
+        AND revision=2`,[spaceId])).rowCount,1,'restored operational role can record retrieval delivery');
       assert.equal((await operational.query(`UPDATE space_erasures SET next_attempt_at=clock_timestamp()
         WHERE space_id=$1 AND originals_removed_at IS NULL`,[erasedSpaceId])).rowCount,1,
       'restored operational role can record space erasure progress');
@@ -240,8 +307,9 @@ try {
     }
   } finally {
     await restored.query(`REVOKE ALL ON agent_key_issuances,projection_heads,projection_reconciliations,
-      outbox_dispatch_checkpoint,outbox_space_rotation,outbox_operator_audit,${evidenceTables.join(',')}
+      outbox_dispatch_checkpoint,outbox_space_rotation,outbox_operator_audit,${evidenceTables.join(',')},${retrievalTables.join(',')}
       FROM ${journalRole}`).catch(()=>{});
+    await restored.query(`REVOKE ALL ON FUNCTION public.vector(public.vector,integer,boolean) FROM ${journalRole}`).catch(()=>{});
     await restored.query(`DROP ROLE IF EXISTS ${journalRole}`).catch(()=>{});
   }
   // A reserved-word role proves identifier quoting. Keep its creation and

@@ -112,6 +112,21 @@ try {
     if (populated.rows[0].present && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained')
       throw new Error('Populated durable outbox upgrade requires drained traffic; set STATEPLANE_POPULATED_INDEX_UPGRADE=drained only after stopping record writers, claim workers and long outbox readers');
   };
+  // 045's backfill reads every source and claim identity, live or deleted,
+  // and probes one extraction or revision per live identity, while evidence
+  // writers wait on its locks (docs/retrieval-projections.md measures it).
+  // Take its locks in its own order under the bounded wait, then require the
+  // drained acknowledgement above a bound of identity rows, so the decision
+  // holds through commit.
+  const RETRIEVAL_BACKFILL_UNDRAINED = 10000;
+  const preflightRetrievalProjections = async () => {
+    await client.query(`LOCK TABLE public.collections, public.records, public.claim_revisions, public.entity_refs,
+      public.extraction_versions IN SHARE ROW EXCLUSIVE MODE`);
+    const identities = await client.query(`SELECT count(*)::int AS n FROM (SELECT 1 FROM public.entity_refs LIMIT $1) bounded`,
+      [RETRIEVAL_BACKFILL_UNDRAINED + 1]);
+    if (identities.rows[0].n > RETRIEVAL_BACKFILL_UNDRAINED && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained')
+      throw new Error(`Populated retrieval projection upgrade requires drained traffic above ${RETRIEVAL_BACKFILL_UNDRAINED} source and claim identities; set STATEPLANE_POPULATED_INDEX_UPGRADE=drained only after stopping record, source and claim writers`);
+  };
   for (const name of files) {
     const sql = await readFile(resolve(directory, name), 'utf8');
     const sha256 = createHash('sha256').update(sql).digest('hex');
@@ -139,11 +154,12 @@ try {
     const boundedDdl = receiptDomainCutover || name === '038_drop_superseded_event_cursor.sql' ||
       name === '039_durable_outbox.sql' || name === '040_evidence_storage.sql' || name === '041_original_object_keys.sql' ||
       name === '042_claim_revision_recorder.sql' || name === '043_claim_commit_authority.sql' ||
-      name === '044_links_deletion_retention.sql';
+      name === '044_links_deletion_retention.sql' || name === '045_retrieval_projections.sql';
     const priorLockTimeout = boundedDdl ? (await client.query('SHOW lock_timeout')).rows[0].lock_timeout : null; // NOSONAR -- migrations run in order within the current transaction
     if (boundedDdl) await client.query("SET LOCAL lock_timeout = '5s'"); // NOSONAR -- set before this step's DDL, never concurrently
     try {
       if (name === '039_durable_outbox.sql') await preflightDurableOutbox(); // NOSONAR -- preflight locks must precede this migration step
+      if (name === '045_retrieval_projections.sql') await preflightRetrievalProjections(); // NOSONAR -- preflight locks must precede this migration step
       await client.query(sql); // NOSONAR -- ordered DDL and ledger writes form one migration transaction
     } catch (error) {
       if (receiptDomainCutover && error?.code === '55P03')
@@ -162,6 +178,10 @@ try {
         throw new Error('Claim commit check upgrade waits for claim transactions; retry when long claim transactions finish', { cause:error });
       if (name === '044_links_deletion_retention.sql' && error?.code === '55P03')
         throw new Error('Link and retention upgrade waits for evidence writers; retry when long source or space transactions finish', { cause:error });
+      // 045 locks claim revisions before identities, as revise and review do; a claim create's opposite order can
+      // make PostgreSQL abort the step as a deadlock, which is retryable in the same way.
+      if (name === '045_retrieval_projections.sql' && (error?.code === '55P03' || error?.code === '40P01'))
+        throw new Error('Retrieval projection upgrade waits for record, extraction and claim writers; retry when long evidence transactions finish', { cause:error });
       throw error;
     }
     if (boundedDdl) await client.query('SELECT set_config($1,$2,true)', ['lock_timeout',priorLockTimeout]); // NOSONAR -- restore this step's transaction-local timeout before the ledger write
