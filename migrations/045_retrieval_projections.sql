@@ -212,7 +212,9 @@ CREATE TRIGGER projection_generations_transition BEFORE INSERT OR UPDATE ON proj
 -- authoritative revision (and, for a source, extraction version) its chunks
 -- were built from, or that it was deleted. A Ref only moves forward, and a
 -- deleted Ref stays deleted. Chunks reference the live row at its revision,
--- so advancing or deleting a Ref requires removing its older chunks first.
+-- so advancing or deleting a Ref requires removing its older chunks first;
+-- embedding checkpoints reference the live row at any revision, so deleting a
+-- Ref also requires removing its checkpoints first.
 CREATE TABLE projection_refs (
   space_id text NOT NULL,
   collection_id text NOT NULL,
@@ -229,6 +231,7 @@ CREATE TABLE projection_refs (
   applied_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   PRIMARY KEY (space_id, collection_id, generation, ref_kind, ref_id),
   UNIQUE (space_id, collection_id, generation, ref_kind, ref_id, revision, live),
+  UNIQUE (space_id, collection_id, generation, ref_kind, ref_id, live),
   UNIQUE (space_id, collection_id, generation, ref_kind, ref_id, extraction_version),
   FOREIGN KEY (space_id, collection_id, generation)
     REFERENCES projection_generations(space_id, collection_id, generation),
@@ -249,10 +252,11 @@ CREATE TRIGGER projection_refs_no_truncate BEFORE TRUNCATE ON projection_refs
 -- A Ref removed from a generation, recorded after its chunks are gone and its
 -- authoritative Ref is deleted. The receipt references the Ref's deleted
 -- `projection_refs` row at the same revision. That row is the one fence a
--- receipt and an apply share: deleting the Ref is a write to it (an apply
--- with an older snapshot then fails with a serialization error or the order
--- check), a deleted row never changes again and its key admits no live row,
--- so the receipt is final in that generation under every isolation level. It
+-- receipt and an apply or checkpoint share: deleting the Ref is a write to it
+-- (an apply or checkpoint with an older snapshot then fails with a
+-- serialization error, the order check or its foreign key), a deleted row
+-- never changes again and its key admits no live row, so the receipt is final
+-- in that generation under every isolation level. It
 -- says nothing about other generations, authority rows, original bytes or
 -- backups.
 CREATE TABLE projection_deletion_receipts (
@@ -415,7 +419,15 @@ CREATE INDEX vector_chunks_hnsw_1536 ON vector_chunks USING hnsw ((embedding::ve
 -- Embeddings computed outside any SQL transaction and saved before they are
 -- applied, so an interrupted or retried preparation resumes instead of
 -- embedding the same chunk again. A checkpoint is keyed by the Ref's target
--- revision; applying moves it into `vector_chunks` and removes it.
+-- revision; applying moves it into `vector_chunks` and removes it. It
+-- references the Ref's live `projection_refs` row in its generation, whatever
+-- revision that row is at, so a worker records the Ref in the generation
+-- before saving checkpoints (a Ref projected for the first time at its target
+-- revision, with its chunks to follow). That row is the checkpoint's fence
+-- with a deletion, as it is for chunks: deleting the Ref is refused while a
+-- checkpoint references it (a foreign key violation, or a serialization error
+-- for a checkpoint the deletion's snapshot cannot see), and no checkpoint is
+-- saved for a deleted or unrecorded Ref.
 CREATE TABLE embedding_checkpoints (
   space_id text NOT NULL,
   collection_id text NOT NULL,
@@ -432,9 +444,12 @@ CREATE TABLE embedding_checkpoints (
   dimensions integer NOT NULL,
   processing_region text NOT NULL,
   embedding vector NOT NULL,
+  live boolean NOT NULL GENERATED ALWAYS AS (true) STORED,
   created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   FOREIGN KEY (space_id, collection_id, generation, embedder, embedding_model, model_version, dimensions)
     REFERENCES projection_generations(space_id, collection_id, generation, embedder, embedding_model, model_version, dimensions),
+  CONSTRAINT embedding_checkpoints_live_ref FOREIGN KEY (space_id, collection_id, generation, ref_kind, ref_id, live)
+    REFERENCES projection_refs(space_id, collection_id, generation, ref_kind, ref_id, live),
   CHECK ((ref_kind = 'source') = (extraction_version IS NOT NULL))
 );
 CREATE UNIQUE INDEX embedding_checkpoints_chunk ON embedding_checkpoints(space_id, collection_id, generation, ref_kind,
@@ -604,20 +619,23 @@ CREATE TRIGGER entity_refs_retrieval AFTER UPDATE OF tombstone ON entity_refs
 
 -- Evidence written before this step: enqueue each live source's latest
 -- extraction and each live claim's current revision, so the first build
--- sees them. Deleted evidence has nothing to project.
+-- sees them. Deleted evidence has nothing to project. Each statement reads
+-- the identities once and, per live identity, one primary-key probe of its
+-- latest extraction or current revision (a LATERAL ... LIMIT 1 is never
+-- flattened into a scan), so extraction and claim history is never read; the
+-- migrator bounds the identities read (scripts/migrate.mjs).
 INSERT INTO retrieval_outbox(space_id, collection_id, ref_kind, ref_id, revision, extraction_version, operation, placement_generation)
-  SELECT DISTINCT ON (x.space_id, x.collection_id, x.source_id) x.space_id, x.collection_id, 'source', x.source_id, e.revision,
-    x.version, 'upsert', s.placement_generation
-  FROM extraction_versions x
-  JOIN entity_refs e ON e.space_id = x.space_id AND e.collection_id = x.collection_id AND e.kind = 'source'
-    AND e.entity_id = x.source_id AND NOT e.tombstone
-  JOIN spaces s ON s.space_id = x.space_id
-  ORDER BY x.space_id, x.collection_id, x.source_id, x.version DESC;
+  SELECT e.space_id, e.collection_id, 'source', e.entity_id, e.revision, x.version, 'upsert', s.placement_generation
+  FROM entity_refs e
+  CROSS JOIN LATERAL (SELECT v.version FROM extraction_versions v WHERE v.space_id = e.space_id
+    AND v.collection_id = e.collection_id AND v.source_id = e.entity_id ORDER BY v.version DESC LIMIT 1) x
+  JOIN spaces s ON s.space_id = e.space_id
+  WHERE e.kind = 'source' AND NOT e.tombstone;
 INSERT INTO retrieval_outbox(space_id, collection_id, ref_kind, ref_id, revision, operation, placement_generation)
   SELECT e.space_id, e.collection_id, 'claim', e.entity_id, e.revision, 'upsert', s.placement_generation
   FROM entity_refs e
-  JOIN claim_revisions r ON r.space_id = e.space_id AND r.collection_id = e.collection_id AND r.claim_id = e.entity_id
-    AND r.revision = e.revision
+  CROSS JOIN LATERAL (SELECT 1 FROM claim_revisions r WHERE r.space_id = e.space_id AND r.collection_id = e.collection_id
+    AND r.claim_id = e.entity_id AND r.revision = e.revision LIMIT 1) x
   JOIN spaces s ON s.space_id = e.space_id
   WHERE e.kind = 'claim' AND NOT e.tombstone;
 

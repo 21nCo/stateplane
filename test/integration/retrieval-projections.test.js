@@ -196,10 +196,15 @@ test('source extraction and claim create, revise, review and deletion enqueue re
     attributedTo: 'city archive' });
   await claims.review(actor, spaceId, 'alpha', created.claimId, { baseRevision: 2, status: 'accepted' });
   await claims.delete(actor, spaceId, 'alpha', created.claimId, { baseRevision: 3 });
+  // A corrected extraction is a new extraction version; replaying the correction enqueues nothing.
+  const correction = { baseVersion: 1, content: 'The bridge opened in 1933.', sourceOffsets: [{ start: 0, end: 26, sourceStart: 0, sourceEnd: 26 }] };
+  assert.equal((await sources.correctExtraction(actor, spaceId, 'alpha', sourceId, correction)).version, 2);
+  assert.equal((await sources.correctExtraction(actor, spaceId, 'alpha', sourceId, correction)).replayed, true);
   await sources.delete(actor, spaceId, 'alpha', sourceId);
   assert.deepEqual(await work(spaceId), [upsert('source', sourceId, 1, 1), upsert('claim', created.claimId, 1),
     upsert('claim', created.claimId, 2), upsert('claim', created.claimId, 3),
-    { ...upsert('claim', created.claimId, 3), operation: 'delete' }, { ...upsert('source', sourceId, 1), operation: 'delete' }]);
+    { ...upsert('claim', created.claimId, 3), operation: 'delete' }, upsert('source', sourceId, 1, 2),
+    { ...upsert('source', sourceId, 1), operation: 'delete' }]);
 
   // The work is part of the authoritative write: visible inside it, and gone with its rollback.
   const sql = await space();
@@ -483,6 +488,108 @@ for (const isolation of ['READ COMMITTED', 'REPEATABLE READ']) for (const scenar
         (SELECT count(*)::int FROM lexical_chunks WHERE space_id=$1) AS chunks`, [spaceId])).rows[0];
     assert.equal(state.receipts, state.live ? 0 : 1, JSON.stringify(state));
     assert.equal(state.chunks, state.live ? 1 : 0, JSON.stringify(state));
+  });
+}
+
+test('an embedding checkpoint needs its Ref live in the generation, and a deletion or receipt needs its checkpoints gone', async () => {
+  const spaceId = await space();
+  await policy(spaceId, 'alpha', 1);
+  await generation(spaceId, 'alpha', 1, 1);
+  const checkpoint = (extractionVersion = 1, revision = 1) => vectorChunk(spaceId, 1, 'source', 'src_1', revision,
+    { table: 'embedding_checkpoints', extractionVersion });
+  const liveRef = refused('23503', 'embedding_checkpoints_live_ref');
+  await assert.rejects(checkpoint(), liveRef, 'a Ref the generation has not recorded has no checkpoint');
+  // A Ref projected for the first time is recorded at its target revision, with its chunks to follow.
+  await projectRef(spaceId, 1, 'source', 'src_1', 1, 1);
+  await checkpoint();
+  await vectorChunk(spaceId, 1, 'source', 'src_1', 1);
+  await pool.query(`DELETE FROM embedding_checkpoints WHERE space_id=$1`, [spaceId]);
+  // A checkpoint for a newer extraction does not stop the apply that consumes it.
+  await pool.query(`INSERT INTO extraction_versions(space_id,collection_id,source_id,version,source_sha256,parser,parser_version,content,credential_id)
+    VALUES($1,'alpha','src_1',2,$2,'text','2','The bridge opened in 1933.','owner-session')`, [spaceId, digest('original bytes')]);
+  await checkpoint(2);
+  await pool.query(`DELETE FROM vector_chunks WHERE space_id=$1`, [spaceId]);
+  await pool.query(`UPDATE projection_refs SET extraction_version=2 WHERE space_id=$1 AND ref_id='src_1'`, [spaceId]);
+  await vectorChunk(spaceId, 1, 'source', 'src_1', 1, { extractionVersion: 2 });
+  await checkpoint(2, 2);
+  // Deleting the Ref, and so its receipt, waits for every checkpoint of it in the generation, whatever its revision.
+  await pool.query(`UPDATE entity_refs SET tombstone=true WHERE space_id=$1 AND kind='source' AND entity_id='src_1'`, [spaceId]);
+  await pool.query(`DELETE FROM vector_chunks WHERE space_id=$1`, [spaceId]);
+  const remove = () => pool.query(`UPDATE projection_refs SET deleted=true WHERE space_id=$1 AND ref_id='src_1'`, [spaceId]);
+  const receipt = () => pool.query(`INSERT INTO projection_deletion_receipts(space_id,collection_id,generation,ref_kind,ref_id,revision,
+    chunks_removed) VALUES($1,'alpha',1,'source','src_1',1,1)`, [spaceId]);
+  await assert.rejects(remove(), liveRef);
+  await assert.rejects(receipt(), refused('23503', 'projection_deletion_receipts_deleted_ref'));
+  await pool.query(`DELETE FROM embedding_checkpoints WHERE space_id=$1 AND revision=2`, [spaceId]);
+  await assert.rejects(remove(), liveRef, 'a checkpoint of the projected revision blocks it too');
+  await pool.query(`DELETE FROM embedding_checkpoints WHERE space_id=$1`, [spaceId]);
+  await remove();
+  await receipt();
+  // After the receipt, no checkpoint of the Ref is saved in that generation.
+  await assert.rejects(checkpoint(2), liveRef);
+  await assert.rejects(checkpoint(2, 2), liveRef);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM embedding_checkpoints WHERE space_id=$1', [spaceId])).rows[0].n, 0);
+});
+
+// Each scenario races a stale transaction against a committed one on the deleted source's Ref in a vector generation:
+// a checkpoint save against the Ref's deletion and receipt. `live` starts the Ref projected at extraction 1. A deletion
+// checks for checkpoints with a current snapshot, so it sees one committed after its own snapshot at either level.
+const saveCheckpoint = (db, spaceId) => vectorChunk(spaceId, 1, 'source', 'src_1', 1, { table: 'embedding_checkpoints', db });
+const deleteLiveRef = async (db, spaceId) => {
+  await db.query(`UPDATE projection_refs SET deleted=true WHERE space_id=$1`, [spaceId]);
+  await db.query(`INSERT INTO projection_deletion_receipts(space_id,collection_id,generation,ref_kind,ref_id,revision,chunks_removed)
+    VALUES($1,'alpha',1,'source','src_1',1,0)`, [spaceId]);
+};
+const deleteNewRef = async (db, spaceId) => {
+  await db.query(`INSERT INTO projection_refs(space_id,collection_id,generation,ref_kind,ref_id,revision,deleted)
+    VALUES($1,'alpha',1,'source','src_1',1,true)`, [spaceId]);
+  await db.query(`INSERT INTO projection_deletion_receipts(space_id,collection_id,generation,ref_kind,ref_id,revision,chunks_removed)
+    VALUES($1,'alpha',1,'source','src_1',1,0)`, [spaceId]);
+};
+const recordAndSave = async (db, spaceId) => {
+  await projectRef(spaceId, 1, 'source', 'src_1', 1, 1, db);
+  await saveCheckpoint(db, spaceId);
+};
+const deleted = { live: false, receipts: 1, checkpoints: 0 };
+const saved = { live: true, receipts: 0, checkpoints: 1 };
+const checkpointScenarios = [
+  { name: 'a checkpoint of a live Ref, after a committed deletion and receipt', live: true, committed: deleteLiveRef,
+    stale: saveCheckpoint, refusal: { 'READ COMMITTED': '23503', 'REPEATABLE READ': '40001' }, final: deleted },
+  { name: 'a deletion and receipt of a live Ref, after a committed checkpoint', live: true, committed: saveCheckpoint,
+    stale: deleteLiveRef, refusal: { 'READ COMMITTED': '23503', 'REPEATABLE READ': '23503' }, final: saved },
+  { name: 'a checkpoint of a Ref new to its snapshot, after a committed deletion and receipt', live: false, committed: deleteNewRef,
+    stale: saveCheckpoint, refusal: { 'READ COMMITTED': '23503', 'REPEATABLE READ': '23503' }, final: deleted },
+  { name: 'recording a Ref new to its snapshot and its checkpoint, after a committed deletion and receipt', live: false,
+    committed: deleteNewRef, stale: recordAndSave, refusal: { 'READ COMMITTED': '23505', 'REPEATABLE READ': '23505' }, final: deleted },
+  { name: 'a deletion and receipt of a Ref new to its snapshot, after it was committed with a checkpoint', live: false,
+    committed: recordAndSave, stale: deleteNewRef, refusal: { 'READ COMMITTED': '23505', 'REPEATABLE READ': '23505' }, final: saved }];
+
+for (const isolation of ['READ COMMITTED', 'REPEATABLE READ']) for (const scenario of checkpointScenarios) {
+  test(`under ${isolation}, ${scenario.name} cannot leave a checkpoint beside a deletion receipt`, async () => {
+    const spaceId = await space();
+    await policy(spaceId, 'alpha', 1);
+    await generation(spaceId, 'alpha', 1, 1);
+    if (scenario.live) await projectRef(spaceId, 1, 'source', 'src_1', 1, 1);
+    await pool.query(`UPDATE entity_refs SET tombstone=true WHERE space_id=$1 AND kind='source' AND entity_id='src_1'`, [spaceId]);
+    const stale = await pool.connect();
+    let outcome = null;
+    try {
+      await stale.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+      await stale.query('SELECT count(*) FROM projection_refs WHERE space_id=$1', [spaceId]);
+      await inTransaction(db => scenario.committed(db, spaceId));
+      try {
+        await scenario.stale(stale, spaceId);
+        await stale.query('COMMIT');
+      } catch (error) {
+        outcome = error.code;
+        await stale.query('ROLLBACK');
+      }
+    } finally { stale.release(); }
+    assert.equal(outcome, scenario.refusal[isolation]);
+    const state = (await pool.query(`SELECT (SELECT bool_or(live) FROM projection_refs WHERE space_id=$1) AS live,
+        (SELECT count(*)::int FROM projection_deletion_receipts WHERE space_id=$1) AS receipts,
+        (SELECT count(*)::int FROM embedding_checkpoints WHERE space_id=$1) AS checkpoints`, [spaceId])).rows[0];
+    assert.deepEqual({ ...state }, scenario.final);
   });
 }
 
@@ -788,16 +895,16 @@ test('migration 045 rolls back atomically when claim writers hold or cross its l
     await writer.query('ROLLBACK');
     await untouched();
 
-    // Above 10,000 live sources and claims the backfill's lock hold is long enough to need a drained window. Bare
-    // identities, written past their payload checks, count toward the bound but have nothing to enqueue.
+    // Above 10,000 source and claim identities the backfill's lock hold is long enough to need a drained window. The
+    // backfill reads deleted identities too, so they count toward the bound although they have nothing to enqueue.
     await db.query('BEGIN');
     await db.query(`SET LOCAL session_replication_role = replica`);
-    await db.query(`INSERT INTO entity_refs(space_id,collection_id,kind,entity_id) SELECT 'sp_upgrade','entries','claim','clm_bulk_'||n
-      FROM generate_series(1,10000) n`);
+    await db.query(`INSERT INTO entity_refs(space_id,collection_id,kind,entity_id,tombstone)
+      SELECT 'sp_upgrade','entries','claim','clm_bulk_'||n,true FROM generate_series(1,10000) n`);
     await db.query('COMMIT');
     const populated = migrate(name, { STATEPLANE_POPULATED_INDEX_UPGRADE: '' });
     assert.equal(populated.status, 1);
-    assert.match(populated.stderr, /Populated retrieval projection upgrade requires drained traffic above 10000 live sources and claims/);
+    assert.match(populated.stderr, /Populated retrieval projection upgrade requires drained traffic above 10000 source and claim identities/);
     await untouched();
 
     // A revise or review inserts the revision before it advances the identity, 045's own order: the step waits for

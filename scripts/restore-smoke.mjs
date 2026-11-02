@@ -163,6 +163,9 @@ try {
       field,content_start,content_end,content_sha256,embedder,embedding_model,model_version,dimensions,processing_region,embedding)
       VALUES($1,$2,1,'record',$3,1,1,0,'/label',0,3,$4,'local-test','hash-embedder','1',384,'apac',$5::vector)`,
     [spaceId,collectionId,liveRecord,'f'.repeat(64),embedding(1)]);
+    // A checkpoint references its Ref's live row in the generation; this claim's chunks are still being prepared.
+    await projection.query(`INSERT INTO projection_refs(space_id,collection_id,generation,ref_kind,ref_id,revision)
+      VALUES($1,$2,1,'claim','clm_restore',1)`,[spaceId,collectionId]);
     await projection.query(`INSERT INTO embedding_checkpoints(space_id,collection_id,generation,ref_kind,ref_id,revision,chunk_index,
       content_sha256,embedder,embedding_model,model_version,dimensions,processing_region,embedding)
       VALUES($1,$2,1,'claim','clm_restore',1,0,$3,'local-test','hash-embedder','1',384,'apac',$4::vector)`,
@@ -230,7 +233,7 @@ try {
     VALUES($1,$2,'clm_restore',2,'unrecorded','principal:owner','restore')`,[spaceId,collectionId]),
   error=>error.code==='23514'&&error.constraint==='claim_revisions_recorded_by');
   // Migration 045's triggers and indexes are post-data objects too. A new claim revision enqueues its work, a lexical
-  // chunk's tsvector is derived from its content, the Ref fence and the deletion receipt still bind, and the
+  // chunk's tsvector is derived from its content, the Ref fence, the checkpoint fence and the deletion receipt still bind, and the
   // per-dimension HNSW index is back.
   await restored.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,recorded_by)
     VALUES($1,$2,'clm_restore',2,'restored revision','principal:owner','restore','owner')`,[spaceId,collectionId]);
@@ -242,6 +245,8 @@ try {
   await assert.rejects(restored.query(`UPDATE projection_refs SET deleted=false,extraction_version=1
     WHERE space_id=$1 AND ref_id='src_restore_deleted'`,[spaceId]),
   error=>error.code==='23514'&&error.constraint==='projection_refs_order');
+  await assert.rejects(restored.query(`UPDATE projection_refs SET deleted=true WHERE space_id=$1 AND ref_id='clm_restore'`,[spaceId]),
+    error=>error.code==='23503'&&error.constraint==='embedding_checkpoints_live_ref','a checkpoint still blocks deleting its Ref');
   assert.equal((await restored.query(`SELECT count(*)::int AS n FROM pg_indexes WHERE tablename='vector_chunks'
     AND indexname IN (SELECT index_name FROM vector_index_strategies WHERE method='hnsw')`)).rows[0].n,4);
   const restoredAuthority=new PostgresAuthority(restored,3600);

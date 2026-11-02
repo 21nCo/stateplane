@@ -112,19 +112,20 @@ try {
     if (populated.rows[0].present && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained')
       throw new Error('Populated durable outbox upgrade requires drained traffic; set STATEPLANE_POPULATED_INDEX_UPGRADE=drained only after stopping record writers, claim workers and long outbox readers');
   };
-  // 045 enqueues every live source and claim while evidence writers wait on
-  // its locks; measured at 32 to 49 microseconds per enqueued row locally
-  // (docs/retrieval-projections.md). Take its locks in its own order under
-  // the bounded wait, then require the drained acknowledgement above a bound
-  // of live identities, so the decision holds through commit.
+  // 045's backfill reads every source and claim identity, live or deleted,
+  // and probes one extraction or revision per live identity, while evidence
+  // writers wait on its locks (docs/retrieval-projections.md measures it).
+  // Take its locks in its own order under the bounded wait, then require the
+  // drained acknowledgement above a bound of identity rows, so the decision
+  // holds through commit.
   const RETRIEVAL_BACKFILL_UNDRAINED = 10000;
   const preflightRetrievalProjections = async () => {
     await client.query(`LOCK TABLE public.collections, public.records, public.claim_revisions, public.entity_refs,
       public.extraction_versions IN SHARE ROW EXCLUSIVE MODE`);
-    const live = await client.query(`SELECT count(*)::int AS n FROM (SELECT 1 FROM public.entity_refs
-      WHERE kind IN ('source','claim') AND NOT tombstone LIMIT $1) bounded`, [RETRIEVAL_BACKFILL_UNDRAINED + 1]);
-    if (live.rows[0].n > RETRIEVAL_BACKFILL_UNDRAINED && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained')
-      throw new Error(`Populated retrieval projection upgrade requires drained traffic above ${RETRIEVAL_BACKFILL_UNDRAINED} live sources and claims; set STATEPLANE_POPULATED_INDEX_UPGRADE=drained only after stopping record, source and claim writers`);
+    const identities = await client.query(`SELECT count(*)::int AS n FROM (SELECT 1 FROM public.entity_refs LIMIT $1) bounded`,
+      [RETRIEVAL_BACKFILL_UNDRAINED + 1]);
+    if (identities.rows[0].n > RETRIEVAL_BACKFILL_UNDRAINED && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained')
+      throw new Error(`Populated retrieval projection upgrade requires drained traffic above ${RETRIEVAL_BACKFILL_UNDRAINED} source and claim identities; set STATEPLANE_POPULATED_INDEX_UPGRADE=drained only after stopping record, source and claim writers`);
   };
   for (const name of files) {
     const sql = await readFile(resolve(directory, name), 'utf8');
