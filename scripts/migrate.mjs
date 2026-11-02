@@ -139,7 +139,7 @@ try {
     const boundedDdl = receiptDomainCutover || name === '038_drop_superseded_event_cursor.sql' ||
       name === '039_durable_outbox.sql' || name === '040_evidence_storage.sql' || name === '041_original_object_keys.sql' ||
       name === '042_claim_revision_recorder.sql' || name === '043_claim_commit_authority.sql' ||
-      name === '044_links_deletion_retention.sql';
+      name === '044_links_deletion_retention.sql' || name === '045_retrieval_projections.sql';
     const priorLockTimeout = boundedDdl ? (await client.query('SHOW lock_timeout')).rows[0].lock_timeout : null; // NOSONAR -- migrations run in order within the current transaction
     if (boundedDdl) await client.query("SET LOCAL lock_timeout = '5s'"); // NOSONAR -- set before this step's DDL, never concurrently
     try {
@@ -162,6 +162,8 @@ try {
         throw new Error('Claim commit check upgrade waits for claim transactions; retry when long claim transactions finish', { cause:error });
       if (name === '044_links_deletion_retention.sql' && error?.code === '55P03')
         throw new Error('Link and retention upgrade waits for evidence writers; retry when long source or space transactions finish', { cause:error });
+      if (name === '045_retrieval_projections.sql' && error?.code === '55P03')
+        throw new Error('Retrieval projection upgrade waits for record, extraction and claim writers; retry when long evidence transactions finish', { cause:error });
       throw error;
     }
     if (boundedDdl) await client.query('SELECT set_config($1,$2,true)', ['lock_timeout',priorLockTimeout]); // NOSONAR -- restore this step's transaction-local timeout before the ledger write

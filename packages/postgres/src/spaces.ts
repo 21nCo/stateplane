@@ -819,6 +819,14 @@ export class PostgresSpaces {
       NOT EXISTS (SELECT 1 FROM projection_heads WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM outbox_space_rotation WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM projection_reconciliations WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM embedding_checkpoints WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM vector_chunks WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM lexical_chunks WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM projection_deletion_receipts WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM projection_refs WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM projection_generations WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM retrieval_policies WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM retrieval_outbox WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM receipt_reservation_scopes WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM receipt_reservations WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM idempotency_receipts WHERE space_id=$1) AND
