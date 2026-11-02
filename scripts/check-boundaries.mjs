@@ -8,7 +8,7 @@ const root = resolve(import.meta.dirname, '..');
 const requireFromApp = createRequire(join(root, 'app/package.json'));
 const { parse: parseSvelte } = requireFromApp('svelte/compiler');
 const roles = new Map([
-  ['contracts', []], ['application', ['contracts']], ['postgres', ['contracts', 'application']],
+  ['contracts', []], ['application', ['contracts']], ['postgres', ['contracts', 'application', 'retrieval']],
   ['auth', ['contracts']], ['storage', ['application', 'contracts']], ['retrieval', ['contracts']],
   ['workers', ['application', 'contracts']], ['api', ['application', 'auth', 'contracts']],
   ['mcp', ['application', 'auth', 'contracts']], ['cli', ['contracts']], ['testing', ['contracts']],

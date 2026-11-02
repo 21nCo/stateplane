@@ -21,6 +21,7 @@
   "dependencies": {
     "@stateplane/contracts": "workspace:*",
     "@stateplane/application": "workspace:*",
+    "@stateplane/retrieval": "workspace:*",
     "pg": "8.22.0",
     "@types/pg": "8.20.0"
   }

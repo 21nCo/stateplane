@@ -1,10 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({ closed: 0, connected: 0, failClose: false, denyGrants: false, denyCatalog: false, ownsObject: false, denyVector: false, wrongIdentity: false }));
-const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[], reconcileError: undefined as Error | undefined, uploadPages: [] as number[], uploadSteps: [] as number[], uploadError: undefined as Error | undefined, uploadBudgets: [] as number[], sweeps: [] as number[][], erasures: [] as number[][], originals: [] as unknown[], active: 0, peak: 0, poolInstances: [] as { emit(event: string, error: Error): boolean }[] }));
+const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[], reconcileError: undefined as Error | undefined, uploadPages: [] as number[], uploadSteps: [] as number[], uploadError: undefined as Error | undefined, uploadBudgets: [] as number[], sweeps: [] as number[][], erasures: [] as number[][], originals: [] as unknown[], active: 0, peak: 0, poolInstances: [] as { emit(event: string, error: Error): boolean }[], projectors: [] as unknown[], retrievalSteps: [] as unknown[], retrievalError: undefined as Error | undefined }));
 vi.mock('@stateplane/postgres', async importOriginal => ({
   CLIENT_READ_TIMEOUT_MS: (await importOriginal<typeof import('@stateplane/postgres')>()).CLIENT_READ_TIMEOUT_MS,
   PostgresAuthority: class {},
+  RecordRetrievalProjector: class { constructor(pool: unknown) { cell.projectors.push(pool); } },
+  PostgresRetrievalWorker: class {
+    async step(options: unknown) { cell.retrievalSteps.push(options); if (cell.retrievalError) throw cell.retrievalError; return {}; }
+  },
   SourceUploadReconciler: class {
     constructor(sourceCell: { originals: unknown }) { cell.originals.push(sourceCell.originals); }
     async step(limit: number, budgetMs: number) { cell.uploadSteps.push(limit); cell.uploadBudgets.push(budgetMs); if (cell.uploadError) throw cell.uploadError; return cell.uploadPages.shift() ?? 0; }
@@ -15,7 +19,8 @@ vi.mock('@stateplane/postgres', async importOriginal => ({
     async claim() { return { messages: cell.claims.shift() ?? [], scan: 'whole' }; }
     async release(messages: unknown[]) { cell.released.push(...messages); return messages.length; }
     async stepReconciliations() { cell.stepped++; if (cell.reconcileError) throw cell.reconcileError; return 0; }
-    async process(message: { attempt: number }) {
+    async process(message: { attempt: number }, projector: unknown) {
+      if (!projector) throw new Error('record completion needs the retrieval projector');
       cell.processed.push(message);
       cell.peak = Math.max(cell.peak, ++cell.active);
       await new Promise(resolve => setTimeout(resolve, 1));
@@ -154,6 +159,17 @@ describe('cell jobs Worker', () => {
       expect(send?.message).toBe('Projection dispatch released 1 leases');
       expect(((send?.cause as AggregateError).errors).slice(1)).toEqual([reconcile, uploads]);
     } finally { cell.uploadError = undefined; cell.reconcileError = undefined; }
+  });
+
+  it('projects source and claim work after the other steps within 10 s and reports a failed claim with the tick', async () => {
+    cell.claims = []; cell.retrievalSteps = []; cell.sweeps = [];
+    await jobs.scheduled({} as never, jobsEnv());
+    expect([cell.sweeps.length, cell.retrievalSteps]).toEqual([1, [{ budgetMs: 10_000 }]]);
+    const claim = new Error('retrieval claim statement timeout');
+    cell.retrievalError = claim;
+    try { await expect(jobs.scheduled({} as never, jobsEnv())).rejects.toBe(claim); }
+    finally { cell.retrievalError = undefined; }
+    expect(cell.retrievalSteps).toHaveLength(2);
   });
 
   it('fails a tick closed without its originals binding, before opening the pool', async () => {

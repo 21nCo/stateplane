@@ -71,7 +71,7 @@ try {
     if (callerPath===undefined) delete process.env.PATH;
     else process.env.PATH=callerPath;
   }
-  const names = ['contracts', 'application', 'auth', 'api', 'cli', 'mcp', 'read-model', 'postgres', 'workers'];
+  const names = ['contracts', 'application', 'auth', 'api', 'cli', 'mcp', 'read-model', 'retrieval', 'postgres', 'workers'];
   const tarballs = [];
   for (const name of names) {
     const tarball = join(temp, `${name}.tgz`);
