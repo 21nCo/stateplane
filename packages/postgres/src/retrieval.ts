@@ -6,7 +6,7 @@ import type { ContentPolicy, Embedder, EmbedderIdentity, TextChunk } from '@stat
 import { CommitOutcomeUnknownError } from './index.js';
 import type { ProjectionChange, ProjectionQuery } from './index.js';
 import { bounded, DeadlineExceededError, diagnostic, inTransaction, infrastructureFault, text } from './faults.js';
-import type { PoolLike } from './faults.js';
+import type { Limit, PoolLike } from './faults.js';
 import { FAILED_OUTBOX, LIVE_OUTBOX } from './outbox-sql.js';
 import type { Projector } from './outbox.js';
 import { lockKey } from './sources.js';
@@ -14,10 +14,13 @@ import { lockKey } from './sources.js';
 type RefKind = 'record' | 'source' | 'claim';
 type Query = (sql: string, values?: unknown[]) => Promise<pg.QueryResult>;
 
-/** The authoritative state one Ref is projected to: a revision (and extraction) with its content, or its deletion. */
+/**
+ * The authoritative state one Ref is projected to: a revision (and extraction) with its content, or its deletion.
+ * `placement` is the space's placement generation the work runs under; every write preparing it fences it.
+ */
 interface Target {
   spaceId: string; collectionId: string; kind: RefKind; id: string;
-  revision: number; extractionVersion: number | null; deleted: boolean; content: string | null;
+  revision: number; extractionVersion: number | null; deleted: boolean; content: string | null; placement?: number;
 }
 /** A generation that is not retired, with the content its own policy configures and the regions both policies allow. */
 interface Generation {
@@ -37,6 +40,9 @@ const ITEM_MS = 20_000;
 const MIN_ITEM_MS = 1_000;
 const LEASE_MS = 60_000;
 const LOCK_MS = 1_000;
+// Settling or releasing what a step holds gets at most this long, and ends
+// at the latest this long after the step's budget.
+const CLEANUP_MS = 1_000;
 // Time an interrupted preparation gets to save the batch it already has. An
 // evidence item's preparation gets at most half its budget and this grace at
 // most a quarter, so both end before the item's own budget does.
@@ -157,7 +163,7 @@ interface Saved { index: number; sha256: string; region: string; embedding: stri
  */
 async function planEmbeddings(query: Query, target: Target, generation: Generation, chunks: Chunk[])
   : Promise<{ missing: Chunk[]; reused: Saved[] } | null> {
-  if (!await scopeOpen(query, target.spaceId, target.collectionId)
+  if (!await scopeOpen(query, target.spaceId, target.collectionId, target.placement)
     || !await lockGeneration(query, target, generation.generation)) return null;
   const key = refKey(target, generation.generation);
   let row = await refRow(query, target, generation.generation, 'SHARE');
@@ -198,7 +204,7 @@ async function planEmbeddings(query: Query, target: Target, generation: Generati
 async function saveCheckpoints(query: Query, target: Target, generation: Generation, chunks: number, saved: Saved[])
   : Promise<boolean> {
   const identity = generation.identity!;
-  if (!await scopeOpen(query, target.spaceId, target.collectionId)
+  if (!await scopeOpen(query, target.spaceId, target.collectionId, target.placement)
     || !await lockGeneration(query, target, generation.generation)) return false;
   // Share locked: an apply of the Ref waits for this save, or this save sees the apply.
   const row = await refRow(query, target, generation.generation, 'SHARE');
@@ -238,13 +244,14 @@ type Outages = Set<Embedder>;
  * progress: one cut by its share before saving anything is an outage for the
  * rest of the step, like one that failed, whatever its siblings saved. After trying
  * them all, the first error that is the target's own is thrown, else the
- * first outage.
+ * first outage. Every transaction ends within `limit`, the preparation's
+ * budget and grace, and each generation's within its own share and grace.
  */
 async function prepareTarget(pool: PoolLike, registry: EmbeddingRegistry, target: Target, signal: AbortSignal,
-  progress: { saved: number }, deadline: number, outages?: Outages): Promise<void> {
+  progress: { saved: number }, deadline: number, limit: Required<Limit>, outages?: Outages): Promise<void> {
   if (target.deleted) return;
   const errors: unknown[] = [];
-  const work = (await inTransaction(pool, db => loadGenerations(db.query.bind(db), target.spaceId, target.collectionId)))
+  const work = (await inTransaction(pool, db => loadGenerations(db.query.bind(db), target.spaceId, target.collectionId), limit))
     .flatMap(generation => generation.vector && generation.identity ? [{ generation, chunks: chunksFor(generation, target) }] : [])
     .filter(entry => entry.chunks.length);
   for (const [index, { generation, chunks }] of work.entries()) {
@@ -254,12 +261,13 @@ async function prepareTarget(pool: PoolLike, registry: EmbeddingRegistry, target
         ? 'Embedder unavailable earlier in this step' : `No configured embedder for generation ${generation.generation} in a region its policies allow`));
       continue;
     }
-    const run = (own: AbortSignal, mine: { saved: number }) => prepareGeneration(pool, target, generation, chunks, embedder, own,
-      saved => { mine.saved += saved; progress.saved += saved; });
+    const run = (own: AbortSignal, mine: { saved: number }, _: number, sql: Required<Limit>) => prepareGeneration(pool, target,
+      generation, chunks, embedder, own, sql, saved => { mine.saved += saved; progress.saved += saved; });
     const share = Math.max(1, Math.floor((deadline - Date.now()) / (work.length - index)));
     const ends = Date.now() + share;
     try {
-      await budgeted(run, signal, share, Math.min(GRACE_MS, Math.floor(share / 4)));
+      // Every share ends by `deadline`, and its grace within the preparation's, so it answers only to `limit`'s signal.
+      await budgeted(run, limit.signal, share, Math.min(GRACE_MS, Math.floor(share / 4)));
     } catch (error) {
       // Only a call cut short by the caller before its share ended says nothing about the provider.
       if (error instanceof EmbedderUnavailableError && (!signal.aborted || Date.now() >= ends)) outages?.add(embedder);
@@ -270,11 +278,12 @@ async function prepareTarget(pool: PoolLike, registry: EmbeddingRegistry, target
 }
 
 async function prepareGeneration(pool: PoolLike, target: Target, generation: Generation, chunks: Chunk[], embedder: Embedder,
-  signal: AbortSignal, tally: (saved: number) => void): Promise<void> {
-  const plan = await inTransaction(pool, db => planEmbeddings(db.query.bind(db), target, generation, chunks));
+  signal: AbortSignal, limit: Limit, tally: (saved: number) => void): Promise<void> {
+  const plan = await inTransaction(pool, db => planEmbeddings(db.query.bind(db), target, generation, chunks), limit);
   if (!plan) return;
+  // A batch received after the grace is never saved.
   const save = (saved: Saved[]) => inTransaction(pool, db => saveCheckpoints(db.query.bind(db), target, generation,
-    chunks.length, saved));
+    chunks.length, saved), limit);
   if (plan.reused.length && !await save(plan.reused)) return;
   // Before every provider call, a retry included, the space and collection
   // must still be open, the generation live, both its policy and the
@@ -285,11 +294,11 @@ async function prepareGeneration(pool: PoolLike, target: Target, generation: Gen
   const admit = async () => {
     const current = await inTransaction(pool, async db => {
       const query: Query = db.query.bind(db);
-      if (!await scopeOpen(query, target.spaceId, target.collectionId))
+      if (!await scopeOpen(query, target.spaceId, target.collectionId, target.placement))
         throw new ScopeClosedError('The space or collection closed during preparation');
       if (!await authorityAt(query, target)) throw new ProjectionIncompleteError('The Ref changed during preparation');
       return (await loadGenerations(query, target.spaceId, target.collectionId)).find(entry => entry.generation === generation.generation);
-    });
+    }, limit);
     if (!current?.regions.includes(embedder.profile.region))
       throw new ProjectionIncompleteError('The processing policy changed during preparation');
   };
@@ -314,8 +323,10 @@ async function prepareGeneration(pool: PoolLike, target: Target, generation: Gen
  * without spending its failure budget. Preparation that finishes in the
  * grace period succeeds. The caller's budget ending first stops it at once
  * with the same outcome, so running out of time is never the work's failure.
+ * `run` gets the limit its transactions end within: the grace's end or the
+ * caller's abort.
  */
-async function budgeted(run: (signal: AbortSignal, progress: { saved: number }, deadline: number) => Promise<void>,
+async function budgeted(run: (signal: AbortSignal, progress: { saved: number }, deadline: number, sql: Required<Limit>) => Promise<void>,
   parent: AbortSignal, ms: number, graceMs = GRACE_MS): Promise<void> {
   const controller = new AbortController();
   const deadline = Date.now() + ms;
@@ -337,7 +348,7 @@ async function budgeted(run: (signal: AbortSignal, progress: { saved: number }, 
   if (parent.aborted) forward();
   else parent.addEventListener('abort', forward, { once: true });
   try {
-    const work = run(controller.signal, progress, deadline);
+    const work = run(controller.signal, progress, deadline, { deadline: deadline + graceMs, signal: parent });
     work.catch(() => {});
     await Promise.race([work, stopped]);
   } catch (error) {
@@ -378,13 +389,17 @@ async function dropCheckpoints(query: Query, key: unknown[], revision: number | 
  * first applies serialize on it and the later one compares forward like any
  * other. A policy narrowing that commits after the regions were read is
  * caught by the storage trigger on insert and reported as `PROJECTION_INCOMPLETE`:
- * the whole apply rolls back and runs again, uncounted.
+ * the whole apply rolls back and runs again, uncounted. Null when no live
+ * generation configures this kind of Ref: nothing was written, so the
+ * caller needs no authority fence.
  */
-async function applyTarget(query: Query, target: Target): Promise<number[]> {
+async function applyTarget(query: Query, target: Target): Promise<number[] | null> {
   await query(`SET LOCAL lock_timeout = '${LOCK_MS}ms'`);
   const blocked: number[] = [];
+  let configured = false;
   for (const generation of await loadGenerations(query, target.spaceId, target.collectionId)) {
     if (!configures(generation, target.kind) || !await lockGeneration(query, target, generation.generation)) continue;
+    configured = true;
     const key = refKey(target, generation.generation);
     let row = await refRow(query, target, generation.generation, 'UPDATE');
     // A Ref this generation has never projected: record it at the target,
@@ -449,7 +464,7 @@ async function applyTarget(query: Query, target: Target): Promise<number[]> {
     }
     await dropCheckpoints(query, key, target.revision, target.extractionVersion);
   }
-  return blocked;
+  return configured ? blocked : null;
 }
 
 /**
@@ -538,16 +553,16 @@ export class RecordRetrievalProjector implements Projector<void> {
     });
     backstop.catch(() => {});
     try {
-      await Promise.race([this.prepareWithin(recordTarget(change), change.generation, signal, prepareMs, end), backstop]);
+      await Promise.race([this.prepareWithin(recordTarget(change), signal, prepareMs, end), backstop]);
     } finally { clearTimeout(timer); }
   }
 
-  private async prepareWithin(target: Target, placement: number, signal: AbortSignal, prepareMs: number, end: number) {
+  private async prepareWithin(target: Target, signal: AbortSignal, prepareMs: number, end: number) {
     try {
-      await budgeted((budget, progress, deadline) => prepareTarget(this.pool, this.#embedders, target, budget, progress, deadline),
-        signal, prepareMs, Math.min(GRACE_MS, Math.floor(prepareMs / 4)));
+      await budgeted((budget, progress, deadline, sql) => prepareTarget(this.pool, this.#embedders, target, budget, progress,
+        deadline, sql), signal, prepareMs, Math.min(GRACE_MS, Math.floor(prepareMs / 4)));
     } catch (error) {
-      const blocked = await inTransaction(this.pool, db => this.applyAvailable(db.query.bind(db), target, placement),
+      const blocked = await inTransaction(this.pool, db => this.applyAvailable(db.query.bind(db), target),
         { deadline: Math.min(Date.now() + FALLBACK_APPLY_MS, end), signal }).catch(() => null);
       // Every generation turned out complete (an earlier attempt's checkpoints
       // sufficed), or the scope closed: completion applies or releases.
@@ -558,22 +573,24 @@ export class RecordRetrievalProjector implements Projector<void> {
 
   async apply(change: ProjectionChange, _prepared: void | undefined, query: ProjectionQuery): Promise<void> {
     const target = recordTarget(change);
-    if ((await applyTarget(query, target)).length) throw new ProjectionIncompleteError('Embeddings are missing for this revision');
-    if (!await authorityHolds(query, target)) throw new ProjectionIncompleteError('The record changed while it was projected');
+    const blocked = await applyTarget(query, target);
+    if (blocked?.length) throw new ProjectionIncompleteError('Embeddings are missing for this revision');
+    if (blocked && !await authorityHolds(query, target)) throw new ProjectionIncompleteError('The record changed while it was projected');
   }
 
   /** Apply what is ready, under completion's scope fences held through commit; 'closed' when the scope no longer admits it. */
-  private async applyAvailable(query: Query, target: Target, placement: number): Promise<number[] | 'closed'> {
-    if (!await scopeOpen(query, target.spaceId, target.collectionId, placement)) return 'closed';
+  private async applyAvailable(query: Query, target: Target): Promise<number[] | 'closed'> {
+    if (!await scopeOpen(query, target.spaceId, target.collectionId, target.placement)) return 'closed';
     const blocked = await applyTarget(query, target);
-    if (!await authorityHolds(query, target)) throw new ProjectionIncompleteError('The record changed while it was projected');
-    return blocked;
+    if (blocked && !await authorityHolds(query, target)) throw new ProjectionIncompleteError('The record changed while it was projected');
+    return blocked ?? [];
   }
 }
 
 function recordTarget(change: ProjectionChange): Target {
   return { spaceId: change.ref.spaceId, collectionId: change.ref.collectionId, kind: 'record', id: change.ref.id,
-    revision: change.revision, extractionVersion: null, deleted: change.deleted, content: change.canonicalData };
+    revision: change.revision, extractionVersion: null, deleted: change.deleted, content: change.canonicalData,
+    placement: change.generation };
 }
 
 export type RetrievalOutcome = 'applied' | 'released' | 'lost' | 'retried' | 'unknown';
@@ -589,16 +606,20 @@ export interface RetrievalStepOptions {
 /**
  * A leased item. `attempt` counts started attempts only; `lease` is the exact
  * `available_at` the lease set, so only its holder, while it lasts, can start,
- * complete or release the item.
+ * complete or release the item. `placement`, read at start, is the space's
+ * placement generation the attempt runs under.
  */
-interface Job { jobId: string; spaceId: string; collectionId: string; kind: 'source' | 'claim'; id: string; attempt: number; lease: string }
+interface Job {
+  jobId: string; spaceId: string; collectionId: string; kind: 'source' | 'claim'; id: string; attempt: number; lease: string;
+  placement?: number;
+}
 /** The ring position a claim found (`before`) and the one it stored. */
 interface Cursor { before: [string, string] | null; stored: [string, string] | null }
 type EvidenceRef = Pick<Job, 'spaceId' | 'collectionId' | 'kind' | 'id'>;
 
-/** Read the current authoritative state of a source or claim and whether its space and collection are open. */
-async function currentTarget(query: Query, job: EvidenceRef): Promise<{ open: boolean; target: Target | null }> {
-  const row = (await query(`SELECT e.revision,e.tombstone,
+/** Read the current authoritative state of a source or claim, the space's placement and whether its space and collection are open. */
+async function currentTarget(query: Query, job: EvidenceRef): Promise<{ open: boolean; placement?: number; target: Target | null }> {
+  const row = (await query(`SELECT e.revision,e.tombstone,s.placement_generation AS placement,
       s.lifecycle IN ('active','readOnly') AND c.lifecycle<>'deleted' AS open,x.version,x.content,r.statement
     FROM entity_refs e JOIN spaces s ON s.space_id=e.space_id
     JOIN collections c ON c.space_id=e.space_id AND c.collection_id=e.collection_id
@@ -610,14 +631,19 @@ async function currentTarget(query: Query, job: EvidenceRef): Promise<{ open: bo
     WHERE e.space_id=$1 AND e.collection_id=$2 AND e.kind=$3 AND e.entity_id=$4`,
   [job.spaceId, job.collectionId, job.kind, job.id])).rows[0];
   if (!row) return { open: false, target: null };
-  const base = { spaceId: job.spaceId, collectionId: job.collectionId, kind: job.kind, id: job.id, revision: Number(row.revision) };
-  if (row.tombstone) return { open: row.open, target: { ...base, extractionVersion: null, deleted: true, content: null } };
+  const placement = Number(row.placement);
+  const base = { spaceId: job.spaceId, collectionId: job.collectionId, kind: job.kind, id: job.id, revision: Number(row.revision),
+    placement };
+  if (row.tombstone) return { open: row.open, placement, target: { ...base, extractionVersion: null, deleted: true, content: null } };
   const content = job.kind === 'source' ? row.content : row.statement;
   // A live source without an extraction has nothing to project yet; its first extraction enqueues work.
-  if (content === null || content === undefined) return { open: row.open, target: null };
-  return { open: row.open, target: { ...base, extractionVersion: job.kind === 'source' ? Number(row.version) : null,
+  if (content === null || content === undefined) return { open: row.open, placement, target: null };
+  return { open: row.open, placement, target: { ...base, extractionVersion: job.kind === 'source' ? Number(row.version) : null,
     deleted: false, content } };
 }
+
+/** A step's settling and releasing: `CLEANUP_MS`, ending at the latest that long after the step's budget `until`. */
+const cleanup = (until: number): Limit => ({ deadline: Math.min(Date.now(), until) + CLEANUP_MS });
 
 const sameTarget = (a: Target | null, b: Target | null) => a !== null && b !== null && a.revision === b.revision
   && a.extractionVersion === b.extractionVersion && a.deleted === b.deleted;
@@ -663,8 +689,11 @@ export class PostgresRetrievalWorker {
    * backlogs. Items the step has no time left to start are released due at
    * once, with no attempt spent, the cursor goes back to the last pair whose
    * item started (or where the claim found it), so pairs that never started
-   * keep their turn, and the step ends. Only a failed claim throws; each item
-   * settles itself.
+   * keep their turn, and the step ends. Every transaction is bounded: a claim
+   * and an item's own by the step's budget, settling and releasing by
+   * `CLEANUP_MS` past it, so a stalled database never holds the step longer.
+   * A claim the budget cuts short ends the step; any other failed claim
+   * throws; each item settles itself.
    */
   async step(settings: RetrievalStepOptions = {}): Promise<RetrievalStep> {
     const budgetMs = bounded(settings.budgetMs ?? 10_000, MIN_ITEM_MS, 60_000);
@@ -677,7 +706,14 @@ export class PostgresRetrievalWorker {
     // Pairs walked since a claim last found work.
     let idle = 0;
     while (until - Date.now() >= MIN_ITEM_MS) {
-      const claim = await this.claim(pairs, perPair, limit);
+      let claim: Awaited<ReturnType<PostgresRetrievalWorker['claim']>>;
+      try { claim = await this.claim(pairs, perPair, limit, until); }
+      catch (error) {
+        // Leases a cut-short COMMIT may have taken expire unstarted.
+        if (error instanceof DeadlineExceededError
+          || error instanceof CommitOutcomeUnknownError && error.cause instanceof DeadlineExceededError) break;
+        throw error;
+      }
       result.claimed += claim.jobs.length;
       if (!claim.jobs.length) {
         // Nothing due in the whole ring, or in as many pairs as one claim may walk.
@@ -688,12 +724,12 @@ export class PostgresRetrievalWorker {
       idle = 0;
       let next = 0;
       for (; next < claim.jobs.length && until - Date.now() >= MIN_ITEM_MS; next++)
-        result[await this.process(claim.jobs[next], Math.min(ITEM_MS, until - Date.now()), outages)]++;
+        result[await this.process(claim.jobs[next], Math.min(ITEM_MS, until - Date.now()), outages, until)]++;
       if (next < claim.jobs.length) {
         const unstarted = claim.jobs.slice(next);
         const started = claim.jobs[next - 1];
         await this.releaseUnstarted(unstarted, claim.cursor,
-          started ? [started.spaceId, started.collectionId] : claim.cursor.before).catch(() => {});
+          started ? [started.spaceId, started.collectionId] : claim.cursor.before, until).catch(() => {});
         result.released += unstarted.length;
         break;
       }
@@ -707,8 +743,8 @@ export class PostgresRetrievalWorker {
    * when none was. `wrapped` says the walk covered every pair with pending
    * work; `cursor` holds the position found and the one stored.
    */
-  private async claim(pairs: number, perPair: number, limit: number): Promise<{ jobs: Job[]; walked: number; wrapped: boolean;
-    cursor: Cursor }> {
+  private async claim(pairs: number, perPair: number, limit: number, until: number): Promise<{ jobs: Job[]; walked: number;
+    wrapped: boolean; cursor: Cursor }> {
     return inTransaction(this.pool, async db => {
       // One claim at a time moves the cursor; claims are short.
       const cursor = (await db.query(`SELECT after_space_id,after_collection_id FROM retrieval_dispatch_checkpoint
@@ -751,22 +787,26 @@ export class PostgresRetrievalWorker {
       const stored: [string, string] | null = last ? [last.space_id, last.collection_id] : after;
       return { walked: ring.length, wrapped, cursor: { before: after, stored }, jobs: claimed.map(row => ({ jobId: row.job_id, spaceId: row.space_id,
         collectionId: row.collection_id, kind: row.ref_kind, id: row.ref_id, attempt: row.attempts, lease: row.lease })) };
-    });
+    }, { deadline: until });
   }
 
   /**
    * Process one leased item: start it (one more attempt, a renewed lease),
-   * read its Ref's current state, prepare outside SQL, then apply under the
-   * scope fence (space and collection open, share locked through commit), the
+   * read its Ref's current state and the space's placement, prepare outside
+   * SQL, then apply under the scope fence (space and collection open, at that
+   * placement, share locked through commit), the
    * lease and the unchanged authoritative state, which is locked against its
    * writers for the commit, all within the item's budget. Generations that need what
    * preparation could not provide keep their previous state; the others
    * apply, and the item then stays pending with that failure's backoff. An
    * outage, a lock wait or interrupted preparation is never the item's own
    * error; any other error retries it with longer backoff and marks it
-   * degraded. An unknown COMMIT outcome keeps the lease until it expires.
+   * degraded. An unknown COMMIT outcome keeps the lease until it expires. A
+   * placement fence committed since start releases the item uncounted; its
+   * next attempt runs under the new placement, as the record outbox requeues
+   * a latest revision under it (an item always projects current authority).
    */
-  private async process(claimed: Job, budgetMs: number, outages: Outages): Promise<RetrievalOutcome> {
+  private async process(claimed: Job, budgetMs: number, outages: Outages, until: number): Promise<RetrievalOutcome> {
     const deadline = Date.now() + budgetMs;
     const signal = AbortSignal.timeout(budgetMs);
     let job = claimed;
@@ -778,37 +818,38 @@ export class PostgresRetrievalWorker {
           RETURNING attempts,available_at::text AS lease`, [job.jobId, job.lease, LEASE_MS])).rows[0];
         if (!started) return null;
         const next = { ...job, attempt: started.attempts, lease: started.lease };
-        return { next, read: await currentTarget(db.query.bind(db), next) };
-      });
+        const read = await currentTarget(db.query.bind(db), next);
+        return { next: { ...next, placement: read.placement }, read };
+      }, { deadline, signal });
       if (!begun) return 'lost';
       // Adopted only once committed: a start that rolled back settles under the claim's lease.
       job = begun.next;
       const { read } = begun;
-      if (!read.open) return await this.settle(job, 'release', null, 0);
+      if (!read.open) return await this.settle(job, 'release', null, 0, until);
       let failure: unknown = null;
       if (read.target && !read.target.deleted) {
         try {
-          await budgeted((budget, progress, deadline) => prepareTarget(this.pool, this.#embedders, read.target!, budget, progress,
-            deadline, outages),
+          await budgeted((budget, progress, deadline, sql) => prepareTarget(this.pool, this.#embedders, read.target!, budget,
+            progress, deadline, sql, outages),
             signal, Math.max(1, Math.min(this.#prepareMs, Math.floor(budgetMs / 2))), Math.min(GRACE_MS, Math.floor(budgetMs / 4)));
         } catch (error) { failure = error; }
       }
       return await inTransaction(this.pool, async db => {
         const query: Query = db.query.bind(db);
         // The scope fence comes first, as erasure locks the space first.
-        const open = await scopeOpen(query, job.spaceId, job.collectionId);
+        const open = await scopeOpen(query, job.spaceId, job.collectionId, job.placement);
         const leased = (await query(`SELECT 1 FROM retrieval_outbox WHERE job_id=$1 AND attempts=$2 AND available_at=$3::timestamptz
           AND available_at>clock_timestamp() AND delivery_state='pending' FOR UPDATE`, [job.jobId, job.attempt, job.lease])).rows[0];
         if (!leased) return 'lost';
         const now = await currentTarget(query, job);
         if (!open || !now.open || (read.target || now.target) && !sameTarget(read.target, now.target)) {
-          // Scope closed, or the Ref changed after it was read: run again with fresh state.
+          // Scope closed or placement fenced, or the Ref changed after it was read: run again with fresh state.
           await this.release(query, job, 0, null);
           return 'released';
         }
-        const blocked = now.target ? await applyTarget(query, now.target) : [];
-        if (now.target && !await authorityHolds(query, now.target)) throw new AuthorityChanged();
-        if (blocked.length) {
+        const blocked = now.target ? await applyTarget(query, now.target) : null;
+        if (blocked && !await authorityHolds(query, now.target!)) throw new AuthorityChanged();
+        if (blocked?.length) {
           const retry = retryOf(failure ?? new ProjectionIncompleteError('Embeddings are missing for this revision'), job.attempt);
           await this.release(query, job, retry.delayMs, retry.error);
           return 'retried';
@@ -819,15 +860,16 @@ export class PostgresRetrievalWorker {
       }, { deadline });
     } catch (error) {
       if (error instanceof CommitOutcomeUnknownError) return 'unknown';
-      if (error instanceof AuthorityChanged) return this.settle(job, 'release', null, 0).catch(() => 'released' as const);
+      if (error instanceof AuthorityChanged) return this.settle(job, 'release', null, 0, until).catch(() => 'released' as const);
       const retry = retryOf(error, job.attempt);
-      await this.settle(job, 'retry', retry.error, retry.delayMs).catch(() => {});
+      await this.settle(job, 'retry', retry.error, retry.delayMs, until).catch(() => {});
       return 'retried';
     }
   }
 
-  private async settle(job: Job, outcome: 'release' | 'retry', error: string | null, delayMs: number): Promise<'released' | 'retried'> {
-    await inTransaction(this.pool, db => this.release(db.query.bind(db), job, delayMs, error));
+  private async settle(job: Job, outcome: 'release' | 'retry', error: string | null, delayMs: number, until: number)
+    : Promise<'released' | 'retried'> {
+    await inTransaction(this.pool, db => this.release(db.query.bind(db), job, delayMs, error), cleanup(until));
     return outcome === 'release' ? 'released' : 'retried';
   }
 
@@ -839,13 +881,12 @@ export class PostgresRetrievalWorker {
     [job.jobId, job.attempt, job.lease, delayMs, error]);
   }
 
-  /** Make claimed items the step could not start due again at once; their attempts are unchanged. */
   /**
    * Release claimed items that never started, due at once with no attempt
    * spent, and move the cursor back to `to` unless another claim has moved
    * it since this one stored its position.
    */
-  private async releaseUnstarted(jobs: Job[], cursor: Cursor, to: [string, string] | null): Promise<void> {
+  private async releaseUnstarted(jobs: Job[], cursor: Cursor, to: [string, string] | null, until: number): Promise<void> {
     await inTransaction(this.pool, async db => {
       await db.query(`UPDATE retrieval_outbox o SET available_at=clock_timestamp()
         FROM unnest($1::text[],$2::text[]) AS j(job_id,lease)
@@ -854,7 +895,7 @@ export class PostgresRetrievalWorker {
       await db.query(`UPDATE retrieval_dispatch_checkpoint SET after_space_id=$3,after_collection_id=$4
         WHERE after_space_id IS NOT DISTINCT FROM $1 AND after_collection_id IS NOT DISTINCT FROM $2`,
       [cursor.stored?.[0] ?? null, cursor.stored?.[1] ?? null, to?.[0] ?? null, to?.[1] ?? null]);
-    });
+    }, cleanup(until));
   }
 
   /**

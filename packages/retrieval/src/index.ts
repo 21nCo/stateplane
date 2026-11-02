@@ -254,8 +254,9 @@ export function chunkText(text: string, field: string | null, size = CHUNK_CODE_
 /** The parts of a retrieval policy that decide what is projected. */
 export interface ContentPolicy { recordFields: readonly string[]; sourceContent: boolean; claimStatements: boolean }
 
-/** Resolve an RFC 6901 JSON Pointer; undefined when any step is missing. */
+/** Resolve an RFC 6901 JSON Pointer; undefined when any step is missing or the pointer is malformed. */
 export function pointer(document: unknown, path: string): unknown {
+  if (path !== '' && !path.startsWith('/')) return undefined;
   let current = document;
   for (const raw of path.split('/').slice(1)) {
     const token = raw.replaceAll('~1', '/').replaceAll('~0', '~');

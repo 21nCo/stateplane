@@ -39,6 +39,7 @@ test('only configured record fields, source content and claim statements are chu
   assert.equal(pointer({ list: ['x', 'y'] }, '/list/1'), 'y');
   assert.equal(pointer({ list: ['x'] }, '/list/01'), undefined);
   assert.equal(pointer({ constructor: 1 }, '/toString'), undefined, 'inherited properties are not fields');
+  assert.equal(pointer({ title: 'x' }, 'title'), undefined, 'a pointer without its leading slash is malformed');
 });
 
 test('the registry selects only allowed regions, then by limits, quality and cost, and resolves exact identities', () => {

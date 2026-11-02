@@ -92,24 +92,26 @@ export class DeadlineExceededError extends Error {}
 /** What a transaction body gets: one query at a time, as `pg.PoolClient#query` takes them. */
 export interface Session { query(sql: string, values?: unknown[]): Promise<pg.QueryResult> }
 
+/** A transaction's budget: it ends at `deadline` (epoch ms) or when `signal` aborts, whichever is first. */
+export interface Limit { deadline: number; signal?: AbortSignal }
+
 /**
  * Run one short cell transaction; a missing COMMIT acknowledgement stays
- * ambiguous. With `limit`, the body's session refuses a statement once the
- * deadline passes or the signal aborts, and bounds each statement by the
- * time left when it starts (`statement_timeout`, lowered again whenever the
- * time left falls more than `STATEMENT_SLACK_MS` below it). On the deadline
- * or an abort it stops waiting for the statement in flight, cancels it from
- * another session and discards this one, so the transaction's locks go
- * then, or at the latest when that statement's own bound ends it. Checking
- * the session out is bounded too, and BEGIN is not sent after the budget
- * ends. COMMIT is never sent once the budget ends. Each of these rolls back as a
- * `DeadlineExceededError`.
+ * ambiguous. With `limit`, every statement of the transaction, from BEGIN
+ * to COMMIT or ROLLBACK, is sent only before the budget ends and awaited
+ * only until it does, and the body's statements are each bounded by the
+ * time left when they start (`statement_timeout`, lowered again whenever
+ * the time left falls more than `STATEMENT_SLACK_MS` below it). Checking the
+ * session out is bounded too. When the budget ends, the statement in flight
+ * is abandoned and cancelled from another session and this session is
+ * discarded, so the transaction's locks go then, or at the latest when that
+ * statement's own bound ends it. A transaction cut short before COMMIT rolls
+ * back as a `DeadlineExceededError`; one cut short while COMMIT is in
+ * flight is a `CommitOutcomeUnknownError`.
  */
 export async function inTransaction<T>(pool: PoolLike, fn: (db: pg.PoolClient) => Promise<T>): Promise<T>;
-export async function inTransaction<T>(pool: PoolLike, fn: (db: Session) => Promise<T>,
-  limit: { deadline: number; signal?: AbortSignal }): Promise<T>;
-export async function inTransaction<T>(pool: PoolLike, fn: (db: never) => Promise<T>,
-  limit?: { deadline: number; signal?: AbortSignal }): Promise<T> {
+export async function inTransaction<T>(pool: PoolLike, fn: (db: Session) => Promise<T>, limit: Limit): Promise<T>;
+export async function inTransaction<T>(pool: PoolLike, fn: (db: never) => Promise<T>, limit?: Limit): Promise<T> {
   const ended = () => limit !== undefined && (Date.now() >= limit.deadline || limit.signal?.aborted === true);
   if (ended()) throw new DeadlineExceededError('The time budget ended before the transaction');
   const client = limit ? await checkout(pool, limit) : await pool.connect();
@@ -117,7 +119,7 @@ export async function inTransaction<T>(pool: PoolLike, fn: (db: never) => Promis
   let begun = false;
   // An unacknowledged BEGIN or COMMIT leaves the session state unknown.
   let discard = true;
-  // The body's statement in flight was abandoned at the budget's end; the session is discarded unread.
+  // The budget ended: a statement in flight then was abandoned, and the session is discarded unread.
   let cut = false;
   // The pool detaches its listener on checkout; a server-ended session must
   // fail this transaction, not the process.
@@ -133,18 +135,19 @@ export async function inTransaction<T>(pool: PoolLike, fn: (db: never) => Promis
   const timer = limit ? setTimeout(expire, Math.max(0, limit.deadline - Date.now())) : undefined;
   limit?.signal?.addEventListener('abort', expire, { once: true });
   const guarded = async (sql: string, values?: unknown[]) => {
-    if (cut || ended()) throw new DeadlineExceededError('The time budget ended during the transaction');
     const remaining = limit!.deadline - Date.now();
     if (remaining < statementMs - STATEMENT_SLACK_MS) {
       statementMs = Math.max(1, remaining);
       await run(`SET LOCAL statement_timeout = '${statementMs}ms'`);
-      if (ended()) throw new DeadlineExceededError('The time budget ended during the transaction');
     }
     return run(sql, values);
   };
   // This session's backend and transaction, read at BEGIN when the transaction is bounded.
   let backend: { pid: number; began: string } | undefined;
+  // Every statement; bounded, none is sent once the budget ends, and one in flight then is abandoned.
   const run = async (sql: string, values?: unknown[]) => {
+    if (!limit) return client.query(sql, values);
+    if (cut || ended()) { cut = true; discard = true; throw new DeadlineExceededError('The time budget ended during the transaction'); }
     const pending = client.query(sql, values);
     pending.catch(() => {});
     try { return await Promise.race([pending, expired]); }
@@ -159,21 +162,22 @@ export async function inTransaction<T>(pool: PoolLike, fn: (db: never) => Promis
   // Unbounded, the body gets the client itself.
   const session = (limit ? { query: guarded } : client) as never;
   try {
-    await client.query('BEGIN'); begun = true; discard = false;
+    await run('BEGIN'); begun = true; discard = false;
     if (limit) {
       // SET LOCAL, and what a cancellation needs, in one round trip.
-      const row = (await client.query(`SELECT set_config('statement_timeout',$1,true),pg_backend_pid() AS pid,
+      const row = (await run(`SELECT set_config('statement_timeout',$1,true),pg_backend_pid() AS pid,
         now()::text AS began`, [`${statementMs}ms`])).rows[0];
       backend = { pid: Number(row.pid), began: row.began };
-    } else await client.query(`SET LOCAL statement_timeout = '${statementMs}ms'`);
+    } else await run(`SET LOCAL statement_timeout = '${statementMs}ms'`);
     const result = await fn(session);
     if (cut || ended()) throw new DeadlineExceededError('The time budget ended before COMMIT');
-    try { await client.query('COMMIT'); begun = false; }
+    try { await run('COMMIT'); begun = false; }
     catch (error) { discard = true; begun = false; throw new CommitOutcomeUnknownError(error); }
     return result;
   } catch (error) {
     if (clientReadTimedOut(error) || cut) discard = true;
-    else if (begun) await client.query('ROLLBACK').catch(() => { discard = true; });
+    // Bounded, a ROLLBACK is not sent after the budget ends, and one in flight then discards the session.
+    else if (begun) await run('ROLLBACK').catch(() => { discard = true; });
     // A statement cut short by the deadline, not by its own bound, is the budget's end.
     if (!(error instanceof DeadlineExceededError) && limit && statementMs < STATEMENT_MS
       && (error as { code?: unknown })?.code === '57014')
@@ -190,7 +194,7 @@ export async function inTransaction<T>(pool: PoolLike, fn: (db: never) => Promis
  * Check a session out within the budget. One that arrives after the deadline
  * or the abort goes straight back to the pool, unused.
  */
-async function checkout(pool: PoolLike, limit: { deadline: number; signal?: AbortSignal }): Promise<pg.PoolClient> {
+async function checkout(pool: PoolLike, limit: Limit): Promise<pg.PoolClient> {
   let late = false;
   const connecting = pool.connect();
   connecting.then(client => { if (late) client.release(); }, () => {});

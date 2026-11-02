@@ -5,7 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
-import { PostgresAuthority, PostgresOutbox, PostgresRetrievalWorker, RecordRetrievalProjector } from '../../packages/postgres/dist/index.js';
+import { CommitOutcomeUnknownError, PostgresAuthority, PostgresOutbox, PostgresRetrievalWorker, RecordRetrievalProjector } from '../../packages/postgres/dist/index.js';
 import { DeterministicEmbedder, EmbedderUnavailableError, EmbeddingRegistry } from '../../packages/retrieval/dist/index.js';
 import { consume, dispatch } from '../../packages/workers/dist/index.js';
 import { DeadlineExceededError, diagnostic, inTransaction } from '../../packages/postgres/dist/faults.js';
@@ -90,6 +90,32 @@ async function waitingOnLock(text, count = 1) {
   }
 }
 const identity = spy => [spy.profile.embedder, spy.profile.model, spy.profile.modelVersion, spy.profile.dimensions];
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+/**
+ * Sessions of `base` whose statements matching `match` reply `ms` late (the
+ * statement itself runs at once); every statement sent is logged with its
+ * time, and every release with whether the session was discarded.
+ */
+function stalling(match, ms, base = pool) {
+  const log = [];
+  const released = [];
+  return { log, released, connect: async () => {
+    const client = await base.connect();
+    const { query, release } = client;
+    client.query = async function (sql, ...rest) {
+      log.push({ at: Date.now(), sql });
+      const result = await query.call(this, sql, ...rest);
+      if (typeof sql === 'string' && match.test(sql)) await sleep(ms);
+      return result;
+    };
+    client.release = function (...args) {
+      released.push(args[0] === true || args[0] instanceof Error);
+      client.query = query; client.release = release;
+      return release.apply(this, args);
+    };
+    return client;
+  } };
+}
 
 async function space() {
   await pool.query("UPDATE projection_outbox SET delivery_state='delivered',available_at=clock_timestamp() WHERE delivery_state<>'delivered'");
@@ -269,7 +295,7 @@ test('reordered, duplicate and deleted record deliveries cannot activate stale c
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await assert.rejects(projector.apply({ ref: created.ref, revision: 2, generation: 1, deleted: false,
+    await assert.rejects(projector.apply({ ref: { spaceId, collectionId: 'alpha', ...created.ref }, revision: 2, generation: 1, deleted: false,
       canonicalData: '{"title":"second draft"}' }, undefined, (sql, values) => client.query(sql, values)), { code: 'PROJECTION_INCOMPLETE' });
     await client.query('COMMIT');
   } finally { client.release(); }
@@ -765,6 +791,35 @@ test('a suspension or deletion committed during preparation stops further calls 
   assert.equal(spy.inTransaction.length, 1, 'no call after the deletion committed');
   const source = await projected(second.spaceId, 'source', 'src_1');
   assert.deepEqual([source.vector, source.checkpoints], [[], 0]);
+
+  // A placement fence during the first batch: the attempt saves and calls nothing more and is released uncounted;
+  // the next attempt runs under the new placement and applies.
+  const third = await space();
+  const fence = () => pool.query('UPDATE spaces SET placement_generation=placement_generation+1 WHERE space_id=$1', [third.spaceId]);
+  const fenced = new Spy({ maxBatch: 1 }, { before: async call => { if (call === 1) await fence(); } });
+  await policy(third.spaceId, 1, { claimStatements: false });
+  await generation(third.spaceId, 1, 1, identity(fenced));
+  await evidence(third.spaceId, { extraction: words });
+  const step = await new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([fenced]) }).step();
+  assert.deepEqual([step.released, step.applied, step.retried], [1, 2, 0], JSON.stringify(step));
+  const placed = await projected(third.spaceId, 'source', 'src_1');
+  const chunks = new Set(fenced.inputs).size;
+  assert.ok(chunks > 1 && placed.vector.length === chunks, `${placed.vector.length} of ${chunks} chunks`);
+  assert.equal(fenced.inputs.length, chunks + 1, 'one call under the fenced placement, its result never saved');
+  const [moved] = await work(third.spaceId);
+  assert.deepEqual([moved.delivery_state, moved.attempts, moved.last_error], ['delivered', 2, null]);
+
+  // The same on a record delivery: no call after the fence, and completion releases it.
+  const fourth = await space();
+  const recordSpy = new Spy({ maxBatch: 1 }, { before: async call => {
+    if (call === 1) await pool.query('UPDATE spaces SET placement_generation=placement_generation+1 WHERE space_id=$1', [fourth.spaceId]);
+  } });
+  await policy(fourth.spaceId, 1);
+  await generation(fourth.spaceId, 1, 1, identity(recordSpy));
+  await write(fourth.scope, 'create', JSON.stringify({ title: words }));
+  assert.deepEqual(await deliver(await hints(), new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([recordSpy]) })),
+    ['released']);
+  assert.equal(recordSpy.inTransaction.length, 1, 'no call after the placement fence committed');
 });
 
 test('erasure that begins while an item is prepared succeeds, and the preparation writes nothing after it', async () => {
@@ -1045,7 +1100,105 @@ test('a bounded transaction issues nothing after its deadline, and an abort or d
   assert.ok(Date.now() - started < 200, `${Date.now() - started} ms`);
   await new Promise(resolve => setTimeout(resolve, 400));
   assert.deepEqual([log.map(entry => entry.sql), returned], [[], 1], 'no BEGIN; the late session went back');
+
+  // A slow reply to BEGIN or to the setup is abandoned at the deadline, nothing more is sent, and the session is discarded.
+  for (const [label, match] of [['BEGIN', /^BEGIN$/], ['setup', /set_config/]]) {
+    const slowly = stalling(match, 400);
+    started = Date.now();
+    await assert.rejects(inTransaction(slowly, db => db.query('INSERT INTO deadline_probe VALUES(1)'), { deadline: started + 80 }),
+      DeadlineExceededError, label);
+    assert.ok(Date.now() - started < 250, `${label}: ${Date.now() - started} ms`);
+    await sleep(450);
+    assert.deepEqual(slowly.log.filter(entry => entry.at >= started + 80).map(entry => entry.sql), [], `${label}: nothing after the deadline`);
+    assert.deepEqual(slowly.released, [true], `${label}: the session was discarded`);
+  }
+  // A COMMIT whose reply the deadline cuts short has an unknown outcome.
+  const committing = stalling(/^COMMIT$/, 400);
+  started = Date.now();
+  await assert.rejects(inTransaction(committing, db => db.query('SELECT 1'), { deadline: started + 150 }),
+    error => error instanceof CommitOutcomeUnknownError && error.cause instanceof DeadlineExceededError);
+  assert.ok(Date.now() - started < 300, `COMMIT: ${Date.now() - started} ms`);
+  // The first release is the transaction's; a later one is the cancellation's own session.
+  assert.equal(committing.released[0], true);
+  // A ROLLBACK after the body's own error is abandoned at the deadline, and after it is not sent at all.
+  const rolling = stalling(/^ROLLBACK$/, 400);
+  started = Date.now();
+  await assert.rejects(inTransaction(rolling, async db => { await db.query('SELECT 1'); throw new Error('own'); },
+    { deadline: started + 150 }), /own/);
+  assert.ok(Date.now() - started < 300, `ROLLBACK: ${Date.now() - started} ms`);
+  const after = stalling(/^$/, 0);
+  started = Date.now();
+  await assert.rejects(inTransaction(after, async db => { await db.query('SELECT 1'); await sleep(150); throw new Error('own'); },
+    { deadline: started + 80 }), /own/);
+  assert.deepEqual([rolling.released[0], after.released, after.log.some(entry => entry.sql === 'ROLLBACK')], [true, [true], false]);
   await pool.query('DROP TABLE deadline_probe');
+});
+
+test('preparation\'s transactions end with its budget: a stalled plan on a one-session pool writes nothing after the deadline', async () => {
+  const { spaceId, collectionId, scope } = await space();
+  const spy = new Spy();
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(spy));
+  const created = await write(scope, 'create', '{"title":"Stalled plan"}');
+  const single = new pg.Pool({ connectionString: target.toString(), max: 1 });
+  try {
+    // The plan's first read of the Ref sleeps on the server, holding the only session, the scope and generation locks.
+    let armed = true;
+    const stalled = { connect: async () => {
+      const client = await single.connect();
+      const { query, release } = client;
+      client.query = async function (sql, ...rest) {
+        if (armed && typeof sql === 'string' && sql.includes('FROM projection_refs WHERE') && sql.includes('FOR SHARE')) {
+          armed = false;
+          await query.call(this, 'SELECT pg_sleep(1.5)');
+        }
+        return query.call(this, sql, ...rest);
+      };
+      client.release = function (...args) { client.query = query; client.release = release; return release.apply(this, args); };
+      return client;
+    } };
+    const writes = [];
+    const monitored = { connect: async () => {
+      const client = await stalled.connect();
+      const { query } = client;
+      client.query = function (sql, ...rest) { writes.push({ at: Date.now(), sql }); return query.call(this, sql, ...rest); };
+      return client;
+    } };
+    const change = { ref: { spaceId, collectionId, kind: 'record', id: created.ref.id }, revision: 1, generation: 1, deleted: false,
+      canonicalData: '{"title":"Stalled plan"}' };
+    const deadline = Date.now() + 400;
+    const projector = new RecordRetrievalProjector(monitored, { embedders: new EmbeddingRegistry([spy]), prepareMs: 50 });
+    await assert.rejects(projector.prepare(change, AbortSignal.timeout(400), deadline), error => error.code === 'EMBEDDER_UNAVAILABLE');
+    assert.equal(armed, false);
+    assert.ok(Date.now() < deadline, 'settled within the delivery\'s budget');
+    // The stalled session was cancelled and discarded: the only session is free at once.
+    const freed = Date.now();
+    (await single.connect()).release();
+    assert.ok(Date.now() - freed < 300, `${Date.now() - freed} ms for the pool's session`);
+    await sleep(1_600);
+    assert.deepEqual(writes.filter(entry => entry.at >= deadline && !entry.sql.includes('pg_cancel_backend')).map(entry => entry.sql), [],
+      'no statement after the delivery\'s deadline');
+    assert.equal(spy.inTransaction.length, 0, 'no call');
+  } finally { await single.end(); }
+});
+
+test('a step whose claim, start or settling stalls returns within its budget and the cleanup bound', async () => {
+  const budgetMs = 1_500;
+  for (const [label, match, bound] of [['claim', /FOR UPDATE SKIP LOCKED/, budgetMs], ['start', /attempts=attempts\+1/, budgetMs + 1_000],
+    ['settle', /last_error=COALESCE/, budgetMs + 1_000]]) {
+    const { spaceId } = await space();
+    const down = new Spy({}, { down: true });
+    await policy(spaceId, 1, { claimStatements: false, lexical: false });
+    await generation(spaceId, 1, 1, identity(down));
+    await evidence(spaceId);
+    const slowly = stalling(match, 4_000);
+    const started = Date.now();
+    await new PostgresRetrievalWorker(slowly, { embedders: new EmbeddingRegistry([down]) }).step({ budgetMs, limit: 1 });
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < bound + 400, `${label}: the step took ${elapsed} ms`);
+    assert.ok(slowly.released.includes(true), `${label}: the stalled session was discarded`);
+  }
+  await sleep(4_100);
 });
 
 test('a record fallback apply whose delivery aborts commits nothing, frees its locks and reports the outage', async () => {

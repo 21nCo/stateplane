@@ -161,7 +161,7 @@ describe('cell jobs Worker', () => {
     } finally { cell.uploadError = undefined; cell.reconcileError = undefined; }
   });
 
-  it('projects source and claim work after the other steps within 10 s and reports a failed claim with the tick', async () => {
+  it('projects source and claim work within 10 s and reports a failed claim with the tick', async () => {
     cell.claims = []; cell.retrievalSteps = []; cell.sweeps = [];
     await jobs.scheduled({} as never, jobsEnv());
     expect([cell.sweeps.length, cell.retrievalSteps]).toEqual([1, [{ budgetMs: 10_000 }]]);
