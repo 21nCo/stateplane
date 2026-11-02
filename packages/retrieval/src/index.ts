@@ -147,13 +147,20 @@ function wait(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-/** Call one batch, retrying only an outage, and check the answer's shape. */
+/**
+ * Call one batch, retrying only an outage, and check the answer's shape.
+ * `admit` runs before every call, including each retry, and stops the batch
+ * by throwing: the caller rechecks there that content may still be sent to
+ * this embedder (for example its processing region), outside any transaction.
+ */
 export async function embedBatch(embedder: Embedder, texts: readonly string[], signal: AbortSignal,
-  delays: readonly number[] = EMBED_RETRY_DELAYS_MS): Promise<number[][]> {
+  delays: readonly number[] = EMBED_RETRY_DELAYS_MS, admit?: () => Promise<void>): Promise<number[][]> {
   const { maxBatch, maxInputCodePoints, dimensions } = embedder.profile;
   if (texts.length < 1 || texts.length > maxBatch || texts.some(text => codePoints(text).length > maxInputCodePoints))
     throw new RangeError('Embedding batch exceeds the embedder limits');
   for (let attempt = 0; ; attempt++) {
+    if (signal.aborted) throw new EmbedderUnavailableError('Embedding time budget exhausted', { cause: signal.reason });
+    await admit?.();
     if (signal.aborted) throw new EmbedderUnavailableError('Embedding time budget exhausted', { cause: signal.reason });
     let vectors: unknown;
     try { vectors = await embedder.embed(texts, signal); }
@@ -172,6 +179,16 @@ export async function embedBatch(embedder: Embedder, texts: readonly string[], s
 
 /** Split a string into code points, the unit every projection offset uses. */
 export function codePoints(text: string): string[] { return Array.from(text); }
+
+/**
+ * A code point PostgreSQL text can store: U+0000 and an unpaired surrogate
+ * (both valid in a record's JSON string) become U+FFFD, one code point for
+ * one, so offsets stay those of the authoritative text.
+ */
+const storable = (point: string) => {
+  const code = point.codePointAt(0)!;
+  return code === 0 || (code >= 0xd800 && code <= 0xdfff) ? '\uFFFD' : point;
+};
 
 /**
  * Initial chunk bounds, not measured relevance settings (STA-49 evaluates
@@ -195,12 +212,13 @@ export interface TextChunk {
  * Chunk one text by code points. A chunk ends at the last whitespace in its
  * second half when there is one, so words stay whole, and the next chunk
  * starts `overlap` code points before that end. Whitespace-only text has no
- * chunks.
+ * chunks. Chunk content holds U+FFFD for each U+0000 or unpaired surrogate,
+ * so every text authority accepts has a storable projection.
  */
 export function chunkText(text: string, field: string | null, size = CHUNK_CODE_POINTS, overlap = CHUNK_OVERLAP): TextChunk[] {
   if (!Number.isSafeInteger(size) || size < 2 || !Number.isSafeInteger(overlap) || overlap < 0 || overlap >= size / 2)
     throw new RangeError('Invalid chunk bounds');
-  const points = codePoints(text);
+  const points = codePoints(text).map(storable);
   const chunks: TextChunk[] = [];
   let start = 0;
   while (start < points.length) {

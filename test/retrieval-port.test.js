@@ -23,6 +23,8 @@ test('chunks keep code-point offsets exact, cut at whitespace and overlap', () =
   }
   assert.equal(chunks.at(-1).end, points.length, 'the astral character counts as one code point');
   assert.deepEqual(chunkText('   ', null), []);
+  // U+0000 and an unpaired surrogate, which PostgreSQL text cannot hold, become U+FFFD one for one.
+  assert.deepEqual(chunkText('a\u0000b \ud800c\u{1F600}', null), [{ field: null, start: 0, end: 7, content: 'a\uFFFDb \uFFFDc\u{1F600}' }]);
   assert.throws(() => chunkText('x', null, 10, 5), RangeError);
 });
 
@@ -78,6 +80,18 @@ test('a batch retries an outage within bounds and rejects malformed vectors as t
     await assert.rejects(embedBatch({ profile: local.profile, embed: async () => answer }, ['a'], never), EmbeddingRejectedError);
   }
   await assert.rejects(embedBatch(local, ['a', 'b', 'c'], never), RangeError);
+
+  // `admit` runs before every call, retries included; once it throws, nothing more is sent.
+  calls = 0;
+  const admitted = [];
+  const narrowed = new Error('region no longer allowed');
+  const admit = async () => { admitted.push(calls); if (calls === 1) throw narrowed; };
+  await assert.rejects(embedBatch(down, ['a'], never, [1, 1], admit), error => error === narrowed);
+  assert.deepEqual([calls, admitted], [1, [0, 1]]);
+  calls = 0;
+  admitted.length = 0;
+  assert.equal((await embedBatch(flaky, ['a'], never, [1, 1], async () => { admitted.push(calls); })).length, 1);
+  assert.deepEqual(admitted, [0, 1, 2], 'checked before the first call and before each retry');
 });
 
 test('the deterministic embedder is stable, normalized and closer for shared words', async () => {

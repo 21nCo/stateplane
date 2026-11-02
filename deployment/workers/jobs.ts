@@ -46,8 +46,9 @@ function cell(env: Env, originals = false) {
   const outbox = new PostgresOutbox(pool, new PostgresAuthority(pool, 1));
   const uploads = originals ? new SourceUploadReconciler({ pool, originals: new R2BlobStore(env.ORIGINALS) }) : undefined;
   // No embedding provider is qualified for a cell yet (its processing region
-  // must be verified first), so the registry is empty: lexical projections
-  // apply, and vector generations stay pending and report degraded.
+  // must be verified first), so the registry is empty: generations without
+  // vectors apply, and each vector generation keeps its previous state with
+  // its work due and reported degraded, never holding back the others.
   const projector = new RecordRetrievalProjector(pool);
   const retrieval = new PostgresRetrievalWorker(pool);
   return { outbox, uploads, projector, retrieval, close: () => pool.end() };
