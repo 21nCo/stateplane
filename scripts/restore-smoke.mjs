@@ -167,6 +167,8 @@ try {
       content_sha256,embedder,embedding_model,model_version,dimensions,processing_region,embedding)
       VALUES($1,$2,1,'claim','clm_restore',1,0,$3,'local-test','hash-embedder','1',384,'apac',$4::vector)`,
     [spaceId,collectionId,'f'.repeat(64),embedding(2)]);
+    await projection.query(`INSERT INTO projection_refs(space_id,collection_id,generation,ref_kind,ref_id,revision,deleted)
+      VALUES($1,$2,1,'source','src_restore_deleted',1,true)`,[spaceId,collectionId]);
     await projection.query(`INSERT INTO projection_deletion_receipts(space_id,collection_id,generation,ref_kind,ref_id,revision,chunks_removed)
       VALUES($1,$2,1,'source','src_restore_deleted',1,0)`,[spaceId,collectionId]);
     await projection.query('COMMIT');
@@ -237,9 +239,9 @@ try {
   assert.deepEqual(expected.lexical_chunks.map(row=>JSON.parse(row).tsv),["'two':1"]);
   await assert.rejects(restored.query(`UPDATE projection_refs SET revision=1 WHERE space_id=$1`,[spaceId]),
     error=>error.code==='23514'&&error.constraint==='projection_refs_order');
-  await assert.rejects(restored.query(`INSERT INTO projection_refs(space_id,collection_id,generation,ref_kind,ref_id,revision,extraction_version)
-    VALUES($1,$2,1,'source','src_restore_deleted',1,1)`,[spaceId,collectionId]),
-  error=>error.code==='23514'&&error.constraint==='projection_refs_deleted');
+  await assert.rejects(restored.query(`UPDATE projection_refs SET deleted=false,extraction_version=1
+    WHERE space_id=$1 AND ref_id='src_restore_deleted'`,[spaceId]),
+  error=>error.code==='23514'&&error.constraint==='projection_refs_order');
   assert.equal((await restored.query(`SELECT count(*)::int AS n FROM pg_indexes WHERE tablename='vector_chunks'
     AND indexname IN (SELECT index_name FROM vector_index_strategies WHERE method='hnsw')`)).rows[0].n,4);
   const restoredAuthority=new PostgresAuthority(restored,3600);

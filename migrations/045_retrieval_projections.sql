@@ -4,10 +4,14 @@
 -- canonical Ref, authoritative revision and generation it was built from, so a
 -- result is always reread and reauthorized at authority before it is returned.
 --
--- Take the locks this step needs up front, in writers' order. The new tables
--- are empty; the backfill below reads only evidence tables. The migrator
--- bounds the wait.
-LOCK TABLE collections, records, entity_refs, extraction_versions, claim_revisions IN SHARE ROW EXCLUSIVE MODE;
+-- Take the locks this step needs up front. Claim revise and review insert a
+-- claim revision before they advance its `entity_refs` row, so
+-- `claim_revisions` is locked first; a claim create writes the other way
+-- round, and if PostgreSQL resolves that cycle by aborting this step the
+-- migrator reports it as a retry, like a lock wait timeout. The new tables
+-- are empty; the backfill below reads only evidence tables, while writers to
+-- them wait (docs/retrieval-projections.md#upgrade-restore-and-grants).
+LOCK TABLE collections, records, claim_revisions, entity_refs, extraction_versions IN SHARE ROW EXCLUSIVE MODE;
 
 -- Rows of these tables are facts: never changed, and removed only by the
 -- table owner inside the scoped erasure routine for the space being erased.
@@ -243,9 +247,14 @@ CREATE TRIGGER projection_refs_no_truncate BEFORE TRUNCATE ON projection_refs
   FOR EACH STATEMENT EXECUTE FUNCTION reject_retrieval_fact_change();
 
 -- A Ref removed from a generation, recorded after its chunks are gone and its
--- authoritative Ref is deleted. The receipt is final: the Ref cannot become
--- live again in that generation. It says nothing about other generations,
--- authority rows, original bytes or backups.
+-- authoritative Ref is deleted. The receipt references the Ref's deleted
+-- `projection_refs` row at the same revision. That row is the one fence a
+-- receipt and an apply share: deleting the Ref is a write to it (an apply
+-- with an older snapshot then fails with a serialization error or the order
+-- check), a deleted row never changes again and its key admits no live row,
+-- so the receipt is final in that generation under every isolation level. It
+-- says nothing about other generations, authority rows, original bytes or
+-- backups.
 CREATE TABLE projection_deletion_receipts (
   space_id text NOT NULL,
   collection_id text NOT NULL,
@@ -253,29 +262,30 @@ CREATE TABLE projection_deletion_receipts (
   ref_kind text NOT NULL CHECK (ref_kind IN ('record', 'source', 'claim')),
   ref_id text NOT NULL CHECK (char_length(ref_id) > 0),
   revision bigint NOT NULL CHECK (revision > 0),
+  live boolean NOT NULL GENERATED ALWAYS AS (false) STORED,
   chunks_removed integer NOT NULL CHECK (chunks_removed >= 0),
   recorded_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   PRIMARY KEY (space_id, collection_id, generation, ref_kind, ref_id),
   FOREIGN KEY (space_id, collection_id, generation)
-    REFERENCES projection_generations(space_id, collection_id, generation)
+    REFERENCES projection_generations(space_id, collection_id, generation),
+  CONSTRAINT projection_deletion_receipts_deleted_ref FOREIGN KEY (space_id, collection_id, generation, ref_kind, ref_id, revision, live)
+    REFERENCES projection_refs(space_id, collection_id, generation, ref_kind, ref_id, revision, live)
 );
 CREATE TRIGGER projection_deletion_receipts_immutable BEFORE UPDATE OR DELETE ON projection_deletion_receipts
   FOR EACH ROW EXECUTE FUNCTION reject_retrieval_fact_change();
 CREATE TRIGGER projection_deletion_receipts_no_truncate BEFORE TRUNCATE ON projection_deletion_receipts
   FOR EACH STATEMENT EXECUTE FUNCTION reject_retrieval_fact_change();
 
--- Ref states and deletion receipts of one Ref in one generation serialize on
--- a transaction lock, so a concurrent apply and deletion cannot both commit.
 -- Nothing is written to a retired generation; the generation row is share
--- locked, so retiring waits for writers already in it.
+-- locked, so retiring waits for writers already in it. A receipt also needs
+-- the authoritative Ref deleted; its foreign key needs the projected Ref
+-- deleted at the receipt's revision.
 CREATE FUNCTION stateplane_guard_projection_ref() RETURNS trigger LANGUAGE plpgsql
 SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   generation_state text;
 BEGIN
-  PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(pg_catalog.concat_ws(chr(31), 'stateplane:projection-ref',
-    NEW.space_id, NEW.collection_id, NEW.generation::text, NEW.ref_kind, NEW.ref_id), 0));
   SELECT g.state INTO generation_state FROM public.projection_generations g WHERE g.space_id = NEW.space_id
     AND g.collection_id = NEW.collection_id AND g.generation = NEW.generation FOR SHARE;
   IF generation_state = 'retired' THEN
@@ -283,11 +293,6 @@ BEGIN
       USING ERRCODE = 'check_violation', CONSTRAINT = 'projection_generations_retired';
   END IF;
   IF TG_TABLE_NAME = 'projection_deletion_receipts' THEN
-    IF EXISTS (SELECT 1 FROM public.projection_refs r WHERE r.space_id = NEW.space_id AND r.collection_id = NEW.collection_id
-        AND r.generation = NEW.generation AND r.ref_kind = NEW.ref_kind AND r.ref_id = NEW.ref_id AND r.live) THEN
-      RAISE EXCEPTION 'a live projected Ref has no deletion receipt'
-        USING ERRCODE = 'check_violation', CONSTRAINT = 'projection_deletion_receipts_live';
-    END IF;
     IF NOT EXISTS (SELECT 1 FROM public.records r WHERE NEW.ref_kind = 'record' AND r.space_id = NEW.space_id
           AND r.collection_id = NEW.collection_id AND r.record_id = NEW.ref_id AND r.tombstone)
         AND NOT EXISTS (SELECT 1 FROM public.entity_refs e WHERE e.space_id = NEW.space_id AND e.collection_id = NEW.collection_id
@@ -296,13 +301,6 @@ BEGIN
         USING ERRCODE = 'check_violation', CONSTRAINT = 'projection_deletion_receipts_authority';
     END IF;
     RETURN NEW;
-  END IF;
-  -- Generated columns are not yet computed in NEW, so `live` is read as `NOT deleted`.
-  IF NOT NEW.deleted AND EXISTS (SELECT 1 FROM public.projection_deletion_receipts d WHERE d.space_id = NEW.space_id
-      AND d.collection_id = NEW.collection_id AND d.generation = NEW.generation AND d.ref_kind = NEW.ref_kind
-      AND d.ref_id = NEW.ref_id) THEN
-    RAISE EXCEPTION 'a Ref with a deletion receipt cannot be projected again in generation %', NEW.generation
-      USING ERRCODE = 'check_violation', CONSTRAINT = 'projection_refs_deleted';
   END IF;
   IF TG_OP = 'UPDATE' THEN
     IF (NEW.space_id, NEW.collection_id, NEW.generation, NEW.ref_kind, NEW.ref_id)

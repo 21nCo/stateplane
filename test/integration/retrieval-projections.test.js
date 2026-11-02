@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { memoryAdapter } from '@superfunctions/db/testing';
@@ -358,24 +358,133 @@ test('a projected Ref only moves forward, and a deletion receipt keeps a deleted
   await assert.rejects(advance(1, 1), check('projection_refs_order'), 'an older extraction never replaces a newer one');
   await assert.rejects(pool.query(`DELETE FROM projection_refs WHERE space_id=$1`, [spaceId]), check('projection_refs_immutable'));
 
-  // A receipt needs the authoritative Ref deleted and no live projection of it.
-  const receipt = () => pool.query(`INSERT INTO projection_deletion_receipts(space_id,collection_id,generation,ref_kind,ref_id,revision,chunks_removed)
-    VALUES($1,'alpha',1,'source','src_1',1,1)`, [spaceId]);
-  await assert.rejects(receipt(), check('projection_deletion_receipts_live'));
-  await advance(1, 2, true);
+  // A receipt needs the authoritative Ref deleted and the projected Ref deleted at the receipt's revision.
+  const receipt = (kind = 'source', id = 'src_1', revision = 1) => pool.query(`INSERT INTO projection_deletion_receipts(space_id,collection_id,
+    generation,ref_kind,ref_id,revision,chunks_removed) VALUES($1,'alpha',1,$2,$3,$4,1)`, [spaceId, kind, id, revision]);
   await assert.rejects(receipt(), check('projection_deletion_receipts_authority'));
   await pool.query(`UPDATE entity_refs SET tombstone=true WHERE space_id=$1 AND kind='source' AND entity_id='src_1'`, [spaceId]);
+  await assert.rejects(receipt(), refused('23503', 'projection_deletion_receipts_deleted_ref'), 'a live projected Ref has no receipt');
+  await advance(1, 2, true);
   await receipt();
   await assert.rejects(advance(2, 2, true), check('projection_refs_order'), 'a deleted Ref stays deleted');
-  await assert.rejects(advance(2, 2), check('projection_refs_deleted'), 'and cannot become live again');
+  await assert.rejects(advance(2, 2), check('projection_refs_order'), 'and cannot become live again');
   await assert.rejects(pool.query(`UPDATE projection_deletion_receipts SET revision=2 WHERE space_id=$1`, [spaceId]),
     check('projection_deletion_receipts_immutable'));
-  // A rebuilt generation cannot project a Ref deleted before it was built either.
+  // A Ref deleted before a generation is built is recorded deleted in it, and then cannot be projected there.
   await pool.query(`UPDATE records SET tombstone=true,revision=2 WHERE space_id=$1 AND collection_id='alpha' AND record_id='rec_1'`, [spaceId]);
-  await pool.query(`INSERT INTO projection_deletion_receipts(space_id,collection_id,generation,ref_kind,ref_id,revision,chunks_removed)
-    VALUES($1,'alpha',1,'record','rec_1',2,0)`, [spaceId]);
-  await assert.rejects(projectRef(spaceId, 1, 'record', 'rec_1', 1), check('projection_refs_deleted'));
+  await pool.query(`INSERT INTO projection_refs(space_id,collection_id,generation,ref_kind,ref_id,revision,deleted)
+    VALUES($1,'alpha',1,'record','rec_1',2,true)`, [spaceId]);
+  await assert.rejects(receipt('record', 'rec_1', 1), refused('23503', 'projection_deletion_receipts_deleted_ref'),
+    'a receipt names the revision its Ref was deleted at');
+  await receipt('record', 'rec_1', 2);
+  await assert.rejects(projectRef(spaceId, 1, 'record', 'rec_1', 1), refused('23505', 'projection_refs_pkey'));
 });
+
+// Each scenario races a stale transaction against a committed one on one Ref of generation 1. `live` starts the Ref
+// projected at extraction 1 with a chunk; otherwise it is not projected yet. The source is already deleted at authority.
+const receiptOnly = async (db, spaceId) => db.query(`INSERT INTO projection_deletion_receipts(space_id,collection_id,generation,ref_kind,
+  ref_id,revision,chunks_removed) VALUES($1,'alpha',1,'source','src_1',1,0)`, [spaceId]);
+const fenceScenarios = [
+  // A receipt is never the only write: it needs the projected Ref's deleted row, which a concurrent apply also writes.
+  { name: 'an apply of a Ref new to its snapshot, after a receipt alone', live: false, committed: receiptOnly, committedRefusal: '23503',
+    stale: async (db, spaceId) => {
+      await projectRef(spaceId, 1, 'source', 'src_1', 1, 1, db);
+      await lexical(spaceId, 1, 'source', 'src_1', 1, { db });
+    },
+    refusal: { 'READ COMMITTED': null, 'REPEATABLE READ': null } },
+  { name: 'a receipt alone, after a committed apply of a Ref new to its snapshot', live: false,
+    committed: async (db, spaceId) => {
+      await projectRef(spaceId, 1, 'source', 'src_1', 1, 1, db);
+      await lexical(spaceId, 1, 'source', 'src_1', 1, { db });
+    },
+    stale: receiptOnly, refusal: { 'READ COMMITTED': '23503', 'REPEATABLE READ': '23503' } },
+  { name: 'an apply of a Ref new to its snapshot, after a committed receipt', live: false,
+    committed: async (db, spaceId) => {
+      await db.query(`INSERT INTO projection_refs(space_id,collection_id,generation,ref_kind,ref_id,revision,deleted)
+        VALUES($1,'alpha',1,'source','src_1',1,true)`, [spaceId]);
+      await db.query(`INSERT INTO projection_deletion_receipts(space_id,collection_id,generation,ref_kind,ref_id,revision,chunks_removed)
+        VALUES($1,'alpha',1,'source','src_1',1,0)`, [spaceId]);
+    },
+    stale: async (db, spaceId) => {
+      await projectRef(spaceId, 1, 'source', 'src_1', 1, 1, db);
+      await lexical(spaceId, 1, 'source', 'src_1', 1, { db });
+    },
+    refusal: { 'READ COMMITTED': '23505', 'REPEATABLE READ': '23505' } },
+  { name: 'an apply of a live Ref, after a committed deletion and receipt', live: true,
+    committed: async (db, spaceId) => {
+      await db.query(`DELETE FROM lexical_chunks WHERE space_id=$1`, [spaceId]);
+      await db.query(`UPDATE projection_refs SET deleted=true WHERE space_id=$1`, [spaceId]);
+      await db.query(`INSERT INTO projection_deletion_receipts(space_id,collection_id,generation,ref_kind,ref_id,revision,chunks_removed)
+        VALUES($1,'alpha',1,'source','src_1',1,1)`, [spaceId]);
+    },
+    stale: async (db, spaceId) => {
+      await db.query(`DELETE FROM lexical_chunks WHERE space_id=$1`, [spaceId]);
+      await db.query(`UPDATE projection_refs SET extraction_version=2 WHERE space_id=$1`, [spaceId]);
+      await lexical(spaceId, 1, 'source', 'src_1', 1, { extractionVersion: 2, db });
+    },
+    refusal: { 'READ COMMITTED': '23514', 'REPEATABLE READ': '40001' } },
+  { name: 'a receipt for a Ref new to its snapshot, after a committed apply', live: false,
+    committed: async (db, spaceId) => {
+      await projectRef(spaceId, 1, 'source', 'src_1', 1, 1, db);
+      await lexical(spaceId, 1, 'source', 'src_1', 1, { db });
+    },
+    stale: async (db, spaceId) => {
+      await db.query(`INSERT INTO projection_refs(space_id,collection_id,generation,ref_kind,ref_id,revision,deleted)
+        VALUES($1,'alpha',1,'source','src_1',1,true)`, [spaceId]);
+      await db.query(`INSERT INTO projection_deletion_receipts(space_id,collection_id,generation,ref_kind,ref_id,revision,chunks_removed)
+        VALUES($1,'alpha',1,'source','src_1',1,0)`, [spaceId]);
+    },
+    refusal: { 'READ COMMITTED': '23505', 'REPEATABLE READ': '23505' } },
+  // Under READ COMMITTED each statement sees the committed apply, so the deletion removes the newer chunk too and
+  // commits after it; under REPEATABLE READ the stale deletion is refused.
+  { name: 'a receipt for a live Ref, after a committed apply of a newer extraction', live: true,
+    committed: async (db, spaceId) => {
+      await db.query(`DELETE FROM lexical_chunks WHERE space_id=$1`, [spaceId]);
+      await db.query(`UPDATE projection_refs SET extraction_version=2 WHERE space_id=$1`, [spaceId]);
+      await lexical(spaceId, 1, 'source', 'src_1', 1, { extractionVersion: 2, db });
+    },
+    stale: async (db, spaceId) => {
+      await db.query(`DELETE FROM lexical_chunks WHERE space_id=$1`, [spaceId]);
+      await db.query(`UPDATE projection_refs SET deleted=true WHERE space_id=$1`, [spaceId]);
+      await db.query(`INSERT INTO projection_deletion_receipts(space_id,collection_id,generation,ref_kind,ref_id,revision,chunks_removed)
+        VALUES($1,'alpha',1,'source','src_1',1,1)`, [spaceId]);
+    },
+    refusal: { 'READ COMMITTED': null, 'REPEATABLE READ': '40001' } }];
+
+for (const isolation of ['READ COMMITTED', 'REPEATABLE READ']) for (const scenario of fenceScenarios) {
+  test(`under ${isolation}, ${scenario.name} cannot leave a live Ref beside a deletion receipt`, async () => {
+    const spaceId = await space();
+    await policy(spaceId, 'alpha', 1, { vector: false, regions: [] });
+    await generation(spaceId, 'alpha', 1, 1, null);
+    if (scenario.live) {
+      await projectRef(spaceId, 1, 'source', 'src_1', 1, 1);
+      await lexical(spaceId, 1, 'source', 'src_1', 1);
+    }
+    await pool.query(`UPDATE entity_refs SET tombstone=true WHERE space_id=$1 AND kind='source' AND entity_id='src_1'`, [spaceId]);
+    const stale = await pool.connect();
+    let outcome = null;
+    try {
+      await stale.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+      // The stale transaction's snapshot is taken before the other transaction commits.
+      await stale.query('SELECT count(*) FROM projection_refs WHERE space_id=$1', [spaceId]);
+      const committed = await inTransaction(db => scenario.committed(db, spaceId)).then(() => null, error => error.code);
+      assert.equal(committed, scenario.committedRefusal ?? null);
+      try {
+        await scenario.stale(stale, spaceId);
+        await stale.query('COMMIT');
+      } catch (error) {
+        outcome = error.code;
+        await stale.query('ROLLBACK');
+      }
+    } finally { stale.release(); }
+    assert.equal(outcome, scenario.refusal[isolation]);
+    const state = (await pool.query(`SELECT (SELECT bool_or(live) FROM projection_refs WHERE space_id=$1) AS live,
+        (SELECT count(*)::int FROM projection_deletion_receipts WHERE space_id=$1) AS receipts,
+        (SELECT count(*)::int FROM lexical_chunks WHERE space_id=$1) AS chunks`, [spaceId])).rows[0];
+    assert.equal(state.receipts, state.live ? 0 : 1, JSON.stringify(state));
+    assert.equal(state.chunks, state.live ? 1 : 0, JSON.stringify(state));
+  });
+}
 
 test('each recorded HNSW dimension has a partial expression index that a filtered nearest-neighbour query uses', async () => {
   const strategies = (await pool.query('SELECT dimensions,method,index_name,hnsw_m,hnsw_ef_construction FROM vector_index_strategies ORDER BY dimensions')).rows;
@@ -420,6 +529,29 @@ test('each recorded HNSW dimension has a partial expression index that a filtere
     await client.query('ROLLBACK TO SAVEPOINT wide');
     await client.query('ROLLBACK');
   } finally { client.release(); }
+
+  // A 3,072-dimension generation stores its embeddings beside the HNSW indexes and ranks them exactly.
+  const wide = await space();
+  const wideEmbedder = ['local-test', 'wide-embedder', '1', 3072];
+  await policy(wide, 'alpha', 1);
+  await generation(wide, 'alpha', 1, 1, wideEmbedder);
+  await inTransaction(async db => {
+    for (const [n, id] of ['rec_1', 'rec_w1', 'rec_w2'].entries()) {
+      if (n) await db.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+        VALUES($1,'alpha',$2,1,1,'generated',$2,'{}','{}'::jsonb)`, [wide, id]);
+      await projectRef(wide, 1, 'record', id, 1, null, db);
+      await vectorChunk(wide, 1, 'record', id, 1, { values: vector(3072, n + 40), model: wideEmbedder, db });
+    }
+  });
+  await assert.rejects(vectorChunk(wide, 1, 'record', 'rec_1', 1, { chunk: 1, values: vector(384), model: wideEmbedder }),
+    check('vector_chunks_dimensions'));
+  const exact = `SELECT ref_id, embedding <=> $2::vector AS distance FROM vector_chunks WHERE dimensions=3072 AND space_id=$1
+    AND collection_id='alpha' AND generation=1 ORDER BY embedding <=> $2::vector LIMIT 2`;
+  const ranked = (await pool.query(exact, [wide, vector(3072, 41)])).rows;
+  assert.equal(ranked[0].ref_id, 'rec_w1');
+  assert.ok(Math.abs(ranked[0].distance) < 1e-6 && ranked[1].distance > ranked[0].distance, JSON.stringify(ranked));
+  const widePlan = (await pool.query(`EXPLAIN ${exact}`, [wide, vector(3072, 41)])).rows.map(row => row['QUERY PLAN']).join('\n');
+  assert.doesNotMatch(widePlan, /hnsw/, 'no ANN index covers 3,072 dimensions');
 });
 
 const retrievalTables = ['retrieval_policies', 'projection_generations', 'projection_refs', 'projection_deletion_receipts', 'lexical_chunks',
@@ -435,6 +567,8 @@ async function populate(spaceId, db = pool) {
   await vectorChunk(spaceId, 1, 'record', 'rec_1', 1, { db });
   await vectorChunk(spaceId, 1, 'record', 'rec_1', 2, { table: 'embedding_checkpoints', db });
   await db.query(`UPDATE entity_refs SET tombstone=true WHERE space_id=$1 AND kind='claim' AND entity_id='clm_1'`, [spaceId]);
+  await db.query(`INSERT INTO projection_refs(space_id,collection_id,generation,ref_kind,ref_id,revision,deleted)
+    VALUES($1,'alpha',1,'claim','clm_1',1,true)`, [spaceId]);
   await db.query(`INSERT INTO projection_deletion_receipts(space_id,collection_id,generation,ref_kind,ref_id,revision,chunks_removed)
     VALUES($1,'alpha',1,'claim','clm_1',1,0)`, [spaceId]);
 }
@@ -486,6 +620,24 @@ test('a nonowner cell role writes projections and proves erasure only with the r
       try { return await fn(client); } finally { client.release(); }
     };
     await assert.rejects(asRole(db => policy(spaceId, 'alpha', 1, {}, db)), refused('42501'));
+    // Without any retrieval privilege, the role's evidence writes still enqueue their work through owner-rights triggers.
+    await assert.rejects(asRole(db => db.query('SELECT 1 FROM retrieval_outbox')), refused('42501'));
+    const cellSpaces = spacesFor(cellPool);
+    await postgresServices(cellSpaces, new Map([['cell-a', { pool: cellPool, cursorSecret: randomBytes(32) }]]), 3600)
+      .collections.define(actor, spaceId, 'gamma', definition('gamma'));
+    const sources = new PostgresSources(cellSpaces, new Map([['cell-a', { pool: cellPool, originals: new R2BlobStore(new MemoryR2()) }]]));
+    const claims = new PostgresClaims(cellSpaces, new Map([['cell-a', { pool: cellPool }]]));
+    const { sourceId } = await sources.ingestText(actor, spaceId, 'gamma', { idempotencyKey: 'src', text: 'The bridge opened in 1932.' });
+    await sources.extract(actor, spaceId, 'gamma', sourceId);
+    const { claimId } = await claims.create(actor, spaceId, 'gamma', { idempotencyKey: 'c1', statement: 'The bridge opened in 1932.',
+      attributedTo: 'city archive', evidence: [{ collectionId: 'gamma', sourceId, extractionVersion: 1, start: 4, end: 10 }] });
+    await claims.revise(actor, spaceId, 'gamma', claimId, { baseRevision: 1, statement: 'The bridge opened in 1933.', attributedTo: 'city archive' });
+    await claims.review(actor, spaceId, 'gamma', claimId, { baseRevision: 2, status: 'accepted' });
+    await claims.delete(actor, spaceId, 'gamma', claimId, { baseRevision: 3 });
+    await sources.delete(actor, spaceId, 'gamma', sourceId);
+    assert.deepEqual((await work(spaceId)).map(row => [row.ref_kind, row.revision, row.extraction_version, row.operation]), [
+      ['source', 1, 1, 'upsert'], ['claim', 1, null, 'upsert'], ['claim', 2, null, 'upsert'], ['claim', 3, null, 'upsert'],
+      ['claim', 3, null, 'delete'], ['source', 1, null, 'delete']]);
 
     execFileSync(process.execPath, ['scripts/grant-retrieval.mjs'], { cwd: root, stdio: 'pipe',
       env: { ...process.env, STATEPLANE_CELL_ADMIN_URL: urlFor(names[0]), STATEPLANE_CELL_ROLE: role } });
@@ -540,7 +692,7 @@ test('the erasure report waits for retrieval rows that outlive a purge', async (
   });
 });
 
-test('migration 045 rolls back atomically while a claim writer holds its lock, then applies and enqueues existing evidence', { timeout: 60000 }, async () => {
+test('migration 045 rolls back atomically when claim writers hold or cross its locks, applies after a revision, and enqueues existing evidence', { timeout: 60000 }, async () => {
   const name = names[1];
   const files = (await readdir(new URL('../../migrations/', import.meta.url))).filter(file => file.endsWith('.sql')).sort();
   const target = files.indexOf('045_retrieval_projections.sql');
@@ -597,14 +749,73 @@ test('migration 045 rolls back atomically while a claim writer holds its lock, t
       ('extraction_versions_retrieval','claim_revisions_retrieval','entity_refs_retrieval')`)).rows[0].n, 0);
     assert.equal((await db.query(`SELECT prosrc FROM pg_proc WHERE proname='stateplane_purge_space'`)).rows[0].prosrc, purgeBefore);
     await writer.query('ROLLBACK');
+    const untouched = async () => {
+      assert.equal((await db.query(`SELECT count(*)::int AS n FROM stateplane_migrations WHERE name='045_retrieval_projections.sql'`)).rows[0].n, 0);
+      assert.equal(await db.query(`SELECT to_regclass('public.retrieval_outbox') AS outbox`).then(r => r.rows[0].outbox), null);
+    };
+    const migrating = (env = {}) => new Promise(resolve => {
+      const child = spawn(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: urlFor(name), ...env } });
+      let stdout = '', stderr = '';
+      child.stdout.on('data', data => { stdout += data; });
+      child.stderr.on('data', data => { stderr += data; });
+      child.on('close', status => resolve({ status, stdout, stderr }));
+    });
+    const waitingFor = async table => {
+      for (let attempt = 0; attempt < 3000; attempt++) {
+        if ((await db.query(`SELECT EXISTS (SELECT 1 FROM pg_locks WHERE NOT granted AND relation=to_regclass($1)) AS waiting`, [table]))
+          .rows[0].waiting) return;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      throw new Error(`migration 045 never waited for ${table}`);
+    };
 
-    const applied = migrate(name);
+    // A claim create writes its identity before its revision, the opposite of 045's lock order. The cycle is
+    // resolved by aborting the step (a deadlock, or the bounded wait if PostgreSQL has not detected it yet), which the
+    // migrator reports as a retry; the writer then proceeds.
+    await writer.query('BEGIN');
+    await writer.query(`SET LOCAL deadlock_timeout = '60s'`);
+    await writer.query(`INSERT INTO entity_refs(space_id,collection_id,kind,entity_id) VALUES('sp_upgrade','entries','claim','clm_new')`);
+    const crossed = migrating();
+    await waitingFor('entity_refs');
+    await writer.query(`INSERT INTO claims(space_id,collection_id,claim_id,principal_id,credential_id)
+      VALUES('sp_upgrade','entries','clm_new','owner','owner-session')`);
+    const revisionWrite = writer.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,
+      recorded_by) VALUES('sp_upgrade','entries','clm_new',1,'New.','principal:owner','owner-session','owner')`);
+    const deadlocked = await crossed;
+    assert.equal(deadlocked.status, 1);
+    assert.match(deadlocked.stderr, /Retrieval projection upgrade waits for record, extraction and claim writers/);
+    await revisionWrite;
+    await writer.query('ROLLBACK');
+    await untouched();
+
+    // Above 10,000 live sources and claims the backfill's lock hold is long enough to need a drained window. Bare
+    // identities, written past their payload checks, count toward the bound but have nothing to enqueue.
+    await db.query('BEGIN');
+    await db.query(`SET LOCAL session_replication_role = replica`);
+    await db.query(`INSERT INTO entity_refs(space_id,collection_id,kind,entity_id) SELECT 'sp_upgrade','entries','claim','clm_bulk_'||n
+      FROM generate_series(1,10000) n`);
+    await db.query('COMMIT');
+    const populated = migrate(name, { STATEPLANE_POPULATED_INDEX_UPGRADE: '' });
+    assert.equal(populated.status, 1);
+    assert.match(populated.stderr, /Populated retrieval projection upgrade requires drained traffic above 10000 live sources and claims/);
+    await untouched();
+
+    // A revise or review inserts the revision before it advances the identity, 045's own order: the step waits for
+    // the writer, which finishes and commits, and then applies.
+    await writer.query('BEGIN');
+    await writer.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,recorded_by)
+      VALUES('sp_upgrade','entries','clm_live',3,'Third.','principal:owner','owner-session','owner')`);
+    const applying = migrating({ STATEPLANE_POPULATED_INDEX_UPGRADE: 'drained' });
+    await waitingFor('claim_revisions');
+    await writer.query(`UPDATE entity_refs SET revision=3 WHERE space_id='sp_upgrade' AND kind='claim' AND entity_id='clm_live'`);
+    await writer.query('COMMIT');
+    const applied = await applying;
     assert.equal(applied.status, 0, applied.stderr);
     assert.match(applied.stdout, /Applied 045_retrieval_projections.sql/);
     // Each live source's latest extraction and each live claim's current revision are enqueued once.
     assert.deepEqual((await db.query(`SELECT ref_kind,ref_id,revision::int,extraction_version::int,operation,placement_generation::int
       FROM retrieval_outbox ORDER BY ref_kind,ref_id`)).rows.map(row => ({ ...row })), [
-      { ref_kind: 'claim', ref_id: 'clm_live', revision: 2, extraction_version: null, operation: 'upsert', placement_generation: 3 },
+      { ref_kind: 'claim', ref_id: 'clm_live', revision: 3, extraction_version: null, operation: 'upsert', placement_generation: 3 },
       { ref_kind: 'source', ref_id: 'src_1', revision: 1, extraction_version: 2, operation: 'upsert', placement_generation: 3 }]);
     // Upgraded and fresh schemas carry the same constraints and indexes.
     const schema = async client => ({
