@@ -44,7 +44,7 @@ const tables = ['stateplane_migrations','space_directory','space_provisioning_au
 const evidenceTables=tables.slice(-13);
 const retrievalTables=['retrieval_policies','retrieval_collection_heads','vector_index_strategies','projection_generations','projection_refs',
   'projection_deletion_receipts','lexical_chunks','vector_chunks','embedding_checkpoints','retrieval_outbox'];
-tables.push(...retrievalTables);
+tables.push(...retrievalTables,'retrieval_dispatch_checkpoint');
 const embedding=seed=>`[${Array.from({length:384},(_,i)=>Math.sin(seed*31+i*7)||0.5).join(',')}]`;
 // A space erased before the dump, whose blob-store erasure is still pending.
 const erasedSpaceId='sp_restore_erased';
@@ -297,6 +297,8 @@ try {
           table==='vector_index_strategies'?[]:[spaceId])).rows[0].n>0,`restored operational role can read ${table} for erasure proof`);
       assert.equal((await operational.query(`UPDATE retrieval_outbox SET attempts=attempts+1 WHERE space_id=$1 AND ref_id='clm_restore'
         AND revision=2`,[spaceId])).rowCount,1,'restored operational role can record retrieval delivery');
+      assert.equal((await operational.query(`UPDATE retrieval_dispatch_checkpoint SET after_space_id=$1,after_collection_id=$2`,
+        [spaceId,collectionId])).rowCount,1,'restored operational role can move the retrieval claim cursor');
       assert.equal((await operational.query(`UPDATE space_erasures SET next_attempt_at=clock_timestamp()
         WHERE space_id=$1 AND originals_removed_at IS NULL`,[erasedSpaceId])).rowCount,1,
       'restored operational role can record space erasure progress');
@@ -307,8 +309,8 @@ try {
     }
   } finally {
     await restored.query(`REVOKE ALL ON agent_key_issuances,projection_heads,projection_reconciliations,
-      outbox_dispatch_checkpoint,outbox_space_rotation,outbox_operator_audit,${evidenceTables.join(',')},${retrievalTables.join(',')}
-      FROM ${journalRole}`).catch(()=>{});
+      outbox_dispatch_checkpoint,outbox_space_rotation,outbox_operator_audit,${evidenceTables.join(',')},${retrievalTables.join(',')},
+      retrieval_dispatch_checkpoint FROM ${journalRole}`).catch(()=>{});
     await restored.query(`REVOKE ALL ON FUNCTION public.vector(public.vector,integer,boolean) FROM ${journalRole}`).catch(()=>{});
     await restored.query(`DROP ROLE IF EXISTS ${journalRole}`).catch(()=>{});
   }

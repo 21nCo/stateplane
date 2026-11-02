@@ -82,8 +82,19 @@ export function rolledBack(error: unknown): boolean {
   return typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) && !/^(?:08|53|57P|58|XX)/.test(code);
 }
 
-/** Run one short cell transaction; a missing COMMIT acknowledgement stays ambiguous. */
-export async function inTransaction<T>(pool: PoolLike, fn: (db: pg.PoolClient) => Promise<T>): Promise<T> {
+/** The caller's budget ended before COMMIT was sent; the transaction rolled back. */
+export class DeadlineExceededError extends Error {}
+
+/**
+ * Run one short cell transaction; a missing COMMIT acknowledgement stays
+ * ambiguous. With `limit`, no statement outlasts its deadline and COMMIT is
+ * not sent once the deadline passes or its signal aborts: either rolls back
+ * as a `DeadlineExceededError`.
+ */
+export async function inTransaction<T>(pool: PoolLike, fn: (db: pg.PoolClient) => Promise<T>,
+  limit?: { deadline: number; signal?: AbortSignal }): Promise<T> {
+  const ended = () => limit !== undefined && (Date.now() >= limit.deadline || limit.signal?.aborted === true);
+  if (ended()) throw new DeadlineExceededError('The time budget ended before the transaction');
   const client = await pool.connect();
   let begun = false;
   // An unacknowledged BEGIN or COMMIT leaves the session state unknown.
@@ -92,16 +103,21 @@ export async function inTransaction<T>(pool: PoolLike, fn: (db: pg.PoolClient) =
   // fail this transaction, not the process.
   const onError = () => { discard = true; };
   client.on?.('error', onError);
+  const statementMs = Math.max(1, Math.min(STATEMENT_MS, limit ? limit.deadline - Date.now() : STATEMENT_MS));
   try {
     await client.query('BEGIN'); begun = true; discard = false;
-    await client.query(`SET LOCAL statement_timeout = '${STATEMENT_MS}ms'`);
+    await client.query(`SET LOCAL statement_timeout = '${statementMs}ms'`);
     const result = await fn(client);
+    if (ended()) throw new DeadlineExceededError('The time budget ended before COMMIT');
     try { await client.query('COMMIT'); begun = false; }
     catch (error) { discard = true; begun = false; throw new CommitOutcomeUnknownError(error); }
     return result;
   } catch (error) {
     if (clientReadTimedOut(error)) discard = true;
     else if (begun) await client.query('ROLLBACK').catch(() => { discard = true; });
+    // A statement cut short by the deadline, not by its own bound, is the budget's end.
+    if (statementMs < STATEMENT_MS && (error as { code?: unknown })?.code === '57014')
+      throw new DeadlineExceededError('The time budget ended during the transaction', { cause: error });
     throw error;
   } finally { client.release(discard); client.removeListener?.('error', onError); }
 }
@@ -117,7 +133,7 @@ export function text(value: unknown, maxBytes: number): string {
 }
 
 /**
- * Keep a bounded, NUL-free diagnostic. Projectors must not put record content
+ * Keep a NUL-free diagnostic of at most 1,024 UTF-8 bytes. Projectors must not put record content
  * in errors. Postgres, Node and socket errors can quote rejected values,
  * hosts or credentials, so any error with a string code keeps only its name
  * and code. The same walk as the classification picks the error shown: an
@@ -132,7 +148,19 @@ export function diagnostic(error: unknown): string {
   const code = errorCode(shown);
   const coded = !(shown instanceof AuthorityError) && typeof code === 'string';
   const message = coded ? `${shown.name} ${code}` : `${shown.name}: ${shown.message}`;
-  return message.replaceAll('\0', '').slice(0, 1024) || 'Projection failed';
+  return utf8Prefix(message.replaceAll('\0', ''), 1024) || 'Projection failed';
+}
+
+/** The longest prefix of whole code points within `maxBytes` of UTF-8; an unpaired surrogate counts as the 3-byte U+FFFD it is sent as. */
+export function utf8Prefix(value: string, maxBytes: number): string {
+  let bytes = 0;
+  let end = 0;
+  for (const point of value) {
+    bytes += Buffer.byteLength(point);
+    if (bytes > maxBytes) break;
+    end += point.length;
+  }
+  return value.slice(0, end);
 }
 
 /** Settle when the work does or the budget expires, whichever is first. */

@@ -5,7 +5,7 @@ import { CHUNK_CODE_POINTS, configuredChunks, EMBED_RETRY_DELAYS_MS, embedBatch,
 import type { ContentPolicy, Embedder, EmbedderIdentity, TextChunk } from '@stateplane/retrieval';
 import { CommitOutcomeUnknownError } from './index.js';
 import type { ProjectionChange, ProjectionQuery } from './index.js';
-import { bounded, diagnostic, inTransaction, infrastructureFault, text } from './faults.js';
+import { bounded, DeadlineExceededError, diagnostic, inTransaction, infrastructureFault, text } from './faults.js';
 import type { PoolLike } from './faults.js';
 import { FAILED_OUTBOX, LIVE_OUTBOX } from './outbox-sql.js';
 import type { Projector } from './outbox.js';
@@ -40,11 +40,17 @@ const LOCK_MS = 1_000;
 // evidence item's preparation gets at most half its budget and this grace at
 // most a quarter, so both end before the item's own budget does.
 const GRACE_MS = 1_000;
+// Applying the generations that are ready, when a record's preparation
+// failed for others, gets at most this long (and never outlasts the
+// delivery's own budget): preparation, its grace and this end within 19 s.
+const FALLBACK_APPLY_MS = 3_000;
 // Backoff from 5 s doubling: an outage or an interrupted item retries within
 // 5 minutes, an item's own failure within an hour. Retrieval work has no
 // dead letter; a failing item stays pending and is reported as degraded.
 const OUTAGE_BACKOFF_CAP_S = 300;
 const FAILURE_BACKOFF_CAP_S = 3_600;
+// The most pairs one claim walks, and that a step walks without finding work.
+const MAX_PAIRS = 1_000;
 // Status reads at most this many rows per queue.
 const STATUS_SAMPLE = 500;
 
@@ -75,6 +81,27 @@ async function loadGenerations(query: Query, spaceId: string, collectionId: stri
     identity: row.embedder === null ? null : { embedder: row.embedder, model: row.embedding_model,
       modelVersion: row.model_version, dimensions: Number(row.dimensions) } }));
 }
+
+/**
+ * Share lock a Ref's space and collection rows through commit, as
+ * completion's scope check does, and report whether they still admit
+ * projection: an active or read-only space, a collection that is not
+ * deleted and, when given, the same placement. Suspension, deletion, the
+ * purge and a placement fence update these rows, so each either waits for
+ * this transaction or committed before it and is seen here. Every retrieval
+ * write takes this fence first, as erasure locks the space first.
+ */
+async function scopeOpen(query: Query, spaceId: string, collectionId: string, placement?: number): Promise<boolean> {
+  await query(`SET LOCAL lock_timeout = '${LOCK_MS}ms'`);
+  const row = (await query(`SELECT s.lifecycle IN ('active','readOnly') AND c.lifecycle<>'deleted'
+      AND ($3::bigint IS NULL OR s.placement_generation=$3::bigint) AS open
+    FROM spaces s JOIN collections c ON c.space_id=s.space_id WHERE s.space_id=$1 AND c.collection_id=$2 FOR SHARE OF s,c`,
+  [spaceId, collectionId, placement ?? null])).rows[0];
+  return row?.open === true;
+}
+
+/** The space or collection closed during preparation: no further call, and nothing it prepared is saved. */
+class ScopeClosedError extends ProjectionIncompleteError {}
 
 /** The configured chunks of a live target under one generation's policy; nothing else is ever indexed or embedded. */
 function chunksFor(generation: Generation, target: Target): Chunk[] {
@@ -117,16 +144,17 @@ async function complete(query: Query, target: Target, generation: Generation, ch
 interface Saved { index: number; sha256: string; region: string; embedding: string }
 
 /**
- * Record a live Ref in a vector generation (at its target revision when the
+ * Under the scope fence, record a live Ref in a vector generation (at its target revision when the
  * generation has never projected it), so checkpoints can reference it, then
  * report which chunks still need an embedding. Embeddings of the same text
  * already in this generation, from earlier revisions or checkpoints, are
- * reused. Returns null when the generation has deleted the Ref, holds a newer
- * revision, or already holds this one completely.
+ * reused. Returns null when the scope is closed, the generation has deleted
+ * the Ref, holds a newer revision, or already holds this one completely.
  */
 async function planEmbeddings(query: Query, target: Target, generation: Generation, chunks: Chunk[])
   : Promise<{ missing: Chunk[]; reused: Saved[] } | null> {
-  if (!await lockGeneration(query, target, generation.generation)) return null;
+  if (!await scopeOpen(query, target.spaceId, target.collectionId)
+    || !await lockGeneration(query, target, generation.generation)) return null;
   const key = refKey(target, generation.generation);
   let row = await refRow(query, target, generation.generation, 'SHARE');
   if (!row) {
@@ -159,14 +187,15 @@ async function planEmbeddings(query: Query, target: Target, generation: Generati
 
 /**
  * Save embeddings computed outside SQL. False, saving nothing, when the
- * generation is retired, has deleted the Ref, has moved it past this target
+ * scope is closed, the generation is retired, has deleted the Ref, has moved it past this target
  * or already holds this target completely: a late preparation never leaves
  * checkpoints that no later apply of the Ref would remove.
  */
 async function saveCheckpoints(query: Query, target: Target, generation: Generation, chunks: number, saved: Saved[])
   : Promise<boolean> {
   const identity = generation.identity!;
-  if (!await lockGeneration(query, target, generation.generation)) return false;
+  if (!await scopeOpen(query, target.spaceId, target.collectionId)
+    || !await lockGeneration(query, target, generation.generation)) return false;
   // Share locked: an apply of the Ref waits for this save, or this save sees the apply.
   const row = await refRow(query, target, generation.generation, 'SHARE');
   if (!row || row.deleted || compare(row, target) > 0
@@ -226,13 +255,18 @@ async function prepareGeneration(pool: PoolLike, registry: EmbeddingRegistry, ta
   const save = (saved: Saved[]) => inTransaction(pool, db => saveCheckpoints(db.query.bind(db), target, generation,
     chunks.length, saved));
   if (plan.reused.length && !await save(plan.reused)) return;
-  // Before every provider call, a retry included, the generation must be
-  // live and both its policy and the collection's current one must still
-  // allow the embedder's region; a narrower policy committed since stops the
+  // Before every provider call, a retry included, the space and collection
+  // must still be open, the generation live, and both its policy and the
+  // collection's current one must still allow the embedder's region. A
+  // suspension, deletion or narrower policy committed since stops the
   // generation's preparation before any more content leaves.
   const admit = async () => {
-    const current = (await inTransaction(pool, db => loadGenerations(db.query.bind(db), target.spaceId, target.collectionId)))
-      .find(entry => entry.generation === generation.generation);
+    const current = await inTransaction(pool, async db => {
+      const query: Query = db.query.bind(db);
+      if (!await scopeOpen(query, target.spaceId, target.collectionId))
+        throw new ScopeClosedError('The space or collection closed during preparation');
+      return (await loadGenerations(query, target.spaceId, target.collectionId)).find(entry => entry.generation === generation.generation);
+    });
     if (!current?.regions.includes(embedder.profile.region))
       throw new ProjectionIncompleteError('The processing policy changed during preparation');
   };
@@ -308,9 +342,14 @@ async function dropCheckpoints(query: Query, key: unknown[], revision: number | 
  * deletion removes the Ref's chunks and checkpoints, marks it deleted and
  * records a receipt. A live target replaces the Ref's chunks with the
  * configured chunks of its content; vector chunks come only from checkpoints
- * of exactly this text. A vector generation missing any of them is left
- * exactly as it was and returned, so one generation's outage never holds back
- * the others. A policy narrowing that commits after the regions were read is
+ * of exactly this text. A vector generation missing any of them keeps its
+ * chunks and is returned, so one generation's outage never holds back the
+ * others. Every applied position leaves the Ref's row at it, even with no
+ * configured content, so a later preparation of an older position finds the
+ * generation past it and neither records the Ref nor saves a checkpoint. A
+ * Ref's first row is inserted only if absent and then locked, so concurrent
+ * first applies serialize on it and the later one compares forward like any
+ * other. A policy narrowing that commits after the regions were read is
  * caught by the storage trigger on insert and reported as `PROJECTION_INCOMPLETE`:
  * the whole apply rolls back and runs again, uncounted.
  */
@@ -320,28 +359,31 @@ async function applyTarget(query: Query, target: Target): Promise<number[]> {
   for (const generation of await loadGenerations(query, target.spaceId, target.collectionId)) {
     if (!configures(generation, target.kind) || !await lockGeneration(query, target, generation.generation)) continue;
     const key = refKey(target, generation.generation);
-    const row = await refRow(query, target, generation.generation, 'UPDATE');
-    if (row?.deleted) continue;
+    let row = await refRow(query, target, generation.generation, 'UPDATE');
+    // A Ref this generation has never projected: record it at the target,
+    // unless a concurrent apply already has (this waits for its outcome).
+    const fresh = !row && ((await query(`INSERT INTO projection_refs(space_id,collection_id,generation,ref_kind,ref_id,revision,
+        extraction_version,deleted) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`,
+    [...key, target.revision, target.deleted ? null : target.extractionVersion, target.deleted])).rowCount ?? 0) === 1;
+    row ??= await refRow(query, target, generation.generation, 'UPDATE');
+    if (!row) throw new ProjectionIncompleteError('The projected Ref changed during apply');
+    if (row.deleted && !fresh) continue;
     if (target.deleted) {
       const lexical = await query(`DELETE FROM lexical_chunks WHERE ${REF}`, key);
       const vector = await query(`DELETE FROM vector_chunks WHERE ${REF}`, key);
       await query(`DELETE FROM embedding_checkpoints WHERE ${REF}`, key);
-      if (row) await query(`UPDATE projection_refs SET revision=GREATEST(revision,$6),deleted=true,extraction_version=NULL
+      if (!fresh) await query(`UPDATE projection_refs SET revision=GREATEST(revision,$6),deleted=true,extraction_version=NULL
         WHERE ${REF}`, [...key, target.revision]);
-      else await query(`INSERT INTO projection_refs(space_id,collection_id,generation,ref_kind,ref_id,revision,deleted)
-        VALUES($1,$2,$3,$4,$5,$6,true)`, [...key, target.revision]);
       await query(`INSERT INTO projection_deletion_receipts(space_id,collection_id,generation,ref_kind,ref_id,revision,chunks_removed)
         SELECT space_id,collection_id,generation,ref_kind,ref_id,revision,$6::integer FROM projection_refs WHERE ${REF}`, [...key, (lexical.rowCount ?? 0) + (vector.rowCount ?? 0)]);
       continue;
     }
-    const position = row ? compare(row, target) : -1;
+    const position = compare(row, target);
     const chunks = chunksFor(generation, target);
-    if (row && (position > 0 || position === 0 && await complete(query, target, generation, chunks.length))) {
+    if (position > 0 || position === 0 && await complete(query, target, generation, chunks.length)) {
       await dropCheckpoints(query, key, row.revision, row.extraction_version);
       continue;
     }
-    // Nothing configured is present and nothing older was projected.
-    if (!row && !chunks.length) continue;
     const columns = [chunks.map(chunk => chunk.index), chunks.map(chunk => chunk.field), chunks.map(chunk => chunk.start),
       chunks.map(chunk => chunk.end)];
     const checkpoints = `unnest($9::integer[],$10::text[],$11::bigint[],$12::bigint[],$13::text[]) AS c(i,field,s,e,sha)
@@ -357,9 +399,7 @@ async function applyTarget(query: Query, target: Target): Promise<number[]> {
     }
     await query(`DELETE FROM lexical_chunks WHERE ${REF}`, key);
     await query(`DELETE FROM vector_chunks WHERE ${REF}`, key);
-    if (!row) await query(`INSERT INTO projection_refs(space_id,collection_id,generation,ref_kind,ref_id,revision,extraction_version)
-      VALUES($1,$2,$3,$4,$5,$6,$7)`, [...key, target.revision, target.extractionVersion]);
-    else if (position < 0) await query(`UPDATE projection_refs SET revision=$6,extraction_version=$7 WHERE ${REF}`,
+    if (position < 0) await query(`UPDATE projection_refs SET revision=$6,extraction_version=$7 WHERE ${REF}`,
       [...key, target.revision, target.extractionVersion]);
     if (chunks.length && generation.lexical) await query(`INSERT INTO lexical_chunks(space_id,collection_id,generation,ref_kind,
         ref_id,revision,extraction_version,policy_version,chunk_index,field,content_start,content_end,content)
@@ -431,10 +471,12 @@ function options(value: RetrievalOptions) {
  *
  * When preparation fails for some generation (an outage, a missing embedder
  * or interrupted preparation), the generations that do not need it are
- * applied at once in a transaction of `prepare`'s own, fenced like
- * completion (open space and collection, current placement, the record still
- * at this revision), and `prepare` then throws: the delivery stays due, so
- * the record's projection head does not move until every generation has it.
+ * applied at once in a transaction of `prepare`'s own, under the same fences
+ * as completion held through its commit (open space and collection, current
+ * placement, the record still at this revision) and within the delivery's
+ * budget, and `prepare` then throws: the delivery stays due, so the record's
+ * projection head does not move until every generation has it. When the
+ * scope has closed, `prepare` returns and completion releases the delivery.
  */
 export class RecordRetrievalProjector implements Projector<void> {
   readonly #embedders: EmbeddingRegistry;
@@ -449,10 +491,11 @@ export class RecordRetrievalProjector implements Projector<void> {
     try {
       await budgeted((budget, progress) => prepareTarget(this.pool, this.#embedders, target, budget, progress), signal, this.#prepareMs);
     } catch (error) {
-      const blocked = await inTransaction(this.pool, db => this.applyAvailable(db.query.bind(db), target, change.generation))
-        .catch(() => null);
-      // Every generation turned out complete (an earlier attempt's checkpoints sufficed): completion applies.
-      if (blocked?.length === 0) return;
+      const blocked = await inTransaction(this.pool, db => this.applyAvailable(db.query.bind(db), target, change.generation),
+        { deadline: Date.now() + FALLBACK_APPLY_MS, signal }).catch(() => null);
+      // Every generation turned out complete (an earlier attempt's checkpoints
+      // sufficed), or the scope closed: completion applies or releases.
+      if (blocked === 'closed' || blocked?.length === 0) return;
       throw error;
     }
   }
@@ -463,14 +506,9 @@ export class RecordRetrievalProjector implements Projector<void> {
     if (!await authorityHolds(query, target)) throw new ProjectionIncompleteError('The record changed while it was projected');
   }
 
-  /** Apply what is ready, under completion's scope fences; null when the scope no longer admits it. */
-  private async applyAvailable(query: Query, target: Target, placement: number): Promise<number[] | null> {
-    await query(`SET LOCAL lock_timeout = '${LOCK_MS}ms'`);
-    const scope = (await query(`SELECT s.lifecycle IN ('active','readOnly') AND c.lifecycle<>'deleted'
-        AND s.placement_generation=$3 AS open
-      FROM spaces s JOIN collections c ON c.space_id=s.space_id AND c.collection_id=$2 WHERE s.space_id=$1 FOR KEY SHARE OF s`,
-    [target.spaceId, target.collectionId, placement])).rows[0];
-    if (!scope?.open) return null;
+  /** Apply what is ready, under completion's scope fences held through commit; 'closed' when the scope no longer admits it. */
+  private async applyAvailable(query: Query, target: Target, placement: number): Promise<number[] | 'closed'> {
+    if (!await scopeOpen(query, target.spaceId, target.collectionId, placement)) return 'closed';
     const blocked = await applyTarget(query, target);
     if (!await authorityHolds(query, target)) throw new ProjectionIncompleteError('The record changed while it was projected');
     return blocked;
@@ -532,12 +570,13 @@ class AuthorityChanged extends Error {}
 /**
  * How a failed attempt is retried: preparation stopped with its progress
  * saved runs again at once with no error; an outage, lock wait or lost
- * session after backoff from 5 s doubling to 5 minutes; anything else, the
- * item's own failure, after backoff to an hour. Only started attempts count.
+ * session, or an apply the item's budget ended, after backoff from 5 s
+ * doubling to 5 minutes; anything else, the item's own failure, after
+ * backoff to an hour. Only started attempts count.
  */
 function retryOf(error: unknown, attempt: number): { delayMs: number; error: string | null } {
   if ((error as { code?: unknown })?.code === PROJECTION_INCOMPLETE) return { delayMs: 0, error: null };
-  const cap = infrastructureFault(error) ? OUTAGE_BACKOFF_CAP_S : FAILURE_BACKOFF_CAP_S;
+  const cap = infrastructureFault(error) || error instanceof DeadlineExceededError ? OUTAGE_BACKOFF_CAP_S : FAILURE_BACKOFF_CAP_S;
   return { delayMs: Math.min(cap, 5 * 2 ** Math.min(Math.max(attempt, 1) - 1, 10)) * 1_000, error: diagnostic(error) };
 }
 
@@ -558,27 +597,35 @@ export class PostgresRetrievalWorker {
 
   /**
    * Claim and process due items until nothing is due or the budget is spent.
-   * Each claim walks space/collection pairs after the previous claim's last
-   * one, taking at most `perPair` items from each, so one backlog cannot
-   * hold the step. Items the step has no time left to start are released due
-   * at once, with no attempt spent, and the step ends. Only a failed claim
+   * Space/collection pairs with pending work take turns as a ring: each
+   * claim, in any step or worker, walks it from the pair after the last one
+   * a claim served (a cell-wide cursor, `retrieval_dispatch_checkpoint`),
+   * taking at most `perPair` items from each, so a due pair is served within
+   * as many claims as there are due pairs ahead of it, however long their
+   * backlogs. Items the step has no time left to start are released due at
+   * once, with no attempt spent, and the step ends. Only a failed claim
    * throws; each item settles itself.
    */
   async step(settings: RetrievalStepOptions = {}): Promise<RetrievalStep> {
     const budgetMs = bounded(settings.budgetMs ?? 10_000, MIN_ITEM_MS, 60_000);
     const limit = bounded(settings.limit ?? 8, 1, 100);
     const perPair = bounded(settings.perPair ?? 2, 1, limit);
-    const pairs = bounded(settings.pairs ?? 100, 1, 1_000);
+    const pairs = bounded(settings.pairs ?? 100, 1, MAX_PAIRS);
     const until = Date.now() + budgetMs;
     const result: RetrievalStep = { claimed: 0, applied: 0, released: 0, lost: 0, retried: 0, unknown: 0 };
     const outages: Outages = new Set();
-    let after: [string, string] | null = null;
-    // Whether the pass over the pair order that this claim continues has found work.
-    let found = false;
+    // Pairs walked since a claim last found work.
+    let idle = 0;
     while (until - Date.now() >= MIN_ITEM_MS) {
-      const claim = await this.claim(after, pairs, perPair, limit);
+      const claim = await this.claim(pairs, perPair, limit);
       result.claimed += claim.jobs.length;
-      found ||= claim.jobs.length > 0;
+      if (!claim.jobs.length) {
+        // Nothing due in the whole ring, or in as many pairs as one claim may walk.
+        idle += claim.walked;
+        if (claim.wrapped || idle >= MAX_PAIRS) break;
+        continue;
+      }
+      idle = 0;
       let next = 0;
       for (; next < claim.jobs.length && until - Date.now() >= MIN_ITEM_MS; next++)
         result[await this.process(claim.jobs[next], Math.min(ITEM_MS, until - Date.now()), outages)]++;
@@ -588,28 +635,41 @@ export class PostgresRetrievalWorker {
         result.released += unstarted.length;
         break;
       }
-      after = claim.next;
-      // A whole pass from the start of the pair order with nothing due ends the step.
-      if (!after) { if (!found) break; found = false; }
     }
     return result;
   }
 
-  private async claim(after: [string, string] | null, pairs: number, perPair: number, limit: number)
-    : Promise<{ jobs: Job[]; next: [string, string] | null }> {
+  /**
+   * Lease due items from up to `pairs` pairs in ring order after the cursor,
+   * and move the cursor to the last pair served, or past the pairs walked
+   * when none was. `wrapped` says the walk covered every pair with pending work.
+   */
+  private async claim(pairs: number, perPair: number, limit: number): Promise<{ jobs: Job[]; walked: number; wrapped: boolean }> {
     return inTransaction(this.pool, async db => {
-      const walked = (await db.query(`WITH RECURSIVE pairs(space_id,collection_id,n) AS (
-          (SELECT space_id,collection_id,1 FROM retrieval_outbox WHERE delivery_state='pending'
-            AND ($1::text IS NULL OR (space_id,collection_id)>($1,$2)) ORDER BY space_id,collection_id LIMIT 1)
-          UNION ALL
-          SELECT nx.space_id,nx.collection_id,p.n+1 FROM pairs p CROSS JOIN LATERAL (
-            SELECT space_id,collection_id FROM retrieval_outbox WHERE delivery_state='pending'
-              AND (space_id,collection_id)>(p.space_id,p.collection_id) ORDER BY space_id,collection_id LIMIT 1) nx
-          WHERE p.n<$3)
-        SELECT space_id,collection_id FROM pairs ORDER BY n`, [after?.[0] ?? null, after?.[1] ?? null, pairs])).rows;
-      if (!walked.length) return { jobs: [], next: null };
-      const claimed = await db.query(`WITH due AS (
-          SELECT d.job_id FROM unnest($1::text[],$2::text[]) WITH ORDINALITY AS p(space_id,collection_id,n)
+      // One claim at a time moves the cursor; claims are short.
+      const cursor = (await db.query(`SELECT after_space_id,after_collection_id FROM retrieval_dispatch_checkpoint
+        FOR UPDATE`)).rows[0] ?? {};
+      const after: [string, string] | null = cursor.after_space_id ? [cursor.after_space_id, cursor.after_collection_id] : null;
+      const walk = async (from: [string, string] | null, upTo: [string, string] | null, count: number) => count < 1 ? []
+        : (await db.query(`WITH RECURSIVE pairs(space_id,collection_id,n) AS (
+            (SELECT space_id,collection_id,1 FROM retrieval_outbox WHERE delivery_state='pending'
+              AND ($1::text IS NULL OR (space_id,collection_id)>($1::text,$2::text))
+              AND ($4::text IS NULL OR (space_id,collection_id)<=($4::text,$5::text)) ORDER BY space_id,collection_id LIMIT 1)
+            UNION ALL
+            SELECT nx.space_id,nx.collection_id,p.n+1 FROM pairs p CROSS JOIN LATERAL (
+              SELECT space_id,collection_id FROM retrieval_outbox WHERE delivery_state='pending'
+                AND (space_id,collection_id)>(p.space_id,p.collection_id)
+                AND ($4::text IS NULL OR (space_id,collection_id)<=($4::text,$5::text)) ORDER BY space_id,collection_id LIMIT 1) nx
+            WHERE p.n<$3)
+          SELECT space_id,collection_id FROM pairs ORDER BY n`,
+        [from?.[0] ?? null, from?.[1] ?? null, count, upTo?.[0] ?? null, upTo?.[1] ?? null])).rows as { space_id: string; collection_id: string }[];
+      // After the cursor to the end, then from the start through the cursor.
+      const ring = await walk(after, null, pairs);
+      if (after) ring.push(...await walk(null, after, pairs - ring.length));
+      const wrapped = ring.length < pairs;
+      if (!ring.length) return { jobs: [], walked: 0, wrapped };
+      const claimed = (await db.query(`WITH due AS (
+          SELECT d.job_id,p.n FROM unnest($1::text[],$2::text[]) WITH ORDINALITY AS p(space_id,collection_id,n)
           JOIN spaces s ON s.space_id=p.space_id AND s.lifecycle IN ('active','readOnly')
           JOIN collections c ON c.space_id=p.space_id AND c.collection_id=p.collection_id AND c.lifecycle<>'deleted'
           CROSS JOIN LATERAL (SELECT job_id,available_at FROM retrieval_outbox WHERE space_id=p.space_id
@@ -618,20 +678,23 @@ export class PostgresRetrievalWorker {
           ORDER BY p.n,d.available_at,d.job_id LIMIT $4)
         UPDATE retrieval_outbox o SET available_at=clock_timestamp()+($5::integer * interval '1 millisecond')
         FROM due WHERE o.job_id=due.job_id
-        RETURNING o.job_id,o.space_id,o.collection_id,o.ref_kind,o.ref_id,o.attempts,o.available_at::text AS lease`,
-      [walked.map(pair => pair.space_id), walked.map(pair => pair.collection_id), perPair, limit, LEASE_MS]);
-      const last = walked.at(-1)!;
-      return { next: walked.length === pairs ? [last.space_id, last.collection_id] : null,
-        jobs: claimed.rows.map(row => ({ jobId: row.job_id, spaceId: row.space_id, collectionId: row.collection_id,
-          kind: row.ref_kind, id: row.ref_id, attempt: row.attempts, lease: row.lease })) };
+        RETURNING o.job_id,o.space_id,o.collection_id,o.ref_kind,o.ref_id,o.attempts,o.available_at::text AS lease,due.n`,
+      [ring.map(pair => pair.space_id), ring.map(pair => pair.collection_id), perPair, limit, LEASE_MS])).rows
+        .sort((a, b) => Number(a.n) - Number(b.n));
+      const last = claimed.at(-1) ?? (wrapped ? null : ring.at(-1)!);
+      if (last) await db.query(`UPDATE retrieval_dispatch_checkpoint SET after_space_id=$1,after_collection_id=$2`,
+        [last.space_id, last.collection_id]);
+      return { walked: ring.length, wrapped, jobs: claimed.map(row => ({ jobId: row.job_id, spaceId: row.space_id,
+        collectionId: row.collection_id, kind: row.ref_kind, id: row.ref_id, attempt: row.attempts, lease: row.lease })) };
     });
   }
 
   /**
    * Process one leased item: start it (one more attempt, a renewed lease),
    * read its Ref's current state, prepare outside SQL, then apply under the
-   * lease, the open space and the unchanged authoritative state, which is
-   * locked against its writers for the commit. Generations that need what
+   * scope fence (space and collection open, share locked through commit), the
+   * lease and the unchanged authoritative state, which is locked against its
+   * writers for the commit, all within the item's budget. Generations that need what
    * preparation could not provide keep their previous state; the others
    * apply, and the item then stays pending with that failure's backoff. An
    * outage, a lock wait or interrupted preparation is never the item's own
@@ -639,6 +702,7 @@ export class PostgresRetrievalWorker {
    * degraded. An unknown COMMIT outcome keeps the lease until it expires.
    */
   private async process(claimed: Job, budgetMs: number, outages: Outages): Promise<RetrievalOutcome> {
+    const deadline = Date.now() + budgetMs;
     const signal = AbortSignal.timeout(budgetMs);
     let job = claimed;
     try {
@@ -663,15 +727,13 @@ export class PostgresRetrievalWorker {
       }
       return await inTransaction(this.pool, async db => {
         const query: Query = db.query.bind(db);
-        await query(`SET LOCAL lock_timeout = '${LOCK_MS}ms'`);
-        // Erasure locks the space row first; so does completion.
-        const space = (await query(`SELECT lifecycle FROM spaces WHERE space_id=$1 FOR KEY SHARE`, [job.spaceId])).rows[0];
+        // The scope fence comes first, as erasure locks the space first.
+        const open = await scopeOpen(query, job.spaceId, job.collectionId);
         const leased = (await query(`SELECT 1 FROM retrieval_outbox WHERE job_id=$1 AND attempts=$2 AND available_at=$3::timestamptz
           AND available_at>clock_timestamp() AND delivery_state='pending' FOR UPDATE`, [job.jobId, job.attempt, job.lease])).rows[0];
         if (!leased) return 'lost';
         const now = await currentTarget(query, job);
-        if (!space || !['active', 'readOnly'].includes(space.lifecycle) || !now.open || (read.target || now.target)
-          && !sameTarget(read.target, now.target)) {
+        if (!open || !now.open || (read.target || now.target) && !sameTarget(read.target, now.target)) {
           // Scope closed, or the Ref changed after it was read: run again with fresh state.
           await this.release(query, job, 0, null);
           return 'released';
@@ -686,7 +748,7 @@ export class PostgresRetrievalWorker {
         await query(`UPDATE retrieval_outbox SET delivery_state='delivered',delivered_at=clock_timestamp(),
           available_at=clock_timestamp(),last_error=NULL WHERE job_id=$1`, [job.jobId]);
         return 'applied';
-      });
+      }, { deadline });
     } catch (error) {
       if (error instanceof CommitOutcomeUnknownError) return 'unknown';
       if (error instanceof AuthorityChanged) return this.settle(job, 'release', null, 0).catch(() => 'released' as const);

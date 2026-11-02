@@ -1,16 +1,17 @@
 import pg from 'pg';
 import { connectionOptions } from './db-connection.mjs';
 
-// Run after migration 045 or restore through a protected cell administration
-// connection. The role is supplied by the protected deployment inventory.
-// Space deletion proves erasure by reading every space-scoped retrieval table
-// (the collection heads are written only by owner-rights triggers). Policy
-// writers insert retrieval policy versions; the projection worker (STA-45 and
-// later) starts and moves generations, advances projected Refs, replaces
-// chunks and checkpoints, records deletion receipts and delivers retrieval
-// work. Migration 045's owner-rights triggers enqueue that work, so the role
-// needs no insert on it. Projected Refs, receipts, generations and work are
-// never deletable: removal stays with the scoped purge routine. Chunks and
+// Run after migrations 045 and 046 or restore through a protected cell
+// administration connection. The role is supplied by the protected
+// deployment inventory. Space deletion proves erasure by reading every
+// space-scoped retrieval table (the collection heads are written only by
+// owner-rights triggers). Policy writers insert retrieval policy versions;
+// the projection worker (STA-45 and later) starts and moves generations,
+// advances projected Refs, replaces chunks and checkpoints, records deletion
+// receipts, delivers retrieval work and moves its claim cursor (046).
+// Migration 045's owner-rights triggers enqueue that work, so the role needs
+// no insert on it. Projected Refs, receipts, generations and work are never
+// deletable: removal stays with the scoped purge routine. Chunks and
 // checkpoints are derived and replaced by deleting them.
 // An HNSW index casts each embedding to its dimension on insert, and
 // PostgreSQL checks EXECUTE on that cast function for the inserting role, so
@@ -30,7 +31,8 @@ const grants=[
   ['lexical_chunks','SELECT, INSERT, DELETE'],
   ['vector_chunks','SELECT, INSERT, DELETE'],
   ['embedding_checkpoints','SELECT, INSERT, DELETE'],
-  ['retrieval_outbox','SELECT, UPDATE']
+  ['retrieval_outbox','SELECT, UPDATE'],
+  ['retrieval_dispatch_checkpoint','SELECT, UPDATE']
 ];
 const routines=['public.vector(public.vector, integer, boolean)'];
 const client=new pg.Client(connectionOptions(url));

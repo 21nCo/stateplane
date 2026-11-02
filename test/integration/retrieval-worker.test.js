@@ -41,11 +41,11 @@ const due = table => pool.query(`UPDATE ${table} SET available_at=clock_timestam
   WHERE delivery_state${table === 'retrieval_outbox' ? "='pending'" : "<>'delivered' AND dead_lettered_at IS NULL"}`);
 
 /**
- * A deterministic embedder that records every input and, at each call,
- * whether any session of the test database was inside a transaction.
- * `before(call)` runs at the start of each call (numbered from 1); `down`
- * fails every call and `failFirst` the first n; `delayMs` waits, giving up on
- * the signal unless `stubborn`.
+ * A deterministic embedder that records every input it returned an
+ * embedding for and, at each call, whether any session of the test database
+ * was inside a transaction. `before(call, signal)` runs at the start of each
+ * call (numbered from 1); `down` fails every call and `failFirst` the first
+ * n; `delayMs` waits, giving up on the signal unless `stubborn`.
  */
 class Spy extends DeterministicEmbedder {
   constructor(profile = {}, behavior = {}) {
@@ -59,16 +59,33 @@ class Spy extends DeterministicEmbedder {
       AND state LIKE 'idle in transaction%' AND pid<>pg_backend_pid()`)).rows[0].open;
     this.inTransaction.push(open);
     const call = this.inTransaction.length;
-    await this.behavior.before?.(call);
+    await this.behavior.before?.(call, signal);
     if (this.behavior.down || call <= (this.behavior.failFirst ?? 0)) throw new EmbedderUnavailableError('provider unreachable');
     // Like a fetch with the signal, a slow call gives up when it aborts.
     if (this.behavior.delayMs) await new Promise((resolve, reject) => {
+      if (!this.behavior.stubborn && signal.aborted) { reject(new EmbedderUnavailableError('aborted')); return; }
       const timer = setTimeout(resolve, this.behavior.delayMs);
       if (!this.behavior.stubborn) signal.addEventListener('abort', () => { clearTimeout(timer); reject(new EmbedderUnavailableError('aborted')); }, { once: true });
     });
     await this.behavior.gate?.();
+    const vectors = await super.embed(texts, signal);
     this.inputs.push(...texts);
-    return super.embed(texts, signal);
+    return vectors;
+  }
+}
+/** Wait for `signal` to abort, then give up as a fetch with that signal would. */
+const untilAborted = signal => new Promise((_, reject) => {
+  const abort = () => reject(new EmbedderUnavailableError('aborted'));
+  if (signal.aborted) abort(); else signal.addEventListener('abort', abort, { once: true });
+});
+/** Poll until `count` sessions wait on a lock in a statement containing `text`. */
+async function waitingOnLock(text, count = 1) {
+  for (let tries = 0; ; tries++) {
+    const waiting = (await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname=current_database()
+      AND wait_event_type='Lock' AND position($1 in query)>0`, [text])).rows[0].n;
+    if (waiting >= count) return;
+    assert.ok(tries < 400, `no session waited on a lock in ${text}`);
+    await new Promise(resolve => setTimeout(resolve, 5));
   }
 }
 const identity = spy => [spy.profile.embedder, spy.profile.model, spy.profile.modelVersion, spy.profile.dimensions];
@@ -396,23 +413,26 @@ test('embedding runs only in a region both policies allow; an embedder outage ke
 
 test('preparation stopped by its budget keeps its checkpoints and resumes without embedding them again', async () => {
   const { spaceId } = await space();
-  const slow = new Spy({ maxBatch: 1 }, { delayMs: 60 });
+  // One chunk per call; every third call is still in flight when the
+  // preparation budget ends and gives up on its signal, so each attempt saves
+  // exactly two chunks and the call cut short returns nothing.
+  const slow = new Spy({ maxBatch: 1 }, { before: (call, signal) => call % 3 === 0 ? untilAborted(signal) : undefined });
   await policy(spaceId, 1, { claimStatements: false, lexical: false });
   await generation(spaceId, 1, 1, identity(slow));
-  const words = Array.from({ length: 1_500 }, (_, i) => `w${i}`).join(' ');
+  const words = Array.from({ length: 1_000 }, (_, i) => `w${i}`).join(' ');
   await evidence(spaceId, { extraction: words });
-  const worker = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([slow]), prepareMs: 150 });
-  // Each attempt embeds about two chunks before its budget ends; it is released
-  // without an error and the next attempt continues from its checkpoints.
-  const result = await worker.step({ budgetMs: 10_000 });
-  assert.ok(result.retried >= 2, JSON.stringify(result));
+  const worker = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([slow]), prepareMs: 1_000 });
+  const result = await worker.step({ budgetMs: 20_000 });
   const [source] = await work(spaceId);
   assert.deepEqual([source.delivery_state, source.last_error], ['delivered', null]);
-  assert.equal(source.attempts, result.retried + 1);
   const done = await projected(spaceId, 'source', 'src_1');
   const chunks = done.vector.length;
-  assert.ok(chunks > 2);
-  assert.equal(slow.inputs.length, chunks, 'each chunk was embedded once');
+  assert.ok(chunks > 4, `${chunks} chunks`);
+  // Each interrupted attempt was released at once, without an error, and the next resumed from its checkpoints.
+  assert.equal(result.retried, Math.ceil(chunks / 2) - 1, JSON.stringify(result));
+  assert.equal(source.attempts, result.retried + 1);
+  assert.deepEqual(slow.inputs.toSorted(), [...new Set(slow.inputs)].toSorted(), 'each chunk was embedded once');
+  assert.equal(slow.inputs.length, chunks);
   assert.equal(done.checkpoints, 0);
 });
 
@@ -424,7 +444,8 @@ test('the cell role projects records and evidence with only its base grants and 
   await evidence(spaceId);
   const created = await write(scope, 'create', '{"title":"Granted"}');
   const retrievalTables = ['retrieval_policies', 'retrieval_collection_heads', 'vector_index_strategies', 'projection_generations',
-    'projection_refs', 'projection_deletion_receipts', 'lexical_chunks', 'vector_chunks', 'embedding_checkpoints', 'retrieval_outbox'];
+    'projection_refs', 'projection_deletion_receipts', 'lexical_chunks', 'vector_chunks', 'embedding_checkpoints', 'retrieval_outbox',
+    'retrieval_dispatch_checkpoint'];
   const role = `sta45_cell_${randomUUID().replaceAll('-', '')}`;
   await pool.query(`CREATE ROLE ${role} NOLOGIN`);
   const cellPool = new pg.Pool({ connectionString: target.toString(), max: 2, options: `-c role=${role}` });
@@ -689,4 +710,222 @@ test('authority that changes between the item\'s reread and its commit is never 
     assert.ok(result.released >= 1, `${label}: the stale apply rolled back (${JSON.stringify(result)})`);
     expect(await projected(spaceId, kind, kind === 'claim' ? 'clm_1' : 'src_1'));
   }
+});
+
+test('a record\'s fallback apply holds the scope fence: a suspension or placement fence it waited for leaves nothing applied', async () => {
+  for (const [label, change] of [['suspension', "lifecycle='suspended'"], ['placement fence', 'placement_generation=placement_generation+1']]) {
+    const { spaceId, scope } = await space();
+    // Generation 1 is lexical; generation 2 needs vectors and has no embedder, so preparation fails at once.
+    await policy(spaceId, 1, { vector: false, regions: [] });
+    await generation(spaceId, 1, 1);
+    await policy(spaceId, 2);
+    await generation(spaceId, 2, 2, identity(new Spy()), 'building');
+    const created = await write(scope, 'create', '{"title":"Fenced"}');
+    const messages = await hints();
+    const writer = await pool.connect();
+    try {
+      await writer.query('BEGIN');
+      await writer.query(`UPDATE spaces SET ${change} WHERE space_id=$1`, [spaceId]);
+      const delivered = deliver(messages, new RecordRetrievalProjector(pool));
+      // The fallback apply waits on the space row the change holds, then sees it committed.
+      await waitingOnLock('s.placement_generation=$3::bigint');
+      await writer.query('COMMIT');
+      assert.deepEqual(await delivered, ['released'], label);
+    } finally { writer.release(); }
+    const record = await projected(spaceId, 'record', created.ref.id);
+    assert.deepEqual([record.refs, record.lexical], [[], []], `${label}: nothing applied after the scope closed`);
+  }
+});
+
+test('a suspension or deletion committed during preparation stops further calls and saves nothing', async () => {
+  // Between retries: the first call fails as an outage while the space is suspended; the retry never calls.
+  const first = await space();
+  const suspend = () => pool.query(`UPDATE spaces SET lifecycle='suspended' WHERE space_id=$1`, [first.spaceId]);
+  const flaky = new Spy({}, { failFirst: 1, before: async call => { if (call === 1) await suspend(); } });
+  await policy(first.spaceId, 1, { claimStatements: false });
+  await generation(first.spaceId, 1, 1, identity(flaky));
+  await evidence(first.spaceId);
+  await new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([flaky]) }).step();
+  assert.equal(flaky.inTransaction.length, 1, 'no call after the suspension committed');
+  const [suspended] = await work(first.spaceId);
+  assert.deepEqual([suspended.delivery_state, suspended.last_error], ['pending', null], 'it waits, without an error of its own');
+  assert.equal((await projected(first.spaceId, 'source', 'src_1')).checkpoints, 0);
+
+  // Between batches: one chunk per call, and the space starts deletion during the first; nothing is saved or called after.
+  const second = await space();
+  const words = Array.from({ length: 600 }, (_, i) => `w${i}`).join(' ');
+  const spy = new Spy({ maxBatch: 1 }, { before: async call => {
+    if (call === 1) await pool.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1`, [second.spaceId]);
+  } });
+  await policy(second.spaceId, 1, { claimStatements: false });
+  await generation(second.spaceId, 1, 1, identity(spy));
+  await evidence(second.spaceId, { extraction: words });
+  await new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([spy]) }).step();
+  assert.equal(spy.inTransaction.length, 1, 'no call after the deletion committed');
+  const source = await projected(second.spaceId, 'source', 'src_1');
+  assert.deepEqual([source.vector, source.checkpoints], [[], 0]);
+});
+
+test('erasure that begins while an item is prepared succeeds, and the preparation writes nothing after it', async () => {
+  const { spaceId } = await space();
+  const locker = await pool.connect();
+  const purger = await pool.connect();
+  let hold = false;
+  let purge;
+  // During the call: deletion commits, and the purge starts and pauses on a
+  // lexical chunk this test holds, after it removed the space's checkpoints.
+  const spy = new Spy({}, { before: async () => {
+    if (!hold) return;
+    await pool.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1`, [spaceId]);
+    await locker.query('BEGIN');
+    await locker.query('SELECT 1 FROM lexical_chunks WHERE space_id=$1 FOR UPDATE', [spaceId]);
+    purge = purger.query('BEGIN').then(() => purger.query('SELECT stateplane_purge_space($1)', [spaceId]));
+    purge.catch(() => {});
+    await waitingOnLock('stateplane_purge_space');
+  } });
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(spy));
+  await evidence(spaceId);
+  const worker = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([spy]) });
+  try {
+    assert.equal((await worker.step()).applied, 2);
+    await extractLocked(spaceId, 2, 'A second extraction.');
+    hold = true;
+    await worker.step();
+    await locker.query('COMMIT');
+    await purge;
+    await purger.query('COMMIT');
+  } finally {
+    await locker.query('ROLLBACK').catch(() => {});
+    await purger.query('ROLLBACK').catch(() => {});
+    locker.release();
+    purger.release();
+  }
+  const left = (await pool.query(`SELECT (SELECT count(*) FROM embedding_checkpoints WHERE space_id=$1)::int AS checkpoints,
+    (SELECT count(*) FROM projection_refs WHERE space_id=$1)::int AS refs`, [spaceId])).rows[0];
+  assert.deepEqual(left, { checkpoints: 0, refs: 0 });
+});
+
+test('pairs with due work take turns across claims, steps and workers, however long another pair\'s backlog', async () => {
+  const spaces = [];
+  for (let i = 0; i < 3; i++) spaces.push((await space()).spaceId);
+  const [a, b, c] = spaces.toSorted();
+  for (const id of spaces) {
+    await policy(id, 1, { vector: false, regions: [] });
+    await generation(id, 1, 1);
+    await evidence(id);
+  }
+  // Two long backlogs: twelve claim revisions each, plus the source.
+  for (const id of [a, b]) for (let revision = 2; revision <= 12; revision++) await revise(id, revision, `Statement ${revision}.`);
+  const order = async since => (await pool.query(`SELECT space_id FROM retrieval_outbox WHERE space_id=ANY($1)
+    AND delivered_at>$2 ORDER BY delivered_at`, [spaces, since])).rows.map(row => row.space_id);
+  await pool.query('UPDATE retrieval_dispatch_checkpoint SET after_space_id=NULL,after_collection_id=NULL');
+  const options = { limit: 2, perPair: 1, pairs: 3 };
+  const start = new Date();
+  await new PostgresRetrievalWorker(pool).step(options);
+  const delivered = await order(start);
+  assert.equal(delivered.length, 13 + 13 + 2);
+  assert.deepEqual(delivered.slice(0, 6), [a, b, c, a, b, c], 'the short pair is served in turn, not after the backlogs');
+
+  // Another worker's step continues from the stored cursor.
+  for (const id of spaces) await revise(id, id === c ? 2 : 13, 'Later statement.');
+  await pool.query(`UPDATE retrieval_dispatch_checkpoint SET after_space_id=$1,after_collection_id='alpha'`, [b]);
+  const later = new Date();
+  await new PostgresRetrievalWorker(pool).step({ ...options, limit: 1 });
+  assert.deepEqual(await order(later), [c, a, b]);
+  assert.deepEqual((await pool.query('SELECT after_space_id,after_collection_id FROM retrieval_dispatch_checkpoint')).rows,
+    [{ after_space_id: b, after_collection_id: 'alpha' }]);
+});
+
+test('a preparation that starts after a newer position without configured content applied records nothing and saves nothing', async () => {
+  // A record: revision 2 drops the only configured field and applies before revision 1's preparation begins.
+  const { spaceId, scope } = await space();
+  const spy = new Spy();
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(spy));
+  const projector = new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([spy]) });
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const late = { prepare: async (change, signal) => { entered(); await gate; return projector.prepare(change, signal); },
+    apply: (change, prepared, query) => projector.apply(change, prepared, query) };
+  const created = await write(scope, 'create', '{"title":"Removed later"}');
+  const running = deliver(await hints(), late);
+  await started;
+  await write(scope, 'replace', '{"note":"no title"}', { recordId: created.ref.id, expectedRevision: 1 });
+  assert.deepEqual(await deliver(await hints(false), projector), ['applied']);
+  release();
+  assert.deepEqual(await running, ['superseded']);
+  const record = await projected(spaceId, 'record', created.ref.id);
+  assert.deepEqual([record.refs, record.lexical, record.checkpoints],
+    [[{ generation: 1, revision: 2, extraction: null, deleted: false }], [], 0]);
+  assert.deepEqual(spy.inputs, [], 'the removed title was never embedded');
+
+  // A source: a whitespace-only extraction applies to generation 2 while
+  // extraction 1 is still being embedded for generation 1.
+  const second = await space();
+  let open;
+  const opened = new Promise(resolve => { open = resolve; });
+  let reached;
+  const embedding = new Promise(resolve => { reached = resolve; });
+  const slow = new Spy({}, { before: async () => { reached(); await opened; } });
+  const other = new Spy({ model: 'feature-hash-b' });
+  await policy(second.spaceId, 1, { claimStatements: false });
+  await generation(second.spaceId, 1, 1, identity(slow));
+  await generation(second.spaceId, 2, 1, identity(other), 'building');
+  await evidence(second.spaceId);
+  const running2 = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([slow, other]) }).step();
+  await embedding;
+  await extractLocked(second.spaceId, 2, '   ');
+  const fast = new EmbeddingRegistry([new Spy(), new Spy({ model: 'feature-hash-b' })]);
+  assert.equal((await new PostgresRetrievalWorker(pool, { embedders: fast }).step()).applied, 1);
+  open();
+  await running2;
+  const source = await projected(second.spaceId, 'source', 'src_1');
+  assert.deepEqual([source.refs.map(ref => [ref.generation, ref.extraction, ref.deleted]), source.lexical, source.vector, source.checkpoints],
+    [[[1, 2, false], [2, 2, false]], [], [], 0]);
+  assert.deepEqual(other.inputs, [], 'generation 2 never embedded the older extraction');
+});
+
+test('concurrent first applies of one Ref converge, neither counted as a failure', async () => {
+  const { spaceId } = await space();
+  await policy(spaceId, 1, { vector: false, regions: [], sourceContent: false });
+  await generation(spaceId, 1, 1);
+  await evidence(spaceId);
+  await revise(spaceId, 2, 'The second statement.');
+  // Only the two claim items are due; each worker takes one.
+  await pool.query(`UPDATE retrieval_outbox SET available_at=clock_timestamp()+interval '1 hour'
+    WHERE space_id=$1 AND ref_kind='source'`, [spaceId]);
+  const blocker = await pool.connect();
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query('SELECT 1 FROM projection_generations WHERE space_id=$1 FOR UPDATE', [spaceId]);
+    const options = { limit: 1, perPair: 1 };
+    const runs = [new PostgresRetrievalWorker(pool).step(options), new PostgresRetrievalWorker(pool).step(options)];
+    await waitingOnLock('FROM projection_generations', 2);
+    await blocker.query('ROLLBACK');
+    assert.deepEqual((await Promise.all(runs)).map(result => result.applied), [1, 1]);
+  } finally { blocker.release(); }
+  assert.deepEqual((await work(spaceId)).filter(row => row.ref_kind === 'claim')
+    .map(row => [row.delivery_state, row.attempts, row.last_error]), [['delivered', 1, null], ['delivered', 1, null]]);
+  const claim = await projected(spaceId, 'claim', 'clm_1');
+  assert.deepEqual([claim.refs, claim.lexical], [[{ generation: 1, revision: 2, extraction: null, deleted: false }],
+    [[1, 2, null, 'The second statement.']]]);
+});
+
+test('a provider error with a long multibyte message is recorded within the diagnostic bound', async () => {
+  const { spaceId, collectionId } = await space();
+  const broken = new Spy({}, { before: () => { throw new Error('é'.repeat(2_000)); } });
+  await policy(spaceId, 1, { claimStatements: false });
+  await generation(spaceId, 1, 1, identity(broken));
+  await evidence(spaceId);
+  const worker = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([broken]) });
+  await worker.step();
+  const [source] = await work(spaceId);
+  assert.equal(source.delivery_state, 'pending');
+  assert.ok(source.last_error.startsWith('Error: éé'), source.last_error.slice(0, 40));
+  const bytes = Buffer.byteLength(source.last_error);
+  assert.ok(bytes <= 1_024 && bytes > 1_020, `${bytes} bytes`);
+  assert.equal((await worker.status(spaceId, collectionId)).state, 'degraded');
 });
