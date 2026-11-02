@@ -27,8 +27,9 @@ interface Generation {
 interface Chunk extends TextChunk { index: number; sha256: string }
 
 // Initial protective bounds, not measured provider capacity. Preparing one
-// Ref stops starting embedding batches after 15 s and ends by 16 s, well
-// inside the record outbox's 30 s processing budget; a retrieval item's lease
+// Ref stops starting embedding batches after 15 s (or half the time its
+// delivery or item has left) and ends by 16 s, well inside the record
+// outbox's 30 s processing budget; a retrieval item's lease
 // outlasts its whole budget. A lock wait gives way after 1 s and is retried.
 const PREPARE_MS = 15_000;
 const ITEM_MS = 20_000;
@@ -44,6 +45,9 @@ const GRACE_MS = 1_000;
 // failed for others, gets at most this long (and never outlasts the
 // delivery's own budget): preparation, its grace and this end within 19 s.
 const FALLBACK_APPLY_MS = 3_000;
+// A record's preparation, fallback apply included, settles at least this long
+// (at most an eighth of the time left) before the delivery's budget ends.
+const SETTLE_MS = 250;
 // Backoff from 5 s doubling: an outage or an interrupted item retries within
 // 5 minutes, an item's own failure within an hour. Retrieval work has no
 // dead letter; a failing item stays pending and is reported as degraded.
@@ -230,8 +234,9 @@ type Outages = Set<Embedder>;
  * transaction. No connection is held while the embedder runs. Each
  * generation with work gets an equal share of the time left (the last one
  * all of it), so an embedder that fails or hangs never keeps another
- * generation from preparing. One cut by its share before saving anything is
- * an outage for the rest of the step, like one that failed. After trying
+ * generation from preparing. Each generation's cut is judged by its own
+ * progress: one cut by its share before saving anything is an outage for the
+ * rest of the step, like one that failed, whatever its siblings saved. After trying
  * them all, the first error that is the target's own is thrown, else the
  * first outage.
  */
@@ -252,12 +257,12 @@ async function prepareTarget(pool: PoolLike, registry: EmbeddingRegistry, target
     const run = (own: AbortSignal, mine: { saved: number }) => prepareGeneration(pool, target, generation, chunks, embedder, own,
       saved => { mine.saved += saved; progress.saved += saved; });
     const share = Math.max(1, Math.floor((deadline - Date.now()) / (work.length - index)));
+    const ends = Date.now() + share;
     try {
-      await (index === work.length - 1 ? run(signal, { saved: 0 })
-        : budgeted(run, signal, share, Math.min(GRACE_MS, Math.floor(share / 4))));
+      await budgeted(run, signal, share, Math.min(GRACE_MS, Math.floor(share / 4)));
     } catch (error) {
-      // A call cut short by the whole budget says nothing about the provider.
-      if (error instanceof EmbedderUnavailableError && !signal.aborted) outages?.add(embedder);
+      // Only a call cut short by the caller before its share ended says nothing about the provider.
+      if (error instanceof EmbedderUnavailableError && (!signal.aborted || Date.now() >= ends)) outages?.add(embedder);
       errors.push(error);
     }
   }
@@ -315,8 +320,11 @@ async function budgeted(run: (signal: AbortSignal, progress: { saved: number }, 
   const controller = new AbortController();
   const deadline = Date.now() + ms;
   const progress = { saved: 0 };
-  const expired = () => progress.saved ? new ProjectionIncompleteError()
-    : new EmbedderUnavailableError('Embedding exceeded its time budget');
+  const expired = () => {
+    const error = progress.saved ? new ProjectionIncompleteError() : new EmbedderUnavailableError('Embedding exceeded its time budget');
+    budgetOutcomes.add(error);
+    return error;
+  };
   let grace: ReturnType<typeof setTimeout> | undefined;
   let stop: (error: unknown) => void = () => {};
   const stopped = new Promise<never>((_, reject) => { stop = reject; });
@@ -333,14 +341,18 @@ async function budgeted(run: (signal: AbortSignal, progress: { saved: number }, 
     work.catch(() => {});
     await Promise.race([work, stopped]);
   } catch (error) {
-    // An embedder that gives up on the aborted signal reports the budget's own outcome.
-    throw controller.signal.aborted ? expired() : error;
+    // An embedder that gives up on the aborted signal reports the budget's own
+    // outcome; a nested budget's (one generation's share) is kept as it is.
+    throw controller.signal.aborted && !budgetOutcomes.has(error as Error) ? expired() : error;
   } finally {
     clearTimeout(timer);
     clearTimeout(grace);
     parent.removeEventListener('abort', forward);
   }
 }
+
+/** Outcomes of an ended budget, each judged by the progress of the work it cut. */
+const budgetOutcomes = new WeakSet<Error>();
 
 /** Remove a Ref's checkpoints at or before a position its generation holds; a later apply never needs them. */
 async function dropCheckpoints(query: Query, key: unknown[], revision: number | string, extraction: number | string | null) {
@@ -508,15 +520,35 @@ export class RecordRetrievalProjector implements Projector<void> {
     ({ embedders: this.#embedders, prepareMs: this.#prepareMs } = options(settings));
   }
 
-  async prepare(change: ProjectionChange, signal: AbortSignal): Promise<void> {
+  async prepare(change: ProjectionChange, signal: AbortSignal,
+    deadline = Date.now() + 2 * this.#prepareMs + FALLBACK_APPLY_MS): Promise<void> {
     if (change.deleted) return;
-    const target = recordTarget(change);
+    // Everything here settles, classified, before the delivery's own budget
+    // ends, so running out of its time is never the delivery's counted failure:
+    // preparation gets at most half the time left and its grace an eighth,
+    // the fallback apply runs until shortly before the delivery's deadline,
+    // and a backstop then ends whatever is still running.
+    const left = deadline - Date.now();
+    const end = deadline - Math.max(1, Math.min(SETTLE_MS, Math.floor(left / 8)));
+    const prepareMs = Math.max(1, Math.min(this.#prepareMs, Math.floor(left / 2)));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const backstop = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new EmbedderUnavailableError('The delivery budget ended during preparation')),
+        Math.max(0, end - Date.now()));
+    });
+    backstop.catch(() => {});
+    try {
+      await Promise.race([this.prepareWithin(recordTarget(change), change.generation, signal, prepareMs, end), backstop]);
+    } finally { clearTimeout(timer); }
+  }
+
+  private async prepareWithin(target: Target, placement: number, signal: AbortSignal, prepareMs: number, end: number) {
     try {
       await budgeted((budget, progress, deadline) => prepareTarget(this.pool, this.#embedders, target, budget, progress, deadline),
-        signal, this.#prepareMs);
+        signal, prepareMs, Math.min(GRACE_MS, Math.floor(prepareMs / 4)));
     } catch (error) {
-      const blocked = await inTransaction(this.pool, db => this.applyAvailable(db.query.bind(db), target, change.generation),
-        { deadline: Date.now() + FALLBACK_APPLY_MS, signal }).catch(() => null);
+      const blocked = await inTransaction(this.pool, db => this.applyAvailable(db.query.bind(db), target, placement),
+        { deadline: Math.min(Date.now() + FALLBACK_APPLY_MS, end), signal }).catch(() => null);
       // Every generation turned out complete (an earlier attempt's checkpoints
       // sufficed), or the scope closed: completion applies or releases.
       if (blocked === 'closed' || blocked?.length === 0) return;

@@ -1107,6 +1107,57 @@ test('a vector generation whose embedder hangs never keeps a healthy one from pr
   assert.equal((await worker.status(spaceId, collectionId)).state, 'degraded');
 });
 
+test('a record delivery with a short budget and a hung embedder is released uncounted, then projects on recovery', async () => {
+  const { spaceId, scope } = await space();
+  // 'waits' gives up on its signal; 'ignores' never does until released.
+  let release = () => {};
+  const spy = new Spy({}, { before: (call, signal) => untilAborted(signal) });
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(spy));
+  const short = new PostgresOutbox(pool, authority, { processingMs: 1_500 });
+  const projector = new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([spy]) });
+  const created = await write(scope, 'create', '{"title":"Short budget"}');
+  for (const label of ['waits', 'ignores']) {
+    if (label === 'ignores') spy.behavior.before = () => new Promise((_, reject) => { release = () => reject(new Error('released')); });
+    const started = Date.now();
+    assert.deepEqual(await consume(await hints(), message => short.process(message, projector), 1), ['retry'], label);
+    release();
+    assert.ok(Date.now() - started < 1_500, `${label}: settled within the delivery's budget`);
+    assert.deepEqual((await pool.query('SELECT delivery_state,failures,last_error FROM projection_outbox WHERE space_id=$1', [spaceId])).rows,
+      [{ delivery_state: 'pending', failures: 0, last_error: 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE' }], label);
+  }
+  spy.behavior.before = undefined;
+  assert.deepEqual(await consume(await hints(), message => short.process(message, projector), 1), ['applied']);
+  assert.deepEqual((await projected(spaceId, 'record', created.ref.id)).vector, [[1, 1, 'eu-west', digest('Short budget')]]);
+});
+
+test('a hung last vector generation is judged by its own progress: an outage for the step, never rerun at once', async () => {
+  const { spaceId, scope, collectionId } = await space();
+  // Generation 1 is healthy; generation 2, prepared last, waits for its signal.
+  const healthy = new Spy({ modelVersion: 'healthy' });
+  const hung = new Spy({ modelVersion: 'hung' }, { before: (call, signal) => untilAborted(signal) });
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(healthy));
+  await policy(spaceId, 2);
+  await generation(spaceId, 2, 2, identity(hung), 'building');
+  const registry = new EmbeddingRegistry([healthy, hung]);
+  const created = await write(scope, 'create', '{"title":"Healthy first"}');
+  assert.deepEqual(await deliver(await hints(), new RecordRetrievalProjector(pool, { embedders: registry, prepareMs: 1_000 })), ['retry']);
+  assert.deepEqual((await projected(spaceId, 'record', created.ref.id)).vector, [[1, 1, 'eu-west', digest('Healthy first')]]);
+  assert.deepEqual((await pool.query('SELECT failures,last_error FROM projection_outbox WHERE space_id=$1', [spaceId])).rows,
+    [{ failures: 0, last_error: 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE' }]);
+
+  await evidence(spaceId);
+  const calls = hung.inTransaction.length;
+  const step = await new PostgresRetrievalWorker(pool, { embedders: registry, prepareMs: 1_000 }).step();
+  assert.deepEqual([step.claimed, step.applied, step.retried], [2, 0, 2], 'neither item is rerun in the step');
+  assert.equal(hung.inTransaction.length - calls, 1, 'the second item skips the hung embedder');
+  assert.deepEqual((await projected(spaceId, 'claim', 'clm_1')).vector, [[1, 1, 'eu-west', digest('The bridge opened in 1932.')]]);
+  for (const row of await work(spaceId)) assert.deepEqual([row.delivery_state, row.attempts, row.last_error, row.waiting],
+    ['pending', 1, 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE', true]);
+  assert.equal((await new PostgresRetrievalWorker(pool).status(spaceId, collectionId)).state, 'degraded');
+});
+
 test('an item whose start rolls back is released under its claim, recording the error as degraded', async () => {
   const { spaceId, collectionId } = await space();
   await policy(spaceId, 1, { vector: false, regions: [] });

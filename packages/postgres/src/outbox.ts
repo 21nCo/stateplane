@@ -17,7 +17,8 @@ export interface DeliveryMessage { eventId: string; attempt: number }
  * error.
  */
 export interface Projector<P = unknown> {
-  prepare?(change: ProjectionChange, signal: AbortSignal): Promise<P>;
+  /** `signal` aborts at `deadline` (epoch ms), when the delivery's budget ends; a prepare still running then is the delivery's failure. */
+  prepare?(change: ProjectionChange, signal: AbortSignal, deadline: number): Promise<P>;
   apply(change: ProjectionChange, prepared: P | undefined, query: ProjectionQuery): Promise<void>;
 }
 export type ProcessOutcome = ProjectionOutcome | 'failed' | 'released';
@@ -318,7 +319,7 @@ export class PostgresOutbox {
     try {
       let prepared: unknown;
       if (active?.prepare) {
-        try { prepared = await within(active.prepare(change, signal), signal); }
+        try { prepared = await within(active.prepare(change, signal, deadline), signal); }
         catch (error) { throw projectorError('prepare', error); }
       }
       const apply = active && (async (current: ProjectionChange, query: ProjectionQuery) => {
