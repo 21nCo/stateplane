@@ -3,7 +3,8 @@ import { connectionOptions } from './db-connection.mjs';
 
 // Run after migration 045 or restore through a protected cell administration
 // connection. The role is supplied by the protected deployment inventory.
-// Space deletion proves erasure by reading every retrieval table. Policy
+// Space deletion proves erasure by reading every space-scoped retrieval table
+// (the collection heads are written only by owner-rights triggers). Policy
 // writers insert retrieval policy versions; the projection worker (STA-45 and
 // later) starts and moves generations, advances projected Refs, replaces
 // chunks and checkpoints, records deletion receipts and delivers retrieval
@@ -21,6 +22,7 @@ if (!url || !role || !/^(?!pg_)[a-z][a-z0-9_]{0,62}$/.test(role))
 
 const grants=[
   ['retrieval_policies','SELECT, INSERT'],
+  ['retrieval_collection_heads','SELECT'],
   ['vector_index_strategies','SELECT'],
   ['projection_generations','SELECT, INSERT, UPDATE'],
   ['projection_refs','SELECT, INSERT, UPDATE'],
@@ -37,17 +39,16 @@ try {
   const found=await client.query('SELECT 1 FROM pg_roles WHERE rolname=$1',[role]);
   if (found.rowCount!==1) throw new Error('Cell operational role does not exist');
   await client.query('BEGIN');
-  for (const [table,privileges] of grants) await client.query(`GRANT ${privileges} ON TABLE public.${table} TO "${role}"`);
-  for (const routine of routines) await client.query(`GRANT EXECUTE ON FUNCTION ${routine} TO "${role}"`);
+  // One batch of statements, applied in order inside this transaction.
+  await client.query([...grants.map(([table,privileges])=>`GRANT ${privileges} ON TABLE public.${table} TO "${role}"`),
+    ...routines.map(routine=>`GRANT EXECUTE ON FUNCTION ${routine} TO "${role}"`)].join(';\n'));
   // A comma-separated privilege list is true when any one is held; check each.
-  for (const [table,privileges] of grants) for (const privilege of privileges.split(', ')) {
-    const checked=await client.query('SELECT has_table_privilege($1,$2,$3) AS granted',[role,`public.${table}`,privilege]);
-    if (checked.rows[0].granted!==true) throw new Error(`Retrieval grant unavailable: ${privilege} on ${table}`);
-  }
-  for (const routine of routines) {
-    const checked=await client.query(`SELECT has_function_privilege($1,$2,'EXECUTE') AS granted`,[role,routine]);
-    if (checked.rows[0].granted!==true) throw new Error(`Retrieval grant unavailable: EXECUTE on ${routine}`);
-  }
+  const wanted=grants.flatMap(([table,privileges])=>privileges.split(', ').map(privilege=>[`public.${table}`,privilege]));
+  const missing=await client.query(`SELECT 'Retrieval grant unavailable: '||p||' on '||t AS problem
+    FROM unnest($2::text[],$3::text[]) AS w(t,p) WHERE NOT has_table_privilege($1,t,p)
+    UNION ALL SELECT 'Retrieval grant unavailable: EXECUTE on '||r FROM unnest($4::text[]) AS r
+    WHERE NOT has_function_privilege($1,r,'EXECUTE')`,[role,wanted.map(([table])=>table),wanted.map(([,privilege])=>privilege),routines]);
+  if (missing.rowCount) throw new Error(missing.rows.map(row=>row.problem).join('; '));
   await client.query('COMMIT');
 } catch(error) {
   await client.query('ROLLBACK').catch(()=>{});

@@ -93,6 +93,36 @@ REVOKE ALL ON FUNCTION stateplane_check_retrieval_policy() FROM PUBLIC;
 CREATE TRIGGER retrieval_policies_valid BEFORE INSERT ON retrieval_policies
   FOR EACH ROW EXECUTE FUNCTION stateplane_check_retrieval_policy();
 
+-- One mutable row per collection with a policy: its current policy version
+-- and the highest generation number it has allocated. Only owner-rights
+-- triggers write it. Publishing a policy and starting a generation both write
+-- this row, and a vector chunk or checkpoint share locks it to read the current
+-- policy, so they serialize: a writer whose snapshot predates a committed
+-- change of the row fails with a serialization error under REPEATABLE READ,
+-- and under READ COMMITTED waits and checks the committed row.
+CREATE TABLE retrieval_collection_heads (
+  space_id text NOT NULL,
+  collection_id text NOT NULL,
+  policy_version bigint NOT NULL,
+  generation bigint NOT NULL DEFAULT 0 CHECK (generation >= 0),
+  PRIMARY KEY (space_id, collection_id),
+  FOREIGN KEY (space_id, collection_id, policy_version) REFERENCES retrieval_policies(space_id, collection_id, version)
+);
+
+CREATE FUNCTION stateplane_publish_retrieval_policy() RETURNS trigger LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  INSERT INTO public.retrieval_collection_heads(space_id, collection_id, policy_version)
+    VALUES (NEW.space_id, NEW.collection_id, NEW.version)
+    ON CONFLICT (space_id, collection_id) DO UPDATE SET policy_version = EXCLUDED.policy_version;
+  RETURN NULL;
+END;
+$$;
+REVOKE ALL ON FUNCTION stateplane_publish_retrieval_policy() FROM PUBLIC;
+CREATE TRIGGER retrieval_policies_publish AFTER INSERT ON retrieval_policies
+  FOR EACH ROW EXECUTE FUNCTION stateplane_publish_retrieval_policy();
+
 -- The ANN strategy for each embedding dimension the cell accepts. A vector
 -- generation must name a recorded dimension. HNSW strategies have a partial
 -- expression index below; `exact` dimensions are above pgvector's 2,000
@@ -161,35 +191,38 @@ CREATE TRIGGER projection_generations_no_truncate BEFORE TRUNCATE ON projection_
 
 -- A generation starts building under the collection's current policy, with an
 -- embedder exactly when that policy enables vectors, and numbers above every
--- earlier generation of its collection. Each transition stamps its own time;
--- nothing else about a generation changes.
+-- earlier generation of its collection, both read from the collection's head
+-- row under an update lock that it then advances. Each transition stamps its
+-- own time; nothing else about a generation changes.
 CREATE FUNCTION stateplane_guard_projection_generation() RETURNS trigger LANGUAGE plpgsql
 SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
-  policy record;
+  head record;
   stamps text[] := ARRAY['state', 'verifying_at', 'activated_at', 'retired_at'];
 BEGIN
   IF TG_OP = 'INSERT' THEN
-    SELECT p.version, p.vector INTO policy FROM public.retrieval_policies p
-      WHERE p.space_id = NEW.space_id AND p.collection_id = NEW.collection_id ORDER BY p.version DESC LIMIT 1;
+    SELECT h.policy_version, h.generation INTO head FROM public.retrieval_collection_heads h
+      WHERE h.space_id = NEW.space_id AND h.collection_id = NEW.collection_id FOR UPDATE;
     IF NEW.state <> 'building' OR NEW.verifying_at IS NOT NULL OR NEW.activated_at IS NOT NULL OR NEW.retired_at IS NOT NULL THEN
       RAISE EXCEPTION 'a projection generation starts building'
         USING ERRCODE = 'check_violation', CONSTRAINT = 'projection_generations_transition';
     END IF;
-    IF policy.version IS DISTINCT FROM NEW.policy_version THEN
+    IF head.policy_version IS DISTINCT FROM NEW.policy_version THEN
       RAISE EXCEPTION 'a projection generation is built under its collection''s current retrieval policy'
         USING ERRCODE = 'check_violation', CONSTRAINT = 'projection_generations_policy';
     END IF;
-    IF policy.vector <> (NEW.embedder IS NOT NULL) THEN
+    IF (SELECT p.vector FROM public.retrieval_policies p WHERE p.space_id = NEW.space_id
+        AND p.collection_id = NEW.collection_id AND p.version = NEW.policy_version) <> (NEW.embedder IS NOT NULL) THEN
       RAISE EXCEPTION 'a projection generation names an embedder exactly when its policy enables vectors'
         USING ERRCODE = 'check_violation', CONSTRAINT = 'projection_generations_policy';
     END IF;
-    IF EXISTS (SELECT 1 FROM public.projection_generations g WHERE g.space_id = NEW.space_id
-        AND g.collection_id = NEW.collection_id AND g.generation >= NEW.generation) THEN
+    IF head.generation >= NEW.generation THEN
       RAISE EXCEPTION 'projection generations increase'
         USING ERRCODE = 'check_violation', CONSTRAINT = 'projection_generations_order';
     END IF;
+    UPDATE public.retrieval_collection_heads h SET generation = NEW.generation
+      WHERE h.space_id = NEW.space_id AND h.collection_id = NEW.collection_id;
     RETURN NEW;
   END IF;
   IF (to_jsonb(NEW) - stamps) IS DISTINCT FROM (to_jsonb(OLD) - stamps)
@@ -210,8 +243,9 @@ CREATE TRIGGER projection_generations_transition BEFORE INSERT OR UPDATE ON proj
 
 -- The projected state of one canonical Ref in one generation: the
 -- authoritative revision (and, for a source, extraction version) its chunks
--- were built from, or that it was deleted. A Ref only moves forward, and a
--- deleted Ref stays deleted. Chunks reference the live row at its revision,
+-- were built from, or that it was deleted. A Ref only moves forward (a
+-- deletion at the same revision is forward, with or without its extraction),
+-- and a deleted Ref stays deleted. Chunks reference the live row at its revision,
 -- so advancing or deleting a Ref requires removing its older chunks first;
 -- embedding checkpoints reference the live row at any revision, so deleting a
 -- Ref also requires removing its checkpoints first.
@@ -317,8 +351,8 @@ BEGIN
   IF TG_OP = 'UPDATE' THEN
     IF (NEW.space_id, NEW.collection_id, NEW.generation, NEW.ref_kind, NEW.ref_id)
         IS DISTINCT FROM (OLD.space_id, OLD.collection_id, OLD.generation, OLD.ref_kind, OLD.ref_id) OR OLD.deleted
-      OR (NEW.revision, COALESCE(NEW.extraction_version, 0), NEW.deleted)
-        <= (OLD.revision, COALESCE(OLD.extraction_version, 0), OLD.deleted) THEN
+      OR (NEW.revision, NEW.deleted, COALESCE(NEW.extraction_version, 0))
+        <= (OLD.revision, OLD.deleted, COALESCE(OLD.extraction_version, 0)) THEN
       RAISE EXCEPTION 'a projected Ref only moves forward, and a deleted Ref stays deleted'
         USING ERRCODE = 'check_violation', CONSTRAINT = 'projection_refs_order';
     END IF;
@@ -385,6 +419,11 @@ CREATE TABLE vector_chunks (
   extraction_version bigint,
   live boolean NOT NULL GENERATED ALWAYS AS (true) STORED,
   policy_version bigint NOT NULL,
+  embedder text NOT NULL,
+  embedding_model text NOT NULL,
+  model_version text NOT NULL,
+  dimensions integer NOT NULL,
+  processing_region text NOT NULL,
   chunk_index integer NOT NULL CHECK (chunk_index >= 0),
   field text CHECK (octet_length(field) <= 256),
   content_start bigint NOT NULL,
@@ -392,11 +431,6 @@ CREATE TABLE vector_chunks (
   source_start bigint,
   source_end bigint,
   content_sha256 stateplane_sha256 NOT NULL,
-  embedder text NOT NULL,
-  embedding_model text NOT NULL,
-  model_version text NOT NULL,
-  dimensions integer NOT NULL,
-  processing_region text NOT NULL,
   embedding vector NOT NULL,
   PRIMARY KEY (space_id, collection_id, generation, ref_kind, ref_id, chunk_index),
   FOREIGN KEY (space_id, collection_id, generation, ref_kind, ref_id, revision, live)
@@ -475,12 +509,17 @@ CREATE TRIGGER embedding_checkpoints_immutable BEFORE UPDATE ON embedding_checkp
 -- retired, only for content its policy configures, and only by a projection
 -- its policy enables. A lexical chunk's `tsv` is always derived from its
 -- content; an embedding has its generation's dimensions and was processed in
--- a region the policy allows.
+-- a region both its generation's policy and the collection's current policy
+-- allow. The current policy is read from the collection's head row under a
+-- share lock, so publishing a policy waits for embedders already writing and
+-- an embedder that meets a newer policy is checked against it (or, under
+-- REPEATABLE READ, fails with a serialization error).
 CREATE FUNCTION stateplane_guard_projection_chunk() RETURNS trigger LANGUAGE plpgsql
 SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   policy record;
+  current_version bigint;
 BEGIN
   SELECT g.state AS generation_state, p.version, p.record_fields, p.source_content, p.claim_statements, p.lexical,
       p.vector, p.text_search_config, p.processing_regions
@@ -513,9 +552,15 @@ BEGIN
     RAISE EXCEPTION 'retrieval policy % does not enable vector projection', policy.version
       USING ERRCODE = 'check_violation', CONSTRAINT = TG_TABLE_NAME || '_configured';
   END IF;
-  IF NOT NEW.processing_region = ANY(policy.processing_regions) THEN
-    RAISE EXCEPTION 'retrieval policy % does not allow processing in %', policy.version, NEW.processing_region
-      USING ERRCODE = 'check_violation', CONSTRAINT = TG_TABLE_NAME || '_region';
+  -- Two statements, not a join: under READ COMMITTED the second reads the
+  -- policy the locked head row names after any wait.
+  SELECT h.policy_version INTO current_version FROM public.retrieval_collection_heads h
+    WHERE h.space_id = NEW.space_id AND h.collection_id = NEW.collection_id FOR SHARE;
+  IF NOT NEW.processing_region = ANY(policy.processing_regions) OR NOT EXISTS (SELECT 1 FROM public.retrieval_policies p
+      WHERE p.space_id = NEW.space_id AND p.collection_id = NEW.collection_id AND p.version = current_version
+        AND NEW.processing_region = ANY(p.processing_regions)) THEN
+    RAISE EXCEPTION 'retrieval policies % and % do not both allow processing in %', policy.version, current_version,
+      NEW.processing_region USING ERRCODE = 'check_violation', CONSTRAINT = TG_TABLE_NAME || '_region';
   END IF;
   IF public.vector_dims(NEW.embedding) <> NEW.dimensions THEN
     RAISE EXCEPTION 'embedding has % dimensions, not %', public.vector_dims(NEW.embedding), NEW.dimensions
@@ -627,7 +672,11 @@ CREATE TRIGGER entity_refs_retrieval AFTER UPDATE OF tombstone ON entity_refs
 
 -- Evidence written before this step: enqueue each live source's latest
 -- extraction and each live claim's current revision, so the first build
--- sees them. Deleted evidence has nothing to project. Each statement reads
+-- sees them. Deleted evidence, and evidence of a space being erased, has
+-- nothing to project: a purge already running migration 044's routine (whose
+-- space is committed `deleting`, or `deleted` for an erasure repair) resumes
+-- after this step with that routine, which removes no retrieval work, so no
+-- work may reference its identities. Each statement reads
 -- the identities once and, per live identity, one primary-key probe of its
 -- latest extraction or current revision (a LATERAL ... LIMIT 1 is never
 -- flattened into a scan), so extraction and claim history is never read; the
@@ -637,14 +686,14 @@ INSERT INTO retrieval_outbox(space_id, collection_id, ref_kind, ref_id, revision
   FROM entity_refs e
   CROSS JOIN LATERAL (SELECT v.version FROM extraction_versions v WHERE v.space_id = e.space_id
     AND v.collection_id = e.collection_id AND v.source_id = e.entity_id ORDER BY v.version DESC LIMIT 1) x
-  JOIN spaces s ON s.space_id = e.space_id
+  JOIN spaces s ON s.space_id = e.space_id AND s.lifecycle NOT IN ('deleting', 'deleted')
   WHERE e.kind = 'source' AND NOT e.tombstone;
 INSERT INTO retrieval_outbox(space_id, collection_id, ref_kind, ref_id, revision, operation, placement_generation)
   SELECT e.space_id, e.collection_id, 'claim', e.entity_id, e.revision, 'upsert', s.placement_generation
   FROM entity_refs e
   CROSS JOIN LATERAL (SELECT 1 FROM claim_revisions r WHERE r.space_id = e.space_id AND r.collection_id = e.collection_id
     AND r.claim_id = e.entity_id AND r.revision = e.revision LIMIT 1) x
-  JOIN spaces s ON s.space_id = e.space_id
+  JOIN spaces s ON s.space_id = e.space_id AND s.lifecycle NOT IN ('deleting', 'deleted')
   WHERE e.kind = 'claim' AND NOT e.tombstone;
 
 -- Space erasure removes projections and retrieval work before the records,
@@ -673,6 +722,7 @@ BEGIN
   DELETE FROM public.projection_deletion_receipts WHERE space_id=p_space_id;
   DELETE FROM public.projection_refs WHERE space_id=p_space_id;
   DELETE FROM public.projection_generations WHERE space_id=p_space_id;
+  DELETE FROM public.retrieval_collection_heads WHERE space_id=p_space_id;
   DELETE FROM public.retrieval_policies WHERE space_id=p_space_id;
   DELETE FROM public.retrieval_outbox WHERE space_id=p_space_id;
   DELETE FROM public.receipt_reservation_scopes WHERE space_id=p_space_id;

@@ -193,19 +193,18 @@ try {
     for (const sql of ['SELECT 1 FROM evidence_outbox WHERE space_id=$1','DELETE FROM evidence_outbox WHERE space_id=$1'])
       assert.match((await upgraded.query(`EXPLAIN ${sql}`,['sp_upgrade'])).rows.map(row=>row['QUERY PLAN']).join('\n'),
         /(?:using|on) evidence_outbox_space\b/,sql);
-    // Migration 045's purge and erasure check find a space's retrieval work and chunks by index.
+    // Migration 045's purge and erasure check find a space's retrieval work and chunks by index, and a deleted record or
+    // identity checks its projected Refs through 045's referencing-side indexes.
     for (const [sql,index] of [['SELECT 1 FROM retrieval_outbox WHERE space_id=$1','retrieval_outbox_work'],
       ['DELETE FROM retrieval_outbox WHERE space_id=$1','retrieval_outbox_work'],
-      ['SELECT 1 FROM lexical_chunks WHERE space_id=$1','lexical_chunks_pkey'],['SELECT 1 FROM vector_chunks WHERE space_id=$1','vector_chunks_pkey']])
-      assert.match((await upgraded.query(`EXPLAIN ${sql}`,['sp_upgrade'])).rows.map(row=>row['QUERY PLAN']).join('\n'),
-        new RegExp(`(?:using|on) ${index}\\b`),sql);
-    // A deleted record or identity checks its projected Refs through migration 045's referencing-side indexes.
-    for (const [sql,index] of [[`SELECT 1 FROM ONLY projection_refs x WHERE 'sp_upgrade'=space_id AND 'entries'=collection_id
-      AND 'rec_1'=record_id FOR KEY SHARE OF x`,'projection_refs_record'],[`SELECT 1 FROM ONLY projection_refs x
-      WHERE 'sp_upgrade'=space_id AND 'entries'=collection_id AND 'claim'=entity_kind AND 'clm_1'=entity_id FOR KEY SHARE OF x`,
-    'projection_refs_entity']])
-      assert.match((await upgraded.query(`EXPLAIN ${sql}`)).rows.map(row=>row['QUERY PLAN']).join('\n'),
-        new RegExp(`(?:using|on) ${index}\\b`),sql);
+      ['SELECT 1 FROM lexical_chunks WHERE space_id=$1','lexical_chunks_pkey'],['SELECT 1 FROM vector_chunks WHERE space_id=$1','vector_chunks_pkey'],
+      [`SELECT 1 FROM ONLY projection_refs x WHERE $1=space_id AND 'entries'=collection_id AND 'rec_1'=record_id FOR KEY SHARE OF x`,
+        'projection_refs_record'],
+      [`SELECT 1 FROM ONLY projection_refs x WHERE $1=space_id AND 'entries'=collection_id AND 'claim'=entity_kind AND 'clm_1'=entity_id
+        FOR KEY SHARE OF x`,'projection_refs_entity']]) {
+      const plan=await upgraded.query(`EXPLAIN ${sql}`,['sp_upgrade']); // NOSONAR -- one connection runs its EXPLAINs in turn
+      assert.match(plan.rows.map(row=>row['QUERY PLAN']).join('\n'),new RegExp(String.raw`(?:using|on) ${index}\b`),sql);
+    }
     runMigrator(names[1]);
     await fresh.connect();
     assert.equal(await index(upgraded),await index(fresh));

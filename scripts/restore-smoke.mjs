@@ -42,7 +42,7 @@ const tables = ['stateplane_migrations','space_directory','space_provisioning_au
   'sources','original_objects','source_upload_grants','source_upload_attempts','extraction_versions',
   'claims','claim_revisions','claim_evidence','links','evidence_events','evidence_outbox','original_erasures','space_erasures'];
 const evidenceTables=tables.slice(-13);
-const retrievalTables=['retrieval_policies','vector_index_strategies','projection_generations','projection_refs',
+const retrievalTables=['retrieval_policies','retrieval_collection_heads','vector_index_strategies','projection_generations','projection_refs',
   'projection_deletion_receipts','lexical_chunks','vector_chunks','embedding_checkpoints','retrieval_outbox'];
 tables.push(...retrievalTables);
 const embedding=seed=>`[${Array.from({length:384},(_,i)=>Math.sin(seed*31+i*7)||0.5).join(',')}]`;
