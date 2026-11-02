@@ -669,7 +669,7 @@ export class PostgresRetrievalWorker {
   async step(settings: RetrievalStepOptions = {}): Promise<RetrievalStep> {
     const budgetMs = bounded(settings.budgetMs ?? 10_000, MIN_ITEM_MS, 60_000);
     const limit = bounded(settings.limit ?? 8, 1, 100);
-    const perPair = bounded(settings.perPair ?? 2, 1, limit);
+    const perPair = bounded(settings.perPair ?? Math.min(2, limit), 1, limit);
     const pairs = bounded(settings.pairs ?? 100, 1, MAX_PAIRS);
     const until = Date.now() + budgetMs;
     const result: RetrievalStep = { claimed: 0, applied: 0, released: 0, lost: 0, retried: 0, unknown: 0 };

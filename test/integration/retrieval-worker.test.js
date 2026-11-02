@@ -937,7 +937,9 @@ test('concurrent first applies of one Ref converge, neither counted as a failure
   try {
     await blocker.query('BEGIN');
     await blocker.query('SELECT 1 FROM projection_generations WHERE space_id=$1 FOR UPDATE', [spaceId]);
-    const options = { limit: 1, perPair: 1 };
+    // perPair defaults to no more than the limit; an explicit one above it is refused.
+    await assert.rejects(new PostgresRetrievalWorker(pool).step({ limit: 1, perPair: 2 }), { code: 'INVALID_ARGUMENT' });
+    const options = { limit: 1 };
     const runs = [new PostgresRetrievalWorker(pool).step(options), new PostgresRetrievalWorker(pool).step(options)];
     await waitingOnLock('FROM projection_generations', 2);
     await blocker.query('ROLLBACK');
@@ -982,7 +984,7 @@ test('a provider error that quotes the input is recorded only by its category, o
   assert.ok(Buffer.byteLength(long) <= 1_024 && Buffer.byteLength(long) > 1_020 && !long.includes('�'));
 });
 
-test('a bounded transaction issues nothing after its deadline, and an abort or deadline ends the statement in flight', async () => {
+test('a bounded transaction issues nothing after its deadline, and an abort or deadline ends the statement in flight or the checkout', async () => {
   await pool.query('CREATE TABLE IF NOT EXISTS deadline_probe(n integer)');
   const log = [];
   const logged = { connect: async () => {
@@ -1029,6 +1031,20 @@ test('a bounded transaction issues nothing after its deadline, and an abort or d
     { deadline: started + 4_000, signal: controller.signal }), DeadlineExceededError);
   assert.ok(Date.now() - started < 400, `${Date.now() - started} ms`);
   await settled('3.2');
+
+  // A checkout slower than the budget rejects at the deadline, sends no BEGIN and returns the late session.
+  let returned = 0;
+  const slow = { connect: async () => {
+    await new Promise(resolve => setTimeout(resolve, 300));
+    const client = await logged.connect();
+    return { ...client, release: discard => { returned++; client.release(discard); } };
+  } };
+  log.length = 0;
+  started = Date.now();
+  await assert.rejects(inTransaction(slow, db => db.query('SELECT 1'), { deadline: started + 60 }), DeadlineExceededError);
+  assert.ok(Date.now() - started < 200, `${Date.now() - started} ms`);
+  await new Promise(resolve => setTimeout(resolve, 400));
+  assert.deepEqual([log.map(entry => entry.sql), returned], [[], 1], 'no BEGIN; the late session went back');
   await pool.query('DROP TABLE deadline_probe');
 });
 

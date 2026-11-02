@@ -100,8 +100,9 @@ export interface Session { query(sql: string, values?: unknown[]): Promise<pg.Qu
  * time left falls more than `STATEMENT_SLACK_MS` below it). On the deadline
  * or an abort it stops waiting for the statement in flight, cancels it from
  * another session and discards this one, so the transaction's locks go
- * then, or at the latest when that statement's own bound ends it. COMMIT is
- * never sent once the budget ends. Each of these rolls back as a
+ * then, or at the latest when that statement's own bound ends it. Checking
+ * the session out is bounded too, and BEGIN is not sent after the budget
+ * ends. COMMIT is never sent once the budget ends. Each of these rolls back as a
  * `DeadlineExceededError`.
  */
 export async function inTransaction<T>(pool: PoolLike, fn: (db: pg.PoolClient) => Promise<T>): Promise<T>;
@@ -111,7 +112,8 @@ export async function inTransaction<T>(pool: PoolLike, fn: (db: never) => Promis
   limit?: { deadline: number; signal?: AbortSignal }): Promise<T> {
   const ended = () => limit !== undefined && (Date.now() >= limit.deadline || limit.signal?.aborted === true);
   if (ended()) throw new DeadlineExceededError('The time budget ended before the transaction');
-  const client = await pool.connect();
+  const client = limit ? await checkout(pool, limit) : await pool.connect();
+  if (ended()) { client.release(); throw new DeadlineExceededError('The time budget ended before the transaction'); }
   let begun = false;
   // An unacknowledged BEGIN or COMMIT leaves the session state unknown.
   let discard = true;
@@ -182,6 +184,24 @@ export async function inTransaction<T>(pool: PoolLike, fn: (db: never) => Promis
     limit?.signal?.removeEventListener('abort', expire);
     client.release(discard); client.removeListener?.('error', onError);
   }
+}
+
+/**
+ * Check a session out within the budget. One that arrives after the deadline
+ * or the abort goes straight back to the pool, unused.
+ */
+async function checkout(pool: PoolLike, limit: { deadline: number; signal?: AbortSignal }): Promise<pg.PoolClient> {
+  let late = false;
+  const connecting = pool.connect();
+  connecting.then(client => { if (late) client.release(); }, () => {});
+  let expire: () => void = () => {};
+  const expired = new Promise<never>((_, reject) => {
+    expire = () => { late = true; reject(new DeadlineExceededError('The time budget ended before the transaction')); };
+  });
+  const timer = setTimeout(expire, Math.max(0, limit.deadline - Date.now()));
+  limit.signal?.addEventListener('abort', expire, { once: true });
+  try { return await Promise.race([connecting, expired]); }
+  finally { clearTimeout(timer); limit.signal?.removeEventListener('abort', expire); }
 }
 
 /**
