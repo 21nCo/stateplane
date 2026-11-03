@@ -1,6 +1,52 @@
-import type { RecordRef } from '@stateplane/contracts';
-export interface Candidate { ref: RecordRef; revision: number; score: number; }
-export interface CandidateIndex { search(spaceId: string, query: string, limit: number): Promise<Candidate[]>; }
+/** The kinds of canonical Ref a projection holds. */
+export type RefKind = 'record' | 'source' | 'claim';
+
+/**
+ * One collection's active generation, which is all a search reads of it, with
+ * the kinds of Ref the caller asked for and may read there.
+ */
+export interface ActiveGeneration { collectionId: string; generation: number; textSearchConfig: string; kinds: readonly RefKind[] }
+/**
+ * What candidates may come from: one space and its granted collections'
+ * active generations. `evidenceCollections` lists the collections whose
+ * sources the caller may read now (null: every live collection, for the
+ * owner); a claim citing any other collection, or a deleted one, is not a
+ * candidate, as the claim service treats it as nonexistent.
+ */
+export interface CandidateScope {
+  spaceId: string; generations: readonly ActiveGeneration[]; evidenceCollections: readonly string[] | null;
+}
+/**
+ * One projected chunk that matched: its canonical Ref, the authoritative
+ * revision (and extraction) and generation it was built from, its offsets,
+ * and its score in the list (higher is better). Candidates come only from
+ * chunks of the position authority holds when they are read, under the claim
+ * read rule, so no candidate list reflects content the caller cannot read
+ * then. A candidate is still a pointer to authority, never evidence that its
+ * Ref is current, readable or complete: callers reread and reauthorize it
+ * before returning anything.
+ */
+export interface ChunkCandidate {
+  collectionId: string; kind: RefKind; id: string; revision: number; extractionVersion: number | null;
+  generation: number; policyVersion: number; chunk: number; field: string | null;
+  start: number; end: number; sourceStart: number | null; sourceEnd: number | null; score: number;
+}
+/**
+ * Lexical candidates: the best chunk of each matching Ref, at most `limit`
+ * Refs over all of the scope's generations, best first.
+ */
+export interface LexicalCandidates {
+  lexical(scope: CandidateScope, query: string, limit: number): Promise<ChunkCandidate[]>;
+}
+/**
+ * Vector candidates: the nearest `limit` chunks to `embedding` in the
+ * scope's generations, which must all be built with `identity`, nearest
+ * first. An approximate index filtered to a scope may return fewer or other
+ * chunks than an exact search would, so a result is never complete.
+ */
+export interface VectorCandidates {
+  nearest(scope: CandidateScope, identity: EmbedderIdentity, embedding: readonly number[], limit: number): Promise<ChunkCandidate[]>;
+}
 
 /**
  * The model a vector generation is built with. A generation pins exactly one
@@ -348,4 +394,42 @@ export class DeterministicEmbedder implements Embedder {
     if (norm === 0) { values[0] = 1; return values; }
     return values.map(value => value / norm);
   }
+}
+
+/**
+ * The reciprocal rank fusion constant. 60 is the value Cormack, Clarke and
+ * Büttcher (SIGIR 2009) found robust across collections; it is not tuned
+ * here (STA-49 evaluates relevance).
+ */
+export const RRF_K = 60;
+
+/** One fused candidate: its key, fused score, and 1-based rank in each list (null when absent). */
+export interface FusedRank { key: string; score: number; ranks: (number | null)[] }
+
+/**
+ * Reciprocal rank fusion of ranked lists of keys, best first: each key scores
+ * the sum of `1 / (k + rank)` over the lists it appears in, so a key both
+ * lists rank well beats one only a single list ranks first. A key counts once
+ * per list, at its best rank, so duplicates (several chunks of one Ref) never
+ * add up. Ties go to the better best rank, then to the earlier list, then to
+ * the key, so the order is deterministic.
+ */
+export function fuseRanks(lists: readonly (readonly string[])[], k = RRF_K): FusedRank[] {
+  if (!Number.isFinite(k) || k < 0) throw new RangeError('Invalid fusion constant');
+  const fused = new Map<string, FusedRank>();
+  lists.forEach((list, index) => {
+    let rank = 0;
+    for (const key of list) {
+      let entry = fused.get(key);
+      if (entry?.ranks[index] != null) continue;
+      rank++;
+      if (!entry) fused.set(key, entry = { key, score: 0, ranks: lists.map(() => null) });
+      entry.ranks[index] = rank;
+      entry.score += 1 / (k + rank);
+    }
+  });
+  const best = (entry: FusedRank) => Math.min(...entry.ranks.map(rank => rank ?? Infinity));
+  const first = (entry: FusedRank) => entry.ranks.findIndex(rank => rank !== null);
+  return [...fused.values()].sort((a, b) => b.score - a.score || best(a) - best(b) || first(a) - first(b)
+    || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
 }

@@ -264,6 +264,7 @@ try {
   assert.equal((await restored.query('SELECT count(*)::int AS n FROM record_event_pending')).rows[0].n,0);
   const journalRole=`sta6_restore_${randomBytes(8).toString('hex')}`;
   await restored.query(`CREATE ROLE ${journalRole} LOGIN`);
+  let journalFailure=null;
   try {
     execFileSync(process.execPath,['scripts/grant-control-journal.mjs'],{cwd:root,
       env:{...process.env,STATEPLANE_CONTROL_URL:targetUrl,STATEPLANE_CONTROL_ROLE:journalRole},stdio:'inherit'});
@@ -307,13 +308,19 @@ try {
       operational.release();
       await restored.query('DELETE FROM agent_key_issuances WHERE issuance_id=$1',[issuance]).catch(()=>{});
     }
-  } finally {
-    await restored.query(`REVOKE ALL ON agent_key_issuances,projection_heads,projection_reconciliations,
-      outbox_dispatch_checkpoint,outbox_space_rotation,outbox_operator_audit,${evidenceTables.join(',')},${retrievalTables.join(',')},
-      retrieval_dispatch_checkpoint FROM ${journalRole}`).catch(()=>{});
-    await restored.query(`REVOKE ALL ON FUNCTION public.vector(public.vector,integer,boolean) FROM ${journalRole}`).catch(()=>{});
-    await restored.query(`DROP ROLE IF EXISTS ${journalRole}`).catch(()=>{});
+  } catch (error) { journalFailure=error; }
+  // Every privilege the grant scripts gave the role (tables and routines alike) lives in this database, so DROP OWNED BY
+  // removes them all, whatever those scripts grant. A cleanup failure fails the smoke unless it would hide the check's own.
+  try {
+    await restored.query(`DROP OWNED BY ${journalRole}`);
+    await restored.query(`DROP ROLE ${journalRole}`);
+  } catch (error) {
+    if (!journalFailure) throw error;
+    process.stderr.write(`Restore smoke could not drop role ${journalRole}: ${error.message}\n`);
   }
+  if (journalFailure) throw journalFailure;
+  assert.equal((await restored.query('SELECT count(*)::int AS n FROM pg_roles WHERE rolname=$1',[journalRole])).rows[0].n,0,
+    'the restore smoke leaves no operational role behind');
   // A reserved-word role proves identifier quoting. Keep its creation and
   // ownership marker atomic so an interrupted run can safely reuse it.
   const reservedRole=await restored.connect();

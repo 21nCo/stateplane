@@ -249,6 +249,13 @@ export class PostgresSpaces {
   async assertCurrent(actor:VerifiedCredential,ownerPrincipalId:string):Promise<void> {
     await this.current(actor,ownerPrincipalId);
   }
+  /** As assertCurrent, returning the provider's expiry for the credential (ms since the epoch; null when it states none). */
+  async assertCurrentUntil(actor:VerifiedCredential,ownerPrincipalId:string):Promise<number|null> {
+    const until=this.credentials.currentUntil ? await this.credentials.currentUntil(actor,ownerPrincipalId)
+      : (await this.credentials.current(actor,ownerPrincipalId)) && null;
+    if (until===false) throw new AuthorityError('FORBIDDEN');
+    return until;
+  }
   /** Check the regional key and grant after the final provider await. The
    * caller supplies its transaction client so a one-connection pool works. */
   async assertScopeCurrent(actor:VerifiedCredential,ownerPrincipalId:string,scope:AuthorityScope,

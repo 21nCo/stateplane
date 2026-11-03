@@ -16,6 +16,8 @@ import { connectionOptions } from './db-connection.mjs';
 // An HNSW index casts each embedding to its dimension on insert, and
 // PostgreSQL checks EXECUTE on that cast function for the inserting role, so
 // the role is granted it explicitly where PUBLIC execution was revoked.
+// Search (STA-46) ranks vector candidates by cosine distance (`<=>`), whose
+// backing function needs the same explicit EXECUTE grant.
 const url=process.env.STATEPLANE_CELL_ADMIN_URL;
 const role=process.env.STATEPLANE_CELL_ROLE;
 if (!url || !role || !/^(?!pg_)[a-z][a-z0-9_]{0,62}$/.test(role))
@@ -34,7 +36,7 @@ const grants=[
   ['retrieval_outbox','SELECT, UPDATE'],
   ['retrieval_dispatch_checkpoint','SELECT, UPDATE']
 ];
-const routines=['public.vector(public.vector, integer, boolean)'];
+const routines=['public.vector(public.vector, integer, boolean)','public.cosine_distance(public.vector, public.vector)'];
 const client=new pg.Client(connectionOptions(url));
 await client.connect();
 try {
