@@ -135,6 +135,16 @@ const scopeArrays = (scope: CandidateScope) => [scope.generations.map(entry => e
   scope.generations.map(entry => entry.generation), scope.generations.map(entry => entry.kinds.join(',')),
   scope.generations.map(entry => entry.textSearchConfig)];
 /**
+ * The claim read rule over a row with `space_id`, `collection_id`, `ref_kind`
+ * and `ref_id`: not a claim, or a claim citing only live collections in
+ * `evidence` (every live one when null).
+ */
+const claimVisible = (row: string, evidence: string) => `(${row}.ref_kind<>'claim' OR NOT EXISTS (SELECT 1 FROM claim_evidence a
+    LEFT JOIN collections k ON k.space_id=a.space_id AND k.collection_id=a.source_collection_id
+    WHERE a.space_id=${row}.space_id AND a.collection_id=${row}.collection_id AND a.claim_id=${row}.ref_id
+      AND (k.collection_id IS NULL OR k.lifecycle='deleted'
+        OR (${evidence}::text[] IS NOT NULL AND a.source_collection_id<>ALL(${evidence}::text[])))))`;
+/**
  * Only chunks of what the caller could read when the candidates are read: the
  * Ref live at the chunk's revision (and, for a source, its latest extraction),
  * and a claim citing only live collections in `evidence` (every live one when
@@ -148,11 +158,7 @@ const readable = (chunk: string, evidence: string) => `AND CASE ${chunk}.ref_kin
       AND e.kind=${chunk}.ref_kind AND e.entity_id=${chunk}.ref_id AND e.revision=${chunk}.revision AND NOT e.tombstone) END
   AND (${chunk}.ref_kind<>'source' OR ${chunk}.extraction_version=(SELECT max(x.version) FROM extraction_versions x
     WHERE x.space_id=${chunk}.space_id AND x.collection_id=${chunk}.collection_id AND x.source_id=${chunk}.ref_id))
-  AND (${chunk}.ref_kind<>'claim' OR NOT EXISTS (SELECT 1 FROM claim_evidence a
-    LEFT JOIN collections k ON k.space_id=a.space_id AND k.collection_id=a.source_collection_id
-    WHERE a.space_id=${chunk}.space_id AND a.collection_id=${chunk}.collection_id AND a.claim_id=${chunk}.ref_id
-      AND (k.collection_id IS NULL OR k.lifecycle='deleted'
-        OR (${evidence}::text[] IS NOT NULL AND a.source_collection_id<>ALL(${evidence}::text[])))))`;
+  AND ${claimVisible(chunk, evidence)}`;
 
 /**
  * The lexical and vector candidate ports over PostgreSQL full-text search
@@ -218,10 +224,12 @@ export class PostgresCandidates implements LexicalCandidates, VectorCandidates {
  * Plan a search: the caller's readable collections in the space (optionally
  * only `wanted`), at most one more than the cap, each with the kinds it may
  * read, its active generation with its policy and the regions both policies
- * allow, and its projection state. A plan only chooses what to read; the
- * reread decides what is returned.
+ * allow, and its projection state over only the work the caller could see:
+ * of the kinds searched there, and claims under the read rule (`evidence`).
+ * A plan only chooses what to read; the reread decides what is returned.
  */
-async function plan(db: Db, scope: AuthorityScope, owner: boolean, request: Request): Promise<Planned[]> {
+async function plan(db: Db, scope: AuthorityScope, owner: boolean, request: Request, evidence: string[] | null)
+  : Promise<Planned[]> {
   const capabilities = request.kinds.map(kind => READ[kind]);
   const rows = (await db.query(`SELECT c.collection_id,g.capabilities,a.generation,a.policy_version,p.lexical,p.vector,
       p.text_search_config,a.embedder,a.embedding_model,a.model_version,a.dimensions,
@@ -247,20 +255,28 @@ async function plan(db: Db, scope: AuthorityScope, owner: boolean, request: Requ
           modelVersion: row.model_version, dimensions: Number(row.dimensions) } : null },
       projection: row.generation === null ? 'unindexed' : 'current', vector: vector ? 'unavailable' : 'disabled', vectorError: null };
   });
-  const indexed = planned.filter(entry => entry.active).map(entry => entry.collectionId);
+  const indexed = planned.filter(entry => entry.active);
   if (!indexed.length) return planned;
-  // Pending and degraded as the worker's status reports them: work waiting; a failure or error among the oldest-due rows,
-  // or a failed record delivery anywhere. Exact reads never depend on this.
+  // Pending and degraded as the worker's status reports them, over the work of the searched (readable) kinds only:
+  // record work (projection_outbox) only when records are searched; source and claim work by kind, a claim's only
+  // under the claim read rule. Work waiting; a failure or error among the oldest-due such rows, or a failed record
+  // delivery anywhere. Work the caller could not read therefore never shows. Exact reads never depend on this.
+  const visible = `o.space_id=$1 AND o.collection_id=x.collection_id AND o.delivery_state='pending' AND o.ref_kind=ANY(x.kinds)
+    AND ${claimVisible('o', '$5')}`;
   const states = new Map((await db.query(`SELECT x.collection_id,
-      EXISTS (SELECT 1 FROM projection_outbox WHERE space_id=$1 AND collection_id=x.collection_id AND ${LIVE_OUTBOX})
-        OR EXISTS (SELECT 1 FROM retrieval_outbox WHERE space_id=$1 AND collection_id=x.collection_id
-          AND delivery_state='pending') AS pending,
-      EXISTS (SELECT 1 FROM projection_outbox WHERE space_id=$1 AND collection_id=x.collection_id AND ${FAILED_OUTBOX})
+      ('record'=ANY(x.kinds) AND EXISTS (SELECT 1 FROM projection_outbox WHERE space_id=$1 AND collection_id=x.collection_id
+          AND ${LIVE_OUTBOX}))
+        OR EXISTS (SELECT 1 FROM retrieval_outbox o WHERE ${visible}) AS pending,
+      ('record'=ANY(x.kinds) AND (EXISTS (SELECT 1 FROM projection_outbox WHERE space_id=$1 AND collection_id=x.collection_id
+          AND ${FAILED_OUTBOX})
         OR EXISTS (SELECT 1 FROM (SELECT last_error FROM projection_outbox WHERE space_id=$1 AND collection_id=x.collection_id
-          AND ${LIVE_OUTBOX} ORDER BY available_at,event_id LIMIT $3) s WHERE s.last_error IS NOT NULL)
-        OR EXISTS (SELECT 1 FROM (SELECT last_error FROM retrieval_outbox WHERE space_id=$1 AND collection_id=x.collection_id
-          AND delivery_state='pending' ORDER BY available_at,job_id LIMIT $3) s WHERE s.last_error IS NOT NULL) AS degraded
-    FROM unnest($2::text[]) AS x(collection_id)`, [scope.spaceId, indexed, STATUS_SAMPLE])).rows
+          AND ${LIVE_OUTBOX} ORDER BY available_at,event_id LIMIT $4) s WHERE s.last_error IS NOT NULL)))
+        OR EXISTS (SELECT 1 FROM (SELECT o.last_error FROM retrieval_outbox o WHERE ${visible}
+          ORDER BY o.available_at,o.job_id LIMIT $4) s WHERE s.last_error IS NOT NULL) AS degraded
+    FROM unnest($2::text[],$3::text[]) AS u(collection_id,kinds)
+    CROSS JOIN LATERAL (SELECT u.collection_id,string_to_array(u.kinds,',') AS kinds) x`,
+  [scope.spaceId, indexed.map(entry => entry.collectionId), indexed.map(entry => entry.active!.kinds.join(',')), STATUS_SAMPLE,
+    evidence])).rows
     .map(row => [String(row.collection_id), row.degraded ? 'degraded' : row.pending ? 'pending' : 'current'] as const));
   for (const entry of planned) if (entry.active) entry.projection = states.get(entry.collectionId) ?? 'current';
   return planned;
@@ -342,8 +358,9 @@ async function reread(db: Db, spaceId: string, candidates: readonly ChunkCandida
 /**
  * The cited range of a record whose `jsonb` cannot hold its text, from its
  * canonical JSON at the candidate's revision. Read one record at a time and
- * only for a candidate about to be returned, so at most `limit` records'
- * canonical JSON (each at most 1 MiB) is read, one after another.
+ * only for a page hit, so at most `limit` records' canonical JSON (each at
+ * most 1 MiB), plus one per citation found no longer to hold, is read, one
+ * after another.
  */
 async function canonicalRange(db: Db, spaceId: string, candidate: ChunkCandidate): Promise<string | null> {
   const row = (await db.query(`SELECT canonical_data FROM records WHERE space_id=$1 AND collection_id=$2 AND record_id=$3
@@ -355,9 +372,13 @@ async function canonicalRange(db: Db, spaceId: string, candidate: ChunkCandidate
   return points && points.length >= candidate.end ? points.slice(candidate.start, candidate.end).join('') : null;
 }
 
-/** Whether authority still holds the exact revision (and extraction) a citation was built from, with its text. */
+/**
+ * Whether authority still holds the exact revision (and extraction) a
+ * citation was built from, with its text (a canonical-JSON record's is read
+ * only when the citation is about to be returned, and checked then).
+ */
 const holds = (candidate: ChunkCandidate, read: Reread) => read.tombstone === false && read.currentRevision === candidate.revision
-  && read.text !== null && (candidate.kind !== 'source' || read.latestExtraction === candidate.extractionVersion);
+  && (read.text !== null || read.canonical) && (candidate.kind !== 'source' || read.latestExtraction === candidate.extractionVersion);
 
 /** What the caller may read now, under the locks `lockScope` holds. */
 interface Access { owner: boolean; grants: Map<string, readonly string[]> }
@@ -463,8 +484,10 @@ export class PostgresRetrievalSearch {
     const { scope, ownerPrincipalId } = admitted;
     const owner = actor.kind === 'session';
     const input = parse(request);
-    const { all, evidence } = await transact(cell.pool, async db => ({ all: await plan(db, scope, owner, input),
-      evidence: await evidenceCollections(db, scope, owner) }));
+    const { all, evidence } = await transact(cell.pool, async db => {
+      const evidence = await evidenceCollections(db, scope, owner);
+      return { all: await plan(db, scope, owner, input, evidence), evidence };
+    });
     const collectionsCapped = all.length > searchBounds.collections;
     const planned = all.slice(0, searchBounds.collections);
     if (input.collections && planned.length !== input.collections.length) throw new AuthorityError('NOT_FOUND');
@@ -550,37 +573,57 @@ export class PostgresRetrievalSearch {
       const readOf = new Map(flat.map((item, at) => [item, reads[at]]));
       const live = await citedCollections(db, spaceId, [...new Set(reads.flatMap(read => read.cited))]);
       const rejected = { deleted: 0, stale: 0, unauthorized: 0 };
-      const hits: SearchHit[] = [];
-      const relied = new Set<string>();
-      for (let index = 0; index < considered.length && hits.length < input.limit; index++) {
+      // Validate every considered Ref: only citations from the active generation of exactly what authority holds now
+      // survive, and a Ref with none left is stale.
+      const kept = new Map<string, { items: typeof cited[number]; read: Reread }>();
+      for (let index = 0; index < considered.length; index++) {
         const head = cited[index][0].hit;
-        const capability = READ[head.kind];
-        if (!mayRead(access, head.collectionId, capability)) { rejected.unauthorized++; continue; }
+        if (!mayRead(access, head.collectionId, READ[head.kind])) { rejected.unauthorized++; continue; }
         const first = readOf.get(cited[index][0])!;
         if (first.currentRevision === null || first.tombstone !== false) { rejected.deleted++; continue; }
-        // Only citations from the active generation of exactly what authority holds now; a Ref with none left is stale.
         const generation = active.get(head.collectionId);
-        const current: typeof cited[number] = [];
-        for (const item of cited[index]) {
-          if (generation?.generation !== item.hit.generation || generation.policyVersion !== item.hit.policyVersion) continue;
-          const read = readOf.get(item)!;
-          if (read.canonical && read.currentRevision === item.hit.revision) read.text = await canonicalRange(db, spaceId, item.hit);
-          if (holds(item.hit, read)) current.push(item);
-        }
-        if (!current.length) { rejected.stale++; continue; }
-        const read = readOf.get(current[0])!;
+        const items = cited[index].filter(item => generation?.generation === item.hit.generation
+          && generation.policyVersion === item.hit.policyVersion && holds(item.hit, readOf.get(item)!));
+        if (!items.length) { rejected.stale++; continue; }
+        const read = readOf.get(items[0])!;
         // The claim read rule: a claim citing a collection whose sources the caller cannot read does not exist for it.
         if (head.kind === 'claim' && read.cited.some(id => !live.has(id) || (!access.owner && !mayRead(access, id, 'sources:read')))) {
           rejected.unauthorized++; continue;
         }
-        relied.add(JSON.stringify([head.collectionId, capability]));
-        for (const id of head.kind === 'claim' ? read.cited : []) relied.add(JSON.stringify([id, 'sources:read']));
-        const entry = planned.find(item => item.collectionId === head.collectionId)!;
-        const ranks = considered[index].ranks;
-        const chunk = current[0].hit;
+        kept.set(considered[index].key, { items, read });
+      }
+      // Fuse again over the surviving matches only, so a rejected or stale match neither ranks nor boosts a Ref, then take
+      // the page. A canonical-JSON record's cited text is read only for a page hit; one that no longer holds drops its
+      // citation and the page is fused again.
+      let page: ReturnType<typeof fuseRanks>;
+      for (;;) {
+        page = fuseRanks(lists.map((list, from) => [...list.keys()]
+          .filter(key => kept.get(key)?.items.some(item => item.from === from)))).slice(0, input.limit);
+        let changed = false;
+        for (const { key } of page) {
+          const entry = kept.get(key)!;
+          for (const item of entry.items) {
+            const read = readOf.get(item)!;
+            if (read.text !== null) continue;
+            read.text = await canonicalRange(db, spaceId, item.hit);
+            if (read.text === null) { read.canonical = false; changed = true; }
+          }
+          entry.items = entry.items.filter(item => readOf.get(item)!.text !== null);
+          if (!entry.items.length) { kept.delete(key); rejected.stale++; }
+        }
+        if (!changed) break;
+      }
+      const hits: SearchHit[] = [];
+      const relied = new Set<string>();
+      for (const { key, ranks, score } of page) {
+        const { items, read } = kept.get(key)!;
+        const chunk = items[0].hit;
+        relied.add(JSON.stringify([chunk.collectionId, READ[chunk.kind]]));
+        for (const id of chunk.kind === 'claim' ? read.cited : []) relied.add(JSON.stringify([id, 'sources:read']));
+        const entry = planned.find(item => item.collectionId === chunk.collectionId)!;
         // One citation per chunk, naming every list that found it there.
         const citations: SearchCitation[] = [];
-        for (const item of current) {
+        for (const item of items) {
           const by = item.from === 0 ? 'lexical' as const : 'vector' as const;
           const same = citations.find(other => other.chunk === item.hit.chunk);
           if (same) { if (!same.matchedBy.includes(by)) same.matchedBy.push(by); continue; }
@@ -588,12 +631,12 @@ export class PostgresRetrievalSearch {
             sourceStart: item.hit.sourceStart, sourceEnd: item.hit.sourceEnd, text: readOf.get(item)!.text! });
         }
         hits.push({ ref: { spaceId, collectionId: chunk.collectionId, kind: chunk.kind, id: chunk.id }, revision: chunk.revision,
-          extractionVersion: chunk.extractionVersion, score: considered[index].score, citations,
+          extractionVersion: chunk.extractionVersion, score, citations,
           provenance: { generation: chunk.generation, policyVersion: chunk.policyVersion, lexicalRank: ranks[0],
             vectorRank: ranks.slice(1).find(rank => rank !== null) ?? null,
-            embedder: current.some(item => item.from > 0) ? entry.active!.identity : null,
-            attributedTo: read.attributedTo, evidence: head.kind === 'claim' ? read.evidence : [] },
-          review: head.kind === 'claim' ? read.review : null,
+            embedder: items.some(item => item.from > 0) ? entry.active!.identity : null,
+            attributedTo: read.attributedTo, evidence: chunk.kind === 'claim' ? read.evidence : [] },
+          review: chunk.kind === 'claim' ? read.review : null,
           freshness: { verifiedAt: read.verifiedAt, projection: entry.projection === 'unindexed' ? 'pending' : entry.projection } });
       }
       await this.assertCurrent(db, actor, ownerPrincipalId, scope, relied);

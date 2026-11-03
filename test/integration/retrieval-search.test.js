@@ -299,6 +299,41 @@ test('a deletion or revision committed after the candidates are read is caught b
   assert.equal(result.underfill.returned, 0, 'reported, never padded');
 });
 
+test('a match the reread rejects as stale neither ranks nor boosts its Ref: ranks and score come from surviving matches', async () => {
+  const f = await fixture({ collections: ['alpha'] });
+  const both = await f.record('alpha', { title: 'heron at the pond' });
+  const revised = await f.record('alpha', { title: 'heron' });
+  const corrected = await f.source('alpha', 'A heron survey.');
+  await index();
+  // Between the vector and the lexical statement a new revision and a new extraction are indexed, so the vector list
+  // holds their superseded chunks and the lexical list their current ones.
+  hooks = [{ match: 'websearch_to_tsquery', run: async () => {
+    await f.record('alpha', { title: 'heron' }, { recordId: revised, expectedRevision: 1 }, 'replace');
+    await sources.correctExtraction(f.owner, f.spaceId, 'alpha', corrected, { baseVersion: 1, content: 'A heron census.',
+      sourceOffsets: [] });
+    await index();
+  } }];
+  const result = await search(registry, hooked).search(f.owner, f.spaceId, { query: 'heron' });
+  assert.equal(hooks.length, 0);
+  assert.equal(result.candidates.considered, 3);
+  assert.deepEqual(result.rejected, { deleted: 0, stale: 0, unauthorized: 0 }, 'each keeps its current lexical citation');
+  const hit = id => result.results.find(item => item.ref.id === id);
+  for (const [id, revision, extractionVersion] of [[revised, 2, null], [corrected, 1, 2]]) {
+    const stale = hit(id);
+    assert.deepEqual([stale.revision, stale.extractionVersion], [revision, extractionVersion]);
+    assert.deepEqual(stale.citations.map(citation => citation.matchedBy), [['lexical']]);
+    assert.equal(stale.provenance.vectorRank, null, 'the superseded vector match has no rank');
+    assert.equal(stale.provenance.embedder, null);
+    assert.equal(stale.score, 1 / (60 + stale.provenance.lexicalRank), 'a single-list score');
+  }
+  // The Ref both lists found current outranks every Ref left with one list, and the page is in score order.
+  const fresh = hit(both);
+  assert.deepEqual(ids(result)[0], `alpha/record/${both}`);
+  assert.equal(fresh.score, 1 / (60 + fresh.provenance.lexicalRank) + 1 / (60 + fresh.provenance.vectorRank));
+  assert.equal(fresh.provenance.vectorRank, 1, 'ranks are fused again over the surviving matches');
+  assert.deepEqual(result.results.map(item => item.score), result.results.map(item => item.score).sort((a, b) => b - a));
+});
+
 test("an owner's claim is fenced on every collection it cites, also outside the search filter", async () => {
   const f = await fixture();
   const cited = await f.source('beta', 'A tide table.');
@@ -384,6 +419,42 @@ test('search reads only granted collections and kinds, and applies the claim rea
     new Set([`alpha/claim/${plain.claimId}`, `alpha/claim/${citing.claimId}`, `beta/source/${betaSource}`]));
 });
 
+test('projection state counts only work of kinds the caller searches and may read, and claims under the read rule', async () => {
+  const f = await fixture();
+  const cited = await f.source('beta', 'The tide survey.');
+  await index();
+  const claimsOnly = await f.agent([['alpha', ['claims:read']]]);
+  const withEvidence = await f.agent([['alpha', ['claims:read']], ['beta', ['sources:read']]]);
+  const meta = result => ({ mode: result.mode, state: result.state, collections: result.collections, underfill: result.underfill,
+    candidates: result.candidates, rejected: result.rejected });
+  const before = meta(await search().search(claimsOnly, f.spaceId, { query: 'tide' }));
+  assert.equal(before.state, 'current');
+
+  // Record work the key cannot read, and a claim it cannot see (it cites beta, whose sources the key cannot read), wait.
+  const record = await f.record('alpha', { title: 'tide table' });
+  await claims.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: randomUUID(), statement: 'The tide turns at noon.',
+    attributedTo: 'harbor', evidence: [{ collectionId: 'beta', sourceId: cited }] });
+  const state = async (actor, request = {}) => {
+    const result = await search().search(actor, f.spaceId, { query: 'tide', collections: ['alpha'], ...request });
+    return [result.state, result.collections[0].projection, result.underfill?.reasons.filter(reason => reason === 'pending') ?? []];
+  };
+  assert.deepEqual(meta(await search().search(claimsOnly, f.spaceId, { query: 'tide' })), before, 'nothing it cannot read shows');
+  assert.deepEqual(await state(f.owner), ['pending', 'pending', ['pending']]);
+  assert.deepEqual(await state(f.owner, { kinds: ['source'] }), ['current', 'current', []], 'only searched kinds count');
+  assert.deepEqual(await state(withEvidence), ['pending', 'pending', ['pending']], 'the claim it may read is waiting');
+
+  // Failures: a failed record delivery and an error on the hidden claim's job.
+  await pool.query(`UPDATE projection_outbox SET failures=1,last_error='projection failed'
+    WHERE space_id=$1 AND collection_id='alpha' AND record_id=$2`, [f.spaceId, record]);
+  assert.deepEqual(meta(await search().search(claimsOnly, f.spaceId, { query: 'tide' })), before);
+  assert.deepEqual((await state(f.owner, { kinds: ['record'] })).slice(0, 2), ['degraded', 'degraded']);
+  assert.deepEqual(await state(withEvidence), ['pending', 'pending', ['pending']]);
+  await pool.query(`UPDATE retrieval_outbox SET attempts=attempts+1,last_error='indexing failed'
+    WHERE space_id=$1 AND collection_id='alpha' AND ref_kind='claim' AND delivery_state='pending'`, [f.spaceId]);
+  assert.deepEqual(meta(await search().search(claimsOnly, f.spaceId, { query: 'tide' })), before);
+  assert.deepEqual((await state(withEvidence)).slice(0, 2), ['degraded', 'degraded']);
+});
+
 /** Let `key`'s grant on `collectionId` lapse now, as an expiry does: no API call, no policy version change. */
 const expire = (spaceId, key, collectionId) => pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()
   WHERE space_id=$1 AND credential_id=$2 AND collection_id=$3`, [spaceId, key.credentialId, collectionId]);
@@ -459,6 +530,34 @@ test('a grant lapsing after the plan, before either candidate statement, fails t
     await rejects(search(registry, hooked).search(reader, g.spaceId, { query: 'sandpipers', collections: ['alpha'] }), 'FORBIDDEN');
     assert.ok(written, `${statement}: the claim was written and indexed in the window`);
   }
+});
+
+test('a relied-on grant expiring during the final provider check fails the search', async () => {
+  const f = await fixture({ collections: ['alpha'] });
+  await f.record('alpha', { title: 'osprey dive' });
+  await index();
+  const key = await f.agent([['alpha', ['records:read']]]);
+  // The grant is live through the plan, candidates and reread; it lapses on its own while the provider is awaited.
+  let reached = false;
+  const slow = new Proxy(spaces, { get(target, property) {
+    if (property === 'assertCurrent') return async (...args) => {
+      reached = true;
+      for (let tries = 0; ; tries++) {
+        const { lapsed } = (await pool.query(`SELECT expires_at<=clock_timestamp() AS lapsed FROM collection_grants
+          WHERE space_id=$1 AND credential_id=$2`, [f.spaceId, key.credentialId])).rows[0];
+        if (lapsed) break;
+        assert.ok(tries < 400, 'the grant lapses');
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+      return target.assertCurrent(...args);
+    };
+    return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
+  } });
+  hooks = [{ match: LOCK_SPACE, run: () => pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '1 second'
+    WHERE space_id=$1 AND credential_id=$2`, [f.spaceId, key.credentialId]) }];
+  const searcher = new PostgresRetrievalSearch(slow, new Map([['cell-a', { pool: hooked }]]), { embedders: registry });
+  await rejects(searcher.search(key, f.spaceId, { query: 'osprey' }), 'FORBIDDEN');
+  assert.ok(reached, 'the reread admitted the hit; the final check refused it');
 });
 
 test('an embedder or vector outage returns lexical results marked degraded while exact reads work', async () => {
