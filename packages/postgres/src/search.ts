@@ -75,8 +75,8 @@ export interface SearchResult {
  * evaluates them): a query of at most 1,000 code points (what every
  * registered embedder accepts) and 4,000 bytes; up to 50 hits, 10 by
  * default; each candidate list fetches four times the limit, at least 20 and
- * at most 200; up to 32 collections per search; the query embedding gets one
- * try of at most 2 s.
+ * at most 200; up to 32 collections per search; the query embeddings get one
+ * try each, all of them within one 2 s budget.
  */
 export const searchBounds = Object.freeze({ queryCodePoints: CHUNK_CODE_POINTS, queryBytes: 4_000, limit: 50, defaultLimit: 10,
   overfetchFactor: 4, minOverfetch: 20, maxOverfetch: 200, collections: 32, embedMs: 2_000 });
@@ -93,7 +93,9 @@ interface Planned {
   /** Of those, the kinds the active generation's policy projects into no list (every one when it enables neither list). */
   unprojected: RefKind[];
   /** The active generation, with the kinds the caller asked for and may read, and its vector identity when vectors are on. */
-  active: (ActiveGeneration & { policyVersion: number; lexical: boolean; identity: EmbedderIdentity | null; regions: string[] }) | null;
+  active: (ActiveGeneration & { policyVersion: number; lexical: boolean; identity: EmbedderIdentity | null; regions: string[];
+    /** Whether its dimension is searched exactly (no ANN index; `vector_index_strategies`), so a short vector list is complete. */
+    exact: boolean }) | null;
   projection: SearchProjectionState; vector: SearchVectorState; vectorError: SearchVectorError | null;
 }
 interface Request { query: string; collections: string[] | null; kinds: RefKind[]; limit: number }
@@ -157,13 +159,16 @@ const claimVisible = (row: string, evidence: string) => `(${row}.ref_kind<>'clai
       AND (k.collection_id IS NULL OR k.lifecycle='deleted'
         OR (${evidence}::text[] IS NOT NULL AND a.source_collection_id<>ALL(${evidence}::text[])))))`;
 /**
- * Only chunks of what the caller could read when the candidates are read: the
- * Ref live at the chunk's revision (and, for a source, its latest extraction),
- * and a claim citing only live collections in `evidence` (every live one when
- * null). Deleted, superseded and hidden content then leaves no trace in a
- * candidate list, its counts or its ranks; the reread still checks everything.
+ * Only chunks of what the caller could read when the candidates are read: in
+ * a live collection, the Ref live at the chunk's revision (and, for a source,
+ * its latest extraction), and a claim citing only live collections in
+ * `evidence` (every live one when null). Deleted, superseded and hidden
+ * content then leaves no trace in a candidate list, its counts or its ranks;
+ * the reread still checks everything.
  */
-const readable = (chunk: string, evidence: string) => `AND CASE ${chunk}.ref_kind
+const readable = (chunk: string, evidence: string) => `AND EXISTS (SELECT 1 FROM collections lc WHERE lc.space_id=${chunk}.space_id
+    AND lc.collection_id=${chunk}.collection_id AND lc.lifecycle<>'deleted')
+  AND CASE ${chunk}.ref_kind
     WHEN 'record' THEN EXISTS (SELECT 1 FROM records r WHERE r.space_id=${chunk}.space_id AND r.collection_id=${chunk}.collection_id
       AND r.record_id=${chunk}.ref_id AND r.revision=${chunk}.revision AND NOT r.tombstone)
     ELSE EXISTS (SELECT 1 FROM entity_refs e WHERE e.space_id=${chunk}.space_id AND e.collection_id=${chunk}.collection_id
@@ -205,7 +210,7 @@ export class PostgresCandidates implements LexicalCandidates, VectorCandidates {
    * partial index where it has one (exact otherwise), with `hnsw.ef_search`
    * raised to `limit` and pgvector's strict-order iterative scan, so a scope
    * filter makes the index scan further instead of returning fewer rows.
-   * Still approximate: never complete recall.
+   * An HNSW scan is still approximate: never complete recall.
    */
   async nearest(scope: CandidateScope, identity: EmbedderIdentity, embedding: readonly number[], limit: number)
     : Promise<ChunkCandidate[]> {
@@ -245,6 +250,7 @@ async function plan(db: Db, scope: AuthorityScope, owner: boolean, request: Requ
   const capabilities = request.kinds.map(kind => READ[kind]);
   const rows = (await db.query(`SELECT c.collection_id,g.capabilities,a.generation,a.policy_version,p.lexical,p.vector,
       p.text_search_config,cardinality(p.record_fields)>0 AS records_projected,p.source_content,p.claim_statements,a.embedder,a.embedding_model,a.model_version,a.dimensions,
+      s.method='exact' AS exact,
       ARRAY(SELECT r FROM unnest(cur.processing_regions) WITH ORDINALITY u(r,n) WHERE r=ANY(p.processing_regions) ORDER BY n) AS regions
     FROM collections c
     LEFT JOIN collection_grants g ON NOT $3 AND g.space_id=c.space_id AND g.collection_id=c.collection_id AND g.credential_id=$2
@@ -253,6 +259,7 @@ async function plan(db: Db, scope: AuthorityScope, owner: boolean, request: Requ
     LEFT JOIN retrieval_policies p ON p.space_id=a.space_id AND p.collection_id=a.collection_id AND p.version=a.policy_version
     LEFT JOIN retrieval_collection_heads h ON h.space_id=a.space_id AND h.collection_id=a.collection_id
     LEFT JOIN retrieval_policies cur ON cur.space_id=h.space_id AND cur.collection_id=h.collection_id AND cur.version=h.policy_version
+    LEFT JOIN vector_index_strategies s ON s.dimensions=a.dimensions
     WHERE c.space_id=$1 AND c.lifecycle<>'deleted' AND ($4::text[] IS NULL OR c.collection_id=ANY($4::text[]))
       AND ($3 OR g.capabilities && $5::text[])
     ORDER BY c.collection_id COLLATE "C" LIMIT $6`,
@@ -268,19 +275,32 @@ async function plan(db: Db, scope: AuthorityScope, owner: boolean, request: Requ
     return { collectionId: String(row.collection_id), kinds, unprojected,
       active: row.generation === null ? null : { collectionId: String(row.collection_id), generation: Number(row.generation), kinds,
         policyVersion: Number(row.policy_version), textSearchConfig: String(row.text_search_config), lexical: row.lexical === true,
-        regions: row.regions as string[], identity: vector ? { embedder: row.embedder, model: row.embedding_model,
+        regions: row.regions as string[], exact: row.exact === true, identity: vector ? { embedder: row.embedder, model: row.embedding_model,
           modelVersion: row.model_version, dimensions: Number(row.dimensions) } : null },
       projection: row.generation === null ? 'unindexed' : 'current', vector: vector ? 'unavailable' : 'disabled', vectorError: null };
   });
+  const states = await projectionStates(db, scope.spaceId, planned, evidence);
+  for (const entry of planned) if (entry.active) entry.projection = states.get(entry.collectionId) ?? 'current';
+  return planned;
+}
+
+/**
+ * The projection state of each planned collection with an active generation,
+ * over only the work the caller could see: of the kinds searched there, and
+ * claims under the read rule (`evidence`). The plan and the reread both read
+ * it, so coverage is never older than the candidates.
+ */
+async function projectionStates(db: Db, spaceId: string, planned: readonly Planned[], evidence: readonly string[] | null)
+  : Promise<Map<string, SearchProjectionState>> {
   const indexed = planned.filter(entry => entry.active);
-  if (!indexed.length) return planned;
+  if (!indexed.length) return new Map();
   // Pending and degraded as the worker's status reports them, over the work of the searched (readable) kinds only:
   // record work (projection_outbox) only when records are searched; source and claim work by kind, a claim's only
   // under the claim read rule. Work waiting; a failure or error among the oldest-due such rows, or a failed record
   // delivery anywhere. Work the caller could not read therefore never shows. Exact reads never depend on this.
   const visible = `o.space_id=$1 AND o.collection_id=x.collection_id AND o.delivery_state='pending' AND o.ref_kind=ANY(x.kinds)
     AND ${claimVisible('o', '$5')}`;
-  const states = new Map((await db.query(`SELECT x.collection_id,
+  return new Map((await db.query(`SELECT x.collection_id,
       ('record'=ANY(x.kinds) AND EXISTS (SELECT 1 FROM projection_outbox WHERE space_id=$1 AND collection_id=x.collection_id
           AND ${LIVE_OUTBOX}))
         OR EXISTS (SELECT 1 FROM retrieval_outbox o WHERE ${visible}) AS pending,
@@ -292,11 +312,13 @@ async function plan(db: Db, scope: AuthorityScope, owner: boolean, request: Requ
           ORDER BY o.available_at,o.job_id LIMIT $4) s WHERE s.last_error IS NOT NULL) AS degraded
     FROM unnest($2::text[],$3::text[]) AS u(collection_id,kinds)
     CROSS JOIN LATERAL (SELECT u.collection_id,string_to_array(u.kinds,',') AS kinds) x`,
-  [scope.spaceId, indexed.map(entry => entry.collectionId), indexed.map(entry => entry.active!.kinds.join(',')), STATUS_SAMPLE,
-    evidence])).rows
-    .map(row => [String(row.collection_id), row.degraded ? 'degraded' : row.pending ? 'pending' : 'current'] as const));
-  for (const entry of planned) if (entry.active) entry.projection = states.get(entry.collectionId) ?? 'current';
-  return planned;
+  [spaceId, indexed.map(entry => entry.collectionId), indexed.map(entry => entry.active!.kinds.join(',')), STATUS_SAMPLE,
+    evidence])).rows.map(row => {
+    let state: SearchProjectionState = 'current';
+    if (row.degraded) state = 'degraded';
+    else if (row.pending) state = 'pending';
+    return [String(row.collection_id), state] as const;
+  }));
 }
 
 /**
@@ -403,15 +425,22 @@ const mayRead = (access: Access, collectionId: string, capability: string) =>
   access.grants.get(collectionId)?.includes(capability) === true;
 
 /**
- * Whether a key's access under the reread's locks is narrower than the plan's
- * the candidates were read with: a searched collection's planned read
- * capability, or (when claims are searched) `sources:read` on a collection
- * the claim filter treated as readable, no longer held.
+ * Every grant a key's response depends on, as `[collection, capability]`
+ * pairs: each planned collection's read capability for every kind searched
+ * (or reported) there, and, when claims are searched, `sources:read` on every
+ * collection the claim filter treated as readable. Candidates, counts, ranks,
+ * collection status and underfill all follow from these, whatever the page
+ * holds; the reread's locks compare them with the plan, and the final check
+ * confirms them (with each page claim's cited collections) through commit.
  */
-const narrowed = (access: Access, planned: readonly Planned[], evidence: readonly string[] | null) => !access.owner
-  && (planned.some(entry => entry.active?.kinds.some(kind => !mayRead(access, entry.collectionId, READ[kind])))
-    || (evidence !== null && planned.some(entry => entry.active?.kinds.includes('claim'))
-      && evidence.some(id => !mayRead(access, id, 'sources:read'))));
+function dependencies(planned: readonly Planned[], evidence: readonly string[] | null): Set<string> {
+  const pairs = new Set<string>();
+  for (const entry of planned) for (const kind of entry.kinds) pairs.add(JSON.stringify([entry.collectionId, READ[kind]]));
+  if (evidence !== null && planned.some(entry => entry.active?.kinds.includes('claim')))
+    for (const id of evidence) pairs.add(JSON.stringify([id, 'sources:read']));
+  return pairs;
+}
+const pairsOf = (relied: ReadonlySet<string>) => [...relied].map(pair => JSON.parse(pair) as [string, string]);
 
 interface Group { identity: EmbedderIdentity; embedder: Embedder; entries: Planned[] }
 
@@ -527,7 +556,17 @@ export class PostgresRetrievalSearch {
       groups.set(key, group);
     }
     const vectorLists: ChunkCandidate[][] = [];
+    // A filtered approximate (HNSW) scan can stop short (pgvector's hnsw.max_scan_tuples), so its short list proves
+    // nothing; an exact scan's short list holds every chunk it could reach.
+    let approximate = false;
+    // One budget for every group's embedding call, so stalled providers cannot multiply the wait before lexical answers.
+    const vectorEnd = performance.now() + searchBounds.embedMs;
     for (const { identity, embedder, entries } of groups.values()) {
+      const left = Math.ceil(vectorEnd - performance.now());
+      if (left <= 0) {
+        for (const entry of entries) entry.vectorError = 'EMBEDDER_UNAVAILABLE';
+        continue;
+      }
       let embedding: number[];
       let admitted: Planned[] = [];
       let stage: 'admission' | 'embedding' = 'admission';
@@ -546,8 +585,8 @@ export class PostgresRetrievalSearch {
         if (!admitted.length) throw new AdmissionClosed();
         stage = 'embedding';
       };
-      // One try; a call that outlasts the bound, even one ignoring its signal, is an outage and is not waited for.
-      const signal = AbortSignal.timeout(searchBounds.embedMs);
+      // One try; a call that outlasts the budget, even one ignoring its signal, is an outage and is not waited for.
+      const signal = AbortSignal.timeout(left);
       try { [embedding] = await within(embedBatch(embedder, [input.query], signal, [], admit), signal); }
       catch (error) {
         if (error instanceof AdmissionClosed) continue;
@@ -556,8 +595,11 @@ export class PostgresRetrievalSearch {
             : error instanceof EmbedderUnavailableError || signal.aborted ? 'EMBEDDER_UNAVAILABLE' : 'EMBEDDER_FAILED';
         continue;
       }
-      try { vectorLists.push(await candidates.nearest(scopeOf(admitted), identity, embedding, bound)); }
+      let list: ChunkCandidate[];
+      try { list = await candidates.nearest(scopeOf(admitted), identity, embedding, bound); }
       catch { for (const entry of admitted) entry.vectorError = 'VECTOR_QUERY_FAILED'; continue; }
+      vectorLists.push(list);
+      if (list.length < bound && !entries[0].active!.exact) approximate = true;
       for (const entry of admitted) entry.vector = 'used';
     }
     const lexical = await candidates.lexical(scopeOf(planned.filter(entry => entry.active?.lexical)), input.query, bound);
@@ -571,20 +613,30 @@ export class PostgresRetrievalSearch {
     const fused = fuseRanks(lists.map(list => [...list.keys()]));
     const considered = fused.slice(0, bound);
     const bounded = lexical.length >= bound || vectorLists.some(list => list.length >= bound) || fused.length > bound;
-    // A filtered approximate scan can stop short (pgvector's hnsw.max_scan_tuples), so a short vector list proves nothing.
-    const approximate = vectorLists.some(list => list.length < bound);
     // Each considered Ref's citations: its best chunk from every list it is in, lexical first.
     const cited = considered.map(entry => lists.flatMap((list, from) => {
       const hit = list.get(entry.key);
       return hit ? [{ from, hit }] : [];
     }));
 
-    const { hits, rejected } = await transact(cell.pool, async db => {
+    const relied = dependencies(planned, evidence);
+    const { hits, rejected, checked } = await transact(cell.pool, async db => {
       const access = await this.lockScope(db, scope, owner, planned.map(entry => entry.collectionId));
       // The candidates were read under the plan's access, so a key whose access narrowed since (a grant expired) could
       // have candidates, counts and ranks from content written after it lost access: fail closed instead.
-      if (narrowed(access, planned, evidence)) throw new AuthorityError('FORBIDDEN', 'Access changed during search');
+      if (!owner && pairsOf(relied).some(([id, capability]) => !mayRead(access, id, capability)))
+        throw new AuthorityError('FORBIDDEN', 'Access changed during search');
       const active = await activeGenerations(db, spaceId, planned.map(entry => entry.collectionId));
+      // Coverage as of now, after every candidate read, under the generation locks: the work visible now, and a collection
+      // whose active generation or policy moved since the plan was not searched at what is active, so it is pending.
+      const states = await projectionStates(db, spaceId, planned, evidence);
+      for (const entry of planned) {
+        if (!entry.active) continue;
+        const now = active.get(entry.collectionId);
+        const moved = now?.generation !== entry.active.generation || now.policyVersion !== entry.active.policyVersion;
+        const state = states.get(entry.collectionId) ?? 'current';
+        entry.projection = moved && state === 'current' ? 'pending' : state;
+      }
       const flat = cited.flat();
       const reads = flat.length ? await reread(db, spaceId, flat.map(item => item.hit)) : [];
       const readOf = new Map(flat.map((item, at) => [item, reads[at]]));
@@ -631,11 +683,9 @@ export class PostgresRetrievalSearch {
         if (!changed) break;
       }
       const hits: SearchHit[] = [];
-      const relied = new Set<string>();
       for (const { key, ranks, score } of page) {
         const { items, read } = kept.get(key)!;
         const chunk = items[0].hit;
-        relied.add(JSON.stringify([chunk.collectionId, READ[chunk.kind]]));
         for (const id of chunk.kind === 'claim' ? read.cited : []) relied.add(JSON.stringify([id, 'sources:read']));
         const entry = planned.find(item => item.collectionId === chunk.collectionId)!;
         // One citation per chunk, naming every list that found it there.
@@ -656,9 +706,13 @@ export class PostgresRetrievalSearch {
           review: chunk.kind === 'claim' ? read.review : null,
           freshness: { verifiedAt: read.verifiedAt, projection: entry.projection === 'unindexed' ? 'pending' : entry.projection } });
       }
-      await this.assertCurrent(db, actor, ownerPrincipalId, scope, relied);
-      return { hits, rejected };
+      const checked = await this.assertCurrent(db, actor, ownerPrincipalId, scope, relied);
+      return { hits, rejected, checked };
     });
+    // Locks fence revocation, not time: the earliest expiry the final check saw must still lie ahead when COMMIT was
+    // acknowledged (measured from before that statement was sent, so never shorter than the real interval).
+    if (performance.now() - checked.at >= checked.remainingMs)
+      throw new AuthorityError('FORBIDDEN', 'Access expired before the search committed');
 
     // Coverage from what actually ran: a collection's readable kinds are searched only through a list that ran over it.
     const collections: SearchCollection[] = planned.map(entry => ({ collectionId: entry.collectionId,
@@ -724,23 +778,34 @@ export class PostgresRetrievalSearch {
   /**
    * The final check, after the last read: the provider confirms the
    * credential, then one statement against one clock reading confirms the
-   * key and every grant a returned hit relied on (its collection's read
-   * capability and, for a claim, `sources:read` on every cited collection).
+   * key and every grant the response relied on (`dependencies`, plus
+   * `sources:read` on every collection a returned claim cites), and returns
+   * how long until the earliest of their expiries, measured from just before
+   * the statement was sent; the caller requires COMMIT to be acknowledged
+   * within it. Owner sessions have no expiring grant here.
    */
   private async assertCurrent(db: Db, actor: VerifiedCredential, ownerPrincipalId: string, scope: AuthorityScope,
-    relied: Set<string>): Promise<void> {
+    relied: ReadonlySet<string>): Promise<{ at: number; remainingMs: number }> {
     await this.spaces.assertCurrent(actor, ownerPrincipalId);
-    if (actor.kind !== 'api-key') return;
-    const pairs = [...relied].map(pair => JSON.parse(pair) as [string, string]);
-    const row = (await db.query(`WITH t AS (SELECT clock_timestamp() AS now)
-      SELECT EXISTS (SELECT 1 FROM t,space_credentials sc WHERE sc.space_id=$1 AND sc.credential_id=$2
+    if (actor.kind !== 'api-key') return { at: performance.now(), remainingMs: Infinity };
+    const pairs = pairsOf(relied);
+    const at = performance.now();
+    // Per pair, the latest-lasting grant holding it; the credential's expiry is finite, so the earliest is too.
+    const row = (await db.query(`WITH t AS MATERIALIZED (SELECT clock_timestamp() AS now),
+      k AS (SELECT sc.expires_at FROM t,space_credentials sc WHERE sc.space_id=$1 AND sc.credential_id=$2
           AND sc.owner_principal_id=$3 AND sc.activated_at IS NOT NULL AND sc.confirmed_at IS NOT NULL AND sc.revoked_at IS NULL
-          AND sc.expires_at>t.now)
-        AND NOT EXISTS (SELECT 1 FROM t,unnest($4::text[],$5::text[]) AS n(collection_id,capability) WHERE NOT EXISTS (
-          SELECT 1 FROM collection_grants g JOIN collections c ON c.space_id=g.space_id AND c.collection_id=g.collection_id
+          AND sc.expires_at>t.now),
+      r AS (SELECT (SELECT max(COALESCE(g.expires_at,'infinity'::timestamptz)) FROM collection_grants g
+          JOIN collections c ON c.space_id=g.space_id AND c.collection_id=g.collection_id
           WHERE g.space_id=$1 AND g.credential_id=$2 AND g.collection_id=n.collection_id AND n.capability=ANY(g.capabilities)
-            AND c.lifecycle<>'deleted' AND (g.expires_at IS NULL OR g.expires_at>t.now))) AS current`,
+            AND c.lifecycle<>'deleted' AND (g.expires_at IS NULL OR g.expires_at>t.now)) AS expires_at
+        FROM t,unnest($4::text[],$5::text[]) AS n(collection_id,capability))
+      SELECT EXISTS (SELECT 1 FROM k) AND NOT EXISTS (SELECT 1 FROM r WHERE expires_at IS NULL) AS current,
+        EXTRACT(EPOCH FROM LEAST((SELECT min(expires_at) FROM k),(SELECT min(expires_at) FROM r))-(SELECT now FROM t))*1000
+          AS remaining_ms`,
     [scope.spaceId, scope.credentialId, ownerPrincipalId, pairs.map(pair => pair[0]), pairs.map(pair => pair[1])])).rows[0];
-    if (row?.current !== true) throw new AuthorityError('FORBIDDEN');
+    const remainingMs = Number(row?.remaining_ms);
+    if (row?.current !== true || !Number.isFinite(remainingMs) || remainingMs <= 0) throw new AuthorityError('FORBIDDEN');
+    return { at, remainingMs };
   }
 }

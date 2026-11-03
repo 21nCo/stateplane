@@ -131,11 +131,11 @@ async function index(embedders = registry) {
 
 /** Publish a policy and an active generation for `collectionId`, before content is written so the worker projects it. */
 async function project(spaceId, collectionId, { lexical = true, vector = true, regions = ['local'], fields = ['/title', '/note'],
-  sources = true, claims = true } = {}) {
+  sources = true, claims = true, dimensions = 384 } = {}) {
   await pool.query(`INSERT INTO retrieval_policies(space_id,collection_id,version,record_fields,source_content,claim_statements,
       lexical,vector,text_search_config,processing_regions,credential_id) VALUES($1,$2,1,$6,$7,$8,$3,$4,'english',$5,'owner')`,
   [spaceId, collectionId, lexical, vector, regions, fields, sources, claims]);
-  const model = vector ? ['local-hash', 'feature-hash', '1', 384] : [null, null, null, null];
+  const model = vector ? ['local-hash', 'feature-hash', '1', dimensions] : [null, null, null, null];
   await pool.query(`INSERT INTO projection_generations(space_id,collection_id,generation,policy_version,embedder,embedding_model,
     model_version,dimensions) VALUES($1,$2,1,1,$3,$4,$5,$6)`, [spaceId, collectionId, ...model]);
   for (const state of ['verifying', 'active']) await pool.query(`UPDATE projection_generations SET state=$3
@@ -729,9 +729,10 @@ test('a policy narrowing committed during one embedding call stops the next grou
 });
 
 /** Retire `collectionId`'s active generation 1 and activate an empty generation 2 under the same policy. */
-async function cutover(client, spaceId, collectionId) {
+async function cutover(client, spaceId, collectionId, vector = true) {
   await client.query(`INSERT INTO projection_generations(space_id,collection_id,generation,policy_version,embedder,embedding_model,
-    model_version,dimensions) VALUES($1,$2,2,1,'local-hash','feature-hash','1',384)`, [spaceId, collectionId]);
+    model_version,dimensions) VALUES($1,$2,2,1,$3,$4,$5,$6)`,
+  [spaceId, collectionId, ...(vector ? ['local-hash', 'feature-hash', '1', 384] : [null, null, null, null])]);
   await client.query(`UPDATE projection_generations SET state='verifying' WHERE space_id=$1 AND collection_id=$2 AND generation=2`,
     [spaceId, collectionId]);
   await client.query('BEGIN');
@@ -873,4 +874,170 @@ test('the lexical query uses the pg_catalog configuration that built the tsvecto
     await shadowed.end();
     await pool.query(`DROP SCHEMA ${schema} CASCADE`);
   }
+});
+
+/** A searcher whose final provider check waits until `collectionId`'s grant (set to lapse 1 s after the scope locks start) lapsed. */
+function lapsingDuringProviderCheck(f, key, collectionId) {
+  const state = { reached: false };
+  const slow = new Proxy(spaces, { get(target, property) {
+    if (property === 'assertCurrent') return async (...args) => {
+      state.reached = true;
+      for (let tries = 0; ; tries++) {
+        const { lapsed } = (await pool.query(`SELECT expires_at<=clock_timestamp() AS lapsed FROM collection_grants
+          WHERE space_id=$1 AND credential_id=$2 AND collection_id=$3`, [f.spaceId, key.credentialId, collectionId])).rows[0];
+        if (lapsed) break;
+        assert.ok(tries < 400, 'the grant lapses');
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+      return target.assertCurrent(...args);
+    };
+    return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
+  } });
+  hooks = [{ match: LOCK_SPACE, run: () => pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '1 second'
+    WHERE space_id=$1 AND credential_id=$2 AND collection_id=$3`, [f.spaceId, key.credentialId, collectionId]) }];
+  return { searcher: new PostgresRetrievalSearch(slow, new Map([['cell-a', { pool: hooked }]]), { embedders: registry }), state };
+}
+
+test('the final check covers every grant behind the response: out-of-page, empty-result and claim-evidence grants', async () => {
+  // Two collections match, the page holds alpha's hit only; beta's grant still backs the counts and beta's status.
+  const f = await fixture({ policy: { alpha: { vector: false }, beta: { vector: false } } });
+  await f.record('alpha', { title: 'puffin burrow puffin' });
+  await f.record('beta', { title: 'puffin' });
+  await index();
+  const key = await f.agent([['alpha', ['records:read']], ['beta', ['records:read']]]);
+  const page = await search().search(key, f.spaceId, { query: 'puffin', limit: 1 });
+  assert.equal(page.results[0].ref.collectionId, 'alpha', 'alpha is the page');
+  assert.equal(page.candidates.considered, 2);
+  const outOfPage = lapsingDuringProviderCheck(f, key, 'beta');
+  await rejects(outOfPage.searcher.search(key, f.spaceId, { query: 'puffin', limit: 1 }), 'FORBIDDEN');
+  assert.ok(outOfPage.state.reached);
+
+  // Nothing matches: the empty page and its collection status still depend on the searched collection's grant.
+  const g = await fixture({ collections: ['alpha'], policy: { alpha: { vector: false } } });
+  await g.record('alpha', { title: 'unrelated' });
+  await index();
+  const lone = await g.agent([['alpha', ['records:read']]]);
+  const empty = lapsingDuringProviderCheck(g, lone, 'alpha');
+  await rejects(empty.searcher.search(lone, g.spaceId, { query: 'guillemot' }), 'FORBIDDEN');
+  assert.ok(empty.state.reached);
+
+  // A claims search in alpha whose candidates and state used beta's sources:read only through the claim read rule.
+  const h = await fixture({ policy: { alpha: { vector: false }, beta: { vector: false } } });
+  const cited = await h.source('beta', 'A cliff count.');
+  await claims.create(h.owner, h.spaceId, 'alpha', { idempotencyKey: randomUUID(), statement: 'Razorbills nest on the cliff.',
+    attributedTo: 'count', evidence: [{ collectionId: 'beta', sourceId: cited }] });
+  await index();
+  const reader = await h.agent([['alpha', ['claims:read']], ['beta', ['sources:read']]]);
+  const request = { query: 'guillemot', collections: ['alpha'] };
+  assert.deepEqual((await search().search(reader, h.spaceId, request)).results, []);
+  const evidence = lapsingDuringProviderCheck(h, reader, 'beta');
+  await rejects(evidence.searcher.search(reader, h.spaceId, request), 'FORBIDDEN');
+  assert.ok(evidence.state.reached);
+});
+
+test('a credential or grant expiring after the final check but before COMMIT fails the search', async () => {
+  const final = 'sc.owner_principal_id=$3';
+  for (const table of ['collection_grants', 'space_credentials']) {
+    const f = await fixture({ collections: ['alpha'], policy: { alpha: { vector: false } } });
+    await f.record('alpha', { title: 'shearwater raft' });
+    await index();
+    const key = await f.agent([['alpha', ['records:read']]]);
+    const lapse = (after = '1 second') => pool.query(`UPDATE ${table} SET expires_at=clock_timestamp()+$3::interval
+      WHERE space_id=$1 AND credential_id=$2`, [f.spaceId, key.credentialId, after]);
+    let delayed = false;
+    // Set to lapse before the scope locks (which would make the update wait), live for the final statement; then only the
+    // reread's COMMIT is held until the expiry passed.
+    hooks = [{ match: LOCK_SPACE, run: () => lapse() }, { match: final, run: async () => {
+      hooks.push({ match: 'COMMIT', run: async () => {
+        for (let tries = 0; ; tries++) {
+          const { lapsed } = (await pool.query(`SELECT expires_at<=clock_timestamp() AS lapsed FROM ${table}
+            WHERE space_id=$1 AND credential_id=$2`, [f.spaceId, key.credentialId])).rows[0];
+          if (lapsed) break;
+          assert.ok(tries < 400, 'the access lapses');
+          await new Promise(resolve => setTimeout(resolve, 5));
+        }
+        delayed = true;
+      } });
+    } }];
+    await rejects(search(registry, hooked).search(key, f.spaceId, { query: 'shearwater' }), 'FORBIDDEN');
+    assert.ok(delayed, `${table}: COMMIT was delayed past the expiry`);
+    // The same expiry with a prompt COMMIT still answers: no fixed margin is taken off the access.
+    await lapse('1 hour');
+    hooks = [{ match: LOCK_SPACE, run: () => lapse() }];
+    assert.equal((await search(registry, hooked).search(key, f.spaceId, { query: 'shearwater' })).results.length, 1, table);
+    assert.equal(hooks.length, 0);
+  }
+});
+
+test('coverage is observed after the candidates: a cutover or a revision before the lexical read withholds exhausted', async () => {
+  // A cutover between the plan and the lexical statement: the new generation was never searched.
+  const f = await fixture({ collections: ['alpha'], policy: { alpha: { vector: false } } });
+  await f.record('alpha', { title: 'unrelated' });
+  await index();
+  assert.deepEqual((await search().search(f.owner, f.spaceId, { query: 'skua' })).underfill.reasons, ['exhausted']);
+  hooks = [{ match: 'websearch_to_tsquery', run: async () => {
+    const client = await pool.connect();
+    try { await cutover(client, f.spaceId, 'alpha', false); } finally { client.release(); }
+  } }];
+  const cut = await search(registry, hooked).search(f.owner, f.spaceId, { query: 'skua' });
+  assert.equal(hooks.length, 0);
+  assert.equal(cut.candidates.lexical, 0);
+  assert.equal(cut.state, 'pending');
+  assert.deepEqual(cut.collections.map(entry => entry.projection), ['pending']);
+  assert.deepEqual(cut.underfill.reasons, ['pending']);
+
+  // A matching record revised just before the lexical statement, its projection work not yet done.
+  const g = await fixture({ collections: ['alpha'], policy: { alpha: { vector: false } } });
+  const id = await g.record('alpha', { title: 'reviewnewmatch original' });
+  await index();
+  hooks = [{ match: 'websearch_to_tsquery', run: () => g.record('alpha', { title: 'reviewnewmatch revised' },
+    { recordId: id, expectedRevision: 1 }, 'replace') }];
+  const revised = await search(registry, hooked).search(g.owner, g.spaceId, { query: 'reviewnewmatch' });
+  assert.equal(hooks.length, 0);
+  assert.deepEqual(revised.results, []);
+  assert.equal(revised.state, 'pending');
+  assert.deepEqual(revised.underfill.reasons, ['pending']);
+  await index();
+  assert.equal((await search().search(g.owner, g.spaceId, { query: 'reviewnewmatch' })).results.length, 1, 'current again');
+});
+
+test('a collection deleted after the plan contributes no candidates and crowds out no live match', async () => {
+  const f = await fixture({ policy: { alpha: { vector: false }, beta: { vector: false } } });
+  const live = await f.record('alpha', { title: 'gannet' });
+  for (let i = 0; i < 20; i++) await f.record('beta', { title: `gannet gannet gannet ${i}`, note: 'gannet gannet' });
+  await index();
+  hooks = [{ match: 'websearch_to_tsquery', run: () => pool.query(`UPDATE collections SET lifecycle='deleted'
+    WHERE space_id=$1 AND collection_id='beta'`, [f.spaceId]) }];
+  const result = await search(registry, hooked).search(f.owner, f.spaceId, { query: 'gannet', limit: 1 });
+  assert.equal(hooks.length, 0);
+  assert.deepEqual(ids(result), [`alpha/record/${live}`]);
+  assert.equal(result.candidates.lexical, 1, "beta's chunks are no candidates");
+  assert.deepEqual(result.rejected, { deleted: 0, stale: 0, unauthorized: 0 });
+});
+
+test('an exact (unindexed dimension) vector list that comes back short is exhaustive, not approximate', async () => {
+  const wide = new (class extends DeterministicEmbedder {})({ embedder: 'local-hash', dimensions: 3072 });
+  const embedders = new EmbeddingRegistry([wide]);
+  const f = await fixture({ collections: ['alpha'], policy: { alpha: { lexical: false, dimensions: 3072 } } });
+  const id = await f.record('alpha', { title: 'fulmar glide' });
+  await index(embedders);
+  const result = await search(embedders).search(f.owner, f.spaceId, { query: 'fulmar' });
+  assert.deepEqual(ids(result), [`alpha/record/${id}`]);
+  assert.equal(result.collections[0].vector, 'used');
+  assert.deepEqual(result.underfill.reasons, ['exhausted'], 'the 3072-dimension scan is exact');
+});
+
+test('stalled embedders in several groups share one vector budget before the lexical fallback', async () => {
+  const regions = ['r1', 'r2', 'r3'];
+  const f = await fixture({ collections: ['alpha', ...regions], policy: { alpha: { vector: false },
+    ...Object.fromEntries(regions.map(region => [region, { regions: [region] }])) } });
+  const id = await f.record('alpha', { title: 'petrel' });
+  await index();
+  const embedders = new EmbeddingRegistry(regions.map(region => new Spy({ hang: true }, region)));
+  const started = Date.now();
+  const result = await search(embedders).search(f.owner, f.spaceId, { query: 'petrel' });
+  assert.ok(Date.now() - started < 3_500, `three stalled groups took ${Date.now() - started} ms, not one 2 s budget`);
+  assert.deepEqual(ids(result), [`alpha/record/${id}`]);
+  assert.deepEqual(result.collections.map(entry => [entry.collectionId, entry.vector, entry.vectorError]),
+    [['alpha', 'disabled', null], ...regions.map(region => [region, 'unavailable', 'EMBEDDER_UNAVAILABLE'])]);
 });

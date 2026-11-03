@@ -208,5 +208,5 @@ test('reciprocal rank fusion favours keys both lists rank, counts a key once per
   assert.deepEqual(fuseRanks([['y', 'x'], ['z', 'w']]).map(entry => entry.key), ['y', 'z', 'x', 'w']);
   assert.deepEqual(fuseRanks([['q'], []]), [{ key: 'q', score: 1 / (RRF_K + 1), ranks: [1, null] }]);
   assert.deepEqual(fuseRanks([]), []);
-  assert.throws(() => fuseRanks([['a']], -1), RangeError);
+  for (const k of [-1, Number.NaN, Number.POSITIVE_INFINITY]) assert.throws(() => fuseRanks([['a']], k), RangeError);
 });
