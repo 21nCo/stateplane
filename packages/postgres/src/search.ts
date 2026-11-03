@@ -177,11 +177,23 @@ const readable = (chunk: string, evidence: string) => `AND EXISTS (SELECT 1 FROM
     WHERE x.space_id=${chunk}.space_id AND x.collection_id=${chunk}.collection_id AND x.source_id=${chunk}.ref_id))
   AND ${claimVisible(chunk, evidence)}`;
 
+/** One transaction whose statements all read the snapshot of its first query: `read`, then `observe`. */
+async function snapshot<T>(pool: Pick<pg.Pool, 'connect'>, observe: ((db: Db) => Promise<void>) | undefined,
+  read: (db: Db) => Promise<T>): Promise<T> {
+  return transact(pool, async db => {
+    await db.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+    const result = await read(db);
+    await observe?.(db);
+    return result;
+  });
+}
+
 /**
  * The lexical and vector candidate ports over PostgreSQL full-text search
- * and pgvector. Each call is one short transaction of its own, reading only
- * the given active generations and, in each, only the kinds it lists;
- * candidates are pointers for a reread, never results.
+ * and pgvector. Each call is one short REPEATABLE READ transaction of its
+ * own, reading only the given active generations and, in each, only the kinds
+ * it lists; `observe`, run after the candidates in that transaction, reads
+ * the same snapshot. Candidates are pointers for a reread, never results.
  */
 export class PostgresCandidates implements LexicalCandidates, VectorCandidates {
   constructor(private readonly pool: Pick<pg.Pool, 'connect'>) {}
@@ -191,9 +203,10 @@ export class PostgresCandidates implements LexicalCandidates, VectorCandidates {
    * text search configuration (`websearch_to_tsquery`), ranked by
    * `ts_rank_cd`; each Ref's best chunk, best first.
    */
-  async lexical(scope: CandidateScope, query: string, limit: number): Promise<ChunkCandidate[]> {
+  async lexical(scope: CandidateScope, query: string, limit: number, observe?: (db: Db) => Promise<void>)
+    : Promise<ChunkCandidate[]> {
     if (!scope.generations.length) return [];
-    return transact(this.pool, async db => (await db.query(`WITH m AS (
+    return snapshot(this.pool, observe, async db => (await db.query(`WITH m AS (
         SELECT l.${candidateColumns.replaceAll(',', ',l.')},ts_rank_cd(l.tsv,q.query)::float8 AS score
         FROM unnest($2::text[],$3::bigint[],$4::text[],$5::text[]) AS a(collection_id,generation,kinds,config)
         CROSS JOIN LATERAL (SELECT websearch_to_tsquery(('pg_catalog.' || a.config)::regconfig,$6) AS query) q
@@ -212,15 +225,15 @@ export class PostgresCandidates implements LexicalCandidates, VectorCandidates {
    * filter makes the index scan further instead of returning fewer rows.
    * An HNSW scan is still approximate: never complete recall.
    */
-  async nearest(scope: CandidateScope, identity: EmbedderIdentity, embedding: readonly number[], limit: number)
-    : Promise<ChunkCandidate[]> {
+  async nearest(scope: CandidateScope, identity: EmbedderIdentity, embedding: readonly number[], limit: number,
+    observe?: (db: Db) => Promise<void>): Promise<ChunkCandidate[]> {
     const dimensions = identity.dimensions;
     if (!Number.isSafeInteger(dimensions) || dimensions < 1 || embedding.length !== dimensions || !Number.isSafeInteger(limit)
       || limit < 1 || limit > 1_000) throw new RangeError('Invalid vector search');
     if (!scope.generations.length) return [];
     // The cast and `dimensions` literal are what the partial index is defined with; both are checked integers.
     const distance = `(v.embedding::vector(${dimensions})) <=> $6::vector(${dimensions})`;
-    return transact(this.pool, async db => {
+    return snapshot(this.pool, observe, async db => {
       await db.query(`SET LOCAL hnsw.ef_search = ${limit}`);
       await db.query(`SET LOCAL hnsw.iterative_scan = strict_order`);
       return (await db.query(`SELECT x.* FROM unnest($2::text[],$3::bigint[],$4::text[],$5::text[])
@@ -279,16 +292,16 @@ async function plan(db: Db, scope: AuthorityScope, owner: boolean, request: Requ
           modelVersion: row.model_version, dimensions: Number(row.dimensions) } : null },
       projection: row.generation === null ? 'unindexed' : 'current', vector: vector ? 'unavailable' : 'disabled', vectorError: null };
   });
-  const states = await projectionStates(db, scope.spaceId, planned, evidence);
-  for (const entry of planned) if (entry.active) entry.projection = states.get(entry.collectionId) ?? 'current';
+  observeStates(planned, await projectionStates(db, scope.spaceId, planned, evidence));
   return planned;
 }
 
 /**
  * The projection state of each planned collection with an active generation,
  * over only the work the caller could see: of the kinds searched there, and
- * claims under the read rule (`evidence`). The plan and the reread both read
- * it, so coverage is never older than the candidates.
+ * claims under the read rule (`evidence`). The plan, each candidate list (in
+ * its own snapshot) and the reread all read it; `observeStates` keeps the
+ * worst, so coverage holds only if it held wherever the candidates were read.
  */
 async function projectionStates(db: Db, spaceId: string, planned: readonly Planned[], evidence: readonly string[] | null)
   : Promise<Map<string, SearchProjectionState>> {
@@ -319,6 +332,16 @@ async function projectionStates(db: Db, spaceId: string, planned: readonly Plann
     else if (row.pending) state = 'pending';
     return [String(row.collection_id), state] as const;
   }));
+}
+
+const SEVERITY: Readonly<Record<SearchProjectionState, number>> = Object.freeze({ current: 0, pending: 1, degraded: 2,
+  unindexed: 3 });
+/** Fold one coverage observation into each collection's state; a later, better one never overwrites an earlier, worse one. */
+function observeStates(planned: readonly Planned[], states: ReadonlyMap<string, SearchProjectionState>): void {
+  for (const entry of planned) {
+    const seen = states.get(entry.collectionId);
+    if (entry.active && seen && SEVERITY[seen] > SEVERITY[entry.projection]) entry.projection = seen;
+  }
 }
 
 /**
@@ -426,9 +449,10 @@ const mayRead = (access: Access, collectionId: string, capability: string) =>
 
 /**
  * Every grant a key's response depends on, as `[collection, capability]`
- * pairs: each planned collection's read capability for every kind searched
- * (or reported) there, and, when claims are searched, `sources:read` on every
- * collection the claim filter treated as readable. Candidates, counts, ranks,
+ * pairs: each plan row's read capability for every kind searched (or
+ * reported) there, the cap witness's included, and, when claims are
+ * searched, `sources:read` on every collection the claim filter treated as
+ * readable. Candidates, counts, ranks,
  * collection status and underfill all follow from these, whatever the page
  * holds; the reread's locks compare them with the plan, and the final check
  * confirms them (with each page claim's cited collections) through commit.
@@ -542,6 +566,10 @@ export class PostgresRetrievalSearch {
     const candidates = new PostgresCandidates(cell.pool);
     const scopeOf = (entries: Planned[]): CandidateScope => ({ spaceId, generations: entries.map(entry => entry.active!),
       evidenceCollections: evidence });
+    const observe = (entries: Planned[]) => async (db: Db) =>
+      observeStates(entries, await projectionStates(db, spaceId, entries, evidence));
+    // Every plan row, the cap witness included: `collectionsCapped` follows from it as the rest follows from the searched ones.
+    const relied = dependencies(all, evidence);
 
     // One embedding per identity and region, sent only to a region both of each collection's policies allow.
     const groups = new Map<string, Group>();
@@ -562,7 +590,7 @@ export class PostgresRetrievalSearch {
     // One budget for every group's embedding call, so stalled providers cannot multiply the wait before lexical answers.
     const vectorEnd = performance.now() + searchBounds.embedMs;
     for (const { identity, embedder, entries } of groups.values()) {
-      const left = Math.ceil(vectorEnd - performance.now());
+      const left = Math.floor(vectorEnd - performance.now());
       if (left <= 0) {
         for (const entry of entries) entry.vectorError = 'EMBEDDER_UNAVAILABLE';
         continue;
@@ -570,12 +598,20 @@ export class PostgresRetrievalSearch {
       let embedding: number[];
       let admitted: Planned[] = [];
       let stage: 'admission' | 'embedding' = 'admission';
-      // Just before the call, in a fresh read: the space still open at the admitted policy and placement, and each
-      // collection live at the planned active generation with the embedder's region allowed by both policies. A
-      // narrowing committed during an earlier group's call therefore stops this one; one committed during this call
-      // cannot recall it, as for the worker.
+      let denied: unknown = null;
+      // Just before the call, in a fresh read: the caller's credential (at the provider) and every grant the search
+      // relies on still current, the space still open at the admitted policy and placement, and each collection live at
+      // the planned active generation with the embedder's region allowed by both policies. A lapse or narrowing
+      // committed during an earlier group's call therefore stops this one; one committed during this call cannot recall
+      // it, as for the worker.
       const admit = async () => {
-        const current = await transact(cell.pool, db => admission(db, scope, entries.map(entry => entry.collectionId)));
+        const current = await transact(cell.pool, async db => {
+          try { await this.assertCurrent(db, actor, ownerPrincipalId, scope, relied); }
+          catch (error) { if (error instanceof AuthorityError) denied = error; throw error; }
+          return admission(db, scope, entries.map(entry => entry.collectionId));
+        });
+        // A read that outlasted the budget changes nothing: the group was already reported unavailable.
+        if (signal.aborted) throw new AdmissionClosed();
         admitted = entries.filter(entry => {
           const now = current.get(entry.collectionId);
           return now !== undefined && now.generation === entry.active!.generation && now.policyVersion === entry.active!.policyVersion
@@ -589,20 +625,23 @@ export class PostgresRetrievalSearch {
       const signal = AbortSignal.timeout(left);
       try { [embedding] = await within(embedBatch(embedder, [input.query], signal, [], admit), signal); }
       catch (error) {
+        if (denied) throw denied;
         if (error instanceof AdmissionClosed) continue;
-        for (const entry of stage === 'admission' ? entries : admitted)
-          entry.vectorError = stage === 'admission' ? 'VECTOR_QUERY_FAILED'
-            : error instanceof EmbedderUnavailableError || signal.aborted ? 'EMBEDDER_UNAVAILABLE' : 'EMBEDDER_FAILED';
+        // The shared budget running out is an outage whatever stage it cut short.
+        let code: SearchVectorError = stage === 'admission' ? 'VECTOR_QUERY_FAILED' : 'EMBEDDER_FAILED';
+        if (signal.aborted || error instanceof EmbedderUnavailableError) code = 'EMBEDDER_UNAVAILABLE';
+        for (const entry of stage === 'admission' ? entries : admitted) entry.vectorError = code;
         continue;
       }
       let list: ChunkCandidate[];
-      try { list = await candidates.nearest(scopeOf(admitted), identity, embedding, bound); }
+      try { list = await candidates.nearest(scopeOf(admitted), identity, embedding, bound, observe(admitted)); }
       catch { for (const entry of admitted) entry.vectorError = 'VECTOR_QUERY_FAILED'; continue; }
       vectorLists.push(list);
       if (list.length < bound && !entries[0].active!.exact) approximate = true;
       for (const entry of admitted) entry.vector = 'used';
     }
-    const lexical = await candidates.lexical(scopeOf(planned.filter(entry => entry.active?.lexical)), input.query, bound);
+    const lexicalEntries = planned.filter(entry => entry.active?.lexical);
+    const lexical = await candidates.lexical(scopeOf(lexicalEntries), input.query, bound, observe(lexicalEntries));
 
     // Fuse one list per source, each deduplicated to the Ref's best chunk, and consider at most `bound` Refs.
     const lists = [lexical, ...vectorLists].map(list => {
@@ -619,23 +658,21 @@ export class PostgresRetrievalSearch {
       return hit ? [{ from, hit }] : [];
     }));
 
-    const relied = dependencies(planned, evidence);
-    const { hits, rejected, checked } = await transact(cell.pool, async db => {
+    const { hits, rejected, deadline } = await transact(cell.pool, async db => {
       const access = await this.lockScope(db, scope, owner, planned.map(entry => entry.collectionId));
       // The candidates were read under the plan's access, so a key whose access narrowed since (a grant expired) could
       // have candidates, counts and ranks from content written after it lost access: fail closed instead.
       if (!owner && pairsOf(relied).some(([id, capability]) => !mayRead(access, id, capability)))
         throw new AuthorityError('FORBIDDEN', 'Access changed during search');
       const active = await activeGenerations(db, spaceId, planned.map(entry => entry.collectionId));
-      // Coverage as of now, after every candidate read, under the generation locks: the work visible now, and a collection
-      // whose active generation or policy moved since the plan was not searched at what is active, so it is pending.
-      const states = await projectionStates(db, spaceId, planned, evidence);
+      // Coverage after every candidate read too, under the generation locks, folded into what the plan and each list's own
+      // snapshot saw: the work visible now, and a collection whose active generation or policy moved since the plan was
+      // not searched at what is active, so it is pending.
+      observeStates(planned, await projectionStates(db, spaceId, planned, evidence));
       for (const entry of planned) {
-        if (!entry.active) continue;
         const now = active.get(entry.collectionId);
-        const moved = now?.generation !== entry.active.generation || now.policyVersion !== entry.active.policyVersion;
-        const state = states.get(entry.collectionId) ?? 'current';
-        entry.projection = moved && state === 'current' ? 'pending' : state;
+        const moved = now?.generation !== entry.active?.generation || now?.policyVersion !== entry.active?.policyVersion;
+        if (entry.active && moved && entry.projection === 'current') entry.projection = 'pending';
       }
       const flat = cited.flat();
       const reads = flat.length ? await reread(db, spaceId, flat.map(item => item.hit)) : [];
@@ -706,13 +743,12 @@ export class PostgresRetrievalSearch {
           review: chunk.kind === 'claim' ? read.review : null,
           freshness: { verifiedAt: read.verifiedAt, projection: entry.projection === 'unindexed' ? 'pending' : entry.projection } });
       }
-      const checked = await this.assertCurrent(db, actor, ownerPrincipalId, scope, relied);
-      return { hits, rejected, checked };
+      const deadline = await this.assertCurrent(db, actor, ownerPrincipalId, scope, relied);
+      return { hits, rejected, deadline };
     });
-    // Locks fence revocation, not time: the earliest expiry the final check saw must still lie ahead when COMMIT was
-    // acknowledged (measured from before that statement was sent, so never shorter than the real interval).
-    if (performance.now() - checked.at >= checked.remainingMs)
-      throw new AuthorityError('FORBIDDEN', 'Access expired before the search committed');
+    // Locks fence revocation, not time: the earliest expiry the final check saw, of the provider credential (a session's
+    // or a key's) and of the regional key and every relied grant, must still lie ahead when COMMIT was acknowledged.
+    if (performance.now() >= deadline) throw new AuthorityError('FORBIDDEN', 'Access expired before the search committed');
 
     // Coverage from what actually ran: a collection's readable kinds are searched only through a list that ran over it.
     const collections: SearchCollection[] = planned.map(entry => ({ collectionId: entry.collectionId,
@@ -776,18 +812,23 @@ export class PostgresRetrievalSearch {
   }
 
   /**
-   * The final check, after the last read: the provider confirms the
-   * credential, then one statement against one clock reading confirms the
-   * key and every grant the response relied on (`dependencies`, plus
-   * `sources:read` on every collection a returned claim cites), and returns
-   * how long until the earliest of their expiries, measured from just before
-   * the statement was sent; the caller requires COMMIT to be acknowledged
-   * within it. Owner sessions have no expiring grant here.
+   * The credential check, before each query embedding call and after the
+   * last read: the provider confirms the credential (a session or a key) with
+   * its expiry, then, for a key, one statement against one clock reading
+   * confirms the regional key and every grant the response relies on
+   * (`dependencies`, plus `sources:read` on every collection a returned claim
+   * cites). Returns the earliest of all their expiries on `performance.now()`'s
+   * clock (each measured from before its read, so never later than the real
+   * one; Infinity only when none of them expires); the final caller requires
+   * COMMIT to be acknowledged before it.
    */
   private async assertCurrent(db: Db, actor: VerifiedCredential, ownerPrincipalId: string, scope: AuthorityScope,
-    relied: ReadonlySet<string>): Promise<{ at: number; remainingMs: number }> {
-    await this.spaces.assertCurrent(actor, ownerPrincipalId);
-    if (actor.kind !== 'api-key') return { at: performance.now(), remainingMs: Infinity };
+    relied: ReadonlySet<string>): Promise<number> {
+    const started = performance.now();
+    const wall = Date.now();
+    const until = await this.spaces.assertCurrentUntil(actor, ownerPrincipalId);
+    const provider = until === null ? Infinity : started + until - wall;
+    if (actor.kind !== 'api-key') return provider;
     const pairs = pairsOf(relied);
     const at = performance.now();
     // Per pair, the latest-lasting grant holding it; the credential's expiry is finite, so the earliest is too.
@@ -806,6 +847,6 @@ export class PostgresRetrievalSearch {
     [scope.spaceId, scope.credentialId, ownerPrincipalId, pairs.map(pair => pair[0]), pairs.map(pair => pair[1])])).rows[0];
     const remainingMs = Number(row?.remaining_ms);
     if (row?.current !== true || !Number.isFinite(remainingMs) || remainingMs <= 0) throw new AuthorityError('FORBIDDEN');
-    return { at, remainingMs };
+    return Math.min(provider, at + remainingMs);
   }
 }

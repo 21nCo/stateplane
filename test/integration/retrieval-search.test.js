@@ -362,7 +362,7 @@ test("an owner's claim is fenced on every collection it cites, also outside the 
   await index();
   const order = [];
   let deletion;
-  const provider = { scope: (...args) => spaces.scope(...args), assertCurrent: async (...args) => {
+  const provider = { scope: (...args) => spaces.scope(...args), assertCurrentUntil: async (...args) => {
     let done = false;
     deletion = pool.query("UPDATE collections SET lifecycle='deleted' WHERE space_id=$1 AND collection_id='beta'", [g.spaceId])
       .then(() => { done = true; order.push('deleted'); });
@@ -373,9 +373,10 @@ test("an owner's claim is fenced on every collection it cites, also outside the 
       assert.ok(tries < 400, 'the deletion either waits or completes');
       await new Promise(resolve => setTimeout(resolve, 5));
     }
-    return spaces.assertCurrent(...args);
+    return spaces.assertCurrentUntil(...args);
   } };
-  const fenced = await new PostgresRetrievalSearch(provider, new Map([['cell-a', { pool }]]), { embedders: registry })
+  // Lexical only, so the final check is the only provider check.
+  const fenced = await new PostgresRetrievalSearch(provider, new Map([['cell-a', { pool }]]), { embedders: new EmbeddingRegistry() })
     .search(g.owner, g.spaceId, request);
   order.push('searched');
   await deletion;
@@ -538,27 +539,11 @@ test('a relied-on grant expiring during the final provider check fails the searc
   await f.record('alpha', { title: 'osprey dive' });
   await index();
   const key = await f.agent([['alpha', ['records:read']]]);
-  // The grant is live through the plan, candidates and reread; it lapses on its own while the provider is awaited.
-  let reached = false;
-  const slow = new Proxy(spaces, { get(target, property) {
-    if (property === 'assertCurrent') return async (...args) => {
-      reached = true;
-      for (let tries = 0; ; tries++) {
-        const { lapsed } = (await pool.query(`SELECT expires_at<=clock_timestamp() AS lapsed FROM collection_grants
-          WHERE space_id=$1 AND credential_id=$2`, [f.spaceId, key.credentialId])).rows[0];
-        if (lapsed) break;
-        assert.ok(tries < 400, 'the grant lapses');
-        await new Promise(resolve => setTimeout(resolve, 5));
-      }
-      return target.assertCurrent(...args);
-    };
-    return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
-  } });
-  hooks = [{ match: LOCK_SPACE, run: () => pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '1 second'
-    WHERE space_id=$1 AND credential_id=$2`, [f.spaceId, key.credentialId]) }];
-  const searcher = new PostgresRetrievalSearch(slow, new Map([['cell-a', { pool: hooked }]]), { embedders: registry });
+  // The grant is live through the plan, the embedding call, the candidates and the reread; it lapses on its own while the
+  // final provider check is awaited.
+  const { searcher, state } = lapsingDuringProviderCheck(f, key, 'alpha');
   await rejects(searcher.search(key, f.spaceId, { query: 'osprey' }), 'FORBIDDEN');
-  assert.ok(reached, 'the reread admitted the hit; the final check refused it');
+  assert.ok(state.reached, 'the reread admitted the hit; the final check refused it');
 });
 
 test('an embedder or vector outage returns lexical results marked degraded while exact reads work', async () => {
@@ -728,6 +713,27 @@ test('a policy narrowing committed during one embedding call stops the next grou
     'beta answers lexically only');
 });
 
+test('access lapsing during one embedding call fails the search before the next group\'s query leaves', async () => {
+  for (const table of ['collection_grants', 'space_credentials']) {
+    const f = await fixture({ policy: { beta: { regions: ['eu'] } } });
+    const local = new Spy();
+    const eu = new Spy({}, 'eu');
+    const both = new EmbeddingRegistry([local, eu]);
+    await f.record('alpha', { title: 'osprey dive' });
+    await f.record('beta', { title: 'osprey perch' });
+    await index(both);
+    const key = await f.agent([['alpha', ['records:read']], ['beta', ['records:read']]]);
+    eu.queries.length = 0;
+    local.behavior.before = async () => {
+      local.behavior.before = undefined;
+      await pool.query(`UPDATE ${table} SET expires_at=clock_timestamp() WHERE space_id=$1 AND credential_id=$2`,
+        [f.spaceId, key.credentialId]);
+    };
+    await rejects(search(both).search(key, f.spaceId, { query: 'osprey' }), 'FORBIDDEN');
+    assert.deepEqual(eu.queries, [], `${table}: the query never reached the next group's embedder`);
+  }
+});
+
 /** Retire `collectionId`'s active generation 1 and activate an empty generation 2 under the same policy. */
 async function cutover(client, spaceId, collectionId, vector = true) {
   await client.query(`INSERT INTO projection_generations(space_id,collection_id,generation,policy_version,embedder,embedding_model,
@@ -876,11 +882,15 @@ test('the lexical query uses the pg_catalog configuration that built the tsvecto
   }
 });
 
-/** A searcher whose final provider check waits until `collectionId`'s grant (set to lapse 1 s after the scope locks start) lapsed. */
+/**
+ * A searcher whose final provider check waits until `collectionId`'s grant (set to lapse 1 s after the scope locks start)
+ * lapsed; provider checks before then (before an embedding call) pass through.
+ */
 function lapsingDuringProviderCheck(f, key, collectionId) {
-  const state = { reached: false };
+  const state = { armed: false, reached: false };
   const slow = new Proxy(spaces, { get(target, property) {
-    if (property === 'assertCurrent') return async (...args) => {
+    if (property === 'assertCurrentUntil') return async (...args) => {
+      if (!state.armed) return target.assertCurrentUntil(...args);
       state.reached = true;
       for (let tries = 0; ; tries++) {
         const { lapsed } = (await pool.query(`SELECT expires_at<=clock_timestamp() AS lapsed FROM collection_grants
@@ -889,12 +899,15 @@ function lapsingDuringProviderCheck(f, key, collectionId) {
         assert.ok(tries < 400, 'the grant lapses');
         await new Promise(resolve => setTimeout(resolve, 5));
       }
-      return target.assertCurrent(...args);
+      return target.assertCurrentUntil(...args);
     };
     return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
   } });
-  hooks = [{ match: LOCK_SPACE, run: () => pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '1 second'
-    WHERE space_id=$1 AND credential_id=$2 AND collection_id=$3`, [f.spaceId, key.credentialId, collectionId]) }];
+  hooks = [{ match: LOCK_SPACE, run: async () => {
+    state.armed = true;
+    await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()+interval '1 second'
+      WHERE space_id=$1 AND credential_id=$2 AND collection_id=$3`, [f.spaceId, key.credentialId, collectionId]);
+  } }];
   return { searcher: new PostgresRetrievalSearch(slow, new Map([['cell-a', { pool: hooked }]]), { embedders: registry }), state };
 }
 
@@ -967,6 +980,47 @@ test('a credential or grant expiring after the final check but before COMMIT fai
     assert.equal((await search(registry, hooked).search(key, f.spaceId, { query: 'shearwater' })).results.length, 1, table);
     assert.equal(hooks.length, 0);
   }
+  // An owner session: its provider expiry bounds the search as a key's does.
+  const g = await fixture({ collections: ['alpha'], policy: { alpha: { vector: false } } });
+  await g.record('alpha', { title: 'shearwater raft' });
+  await index();
+  let expiresAt = null;
+  const session = value => config.database.update({ model: 'sessions', where: [{ field: 'id', operator: 'eq',
+    value: g.owner.credentialId }], data: { expiresAt: (expiresAt = value) }, namespace: config.namespace });
+  hooks = [{ match: LOCK_SPACE, run: async () => {
+    await session(new Date(Date.now() + 1_000));
+    hooks.push({ match: 'COMMIT', run: async () => {
+      while (Date.now() <= expiresAt.getTime() + 5) await new Promise(resolve => setTimeout(resolve, 5));
+    } });
+  } }];
+  await rejects(search(registry, hooked).search(g.owner, g.spaceId, { query: 'shearwater' }), 'FORBIDDEN');
+  assert.equal(hooks.length, 0, 'session: COMMIT was delayed past the expiry');
+  for (const later of [new Date(Date.now() + 3_600_000), null]) {
+    await session(later);
+    assert.equal((await search().search(g.owner, g.spaceId, { query: 'shearwater' })).results.length, 1, `session expiring ${later}`);
+  }
+});
+
+test('the cap witness grant is a dependency: its lapse before the reread or during the final check fails the search', async () => {
+  const names = Array.from({ length: 33 }, (_, i) => `c${String(i).padStart(2, '0')}`);
+  const f = await fixture({ collections: names, policy: Object.fromEntries(names.map(name => [name, { vector: false }])) });
+  await f.record('c00', { title: 'kittiwake ledge' });
+  await index();
+  const key = await f.agent(names.map(name => [name, ['records:read']]));
+  const control = await search().search(key, f.spaceId, { query: 'kittiwake' });
+  assert.equal(control.collectionsCapped, true);
+  assert.equal(control.collections.length, 32);
+  assert.ok(control.underfill.reasons.includes('capped'));
+  // c32, never searched, lapses during the final provider check of an empty page.
+  const lapsing = lapsingDuringProviderCheck(f, key, 'c32');
+  await rejects(lapsing.searcher.search(key, f.spaceId, { query: 'guillemot' }), 'FORBIDDEN');
+  assert.ok(lapsing.state.reached);
+  // Live again; then it lapses after the plan, before the reread's locks.
+  await pool.query(`UPDATE collection_grants SET expires_at=NULL WHERE space_id=$1 AND credential_id=$2 AND collection_id='c32'`,
+    [f.spaceId, key.credentialId]);
+  hooks = [{ match: LOCK_SPACE, run: () => expire(f.spaceId, key, 'c32') }];
+  await rejects(search(registry, hooked).search(key, f.spaceId, { query: 'kittiwake' }), 'FORBIDDEN');
+  assert.equal(hooks.length, 0);
 });
 
 test('coverage is observed after the candidates: a cutover or a revision before the lexical read withholds exhausted', async () => {
@@ -990,15 +1044,26 @@ test('coverage is observed after the candidates: a cutover or a revision before 
   const g = await fixture({ collections: ['alpha'], policy: { alpha: { vector: false } } });
   const id = await g.record('alpha', { title: 'reviewnewmatch original' });
   await index();
+  // Delivered after the lexical read, before the reread's refresh: only the candidate snapshot saw it waiting.
   hooks = [{ match: 'websearch_to_tsquery', run: () => g.record('alpha', { title: 'reviewnewmatch revised' },
-    { recordId: id, expectedRevision: 1 }, 'replace') }];
+    { recordId: id, expectedRevision: 1 }, 'replace') }, { match: LOCK_SPACE, run: () => index() }];
   const revised = await search(registry, hooked).search(g.owner, g.spaceId, { query: 'reviewnewmatch' });
   assert.equal(hooks.length, 0);
   assert.deepEqual(revised.results, []);
   assert.equal(revised.state, 'pending');
   assert.deepEqual(revised.underfill.reasons, ['pending']);
-  await index();
   assert.equal((await search().search(g.owner, g.spaceId, { query: 'reviewnewmatch' })).results.length, 1, 'current again');
+
+  // Waiting when planned, delivered after the lexical read and before the refresh: a later current never overwrites it.
+  const h = await fixture({ collections: ['alpha'], policy: { alpha: { vector: false } } });
+  await h.record('alpha', { title: 'auklet colony' });
+  hooks = [{ match: LOCK_SPACE, run: () => index() }];
+  const waiting = await search(registry, hooked).search(h.owner, h.spaceId, { query: 'auklet' });
+  assert.equal(hooks.length, 0);
+  assert.deepEqual(waiting.results, []);
+  assert.equal(waiting.state, 'pending');
+  assert.deepEqual(waiting.underfill.reasons, ['pending']);
+  assert.equal((await search().search(h.owner, h.spaceId, { query: 'auklet' })).results.length, 1, 'delivered');
 });
 
 test('a collection deleted after the plan contributes no candidates and crowds out no live match', async () => {
@@ -1040,4 +1105,11 @@ test('stalled embedders in several groups share one vector budget before the lex
   assert.deepEqual(ids(result), [`alpha/record/${id}`]);
   assert.deepEqual(result.collections.map(entry => [entry.collectionId, entry.vector, entry.vectorError]),
     [['alpha', 'disabled', null], ...regions.map(region => [region, 'unavailable', 'EMBEDDER_UNAVAILABLE'])]);
+  // The budget running out during a group's admission read is the same outage, not a failed vector query.
+  hooks = [{ match: 's.placement_generation=$3', run: () => new Promise(resolve => setTimeout(resolve, 2_300)) }];
+  const late = await search(embedders, hooked).search(f.owner, f.spaceId, { query: 'petrel', collections: ['alpha', 'r1'] });
+  assert.equal(hooks.length, 0);
+  assert.deepEqual(late.collections.map(entry => [entry.collectionId, entry.vector, entry.vectorError]),
+    [['alpha', 'disabled', null], ['r1', 'unavailable', 'EMBEDDER_UNAVAILABLE']]);
+  assert.deepEqual(ids(late), [`alpha/record/${id}`]);
 });

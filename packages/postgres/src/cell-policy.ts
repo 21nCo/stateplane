@@ -17,6 +17,12 @@ type PolicyRow = { owner_principal_id:string; lifecycle:string; collection_lifec
   grant_current?:boolean; validity_ms:number|string };
 export interface CurrentCredential {
   current(claims: Pick<RouteClaims, 'kind' | 'credentialId'>, ownerPrincipalId?: string): Promise<boolean>;
+  /**
+   * As `current`, but the provider's expiry for a current credential (ms since
+   * the epoch, null when it has none) and false otherwise. A provider without
+   * it states no expiry.
+   */
+  currentUntil?(claims: Pick<RouteClaims, 'kind' | 'credentialId'>, ownerPrincipalId?: string): Promise<number | null | false>;
 }
 export interface AuthorizedCellContext {
   readonly scope: Readonly<AuthorityScope>;

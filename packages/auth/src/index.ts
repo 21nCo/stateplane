@@ -35,12 +35,19 @@ export class AuthFnIdentityVerifier implements IdentityVerifier {
   }
   /** Re-read the provider at cell admission; a signed assertion is not proof of current status. */
   async current(claims: Pick<VerifiedCredential, 'kind' | 'credentialId'>, ownerPrincipalId?: string): Promise<boolean> {
+    return await this.currentUntil(claims, ownerPrincipalId) !== false;
+  }
+  /** As `current`, with the record's expiry (ms since the epoch, null when none) when it is current, false otherwise. */
+  async currentUntil(claims: Pick<VerifiedCredential, 'kind' | 'credentialId'>, ownerPrincipalId?: string)
+    : Promise<number | null | false> {
     const record = await this.config.database.findOne<{
       id: string; userId: string; revokedAt?: Date | null; expiresAt?: Date | null;
     }>({ model:claims.kind === 'api-key' ? 'api_keys' : 'sessions',
       where:[{field:'id',operator:'eq',value:claims.credentialId}],namespace:this.config.namespace ?? 'authfn' });
-    return !!record && (ownerPrincipalId === undefined || record.userId === ownerPrincipalId) && !record.revokedAt &&
-      (record.expiresAt == null || new Date(record.expiresAt).getTime() > Date.now());
+    if (!record || (ownerPrincipalId !== undefined && record.userId !== ownerPrincipalId) || record.revokedAt) return false;
+    if (record.expiresAt == null) return null;
+    const until = new Date(record.expiresAt).getTime();
+    return until > Date.now() ? until : false;
   }
 }
 
