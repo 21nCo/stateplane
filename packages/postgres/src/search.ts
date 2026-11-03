@@ -173,7 +173,7 @@ export class PostgresCandidates implements LexicalCandidates, VectorCandidates {
     return transact(this.pool, async db => (await db.query(`WITH m AS (
         SELECT l.${candidateColumns.replaceAll(',', ',l.')},ts_rank_cd(l.tsv,q.query)::float8 AS score
         FROM unnest($2::text[],$3::bigint[],$4::text[],$5::text[]) AS a(collection_id,generation,kinds,config)
-        CROSS JOIN LATERAL (SELECT websearch_to_tsquery(a.config::regconfig,$6) AS query) q
+        CROSS JOIN LATERAL (SELECT websearch_to_tsquery(('pg_catalog.' || a.config)::regconfig,$6) AS query) q
         JOIN lexical_chunks l ON l.space_id=$1 AND l.collection_id=a.collection_id AND l.generation=a.generation
           AND l.ref_kind=ANY(string_to_array(a.kinds,',')) AND l.tsv @@ q.query ${readable('l', '$8')}),
       best AS (SELECT DISTINCT ON (collection_id,ref_kind,ref_id) * FROM m
@@ -286,8 +286,7 @@ interface Reread {
   text: string | null;
   /** A record whose `jsonb` cannot hold its text (U+0000): its cited range is read from its canonical JSON on demand. */
   canonical: boolean;
-  review: SearchHit['review']; attributedTo: string | null; evidence: ClaimEvidenceView[]; cited: string[];
-  citesDeleted: boolean; verifiedAt: string;
+  review: SearchHit['review']; attributedTo: string | null; evidence: ClaimEvidenceView[]; cited: string[]; verifiedAt: string;
 }
 
 /**
@@ -297,7 +296,7 @@ interface Reread {
  * extraction or claim revision the chunk was built from (sliced by code
  * point in SQL, so only the range leaves the database), a claim revision's
  * review, attribution and evidence, and every collection any revision of the
- * claim cites (and whether one of them is deleted).
+ * claim cites (whose liveness `citedCollections` decides under its locks).
  */
 async function reread(db: Db, spaceId: string, candidates: readonly ChunkCandidate[]): Promise<Reread[]> {
   const column = <T>(pick: (item: ChunkCandidate) => T) => candidates.map(pick);
@@ -312,10 +311,7 @@ async function reread(db: Db, spaceId: string, candidates: readonly ChunkCandida
           v.extraction_version,v.start_offset,v.end_offset) ORDER BY v.ordinal) FROM claim_evidence v WHERE v.space_id=$1
         AND v.collection_id=c.collection_id AND v.claim_id=c.id AND v.revision=c.revision),'[]'::jsonb) END AS evidence,
       ARRAY(SELECT DISTINCT a.source_collection_id FROM claim_evidence a WHERE c.kind='claim' AND a.space_id=$1
-        AND a.collection_id=c.collection_id AND a.claim_id=c.id) AS cited,
-      EXISTS (SELECT 1 FROM claim_evidence a JOIN collections k ON k.space_id=a.space_id AND k.collection_id=a.source_collection_id
-        WHERE c.kind='claim' AND a.space_id=$1 AND a.collection_id=c.collection_id AND a.claim_id=c.id
-          AND k.lifecycle='deleted') AS cites_deleted
+        AND a.collection_id=c.collection_id AND a.claim_id=c.id) AS cited
     FROM unnest($2::text[],$3::text[],$4::text[],$5::bigint[],$6::bigint[],$7::jsonb[],$8::bigint[],$9::bigint[]) WITH ORDINALITY
       AS c(collection_id,kind,id,revision,extraction_version,path,start,finish,n)
     LEFT JOIN records rec ON c.kind='record' AND rec.space_id=$1 AND rec.collection_id=c.collection_id AND rec.record_id=c.id
@@ -337,8 +333,7 @@ async function reread(db: Db, spaceId: string, candidates: readonly ChunkCandida
     tombstone: row.tombstone, latestExtraction: row.latest === null ? null : Number(row.latest), text: row.text ?? null,
     canonical: row.canonical === true,
     review: row.review_status ? { status: row.review_status, reviewedBy: row.reviewed_by, reviewedAt: iso(row.reviewed_at) } : null,
-    attributedTo: row.attributed_to ?? null, cited: row.cited, citesDeleted: row.cites_deleted === true,
-    verifiedAt: iso(row.verified_at)!,
+    attributedTo: row.attributed_to ?? null, cited: row.cited, verifiedAt: iso(row.verified_at)!,
     evidence: ((row.evidence ?? []) as unknown[][]).map(item => ({ collectionId: String(item[0]), sourceId: String(item[1]),
       extractionVersion: item[2] === null ? null : Number(item[2]), start: item[3] === null ? null : Number(item[3]),
       end: item[4] === null ? null : Number(item[4]) })) }));
@@ -420,6 +415,20 @@ async function activeGenerations(db: Db, spaceId: string, collectionIds: string[
   [spaceId, collectionIds])).rows;
   return new Map(rows.map(row => [String(row.collection_id), { generation: Number(row.generation),
     policyVersion: Number(row.policy_version) }]));
+}
+
+/**
+ * Every collection the reread claims cite, share locked through commit after
+ * the scope and generation locks, in one fixed order, for the owner and keys
+ * alike, as the claim read rule's fence does: a collection deletion either
+ * committed before, and is seen here, or waits for the search to commit. The
+ * live ones; liveness is decided from these locked rows only.
+ */
+async function citedCollections(db: Db, spaceId: string, collectionIds: string[]): Promise<Set<string>> {
+  if (!collectionIds.length) return new Set();
+  const rows = (await db.query(`SELECT collection_id,lifecycle FROM collections WHERE space_id=$1 AND collection_id=ANY($2::text[])
+    ORDER BY collection_id COLLATE "C" FOR SHARE`, [spaceId, collectionIds])).rows;
+  return new Set(rows.filter(row => row.lifecycle !== 'deleted').map(row => String(row.collection_id)));
 }
 
 /**
@@ -539,6 +548,7 @@ export class PostgresRetrievalSearch {
       const flat = cited.flat();
       const reads = flat.length ? await reread(db, spaceId, flat.map(item => item.hit)) : [];
       const readOf = new Map(flat.map((item, at) => [item, reads[at]]));
+      const live = await citedCollections(db, spaceId, [...new Set(reads.flatMap(read => read.cited))]);
       const rejected = { deleted: 0, stale: 0, unauthorized: 0 };
       const hits: SearchHit[] = [];
       const relied = new Set<string>();
@@ -560,7 +570,7 @@ export class PostgresRetrievalSearch {
         if (!current.length) { rejected.stale++; continue; }
         const read = readOf.get(current[0])!;
         // The claim read rule: a claim citing a collection whose sources the caller cannot read does not exist for it.
-        if (head.kind === 'claim' && (read.citesDeleted || (!access.owner && read.cited.some(id => !mayRead(access, id, 'sources:read'))))) {
+        if (head.kind === 'claim' && read.cited.some(id => !live.has(id) || (!access.owner && !mayRead(access, id, 'sources:read')))) {
           rejected.unauthorized++; continue;
         }
         relied.add(JSON.stringify([head.collectionId, capability]));

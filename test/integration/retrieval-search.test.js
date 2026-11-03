@@ -277,16 +277,75 @@ test('a deletion or revision committed after the candidates are read is caught b
   const f = await fixture();
   const deleted = await f.record('alpha', { title: 'compass rose' });
   const revised = await f.record('alpha', { title: 'compass needle' });
+  const deletedSource = await f.source('alpha', 'A compass survey.');
+  const corrected = await f.source('alpha', 'A compass bearing.');
+  const claim = await claims.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: randomUUID(), statement: 'The compass points north.',
+    attributedTo: 'navigator' });
   await index();
+  assert.equal((await search().search(f.owner, f.spaceId, { query: 'compass' })).results.length, 5);
   hooks = [{ match: REREAD, run: async () => {
     await f.record('alpha', undefined, { recordId: deleted, expectedRevision: 1 }, 'delete');
     await f.record('alpha', { title: 'compass needle, recalibrated' }, { recordId: revised, expectedRevision: 1 }, 'replace');
+    await sources.delete(f.owner, f.spaceId, 'alpha', deletedSource);
+    await sources.correctExtraction(f.owner, f.spaceId, 'alpha', corrected, { baseVersion: 1, content: 'A compass heading.',
+      sourceOffsets: [] });
+    await claims.delete(f.owner, f.spaceId, 'alpha', claim.claimId, { baseRevision: 1 });
   } }];
   const result = await search(registry, hooked).search(f.owner, f.spaceId, { query: 'compass' });
   assert.equal(hooks.length, 0);
   assert.deepEqual(result.results, []);
-  assert.deepEqual(result.rejected, { deleted: 1, stale: 1, unauthorized: 0 });
+  // The record, source and claim tombstones are deleted; the record's new revision and the source's new extraction are stale.
+  assert.deepEqual(result.rejected, { deleted: 3, stale: 2, unauthorized: 0 });
   assert.equal(result.underfill.returned, 0, 'reported, never padded');
+});
+
+test("an owner's claim is fenced on every collection it cites, also outside the search filter", async () => {
+  const f = await fixture();
+  const cited = await f.source('beta', 'A tide table.');
+  const make = () => claims.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: randomUUID(), statement: 'The tide turns at noon.',
+    attributedTo: 'harbor master', evidence: [{ collectionId: 'beta', sourceId: cited }] });
+  const claim = await make();
+  await index();
+  const request = { query: 'tide', collections: ['alpha'], kinds: ['claim'] };
+  assert.deepEqual(ids(await search().search(f.owner, f.spaceId, request)), [`alpha/claim/${claim.claimId}`]);
+  const deleteBeta = () => pool.query("UPDATE collections SET lifecycle='deleted' WHERE space_id=$1 AND collection_id='beta'",
+    [f.spaceId]);
+
+  // Deleted after the reread read beta live, before the cited collections are locked: the locked row decides, so excluded.
+  hooks = [{ match: 'SELECT collection_id,lifecycle FROM collections', run: deleteBeta }];
+  const excluded = await search(registry, hooked).search(f.owner, f.spaceId, request);
+  assert.equal(hooks.length, 0);
+  assert.deepEqual(excluded.results, []);
+  assert.deepEqual(excluded.rejected, { deleted: 0, stale: 0, unauthorized: 1 });
+
+  // Deleted during the final provider check: the deletion waits for the search's commit, so the returned claim was current.
+  const g = await fixture();
+  const source = await g.source('beta', 'A tide table.');
+  const held = await claims.create(g.owner, g.spaceId, 'alpha', { idempotencyKey: randomUUID(), statement: 'The tide turns at noon.',
+    attributedTo: 'harbor master', evidence: [{ collectionId: 'beta', sourceId: source }] });
+  await index();
+  const order = [];
+  let deletion;
+  const provider = { scope: (...args) => spaces.scope(...args), assertCurrent: async (...args) => {
+    let done = false;
+    deletion = pool.query("UPDATE collections SET lifecycle='deleted' WHERE space_id=$1 AND collection_id='beta'", [g.spaceId])
+      .then(() => { done = true; order.push('deleted'); });
+    for (let tries = 0; !done; tries++) {
+      const waiting = (await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname=current_database()
+        AND wait_event_type='Lock'`)).rows[0].n;
+      if (waiting) break;
+      assert.ok(tries < 400, 'the deletion either waits or completes');
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    return spaces.assertCurrent(...args);
+  } };
+  const fenced = await new PostgresRetrievalSearch(provider, new Map([['cell-a', { pool }]]), { embedders: registry })
+    .search(g.owner, g.spaceId, request);
+  order.push('searched');
+  await deletion;
+  assert.deepEqual(order, ['searched', 'deleted'], 'the deletion waited for the search');
+  assert.deepEqual(ids(fenced), [`alpha/claim/${held.claimId}`]);
+  assert.deepEqual((await search().search(g.owner, g.spaceId, request)).results, []);
 });
 
 test('search reads only granted collections and kinds, and applies the claim read rule', async () => {
@@ -656,5 +715,26 @@ test('the cell role answers by vector with only its base grants and db:grant-ret
     for (const routine of publicRoutines) await pool.query(`GRANT EXECUTE ON ROUTINE ${routine} TO PUBLIC`);
     await pool.query(`DROP OWNED BY ${role}`);
     await pool.query(`DROP ROLE ${role}`);
+  }
+});
+
+test('the lexical query uses the pg_catalog configuration that built the tsvector, whatever the search_path', async () => {
+  const f = await fixture({ collections: ['alpha'], policy: { alpha: { vector: false } } });
+  const id = await f.record('alpha', { title: 'Herons wading at dawn' });
+  await index();
+  // A same-named configuration earlier in the search_path that does not stem: `wading` would no longer find `wade`.
+  const schema = `sta46_shadow_${randomUUID().replaceAll('-', '')}`;
+  await pool.query(`CREATE SCHEMA ${schema}`);
+  await pool.query(`CREATE TEXT SEARCH CONFIGURATION ${schema}.english (COPY = pg_catalog.simple)`);
+  const shadowed = new pg.Pool({ connectionString: target.toString(), max: 2, options: `-c search_path=${schema},pg_catalog,public` });
+  try {
+    assert.equal((await shadowed.query(`SELECT 'english'::regconfig::oid=$1::regconfig::oid AS shadowed`, [`${schema}.english`]))
+      .rows[0].shadowed, true, 'an unqualified name resolves to the shadowing configuration');
+    const result = await search(registry, shadowed).search(f.owner, f.spaceId, { query: 'wading' });
+    assert.deepEqual(ids(result), [`alpha/record/${id}`]);
+    assert.equal(result.candidates.lexical, 1);
+  } finally {
+    await shadowed.end();
+    await pool.query(`DROP SCHEMA ${schema} CASCADE`);
   }
 });
