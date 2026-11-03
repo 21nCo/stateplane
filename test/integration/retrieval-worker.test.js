@@ -1443,11 +1443,16 @@ test('status reports the oldest pending evidence over all of it and a failed rec
   assert.deepEqual([status.evidence.pending, status.evidence.capped], [500, true]);
   assert.deepEqual(status.records, { pending: 500, degraded: 1, capped: true, lastError: 'Error: projector failed' });
   assert.equal(status.state, 'degraded');
-  // The oldest pending item is one row through its index, not a scan of the backlog.
+  // The oldest pending item is one row through its index, not a scan of the backlog. The plan follows the table's
+  // statistics, so they are brought current first, as autovacuum or an ANALYZE after a burst would; no plan is forced.
+  await pool.query('ANALYZE retrieval_outbox');
   const plan = (await pool.query(`EXPLAIN (FORMAT JSON) SELECT enqueued_at FROM retrieval_outbox
     WHERE space_id=$1 AND collection_id=$2 AND delivery_state='pending' ORDER BY enqueued_at LIMIT 1`, [spaceId, collectionId]))
     .rows[0]['QUERY PLAN'][0].Plan;
-  assert.equal(plan.Plans?.[0]?.['Index Name'], 'retrieval_outbox_age', JSON.stringify(plan));
+  const nodes = [];
+  for (const queue = [plan]; queue.length;) { const node = queue.shift(); nodes.push(node); queue.push(...(node.Plans ?? [])); }
+  assert.ok(nodes.some(node => node['Index Name'] === 'retrieval_outbox_age'), JSON.stringify(plan));
+  assert.ok(!nodes.some(node => /Sort/.test(node['Node Type'])), `read in index order, not sorted: ${JSON.stringify(plan)}`);
   // An older error in the oldest-due sample does not hide the failed row's newer one.
   await pool.query(`UPDATE projection_outbox SET last_error='Error: older live error',
     last_error_at=clock_timestamp()-interval '1 hour' WHERE event_id=(SELECT event_id
