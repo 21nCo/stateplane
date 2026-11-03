@@ -13,7 +13,7 @@ import { PostgresAuthority, PostgresClaims, PostgresContextBundles, PostgresOutb
 import { BUNDLE_CLOSE, BUNDLE_OPEN, DeterministicEmbedder, EmbedderUnavailableError, EmbeddingRegistry }
   from '../../packages/retrieval/dist/index.js';
 import { R2BlobStore } from '../../packages/storage/dist/index.js';
-import { exactQuestions, ordinaryRequests } from '../fixtures/exact-questions.js';
+import { exactQuestions, ordinaryRequests, overRefusals } from '../fixtures/exact-questions.js';
 import { consume, dispatch } from '../../packages/workers/dist/index.js';
 
 // STA-47: bounded context bundles over hybrid search of real projections,
@@ -374,17 +374,25 @@ test('count, status and completeness requests are refused before anything is sea
   let connections = 0;
   const counting = { connect: () => { connections++; return pool.connect(); } };
   healthy.queries.length = 0;
-  // Every exact question of the shared corpus through the task, through the query, and as a task beside an ordinary query.
-  const requests = exactQuestions.flatMap(([text]) => [{ task: text }, { query: text }, { task: text, query: 'invoice' }]);
-  for (const request of requests) {
+  // Every refused request of the shared corpus (exact questions, then over-refusals) through the task, through the query,
+  // and as a task beside an ordinary query; a refusal names exact reads and the allowed request forms.
+  const refused = [...exactQuestions, ...overRefusals.map(([text]) => [text, null])];
+  const requests = refused.flatMap(([text, kind]) => [{ task: text }, { query: text }, { task: text, query: 'invoice' }]
+    .map(request => [request, kind]));
+  for (const [request, kind] of requests) {
     await assert.rejects(bundles(registry, counting).bundle(f.owner, f.spaceId, { ...request, budget }), error => {
       assert.equal(error.code, 'INVALID_ARGUMENT');
-      assert.match(error.message, /do not answer (count|status|completeness) questions; use exact reads/);
+      const unrecognized = /^Context bundles serve only the allowed request forms and topics; use exact reads/;
+      const exact = new RegExp(`^Context bundles do not answer ${kind ?? '(?:count|status|completeness)'} questions; use exact reads`);
+      if (kind === 'unrecognized') assert.match(error.message, unrecognized);
+      else if (kind) assert.match(error.message, exact);
+      else assert.ok(unrecognized.test(error.message) || exact.test(error.message), error.message);
+      assert.match(error.message, /A bundle request is a topic .*a why-question.*summarize, describe, explain/);
       return true;
     });
   }
   assert.equal(connections, 0, 'no projection or authority read');
-  assert.equal(requests.length, exactQuestions.length * 3);
+  assert.equal(requests.length, (exactQuestions.length + overRefusals.length) * 3);
   assert.deepEqual(healthy.queries, [], 'no query embedding');
   // The authoritative answer is an exact read, which needs no projection.
   const counted = await services.records.count(f.owner, f.spaceId, 'alpha', '[]');
@@ -394,8 +402,8 @@ test('count, status and completeness requests are refused before anything is sea
   assert.ok(bundle.excerpts.length >= 2);
   assert.equal(bundle.complete, false);
   assert.match(bundle.context, /no count, status or completeness follows from them/);
-  // Every ordinary request of the corpus is served, as task and query.
-  for (const text of ordinaryRequests) {
+  // Every ordinary request of the corpus, and each over-refusal's rephrasing, is served as task and query.
+  for (const text of [...ordinaryRequests, ...overRefusals.map(([, rephrasing]) => rephrasing)]) {
     const served = await bundles(registry, counting).bundle(f.owner, f.spaceId, { task: text, query: text, budget });
     assert.deepEqual([served.task, served.trust, served.complete], [text, 'untrusted', false]);
   }

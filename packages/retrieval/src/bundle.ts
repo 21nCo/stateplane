@@ -193,6 +193,17 @@ export function assembleBundle(hits: readonly BundleHitInput[], budget: BundleBu
 
 /** A question only exact authoritative reads can answer. */
 export type ExactQuestion = 'count' | 'status' | 'completeness';
+/**
+ * Why a bundle request is refused: it asks an exact question, or a clause of
+ * it is a question or an instruction outside the forms a bundle serves
+ * (`unrecognized`), which may ask one in words no rule names.
+ */
+export type BundleRefusal = ExactQuestion | 'unrecognized';
+
+/** The request forms a bundle serves, for a refusal to name. */
+export const BUNDLE_REQUEST_FORMS = 'A bundle request is a topic ("harbor lantern notes"); a why-question; "how does ... work"; '
+  + '"what did ... say about ..."; "what happened during ..."; "who wrote, said or reviewed ..."; summarize, describe, explain, outline, '
+  + 'compare or draft ...; or find, show or get notes, records or information about ..., or a summary or overview of ....';
 
 // Whole words and phrases, between non-letters or digits.
 const word = (pattern: string) => `(?<![\\p{L}\\p{N}])(?:${pattern})(?![\\p{L}\\p{N}])`;
@@ -205,6 +216,13 @@ const STATES = alternatives(['done', 'complete', 'completed', 'incomplete', 'fin
   'ready', 'started', 'delivered', 'undelivered', 'fixed', 'signed', 'submitted', 'received', 'verified', 'reviewed', 'expired',
   'failed', 'succeeded', 'archived', 'deleted', 'published', 'live', 'current', 'valid', 'invalid', 'available', 'due', 'past\\s+due',
   'in\\s+progress', 'on\\s+hold', 'on\\s+track', 'up\\s+to\\s+date', 'out\\s+of\\s+date']);
+// The states that select a set when they qualify a plural: "unpaid invoices", "open tickets".
+const SELECTING = alternatives(['done', 'complete', 'completed', 'incomplete', 'finished', 'unfinished', 'resolved', 'unresolved',
+  'closed', 'open', 'opened', 'pending', 'blocked', 'approved', 'unapproved', 'rejected', 'merged', 'shipped', 'unshipped', 'accepted',
+  'paid', 'unpaid', 'overdue', 'outstanding', 'missing', 'remaining', 'settled', 'unsettled', 'cancell?ed', 'late', 'active',
+  'inactive', 'delivered', 'undelivered', 'fixed', 'signed', 'unsigned', 'submitted', 'received', 'verified', 'unverified',
+  'reviewed', 'unreviewed', 'expired', 'failed', 'archived', 'deleted', 'published', 'unpublished', 'overdrawn', 'unanswered',
+  'unassigned', 'assigned']);
 // A past participle: a regular "-ed" form or an irregular one.
 const PARTICIPLE = `\\p{L}{2,}ed|${alternatives(['done', 'paid', 'sent', 'made', 'gone', 'built', 'won', 'lost', 'left', 'set', 'put',
   'cut', 'run', 'begun', 'bought', 'brought', 'caught', 'held', 'kept', 'met', 'read', 'sold', 'told', 'written', 'taken', 'given',
@@ -224,28 +242,44 @@ const PASSIVE = `(?:${HAVE}${ADVERBS}\\s+)?(?:${BE})${ADVERBS}\\s+(?:${STATES}|$
 const PERFECT = `${HAVE}${ADVERBS}\\s+(?:${STATES}|${PARTICIPLE})`;
 // The rest of one clause, possibly empty, ending before a following word.
 const BETWEEN = '(?:\\s+\\S+)*?\\s+';
-
-/**
- * Words that open a request without being its question: politeness and
- * request prefixes ("please", "can you", "tell me", "let me know", "I want to
- * know"), removed from the start of each clause before it is classified;
- * one before "if" stays, as it makes the "if" a question.
- */
-const PREFIX = new RegExp(`^(?:${alternatives(['please', 'pls', 'plz', 'kindly', 'hey', 'hi', 'hello', 'ok(?:ay)?', 'so', 'and', 'but',
-  'or', 'also', 'now', 'then', 'just', 'quick(?:ly)?', 'quick\\s+question', 'one\\s+more\\s+thing', 'by\\s+the\\s+way',
-  `(?:can|could|would|will|won't)\\s+you(?:\\s+(?:please|kindly|just|quickly))?`,
-  '(?:can|could|may)\\s+(?:i|we)\\s+(?:see|get|have|read)', '(?:do|did|does)\\s+(?:you|anyone|anybody)\\s+(?:know|have|remember)',
-  '(?:have|has)\\s+(?:you|anyone|anybody)\\s+got', '(?:i|we)\\s+(?:want|need|would\\s+like|\'d\\s+like|wanna|wish)(?:\\s+you)?'
-    + '(?:\\s+to\\s+(?:know|see|find\\s+out|check|confirm|learn|understand|get|hear))?', 'i\\s+wonder', "i(?:\\s*'m|\\s+am)\\s+(?:wondering|curious)",
-  '(?:tell|remind)\\s+(?:me|us)', 'let\\s+(?:me|us)\\s+know', 'help\\s+me(?:\\s+(?:understand|see))?',
-  'i\\s+(?:need|want)'])})(?![\\p{L}\\p{N}'])(?![\\s,]*if(?![\\p{L}\\p{N}]))[\\s,]*`, 'iu');
+// A word that opens a question, direct or embedded.
+const WH = alternatives(['what', 'which', 'who', 'whom', 'whose', 'where', 'when', 'why', 'how', 'whether', 'if', 'whatever',
+  'whichever', 'whoever', 'whomever', 'wherever', 'whenever']);
 
 const regex = (source: string) => new RegExp(source, 'iu');
-/** Each family of exact question recognized in one clause (prefixes removed), in the order they are tried. */
+const prefix = (source: string, after = '') => new RegExp(`^(?:${source})(?![\\p{L}\\p{N}'])${after}[\\s,]*`, 'iu');
+
+/**
+ * Words that open a request without being its content, removed from the start
+ * of each clause until none is left: politeness ("please", "can you", "could
+ * I"), "I want to" before a verb, and a verb of telling or knowing ("tell
+ * me", "let me know", "I wonder", "do you know") only before "about", a
+ * question word or the clause's end, so "tell me the suppliers" keeps its verb.
+ */
+const PREFIXES: readonly RegExp[] = Object.freeze([
+  prefix(alternatives(['please', 'pls', 'plz', 'kindly', 'hey', 'hi', 'hello', 'ok(?:ay)?', 'so', 'and', 'but', 'or', 'also', 'now',
+    'then', 'just', 'quick(?:ly)?', 'quick\\s+question', 'one\\s+more\\s+thing', 'by\\s+the\\s+way',
+    "(?:can|could|would|will|won't)\\s+you(?:\\s+(?:please|kindly|just|quickly))?", '(?:can|could|may|might)\\s+(?:i|we)(?:\\s+please)?',
+    "(?:i|we)\\s+(?:want|need|would\\s+like|'d\\s+like|wish|wanna|hope|am\\s+trying|'m\\s+trying|are\\s+trying|'re\\s+trying)(?:\\s+you)?\\s+to"])),
+  prefix(alternatives(['(?:tell|remind)\\s+(?:me|us)', 'let\\s+(?:me|us)\\s+know', 'know', 'learn', 'understand', 'hear', 'find\\s+out',
+    'see', 'ask', 'wonder', 'i\\s+wonder', "i(?:\\s*'m|\\s+am)\\s+(?:wondering|curious)", 'help\\s+(?:me|us)(?:\\s+(?:understand|see))?',
+    '(?:do|does|did)\\s+(?:you|anyone|anybody)\\s+(?:know|remember|recall)']),
+  `(?=\\s+(?:about|on|regarding|concerning|${WH})(?![\\p{L}\\p{N}])|\\s*$)`)]);
+/** A request to be given something, read as "get": "do you have", "I need", "I'd like", "I'm looking for". */
+const LEAD_IN = prefix(alternatives(['(?:do|does)\\s+(?:you|anyone|anybody)\\s+have', '(?:have|has)\\s+(?:you|anyone|anybody)\\s+got',
+  "(?:i|we)\\s+(?:need|want|would\\s+like|'d\\s+like|require|am\\s+looking\\s+for|'m\\s+looking\\s+for|are\\s+looking\\s+for|"
+    + "'re\\s+looking\\s+for)"]));
+
+/**
+ * The deny rules: each family of exact question named in one clause, in the
+ * order they are tried. They apply to every clause, whatever its form, and
+ * name the kind of a refusal.
+ */
 const EXACT: readonly [ExactQuestion, RegExp][] = Object.freeze([
-  // How many or how much: counts, totals, quantities and amounts.
-  ['count', regex(word('how\\s+(?:many|much|often)|count(?:s|ed|ing)?|number\\s+of|totals?|totall?(?:ed|ing)|tally|tallies|sum\\s+of|'
-    + 'quantit(?:y|ies)|amount\\s+of|amounts?\\s+(?:owed|due|outstanding|remaining|left)|owe[sd]?|owing'))],
+  // How many or how much: counts, totals, sums, sizes, quantities and amounts.
+  ['count', regex(word('how\\s+(?:many|much|often)|count(?:s|ed|ing)?|number\\s+of|totals?|totall?(?:ed|ing)|tally|tallies|'
+    + 'sum(?:s|med|ming)?|sizes?\\s+of|headcounts?|census|quantit(?:y|ies)|amount\\s+of|amounts?\\s+(?:owed|due|outstanding|remaining|left)|'
+    + 'owe[sd]?|owing'))],
   // Whether anything (more) exists: "is there more", "are there any", "which towers exist".
   ['completeness', regex(`^${word(`(?:is|are|was|were)(?:${NOT})?\\s+there`)}`)],
   ['completeness', regex(word('exists?|existed|existing\\s+(?:ones|ones?)|any\\s*more|anymore|any\\s+(?:other|others|remaining|left)|'
@@ -255,16 +289,19 @@ const EXACT: readonly [ExactQuestion, RegExp][] = Object.freeze([
     + 'percent(?:age)?\\s+(?:complete|completed|done|finished)|(?:what|which)\\s+(?:state|stage|phase|step|point|condition)|'
     + "how\\s+(?:is|are|was|were|'s|'re)\\s+(?:\\S+\\s+)*?(?:going|coming(?:\\s+along)?|doing|looking|shaping\\s+up)|"
     + 'where\\s+(?:are|is|do|does|did)\\s+(?:\\S+\\s+)*?stands?|where\\s+are\\s+we\\s+(?:on|with)|how\\s+(?:close|near)|'
-    + '(?:any|an|latest)\\s+updates?|latest\\s+(?:on|news)|when\\s+will|or\\s+not|yet\\s+to|still\\s+(?:needs?|has|have)\\s+to'))],
+    + '(?:any|an|latest)\\s+updates?|updates?\\s+(?:on|about|regarding|for)|latest\\s+(?:on|news)|when\\s+will|or\\s+not|yet\\s+to|'
+    + 'still\\s+(?:needs?|has|have)\\s+to|awaiting|under\\s+review|(?:on|off)\\s+duty|(?:in|out\\s+of)\\s+stock'))],
   // Any yes/no question: a clause opening with an auxiliary or a modal, whatever it asks about.
   ['status', regex(`^${word(AUXILIARY)}\\s+\\S`)],
   ['status', regex(`^${word(MODAL)}\\s+\\S`)],
-  // Whether something holds: any "whether" clause, and "if" after a verb of asking or knowing.
+  // Whether something holds: any "whether" clause, "if" after a verb of asking or knowing, and a clause opening with "if".
   ['status', regex(word('whether|(?:know|check|see|ask|wonder|wondering|confirm|verify|determine|find\\s+out|sure|tell\\s+me|'
     + 'tell\\s+us|say)\\s+if'))],
+  ['status', regex(`^${word('if')}`)],
   ['status', regex(`${word('if')}${BETWEEN}${word(STATES)}`)],
-  // A state still or not yet reached: "still open", "not yet paid", "done yet".
-  ['status', regex(word(`still\\s+(?:not\\s+)?(?:${STATES})|not\\s+yet\\s+(?:${STATES}|${PARTICIPLE})|(?:${STATES})\\s+yet`))],
+  // A state still or not yet reached, or marked: "still open", "not yet paid", "done yet", "marked unpaid".
+  ['status', regex(word(`still\\s+(?:not\\s+)?(?:${STATES})|not\\s+yet\\s+(?:${STATES}|${PARTICIPLE})|(?:${STATES})\\s+yet|`
+    + `marked(?:\\s+as)?\\s+(?:${STATES}|${PARTICIPLE})`))],
   // Which or what things are, have been or got into a state: "which invoices haven't been paid", "what has shipped",
   // "which claims got approved", "which tickets are currently open".
   ['status', regex(`${word('which|what|whose')}(?:${BETWEEN}|\\s+)${word(`${PASSIVE}|${PERFECT}`)}`)],
@@ -274,21 +311,120 @@ const EXACT: readonly [ExactQuestion, RegExp][] = Object.freeze([
   // Which or what things reached a state, said last: "which tickets closed", "what shipped this week".
   ['status', regex(`^${word('which|what')}(?:\\s+\\S+){0,3}\\s+${word(STATES)}(?:\\s+(?:today|yesterday|recently|so\\s+far|yet|already|`
     + 'this\\s+\\S+|last\\s+\\S+|since\\s+.*|on\\s+time|in\\s+time))?$')],
-  // Every member of a set, or what is left of one.
-  ['completeness', regex(word('every|each|all\\s+(?!about(?![\\p{L}\\p{N}]))\\p{L}+|complete\\s+(?:list|set)|full\\s+(?:list|set)|'
-    + 'entire\\s+(?:list|set)|whole\\s+(?:list|set)|lists?\\s+of|exhaustive(?:ly)?|completeness|'
-    + '(?:anything|something|nothing|everything)\\s+(?:else|missing|left|remaining|outstanding|pending|undone)'))],
+  // Every member of a set, a list or roster of one, or what is left of one.
+  ['completeness', regex(word('every|each|all\\s+(?!about(?![\\p{L}\\p{N}]))\\p{L}+|'
+    + '(?:complete|full|entire|whole|exhaustive|comprehensive)(?:\\s+\\S+){0,2}?\\s+(?:lists?|sets?|rosters?|inventor(?:y|ies)|'
+    + 'registers?|director(?:y|ies)|catalog(?:ue)?s?|index|rundown)|(?:lists?|rosters?|inventor(?:y|ies)|registers?|director(?:y|ies)|'
+    + 'catalog(?:ue)?s?|rundown)\\s+of|listings?|rosters?|inventor(?:y|ies)|director(?:y|ies)|registry|checklists?|exhaustive(?:ly)?|'
+    + 'completeness|(?:anything|something|nothing|everything)\\s+(?:else|missing|left|remaining|outstanding|pending|undone)'))],
   // A request to enumerate: "list the suppliers", "name each supplier".
   ['completeness', regex(`^${word('list|enumerate|itemi[sz]e|catalog(?:ue)?|tally|name\\s+(?:the|all|each|every|any|some|those|'
     + 'these|which|who|what|them)')}`)],
   // What remains, is left or is missing: "which tickets remain", "what is left to do".
   ['completeness', regex(`${word('which|what|who')}(?:${BETWEEN}|\\s+)${word('remains?|remaining|left|missing|outstanding')}`)],
+  // Things selected by a state: "unpaid invoices", "the open ones".
+  ['status', regex(`${word(SELECTING)}\\s+\\p{L}+(?<!ss)s(?![\\p{L}\\p{N}])`)],
   // A request for the things in a state: "show me the unpaid invoices", "find open tickets".
   ['status', regex(`^${word('show|give|get|fetch|display|pull\\s+up|return|send|bring|find|retrieve|look\\s+up')}`
     + `(?:\\s+(?:me|us))?(?:\\s+(?:the|all|any|our|my|those|these|which))?\\s+${word(STATES)}`)],
   // A request to confirm a state: "confirm the invoice was paid", "check that the audit has finished".
   ['status', regex(`^${word('confirm|verify|check|make\\s+sure|ensure|double\\s+check')}${BETWEEN}`
     + `${word(`(?:${BE}|${HAVE})${ADVERBS}\\s+(?:${STATES}|${PARTICIPLE})`)}`)]]);
+
+// A question asked by its question mark alone, ending in a state or participle: "invoice two paid?", "the parts arrived?".
+const ASKED = regex(`^(?!${word('why|how|where|when|who|whom|whose')}).*${word(`${STATES}|${PARTICIPLE}`)}(?:\\s+(?:yet|already|now|too|again|or\\s+not))?$`);
+
+// The allowed request forms. A clause is served only in one of them (or as a topic), and only if no deny rule matches it.
+// An instruction to explain or summarize content: "summarize the keeper log", "explain why the lantern failed".
+const EXPLAIN = regex(`^${word('summari[sz]e|describe|explain|outline|draft|compare|contrast|discuss|recap|clarify|paraphrase')}\\s+\\S`);
+// A request for passages or a summary: "find notes about the storm", "give me an overview of the harbor".
+const GET = 'find|show|get|give|fetch|retrieve|pull\\s+up|bring\\s+up|look\\s+up|look\\s+for|search\\s+for|surface|provide|send|share|'
+  + 'see|read|have';
+const PASSAGE = 'notes?|records?|excerpts?|passages?|quotes?|quotations?|context|background|information|info|details?|mentions?|'
+  + 'references?|discussions?|documents?|documentation|docs|materials?|entries|entry|text|writing|logs?|accounts?';
+const ON = 'about|on|regarding|concerning|re|for|from|by|of|in|mentioning|covering|describing|discussing|that\\s+mentions?|'
+  + 'related\\s+to|relating\\s+to';
+const OBJECT = '(?:\\s+(?:me|us))?(?:\\s+(?:the|any|some|a|an|our|my|your|their|his|her|its|those|these|relevant|recent))?';
+const GET_PASSAGES = regex(`^${word(GET)}${OBJECT}(?:\\s+(?!${word(SELECTING)})\\S+){0,3}?\\s+${word(PASSAGE)}\\s+${word(ON)}\\s+\\S`);
+const GET_SUMMARY = regex(`^${word(GET)}${OBJECT}(?:\\s+(?:brief|short|quick|high\\s+level|detailed|longer|concise))?\\s+`
+  + `${word('summary|summaries|overview|description|explanation|outline|recap|background|context|digest|synopsis|account|explainer')}`
+  + `\\s+${word('of|on|about|for|regarding|concerning|from')}\\s+\\S`);
+// A phrase, up to five words, naming who: no negation in it.
+const AGENT = `(?:(?!${word(`not|never|\\S*n'?t`)})\\S+\\s+){1,5}?`;
+const SAY = 'say|write|note|record|report|describe|mention|think|suggest|recommend|propose|argue|claim|explain';
+const SAID = 'said|wrote|noted|recorded|reported|described|mentioned|thought|suggested|recommended|proposed|argued|claimed|explained';
+const ABOUT = '(?:about|regarding|concerning|on)\\s+\\S';
+/** The question forms a bundle serves, from their question word: anywhere in a clause. */
+const QUESTIONS: readonly RegExp[] = Object.freeze([
+  regex('^why(?![\\p{L}\\p{N}])'),
+  regex(`^how\\s+(?:does|do|did)\\s+(?:\\S+\\s+){1,6}?${word('work|happen|function|operate|compare|differ|relate|fit|interact|begin|'
+    + 'start|end|develop|unfold')}`),
+  regex(`^what\\s+(?:did|does|do)\\s+${AGENT}${word(SAY)}\\s+${ABOUT}`),
+  regex(`^what\\s+(?:was|is|has\\s+been)\\s+said\\s+${ABOUT}`),
+  regex(`^what\\s+${AGENT}${word(SAID)}\\s+${ABOUT}`),
+  regex(`^what\\s+happened\\s+${word('during|in|at|on|before|after|throughout')}\\s+\\S`),
+  regex(`^${word('who')}\\s+${word('wrote|said|reviewed|authored|reported|recorded|noted|proposed|described|mentioned|suggested|'
+    + 'raised|explained|argued|claimed')}`)]);
+/** The question forms a bundle also serves after other words: "describe how the bridge was repaired", "summarize what the keeper wrote". */
+const EMBEDDED: readonly RegExp[] = Object.freeze([
+  regex(`^how\\s+(?!${word('many|much|far|often|long|soon|close|near|old|big|large|small|fast|quickly')})\\S`),
+  regex(`^what\\s+${AGENT}${word(SAID)}(?![\\p{L}\\p{N}])`)]);
+
+// Words a clause may open with that never begin an instruction: prepositions, determiners, pronouns and conjunctions.
+const NOT_A_VERB = new Set(['about', 'on', 'regarding', 'concerning', 'of', 'in', 'at', 'for', 'from', 'by', 'with', 'during', 'after',
+  'before', 'since', 'under', 'over', 'between', 'among', 'around', 'near', 'to', 'into', 'onto', 'through', 'across', 'without',
+  'within', 'against', 'behind', 'beyond', 'beside', 'besides', 'toward', 'towards', 'like', 'per', 'via', 're', 'as', 'the', 'a',
+  'an', 'this', 'that', 'these', 'those', 'it', 'its', 'everything', 'anything', 'something', 'nothing', 'both', 'and', 'or', 'but',
+  'not', 'our', 'my', 'your', 'their', 'his', 'her', 'i', 'we', 'you', 'they', 'he', 'she', 'one', 'two', 'three']);
+// What follows an instruction's verb: an object pronoun, a determiner or quantifier, a question word or a particle.
+const OBJECT_WORDS = new Set(['me', 'us', 'them', 'him', 'her', 'it', 'you', 'the', 'a', 'an', 'all', 'every', 'each', 'any', 'some',
+  'our', 'my', 'your', 'their', 'his', 'its', 'those', 'these', 'no', 'both', 'either', 'several', 'many', 'much', 'more', 'most',
+  'few', 'what', 'which', 'who', 'whom', 'whose', 'where', 'when', 'why', 'how', 'whether', 'if', 'up', 'out', 'off', 'down', 'back',
+  'over', 'through', 'together']);
+// Verbs that open an instruction even before a bare noun ("provide suppliers"); others are known by what follows them.
+const VERBS = new Set(['list', 'show', 'give', 'get', 'fetch', 'find', 'provide', 'display', 'print', 'return', 'send', 'share', 'pull',
+  'bring', 'tell', 'name', 'enumerate', 'itemize', 'itemise', 'tally', 'count', 'total', 'sum', 'compute', 'calculate', 'check',
+  'confirm', 'verify', 'determine', 'identify', 'compile', 'gather', 'collect', 'produce', 'generate', 'output', 'export', 'extract',
+  'select', 'pick', 'choose', 'rank', 'sort', 'filter', 'monitor', 'inspect', 'search', 'retrieve', 'surface', 'highlight', 'mark',
+  'see', 'read', 'update', 'trace', 'tabulate', 'figure', 'estimate', 'measure', 'quantify', 'assess', 'evaluate', 'classify',
+  'categorize', 'categorise', 'add', 'say', 'specify', 'cite', 'include', 'exclude', 'make', 'create', 'build', 'write', 'prepare',
+  'look', 'dig', 'scan', 'query', 'locate', 'catalog', 'catalogue', 'recount', 'reckon', 'email', 'forward', 'paste', 'dump',
+  'render', 'present', 'furnish', 'supply', 'analyze', 'analyse', 'walk', 'take', 'do', 'ask', 'answer', 'respond', 'reply', 'let',
+  'use', 'keep', 'put', 'go', 'come', 'try', 'resolve', 'approve', 'reject', 'submit', 'cancel', 'delete', 'remove', 'fix', 'recite',
+  'rattle', 'reel', 'spell', 'fill', 'inform', 'notify', 'alert', 'remind', 'learn', 'know', 'understand', 'hear', 'ensure']);
+const AUXILIARIES = new RegExp(`^(?:${AUXILIARY}|${MODAL})$`, 'iu');
+const QUESTION_OPENING = regex(`^${word(WH)}`);
+// Each question word in a clause (`matchAll` copies it, so its position is never shared).
+const QUESTION_WORD = new RegExp(word(WH), 'giu');
+
+/** Whether a clause, opening with `first` then `second`, is an instruction: a known verb, a verb-forming suffix, or a verb's object after. */
+function instruction(first: string, second: string | undefined): boolean {
+  if (NOT_A_VERB.has(first) || second === 'of') return false;
+  return VERBS.has(first) || /^\p{L}{3,}(?:ize|ify|yze)$/u.test(first) || (second !== undefined && OBJECT_WORDS.has(second));
+}
+
+/**
+ * Why one clause is refused, or null when it is served: a deny rule names an
+ * exact question; otherwise it must be an allowed instruction, a request for
+ * passages or a summary, an allowed question, or a topic (no question mark,
+ * not opening with an auxiliary, a modal or an instruction), and each
+ * question word in it must open an allowed question form.
+ */
+function refusal(clause: string, asked: boolean): BundleRefusal | null {
+  for (const [kind, pattern] of EXACT) if (pattern.test(clause)) return kind;
+  if (asked && ASKED.test(clause)) return 'status';
+  const [first, second] = clause.split(' ');
+  const opening = QUESTION_OPENING.test(clause);
+  const allowed = EXPLAIN.test(clause) || GET_PASSAGES.test(clause) || GET_SUMMARY.test(clause)
+    || (opening ? QUESTIONS.some(form => form.test(clause))
+      : !asked && !AUXILIARIES.test(first) && !instruction(first, second));
+  if (!allowed) return 'unrecognized';
+  for (const match of clause.matchAll(QUESTION_WORD)) {
+    const rest = clause.slice(match.index);
+    if (!QUESTIONS.some(form => form.test(rest)) && !(match.index > 0 && EMBEDDED.some(form => form.test(rest)))) return 'unrecognized';
+  }
+  return null;
+}
 
 // Characters that render as nothing (zero-width spaces and joiners, soft hyphens, bidirectional and other format controls).
 const IGNORABLE = /[\p{Default_Ignorable_Code_Point}\p{Cf}]/gu;
@@ -312,40 +448,44 @@ function readings(text: string): string[] {
     .replace(/[\u2018\u2019\u02bc`\u00b4]/gu, "'").replace(CLITIC, " '").replace(/\s+/gu, ' ').trim()))];
 }
 
-// A question asked by its question mark alone, ending in a state or participle: "invoice two paid?", "the parts arrived?".
-const ASKED = regex(`^(?!${word('why|how|where|when|who|whom|whose')}).*${word(`${STATES}|${PARTICIPLE}`)}(?:\\s+(?:yet|already|now|too|again|or\\s+not))?$`);
-
 /**
  * The clauses of one reading, each without its leading request and
- * politeness prefixes, and whether it ends in a question mark.
+ * politeness prefixes and with a request to be given something read as
+ * "get", and whether it ends in a question mark.
  */
 function clauses(reading: string): { text: string; asked: boolean }[] {
   return [...reading.replace(/\s+[-\u2013\u2014]+\s+/gu, ';').matchAll(/([^.;:!?,()[\]{}"\u201c\u201d\u00ab\u00bb]+)([.;:!?,()[\]{}"\u201c\u201d\u00ab\u00bb]*)/gu)]
     .map(([, clause, end]) => {
       let text = clause.trim();
-      for (let previous = ''; previous !== text;) { previous = text; text = text.replace(PREFIX, ''); }
-      return { text, asked: end.includes('?') };
+      for (let previous = ''; previous !== text;) {
+        previous = text;
+        for (const pattern of PREFIXES) text = text.replace(pattern, '');
+      }
+      return { text: text.replace(LEAD_IN, 'get '), asked: end.includes('?') };
     }).filter(clause => clause.text);
 }
 
 /**
- * Which exact question `text` asks, if any: a count, a status, or whether a
- * set is complete. Such a question is never answered from ranked projections,
- * so a bundle request asking one is refused before anything is searched or
- * embedded. Classification is by English sentence structure, clause by
- * clause after request prefixes ("please", "can you", "tell me") are
- * removed: count words; any yes/no question (a clause opening with an
- * auxiliary or a modal) and any embedded whether-question; which/what and an
- * auxiliary chain before a state or participle; and enumeration, existence
- * and what remains. It is conservative (a request that mentions a total, or
- * asks whether a note describes a storm, is refused too); phrasing it does
- * not recognize still gets a bundle that holds no count, status or
- * completeness signal of its own and whose frame says so.
+ * Why a bundle request text is refused, or null when a bundle serves it. A
+ * bundle never answers a count, status or completeness question, so
+ * classification fails closed: the text is served only when every clause
+ * (split at sentence punctuation, commas, brackets and spaced dashes, with
+ * request prefixes such as "please", "can you" or "tell me about" removed)
+ * is one of the forms of `BUNDLE_REQUEST_FORMS` or a topic, and no deny rule
+ * names an exact question in it. Any other question (a question mark, or a
+ * clause opening with a question word, an auxiliary or a modal) or
+ * instruction is refused as `unrecognized`, whatever it asks; a deny rule
+ * names the kind when one matches. Only a bare topic phrase is served
+ * without an allowed form, and the deny rules still apply to it (counts,
+ * totals, sizes; status, progress and things selected or marked by a state;
+ * every, each, all, lists, rosters, existence and what remains).
  */
-export function exactQuestion(text: string): ExactQuestion | null {
+export function exactQuestion(text: string): BundleRefusal | null {
+  let found: BundleRefusal | null = null;
   for (const reading of readings(text)) for (const { text: clause, asked } of clauses(reading)) {
-    for (const [kind, pattern] of EXACT) if (pattern.test(clause)) return kind;
-    if (asked && ASKED.test(clause)) return 'status';
+    const kind = refusal(clause, asked);
+    if (kind && kind !== 'unrecognized') return kind;
+    found ??= kind;
   }
-  return null;
+  return found;
 }

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { assembleBundle, BUNDLE_CLOSE, BUNDLE_OPEN, bundleBounds, exactQuestion } from '../packages/retrieval/dist/index.js';
-import { exactQuestions, ordinaryRequests } from './fixtures/exact-questions.js';
+import { exactQuestions, ordinaryRequests, overRefusals } from './fixtures/exact-questions.js';
 
 const points = text => Array.from(text);
 const hit = (id, texts, extra = {}) => ({ ref: { spaceId: 'sp_1', collectionId: 'notes', kind: 'record', id }, revision: 2,
@@ -164,4 +164,43 @@ test('count, status and completeness questions are recognized by structure; ordi
   for (const text of ['Has the shipment arrived?', 'Can you list the suppliers?'])
     for (const variant of [text.replaceAll(' ', '-'), text.replaceAll(' ', '_'), text.replaceAll(' ', '\u200b'), text.toUpperCase()])
       assert.notEqual(exactQuestion(variant), null, JSON.stringify(variant));
+});
+
+test('bundle requests fail closed: only the allowed forms and bare topics are served', () => {
+  // Words no rule lists, in every question and instruction shape: refused whatever the verb, noun or state.
+  const verbs = [['vetted', 'vet'], ['onboarded', 'onboard'], ['quarantined', 'quarantine'], ['mothballed', 'mothball'], ['bought', 'buy']];
+  for (const noun of ['moorings', 'buoys', 'charters']) for (const [past, base] of verbs) {
+    for (const text of [`Which ${noun} ${past}?`, `Which ${noun} did the harbor ${base}?`, `What ${noun} did we ${base}`,
+      `What did the board ${base}?`, `Who ${past} the ${noun}?`, `Whose ${noun} were ${past}`, `Where are the ${noun}?`,
+      `When were the ${noun} ${past}?`, `What are the ${noun}?`, `${noun} ${past}?`, `Please ${base} the ${noun}`, `${base} me the ${noun}`,
+      `Could you ${base} the ${noun}?`, `I want to ${base} the ${noun}`, `Give me the ${noun}`, `Show the ${noun} we ${past}`,
+      `I need the ${noun}`, `Tell me the ${noun}`, `Summarize which ${noun} were ${past}`, `Find notes about which ${noun} we ${past}`])
+      assert.notEqual(exactQuestion(text), null, JSON.stringify(text));
+    // The same words in an allowed form or as a bare topic are served.
+    for (const text of [`Summarize the notes on the ${noun}`, `Find notes about the ${noun}`, `Why were the ${noun} ${past}?`,
+      `What did the harbor master say about the ${noun}?`, `${noun} at the harbor`, `Give me an overview of the ${noun}`])
+      assert.equal(exactQuestion(text), null, JSON.stringify(text));
+  }
+  // An allowed form does not admit an exact question inside it, in another clause or behind a question word.
+  for (const text of ['Summarize the notes, then list the suppliers', 'Explain why the gauge drifted. Which buoys moved?',
+    'Describe how many moorings there are', 'Find notes about every mooring', 'What did the keeper say about which buoys moved?'])
+    assert.notEqual(exactQuestion(text), null, JSON.stringify(text));
+  // Documented over-refusals: no exact question, but not an allowed form; each rephrasing is served.
+  for (const [text, rephrasing] of overRefusals) {
+    assert.notEqual(exactQuestion(text), null, JSON.stringify(text));
+    assert.equal(exactQuestion(rephrasing), null, JSON.stringify(rephrasing));
+  }
+});
+
+test('classifying a bundle request stays fast on a worst-case input', () => {
+  // Process CPU time, after the first call compiles the patterns, so a loaded host does not count against the classifier.
+  exactQuestion('harbor lantern');
+  const cpu = () => { const { user, system } = process.cpuUsage(); return (user + system) / 1_000; };
+  for (const head of ['which', 'what', 'who', 'if', 'confirm', 'how is', 'why', 'what did', 'find me the', 'explain', 'what the'])
+    for (const fill of ['a ', 'a-', 'a, ', 'a\u200b']) {
+      const text = Array.from(`${head} ${fill.repeat(600)}`).slice(0, 1_000).join('');
+      const started = cpu();
+      exactQuestion(text);
+      assert.ok(cpu() - started < 300, `${head} ${JSON.stringify(fill)}`);
+    }
 });

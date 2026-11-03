@@ -1,10 +1,14 @@
-// STA-47: one corpus of exact questions (count, status, completeness) that a
-// context bundle must refuse, and of ordinary retrieval requests it must
-// serve, shared by the unit test of `exactQuestion` and the service test of
-// `PostgresContextBundles`. It holds every sibling local review raised, and
-// new variants of each structure the classifier recognizes.
+// STA-47: one corpus of bundle requests, shared by the unit test of
+// `exactQuestion` and the service test of `PostgresContextBundles`, in three
+// tables: requests a bundle must refuse (every sibling local review raised,
+// and new variants of each structure), ordinary requests in the allowed forms
+// it must serve, and documented over-refusals with a served rephrasing.
 
-/** [text, kind]: requests only exact authoritative reads can answer. */
+/**
+ * [text, kind]: requests a bundle refuses. The kind is the deny rule's
+ * (`count`, `status`, `completeness`), or `unrecognized` for a question or
+ * instruction outside the allowed forms.
+ */
 export const exactQuestions = Object.freeze([
   // Count: how many or how much, counts, totals, quantities and amounts.
   ['How many invoices are overdue?', 'count'], ['count the open tickets', 'count'], ['Count the overdue invoices', 'count'],
@@ -76,17 +80,72 @@ export const exactQuestions = Object.freeze([
   ['where do we stand on the audit', 'status'], ['any update on the shipment', 'status'], ['When will the parts arrive', 'status'],
   ['which invoices are yet to be paid', 'status'], ['who hasn\'t paid', 'status'], ['Tell me the invoices that have been paid', 'status'],
   ['Could you let me know if invoice two has been paid?', 'status'], ["I'd like to know which invoices are outstanding", 'status'],
-  ['Has every ticket been closed?', 'status'], ["I'm wondering whether it shipped", 'status'], ['what do we owe the vendor', 'count']]);
+  ['Has every ticket been closed?', 'status'], ["I'm wondering whether it shipped", 'status'], ['what do we owe the vendor', 'count'],
+
+  // Round 3: ordinary phrasings outside the deny rules, refused because a bundle serves only the allowed forms (fail closed).
+  ['Which invoices carry an unpaid balance?', 'unrecognized'], ['Show me invoices marked unpaid', 'status'],
+  ['What is the size of the invoice collection?', 'count'], ['Provide the complete supplier list.', 'completeness'],
+  ['Which invoices did the vendor pay?', 'unrecognized'], ['What did we finish?', 'unrecognized'], ['Which keepers are on duty?', 'status'],
+  ['Which claims are under review?', 'status'], ['Which invoices are awaiting payment?', 'status'],
+  ['Which accounts are overdrawn?', 'unrecognized'], ['Which shipments went out?', 'unrecognized'],
+  ['Which supplier went bankrupt?', 'unrecognized'], ['Which vendors failed to deliver?', 'unrecognized'], ['What broke?', 'unrecognized'],
+  ['What are the suppliers?', 'unrecognized'], ['Who are our suppliers?', 'unrecognized'], ['What suppliers do we have?', 'unrecognized'],
+  ['Which suppliers do we use?', 'unrecognized'], ['Show me the suppliers', 'unrecognized'], ['Give me the suppliers', 'unrecognized'],
+  ['Show the suppliers', 'unrecognized'], ['Give me a listing of suppliers', 'completeness'], ['What is the sum?', 'count'],
+
+  // New variants: wh- and do-support questions with unlisted verbs, instructions with unlisted verbs, requests to be given a set.
+  ['Which lighthouse keepers transferred?', 'status'], ['What did the council approve?', 'unrecognized'],
+  ['What tickets did Ana triage?', 'unrecognized'], ['Who handles the harbor permits?', 'unrecognized'],
+  ['Whose invoices bounced?', 'unrecognized'], ['Where is the storm log?', 'unrecognized'], ['When did the shipment leave?', 'unrecognized'],
+  ['Furnish the suppliers', 'unrecognized'], ['Rattle off suppliers', 'unrecognized'], ['Compile supplier names', 'unrecognized'],
+  ['Quantify the backlog', 'unrecognized'], ['Get me everyone on the roster', 'completeness'], ['Pull up suppliers', 'unrecognized'],
+  ['I need the suppliers', 'unrecognized'], ['Do you have the supplier names?', 'unrecognized'], ['Can I see the suppliers?', 'unrecognized'],
+  ["I'd like the vendors", 'unrecognized'], ['I want to check the suppliers', 'unrecognized'], ['Tell me the suppliers', 'unrecognized'],
+  ['Find me the vendors', 'unrecognized'], ['the vendors?', 'unrecognized'], ['give_me_the_suppliers', 'unrecognized'],
+  ['What happened to the shipment?', 'unrecognized'], ['tell me, who are the vendors', 'unrecognized'],
+  ['What about the vendors?', 'unrecognized'], ['Walk me through the suppliers', 'unrecognized'],
+  ['Fill me in on the suppliers', 'unrecognized'], ['Present the suppliers', 'unrecognized'],
+  // An allowed form whose content asks an exact question is still refused by the deny rules.
+  ['Summarize which invoices were paid', 'status'], ['Explain whether the vendor paid', 'status'],
+  ['Find notes about which keepers are on duty', 'status'], ['Summarize the unpaid invoices', 'status'],
+  ['What did the keeper say about who was paid', 'status'], ['Describe every supplier', 'completeness'],
+  ['Why did the vendor raise prices, and how many invoices are late?', 'count']]);
 
 /** Ordinary retrieval requests, which a bundle serves. */
 export const ordinaryRequests = Object.freeze(['harbor lantern', 'Why was the lantern lit at dusk?', 'account recovery notes',
   'everything about tides', 'discounted fares', 'the keeper described the tower', 'Draft a summary of the lantern keeper notes',
   'overdue invoice', 'Summarize the bridge repair discussion', 'What did the keeper write about the storm?', 'invoice amount dispute',
-  'Which keeper lit the lantern?', 'notes on the open sea crossing', 'Why was the gate left open?', 'tell me about the lantern keeper',
+  'notes on the open sea crossing', 'Why was the gate left open?', 'tell me about the lantern keeper',
   'what the harbor master said about tides', 'a shopping list for the lighthouse', 'it was all about the tides', 'kestrel nest',
   'tidal gauge', 'Describe the storm damage to the tower', 'Explain why the lantern failed', 'Find notes about the harbor lantern',
   'Who reviewed the lantern claim?', 'Can you summarize the keeper log?', 'Please describe the tower', 'Show me notes about the storm',
-  'Tell me what the keeper wrote about tides', 'What happened during the storm?', 'Who signed the harbor treaty?',
+  'Tell me what the keeper wrote about tides', 'What happened during the storm?',
   'Why did the vendor raise prices?', 'How does the lantern mechanism work?', 'explain the invoice dispute with the vendor',
   'find the keeper notes on fog signals', 'summarize what the harbor master wrote', 'who wrote the storm log',
-  'Describe how the bridge was repaired', 'hands-on lantern maintenance notes', 'weather at the harbor in March']);
+  'Describe how the bridge was repaired', 'hands-on lantern maintenance notes', 'weather at the harbor in March',
+  'Give me a summary of the storm', 'Can I see notes about the storm?', 'I need background on the harbor treaty',
+  'Compare the keeper logs from March and April', 'Outline the lantern maintenance procedure', 'How did the storm damage happen?',
+  'What was said about the tides?', 'notes on what happened during the storm', 'I want to know about the lantern',
+  'Do you have notes about fog signals?', 'Explain how the lantern works', 'Give me an overview of the harbor treaty',
+  'Find records about the bridge repair', 'Show me information on fog signals', 'lantern lighting by the keeper', 'map of the harbor',
+  'What did the harbor master write about the treaty?', 'Search for notes about the storm', 'Fetch the context on the vendor dispute',
+  'report on the storm', 'Please find excerpts about tides, and explain why the gauge drifted']);
+
+/**
+ * [text, rephrasing]: requests that ask no exact question but are refused
+ * because their form is not an allowed one, each with a rephrasing a bundle
+ * serves. Failing closed costs these; failing open would cost AC3.
+ */
+export const overRefusals = Object.freeze([
+  ['Which keeper lit the lantern?', 'notes about the keeper lighting the lantern'],
+  ['Who signed the harbor treaty?', 'Describe the signing of the harbor treaty'],
+  ['How was the bridge repaired?', 'Describe how the bridge was repaired'],
+  ['What is a tidal gauge?', 'Explain tidal gauges'],
+  ['What was decided about tides?', 'Summarize the decision about tides'],
+  ['Does the keeper log describe the storm?', 'Find notes about the storm in the keeper log'],
+  ['notes the keeper wrote', 'notes written by the keeper'],
+  ['the keeper who lit the lantern', 'the keeper lighting the lantern'],
+  ['procedures if the lantern fails', 'procedures for a lantern failure'],
+  ['follow-up notes on the storm', 'notes on the storm follow-up'],
+  ['open questions about tides', 'Summarize the questions about tides'],
+  ['harbor lantern?', 'harbor lantern']]);

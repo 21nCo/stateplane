@@ -1,5 +1,5 @@
 import type { VerifiedCredential } from '@stateplane/contracts';
-import { assembleBundle, bundleBounds, codePoints, exactQuestion } from '@stateplane/retrieval';
+import { assembleBundle, BUNDLE_REQUEST_FORMS, bundleBounds, codePoints, exactQuestion } from '@stateplane/retrieval';
 import type { BundleBudget, BundleExcerpt } from '@stateplane/retrieval';
 import { boundedText, fields, invalid } from './sources.js';
 import { PostgresRetrievalSearch, searchBounds } from './search.js';
@@ -76,7 +76,9 @@ function parse(request: unknown): Request {
  * authorization is the search's, current at its commit. Assembly runs after
  * that commit, reads nothing and calls nothing, so it cannot widen what the
  * search authorized. A request asking a count, status or completeness
- * question is refused before anything is searched or embedded.
+ * question, or any question or instruction outside the allowed request forms
+ * (`exactQuestion` fails closed), is refused before anything is searched or
+ * embedded.
  */
 export class PostgresContextBundles {
   constructor(private readonly search: PostgresRetrievalSearch) {
@@ -92,8 +94,10 @@ export class PostgresContextBundles {
   async bundle(actor: VerifiedCredential, spaceId: string, request: unknown): Promise<ContextBundle> {
     const input = parse(request);
     for (const value of [input.task, input.query]) {
-      const question = value === null ? null : exactQuestion(value);
-      if (question) invalid(`Context bundles do not answer ${question} questions; use exact reads of records, sources and claims`);
+      const refusal = value === null ? null : exactQuestion(value);
+      if (refusal) invalid(`${refusal === 'unrecognized' ? 'Context bundles serve only the allowed request forms and topics'
+        : `Context bundles do not answer ${refusal} questions`}; use exact reads of records, sources and claims for counts, `
+        + `statuses and completeness. ${BUNDLE_REQUEST_FORMS}`);
     }
     const result = await this.search.search(actor, spaceId, input.search);
     const assembled = assembleBundle(result.results.map(hit => ({ ref: hit.ref, revision: hit.revision,
