@@ -388,7 +388,8 @@ test('count, status and completeness requests are refused before anything is sea
       else if (kind) assert.match(error.message, exact);
       else assert.ok(unrecognized.test(error.message) || exact.test(error.message), error.message);
       assert.match(error.message, /A bundle request is a topic .*a why-question.*summarize, describe, explain/);
-      assert.match(error.message, /Each line and each part joined by and, or, then/);
+      assert.match(error.message, /Each line, each part joined by and, or, then.*each subordinate clause/);
+      assert.match(error.message, /no instruction verb, auxiliary or modal may be run on inside one/);
       return true;
     });
   }

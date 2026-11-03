@@ -143,6 +143,21 @@ test('overlapping citations of one field become one excerpt over their exact uni
     sourceEnd: null, text: 'abc' }] }], { bytes: 4_096, tokens: null }), RangeError);
 });
 
+test('with the longest identifiers, the minimum budget may hold the frame alone, and never more than its budget', () => {
+  // A collection, record and field of the longest lengths the stores accept: the excerpt's header alone is longer than what
+  // the minimum budget leaves after the frame, so nothing is quoted and the bundle says it was cut.
+  const long = hit('x'.repeat(256), [[`/${'f'.repeat(1_024)}`, 0, 'The harbor lantern was lit at dusk by the keeper of the tower.']],
+    { ref: { spaceId: 'sp_1', collectionId: 'c'.repeat(256), kind: 'record', id: 'x'.repeat(256) } });
+  const bundle = assembleBundle([long], { bytes: bundleBounds.minBudget, tokens: null });
+  assert.equal(bundle.context, BUNDLE_OPEN + BUNDLE_CLOSE);
+  assert.deepEqual([bundle.excerpts, bundle.truncated], [[], true]);
+  assert.ok(bundle.usage.bytes <= bundleBounds.minBudget);
+  // With short identifiers the same budget quotes it.
+  const short = assembleBundle([hit('r1', [['/note', 0, 'The harbor lantern was lit at dusk by the keeper of the tower.']])],
+    { bytes: bundleBounds.minBudget, tokens: null });
+  assert.equal(short.excerpts.length, 1);
+});
+
 test('a budget is required, bounded and integral', () => {
   for (const budget of [{ bytes: null, tokens: null }, { bytes: 1_023, tokens: null }, { bytes: null, tokens: 262_145 },
     { bytes: 2_000.5, tokens: null }, { bytes: Number.NaN, tokens: null }])
@@ -215,6 +230,51 @@ test('every line, separated part and coordinated subrequest must be an allowed f
     assert.notEqual(exactQuestion(text), null, JSON.stringify(text));
 });
 
+test('an instruction, auxiliary or modal hides a request wherever it occurs, behind any leading word or subordinator', () => {
+  // A leading sequencing or "-ly" adverb, a listed one or not, is removed like a prefix; standalone, after a coordinator or a
+  // comma, the request behind it is classified as itself.
+  const leads = ['first', 'firstly', 'second', 'secondly', 'next', 'then', 'finally', 'lastly', 'afterwards', 'in addition',
+    'additionally', 'meanwhile', 'separately', 'likewise', 'again', 'now', 'right away', 'simply', 'briefly', 'basically', 'merely',
+    'literally', 'immediately', 'quietly', 'promptly', 'eventually', 'ultimately', 'gingerly', 'tenth', 'fourth'];
+  const requests = ['list the suppliers', 'enumerate the vendors', 'give me the suppliers', 'show me the suppliers', 'name the keepers',
+    'provide the supplier list', 'list all vendors', 'tell me the suppliers', 'count the invoices', 'is invoice two paid',
+    'procure the suppliers', 'provide suppliers'];
+  for (const lead of leads) for (const request of requests)
+    for (const text of [`${lead} ${request}`, `${lead}, ${request}`, `Summarize the notes and ${lead} ${request}`,
+      `Find notes about the storm, ${lead} ${request}`, `harbor notes ${lead} ${request}`])
+      assert.notEqual(exactQuestion(text), null, JSON.stringify(text));
+  for (const lead of ['briefly', 'first', 'next', 'simply', 'finally'])
+    for (const text of [`${lead} summarize the storm`, `Summarize the logs and ${lead} describe the storm`])
+      assert.equal(exactQuestion(text), null, JSON.stringify(text));
+  // A subordinate clause after any form, an allowed opening included, is a subrequest of its own and must be allowed itself.
+  const subordinators = ['before', 'after', 'once', 'until', 'till', 'so', 'so that', 'when', 'whenever', 'while', 'because', 'since',
+    'unless', 'if', 'as soon as', 'as long as', 'in order to', 'to', 'by', 'without', 'instead of', 'whereas', 'though', 'as'];
+  const openings = ['Summarize the notes', 'Describe the storm', 'Find notes about the storm', 'why did the storm hit', 'harbor lantern',
+    'What did the keeper write about tides', 'Give me an overview of the storm'];
+  const hidden = ['you list the suppliers', 'we can list the suppliers', 'you have listed the suppliers', 'list the suppliers',
+    'listing the suppliers', 'enumerating the vendors', 'giving me the suppliers', 'is invoice two paid', 'it is paid',
+    'you tell me which invoices are paid', 'they procure the vendors'];
+  for (const opening of openings) for (const subordinator of subordinators) for (const request of hidden) {
+    const text = `${opening} ${subordinator} ${request}`;
+    if (subordinator === 'to' && !/^(?:list|listing|enumerating|giving)/u.test(request)) continue;
+    assert.notEqual(exactQuestion(text), null, JSON.stringify(text));
+  }
+  // The same subordinators before a noun phrase leave an ordinary request served.
+  for (const text of ['Summarize the notes before the storm', 'Describe the harbor after the flood', 'notes on the storm before the flood',
+    'Explain the flood since the spring', 'Why did the storm hit after the calm'])
+    assert.equal(exactQuestion(text), null, JSON.stringify(text));
+  // An auxiliary or modal run on with no boundary: refused in a topic, after an allowed form and after an embedded question.
+  for (const text of ['harbor lantern will invoice two be paid', 'Summarize the notes is invoice two paid',
+    'why did the storm hit is invoice two paid', 'Explain why the gauge drifted is invoice two paid', 'storm notes have they paid'])
+    assert.notEqual(exactQuestion(text), null, JSON.stringify(text));
+  // Marks and dotted capitals read as plain letters; arrows and other separators are boundaries.
+  for (const [text] of exactQuestions.filter(([text]) => /^[a-z ?]+$/iu.test(text)).slice(0, 60))
+    for (const variant of [text.replace(/i/gu, '\u00ef'), text.toUpperCase().replace(/I/gu, '\u0130'), text.replace(/a/gu, 'a\u0301')])
+      assert.notEqual(exactQuestion(variant), null, JSON.stringify(variant));
+  for (const separator of ['~', '=>', '->', '>', '\u2192', '\u21d2', '\u27f6', '#', '=', '\t', '\u3000'])
+    assert.notEqual(exactQuestion(`Summarize the notes ${separator} list the suppliers`), null, JSON.stringify(separator));
+});
+
 test('a topic carrying a state, a selecting word or what remains is refused wherever the cue occurs', () => {
   const cues = ['done', 'complete', 'finished', 'resolved', 'closed', 'open', 'pending', 'blocked', 'approved', 'rejected', 'shipped',
     'unshipped', 'paid', 'unpaid', 'overdue', 'outstanding', 'missing', 'remaining', 'left', 'settled', 'cancelled', 'late', 'active',
@@ -235,7 +295,8 @@ test('classifying a bundle request stays fast on a worst-case input', () => {
   const cpu = () => { const { user, system } = process.cpuUsage(); return (user + system) / 1_000; };
   for (const head of ['which', 'what', 'who', 'if', 'confirm', 'how is', 'why', 'what did', 'find me the', 'explain', 'what the',
     'summarize', 'harbor'])
-    for (const fill of ['a ', 'a-', 'a, ', 'a\u200b', 'a\n', 'x and ', 'notes and ', 'invoices not ', 'a / ', 'a & ', 'the x and why ']) {
+    for (const fill of ['a ', 'a-', 'a, ', 'a\u200b', 'a\n', 'x and ', 'notes and ', 'invoices not ', 'a / ', 'a & ', 'the x and why ',
+      'afterwards ', 'simply ', 'a ~ ', 'x before you ', '\u00efs ', '\u0130 ', 'is that ', 'list ', 'to ', '\ufdfa']) {
       const text = Array.from(`${head} ${fill.repeat(600)}`).slice(0, 1_000).join('');
       const started = cpu();
       exactQuestion(text);

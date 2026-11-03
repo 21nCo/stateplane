@@ -143,14 +143,40 @@ export const exactQuestions = Object.freeze([
   ['harbor notes, all', 'completeness'], ['the parts arrived yesterday', 'status'], ['invoices never reconciled', 'status'],
   ['Summarize the storm and invoices outstanding', 'completeness'], ['Find notes about invoices not paid', 'status'],
   ['Summarize the invoices not paid', 'status'], ['Find notes about the open tickets', 'status'],
-  ['why did the storm hit and invoice two paid', 'status']]);
+  ['why did the storm hit and invoice two paid', 'status'],
+
+  // Round 5: an instruction, auxiliary or modal anywhere hides a request; a leading adverb or a subordinate clause hides nothing;
+  // marks and dotted capitals read as plain letters; arrows, tildes, #, =, > and tabs are boundaries.
+  ['First list the suppliers', 'completeness'], ['Next enumerate the suppliers', 'completeness'],
+  ['Summarize the notes before you list the suppliers', 'unrecognized'], ['Summarize the notes after you list the suppliers', 'unrecognized'],
+  ['Summarize the notes once you have listed the suppliers', 'unrecognized'],
+  ['Describe the storm so you can list the suppliers', 'unrecognized'], ['İS İT PAİD', 'status'],
+  ['İS THERE MORE', 'completeness'], ['ïs ïnvoïce païd', 'status'], ['afterwards list the suppliers', 'completeness'],
+  ['simply give me the suppliers', 'unrecognized'], ['Summarize the notes and finally enumerate the vendors', 'completeness'],
+  ['secondly, show me the suppliers', 'unrecognized'], ['In addition provide the supplier list', 'unrecognized'],
+  ['literally list all vendors', 'completeness'], ['Summarize the notes ~ list the suppliers', 'completeness'],
+  ['Summarize the notes => list the suppliers', 'completeness'], ['Summarize the notes -> list the suppliers', 'completeness'],
+  ['Summarize the notes > list the suppliers', 'completeness'], ['Summarize the notes → list the suppliers', 'completeness'],
+  ['Summarize the notes ⇒ list the suppliers', 'completeness'], ['Summarize the notes # list the suppliers', 'completeness'],
+  ['Summarize the notes = list the suppliers', 'completeness'], ['Summarize the notes\tlist the suppliers', 'completeness'],
+  ['Summarize the notes　list the suppliers', 'completeness'], ['Summarize the notes->list the suppliers', 'completeness'],
+  ['Summarize the notes list the suppliers', 'completeness'], ['harbor notes give me the suppliers', 'unrecognized'],
+  ['storm log, quietly enumerate the towers', 'completeness'], ['Summarize the notes is invoice two paid', 'unrecognized'],
+  ['Explain why the gauge drifted is invoice two paid', 'unrecognized'], ['harbor lantern will invoice two be paid', 'unrecognized'],
+  ['Find notes about the storm before enumerating the vendors', 'unrecognized'],
+  ['Summarize the notes in order to list the suppliers', 'completeness'], ['Summarize the notes to list the suppliers', 'completeness'],
+  ['Describe the storm because you need to list the suppliers', 'unrecognized'],
+  ['Explain the flood until we have listed the suppliers', 'unrecognized'],
+  ['why did the storm hit, as soon as you can list the vendors', 'unrecognized'],
+  ['Summarize the notes so I can see the suppliers', 'unrecognized'], ['Summarize the notes if you can list the suppliers', 'unrecognized'],
+  ['supplier list', 'completeness'], ['invoices still to pay', 'status']]);
 
 /** Ordinary retrieval requests, which a bundle serves. */
 export const ordinaryRequests = Object.freeze(['harbor lantern', 'Why was the lantern lit at dusk?', 'account recovery notes',
   'everything about tides', 'discounted fares', 'the keeper described the tower', 'Draft a summary of the lantern keeper notes',
   'Summarize the bridge repair discussion', 'What did the keeper write about the storm?', 'invoice amount dispute',
   'Why was the gate left open?', 'tell me about the lantern keeper',
-  'what the harbor master said about tides', 'a shopping list for the lighthouse', 'it was all about the tides', 'kestrel nest',
+  'what the harbor master said about tides', 'a shopping list for the lighthouse', 'kestrel nest',
   'tidal gauge', 'Describe the storm damage to the tower', 'Explain why the lantern failed', 'Find notes about the harbor lantern',
   'Who reviewed the lantern claim?', 'Can you summarize the keeper log?', 'Please describe the tower', 'Show me notes about the storm',
   'Tell me what the keeper wrote about tides', 'What happened during the storm?',
@@ -168,7 +194,14 @@ export const ordinaryRequests = Object.freeze(['harbor lantern', 'Why was the la
   'compare fog and tides', 'summarize the storm and the flood', 'find notes about salt and pepper',
   'why did the storm hit and the lantern fail', 'Summarize the keeper log\nFind notes about the storm', '- harbor lantern\n- tidal gauge',
   'fog / tides', 'Explain the storm & describe the flood', 'Compare the March logs with the April logs, then outline the differences',
-  'How did the storm begin and end?', 'What did the keeper write about fog and tides?', 'Summarize the storm notes and the vendors']);
+  'How did the storm begin and end?', 'What did the keeper write about fog and tides?', 'Summarize the storm notes and the vendors',
+  // Round 5: a leading adverb is removed like a prefix; a subordinator before a noun phrase, an embedded clause with one auxiliary,
+  // a verb's spelling after a determiner or preposition, and marked letters stay ordinary.
+  'briefly summarize the storm', 'first, find notes about the storm', 'Summarize the logs and briefly describe the storm',
+  'Find notes about the storm, then briefly explain the flood', 'Summarize the notes before the storm', 'Describe the harbor after the flood',
+  'notes on the storm before the flood', 'daily logs', 'early storm notes', 'Describe how the keeper checks the lantern',
+  'Explain how the lantern is repaired', 'weather update notes', "the keeper's log about the storm", 'Caf\u00e9 notes about the storm',
+  'na\u00efve lantern design', 'notes on the final check of the lantern', 'Why did the keeper look for the leak']);
 
 /**
  * [text, rephrasing]: requests that ask no exact question but are refused
@@ -195,4 +228,13 @@ export const overRefusals = Object.freeze([
   ['How do tides and currents interact?', 'How do tides interact with currents?'],
   ['What did the keeper and the master say about tides?', 'What did the keeper say about tides? What did the master say about tides?'],
   ['Who wrote and reviewed the log?', 'Who wrote the log, and who reviewed it?'],
-  ['Why was the bell rung and the lantern lit?', 'Why was the bell rung, and why was the lantern lit?']]);
+  ['Why was the bell rung and the lantern lit?', 'Why was the bell rung, and why was the lantern lit?'],
+  // Round 5: a topic holds no auxiliary, modal or subject pronoun; an instruction verb before an object is a request wherever it
+  // occurs; a subordinator before a subject, auxiliary, modal or instruction verb opens a subrequest of its own.
+  ['it was all about the tides', 'notes about the tides'], ['Why did the keeper find the leak', 'Why did the keeper look for the leak'],
+  ['Explain how to fix the lantern', 'Explain how the lantern is repaired'],
+  ['Why was the lantern lit when it was dark?', 'Why was the lantern lit at dusk?'],
+  ['Describe the storm so the crew can prepare', 'Describe the storm and the crew preparations'],
+  ['only the storm notes', 'the storm notes'], ['notes we wrote about the storm', 'notes written about the storm'],
+  ['Outline the steps the crew took during the storm', "Outline the crew's steps during the storm"],
+  ['Summarize the notes the keeper wrote', 'Summarize the notes written by the keeper']]);

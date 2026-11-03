@@ -204,8 +204,9 @@ export type BundleRefusal = ExactQuestion | 'unrecognized';
 export const BUNDLE_REQUEST_FORMS = 'A bundle request is a topic ("harbor lantern notes"); a why-question; "how does ... work"; '
   + '"what did ... say about ..."; "what happened during ..."; "who wrote, said or reviewed ..."; summarize, describe, explain, outline, '
   + 'compare or draft ...; or find, show or get notes, records or information about ..., or a summary or overview of .... '
-  + 'Each line and each part joined by and, or, then, plus or the like must be one of these, and a topic names no state, '
-  + 'nothing remaining or left, and no "all".';
+  + 'Each line, each part joined by and, or, then, plus or the like, and each subordinate clause (before you ..., so we can ..., '
+  + 'to list ...) must be one of these; no instruction verb, auxiliary or modal may be run on inside one; and a topic has no '
+  + 'verb or subject of its own and names no state, nothing remaining or left, and no "all".';
 
 // Whole words and phrases, between non-letters or digits.
 const word = (pattern: string) => `(?<![\\p{L}\\p{N}])(?:${pattern})(?![\\p{L}\\p{N}])`;
@@ -292,7 +293,7 @@ const EXACT: readonly [ExactQuestion, RegExp][] = Object.freeze([
     + "how\\s+(?:is|are|was|were|'s|'re)\\s+(?:\\S+\\s+)*?(?:going|coming(?:\\s+along)?|doing|looking|shaping\\s+up)|"
     + 'where\\s+(?:are|is|do|does|did)\\s+(?:\\S+\\s+)*?stands?|where\\s+are\\s+we\\s+(?:on|with)|how\\s+(?:close|near)|'
     + '(?:any|an|latest)\\s+updates?|updates?\\s+(?:on|about|regarding|for)|latest\\s+(?:on|news)|when\\s+will|or\\s+not|yet\\s+to|'
-    + 'still\\s+(?:needs?|has|have)\\s+to|awaiting|under\\s+review|(?:on|off)\\s+duty|(?:in|out\\s+of)\\s+stock'))],
+    + 'still\\s+(?:(?:needs?|has|have)\\s+)?to|awaiting|under\\s+review|(?:on|off)\\s+duty|(?:in|out\\s+of)\\s+stock'))],
   // Any yes/no question: a clause opening with an auxiliary or a modal, whatever it asks about.
   ['status', regex(`^${word(AUXILIARY)}\\s+\\S`)],
   ['status', regex(`^${word(MODAL)}\\s+\\S`)],
@@ -415,7 +416,7 @@ function nounPhrase(conjunct: string, first: string, second: string | undefined)
 // Topic cues, wherever they occur in a topic: something left, remaining, missing or outstanding, or "all" at the
 // end, asks what is left of a set; a state or a state-selecting word, negated or alone, asks a status; so does a topic ending in
 // a participle ("invoice two paid", "parts arrived yesterday").
-const TOPIC_COMPLETENESS = regex(`${word('remaining|missing|outstanding|left')}|${word('all')}$`);
+const TOPIC_COMPLETENESS = regex(`${word('remaining|missing|outstanding|left')}|${word('all|lists?')}$`);
 const TOPIC_STATE = regex(word(`${STATES}|${SELECTING}`));
 const TOPIC_PARTICIPLE = regex(`${word(`(?!(?:\\p{L}*eed|hundred|sacred|kindred)(?![\\p{L}\\p{N}]))(?:${PARTICIPLE})`)}`
   + '(?:\\s+(?:yet|already|now|too|again|so\\s+far|today|yesterday|recently|this\\s+\\S+|last\\s+\\S+))?$');
@@ -430,6 +431,77 @@ const EXPLANATION = regex(`^${word('why|how')}`);
 function topicCue(topic: string): ExactQuestion | null {
   if (TOPIC_COMPLETENESS.test(topic)) return 'completeness';
   return TOPIC_STATE.test(topic) || TOPIC_PARTICIPLE.test(topic) ? 'status' : null;
+}
+
+// Every instruction verb, the allowed ones too: one at any later position of a subrequest is a request of its own.
+const INSTRUCTIONS = new Set([...VERBS, 'summarize', 'summarise', 'describe', 'explain', 'outline', 'draft', 'compare', 'contrast',
+  'discuss', 'recap', 'clarify', 'paraphrase', 'fetch', 'retrieve', 'surface', 'provide', 'share', 'enumerate', 'itemize',
+  'itemise', 'catalog', 'catalogue', 'furnish', 'list', 'tally']);
+// Verbs that ask for a set even before a bare plural ("notes list suppliers"); the others only before an object word.
+const SET_VERBS = new Set(['list', 'enumerate', 'itemize', 'itemise', 'tally', 'count', 'name', 'show', 'give', 'get', 'fetch',
+  'provide', 'display', 'print', 'return', 'send', 'share', 'tell', 'compile', 'gather', 'collect', 'retrieve', 'furnish', 'supply',
+  'catalog', 'catalogue', 'total', 'sum']);
+const ENUMERATE = new Set(['list', 'enumerate', 'itemize', 'itemise', 'catalog', 'catalogue', 'name']);
+// Words before which a verb's spelling is a noun: determiners and possessives ("the list", "our update").
+const NOUN_MARKERS = new Set(['the', 'a', 'an', 'this', 'these', 'those', 'our', 'my', 'your', 'their', 'his', 'her', 'its', "'s", 'no',
+  'each', 'every', 'any', 'some']);
+// Subject pronouns: one opens a clause, except right after an auxiliary, a modal or a question word ("why did we", "how they").
+const PRONOUNS = new Set(['i', 'we', 'you', 'they', 'he', 'she']);
+// Contracted auxiliaries, each its own word after `readings`.
+const CONTRACTED = new Set(["'re", "'ve", "'ll", "'m", "'d"]);
+const PLURAL = /^\p{L}{2,}(?<!ss|us|is)s$/u;
+const FINITE = new RegExp(`^(?:${PARTICIPLE}|said|went|came|took|gave|got|saw|knew|thought|wrote|broke|began|ran|drove|chose|fell|rose|`
+  + 'stood|sank|swam|flew|grew|drew|threw|wore|tore|spoke|stole|froze|hid|rode|shook|forgot|forgave)$', 'u');
+// What makes the word before it a verb when that word is not known to be something else.
+const DETERMINERS = new Set(['the', 'a', 'an', 'all', 'every', 'each', 'any', 'some', 'our', 'my', 'your', 'their', 'his', 'its', 'those',
+  'these', 'no', 'both', 'several', 'me', 'us', 'them', 'him']);
+// Words before a determiner that are not verbs: prepositions, conjunctions, determiners, pronouns, participles, numbers.
+const NOT_VERBS = new Set(['including', 'despite', 'except', 'throughout', 'upon', 'along', 'amid', 'amongst', 'beneath', 'below',
+  'above', 'past', 'following', 'until', 'till', 'than', 'plus', 'minus', 'versus', 'vs', 'off', 'out', 'up', 'down', 'near', 'nor',
+  'all', 'half', 'whole', 'inside', 'outside', 'underneath', 'unlike', 'onto', 'off', 'toward', 'whereas', "'s", 'is', 'what']);
+const nonVerb = (word: string) => NOT_A_VERB.has(word) || NOT_VERBS.has(word) || NOUN_MARKERS.has(word) || OBJECT_WORDS.has(word)
+  || PRONOUNS.has(word) || /^(?:\p{L}{2,}(?:ed|ing)|\p{N}+\p{L}*)$/u.test(word);
+const isAuxiliary = (word: string) => AUXILIARIES.test(word) || CONTRACTED.has(word);
+const isQuestionWord = (word: string) => new RegExp(`^(?:${WH})$`, 'u').test(word);
+
+/**
+ * Why a subrequest holds a second request or clause wherever it occurs, not
+ * only at its start, or null: an instruction verb after its first word
+ * (unless a determiner or possessive makes it a noun) before an object word,
+ * a determiner or quantifier, a pronoun or, for a verb asking for a set, a
+ * plural; before any question word, any other word not known to be a
+ * preposition, determiner, pronoun, participle or number before a
+ * determiner or object pronoun (an unknown verb and its object); an
+ * auxiliary or a modal other than the one its own allowed question word
+ * opens, before that clause's verb; and a subject pronoun anywhere in a
+ * topic, or elsewhere other than right after an auxiliary, a modal or a
+ * question word.
+ */
+function hidden(text: string, topic: boolean): BundleRefusal | null {
+  const words = text.split(' ');
+  let licensed = false;
+  let questioned = false;
+  for (const [at, word] of words.entries()) {
+    const next = words[at + 1];
+    if (isQuestionWord(word)) { licensed = true; questioned = true; continue; }
+    // Before any question word, an unknown word before a determiner or an object pronoun is a verb and its object: "harbor
+    // notes tenth procure the suppliers".
+    if (!questioned && at > 0 && next !== undefined && DETERMINERS.has(next) && !nonVerb(word) && !INSTRUCTIONS.has(word)) return 'unrecognized';
+    if (isAuxiliary(word)) {
+      if (at === 0 && !topic) continue;
+      if (!licensed) return 'unrecognized';
+      licensed = false;
+      continue;
+    }
+    // A finished verb ends the clause the question word opened: "explain why the gauge drifted is ..." holds a second one.
+    if (licensed && FINITE.test(word)) licensed = false;
+    if (PRONOUNS.has(word) && (topic || at === 0 || !(isAuxiliary(words[at - 1]) || isQuestionWord(words[at - 1]))))
+      return 'unrecognized';
+    if (at > 0 && INSTRUCTIONS.has(word) && !NOUN_MARKERS.has(words[at - 1]) && next !== undefined
+      && (OBJECT_WORDS.has(next) || PRONOUNS.has(next) || (SET_VERBS.has(word) && PLURAL.test(next))))
+      return ENUMERATE.has(word) ? 'completeness' : 'unrecognized';
+  }
+  return null;
 }
 
 /**
@@ -462,9 +534,11 @@ function denied(text: string, asked: boolean): BundleRefusal | null {
 function refusal(head: string, group: string, asked: boolean): BundleRefusal | null {
   const refused = denied(head, asked) ?? (group === head ? null : denied(group, asked));
   if (refused) return refused;
-  if (EXPLAIN.test(head) || GET_SUMMARY.test(head) || (QUESTION_OPENING.test(head) && QUESTIONS.some(form => form.test(head)))) return null;
+  if (EXPLAIN.test(head) || GET_SUMMARY.test(head) || (QUESTION_OPENING.test(head) && QUESTIONS.some(form => form.test(head))))
+    return hidden(head, false);
   const [first, second] = head.split(' ');
-  if (GET_PASSAGES.test(head) || (!asked && nounPhrase(head, first, second))) return topicCue(head);
+  if (GET_PASSAGES.test(head)) return hidden(head, false) ?? topicCue(head);
+  if (!asked && nounPhrase(head, first, second)) return hidden(head, true) ?? topicCue(head);
   return 'unrecognized';
 }
 
@@ -479,7 +553,7 @@ const CLITIC = /(?<=\p{L})'(?=(?:s|re|ve|d|ll|m)(?![\p{L}\p{N}]))/gu;
 // Line breaks, each a clause boundary; a list marker opening a line; separators, wherever they are; and coordinating symbols.
 const LINE = /[\n\r\v\f\u0085\u2028\u2029]/u;
 const LIST_MARKER = /^\s*(?:[-*>\u2022\u2023\u2043\u2219\u25aa\u25cf\u25e6\u00b7]+|\(?(?:\d+|[a-z])[.)])\s+/iu;
-const SEPARATOR = /[|/\\\u00b7\u2013-\u2015\u2022\u2023\u2027\u2043\u2219\u25aa\u25cf\u25e6]|-{2,}|\s\*+(?=\s)/gu;
+const SEPARATOR = /[|/\\\u00b7\u2013-\u2015\u2022\u2023\u2027\u2043\u2219\u25aa\u25cf\u25e6~#=<>\u2190-\u21ff\u2794-\u27bf\u27f0-\u27ff\u2900-\u297f\u2b00-\u2b2f\u2b4d-\u2b73]|-{2,}|-(?=>)|\s\*+(?=\s)/gu;
 
 /**
  * The forms of `text` a question is looked for in: NFKC-normalized and
@@ -494,8 +568,10 @@ const SEPARATOR = /[|/\\\u00b7\u2013-\u2015\u2022\u2023\u2027\u2043\u2219\u25aa\
  * 's"), and whitespace collapsed.
  */
 function readings(text: string): string[] {
-  const normalized = text.normalize('NFKC');
-  const forms = ['', ' '].map(by => normalized.replace(IGNORABLE, by).normalize('NFKC').replace(IGNORABLE, by));
+  const normalized = text.replace(/[\t\u3000]/gu, ';').normalize('NFKC');
+  const unmarked = (form: string) => form.normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase().normalize('NFKD').replace(/\p{M}/gu, '');
+  const forms = ['', ' '].map(by => normalized.replace(IGNORABLE, by).normalize('NFKC').replace(IGNORABLE, by))
+    .flatMap(form => [form, unmarked(form)]);
   const lined = [...forms, ...forms.map(form => form.replace(JOINER, ' '))].flatMap(form => {
     const lines = form.split(LINE);
     return lines.length > 1 ? [lines.map(line => line.replace(LIST_MARKER, '')).join(';'), lines.join(' ')] : [form.replace(LIST_MARKER, '')];
@@ -508,12 +584,53 @@ function readings(text: string): string[] {
 const COORDINATOR = new RegExp(`(?:^|\\s)(?:${alternatives(['and\\s+then', 'and\\s+also', 'and\\s+or', 'as\\s+well\\s+as', 'as\\s+well',
   'after\\s+that', 'followed\\s+by', 'and', 'or', 'nor', 'but', 'then', 'plus', 'also', 'while'])})(?=\\s|$)`, 'giu');
 
+// Sequencing and linking adverbs that may open a request without being its content.
+const SEQUENCE_WORDS = Object.freeze(['first', 'second', 'third', 'next', 'then', 'finally', 'lastly', 'last', 'afterwards?', 'after\\s+this',
+  'additionally', 'in\\s+addition', 'again', 'once\\s+(?:more|again)', 'meanwhile', 'separately', 'likewise', 'now', 'later',
+  'thereafter', 'subsequently', 'furthermore', 'moreover', 'besides', 'too', 'right\\s+away', 'at\\s+once', 'to\\s+(?:start|begin)(?:\\s+with)?',
+  'for\\s+starters', 'in\\s+turn', 'in\\s+the\\s+end', 'at\\s+last', 'instead', 'otherwise', 'anyway', 'actually', 'oh']);
+const SEQUENCE = prefix(alternatives(SEQUENCE_WORDS));
+// An "-ly" adverb ("simply", "briefly"): removed like a prefix unless it is a verb ("apply", "supply") or has an object after it.
+const LY = /^(\p{L}{2,}ly)(?![\p{L}\p{N}'])[\s,]*/u;
+const LY_VERBS = new Set(['apply', 'supply', 'reply', 'multiply', 'comply', 'imply', 'rely', 'fly', 'rally', 'tally', 'ally', 'bully',
+  'sully', 'dally', 'belly', 'jelly']);
+
+// A sequencing or "-ly" adverb inside a clause, before a verb and its object ("harbor notes first procure the suppliers"): a
+// boundary, so the request after it is classified as its own subrequest.
+const ADVERB_BREAK = new RegExp(`\\s(?:${alternatives(SEQUENCE_WORDS)}|(?!${[...LY_VERBS].join('|')})\\p{L}{2,}ly)`
+  + `(?=\\s\\p{L}+\\s(?:${[...OBJECT_WORDS].join('|')})(?![\\p{L}\\p{N}']))`, 'gu');
+
+/** `text` without one leading sequencing or "-ly" adverb, when it opens with one. */
+function withoutAdverb(text: string): string {
+  const sequenced = text.replace(SEQUENCE, '');
+  if (sequenced !== text) return sequenced;
+  const adverb = LY.exec(text);
+  if (!adverb || LY_VERBS.has(adverb[1]) || INSTRUCTIONS.has(adverb[1])) return text;
+  const rest = text.slice(adverb[0].length);
+  return OBJECT_WORDS.has(rest.split(' ')[0]) ? text : rest;
+}
+
+// The "-ing" forms of the instruction verbs ("before listing").
+const GERUNDS = [...INSTRUCTIONS].flatMap(verb => [`${verb}ing`, `${verb.replace(/e$/u, '')}ing`, `${verb}${verb.at(-1)}ing`]);
+// A subordinate clause: a subordinator before a subject, an auxiliary, a modal or an instruction verb ("before you list",
+// "so we can", "once listed", "to list"), each its own subrequest, so an allowed opening never authorizes it. "to" opens one
+// only after a word that is not a verb of wanting or trying ("I want to see the notes" is one request).
+const SUBORDINATE = new RegExp(`(?:\\s(?:${alternatives(['before', 'after', 'once', 'until', 'till', 'so\\s+that', 'so', 'when',
+  'whenever', 'because', 'since', 'unless', 'if', 'as\\s+soon\\s+as', 'as\\s+long\\s+as', 'in\\s+order\\s+to', 'so\\s+as\\s+to', 'in\\s+case',
+  'by', 'without', 'instead\\s+of', 'rather\\s+than', 'whereas', 'though', 'although', 'even\\s+though', 'even\\s+if', 'as', 'where',
+  'whereby', 'wherein', 'thereby', 'hence', 'thus', 'therefore', 'so\\s+then'])})|`
+  + "(?<!(?:^|[^\\p{L}'])(?:want|wants|wanted|need|needs|needed|like|wish|hope|trying|try|tried|going|able|ought|used|have|has|had|"
+  + "how|what))\\sto)(?=\\s(?:i|we|you|they|he|she|it|there|'s|"
+  + `${alternatives(['am', 'is', 'are', 'was', 'were', 'has', 'have', 'had', 'did', 'does', 'do', 'will', 'would', 'can', 'could', 'should',
+    'shall', 'must', 'may', 'might', 'need'])}|${[...INSTRUCTIONS, ...GERUNDS].join('|')})(?![\\p{L}\\p{N}']))`, 'gu');
+
 /** One conjunct without its leading request and politeness prefixes, a request to be given something read as "get"; and whether it had one. */
 function unprefixed(conjunct: string): { text: string; prefixed: boolean } {
   let text = conjunct.trim();
   for (let previous = ''; previous !== text;) {
     previous = text;
     for (const pattern of PREFIXES) text = text.replace(pattern, '');
+    text = withoutAdverb(text);
   }
   const got = text.replace(LEAD_IN, 'get ');
   return { text: got, prefixed: got !== conjunct.trim() };
@@ -530,7 +647,7 @@ function unprefixed(conjunct: string): { text: string; prefixed: boolean } {
  * fog and tides") and is also returned as a topic, whose cues are refused.
  */
 function clauses(reading: string): { groups: { head: string; text: string }[]; topics: string[]; asked: boolean }[] {
-  return [...reading.replace(/\s+[-\u2013\u2014]+\s+/gu, ';').matchAll(/([^.;:!?,()[\]{}"\u201c\u201d\u00ab\u00bb]+)([.;:!?,()[\]{}"\u201c\u201d\u00ab\u00bb]*)/gu)]
+  return [...reading.replace(/\s+[-\u2013\u2014]+\s+/gu, ';').replace(SUBORDINATE, ';').replace(ADVERB_BREAK, ';').matchAll(/([^.;:!?,()[\]{}"\u201c\u201d\u00ab\u00bb]+)([.;:!?,()[\]{}"\u201c\u201d\u00ab\u00bb]*)/gu)]
     .map(([, clause, end]) => {
       const groups: { head: string; text: string }[] = [];
       const topics: string[] = [];
@@ -555,7 +672,11 @@ function clauses(reading: string): { groups: { head: string; text: string }[]; t
  * dashes, separators and line breaks, with request prefixes such as
  * "please", "can you" or "tell me about" removed) and every coordinated
  * subrequest in it (split at and, or, but, then, plus, also, as well as, &,
- * + and the like) is one of the forms of `BUNDLE_REQUEST_FORMS` or a topic,
+ * + and the like, and at a subordinator before a subject, an auxiliary, a
+ * modal or an instruction verb, with leading sequencing and "-ly" adverbs
+ * removed) is one of the forms of `BUNDLE_REQUEST_FORMS` or a topic, holds
+ * no second request run on inside it (an instruction verb with an object,
+ * an unlicensed auxiliary, modal or subject pronoun, wherever it occurs),
  * and no deny rule names an exact question in it. Any other question (a
  * question mark, or a subrequest opening with a question word, an auxiliary
  * or a modal) or instruction is refused as `unrecognized`, whatever it asks;
@@ -582,7 +703,7 @@ export function exactQuestion(text: string): BundleRefusal | null {
       if (kind) return kind;
     }
     for (const topic of topics) {
-      const kind = note(topicCue(topic));
+      const kind = note(hidden(topic, true) ?? topicCue(topic));
       if (kind) return kind;
     }
   }
