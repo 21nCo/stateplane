@@ -130,10 +130,11 @@ async function index(embedders = registry) {
 }
 
 /** Publish a policy and an active generation for `collectionId`, before content is written so the worker projects it. */
-async function project(spaceId, collectionId, { lexical = true, vector = true, regions = ['local'] } = {}) {
+async function project(spaceId, collectionId, { lexical = true, vector = true, regions = ['local'], fields = ['/title', '/note'],
+  sources = true, claims = true } = {}) {
   await pool.query(`INSERT INTO retrieval_policies(space_id,collection_id,version,record_fields,source_content,claim_statements,
-      lexical,vector,text_search_config,processing_regions,credential_id) VALUES($1,$2,1,'{/title,/note}',true,true,$3,$4,'english',$5,'owner')`,
-  [spaceId, collectionId, lexical, vector, regions]);
+      lexical,vector,text_search_config,processing_regions,credential_id) VALUES($1,$2,1,$6,$7,$8,$3,$4,'english',$5,'owner')`,
+  [spaceId, collectionId, lexical, vector, regions, fields, sources, claims]);
   const model = vector ? ['local-hash', 'feature-hash', '1', 384] : [null, null, null, null];
   await pool.query(`INSERT INTO projection_generations(space_id,collection_id,generation,policy_version,embedder,embedding_model,
     model_version,dimensions) VALUES($1,$2,1,1,$3,$4,$5,$6)`, [spaceId, collectionId, ...model]);
@@ -622,6 +623,42 @@ test('a short result is exhausted only when every list was exact and every reada
   const listed = await search().search(f.owner, f.spaceId, { query: 'tidepool', collections: ['c00', 'c32'] });
   assert.equal(listed.collectionsCapped, false);
   assert.deepEqual(listed.underfill.reasons, ['exhausted'], 'every searched list was lexical and returned all it had');
+  assert.deepEqual(listed.collections.map(entry => entry.unsearched), [[], []], 'every requested kind is projected and searched');
+});
+
+test('a collection no list ran over is reported unsearched, never exhausted', async () => {
+  // beta's policy enables neither list: its matching record was never searched.
+  const f = await fixture({ collections: ['alpha', 'beta'], policy: { alpha: { vector: false }, beta: { lexical: false, vector: false } } });
+  const kelp = await f.record('alpha', { title: 'kelp forest' });
+  await f.record('beta', { title: 'kelp forest' });
+  await index();
+  const both = await search().search(f.owner, f.spaceId, { query: 'kelp' });
+  assert.deepEqual(ids(both), [`alpha/record/${kelp}`]);
+  assert.deepEqual(both.collections.map(entry => [entry.collectionId, entry.lexical, entry.vector, entry.projection, entry.unsearched]),
+    [['alpha', true, 'disabled', 'current', []], ['beta', false, 'disabled', 'current', ['record', 'source', 'claim']]]);
+  assert.deepEqual(both.underfill.reasons, ['unprojected']);
+  const alone = await search().search(f.owner, f.spaceId, { query: 'kelp', collections: ['alpha'] });
+  assert.deepEqual(alone.underfill.reasons, ['exhausted'], 'alpha alone was covered');
+});
+
+test('a requested readable kind the policy does not project is reported unsearched, never exhausted', async () => {
+  // A policy that projects no sources: a matching source was never searched, whatever records and claims were.
+  const g = await fixture({ collections: ['alpha'], policy: { alpha: { vector: false, sources: false } } });
+  const note = await g.record('alpha', { title: 'saltmarsh census' });
+  await g.source('alpha', 'saltmarsh tides and the census of herons');
+  await index();
+  const all = await search().search(g.owner, g.spaceId, { query: 'saltmarsh' });
+  assert.deepEqual(ids(all), [`alpha/record/${note}`]);
+  assert.deepEqual(all.collections.map(entry => entry.unsearched), [['source']]);
+  assert.deepEqual(all.underfill.reasons, ['unprojected']);
+  // Asking only for kinds the policy projects is covered again; a key that cannot read sources is not told about them.
+  const records = await search().search(g.owner, g.spaceId, { query: 'saltmarsh', kinds: ['record', 'claim'] });
+  assert.deepEqual(records.collections.map(entry => entry.unsearched), [[]]);
+  assert.deepEqual(records.underfill.reasons, ['exhausted']);
+  const key = await g.agent([['alpha', ['records:read', 'claims:read']]]);
+  const keyed = await search().search(key, g.spaceId, { query: 'saltmarsh' });
+  assert.deepEqual(keyed.collections.map(entry => entry.unsearched), [[]]);
+  assert.deepEqual(keyed.underfill.reasons, ['exhausted']);
 });
 
 test('a filtered nearest-neighbour query keeps scanning the HNSW index past other spaces', async () => {

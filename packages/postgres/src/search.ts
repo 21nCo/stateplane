@@ -22,7 +22,8 @@ export type SearchVectorState = 'used' | 'disabled' | 'unavailable';
 export type SearchVectorError = 'EMBEDDER_NOT_CONFIGURED' | 'EMBEDDER_UNAVAILABLE' | 'EMBEDDER_FAILED' | 'VECTOR_QUERY_FAILED'
   | 'POLICY_CHANGED';
 export type SearchProjectionState = 'current' | 'pending' | 'degraded' | 'unindexed';
-export type SearchUnderfill = 'rejected' | 'bounded' | 'capped' | 'approximate' | 'exhausted' | 'degraded' | 'unindexed' | 'pending';
+export type SearchUnderfill = 'rejected' | 'bounded' | 'capped' | 'approximate' | 'exhausted' | 'degraded' | 'unindexed' | 'pending'
+  | 'unprojected';
 /** A code-point range of the authoritative text a hit matched in, read from authority, never from a projection. */
 export interface SearchCitation {
   /** Every list whose best chunk for the Ref this is: lexical, vector or both. */
@@ -47,6 +48,13 @@ export interface SearchHit {
 export interface SearchCollection {
   collectionId: string; generation: number | null; lexical: boolean; vector: SearchVectorState;
   vectorError: SearchVectorError | null; projection: SearchProjectionState;
+  /**
+   * The requested kinds the caller may read here that no candidate list
+   * covered: every one when no list ran over the collection (no active
+   * generation, or no lexical side and no vector side used), otherwise those
+   * the active generation's policy does not project.
+   */
+  unsearched: RefKind[];
 }
 /**
  * A ranked, reauthorized page of hits. It is never a complete answer: no
@@ -80,6 +88,10 @@ const requestFields = Object.freeze(['query', 'collections', 'kinds', 'limit']);
 
 interface Planned {
   collectionId: string;
+  /** The kinds the caller asked for and may read here. */
+  kinds: RefKind[];
+  /** Of those, the kinds the active generation's policy projects into no list (every one when it enables neither list). */
+  unprojected: RefKind[];
   /** The active generation, with the kinds the caller asked for and may read, and its vector identity when vectors are on. */
   active: (ActiveGeneration & { policyVersion: number; lexical: boolean; identity: EmbedderIdentity | null; regions: string[] }) | null;
   projection: SearchProjectionState; vector: SearchVectorState; vectorError: SearchVectorError | null;
@@ -232,7 +244,7 @@ async function plan(db: Db, scope: AuthorityScope, owner: boolean, request: Requ
   : Promise<Planned[]> {
   const capabilities = request.kinds.map(kind => READ[kind]);
   const rows = (await db.query(`SELECT c.collection_id,g.capabilities,a.generation,a.policy_version,p.lexical,p.vector,
-      p.text_search_config,a.embedder,a.embedding_model,a.model_version,a.dimensions,
+      p.text_search_config,cardinality(p.record_fields)>0 AS records_projected,p.source_content,p.claim_statements,a.embedder,a.embedding_model,a.model_version,a.dimensions,
       ARRAY(SELECT r FROM unnest(cur.processing_regions) WITH ORDINALITY u(r,n) WHERE r=ANY(p.processing_regions) ORDER BY n) AS regions
     FROM collections c
     LEFT JOIN collection_grants g ON NOT $3 AND g.space_id=c.space_id AND g.collection_id=c.collection_id AND g.credential_id=$2
@@ -248,7 +260,12 @@ async function plan(db: Db, scope: AuthorityScope, owner: boolean, request: Requ
   const planned: Planned[] = rows.map(row => {
     const kinds = request.kinds.filter(kind => owner || (row.capabilities as string[]).includes(READ[kind]));
     const vector = row.vector === true && row.embedder !== null;
-    return { collectionId: String(row.collection_id),
+    // What the generation's policy makes searchable: a kind it projects, through a list it enables.
+    const projects: Record<RefKind, boolean> = { record: row.records_projected === true, source: row.source_content === true,
+      claim: row.claim_statements === true };
+    const unprojected = row.generation === null ? []
+      : kinds.filter(kind => !projects[kind] || (row.lexical !== true && !vector));
+    return { collectionId: String(row.collection_id), kinds, unprojected,
       active: row.generation === null ? null : { collectionId: String(row.collection_id), generation: Number(row.generation), kinds,
         policyVersion: Number(row.policy_version), textSearchConfig: String(row.text_search_config), lexical: row.lexical === true,
         regions: row.regions as string[], identity: vector ? { embedder: row.embedder, model: row.embedding_model,
@@ -643,20 +660,25 @@ export class PostgresRetrievalSearch {
       return { hits, rejected };
     });
 
+    // Coverage from what actually ran: a collection's readable kinds are searched only through a list that ran over it.
     const collections: SearchCollection[] = planned.map(entry => ({ collectionId: entry.collectionId,
       generation: entry.active?.generation ?? null, lexical: entry.active?.lexical === true, vector: entry.vector,
-      vectorError: entry.vector === 'unavailable' ? entry.vectorError : null, projection: entry.projection }));
+      vectorError: entry.vector === 'unavailable' ? entry.vectorError : null, projection: entry.projection,
+      unsearched: entry.active?.lexical || entry.vector === 'used' ? entry.unprojected : entry.kinds }));
     const vectorDown = collections.some(entry => entry.vector === 'unavailable');
     const degraded = vectorDown || collections.some(entry => entry.projection === 'degraded');
     const pending = collections.some(entry => entry.projection === 'pending' || entry.projection === 'unindexed');
     // Exhausted only when every searched list returned all it had (no bound reached, no ANN list) and nothing readable went
-    // unsearched: no collection left out, none unindexed or behind its authority, no vector side down.
-    const unsearched = collectionsCapped || collections.some(entry => entry.projection !== 'current' || entry.vector === 'unavailable');
+    // unsearched: no collection left out, every requested readable kind of every collection covered by a list that ran,
+    // every collection current with its authority and no vector side down.
+    const covered = !collectionsCapped && collections.every(entry => !entry.unsearched.length && entry.projection === 'current'
+      && entry.vector !== 'unavailable');
     const reasons: [SearchUnderfill, boolean][] = [
       ['rejected', rejected.deleted + rejected.stale + rejected.unauthorized > 0], ['bounded', bounded],
-      ['capped', collectionsCapped], ['approximate', approximate], ['exhausted', !bounded && !approximate && !unsearched],
+      ['capped', collectionsCapped], ['approximate', approximate], ['exhausted', !bounded && !approximate && covered],
       ['degraded', vectorDown], ['unindexed', collections.some(entry => entry.projection === 'unindexed')],
-      ['pending', collections.some(entry => entry.projection === 'pending' || entry.projection === 'degraded')]];
+      ['pending', collections.some(entry => entry.projection === 'pending' || entry.projection === 'degraded')],
+      ['unprojected', planned.some(entry => entry.unprojected.length > 0)]];
     return { spaceId, query: input.query, limit: input.limit,
       mode: collections.some(entry => entry.vector === 'used') ? 'hybrid' : 'lexical',
       state: degraded ? 'degraded' : pending ? 'pending' : 'current', complete: false, results: hits,
