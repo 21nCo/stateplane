@@ -468,6 +468,16 @@ const pairsOf = (relied: ReadonlySet<string>) => [...relied].map(pair => JSON.pa
 
 interface Group { identity: EmbedderIdentity; embedder: Embedder; entries: Planned[] }
 
+/**
+ * When the caller's access lapses: `monotonic`, the earliest expiry on
+ * `performance.now()`'s clock, each measured from before its read, and
+ * `wallUntil`, the provider credential's own absolute expiry (Infinity when
+ * none), on the wall clock the provider states it in, so a clock step past it
+ * is caught too.
+ */
+interface Deadline { monotonic: number; wallUntil: number }
+const expired = (deadline: Deadline) => performance.now() >= deadline.monotonic || Date.now() >= deadline.wallUntil;
+
 /** Thrown by a group's admission when none of its collections may still send the query to its embedder. */
 class AdmissionClosed extends Error {}
 
@@ -603,13 +613,15 @@ export class PostgresRetrievalSearch {
       // relies on still current, the space still open at the admitted policy and placement, and each collection live at
       // the planned active generation with the embedder's region allowed by both policies. A lapse or narrowing
       // committed during an earlier group's call therefore stops this one; one committed during this call cannot recall
-      // it, as for the worker.
+      // it, as for the worker. The read, the provider's included, ends with the shared budget: its session is released or
+      // discarded then, so it never holds a connection the lexical fallback needs.
       const admit = async () => {
-        const current = await transact(cell.pool, async db => {
-          try { await this.assertCurrent(db, actor, ownerPrincipalId, scope, relied); }
+        const { current, deadline } = await transact(cell.pool, async db => {
+          let deadline: Deadline;
+          try { deadline = await this.assertCurrent(db, actor, ownerPrincipalId, scope, relied); }
           catch (error) { if (error instanceof AuthorityError) denied = error; throw error; }
-          return admission(db, scope, entries.map(entry => entry.collectionId));
-        });
+          return { current: await admission(db, scope, entries.map(entry => entry.collectionId)), deadline };
+        }, vectorEnd);
         // A read that outlasted the budget changes nothing: the group was already reported unavailable.
         if (signal.aborted) throw new AdmissionClosed();
         admitted = entries.filter(entry => {
@@ -619,6 +631,11 @@ export class PostgresRetrievalSearch {
         });
         for (const entry of entries) if (!admitted.includes(entry)) entry.vectorError = 'POLICY_CHANGED';
         if (!admitted.length) throw new AdmissionClosed();
+        // The query leaves next (the embedding call is the next await): only while all that access is still unexpired.
+        if (expired(deadline)) {
+          denied = new AuthorityError('FORBIDDEN', 'Access expired before the query was sent');
+          throw denied;
+        }
         stage = 'embedding';
       };
       // One try; a call that outlasts the budget, even one ignoring its signal, is an outage and is not waited for.
@@ -629,7 +646,8 @@ export class PostgresRetrievalSearch {
         if (error instanceof AdmissionClosed) continue;
         // The shared budget running out is an outage whatever stage it cut short.
         let code: SearchVectorError = stage === 'admission' ? 'VECTOR_QUERY_FAILED' : 'EMBEDDER_FAILED';
-        if (signal.aborted || error instanceof EmbedderUnavailableError) code = 'EMBEDDER_UNAVAILABLE';
+        if (signal.aborted || performance.now() >= vectorEnd || error instanceof EmbedderUnavailableError)
+          code = 'EMBEDDER_UNAVAILABLE';
         for (const entry of stage === 'admission' ? entries : admitted) entry.vectorError = code;
         continue;
       }
@@ -748,7 +766,7 @@ export class PostgresRetrievalSearch {
     });
     // Locks fence revocation, not time: the earliest expiry the final check saw, of the provider credential (a session's
     // or a key's) and of the regional key and every relied grant, must still lie ahead when COMMIT was acknowledged.
-    if (performance.now() >= deadline) throw new AuthorityError('FORBIDDEN', 'Access expired before the search committed');
+    if (expired(deadline)) throw new AuthorityError('FORBIDDEN', 'Access expired before the search committed');
 
     // Coverage from what actually ran: a collection's readable kinds are searched only through a list that ran over it.
     const collections: SearchCollection[] = planned.map(entry => ({ collectionId: entry.collectionId,
@@ -817,18 +835,20 @@ export class PostgresRetrievalSearch {
    * its expiry, then, for a key, one statement against one clock reading
    * confirms the regional key and every grant the response relies on
    * (`dependencies`, plus `sources:read` on every collection a returned claim
-   * cites). Returns the earliest of all their expiries on `performance.now()`'s
-   * clock (each measured from before its read, so never later than the real
-   * one; Infinity only when none of them expires); the final caller requires
-   * COMMIT to be acknowledged before it.
+   * cites). Returns their `Deadline`: the earliest of all their expiries on
+   * `performance.now()`'s clock (each measured from before its read, so never
+   * later than the real one; Infinity only when none of them expires) and the
+   * provider's absolute expiry. Admission requires it unexpired when the
+   * query leaves, the final caller when COMMIT was acknowledged.
    */
   private async assertCurrent(db: Db, actor: VerifiedCredential, ownerPrincipalId: string, scope: AuthorityScope,
-    relied: ReadonlySet<string>): Promise<number> {
+    relied: ReadonlySet<string>): Promise<Deadline> {
     const started = performance.now();
     const wall = Date.now();
     const until = await this.spaces.assertCurrentUntil(actor, ownerPrincipalId);
     const provider = until === null ? Infinity : started + until - wall;
-    if (actor.kind !== 'api-key') return provider;
+    const wallUntil = until ?? Infinity;
+    if (actor.kind !== 'api-key') return { monotonic: provider, wallUntil };
     const pairs = pairsOf(relied);
     const at = performance.now();
     // Per pair, the latest-lasting grant holding it; the credential's expiry is finite, so the earliest is too.
@@ -847,6 +867,6 @@ export class PostgresRetrievalSearch {
     [scope.spaceId, scope.credentialId, ownerPrincipalId, pairs.map(pair => pair[0]), pairs.map(pair => pair[1])])).rows[0];
     const remainingMs = Number(row?.remaining_ms);
     if (row?.current !== true || !Number.isFinite(remainingMs) || remainingMs <= 0) throw new AuthorityError('FORBIDDEN');
-    return Math.min(provider, at + remainingMs);
+    return { monotonic: Math.min(provider, at + remainingMs), wallUntil };
   }
 }

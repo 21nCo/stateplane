@@ -62,8 +62,8 @@ class MemoryR2 {
 
 /** A pool whose hooks run once, just before the first statement containing their text. */
 let hooks = [];
-const hooked = { connect: async () => {
-  const client = await pool.connect();
+const hookedOn = base => ({ connect: async () => {
+  const client = await base.connect();
   return new Proxy(client, { get(target, property) {
     if (property !== 'query') return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
     return async (sql, ...rest) => {
@@ -72,7 +72,8 @@ const hooked = { connect: async () => {
       return target.query(sql, ...rest);
     };
   } });
-} };
+} });
+const hooked = hookedOn(pool);
 const REREAD = 'COALESCE(rec.revision,e.revision)';
 const LOCK_SPACE = 'SELECT lifecycle,policy_version,placement_generation FROM spaces WHERE space_id=$1 FOR SHARE';
 
@@ -86,6 +87,11 @@ const sources = new PostgresSources(spaces, new Map([['cell-a', { pool, original
 const claims = new PostgresClaims(spaces, new Map([['cell-a', { pool }]]));
 const authority = new PostgresAuthority(pool, 3600);
 const outbox = new PostgresOutbox(pool, authority);
+const PLAN = "s.method='exact'";
+const ADMISSION = 's.placement_generation=$3';
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const sessionExpiry = (owner, expiresAt) => config.database.update({ model: 'sessions', where: [{ field: 'id', operator: 'eq',
+  value: owner.credentialId }], data: { expiresAt }, namespace: config.namespace });
 const verify = token => identity.verify(new Request('https://h.invalid', { headers: { authorization: `Bearer ${token}` } }));
 const definition = slug => JSON.stringify({ slug, version: 1, schema: { $schema: 'https://json-schema.org/draft/2020-12/schema',
   type: 'object', properties: { title: { type: 'string' }, note: { type: 'string' } }, additionalProperties: false },
@@ -1105,11 +1111,94 @@ test('stalled embedders in several groups share one vector budget before the lex
   assert.deepEqual(ids(result), [`alpha/record/${id}`]);
   assert.deepEqual(result.collections.map(entry => [entry.collectionId, entry.vector, entry.vectorError]),
     [['alpha', 'disabled', null], ...regions.map(region => [region, 'unavailable', 'EMBEDDER_UNAVAILABLE'])]);
-  // The budget running out during a group's admission read is the same outage, not a failed vector query.
-  hooks = [{ match: 's.placement_generation=$3', run: () => new Promise(resolve => setTimeout(resolve, 2_300)) }];
-  const late = await search(embedders, hooked).search(f.owner, f.spaceId, { query: 'petrel', collections: ['alpha', 'r1'] });
+  // The budget running out during a group's admission read is the same outage, not a failed vector query, and the search
+  // answers while that read is still held.
+  let release;
+  hooks = [{ match: ADMISSION, run: () => new Promise(resolve => { release = resolve; }) }];
+  try {
+    const late = await Promise.race([
+      search(embedders, hooked).search(f.owner, f.spaceId, { query: 'petrel', collections: ['alpha', 'r1'] }),
+      sleep(3_500).then(() => assert.fail('the search waited for its admission read'))]);
+    assert.equal(hooks.length, 0);
+    assert.deepEqual(late.collections.map(entry => [entry.collectionId, entry.vector, entry.vectorError]),
+      [['alpha', 'disabled', null], ['r1', 'unavailable', 'EMBEDDER_UNAVAILABLE']]);
+    assert.deepEqual(ids(late), [`alpha/record/${id}`]);
+  } finally { release?.(); }
+});
+
+test('access expiring during admission stops the query before it leaves: grant, regional key, session and wall clock', async () => {
+  for (const what of ['collection_grants', 'space_credentials', 'session', 'wall clock']) {
+    const f = await fixture({ collections: ['alpha'] });
+    await f.record('alpha', { title: 'osprey dive' });
+    await index();
+    const key = what.includes('_') ? await f.agent([['alpha', ['records:read']]]) : null;
+    const spy = new Spy();
+    const now = Date.now;
+    // Current at the admission check; lapsed once the admission transaction has committed (its read delayed past the
+    // expiry, or the wall clock stepped past a session's provider expiry), so the embedder call must not start.
+    hooks = [{ match: PLAN, run: async () => {
+      if (key) await pool.query(`UPDATE ${what} SET expires_at=clock_timestamp()+interval '300 milliseconds'
+        WHERE space_id=$1 AND credential_id=$2`, [f.spaceId, key.credentialId]);
+      else await sessionExpiry(f.owner, new Date(Date.now() + (what === 'session' ? 300 : 2_000)));
+    } }, { match: ADMISSION, run: async () => {
+      if (what === 'wall clock') Date.now = () => now() + 5_000;
+      else await sleep(450);
+    } }];
+    try { await rejects(search(new EmbeddingRegistry([spy]), hooked).search(key ?? f.owner, f.spaceId, { query: 'osprey' }), 'FORBIDDEN'); }
+    finally { Date.now = now; }
+    assert.equal(hooks.length, 0, what);
+    assert.deepEqual(spy.queries, [], `${what}: the query never reached the embedder`);
+  }
+});
+
+test("a wall-clock step past the provider's expiry before the reread COMMIT fails the search", async () => {
+  const g = await fixture({ collections: ['alpha'], policy: { alpha: { vector: false } } });
+  await g.record('alpha', { title: 'shearwater raft' });
+  await index();
+  const now = Date.now;
+  hooks = [{ match: LOCK_SPACE, run: async () => {
+    await sessionExpiry(g.owner, new Date(Date.now() + 2_000));
+    hooks.push({ match: 'COMMIT', run: async () => { Date.now = () => now() + 5_000; } });
+  } }];
+  try { await rejects(search(registry, hooked).search(g.owner, g.spaceId, { query: 'shearwater' }), 'FORBIDDEN'); }
+  finally { Date.now = now; }
+  assert.equal(hooks.length, 0, 'the clock stepped just before COMMIT');
+  // The same expiry without the step still answers.
+  hooks = [{ match: LOCK_SPACE, run: () => sessionExpiry(g.owner, new Date(Date.now() + 2_000)) }];
+  assert.equal((await search(registry, hooked).search(g.owner, g.spaceId, { query: 'shearwater' })).results.length, 1);
   assert.equal(hooks.length, 0);
-  assert.deepEqual(late.collections.map(entry => [entry.collectionId, entry.vector, entry.vectorError]),
-    [['alpha', 'disabled', null], ['r1', 'unavailable', 'EMBEDDER_UNAVAILABLE']]);
-  assert.deepEqual(ids(late), [`alpha/record/${id}`]);
+});
+
+test('an admission stalled past the vector budget frees its connection: lexical answers on a one-connection pool', async () => {
+  const f = await fixture({ collections: ['alpha'] });
+  const id = await f.record('alpha', { title: 'petrel' });
+  await index();
+  const single = new pg.Pool({ connectionString: target.toString(), max: 1 });
+  const currentUntil = identity.currentUntil;
+  try {
+    for (const stalled of ['admission read', 'provider']) {
+      const spy = new Spy();
+      let armed = false;
+      identity.currentUntil = async function (...args) {
+        if (armed) { armed = false; await sleep(4_000); }
+        return currentUntil.apply(this, args);
+      };
+      hooks = stalled === 'provider' ? [{ match: PLAN, run: async () => { armed = true; } }]
+        : [{ match: ADMISSION, run: () => sleep(4_000) }];
+      const started = performance.now();
+      const result = await search(new EmbeddingRegistry([spy]), hookedOn(single)).search(f.owner, f.spaceId, { query: 'petrel' });
+      const took = performance.now() - started;
+      assert.ok(took < 3_000, `${stalled}: lexical answered after ${Math.round(took)} ms, not within the 2 s budget`);
+      assert.deepEqual(ids(result), [`alpha/record/${id}`]);
+      assert.deepEqual(result.collections.map(entry => [entry.vector, entry.vectorError]), [['unavailable', 'EMBEDDER_UNAVAILABLE']]);
+      assert.equal(hooks.length, 0, stalled);
+      // Once the stall has passed, the late admission still sends nothing, and the pool's one connection serves the next search.
+      await sleep(2_500);
+      assert.deepEqual(spy.queries, [], `${stalled}: the late admission never embedded`);
+      identity.currentUntil = currentUntil;
+      const next = await search(registry, single).search(f.owner, f.spaceId, { query: 'petrel' });
+      assert.equal(next.mode, 'hybrid', stalled);
+      assert.deepEqual(ids(next), [`alpha/record/${id}`]);
+    }
+  } finally { identity.currentUntil = currentUntil; await single.end(); }
 });
