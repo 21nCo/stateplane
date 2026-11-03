@@ -151,11 +151,13 @@ async function fixture({ collections = ['alpha', 'beta'], policy = {} } = {}) {
     await services.collections.define(owner, spaceId, id, definition(id));
     await project(spaceId, id, policy[id]);
   }
-  const scope = collectionId => ({ spaceId, collectionId, principalId: user.id, credentialId: owner.credentialId,
-    capability: 'records:write', policyVersion: 1, placementGeneration: 1 });
+  const scope = (collectionId, policyVersion = 1) => ({ spaceId, collectionId, principalId: user.id, credentialId: owner.credentialId,
+    capability: 'records:write', policyVersion, placementGeneration: 1 });
   const record = async (collectionId, data, extras = {}, operation = 'create') => {
     const key = randomUUID();
-    return (await authority.mutate(scope(collectionId), { operation, idempotencyKey: key, requestDigest: sha(key),
+    // Issuing a key moves the space's policy version; write at the current one.
+    const { policy_version: version } = (await pool.query('SELECT policy_version FROM spaces WHERE space_id=$1', [spaceId])).rows[0];
+    return (await authority.mutate(scope(collectionId, Number(version)), { operation, idempotencyKey: key, requestDigest: sha(key),
       ...(data === undefined ? {} : { canonicalData: JSON.stringify(Object.fromEntries(Object.entries(data).sort())) }),
       ...(operation === 'replace' ? { unique: [], indexes: [] } : {}), ...extras })).ref.id;
   };
@@ -323,6 +325,10 @@ test('search reads only granted collections and kinds, and applies the claim rea
     new Set([`alpha/claim/${plain.claimId}`, `alpha/claim/${citing.claimId}`, `beta/source/${betaSource}`]));
 });
 
+/** Let `key`'s grant on `collectionId` lapse now, as an expiry does: no API call, no policy version change. */
+const expire = (spaceId, key, collectionId) => pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()
+  WHERE space_id=$1 AND credential_id=$2 AND collection_id=$3`, [spaceId, key.credentialId, collectionId]);
+
 test('a revocation committed before the reread fails the search; one committed during it waits for its commit', async () => {
   const f = await fixture();
   await f.record('alpha', { title: 'kestrel nest' });
@@ -332,13 +338,11 @@ test('a revocation committed before the reread fails the search; one committed d
   await rejects(search(registry, hooked).search(key, f.spaceId, { query: 'kestrel' }), 'FORBIDDEN');
   await rejects(search().search(key, f.spaceId, { query: 'kestrel' }), 'NOT_FOUND');
 
-  // A grant that lapses between the plan and the reread: its collection's hits are unauthorized.
+  // A grant that lapses between the plan and the reread narrows the access the candidates were read under: no counts.
   const expiring = await f.agent([['alpha', ['records:read']], ['beta', ['records:read']]]);
-  hooks = [{ match: LOCK_SPACE, run: () => pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()
-    WHERE space_id=$1 AND credential_id=$2 AND collection_id='alpha'`, [f.spaceId, expiring.credentialId]) }];
-  const lapsed = await search(registry, hooked).search(expiring, f.spaceId, { query: 'kestrel' });
-  assert.deepEqual(lapsed.results, []);
-  assert.equal(lapsed.rejected.unauthorized, 1);
+  hooks = [{ match: LOCK_SPACE, run: () => expire(f.spaceId, expiring, 'alpha') }];
+  await rejects(search(registry, hooked).search(expiring, f.spaceId, { query: 'kestrel' }), 'FORBIDDEN');
+  assert.equal(hooks.length, 0);
 
   // Revoking while the reread holds its locks waits, so what the search returns was authorized at its commit.
   const holder = await f.agent([['alpha', ['records:read']]]);
@@ -362,6 +366,42 @@ test('a revocation committed before the reread fails the search; one committed d
   await rejects(search().search(holder, f.spaceId, { query: 'kestrel' }), 'NOT_FOUND');
 });
 
+test('a grant lapsing after the plan, before either candidate statement, fails the search instead of counting new content', async () => {
+  // Each statement in turn is the only one that can see the content: lexical is off for the vector case.
+  for (const [statement, match, lexical] of [['lexical', 'websearch_to_tsquery', true], ['vector', 'hnsw.iterative_scan', false]]) {
+    // The searched collection's own read grant lapses; then matching content is written and indexed there.
+    const f = await fixture({ policy: { alpha: { lexical } } });
+    await f.record('beta', { title: 'unrelated' });
+    await index();
+    const key = await f.agent([['alpha', ['records:read']], ['beta', ['records:read']]]);
+    let written = false;
+    hooks = [{ match, run: async () => {
+      await expire(f.spaceId, key, 'alpha');
+      await f.record('alpha', { title: 'sandpiper flock' });
+      await index();
+      written = true;
+    } }];
+    await rejects(search(registry, hooked).search(key, f.spaceId, { query: 'sandpiper' }), 'FORBIDDEN');
+    assert.ok(written, `${statement}: the content was written and indexed in the window`);
+
+    // An evidence collection's sources:read lapses; then a claim citing it is written and indexed in the searched one.
+    const g = await fixture({ policy: { alpha: { lexical } } });
+    const cited = await g.source('beta', 'A shore survey.');
+    await index();
+    const reader = await g.agent([['alpha', ['claims:read']], ['beta', ['sources:read']]]);
+    written = false;
+    hooks = [{ match, run: async () => {
+      await expire(g.spaceId, reader, 'beta');
+      await claims.create(g.owner, g.spaceId, 'alpha', { idempotencyKey: randomUUID(), statement: 'Sandpipers nest on the shore.',
+        attributedTo: 'survey', evidence: [{ collectionId: 'beta', sourceId: cited }] });
+      await index();
+      written = true;
+    } }];
+    await rejects(search(registry, hooked).search(reader, g.spaceId, { query: 'sandpipers', collections: ['alpha'] }), 'FORBIDDEN');
+    assert.ok(written, `${statement}: the claim was written and indexed in the window`);
+  }
+});
+
 test('an embedder or vector outage returns lexical results marked degraded while exact reads work', async () => {
   const f = await fixture({ collections: ['alpha', 'beta'], policy: { beta: { lexical: false } } });
   const id = await f.record('alpha', { title: 'heron migration' });
@@ -380,13 +420,15 @@ test('an embedder or vector outage returns lexical results marked degraded while
       [['alpha', true, 'unavailable', error], ['beta', false, 'unavailable', error]]);
     assert.deepEqual(ids(result), [`alpha/record/${id}`], 'the lexical side still answers');
     assert.equal(result.results[0].provenance.vectorRank, null);
-    assert.ok(result.underfill.reasons.includes('degraded'));
+    // The vector side (and beta altogether) went unsearched, so the short result is never exhausted.
+    assert.deepEqual(result.underfill.reasons, ['degraded']);
   }
   // The vector query itself failing is the same degradation.
   hooks = [{ match: 'hnsw.iterative_scan', run: async client => { await client.query('SELECT 1/0'); } }];
   const failed = await search(registry, hooked).search(f.owner, f.spaceId, { query: 'heron' });
   assert.deepEqual(failed.collections.map(entry => entry.vectorError), ['VECTOR_QUERY_FAILED', 'VECTOR_QUERY_FAILED']);
   assert.deepEqual(ids(failed), [`alpha/record/${id}`]);
+  assert.deepEqual(failed.underfill.reasons, ['degraded']);
   // Exact reads never depend on search or its embedder.
   assert.equal((await authority.transaction({ ...f.scope('alpha'), capability: 'records:read' }, tx => tx.getRecord(id))).ref.id, id);
   // Healthy again: the vector-only collection answers too.
@@ -578,4 +620,41 @@ test('the reread reads only the cited ranges of large texts, and a canonical-JSO
   const record = result.results.find(hit => hit.ref.id === nul);
   assert.equal(record.citations[0].text, [...'pelican\u0000 wharf'].slice(record.citations[0].start, record.citations[0].end).join(''));
   assert.ok(record.citations[0].text.includes('\u0000'));
+});
+
+test('the cell role answers by vector with only its base grants and db:grant-retrieval', async () => {
+  const f = await fixture({ policy: { beta: { lexical: false } } });
+  const hybrid = await f.record('alpha', { title: 'curlew call' });
+  const vectorOnly = await f.record('beta', { title: 'curlew wading' });
+  await index();
+  const retrievalTables = ['retrieval_policies', 'retrieval_collection_heads', 'vector_index_strategies', 'projection_generations',
+    'projection_refs', 'projection_deletion_receipts', 'lexical_chunks', 'vector_chunks', 'embedding_checkpoints', 'retrieval_outbox',
+    'retrieval_dispatch_checkpoint'];
+  const role = `sta46_cell_${randomUUID().replaceAll('-', '')}`;
+  await pool.query(`CREATE ROLE ${role} NOLOGIN`);
+  const cellPool = new pg.Pool({ connectionString: target.toString(), max: 2, options: `-c role=${role}` });
+  // Routines PUBLIC may execute now, so exactly those are granted back afterwards.
+  const publicRoutines = (await pool.query(`SELECT p.oid::regprocedure::text AS routine FROM pg_proc p
+    WHERE p.pronamespace='public'::regnamespace AND (p.proacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) a
+      WHERE a.grantee=0 AND a.privilege_type='EXECUTE'))`)).rows.map(row => row.routine);
+  try {
+    await pool.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${role}`);
+    await pool.query(`REVOKE ALL ON ${retrievalTables.join(',')} FROM ${role}`);
+    await pool.query('REVOKE EXECUTE ON ALL ROUTINES IN SCHEMA public FROM PUBLIC');
+    execFileSync(process.execPath, ['scripts/grant-retrieval.mjs'], { cwd: fileURLToPath(new URL('../..', import.meta.url)),
+      stdio: 'pipe', env: { ...process.env, STATEPLANE_CELL_ADMIN_URL: target.toString(), STATEPLANE_CELL_ROLE: role } });
+    const result = await search(registry, cellPool).search(f.owner, f.spaceId, { query: 'curlew' });
+    assert.deepEqual(result.collections.map(entry => [entry.collectionId, entry.vector, entry.vectorError]),
+      [['alpha', 'used', null], ['beta', 'used', null]]);
+    assert.equal(result.mode, 'hybrid');
+    for (const id of [hybrid, vectorOnly]) {
+      const hit = result.results.find(entry => entry.ref.id === id);
+      assert.ok(hit?.provenance.vectorRank >= 1, `${id} found by vector`);
+    }
+  } finally {
+    await cellPool.end();
+    for (const routine of publicRoutines) await pool.query(`GRANT EXECUTE ON ROUTINE ${routine} TO PUBLIC`);
+    await pool.query(`DROP OWNED BY ${role}`);
+    await pool.query(`DROP ROLE ${role}`);
+  }
 });

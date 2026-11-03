@@ -369,6 +369,17 @@ interface Access { owner: boolean; grants: Map<string, readonly string[]> }
 const mayRead = (access: Access, collectionId: string, capability: string) =>
   access.grants.get(collectionId)?.includes(capability) === true;
 
+/**
+ * Whether a key's access under the reread's locks is narrower than the plan's
+ * the candidates were read with: a searched collection's planned read
+ * capability, or (when claims are searched) `sources:read` on a collection
+ * the claim filter treated as readable, no longer held.
+ */
+const narrowed = (access: Access, planned: readonly Planned[], evidence: readonly string[] | null) => !access.owner
+  && (planned.some(entry => entry.active?.kinds.some(kind => !mayRead(access, entry.collectionId, READ[kind])))
+    || (evidence !== null && planned.some(entry => entry.active?.kinds.includes('claim'))
+      && evidence.some(id => !mayRead(access, id, 'sources:read'))));
+
 interface Group { identity: EmbedderIdentity; embedder: Embedder; entries: Planned[] }
 
 /** Thrown by a group's admission when none of its collections may still send the query to its embedder. */
@@ -521,6 +532,9 @@ export class PostgresRetrievalSearch {
 
     const { hits, rejected } = await transact(cell.pool, async db => {
       const access = await this.lockScope(db, scope, owner, planned.map(entry => entry.collectionId));
+      // The candidates were read under the plan's access, so a key whose access narrowed since (a grant expired) could
+      // have candidates, counts and ranks from content written after it lost access: fail closed instead.
+      if (narrowed(access, planned, evidence)) throw new AuthorityError('FORBIDDEN', 'Access changed during search');
       const active = await activeGenerations(db, spaceId, planned.map(entry => entry.collectionId));
       const flat = cited.flat();
       const reads = flat.length ? await reread(db, spaceId, flat.map(item => item.hit)) : [];
@@ -582,10 +596,12 @@ export class PostgresRetrievalSearch {
     const vectorDown = collections.some(entry => entry.vector === 'unavailable');
     const degraded = vectorDown || collections.some(entry => entry.projection === 'degraded');
     const pending = collections.some(entry => entry.projection === 'pending' || entry.projection === 'unindexed');
-    // Exhausted only when every searched list returned all it had: no bound reached, no collection left out, no ANN list.
+    // Exhausted only when every searched list returned all it had (no bound reached, no ANN list) and nothing readable went
+    // unsearched: no collection left out, none unindexed or behind its authority, no vector side down.
+    const unsearched = collectionsCapped || collections.some(entry => entry.projection !== 'current' || entry.vector === 'unavailable');
     const reasons: [SearchUnderfill, boolean][] = [
       ['rejected', rejected.deleted + rejected.stale + rejected.unauthorized > 0], ['bounded', bounded],
-      ['capped', collectionsCapped], ['approximate', approximate], ['exhausted', !bounded && !collectionsCapped && !approximate],
+      ['capped', collectionsCapped], ['approximate', approximate], ['exhausted', !bounded && !approximate && !unsearched],
       ['degraded', vectorDown], ['unindexed', collections.some(entry => entry.projection === 'unindexed')],
       ['pending', collections.some(entry => entry.projection === 'pending' || entry.projection === 'degraded')]];
     return { spaceId, query: input.query, limit: input.limit,
