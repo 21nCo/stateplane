@@ -98,7 +98,9 @@ function element(n: number, hit: BundleHitInput, field: string | null, start: nu
 /**
  * The excerpts one hit offers, in its citation order: citations of the same
  * field whose ranges overlap or touch become one excerpt over their union
- * (both are slices of the same authoritative text, so the union is exact).
+ * (all are slices of the same authoritative text, so the union is exact). A
+ * citation joining several earlier excerpts merges them all into the first,
+ * so no two excerpts of a field ever overlap or touch.
  */
 function rangesOf(hit: BundleHitInput) {
   const ranges: { field: string | null; start: number; end: number; sourceStart: number | null; sourceEnd: number | null;
@@ -106,14 +108,15 @@ function rangesOf(hit: BundleHitInput) {
   for (const citation of hit.citations) {
     const points = codePoints(citation.text);
     if (points.length !== citation.end - citation.start) throw new RangeError('Citation text does not match its range');
-    const same = ranges.find(range => range.field === citation.field && citation.start <= range.end && range.start <= citation.end);
-    if (!same) { ranges.push({ ...citation, points }); continue; }
-    const start = Math.min(same.start, citation.start);
-    const end = Math.max(same.end, citation.end);
+    const joined = ranges.filter(range => range.field === citation.field && citation.start <= range.end && range.start <= citation.end);
+    if (!joined.length) { ranges.push({ ...citation, points }); continue; }
+    const parts = [...joined, { start: citation.start, end: citation.end, points }];
+    const start = Math.min(...parts.map(part => part.start));
+    const end = Math.max(...parts.map(part => part.end));
     const merged = new Array<string>(end - start);
-    same.points.forEach((point, at) => { merged[same.start - start + at] = point; });
-    points.forEach((point, at) => { merged[citation.start - start + at] = point; });
-    Object.assign(same, { start, end, points: merged, sourceStart: null, sourceEnd: null });
+    for (const part of parts) part.points.forEach((point, at) => { merged[part.start - start + at] = point; });
+    Object.assign(joined[0], { start, end, points: merged, sourceStart: null, sourceEnd: null });
+    for (const range of joined.slice(1)) ranges.splice(ranges.indexOf(range), 1);
   }
   return ranges;
 }
@@ -166,7 +169,9 @@ export function assembleBundle(hits: readonly BundleHitInput[], budget: BundleBu
           if (fits(middle)) low = middle; else high = middle - 1;
         }
         let length = fits(low) ? low : 0;
-        for (let cut = length; cut > length / 2; cut--) if (/\s/u.test(range.points[cut - 1])) { length = cut; break; }
+        // Back off to whitespace only within the second half, and never below the minimum that would otherwise be quoted.
+        const floor = Math.max(length / 2, bundleBounds.minExcerptCodePoints - 1);
+        for (let cut = length; cut > floor; cut--) if (/\s/u.test(range.points[cut - 1])) { length = cut; break; }
         if (length < bundleBounds.minExcerptCodePoints) break outer;
         end = range.start + length;
         text = element(n, hit, range.field, range.start, end, escaped.slice(0, length).join(''));
@@ -189,28 +194,72 @@ export function assembleBundle(hits: readonly BundleHitInput[], budget: BundleBu
 /** A question only exact authoritative reads can answer. */
 export type ExactQuestion = 'count' | 'status' | 'completeness';
 
-// Whole words and phrases, matched case-insensitively after NFKC normalization, between non-letters or digits.
-const word = (pattern: string) => new RegExp(`(?<![\\p{L}\\p{N}])(?:${pattern})(?![\\p{L}\\p{N}])`, 'iu');
+// Whole words and phrases, between non-letters or digits.
+const word = (pattern: string) => `(?<![\\p{L}\\p{N}])(?:${pattern})(?![\\p{L}\\p{N}])`;
+// The rest of one clause, and the start of one.
+const CLAUSE = '[^.;:!?]*';
+const START = '(?:^|[.;:!?]\\s*)';
+// A state that only an exact read can report.
+const STATES = ['done', 'complete', 'completed', 'incomplete', 'finished', 'unfinished', 'resolved', 'unresolved', 'closed', 'open',
+  'pending', 'blocked', 'approved', 'unapproved', 'rejected', 'merged', 'shipped', 'accepted', 'paid', 'unpaid', 'overdue',
+  'outstanding', 'missing', 'remaining', 'settled', 'unsettled', 'cancell?ed', 'late', 'active', 'inactive', 'ready', 'started',
+  'delivered', 'undelivered', 'fixed', 'signed', 'submitted', 'received', 'verified', 'reviewed', 'expired', 'failed', 'succeeded',
+  'archived', 'deleted', 'published', 'in\\s+progress', 'on\\s+hold', 'up\\s+to\\s+date'].join('|');
+const AUXILIARY = "(?:is|are|was|were|has|have|had|did|does|do)(?:n['\u2019]t)?";
+const pattern = (source: string) => new RegExp(source, 'iu');
+/** Each family of exact question recognized, in the order they are tried. */
 const EXACT: readonly [ExactQuestion, RegExp][] = Object.freeze([
-  ['count', word('how\\s+many|count(?:s|ed|ing)?|number\\s+of|totals?|tally|sum\\s+of')],
-  ['status', word('status(?:es)?|state\\s+of|current\\s+state|progress\\s+(?:of|on)')],
-  ['status', new RegExp(`^\\s*(?:is|are|was|were|has|have|did)(?![\\p{L}\\p{N}])[\\s\\S]*${word('done|complete|completed|finished|'
-    + 'resolved|closed|open|pending|blocked|approved|rejected|merged|shipped|live|accepted').source}`, 'iu')],
-  ['completeness', word('every|all\\s+(?:of\\s+)?the|list\\s+all|complete\\s+(?:list|set)|full\\s+(?:list|set)|'
-    + 'exhaustive(?:ly)?|completeness|entire\\s+(?:list|set)|anything\\s+else|nothing\\s+else|any\\s+(?:other|more|remaining)|'
-    + 'all\\s+(?:other|remaining)|none\\s+(?:of|left)|are\\s+there\\s+(?:any|no)|is\\s+there\\s+(?:any|no)')]]);
+  // How many or how much: counts, totals, quantities and amounts.
+  ['count', pattern(word('how\\s+(?:many|much|often)|count(?:s|ed|ing)?|number\\s+of|totals?|totall?(?:ed|ing)|tally|tallies|sum\\s+of|'
+    + 'quantit(?:y|ies)|amount\\s+of|amounts?\\s+(?:owed|due|outstanding|remaining|left)'))],
+  // A status or progress by name.
+  ['status', pattern(word('status(?:es)?|state\\s+of|current\\s+state|progress|how\\s+far\\s+along|'
+    + 'percent(?:age)?\\s+(?:complete|completed|done|finished)'))],
+  // A clause opening with an auxiliary that names a state: "is invoice two paid", "has anything failed".
+  ['status', pattern(START + word(AUXILIARY) + CLAUSE + word(STATES))],
+  // Whether or if something is in a state: "tell me whether the repair is done".
+  ['status', pattern(word('whether|if') + CLAUSE + word(STATES))],
+  // A state still or not yet reached: "still open", "not yet paid", "done yet".
+  ['status', pattern(word(`still\\s+(?:not\\s+)?(?:${STATES})|not\\s+yet\\s+(?:${STATES})|(?:${STATES})\\s+yet`))],
+  // Which things are or remain in a state: "which tickets remain unresolved", "what is still pending".
+  ['status', pattern(word('which|what') + CLAUSE + word(`(?:is|are|was|were|remains?|remained|stays?|stayed)\\s+(?:still\\s+)?`
+    + `(?:not\\s+)?(?:${STATES})`))],
+  // Every member of a set, or whether any more exist.
+  ['completeness', pattern(word('every|all\\s+(?!about(?![\\p{L}\\p{N}]))\\p{L}+|complete\\s+(?:list|set)|full\\s+(?:list|set)|'
+    + 'entire\\s+(?:list|set)|exhaustive(?:ly)?|completeness|(?:anything|something|nothing|everything)\\s+(?:else|missing|left|'
+    + 'remaining|outstanding|pending|undone)|any\\s+(?:other|more|remaining)|none\\s+(?:of|left)|are\\s+there\\s+(?:any|no)|'
+    + 'is\\s+there\\s+(?:any|no)'))],
+  // A request to enumerate: "list the suppliers", "please enumerate the towers".
+  ['completeness', pattern(START + '(?:please\\s+)?' + word('list|enumerate|itemi[sz]e'))],
+  // What remains, is left or is missing: "which tickets remain", "what is left to do".
+  ['completeness', pattern(word('which|what|who') + CLAUSE + word('remains?|remaining|left|missing|outstanding'))]]);
+
+// Characters that render as nothing (zero-width spaces and joiners, soft hyphens, bidirectional and other format controls).
+const IGNORABLE = /[\p{Default_Ignorable_Code_Point}\p{Cf}]/gu;
+
+/**
+ * The forms of `text` a question is looked for in: NFKC-normalized, with
+ * every invisible character removed and, separately, read as a space (so
+ * neither "c\u00ADount" nor "how\u200Bmany" hides a word), and whitespace
+ * collapsed.
+ */
+function readings(text: string): string[] {
+  const normalized = text.normalize('NFKC');
+  return [...new Set(['', ' '].map(by => normalized.replace(IGNORABLE, by).normalize('NFKC').replace(IGNORABLE, by)
+    .replace(/\s+/gu, ' ').trim()))];
+}
 
 /**
  * Which exact question `text` asks, if any: a count, a status, or whether a
  * set is complete. Such a question is never answered from ranked projections,
  * so a bundle request asking one is refused before anything is searched or
- * embedded. Matching is by English phrasing and conservative (a request that
- * only mentions, say, a total is refused too); phrasing it does not recognize
- * still gets a bundle that holds no count, status or completeness signal of
- * its own and whose frame says so.
+ * embedded. Matching is by English phrasing, case-insensitive, and
+ * conservative (a request that only mentions, say, a total, or that opens
+ * with "list", is refused too); phrasing it does not recognize still gets a
+ * bundle that holds no count, status or completeness signal of its own and
+ * whose frame says so.
  */
 export function exactQuestion(text: string): ExactQuestion | null {
-  const normalized = text.normalize('NFKC');
-  for (const [kind, pattern] of EXACT) if (pattern.test(normalized)) return kind;
+  for (const reading of readings(text)) for (const [kind, regex] of EXACT) if (regex.test(reading)) return kind;
   return null;
 }

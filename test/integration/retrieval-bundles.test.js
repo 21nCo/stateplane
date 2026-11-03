@@ -373,9 +373,13 @@ test('count, status and completeness requests are refused before anything is sea
   let connections = 0;
   const counting = { connect: () => { connections++; return pool.connect(); } };
   healthy.queries.length = 0;
-  for (const request of [{ query: 'How many invoices are overdue?' }, { query: 'invoice', task: 'Count the overdue invoices' },
-    { query: 'status of invoice two' }, { task: 'Is invoice two paid or still open?' }, { query: 'list all overdue invoices' },
-    { query: 'Are there any other overdue invoices?' }]) {
+  const asked = ['How many invoices are overdue?', 'Count the overdue invoices', 'status of invoice two',
+    'Is invoice two paid or still open?', 'list all overdue invoices', 'Are there any other overdue invoices?', 'Is invoice two paid?',
+    'Show all suppliers', 'What is the quantity of invoices?', 'Please tell me whether the bridge repair is done', 'how much do we owe',
+    'which tickets remain unresolved', 'give me the overall progress', 'is anything missing', 'how\u200bmany invoices',
+    'c\u00adount the invoices'];
+  // Each through the task and through the query, and a refused task beside an ordinary query.
+  for (const request of [...asked.flatMap(text => [{ task: text }, { query: text }]), { query: 'invoice', task: 'Count the overdue invoices' }]) {
     await assert.rejects(bundles(registry, counting).bundle(f.owner, f.spaceId, { ...request, budget }), error => {
       assert.equal(error.code, 'INVALID_ARGUMENT');
       assert.match(error.message, /do not answer (count|status|completeness) questions; use exact reads/);

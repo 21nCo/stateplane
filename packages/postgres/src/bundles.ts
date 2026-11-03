@@ -17,7 +17,13 @@ export interface ContextBundle {
   budget: BundleBudget; usage: { bytes: number; tokensAtMost: number };
   /** The text for a model's context: a frame marking it untrusted, and each excerpt escaped and numbered. */
   context: string;
-  /** Each excerpt's citation, numbered as in `context`. */
+  /**
+   * Each excerpt's citation, numbered as in `context`, for the caller, not a
+   * model: it holds stored strings (IDs, fields, a claim's `attributedTo` and
+   * `review.reviewedBy`) unescaped, outside the frame and the budget. Only
+   * `context` is meant for a model's context; a transport must not place this
+   * metadata there unframed.
+   */
   excerpts: BundleExcerpt[];
   /** Whether an excerpt was cut short or a cited range left out for the budget. */
   truncated: boolean;

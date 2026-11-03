@@ -101,6 +101,21 @@ test('a remainder too short to be useful is left out rather than quoted', () => 
     else if (bundle.excerpts.length === 1 && !bundle.excerpts[0].truncated) { leftOut++; assert.ok(bundle.truncated); }
   }
   assert.ok(leftOut > 0, 'some room was too small for a useful excerpt');
+  // Backing off to whitespace never drops below the minimum: wherever the same text without the early space is quoted,
+  // the text with it is quoted too, with at least the minimum.
+  const spaced = hit('r2', [['/note', 0, `${'b'.repeat(24)} ${'c'.repeat(600)}`]]);
+  const plain = hit('r2', [['/note', 0, 'b'.repeat(625)]]);
+  let close = 0;
+  for (let length = 100; length <= 700; length++) {
+    const first = hit('r1', [['/note', 0, 'a'.repeat(length)]]);
+    const quoted = bundle => assembleBundle([first, bundle], { bytes: 1_024, tokens: null }).excerpts.find(item => item.ref.id === 'r2');
+    const without = quoted(plain);
+    if (!without) continue;
+    const withSpace = quoted(spaced);
+    assert.ok(withSpace && withSpace.end - withSpace.start >= bundleBounds.minExcerptCodePoints, `room for ${without.end} code points`);
+    if (without.end < 50) close++;
+  }
+  assert.ok(close > 0, 'some room fits the minimum but not twice the early space');
   // No hits: only the frame.
   const empty = assembleBundle([], { bytes: 1_024, tokens: null });
   assert.equal(empty.context, BUNDLE_OPEN + BUNDLE_CLOSE);
@@ -117,6 +132,11 @@ test('overlapping citations of one field become one excerpt over their exact uni
   assert.deepEqual(bundle.excerpts.map(item => [item.field, item.start, item.end, item.sourceStart]),
     [['/note', 4, 50, null], ['/title', 0, 10, null]]);
   assert.equal(parseContext(bundle.context)[0].text, slice(4, 50));
+  // A citation bridging two earlier excerpts merges all three, so no text is quoted twice.
+  const bridged = assembleBundle([{ ...hit('r1', []), citations: [[0, 10], [20, 30], [5, 25], [40, 45]].map(([start, end]) =>
+    ({ field: '/note', start, end, sourceStart: null, sourceEnd: null, text: slice(start, end) })) }], { bytes: 4_096, tokens: null });
+  assert.deepEqual(bridged.excerpts.map(item => [item.start, item.end]), [[0, 30], [40, 45]]);
+  assert.deepEqual(parseContext(bridged.context).map(item => item.text), [slice(0, 30), slice(40, 45)]);
   // A citation whose text is not its range is refused, never quoted under a wrong citation.
   assert.throws(() => assembleBundle([{ ...hit('r1', []), citations: [{ field: null, start: 0, end: 5, sourceStart: null,
     sourceEnd: null, text: 'abc' }] }], { bytes: 4_096, tokens: null }), RangeError);
@@ -131,13 +151,31 @@ test('a budget is required, bounded and integral', () => {
 test('count, status and completeness questions are recognized; ordinary retrieval is not', () => {
   for (const [text, kind] of [['How many invoices are overdue?', 'count'], ['count the open tickets', 'count'],
     ['number of lanterns in the harbor', 'count'], ['What is the TOTAL spend?', 'count'], ['ｈｏｗ ｍａｎｙ keepers', 'count'],
+    ['What is the quantity of invoices?', 'count'], ['how much do we owe', 'count'], ['the amount of rope ordered', 'count'],
+    ['How often did the lantern fail', 'count'],
     ['status of the bridge repair', 'status'], ['What is the current state of the migration?', 'status'],
-    ['Is the bridge repair done?', 'status'], ['Has the claim been approved', 'status'],
-    ['list all suppliers', 'completeness'], ['every decision about the harbor', 'completeness'],
-    ['Are there any other keepers?', 'completeness'], ['Give me the complete list of towers', 'completeness'],
-    ['Is there anything else about the lantern?', 'completeness']])
+    ['Is the bridge repair done?', 'status'], ['Has the claim been approved', 'status'], ['Is invoice two paid?', 'status'],
+    ['Please tell me whether the bridge repair is done', 'status'], ['Can you check if the invoices are unpaid', 'status'],
+    ['give me the overall progress', 'status'], ['is anything missing', 'status'], ["Isn’t the ticket resolved?", 'status'],
+    ['Lantern review: was it approved', 'status'], ['tickets still open', 'status'], ['invoices not yet paid', 'status'],
+    ['which tickets remain unresolved', 'status'], ['What is still pending on the bridge?', 'status'],
+    ['Does invoice two remain outstanding', 'status'], ['how far along is the bridge repair', 'status'],
+    ['list all suppliers', 'completeness'], ['Show all suppliers', 'completeness'], ['all invoices from March', 'completeness'],
+    ['every decision about the harbor', 'completeness'], ['Are there any other keepers?', 'completeness'],
+    ['Give me the complete list of towers', 'completeness'], ['Is there anything else about the lantern?', 'completeness'],
+    ['List the suppliers', 'completeness'], ['please enumerate the towers', 'completeness'],
+    ['what is left to do on the bridge', 'completeness'], ['who remains on the roster', 'completeness'],
+    ['nothing missing from the log?', 'completeness']])
     assert.equal(exactQuestion(text), kind, text);
+  // Invisible characters hide no word, whether they join its letters or stand for the space between two.
+  for (const text of ['how​many keepers', 'c­ount the towers', 'sta‍tus of the repair', 'is⁠ the invoice p‌aid',
+    'list﻿ all suppliers', 'how  many keepers', 'how\nmany keepers', 'pro\u{e0020}gress'])
+    assert.notEqual(exactQuestion(text), null, JSON.stringify(text));
   for (const text of ['harbor lantern', 'Why was the lantern lit at dusk?', 'account recovery notes', 'everything about tides',
-    'discounted fares', 'the keeper described the tower', 'Draft a summary of the lantern keeper notes'])
+    'discounted fares', 'the keeper described the tower', 'Draft a summary of the lantern keeper notes', 'overdue invoice',
+    'Summarize the bridge repair discussion', 'all-hands meeting notes', 'What did the keeper write about the storm?',
+    'invoice amount dispute', 'Which keeper lit the lantern?', 'notes on the open sea crossing', 'Why was the gate left open?',
+    'tell me about the lantern keeper', 'what the harbor master said about tides', 'a shopping list for the lighthouse',
+    'it was all about the tides', 'kestrel nest', 'tidal gauge'])
     assert.equal(exactQuestion(text), null, text);
 });
