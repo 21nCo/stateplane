@@ -60,7 +60,10 @@ class MemoryR2 {
   async list() { return { objects: [], truncated: false }; }
 }
 
-/** A pool whose hooks run once, just before the first statement containing their text. */
+/**
+ * A pool whose hooks run once on the first statement containing their text: `run` just before it, `after` just after it
+ * (given its result, and returning the result the caller sees).
+ */
 let hooks = [];
 const hookedOn = base => ({ connect: async () => {
   const client = await base.connect();
@@ -68,8 +71,11 @@ const hookedOn = base => ({ connect: async () => {
     if (property !== 'query') return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
     return async (sql, ...rest) => {
       const hook = typeof sql === 'string' ? hooks.find(item => sql.includes(item.match)) : undefined;
-      if (hook) { hooks = hooks.filter(item => item !== hook); await hook.run(target); }
-      return target.query(sql, ...rest);
+      if (!hook) return target.query(sql, ...rest);
+      hooks = hooks.filter(item => item !== hook);
+      await hook.run?.(target);
+      const result = await target.query(sql, ...rest);
+      return hook.after ? hook.after(result) : result;
     };
   } });
 } });
@@ -1136,27 +1142,33 @@ test('access expiring during admission stops the query before it leaves: grant, 
     const now = Date.now;
     const findOne = config.database.findOne;
     // Current at the admission check, lapsed once the admission transaction has committed, so the embedder call must
-    // not start. Each lapse is armed at the check's own read, after whatever the provider lookup costs: a key's or
-    // grant's expiry just before the remaining_ms statement, a session's inside the provider's session read. The
-    // ADMISSION read, reached only once that check has passed, then waits for the lapse itself. The wall-clock case
-    // gives the session a long expiry and steps the clock past it instead.
+    // not start. Each lapse is written only after the check's own read has seen access current, however long that read
+    // took: a key's or grant's once the remaining_ms statement has answered (which then reports no more time left than
+    // the expiry written), a session's once the provider's session read has returned (the provider compares its expiry
+    // in-process next). The ADMISSION read, reached only once that check has passed, then waits for the lapse itself.
+    // The wall-clock case gives the session a long expiry and steps the clock past it instead.
     let lapsed = null;
     let sessionRead = false;
-    const arm = { collection_grants: () => hooks.unshift({ match: 'AS remaining_ms', run: async () => {
-      await pool.query(`UPDATE ${what} SET expires_at=clock_timestamp()+interval '300 milliseconds'
-        WHERE space_id=$1 AND credential_id=$2`, [f.spaceId, key.credentialId]);
+    const arm = { collection_grants: () => hooks.unshift({ match: 'AS remaining_ms', after: async read => {
+      const seen = read.rows[0];
+      assert.ok(seen?.current === true && Number(seen.remaining_ms) > 0, `${what}: the admission check read access current`);
+      const written = (await pool.query(`UPDATE ${what} SET expires_at=clock_timestamp()+interval '300 milliseconds'
+        WHERE space_id=$1 AND credential_id=$2 RETURNING EXTRACT(EPOCH FROM expires_at-clock_timestamp())*1000 AS remaining_ms`,
+      [f.spaceId, key.credentialId])).rows.map(row => Number(row.remaining_ms));
+      assert.ok(written.length, `${what}: the expiry was written`);
       lapsed = async () => (await pool.query(`SELECT bool_and(expires_at<=clock_timestamp()) AS lapsed FROM ${what}
         WHERE space_id=$1 AND credential_id=$2`, [f.spaceId, key.credentialId])).rows[0].lapsed;
+      return { ...read, rows: [{ ...seen, remaining_ms: Math.min(Number(seen.remaining_ms), ...written) }] };
     } }), session: () => { sessionRead = true; }, 'wall clock': () => sessionExpiry(f.owner, new Date(Date.now() + 60_000)) };
     arm.space_credentials = arm.collection_grants;
     config.database.findOne = async function (query, ...rest) {
-      if (sessionRead && query.model === 'sessions') {
-        sessionRead = false;
-        const until = Date.now() + 300;
-        await sessionExpiry(f.owner, new Date(until));
-        lapsed = async () => Date.now() > until;
-      }
-      return findOne.call(this, query, ...rest);
+      const record = await findOne.call(this, query, ...rest);
+      if (!sessionRead || query.model !== 'sessions' || !record) return record;
+      sessionRead = false;
+      const until = Date.now() + 300;
+      const written = sessionExpiry(f.owner, new Date(until));
+      lapsed = async () => { await written; return Date.now() > until; };
+      return { ...record, expiresAt: new Date(until) };
     };
     hooks = [{ match: PLAN, run: async () => { await arm[what](); } }, { match: ADMISSION, run: async () => {
       if (what === 'wall clock') { Date.now = () => now() + 120_000; return; }
