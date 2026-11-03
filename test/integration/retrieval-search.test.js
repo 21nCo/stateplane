@@ -1134,32 +1134,42 @@ test('access expiring during admission stops the query before it leaves: grant, 
     const key = what.includes('_') ? await f.agent([['alpha', ['records:read']]]) : null;
     const spy = new Spy();
     const now = Date.now;
-    const currentUntil = identity.currentUntil;
-    // Current at the admission check; lapsed once the admission transaction has committed (its read delayed past the
-    // expiry, or the wall clock stepped past a session's provider expiry), so the embedder call must not start. The
-    // expiry is armed inside the admission's own credential check (the first provider call after the plan), not at the
-    // plan, so a slow plan-to-admission gap cannot lapse it before that check; the ADMISSION read, which runs only
-    // once the check has passed, is then delayed past it.
-    let armed = false;
-    let checked = false;
-    identity.currentUntil = async function (...args) {
-      if (armed) {
-        armed = false;
-        if (key) await pool.query(`UPDATE ${what} SET expires_at=clock_timestamp()+interval '400 milliseconds'
-          WHERE space_id=$1 AND credential_id=$2`, [f.spaceId, key.credentialId]);
-        else await sessionExpiry(f.owner, new Date(Date.now() + (what === 'session' ? 400 : 2_000)));
-        checked = true;
+    const findOne = config.database.findOne;
+    // Current at the admission check, lapsed once the admission transaction has committed, so the embedder call must
+    // not start. Each lapse is armed at the check's own read, after whatever the provider lookup costs: a key's or
+    // grant's expiry just before the remaining_ms statement, a session's inside the provider's session read. The
+    // ADMISSION read, reached only once that check has passed, then waits for the lapse itself. The wall-clock case
+    // gives the session a long expiry and steps the clock past it instead.
+    let lapsed = null;
+    let sessionRead = false;
+    const arm = { collection_grants: () => hooks.unshift({ match: 'AS remaining_ms', run: async () => {
+      await pool.query(`UPDATE ${what} SET expires_at=clock_timestamp()+interval '300 milliseconds'
+        WHERE space_id=$1 AND credential_id=$2`, [f.spaceId, key.credentialId]);
+      lapsed = async () => (await pool.query(`SELECT bool_and(expires_at<=clock_timestamp()) AS lapsed FROM ${what}
+        WHERE space_id=$1 AND credential_id=$2`, [f.spaceId, key.credentialId])).rows[0].lapsed;
+    } }), session: () => { sessionRead = true; }, 'wall clock': () => sessionExpiry(f.owner, new Date(Date.now() + 60_000)) };
+    arm.space_credentials = arm.collection_grants;
+    config.database.findOne = async function (query, ...rest) {
+      if (sessionRead && query.model === 'sessions') {
+        sessionRead = false;
+        const until = Date.now() + 300;
+        await sessionExpiry(f.owner, new Date(until));
+        lapsed = async () => Date.now() > until;
       }
-      return currentUntil.apply(this, args);
+      return findOne.call(this, query, ...rest);
     };
-    hooks = [{ match: PLAN, run: async () => { armed = true; } }, { match: ADMISSION, run: async () => {
-      assert.ok(checked, `${what}: the expiry was armed by the admission credential check`);
-      if (what === 'wall clock') Date.now = () => now() + 5_000;
-      else await sleep(1_000);
+    hooks = [{ match: PLAN, run: async () => { await arm[what](); } }, { match: ADMISSION, run: async () => {
+      if (what === 'wall clock') { Date.now = () => now() + 120_000; return; }
+      assert.ok(lapsed, `${what}: the lapse was armed by the admission credential check`);
+      // Bounded well inside the 2 s vector budget, so the outcome is FORBIDDEN, never EMBEDDER_UNAVAILABLE.
+      const give = performance.now() + 1_000;
+      while (!(await lapsed())) {
+        assert.ok(performance.now() < give, `${what}: access lapsed during admission`);
+        await sleep(10);
+      }
     } }];
     try { await rejects(search(new EmbeddingRegistry([spy]), hooked).search(key ?? f.owner, f.spaceId, { query: 'osprey' }), 'FORBIDDEN'); }
-    finally { Date.now = now; identity.currentUntil = currentUntil; }
-    assert.ok(checked, what);
+    finally { Date.now = now; config.database.findOne = findOne; }
     assert.equal(hooks.length, 0, `${what}: the admission check saw access current`);
     assert.deepEqual(spy.queries, [], `${what}: the query never reached the embedder`);
   }
