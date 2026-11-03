@@ -1134,19 +1134,33 @@ test('access expiring during admission stops the query before it leaves: grant, 
     const key = what.includes('_') ? await f.agent([['alpha', ['records:read']]]) : null;
     const spy = new Spy();
     const now = Date.now;
+    const currentUntil = identity.currentUntil;
     // Current at the admission check; lapsed once the admission transaction has committed (its read delayed past the
-    // expiry, or the wall clock stepped past a session's provider expiry), so the embedder call must not start.
-    hooks = [{ match: PLAN, run: async () => {
-      if (key) await pool.query(`UPDATE ${what} SET expires_at=clock_timestamp()+interval '300 milliseconds'
-        WHERE space_id=$1 AND credential_id=$2`, [f.spaceId, key.credentialId]);
-      else await sessionExpiry(f.owner, new Date(Date.now() + (what === 'session' ? 300 : 2_000)));
-    } }, { match: ADMISSION, run: async () => {
+    // expiry, or the wall clock stepped past a session's provider expiry), so the embedder call must not start. The
+    // expiry is armed inside the admission's own credential check (the first provider call after the plan), not at the
+    // plan, so a slow plan-to-admission gap cannot lapse it before that check; the ADMISSION read, which runs only
+    // once the check has passed, is then delayed past it.
+    let armed = false;
+    let checked = false;
+    identity.currentUntil = async function (...args) {
+      if (armed) {
+        armed = false;
+        if (key) await pool.query(`UPDATE ${what} SET expires_at=clock_timestamp()+interval '400 milliseconds'
+          WHERE space_id=$1 AND credential_id=$2`, [f.spaceId, key.credentialId]);
+        else await sessionExpiry(f.owner, new Date(Date.now() + (what === 'session' ? 400 : 2_000)));
+        checked = true;
+      }
+      return currentUntil.apply(this, args);
+    };
+    hooks = [{ match: PLAN, run: async () => { armed = true; } }, { match: ADMISSION, run: async () => {
+      assert.ok(checked, `${what}: the expiry was armed by the admission credential check`);
       if (what === 'wall clock') Date.now = () => now() + 5_000;
-      else await sleep(450);
+      else await sleep(1_000);
     } }];
     try { await rejects(search(new EmbeddingRegistry([spy]), hooked).search(key ?? f.owner, f.spaceId, { query: 'osprey' }), 'FORBIDDEN'); }
-    finally { Date.now = now; }
-    assert.equal(hooks.length, 0, what);
+    finally { Date.now = now; identity.currentUntil = currentUntil; }
+    assert.ok(checked, what);
+    assert.equal(hooks.length, 0, `${what}: the admission check saw access current`);
     assert.deepEqual(spy.queries, [], `${what}: the query never reached the embedder`);
   }
 });
