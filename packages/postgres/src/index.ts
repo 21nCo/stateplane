@@ -2137,3 +2137,4 @@ export type { DeletionErasure, ExtractionView, OriginalView, SourceCell, SourceD
 export * from './claims.js';
 export * from './links.js';
 export * from './retrieval.js';
+export * from './search.js';

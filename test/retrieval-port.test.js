@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { chunkText, configuredChunks, DeterministicEmbedder, embedBatch, EmbedderFailedError, EmbedderUnavailableError, EmbeddingRegistry,
-  EmbeddingRejectedError, pointer } from '../packages/retrieval/dist/index.js';
+  EmbeddingRejectedError, fuseRanks, pointer, RRF_K } from '../packages/retrieval/dist/index.js';
 
 const never = new AbortController().signal;
 const profile = (overrides = {}) => new DeterministicEmbedder(overrides);
@@ -197,4 +197,16 @@ test('the deterministic embedder is stable, normalized and closer for shared wor
   assert.ok(Math.abs(dot(a, a) - 1) < 1e-9);
   assert.ok(dot(a, b) > dot(a, c));
   assert.equal(empty.filter(value => value !== 0).length, 1, 'text without words still has a nonzero vector');
+});
+
+test('reciprocal rank fusion favours keys both lists rank, counts a key once per list and orders ties deterministically', () => {
+  const fused = fuseRanks([['a', 'b', 'a', 'c'], ['b', 'd', 'b']]);
+  // b: 1/62 + 1/61 beats a: 1/61; a repeated chunk keeps its best rank and adds nothing.
+  assert.deepEqual(fused.map(entry => [entry.key, entry.ranks]), [['b', [2, 1]], ['a', [1, null]], ['d', [null, 2]], ['c', [3, null]]]);
+  assert.equal(fused[0].score, 1 / (RRF_K + 2) + 1 / (RRF_K + 1));
+  // Equal scores: the better best rank, then the earlier list, then the key.
+  assert.deepEqual(fuseRanks([['y', 'x'], ['z', 'w']]).map(entry => entry.key), ['y', 'z', 'x', 'w']);
+  assert.deepEqual(fuseRanks([['q'], []]), [{ key: 'q', score: 1 / (RRF_K + 1), ranks: [1, null] }]);
+  assert.deepEqual(fuseRanks([]), []);
+  assert.throws(() => fuseRanks([['a']], -1), RangeError);
 });
