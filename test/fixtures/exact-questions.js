@@ -3,6 +3,8 @@
 // tables: requests a bundle must refuse (every sibling local review raised,
 // and new variants of each structure), ordinary requests in the allowed forms
 // it must serve, and documented over-refusals with a served rephrasing.
+// The refused and served tables are also joined, by every coordinator,
+// separator and line break, in the unit test: a join must be refused.
 
 /**
  * [text, kind]: requests a bundle refuses. The kind is the deny rule's
@@ -101,7 +103,7 @@ export const exactQuestions = Object.freeze([
   ['Quantify the backlog', 'unrecognized'], ['Get me everyone on the roster', 'completeness'], ['Pull up suppliers', 'unrecognized'],
   ['I need the suppliers', 'unrecognized'], ['Do you have the supplier names?', 'unrecognized'], ['Can I see the suppliers?', 'unrecognized'],
   ["I'd like the vendors", 'unrecognized'], ['I want to check the suppliers', 'unrecognized'], ['Tell me the suppliers', 'unrecognized'],
-  ['Find me the vendors', 'unrecognized'], ['the vendors?', 'unrecognized'], ['give_me_the_suppliers', 'unrecognized'],
+  ['Find me the vendors', 'unrecognized'], ['give_me_the_suppliers', 'unrecognized'],
   ['What happened to the shipment?', 'unrecognized'], ['tell me, who are the vendors', 'unrecognized'],
   ['What about the vendors?', 'unrecognized'], ['Walk me through the suppliers', 'unrecognized'],
   ['Fill me in on the suppliers', 'unrecognized'], ['Present the suppliers', 'unrecognized'],
@@ -109,13 +111,45 @@ export const exactQuestions = Object.freeze([
   ['Summarize which invoices were paid', 'status'], ['Explain whether the vendor paid', 'status'],
   ['Find notes about which keepers are on duty', 'status'], ['Summarize the unpaid invoices', 'status'],
   ['What did the keeper say about who was paid', 'status'], ['Describe every supplier', 'completeness'],
-  ['Why did the vendor raise prices, and how many invoices are late?', 'count']]);
+  ['Why did the vendor raise prices, and how many invoices are late?', 'count'],
+
+  // Round 4: every line, separated part and coordinated subrequest must be an allowed form; an allowed opening authorizes no later one.
+  ['Summarize the storm notes and list the suppliers', 'completeness'], ['Find notes about the storm and enumerate the suppliers', 'completeness'],
+  ['Summarize the storm notes and does invoice two remain outstanding', 'status'], ['Summarize the notes\nIs invoice two paid', 'status'],
+  ['Summarize the notes\nlist the suppliers', 'completeness'], ['harbor notes\nlist all', 'completeness'],
+  ['Summarize the notes then list the suppliers', 'completeness'], ['Summarize the notes and then is invoice two paid', 'status'],
+  ['Summarize the notes plus list the suppliers', 'completeness'], ['Summarize the notes & list the suppliers', 'completeness'],
+  ['Summarize the notes + is invoice two paid', 'status'], ['Summarize the notes as well as list the suppliers', 'completeness'],
+  ['Summarize the notes and also give me the suppliers', 'unrecognized'], ['summarize the notes and will invoice two be paid', 'status'],
+  ['why did the storm hit and is invoice two paid', 'status'], ['describe the storm and confirm the invoice was paid', 'status'],
+  ['Summarize the notes / list the suppliers', 'completeness'], ['Summarize the notes | list the suppliers', 'completeness'],
+  ['Summarize the notes \u2022 list the suppliers', 'completeness'], ['Summarize the notes\u2028list the suppliers', 'completeness'],
+  ['Summarize the notes\u2029list the suppliers', 'completeness'], ['Summarize the notes\r\nIs invoice two paid', 'status'],
+  ['Summarize the notes\u0085list the suppliers', 'completeness'], ['Summarize the notes\vlist the suppliers', 'completeness'],
+  ['Summarize the notes\flist the suppliers', 'completeness'], ['harbor notes\n- list the suppliers', 'completeness'],
+  ['harbor notes\n1. is invoice two paid', 'status'], ['harbor notes\n2) list the suppliers', 'completeness'],
+  ['harbor notes\n\n* is invoice two paid', 'status'], ['Summarize the notes\u2014list the suppliers', 'completeness'],
+  ['Summarize the notes--list the suppliers', 'completeness'], ['Summarize the notes/list the suppliers', 'completeness'],
+  ['Summarize the notes&is invoice two paid', 'status'], ['Summarize the notes after that list the suppliers', 'completeness'],
+  ['Summarize the notes followed by is invoice two paid', 'status'], ['Summarize the notes while you list the suppliers', 'unrecognized'],
+  ['Summarize the notes but which invoices are paid', 'status'], ['Summarize the notes or how many invoices are late', 'count'],
+  ['What did we finish and report on the storm', 'unrecognized'], ['Show me the suppliers and notes on the storm', 'unrecognized'],
+  ['Summarize the notes and we paid the vendor', 'unrecognized'], ['there are more suppliers', 'unrecognized'],
+  // Round 4: a topic carrying a state, a selecting word or what remains anywhere: before or after its noun, negated or alone.
+  ['invoices not paid', 'status'], ['invoices unpaid', 'status'], ['invoices outstanding', 'completeness'],
+  ['tickets remaining', 'completeness'], ['tasks left', 'completeness'], ['orders not shipped', 'status'], ['tickets not closed', 'status'],
+  ['invoice two paid', 'status'], ['invoice two: paid', 'status'], ['invoices yet unpaid', 'status'], ['paid or unpaid', 'status'],
+  ['items left', 'completeness'], ['unpaid', 'status'], ['done', 'status'], ['left invoices', 'completeness'],
+  ['harbor notes, all', 'completeness'], ['the parts arrived yesterday', 'status'], ['invoices never reconciled', 'status'],
+  ['Summarize the storm and invoices outstanding', 'completeness'], ['Find notes about invoices not paid', 'status'],
+  ['Summarize the invoices not paid', 'status'], ['Find notes about the open tickets', 'status'],
+  ['why did the storm hit and invoice two paid', 'status']]);
 
 /** Ordinary retrieval requests, which a bundle serves. */
 export const ordinaryRequests = Object.freeze(['harbor lantern', 'Why was the lantern lit at dusk?', 'account recovery notes',
   'everything about tides', 'discounted fares', 'the keeper described the tower', 'Draft a summary of the lantern keeper notes',
-  'overdue invoice', 'Summarize the bridge repair discussion', 'What did the keeper write about the storm?', 'invoice amount dispute',
-  'notes on the open sea crossing', 'Why was the gate left open?', 'tell me about the lantern keeper',
+  'Summarize the bridge repair discussion', 'What did the keeper write about the storm?', 'invoice amount dispute',
+  'Why was the gate left open?', 'tell me about the lantern keeper',
   'what the harbor master said about tides', 'a shopping list for the lighthouse', 'it was all about the tides', 'kestrel nest',
   'tidal gauge', 'Describe the storm damage to the tower', 'Explain why the lantern failed', 'Find notes about the harbor lantern',
   'Who reviewed the lantern claim?', 'Can you summarize the keeper log?', 'Please describe the tower', 'Show me notes about the storm',
@@ -129,7 +163,12 @@ export const ordinaryRequests = Object.freeze(['harbor lantern', 'Why was the la
   'Do you have notes about fog signals?', 'Explain how the lantern works', 'Give me an overview of the harbor treaty',
   'Find records about the bridge repair', 'Show me information on fog signals', 'lantern lighting by the keeper', 'map of the harbor',
   'What did the harbor master write about the treaty?', 'Search for notes about the storm', 'Fetch the context on the vendor dispute',
-  'report on the storm', 'Please find excerpts about tides, and explain why the gauge drifted']);
+  'report on the storm', 'Please find excerpts about tides, and explain why the gauge drifted',
+  // Coordinated and separated forms: each subrequest is allowed, or a bare noun phrase continuing one.
+  'compare fog and tides', 'summarize the storm and the flood', 'find notes about salt and pepper',
+  'why did the storm hit and the lantern fail', 'Summarize the keeper log\nFind notes about the storm', '- harbor lantern\n- tidal gauge',
+  'fog / tides', 'Explain the storm & describe the flood', 'Compare the March logs with the April logs, then outline the differences',
+  'How did the storm begin and end?', 'What did the keeper write about fog and tides?', 'Summarize the storm notes and the vendors']);
 
 /**
  * [text, rephrasing]: requests that ask no exact question but are refused
@@ -148,4 +187,12 @@ export const overRefusals = Object.freeze([
   ['procedures if the lantern fails', 'procedures for a lantern failure'],
   ['follow-up notes on the storm', 'notes on the storm follow-up'],
   ['open questions about tides', 'Summarize the questions about tides'],
-  ['harbor lantern?', 'harbor lantern']]);
+  ['harbor lantern?', 'harbor lantern'], ['the vendors?', 'notes about the vendors'],
+  // Round 4: a topic cue counts wherever it occurs, and only the opening conjunct of a subrequest can make it an allowed form.
+  ['overdue invoice', 'Summarize the overdue invoice'], ['notes on the open sea crossing', 'Describe the open sea crossing'],
+  ['open source notes', 'Summarize the open source notes'], ['current events', 'Describe current events'],
+  ['left wing politics', 'Describe left wing politics'], ['notes left by the keeper', 'notes written by the keeper'],
+  ['How do tides and currents interact?', 'How do tides interact with currents?'],
+  ['What did the keeper and the master say about tides?', 'What did the keeper say about tides? What did the master say about tides?'],
+  ['Who wrote and reviewed the log?', 'Who wrote the log, and who reviewed it?'],
+  ['Why was the bell rung and the lantern lit?', 'Why was the bell rung, and why was the lantern lit?']]);

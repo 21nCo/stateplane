@@ -388,6 +388,7 @@ test('count, status and completeness requests are refused before anything is sea
       else if (kind) assert.match(error.message, exact);
       else assert.ok(unrecognized.test(error.message) || exact.test(error.message), error.message);
       assert.match(error.message, /A bundle request is a topic .*a why-question.*summarize, describe, explain/);
+      assert.match(error.message, /Each line and each part joined by and, or, then/);
       return true;
     });
   }
@@ -398,7 +399,7 @@ test('count, status and completeness requests are refused before anything is sea
   const counted = await services.records.count(f.owner, f.spaceId, 'alpha', '[]');
   assert.equal(counted, 3);
   // An ordinary retrieval request about the same content is bundled, and carries no count of its own.
-  const bundle = await bundles(registry, counting).bundle(f.owner, f.spaceId, { query: 'overdue invoice', budget });
+  const bundle = await bundles(registry, counting).bundle(f.owner, f.spaceId, { query: 'Summarize the overdue invoice', budget });
   assert.ok(bundle.excerpts.length >= 2);
   assert.equal(bundle.complete, false);
   assert.match(bundle.context, /no count, status or completeness follows from them/);

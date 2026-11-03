@@ -203,7 +203,9 @@ export type BundleRefusal = ExactQuestion | 'unrecognized';
 /** The request forms a bundle serves, for a refusal to name. */
 export const BUNDLE_REQUEST_FORMS = 'A bundle request is a topic ("harbor lantern notes"); a why-question; "how does ... work"; '
   + '"what did ... say about ..."; "what happened during ..."; "who wrote, said or reviewed ..."; summarize, describe, explain, outline, '
-  + 'compare or draft ...; or find, show or get notes, records or information about ..., or a summary or overview of ....';
+  + 'compare or draft ...; or find, show or get notes, records or information about ..., or a summary or overview of .... '
+  + 'Each line and each part joined by and, or, then, plus or the like must be one of these, and a topic names no state, '
+  + 'nothing remaining or left, and no "all".';
 
 // Whole words and phrases, between non-letters or digits.
 const word = (pattern: string) => `(?<![\\p{L}\\p{N}])(?:${pattern})(?![\\p{L}\\p{N}])`;
@@ -375,7 +377,9 @@ const NOT_A_VERB = new Set(['about', 'on', 'regarding', 'concerning', 'of', 'in'
   'before', 'since', 'under', 'over', 'between', 'among', 'around', 'near', 'to', 'into', 'onto', 'through', 'across', 'without',
   'within', 'against', 'behind', 'beyond', 'beside', 'besides', 'toward', 'towards', 'like', 'per', 'via', 're', 'as', 'the', 'a',
   'an', 'this', 'that', 'these', 'those', 'it', 'its', 'everything', 'anything', 'something', 'nothing', 'both', 'and', 'or', 'but',
-  'not', 'our', 'my', 'your', 'their', 'his', 'her', 'i', 'we', 'you', 'they', 'he', 'she', 'one', 'two', 'three']);
+  'not', 'our', 'my', 'your', 'their', 'his', 'her', 'one', 'two', 'three']);
+// Words that open a clause with its own subject ("we paid the vendor", "there are more"): never a topic.
+const SUBJECTS = new Set(['i', 'we', 'you', 'they', 'he', 'she', 'there']);
 // What follows an instruction's verb: an object pronoun, a determiner or quantifier, a question word or a particle.
 const OBJECT_WORDS = new Set(['me', 'us', 'them', 'him', 'her', 'it', 'you', 'the', 'a', 'an', 'all', 'every', 'each', 'any', 'some',
   'our', 'my', 'your', 'their', 'his', 'its', 'those', 'these', 'no', 'both', 'either', 'several', 'many', 'much', 'more', 'most',
@@ -403,89 +407,184 @@ function instruction(first: string, second: string | undefined): boolean {
   return VERBS.has(first) || /^\p{L}{3,}(?:ize|ify|yze)$/u.test(first) || (second !== undefined && OBJECT_WORDS.has(second));
 }
 
+/** Whether a conjunct, opening with `first` then `second`, could be a bare noun phrase: no question word, verb or subject opens it. */
+function nounPhrase(conjunct: string, first: string, second: string | undefined): boolean {
+  return !QUESTION_OPENING.test(conjunct) && !AUXILIARIES.test(first) && !SUBJECTS.has(first) && !instruction(first, second);
+}
+
+// Topic cues, wherever they occur in a topic: something left, remaining, missing or outstanding, or "all" at the
+// end, asks what is left of a set; a state or a state-selecting word, negated or alone, asks a status; so does a topic ending in
+// a participle ("invoice two paid", "parts arrived yesterday").
+const TOPIC_COMPLETENESS = regex(`${word('remaining|missing|outstanding|left')}|${word('all')}$`);
+const TOPIC_STATE = regex(word(`${STATES}|${SELECTING}`));
+const TOPIC_PARTICIPLE = regex(`${word(`(?!(?:\\p{L}*eed|hundred|sacred|kindred)(?![\\p{L}\\p{N}]))(?:${PARTICIPLE})`)}`
+  + '(?:\\s+(?:yet|already|now|too|again|so\\s+far|today|yesterday|recently|this\\s+\\S+|last\\s+\\S+))?$');
+// A state after a plural, negated, still or not yet reached, or one only an adjective can be: "invoices not paid",
+// "tickets still open", "invoices unpaid", "tasks left". Refused in any form but a why- or how-question.
+const POSTPOSITIVE = regex(`\\p{L}{2,}(?<!ss|us|is|as)s\\s+(?:(?:${word('not|never|yet|still')})\\s+)+${word(`${SELECTING}|${PARTICIPLE}`)}`
+  + `|\\p{L}{2,}(?<!ss|us|is|as)s\\s+${word('un\\p{L}{2,}ed|unpaid|undone|remaining|left|outstanding|missing|overdue|pending|due|incomplete')}`);
+const POSTPOSITIVE_COMPLETENESS = regex(word('remaining|left|outstanding|missing'));
+const EXPLANATION = regex(`^${word('why|how')}`);
+
+/** The cue a topic carries, if any: a topic is refused when one occurs anywhere in it. */
+function topicCue(topic: string): ExactQuestion | null {
+  if (TOPIC_COMPLETENESS.test(topic)) return 'completeness';
+  return TOPIC_STATE.test(topic) || TOPIC_PARTICIPLE.test(topic) ? 'status' : null;
+}
+
 /**
- * Why one clause is refused, or null when it is served: a deny rule names an
- * exact question; otherwise it must be an allowed instruction, a request for
- * passages or a summary, an allowed question, or a topic (no question mark,
- * not opening with an auxiliary, a modal or an instruction), and each
- * question word in it must open an allowed question form.
+ * The exact question a deny rule names anywhere in `text`, or `unrecognized`
+ * when a question word in it does not open an allowed question form.
  */
-function refusal(clause: string, asked: boolean): BundleRefusal | null {
-  for (const [kind, pattern] of EXACT) if (pattern.test(clause)) return kind;
-  if (asked && ASKED.test(clause)) return 'status';
-  const [first, second] = clause.split(' ');
-  const opening = QUESTION_OPENING.test(clause);
-  const allowed = EXPLAIN.test(clause) || GET_PASSAGES.test(clause) || GET_SUMMARY.test(clause)
-    || (opening ? QUESTIONS.some(form => form.test(clause))
-      : !asked && !AUXILIARIES.test(first) && !instruction(first, second));
-  if (!allowed) return 'unrecognized';
-  for (const match of clause.matchAll(QUESTION_WORD)) {
-    const rest = clause.slice(match.index);
+function denied(text: string, asked: boolean): BundleRefusal | null {
+  for (const [kind, pattern] of EXACT) if (pattern.test(text)) return kind;
+  if (asked && ASKED.test(text)) return 'status';
+  if (!EXPLANATION.test(text)) {
+    const postpositive = POSTPOSITIVE.exec(text);
+    if (postpositive) return POSTPOSITIVE_COMPLETENESS.test(postpositive[0]) ? 'completeness' : 'status';
+  }
+  for (const match of text.matchAll(QUESTION_WORD)) {
+    const rest = text.slice(match.index);
     if (!QUESTIONS.some(form => form.test(rest)) && !(match.index > 0 && EMBEDDED.some(form => form.test(rest)))) return 'unrecognized';
   }
   return null;
 }
 
+/**
+ * Why one subrequest is refused, or null when it is served. Its opening
+ * conjunct alone must be an allowed instruction, a request for passages or a
+ * summary, an allowed question, or a topic (no question mark, not opening
+ * with a question word, an auxiliary, a modal, a subject or an instruction,
+ * and carrying no topic cue), so no later conjunct can complete a form; and
+ * no deny rule may match the conjunct or the whole subrequest. A request for
+ * passages names a topic, so the topic cues apply to it too.
+ */
+function refusal(head: string, group: string, asked: boolean): BundleRefusal | null {
+  const refused = denied(head, asked) ?? (group === head ? null : denied(group, asked));
+  if (refused) return refused;
+  if (EXPLAIN.test(head) || GET_SUMMARY.test(head) || (QUESTION_OPENING.test(head) && QUESTIONS.some(form => form.test(head)))) return null;
+  const [first, second] = head.split(' ');
+  if (GET_PASSAGES.test(head) || (!asked && nounPhrase(head, first, second))) return topicCue(head);
+  return 'unrecognized';
+}
+
 // Characters that render as nothing (zero-width spaces and joiners, soft hyphens, bidirectional and other format controls).
 const IGNORABLE = /[\p{Default_Ignorable_Code_Point}\p{Cf}]/gu;
-// Punctuation joining two letters, which may stand for a space ("how-many", "list_all", "is.it.paid").
-const JOINER = /(?<=\p{L})[-_.\u2010-\u2015\u2212\u00b7/\\]+(?=\p{L})/gu;
+// Punctuation joining two letters, which may stand for a space ("how-many", "list_all", "is.it.paid"); a separator
+// (/, \, a middle dot, a dash or a double hyphen) is a clause boundary instead, so it never joins two requests into one.
+const JOINER = /(?<=\p{L})[-_.\u2010-\u2012\u2212](?=\p{L})/gu;
 // A clitic after a letter: "what's", "they're", "we've".
 const CLITIC = /(?<=\p{L})'(?=(?:s|re|ve|d|ll|m)(?![\p{L}\p{N}]))/gu;
+
+// Line breaks, each a clause boundary; a list marker opening a line; separators, wherever they are; and coordinating symbols.
+const LINE = /[\n\r\v\f\u0085\u2028\u2029]/u;
+const LIST_MARKER = /^\s*(?:[-*>\u2022\u2023\u2043\u2219\u25aa\u25cf\u25e6\u00b7]+|\(?(?:\d+|[a-z])[.)])\s+/iu;
+const SEPARATOR = /[|/\\\u00b7\u2013-\u2015\u2022\u2023\u2027\u2043\u2219\u25aa\u25cf\u25e6]|-{2,}|\s\*+(?=\s)/gu;
 
 /**
  * The forms of `text` a question is looked for in: NFKC-normalized and
  * lowercased, with every invisible character removed and, separately, read
  * as a space (so neither "c\u00adount" nor "how\u200bmany" hides a word),
- * and each also with punctuation between two letters read as a space; curly
- * apostrophes as straight ones, a clitic as its own word ("what's" as
- * "what 's"), and whitespace collapsed.
+ * and each also with punctuation between two letters read as a space; each
+ * line its own clause (and, when there are several, also all read as one, so
+ * neither a line break between two words nor one between two requests hides
+ * a question), with a list marker opening a line removed; separators (/, |,
+ * \, bullets, a spaced *) as clause boundaries and & and + as "and"; curly
+ * apostrophes as straight ones, a clitic as its own word ("what's" as "what
+ * 's"), and whitespace collapsed.
  */
 function readings(text: string): string[] {
   const normalized = text.normalize('NFKC');
   const forms = ['', ' '].map(by => normalized.replace(IGNORABLE, by).normalize('NFKC').replace(IGNORABLE, by));
-  return [...new Set([...forms, ...forms.map(form => form.replace(JOINER, ' '))].map(form => form.toLowerCase()
+  const lined = [...forms, ...forms.map(form => form.replace(JOINER, ' '))].flatMap(form => {
+    const lines = form.split(LINE);
+    return lines.length > 1 ? [lines.map(line => line.replace(LIST_MARKER, '')).join(';'), lines.join(' ')] : [form.replace(LIST_MARKER, '')];
+  });
+  return [...new Set(lined.map(form => form.toLowerCase().replace(SEPARATOR, ';').replace(/[&+]/gu, ' and ')
     .replace(/[\u2018\u2019\u02bc`\u00b4]/gu, "'").replace(CLITIC, " '").replace(/\s+/gu, ' ').trim()))];
 }
 
+// The coordinators a clause is split at, each conjunct read on its own.
+const COORDINATOR = new RegExp(`(?:^|\\s)(?:${alternatives(['and\\s+then', 'and\\s+also', 'and\\s+or', 'as\\s+well\\s+as', 'as\\s+well',
+  'after\\s+that', 'followed\\s+by', 'and', 'or', 'nor', 'but', 'then', 'plus', 'also', 'while'])})(?=\\s|$)`, 'giu');
+
+/** One conjunct without its leading request and politeness prefixes, a request to be given something read as "get"; and whether it had one. */
+function unprefixed(conjunct: string): { text: string; prefixed: boolean } {
+  let text = conjunct.trim();
+  for (let previous = ''; previous !== text;) {
+    previous = text;
+    for (const pattern of PREFIXES) text = text.replace(pattern, '');
+  }
+  const got = text.replace(LEAD_IN, 'get ');
+  return { text: got, prefixed: got !== conjunct.trim() };
+}
+
 /**
- * The clauses of one reading, each without its leading request and
- * politeness prefixes and with a request to be given something read as
- * "get", and whether it ends in a question mark.
+ * The clauses of one reading (split at sentence punctuation, commas,
+ * brackets, quotes and spaced dashes), each split at coordinators into
+ * groups of conjuncts and whether it ends in a question mark. A conjunct
+ * opening with a question word, an auxiliary, a modal, a subject, an
+ * instruction or a request prefix starts a group of its own, so it must be
+ * an allowed form itself and every deny rule anchored at a clause's start
+ * applies to it; a bare noun phrase continues the group before it ("compare
+ * fog and tides") and is also returned as a topic, whose cues are refused.
  */
-function clauses(reading: string): { text: string; asked: boolean }[] {
+function clauses(reading: string): { groups: { head: string; text: string }[]; topics: string[]; asked: boolean }[] {
   return [...reading.replace(/\s+[-\u2013\u2014]+\s+/gu, ';').matchAll(/([^.;:!?,()[\]{}"\u201c\u201d\u00ab\u00bb]+)([.;:!?,()[\]{}"\u201c\u201d\u00ab\u00bb]*)/gu)]
     .map(([, clause, end]) => {
-      let text = clause.trim();
-      for (let previous = ''; previous !== text;) {
-        previous = text;
-        for (const pattern of PREFIXES) text = text.replace(pattern, '');
+      const groups: { head: string; text: string }[] = [];
+      const topics: string[] = [];
+      for (const part of clause.split(COORDINATOR)) {
+        const { text, prefixed } = unprefixed(part);
+        if (!text) continue;
+        const [first, second] = text.split(' ');
+        if (groups.length && !prefixed && nounPhrase(text, first, second)) {
+          groups[groups.length - 1].text += ` and ${text}`;
+          topics.push(text);
+        } else groups.push({ head: text, text });
       }
-      return { text: text.replace(LEAD_IN, 'get '), asked: end.includes('?') };
-    }).filter(clause => clause.text);
+      return { groups, topics, asked: end.includes('?') };
+    }).filter(clause => clause.groups.length);
 }
 
 /**
  * Why a bundle request text is refused, or null when a bundle serves it. A
  * bundle never answers a count, status or completeness question, so
- * classification fails closed: the text is served only when every clause
- * (split at sentence punctuation, commas, brackets and spaced dashes, with
- * request prefixes such as "please", "can you" or "tell me about" removed)
- * is one of the forms of `BUNDLE_REQUEST_FORMS` or a topic, and no deny rule
- * names an exact question in it. Any other question (a question mark, or a
- * clause opening with a question word, an auxiliary or a modal) or
- * instruction is refused as `unrecognized`, whatever it asks; a deny rule
- * names the kind when one matches. Only a bare topic phrase is served
- * without an allowed form, and the deny rules still apply to it (counts,
- * totals, sizes; status, progress and things selected or marked by a state;
- * every, each, all, lists, rosters, existence and what remains).
+ * classification fails closed: the text is served only when every line,
+ * every clause (split at sentence punctuation, commas, brackets, spaced
+ * dashes, separators and line breaks, with request prefixes such as
+ * "please", "can you" or "tell me about" removed) and every coordinated
+ * subrequest in it (split at and, or, but, then, plus, also, as well as, &,
+ * + and the like) is one of the forms of `BUNDLE_REQUEST_FORMS` or a topic,
+ * and no deny rule names an exact question in it. Any other question (a
+ * question mark, or a subrequest opening with a question word, an auxiliary
+ * or a modal) or instruction is refused as `unrecognized`, whatever it asks;
+ * a deny rule names the kind when one matches. An allowed opening never
+ * authorizes a later subrequest. Only a bare topic phrase is served without
+ * an allowed form, and the deny rules still apply to it (counts, totals,
+ * sizes; status, progress and things selected or marked by a state; every,
+ * each, all, lists, rosters, existence and what remains), as do the topic
+ * cues wherever they occur in it: a state word, before or after its noun,
+ * negated or alone; remaining, left, missing or outstanding; a trailing
+ * "all"; or a closing participle.
  */
 export function exactQuestion(text: string): BundleRefusal | null {
   let found: BundleRefusal | null = null;
-  for (const reading of readings(text)) for (const { text: clause, asked } of clauses(reading)) {
-    const kind = refusal(clause, asked);
+  const note = (kind: BundleRefusal | null) => {
     if (kind && kind !== 'unrecognized') return kind;
     found ??= kind;
+    return null;
+  };
+  for (const reading of readings(text)) for (const { groups, topics, asked } of clauses(reading)) {
+    for (const [index, { head, text: group }] of groups.entries()) {
+      // The question mark ends the clause's last subrequest.
+      const kind = note(refusal(head, group, asked && index === groups.length - 1));
+      if (kind) return kind;
+    }
+    for (const topic of topics) {
+      const kind = note(topicCue(topic));
+      if (kind) return kind;
+    }
   }
   return found;
 }

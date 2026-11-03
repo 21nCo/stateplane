@@ -192,12 +192,50 @@ test('bundle requests fail closed: only the allowed forms and bare topics are se
   }
 });
 
+test('every line, separated part and coordinated subrequest must be an allowed form', () => {
+  // Joining a refused row to a served one, in either order, by any coordinator, separator, list marker or line break, is refused:
+  // an allowed opening never authorizes a later subrequest. Rows asking only by a question mark keep it, so it stays theirs.
+  const joins = [' and ', ' or ', ' nor ', ' but ', ' then ', ' and then ', ' plus ', ' also ', ' and also ', ' as well as ',
+    ' after that ', ' followed by ', ' while ', '\n', '\r\n', '\r', ' ', ' ', '\u0085', '\v', '\f', '\n- ', '\n* ', '\n1. ',
+    '\n2) ', '\n• ', ' / ', '/', ' | ', '|', ' • ', ' · ', ' & ', '&', ' + ', '+', '—', ' -- ', ', ', '; '];
+  const served = ['Summarize the storm notes', 'Find notes about the storm', 'why did the storm hit', 'harbor lantern',
+    'compare fog and tides', 'What did the keeper write about tides?'];
+  const refused = exactQuestions.map(([text]) => text).flatMap(text => [text, text.replace(/[.!?]$/u, '')])
+    .filter(text => exactQuestion(text) !== null);
+  for (const row of refused) for (const other of served) for (const join of joins)
+    for (const text of [`${other.replace(/\?$/u, '')}${join}${row}`, `${row}${join}${other}`])
+      assert.notEqual(exactQuestion(text), null, JSON.stringify(text));
+  for (const text of served) assert.equal(exactQuestion(text), null, JSON.stringify(text));
+  // A bare noun phrase continuing an allowed form is served, unless it carries a topic cue; an allowed form's question word or
+  // verb cannot be completed by a later conjunct ("what did we finish and report on the storm").
+  for (const text of ['Summarize the storm notes and the vendors', 'why did the storm hit and the lantern fail', 'fog / tides'])
+    assert.equal(exactQuestion(text), null, JSON.stringify(text));
+  for (const text of ['Summarize the storm notes and the invoices unpaid', 'why did the storm hit and invoice two paid',
+    'What did we finish and report on the storm', 'Show me the suppliers and notes on the storm', 'find notes about fog and every tide'])
+    assert.notEqual(exactQuestion(text), null, JSON.stringify(text));
+});
+
+test('a topic carrying a state, a selecting word or what remains is refused wherever the cue occurs', () => {
+  const cues = ['done', 'complete', 'finished', 'resolved', 'closed', 'open', 'pending', 'blocked', 'approved', 'rejected', 'shipped',
+    'unshipped', 'paid', 'unpaid', 'overdue', 'outstanding', 'missing', 'remaining', 'left', 'settled', 'cancelled', 'late', 'active',
+    'delivered', 'signed', 'unsigned', 'verified', 'expired', 'failed', 'archived', 'published', 'overdrawn', 'unassigned', 'due',
+    'in progress', 'on hold', 'past due'];
+  for (const cue of cues) for (const text of [`${cue} invoices`, `invoices ${cue}`, `invoices not ${cue}`, `invoice two ${cue}`,
+    `invoices never ${cue}`, cue, `not ${cue}`, `invoice two: ${cue}`, `harbor notes\ninvoices ${cue}`,
+    `Summarize the storm and invoices ${cue}`, `Find notes about invoices not ${cue}`])
+    assert.notEqual(exactQuestion(text), null, JSON.stringify(text));
+  for (const [text, kind] of [['tasks left', 'completeness'], ['invoices outstanding', 'completeness'], ['harbor notes, all', 'completeness'],
+    ['orders not shipped', 'status'], ['the parts arrived yesterday', 'status'], ['invoices unreconciled', 'status']])
+    assert.equal(exactQuestion(text), kind, text);
+});
+
 test('classifying a bundle request stays fast on a worst-case input', () => {
   // Process CPU time, after the first call compiles the patterns, so a loaded host does not count against the classifier.
   exactQuestion('harbor lantern');
   const cpu = () => { const { user, system } = process.cpuUsage(); return (user + system) / 1_000; };
-  for (const head of ['which', 'what', 'who', 'if', 'confirm', 'how is', 'why', 'what did', 'find me the', 'explain', 'what the'])
-    for (const fill of ['a ', 'a-', 'a, ', 'a\u200b']) {
+  for (const head of ['which', 'what', 'who', 'if', 'confirm', 'how is', 'why', 'what did', 'find me the', 'explain', 'what the',
+    'summarize', 'harbor'])
+    for (const fill of ['a ', 'a-', 'a, ', 'a\u200b', 'a\n', 'x and ', 'notes and ', 'invoices not ', 'a / ', 'a & ', 'the x and why ']) {
       const text = Array.from(`${head} ${fill.repeat(600)}`).slice(0, 1_000).join('');
       const started = cpu();
       exactQuestion(text);
