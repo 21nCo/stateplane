@@ -196,70 +196,156 @@ export type ExactQuestion = 'count' | 'status' | 'completeness';
 
 // Whole words and phrases, between non-letters or digits.
 const word = (pattern: string) => `(?<![\\p{L}\\p{N}])(?:${pattern})(?![\\p{L}\\p{N}])`;
-// The rest of one clause, and the start of one.
-const CLAUSE = '[^.;:!?]*';
-const START = '(?:^|[.;:!?]\\s*)';
+const alternatives = (words: readonly string[]) => words.join('|');
+const NOT = "n'?t";
 // A state that only an exact read can report.
-const STATES = ['done', 'complete', 'completed', 'incomplete', 'finished', 'unfinished', 'resolved', 'unresolved', 'closed', 'open',
-  'pending', 'blocked', 'approved', 'unapproved', 'rejected', 'merged', 'shipped', 'accepted', 'paid', 'unpaid', 'overdue',
-  'outstanding', 'missing', 'remaining', 'settled', 'unsettled', 'cancell?ed', 'late', 'active', 'inactive', 'ready', 'started',
-  'delivered', 'undelivered', 'fixed', 'signed', 'submitted', 'received', 'verified', 'reviewed', 'expired', 'failed', 'succeeded',
-  'archived', 'deleted', 'published', 'in\\s+progress', 'on\\s+hold', 'up\\s+to\\s+date'].join('|');
-const AUXILIARY = "(?:is|are|was|were|has|have|had|did|does|do)(?:n['\u2019]t)?";
-const pattern = (source: string) => new RegExp(source, 'iu');
-/** Each family of exact question recognized, in the order they are tried. */
+const STATES = alternatives(['done', 'complete', 'completed', 'incomplete', 'finished', 'unfinished', 'resolved', 'unresolved',
+  'closed', 'open', 'opened', 'pending', 'blocked', 'approved', 'unapproved', 'rejected', 'merged', 'shipped', 'accepted', 'paid',
+  'unpaid', 'overdue', 'outstanding', 'missing', 'remaining', 'settled', 'unsettled', 'cancell?ed', 'late', 'active', 'inactive',
+  'ready', 'started', 'delivered', 'undelivered', 'fixed', 'signed', 'submitted', 'received', 'verified', 'reviewed', 'expired',
+  'failed', 'succeeded', 'archived', 'deleted', 'published', 'live', 'current', 'valid', 'invalid', 'available', 'due', 'past\\s+due',
+  'in\\s+progress', 'on\\s+hold', 'on\\s+track', 'up\\s+to\\s+date', 'out\\s+of\\s+date']);
+// A past participle: a regular "-ed" form or an irregular one.
+const PARTICIPLE = `\\p{L}{2,}ed|${alternatives(['done', 'paid', 'sent', 'made', 'gone', 'built', 'won', 'lost', 'left', 'set', 'put',
+  'cut', 'run', 'begun', 'bought', 'brought', 'caught', 'held', 'kept', 'met', 'read', 'sold', 'told', 'written', 'taken', 'given',
+  'broken', 'chosen', 'driven', 'shown', 'known', 'seen', 'drawn', 'thrown', 'grown', 'spent', 'lent', 'found', 'won', 'shut',
+  'hit', 'quit', 'split', 'spun', 'struck', 'sworn', 'torn', 'worn', 'upheld', 'undone', 'redone', 'rewritten', 'overtaken',
+  'withdrawn', 'forgiven', 'forgotten', 'frozen', 'hidden', 'proven', 'stolen', 'lit', 'laid', 'dealt', 'meant', 'bound', 'wound'])}`;
+// An auxiliary that opens a yes/no question, and a modal that does.
+const AUXILIARY = `(?:am|is|are|was|were|has|have|had|did|does|do)(?:${NOT})?`;
+const MODAL = `(?:(?:will|would|can|could|should|shall|must|may|might|need)(?:${NOT})?|won'?t|cannot)`;
+// An auxiliary chain between a which/what/who and a state or participle: "have been", "haven't yet been", "got", "are currently".
+const ADVERB = alternatives(['not', 'never', 'still', 'currently', 'already', 'now', 'yet', 'all', 'fully', 'finally', 'ever', 'just',
+  'actually', 'really', 'recently', 'partly', 'partially', 'officially', 'successfully']);
+const BE = `(?:am|is|are|was|were|be|been|being|get|gets|got|gotten|getting|remains?|remained|stays?|stayed|'s|'re|'m)(?:${NOT})?`;
+const HAVE = `(?:has|have|had|'s|'ve|'d)(?:${NOT})?`;
+const ADVERBS = `(?:\\s+(?:${ADVERB}))*`;
+const PASSIVE = `(?:${HAVE}${ADVERBS}\\s+)?(?:${BE})${ADVERBS}\\s+(?:${STATES}|${PARTICIPLE})`;
+const PERFECT = `${HAVE}${ADVERBS}\\s+(?:${STATES}|${PARTICIPLE})`;
+// The rest of one clause, possibly empty, ending before a following word.
+const BETWEEN = '(?:\\s+\\S+)*?\\s+';
+
+/**
+ * Words that open a request without being its question: politeness and
+ * request prefixes ("please", "can you", "tell me", "let me know", "I want to
+ * know"), removed from the start of each clause before it is classified;
+ * one before "if" stays, as it makes the "if" a question.
+ */
+const PREFIX = new RegExp(`^(?:${alternatives(['please', 'pls', 'plz', 'kindly', 'hey', 'hi', 'hello', 'ok(?:ay)?', 'so', 'and', 'but',
+  'or', 'also', 'now', 'then', 'just', 'quick(?:ly)?', 'quick\\s+question', 'one\\s+more\\s+thing', 'by\\s+the\\s+way',
+  `(?:can|could|would|will|won't)\\s+you(?:\\s+(?:please|kindly|just|quickly))?`,
+  '(?:can|could|may)\\s+(?:i|we)\\s+(?:see|get|have|read)', '(?:do|did|does)\\s+(?:you|anyone|anybody)\\s+(?:know|have|remember)',
+  '(?:have|has)\\s+(?:you|anyone|anybody)\\s+got', '(?:i|we)\\s+(?:want|need|would\\s+like|\'d\\s+like|wanna|wish)(?:\\s+you)?'
+    + '(?:\\s+to\\s+(?:know|see|find\\s+out|check|confirm|learn|understand|get|hear))?', 'i\\s+wonder', "i(?:\\s*'m|\\s+am)\\s+(?:wondering|curious)",
+  '(?:tell|remind)\\s+(?:me|us)', 'let\\s+(?:me|us)\\s+know', 'help\\s+me(?:\\s+(?:understand|see))?',
+  'i\\s+(?:need|want)'])})(?![\\p{L}\\p{N}'])(?![\\s,]*if(?![\\p{L}\\p{N}]))[\\s,]*`, 'iu');
+
+const regex = (source: string) => new RegExp(source, 'iu');
+/** Each family of exact question recognized in one clause (prefixes removed), in the order they are tried. */
 const EXACT: readonly [ExactQuestion, RegExp][] = Object.freeze([
   // How many or how much: counts, totals, quantities and amounts.
-  ['count', pattern(word('how\\s+(?:many|much|often)|count(?:s|ed|ing)?|number\\s+of|totals?|totall?(?:ed|ing)|tally|tallies|sum\\s+of|'
-    + 'quantit(?:y|ies)|amount\\s+of|amounts?\\s+(?:owed|due|outstanding|remaining|left)'))],
-  // A status or progress by name.
-  ['status', pattern(word('status(?:es)?|state\\s+of|current\\s+state|progress|how\\s+far\\s+along|'
-    + 'percent(?:age)?\\s+(?:complete|completed|done|finished)'))],
-  // A clause opening with an auxiliary that names a state: "is invoice two paid", "has anything failed".
-  ['status', pattern(START + word(AUXILIARY) + CLAUSE + word(STATES))],
-  // Whether or if something is in a state: "tell me whether the repair is done".
-  ['status', pattern(word('whether|if') + CLAUSE + word(STATES))],
+  ['count', regex(word('how\\s+(?:many|much|often)|count(?:s|ed|ing)?|number\\s+of|totals?|totall?(?:ed|ing)|tally|tallies|sum\\s+of|'
+    + 'quantit(?:y|ies)|amount\\s+of|amounts?\\s+(?:owed|due|outstanding|remaining|left)|owe[sd]?|owing'))],
+  // Whether anything (more) exists: "is there more", "are there any", "which towers exist".
+  ['completeness', regex(`^${word(`(?:is|are|was|were)(?:${NOT})?\\s+there`)}`)],
+  ['completeness', regex(word('exists?|existed|existing\\s+(?:ones|ones?)|any\\s*more|anymore|any\\s+(?:other|others|remaining|left)|'
+    + 'none\\s+(?:of|left)|are\\s+there\\s+(?:any|no|more)|is\\s+there\\s+(?:any|no|more)|rest\\s+of|what\\s+else|who\\s+else'))],
+  // A status or progress by name, or a state, stage or phase asked for: "what state is invoice two in".
+  ['status', regex(word('status(?:es)?|state\\s+of|current\\s+state|progress|how\\s+far\\s+along|'
+    + 'percent(?:age)?\\s+(?:complete|completed|done|finished)|(?:what|which)\\s+(?:state|stage|phase|step|point|condition)|'
+    + "how\\s+(?:is|are|was|were|'s|'re)\\s+(?:\\S+\\s+)*?(?:going|coming(?:\\s+along)?|doing|looking|shaping\\s+up)|"
+    + 'where\\s+(?:are|is|do|does|did)\\s+(?:\\S+\\s+)*?stands?|where\\s+are\\s+we\\s+(?:on|with)|how\\s+(?:close|near)|'
+    + '(?:any|an|latest)\\s+updates?|latest\\s+(?:on|news)|when\\s+will|or\\s+not|yet\\s+to|still\\s+(?:needs?|has|have)\\s+to'))],
+  // Any yes/no question: a clause opening with an auxiliary or a modal, whatever it asks about.
+  ['status', regex(`^${word(AUXILIARY)}\\s+\\S`)],
+  ['status', regex(`^${word(MODAL)}\\s+\\S`)],
+  // Whether something holds: any "whether" clause, and "if" after a verb of asking or knowing.
+  ['status', regex(word('whether|(?:know|check|see|ask|wonder|wondering|confirm|verify|determine|find\\s+out|sure|tell\\s+me|'
+    + 'tell\\s+us|say)\\s+if'))],
+  ['status', regex(`${word('if')}${BETWEEN}${word(STATES)}`)],
   // A state still or not yet reached: "still open", "not yet paid", "done yet".
-  ['status', pattern(word(`still\\s+(?:not\\s+)?(?:${STATES})|not\\s+yet\\s+(?:${STATES})|(?:${STATES})\\s+yet`))],
-  // Which things are or remain in a state: "which tickets remain unresolved", "what is still pending".
-  ['status', pattern(word('which|what') + CLAUSE + word(`(?:is|are|was|were|remains?|remained|stays?|stayed)\\s+(?:still\\s+)?`
-    + `(?:not\\s+)?(?:${STATES})`))],
-  // Every member of a set, or whether any more exist.
-  ['completeness', pattern(word('every|all\\s+(?!about(?![\\p{L}\\p{N}]))\\p{L}+|complete\\s+(?:list|set)|full\\s+(?:list|set)|'
-    + 'entire\\s+(?:list|set)|exhaustive(?:ly)?|completeness|(?:anything|something|nothing|everything)\\s+(?:else|missing|left|'
-    + 'remaining|outstanding|pending|undone)|any\\s+(?:other|more|remaining)|none\\s+(?:of|left)|are\\s+there\\s+(?:any|no)|'
-    + 'is\\s+there\\s+(?:any|no)'))],
-  // A request to enumerate: "list the suppliers", "please enumerate the towers".
-  ['completeness', pattern(START + '(?:please\\s+)?' + word('list|enumerate|itemi[sz]e'))],
+  ['status', regex(word(`still\\s+(?:not\\s+)?(?:${STATES})|not\\s+yet\\s+(?:${STATES}|${PARTICIPLE})|(?:${STATES})\\s+yet`))],
+  // Which or what things are, have been or got into a state: "which invoices haven't been paid", "what has shipped",
+  // "which claims got approved", "which tickets are currently open".
+  ['status', regex(`${word('which|what|whose')}(?:${BETWEEN}|\\s+)${word(`${PASSIVE}|${PERFECT}`)}`)],
+  ['status', regex(`${word('that')}\\s+${word(`${PASSIVE}|${PERFECT}`)}`)],
+  // Who is, has been or got into a state, or has not done something: "who has been paid", "who hasn't signed".
+  ['status', regex(`${word('who|whom')}(?:${BETWEEN}|\\s+)${word(`${PASSIVE}|(?:has|have|had)(?:${NOT}|\\s+(?:not|never))`)}`)],
+  // Which or what things reached a state, said last: "which tickets closed", "what shipped this week".
+  ['status', regex(`^${word('which|what')}(?:\\s+\\S+){0,3}\\s+${word(STATES)}(?:\\s+(?:today|yesterday|recently|so\\s+far|yet|already|`
+    + 'this\\s+\\S+|last\\s+\\S+|since\\s+.*|on\\s+time|in\\s+time))?$')],
+  // Every member of a set, or what is left of one.
+  ['completeness', regex(word('every|each|all\\s+(?!about(?![\\p{L}\\p{N}]))\\p{L}+|complete\\s+(?:list|set)|full\\s+(?:list|set)|'
+    + 'entire\\s+(?:list|set)|whole\\s+(?:list|set)|lists?\\s+of|exhaustive(?:ly)?|completeness|'
+    + '(?:anything|something|nothing|everything)\\s+(?:else|missing|left|remaining|outstanding|pending|undone)'))],
+  // A request to enumerate: "list the suppliers", "name each supplier".
+  ['completeness', regex(`^${word('list|enumerate|itemi[sz]e|catalog(?:ue)?|tally|name\\s+(?:the|all|each|every|any|some|those|'
+    + 'these|which|who|what|them)')}`)],
   // What remains, is left or is missing: "which tickets remain", "what is left to do".
-  ['completeness', pattern(word('which|what|who') + CLAUSE + word('remains?|remaining|left|missing|outstanding'))]]);
+  ['completeness', regex(`${word('which|what|who')}(?:${BETWEEN}|\\s+)${word('remains?|remaining|left|missing|outstanding')}`)],
+  // A request for the things in a state: "show me the unpaid invoices", "find open tickets".
+  ['status', regex(`^${word('show|give|get|fetch|display|pull\\s+up|return|send|bring|find|retrieve|look\\s+up')}`
+    + `(?:\\s+(?:me|us))?(?:\\s+(?:the|all|any|our|my|those|these|which))?\\s+${word(STATES)}`)],
+  // A request to confirm a state: "confirm the invoice was paid", "check that the audit has finished".
+  ['status', regex(`^${word('confirm|verify|check|make\\s+sure|ensure|double\\s+check')}${BETWEEN}`
+    + `${word(`(?:${BE}|${HAVE})${ADVERBS}\\s+(?:${STATES}|${PARTICIPLE})`)}`)]]);
 
 // Characters that render as nothing (zero-width spaces and joiners, soft hyphens, bidirectional and other format controls).
 const IGNORABLE = /[\p{Default_Ignorable_Code_Point}\p{Cf}]/gu;
+// Punctuation joining two letters, which may stand for a space ("how-many", "list_all", "is.it.paid").
+const JOINER = /(?<=\p{L})[-_.\u2010-\u2015\u2212\u00b7/\\]+(?=\p{L})/gu;
+// A clitic after a letter: "what's", "they're", "we've".
+const CLITIC = /(?<=\p{L})'(?=(?:s|re|ve|d|ll|m)(?![\p{L}\p{N}]))/gu;
 
 /**
- * The forms of `text` a question is looked for in: NFKC-normalized, with
- * every invisible character removed and, separately, read as a space (so
- * neither "c\u00ADount" nor "how\u200Bmany" hides a word), and whitespace
- * collapsed.
+ * The forms of `text` a question is looked for in: NFKC-normalized and
+ * lowercased, with every invisible character removed and, separately, read
+ * as a space (so neither "c\u00adount" nor "how\u200bmany" hides a word),
+ * and each also with punctuation between two letters read as a space; curly
+ * apostrophes as straight ones, a clitic as its own word ("what's" as
+ * "what 's"), and whitespace collapsed.
  */
 function readings(text: string): string[] {
   const normalized = text.normalize('NFKC');
-  return [...new Set(['', ' '].map(by => normalized.replace(IGNORABLE, by).normalize('NFKC').replace(IGNORABLE, by)
-    .replace(/\s+/gu, ' ').trim()))];
+  const forms = ['', ' '].map(by => normalized.replace(IGNORABLE, by).normalize('NFKC').replace(IGNORABLE, by));
+  return [...new Set([...forms, ...forms.map(form => form.replace(JOINER, ' '))].map(form => form.toLowerCase()
+    .replace(/[\u2018\u2019\u02bc`\u00b4]/gu, "'").replace(CLITIC, " '").replace(/\s+/gu, ' ').trim()))];
+}
+
+// A question asked by its question mark alone, ending in a state or participle: "invoice two paid?", "the parts arrived?".
+const ASKED = regex(`^(?!${word('why|how|where|when|who|whom|whose')}).*${word(`${STATES}|${PARTICIPLE}`)}(?:\\s+(?:yet|already|now|too|again|or\\s+not))?$`);
+
+/**
+ * The clauses of one reading, each without its leading request and
+ * politeness prefixes, and whether it ends in a question mark.
+ */
+function clauses(reading: string): { text: string; asked: boolean }[] {
+  return [...reading.replace(/\s+[-\u2013\u2014]+\s+/gu, ';').matchAll(/([^.;:!?,()[\]{}"\u201c\u201d\u00ab\u00bb]+)([.;:!?,()[\]{}"\u201c\u201d\u00ab\u00bb]*)/gu)]
+    .map(([, clause, end]) => {
+      let text = clause.trim();
+      for (let previous = ''; previous !== text;) { previous = text; text = text.replace(PREFIX, ''); }
+      return { text, asked: end.includes('?') };
+    }).filter(clause => clause.text);
 }
 
 /**
  * Which exact question `text` asks, if any: a count, a status, or whether a
  * set is complete. Such a question is never answered from ranked projections,
  * so a bundle request asking one is refused before anything is searched or
- * embedded. Matching is by English phrasing, case-insensitive, and
- * conservative (a request that only mentions, say, a total, or that opens
- * with "list", is refused too); phrasing it does not recognize still gets a
- * bundle that holds no count, status or completeness signal of its own and
- * whose frame says so.
+ * embedded. Classification is by English sentence structure, clause by
+ * clause after request prefixes ("please", "can you", "tell me") are
+ * removed: count words; any yes/no question (a clause opening with an
+ * auxiliary or a modal) and any embedded whether-question; which/what and an
+ * auxiliary chain before a state or participle; and enumeration, existence
+ * and what remains. It is conservative (a request that mentions a total, or
+ * asks whether a note describes a storm, is refused too); phrasing it does
+ * not recognize still gets a bundle that holds no count, status or
+ * completeness signal of its own and whose frame says so.
  */
 export function exactQuestion(text: string): ExactQuestion | null {
-  for (const reading of readings(text)) for (const [kind, regex] of EXACT) if (regex.test(reading)) return kind;
+  for (const reading of readings(text)) for (const { text: clause, asked } of clauses(reading)) {
+    for (const [kind, pattern] of EXACT) if (pattern.test(clause)) return kind;
+    if (asked && ASKED.test(clause)) return 'status';
+  }
   return null;
 }

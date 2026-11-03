@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { assembleBundle, BUNDLE_CLOSE, BUNDLE_OPEN, bundleBounds, exactQuestion } from '../packages/retrieval/dist/index.js';
+import { exactQuestions, ordinaryRequests } from './fixtures/exact-questions.js';
 
 const points = text => Array.from(text);
 const hit = (id, texts, extra = {}) => ({ ref: { spaceId: 'sp_1', collectionId: 'notes', kind: 'record', id }, revision: 2,
@@ -148,34 +149,19 @@ test('a budget is required, bounded and integral', () => {
     assert.throws(() => assembleBundle([], budget), RangeError);
 });
 
-test('count, status and completeness questions are recognized; ordinary retrieval is not', () => {
-  for (const [text, kind] of [['How many invoices are overdue?', 'count'], ['count the open tickets', 'count'],
-    ['number of lanterns in the harbor', 'count'], ['What is the TOTAL spend?', 'count'], ['ｈｏｗ ｍａｎｙ keepers', 'count'],
-    ['What is the quantity of invoices?', 'count'], ['how much do we owe', 'count'], ['the amount of rope ordered', 'count'],
-    ['How often did the lantern fail', 'count'],
-    ['status of the bridge repair', 'status'], ['What is the current state of the migration?', 'status'],
-    ['Is the bridge repair done?', 'status'], ['Has the claim been approved', 'status'], ['Is invoice two paid?', 'status'],
-    ['Please tell me whether the bridge repair is done', 'status'], ['Can you check if the invoices are unpaid', 'status'],
-    ['give me the overall progress', 'status'], ['is anything missing', 'status'], ["Isn’t the ticket resolved?", 'status'],
-    ['Lantern review: was it approved', 'status'], ['tickets still open', 'status'], ['invoices not yet paid', 'status'],
-    ['which tickets remain unresolved', 'status'], ['What is still pending on the bridge?', 'status'],
-    ['Does invoice two remain outstanding', 'status'], ['how far along is the bridge repair', 'status'],
-    ['list all suppliers', 'completeness'], ['Show all suppliers', 'completeness'], ['all invoices from March', 'completeness'],
-    ['every decision about the harbor', 'completeness'], ['Are there any other keepers?', 'completeness'],
-    ['Give me the complete list of towers', 'completeness'], ['Is there anything else about the lantern?', 'completeness'],
-    ['List the suppliers', 'completeness'], ['please enumerate the towers', 'completeness'],
-    ['what is left to do on the bridge', 'completeness'], ['who remains on the roster', 'completeness'],
-    ['nothing missing from the log?', 'completeness']])
-    assert.equal(exactQuestion(text), kind, text);
-  // Invisible characters hide no word, whether they join its letters or stand for the space between two.
-  for (const text of ['how​many keepers', 'c­ount the towers', 'sta‍tus of the repair', 'is⁠ the invoice p‌aid',
-    'list﻿ all suppliers', 'how  many keepers', 'how\nmany keepers', 'pro\u{e0020}gress'])
-    assert.notEqual(exactQuestion(text), null, JSON.stringify(text));
-  for (const text of ['harbor lantern', 'Why was the lantern lit at dusk?', 'account recovery notes', 'everything about tides',
-    'discounted fares', 'the keeper described the tower', 'Draft a summary of the lantern keeper notes', 'overdue invoice',
-    'Summarize the bridge repair discussion', 'all-hands meeting notes', 'What did the keeper write about the storm?',
-    'invoice amount dispute', 'Which keeper lit the lantern?', 'notes on the open sea crossing', 'Why was the gate left open?',
-    'tell me about the lantern keeper', 'what the harbor master said about tides', 'a shopping list for the lighthouse',
-    'it was all about the tides', 'kestrel nest', 'tidal gauge'])
-    assert.equal(exactQuestion(text), null, text);
+test('count, status and completeness questions are recognized by structure; ordinary retrieval is not', () => {
+  // One corpus, shared with the service test: every sibling local review raised and new variants of each structure.
+  for (const [text, kind] of exactQuestions) assert.equal(exactQuestion(text), kind, JSON.stringify(text));
+  for (const text of ordinaryRequests) assert.equal(exactQuestion(text), null, JSON.stringify(text));
+  // Structure, not vocabulary: a yes/no question, an embedded whether-question or a which-question over a participle is
+  // refused whatever its verb, behind any request prefix; the same words as an ordinary request are not.
+  for (const verb of ['arrived', 'reconciled', 'dispatched', 'escalated', 'translated']) {
+    for (const text of [`Has the shipment ${verb}?`, `Please, was the shipment ${verb}?`, `Can you tell me whether the shipment ${verb}`,
+      `Which shipments have been ${verb}?`, `Tell me which shipments got ${verb}`, `What has ${verb}?`, `the shipment ${verb}?`])
+      assert.equal(exactQuestion(text), 'status', text);
+    assert.equal(exactQuestion(`Summarize the notes on the ${verb} shipment`), null);
+  }
+  for (const text of ['Has the shipment arrived?', 'Can you list the suppliers?'])
+    for (const variant of [text.replaceAll(' ', '-'), text.replaceAll(' ', '_'), text.replaceAll(' ', '\u200b'), text.toUpperCase()])
+      assert.notEqual(exactQuestion(variant), null, JSON.stringify(variant));
 });

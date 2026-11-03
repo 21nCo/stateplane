@@ -13,6 +13,7 @@ import { PostgresAuthority, PostgresClaims, PostgresContextBundles, PostgresOutb
 import { BUNDLE_CLOSE, BUNDLE_OPEN, DeterministicEmbedder, EmbedderUnavailableError, EmbeddingRegistry }
   from '../../packages/retrieval/dist/index.js';
 import { R2BlobStore } from '../../packages/storage/dist/index.js';
+import { exactQuestions, ordinaryRequests } from '../fixtures/exact-questions.js';
 import { consume, dispatch } from '../../packages/workers/dist/index.js';
 
 // STA-47: bounded context bundles over hybrid search of real projections,
@@ -373,13 +374,9 @@ test('count, status and completeness requests are refused before anything is sea
   let connections = 0;
   const counting = { connect: () => { connections++; return pool.connect(); } };
   healthy.queries.length = 0;
-  const asked = ['How many invoices are overdue?', 'Count the overdue invoices', 'status of invoice two',
-    'Is invoice two paid or still open?', 'list all overdue invoices', 'Are there any other overdue invoices?', 'Is invoice two paid?',
-    'Show all suppliers', 'What is the quantity of invoices?', 'Please tell me whether the bridge repair is done', 'how much do we owe',
-    'which tickets remain unresolved', 'give me the overall progress', 'is anything missing', 'how\u200bmany invoices',
-    'c\u00adount the invoices'];
-  // Each through the task and through the query, and a refused task beside an ordinary query.
-  for (const request of [...asked.flatMap(text => [{ task: text }, { query: text }]), { query: 'invoice', task: 'Count the overdue invoices' }]) {
+  // Every exact question of the shared corpus through the task, through the query, and as a task beside an ordinary query.
+  const requests = exactQuestions.flatMap(([text]) => [{ task: text }, { query: text }, { task: text, query: 'invoice' }]);
+  for (const request of requests) {
     await assert.rejects(bundles(registry, counting).bundle(f.owner, f.spaceId, { ...request, budget }), error => {
       assert.equal(error.code, 'INVALID_ARGUMENT');
       assert.match(error.message, /do not answer (count|status|completeness) questions; use exact reads/);
@@ -387,6 +384,7 @@ test('count, status and completeness requests are refused before anything is sea
     });
   }
   assert.equal(connections, 0, 'no projection or authority read');
+  assert.equal(requests.length, exactQuestions.length * 3);
   assert.deepEqual(healthy.queries, [], 'no query embedding');
   // The authoritative answer is an exact read, which needs no projection.
   const counted = await services.records.count(f.owner, f.spaceId, 'alpha', '[]');
@@ -396,6 +394,11 @@ test('count, status and completeness requests are refused before anything is sea
   assert.ok(bundle.excerpts.length >= 2);
   assert.equal(bundle.complete, false);
   assert.match(bundle.context, /no count, status or completeness follows from them/);
+  // Every ordinary request of the corpus is served, as task and query.
+  for (const text of ordinaryRequests) {
+    const served = await bundles(registry, counting).bundle(f.owner, f.spaceId, { task: text, query: text, budget });
+    assert.deepEqual([served.task, served.trust, served.complete], [text, 'untrusted', false]);
+  }
 });
 
 test('a bundle never exceeds a small budget: whole excerpts in rank order, then one cut at a cited boundary', async () => {
