@@ -24,6 +24,7 @@ export function claimOutboxSql(due: string, leaseSeconds: string, started: strin
   return `WITH due AS (${due}), claimed AS (
     UPDATE projection_outbox o SET attempts=o.attempts+1, failures=o.failures+${expired},
       last_error=CASE WHEN ${expired}=1 THEN 'Processing lease expired' ELSE o.last_error END,
+      last_error_at=CASE WHEN ${expired}=1 THEN clock_timestamp() ELSE o.last_error_at END,
       delivery_state=CASE WHEN ${parked} THEN 'degraded' ELSE 'delivering' END,
       dead_lettered_at=CASE WHEN ${parked} THEN clock_timestamp() END,
       available_at=CASE WHEN ${parked} THEN 'infinity'::timestamptz
@@ -40,7 +41,7 @@ export function claimOutboxSql(due: string, leaseSeconds: string, started: strin
  * $4 attempt, $5 revision, $6 generation, $7 error. Backoff starts at five
  * seconds and doubles to one hour; the last allowed failure parks the row.
  */
-export const failOutboxSql = `UPDATE projection_outbox SET failures=failures+1, last_error=$7,
+export const failOutboxSql = `UPDATE projection_outbox SET failures=failures+1, last_error=$7, last_error_at=clock_timestamp(),
     delivery_state='degraded', started_attempt=NULL,
     dead_lettered_at=CASE WHEN failures+1>=${MAX_PROJECTION_FAILURES} THEN clock_timestamp() END,
     available_at=CASE WHEN failures+1>=${MAX_PROJECTION_FAILURES} THEN 'infinity'::timestamptz

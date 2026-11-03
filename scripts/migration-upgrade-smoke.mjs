@@ -158,6 +158,8 @@ try {
     assert.match(output,/Applied 039_durable_outbox.sql/);
     assert.match(output,/Applied 040_evidence_storage.sql/);
     assert.match(output,/Applied 045_retrieval_projections.sql/);
+    assert.match(output,/Applied 046_retrieval_dispatch_checkpoint.sql/);
+    assert.match(output,/Applied 047_retrieval_outbox_age.sql/);
     assert.deepEqual(await facts(upgraded),before);
     assert.deepEqual((await upgraded.query(`SELECT count(*)::int AS n FROM projection_outbox
       WHERE failures<>0 OR started_attempt IS NOT NULL OR dead_lettered_at IS NOT NULL OR outcome IS NOT NULL`)).rows[0].n,0);

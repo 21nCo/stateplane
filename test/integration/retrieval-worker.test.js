@@ -1,0 +1,1695 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readdir, readFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { execFileSync, spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import pg from 'pg';
+import { CommitOutcomeUnknownError, PostgresAuthority, PostgresOutbox, PostgresRetrievalWorker, RecordRetrievalProjector } from '../../packages/postgres/dist/index.js';
+import { DeterministicEmbedder, EmbedderUnavailableError, EmbeddingRegistry } from '../../packages/retrieval/dist/index.js';
+import { consume, dispatch } from '../../packages/workers/dist/index.js';
+import { DeadlineExceededError, diagnostic, inTransaction } from '../../packages/postgres/dist/faults.js';
+
+// STA-45: the record projector and the evidence worker against real
+// PostgreSQL with pgvector. The record dispatcher is cell-wide, so this suite
+// owns its database.
+const password = process.env.DATABASE_URL ? null : (await readFile(new URL('../../.data/local-db-password', import.meta.url), 'utf8')).trim();
+const baseUrl = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT ?? '55432'}/stateplane`;
+const name = `stateplane_retrieval_worker_${randomUUID().replaceAll('-', '')}`;
+const admin = new pg.Client({ connectionString: baseUrl });
+await admin.connect();
+try { await admin.query(`CREATE DATABASE ${name}`); } finally { await admin.end(); }
+const target = new URL(baseUrl); target.pathname = `/${name}`;
+async function dropDatabase() {
+  const cleanup = new pg.Client({ connectionString: baseUrl });
+  await cleanup.connect();
+  try { await cleanup.query(`DROP DATABASE IF EXISTS ${name}`); } finally { await cleanup.end(); }
+}
+try {
+  execFileSync(process.execPath, ['scripts/migrate.mjs'], { cwd: fileURLToPath(new URL('../..', import.meta.url)),
+    env: { ...process.env, DATABASE_URL: target.toString() }, stdio: 'ignore' });
+} catch (error) { await dropDatabase(); throw error; }
+const pool = new pg.Pool({ connectionString: target.toString(), max: 6 });
+// Watches the worker's sessions from outside: no embedding call may find one in a transaction.
+const monitor = new pg.Client({ connectionString: target.toString() });
+await monitor.connect();
+test.after(async () => { await monitor.end(); await pool.end(); await dropDatabase(); });
+
+const authority = new PostgresAuthority(pool, 3600);
+const outbox = new PostgresOutbox(pool, authority);
+const digest = value => createHash('sha256').update(value).digest('hex');
+const due = table => pool.query(`UPDATE ${table} SET available_at=clock_timestamp()-interval '1 second'
+  WHERE delivery_state${table === 'retrieval_outbox' ? "='pending'" : "<>'delivered' AND dead_lettered_at IS NULL"}`);
+
+/**
+ * A deterministic embedder that records every input it returned an
+ * embedding for and, at each call, whether any session of the test database
+ * was inside a transaction. `before(call, signal)` runs at the start of each
+ * call (numbered from 1); `down` fails every call and `failFirst` the first
+ * n; `delayMs` waits, giving up on the signal unless `stubborn`.
+ */
+class Spy extends DeterministicEmbedder {
+  constructor(profile = {}, behavior = {}) {
+    super({ embedder: 'local-hash', model: 'feature-hash', modelVersion: '1', region: 'eu-west', ...profile });
+    this.inputs = [];
+    this.inTransaction = [];
+    this.behavior = behavior;
+  }
+  async embed(texts, signal) {
+    const open = (await monitor.query(`SELECT count(*)::int AS open FROM pg_stat_activity WHERE datname=current_database()
+      AND state LIKE 'idle in transaction%' AND pid<>pg_backend_pid()`)).rows[0].open;
+    this.inTransaction.push(open);
+    const call = this.inTransaction.length;
+    await this.behavior.before?.(call, signal);
+    if (this.behavior.down || call <= (this.behavior.failFirst ?? 0)) throw new EmbedderUnavailableError('provider unreachable');
+    // Like a fetch with the signal, a slow call gives up when it aborts.
+    if (this.behavior.delayMs) await new Promise((resolve, reject) => {
+      if (!this.behavior.stubborn && signal.aborted) { reject(new EmbedderUnavailableError('aborted')); return; }
+      const timer = setTimeout(resolve, this.behavior.delayMs);
+      if (!this.behavior.stubborn) signal.addEventListener('abort', () => { clearTimeout(timer); reject(new EmbedderUnavailableError('aborted')); }, { once: true });
+    });
+    await this.behavior.gate?.();
+    const vectors = await super.embed(texts, signal);
+    this.inputs.push(...texts);
+    return vectors;
+  }
+}
+/** Wait for `signal` to abort, then give up as a fetch with that signal would. */
+const untilAborted = signal => new Promise((_, reject) => {
+  const abort = () => reject(new EmbedderUnavailableError('aborted'));
+  if (signal.aborted) abort(); else signal.addEventListener('abort', abort, { once: true });
+});
+/** Poll until `count` sessions wait on a lock in a statement containing `text`. */
+async function waitingOnLock(text, count = 1) {
+  for (let tries = 0; ; tries++) {
+    const waiting = (await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname=current_database()
+      AND wait_event_type='Lock' AND position($1 in query)>0`, [text])).rows[0].n;
+    if (waiting >= count) return;
+    assert.ok(tries < 400, `no session waited on a lock in ${text}`);
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+}
+const identity = spy => [spy.profile.embedder, spy.profile.model, spy.profile.modelVersion, spy.profile.dimensions];
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+/**
+ * Sessions of `base` whose statements matching `match` reply `ms` late (the
+ * statement itself runs at once); every statement sent is logged with its
+ * time, and every release with whether the session was discarded.
+ */
+function stalling(match, ms, base = pool) {
+  const log = [];
+  const released = [];
+  return { log, released, connect: async () => {
+    const client = await base.connect();
+    const { query, release } = client;
+    client.query = async function (sql, ...rest) {
+      log.push({ at: Date.now(), sql });
+      const result = await query.call(this, sql, ...rest);
+      if (typeof sql === 'string' && match.test(sql)) await sleep(ms);
+      return result;
+    };
+    client.release = function (...args) {
+      released.push(args[0] === true || args[0] instanceof Error);
+      client.query = query; client.release = release;
+      return release.apply(this, args);
+    };
+    return client;
+  } };
+}
+
+async function space() {
+  await pool.query("UPDATE projection_outbox SET delivery_state='delivered',available_at=clock_timestamp() WHERE delivery_state<>'delivered'");
+  await pool.query("UPDATE retrieval_outbox SET delivery_state='delivered',delivered_at=clock_timestamp() WHERE delivery_state='pending'");
+  const spaceId = `sp_${randomUUID()}`;
+  const collectionId = 'alpha';
+  await pool.query(`BEGIN;
+    INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id) VALUES('${spaceId}','owner','cell-a','cell-a','target-a');
+    INSERT INTO collections(space_id,collection_id) VALUES('${spaceId}','${collectionId}');
+    INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition) VALUES('${spaceId}','${collectionId}',1,'{}');
+    COMMIT`);
+  const scope = { spaceId, collectionId, principalId: 'owner', credentialId: 'owner-session', capability: 'records:write',
+    policyVersion: 1, placementGeneration: 1 };
+  return { spaceId, collectionId, scope };
+}
+
+async function policy(spaceId, version, fields = {}) {
+  const p = { recordFields: ['/title'], sourceContent: true, claimStatements: true, lexical: true, vector: true,
+    regions: ['eu-west'], ...fields };
+  await pool.query(`INSERT INTO retrieval_policies(space_id,collection_id,version,record_fields,source_content,claim_statements,
+      lexical,vector,text_search_config,processing_regions,credential_id) VALUES($1,'alpha',$2,$3,$4,$5,$6,$7,'english',$8,'owner')`,
+  [spaceId, version, p.recordFields, p.sourceContent, p.claimStatements, p.lexical, p.vector, p.regions]);
+}
+async function generation(spaceId, number, policyVersion, model = null, state = 'active') {
+  const [embedder, modelName, version, dimensions] = model ?? [null, null, null, null];
+  await pool.query(`INSERT INTO projection_generations(space_id,collection_id,generation,policy_version,embedder,embedding_model,
+    model_version,dimensions) VALUES($1,'alpha',$2,$3,$4,$5,$6,$7)`, [spaceId, number, policyVersion, embedder, modelName, version, dimensions]);
+  for (const next of state === 'active' ? ['verifying', 'active'] : []) await pool.query(`UPDATE projection_generations SET state=$3
+    WHERE space_id=$1 AND collection_id='alpha' AND generation=$2`, [spaceId, number, next]);
+}
+
+function write(scope, operation, data, extras = {}) {
+  const key = randomUUID();
+  const complete = operation === 'replace' ? { unique: [], indexes: [], ...extras } : extras;
+  return authority.mutate(scope, { operation, idempotencyKey: key, requestDigest: digest(key),
+    ...(data === undefined ? {} : { canonicalData: data }), ...complete });
+}
+/** Lease every due record event (making every undelivered one due first, unless `makeDue` is false) and return its hints in revision order. */
+async function hints(makeDue = true) {
+  if (makeDue) await due('projection_outbox');
+  const sent = [];
+  await dispatch(outbox, { send: async messages => { sent.push(...messages); } });
+  const revisions = new Map((await pool.query('SELECT event_id,revision FROM projection_outbox WHERE event_id=ANY($1)',
+    [sent.map(message => message.eventId)])).rows.map(row => [row.event_id, Number(row.revision)]));
+  return sent.sort((a, b) => revisions.get(a.eventId) - revisions.get(b.eventId));
+}
+const deliver = (messages, projector) => consume(messages, message => outbox.process(message, projector), 1);
+
+/** Every projection row of one Ref, per generation. */
+async function projected(spaceId, kind, id) {
+  const refs = (await pool.query(`SELECT generation,revision,extraction_version,deleted FROM projection_refs
+    WHERE space_id=$1 AND ref_kind=$2 AND ref_id=$3 ORDER BY generation`, [spaceId, kind, id])).rows
+    .map(row => ({ generation: Number(row.generation), revision: Number(row.revision),
+      extraction: row.extraction_version === null ? null : Number(row.extraction_version), deleted: row.deleted }));
+  const lexical = (await pool.query(`SELECT generation,revision,chunk_index,field,content FROM lexical_chunks
+    WHERE space_id=$1 AND ref_kind=$2 AND ref_id=$3 ORDER BY generation,chunk_index`, [spaceId, kind, id])).rows
+    .map(row => [Number(row.generation), Number(row.revision), row.field, row.content]);
+  const vector = (await pool.query(`SELECT generation,revision,processing_region,content_sha256 FROM vector_chunks
+    WHERE space_id=$1 AND ref_kind=$2 AND ref_id=$3 ORDER BY generation,chunk_index`, [spaceId, kind, id])).rows
+    .map(row => [Number(row.generation), Number(row.revision), row.processing_region, row.content_sha256]);
+  const checkpoints = Number((await pool.query(`SELECT count(*) FROM embedding_checkpoints WHERE space_id=$1 AND ref_kind=$2
+    AND ref_id=$3`, [spaceId, kind, id])).rows[0].count);
+  const receipts = (await pool.query(`SELECT generation,revision,chunks_removed FROM projection_deletion_receipts
+    WHERE space_id=$1 AND ref_kind=$2 AND ref_id=$3 ORDER BY generation`, [spaceId, kind, id])).rows
+    .map(row => [Number(row.generation), Number(row.revision), row.chunks_removed]);
+  return { refs, lexical, vector, checkpoints, receipts };
+}
+
+/** A source with one extraction and a claim, written as their services do; their triggers enqueue retrieval work. */
+async function evidence(spaceId, { extraction = 'The bridge opened in 1932 after four years.', statement = 'The bridge opened in 1932.' } = {}) {
+  const db = await pool.connect();
+  try {
+    await db.query('BEGIN');
+    await insertEvidence(db, spaceId, extraction, statement);
+    await db.query('COMMIT');
+  } catch (error) { await db.query('ROLLBACK'); throw error; }
+  finally { db.release(); }
+}
+async function insertEvidence(db, spaceId, extraction, statement) {
+  await db.query(`INSERT INTO entity_refs(space_id,collection_id,kind,entity_id) VALUES($1,'alpha','source','src_1'),($1,'alpha','claim','clm_1')`,
+    [spaceId]);
+  await db.query(`INSERT INTO sources(space_id,collection_id,source_id,locator,principal_id,credential_id)
+    VALUES($1,'alpha','src_1','https://example.invalid/report','owner','owner-session')`, [spaceId]);
+  await db.query(`INSERT INTO original_objects(space_id,collection_id,source_id,reference_only,sha256,byte_size,mime_type,captured_at,object_key)
+    VALUES($1,'alpha','src_1',false,$2,14,'text/plain',clock_timestamp()-interval '1 minute','originals/src_1')`, [spaceId, digest('original bytes')]);
+  await extract(spaceId, 1, extraction, db);
+  await db.query(`INSERT INTO claims(space_id,collection_id,claim_id,principal_id,credential_id) VALUES($1,'alpha','clm_1','owner','owner-session')`,
+    [spaceId]);
+  await revise(spaceId, 1, statement, false, db);
+}
+const extract = (spaceId, version, content, db = pool) => db.query(`INSERT INTO extraction_versions(space_id,collection_id,source_id,version,
+  source_sha256,parser,parser_version,content,credential_id) VALUES($1,'alpha','src_1',$2,$3,'text','1',$4,'owner-session')`,
+[spaceId, version, digest('original bytes'), content]);
+async function revise(spaceId, revision, statement, reviewed = false, db = pool) {
+  await db.query(`INSERT INTO claim_revisions(space_id,collection_id,claim_id,revision,statement,attributed_to,credential_id,
+      recorded_by,review_status,reviewed_by,reviewed_at)
+    VALUES($1,'alpha','clm_1',$2,$3,'principal:owner','owner-session','owner',$4,$5,$6)`,
+  [spaceId, revision, statement, reviewed ? 'accepted' : 'unreviewed', reviewed ? 'owner' : null, reviewed ? new Date() : null]);
+  if (revision > 1) await pool.query(`UPDATE entity_refs SET revision=$2 WHERE space_id=$1 AND kind='claim' AND entity_id='clm_1'`,
+    [spaceId, revision]);
+}
+// As the services do: a source's extraction writers and its deletion hold
+// its extraction lock, and a deletion tombstones the Ref at its revision.
+const extractionLock = (db, spaceId) => db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',
+  [JSON.stringify(['stateplane:extraction', spaceId, 'alpha', 'src_1'])]);
+async function serviceTransaction(work) {
+  const db = await pool.connect();
+  try { await db.query('BEGIN'); await work(db); await db.query('COMMIT'); }
+  catch (error) { await db.query('ROLLBACK'); throw error; }
+  finally { db.release(); }
+}
+const deleteEvidence = (spaceId, kind, id) => serviceTransaction(async db => {
+  if (kind === 'source') await extractionLock(db, spaceId);
+  await db.query(`UPDATE entity_refs SET tombstone=true WHERE space_id=$1 AND kind=$2 AND entity_id=$3 AND NOT tombstone`,
+    [spaceId, kind, id]);
+});
+const extractLocked = (spaceId, version, content) => serviceTransaction(async db => {
+  await extractionLock(db, spaceId);
+  await extract(spaceId, version, content, db);
+});
+const work = async spaceId => (await pool.query(`SELECT ref_kind,ref_id,revision,operation,delivery_state,attempts,last_error,
+  available_at>clock_timestamp() AS waiting FROM retrieval_outbox WHERE space_id=$1 ORDER BY enqueued_at,job_id`, [spaceId])).rows;
+
+test('records project only configured fields into every generation, embedding outside any transaction', async () => {
+  const { spaceId, scope } = await space();
+  const spy = new Spy();
+  // Generation 1 is lexical only under policy 1; generation 2 is being built with vectors under policy 2.
+  await policy(spaceId, 1, { vector: false, regions: [] });
+  await generation(spaceId, 1, 1);
+  await policy(spaceId, 2, { recordFields: ['/title', '/body'] });
+  await generation(spaceId, 2, 2, identity(spy), 'building');
+  const projector = new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([spy]) });
+  const created = await write(scope, 'create', JSON.stringify({ body: 'Opened to traffic in 1932.', secret: 'do-not-index',
+    title: 'Bridge opening' }));
+  assert.deepEqual(await deliver(await hints(), projector), ['applied']);
+  const view = await projected(spaceId, 'record', created.ref.id);
+  assert.deepEqual(view.refs, [{ generation: 1, revision: 1, extraction: null, deleted: false },
+    { generation: 2, revision: 1, extraction: null, deleted: false }]);
+  assert.deepEqual(view.lexical, [[1, 1, '/title', 'Bridge opening'], [2, 1, '/title', 'Bridge opening'],
+    [2, 1, '/body', 'Opened to traffic in 1932.']]);
+  assert.deepEqual(view.vector, [[2, 1, 'eu-west', digest('Bridge opening')], [2, 1, 'eu-west', digest('Opened to traffic in 1932.')]]);
+  assert.equal(view.checkpoints, 0, 'applied checkpoints are removed');
+  assert.deepEqual(spy.inputs, ['Bridge opening', 'Opened to traffic in 1932.'], 'only configured fields reach the embedder');
+  assert.ok(spy.inTransaction.length > 0 && spy.inTransaction.every(open => open === 0), 'no session was in a transaction');
+  const leaked = (await pool.query(`SELECT count(*)::int AS n FROM lexical_chunks WHERE space_id=$1 AND content LIKE '%do-not-index%'`,
+    [spaceId])).rows[0].n;
+  assert.equal(leaked, 0);
+  const tsv = (await pool.query(`SELECT count(*)::int AS n FROM lexical_chunks WHERE space_id=$1 AND tsv @@ to_tsquery('english','traffic')`,
+    [spaceId])).rows[0].n;
+  assert.equal(tsv, 1);
+});
+
+test('reordered, duplicate and deleted record deliveries cannot activate stale content in any generation', async () => {
+  const { spaceId, scope } = await space();
+  const spy = new Spy();
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(spy));
+  const projector = new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([spy]) });
+  const created = await write(scope, 'create', '{"title":"first draft"}');
+  await write(scope, 'replace', '{"title":"second draft"}', { recordId: created.ref.id, expectedRevision: 1 });
+  const [first, second] = await hints();
+  // The newer revision arrives first; the older one is then superseded and never prepared.
+  assert.deepEqual(await deliver([second, first, second], projector), ['applied', 'superseded', 'lost']);
+  assert.deepEqual((await projected(spaceId, 'record', created.ref.id)).lexical, [[1, 2, '/title', 'second draft']]);
+  assert.deepEqual(spy.inputs, ['second draft']);
+
+  await write(scope, 'delete', undefined, { recordId: created.ref.id, expectedRevision: 2 });
+  assert.deepEqual(await deliver(await hints(), projector), ['applied']);
+  const deleted = await projected(spaceId, 'record', created.ref.id);
+  assert.deepEqual(deleted.refs, [{ generation: 1, revision: 3, extraction: null, deleted: true }]);
+  assert.deepEqual([deleted.lexical, deleted.vector, deleted.checkpoints, deleted.receipts], [[], [], 0, [[1, 3, 2]]]);
+
+  // Even an apply that slipped past the outbox's latest-revision fence cannot
+  // bring the deleted Ref back: the generation keeps it deleted.
+  // Its own last check, that the record still holds revision 2, refuses it
+  // too; what it wrote before that check is committed here regardless.
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await assert.rejects(projector.apply({ ref: { spaceId, collectionId: 'alpha', ...created.ref }, revision: 2, generation: 1, deleted: false,
+      canonicalData: '{"title":"second draft"}' }, undefined, (sql, values) => client.query(sql, values)), { code: 'PROJECTION_INCOMPLETE' });
+    await client.query('COMMIT');
+  } finally { client.release(); }
+  assert.deepEqual(await projected(spaceId, 'record', created.ref.id), deleted);
+});
+
+test('an embedder outage leaves exact reads and writes available, releases record work uncounted and reports degraded', async () => {
+  const { spaceId, scope, collectionId } = await space();
+  const spy = new Spy({}, { down: true });
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(spy));
+  const projector = new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([spy]) });
+  const worker = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([spy]) });
+  const created = await write(scope, 'create', '{"title":"outage"}');
+  for (let round = 0; round < 3; round++) assert.deepEqual(await deliver(await hints(), projector), ['retry']);
+  const row = (await pool.query('SELECT delivery_state,failures,last_error FROM projection_outbox WHERE space_id=$1', [spaceId])).rows[0];
+  assert.deepEqual(row, { delivery_state: 'pending', failures: 0, last_error: 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE' });
+  const status = await worker.status(spaceId, collectionId);
+  assert.equal(status.state, 'degraded');
+  assert.deepEqual(status.records, { pending: 0, degraded: 1, capped: false, lastError: 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE' });
+  assert.deepEqual(status.generations.map(entry => [entry.generation, entry.state, entry.embedderAvailable]), [[1, 'active', true]]);
+  // Authority is untouched by the outage: exact read and a conditional write succeed.
+  const read = await authority.transaction({ ...scope, capability: 'records:read' }, tx => tx.getRecord(created.ref.id));
+  assert.deepEqual([read.revision, read.canonicalData], [1, '{"title":"outage"}']);
+  await write(scope, 'replace', '{"title":"recovered"}', { recordId: created.ref.id, expectedRevision: 1 });
+  assert.equal((await projected(spaceId, 'record', created.ref.id)).lexical.length, 0, 'nothing was half applied');
+
+  spy.behavior.down = false;
+  const outcomes = await deliver(await hints(), projector);
+  assert.deepEqual(outcomes.sort(), ['applied', 'superseded']);
+  assert.deepEqual((await projected(spaceId, 'record', created.ref.id)).lexical, [[1, 2, '/title', 'recovered']]);
+  assert.equal((await worker.status(spaceId, collectionId)).state, 'current');
+});
+
+test('source and claim work projects current authority; reorders, duplicates and deletions never activate stale text', async () => {
+  const { spaceId, collectionId } = await space();
+  const spy = new Spy();
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(spy));
+  await evidence(spaceId);
+  const worker = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([spy]) });
+  assert.equal((await worker.status(spaceId, collectionId)).state, 'pending');
+  assert.deepEqual(await worker.step(), { claimed: 2, applied: 2, released: 0, lost: 0, retried: 0, unknown: 0 });
+  assert.deepEqual((await projected(spaceId, 'source', 'src_1')).lexical, [[1, 1, null, 'The bridge opened in 1932 after four years.']]);
+  assert.deepEqual((await projected(spaceId, 'claim', 'clm_1')).vector, [[1, 1, 'eu-west', digest('The bridge opened in 1932.')]]);
+  assert.ok(spy.inTransaction.every(open => open === 0));
+
+  // A review is a new revision with the same statement: its embedding is reused, not recomputed.
+  const calls = spy.calls.length;
+  await revise(spaceId, 2, 'The bridge opened in 1932.', true);
+  await worker.step();
+  assert.equal(spy.calls.length, calls);
+  assert.deepEqual((await projected(spaceId, 'claim', 'clm_1')).vector, [[1, 2, 'eu-west', digest('The bridge opened in 1932.')]]);
+
+  // A new extraction, a revision and the claim's deletion all commit before
+  // any delivery; the oldest item is made due last, the newest first.
+  await extractLocked(spaceId, 2, 'Corrected: the bridge opened in 1933.');
+  await revise(spaceId, 3, 'The bridge opened in 1933.');
+  await deleteEvidence(spaceId, 'claim', 'clm_1');
+  await pool.query(`UPDATE retrieval_outbox SET available_at=clock_timestamp()-(revision * interval '1 minute')
+    WHERE space_id=$1 AND delivery_state='pending'`, [spaceId]);
+  const before = spy.inputs.length;
+  assert.equal((await worker.step()).applied, 3);
+  assert.deepEqual(spy.inputs.slice(before), ['Corrected: the bridge opened in 1933.'], 'the deleted claim\'s new text is never embedded');
+  const claim = await projected(spaceId, 'claim', 'clm_1');
+  // The services tombstone a Ref at its revision; the receipt is at that same revision.
+  assert.deepEqual([claim.refs, claim.lexical, claim.vector, claim.checkpoints, claim.receipts],
+    [[{ generation: 1, revision: 3, extraction: null, deleted: true }], [], [], 0, [[1, 3, 2]]]);
+  assert.deepEqual((await projected(spaceId, 'source', 'src_1')).refs, [{ generation: 1, revision: 1, extraction: 2, deleted: false }]);
+  assert.ok((await work(spaceId)).every(row => row.delivery_state === 'delivered'));
+  assert.equal((await worker.status(spaceId, collectionId)).state, 'current');
+});
+
+test('an item whose Ref changes while it is prepared, or whose lease another worker took, cannot apply what it prepared', async () => {
+  const { spaceId } = await space();
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  let entered;
+  const preparing = new Promise(resolve => { entered = resolve; });
+  const slow = new Spy({}, { gate: async () => { entered(); await blocked; } });
+  await policy(spaceId, 1, { sourceContent: false });
+  await generation(spaceId, 1, 1, identity(slow));
+  await evidence(spaceId);
+  const first = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([slow]) });
+  const running = first.step({ budgetMs: 10_000 });
+  await preparing;
+  // While the first worker embeds revision 1, the claim is revised, and its lease is taken over after expiry.
+  await revise(spaceId, 2, 'Revised while embedding.');
+  await pool.query(`UPDATE retrieval_outbox SET available_at=clock_timestamp()-interval '1 second'
+    WHERE space_id=$1 AND ref_kind='claim' AND revision=1`, [spaceId]);
+  const fast = new Spy();
+  const second = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([fast]) });
+  const taken = await second.step();
+  assert.equal(taken.applied, 2, 'the second worker applies the current revision for both items');
+  release();
+  const late = await running;
+  assert.equal(late.lost + late.released, late.claimed - late.applied);
+  assert.equal(late.lost, 1, 'the expired lease cannot complete');
+  assert.deepEqual((await projected(spaceId, 'claim', 'clm_1')).lexical, [[1, 2, null, 'Revised while embedding.']]);
+  const claim = await projected(spaceId, 'claim', 'clm_1');
+  assert.deepEqual(claim.vector, [[1, 2, 'eu-west', digest('Revised while embedding.')]]);
+  assert.equal(claim.checkpoints, 0, 'the late preparation of revision 1 saved nothing');
+});
+
+test('embedding runs only in a region both policies allow; an embedder outage keeps evidence pending and degraded', async () => {
+  const { spaceId, collectionId } = await space();
+  const us = new Spy({ region: 'us-east', costPerMillionCodePoints: 0 });
+  const central = new Spy({ region: 'eu-central' });
+  const west = new Spy({ region: 'eu-west' }, { down: true });
+  await policy(spaceId, 1, { sourceContent: false, regions: ['eu-central', 'eu-west'] });
+  await generation(spaceId, 1, 1, identity(us));
+  await evidence(spaceId, { statement: 'Regional statement.' });
+  const registry = new EmbeddingRegistry([us, central, west]);
+  const worker = new PostgresRetrievalWorker(pool, { embedders: registry });
+  await worker.step();
+  assert.deepEqual([us.inputs, central.inputs], [[], ['Regional statement.']], 'the cheaper US embedder is never used');
+
+  // Policy 2 narrows processing to eu-west, whose embedder is down: the next
+  // revision is never sent to eu-central, and stays pending and degraded.
+  await policy(spaceId, 2, { sourceContent: false, regions: ['eu-west'] });
+  await revise(spaceId, 2, 'Narrowed statement.');
+  const outage = await worker.step();
+  assert.deepEqual([outage.retried, central.inputs.length, west.inTransaction.length > 0], [1, 1, true]);
+  const [, , pending] = await work(spaceId);
+  assert.deepEqual([pending.delivery_state, pending.last_error, pending.waiting], ['pending', 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE', true]);
+  const status = await worker.status(spaceId, collectionId);
+  assert.deepEqual([status.state, status.evidence.degraded, status.evidence.lastError],
+    ['degraded', 1, 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE']);
+  assert.deepEqual((await projected(spaceId, 'claim', 'clm_1')).lexical, [[1, 1, null, 'Regional statement.']],
+    'the generation keeps the older revision, which a search rereads at authority');
+
+  // With no configured embedder in an allowed region, status says so before any call.
+  const unconfigured = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([us, central]) });
+  assert.equal((await unconfigured.status(spaceId, collectionId)).generations[0].embedderAvailable, false);
+
+  west.behavior.down = false;
+  await due('retrieval_outbox');
+  assert.equal((await worker.step()).applied, 1);
+  assert.deepEqual((await projected(spaceId, 'claim', 'clm_1')).vector, [[1, 2, 'eu-west', digest('Narrowed statement.')]]);
+  assert.equal((await worker.status(spaceId, collectionId)).state, 'current');
+});
+
+test('preparation stopped by its budget keeps its checkpoints and resumes without embedding them again', async () => {
+  const { spaceId } = await space();
+  // One chunk per call; every third call is still in flight when the
+  // preparation budget ends and gives up on its signal, so each attempt saves
+  // exactly two chunks and the call cut short returns nothing.
+  const slow = new Spy({ maxBatch: 1 }, { before: (call, signal) => call % 3 === 0 ? untilAborted(signal) : undefined });
+  await policy(spaceId, 1, { claimStatements: false, lexical: false });
+  await generation(spaceId, 1, 1, identity(slow));
+  const words = Array.from({ length: 1_000 }, (_, i) => `w${i}`).join(' ');
+  await evidence(spaceId, { extraction: words });
+  const worker = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([slow]), prepareMs: 1_000 });
+  const result = await worker.step({ budgetMs: 20_000 });
+  const [source] = await work(spaceId);
+  assert.deepEqual([source.delivery_state, source.last_error], ['delivered', null]);
+  const done = await projected(spaceId, 'source', 'src_1');
+  const chunks = done.vector.length;
+  assert.ok(chunks > 4, `${chunks} chunks`);
+  // Each interrupted attempt was released at once, without an error, and the next resumed from its checkpoints.
+  assert.equal(result.retried, Math.ceil(chunks / 2) - 1, JSON.stringify(result));
+  assert.equal(source.attempts, result.retried + 1);
+  assert.deepEqual(slow.inputs.toSorted(), [...new Set(slow.inputs)].toSorted(), 'each chunk was embedded once');
+  assert.equal(slow.inputs.length, chunks);
+  assert.equal(done.checkpoints, 0);
+});
+
+test('the cell role projects records and evidence with only its base grants and db:grant-retrieval', async () => {
+  const { spaceId, scope } = await space();
+  const spy = new Spy();
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(spy));
+  await evidence(spaceId);
+  const created = await write(scope, 'create', '{"title":"Granted"}');
+  const retrievalTables = ['retrieval_policies', 'retrieval_collection_heads', 'vector_index_strategies', 'projection_generations',
+    'projection_refs', 'projection_deletion_receipts', 'lexical_chunks', 'vector_chunks', 'embedding_checkpoints', 'retrieval_outbox',
+    'retrieval_dispatch_checkpoint'];
+  const role = `sta45_cell_${randomUUID().replaceAll('-', '')}`;
+  await pool.query(`CREATE ROLE ${role} NOLOGIN`);
+  const cellPool = new pg.Pool({ connectionString: target.toString(), max: 2, options: `-c role=${role}` });
+  // Routines PUBLIC may execute now, so exactly those are granted back afterwards.
+  const publicRoutines = (await pool.query(`SELECT p.oid::regprocedure::text AS routine FROM pg_proc p
+    WHERE p.pronamespace='public'::regnamespace AND (p.proacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) a
+      WHERE a.grantee=0 AND a.privilege_type='EXECUTE'))`)).rows.map(row => row.routine);
+  try {
+    await pool.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${role}`);
+    await pool.query(`REVOKE ALL ON ${retrievalTables.join(',')} FROM ${role}`);
+    await pool.query('REVOKE EXECUTE ON ALL ROUTINES IN SCHEMA public FROM PUBLIC');
+    execFileSync(process.execPath, ['scripts/grant-retrieval.mjs'], { cwd: fileURLToPath(new URL('../..', import.meta.url)),
+      stdio: 'pipe', env: { ...process.env, STATEPLANE_CELL_ADMIN_URL: target.toString(), STATEPLANE_CELL_ROLE: role } });
+    const registry = new EmbeddingRegistry([spy]);
+    const worker = new PostgresRetrievalWorker(cellPool, { embedders: registry });
+    assert.equal((await worker.step()).applied, 2);
+    const cellOutbox = new PostgresOutbox(cellPool, new PostgresAuthority(cellPool, 3600));
+    const projector = new RecordRetrievalProjector(cellPool, { embedders: registry });
+    assert.deepEqual(await consume(await hints(), message => cellOutbox.process(message, projector), 1), ['applied']);
+    await deleteEvidence(spaceId, 'claim', 'clm_1');
+    assert.equal((await worker.step()).applied, 1);
+    assert.equal((await worker.status(spaceId, 'alpha')).state, 'current');
+  } finally {
+    await cellPool.end();
+    for (const routine of publicRoutines) await pool.query(`GRANT EXECUTE ON ROUTINE ${routine} TO PUBLIC`);
+    await pool.query(`DROP OWNED BY ${role}`);
+    await pool.query(`DROP ROLE ${role}`);
+  }
+  assert.equal((await projected(spaceId, 'record', created.ref.id)).vector.length, 1);
+  assert.equal((await projected(spaceId, 'source', 'src_1')).vector.length, 1);
+  assert.deepEqual((await projected(spaceId, 'claim', 'clm_1')).receipts, [[1, 1, 2]]);
+});
+
+test('a retired generation is never written, and a suspended space\'s work waits without failing', async () => {
+  const { spaceId, collectionId } = await space();
+  await policy(spaceId, 1, { vector: false, regions: [] });
+  await generation(spaceId, 1, 1);
+  await generation(spaceId, 2, 1, null, 'building');
+  await evidence(spaceId);
+  const worker = new PostgresRetrievalWorker(pool);
+  assert.equal((await worker.step()).applied, 2, 'lexical generations need no embedder');
+  await pool.query(`UPDATE projection_generations SET state='retired' WHERE space_id=$1 AND generation=1`, [spaceId]);
+  await revise(spaceId, 2, 'Second statement.');
+  await pool.query(`UPDATE spaces SET lifecycle='suspended' WHERE space_id=$1`, [spaceId]);
+  assert.deepEqual(await worker.step(), { claimed: 0, applied: 0, released: 0, lost: 0, retried: 0, unknown: 0 });
+  const [, , waiting] = await work(spaceId);
+  assert.deepEqual([waiting.delivery_state, waiting.attempts, waiting.last_error], ['pending', 0, null]);
+  await pool.query(`UPDATE spaces SET lifecycle='active' WHERE space_id=$1`, [spaceId]);
+  assert.equal((await worker.step()).applied, 1);
+  assert.deepEqual((await projected(spaceId, 'claim', 'clm_1')).lexical, [[1, 1, null, 'The bridge opened in 1932.'],
+    [2, 2, null, 'Second statement.']]);
+  assert.deepEqual((await worker.status(spaceId, collectionId)).generations.map(entry => [entry.generation, entry.state]), [[2, 'building']]);
+});
+
+test('one vector generation\'s outage or missing embedder never holds back the collection\'s other generations', async () => {
+  const { spaceId, scope, collectionId } = await space();
+  const spy = new Spy({}, { down: true });
+  // Generation 1 serves lexical only; generation 2 is being built with vectors.
+  await policy(spaceId, 1, { vector: false, regions: [] });
+  await generation(spaceId, 1, 1);
+  await policy(spaceId, 2);
+  await generation(spaceId, 2, 2, identity(spy), 'building');
+  await evidence(spaceId);
+  const created = await write(scope, 'create', '{"title":"Mixed generations"}');
+  const registry = new EmbeddingRegistry([spy]);
+  const projector = new RecordRetrievalProjector(pool, { embedders: registry });
+
+  // The record reaches generation 1 at once and stays due, uncounted, for generation 2.
+  assert.deepEqual(await deliver(await hints(), projector), ['retry']);
+  const record = await projected(spaceId, 'record', created.ref.id);
+  assert.deepEqual([record.lexical, record.vector], [[[1, 1, '/title', 'Mixed generations']], []]);
+  assert.deepEqual((await pool.query('SELECT delivery_state,failures,last_error FROM projection_outbox WHERE space_id=$1', [spaceId])).rows,
+    [{ delivery_state: 'pending', failures: 0, last_error: 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE' }]);
+
+  // Sources and claims under the jobs Worker's empty registry: generation 1
+  // applies; each item stays pending with an outage's backoff and error.
+  const unconfigured = new PostgresRetrievalWorker(pool);
+  const step = await unconfigured.step();
+  assert.deepEqual([step.claimed, step.applied, step.retried], [2, 0, 2]);
+  assert.deepEqual((await projected(spaceId, 'claim', 'clm_1')).lexical, [[1, 1, null, 'The bridge opened in 1932.']]);
+  assert.deepEqual((await projected(spaceId, 'source', 'src_1')).lexical, [[1, 1, null, 'The bridge opened in 1932 after four years.']]);
+  for (const row of await work(spaceId)) assert.deepEqual([row.delivery_state, row.attempts, row.last_error, row.waiting],
+    ['pending', 1, 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE', true]);
+  const status = await unconfigured.status(spaceId, collectionId);
+  assert.equal(status.state, 'degraded');
+  assert.deepEqual(status.generations.map(entry => [entry.generation, entry.embedderAvailable]), [[1, null], [2, false]]);
+
+  // With the embedder configured and up, generation 2 catches up and nothing else changes.
+  spy.behavior.down = false;
+  await due('retrieval_outbox');
+  assert.equal((await new PostgresRetrievalWorker(pool, { embedders: registry }).step()).applied, 2);
+  assert.deepEqual(await deliver(await hints(), projector), ['applied']);
+  const caught = await projected(spaceId, 'record', created.ref.id);
+  assert.deepEqual([caught.lexical, caught.vector, caught.checkpoints], [[[1, 1, '/title', 'Mixed generations'],
+    [2, 1, '/title', 'Mixed generations']], [[2, 1, 'eu-west', digest('Mixed generations')]], 0]);
+  assert.deepEqual((await projected(spaceId, 'claim', 'clm_1')).vector, [[2, 1, 'eu-west', digest('The bridge opened in 1932.')]]);
+  assert.equal((await unconfigured.status(spaceId, collectionId)).state, 'degraded', 'still no embedder in this worker');
+  assert.equal((await new PostgresRetrievalWorker(pool, { embedders: registry }).status(spaceId, collectionId)).state, 'current');
+});
+
+test('a record string holding U+0000 projects as U+FFFD at the same offsets', async () => {
+  const { spaceId, scope } = await space();
+  const spy = new Spy();
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(spy));
+  const created = await write(scope, 'create', '{"title":"a\\u0000b c"}');
+  assert.deepEqual(await deliver(await hints(), new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([spy]) })),
+    ['applied']);
+  const view = await projected(spaceId, 'record', created.ref.id);
+  assert.deepEqual(view.lexical, [[1, 1, '/title', 'a\uFFFDb c']]);
+  assert.deepEqual(view.vector, [[1, 1, 'eu-west', digest('a\uFFFDb c')]]);
+  const [range] = (await pool.query('SELECT content_start,content_end FROM lexical_chunks WHERE space_id=$1', [spaceId])).rows;
+  assert.deepEqual([Number(range.content_start), Number(range.content_end)], [0, 5]);
+});
+
+test('a narrower processing policy committed during a call or between retries stops embedding in the removed region', async () => {
+  const words = Array.from({ length: 300 }, (_, i) => `w${i}`).join(' ');
+  const narrow = spaceId => policy(spaceId, 2, { claimStatements: false, regions: ['eu-central'] });
+
+  // During a call: one chunk per call, and the policy drops eu-west while the
+  // first is in flight. Its result is refused, no later batch goes to eu-west,
+  // and the work runs again at once in eu-central, without an error of its own.
+  const first = await space();
+  const west = new Spy({ maxBatch: 1 }, { before: async call => { if (call === 1) await narrow(first.spaceId); } });
+  const central = new Spy({ maxBatch: 1, region: 'eu-central' });
+  await policy(first.spaceId, 1, { claimStatements: false, regions: ['eu-west', 'eu-central'] });
+  await generation(first.spaceId, 1, 1, identity(west));
+  await evidence(first.spaceId, { extraction: words });
+  const worker = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([west, central]) });
+  assert.ok((await worker.step()).applied >= 1);
+  assert.equal(west.inTransaction.length, 1, 'no call to eu-west after the narrowing committed');
+  const source = await projected(first.spaceId, 'source', 'src_1');
+  assert.ok(source.vector.length >= 2 && source.vector.every(([, , region]) => region === 'eu-central'));
+  assert.equal(source.checkpoints, 0);
+  assert.deepEqual((await work(first.spaceId)).map(row => [row.ref_kind, row.delivery_state, row.last_error]),
+    [['source', 'delivered', null], ['claim', 'delivered', null]]);
+
+  // Between retries: the first call fails as an outage while the policy narrows; the retry never calls.
+  const second = await space();
+  const flaky = new Spy({}, { failFirst: 1, before: async call => { if (call === 1) await narrow(second.spaceId); } });
+  await policy(second.spaceId, 1, { claimStatements: false, regions: ['eu-west', 'eu-central'] });
+  await generation(second.spaceId, 1, 1, identity(flaky));
+  await evidence(second.spaceId, { extraction: 'Short extraction.' });
+  await new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([flaky]) }).step();
+  assert.equal(flaky.inTransaction.length, 1, 'the retry rechecked the policy and did not call');
+  const [pending] = await work(second.spaceId);
+  assert.deepEqual([pending.delivery_state, pending.last_error], ['pending', 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE']);
+});
+
+test('a step out of time releases unstarted items without spending attempts, and a slow embedder at its tail is an outage', async () => {
+  const { spaceId } = await space();
+  // Ignores its signal, as a provider call that cannot be cancelled would.
+  const stubborn = new Spy({}, { delayMs: 1_500, stubborn: true });
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(stubborn));
+  await evidence(spaceId);
+  const worker = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([stubborn]) });
+  const began = Date.now();
+  // The first item starts with about 1.2 s; preparation gets half and its
+  // grace a quarter, so it ends as an outage before the item's own budget.
+  const result = await worker.step({ budgetMs: 1_200 });
+  assert.ok(Date.now() - began < 1_600, 'the step ended within its budget');
+  assert.deepEqual(result, { claimed: 2, applied: 0, released: 1, lost: 0, retried: 1, unknown: 0 });
+  const rows = (await pool.query(`SELECT ref_kind,attempts,last_error,available_at>clock_timestamp() AS waiting,
+      available_at<=clock_timestamp()+interval '5 seconds' AS outage_backoff
+    FROM retrieval_outbox WHERE space_id=$1 ORDER BY enqueued_at,job_id`, [spaceId])).rows;
+  assert.deepEqual(rows, [
+    { ref_kind: 'source', attempts: 1, last_error: 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE', waiting: true, outage_backoff: true },
+    { ref_kind: 'claim', attempts: 0, last_error: null, waiting: false, outage_backoff: true }]);
+  // Let the abandoned call finish before the next test.
+  await new Promise(resolve => setTimeout(resolve, 1_700));
+});
+
+test('a late record or extraction preparation leaves no checkpoints once a newer revision is applied', async () => {
+  const { spaceId, scope } = await space();
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let entered;
+  const embedding = new Promise(resolve => { entered = resolve; });
+  const slow = new Spy({}, { before: async () => { entered(); await gate; } });
+  const fast = new Spy();
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(slow));
+  const created = await write(scope, 'create', '{"title":"first"}');
+  const late = deliver(await hints(), new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([slow]) }));
+  await embedding;
+  await write(scope, 'replace', '{"title":"second"}', { recordId: created.ref.id, expectedRevision: 1 });
+  // Only the new revision's event is dispatched; revision 1 keeps its lease.
+  assert.deepEqual(await deliver(await hints(false), new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([fast]) })),
+    ['applied']);
+  release();
+  assert.deepEqual(await late, ['superseded']);
+  const record = await projected(spaceId, 'record', created.ref.id);
+  assert.deepEqual([record.vector, record.checkpoints], [[[1, 2, 'eu-west', digest('second')]], 0]);
+
+  // The same for a source extraction prepared while a newer one is applied.
+  const evidenceSpace = await space();
+  let open;
+  const extractionGate = new Promise(resolve => { open = resolve; });
+  let started;
+  const extracting = new Promise(resolve => { started = resolve; });
+  const slowSource = new Spy({}, { before: async () => { started(); await extractionGate; } });
+  await policy(evidenceSpace.spaceId, 1, { claimStatements: false });
+  await generation(evidenceSpace.spaceId, 1, 1, identity(slowSource));
+  await evidence(evidenceSpace.spaceId);
+  const running = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([slowSource]) }).step();
+  await extracting;
+  await extractLocked(evidenceSpace.spaceId, 2, 'A newer extraction.');
+  await pool.query(`UPDATE retrieval_outbox SET available_at=clock_timestamp()-interval '1 second'
+    WHERE space_id=$1 AND ref_kind='source' AND extraction_version=1`, [evidenceSpace.spaceId]);
+  assert.ok((await new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([fast]) }).step()).applied >= 1);
+  open();
+  await running;
+  const source = await projected(evidenceSpace.spaceId, 'source', 'src_1');
+  assert.deepEqual([source.refs[0].extraction, source.vector, source.checkpoints], [2, [[1, 1, 'eu-west', digest('A newer extraction.')]], 0]);
+});
+
+/**
+ * Hold the item's apply after its reread of authority (on the generation
+ * lock, inside its 1 s lock wait), commit `change` meanwhile, keep the
+ * change's own work from being due, then let the apply continue.
+ */
+async function changeDuringApply(spaceId, worker, change) {
+  const blocker = await pool.connect();
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query('SELECT 1 FROM projection_generations WHERE space_id=$1 FOR UPDATE', [spaceId]);
+    const running = worker.step();
+    for (let tries = 0; ; tries++) {
+      const waiting = (await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname=current_database()
+        AND wait_event_type='Lock' AND query LIKE '%FROM projection_generations%'`)).rows[0].n;
+      if (waiting) break;
+      assert.ok(tries < 400, 'the apply never reached the generation lock');
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    await change();
+    await pool.query(`UPDATE retrieval_outbox SET available_at=clock_timestamp()+interval '1 hour'
+      WHERE space_id=$1 AND delivery_state='pending' AND attempts=0`, [spaceId]);
+    await blocker.query('ROLLBACK');
+    return await running;
+  } finally { blocker.release(); }
+}
+
+test('authority that changes between the item\'s reread and its commit is never projected over', async () => {
+  const cases = [
+    ['claim', 'a claim deletion', spaceId => deleteEvidence(spaceId, 'claim', 'clm_1'),
+      view => assert.deepEqual([view.refs, view.lexical, view.receipts], [[{ generation: 1, revision: 1, extraction: null, deleted: true }], [], [[1, 1, 0]]])],
+    ['claim', 'a claim revision', spaceId => revise(spaceId, 2, 'Revised during apply.'),
+      view => assert.deepEqual(view.lexical, [[1, 2, null, 'Revised during apply.']])],
+    ['source', 'a new extraction', spaceId => extractLocked(spaceId, 2, 'Extracted during apply.'),
+      view => assert.deepEqual([view.refs[0].extraction, view.lexical], [2, [[1, 1, null, 'Extracted during apply.']]])],
+    ['source', 'a source deletion', spaceId => deleteEvidence(spaceId, 'source', 'src_1'),
+      view => assert.deepEqual([view.refs, view.lexical, view.receipts], [[{ generation: 1, revision: 1, extraction: null, deleted: true }], [], [[1, 1, 0]]])],
+  ];
+  for (const [kind, label, change, expect] of cases) {
+    const { spaceId } = await space();
+    await policy(spaceId, 1, { vector: false, regions: [], sourceContent: kind === 'source', claimStatements: kind === 'claim' });
+    await generation(spaceId, 1, 1);
+    await evidence(spaceId);
+    // The other kind's item is not configured, so it applies without waiting.
+    const result = await changeDuringApply(spaceId, new PostgresRetrievalWorker(pool), () => change(spaceId));
+    assert.ok(result.released >= 1, `${label}: the stale apply rolled back (${JSON.stringify(result)})`);
+    expect(await projected(spaceId, kind, kind === 'claim' ? 'clm_1' : 'src_1'));
+  }
+});
+
+test('a record\'s fallback apply holds the scope fence: a suspension or placement fence it waited for leaves nothing applied', async () => {
+  for (const [label, change] of [['suspension', "lifecycle='suspended'"], ['placement fence', 'placement_generation=placement_generation+1']]) {
+    const { spaceId, scope } = await space();
+    // Generation 1 is lexical; generation 2 needs vectors and has no embedder, so preparation fails at once.
+    await policy(spaceId, 1, { vector: false, regions: [] });
+    await generation(spaceId, 1, 1);
+    await policy(spaceId, 2);
+    await generation(spaceId, 2, 2, identity(new Spy()), 'building');
+    const created = await write(scope, 'create', '{"title":"Fenced"}');
+    const messages = await hints();
+    const writer = await pool.connect();
+    try {
+      await writer.query('BEGIN');
+      await writer.query(`UPDATE spaces SET ${change} WHERE space_id=$1`, [spaceId]);
+      const delivered = deliver(messages, new RecordRetrievalProjector(pool));
+      // The fallback apply waits on the space row the change holds, then sees it committed.
+      await waitingOnLock('s.placement_generation=$3::bigint');
+      await writer.query('COMMIT');
+      assert.deepEqual(await delivered, ['released'], label);
+    } finally { writer.release(); }
+    const record = await projected(spaceId, 'record', created.ref.id);
+    assert.deepEqual([record.refs, record.lexical], [[], []], `${label}: nothing applied after the scope closed`);
+  }
+});
+
+test('a suspension or deletion committed during preparation stops further calls and saves nothing', async () => {
+  // Between retries: the first call fails as an outage while the space is suspended; the retry never calls.
+  const first = await space();
+  const suspend = () => pool.query(`UPDATE spaces SET lifecycle='suspended' WHERE space_id=$1`, [first.spaceId]);
+  const flaky = new Spy({}, { failFirst: 1, before: async call => { if (call === 1) await suspend(); } });
+  await policy(first.spaceId, 1, { claimStatements: false });
+  await generation(first.spaceId, 1, 1, identity(flaky));
+  await evidence(first.spaceId);
+  await new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([flaky]) }).step();
+  assert.equal(flaky.inTransaction.length, 1, 'no call after the suspension committed');
+  const [suspended] = await work(first.spaceId);
+  assert.deepEqual([suspended.delivery_state, suspended.last_error], ['pending', null], 'it waits, without an error of its own');
+  assert.equal((await projected(first.spaceId, 'source', 'src_1')).checkpoints, 0);
+
+  // Between batches: one chunk per call, and the space starts deletion during the first; nothing is saved or called after.
+  const second = await space();
+  const words = Array.from({ length: 600 }, (_, i) => `w${i}`).join(' ');
+  const spy = new Spy({ maxBatch: 1 }, { before: async call => {
+    if (call === 1) await pool.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1`, [second.spaceId]);
+  } });
+  await policy(second.spaceId, 1, { claimStatements: false });
+  await generation(second.spaceId, 1, 1, identity(spy));
+  await evidence(second.spaceId, { extraction: words });
+  await new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([spy]) }).step();
+  assert.equal(spy.inTransaction.length, 1, 'no call after the deletion committed');
+  const source = await projected(second.spaceId, 'source', 'src_1');
+  assert.deepEqual([source.vector, source.checkpoints], [[], 0]);
+
+  // A placement fence during the first batch: the attempt saves and calls nothing more and is released uncounted;
+  // the next attempt runs under the new placement and applies.
+  const third = await space();
+  const fence = () => pool.query('UPDATE spaces SET placement_generation=placement_generation+1 WHERE space_id=$1', [third.spaceId]);
+  const fenced = new Spy({ maxBatch: 1 }, { before: async call => { if (call === 1) await fence(); } });
+  await policy(third.spaceId, 1, { claimStatements: false });
+  await generation(third.spaceId, 1, 1, identity(fenced));
+  await evidence(third.spaceId, { extraction: words });
+  const step = await new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([fenced]) }).step();
+  assert.deepEqual([step.released, step.applied, step.retried], [1, 2, 0], JSON.stringify(step));
+  const placed = await projected(third.spaceId, 'source', 'src_1');
+  const chunks = new Set(fenced.inputs).size;
+  assert.ok(chunks > 1 && placed.vector.length === chunks, `${placed.vector.length} of ${chunks} chunks`);
+  assert.equal(fenced.inputs.length, chunks + 1, 'one call under the fenced placement, its result never saved');
+  const [moved] = await work(third.spaceId);
+  assert.deepEqual([moved.delivery_state, moved.attempts, moved.last_error], ['delivered', 2, null]);
+
+  // The same on a record delivery: no call after the fence, and completion releases it.
+  const fourth = await space();
+  const recordSpy = new Spy({ maxBatch: 1 }, { before: async call => {
+    if (call === 1) await pool.query('UPDATE spaces SET placement_generation=placement_generation+1 WHERE space_id=$1', [fourth.spaceId]);
+  } });
+  await policy(fourth.spaceId, 1);
+  await generation(fourth.spaceId, 1, 1, identity(recordSpy));
+  await write(fourth.scope, 'create', JSON.stringify({ title: words }));
+  assert.deepEqual(await deliver(await hints(), new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([recordSpy]) })),
+    ['released']);
+  assert.equal(recordSpy.inTransaction.length, 1, 'no call after the placement fence committed');
+});
+
+test('erasure that begins while an item is prepared succeeds, and the preparation writes nothing after it', async () => {
+  const { spaceId } = await space();
+  const locker = await pool.connect();
+  const purger = await pool.connect();
+  let hold = false;
+  let purge;
+  // During the call: deletion commits, and the purge starts and pauses on a
+  // lexical chunk this test holds, after it removed the space's checkpoints.
+  const spy = new Spy({}, { before: async () => {
+    if (!hold) return;
+    await pool.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1`, [spaceId]);
+    await locker.query('BEGIN');
+    await locker.query('SELECT 1 FROM lexical_chunks WHERE space_id=$1 FOR UPDATE', [spaceId]);
+    purge = purger.query('BEGIN').then(() => purger.query('SELECT stateplane_purge_space($1)', [spaceId]));
+    purge.catch(() => {});
+    await waitingOnLock('stateplane_purge_space');
+  } });
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(spy));
+  await evidence(spaceId);
+  const worker = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([spy]) });
+  try {
+    assert.equal((await worker.step()).applied, 2);
+    await extractLocked(spaceId, 2, 'A second extraction.');
+    hold = true;
+    await worker.step();
+    await locker.query('COMMIT');
+    await purge;
+    await purger.query('COMMIT');
+  } finally {
+    await locker.query('ROLLBACK').catch(() => {});
+    await purger.query('ROLLBACK').catch(() => {});
+    locker.release();
+    purger.release();
+  }
+  const left = (await pool.query(`SELECT (SELECT count(*) FROM embedding_checkpoints WHERE space_id=$1)::int AS checkpoints,
+    (SELECT count(*) FROM projection_refs WHERE space_id=$1)::int AS refs`, [spaceId])).rows[0];
+  assert.deepEqual(left, { checkpoints: 0, refs: 0 });
+});
+
+test('pairs with due work take turns across claims, steps and workers, however long another pair\'s backlog', async () => {
+  const spaces = [];
+  for (let i = 0; i < 3; i++) spaces.push((await space()).spaceId);
+  const [a, b, c] = spaces.toSorted();
+  for (const id of spaces) {
+    await policy(id, 1, { vector: false, regions: [] });
+    await generation(id, 1, 1);
+    await evidence(id);
+  }
+  // Two long backlogs: twelve claim revisions each, plus the source.
+  for (const id of [a, b]) for (let revision = 2; revision <= 12; revision++) await revise(id, revision, `Statement ${revision}.`);
+  const order = async since => (await pool.query(`SELECT space_id FROM retrieval_outbox WHERE space_id=ANY($1)
+    AND delivered_at>$2 ORDER BY delivered_at`, [spaces, since])).rows.map(row => row.space_id);
+  await pool.query('UPDATE retrieval_dispatch_checkpoint SET after_space_id=NULL,after_collection_id=NULL');
+  const options = { limit: 2, perPair: 1, pairs: 3 };
+  const start = new Date();
+  await new PostgresRetrievalWorker(pool).step(options);
+  const delivered = await order(start);
+  assert.equal(delivered.length, 13 + 13 + 2);
+  assert.deepEqual(delivered.slice(0, 6), [a, b, c, a, b, c], 'the short pair is served in turn, not after the backlogs');
+
+  // Another worker's step continues from the stored cursor.
+  for (const id of spaces) await revise(id, id === c ? 2 : 13, 'Later statement.');
+  await pool.query(`UPDATE retrieval_dispatch_checkpoint SET after_space_id=$1,after_collection_id='alpha'`, [b]);
+  const later = new Date();
+  await new PostgresRetrievalWorker(pool).step({ ...options, limit: 1 });
+  assert.deepEqual(await order(later), [c, a, b]);
+  assert.deepEqual((await pool.query('SELECT after_space_id,after_collection_id FROM retrieval_dispatch_checkpoint')).rows,
+    [{ after_space_id: b, after_collection_id: 'alpha' }]);
+});
+
+test('pairs whose claimed items never started keep their turn: the cursor moves back to the last pair that started', async () => {
+  const spaces = [];
+  for (let i = 0; i < 3; i++) spaces.push((await space()).spaceId);
+  const [a, b, c] = spaces.toSorted();
+  // The first pair's embedder waits for its signal; the others are healthy.
+  const hung = new Spy({ modelVersion: 'hung' }, { before: (call, signal) => untilAborted(signal) });
+  const healthy = new Spy({ modelVersion: 'healthy' });
+  for (const id of spaces) {
+    await policy(id, 1);
+    await generation(id, 1, 1, identity(id === a ? hung : healthy));
+    await evidence(id);
+  }
+  // A sustained due backlog in the hung pair.
+  for (let revision = 2; revision <= 6; revision++) await revise(a, revision, `Statement ${revision}.`);
+  const worker = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([hung, healthy]) });
+  const cursor = async () => (await pool.query('SELECT after_space_id FROM retrieval_dispatch_checkpoint')).rows[0].after_space_id;
+  const started = async () => (await pool.query(`SELECT space_id FROM retrieval_outbox WHERE space_id=ANY($1) AND attempts>0
+    OR space_id=ANY($1) AND delivery_state='delivered' GROUP BY space_id ORDER BY space_id`, [spaces])).rows.map(row => row.space_id);
+  await pool.query('UPDATE retrieval_dispatch_checkpoint SET after_space_id=NULL,after_collection_id=NULL');
+  const options = { budgetMs: 1_200, limit: 3, perPair: 1 };
+
+  // The hung pair's item spends the step; the other two are released and keep their turn.
+  const first = await worker.step(options);
+  assert.deepEqual([first.claimed, first.retried, first.released], [3, 1, 2]);
+  assert.deepEqual(await started(), [a]);
+  assert.equal(await cursor(), a, 'the cursor names only the pair whose item started');
+  assert.equal(healthy.inTransaction.length, 0);
+
+  // The next step serves them before the hung pair's backlog comes round again.
+  const second = await worker.step(options);
+  assert.equal(second.applied, 2);
+  assert.deepEqual(await started(), [a, b, c]);
+  assert.ok(healthy.inTransaction.length > 0);
+});
+
+test('a preparation that starts after a newer position without configured content applied records nothing and saves nothing', async () => {
+  // A record: revision 2 drops the only configured field and applies before revision 1's preparation begins.
+  const { spaceId, scope } = await space();
+  const spy = new Spy();
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(spy));
+  const projector = new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([spy]) });
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const late = { prepare: async (change, signal) => { entered(); await gate; return projector.prepare(change, signal); },
+    apply: (change, prepared, query) => projector.apply(change, prepared, query) };
+  const created = await write(scope, 'create', '{"title":"Removed later"}');
+  const running = deliver(await hints(), late);
+  await started;
+  await write(scope, 'replace', '{"note":"no title"}', { recordId: created.ref.id, expectedRevision: 1 });
+  assert.deepEqual(await deliver(await hints(false), projector), ['applied']);
+  release();
+  assert.deepEqual(await running, ['superseded']);
+  const record = await projected(spaceId, 'record', created.ref.id);
+  assert.deepEqual([record.refs, record.lexical, record.checkpoints],
+    [[{ generation: 1, revision: 2, extraction: null, deleted: false }], [], 0]);
+  assert.deepEqual(spy.inputs, [], 'the removed title was never embedded');
+
+  // A source: a whitespace-only extraction applies to generation 2 while
+  // extraction 1 is still being embedded for generation 1.
+  const second = await space();
+  let open;
+  const opened = new Promise(resolve => { open = resolve; });
+  let reached;
+  const embedding = new Promise(resolve => { reached = resolve; });
+  const slow = new Spy({}, { before: async () => { reached(); await opened; } });
+  const other = new Spy({ model: 'feature-hash-b' });
+  await policy(second.spaceId, 1, { claimStatements: false });
+  await generation(second.spaceId, 1, 1, identity(slow));
+  await generation(second.spaceId, 2, 1, identity(other), 'building');
+  await evidence(second.spaceId);
+  const running2 = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([slow, other]) }).step();
+  await embedding;
+  await extractLocked(second.spaceId, 2, '   ');
+  const fast = new EmbeddingRegistry([new Spy(), new Spy({ model: 'feature-hash-b' })]);
+  assert.equal((await new PostgresRetrievalWorker(pool, { embedders: fast }).step()).applied, 1);
+  open();
+  await running2;
+  const source = await projected(second.spaceId, 'source', 'src_1');
+  assert.deepEqual([source.refs.map(ref => [ref.generation, ref.extraction, ref.deleted]), source.lexical, source.vector, source.checkpoints],
+    [[[1, 2, false], [2, 2, false]], [], [], 0]);
+  assert.deepEqual(other.inputs, [], 'generation 2 never embedded the older extraction');
+});
+
+test('concurrent first applies of one Ref converge, neither counted as a failure', async () => {
+  const { spaceId } = await space();
+  await policy(spaceId, 1, { vector: false, regions: [], sourceContent: false });
+  await generation(spaceId, 1, 1);
+  await evidence(spaceId);
+  await revise(spaceId, 2, 'The second statement.');
+  // Only the two claim items are due; each worker takes one.
+  await pool.query(`UPDATE retrieval_outbox SET available_at=clock_timestamp()+interval '1 hour'
+    WHERE space_id=$1 AND ref_kind='source'`, [spaceId]);
+  const blocker = await pool.connect();
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query('SELECT 1 FROM projection_generations WHERE space_id=$1 FOR UPDATE', [spaceId]);
+    // perPair defaults to no more than the limit; an explicit one above it is refused.
+    await assert.rejects(new PostgresRetrievalWorker(pool).step({ limit: 1, perPair: 2 }), { code: 'INVALID_ARGUMENT' });
+    const options = { limit: 1 };
+    const runs = [new PostgresRetrievalWorker(pool).step(options), new PostgresRetrievalWorker(pool).step(options)];
+    await waitingOnLock('FROM projection_generations', 2);
+    await blocker.query('ROLLBACK');
+    assert.deepEqual((await Promise.all(runs)).map(result => result.applied), [1, 1]);
+  } finally { blocker.release(); }
+  assert.deepEqual((await work(spaceId)).filter(row => row.ref_kind === 'claim')
+    .map(row => [row.delivery_state, row.attempts, row.last_error]), [['delivered', 1, null], ['delivered', 1, null]]);
+  const claim = await projected(spaceId, 'claim', 'clm_1');
+  assert.deepEqual([claim.refs, claim.lexical], [[{ generation: 1, revision: 2, extraction: null, deleted: false }],
+    [[1, 2, null, 'The second statement.']]]);
+});
+
+test('a provider error that quotes the input is recorded only by its category, on record and evidence work', async () => {
+  const secret = 'Confidential bridge tender';
+  const { spaceId, scope, collectionId } = await space();
+  const quoting = new Spy({}, { before: () => { throw new Error(`model refused input: ${secret}`); } });
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(quoting));
+  await evidence(spaceId, { extraction: `${secret} opened.`, statement: `${secret} was signed.` });
+  const projector = new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([quoting]) });
+  const worker = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([quoting]) });
+  await write(scope, 'create', JSON.stringify({ title: secret }));
+  assert.deepEqual(await deliver(await hints(), projector), ['failed']);
+  await worker.step();
+  const failed = 'EmbedderFailedError: The embedder failed for this input';
+  const record = (await pool.query('SELECT failures,last_error FROM projection_outbox WHERE space_id=$1', [spaceId])).rows[0];
+  assert.deepEqual(record, { failures: 1, last_error: failed }, 'the input\'s own failure, without its text');
+  assert.deepEqual((await work(spaceId)).map(row => [row.ref_kind, row.delivery_state, row.last_error]),
+    [['source', 'pending', failed], ['claim', 'pending', failed]]);
+  const status = await worker.status(spaceId, collectionId);
+  assert.ok(!JSON.stringify(status).includes(secret), 'status discloses no input');
+
+  // A coded transient error from the provider is an outage, and keeps no text either.
+  quoting.behavior.before = () => { throw Object.assign(new Error(`socket reset sending ${secret}`), { code: 'ECONNRESET' }); };
+  await due('retrieval_outbox');
+  await worker.step();
+  assert.deepEqual((await work(spaceId)).map(row => row.last_error),
+    ['EmbedderUnavailableError EMBEDDER_UNAVAILABLE', 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE']);
+
+  // Other diagnostics stay within 1,024 UTF-8 bytes, cut on a code point.
+  const long = diagnostic(new Error('é'.repeat(2_000)));
+  assert.ok(Buffer.byteLength(long) <= 1_024 && Buffer.byteLength(long) > 1_020 && !long.includes('�'));
+});
+
+test('a bounded transaction issues nothing after its deadline, and an abort or deadline ends the statement in flight or the checkout', async () => {
+  await pool.query('CREATE TABLE IF NOT EXISTS deadline_probe(n integer)');
+  const log = [];
+  const logged = { connect: async () => {
+    const client = await pool.connect();
+    return { query: (sql, values) => { log.push({ at: Date.now(), sql }); return client.query(sql, values); },
+      release: discard => client.release(discard), on: (...args) => client.on(...args),
+      removeListener: (...args) => client.removeListener(...args) };
+  } };
+  const running = async sleep => (await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity
+    WHERE datname=current_database() AND state='active' AND query LIKE $1`, [`%pg_sleep(${sleep})%`])).rows[0].n;
+  const settled = async sleep => {
+    for (let tries = 0; await running(sleep); tries++) {
+      assert.ok(tries < 40, `pg_sleep(${sleep}) still running`);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  };
+
+  // Several statements, each shorter than the budget, together longer: none starts after the deadline.
+  const deadline = Date.now() + 200;
+  await assert.rejects(inTransaction(logged, async db => {
+    for (let n = 0; n < 10; n++) {
+      await db.query('INSERT INTO deadline_probe VALUES($1)', [n]);
+      await db.query('SELECT pg_sleep(0.04)');
+    }
+  }, { deadline }), DeadlineExceededError);
+  const ended = Date.now();
+  const late = log.filter(entry => entry.at >= deadline && entry.sql !== 'ROLLBACK');
+  assert.deepEqual(late, [], 'no statement after the deadline');
+  assert.ok(ended - deadline < 150, `rejected ${ended - deadline} ms after the deadline`);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM deadline_probe')).rows[0].n, 0, 'nothing committed');
+
+  // One statement longer than the time left is ended at the deadline, on the server too.
+  let started = Date.now();
+  await assert.rejects(inTransaction(logged, db => db.query('SELECT pg_sleep(3.1)'), { deadline: started + 150 }),
+    DeadlineExceededError);
+  assert.ok(Date.now() - started < 400, `${Date.now() - started} ms`);
+  await settled('3.1');
+
+  // An abort ends the statement in flight at once, well before its bound or the deadline, and cancels it.
+  const controller = new AbortController();
+  started = Date.now();
+  setTimeout(() => controller.abort(), 100);
+  await assert.rejects(inTransaction(logged, db => db.query('SELECT pg_sleep(3.2)'),
+    { deadline: started + 4_000, signal: controller.signal }), DeadlineExceededError);
+  assert.ok(Date.now() - started < 400, `${Date.now() - started} ms`);
+  await settled('3.2');
+
+  // A checkout slower than the budget rejects at the deadline, sends no BEGIN and returns the late session.
+  let returned = 0;
+  const slow = { connect: async () => {
+    await new Promise(resolve => setTimeout(resolve, 300));
+    const client = await logged.connect();
+    return { ...client, release: discard => { returned++; client.release(discard); } };
+  } };
+  log.length = 0;
+  started = Date.now();
+  await assert.rejects(inTransaction(slow, db => db.query('SELECT 1'), { deadline: started + 60 }), DeadlineExceededError);
+  assert.ok(Date.now() - started < 200, `${Date.now() - started} ms`);
+  await new Promise(resolve => setTimeout(resolve, 400));
+  assert.deepEqual([log.map(entry => entry.sql), returned], [[], 1], 'no BEGIN; the late session went back');
+
+  // A slow reply to BEGIN or to the setup is abandoned at the deadline, nothing more is sent, and the session is discarded.
+  for (const [label, match] of [['BEGIN', /^BEGIN$/], ['setup', /set_config/]]) {
+    const slowly = stalling(match, 400);
+    started = Date.now();
+    await assert.rejects(inTransaction(slowly, db => db.query('INSERT INTO deadline_probe VALUES(1)'), { deadline: started + 80 }),
+      DeadlineExceededError, label);
+    assert.ok(Date.now() - started < 250, `${label}: ${Date.now() - started} ms`);
+    await sleep(450);
+    assert.deepEqual(slowly.log.filter(entry => entry.at >= started + 80).map(entry => entry.sql), [], `${label}: nothing after the deadline`);
+    assert.deepEqual(slowly.released, [true], `${label}: the session was discarded`);
+  }
+  // A COMMIT whose reply the deadline cuts short has an unknown outcome.
+  const committing = stalling(/^COMMIT$/, 400);
+  started = Date.now();
+  await assert.rejects(inTransaction(committing, db => db.query('SELECT 1'), { deadline: started + 150 }),
+    error => error instanceof CommitOutcomeUnknownError && error.cause instanceof DeadlineExceededError);
+  assert.ok(Date.now() - started < 300, `COMMIT: ${Date.now() - started} ms`);
+  // The first release is the transaction's; a later one is the cancellation's own session.
+  assert.equal(committing.released[0], true);
+  // A ROLLBACK after the body's own error is abandoned at the deadline, and after it is not sent at all.
+  const rolling = stalling(/^ROLLBACK$/, 400);
+  started = Date.now();
+  await assert.rejects(inTransaction(rolling, async db => { await db.query('SELECT 1'); throw new Error('own'); },
+    { deadline: started + 150 }), /own/);
+  assert.ok(Date.now() - started < 300, `ROLLBACK: ${Date.now() - started} ms`);
+  const after = stalling(/^$/, 0);
+  started = Date.now();
+  await assert.rejects(inTransaction(after, async db => { await db.query('SELECT 1'); await sleep(150); throw new Error('own'); },
+    { deadline: started + 80 }), /own/);
+  assert.deepEqual([rolling.released[0], after.released, after.log.some(entry => entry.sql === 'ROLLBACK')], [true, [true], false]);
+  await pool.query('DROP TABLE deadline_probe');
+});
+
+test('preparation\'s transactions end with its budget: a stalled plan on a one-session pool writes nothing after the deadline', async () => {
+  const { spaceId, collectionId, scope } = await space();
+  const spy = new Spy();
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(spy));
+  const created = await write(scope, 'create', '{"title":"Stalled plan"}');
+  const single = new pg.Pool({ connectionString: target.toString(), max: 1 });
+  try {
+    // The plan's first read of the Ref sleeps on the server, holding the only session, the scope and generation locks.
+    let armed = true;
+    const stalled = { connect: async () => {
+      const client = await single.connect();
+      const { query, release } = client;
+      client.query = async function (sql, ...rest) {
+        if (armed && typeof sql === 'string' && sql.includes('FROM projection_refs WHERE') && sql.includes('FOR SHARE')) {
+          armed = false;
+          await query.call(this, 'SELECT pg_sleep(1.5)');
+        }
+        return query.call(this, sql, ...rest);
+      };
+      client.release = function (...args) { client.query = query; client.release = release; return release.apply(this, args); };
+      return client;
+    } };
+    const writes = [];
+    const monitored = { connect: async () => {
+      const client = await stalled.connect();
+      const { query } = client;
+      client.query = function (sql, ...rest) { writes.push({ at: Date.now(), sql }); return query.call(this, sql, ...rest); };
+      return client;
+    } };
+    const change = { ref: { spaceId, collectionId, kind: 'record', id: created.ref.id }, revision: 1, generation: 1, deleted: false,
+      canonicalData: '{"title":"Stalled plan"}' };
+    const deadline = Date.now() + 400;
+    const projector = new RecordRetrievalProjector(monitored, { embedders: new EmbeddingRegistry([spy]), prepareMs: 50 });
+    await assert.rejects(projector.prepare(change, AbortSignal.timeout(400), deadline), error => error.code === 'EMBEDDER_UNAVAILABLE');
+    assert.equal(armed, false);
+    assert.ok(Date.now() < deadline, 'settled within the delivery\'s budget');
+    // The stalled session was cancelled and discarded: the only session is free at once.
+    const freed = Date.now();
+    (await single.connect()).release();
+    assert.ok(Date.now() - freed < 300, `${Date.now() - freed} ms for the pool's session`);
+    await sleep(1_600);
+    assert.deepEqual(writes.filter(entry => entry.at >= deadline && !entry.sql.includes('pg_cancel_backend')).map(entry => entry.sql), [],
+      'no statement after the delivery\'s deadline');
+    assert.equal(spy.inTransaction.length, 0, 'no call');
+  } finally { await single.end(); }
+});
+
+test('a step whose claim, start or settling stalls returns within its budget and the cleanup bound', async () => {
+  const budgetMs = 1_500;
+  for (const [label, match, bound] of [['claim', /FOR UPDATE SKIP LOCKED/, budgetMs], ['start', /attempts=attempts\+1/, budgetMs + 1_000],
+    ['settle', /last_error=COALESCE/, budgetMs + 1_000]]) {
+    const { spaceId } = await space();
+    const down = new Spy({}, { down: true });
+    await policy(spaceId, 1, { claimStatements: false, lexical: false });
+    await generation(spaceId, 1, 1, identity(down));
+    await evidence(spaceId);
+    const slowly = stalling(match, 4_000);
+    const started = Date.now();
+    await new PostgresRetrievalWorker(slowly, { embedders: new EmbeddingRegistry([down]) }).step({ budgetMs, limit: 1 });
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < bound + 400, `${label}: the step took ${elapsed} ms`);
+    assert.ok(slowly.released.includes(true), `${label}: the stalled session was discarded`);
+  }
+  await sleep(4_100);
+});
+
+test('a record fallback apply whose delivery aborts commits nothing, frees its locks and reports the outage', async () => {
+  const { spaceId, collectionId, scope } = await space();
+  // Generation 1 is lexical; generation 2 needs vectors and has no embedder, so preparation fails at once.
+  await policy(spaceId, 1, { vector: false, regions: [] });
+  await generation(spaceId, 1, 1);
+  await policy(spaceId, 2);
+  await generation(spaceId, 2, 2, identity(new Spy()), 'building');
+  const created = await write(scope, 'create', '{"title":"Aborted"}');
+  const change = { ref: { spaceId, collectionId, kind: 'record', id: created.ref.id }, revision: 1, generation: 1, deleted: false, canonicalData: '{"title":"Aborted"}' };
+  const writer = await pool.connect();
+  try {
+    await writer.query('BEGIN');
+    // As a record write does: it blocks the authority fence's share lock, not the key share of a projection's foreign key.
+    await writer.query('SELECT 1 FROM records WHERE space_id=$1 AND record_id=$2 FOR NO KEY UPDATE', [spaceId, created.ref.id]);
+    const controller = new AbortController();
+    const prepared = new RecordRetrievalProjector(pool).prepare(change, controller.signal);
+    prepared.catch(() => {});
+    // The fallback apply waits on the record row the writer holds; the delivery's budget then ends.
+    await waitingOnLock('FROM records WHERE');
+    const aborted = Date.now();
+    controller.abort();
+    await assert.rejects(prepared, error => error.code === 'EMBEDDER_UNAVAILABLE');
+    assert.ok(Date.now() - aborted < 300, `${Date.now() - aborted} ms`);
+    // Its lock wait was cancelled, not left to its 1 s lock timeout, while the writer still holds the row.
+    const waiting = async () => (await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity
+      WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%FROM records WHERE%'`)).rows[0].n;
+    for (let tries = 0; await waiting(); tries++) {
+      assert.ok(tries < 30 && Date.now() - aborted < 600, 'the fallback still waits on the record row');
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    await writer.query('COMMIT');
+  } finally { writer.release(); }
+  const record = await projected(spaceId, 'record', created.ref.id);
+  assert.deepEqual([record.refs, record.lexical], [[], []], 'nothing committed');
+});
+
+test('a deletion or newer revision committed between batches stops further calls for the superseded text', async () => {
+  const words = Array.from({ length: 600 }, (_, i) => `w${i}`).join(' ');
+  // Evidence: the source is deleted, as its service does, during the first of several one-chunk calls.
+  const first = await space();
+  const spy = new Spy({ maxBatch: 1 }, { before: async call => { if (call === 1) await deleteEvidence(first.spaceId, 'source', 'src_1'); } });
+  await policy(first.spaceId, 1, { claimStatements: false });
+  await generation(first.spaceId, 1, 1, identity(spy));
+  await evidence(first.spaceId, { extraction: words });
+  const worker = new PostgresRetrievalWorker(pool, { embedders: new EmbeddingRegistry([spy]) });
+  await worker.step();
+  assert.equal(spy.inTransaction.length, 1, 'no call after the deletion committed');
+  await due('retrieval_outbox');
+  await worker.step();
+  const source = await projected(first.spaceId, 'source', 'src_1');
+  assert.deepEqual([source.refs.map(ref => ref.deleted), source.vector, source.checkpoints], [[true], [], 0]);
+  assert.ok((await work(first.spaceId)).every(row => row.delivery_state === 'delivered' && row.last_error === null));
+
+  // A record: revision 2 commits during the first call preparing revision 1.
+  const second = await space();
+  let created;
+  const recordSpy = new Spy({ maxBatch: 1 }, { before: async call => {
+    if (call === 1) await write(second.scope, 'replace', '{"title":"Short"}', { recordId: created.ref.id, expectedRevision: 1 });
+  } });
+  await policy(second.spaceId, 1);
+  await generation(second.spaceId, 1, 1, identity(recordSpy));
+  created = await write(second.scope, 'create', JSON.stringify({ title: words }));
+  const projector = new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([recordSpy]) });
+  const [outcome] = await deliver(await hints(), projector);
+  assert.equal(recordSpy.inTransaction.length, 1, 'no call for revision 1 after revision 2 committed');
+  assert.equal(outcome, 'retry');
+  assert.equal((await pool.query('SELECT max(failures)::int AS n FROM projection_outbox WHERE space_id=$1', [second.spaceId])).rows[0].n, 0);
+  assert.deepEqual((await deliver(await hints(), projector)).sort(), ['applied', 'superseded']);
+  assert.deepEqual((await projected(second.spaceId, 'record', created.ref.id)).lexical, [[1, 2, '/title', 'Short']]);
+});
+
+test('a vector generation whose embedder hangs never keeps a healthy one from preparing, on record and evidence work', async () => {
+  const { spaceId, scope, collectionId } = await space();
+  // Generation 1's embedder waits for its signal; generation 2's is healthy and distinct.
+  const hung = new Spy({ modelVersion: 'hung' }, { before: (call, signal) => untilAborted(signal) });
+  const healthy = new Spy({ modelVersion: 'healthy' });
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(hung));
+  await policy(spaceId, 2);
+  await generation(spaceId, 2, 2, identity(healthy), 'building');
+  const registry = new EmbeddingRegistry([hung, healthy]);
+  const created = await write(scope, 'create', '{"title":"Hung neighbour"}');
+
+  // Generation 1 gets half the 3 s and gives way; generation 2 prepares and applies, the delivery stays due, uncounted.
+  assert.deepEqual(await deliver(await hints(), new RecordRetrievalProjector(pool, { embedders: registry, prepareMs: 3_000 })), ['retry']);
+  const record = await projected(spaceId, 'record', created.ref.id);
+  assert.deepEqual([record.lexical, record.vector], [[[2, 1, '/title', 'Hung neighbour']], [[2, 1, 'eu-west', digest('Hung neighbour')]]]);
+  assert.deepEqual((await pool.query('SELECT delivery_state,failures,last_error FROM projection_outbox WHERE space_id=$1', [spaceId])).rows,
+    [{ delivery_state: 'pending', failures: 0, last_error: 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE' }]);
+  assert.equal(hung.inTransaction.length, 1);
+
+  // Evidence, with a call that ignores its signal: the first item gives the
+  // hung embedder its share and marks it an outage; the second item in the
+  // same step never calls it. Generation 2 has both.
+  let release = () => {};
+  hung.behavior.before = () => new Promise((_, reject) => { release = () => reject(new EmbedderUnavailableError('released')); });
+  await evidence(spaceId);
+  const worker = new PostgresRetrievalWorker(pool, { embedders: registry, prepareMs: 3_000 });
+  const step = await worker.step();
+  release();
+  assert.deepEqual([step.claimed, step.applied, step.retried], [2, 0, 2]);
+  assert.equal(hung.inTransaction.length, 2, 'one call for the step');
+  assert.deepEqual((await projected(spaceId, 'claim', 'clm_1')).vector, [[2, 1, 'eu-west', digest('The bridge opened in 1932.')]]);
+  assert.deepEqual((await projected(spaceId, 'source', 'src_1')).vector,
+    [[2, 1, 'eu-west', digest('The bridge opened in 1932 after four years.')]]);
+  for (const row of await work(spaceId)) assert.deepEqual([row.delivery_state, row.attempts, row.last_error, row.waiting],
+    ['pending', 1, 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE', true]);
+  assert.equal((await worker.status(spaceId, collectionId)).state, 'degraded');
+});
+
+test('a record delivery with a short budget and a hung embedder is released uncounted, then projects on recovery', async () => {
+  const { spaceId, scope } = await space();
+  // 'waits' gives up on its signal; 'ignores' never does until released.
+  let release = () => {};
+  const spy = new Spy({}, { before: (call, signal) => untilAborted(signal) });
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(spy));
+  const short = new PostgresOutbox(pool, authority, { processingMs: 1_500 });
+  const projector = new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([spy]) });
+  const created = await write(scope, 'create', '{"title":"Short budget"}');
+  for (const label of ['waits', 'ignores']) {
+    if (label === 'ignores') spy.behavior.before = () => new Promise((_, reject) => { release = () => reject(new Error('released')); });
+    const started = Date.now();
+    assert.deepEqual(await consume(await hints(), message => short.process(message, projector), 1), ['retry'], label);
+    release();
+    assert.ok(Date.now() - started < 1_500, `${label}: settled within the delivery's budget`);
+    assert.deepEqual((await pool.query('SELECT delivery_state,failures,last_error FROM projection_outbox WHERE space_id=$1', [spaceId])).rows,
+      [{ delivery_state: 'pending', failures: 0, last_error: 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE' }], label);
+  }
+  spy.behavior.before = undefined;
+  assert.deepEqual(await consume(await hints(), message => short.process(message, projector), 1), ['applied']);
+  assert.deepEqual((await projected(spaceId, 'record', created.ref.id)).vector, [[1, 1, 'eu-west', digest('Short budget')]]);
+});
+
+test('a hung last vector generation is judged by its own progress: an outage for the step, never rerun at once', async () => {
+  const { spaceId, scope, collectionId } = await space();
+  // Generation 1 is healthy; generation 2, prepared last, waits for its signal.
+  const healthy = new Spy({ modelVersion: 'healthy' });
+  const hung = new Spy({ modelVersion: 'hung' }, { before: (call, signal) => untilAborted(signal) });
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(healthy));
+  await policy(spaceId, 2);
+  await generation(spaceId, 2, 2, identity(hung), 'building');
+  const registry = new EmbeddingRegistry([healthy, hung]);
+  const created = await write(scope, 'create', '{"title":"Healthy first"}');
+  assert.deepEqual(await deliver(await hints(), new RecordRetrievalProjector(pool, { embedders: registry, prepareMs: 1_000 })), ['retry']);
+  assert.deepEqual((await projected(spaceId, 'record', created.ref.id)).vector, [[1, 1, 'eu-west', digest('Healthy first')]]);
+  assert.deepEqual((await pool.query('SELECT failures,last_error FROM projection_outbox WHERE space_id=$1', [spaceId])).rows,
+    [{ failures: 0, last_error: 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE' }]);
+
+  await evidence(spaceId);
+  const calls = hung.inTransaction.length;
+  const step = await new PostgresRetrievalWorker(pool, { embedders: registry, prepareMs: 1_000 }).step();
+  assert.deepEqual([step.claimed, step.applied, step.retried], [2, 0, 2], 'neither item is rerun in the step');
+  assert.equal(hung.inTransaction.length - calls, 1, 'the second item skips the hung embedder');
+  assert.deepEqual((await projected(spaceId, 'claim', 'clm_1')).vector, [[1, 1, 'eu-west', digest('The bridge opened in 1932.')]]);
+  for (const row of await work(spaceId)) assert.deepEqual([row.delivery_state, row.attempts, row.last_error, row.waiting],
+    ['pending', 1, 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE', true]);
+  assert.equal((await new PostgresRetrievalWorker(pool).status(spaceId, collectionId)).state, 'degraded');
+});
+
+test('an item whose start rolls back is released under its claim, recording the error as degraded', async () => {
+  const { spaceId, collectionId } = await space();
+  await policy(spaceId, 1, { vector: false, regions: [] });
+  await generation(spaceId, 1, 1);
+  await evidence(spaceId);
+  // The first read of current authority, inside the start transaction, fails once.
+  let armed = true;
+  const failing = { connect: async () => {
+    const client = await pool.connect();
+    const { query, release } = client;
+    client.query = function (sql, ...rest) {
+      if (armed && typeof sql === 'string' && sql.includes('LEFT JOIN LATERAL (SELECT v.version')) {
+        armed = false;
+        return Promise.reject(new Error('injected read failure'));
+      }
+      return query.call(this, sql, ...rest);
+    };
+    client.release = function (...args) { client.query = query; client.release = release; return release.apply(this, args); };
+    return client;
+  } };
+  const worker = new PostgresRetrievalWorker(failing);
+  const step = await worker.step();
+  assert.equal(armed, false);
+  assert.deepEqual([step.retried, step.applied], [1, 1]);
+  const rows = await work(spaceId);
+  const failed = rows.find(row => row.delivery_state === 'pending');
+  const applied = rows.find(row => row !== failed);
+  assert.deepEqual([failed.delivery_state, failed.attempts, failed.waiting], ['pending', 0, true], 'the uncommitted attempt never counted');
+  assert.ok(failed.last_error, 'the error is recorded');
+  assert.equal(applied.delivery_state, 'delivered');
+  assert.equal((await worker.status(spaceId, collectionId)).state, 'degraded');
+});
+
+test('a socket error on COMMIT keeps the record delivery\'s outcome unknown; a server reply to COMMIT is a known rollback', async () => {
+  const { spaceId, scope } = await space();
+  await write(scope, 'create', '{"title":"commit"}');
+  const projector = new RecordRetrievalProjector(pool);
+  // Completion's COMMIT fails with `cause`, as the authority reports a missing acknowledgement.
+  const committing = cause => new PostgresOutbox(pool, { requestBudgetMs: authority.requestBudgetMs,
+    transaction: async () => { throw new CommitOutcomeUnknownError(cause); } });
+  const row = async () => (await pool.query(`SELECT delivery_state,failures,started_attempt IS NOT NULL AS started
+    FROM projection_outbox WHERE space_id=$1`, [spaceId])).rows[0];
+  // Node system errors whose code has five capitals, as a SQLSTATE does: the session, not the server, failed.
+  const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE', errno: -32, syscall: 'write' });
+  const eperm = Object.assign(new Error('connect EPERM'), { code: 'EPERM' });
+  for (const cause of [epipe, eperm]) {
+    await pool.query("UPDATE projection_outbox SET delivery_state='pending',started_attempt=NULL WHERE space_id=$1", [spaceId]);
+    const [lease] = await hints();
+    await assert.rejects(committing(cause).process(lease, projector),
+      error => error instanceof CommitOutcomeUnknownError && error.cause === cause, cause.code);
+    assert.deepEqual(await row(), { delivery_state: 'delivering', failures: 0, started: true }, `${cause.code}: the lease is kept`);
+  }
+  // A server's error reply to COMMIT (a deferred check, 23514) rolled it back: the delivery's own failure.
+  await pool.query("UPDATE projection_outbox SET delivery_state='pending',started_attempt=NULL WHERE space_id=$1", [spaceId]);
+  const [lease] = await hints();
+  const check = Object.assign(new Error('deferred check failed'), { code: '23514', severity: 'ERROR' });
+  assert.equal(await committing(check).process(lease, projector), 'failed');
+  assert.deepEqual(await row(), { delivery_state: 'degraded', failures: 1, started: false });
+});
+
+test('status reports the oldest pending evidence over all of it and a failed record\'s error outside the oldest-due sample', async () => {
+  const { spaceId, collectionId, scope } = await space();
+  const worker = new PostgresRetrievalWorker(pool);
+  await evidence(spaceId);
+  const first = (await pool.query('SELECT job_id,enqueued_at FROM retrieval_outbox WHERE space_id=$1 ORDER BY enqueued_at LIMIT 1',
+    [spaceId])).rows[0];
+  // 501 newer items are due first; the oldest backs off for a day, and the other older one is due after them.
+  await pool.query(`INSERT INTO retrieval_outbox(space_id,collection_id,ref_kind,ref_id,revision,operation,placement_generation,available_at)
+    SELECT $1,'alpha','claim','clm_1',g,'upsert',1,clock_timestamp()-interval '1 hour' FROM generate_series(2,502) g`, [spaceId]);
+  await pool.query(`UPDATE retrieval_outbox SET available_at=clock_timestamp()+interval '1 day',attempts=1,last_error='error 40001'
+    WHERE job_id=$1`, [first.job_id]);
+  // 501 records are due; the first one's delivery failed and backs off for a day.
+  for (let n = 0; n < 501; n++) await write(scope, 'create', `{"title":"record ${n}"}`);
+  await pool.query(`UPDATE projection_outbox SET failures=1,last_error='Error: projector failed',last_error_at=clock_timestamp(),
+    available_at=clock_timestamp()+interval '1 day'
+    WHERE event_id=(SELECT event_id FROM projection_outbox WHERE space_id=$1 ORDER BY revision,event_id LIMIT 1)`, [spaceId]);
+  const status = await worker.status(spaceId, collectionId);
+  assert.equal(status.evidence.oldestPendingAt, first.enqueued_at.toISOString(), 'the backed-off item is the oldest');
+  assert.deepEqual([status.evidence.pending, status.evidence.capped], [500, true]);
+  assert.deepEqual(status.records, { pending: 500, degraded: 1, capped: true, lastError: 'Error: projector failed' });
+  assert.equal(status.state, 'degraded');
+  // The oldest pending item is one row through its index, not a scan of the backlog. The plan follows the table's
+  // statistics, so they are brought current first, as autovacuum or an ANALYZE after a burst would; no plan is forced.
+  await pool.query('ANALYZE retrieval_outbox');
+  const plan = (await pool.query(`EXPLAIN (FORMAT JSON) SELECT enqueued_at FROM retrieval_outbox
+    WHERE space_id=$1 AND collection_id=$2 AND delivery_state='pending' ORDER BY enqueued_at LIMIT 1`, [spaceId, collectionId]))
+    .rows[0]['QUERY PLAN'][0].Plan;
+  const nodes = [];
+  for (const queue = [plan]; queue.length;) { const node = queue.shift(); nodes.push(node); queue.push(...(node.Plans ?? [])); }
+  assert.ok(nodes.some(node => node['Index Name'] === 'retrieval_outbox_age'), JSON.stringify(plan));
+  assert.ok(!nodes.some(node => /Sort/.test(node['Node Type'])), `read in index order, not sorted: ${JSON.stringify(plan)}`);
+  // An older error in the oldest-due sample does not hide the failed row's newer one.
+  await pool.query(`UPDATE projection_outbox SET last_error='Error: older live error',
+    last_error_at=clock_timestamp()-interval '1 hour' WHERE event_id=(SELECT event_id
+    FROM projection_outbox WHERE space_id=$1 AND failures=0 ORDER BY available_at,event_id LIMIT 1)`, [spaceId]);
+  assert.deepEqual((await worker.status(spaceId, collectionId)).records,
+    { pending: 499, degraded: 1, capped: true, lastError: 'Error: projector failed' });
+});
+
+test('status samples over 500 failed records in event order, the same rows and error on every call', async () => {
+  const { spaceId, collectionId, scope } = await space();
+  const worker = new PostgresRetrievalWorker(pool);
+  for (let n = 0; n < 1001; n++) await write(scope, 'create', `{"title":"record ${n}"}`);
+  // 500 records stay due without an error; the other 501 failed, each later than the one before it in event order,
+  // so the newest error belongs to the last event, which is outside the first 500 failed rows.
+  await pool.query(`WITH ranked AS (SELECT event_id,row_number() OVER (ORDER BY event_id) AS n FROM projection_outbox
+      WHERE space_id=$1 AND event_id NOT IN (SELECT event_id FROM projection_outbox WHERE space_id=$1 ORDER BY event_id LIMIT 500))
+    UPDATE projection_outbox o SET failures=1,last_error='error ' || ranked.n,
+      available_at=clock_timestamp()+interval '1 day'+ranked.n * interval '1 second'
+    FROM ranked WHERE o.event_id=ranked.event_id`, [spaceId]);
+  for (let call = 0; call < 3; call++)
+    assert.deepEqual((await worker.status(spaceId, collectionId)).records,
+      { pending: 500, degraded: 500, capped: true, lastError: 'error 500' }, `call ${call}`);
+});
+
+test('a stalled cancellation holds a one-session pool for at most its bound, then the next transaction gets the session', async () => {
+  const single = new pg.Pool({ connectionString: target.toString(), max: 1 });
+  try {
+    // The cancel statement runs at once on the server, but its reply never arrives in time.
+    const slowly = stalling(/pg_cancel_backend/, 5_000, single);
+    const cut = Date.now() + 200;
+    await assert.rejects(inTransaction(slowly, db => db.query('SELECT pg_sleep(3)'), { deadline: cut }), DeadlineExceededError);
+    // The cancellation takes the freed session (pg-pool lets a caller arriving before then take it first).
+    await sleep(100);
+    assert.equal(slowly.log.filter(entry => /pg_cancel_backend/.test(entry.sql)).length, 1, 'the cancellation holds the session');
+    const next = Date.now();
+    const row = await inTransaction(slowly, async db => (await db.query('SELECT 1 AS one')).rows[0], { deadline: next + 1_500 });
+    assert.deepEqual(row, { one: 1 });
+    assert.ok(Date.now() - cut < 1_400, `${Date.now() - cut} ms from the cut to the next transaction's result`);
+    // Both the cut transaction's session and the unanswered cancellation's were discarded.
+    assert.deepEqual(slowly.released, [true, true, false]);
+  } finally { await single.end(); }
+});
+
+test('status reports the most recently recorded error, whatever a lease, a backoff or parking did to available_at', async () => {
+  const { spaceId, collectionId, scope } = await space();
+  const spy = new Spy({}, { before: () => { throw new Error('rejected input'); } });
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(spy));
+  const projector = new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([spy]) });
+  const worker = new PostgresRetrievalWorker(pool);
+  for (const title of ['parked', 'later']) await write(scope, 'create', `{"title":"${title}"}`);
+  const [parked, later] = (await pool.query('SELECT event_id FROM projection_outbox WHERE space_id=$1 ORDER BY revision,event_id',
+    [spaceId])).rows.map(row => row.event_id);
+  // The first record is one failure from its dead letter; both fail as the input's, so it parks (available_at infinity).
+  await pool.query('UPDATE projection_outbox SET failures=7 WHERE event_id=$1', [parked]);
+  assert.deepEqual(await deliver(await hints(), projector), ['failed', 'failed']);
+  // Later, the second record's retry meets an outage and is released uncounted with a newer error.
+  spy.behavior = { down: true };
+  await pool.query('UPDATE projection_outbox SET available_at=clock_timestamp() WHERE event_id=$1', [later]);
+  assert.deepEqual(await deliver(await hints(false), projector), ['retry']);
+  const rows = (await pool.query(`SELECT event_id,available_at='infinity' AS parked,last_error FROM projection_outbox
+    WHERE space_id=$1 ORDER BY event_id=$2 DESC`, [spaceId, parked])).rows;
+  assert.deepEqual(rows.map(row => [row.parked, row.last_error]), [[true, 'EmbedderFailedError: The embedder failed for this input'],
+    [false, 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE']]);
+  const newest = 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE';
+  assert.equal((await worker.status(spaceId, collectionId)).records.lastError, newest);
+  // A lease moves the newer row's available_at without a new error: the newest error is unchanged.
+  await pool.query('UPDATE projection_outbox SET available_at=clock_timestamp() WHERE event_id=$1', [later]);
+  assert.equal((await hints(false)).length, 1);
+  for (let call = 0; call < 2; call++) assert.equal((await worker.status(spaceId, collectionId)).records.lastError, newest);
+  // Evidence: the error recorded later wins over one whose item backs off longer.
+  await evidence(spaceId);
+  const jobs = (await pool.query('SELECT job_id FROM retrieval_outbox WHERE space_id=$1 ORDER BY job_id', [spaceId])).rows.map(row => row.job_id);
+  await pool.query(`UPDATE retrieval_outbox SET last_error='Error: older',last_error_at=clock_timestamp()-interval '1 hour',
+    available_at=clock_timestamp()+interval '1 day' WHERE job_id=$1`, [jobs[0]]);
+  await pool.query(`UPDATE retrieval_outbox SET last_error='Error: newer',last_error_at=clock_timestamp() WHERE job_id=$1`, [jobs[1]]);
+  assert.equal((await worker.status(spaceId, collectionId)).evidence.lastError, 'Error: newer');
+  // Later tests' setup marks every live row delivered, which a dead letter refuses: retry it as an operator would.
+  await pool.query(`UPDATE projection_outbox SET dead_lettered_at=NULL,failures=0,delivery_state='pending',
+    available_at=clock_timestamp() WHERE event_id=$1`, [parked]);
+});
+
+test('an embedder whose profile field can no longer be read is refused as an outage: never called, released uncounted', async () => {
+  const { spaceId, scope } = await space();
+  const spy = new Spy();
+  await policy(spaceId, 1);
+  await generation(spaceId, 1, 1, identity(spy));
+  const projector = new RecordRetrievalProjector(pool, { embedders: new EmbeddingRegistry([spy]) });
+  Object.defineProperty(spy, 'profile', { configurable: true,
+    value: { ...spy.profile, get region() { throw new Error('profile field unreadable'); } } });
+  await write(scope, 'create', '{"title":"unreadable"}');
+  assert.deepEqual(await deliver(await hints(), projector), ['retry']);
+  assert.deepEqual((await pool.query('SELECT delivery_state,failures,last_error FROM projection_outbox WHERE space_id=$1', [spaceId])).rows,
+    [{ delivery_state: 'pending', failures: 0, last_error: 'EmbedderUnavailableError EMBEDDER_UNAVAILABLE' }]);
+  assert.equal(spy.inTransaction.length, 0, 'the adapter was never called');
+});
+
+// The checksum every cell recorded for 045 as it shipped on main; 045 must stay byte-identical.
+const SHIPPED_045 = 'bfb72a343f14d90c94b9c48ee9b981b37933a25fa128d46ff07cabc0ad239064';
+const root = fileURLToPath(new URL('../..', import.meta.url));
+// A database migrated through main's 045, recorded with its shipped checksum, for the test to upgrade.
+async function atMain045(suffix, body) {
+  const upgrade = `${name}_${suffix}`;
+  const admin = new pg.Client({ connectionString: baseUrl });
+  await admin.connect();
+  try {
+    await admin.query(`CREATE DATABASE ${upgrade}`);
+    const url = new URL(baseUrl); url.pathname = `/${upgrade}`;
+    const db = new pg.Client({ connectionString: url.toString() });
+    await db.connect();
+    try {
+      const directory = new URL('../../migrations/', import.meta.url);
+      const files = (await readdir(directory)).filter(file => file.endsWith('.sql')).sort();
+      await db.query('BEGIN; CREATE TABLE stateplane_migrations (name text PRIMARY KEY, sha256 text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())');
+      for (const file of files.slice(0, files.indexOf('045_retrieval_projections.sql') + 1)) {
+        const sql = await readFile(new URL(file, directory), 'utf8');
+        await db.query(sql); // NOSONAR -- migrations apply in order
+        await db.query('INSERT INTO stateplane_migrations(name,sha256) VALUES($1,$2)', // NOSONAR -- recorded with its file
+          [file, file === '045_retrieval_projections.sql' ? SHIPPED_045 : digest(sql)]);
+      }
+      await db.query('COMMIT');
+      await body(db, url.toString());
+    } finally { await db.end(); }
+  } finally {
+    await admin.query(`DROP DATABASE IF EXISTS ${upgrade} WITH (FORCE)`).catch(() => {});
+    await admin.end();
+  }
+}
+const migrateAsync = url => new Promise(resolve => {
+  const child = spawn(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: url } });
+  let stdout = ''; let stderr = '';
+  child.stdout.on('data', chunk => { stdout += chunk; });
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  child.on('close', status => resolve({ status, stdout, stderr }));
+});
+async function until(db, sql, what) {
+  for (let attempt = 0; !(await db.query(sql)).rows[0]?.ok; attempt += 1) {
+    assert.ok(attempt < 1000, what);
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+const upgraded = async db => (await db.query(`SELECT (SELECT indisvalid FROM pg_index WHERE indexrelid=to_regclass('public.retrieval_outbox_age')) AS age,
+  (SELECT count(*)::int FROM information_schema.columns WHERE column_name='last_error_at'
+    AND table_name IN ('projection_outbox','retrieval_outbox')) AS columns,
+  (SELECT array_agg(name ORDER BY name) FROM stateplane_migrations WHERE name >= '046') AS recorded`)).rows[0];
+const AFTER_045 = ['046_retrieval_dispatch_checkpoint.sql', '047_retrieval_outbox_age.sql'];
+
+test('a cell that applied main\'s migration 045 upgrades without drift and gains migrations 046 and 047', { timeout: 60_000 }, async () => {
+  await atMain045('u', async (db, url) => {
+    const output = execFileSync(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: url }, encoding: 'utf8' });
+    assert.match(output, /Applied 046_retrieval_dispatch_checkpoint.sql\nApplied 047_retrieval_outbox_age.sql/);
+    assert.deepEqual(await upgraded(db), { age: true, columns: 2, recorded: AFTER_045 });
+    assert.equal(execFileSync(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: url }, encoding: 'utf8' }), '');
+  });
+});
+
+test('a space purge in flight during the upgrade finishes, and the upgrade waits for it rather than deadlocking', { timeout: 60_000 }, async () => {
+  await atMain045('p', async (db, url) => {
+    const purge = new pg.Client({ connectionString: url });
+    await purge.connect();
+    try {
+      // A purge's order: the record outbox, then the evidence outbox.
+      await purge.query("BEGIN; SET LOCAL lock_timeout = '10s'");
+      await purge.query("DELETE FROM projection_outbox WHERE space_id='sp_gone'");
+      const migrating = migrateAsync(url);
+      await until(db, `SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid=l.relation
+        WHERE NOT l.granted AND c.relname='projection_outbox') AS ok`, 'the upgrade never waited for the purge');
+      await purge.query("DELETE FROM retrieval_outbox WHERE space_id='sp_gone'");
+      await purge.query('COMMIT');
+      const result = await migrating;
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(await upgraded(db), { age: true, columns: 2, recorded: AFTER_045 });
+    } finally { await purge.end(); }
+  });
+});
+
+test('a writer holding the outboxes the other way round fails the upgrade with retry guidance and no partial schema', { timeout: 60_000 }, async () => {
+  await atMain045('d', async (db, url) => {
+    const writer = new pg.Client({ connectionString: url });
+    await writer.connect();
+    try {
+      await writer.query("BEGIN; SET LOCAL lock_timeout = '10s'");
+      await writer.query("DELETE FROM retrieval_outbox WHERE space_id='sp_gone'");
+      const migrating = migrateAsync(url);
+      await until(db, `SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid=l.relation
+        WHERE NOT l.granted AND c.relname='retrieval_outbox') AS ok`, 'the upgrade never waited for the writer');
+      // The step holds the record outbox and waits for this writer, which now waits for it: PostgreSQL aborts the step.
+      await writer.query("DELETE FROM projection_outbox WHERE space_id='sp_gone'");
+      await writer.query('COMMIT');
+      const failed = await migrating;
+      assert.equal(failed.status, 1);
+      assert.match(failed.stderr, /^Projection outbox upgrade waits for record writers, outbox workers and space purges; retry/);
+      assert.deepEqual(await upgraded(db), { age: null, columns: 0, recorded: null });
+      const retried = await migrateAsync(url);
+      assert.equal(retried.status, 0, retried.stderr);
+      assert.deepEqual(await upgraded(db), { age: true, columns: 2, recorded: AFTER_045 });
+    } finally { await writer.end(); }
+  });
+});
+
+test('the evidence outbox age index builds concurrently over a populated outbox, and an interrupted build is rebuilt', { timeout: 60_000 }, async () => {
+  await atMain045('c', async (db, url) => {
+    await db.query("BEGIN; SET LOCAL session_replication_role = replica");
+    await db.query(`INSERT INTO retrieval_outbox(space_id,collection_id,ref_kind,ref_id,revision,operation,placement_generation,delivery_state,delivered_at)
+      SELECT 'sp_busy','entries','claim','clm_'||n,1,'upsert',1,CASE WHEN n % 3 = 0 THEN 'delivered' ELSE 'pending' END,
+        CASE WHEN n % 3 = 0 THEN clock_timestamp() END FROM generate_series(1,2000) n`);
+    await db.query('COMMIT');
+    const snapshot = new pg.Client({ connectionString: url });
+    const writer = new pg.Client({ connectionString: url });
+    await snapshot.connect();
+    await writer.connect();
+    try {
+      // An older snapshot keeps the build in progress, so writes are tried while it runs.
+      await snapshot.query('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM spaces');
+      const migrating = migrateAsync(url);
+      const building = `SELECT pid AS ok FROM pg_stat_activity WHERE datname=current_database()
+        AND pid<>pg_backend_pid() AND query LIKE '%CREATE INDEX CONCURRENTLY%' AND wait_event_type='Lock'`;
+      await until(db, building, 'the index never built outside the schema transaction');
+      const pid = (await db.query(building)).rows[0].ok;
+      await writer.query("BEGIN; SET LOCAL lock_timeout = '1s'; SET LOCAL session_replication_role = replica");
+      await writer.query(`INSERT INTO retrieval_outbox(space_id,collection_id,ref_kind,ref_id,revision,operation,placement_generation)
+        VALUES('sp_busy','entries','claim','clm_new',1,'upsert',1)`);
+      await writer.query(`UPDATE retrieval_outbox SET available_at=clock_timestamp()+interval '1 minute',last_error='Error: released',
+        last_error_at=clock_timestamp() WHERE ref_id='clm_1'`);
+      await writer.query('COMMIT');
+      // Interrupted mid-build: the invalid index stays, 047 is not recorded, and 046 kept its commit.
+      await db.query('SELECT pg_terminate_backend($1)', [pid]);
+      const interrupted = await migrating;
+      assert.notEqual(interrupted.status, 0);
+      assert.deepEqual(await upgraded(db), { age: false, columns: 2, recorded: [AFTER_045[0]] });
+      await snapshot.query('COMMIT');
+      const retried = await migrateAsync(url);
+      assert.equal(retried.status, 0, retried.stderr);
+      assert.equal(retried.stdout, 'Applied 047_retrieval_outbox_age.sql\n');
+      assert.deepEqual(await upgraded(db), { age: true, columns: 2, recorded: AFTER_045 });
+      assert.equal((await db.query(`SELECT count(*)::int AS n FROM retrieval_outbox WHERE delivery_state='pending'`)).rows[0].n, 1335);
+      assert.deepEqual(await migrateAsync(url), { status: 0, stdout: '', stderr: '' });
+    } finally { await writer.end(); await snapshot.end(); }
+  });
+});

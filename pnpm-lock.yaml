@@ -221,6 +221,9 @@ importers:
       '@stateplane/contracts':
         specifier: workspace:*
         version: link:../contracts
+      '@stateplane/retrieval':
+        specifier: workspace:*
+        version: link:../retrieval
       '@types/pg':
         specifier: 8.20.0
         version: 8.20.0

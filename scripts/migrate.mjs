@@ -14,7 +14,10 @@ try {
   // Hold one session lock across the transaction boundary between the staged
   // batch CHECK creation and validation. Each ledger write remains atomic with
   // its SQL file, including when validation is retried after interruption.
-  await client.query('SELECT pg_advisory_lock(73003)');
+  // Wait for it by polling, not inside one statement: a waiting statement holds
+  // a snapshot, which a concurrent index build (047) waits for in turn.
+  while (!(await client.query('SELECT pg_try_advisory_lock(73003) AS held')).rows[0].held)
+    await new Promise(resolveWait => setTimeout(resolveWait, 100));
   advisoryLockHeld = true;
   // Set isolation before the migration ledger can establish a snapshot.
   // Administrative defaults may otherwise make the post-lock outbox
@@ -127,6 +130,27 @@ try {
     if (identities.rows[0].n > RETRIEVAL_BACKFILL_UNDRAINED && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained')
       throw new Error(`Populated retrieval projection upgrade requires drained traffic above ${RETRIEVAL_BACKFILL_UNDRAINED} source and claim identities; set STATEPLANE_POPULATED_INDEX_UPGRADE=drained only after stopping record, source and claim writers`);
   };
+  // A concurrent index build cannot run in a transaction. It takes only SHARE
+  // UPDATE EXCLUSIVE, so writers and workers continue while it scans a
+  // populated table; it waits for transactions already writing it and for
+  // older snapshots. An interrupted build leaves an invalid index and no ledger
+  // row: the next run drops it concurrently, builds again, and records the
+  // file only once the index is valid. The session advisory lock keeps any
+  // other migrator from building or dropping it meanwhile.
+  const concurrentIndexes = new Map([['047_retrieval_outbox_age.sql', 'public.retrieval_outbox_age']]);
+  const indexValid = async index => (await client.query(
+    'SELECT indisvalid AS valid FROM pg_index WHERE indexrelid = to_regclass($1)', [index])).rows[0]?.valid;
+  const buildConcurrentIndex = async (name, sql, index) => {
+    try {
+      if (await indexValid(index) === false) await client.query(`DROP INDEX CONCURRENTLY ${index}`);
+      await client.query(sql);
+    } catch (error) {
+      if (['55P03', '40P01', '57014'].includes(error?.code))
+        throw new Error(`Concurrent index build ${name} was interrupted; retry, and the invalid index it left is rebuilt`, { cause:error });
+      throw error;
+    }
+    if (await indexValid(index) !== true) throw new Error(`Concurrent index build ${name} left ${index} invalid; retry`);
+  };
   for (const name of files) {
     const sql = await readFile(resolve(directory, name), 'utf8');
     const sha256 = createHash('sha256').update(sql).digest('hex');
@@ -134,10 +158,25 @@ try {
       if (recorded.get(name) !== sha256) throw new Error(`Migration drift: ${name}`);
       continue;
     }
-    if (name === '033_validate_batch_attempts.sql' || name === '035_validate_batch_receipt_domain.sql') {
+    if (concurrentIndexes.has(name)) {
+      // Commit every earlier step first; record this one in its own statement once the index is valid.
+      await client.query('COMMIT');
+      transactionOpen = false;
+      await buildConcurrentIndex(name, sql, concurrentIndexes.get(name));
+      await client.query('INSERT INTO stateplane_migrations (name, sha256) VALUES ($1, $2)', [name, sha256]);
+      process.stdout.write(`Applied ${name}\n`);
+      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+      transactionOpen = true;
+      continue;
+    }
+    if (name === '033_validate_batch_attempts.sql' || name === '035_validate_batch_receipt_domain.sql' ||
+      name === '046_retrieval_dispatch_checkpoint.sql') {
       // Release the preceding ADD CONSTRAINT schema lock before a populated
       // validation scan. The session advisory lock keeps concurrent migrators
       // serialized through this intentional, retry-safe transaction boundary.
+      // 046 alters projection_outbox, which a space purge started while 045
+      // applies already holds as it waits for 045's claim locks: 045 commits
+      // first, so the purge finishes instead of deadlocking with 046.
       await client.query('COMMIT');
       transactionOpen = false;
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
@@ -154,7 +193,8 @@ try {
     const boundedDdl = receiptDomainCutover || name === '038_drop_superseded_event_cursor.sql' ||
       name === '039_durable_outbox.sql' || name === '040_evidence_storage.sql' || name === '041_original_object_keys.sql' ||
       name === '042_claim_revision_recorder.sql' || name === '043_claim_commit_authority.sql' ||
-      name === '044_links_deletion_retention.sql' || name === '045_retrieval_projections.sql';
+      name === '044_links_deletion_retention.sql' || name === '045_retrieval_projections.sql' ||
+      name === '046_retrieval_dispatch_checkpoint.sql';
     const priorLockTimeout = boundedDdl ? (await client.query('SHOW lock_timeout')).rows[0].lock_timeout : null; // NOSONAR -- migrations run in order within the current transaction
     if (boundedDdl) await client.query("SET LOCAL lock_timeout = '5s'"); // NOSONAR -- set before this step's DDL, never concurrently
     try {
@@ -182,6 +222,10 @@ try {
       // make PostgreSQL abort the step as a deadlock, which is retryable in the same way.
       if (name === '045_retrieval_projections.sql' && (error?.code === '55P03' || error?.code === '40P01'))
         throw new Error('Retrieval projection upgrade waits for record, extraction and claim writers; retry when long evidence transactions finish', { cause:error });
+      // 046 locks projection_outbox before retrieval_outbox, as purges do; a writer holding them the other way
+      // round can still make PostgreSQL abort the step as a deadlock, which rolls it back and is retryable alike.
+      if (name === '046_retrieval_dispatch_checkpoint.sql' && (error?.code === '55P03' || error?.code === '40P01'))
+        throw new Error('Projection outbox upgrade waits for record writers, outbox workers and space purges; retry when long record or outbox transactions finish', { cause:error });
       throw error;
     }
     if (boundedDdl) await client.query('SELECT set_config($1,$2,true)', ['lock_timeout',priorLockTimeout]); // NOSONAR -- restore this step's transaction-local timeout before the ledger write

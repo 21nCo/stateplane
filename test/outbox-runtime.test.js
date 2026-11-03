@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { consume, dispatch, parseDeliveryMessage } from '../packages/workers/dist/index.js';
+import { consume, dispatch, DispatchDeadlineError, parseDeliveryMessage } from '../packages/workers/dist/index.js';
 
 const hint = (n, attempt = 1) => ({ eventId: `evt_${String(n).padStart(8, '0')}-0000-4000-8000-000000000000`, attempt });
 
@@ -44,6 +44,53 @@ test('a dispatch tick keeps claiming until nothing is due, its budget is spent o
   const partial = await dispatch(queued([hint(8)], [hint(9), hint(10)], [hint(11)]), flaky, { budgetMs: 60_000 });
   assert.deepEqual([partial.claimed, partial.sent, partial.released, partial.batches], [3, 1, 2, 2]);
   for (const budgetMs of [-1, 1.5, 600_001]) await assert.rejects(dispatch(endless, transport, { budgetMs }), RangeError);
+});
+
+test('with a deadline, dispatch bounds every store call by it, ends quietly when a claim is cut short and keeps a cut send\'s leases', async () => {
+  const hang = () => new Promise(() => {});
+  // A store that honours its bound as PostgresOutbox does: it rejects once the deadline passes.
+  const bounded = (bound, work) => Promise.race([work, new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('The time budget ended during the transaction')), bound.deadline - Date.now()))]);
+  const store = ({ claim, release = async () => 0 }) => {
+    const calls = [];
+    return { calls, claim: async (limits, bound) => { calls.push(['claim', bound]); return bounded(bound, claim()); },
+      release: async (messages, bound) => { calls.push(['release', bound]); return bounded(bound, release(messages)); },
+      stepReconciliations: async () => 0 };
+  };
+  const transport = { send: async () => {} };
+  // A claim that stalls ends dispatch at the deadline, with no error: leases it may have committed expire unstarted.
+  let deadline = Date.now() + 100;
+  const stalledClaim = store({ claim: hang });
+  assert.deepEqual(await dispatch(stalledClaim, transport, { budgetMs: 60_000, deadline }),
+    { claimed: 0, sent: 0, released: 0, parked: 0, batches: 0 });
+  assert.ok(Date.now() >= deadline && Date.now() - deadline < 2_000);
+  assert.deepEqual(stalledClaim.calls, [['claim', { deadline }]]);
+  // A send that stalls is abandoned at the deadline; its hints may still arrive, so nothing is released.
+  deadline = Date.now() + 100;
+  const sending = store({ claim: async () => ({ messages: [hint(1)], scan: 'partial' }) });
+  const cut = await dispatch(sending, { send: hang }, { budgetMs: 60_000, deadline });
+  assert.ok(cut.error instanceof DispatchDeadlineError);
+  assert.deepEqual([cut.claimed, cut.sent, cut.released, sending.calls.map(([call]) => call)], [1, 0, 0, ['claim']]);
+  assert.ok(Date.now() - deadline < 2_000);
+  // A failed send is released within the deadline; a release the deadline cuts short leaves its leases to expire.
+  deadline = Date.now() + 100;
+  const failure = new Error('queue unavailable');
+  const releasing = store({ claim: async () => ({ messages: [hint(2)], scan: 'partial' }), release: hang });
+  const failed = await dispatch(releasing, { send: async () => { throw failure; } }, { budgetMs: 60_000, deadline });
+  assert.deepEqual([failed.error, failed.released, releasing.calls], [failure, 0, [['claim', { deadline }], ['release', { deadline }]]]);
+  // Once the deadline has passed, nothing more is claimed.
+  const late = store({ claim: async () => ({ messages: [hint(3)], scan: 'partial' }) });
+  assert.equal((await dispatch(late, transport, { budgetMs: 60_000, deadline: Date.now() - 1 })).batches, 0);
+  assert.deepEqual(late.calls, []);
+  // A claim that returns just after the deadline sends nothing and releases nothing: its leases expire unstarted.
+  deadline = Date.now() + 50;
+  let sent = 0;
+  const overran = { calls: [], claim: async () => { while (Date.now() <= deadline) await new Promise(resolve => setTimeout(resolve, 5));
+    return { messages: [hint(4)], scan: 'partial' }; },
+  release: async messages => { overran.calls.push('release'); return messages.length; }, stepReconciliations: async () => 0 };
+  const unsent = await dispatch(overran, { send: async () => { sent++; } }, { budgetMs: 60_000, deadline });
+  assert.ok(unsent.error instanceof DispatchDeadlineError);
+  assert.deepEqual([unsent.claimed, unsent.sent, unsent.released, sent, overran.calls], [1, 0, 0, 0, []]);
 });
 
 test('an empty claim ends a tick only once the empty run has covered every live pair', async () => {
