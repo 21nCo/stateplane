@@ -91,10 +91,14 @@ const definition = slug => JSON.stringify({ slug, version: 1, schema: { $schema:
   type: 'object', properties: { title: { type: 'string' }, note: { type: 'string' } }, additionalProperties: false },
   unique: [], filterable: [], sortable: [] });
 
-/** A deterministic embedder in region `local`; `down` makes every call an outage, `fail` the input's fault, `hang` never answer. */
+/**
+ * A deterministic embedder (in region `local` by default); `down` makes every call an outage, `fail` the input's fault,
+ * `hang` never answer, and `before` runs before a call answers.
+ */
 class Spy extends DeterministicEmbedder {
-  constructor(behavior = {}) { super({ embedder: 'local-hash', region: 'local' }); this.behavior = behavior; this.queries = []; }
+  constructor(behavior = {}, region = 'local') { super({ embedder: 'local-hash', region }); this.behavior = behavior; this.queries = []; }
   async embed(texts, signal) {
+    await this.behavior.before?.(texts);
     if (this.behavior.down) throw new EmbedderUnavailableError('provider unreachable');
     if (this.behavior.fail) throw new Error(`rejected input: ${texts[0]}`);
     if (this.behavior.hang) return new Promise(() => {});
@@ -208,7 +212,11 @@ test('hybrid search returns fused, deduplicated, cited and fresh hits from autho
   assert.equal(claimHit.review.status, 'accepted');
   assert.equal(claimHit.provenance.attributedTo, 'harbor log');
   assert.deepEqual(claimHit.provenance.evidence, [{ collectionId: 'beta', sourceId, extractionVersion: null, start: null, end: null }]);
-  assert.equal(claimHit.citations[0].text, 'The harbor lantern burned whale oil.');
+  // One chunk found by both lists is one citation that names both, and keeps the vector match's embedder.
+  assert.deepEqual(claimHit.citations.map(citation => [citation.text, citation.matchedBy]),
+    [['The harbor lantern burned whale oil.', ['lexical', 'vector']]]);
+  assert.ok(claimHit.provenance.lexicalRank >= 1 && claimHit.provenance.vectorRank >= 1);
+  assert.equal(claimHit.provenance.embedder?.embedder, 'local-hash');
   const sourceHit = result.results.find(entry => entry.ref.kind === 'source');
   assert.equal(sourceHit.extractionVersion, 1);
   assert.equal(sourceHit.citations[0].text, 'Harbor records describe the lantern keeper and the lantern tower.');
@@ -244,9 +252,13 @@ test('deleted, tombstoned and stale hits are rejected at reread, never returned'
   await claims.delete(f.owner, f.spaceId, 'alpha', claim.claimId, { baseRevision: 1 });
   const stale = await search().search(f.owner, f.spaceId, { query: 'beacon' });
   assert.deepEqual(ids(stale), [`alpha/record/${kept}`]);
-  assert.deepEqual(stale.rejected, { deleted: 3, stale: 2, unauthorized: 0 });
+  // Content authority no longer holds is no candidate at all, so no count or rank discloses that it matched.
+  assert.equal(stale.candidates.lexical, 1);
+  assert.equal(stale.candidates.vector, 1, 'only the live record is a vector neighbour');
+  assert.deepEqual(stale.rejected, { deleted: 0, stale: 0, unauthorized: 0 });
   assert.equal(stale.state, 'pending', 'undelivered work is reported');
-  assert.deepEqual(stale.underfill, { returned: 1, requested: 10, reasons: ['rejected', 'exhausted', 'pending'] });
+  // A short vector list proves nothing (the filtered index scan may stop early), so the result is never exhausted.
+  assert.deepEqual(stale.underfill, { returned: 1, requested: 10, reasons: ['approximate', 'pending'] });
 
   // Once delivered, the new text is found and the old is gone.
   await index();
@@ -297,7 +309,15 @@ test('search reads only granted collections and kinds, and applies the claim rea
   const claimsOnly = await f.agent([['alpha', ['claims:read']]]);
   const visible = await search().search(claimsOnly, f.spaceId, { query: 'orchard' });
   assert.deepEqual(ids(visible), [`alpha/claim/${plain.claimId}`]);
-  assert.equal(visible.rejected.unauthorized, 1);
+  assert.deepEqual(visible.rejected, { deleted: 0, stale: 0, unauthorized: 0 });
+  assert.deepEqual(visible.candidates, { lexical: 1, vector: 1, considered: 1 });
+  // A term only the hidden claim holds yields exactly what a term nothing holds does: no count, rank or reason differs.
+  const summary = result => ({ ids: ids(result), candidates: result.candidates, rejected: result.rejected, underfill: result.underfill,
+    lexicalRanks: result.results.map(hit => hit.provenance.lexicalRank) });
+  const hidden = await search().search(claimsOnly, f.spaceId, { query: 'surveyed', collections: ['alpha'], kinds: ['claim'] });
+  const nothing = await search().search(claimsOnly, f.spaceId, { query: 'zymurgy', collections: ['alpha'], kinds: ['claim'] });
+  assert.deepEqual(summary(hidden), summary(nothing));
+  assert.equal(hidden.candidates.lexical, 0);
   const both = await f.agent([['alpha', ['claims:read']], ['beta', ['sources:read']]]);
   assert.deepEqual(new Set(ids(await search().search(both, f.spaceId, { query: 'orchard' }))),
     new Set([`alpha/claim/${plain.claimId}`, `alpha/claim/${citing.claimId}`, `beta/source/${betaSource}`]));
@@ -378,12 +398,30 @@ test('underfill after filtering is explicit and bounded overfetch never pads', a
   const made = [];
   for (let i = 0; i < 25; i++) made.push(await f.record('alpha', { title: `quarry stone ${i}` }));
   await index();
-  for (const id of made) await f.record('alpha', undefined, { recordId: id, expectedRevision: 1 }, 'delete');
-  const result = await search().search(f.owner, f.spaceId, { query: 'quarry', limit: 1 });
+  // Every match is deleted after the candidates were read, so the reread rejects every one.
+  hooks = [{ match: REREAD, run: async () => {
+    for (const id of made) await f.record('alpha', undefined, { recordId: id, expectedRevision: 1 }, 'delete');
+  } }];
+  const result = await search(registry, hooked).search(f.owner, f.spaceId, { query: 'quarry', limit: 1 });
   assert.deepEqual(result.results, []);
   assert.equal(result.candidates.considered, 20, 'the overfetch bound for limit 1');
   assert.equal(result.rejected.deleted, 20);
-  assert.deepEqual(result.underfill, { returned: 0, requested: 1, reasons: ['rejected', 'bounded', 'pending'] });
+  assert.deepEqual(result.underfill, { returned: 0, requested: 1, reasons: ['rejected', 'bounded'] });
+});
+
+test('a short result is exhausted only when every list was exact and every readable collection was searched', async () => {
+  const names = Array.from({ length: 33 }, (_, i) => `c${String(i).padStart(2, '0')}`);
+  const f = await fixture({ collections: names, policy: Object.fromEntries(names.map(id => [id, { vector: false }])) });
+  await f.record('c00', { title: 'tidepool survey' });
+  await index();
+  const capped = await search().search(f.owner, f.spaceId, { query: 'tidepool' });
+  assert.equal(capped.collectionsCapped, true);
+  assert.equal(capped.collections.length, 32);
+  assert.equal(capped.results.length, 1);
+  assert.deepEqual(capped.underfill.reasons, ['capped'], 'an unsearched collection may hold more');
+  const listed = await search().search(f.owner, f.spaceId, { query: 'tidepool', collections: ['c00', 'c32'] });
+  assert.equal(listed.collectionsCapped, false);
+  assert.deepEqual(listed.underfill.reasons, ['exhausted'], 'every searched list was lexical and returned all it had');
 });
 
 test('a filtered nearest-neighbour query keeps scanning the HNSW index past other spaces', async () => {
@@ -407,7 +445,8 @@ test('a filtered nearest-neighbour query keeps scanning the HNSW index past othe
     client.release = (...args) => { client.query = query; client.release = release; return release(...args); };
     return client;
   } };
-  const found = await new PostgresCandidates(planned).nearest({ spaceId: f.spaceId, generations }, model, vector, 20);
+  const found = await new PostgresCandidates(planned).nearest({ spaceId: f.spaceId, generations, evidenceCollections: null },
+    model, vector, 20);
   assert.deepEqual(new Set(found.map(hit => hit.id)), new Set(wanted), 'every target chunk, none of the noise');
 
   const db = await pool.connect();
@@ -423,4 +462,120 @@ test('a filtered nearest-neighbour query keeps scanning the HNSW index past othe
     await db.query('SET LOCAL hnsw.iterative_scan = off');
     assert.ok((await db.query(sql, [f.spaceId, `[${vector}]`])).rows.length < wanted.length);
   } finally { await db.query('ROLLBACK'); db.release(); }
+});
+
+test('a policy narrowing committed during one embedding call stops the next group before its query leaves', async () => {
+  const f = await fixture({ policy: { beta: { regions: ['eu'] } } });
+  const local = new Spy();
+  const eu = new Spy({}, 'eu');
+  const both = new EmbeddingRegistry([local, eu]);
+  const alpha = await f.record('alpha', { title: 'osprey dive' });
+  await f.record('beta', { title: 'osprey perch' });
+  await index(both);
+  eu.queries.length = 0;
+  // While alpha's group embeds in `local`, beta's current policy drops `eu`, the only region its generation's policy allows.
+  local.behavior.before = async () => {
+    local.behavior.before = undefined;
+    await pool.query(`INSERT INTO retrieval_policies(space_id,collection_id,version,record_fields,source_content,claim_statements,
+        lexical,vector,text_search_config,processing_regions,credential_id)
+      VALUES($1,'beta',2,'{/title,/note}',true,true,true,true,'english','{local}','owner')`, [f.spaceId]);
+  };
+  const result = await search(both).search(f.owner, f.spaceId, { query: 'osprey' });
+  assert.deepEqual(eu.queries, [], 'the query never reached the removed region');
+  assert.deepEqual(result.collections.map(entry => [entry.collectionId, entry.vector, entry.vectorError]),
+    [['alpha', 'used', null], ['beta', 'unavailable', 'POLICY_CHANGED']]);
+  assert.equal(result.mode, 'hybrid');
+  assert.equal(result.state, 'degraded');
+  assert.ok(ids(result).includes(`alpha/record/${alpha}`));
+  assert.ok(result.results.filter(hit => hit.ref.collectionId === 'beta').every(hit => hit.provenance.vectorRank === null),
+    'beta answers lexically only');
+});
+
+/** Retire `collectionId`'s active generation 1 and activate an empty generation 2 under the same policy. */
+async function cutover(client, spaceId, collectionId) {
+  await client.query(`INSERT INTO projection_generations(space_id,collection_id,generation,policy_version,embedder,embedding_model,
+    model_version,dimensions) VALUES($1,$2,2,1,'local-hash','feature-hash','1',384)`, [spaceId, collectionId]);
+  await client.query(`UPDATE projection_generations SET state='verifying' WHERE space_id=$1 AND collection_id=$2 AND generation=2`,
+    [spaceId, collectionId]);
+  await client.query('BEGIN');
+  await client.query(`UPDATE projection_generations SET state='retired' WHERE space_id=$1 AND collection_id=$2 AND generation=1`,
+    [spaceId, collectionId]);
+  await client.query(`UPDATE projection_generations SET state='active' WHERE space_id=$1 AND collection_id=$2 AND generation=2`,
+    [spaceId, collectionId]);
+  await client.query('COMMIT');
+}
+
+test('hits from a generation retired before the reread are stale; a cutover during it waits for the search', async () => {
+  const f = await fixture({ collections: ['alpha'] });
+  await f.record('alpha', { title: 'cormorant colony' });
+  await index();
+  // Cut over after the candidates were read: every candidate is from the retired generation.
+  hooks = [{ match: LOCK_SPACE, run: async () => {
+    const client = await pool.connect();
+    try { await cutover(client, f.spaceId, 'alpha'); } finally { client.release(); }
+  } }];
+  const retired = await search(registry, hooked).search(f.owner, f.spaceId, { query: 'cormorant' });
+  assert.equal(hooks.length, 0);
+  assert.equal(retired.candidates.lexical, 1, 'read from generation 1 before the cutover');
+  assert.deepEqual(retired.results, [], 'nothing from a retired generation is returned as current');
+  assert.equal(retired.rejected.stale, 1);
+  assert.ok(retired.underfill.reasons.includes('rejected'));
+
+  // A cutover started while the reread holds the active generation waits for the search to commit.
+  const g = await fixture({ collections: ['alpha'] });
+  const held = await g.record('alpha', { title: 'cormorant roost' });
+  await index();
+  const order = [];
+  let moving;
+  hooks = [{ match: REREAD, run: async () => {
+    const client = await pool.connect();
+    moving = cutover(client, g.spaceId, 'alpha').then(() => order.push('cut over')).finally(() => client.release());
+    for (let tries = 0; ; tries++) {
+      const waiting = (await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname=current_database()
+        AND wait_event_type='Lock'`)).rows[0].n;
+      if (waiting) break;
+      assert.ok(tries < 400, 'the cutover waits on the search');
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+  } }];
+  const kept = await search(registry, hooked).search(g.owner, g.spaceId, { query: 'cormorant' });
+  order.push('searched');
+  await moving;
+  assert.deepEqual(ids(kept), [`alpha/record/${held}`]);
+  assert.deepEqual(order, ['searched', 'cut over']);
+});
+
+test('the reread reads only the cited ranges of large texts, and a canonical-JSON record on demand', async () => {
+  const f = await fixture({ collections: ['alpha'] });
+  const filler = 'é'.repeat(200_000);
+  const sourceId = await f.source('alpha', `The pelican ledger opens here. ${filler}`);
+  const nul = await f.record('alpha', { title: 'pelican\u0000 wharf' });
+  await index();
+  const rows = [];
+  const watched = { connect: async () => {
+    const client = await pool.connect();
+    return new Proxy(client, { get(target, property) {
+      if (property !== 'query') return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
+      return async (sql, ...rest) => {
+        const reply = await target.query(sql, ...rest);
+        if (typeof sql === 'string' && sql.includes(REREAD)) rows.push(...reply.rows);
+        return reply;
+      };
+    } });
+  } };
+  const result = await search(registry, watched).search(f.owner, f.spaceId, { query: 'pelican' });
+  assert.ok(rows.length >= 2);
+  // No reread row carries more than one chunk's range of text.
+  for (const row of rows) {
+    assert.ok(!Object.hasOwn(row, 'whole'));
+    assert.ok(row.text === null || [...row.text].length <= 1_000, 'only a cited range leaves the database');
+  }
+  const source = result.results.find(hit => hit.ref.id === sourceId);
+  assert.ok(source.citations.length >= 1);
+  const full = `The pelican ledger opens here. ${filler}`;
+  for (const citation of source.citations) assert.equal(citation.text, [...full].slice(citation.start, citation.end).join(''));
+  // A record jsonb cannot hold is cited from its canonical JSON, with its U+0000 intact.
+  const record = result.results.find(hit => hit.ref.id === nul);
+  assert.equal(record.citations[0].text, [...'pelican\u0000 wharf'].slice(record.citations[0].start, record.citations[0].end).join(''));
+  assert.ok(record.citations[0].text.includes('\u0000'));
 });

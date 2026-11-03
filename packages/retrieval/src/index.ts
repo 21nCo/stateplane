@@ -6,14 +6,25 @@ export type RefKind = 'record' | 'source' | 'claim';
  * the kinds of Ref the caller asked for and may read there.
  */
 export interface ActiveGeneration { collectionId: string; generation: number; textSearchConfig: string; kinds: readonly RefKind[] }
-/** What candidates may come from: one space and its granted collections' active generations. */
-export interface CandidateScope { spaceId: string; generations: readonly ActiveGeneration[] }
+/**
+ * What candidates may come from: one space and its granted collections'
+ * active generations. `evidenceCollections` lists the collections whose
+ * sources the caller may read now (null: every live collection, for the
+ * owner); a claim citing any other collection, or a deleted one, is not a
+ * candidate, as the claim service treats it as nonexistent.
+ */
+export interface CandidateScope {
+  spaceId: string; generations: readonly ActiveGeneration[]; evidenceCollections: readonly string[] | null;
+}
 /**
  * One projected chunk that matched: its canonical Ref, the authoritative
  * revision (and extraction) and generation it was built from, its offsets,
- * and its score in the list (higher is better). A candidate is a pointer
- * to authority, never evidence that its Ref is current, readable or
- * complete: callers reread and reauthorize it before returning anything.
+ * and its score in the list (higher is better). Candidates come only from
+ * chunks of the position authority holds when they are read, under the claim
+ * read rule, so no candidate list reflects content the caller cannot read
+ * then. A candidate is still a pointer to authority, never evidence that its
+ * Ref is current, readable or complete: callers reread and reauthorize it
+ * before returning anything.
  */
 export interface ChunkCandidate {
   collectionId: string; kind: RefKind; id: string; revision: number; extractionVersion: number | null;

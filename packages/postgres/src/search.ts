@@ -19,12 +19,14 @@ export interface SearchOptions {
   embedders?: EmbeddingRegistry;
 }
 export type SearchVectorState = 'used' | 'disabled' | 'unavailable';
-export type SearchVectorError = 'EMBEDDER_NOT_CONFIGURED' | 'EMBEDDER_UNAVAILABLE' | 'EMBEDDER_FAILED' | 'VECTOR_QUERY_FAILED';
+export type SearchVectorError = 'EMBEDDER_NOT_CONFIGURED' | 'EMBEDDER_UNAVAILABLE' | 'EMBEDDER_FAILED' | 'VECTOR_QUERY_FAILED'
+  | 'POLICY_CHANGED';
 export type SearchProjectionState = 'current' | 'pending' | 'degraded' | 'unindexed';
-export type SearchUnderfill = 'rejected' | 'bounded' | 'exhausted' | 'degraded' | 'unindexed' | 'pending';
+export type SearchUnderfill = 'rejected' | 'bounded' | 'capped' | 'approximate' | 'exhausted' | 'degraded' | 'unindexed' | 'pending';
 /** A code-point range of the authoritative text a hit matched in, read from authority, never from a projection. */
 export interface SearchCitation {
-  matchedBy: 'lexical' | 'vector'; chunk: number; field: string | null; start: number; end: number;
+  /** Every list whose best chunk for the Ref this is: lexical, vector or both. */
+  matchedBy: ('lexical' | 'vector')[]; chunk: number; field: string | null; start: number; end: number;
   sourceStart: number | null; sourceEnd: number | null; text: string;
 }
 export interface SearchHit {
@@ -132,6 +134,25 @@ function candidate(row: Record<string, unknown>): ChunkCandidate {
 const scopeArrays = (scope: CandidateScope) => [scope.generations.map(entry => entry.collectionId),
   scope.generations.map(entry => entry.generation), scope.generations.map(entry => entry.kinds.join(',')),
   scope.generations.map(entry => entry.textSearchConfig)];
+/**
+ * Only chunks of what the caller could read when the candidates are read: the
+ * Ref live at the chunk's revision (and, for a source, its latest extraction),
+ * and a claim citing only live collections in `evidence` (every live one when
+ * null). Deleted, superseded and hidden content then leaves no trace in a
+ * candidate list, its counts or its ranks; the reread still checks everything.
+ */
+const readable = (chunk: string, evidence: string) => `AND CASE ${chunk}.ref_kind
+    WHEN 'record' THEN EXISTS (SELECT 1 FROM records r WHERE r.space_id=${chunk}.space_id AND r.collection_id=${chunk}.collection_id
+      AND r.record_id=${chunk}.ref_id AND r.revision=${chunk}.revision AND NOT r.tombstone)
+    ELSE EXISTS (SELECT 1 FROM entity_refs e WHERE e.space_id=${chunk}.space_id AND e.collection_id=${chunk}.collection_id
+      AND e.kind=${chunk}.ref_kind AND e.entity_id=${chunk}.ref_id AND e.revision=${chunk}.revision AND NOT e.tombstone) END
+  AND (${chunk}.ref_kind<>'source' OR ${chunk}.extraction_version=(SELECT max(x.version) FROM extraction_versions x
+    WHERE x.space_id=${chunk}.space_id AND x.collection_id=${chunk}.collection_id AND x.source_id=${chunk}.ref_id))
+  AND (${chunk}.ref_kind<>'claim' OR NOT EXISTS (SELECT 1 FROM claim_evidence a
+    LEFT JOIN collections k ON k.space_id=a.space_id AND k.collection_id=a.source_collection_id
+    WHERE a.space_id=${chunk}.space_id AND a.collection_id=${chunk}.collection_id AND a.claim_id=${chunk}.ref_id
+      AND (k.collection_id IS NULL OR k.lifecycle='deleted'
+        OR (${evidence}::text[] IS NOT NULL AND a.source_collection_id<>ALL(${evidence}::text[])))))`;
 
 /**
  * The lexical and vector candidate ports over PostgreSQL full-text search
@@ -154,11 +175,11 @@ export class PostgresCandidates implements LexicalCandidates, VectorCandidates {
         FROM unnest($2::text[],$3::bigint[],$4::text[],$5::text[]) AS a(collection_id,generation,kinds,config)
         CROSS JOIN LATERAL (SELECT websearch_to_tsquery(a.config::regconfig,$6) AS query) q
         JOIN lexical_chunks l ON l.space_id=$1 AND l.collection_id=a.collection_id AND l.generation=a.generation
-          AND l.ref_kind=ANY(string_to_array(a.kinds,',')) AND l.tsv @@ q.query),
+          AND l.ref_kind=ANY(string_to_array(a.kinds,',')) AND l.tsv @@ q.query ${readable('l', '$8')}),
       best AS (SELECT DISTINCT ON (collection_id,ref_kind,ref_id) * FROM m
         ORDER BY collection_id,ref_kind,ref_id,score DESC,chunk_index)
       SELECT * FROM best ORDER BY score DESC,collection_id COLLATE "C",ref_kind,ref_id COLLATE "C" LIMIT $7`,
-    [scope.spaceId, ...scopeArrays(scope), query, limit])).rows.map(candidate));
+    [scope.spaceId, ...scopeArrays(scope), query, limit, scope.evidenceCollections])).rows.map(candidate));
   }
 
   /**
@@ -184,10 +205,11 @@ export class PostgresCandidates implements LexicalCandidates, VectorCandidates {
         CROSS JOIN LATERAL (SELECT v.${candidateColumns.replaceAll(',', ',v.')},1-(${distance}) AS score FROM vector_chunks v
           WHERE v.space_id=$1 AND v.collection_id=a.collection_id AND v.generation=a.generation AND v.dimensions=${dimensions}
             AND v.embedder=$7 AND v.embedding_model=$8 AND v.model_version=$9 AND v.ref_kind=ANY(string_to_array(a.kinds,','))
+            ${readable('v', '$11')}
           ORDER BY ${distance} LIMIT $10) x
         ORDER BY x.score DESC,x.collection_id COLLATE "C",x.ref_kind,x.ref_id COLLATE "C",x.chunk_index LIMIT $10`,
       [scope.spaceId, ...scopeArrays(scope), `[${embedding.join(',')}]`, identity.embedder, identity.model, identity.modelVersion,
-        limit])).rows.map(candidate);
+        limit, scope.evidenceCollections])).rows.map(candidate);
     });
   }
 }
@@ -244,9 +266,26 @@ async function plan(db: Db, scope: AuthorityScope, owner: boolean, request: Requ
   return planned;
 }
 
+/**
+ * The live collections whose sources a key may read now (null for the owner,
+ * who reads every live one): a claim citing any other is no candidate.
+ */
+async function evidenceCollections(db: Db, scope: AuthorityScope, owner: boolean): Promise<string[] | null> {
+  if (owner) return null;
+  return (await db.query(`SELECT g.collection_id FROM collection_grants g
+      JOIN collections c ON c.space_id=g.space_id AND c.collection_id=g.collection_id
+    WHERE g.space_id=$1 AND g.credential_id=$2 AND c.lifecycle<>'deleted' AND 'sources:read'=ANY(g.capabilities)
+      AND (g.expires_at IS NULL OR g.expires_at>clock_timestamp()) ORDER BY g.collection_id COLLATE "C"`,
+  [scope.spaceId, scope.credentialId])).rows.map(row => String(row.collection_id));
+}
+
 /** One candidate citation as authority holds it now. */
 interface Reread {
-  currentRevision: number | null; tombstone: boolean | null; latestExtraction: number | null; text: string | null;
+  currentRevision: number | null; tombstone: boolean | null; latestExtraction: number | null;
+  /** The cited range only, or null when authority's text no longer reaches the citation's end. */
+  text: string | null;
+  /** A record whose `jsonb` cannot hold its text (U+0000): its cited range is read from its canonical JSON on demand. */
+  canonical: boolean;
   review: SearchHit['review']; attributedTo: string | null; evidence: ClaimEvidenceView[]; cited: string[];
   citesDeleted: boolean; verifiedAt: string;
 }
@@ -254,10 +293,11 @@ interface Reread {
 /**
  * Reread every candidate citation at authority in one statement, so all of
  * them come from one snapshot: the Ref's current revision and tombstone, a
- * source's latest extraction, the cited text at the citation's offsets (from
- * the record field, extraction or claim revision the chunk was built from),
- * a claim revision's review, attribution and evidence, and every collection
- * any revision of the claim cites (and whether one of them is deleted).
+ * source's latest extraction, the cited range of the record field,
+ * extraction or claim revision the chunk was built from (sliced by code
+ * point in SQL, so only the range leaves the database), a claim revision's
+ * review, attribution and evidence, and every collection any revision of the
+ * claim cites (and whether one of them is deleted).
  */
 async function reread(db: Db, spaceId: string, candidates: readonly ChunkCandidate[]): Promise<Reread[]> {
   const column = <T>(pick: (item: ChunkCandidate) => T) => candidates.map(pick);
@@ -265,8 +305,8 @@ async function reread(db: Db, spaceId: string, candidates: readonly ChunkCandida
     : JSON.stringify(field.split('/').slice(1).map(token => token.replaceAll('~1', '/').replaceAll('~0', '~')));
   const rows = (await db.query(`SELECT c.n,clock_timestamp() AS verified_at,COALESCE(rec.revision,e.revision) AS current_revision,
       COALESCE(rec.tombstone,e.tombstone) AS tombstone,x.latest,
-      CASE c.kind WHEN 'record' THEN f.value WHEN 'source' THEN ev.content ELSE cr.statement END AS whole,
-      CASE WHEN c.kind='record' AND rec.record_id IS NOT NULL AND rec.data IS NULL THEN rec.canonical_data END AS canonical,
+      CASE WHEN char_length(w.whole)>=c.finish THEN substr(w.whole,(c.start+1)::int,(c.finish-c.start)::int) END AS text,
+      (c.kind='record' AND rec.record_id IS NOT NULL AND rec.data IS NULL) AS canonical,
       cr.review_status,cr.reviewed_by,cr.reviewed_at,cr.attributed_to,
       CASE WHEN c.kind='claim' THEN COALESCE((SELECT jsonb_agg(jsonb_build_array(v.source_collection_id,v.source_id,
           v.extraction_version,v.start_offset,v.end_offset) ORDER BY v.ordinal) FROM claim_evidence v WHERE v.space_id=$1
@@ -276,10 +316,9 @@ async function reread(db: Db, spaceId: string, candidates: readonly ChunkCandida
       EXISTS (SELECT 1 FROM claim_evidence a JOIN collections k ON k.space_id=a.space_id AND k.collection_id=a.source_collection_id
         WHERE c.kind='claim' AND a.space_id=$1 AND a.collection_id=c.collection_id AND a.claim_id=c.id
           AND k.lifecycle='deleted') AS cites_deleted
-    FROM unnest($2::text[],$3::text[],$4::text[],$5::bigint[],$6::bigint[],$7::jsonb[]) WITH ORDINALITY
-      AS c(collection_id,kind,id,revision,extraction_version,path,n)
+    FROM unnest($2::text[],$3::text[],$4::text[],$5::bigint[],$6::bigint[],$7::jsonb[],$8::bigint[],$9::bigint[]) WITH ORDINALITY
+      AS c(collection_id,kind,id,revision,extraction_version,path,start,finish,n)
     LEFT JOIN records rec ON c.kind='record' AND rec.space_id=$1 AND rec.collection_id=c.collection_id AND rec.record_id=c.id
-    LEFT JOIN LATERAL (SELECT rec.data #>> ARRAY(SELECT jsonb_array_elements_text(c.path)) AS value) f ON c.kind='record'
     LEFT JOIN entity_refs e ON c.kind<>'record' AND e.space_id=$1 AND e.collection_id=c.collection_id AND e.kind=c.kind
       AND e.entity_id=c.id
     LEFT JOIN LATERAL (SELECT max(v.version) AS latest FROM extraction_versions v WHERE c.kind='source' AND v.space_id=$1
@@ -288,29 +327,37 @@ async function reread(db: Db, spaceId: string, candidates: readonly ChunkCandida
       AND ev.source_id=c.id AND ev.version=c.extraction_version
     LEFT JOIN claim_revisions cr ON c.kind='claim' AND cr.space_id=$1 AND cr.collection_id=c.collection_id AND cr.claim_id=c.id
       AND cr.revision=c.revision
+    CROSS JOIN LATERAL (SELECT CASE c.kind WHEN 'record' THEN rec.data #>> ARRAY(SELECT jsonb_array_elements_text(c.path))
+      WHEN 'source' THEN ev.content ELSE cr.statement END AS whole) w
     ORDER BY c.n`,
   [spaceId, column(item => item.collectionId), column(item => item.kind), column(item => item.id), column(item => item.revision),
-    column(item => item.extractionVersion), column(item => path(item.field))])).rows;
-  return rows.map((row, index) => {
-    const candidate = candidates[index];
-    // A record whose jsonb cannot hold its text (U+0000) is read from its canonical JSON.
-    let whole: string | null = row.whole;
-    if (whole === null && row.canonical !== null) {
-      const value = pointer(JSON.parse(row.canonical), candidate.field ?? '');
-      whole = typeof value === 'string' ? value : null;
-    }
-    // Code points of the authoritative text, as every projection offset counts them.
-    const points = whole === null ? null : codePoints(whole);
-    return { currentRevision: row.current_revision === null ? null : Number(row.current_revision), tombstone: row.tombstone,
-      latestExtraction: row.latest === null ? null : Number(row.latest),
-      text: points && points.length >= candidate.end ? points.slice(candidate.start, candidate.end).join('') : null,
-      review: row.review_status ? { status: row.review_status, reviewedBy: row.reviewed_by, reviewedAt: iso(row.reviewed_at) } : null,
-      attributedTo: row.attributed_to ?? null, cited: row.cited, citesDeleted: row.cites_deleted === true,
-      verifiedAt: iso(row.verified_at)!,
-      evidence: ((row.evidence ?? []) as unknown[][]).map(item => ({ collectionId: String(item[0]), sourceId: String(item[1]),
-        extractionVersion: item[2] === null ? null : Number(item[2]), start: item[3] === null ? null : Number(item[3]),
-        end: item[4] === null ? null : Number(item[4]) })) };
-  });
+    column(item => item.extractionVersion), column(item => path(item.field)), column(item => item.start),
+    column(item => item.end)])).rows;
+  return rows.map(row => ({ currentRevision: row.current_revision === null ? null : Number(row.current_revision),
+    tombstone: row.tombstone, latestExtraction: row.latest === null ? null : Number(row.latest), text: row.text ?? null,
+    canonical: row.canonical === true,
+    review: row.review_status ? { status: row.review_status, reviewedBy: row.reviewed_by, reviewedAt: iso(row.reviewed_at) } : null,
+    attributedTo: row.attributed_to ?? null, cited: row.cited, citesDeleted: row.cites_deleted === true,
+    verifiedAt: iso(row.verified_at)!,
+    evidence: ((row.evidence ?? []) as unknown[][]).map(item => ({ collectionId: String(item[0]), sourceId: String(item[1]),
+      extractionVersion: item[2] === null ? null : Number(item[2]), start: item[3] === null ? null : Number(item[3]),
+      end: item[4] === null ? null : Number(item[4]) })) }));
+}
+
+/**
+ * The cited range of a record whose `jsonb` cannot hold its text, from its
+ * canonical JSON at the candidate's revision. Read one record at a time and
+ * only for a candidate about to be returned, so at most `limit` records'
+ * canonical JSON (each at most 1 MiB) is read, one after another.
+ */
+async function canonicalRange(db: Db, spaceId: string, candidate: ChunkCandidate): Promise<string | null> {
+  const row = (await db.query(`SELECT canonical_data FROM records WHERE space_id=$1 AND collection_id=$2 AND record_id=$3
+    AND revision=$4 AND NOT tombstone AND data IS NULL`, [spaceId, candidate.collectionId, candidate.id, candidate.revision])).rows[0];
+  if (!row) return null;
+  const value = pointer(JSON.parse(row.canonical_data), candidate.field ?? '');
+  // Code points of the authoritative text, as every projection offset counts them.
+  const points = typeof value === 'string' ? codePoints(value) : null;
+  return points && points.length >= candidate.end ? points.slice(candidate.start, candidate.end).join('') : null;
 }
 
 /** Whether authority still holds the exact revision (and extraction) a citation was built from, with its text. */
@@ -323,6 +370,46 @@ const mayRead = (access: Access, collectionId: string, capability: string) =>
   access.grants.get(collectionId)?.includes(capability) === true;
 
 interface Group { identity: EmbedderIdentity; embedder: Embedder; entries: Planned[] }
+
+/** Thrown by a group's admission when none of its collections may still send the query to its embedder. */
+class AdmissionClosed extends Error {}
+
+/**
+ * Each collection's active generation now, with its policy version and the
+ * regions both that policy and the collection's current one allow, read
+ * just before a query embedding call; empty when the space is no longer open
+ * at the admitted policy and placement. Live collections only.
+ */
+async function admission(db: Db, scope: AuthorityScope, collectionIds: string[])
+  : Promise<Map<string, { generation: number; policyVersion: number; regions: string[] }>> {
+  const rows = (await db.query(`SELECT a.collection_id,a.generation,a.policy_version,
+      ARRAY(SELECT r FROM unnest(cur.processing_regions) WITH ORDINALITY u(r,n) WHERE r=ANY(p.processing_regions) ORDER BY n) AS regions
+    FROM spaces s JOIN collections c ON c.space_id=s.space_id
+    JOIN projection_generations a ON a.space_id=c.space_id AND a.collection_id=c.collection_id AND a.state='active'
+    JOIN retrieval_policies p ON p.space_id=a.space_id AND p.collection_id=a.collection_id AND p.version=a.policy_version
+    JOIN retrieval_collection_heads h ON h.space_id=a.space_id AND h.collection_id=a.collection_id
+    JOIN retrieval_policies cur ON cur.space_id=h.space_id AND cur.collection_id=h.collection_id AND cur.version=h.policy_version
+    WHERE s.space_id=$1 AND s.lifecycle IN ('active','readOnly') AND s.policy_version=$2 AND s.placement_generation=$3
+      AND c.lifecycle<>'deleted' AND c.collection_id=ANY($4::text[])`,
+  [scope.spaceId, scope.policyVersion, scope.placementGeneration, collectionIds])).rows;
+  return new Map(rows.map(row => [String(row.collection_id), { generation: Number(row.generation),
+    policyVersion: Number(row.policy_version), regions: row.regions as string[] }]));
+}
+
+/**
+ * The searched collections' active generations, share locked through commit
+ * after the scope locks, so a cutover either committed before the reread and
+ * is seen, or waits for the search to commit. A hit from any other
+ * generation (or policy version) is stale.
+ */
+async function activeGenerations(db: Db, spaceId: string, collectionIds: string[])
+  : Promise<Map<string, { generation: number; policyVersion: number }>> {
+  const rows = (await db.query(`SELECT collection_id,generation,policy_version FROM projection_generations
+    WHERE space_id=$1 AND collection_id=ANY($2::text[]) AND state='active' ORDER BY collection_id COLLATE "C" FOR SHARE`,
+  [spaceId, collectionIds])).rows;
+  return new Map(rows.map(row => [String(row.collection_id), { generation: Number(row.generation),
+    policyVersion: Number(row.policy_version) }]));
+}
 
 /**
  * Hybrid search over each granted collection's active projection generation.
@@ -356,17 +443,18 @@ export class PostgresRetrievalSearch {
     const { scope, ownerPrincipalId } = admitted;
     const owner = actor.kind === 'session';
     const input = parse(request);
-    const all = await transact(cell.pool, db => plan(db, scope, owner, input));
+    const { all, evidence } = await transact(cell.pool, async db => ({ all: await plan(db, scope, owner, input),
+      evidence: await evidenceCollections(db, scope, owner) }));
     const collectionsCapped = all.length > searchBounds.collections;
     const planned = all.slice(0, searchBounds.collections);
     if (input.collections && planned.length !== input.collections.length) throw new AuthorityError('NOT_FOUND');
     if (!owner && !planned.length) throw new AuthorityError('FORBIDDEN');
     const bound = overfetch(input.limit);
     const candidates = new PostgresCandidates(cell.pool);
-    const scopeOf = (entries: Planned[]): CandidateScope => ({ spaceId, generations: entries.map(entry => entry.active!) });
+    const scopeOf = (entries: Planned[]): CandidateScope => ({ spaceId, generations: entries.map(entry => entry.active!),
+      evidenceCollections: evidence });
 
-    // Vector lists first, so the plan's region read is the last thing before the query leaves for an embedder:
-    // one embedding per identity and region, sent only to a region both of each collection's policies allow.
+    // One embedding per identity and region, sent only to a region both of each collection's policies allow.
     const groups = new Map<string, Group>();
     for (const entry of planned) {
       const identity = entry.active?.identity;
@@ -381,17 +469,36 @@ export class PostgresRetrievalSearch {
     const vectorLists: ChunkCandidate[][] = [];
     for (const { identity, embedder, entries } of groups.values()) {
       let embedding: number[];
+      let admitted: Planned[] = [];
+      let stage: 'admission' | 'embedding' = 'admission';
+      // Just before the call, in a fresh read: the space still open at the admitted policy and placement, and each
+      // collection live at the planned active generation with the embedder's region allowed by both policies. A
+      // narrowing committed during an earlier group's call therefore stops this one; one committed during this call
+      // cannot recall it, as for the worker.
+      const admit = async () => {
+        const current = await transact(cell.pool, db => admission(db, scope, entries.map(entry => entry.collectionId)));
+        admitted = entries.filter(entry => {
+          const now = current.get(entry.collectionId);
+          return now !== undefined && now.generation === entry.active!.generation && now.policyVersion === entry.active!.policyVersion
+            && now.regions.includes(embedder.profile.region);
+        });
+        for (const entry of entries) if (!admitted.includes(entry)) entry.vectorError = 'POLICY_CHANGED';
+        if (!admitted.length) throw new AdmissionClosed();
+        stage = 'embedding';
+      };
       // One try; a call that outlasts the bound, even one ignoring its signal, is an outage and is not waited for.
       const signal = AbortSignal.timeout(searchBounds.embedMs);
-      try { [embedding] = await within(embedBatch(embedder, [input.query], signal, []), signal); }
+      try { [embedding] = await within(embedBatch(embedder, [input.query], signal, [], admit), signal); }
       catch (error) {
-        for (const entry of entries) entry.vectorError = error instanceof EmbedderUnavailableError || signal.aborted
-          ? 'EMBEDDER_UNAVAILABLE' : 'EMBEDDER_FAILED';
+        if (error instanceof AdmissionClosed) continue;
+        for (const entry of stage === 'admission' ? entries : admitted)
+          entry.vectorError = stage === 'admission' ? 'VECTOR_QUERY_FAILED'
+            : error instanceof EmbedderUnavailableError || signal.aborted ? 'EMBEDDER_UNAVAILABLE' : 'EMBEDDER_FAILED';
         continue;
       }
-      try { vectorLists.push(await candidates.nearest(scopeOf(entries), identity, embedding, bound)); }
-      catch { for (const entry of entries) entry.vectorError = 'VECTOR_QUERY_FAILED'; continue; }
-      for (const entry of entries) entry.vector = 'used';
+      try { vectorLists.push(await candidates.nearest(scopeOf(admitted), identity, embedding, bound)); }
+      catch { for (const entry of admitted) entry.vectorError = 'VECTOR_QUERY_FAILED'; continue; }
+      for (const entry of admitted) entry.vector = 'used';
     }
     const lexical = await candidates.lexical(scopeOf(planned.filter(entry => entry.active?.lexical)), input.query, bound);
 
@@ -404,6 +511,8 @@ export class PostgresRetrievalSearch {
     const fused = fuseRanks(lists.map(list => [...list.keys()]));
     const considered = fused.slice(0, bound);
     const bounded = lexical.length >= bound || vectorLists.some(list => list.length >= bound) || fused.length > bound;
+    // A filtered approximate scan can stop short (pgvector's hnsw.max_scan_tuples), so a short vector list proves nothing.
+    const approximate = vectorLists.some(list => list.length < bound);
     // Each considered Ref's citations: its best chunk from every list it is in, lexical first.
     const cited = considered.map(entry => lists.flatMap((list, from) => {
       const hit = list.get(entry.key);
@@ -412,6 +521,7 @@ export class PostgresRetrievalSearch {
 
     const { hits, rejected } = await transact(cell.pool, async db => {
       const access = await this.lockScope(db, scope, owner, planned.map(entry => entry.collectionId));
+      const active = await activeGenerations(db, spaceId, planned.map(entry => entry.collectionId));
       const flat = cited.flat();
       const reads = flat.length ? await reread(db, spaceId, flat.map(item => item.hit)) : [];
       const readOf = new Map(flat.map((item, at) => [item, reads[at]]));
@@ -424,10 +534,15 @@ export class PostgresRetrievalSearch {
         if (!mayRead(access, head.collectionId, capability)) { rejected.unauthorized++; continue; }
         const first = readOf.get(cited[index][0])!;
         if (first.currentRevision === null || first.tombstone !== false) { rejected.deleted++; continue; }
-        // Only citations of exactly what authority holds now; a Ref with none left is stale.
+        // Only citations from the active generation of exactly what authority holds now; a Ref with none left is stale.
+        const generation = active.get(head.collectionId);
         const current: typeof cited[number] = [];
-        for (const item of cited[index])
-          if (holds(item.hit, readOf.get(item)!) && !current.some(other => other.hit.chunk === item.hit.chunk)) current.push(item);
+        for (const item of cited[index]) {
+          if (generation?.generation !== item.hit.generation || generation.policyVersion !== item.hit.policyVersion) continue;
+          const read = readOf.get(item)!;
+          if (read.canonical && read.currentRevision === item.hit.revision) read.text = await canonicalRange(db, spaceId, item.hit);
+          if (holds(item.hit, read)) current.push(item);
+        }
         if (!current.length) { rejected.stale++; continue; }
         const read = readOf.get(current[0])!;
         // The claim read rule: a claim citing a collection whose sources the caller cannot read does not exist for it.
@@ -439,11 +554,17 @@ export class PostgresRetrievalSearch {
         const entry = planned.find(item => item.collectionId === head.collectionId)!;
         const ranks = considered[index].ranks;
         const chunk = current[0].hit;
+        // One citation per chunk, naming every list that found it there.
+        const citations: SearchCitation[] = [];
+        for (const item of current) {
+          const by = item.from === 0 ? 'lexical' as const : 'vector' as const;
+          const same = citations.find(other => other.chunk === item.hit.chunk);
+          if (same) { if (!same.matchedBy.includes(by)) same.matchedBy.push(by); continue; }
+          citations.push({ matchedBy: [by], chunk: item.hit.chunk, field: item.hit.field, start: item.hit.start, end: item.hit.end,
+            sourceStart: item.hit.sourceStart, sourceEnd: item.hit.sourceEnd, text: readOf.get(item)!.text! });
+        }
         hits.push({ ref: { spaceId, collectionId: chunk.collectionId, kind: chunk.kind, id: chunk.id }, revision: chunk.revision,
-          extractionVersion: chunk.extractionVersion, score: considered[index].score,
-          citations: current.map(item => ({ matchedBy: item.from === 0 ? 'lexical' as const : 'vector' as const,
-            chunk: item.hit.chunk, field: item.hit.field, start: item.hit.start, end: item.hit.end,
-            sourceStart: item.hit.sourceStart, sourceEnd: item.hit.sourceEnd, text: readOf.get(item)!.text! })),
+          extractionVersion: chunk.extractionVersion, score: considered[index].score, citations,
           provenance: { generation: chunk.generation, policyVersion: chunk.policyVersion, lexicalRank: ranks[0],
             vectorRank: ranks.slice(1).find(rank => rank !== null) ?? null,
             embedder: current.some(item => item.from > 0) ? entry.active!.identity : null,
@@ -461,8 +582,10 @@ export class PostgresRetrievalSearch {
     const vectorDown = collections.some(entry => entry.vector === 'unavailable');
     const degraded = vectorDown || collections.some(entry => entry.projection === 'degraded');
     const pending = collections.some(entry => entry.projection === 'pending' || entry.projection === 'unindexed');
+    // Exhausted only when every searched list returned all it had: no bound reached, no collection left out, no ANN list.
     const reasons: [SearchUnderfill, boolean][] = [
-      ['rejected', rejected.deleted + rejected.stale + rejected.unauthorized > 0], ['bounded', bounded], ['exhausted', !bounded],
+      ['rejected', rejected.deleted + rejected.stale + rejected.unauthorized > 0], ['bounded', bounded],
+      ['capped', collectionsCapped], ['approximate', approximate], ['exhausted', !bounded && !collectionsCapped && !approximate],
       ['degraded', vectorDown], ['unindexed', collections.some(entry => entry.projection === 'unindexed')],
       ['pending', collections.some(entry => entry.projection === 'pending' || entry.projection === 'degraded')]];
     return { spaceId, query: input.query, limit: input.limit,
