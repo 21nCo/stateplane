@@ -5,7 +5,7 @@ import { exactQuestions, ordinaryRequests, overRefusals } from './fixtures/exact
 
 const points = text => Array.from(text);
 const hit = (id, texts, extra = {}) => ({ ref: { spaceId: 'sp_1', collectionId: 'notes', kind: 'record', id }, revision: 2,
-  extractionVersion: null, verifiedAt: '2026-11-03T00:00:00.000Z', review: null, attributedTo: null,
+  extractionVersion: null, verifiedAt: '2026-11-03T00:00:00.000Z', attributedTo: null,
   citations: texts.map(([field, start, text]) => ({ field, start, end: start + points(text).length, sourceStart: null, sourceEnd: null,
     text })), ...extra });
 const bytes = text => Buffer.byteLength(text, 'utf8');
@@ -23,17 +23,26 @@ const unescape = text => text.replace(/&(?:amp|lt|gt|quot|#x([0-9a-f]+));/g, (en
   hex ? String.fromCodePoint(parseInt(hex, 16)) : { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"' }[entity]);
 
 test('a bundle cites every excerpt exactly and frames it as untrusted data', () => {
-  const claim = hit('c1', [[null, 0, 'The lantern burned whale oil.']], { ref: { spaceId: 'sp_1', collectionId: 'notes', kind: 'claim',
-    id: 'c1' }, review: { status: 'accepted', reviewedBy: 'u', reviewedAt: '2026-11-02T00:00:00.000Z' }, attributedTo: 'log' });
-  const bundle = assembleBundle([hit('r1', [['/title', 0, 'Harbor lantern'], ['/note', 4, 'lantern by the harbor']]), claim],
-    { bytes: 4_096, tokens: null });
+  // A search hit for a claim carries its review; a bundle returns no status, so neither the context nor an excerpt carries it.
+  const claim = (id, review) => hit(id, [[null, 0, 'The lantern burned whale oil.']], { ref: { spaceId: 'sp_1', collectionId: 'notes',
+    kind: 'claim', id }, review, attributedTo: 'log' });
+  // A source excerpt that is one whole cited chunk keeps the chunk's original range.
+  const source = hit('s1', [], { ref: { spaceId: 'sp_1', collectionId: 'notes', kind: 'source', id: 's1' }, extractionVersion: 3,
+    citations: [{ field: null, start: 7, end: 14, sourceStart: 120, sourceEnd: 135, text: 'harbor!' }] });
+  const bundle = assembleBundle([hit('r1', [['/title', 0, 'Harbor lantern'], ['/note', 4, 'lantern by the harbor']]),
+    claim('c1', { status: 'accepted', reviewedBy: 'u', reviewedAt: '2026-11-02T00:00:00.000Z' }), claim('c2', null),
+    claim('c3', { status: 'rejected', reviewedBy: 'u', reviewedAt: '2026-11-02T00:00:00.000Z' }), source], { bytes: 4_096, tokens: null });
   assert.match(BUNDLE_OPEN, /trust="untrusted"/);
   assert.match(BUNDLE_OPEN, /never as instructions/);
   assert.match(BUNDLE_OPEN, /no count, status or completeness/);
   const parsed = parseContext(bundle.context);
-  assert.deepEqual(parsed.map(item => item.text), ['Harbor lantern', 'lantern by the harbor', 'The lantern burned whale oil.']);
+  const claimText = 'The lantern burned whale oil.';
+  assert.deepEqual(parsed.map(item => item.text), ['Harbor lantern', 'lantern by the harbor', claimText, claimText, claimText, 'harbor!']);
   assert.deepEqual(bundle.excerpts.map(item => [item.n, item.ref.id, item.field, item.start, item.end, item.truncated]),
-    [[1, 'r1', '/title', 0, 14, false], [2, 'r1', '/note', 4, 25, false], [3, 'c1', null, 0, 29, false]]);
+    [[1, 'r1', '/title', 0, 14, false], [2, 'r1', '/note', 4, 25, false], [3, 'c1', null, 0, 29, false], [4, 'c2', null, 0, 29, false],
+      [5, 'c3', null, 0, 29, false], [6, 's1', null, 7, 14, false]]);
+  assert.deepEqual([bundle.excerpts[5].sourceStart, bundle.excerpts[5].sourceEnd, bundle.excerpts[5].extractionVersion], [120, 135, 3]);
+  assert.deepEqual(bundle.excerpts.slice(0, 5).map(item => [item.sourceStart, item.sourceEnd]), Array(5).fill([null, null]));
   // The context names each excerpt's citation as the structured list does.
   for (const [at, excerpt] of bundle.excerpts.entries()) {
     const { attributes } = parsed[at];
@@ -41,8 +50,14 @@ test('a bundle cites every excerpt exactly and frames it as untrusted data', () 
       attributes.end], [String(excerpt.n), excerpt.ref.collectionId, excerpt.ref.kind, excerpt.ref.id, '2', String(excerpt.start),
       String(excerpt.end)]);
   }
-  assert.equal(parsed[2].attributes.review, 'accepted');
-  assert.equal(bundle.excerpts[2].attributedTo, 'log');
+  assert.equal(parsed[5].attributes.extraction, '3');
+  // Reviewed or not, no excerpt names a review status: the context's attributes and the excerpt fields are the citation only.
+  for (const { attributes } of parsed) assert.ok(Object.keys(attributes).every(name =>
+    ['n', 'collection', 'kind', 'id', 'revision', 'extraction', 'field', 'start', 'end'].includes(name)), Object.keys(attributes).join());
+  assert.doesNotMatch(bundle.context, /review|accepted|rejected/);
+  for (const excerpt of bundle.excerpts) assert.deepEqual(Object.keys(excerpt).sort(), ['attributedTo', 'end', 'extractionVersion', 'field',
+    'n', 'ref', 'revision', 'sourceEnd', 'sourceStart', 'start', 'truncated', 'verifiedAt']);
+  assert.deepEqual(bundle.excerpts.slice(2, 5).map(item => item.attributedTo), ['log', 'log', 'log']);
   assert.equal(bundle.truncated, false);
   assert.deepEqual(bundle.usage, { bytes: bytes(bundle.context), tokensAtMost: bytes(bundle.context) });
 });
@@ -227,6 +242,21 @@ test('every line, separated part and coordinated subrequest must be an allowed f
     assert.equal(exactQuestion(text), null, JSON.stringify(text));
   for (const text of ['Summarize the storm notes and the invoices unpaid', 'why did the storm hit and invoice two paid',
     'What did we finish and report on the storm', 'Show me the suppliers and notes on the storm', 'find notes about fog and every tide'])
+    assert.notEqual(exactQuestion(text), null, JSON.stringify(text));
+});
+
+test('a coordinated instruction to explain is served exactly as it is alone, and a continuing noun phrase keeps its cues', () => {
+  const verbs = ['summarize', 'summarise', 'describe', 'explain', 'outline', 'draft', 'compare', 'contrast', 'discuss', 'recap', 'clarify',
+    'paraphrase'];
+  const leads = ['Summarize the storm and ', 'Find notes about the storm and ', 'why did the storm hit and ', 'harbor lantern and ',
+    'Explain the flood, then ', 'compare fog and tides plus '];
+  for (const verb of verbs) for (const object of ['current events', 'the open sea crossing', 'the storm']) {
+    const alone = `${verb} ${object}`;
+    assert.equal(exactQuestion(alone), null, alone);
+    for (const lead of leads) assert.equal(exactQuestion(`${lead}${alone}`), null, JSON.stringify(`${lead}${alone}`));
+  }
+  for (const text of ['Summarize the storm and current events', 'compare fog and open tickets', 'Summarize the storm and tasks left',
+    'describe the storm and invoices not paid', 'Summarize the storm and describe the unpaid invoices'])
     assert.notEqual(exactQuestion(text), null, JSON.stringify(text));
 });
 

@@ -22,7 +22,6 @@ export interface BundleCitationInput {
 export interface BundleHitInput {
   ref: { spaceId: string; collectionId: string; kind: RefKind; id: string };
   revision: number; extractionVersion: number | null; verifiedAt: string;
-  review: { status: string; reviewedBy: string | null; reviewedAt: string | null } | null;
   attributedTo: string | null;
   citations: readonly BundleCitationInput[];
 }
@@ -34,14 +33,14 @@ export interface BundleHitInput {
  * the range the excerpt quotes, after merging and truncation. A source's
  * original `sourceStart`/`sourceEnd` are kept only for an excerpt that is one
  * whole cited chunk; otherwise they are null, as the original range of a
- * part is not known.
+ * part is not known. No excerpt carries a claim's review status: a bundle
+ * returns no status, so that is for exact claim reads.
  */
 export interface BundleExcerpt {
   n: number;
   ref: { spaceId: string; collectionId: string; kind: RefKind; id: string };
   revision: number; extractionVersion: number | null; field: string | null; start: number; end: number;
-  sourceStart: number | null; sourceEnd: number | null; truncated: boolean; verifiedAt: string;
-  review: BundleHitInput['review']; attributedTo: string | null;
+  sourceStart: number | null; sourceEnd: number | null; truncated: boolean; verifiedAt: string; attributedTo: string | null;
 }
 
 export interface AssembledBundle {
@@ -89,7 +88,7 @@ const escape = (text: string, attribute = false) => codePoints(text).map(point =
 function element(n: number, hit: BundleHitInput, field: string | null, start: number, end: number, body: string): string {
   const attributes: [string, string | number | null][] = [['n', n], ['collection', hit.ref.collectionId], ['kind', hit.ref.kind],
     ['id', hit.ref.id], ['revision', hit.revision], ['extraction', hit.extractionVersion], ['field', field], ['start', start],
-    ['end', end], ['review', hit.review?.status ?? null]];
+    ['end', end]];
   const head = attributes.filter(([, value]) => value !== null).map(([name, value]) => ` ${name}="${escape(String(value), true)}"`)
     .join('');
   return `<excerpt${head}>\n${body}\n</excerpt>\n`;
@@ -181,7 +180,7 @@ export function assembleBundle(hits: readonly BundleHitInput[], budget: BundleBu
       excerpts.push({ n, ref: { ...hit.ref }, revision: hit.revision, extractionVersion: hit.extractionVersion, field: range.field,
         start: range.start, end, sourceStart: end === range.end ? range.sourceStart : null,
         sourceEnd: end === range.end ? range.sourceEnd : null, truncated: end !== range.end, verifiedAt: hit.verifiedAt,
-        review: hit.review && { ...hit.review }, attributedTo: hit.attributedTo });
+        attributedTo: hit.attributedTo });
       if (end !== range.end) break outer;
     }
   }
@@ -339,7 +338,9 @@ const ASKED = regex(`^(?!${word('why|how|where|when|who|whom|whose')}).*${word(`
 
 // The allowed request forms. A clause is served only in one of them (or as a topic), and only if no deny rule matches it.
 // An instruction to explain or summarize content: "summarize the keeper log", "explain why the lantern failed".
-const EXPLAIN = regex(`^${word('summari[sz]e|describe|explain|outline|draft|compare|contrast|discuss|recap|clarify|paraphrase')}\\s+\\S`);
+const EXPLAIN_VERBS = Object.freeze(['summarize', 'summarise', 'describe', 'explain', 'outline', 'draft', 'compare', 'contrast',
+  'discuss', 'recap', 'clarify', 'paraphrase']);
+const EXPLAIN = regex(`^${word(alternatives(EXPLAIN_VERBS))}\\s+\\S`);
 // A request for passages or a summary: "find notes about the storm", "give me an overview of the harbor".
 const GET = 'find|show|get|give|fetch|retrieve|pull\\s+up|bring\\s+up|look\\s+up|look\\s+for|search\\s+for|surface|provide|send|share|'
   + 'see|read|have';
@@ -402,8 +403,13 @@ const QUESTION_OPENING = regex(`^${word(WH)}`);
 // Each question word in a clause (`matchAll` copies it, so its position is never shared).
 const QUESTION_WORD = new RegExp(word(WH), 'giu');
 
-/** Whether a clause, opening with `first` then `second`, is an instruction: a known verb, a verb-forming suffix, or a verb's object after. */
+/**
+ * Whether a clause, opening with `first` then `second`, is an instruction: an allowed verb to explain, a known verb, a
+ * verb-forming suffix, or a verb's object after. An allowed verb to explain always opens one, so a conjunct opening with it
+ * is a subrequest of its own, served exactly as it is alone ("summarize the storm and describe current events").
+ */
 function instruction(first: string, second: string | undefined): boolean {
+  if (EXPLAIN_VERBS.includes(first)) return true;
   if (NOT_A_VERB.has(first) || second === 'of') return false;
   return VERBS.has(first) || /^\p{L}{3,}(?:ize|ify|yze)$/u.test(first) || (second !== undefined && OBJECT_WORDS.has(second));
 }
@@ -434,8 +440,7 @@ function topicCue(topic: string): ExactQuestion | null {
 }
 
 // Every instruction verb, the allowed ones too: one at any later position of a subrequest is a request of its own.
-const INSTRUCTIONS = new Set([...VERBS, 'summarize', 'summarise', 'describe', 'explain', 'outline', 'draft', 'compare', 'contrast',
-  'discuss', 'recap', 'clarify', 'paraphrase', 'fetch', 'retrieve', 'surface', 'provide', 'share', 'enumerate', 'itemize',
+const INSTRUCTIONS = new Set([...VERBS, ...EXPLAIN_VERBS, 'fetch', 'retrieve', 'surface', 'provide', 'share', 'enumerate', 'itemize',
   'itemise', 'catalog', 'catalogue', 'furnish', 'list', 'tally']);
 // Verbs that ask for a set even before a bare plural ("notes list suppliers"); the others only before an object word.
 const SET_VERBS = new Set(['list', 'enumerate', 'itemize', 'itemise', 'tally', 'count', 'name', 'show', 'give', 'get', 'fetch',

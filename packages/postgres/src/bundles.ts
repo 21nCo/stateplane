@@ -19,8 +19,8 @@ export interface ContextBundle {
   context: string;
   /**
    * Each excerpt's citation, numbered as in `context`, for the caller, not a
-   * model: it holds stored strings (IDs, fields, a claim's `attributedTo` and
-   * `review.reviewedBy`) unescaped, outside the frame and the budget. Only
+   * model: it holds stored strings (IDs, fields, a claim's `attributedTo`)
+   * unescaped, outside the frame and the budget, and no claim's review status. Only
    * `context` is meant for a model's context; a transport must not place this
    * metadata there unframed.
    */
@@ -103,8 +103,8 @@ export class PostgresContextBundles {
     }
     const result = await this.search.search(actor, spaceId, input.search);
     const assembled = assembleBundle(result.results.map(hit => ({ ref: hit.ref, revision: hit.revision,
-      extractionVersion: hit.extractionVersion, verifiedAt: hit.freshness.verifiedAt, review: hit.review,
-      attributedTo: hit.provenance.attributedTo, citations: hit.citations })), input.budget);
+      extractionVersion: hit.extractionVersion, verifiedAt: hit.freshness.verifiedAt, attributedTo: hit.provenance.attributedTo,
+      citations: hit.citations })), input.budget);
     return { spaceId, task: input.task, query: result.query, budget: input.budget, usage: assembled.usage, context: assembled.context,
       excerpts: assembled.excerpts, truncated: assembled.truncated, trust: 'untrusted', complete: false,
       coverage: { mode: result.mode, state: result.state } };

@@ -201,7 +201,9 @@ export const ordinaryRequests = Object.freeze(['harbor lantern', 'Why was the la
   'Find notes about the storm, then briefly explain the flood', 'Summarize the notes before the storm', 'Describe the harbor after the flood',
   'notes on the storm before the flood', 'daily logs', 'early storm notes', 'Describe how the keeper checks the lantern',
   'Explain how the lantern is repaired', 'weather update notes', "the keeper's log about the storm", 'Caf\u00e9 notes about the storm',
-  'na\u00efve lantern design', 'notes on the final check of the lantern', 'Why did the keeper look for the leak']);
+  'na\u00efve lantern design', 'notes on the final check of the lantern', 'Why did the keeper look for the leak',
+  // PR review: an instruction to explain opens a subrequest of its own, served as it is alone, even after another request.
+  'Summarize the storm and describe current events', 'Find notes about the harbor and discuss the open sea crossing']);
 
 /**
  * [text, rephrasing]: requests that ask no exact question but are refused
@@ -237,7 +239,9 @@ export const overRefusals = Object.freeze([
   ['Describe the storm so the crew can prepare', 'Describe the storm and the crew preparations'],
   ['only the storm notes', 'the storm notes'], ['notes we wrote about the storm', 'notes written about the storm'],
   ['Outline the steps the crew took during the storm', "Outline the crew's steps during the storm"],
-  ['Summarize the notes the keeper wrote', 'Summarize the notes written by the keeper']]);
+  ['Summarize the notes the keeper wrote', 'Summarize the notes written by the keeper'],
+  // PR review: all lines are also read as one, where a second line's verb and its object are a run-on request.
+  ['Summarize the storm\ndescribe the flood', 'Summarize the storm and describe the flood']]);
 
 /**
  * Exact questions the classifier does not recognize, so a bundle serves them. Refusal is best-effort; a bundle for
