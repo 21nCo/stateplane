@@ -433,3 +433,4 @@ export function fuseRanks(lists: readonly (readonly string[])[], k = RRF_K): Fus
   return [...fused.values()].sort((a, b) => b.score - a.score || best(a) - best(b) || first(a) - first(b)
     || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
 }
+export * from './bundle.js';

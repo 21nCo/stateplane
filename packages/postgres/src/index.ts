@@ -2138,3 +2138,4 @@ export * from './claims.js';
 export * from './links.js';
 export * from './retrieval.js';
 export * from './search.js';
+export * from './bundles.js';
