@@ -211,6 +211,17 @@ export class EmbeddingRegistry {
     }
     return null;
   }
+
+  /**
+   * The identity and region of every embedder accepting `inputCodePoints`:
+   * `resolve` finds one exactly when its identity is here with one of the
+   * given regions.
+   */
+  resolvable(inputCodePoints: number): (EmbedderIdentity & { region: string })[] {
+    return this.#embedders.filter(({ profile }) => profile.maxInputCodePoints >= inputCodePoints)
+      .map(({ profile }) => ({ embedder: profile.embedder, model: profile.model, modelVersion: profile.modelVersion,
+        dimensions: profile.dimensions, region: profile.region }));
+  }
 }
 
 /**

@@ -518,6 +518,32 @@ test('a stepper that cannot embed a vector rebuild leaves it due for one that ca
   assert.deepEqual([view.rebuild.phase, view.rebuild.backfilled, view.rebuild.lastError], ['verified', 1, null]);
 });
 
+test('a backlog of vector rebuilds a stepper cannot embed costs its claims nothing, and a lexical rebuild behind it advances', async () => {
+  const unsupported = Array.from({ length: 12 }, (_, n) => `v${n}`);
+  const f = await fixture({ collections: [...unsupported, 'lexical'], policy: { lexical: { vector: false } } });
+  const control = generations(new Target());
+  for (const collectionId of unsupported) await control.start(f.spaceId, collectionId, { embedder: V2 });
+  await control.start(f.spaceId, 'lexical');
+  // Every model migration has been due longer than the lexical rebuild.
+  await pool.query(`UPDATE projection_rebuilds SET available_at=clock_timestamp()-interval '1 hour'
+    WHERE space_id=$1 AND collection_id<>'lexical'`, [f.spaceId]);
+  await pool.query(`UPDATE projection_rebuilds SET available_at=clock_timestamp()-interval '1 second'
+    WHERE space_id=$1 AND collection_id='lexical'`, [f.spaceId]);
+  const jobs = async () => (await pool.query(`SELECT collection_id,phase,cursor_id,attempts,available_at,last_error FROM projection_rebuilds
+    WHERE space_id=$1 AND collection_id<>'lexical' ORDER BY collection_id`, [f.spaceId])).rows;
+  const waiting = await jobs();
+  // A stepper with only the old model: every candidate query it makes is counted.
+  let candidates = 0;
+  const counted = hookedPool(pool, () => [{ match: 'FROM projection_rebuilds r\n' }], () => { candidates++; });
+  const oldModel = new PostgresProjectionGenerations(counted, { embedders: new EmbeddingRegistry([healthy]) });
+  assert.deepEqual(await oldModel.step({ budgetMs: 10_000 }), { rebuilds: 1, refs: 0, pruned: 0 });
+  assert.equal((await pool.query(`SELECT phase FROM projection_rebuilds WHERE space_id=$1 AND collection_id='lexical'`,
+    [f.spaceId])).rows[0].phase, 'verified');
+  // One query leased the lexical rebuild and one found nothing else due: none per waiting migration.
+  assert.equal(candidates, 2);
+  assert.deepEqual(await jobs(), waiting);
+});
+
 test('a standby generation whose model is withdrawn keeps new work pending until it is retired', async () => {
   const f = await fixture({ collections: ['alpha'] });
   await f.record('alpha', { title: 'harbor one' });

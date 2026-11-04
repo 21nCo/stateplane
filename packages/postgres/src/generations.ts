@@ -368,34 +368,37 @@ export class PostgresProjectionGenerations {
    * embedder this stepper's registry resolves. A rebuild it cannot embed is
    * left due exactly as it is (attempts, error and cursor unchanged) for a
    * stepper that can, so a cell without a configured embedder still advances
-   * lexical rebuilds and never holds back a model migration.
+   * lexical rebuilds and never holds back a model migration. The query itself
+   * leaves those out, so however many wait the claim reads none of them.
    */
   private async claim(until: number): Promise<Job | null> {
     return inTransaction(this.pool, async db => {
       const query: Query = db.query.bind(db);
       const passed: { s: string; c: string; g: number }[] = [];
       for (;;) {
-        // Not locked here: the lease below rechecks the job, so a job another step leases meanwhile is just passed.
-        const due = (await query(`SELECT r.space_id,r.collection_id,r.generation,g.embedder IS NOT NULL AS vector
+        // Not locked here: the lease below rechecks the job, so a job another step leases meanwhile is just passed;
+        // only such races repeat this query.
+        const due = (await query(`SELECT r.space_id,r.collection_id,r.generation
           FROM projection_rebuilds r
             JOIN projection_generations g ON g.space_id=r.space_id AND g.collection_id=r.collection_id AND g.generation=r.generation
             JOIN spaces s ON s.space_id=r.space_id AND s.lifecycle IN ('active','readOnly')
             JOIN collections c ON c.space_id=r.space_id AND c.collection_id=r.collection_id AND c.lifecycle<>'deleted'
           WHERE r.phase IN ('backfill','verify') AND r.available_at<=clock_timestamp()
             AND g.state=CASE r.phase WHEN 'backfill' THEN 'building' ELSE 'verifying' END
-            AND ($2::boolean OR g.embedder IS NULL)
+            -- A vector generation only with an embedder the registry resolves: its identity in a region both its
+            -- policy and the collection's current one allow (the regions loadGenerations gives it).
+            AND (g.embedder IS NULL OR EXISTS (SELECT 1 FROM jsonb_to_recordset($2::jsonb)
+                AS e(embedder text,model text,"modelVersion" text,dimensions integer,region text)
+              JOIN retrieval_policies p ON p.space_id=g.space_id AND p.collection_id=g.collection_id AND p.version=g.policy_version
+              JOIN retrieval_collection_heads h ON h.space_id=g.space_id AND h.collection_id=g.collection_id
+              JOIN retrieval_policies hp ON hp.space_id=h.space_id AND hp.collection_id=h.collection_id AND hp.version=h.policy_version
+              WHERE e.embedder=g.embedder AND e.model=g.embedding_model AND e."modelVersion"=g.model_version
+                AND e.dimensions=g.dimensions AND e.region=ANY(p.processing_regions) AND e.region=ANY(hp.processing_regions)))
             AND NOT $1::jsonb @> jsonb_build_array(jsonb_build_object('s',r.space_id,'c',r.collection_id,'g',r.generation))
           ORDER BY r.available_at,r.space_id,r.collection_id,r.generation LIMIT 1`,
-        [JSON.stringify(passed), this.#embedders.size > 0])).rows[0];
+        [JSON.stringify(passed), JSON.stringify(this.#embedders.resolvable(CHUNK_CODE_POINTS))])).rows[0];
         if (!due) return null;
         const key = [due.space_id, due.collection_id, due.generation];
-        if (due.vector) {
-          const generation = (await loadGenerations(query, due.space_id, due.collection_id, Number(due.generation)))[0];
-          if (!generation?.identity || !this.#embedders.resolve(generation.identity, generation.regions, CHUNK_CODE_POINTS)) {
-            passed.push({ s: due.space_id, c: due.collection_id, g: Number(due.generation) });
-            continue;
-          }
-        }
         const row = (await query(`UPDATE projection_rebuilds r
             SET available_at=clock_timestamp()+($4::integer * interval '1 millisecond'),attempts=r.attempts+1
           FROM (SELECT space_id,collection_id,generation FROM projection_rebuilds WHERE space_id=$1 AND collection_id=$2
