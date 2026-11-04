@@ -238,8 +238,11 @@ try {
       // 048 alters projection_generations, which every retrieval write and search share locks while it runs.
       if (name === '048_projection_rebuilds.sql' && (error?.code === '55P03' || error?.code === '40P01'))
         throw new Error('Projection generation upgrade waits for retrieval workers and searches; retry when long retrieval transactions finish', { cause:error });
+      // 57014 is also an explicit or infrastructure cancellation; only PostgreSQL's statement timeout message names the bound.
       if (name === '048_projection_rebuilds.sql' && error?.code === '57014')
-        throw new Error(`Projection generation upgrade ran past its ${MIGRATION_048_STATEMENT_MS / 1000} s statement bound and was rolled back, releasing the generations; retry`, { cause:error });
+        throw new Error(/statement timeout/.test(error.message ?? '')
+          ? `Projection generation upgrade ran past its ${MIGRATION_048_STATEMENT_MS / 1000} s statement bound and was rolled back, releasing the generations; retry`
+          : 'Projection generation upgrade was cancelled and rolled back, releasing the generations; retry', { cause:error });
       throw error;
     }
     if (boundedDdl) await client.query('SELECT set_config($1,$2,true)', ['lock_timeout',priorLockTimeout]); // NOSONAR -- restore this step's transaction-local timeout before the ledger write

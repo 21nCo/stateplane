@@ -72,7 +72,7 @@ export const hookedPool = (base, pending, used) => ({ connect: async () => {
   return new Proxy(client, { get(target, property) {
     if (property !== 'query') return typeof target[property] === 'function' ? target[property].bind(target) : target[property];
     return async (sql, ...rest) => {
-      const hook = typeof sql === 'string' ? pending().find(item => sql.includes(item.match)) : undefined;
+      const hook = typeof sql === 'string' ? pending().find(item => sql.includes(item.match) && (item.when?.(rest[0]) ?? true)) : undefined;
       if (!hook) return target.query(sql, ...rest);
       used(hook);
       await hook.run?.(target);

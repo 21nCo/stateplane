@@ -534,7 +534,7 @@ test('a backlog of vector rebuilds a stepper cannot embed costs its claims nothi
   const waiting = await jobs();
   // A stepper with only the old model: every candidate query it makes is counted.
   let candidates = 0;
-  const counted = hookedPool(pool, () => [{ match: 'FROM projection_rebuilds r\n' }], () => { candidates++; });
+  const counted = hookedPool(pool, () => [{ match: 'SELECT r.space_id,r.collection_id,r.generation\n' }], () => { candidates++; });
   const oldModel = new PostgresProjectionGenerations(counted, { embedders: new EmbeddingRegistry([healthy]) });
   assert.deepEqual(await oldModel.step({ budgetMs: 10_000 }), { rebuilds: 1, refs: 0, pruned: 0 });
   assert.equal((await pool.query(`SELECT phase FROM projection_rebuilds WHERE space_id=$1 AND collection_id='lexical'`,
@@ -542,6 +542,63 @@ test('a backlog of vector rebuilds a stepper cannot embed costs its claims nothi
   // One query leased the lexical rebuild and one found nothing else due: none per waiting migration.
   assert.equal(candidates, 2);
   assert.deepEqual(await jobs(), waiting);
+});
+
+/**
+ * A model migration under a policy allowing 'local' and 'eu', stepped by a stepper with the new model only in 'local' while
+ * another session publishes policy version 2 allowing only 'eu': just before the job's lease (`before-lease`), just after it
+ * (`after-lease`) or after the step loaded the generation, just before the Ref is read for preparation (`before-prepare`).
+ * The job must be left as it was, due at once, and a stepper with the new model in 'eu' then verifies it. Returns how many
+ * times the stepper leased the job and read its Ref.
+ */
+async function narrowedDuringStep(when) {
+  const f = await fixture({ collections: ['alpha'], policy: { alpha: { regions: ['local', 'eu'] } } });
+  await f.record('alpha', { title: 'harbor one' });
+  await index();
+  const local = new DeterministicEmbedder({ ...V2, region: 'local' });
+  await new PostgresProjectionGenerations(pool, { embedders: registry(local) }).start(f.spaceId, 'alpha', { embedder: V2 });
+  await due();
+  const job = async () => (await pool.query(`SELECT phase,cursor_kind,cursor_id,attempts,last_error,last_error_at,
+    available_at<=clock_timestamp() AS due FROM projection_rebuilds WHERE space_id=$1`, [f.spaceId])).rows[0];
+  const before = await job();
+  const narrow = () => pool.query(`INSERT INTO retrieval_policies(space_id,collection_id,version,record_fields,source_content,
+      claim_statements,lexical,vector,text_search_config,processing_regions,credential_id) SELECT space_id,collection_id,2,record_fields,
+      source_content,claim_statements,lexical,vector,text_search_config,ARRAY['eu'],credential_id FROM retrieval_policies
+    WHERE space_id=$1 AND collection_id='alpha' AND version=1`, [f.spaceId]);
+  // Only this space's statements: other tests' rebuilds may be due too.
+  const own = values => values?.includes(f.spaceId);
+  const lease = 'UPDATE projection_rebuilds j\n';
+  const read = 'FROM records r JOIN spaces s';
+  let leased = 0;
+  let reads = 0;
+  const count = result => { leased += result.rowCount; return result; };
+  const trigger = { 'before-lease': { match: lease, run: narrow, after: count },
+    'after-lease': { match: lease, after: async result => { await narrow(); return count(result); } },
+    'before-prepare': { match: read, run: narrow } }[when];
+  let hooks = [{ ...trigger, when: own }, { match: lease, when: own, after: count, keep: true }, { match: read, when: own, keep: true }];
+  const raced = hookedPool(pool, () => hooks, hook => {
+    if (hook.match === read) reads++;
+    if (!hook.keep) hooks = hooks.filter(entry => entry !== hook);
+  });
+  await new PostgresProjectionGenerations(raced, { embedders: registry(local) }).step({ budgetMs: 10_000 });
+  assert.equal(hooks.length, 2, 'the policy was published during the step');
+  assert.deepEqual(await job(), before, 'attempts, error and cursor as they were, due at once');
+  const capable = new PostgresProjectionGenerations(pool, { embedders: registry(new DeterministicEmbedder({ ...V2, region: 'eu' })) });
+  const view = await settle(capable, f, 2);
+  assert.deepEqual([view.rebuild.phase, view.rebuild.backfilled, view.rebuild.lastError], ['verified', 1, null]);
+  return { leased, reads };
+}
+
+test('a policy narrowing published before the lease leaves a rebuild the stepper can no longer embed as it was', async () => {
+  // The lease rechecks what the candidate query read: the job is never leased.
+  assert.deepEqual(await narrowedDuringStep('before-lease'), { leased: 0, reads: 0 });
+});
+
+test('a policy narrowing published after the lease gives the rebuild back uncharged, before or during the first Ref', async () => {
+  // The generation the step loads after the lease already shows the narrowing: the job is given back before its Ref is read.
+  assert.deepEqual(await narrowedDuringStep('after-lease'), { leased: 1, reads: 0 });
+  // Preparation then finds no embedder in the allowed regions: a lost capability, not an outage.
+  assert.deepEqual(await narrowedDuringStep('before-prepare'), { leased: 1, reads: 1 });
 });
 
 test('a standby generation whose model is withdrawn keeps new work pending until it is retired', async () => {

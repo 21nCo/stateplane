@@ -58,6 +58,8 @@ interface Job {
   cursor: { kind: RefKind; id: string } | null;
 }
 type Cursor = { kind: RefKind; id: string } | null;
+/** Rebuilds a step's claims pass over, by space, collection and generation. */
+type Passed = { s: string; c: string; g: number }[];
 /**
  * Progress not yet written to the job: the cursor it was last written at
  * (`from`), the last Ref finished since and the counters those Refs moved.
@@ -79,6 +81,28 @@ const cutShort = (error: unknown) => error instanceof DeadlineExceededError
 const RACED = new Set(['projection_generations_pending', 'projection_generations_policy', 'projection_generations_order']);
 /** A lock wait that ran out, or a deadlock: another session holds the generations or the job. */
 const busy = (error: unknown) => ['55P03', '40P01'].includes((error as { code?: unknown })?.code as string);
+/**
+ * The rebuilds a stepper may lease, as `projection_rebuilds r` joined to its
+ * generation `g`, ending in a WHERE clause callers extend: due, in a phase
+ * whose generation is in its state, in an open space and collection and, for
+ * a vector generation, with an embedder `embedders` (the registry's
+ * `resolvable` list, as jsonb) has in a region both the generation's policy
+ * and the collection's current one allow, the regions `loadGenerations`
+ * gives it. The candidate query and the lease both use it.
+ */
+const ELIGIBLE = (embedders: string) => `projection_rebuilds r
+    JOIN projection_generations g ON g.space_id=r.space_id AND g.collection_id=r.collection_id AND g.generation=r.generation
+    JOIN spaces s ON s.space_id=r.space_id AND s.lifecycle IN ('active','readOnly')
+    JOIN collections c ON c.space_id=r.space_id AND c.collection_id=r.collection_id AND c.lifecycle<>'deleted'
+  WHERE r.phase IN ('backfill','verify') AND r.available_at<=clock_timestamp()
+    AND g.state=CASE r.phase WHEN 'backfill' THEN 'building' ELSE 'verifying' END
+    AND (g.embedder IS NULL OR EXISTS (SELECT 1 FROM jsonb_to_recordset(${embedders}::jsonb)
+        AS e(embedder text,model text,"modelVersion" text,dimensions integer,region text)
+      JOIN retrieval_policies p ON p.space_id=g.space_id AND p.collection_id=g.collection_id AND p.version=g.policy_version
+      JOIN retrieval_collection_heads h ON h.space_id=g.space_id AND h.collection_id=g.collection_id
+      JOIN retrieval_policies hp ON hp.space_id=h.space_id AND hp.collection_id=h.collection_id AND hp.version=h.policy_version
+      WHERE e.embedder=g.embedder AND e.model=g.embedding_model AND e."modelVersion"=g.model_version
+        AND e.dimensions=g.dimensions AND e.region=ANY(p.processing_regions) AND e.region=ANY(hp.processing_regions)))`;
 
 function identityOf(value: unknown): EmbedderIdentity {
   const identity = value as EmbedderIdentity;
@@ -312,15 +336,17 @@ export class PostgresProjectionGenerations {
     let failure: unknown = null;
     try { await this.prune(Date.now() + Math.floor(budgetMs / 4), result); } catch (error) { if (!cutShort(error)) failure = error; }
     const outages: Outages = new Set();
+    // Rebuilds this step gave back because it cannot embed them, or lost to another step's lease: not claimed again here.
+    const passed: Passed = [];
     while (until - Date.now() >= MIN_REF_MS) {
       let job: Job | null;
-      try { job = await this.claim(until); } catch (error) {
+      try { job = await this.claim(until, passed); } catch (error) {
         if (cutShort(error)) break;
         throw error;
       }
       if (!job) break;
       result.rebuilds++;
-      result.refs += await this.advance(job, until, outages);
+      result.refs += await this.advance(job, until, outages, passed);
     }
     if (failure) throw failure;
     return result;
@@ -368,50 +394,53 @@ export class PostgresProjectionGenerations {
    * embedder this stepper's registry resolves. A rebuild it cannot embed is
    * left due exactly as it is (attempts, error and cursor unchanged) for a
    * stepper that can, so a cell without a configured embedder still advances
-   * lexical rebuilds and never holds back a model migration. The query itself
-   * leaves those out, so however many wait the claim reads none of them.
+   * lexical rebuilds and never holds back a model migration.
+   *
+   * The query keeps those rebuilds out of its result, so the claim makes no
+   * round trip per rebuild it cannot embed; the database still reads their
+   * rows in due order. The lease rechecks the same predicate under its own
+   * snapshot, so a policy committed after the candidate was read never
+   * charges the job; one committed after the lease is handled by `advance`.
    */
-  private async claim(until: number): Promise<Job | null> {
+  private async claim(until: number, passed: Passed): Promise<Job | null> {
+    const embedders = JSON.stringify(this.#embedders.resolvable(CHUNK_CODE_POINTS));
     return inTransaction(this.pool, async db => {
       const query: Query = db.query.bind(db);
-      const passed: { s: string; c: string; g: number }[] = [];
       for (;;) {
-        // Not locked here: the lease below rechecks the job, so a job another step leases meanwhile is just passed;
-        // only such races repeat this query.
+        // Not locked here: the lease below rechecks the job, so one another step leases meanwhile, or that a policy
+        // published meanwhile made unembeddable, is passed for the rest of the step; only such races repeat this query.
         const due = (await query(`SELECT r.space_id,r.collection_id,r.generation
-          FROM projection_rebuilds r
-            JOIN projection_generations g ON g.space_id=r.space_id AND g.collection_id=r.collection_id AND g.generation=r.generation
-            JOIN spaces s ON s.space_id=r.space_id AND s.lifecycle IN ('active','readOnly')
-            JOIN collections c ON c.space_id=r.space_id AND c.collection_id=r.collection_id AND c.lifecycle<>'deleted'
-          WHERE r.phase IN ('backfill','verify') AND r.available_at<=clock_timestamp()
-            AND g.state=CASE r.phase WHEN 'backfill' THEN 'building' ELSE 'verifying' END
-            -- A vector generation only with an embedder the registry resolves: its identity in a region both its
-            -- policy and the collection's current one allow (the regions loadGenerations gives it).
-            AND (g.embedder IS NULL OR EXISTS (SELECT 1 FROM jsonb_to_recordset($2::jsonb)
-                AS e(embedder text,model text,"modelVersion" text,dimensions integer,region text)
-              JOIN retrieval_policies p ON p.space_id=g.space_id AND p.collection_id=g.collection_id AND p.version=g.policy_version
-              JOIN retrieval_collection_heads h ON h.space_id=g.space_id AND h.collection_id=g.collection_id
-              JOIN retrieval_policies hp ON hp.space_id=h.space_id AND hp.collection_id=h.collection_id AND hp.version=h.policy_version
-              WHERE e.embedder=g.embedder AND e.model=g.embedding_model AND e."modelVersion"=g.model_version
-                AND e.dimensions=g.dimensions AND e.region=ANY(p.processing_regions) AND e.region=ANY(hp.processing_regions)))
+          FROM ${ELIGIBLE('$2')}
             AND NOT $1::jsonb @> jsonb_build_array(jsonb_build_object('s',r.space_id,'c',r.collection_id,'g',r.generation))
           ORDER BY r.available_at,r.space_id,r.collection_id,r.generation LIMIT 1`,
-        [JSON.stringify(passed), JSON.stringify(this.#embedders.resolvable(CHUNK_CODE_POINTS))])).rows[0];
+        [JSON.stringify(passed), embedders])).rows[0];
         if (!due) return null;
         const key = [due.space_id, due.collection_id, due.generation];
-        const row = (await query(`UPDATE projection_rebuilds r
-            SET available_at=clock_timestamp()+($4::integer * interval '1 millisecond'),attempts=r.attempts+1
-          FROM (SELECT space_id,collection_id,generation FROM projection_rebuilds WHERE space_id=$1 AND collection_id=$2
-            AND generation=$3 AND phase IN ('backfill','verify') AND available_at<=clock_timestamp() FOR UPDATE SKIP LOCKED) due
-          WHERE r.space_id=due.space_id AND r.collection_id=due.collection_id AND r.generation=due.generation
-          RETURNING r.space_id,r.collection_id,r.generation,r.phase,r.cursor_kind,r.cursor_id,r.attempts,
-            r.available_at::text AS lease`, [...key, LEASE_MS])).rows[0];
+        const row = (await query(`UPDATE projection_rebuilds j
+            SET available_at=clock_timestamp()+($4::integer * interval '1 millisecond'),attempts=j.attempts+1
+          FROM (SELECT r.space_id,r.collection_id,r.generation FROM ${ELIGIBLE('$5')}
+            AND r.space_id=$1 AND r.collection_id=$2 AND r.generation=$3 FOR UPDATE OF r SKIP LOCKED) due
+          WHERE j.space_id=due.space_id AND j.collection_id=due.collection_id AND j.generation=due.generation
+          RETURNING j.space_id,j.collection_id,j.generation,j.phase,j.cursor_kind,j.cursor_id,j.attempts,
+            j.available_at::text AS lease`, [...key, LEASE_MS, embedders])).rows[0];
         if (!row) { passed.push({ s: due.space_id, c: due.collection_id, g: Number(due.generation) }); continue; }
         return { spaceId: row.space_id, collectionId: row.collection_id, generation: Number(row.generation), phase: row.phase,
           lease: row.lease, attempts: row.attempts,
           cursor: row.cursor_kind === null ? null : { kind: row.cursor_kind, id: row.cursor_id } };
       }
     }, { deadline: until });
+  }
+
+  /** Whether this stepper's registry can embed the generation: a lexical one always, a vector one when its embedder resolves. */
+  private embeds(generation: Generation): boolean {
+    return !generation.vector || !generation.identity
+      || this.#embedders.resolve(generation.identity, generation.regions, CHUNK_CODE_POINTS) !== null;
+  }
+
+  /** The job's generation as it is now, if not retired. */
+  private async load(job: Job, until: number): Promise<Generation | undefined> {
+    return (await inTransaction(this.pool, db => loadGenerations(db.query.bind(db), job.spaceId, job.collectionId, job.generation),
+      control(until)))[0];
   }
 
   /** The next Refs after the job's cursor, in key order, of the kinds the generation configures. */
@@ -444,9 +473,12 @@ export class PostgresProjectionGenerations {
    * refused its content) is a mismatch that fails verification. An outage or
    * an interrupted preparation backs the job off without moving past the
    * Ref; in the backfill any other failure does too, so no Ref is ever
-   * skipped. Returns the Refs finished.
+   * skipped. A generation this stepper can no longer embed (a policy
+   * published since the lease narrowed its regions), found when it is loaded
+   * or when a Ref's preparation fails, is not an outage: the job is given
+   * back uncharged. Returns the Refs finished.
    */
-  private async advance(claimed: Job, until: number, outages: Outages): Promise<number> {
+  private async advance(claimed: Job, until: number, outages: Outages, passed: Passed): Promise<number> {
     let job = claimed;
     const progress: Progress = { from: job.cursor, cursor: job.cursor, done: 0, repaired: 0, mismatches: [] };
     // Progress was written: it is now the job's.
@@ -455,9 +487,10 @@ export class PostgresProjectionGenerations {
     try {
       for (;;) {
         if (until - Date.now() < MIN_REF_MS) { await this.settle(job, progress, 0, null, until); return finished; }
-        const generation = (await inTransaction(this.pool, db => loadGenerations(db.query.bind(db), job.spaceId, job.collectionId,
-          job.generation), control(until)))[0];
+        const generation = await this.load(job, until);
         if (!generation) return finished;
+        // A policy published since the lease can leave this stepper unable to embed the generation: the job is not its to charge.
+        if (!this.embeds(generation)) { await this.release(job, progress, until, passed); return finished; }
         const refs = await this.page({ ...job, cursor: progress.cursor }, generation, until);
         if (!refs.length) {
           if (!await this.finishPhase(job, progress, until) || job.phase === 'verify') return finished;
@@ -472,6 +505,11 @@ export class PostgresProjectionGenerations {
           try { outcome = await this.project(job, generation, ref, progress, until, outages); } catch (error) {
             // An unacknowledged commit is not the Ref's failure: the job stops and resumes from what is durable.
             if (error instanceof CommitOutcomeUnknownError) throw error;
+            // Preparation found no embedder, or stopped, because a policy published meanwhile narrowed the regions: a lost
+            // capability, not an outage of an embedder that resolves, so the job is released uncharged.
+            // A reload that fails says nothing about the capability; the error is then handled as it is.
+            const now = generation.identity ? await this.load(job, until).catch(() => undefined) : undefined;
+            if (now && !this.embeds(now)) { await this.release(job, progress, until, passed); return finished; }
             if (job.phase === 'backfill' || transientFault(error)) {
               const retry = retryOf(error, finished ? 1 : job.attempts);
               await this.settle(job, progress, retry.delayMs, retry.error, until);
@@ -624,6 +662,24 @@ export class PostgresProjectionGenerations {
           last_error=COALESCE($7::text,last_error),last_error_at=CASE WHEN $7::text IS NULL THEN last_error_at ELSE clock_timestamp() END
         WHERE space_id=$1 AND collection_id=$2 AND generation=$3 AND phase=$4 AND available_at=$5::timestamptz`,
       [job.spaceId, job.collectionId, job.generation, job.phase, job.lease, delayMs, error]);
+    }, { deadline: Math.min(Date.now(), until) + 1_000 });
+  }
+
+  /**
+   * Write progress unless the job already moved past it, and give the job
+   * back under its lease, due at once, uncharged: the lease's attempt is
+   * taken back and the last error is left as it is. For a stepper that cannot
+   * embed the job's generation, never through `retryOf`; this step then
+   * passes over it.
+   */
+  private async release(job: Job, progress: Progress, until: number, passed: Passed): Promise<void> {
+    passed.push({ s: job.spaceId, c: job.collectionId, g: job.generation });
+    await inTransaction(this.pool, async db => {
+      const query: Query = db.query.bind(db);
+      await this.write(query, job, progress);
+      await query(`UPDATE projection_rebuilds SET available_at=clock_timestamp(),attempts=GREATEST(attempts-1,0)
+        WHERE space_id=$1 AND collection_id=$2 AND generation=$3 AND phase=$4 AND available_at=$5::timestamptz`,
+      [job.spaceId, job.collectionId, job.generation, job.phase, job.lease]);
     }, { deadline: Math.min(Date.now(), until) + 1_000 });
   }
 
