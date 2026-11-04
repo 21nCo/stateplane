@@ -10,10 +10,10 @@ import { join } from 'node:path';
 import YAML from 'yaml';
 import Ajv2020 from 'ajv/dist/2020.js';
 import { McpFnTestClient, authenticatedHttpTarget } from '@mcpfn/testing';
-import { postgresServices } from '../../packages/postgres/dist/index.js';
+import { PostgresProjectionGenerations, postgresServices } from '../../packages/postgres/dist/index.js';
 import { createHttpHandler } from '../../packages/api/dist/index.js';
 import { createMcpHandler } from '../../packages/mcp/dist/index.js';
-import { claims, fixture, identity, index, pool, registry, spaces } from './retrieval-harness.js';
+import { claims, fixture, hookedPool, identity, index, pool, registry, spaces } from './retrieval-harness.js';
 
 // STA-49: search, bundles and projection status over HTTP, the CLI (which speaks HTTP) and MCP, through one
 // composition of the real services on PostgreSQL 17 + pgvector, with the deterministic embedder configured.
@@ -215,4 +215,32 @@ test('HTTP, CLI and MCP give one authorization outcome for search, bundles and p
   // A deleted collection is gone for its owner's status too.
   await pool.query(`UPDATE collections SET lifecycle='deleted' WHERE space_id=$1 AND collection_id='beta'`, [f.spaceId]);
   assert.equal((await same('deleted collection status', 'status', await callers.owner.status('beta'))).error, 'NOT_FOUND');
+});
+
+test('projection status shows a rebuild in progress on every transport and refuses a suspension committed during its reads', async t => {
+  const f = await fixture();
+  await f.record('alpha', { title: 'beacon harbor log', note: 'The harbor beacon was relit at dusk.' });
+  await index();
+  const generations = new PostgresProjectionGenerations(pool, { embedders: registry });
+  await generations.start(f.spaceId, 'alpha');
+  // One step backfills and verifies this single record; the generation then waits, verifying, for activation.
+  await generations.step();
+  const origin = await host(t);
+  const temp = await mkdtemp(join(tmpdir(), 'stateplane-sta49-'));
+  t.after(() => rm(temp, { recursive: true, force: true }));
+  const owner = await caller(t, origin, temp, f.ownerToken, 'owner', f.spaceId);
+  const results = await owner.status('alpha');
+  assert.deepEqual(await same('rebuilding status', 'status', results), { state: results.http.state, generations: ['1:active', '2:verifying'] });
+  const { rebuild } = results.http;
+  assert.deepEqual([rebuild.generation, rebuild.state, rebuild.rebuild.phase, rebuild.rebuild.backfilled, rebuild.rebuild.verified],
+    [2, 'verifying', 'verified', 1, 1], JSON.stringify(rebuild));
+  assert.ok(rebuild.rebuild.cursor !== null && rebuild.rebuild.verifiedAt !== null, JSON.stringify(rebuild));
+
+  // A suspension that commits after the leading fence, while the generations are read, refuses the answer.
+  let hooks = [{ match: 'FROM projection_generations g LEFT JOIN projection_rebuilds',
+    run: () => pool.query(`UPDATE spaces SET lifecycle='suspended' WHERE space_id=$1`, [f.spaceId]) }];
+  const hooked = postgresServices(spaces, new Map([['cell-a', { pool: hookedPool(pool, () => hooks, used => { hooks = hooks.filter(hook => hook !== used); }),
+    cursorSecret: randomBytes(32) }]]), 3600, { embedders: registry });
+  await assert.rejects(hooked.retrieval.status(f.owner, f.spaceId, 'alpha'), error => { assert.equal(error.code, 'SPACE_UNAVAILABLE', error.message); return true; });
+  assert.equal(hooks.length, 0, 'the suspension ran between the reads');
 });

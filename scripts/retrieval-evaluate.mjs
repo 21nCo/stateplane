@@ -11,7 +11,9 @@
 // The report (JSON on stdout, or --out FILE) measures this corpus, this embedder and this server; it is no
 // guarantee. The database is dropped at the end. The default embedder is the deterministic feature-hash one, which
 // is not a semantic model; --embedder MODULE uses the Embedder a module exports as default (for a provider sandbox,
-// scripts/http-embedder.mjs).
+// scripts/http-embedder.mjs). Projection is drained as scripts/retrieval-drain.mjs bounds it: a queue that makes no
+// progress for --drain-stalls rounds, or work left after --drain-seconds, ends the run with an error and the database
+// is still dropped.
 import { readFile, writeFile } from 'node:fs/promises';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -22,23 +24,26 @@ import pg from 'pg';
 import { memoryAdapter } from '@superfunctions/db/testing';
 import { createAuthFn, createUser, issueSession } from '@authfn/core';
 import { AuthFnAgentKeys, AuthFnIdentityVerifier } from '../packages/auth/dist/index.js';
-import { PostgresAuthority, PostgresClaims, PostgresOutbox, PostgresRetrievalSearch, PostgresRetrievalWorker, PostgresSources,
-  PostgresSpaces, RecordRetrievalProjector, postgresServices } from '../packages/postgres/dist/index.js';
+import { PostgresAuthority, PostgresClaims, PostgresRetrievalSearch, PostgresSources, PostgresSpaces, postgresServices }
+  from '../packages/postgres/dist/index.js';
 import { DeterministicEmbedder, EmbeddingRegistry } from '../packages/retrieval/dist/index.js';
 import { R2BlobStore } from '../packages/storage/dist/index.js';
-import { consume, dispatch } from '../packages/workers/dist/index.js';
 import { relevanceCollections, relevanceDocuments, relevanceQueries } from '../test/fixtures/relevance-corpus.js';
+import { drainProjections } from './retrieval-drain.mjs';
 import { mean, ndcgAt, percentile, precisionAt, recallAt, reciprocalRank, round } from './relevance-metrics.mjs';
 
 const { values: options } = parseArgs({ options: {
   runs: { type: 'string', default: '5' }, scale: { type: 'string', default: '2000' }, load: { type: 'string', default: '200' },
-  concurrency: { type: 'string', default: '8' }, embedder: { type: 'string' }, out: { type: 'string' } } });
+  concurrency: { type: 'string', default: '8' }, 'drain-seconds': { type: 'string', default: '3600' },
+  'drain-stalls': { type: 'string', default: '5' }, embedder: { type: 'string' }, out: { type: 'string' } } });
 const count = (name, min) => {
   const value = Number(options[name]);
   if (!Number.isSafeInteger(value) || value < min) throw new RangeError(`--${name} must be an integer of at least ${min}`);
   return value;
 };
 const runs = count('runs', 1), scale = count('scale', 0), load = count('load', 1), concurrency = count('concurrency', 1);
+// Projection is drained only while it progresses and until this deadline, so a failing embedder ends the run.
+const drainSettings = { deadline: Date.now() + count('drain-seconds', 1) * 1000, stalls: count('drain-stalls', 1) };
 const root = fileURLToPath(new URL('..', import.meta.url));
 const embedder = options.embedder ? (await import(pathToFileURL(options.embedder).href)).default : new DeterministicEmbedder();
 const registry = new EmbeddingRegistry([embedder]);
@@ -117,7 +122,7 @@ async function evaluate() {
         refs.set(`${document.collection}/claim/${created.claimId}`, document.id);
       }
     }
-    await project(authority);
+    await drainProjections(pool, authority, registry, drainSettings);
     return { spaceId, refs };
   }
 
@@ -237,25 +242,6 @@ async function atScale(space, spaces, services, owner) {
     chunks: { lexical: sizes.lexical, vector: sizes.vector },
     indexBytes: { lexical_chunks_tsv: Number(sizes.gin), [`vector_chunks_hnsw_${dimensions}`]: Number(sizes.hnsw) }, plans,
     load: { searches: load, concurrency, errors, throughputPerSecond: round(samples.length / seconds), latencyMs: latency(samples) } };
-}
-
-/** Deliver every due record event and evidence item, as the cell's queue consumer and jobs Worker would. */
-async function project(authority) {
-  const outbox = new PostgresOutbox(pool, authority);
-  const projector = new RecordRetrievalProjector(pool, { embedders: registry });
-  for (;;) {
-    await pool.query(`UPDATE projection_outbox SET available_at=clock_timestamp()-interval '1 second'
-      WHERE delivery_state<>'delivered' AND dead_lettered_at IS NULL`);
-    const sent = [];
-    await dispatch(outbox, { send: async messages => { sent.push(...messages); } });
-    if (!sent.length) break;
-    await consume(sent, message => outbox.process(message, projector), 8);
-  }
-  const worker = new PostgresRetrievalWorker(pool, { embedders: registry });
-  for (;;) {
-    await pool.query(`UPDATE retrieval_outbox SET available_at=clock_timestamp()-interval '1 second' WHERE delivery_state='pending'`);
-    if (!(await worker.step({ budgetMs: 30_000 })).claimed) break;
-  }
 }
 
 async function timed(run) { const start = performance.now(); const value = await run(); return { value, ms: performance.now() - start }; }
