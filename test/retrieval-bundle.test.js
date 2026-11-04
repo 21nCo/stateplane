@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { assembleBundle, BUNDLE_CLOSE, BUNDLE_OPEN, bundleBounds, exactQuestion } from '../packages/retrieval/dist/index.js';
-import { exactQuestions, ordinaryRequests, overRefusals } from './fixtures/exact-questions.js';
+import { emptyRequests, exactQuestions, ordinaryRequests, overRefusals } from './fixtures/exact-questions.js';
 
 const points = text => Array.from(text);
 const hit = (id, texts, extra = {}) => ({ ref: { spaceId: 'sp_1', collectionId: 'notes', kind: 'record', id }, revision: 2,
@@ -73,7 +73,7 @@ test('stored text cannot close an excerpt or the frame, add markup or carry cont
   const [parsed] = parseContext(bundle.context);
   assert.equal(parsed.attributes.id, 'x"><evil');
   assert.equal(parsed.attributes.field, '/a"b<c>');
-  assert.equal(parsed.text, hostile.replace('\ud800', '\uFFFD'));
+  assert.equal(parsed.text, hostile.replace(String.fromCharCode(0xd800), String.fromCharCode(0xfffd)));
 });
 
 test('a bundle never exceeds its byte or token budget and cuts at a whole code point', () => {
@@ -183,6 +183,10 @@ test('count, status and completeness questions are recognized by structure; ordi
   // One corpus, shared with the service test: every sibling local review raised and new variants of each structure.
   for (const [text, kind] of exactQuestions) assert.equal(exactQuestion(text), kind, JSON.stringify(text));
   for (const text of ordinaryRequests) assert.equal(exactQuestion(text), null, JSON.stringify(text));
+  // Nonblank text holding no subrequest asks for nothing: refused, alone, repeated or spaced; blank text is the caller's to reject.
+  for (const text of emptyRequests) for (const variant of [text, `${text} ${text}`, `\n${text}\n`])
+    assert.equal(exactQuestion(variant), 'unrecognized', JSON.stringify(variant));
+  for (const text of ['', ' ', '\t\n']) assert.equal(exactQuestion(text), null, JSON.stringify(text));
   // Structure, not vocabulary: a yes/no question, an embedded whether-question or a which-question over a participle is
   // refused whatever its verb, behind any request prefix; the same words as an ordinary request are not.
   for (const verb of ['arrived', 'reconciled', 'dispatched', 'escalated', 'translated']) {

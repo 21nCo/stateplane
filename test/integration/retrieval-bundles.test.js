@@ -13,7 +13,7 @@ import { PostgresAuthority, PostgresClaims, PostgresContextBundles, PostgresOutb
 import { BUNDLE_CLOSE, BUNDLE_OPEN, DeterministicEmbedder, EmbedderUnavailableError, EmbeddingRegistry }
   from '../../packages/retrieval/dist/index.js';
 import { R2BlobStore } from '../../packages/storage/dist/index.js';
-import { exactQuestions, ordinaryRequests, overRefusals, unrecognizedExact } from '../fixtures/exact-questions.js';
+import { emptyRequests, exactQuestions, ordinaryRequests, overRefusals, unrecognizedExact } from '../fixtures/exact-questions.js';
 import { consume, dispatch } from '../../packages/workers/dist/index.js';
 
 // STA-47: bounded context bundles over hybrid search of real projections,
@@ -235,7 +235,7 @@ test('a bundle quotes reauthorized, cited excerpts of authority, framed as untru
     [unreviewed.claimId]: { null: 'The harbor lantern was rebuilt in stone.' } };
   for (const [at, excerpt] of bundle.excerpts.entries()) {
     const whole = authoritative[excerpt.ref.id]?.[excerpt.field];
-    if (whole === undefined) continue;
+    assert.notEqual(whole, undefined, `${excerpt.ref.kind} ${excerpt.ref.id} cites unexpected field ${excerpt.field}`);
     assert.equal(framed[at].text, [...whole].slice(excerpt.start, excerpt.end).join(''));
     assert.deepEqual([framed[at].n, framed[at].collection, framed[at].kind, framed[at].id, framed[at].start, framed[at].end],
       [String(excerpt.n), excerpt.ref.collectionId, excerpt.ref.kind, excerpt.ref.id, String(excerpt.start), String(excerpt.end)]);
@@ -387,9 +387,9 @@ test('count, status and completeness requests are refused before anything is sea
   let connections = 0;
   const counting = { connect: () => { connections++; return pool.connect(); } };
   healthy.queries.length = 0;
-  // Every refused request of the shared corpus (exact questions, then over-refusals) through the task, through the query,
-  // and as a task beside an ordinary query; a refusal names exact reads and the allowed request forms.
-  const refused = [...exactQuestions, ...overRefusals.map(([text]) => [text, null])];
+  // Every refused request of the shared corpus (exact questions, over-refusals, then requests holding no subrequest) through
+  // the task, through the query, and as a task beside an ordinary query; a refusal names exact reads and the allowed forms.
+  const refused = [...exactQuestions, ...overRefusals.map(([text]) => [text, null]), ...emptyRequests.map(text => [text, 'unrecognized'])];
   const requests = refused.flatMap(([text, kind]) => [{ task: text }, { query: text }, { task: text, query: 'invoice' }]
     .map(request => [request, kind]));
   for (const [request, kind] of requests) {
@@ -407,7 +407,7 @@ test('count, status and completeness requests are refused before anything is sea
     });
   }
   assert.equal(connections, 0, 'no projection or authority read');
-  assert.equal(requests.length, (exactQuestions.length + overRefusals.length) * 3);
+  assert.equal(requests.length, (exactQuestions.length + overRefusals.length + emptyRequests.length) * 3);
   assert.deepEqual(healthy.queries, [], 'no query embedding');
   // The authoritative answer is an exact read, which needs no projection.
   const counted = await services.records.count(f.owner, f.spaceId, 'alpha', '[]');

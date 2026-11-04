@@ -9,8 +9,10 @@
 /**
  * [text, kind]: requests a bundle refuses. The kind is the deny rule's
  * (`count`, `status`, `completeness`), or `unrecognized` for a question or
- * instruction outside the allowed forms.
+ * instruction outside the allowed forms. A `rows(kind, block)` block holds
+ * requests of one kind separated by `|` or line breaks.
  */
+const rows = (kind, block) => block.split(/\s*[|\n]\s*/u).filter(Boolean).map(text => [text, kind]);
 export const exactQuestions = Object.freeze([
   // Count: how many or how much, counts, totals, quantities and amounts.
   ['How many invoices are overdue?', 'count'], ['count the open tickets', 'count'], ['Count the overdue invoices', 'count'],
@@ -27,91 +29,82 @@ export const exactQuestions = Object.freeze([
   ['Which stage is the audit at?', 'status'], ['pro\u{e0020}gress of the audit', 'status'],
 
   // Any yes/no question: a clause opening with an auxiliary or a modal, after any request prefix.
-  ['Is the bridge repair done?', 'status'], ['Has the claim been approved', 'status'], ['Is invoice two paid?', 'status'],
-  ['Is invoice two paid or still open?', 'status'], ['Please, is invoice two paid?', 'status'], ["Isn\u2019t the ticket resolved?", 'status'],
-  ['Lantern review: was it approved', 'status'], ['Has the shipment arrived?', 'status'], ['Did the vendor pay?', 'status'],
-  ['Did we finish the audit?', 'status'], ['Is the bridge repaired?', 'status'], ['is anything missing', 'status'],
-  ['Does invoice two remain outstanding', 'status'], ['Were the keepers relieved on schedule?', 'status'],
-  ["Hasn't the vendor sent the parts", 'status'], ['Do the towers have power again?', 'status'], ['am I cleared to sail', 'status'],
-  ['Will the shipment arrive on Friday?', 'status'], ["Won't the audit close this week?", 'status'],
-  ['Could you tell me, did the keeper sign?', 'status'], ['Hey, so did the vendor ever deliver?', 'status'],
-  ['Invoice two: has it cleared?', 'status'], ['is\u2060 the invoice p\u200caid', 'status'], ['is.the.invoice.paid', 'status'],
-  ['Can you check: is the gate fixed?', 'status'], ['I want to know, was the lantern relit?', 'status'],
+  ...rows('status', `Is the bridge repair done? | Has the claim been approved | Is invoice two paid?
+    Is invoice two paid or still open? | Please, is invoice two paid? | Isn\u2019t the ticket resolved?
+    Lantern review: was it approved | Has the shipment arrived? | Did the vendor pay? | Did we finish the audit?
+    Is the bridge repaired? | is anything missing | Does invoice two remain outstanding | Were the keepers relieved on schedule?
+    Hasn't the vendor sent the parts | Do the towers have power again? | am I cleared to sail | Will the shipment arrive on Friday?
+    Won't the audit close this week? | Could you tell me, did the keeper sign? | Hey, so did the vendor ever deliver?
+    Invoice two: has it cleared? | is\u2060 the invoice p\u200caid | is.the.invoice.paid | Can you check: is the gate fixed?
+    I want to know, was the lantern relit?`),
 
   // Embedded whether- and if-questions.
-  ['Please tell me whether the bridge repair is done', 'status'], ['Can you check if the invoices are unpaid', 'status'],
-  ['let me know whether the vendor shipped the parts', 'status'], ['I wonder if the harbor master signed off', 'status'],
-  ['find out whether the keeper relieved the watch', 'status'], ['tell me if the tower lamp works', 'status'],
+  ...rows('status', `Please tell me whether the bridge repair is done | Can you check if the invoices are unpaid
+    let me know whether the vendor shipped the parts | I wonder if the harbor master signed off
+    find out whether the keeper relieved the watch | tell me if the tower lamp works`),
 
   // A state still or not yet reached.
-  ['tickets still open', 'status'], ['invoices not yet paid', 'status'], ['invoices not yet reconciled', 'status'],
-  ['are the repairs done yet', 'status'],
+  ...rows('status', `tickets still open | invoices not yet paid | invoices not yet reconciled | are the repairs done yet`),
 
   // Which, what or whose things are, have been or got into a state; who has been or is in one.
-  ['which tickets remain unresolved', 'status'], ['What is still pending on the bridge?', 'status'],
-  ['Which invoices have been paid?', 'status'], ["Tell me which invoices haven't been paid", 'status'], ['What has shipped?', 'status'],
-  ['Which claims got approved?', 'status'], ['Which tickets are currently open?', 'status'],
-  ['Which orders have been dispatched?', 'status'], ["What's been reconciled so far?", 'status'],
-  ['Which of the invoices the vendor sent in March were never settled?', 'status'], ['Whose claims got rejected', 'status'],
-  ['show me which repairs are now complete', 'status'], ['what got done on the bridge', 'status'],
-  ['Who has been paid?', 'status'], ['who is still missing from the roster', 'status'], ['which tickets closed this week', 'status'],
-  ['what shipped yesterday', 'status'], ['Which lanterns are lit?', 'status'],
+  ...rows('status', `which tickets remain unresolved | What is still pending on the bridge? | Which invoices have been paid?
+    Tell me which invoices haven't been paid | What has shipped? | Which claims got approved? | Which tickets are currently open?
+    Which orders have been dispatched? | What's been reconciled so far?
+    Which of the invoices the vendor sent in March were never settled? | Whose claims got rejected
+    show me which repairs are now complete | what got done on the bridge | Who has been paid? | who is still missing from the roster
+    which tickets closed this week | what shipped yesterday | Which lanterns are lit?`),
 
   // Existence and whether more exists.
-  ['Are there any other keepers?', 'completeness'], ['Is there anything else about the lantern?', 'completeness'],
-  ['Is there more?', 'completeness'], ['which towers exist', 'completeness'], ['Does a log for the storm exist', 'completeness'],
-  ['any more invoices from the vendor', 'completeness'], ['what else did the keeper record', 'completeness'],
-  ['the rest of the suppliers', 'completeness'], ['Are there notes on the storm?', 'completeness'],
+  ...rows('completeness', `Are there any other keepers? | Is there anything else about the lantern? | Is there more?
+    which towers exist | Does a log for the storm exist | any more invoices from the vendor | what else did the keeper record
+    the rest of the suppliers | Are there notes on the storm?`),
 
   // Every member of a set, enumeration, and what remains.
-  ['list all suppliers', 'completeness'], ['list all overdue invoices', 'completeness'], ['Show all suppliers', 'completeness'],
-  ['all invoices from March', 'completeness'], ['every decision about the harbor', 'completeness'],
-  ['Give me the complete list of towers', 'completeness'], ['List the suppliers', 'completeness'],
-  ['please enumerate the towers', 'completeness'], ['Can you list the suppliers?', 'completeness'],
-  ['Give me a list of suppliers', 'completeness'], ['Name each supplier', 'completeness'], ['name all the keepers', 'completeness'],
-  ['list\ufeff all suppliers', 'completeness'], ['list_all suppliers', 'completeness'], ['each supplier we used', 'completeness'],
-  ['could you please itemize the repairs', 'completeness'], ['what is left to do on the bridge', 'status'],
-  ['who remains on the roster', 'completeness'], ['nothing missing from the log?', 'completeness'],
-  ['which suppliers remain', 'completeness'], ['what is missing from the ledger', 'status'],
-  ['What remains to be done?', 'status'],
+  ...rows('completeness', `list all suppliers | list all overdue invoices | Show all suppliers | all invoices from March
+    every decision about the harbor | Give me the complete list of towers | List the suppliers | please enumerate the towers
+    Can you list the suppliers? | Give me a list of suppliers | Name each supplier | name all the keepers | list\ufeff all suppliers
+    list_all suppliers | each supplier we used | could you please itemize the repairs`),
+  ...rows('status', `what is left to do on the bridge`),
+  ...rows('completeness', `who remains on the roster | nothing missing from the log? | which suppliers remain`),
+  ...rows('status', `what is missing from the ledger | What remains to be done?`),
 
   // Requests for the things in a state, or to confirm one; a state asked by a question mark alone; progress idioms.
-  ['Show me the unpaid invoices', 'status'], ['Give me the open tickets', 'status'], ['find open tickets', 'status'],
-  ['Confirm the invoice was paid', 'status'], ['check that the audit has finished', 'status'], ['invoice two paid?', 'status'],
-  ['the shipment arrived?', 'status'], ['the invoice, paid or not', 'status'], ['How is the bridge repair going?', 'status'],
-  ['where do we stand on the audit', 'status'], ['any update on the shipment', 'status'], ['When will the parts arrive', 'status'],
-  ['which invoices are yet to be paid', 'status'], ['who hasn\'t paid', 'status'], ['Tell me the invoices that have been paid', 'status'],
-  ['Could you let me know if invoice two has been paid?', 'status'], ["I'd like to know which invoices are outstanding", 'status'],
-  ['Has every ticket been closed?', 'status'], ["I'm wondering whether it shipped", 'status'], ['what do we owe the vendor', 'count'],
+  ...rows('status', `Show me the unpaid invoices | Give me the open tickets | find open tickets | Confirm the invoice was paid
+    check that the audit has finished | invoice two paid? | the shipment arrived? | the invoice, paid or not
+    How is the bridge repair going? | where do we stand on the audit | any update on the shipment | When will the parts arrive
+    which invoices are yet to be paid | who hasn't paid | Tell me the invoices that have been paid
+    Could you let me know if invoice two has been paid? | I'd like to know which invoices are outstanding
+    Has every ticket been closed? | I'm wondering whether it shipped`),
+  ...rows('count', `what do we owe the vendor`),
 
   // Round 3: ordinary phrasings outside the deny rules, refused because a bundle serves only the allowed forms (fail closed).
-  ['Which invoices carry an unpaid balance?', 'unrecognized'], ['Show me invoices marked unpaid', 'status'],
-  ['What is the size of the invoice collection?', 'count'], ['Provide the complete supplier list.', 'completeness'],
-  ['Which invoices did the vendor pay?', 'unrecognized'], ['What did we finish?', 'unrecognized'], ['Which keepers are on duty?', 'status'],
-  ['Which claims are under review?', 'status'], ['Which invoices are awaiting payment?', 'status'],
-  ['Which accounts are overdrawn?', 'unrecognized'], ['Which shipments went out?', 'unrecognized'],
-  ['Which supplier went bankrupt?', 'unrecognized'], ['Which vendors failed to deliver?', 'unrecognized'], ['What broke?', 'unrecognized'],
-  ['What are the suppliers?', 'unrecognized'], ['Who are our suppliers?', 'unrecognized'], ['What suppliers do we have?', 'unrecognized'],
-  ['Which suppliers do we use?', 'unrecognized'], ['Show me the suppliers', 'unrecognized'], ['Give me the suppliers', 'unrecognized'],
-  ['Show the suppliers', 'unrecognized'], ['Give me a listing of suppliers', 'completeness'], ['What is the sum?', 'count'],
+  ...rows('unrecognized', `Which invoices carry an unpaid balance?`),
+  ...rows('status', `Show me invoices marked unpaid`),
+  ...rows('count', `What is the size of the invoice collection?`),
+  ...rows('completeness', `Provide the complete supplier list.`),
+  ...rows('unrecognized', `Which invoices did the vendor pay? | What did we finish?`),
+  ...rows('status', `Which keepers are on duty? | Which claims are under review? | Which invoices are awaiting payment?`),
+  ...rows('unrecognized', `Which accounts are overdrawn? | Which shipments went out? | Which supplier went bankrupt?
+    Which vendors failed to deliver? | What broke? | What are the suppliers? | Who are our suppliers? | What suppliers do we have?
+    Which suppliers do we use? | Show me the suppliers | Give me the suppliers | Show the suppliers`),
+  ...rows('completeness', `Give me a listing of suppliers`),
+  ...rows('count', `What is the sum?`),
 
   // New variants: wh- and do-support questions with unlisted verbs, instructions with unlisted verbs, requests to be given a set.
-  ['Which lighthouse keepers transferred?', 'status'], ['What did the council approve?', 'unrecognized'],
-  ['What tickets did Ana triage?', 'unrecognized'], ['Who handles the harbor permits?', 'unrecognized'],
-  ['Whose invoices bounced?', 'unrecognized'], ['Where is the storm log?', 'unrecognized'], ['When did the shipment leave?', 'unrecognized'],
-  ['Furnish the suppliers', 'unrecognized'], ['Rattle off suppliers', 'unrecognized'], ['Compile supplier names', 'unrecognized'],
-  ['Quantify the backlog', 'unrecognized'], ['Get me everyone on the roster', 'completeness'], ['Pull up suppliers', 'unrecognized'],
-  ['I need the suppliers', 'unrecognized'], ['Do you have the supplier names?', 'unrecognized'], ['Can I see the suppliers?', 'unrecognized'],
-  ["I'd like the vendors", 'unrecognized'], ['I want to check the suppliers', 'unrecognized'], ['Tell me the suppliers', 'unrecognized'],
-  ['Find me the vendors', 'unrecognized'], ['give_me_the_suppliers', 'unrecognized'],
-  ['What happened to the shipment?', 'unrecognized'], ['tell me, who are the vendors', 'unrecognized'],
-  ['What about the vendors?', 'unrecognized'], ['Walk me through the suppliers', 'unrecognized'],
-  ['Fill me in on the suppliers', 'unrecognized'], ['Present the suppliers', 'unrecognized'],
+  ...rows('status', `Which lighthouse keepers transferred?`),
+  ...rows('unrecognized', `What did the council approve? | What tickets did Ana triage? | Who handles the harbor permits?
+    Whose invoices bounced? | Where is the storm log? | When did the shipment leave? | Furnish the suppliers | Rattle off suppliers
+    Compile supplier names | Quantify the backlog`),
+  ...rows('completeness', `Get me everyone on the roster`),
+  ...rows('unrecognized', `Pull up suppliers | I need the suppliers | Do you have the supplier names? | Can I see the suppliers?
+    I'd like the vendors | I want to check the suppliers | Tell me the suppliers | Find me the vendors | give_me_the_suppliers
+    What happened to the shipment? | tell me, who are the vendors | What about the vendors? | Walk me through the suppliers
+    Fill me in on the suppliers | Present the suppliers`),
   // An allowed form whose content asks an exact question is still refused by the deny rules.
-  ['Summarize which invoices were paid', 'status'], ['Explain whether the vendor paid', 'status'],
-  ['Find notes about which keepers are on duty', 'status'], ['Summarize the unpaid invoices', 'status'],
-  ['What did the keeper say about who was paid', 'status'], ['Describe every supplier', 'completeness'],
-  ['Why did the vendor raise prices, and how many invoices are late?', 'count'],
+  ...rows('status', `Summarize which invoices were paid | Explain whether the vendor paid | Find notes about which keepers are on duty
+    Summarize the unpaid invoices | What did the keeper say about who was paid`),
+  ...rows('completeness', `Describe every supplier`),
+  ...rows('count', `Why did the vendor raise prices, and how many invoices are late?`),
 
   // Round 4: every line, separated part and coordinated subrequest must be an allowed form; an allowed opening authorizes no later one.
   ['Summarize the storm notes and list the suppliers', 'completeness'], ['Find notes about the storm and enumerate the suppliers', 'completeness'],
@@ -250,4 +243,12 @@ export const overRefusals = Object.freeze([
  */
 export const unrecognizedExact = Object.freeze(['Describe the payment situation of invoice two', 'Explain the standing of the audit',
   'Explain the exact cardinality of the supplier set', 'Summarize the unpaid', 'Summarize everything overdue',
-  'Describe how the repair is going?']);
+  'Describe how the repair is going?', 'Summarize the storm confirm invoice two paid']);
+
+/**
+ * Nonblank requests holding no subrequest: punctuation, separators, symbols or a request prefix alone. They ask for
+ * nothing, so a bundle refuses them as `unrecognized` before searching; they are not joined with served requests,
+ * where they are only punctuation.
+ */
+export const emptyRequests = Object.freeze(['???', '...', '!!!', '  ?  ', '-', '\u2014', '?!', ';;', '()', '"', '* -', '~', '=>', '->',
+  '#', '\u2192', '\u200b', '\ud83d\udd25', 'please', 'please?', 'can you tell me', 'hey, please...']);

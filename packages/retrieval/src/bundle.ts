@@ -696,16 +696,21 @@ function clauses(reading: string): { groups: { head: string; text: string }[]; t
  * each, all, lists, rosters, existence and what remains), as do the topic
  * cues wherever they occur in it: a state word, before or after its noun,
  * negated or alone; remaining, left, missing or outstanding; a trailing
- * "all"; or a closing participle.
+ * "all"; or a closing participle. Nonblank text with no subrequest holding
+ * a letter or digit in any reading (punctuation, separators, symbols or a
+ * request prefix alone) asks for nothing, so it is refused as
+ * `unrecognized`; blank text is null.
  */
 export function exactQuestion(text: string): BundleRefusal | null {
   let found: BundleRefusal | null = null;
+  let asks = false;
   const note = (kind: BundleRefusal | null) => {
     if (kind && kind !== 'unrecognized') return kind;
     found ??= kind;
     return null;
   };
   for (const reading of readings(text)) for (const { groups, topics, asked } of clauses(reading)) {
+    asks ||= groups.some(({ text: group }) => /[\p{L}\p{N}]/u.test(group));
     for (const [index, { head, text: group }] of groups.entries()) {
       // The question mark ends the clause's last subrequest.
       const kind = note(refusal(head, group, asked && index === groups.length - 1));
@@ -716,5 +721,5 @@ export function exactQuestion(text: string): BundleRefusal | null {
       if (kind) return kind;
     }
   }
-  return found;
+  return asks || !text.trim() ? found : 'unrecognized';
 }
