@@ -1598,12 +1598,12 @@ const upgraded = async db => (await db.query(`SELECT (SELECT indisvalid FROM pg_
   (SELECT count(*)::int FROM information_schema.columns WHERE column_name='last_error_at'
     AND table_name IN ('projection_outbox','retrieval_outbox')) AS columns,
   (SELECT array_agg(name ORDER BY name) FROM stateplane_migrations WHERE name >= '046') AS recorded`)).rows[0];
-const AFTER_045 = ['046_retrieval_dispatch_checkpoint.sql', '047_retrieval_outbox_age.sql'];
+const AFTER_045 = ['046_retrieval_dispatch_checkpoint.sql', '047_retrieval_outbox_age.sql', '048_projection_rebuilds.sql'];
 
-test('a cell that applied main\'s migration 045 upgrades without drift and gains migrations 046 and 047', { timeout: 60_000 }, async () => {
+test('a cell that applied main\'s migration 045 upgrades without drift and gains migrations 046 to 048', { timeout: 60_000 }, async () => {
   await atMain045('u', async (db, url) => {
     const output = execFileSync(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: url }, encoding: 'utf8' });
-    assert.match(output, /Applied 046_retrieval_dispatch_checkpoint.sql\nApplied 047_retrieval_outbox_age.sql/);
+    assert.match(output, /Applied 046_retrieval_dispatch_checkpoint.sql\nApplied 047_retrieval_outbox_age.sql\nApplied 048_projection_rebuilds.sql/);
     assert.deepEqual(await upgraded(db), { age: true, columns: 2, recorded: AFTER_045 });
     assert.equal(execFileSync(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: url }, encoding: 'utf8' }), '');
   });
@@ -1653,6 +1653,88 @@ test('a writer holding the outboxes the other way round fails the upgrade with r
   });
 });
 
+test('a search holding the generations fails upgrade 048 with retry guidance, nothing of it applied, and a retry succeeds', { timeout: 60_000 }, async () => {
+  await atMain045('g', async (db, url) => {
+    const reader = new pg.Client({ connectionString: url });
+    await reader.connect();
+    try {
+      // A retrieval write or search share locks projection_generations until it ends; read committed, it holds no snapshot.
+      await reader.query('BEGIN; LOCK TABLE projection_generations IN ACCESS SHARE MODE');
+      const failed = await migrateAsync(url);
+      assert.equal(failed.status, 1);
+      assert.match(failed.stdout, /Applied 047_retrieval_outbox_age.sql\n$/);
+      assert.match(failed.stderr, /^Projection generation upgrade waits for retrieval workers and searches; retry/);
+      const applied = async () => (await db.query(`SELECT to_regclass('public.projection_rebuilds') IS NOT NULL AS rebuilds,
+        (SELECT count(*)::int FROM information_schema.columns WHERE table_name='projection_generations'
+          AND column_name IN ('standby_at','pruned_at')) AS columns,
+        (SELECT array_agg(name ORDER BY name) FROM stateplane_migrations WHERE name >= '046') AS recorded`)).rows[0];
+      assert.deepEqual(await applied(), { rebuilds: false, columns: 0, recorded: AFTER_045.slice(0, 2) });
+      await reader.query('COMMIT');
+      const retried = await migrateAsync(url);
+      assert.equal(retried.status, 0, retried.stderr);
+      assert.equal(retried.stdout, 'Applied 048_projection_rebuilds.sql\n');
+      assert.deepEqual(await applied(), { rebuilds: true, columns: 2, recorded: AFTER_045 });
+    } finally { await reader.end(); }
+  });
+});
+
+test('a 048 statement running past its bound is cancelled, releasing the generations with nothing of 048 applied, and a retry succeeds', { timeout: 90_000 }, async () => {
+  await atMain045('s', async (db, url) => {
+    // A statement that keeps running once it holds projection_generations exclusively (as a slow scan would).
+    await db.query(`CREATE FUNCTION test_slow_generations() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN
+      IF EXISTS (SELECT 1 FROM pg_event_trigger_ddl_commands() WHERE object_identity='public.projection_generations')
+      THEN PERFORM pg_sleep(600); END IF; END $$`);
+    await db.query(`CREATE EVENT TRIGGER test_slow_generations ON ddl_command_end WHEN TAG IN ('ALTER TABLE')
+      EXECUTE FUNCTION test_slow_generations()`);
+    const started = Date.now();
+    const migrating = migrateAsync(url);
+    await until(db, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event='PgSleep') AS ok`,
+      '048 never reached its slow statement');
+    // Meanwhile the generations are held: a search's share lock waits.
+    await assert.rejects(db.query("BEGIN; SET LOCAL lock_timeout = '200ms'; LOCK TABLE projection_generations IN ACCESS SHARE MODE"),
+      error => error.code === '55P03');
+    await db.query('ROLLBACK');
+    const failed = await migrating;
+    assert.ok(Date.now() - started < 40_000, 'the statement bound never ended the step');
+    assert.equal(failed.status, 1);
+    assert.match(failed.stdout, /Applied 047_retrieval_outbox_age.sql\n$/);
+    assert.match(failed.stderr, /^Projection generation upgrade ran past its 15 s statement bound and was rolled back, releasing the generations; retry/);
+    const applied = async () => (await db.query(`SELECT to_regclass('public.projection_rebuilds') IS NOT NULL AS rebuilds,
+      (SELECT count(*)::int FROM information_schema.columns WHERE table_name='projection_generations'
+        AND column_name IN ('standby_at','pruned_at')) AS columns,
+      (SELECT array_agg(name ORDER BY name) FROM stateplane_migrations WHERE name >= '046') AS recorded,
+      (SELECT count(*)::int FROM pg_locks l JOIN pg_class c ON c.oid=l.relation
+        WHERE c.relname='projection_generations' AND l.pid<>pg_backend_pid()) AS held`)).rows[0];
+    assert.deepEqual(await applied(), { rebuilds: false, columns: 0, recorded: AFTER_045.slice(0, 2), held: 0 });
+    await db.query('DROP EVENT TRIGGER test_slow_generations');
+    const retried = await migrateAsync(url);
+    assert.equal(retried.status, 0, retried.stderr);
+    assert.equal(retried.stdout, 'Applied 048_projection_rebuilds.sql\n');
+    assert.deepEqual(await applied(), { rebuilds: true, columns: 2, recorded: AFTER_045, held: 0 });
+  });
+});
+
+test('a 048 statement cancelled from outside is reported as a cancellation, not as its bound, with nothing of 048 applied', { timeout: 60_000 }, async () => {
+  await atMain045('x', async (db, url) => {
+    await db.query(`CREATE FUNCTION test_slow_generations() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN
+      IF EXISTS (SELECT 1 FROM pg_event_trigger_ddl_commands() WHERE object_identity='public.projection_generations')
+      THEN PERFORM pg_sleep(600); END IF; END $$`);
+    await db.query(`CREATE EVENT TRIGGER test_slow_generations ON ddl_command_end WHEN TAG IN ('ALTER TABLE')
+      EXECUTE FUNCTION test_slow_generations()`);
+    const migrating = migrateAsync(url);
+    await until(db, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event='PgSleep') AS ok`,
+      '048 never reached its slow statement');
+    // An operator cancels the statement well inside its bound.
+    await db.query(`SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE datname=current_database() AND wait_event='PgSleep'`);
+    const failed = await migrating;
+    assert.equal(failed.status, 1);
+    assert.match(failed.stderr, /^Projection generation upgrade was cancelled and rolled back, releasing the generations; retry/);
+    assert.deepEqual((await db.query(`SELECT to_regclass('public.projection_rebuilds') IS NOT NULL AS rebuilds,
+      (SELECT array_agg(name ORDER BY name) FROM stateplane_migrations WHERE name >= '046') AS recorded`)).rows[0],
+    { rebuilds: false, recorded: AFTER_045.slice(0, 2) });
+  });
+});
+
 test('the evidence outbox age index builds concurrently over a populated outbox, and an interrupted build is rebuilt', { timeout: 60_000 }, async () => {
   await atMain045('c', async (db, url) => {
     await db.query("BEGIN; SET LOCAL session_replication_role = replica");
@@ -1686,7 +1768,7 @@ test('the evidence outbox age index builds concurrently over a populated outbox,
       await snapshot.query('COMMIT');
       const retried = await migrateAsync(url);
       assert.equal(retried.status, 0, retried.stderr);
-      assert.equal(retried.stdout, 'Applied 047_retrieval_outbox_age.sql\n');
+      assert.equal(retried.stdout, 'Applied 047_retrieval_outbox_age.sql\nApplied 048_projection_rebuilds.sql\n');
       assert.deepEqual(await upgraded(db), { age: true, columns: 2, recorded: AFTER_045 });
       assert.equal((await db.query(`SELECT count(*)::int AS n FROM retrieval_outbox WHERE delivery_state='pending'`)).rows[0].n, 1335);
       assert.deepEqual(await migrateAsync(url), { status: 0, stdout: '', stderr: '' });

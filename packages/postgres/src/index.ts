@@ -2136,6 +2136,10 @@ export type { DeletionErasure, ExtractionView, OriginalView, SourceCell, SourceD
   UploadGrantView } from './sources.js';
 export * from './claims.js';
 export * from './links.js';
-export * from './retrieval.js';
+// The retrieval module's helpers are shared with generations.ts; only these are public.
+export { PostgresRetrievalWorker, RecordRetrievalProjector } from './retrieval.js';
+export type { ProjectionGenerationStatus, ProjectionQueueStatus, ProjectionStatus, RetrievalOptions, RetrievalOutcome,
+  RetrievalStep, RetrievalStepOptions } from './retrieval.js';
+export * from './generations.js';
 export * from './search.js';
 export * from './bundles.js';

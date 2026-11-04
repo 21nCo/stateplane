@@ -11,20 +11,20 @@ import { FAILED_OUTBOX, LIVE_OUTBOX } from './outbox-sql.js';
 import type { Projector } from './outbox.js';
 import { lockKey } from './sources.js';
 
-type RefKind = 'record' | 'source' | 'claim';
-type Query = (sql: string, values?: unknown[]) => Promise<pg.QueryResult>;
+export type RefKind = 'record' | 'source' | 'claim';
+export type Query = (sql: string, values?: unknown[]) => Promise<pg.QueryResult>;
 
 /**
  * The authoritative state one Ref is projected to: a revision (and extraction) with its content, or its deletion.
  * `placement` is the space's placement generation the work runs under; every write preparing it fences it.
  */
-interface Target {
+export interface Target {
   spaceId: string; collectionId: string; kind: RefKind; id: string;
   revision: number; extractionVersion: number | null; deleted: boolean; content: string | null; placement?: number;
 }
 /** A generation that is not retired, with the content its own policy configures and the regions both policies allow. */
-interface Generation {
-  generation: number; state: 'building' | 'verifying' | 'active'; policyVersion: number; lexical: boolean; vector: boolean; policy: ContentPolicy;
+export interface Generation {
+  generation: number; state: 'building' | 'verifying' | 'active' | 'standby'; policyVersion: number; lexical: boolean; vector: boolean; policy: ContentPolicy;
   identity: EmbedderIdentity | null; regions: string[];
 }
 interface Chunk extends TextChunk { index: number; sha256: string }
@@ -34,19 +34,19 @@ interface Chunk extends TextChunk { index: number; sha256: string }
 // delivery or item has left) and ends by 16 s, well inside the record
 // outbox's 30 s processing budget; a retrieval item's lease
 // outlasts its whole budget. A lock wait gives way after 1 s and is retried.
-const PREPARE_MS = 15_000;
+export const PREPARE_MS = 15_000;
 const ITEM_MS = 20_000;
 // An item is started only with at least this much of the step left; otherwise it waits for the next step.
 const MIN_ITEM_MS = 1_000;
 const LEASE_MS = 60_000;
-const LOCK_MS = 1_000;
+export const LOCK_MS = 1_000;
 // Settling or releasing what a step holds gets at most this long, and ends
 // at the latest this long after the step's budget.
 const CLEANUP_MS = 1_000;
 // Time an interrupted preparation gets to save the batch it already has. An
 // evidence item's preparation gets at most half its budget and this grace at
 // most a quarter, so both end before the item's own budget does.
-const GRACE_MS = 1_000;
+export const GRACE_MS = 1_000;
 // Applying the generations that are ready, when a record's preparation
 // failed for others, gets at most this long (and never outlasts the
 // delivery's own budget): preparation, its grace and this end within 19 s.
@@ -57,8 +57,8 @@ const SETTLE_MS = 250;
 // Backoff from 5 s doubling: an outage or an interrupted item retries within
 // 5 minutes, an item's own failure within an hour. Retrieval work has no
 // dead letter; a failing item stays pending and is reported as degraded.
-const OUTAGE_BACKOFF_CAP_S = 300;
-const FAILURE_BACKOFF_CAP_S = 3_600;
+export const OUTAGE_BACKOFF_CAP_S = 300;
+export const FAILURE_BACKOFF_CAP_S = 3_600;
 // The most pairs one claim walks, and that a step walks without finding work.
 const MAX_PAIRS = 1_000;
 // Status reads at most this many rows per queue.
@@ -73,9 +73,9 @@ const REF = 'space_id=$1 AND collection_id=$2 AND generation=$3 AND ref_kind=$4 
  * The collection's generations that are not retired, oldest first. Each is
  * projected under its own (immutable) policy, and embedding is allowed only in
  * regions both its policy and the collection's current policy list, in the
- * current policy's order.
+ * current policy's order. With `only`, just that generation, if it is not retired.
  */
-async function loadGenerations(query: Query, spaceId: string, collectionId: string): Promise<Generation[]> {
+export async function loadGenerations(query: Query, spaceId: string, collectionId: string, only?: number): Promise<Generation[]> {
   const rows = (await query(`SELECT g.generation,g.state,g.policy_version,g.embedder,g.embedding_model,g.model_version,g.dimensions,
       p.record_fields,p.source_content,p.claim_statements,p.lexical,p.vector,
       ARRAY(SELECT r FROM unnest(c.processing_regions) WITH ORDINALITY u(r,n)
@@ -84,7 +84,8 @@ async function loadGenerations(query: Query, spaceId: string, collectionId: stri
     JOIN retrieval_policies p ON p.space_id=g.space_id AND p.collection_id=g.collection_id AND p.version=g.policy_version
     JOIN retrieval_collection_heads h ON h.space_id=g.space_id AND h.collection_id=g.collection_id
     JOIN retrieval_policies c ON c.space_id=h.space_id AND c.collection_id=h.collection_id AND c.version=h.policy_version
-    WHERE g.space_id=$1 AND g.collection_id=$2 AND g.state<>'retired' ORDER BY g.generation`, [spaceId, collectionId])).rows;
+    WHERE g.space_id=$1 AND g.collection_id=$2 AND g.state<>'retired' AND ($3::bigint IS NULL OR g.generation=$3::bigint)
+    ORDER BY g.generation`, [spaceId, collectionId, only ?? null])).rows;
   return rows.map(row => ({ generation: Number(row.generation), state: row.state, policyVersion: Number(row.policy_version),
     lexical: row.lexical, vector: row.vector, regions: row.regions,
     policy: { recordFields: row.record_fields, sourceContent: row.source_content, claimStatements: row.claim_statements },
@@ -101,7 +102,7 @@ async function loadGenerations(query: Query, spaceId: string, collectionId: stri
  * this transaction or committed before it and is seen here. Every retrieval
  * write takes this fence first, as erasure locks the space first.
  */
-async function scopeOpen(query: Query, spaceId: string, collectionId: string, placement?: number): Promise<boolean> {
+export async function scopeOpen(query: Query, spaceId: string, collectionId: string, placement?: number): Promise<boolean> {
   await query(`SET LOCAL lock_timeout = '${LOCK_MS}ms'`);
   const row = (await query(`SELECT s.lifecycle IN ('active','readOnly') AND c.lifecycle<>'deleted'
       AND ($3::bigint IS NULL OR s.placement_generation=$3::bigint) AS open
@@ -114,38 +115,38 @@ async function scopeOpen(query: Query, spaceId: string, collectionId: string, pl
 class ScopeClosedError extends ProjectionIncompleteError {}
 
 /** The configured chunks of a live target under one generation's policy; nothing else is ever indexed or embedded. */
-function chunksFor(generation: Generation, target: Target): Chunk[] {
+export function chunksFor(generation: Generation, target: Target): Chunk[] {
   if (target.deleted || target.content === null) return [];
   return configuredChunks(target.kind, generation.policy, target.content)
     .map((chunk, index) => ({ ...chunk, index, sha256: sha256(chunk.content) }));
 }
 
 /** Whether a generation's policy configures any content of this kind of Ref; if not, it never projects one. */
-function configures(generation: Generation, kind: RefKind): boolean {
+export function configures(generation: Generation, kind: RefKind): boolean {
   if (kind === 'record') return generation.policy.recordFields.length > 0;
   return kind === 'source' ? generation.policy.sourceContent : generation.policy.claimStatements;
 }
 
 /** Compare a projected Ref's position with a live target: revision, then extraction version. */
-function compare(row: { revision: string | number; extraction_version: string | number | null }, target: Target): number {
+export function compare(row: { revision: string | number; extraction_version: string | number | null }, target: Target): number {
   return Math.sign(Number(row.revision) - target.revision)
     || Math.sign(Number(row.extraction_version ?? 0) - (target.extractionVersion ?? 0));
 }
 
 /** Share lock a generation that is not retired, so retiring it waits for this writer. */
-async function lockGeneration(query: Query, target: Target, generation: number): Promise<boolean> {
+export async function lockGeneration(query: Query, target: Target, generation: number): Promise<boolean> {
   const row = (await query(`SELECT state FROM projection_generations WHERE space_id=$1 AND collection_id=$2 AND generation=$3
     FOR SHARE`, [target.spaceId, target.collectionId, generation])).rows[0];
   return row !== undefined && row.state !== 'retired';
 }
 
-async function refRow(query: Query, target: Target, generation: number, lock: 'SHARE' | 'UPDATE') {
+export async function refRow(query: Query, target: Target, generation: number, lock: 'SHARE' | 'UPDATE') {
   return (await query(`SELECT revision,extraction_version,deleted FROM projection_refs WHERE ${REF} FOR ${lock}`,
     refKey(target, generation))).rows[0] as { revision: string; extraction_version: string | null; deleted: boolean } | undefined;
 }
 
 /** Whether a Ref at the target already holds every chunk its generation's projections need. */
-async function complete(query: Query, target: Target, generation: Generation, chunks: number): Promise<boolean> {
+export async function complete(query: Query, target: Target, generation: Generation, chunks: number): Promise<boolean> {
   const row = (await query(`SELECT (SELECT count(*) FROM lexical_chunks WHERE ${REF})::int AS lexical,
     (SELECT count(*) FROM vector_chunks WHERE ${REF})::int AS vector`, refKey(target, generation.generation))).rows[0];
   return row.lexical === (generation.lexical ? chunks : 0) && row.vector === (generation.vector ? chunks : 0);
@@ -231,7 +232,7 @@ async function saveCheckpoints(query: Query, target: Target, generation: Generat
 }
 
 /** Embedders that failed during one step; later items skip them until the next step. */
-type Outages = Set<Embedder>;
+export type Outages = Set<Embedder>;
 
 /**
  * Prepare a live target outside any transaction: for each vector generation,
@@ -246,12 +247,13 @@ type Outages = Set<Embedder>;
  * them all, the first error that is the target's own is thrown, else the
  * first outage. Every transaction ends within `limit`, the preparation's
  * budget and grace, and each generation's within its own share and grace.
+ * With `only`, just that generation is prepared.
  */
-async function prepareTarget(pool: PoolLike, registry: EmbeddingRegistry, target: Target, signal: AbortSignal,
-  progress: { saved: number }, deadline: number, limit: Required<Limit>, outages?: Outages): Promise<void> {
+export async function prepareTarget(pool: PoolLike, registry: EmbeddingRegistry, target: Target, signal: AbortSignal,
+  progress: { saved: number }, deadline: number, limit: Required<Limit>, outages?: Outages, only?: number): Promise<void> {
   if (target.deleted) return;
   const errors: unknown[] = [];
-  const work = (await inTransaction(pool, db => loadGenerations(db.query.bind(db), target.spaceId, target.collectionId), limit))
+  const work = (await inTransaction(pool, db => loadGenerations(db.query.bind(db), target.spaceId, target.collectionId, only), limit))
     .flatMap(generation => generation.vector && generation.identity ? [{ generation, chunks: chunksFor(generation, target) }] : [])
     .filter(entry => entry.chunks.length);
   for (const [index, { generation, chunks }] of work.entries()) {
@@ -326,7 +328,7 @@ async function prepareGeneration(pool: PoolLike, target: Target, generation: Gen
  * `run` gets the limit its transactions end within: the grace's end or the
  * caller's abort.
  */
-async function budgeted(run: (signal: AbortSignal, progress: { saved: number }, deadline: number, sql: Required<Limit>) => Promise<void>,
+export async function budgeted(run: (signal: AbortSignal, progress: { saved: number }, deadline: number, sql: Required<Limit>) => Promise<void>,
   parent: AbortSignal, ms: number, graceMs = GRACE_MS): Promise<void> {
   const controller = new AbortController();
   const deadline = Date.now() + ms;
@@ -391,13 +393,13 @@ async function dropCheckpoints(query: Query, key: unknown[], revision: number | 
  * caught by the storage trigger on insert and reported as `PROJECTION_INCOMPLETE`:
  * the whole apply rolls back and runs again, uncounted. Null when no live
  * generation configures this kind of Ref: nothing was written, so the
- * caller needs no authority fence.
+ * caller needs no authority fence. With `only`, just that generation is applied.
  */
-async function applyTarget(query: Query, target: Target): Promise<number[] | null> {
+export async function applyTarget(query: Query, target: Target, only?: number): Promise<number[] | null> {
   await query(`SET LOCAL lock_timeout = '${LOCK_MS}ms'`);
   const blocked: number[] = [];
   let configured = false;
-  for (const generation of await loadGenerations(query, target.spaceId, target.collectionId)) {
+  for (const generation of await loadGenerations(query, target.spaceId, target.collectionId, only)) {
     if (!configures(generation, target.kind) || !await lockGeneration(query, target, generation.generation)) continue;
     configured = true;
     const key = refKey(target, generation.generation);
@@ -476,7 +478,7 @@ async function applyTarget(query: Query, target: Target): Promise<number[] | nul
  * record row; claim revisions and deletions update the claim's `entity_refs`
  * row; source extractions and deletions hold the source's extraction lock.
  */
-async function authorityHolds(query: Query, target: Target): Promise<boolean> {
+export async function authorityHolds(query: Query, target: Target): Promise<boolean> {
   return authorityAt(query, target, true);
 }
 
@@ -507,7 +509,7 @@ export interface RetrievalOptions {
   prepareMs?: number;
 }
 
-function options(value: RetrievalOptions) {
+export function retrievalOptions(value: RetrievalOptions) {
   const embedders = value.embedders ?? new EmbeddingRegistry();
   if (!(embedders instanceof EmbeddingRegistry)) throw new RangeError('Invalid embedder registry');
   return { embedders, prepareMs: bounded(value.prepareMs ?? PREPARE_MS, 1, PREPARE_MS) };
@@ -532,7 +534,7 @@ export class RecordRetrievalProjector implements Projector<void> {
   readonly #embedders: EmbeddingRegistry;
   readonly #prepareMs: number;
   constructor(private readonly pool: PoolLike, settings: RetrievalOptions = {}) {
-    ({ embedders: this.#embedders, prepareMs: this.#prepareMs } = options(settings));
+    ({ embedders: this.#embedders, prepareMs: this.#prepareMs } = retrievalOptions(settings));
   }
 
   async prepare(change: ProjectionChange, signal: AbortSignal,
@@ -615,10 +617,10 @@ interface Job {
 }
 /** The ring position a claim found (`before`) and the one it stored. */
 interface Cursor { before: [string, string] | null; stored: [string, string] | null }
-type EvidenceRef = Pick<Job, 'spaceId' | 'collectionId' | 'kind' | 'id'>;
+export type EvidenceRef = Pick<Job, 'spaceId' | 'collectionId' | 'kind' | 'id'>;
 
 /** Read the current authoritative state of a source or claim, the space's placement and whether its space and collection are open. */
-async function currentTarget(query: Query, job: EvidenceRef): Promise<{ open: boolean; placement?: number; target: Target | null }> {
+export async function currentTarget(query: Query, job: EvidenceRef): Promise<{ open: boolean; placement?: number; target: Target | null }> {
   const row = (await query(`SELECT e.revision,e.tombstone,s.placement_generation AS placement,
       s.lifecycle IN ('active','readOnly') AND c.lifecycle<>'deleted' AS open,x.version,x.content,r.statement
     FROM entity_refs e JOIN spaces s ON s.space_id=e.space_id
@@ -650,7 +652,7 @@ const newer = (a: { last_error: string | null; error_at: Date | null }, b: typeo
 /** A step's settling and releasing: `CLEANUP_MS`, ending at the latest that long after the step's budget `until`. */
 const cleanup = (until: number): Limit => ({ deadline: Math.min(Date.now(), until) + CLEANUP_MS });
 
-const sameTarget = (a: Target | null, b: Target | null) => a !== null && b !== null && a.revision === b.revision
+export const sameTarget = (a: Target | null, b: Target | null) => a !== null && b !== null && a.revision === b.revision
   && a.extractionVersion === b.extractionVersion && a.deleted === b.deleted;
 
 /** Authority changed between the reread and the commit fence; the apply rolls back and the item runs again. */
@@ -663,7 +665,7 @@ class AuthorityChanged extends Error {}
  * doubling to 5 minutes; anything else, the item's own failure, after
  * backoff to an hour. Only started attempts count.
  */
-function retryOf(error: unknown, attempt: number): { delayMs: number; error: string | null } {
+export function retryOf(error: unknown, attempt: number): { delayMs: number; error: string | null } {
   if ((error as { code?: unknown })?.code === PROJECTION_INCOMPLETE) return { delayMs: 0, error: null };
   const cap = infrastructureFault(error) || error instanceof DeadlineExceededError ? OUTAGE_BACKOFF_CAP_S : FAILURE_BACKOFF_CAP_S;
   return { delayMs: Math.min(cap, 5 * 2 ** Math.min(Math.max(attempt, 1) - 1, 10)) * 1_000, error: diagnostic(error) };
@@ -681,7 +683,7 @@ export class PostgresRetrievalWorker {
   readonly #embedders: EmbeddingRegistry;
   readonly #prepareMs: number;
   constructor(private readonly pool: PoolLike, settings: RetrievalOptions = {}) {
-    ({ embedders: this.#embedders, prepareMs: this.#prepareMs } = options(settings));
+    ({ embedders: this.#embedders, prepareMs: this.#prepareMs } = retrievalOptions(settings));
   }
 
   /**
@@ -964,7 +966,7 @@ export class PostgresRetrievalWorker {
 
 export interface ProjectionQueueStatus { pending: number; degraded: number; capped: boolean; lastError: string | null }
 export interface ProjectionGenerationStatus {
-  generation: number; state: 'building' | 'verifying' | 'active'; policyVersion: number; lexical: boolean; vector: boolean;
+  generation: number; state: 'building' | 'verifying' | 'active' | 'standby'; policyVersion: number; lexical: boolean; vector: boolean;
   embedder: EmbedderIdentity | null; embedderAvailable: boolean | null;
 }
 export interface ProjectionStatus {

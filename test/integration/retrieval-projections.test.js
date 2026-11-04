@@ -869,14 +869,15 @@ test('each recorded HNSW dimension has a partial expression index that a filtere
   assert.doesNotMatch(widePlan, /hnsw/, 'no ANN index covers 3,072 dimensions');
 });
 
-const retrievalTables = ['retrieval_policies', 'retrieval_collection_heads', 'projection_generations', 'projection_refs', 'projection_deletion_receipts', 'lexical_chunks',
-  'vector_chunks', 'embedding_checkpoints', 'retrieval_outbox'];
+const retrievalTables = ['retrieval_policies', 'retrieval_collection_heads', 'projection_generations', 'projection_rebuilds', 'projection_refs',
+  'projection_deletion_receipts', 'lexical_chunks', 'vector_chunks', 'embedding_checkpoints', 'retrieval_outbox'];
 const counts = async spaceId => Object.fromEntries(await Promise.all(retrievalTables.map(async table =>
   [table, (await pool.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`, [spaceId])).rows[0].n])));
 /** One row in every retrieval table of a space made by `space()`. */
 async function populate(spaceId, db = pool) {
   await policy(spaceId, 'alpha', 1, {}, db);
   await generation(spaceId, 'alpha', 1, 1, embedder, db);
+  await db.query(`INSERT INTO projection_rebuilds(space_id,collection_id,generation) VALUES($1,'alpha',1)`, [spaceId]);
   await projectRef(spaceId, 1, 'record', 'rec_1', 1, null, db);
   await lexical(spaceId, 1, 'record', 'rec_1', 1, { db });
   await vectorChunk(spaceId, 1, 'record', 'rec_1', 1, { db });
@@ -1018,7 +1019,7 @@ test('a nonowner cell role writes projections and proves erasure only with the r
         has_table_privilege($1,t,'INSERT') AS i, has_table_privilege($1,t,'UPDATE') AS u, has_table_privilege($1,t,'DELETE') AS d,
         has_table_privilege($1,t,'TRUNCATE') AS x FROM unnest($2::text[]) t`, [role, [...retrievalTables, 'vector_index_strategies']])).rows
       .map(({ t, ...row }) => [t, Object.entries(row).filter(([, granted]) => granted).map(([privilege]) => privilege).join('')]));
-    assert.deepEqual(privileges, { retrieval_policies: 'ri', retrieval_collection_heads: 'r', vector_index_strategies: 'r', projection_generations: 'riu', projection_refs: 'riu',
+    assert.deepEqual(privileges, { retrieval_policies: 'ri', retrieval_collection_heads: 'r', vector_index_strategies: 'r', projection_generations: 'riu', projection_rebuilds: 'riu', projection_refs: 'riu',
       projection_deletion_receipts: 'ri', lexical_chunks: 'rid', vector_chunks: 'rid', embedding_checkpoints: 'rid', retrieval_outbox: 'ru' });
     // The role builds a generation, including a vector chunk through the HNSW index's dimension cast.
     await asRole(async db => {

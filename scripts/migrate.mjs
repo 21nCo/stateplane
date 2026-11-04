@@ -7,6 +7,8 @@ import { migrationInventory, migrationOrder } from './migration-order.mjs';
 
 const client = new pg.Client(connectionOptions(process.env.DATABASE_URL));
 const directory = resolve(import.meta.dirname, '../migrations');
+// Initial protective bound, not measured: one statement of migration 048 (docs/retrieval-projections.md#migration-048).
+const MIGRATION_048_STATEMENT_MS = 15_000;
 let transactionOpen = false;
 let advisoryLockHeld = false;
 try {
@@ -194,9 +196,16 @@ try {
       name === '039_durable_outbox.sql' || name === '040_evidence_storage.sql' || name === '041_original_object_keys.sql' ||
       name === '042_claim_revision_recorder.sql' || name === '043_claim_commit_authority.sql' ||
       name === '044_links_deletion_retention.sql' || name === '045_retrieval_projections.sql' ||
-      name === '046_retrieval_dispatch_checkpoint.sql';
+      name === '046_retrieval_dispatch_checkpoint.sql' || name === '048_projection_rebuilds.sql';
     const priorLockTimeout = boundedDdl ? (await client.query('SHOW lock_timeout')).rows[0].lock_timeout : null; // NOSONAR -- migrations run in order within the current transaction
     if (boundedDdl) await client.query("SET LOCAL lock_timeout = '5s'"); // NOSONAR -- set before this step's DDL, never concurrently
+    // 048 holds projection_generations exclusively from its first statement to its commit, and every retrieval write
+    // and search needs that table: bound each of its statements too, not only their lock waits, so a slow one rolls
+    // the whole step back and releases the table rather than holding it. Its scans are of projection_generations,
+    // one row per generation of a collection (docs/retrieval-projections.md#migration-048).
+    const boundedRun = name === '048_projection_rebuilds.sql';
+    const priorStatementTimeout = boundedRun ? (await client.query('SHOW statement_timeout')).rows[0].statement_timeout : null; // NOSONAR -- migrations run in order within the current transaction
+    if (boundedRun) await client.query(`SET LOCAL statement_timeout = '${MIGRATION_048_STATEMENT_MS}ms'`); // NOSONAR -- set before this step's DDL, never concurrently
     try {
       if (name === '039_durable_outbox.sql') await preflightDurableOutbox(); // NOSONAR -- preflight locks must precede this migration step
       if (name === '045_retrieval_projections.sql') await preflightRetrievalProjections(); // NOSONAR -- preflight locks must precede this migration step
@@ -226,9 +235,18 @@ try {
       // round can still make PostgreSQL abort the step as a deadlock, which rolls it back and is retryable alike.
       if (name === '046_retrieval_dispatch_checkpoint.sql' && (error?.code === '55P03' || error?.code === '40P01'))
         throw new Error('Projection outbox upgrade waits for record writers, outbox workers and space purges; retry when long record or outbox transactions finish', { cause:error });
+      // 048 alters projection_generations, which every retrieval write and search share locks while it runs.
+      if (name === '048_projection_rebuilds.sql' && (error?.code === '55P03' || error?.code === '40P01'))
+        throw new Error('Projection generation upgrade waits for retrieval workers and searches; retry when long retrieval transactions finish', { cause:error });
+      // 57014 is also an explicit or infrastructure cancellation; only PostgreSQL's statement timeout message names the bound.
+      if (name === '048_projection_rebuilds.sql' && error?.code === '57014')
+        throw new Error(/statement timeout/.test(error.message ?? '')
+          ? `Projection generation upgrade ran past its ${MIGRATION_048_STATEMENT_MS / 1000} s statement bound and was rolled back, releasing the generations; retry`
+          : 'Projection generation upgrade was cancelled and rolled back, releasing the generations; retry', { cause:error });
       throw error;
     }
     if (boundedDdl) await client.query('SELECT set_config($1,$2,true)', ['lock_timeout',priorLockTimeout]); // NOSONAR -- restore this step's transaction-local timeout before the ledger write
+    if (boundedRun) await client.query('SELECT set_config($1,$2,true)', ['statement_timeout',priorStatementTimeout]); // NOSONAR -- restore this step's transaction-local timeout before the ledger write
     await client.query('INSERT INTO stateplane_migrations (name, sha256) VALUES ($1, $2)', [name, sha256]);
     process.stdout.write(`Applied ${name}\n`);
   }

@@ -42,8 +42,8 @@ const tables = ['stateplane_migrations','space_directory','space_provisioning_au
   'sources','original_objects','source_upload_grants','source_upload_attempts','extraction_versions',
   'claims','claim_revisions','claim_evidence','links','evidence_events','evidence_outbox','original_erasures','space_erasures'];
 const evidenceTables=tables.slice(-13);
-const retrievalTables=['retrieval_policies','retrieval_collection_heads','vector_index_strategies','projection_generations','projection_refs',
-  'projection_deletion_receipts','lexical_chunks','vector_chunks','embedding_checkpoints','retrieval_outbox'];
+const retrievalTables=['retrieval_policies','retrieval_collection_heads','vector_index_strategies','projection_generations',
+  'projection_rebuilds','projection_refs','projection_deletion_receipts','lexical_chunks','vector_chunks','embedding_checkpoints','retrieval_outbox'];
 tables.push(...retrievalTables,'retrieval_dispatch_checkpoint');
 const embedding=seed=>`[${Array.from({length:384},(_,i)=>Math.sin(seed*31+i*7)||0.5).join(',')}]`;
 // A space erased before the dump, whose blob-store erasure is still pending.
@@ -155,6 +155,7 @@ try {
       vector,processing_regions,credential_id) VALUES($1,$2,1,ARRAY['/label'],true,true,true,ARRAY['apac'],'restore')`,[spaceId,collectionId]);
     await projection.query(`INSERT INTO projection_generations(space_id,collection_id,generation,policy_version,embedder,embedding_model,
       model_version,dimensions) VALUES($1,$2,1,1,'local-test','hash-embedder','1',384)`,[spaceId,collectionId]);
+    await projection.query('INSERT INTO projection_rebuilds(space_id,collection_id,generation) VALUES($1,$2,1)',[spaceId,collectionId]);
     await projection.query(`INSERT INTO projection_refs(space_id,collection_id,generation,ref_kind,ref_id,revision)
       VALUES($1,$2,1,'record',$3,1)`,[spaceId,collectionId,liveRecord]);
     await projection.query(`INSERT INTO lexical_chunks(space_id,collection_id,generation,ref_kind,ref_id,revision,policy_version,chunk_index,
@@ -298,6 +299,8 @@ try {
           table==='vector_index_strategies'?[]:[spaceId])).rows[0].n>0,`restored operational role can read ${table} for erasure proof`);
       assert.equal((await operational.query(`UPDATE retrieval_outbox SET attempts=attempts+1 WHERE space_id=$1 AND ref_id='clm_restore'
         AND revision=2`,[spaceId])).rowCount,1,'restored operational role can record retrieval delivery');
+      assert.equal((await operational.query(`UPDATE projection_rebuilds SET available_at=clock_timestamp() WHERE space_id=$1`,
+        [spaceId])).rowCount,1,'restored operational role can lease a rebuild');
       assert.equal((await operational.query(`UPDATE retrieval_dispatch_checkpoint SET after_space_id=$1,after_collection_id=$2`,
         [spaceId,collectionId])).rowCount,1,'restored operational role can move the retrieval claim cursor');
       assert.equal((await operational.query(`UPDATE space_erasures SET next_attempt_at=clock_timestamp()

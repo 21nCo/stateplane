@@ -831,6 +831,7 @@ export class PostgresSpaces {
       NOT EXISTS (SELECT 1 FROM lexical_chunks WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM projection_deletion_receipts WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM projection_refs WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM projection_rebuilds WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM projection_generations WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM retrieval_collection_heads WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM retrieval_policies WHERE space_id=$1) AND
