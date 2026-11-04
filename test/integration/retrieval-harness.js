@@ -166,8 +166,9 @@ export async function fixture({ collections = ['alpha', 'beta'], policy = {} } =
     const key = randomUUID();
     // Issuing a key moves the space's policy version; write at the current one.
     const { policy_version: version } = (await pool.query('SELECT policy_version FROM spaces WHERE space_id=$1', [spaceId])).rows[0];
+    // Canonical JSON orders keys by UTF-8 bytes, as the authority's canonical check requires.
     return (await authority.mutate(scope(collectionId, Number(version)), { operation, idempotencyKey: key, requestDigest: sha(key),
-      ...(data === undefined ? {} : { canonicalData: JSON.stringify(Object.fromEntries(Object.entries(data).sort())) }),
+      ...(data === undefined ? {} : { canonicalData: JSON.stringify(Object.fromEntries(Object.entries(data).sort(([a], [b]) => Buffer.compare(Buffer.from(a), Buffer.from(b))))) }),
       ...(operation === 'replace' ? { unique: [], indexes: [] } : {}), ...extras })).ref.id;
   };
   const source = async (collectionId, text, key = randomUUID()) => {
