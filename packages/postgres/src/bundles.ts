@@ -75,10 +75,12 @@ function parse(request: unknown): Request {
  * revoked, unauthorized or stale hit never reaches a bundle, and the bundle's
  * authorization is the search's, current at its commit. Assembly runs after
  * that commit, reads nothing and calls nothing, so it cannot widen what the
- * search authorized. A request asking a count, status or completeness
- * question, or any question or instruction outside the allowed request forms
- * (`exactQuestion` fails closed), is refused before anything is searched or
- * embedded.
+ * search authorized. A bundle computes no count, status or completeness:
+ * it holds only cited excerpts, is `complete: false` and its frame says no
+ * count, status or completeness follows from it, whatever the request. As
+ * best-effort defense in depth, a request `exactQuestion` recognizes as a
+ * count, status or completeness question, or as outside the allowed request
+ * forms, is refused before anything is searched or embedded.
  */
 export class PostgresContextBundles {
   constructor(private readonly search: PostgresRetrievalSearch) {

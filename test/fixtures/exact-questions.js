@@ -206,7 +206,7 @@ export const ordinaryRequests = Object.freeze(['harbor lantern', 'Why was the la
 /**
  * [text, rephrasing]: requests that ask no exact question but are refused
  * because their form is not an allowed one, each with a rephrasing a bundle
- * serves. Failing closed costs these; failing open would cost AC3.
+ * serves. Failing closed costs these.
  */
 export const overRefusals = Object.freeze([
   ['Which keeper lit the lantern?', 'notes about the keeper lighting the lantern'],
@@ -238,3 +238,12 @@ export const overRefusals = Object.freeze([
   ['only the storm notes', 'the storm notes'], ['notes we wrote about the storm', 'notes written about the storm'],
   ['Outline the steps the crew took during the storm', "Outline the crew's steps during the storm"],
   ['Summarize the notes the keeper wrote', 'Summarize the notes written by the keeper']]);
+
+/**
+ * Exact questions the classifier does not recognize, so a bundle serves them. Refusal is best-effort; a bundle for
+ * one of these still answers nothing: only cited excerpts, `complete: false` and the untrusted frame's notice.
+ * Structural refusal is STA-53, which moves these to `exactQuestions`.
+ */
+export const unrecognizedExact = Object.freeze(['Describe the payment situation of invoice two', 'Explain the standing of the audit',
+  'Explain the exact cardinality of the supplier set', 'Summarize the unpaid', 'Summarize everything overdue',
+  'Describe how the repair is going?']);

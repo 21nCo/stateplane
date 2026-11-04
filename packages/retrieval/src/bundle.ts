@@ -665,9 +665,13 @@ function clauses(reading: string): { groups: { head: string; text: string }[]; t
 }
 
 /**
- * Why a bundle request text is refused, or null when a bundle serves it. A
- * bundle never answers a count, status or completeness question, so
- * classification fails closed: the text is served only when every line,
+ * Why a bundle request text is refused, or null when a bundle serves it.
+ * Best-effort defense in depth: a bundle answers no count, status or
+ * completeness question by its output contract (cited excerpts only,
+ * `complete: false`, an untrusted frame saying none follows), and this
+ * refuses the requests it recognizes, failing closed on the structure it
+ * parses; free text can still ask one it does not recognize, and that
+ * request gets only the contract. The text is served only when every line,
  * every clause (split at sentence punctuation, commas, brackets, spaced
  * dashes, separators and line breaks, with request prefixes such as
  * "please", "can you" or "tell me about" removed) and every coordinated

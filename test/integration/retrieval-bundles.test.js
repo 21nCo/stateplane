@@ -13,7 +13,7 @@ import { PostgresAuthority, PostgresClaims, PostgresContextBundles, PostgresOutb
 import { BUNDLE_CLOSE, BUNDLE_OPEN, DeterministicEmbedder, EmbedderUnavailableError, EmbeddingRegistry }
   from '../../packages/retrieval/dist/index.js';
 import { R2BlobStore } from '../../packages/storage/dist/index.js';
-import { exactQuestions, ordinaryRequests, overRefusals } from '../fixtures/exact-questions.js';
+import { exactQuestions, ordinaryRequests, overRefusals, unrecognizedExact } from '../fixtures/exact-questions.js';
 import { consume, dispatch } from '../../packages/workers/dist/index.js';
 
 // STA-47: bounded context bundles over hybrid search of real projections,
@@ -408,6 +408,22 @@ test('count, status and completeness requests are refused before anything is sea
   for (const text of [...ordinaryRequests, ...overRefusals.map(([, rephrasing]) => rephrasing)]) {
     const served = await bundles(registry, counting).bundle(f.owner, f.spaceId, { task: text, query: text, budget });
     assert.deepEqual([served.task, served.trust, served.complete], [text, 'untrusted', false]);
+  }
+  // An exact question the classifier misses is served, but its bundle answers nothing: the output contract carries only
+  // cited excerpts of authority, complete false and the untrusted frame's notice, with no count, status or completeness field.
+  for (const text of unrecognizedExact) {
+    const served = await bundles(registry, counting).bundle(f.owner, f.spaceId, { task: text, query: 'invoice', budget });
+    assert.deepEqual(Object.keys(served).sort(), ['budget', 'complete', 'context', 'coverage', 'excerpts', 'query', 'spaceId', 'task',
+      'truncated', 'trust', 'usage']);
+    assert.deepEqual([served.task, served.trust, served.complete, Object.keys(served.coverage).sort()],
+      [text, 'untrusted', false, ['mode', 'state']]);
+    assert.ok(served.excerpts.length >= 1);
+    assert.ok(served.context.startsWith(BUNDLE_OPEN) && served.context.endsWith(BUNDLE_CLOSE));
+    assert.match(BUNDLE_OPEN, /no count, status or completeness follows from them/);
+    const body = served.context.slice(BUNDLE_OPEN.length, -BUNDLE_CLOSE.length);
+    assert.match(body, /^(?:<excerpt [^>]*>[^<]*<\/excerpt>\n)+$/, 'nothing but cited excerpts inside the frame');
+    assert.equal(body.match(/<excerpt /g).length, served.excerpts.length);
+    for (const excerpt of served.excerpts) assert.ok(excerpt.ref && Number.isInteger(excerpt.start) && Number.isInteger(excerpt.end));
   }
 });
 
