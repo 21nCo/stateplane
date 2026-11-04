@@ -84,8 +84,9 @@ REVOKE ALL ON FUNCTION stateplane_guard_projection_generation() FROM PUBLIC;
 -- A rebuild of one generation from authority: a resumable job that walks the
 -- collection's Refs in key order (kind, then ID), projecting each into the
 -- generation (`backfill`), then walks them again checking each against
--- authority (`verify`), ending `verified` or `failed`. The cursor is the last
--- Ref the phase finished, so an interrupted job resumes after it. A job is
+-- authority (`verify`), ending `verified` or `failed`; retiring the generation
+-- before then ends it `abandoned`, outside the due index. The cursor is the
+-- last Ref the phase finished, so an interrupted job resumes after it. A job is
 -- leased by moving `available_at` past the lease, as retrieval work is; only
 -- that exact lease may move it. Delivery state only: removed with its
 -- generation when the space is erased.
@@ -93,7 +94,7 @@ CREATE TABLE projection_rebuilds (
   space_id text NOT NULL,
   collection_id text NOT NULL,
   generation bigint NOT NULL,
-  phase text NOT NULL DEFAULT 'backfill' CHECK (phase IN ('backfill', 'verify', 'verified', 'failed')),
+  phase text NOT NULL DEFAULT 'backfill' CHECK (phase IN ('backfill', 'verify', 'verified', 'failed', 'abandoned')),
   cursor_kind text CHECK (cursor_kind IN ('claim', 'record', 'source')),
   cursor_id text CHECK (char_length(cursor_id) > 0),
   backfilled bigint NOT NULL DEFAULT 0 CHECK (backfilled >= 0),
@@ -114,7 +115,8 @@ CREATE TABLE projection_rebuilds (
     REFERENCES projection_generations(space_id, collection_id, generation) ON DELETE CASCADE,
   CHECK ((cursor_kind IS NULL) = (cursor_id IS NULL)),
   CHECK ((last_error IS NULL) = (last_error_at IS NULL)),
-  CHECK ((phase = 'backfill') = (backfilled_at IS NULL)),
-  CHECK ((phase IN ('verified', 'failed')) = (verified_at IS NOT NULL))
+  -- An abandoned job keeps the phase times it had.
+  CHECK (phase = 'abandoned' OR (phase = 'backfill') = (backfilled_at IS NULL)),
+  CHECK (phase = 'abandoned' OR (phase IN ('verified', 'failed')) = (verified_at IS NOT NULL))
 );
 CREATE INDEX projection_rebuilds_due ON projection_rebuilds(available_at) WHERE phase IN ('backfill', 'verify');

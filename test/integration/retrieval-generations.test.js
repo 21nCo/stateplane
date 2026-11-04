@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
-import { PostgresProjectionGenerations } from '../../packages/postgres/dist/index.js';
+import { PostgresProjectionGenerations, PostgresRetrievalWorker } from '../../packages/postgres/dist/index.js';
 import { DeadlineExceededError } from '../../packages/postgres/dist/faults.js';
 import { DeterministicEmbedder, EmbedderUnavailableError, EmbeddingRegistry } from '../../packages/retrieval/dist/index.js';
 import { claims, fixture, healthy, hookedPool, ids, index, lockWaited, pool, rejects, search, spaces, target as database }
@@ -265,9 +265,13 @@ test('generation control refuses what would leave a collection without a safe ac
   await rejects(control.activate(f.spaceId, 'alpha', 2), 'CONFLICT');
   await rejects(control.retire(f.spaceId, 'alpha', 1), 'CONFLICT');
   await rejects(control.rollback(f.spaceId, 'alpha'), 'PRECONDITION_FAILED');
-  // Abandoned while building: the job never runs again, and the next rebuild takes a higher number.
-  assert.equal((await control.retire(f.spaceId, 'alpha', 2)).state, 'retired');
+  // Abandoned while building: the job ends with it, out of the due jobs, never runs again, and the next rebuild takes a
+  // higher number.
+  const abandoned = await control.retire(f.spaceId, 'alpha', 2);
+  assert.deepEqual([abandoned.state, abandoned.rebuild.phase], ['retired', 'abandoned']);
   await due();
+  assert.equal((await pool.query(`SELECT count(*)::int AS n FROM projection_rebuilds WHERE space_id=$1
+    AND phase IN ('backfill','verify')`, [f.spaceId])).rows[0].n, 0);
   assert.equal((await control.step({ budgetMs: 2_000 })).rebuilds, 0);
   assert.equal((await control.start(f.spaceId, 'alpha')).generation, 3);
   // A lexical-only policy rebuilds without an embedder.
@@ -488,4 +492,88 @@ test('an activation during a re-verification step is refused cleanly and the ste
     ['verifying', 'verified', 1, 0, null]);
   await control.activate(f.spaceId, 'alpha', 2);
   assert.deepEqual(await states(control, f), [[1, 'standby'], [2, 'active']]);
+});
+
+test('a stepper that cannot embed a vector rebuild leaves it due for one that can, and still advances lexical rebuilds', async () => {
+  const f = await fixture({ collections: ['alpha', 'beta'], policy: { beta: { vector: false } } });
+  await f.record('alpha', { title: 'harbor one' });
+  await f.record('beta', { title: 'harbor two' });
+  await index();
+  const control = generations(new Target());
+  await control.start(f.spaceId, 'alpha', { embedder: V2 });
+  await control.start(f.spaceId, 'beta');
+  await due();
+  const job = async collectionId => (await pool.query(`SELECT phase,cursor_id,attempts,available_at,last_error FROM projection_rebuilds
+    WHERE space_id=$1 AND collection_id=$2`, [f.spaceId, collectionId])).rows[0];
+  const waiting = await job('alpha');
+  // The cell tick's stepper (no embedder at all) and one with only the old model: the model migration is left as it was.
+  const cellTick = new PostgresProjectionGenerations(pool);
+  assert.deepEqual(await cellTick.step({ budgetMs: 30_000 }), { rebuilds: 1, refs: 2, pruned: 0 });
+  assert.equal((await job('beta')).phase, 'verified', 'the lexical rebuild advances');
+  const oldModel = new PostgresProjectionGenerations(pool, { embedders: new EmbeddingRegistry([healthy]) });
+  assert.equal((await oldModel.step({ budgetMs: 2_000 })).rebuilds, 0);
+  assert.deepEqual(await job('alpha'), waiting);
+  // A stepper with the new model finishes it.
+  const view = await settle(control, f, 2);
+  assert.deepEqual([view.rebuild.phase, view.rebuild.backfilled, view.rebuild.lastError], ['verified', 1, null]);
+});
+
+test('a standby generation whose model is withdrawn keeps new work pending until it is retired', async () => {
+  const f = await fixture({ collections: ['alpha'] });
+  await f.record('alpha', { title: 'harbor one' });
+  await index();
+  const target = new Target();
+  const control = generations(target);
+  await control.start(f.spaceId, 'alpha', { embedder: V2 });
+  await settle(control, f, 2);
+  await control.activate(f.spaceId, 'alpha', 2);
+  // The worker is configured with the new model only: generation 1, on standby, cannot be embedded.
+  const newModel = new EmbeddingRegistry([target]);
+  const { claimId } = await claims.create(f.owner, f.spaceId, 'alpha', { idempotencyKey: 'c', statement: 'The harbor bell rang.', attributedTo: 'log' });
+  await pool.query(`UPDATE retrieval_outbox SET available_at=clock_timestamp()-interval '1 second' WHERE delivery_state='pending'`);
+  await new PostgresRetrievalWorker(pool, { embedders: newModel }).step();
+  const status = async () => (await search(newModel).search(f.owner, f.spaceId, { query: 'harbor' })).collections[0];
+  const held = await status();
+  // The active generation has the claim; the work stays due for the standby one, so search reports the collection degraded.
+  const holds = async generation => (await pool.query(`SELECT count(*)::int AS n FROM vector_chunks WHERE space_id=$1
+    AND collection_id='alpha' AND generation=$2 AND ref_id=$3`, [f.spaceId, generation, claimId])).rows[0].n > 0;
+  assert.deepEqual([held.generation, held.projection, await holds(2), await holds(1)], [2, 'degraded', true, false]);
+  // Retired: nothing is left to embed for it, the work is delivered and the collection is current again.
+  await control.retire(f.spaceId, 'alpha', 1);
+  await index(newModel);
+  assert.equal((await status()).projection, 'current');
+  assert.equal((await pool.query(`SELECT count(*)::int AS n FROM retrieval_outbox WHERE space_id=$1 AND delivery_state='pending'`,
+    [f.spaceId])).rows[0].n, 0);
+});
+
+test('the generation guard refuses every standby and pruning transition it does not allow', async () => {
+  const f = await fixture({ collections: ['alpha'] });
+  await f.record('alpha', { title: 'harbor one' });
+  await index();
+  const control = generations(new Target());
+  await control.start(f.spaceId, 'alpha', { embedder: V2 });
+  const refused = (generation, set) => assert.rejects(pool.query(`UPDATE projection_generations SET ${set} WHERE space_id=$1
+    AND collection_id='alpha' AND generation=$2`, [f.spaceId, generation]), error => {
+    assert.equal(error.constraint, 'projection_generations_transition', error.message);
+    return true;
+  });
+  await refused(2, "state='standby'");
+  await refused(2, 'pruned_at=clock_timestamp()');
+  await settle(control, f, 2);
+  await refused(2, "state='standby'");
+  await control.activate(f.spaceId, 'alpha', 2);
+  await refused(1, "state='building'");
+  await refused(1, "state='verifying'");
+  await refused(1, 'pruned_at=clock_timestamp()');
+  await refused(1, "standby_at=clock_timestamp()-interval '1 day'");
+  await control.rollback(f.spaceId, 'alpha');
+  await refused(2, "state='standby'");
+  await refused(2, "state='active'");
+  // Pruning stamps once, and nothing else changes with it.
+  await refused(2, "pruned_at=clock_timestamp(),policy_version=policy_version+1");
+  await control.step({ budgetMs: 5_000 });
+  assert.ok((await control.list(f.spaceId, 'alpha'))[1].prunedAt);
+  await refused(2, "pruned_at=clock_timestamp()+interval '1 day'");
+  await refused(2, 'pruned_at=NULL');
+  assert.deepEqual(await states(control, f), [[1, 'active'], [2, 'retired']]);
 });

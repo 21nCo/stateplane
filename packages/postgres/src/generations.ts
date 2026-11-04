@@ -28,7 +28,7 @@ const MISMATCH_SAMPLE = 20;
 const KINDS: readonly RefKind[] = ['claim', 'record', 'source'];
 
 export type GenerationState = 'building' | 'verifying' | 'active' | 'standby' | 'retired';
-export type RebuildPhase = 'backfill' | 'verify' | 'verified' | 'failed';
+export type RebuildPhase = 'backfill' | 'verify' | 'verified' | 'failed' | 'abandoned';
 export interface RebuildMismatch { kind: RefKind; id: string; reason: 'failed' | 'incomplete' }
 export interface RebuildView {
   phase: RebuildPhase; cursor: { kind: RefKind; id: string } | null;
@@ -250,7 +250,8 @@ export class PostgresProjectionGenerations {
 
   /**
    * Retire a generation that is being built or verified (abandoning its
-   * rebuild) or on standby. The active generation is not retired here
+   * rebuild: an unfinished job ends `abandoned` in the same transaction and
+   * is never leased again) or on standby. The active generation is not retired here
    * (`CONFLICT`): a rollback or another activation replaces it. Retiring
    * waits for writers already in the generation; its chunks and checkpoints
    * are removed by later steps. Retiring a retired generation changes nothing.
@@ -265,7 +266,11 @@ export class PostgresProjectionGenerations {
         FOR UPDATE`, [space, collection, number])).rows[0]?.state;
       if (state === undefined) throw new AuthorityError('NOT_FOUND', 'No such generation');
       if (state === 'active') throw new AuthorityError('CONFLICT', 'The active generation is replaced by rollback or activation');
-      if (state !== 'retired') await this.move(query, space, collection, number, 'retired');
+      if (state === 'retired') return;
+      await this.move(query, space, collection, number, 'retired');
+      // The generation before its job, as everywhere; a step holding the job's lease then finds it ended.
+      await query(`UPDATE projection_rebuilds SET phase='abandoned' WHERE space_id=$1 AND collection_id=$2 AND generation=$3
+        AND phase IN ('backfill','verify')`, [space, collection, number]);
     });
     return (await this.list(space, collection)).find(view => view.generation === number)!;
   }
@@ -357,23 +362,53 @@ export class PostgresProjectionGenerations {
     }
   }
 
-  /** Lease the rebuild due longest whose generation is in its phase's state and whose space and collection are open. */
+  /**
+   * Lease the rebuild due longest whose generation is in its phase's state,
+   * whose space and collection are open and, for a vector generation, whose
+   * embedder this stepper's registry resolves. A rebuild it cannot embed is
+   * left due exactly as it is (attempts, error and cursor unchanged) for a
+   * stepper that can, so a cell without a configured embedder still advances
+   * lexical rebuilds and never holds back a model migration.
+   */
   private async claim(until: number): Promise<Job | null> {
-    const row = (await inTransaction(this.pool, db => db.query(`UPDATE projection_rebuilds r
-        SET available_at=clock_timestamp()+($1::integer * interval '1 millisecond'),attempts=r.attempts+1
-      FROM (SELECT r.space_id,r.collection_id,r.generation FROM projection_rebuilds r
-          JOIN projection_generations g ON g.space_id=r.space_id AND g.collection_id=r.collection_id AND g.generation=r.generation
-          JOIN spaces s ON s.space_id=r.space_id AND s.lifecycle IN ('active','readOnly')
-          JOIN collections c ON c.space_id=r.space_id AND c.collection_id=r.collection_id AND c.lifecycle<>'deleted'
-        WHERE r.phase IN ('backfill','verify') AND r.available_at<=clock_timestamp()
-          AND g.state=CASE r.phase WHEN 'backfill' THEN 'building' ELSE 'verifying' END
-        ORDER BY r.available_at LIMIT 1 FOR UPDATE OF r SKIP LOCKED) due
-      WHERE r.space_id=due.space_id AND r.collection_id=due.collection_id AND r.generation=due.generation
-      RETURNING r.space_id,r.collection_id,r.generation,r.phase,r.cursor_kind,r.cursor_id,r.attempts,
-        r.available_at::text AS lease`, [LEASE_MS]), { deadline: until })).rows[0];
-    return row ? { spaceId: row.space_id, collectionId: row.collection_id, generation: Number(row.generation), phase: row.phase,
-      lease: row.lease, attempts: row.attempts,
-      cursor: row.cursor_kind === null ? null : { kind: row.cursor_kind, id: row.cursor_id } } : null;
+    return inTransaction(this.pool, async db => {
+      const query: Query = db.query.bind(db);
+      const passed: { s: string; c: string; g: number }[] = [];
+      for (;;) {
+        // Not locked here: the lease below rechecks the job, so a job another step leases meanwhile is just passed.
+        const due = (await query(`SELECT r.space_id,r.collection_id,r.generation,g.embedder IS NOT NULL AS vector
+          FROM projection_rebuilds r
+            JOIN projection_generations g ON g.space_id=r.space_id AND g.collection_id=r.collection_id AND g.generation=r.generation
+            JOIN spaces s ON s.space_id=r.space_id AND s.lifecycle IN ('active','readOnly')
+            JOIN collections c ON c.space_id=r.space_id AND c.collection_id=r.collection_id AND c.lifecycle<>'deleted'
+          WHERE r.phase IN ('backfill','verify') AND r.available_at<=clock_timestamp()
+            AND g.state=CASE r.phase WHEN 'backfill' THEN 'building' ELSE 'verifying' END
+            AND ($2::boolean OR g.embedder IS NULL)
+            AND NOT $1::jsonb @> jsonb_build_array(jsonb_build_object('s',r.space_id,'c',r.collection_id,'g',r.generation))
+          ORDER BY r.available_at,r.space_id,r.collection_id,r.generation LIMIT 1`,
+        [JSON.stringify(passed), this.#embedders.size > 0])).rows[0];
+        if (!due) return null;
+        const key = [due.space_id, due.collection_id, due.generation];
+        if (due.vector) {
+          const generation = (await loadGenerations(query, due.space_id, due.collection_id, Number(due.generation)))[0];
+          if (!generation?.identity || !this.#embedders.resolve(generation.identity, generation.regions, CHUNK_CODE_POINTS)) {
+            passed.push({ s: due.space_id, c: due.collection_id, g: Number(due.generation) });
+            continue;
+          }
+        }
+        const row = (await query(`UPDATE projection_rebuilds r
+            SET available_at=clock_timestamp()+($4::integer * interval '1 millisecond'),attempts=r.attempts+1
+          FROM (SELECT space_id,collection_id,generation FROM projection_rebuilds WHERE space_id=$1 AND collection_id=$2
+            AND generation=$3 AND phase IN ('backfill','verify') AND available_at<=clock_timestamp() FOR UPDATE SKIP LOCKED) due
+          WHERE r.space_id=due.space_id AND r.collection_id=due.collection_id AND r.generation=due.generation
+          RETURNING r.space_id,r.collection_id,r.generation,r.phase,r.cursor_kind,r.cursor_id,r.attempts,
+            r.available_at::text AS lease`, [...key, LEASE_MS])).rows[0];
+        if (!row) { passed.push({ s: due.space_id, c: due.collection_id, g: Number(due.generation) }); continue; }
+        return { spaceId: row.space_id, collectionId: row.collection_id, generation: Number(row.generation), phase: row.phase,
+          lease: row.lease, attempts: row.attempts,
+          cursor: row.cursor_kind === null ? null : { kind: row.cursor_kind, id: row.cursor_id } };
+      }
+    }, { deadline: until });
   }
 
   /** The next Refs after the job's cursor, in key order, of the kinds the generation configures. */

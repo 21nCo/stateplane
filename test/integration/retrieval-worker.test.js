@@ -1653,6 +1653,31 @@ test('a writer holding the outboxes the other way round fails the upgrade with r
   });
 });
 
+test('a search holding the generations fails upgrade 048 with retry guidance, nothing of it applied, and a retry succeeds', { timeout: 60_000 }, async () => {
+  await atMain045('g', async (db, url) => {
+    const reader = new pg.Client({ connectionString: url });
+    await reader.connect();
+    try {
+      // A retrieval write or search share locks projection_generations until it ends; read committed, it holds no snapshot.
+      await reader.query('BEGIN; LOCK TABLE projection_generations IN ACCESS SHARE MODE');
+      const failed = await migrateAsync(url);
+      assert.equal(failed.status, 1);
+      assert.match(failed.stdout, /Applied 047_retrieval_outbox_age.sql\n$/);
+      assert.match(failed.stderr, /^Projection generation upgrade waits for retrieval workers and searches; retry/);
+      const applied = async () => (await db.query(`SELECT to_regclass('public.projection_rebuilds') IS NOT NULL AS rebuilds,
+        (SELECT count(*)::int FROM information_schema.columns WHERE table_name='projection_generations'
+          AND column_name IN ('standby_at','pruned_at')) AS columns,
+        (SELECT array_agg(name ORDER BY name) FROM stateplane_migrations WHERE name >= '046') AS recorded`)).rows[0];
+      assert.deepEqual(await applied(), { rebuilds: false, columns: 0, recorded: AFTER_045.slice(0, 2) });
+      await reader.query('COMMIT');
+      const retried = await migrateAsync(url);
+      assert.equal(retried.status, 0, retried.stderr);
+      assert.equal(retried.stdout, 'Applied 048_projection_rebuilds.sql\n');
+      assert.deepEqual(await applied(), { rebuilds: true, columns: 2, recorded: AFTER_045 });
+    } finally { await reader.end(); }
+  });
+});
+
 test('the evidence outbox age index builds concurrently over a populated outbox, and an interrupted build is rebuilt', { timeout: 60_000 }, async () => {
   await atMain045('c', async (db, url) => {
     await db.query("BEGIN; SET LOCAL session_replication_role = replica");
