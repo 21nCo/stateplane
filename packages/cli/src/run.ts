@@ -40,6 +40,8 @@ function parse(argv:string[]):{words:string[];flags:Flags} {
 /* HTTP body budgets of the evidence routes (largeBody and smallBody in packages/api/src/http.ts). */
 const largeBody = 3_145_728;
 const smallBody = 32_768;
+/** The search and bundle body budget (retrievalBody in packages/api/src/http.ts). */
+const retrievalBody = 131_072;
 /** The service's upload bound (sourceBounds.uploadBytes, 25 MiB). */
 const uploadBytes = 26_214_400;
 /** The service's text bound (1 MiB of UTF-8). */
@@ -92,6 +94,8 @@ const allowed:Record<string,readonly string[]>={
   'batches status':['space','collection','operation-key'],
   'batches cancel':['space','collection','operation-key'],
   'events list':['space','collection','cursor'],
+  'retrieval search':['space','data','file'], 'retrieval bundle':['space','data','file'],
+  'retrieval status':['space','collection'],
   ...evidenceCommands
 };
 function validateFlags(resource:string,action:string|undefined,flags:Flags):void {
@@ -176,7 +180,7 @@ function endpoint(value:string):string {
 }
 function output(value:unknown):void { process.stdout.write(JSON.stringify(value)+'\n'); }
 function help():void {
-  output({usage:'stateplane <config|auth|spaces|collections|records|batches|events|sources|uploads|claims|links> <command> [--space ID] [--collection ID] [options]',
+  output({usage:'stateplane <config|auth|spaces|collections|records|batches|events|sources|uploads|claims|links|retrieval> <command> [--space ID] [--collection ID] [options]',
     docs:'See docs/http-cli.md for examples and recovery rules.'});
 }
 
@@ -520,6 +524,15 @@ async function runCollectionResource(client:StateplaneHttpClient,resource:string
   throw new StateplaneCliError('INVALID_ARGUMENT');
 }
 
+/** Search, bundles and projection status. A search or bundle request is the JSON object of --data or --file,
+ * sent as the HTTP body, so every transport passes the service the same request. */
+async function runRetrieval(client:StateplaneHttpClient,action:string|undefined,flags:Flags,spacePath:string):Promise<unknown> {
+  if (action==='status') return client.request('GET',`${spacePath}/collections/${encoded(required(flags,'collection'))}/projections`);
+  const data=await payload(flags,retrievalBody);
+  if (!data || typeof data!=='object' || Array.isArray(data)) throw new StateplaneCliError('INVALID_ARGUMENT');
+  return client.request('POST',`${spacePath}/${action==='search' ? 'search' : 'bundles'}`,withinWireBudget(data,retrievalBody));
+}
+
 /** Capture endpoint, selected space and token as one cross-process snapshot. */
 async function runHttpCommand(resource:string,action:string|undefined,flags:Flags):Promise<unknown> {
   const snapshot=await withConfigMutation(async current=>({config:current,token:await loadToken(current)}));
@@ -530,6 +543,7 @@ async function runHttpCommand(resource:string,action:string|undefined,flags:Flag
   const spacePath=space ? `/v1/spaces/${encoded(space)}` : '';
   if (resource==='spaces') return runSpaces(client,action,flags,spacePath);
   if (!spacePath) throw new StateplaneCliError('INVALID_ARGUMENT');
+  if (resource==='retrieval') return runRetrieval(client,action,flags,spacePath);
   return runCollectionResource(client,resource,action,flags,spacePath);
 }
 

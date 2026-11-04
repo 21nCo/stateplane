@@ -153,7 +153,8 @@ async function project(spaceId, collectionId, { lexical = true, vector = true, r
 /** A space with collections alpha and beta, each projected lexically and by vector. */
 export async function fixture({ collections = ['alpha', 'beta'], policy = {} } = {}) {
   const user = await createUser(config, { primaryEmail: `owner-${randomUUID()}@example.invalid` });
-  const owner = await verify((await issueSession(config, {}, { userId: user.id, methods: ['password'] })).sessionToken);
+  const ownerToken = (await issueSession(config, {}, { userId: user.id, methods: ['password'] })).sessionToken;
+  const owner = await verify(ownerToken);
   const spaceId = `sp_${randomUUID()}`;
   await spaces.create(owner, 'cell-a', spaceId);
   for (const id of collections) {
@@ -181,7 +182,7 @@ export async function fixture({ collections = ['alpha', 'beta'], policy = {} } =
       grants.map(([collectionId, capabilities]) => ({ collectionId, capabilities })));
     return Object.assign(await verify(key.secret), { keyId: key.id });
   };
-  return { spaceId, owner, scope, record, source, agent };
+  return { spaceId, owner, ownerToken, scope, record, source, agent };
 }
 export const ids = result => result.results.map(hit => `${hit.ref.collectionId}/${hit.ref.kind}/${hit.ref.id}`);
 

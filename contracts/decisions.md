@@ -78,6 +78,8 @@ The reference cursor checks canonical wire bytes and binding, then validates a f
 
 - Regional Postgres full-text plus pgvector projections use a replaceable embedder and generation-fenced async worker. Reauthorize and re-read each search result; report index state separately from the committed write.
 - Proof: STA-12 jobs; STA-14 recall.
+- Transports (STA-49): search, bundles and projection status are one application service each, so HTTP, the CLI (over HTTP) and MCP admit, reauthorize and refuse identically; search and bundles are safe POST reads. Projection status is owner only: its counts cover work on Refs a key may not read (hidden claims, unreadable kinds), so a key reads the state of what it may read from each search's `collections[]` instead. Over MCP a bundle omits its unescaped `excerpts` metadata, which must not reach a model unframed; the frame carries each citation. Request bodies are bounded at 128 KiB, which holds the largest request the services accept after JSON escaping.
+- Relevance (STA-49): no vector similarity floor is set and RRF `k` stays 60. Similarity scales differ per model, and the published evaluation's embedder is a feature hash, so a floor measured on it would not transfer; a floor needs a provider-sandbox measurement per model. Results stay ranked pages with `complete: false`.
 
 ## D9 — Validation details
 

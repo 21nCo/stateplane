@@ -14,9 +14,11 @@ scope.
 
 ## Fixed tool registry
 
-`stateplaneMcpDeclaration()` is a side-effect-free McpFn declaration with 42
+`stateplaneMcpDeclaration()` is a side-effect-free McpFn declaration with 45
 fixed tools and one guidance resource: 19 for spaces, collections, records,
-batches and events, and 23 for evidence storage (STA-37). Defining a collection inserts registry
+batches and events, 23 for evidence storage (STA-37) and 3 for retrieval
+(STA-49: `retrieval_search`, `retrieval_bundle` and `retrieval_status`, see
+[retrieval projections](retrieval-projections.md#transports-sta-49)). Defining a collection inserts registry
 data; it never adds a tool. Every credential sees the same list, and access is
 decided per call by the shared services. The public manifest is committed in
 [contracts/mcp-manifest.json](../contracts/mcp-manifest.json); review a change
@@ -90,6 +92,10 @@ predicate variant, and the collection definition of both definition tools, are
 compared with OpenAPI by `test/mcp.test.js`. Results are
 the JSON an HTTP client receives, in `structuredContent` and as JSON text;
 `records_count` returns `{count}` because MCP results are objects.
+`retrieval_bundle` leaves out the bundle's `excerpts` list: it holds stored
+strings unescaped, outside the untrusted frame, and an MCP result reaches a
+model, while the frame already names each excerpt's collection, kind, ID,
+revision and range. HTTP and the CLI return it.
 
 ## Arguments and precedence
 

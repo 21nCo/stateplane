@@ -1642,3 +1642,68 @@ test('agent key issuance accepts RFC 3339 key and grant expiries and normalizes 
   }
   assert.equal(issued.length,0,'an invalid expiry never reaches issuance');
 });
+
+test('search, bundle and projection status reach their services over HTTP and CLI and fail as reads',async t=>{
+  const state=fixture();
+  const calls=[];
+  let fault=null;
+  const record=(name,result)=>async(_actor,...args)=>{
+    calls.push([name,...args]);
+    if (fault) { const error=fault; fault=null; throw error; }
+    return result;
+  };
+  state.services.retrieval={search:record('search',{results:[],complete:false}),
+    bundle:record('bundle',{context:'<stateplane-context trust="untrusted" complete="false"></stateplane-context>',excerpts:[]}),
+    status:record('status',{state:'current',rebuild:null})};
+  const handler=createHttpHandler(state);
+  const {server,endpoint}=await serve(handler);
+  t.after(()=>server.close());
+  const http=async(method,path,body,type='application/json')=>{
+    const response=await handler(new Request(`https://stateplane.example.invalid${path}`,{method,
+      headers:{Authorization:'Bearer secret-test-token',...(body===undefined?{}:{'Content-Type':type})},body}));
+    return [response.status,await response.json(),response.headers.get('Retry-After')];
+  };
+  const search={query:'fog',collections:['entries'],kinds:['record'],limit:3};
+  assert.deepEqual((await http('POST','/v1/spaces/sp_a/search',JSON.stringify(search)))[1],{results:[],complete:false});
+  assert.equal((await http('POST','/v1/spaces/sp_a/bundles',JSON.stringify({task:'Summarize fog',budget:{bytes:2048}})))[0],200);
+  assert.deepEqual((await http('GET','/v1/spaces/sp_a/collections/entries/projections'))[1],{state:'current',rebuild:null});
+  // Malformed JSON reaches the service as null, which admits the caller before it refuses the request.
+  await http('POST','/v1/spaces/sp_a/search','{');
+  assert.deepEqual(calls,[['search','sp_a',search],['bundle','sp_a',{task:'Summarize fog',budget:{bytes:2048}}],
+    ['status','sp_a','entries'],['search','sp_a',null]]);
+  calls.length=0;
+  // A statement cancellation on a search or bundle is a read's RATE_LIMITED, retryable, never an unknown write outcome.
+  for (const path of ['search','bundles']) {
+    fault=Object.assign(new Error('private cause'),{code:'57014'});
+    const [status,body,retryAfter]=await http('POST',`/v1/spaces/sp_a/${path}`,JSON.stringify({query:'fog'}));
+    assert.deepEqual([status,body.error.code,body.error.retryable,retryAfter],[429,'RATE_LIMITED',true,'1'],path);
+  }
+  const oversized=await http('POST','/v1/spaces/sp_a/search',JSON.stringify({query:'x'.repeat(131_072)}));
+  assert.deepEqual([oversized[0],oversized[1].error.code,oversized[1].error.retryable],[429,'RATE_LIMITED',false]);
+  for (const [method,path] of [['GET','/v1/spaces/sp_a/search'],['PUT','/v1/spaces/sp_a/bundles'],
+    ['POST','/v1/spaces/sp_a/collections/entries/projections'],['POST','/v1/spaces/sp_a/search/x']])
+    assert.equal((await http(method,path,method==='GET'?undefined:'{}'))[1].error.code,'NOT_FOUND',`${method} ${path}`);
+  calls.length=0;
+
+  const root=await mkdtemp(join(tmpdir(),'stateplane-cli-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  const cli=(argv,input)=>cliProcess(root,argv,input);
+  assert.equal((await cli(['config','endpoint','--url',endpoint])).status,0);
+  assert.equal((await cliProcess(root,['auth','import','--token-stdin','--store','file'],'secret-test-token\n')).status,0);
+  assert.equal((await cli(['spaces','select','--space','sp_a'])).status,0);
+  const file=join(root,'bundle.json');
+  await writeFile(file,JSON.stringify({query:'fog',budget:{tokens:1024}}));
+  const outputs=[await cli(['retrieval','search','--data',JSON.stringify(search)]),await cli(['retrieval','bundle','--file',file]),
+    await cli(['retrieval','status','--collection','entries'])];
+  for (const output of outputs) assert.equal(output.status,0,output.stderr);
+  assert.deepEqual(JSON.parse(outputs[0].stdout),{results:[],complete:false});
+  assert.deepEqual(calls,[['search','sp_a',search],['bundle','sp_a',{query:'fog',budget:{tokens:1024}}],['status','sp_a','entries']]);
+  calls.length=0;
+  // A request that is not a JSON object, a missing collection or an unknown flag fails locally before any HTTP call.
+  for (const argv of [['retrieval','search','--data','[1]'],['retrieval','search','--data','"fog"'],['retrieval','status'],
+    ['retrieval','search','--data','{}','--collection','entries'],['retrieval','rank','--data','{}']]) {
+    const failed=await cli(argv);
+    assert.equal(JSON.parse(failed.stderr).error.code,'INVALID_ARGUMENT',argv.join(' '));
+  }
+  assert.deepEqual(calls,[]);
+});

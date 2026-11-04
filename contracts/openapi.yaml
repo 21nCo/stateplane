@@ -480,6 +480,61 @@ paths:
       responses:
         '200': { description: Deleted link and erasure report, content: { application/json: { schema: { $ref: '#/components/schemas/LinkDeletion' } } } }
         default: { $ref: '#/components/responses/Error' }
+  /v1/spaces/{spaceId}/search:
+    parameters: [ { $ref: '#/components/parameters/spaceId' } ]
+    post:
+      operationId: searchSpace
+      description: >-
+        Ranks records, sources and claims the caller may read now by full-text
+        and, where a collection's retrieval policy and a configured embedder
+        allow, vector similarity, fused by reciprocal rank. Without
+        collections, every collection readable for a requested kind is
+        searched, at most 32; a listed collection that is missing or not
+        readable for any requested kind is NOT_FOUND, and a key that can read
+        none is FORBIDDEN. A kind is searched only with its read capability
+        (records:read, sources:read, claims:read), and a claim only under the
+        claim read rule. Projections are derived data: every hit is reread
+        and reauthorized at authority in a fresh transaction and cites
+        authoritative text, and a revocation or grant lapse committed before
+        that reread fails the search FORBIDDEN. A page is never complete
+        (complete is always false) and answers no count, status or
+        completeness. A safe read: repeat it after a retryable error.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SearchRequest' } } } }
+      responses:
+        '200': { description: A ranked, reauthorized page, content: { application/json: { schema: { $ref: '#/components/schemas/SearchResult' } } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/spaces/{spaceId}/bundles:
+    parameters: [ { $ref: '#/components/parameters/spaceId' } ]
+    post:
+      operationId: bundleContext
+      description: >-
+        Cited excerpts of one search's hits for an explicit task or query,
+        within a byte or token budget, in context: one text framed
+        trust="untrusted" complete="false" for a model's context. excerpts
+        holds each excerpt's citation for the caller, unescaped and outside
+        the frame and budget; do not place it in a model's context. A
+        request asking a count, status or completeness, or outside the allowed
+        request forms, is refused INVALID_ARGUMENT before anything is admitted
+        or searched; the bundle itself carries no count, status or
+        completeness whatever it is asked. Authorization is the search's.
+        A safe read: repeat it after a retryable error.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/BundleRequest' } } } }
+      responses:
+        '200': { description: A framed context bundle, content: { application/json: { schema: { $ref: '#/components/schemas/ContextBundle' } } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/spaces/{spaceId}/collections/{collectionId}/projections:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
+    get:
+      operationId: getProjectionStatus
+      description: >-
+        Owner only; an agent key is FORBIDDEN and sees the state of what it
+        may read in each search's collections. The collection's retrieval
+        projection state, its sampled waiting and failed work, its
+        generations that are not retired and the rebuild being built or
+        verified. Projection state never changes an exact read's answer.
+      responses:
+        '200': { description: Projection status, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectionStatus' } } } }
+        default: { $ref: '#/components/responses/Error' }
 components:
   schemas:
     SpaceLifecycle:
@@ -882,6 +937,312 @@ components:
         policy: { enum: [restrict, detach] }
         from: { $ref: '#/components/schemas/Endpoint' }
         to: { $ref: '#/components/schemas/Endpoint' }
+    RefKind: { enum: [record, source, claim] }
+    RetrievalText: { type: string, minLength: 1, maxLength: 1000, description: 'Nonblank text of at most 1,000 code points and 4,000 UTF-8 bytes.' }
+    RetrievalFilters:
+      type: object
+      properties:
+        collections: { type: array, minItems: 1, maxItems: 32, items: { $ref: '#/components/schemas/EvidenceId' }, description: 'Collections to search; every readable one, up to 32, when omitted. Duplicates count once.' }
+        kinds: { type: array, minItems: 1, maxItems: 3, items: { $ref: '#/components/schemas/RefKind' }, description: All three when omitted. }
+        limit: { type: integer, minimum: 1, maximum: 50, description: 'Hits to return; 10 when omitted.' }
+    SearchRequest:
+      type: object
+      required: [query]
+      additionalProperties: false
+      properties:
+        query: { $ref: '#/components/schemas/RetrievalText' }
+        collections: { $ref: '#/components/schemas/RetrievalFilters/properties/collections' }
+        kinds: { $ref: '#/components/schemas/RetrievalFilters/properties/kinds' }
+        limit: { $ref: '#/components/schemas/RetrievalFilters/properties/limit' }
+    BundleRequest:
+      type: object
+      required: [budget]
+      additionalProperties: false
+      anyOf: [ { required: [task] }, { required: [query] } ]
+      properties:
+        task: { $ref: '#/components/schemas/RetrievalText' }
+        query: { $ref: '#/components/schemas/RetrievalText' }
+        budget:
+          type: object
+          additionalProperties: false
+          minProperties: 1
+          properties:
+            bytes: { type: integer, minimum: 1024, maximum: 262144 }
+            tokens: { type: integer, minimum: 1024, maximum: 262144, description: 'Enforced as the same number of bytes: an upper bound for tokenizers whose every token covers at least one byte.' }
+        collections: { $ref: '#/components/schemas/RetrievalFilters/properties/collections' }
+        kinds: { $ref: '#/components/schemas/RetrievalFilters/properties/kinds' }
+        limit: { $ref: '#/components/schemas/RetrievalFilters/properties/limit' }
+    RetrievalRef:
+      type: object
+      required: [spaceId, collectionId, kind, id]
+      additionalProperties: false
+      properties:
+        spaceId: { type: string }
+        collectionId: { type: string }
+        kind: { $ref: '#/components/schemas/RefKind' }
+        id: { type: string }
+    EmbedderIdentity:
+      type: object
+      required: [embedder, model, modelVersion, dimensions]
+      additionalProperties: false
+      properties:
+        embedder: { type: string }
+        model: { type: string }
+        modelVersion: { type: string }
+        dimensions: { type: integer, minimum: 1 }
+    NullableEmbedder:
+      oneOf: [ { $ref: '#/components/schemas/EmbedderIdentity' }, { type: 'null' } ]
+    SearchHit:
+      type: object
+      required: [ref, revision, extractionVersion, score, citations, provenance, review, freshness]
+      additionalProperties: false
+      properties:
+        ref: { $ref: '#/components/schemas/RetrievalRef' }
+        revision: { type: integer, minimum: 1 }
+        extractionVersion: { type: [integer, 'null'] }
+        score: { type: number, description: Reciprocal rank fusion score; comparable only within one result. }
+        citations:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [matchedBy, chunk, field, start, end, sourceStart, sourceEnd, text]
+            additionalProperties: false
+            properties:
+              matchedBy: { type: array, minItems: 1, items: { enum: [lexical, vector] } }
+              chunk: { type: integer, minimum: 0 }
+              field: { type: [string, 'null'] }
+              start: { type: integer, minimum: 0 }
+              end: { type: integer, minimum: 0 }
+              sourceStart: { type: [integer, 'null'] }
+              sourceEnd: { type: [integer, 'null'] }
+              text: { type: string, description: Authoritative text at the cited code-point range; untrusted stored content. }
+        provenance:
+          type: object
+          required: [generation, policyVersion, lexicalRank, vectorRank, embedder, attributedTo, evidence]
+          additionalProperties: false
+          properties:
+            generation: { type: integer, minimum: 1 }
+            policyVersion: { type: integer, minimum: 1 }
+            lexicalRank: { type: [integer, 'null'] }
+            vectorRank: { type: [integer, 'null'] }
+            embedder: { $ref: '#/components/schemas/NullableEmbedder' }
+            attributedTo: { type: [string, 'null'] }
+            evidence: { type: array, items: { $ref: '#/components/schemas/ClaimEvidence' } }
+        review:
+          oneOf:
+            - { type: 'null' }
+            - type: object
+              required: [status, reviewedBy, reviewedAt]
+              additionalProperties: false
+              properties:
+                status: { enum: [unreviewed, accepted, rejected] }
+                reviewedBy: { type: [string, 'null'] }
+                reviewedAt: { $ref: '#/components/schemas/NullableInstant' }
+        freshness:
+          type: object
+          required: [verifiedAt, projection]
+          additionalProperties: false
+          properties:
+            verifiedAt: { $ref: '#/components/schemas/Instant' }
+            projection: { enum: [current, pending, degraded] }
+    SearchResult:
+      type: object
+      required: [spaceId, query, limit, mode, state, complete, results, underfill, candidates, rejected, collections, collectionsCapped]
+      additionalProperties: false
+      properties:
+        spaceId: { type: string }
+        query: { type: string }
+        limit: { type: integer, minimum: 1, maximum: 50 }
+        mode: { enum: [hybrid, lexical] }
+        state: { enum: [current, pending, degraded] }
+        complete: { const: false }
+        results: { type: array, maxItems: 50, items: { $ref: '#/components/schemas/SearchHit' } }
+        underfill:
+          oneOf:
+            - { type: 'null' }
+            - type: object
+              required: [returned, requested, reasons]
+              additionalProperties: false
+              properties:
+                returned: { type: integer, minimum: 0 }
+                requested: { type: integer, minimum: 1 }
+                reasons: { type: array, items: { enum: [rejected, bounded, capped, approximate, exhausted, degraded, unindexed, pending, unprojected] } }
+        candidates:
+          type: object
+          required: [lexical, vector, considered]
+          additionalProperties: false
+          properties:
+            lexical: { type: integer, minimum: 0 }
+            vector: { type: integer, minimum: 0 }
+            considered: { type: integer, minimum: 0 }
+        rejected:
+          type: object
+          required: [deleted, stale, unauthorized]
+          additionalProperties: false
+          properties:
+            deleted: { type: integer, minimum: 0 }
+            stale: { type: integer, minimum: 0 }
+            unauthorized: { type: integer, minimum: 0 }
+        collections:
+          type: array
+          maxItems: 32
+          items:
+            type: object
+            required: [collectionId, generation, lexical, vector, vectorError, projection, unsearched]
+            additionalProperties: false
+            properties:
+              collectionId: { type: string }
+              generation: { type: [integer, 'null'] }
+              lexical: { type: boolean }
+              vector: { enum: [used, disabled, unavailable] }
+              vectorError: { enum: [EMBEDDER_NOT_CONFIGURED, EMBEDDER_UNAVAILABLE, EMBEDDER_FAILED, VECTOR_QUERY_FAILED, POLICY_CHANGED, null] }
+              projection: { enum: [current, pending, degraded, unindexed] }
+              unsearched: { type: array, items: { $ref: '#/components/schemas/RefKind' } }
+        collectionsCapped: { type: boolean }
+    ContextBundle:
+      type: object
+      required: [spaceId, task, query, budget, usage, context, excerpts, truncated, trust, complete, coverage]
+      additionalProperties: false
+      properties:
+        spaceId: { type: string }
+        task: { type: [string, 'null'] }
+        query: { type: string }
+        budget:
+          type: object
+          required: [bytes, tokens]
+          additionalProperties: false
+          properties:
+            bytes: { type: [integer, 'null'] }
+            tokens: { type: [integer, 'null'] }
+        usage:
+          type: object
+          required: [bytes, tokensAtMost]
+          additionalProperties: false
+          properties:
+            bytes: { type: integer, minimum: 0 }
+            tokensAtMost: { type: integer, minimum: 0 }
+        context: { type: string, description: 'The only text meant for a model: <stateplane-context trust="untrusted" complete="false"> with each excerpt escaped and cited.' }
+        excerpts:
+          type: array
+          description: Each excerpt's citation for the caller, never a model; stored strings are unescaped. No claim review status.
+          items:
+            type: object
+            required: [n, ref, revision, extractionVersion, field, start, end, sourceStart, sourceEnd, truncated, verifiedAt, attributedTo]
+            additionalProperties: false
+            properties:
+              n: { type: integer, minimum: 1 }
+              ref: { $ref: '#/components/schemas/RetrievalRef' }
+              revision: { type: integer, minimum: 1 }
+              extractionVersion: { type: [integer, 'null'] }
+              field: { type: [string, 'null'] }
+              start: { type: integer, minimum: 0 }
+              end: { type: integer, minimum: 0 }
+              sourceStart: { type: [integer, 'null'] }
+              sourceEnd: { type: [integer, 'null'] }
+              truncated: { type: boolean }
+              verifiedAt: { $ref: '#/components/schemas/Instant' }
+              attributedTo: { type: [string, 'null'] }
+        truncated: { type: boolean }
+        trust: { const: untrusted }
+        complete: { const: false }
+        coverage:
+          type: object
+          required: [mode, state]
+          additionalProperties: false
+          properties:
+            mode: { enum: [hybrid, lexical] }
+            state: { enum: [current, pending, degraded] }
+    ProjectionQueue:
+      type: object
+      required: [pending, degraded, capped, lastError]
+      additionalProperties: false
+      properties:
+        pending: { type: integer, minimum: 0 }
+        degraded: { type: integer, minimum: 0 }
+        capped: { type: boolean, description: The counts cover at most 500 rows and are then lower bounds. }
+        lastError: { type: [string, 'null'] }
+    ProjectionStatus:
+      type: object
+      required: [spaceId, collectionId, state, records, evidence, generations, rebuild]
+      additionalProperties: false
+      properties:
+        spaceId: { type: string }
+        collectionId: { type: string }
+        state: { enum: [current, pending, degraded] }
+        records: { $ref: '#/components/schemas/ProjectionQueue' }
+        evidence:
+          type: object
+          required: [pending, degraded, capped, lastError, oldestPendingAt]
+          additionalProperties: false
+          properties:
+            pending: { type: integer, minimum: 0 }
+            degraded: { type: integer, minimum: 0 }
+            capped: { type: boolean }
+            lastError: { type: [string, 'null'] }
+            oldestPendingAt: { $ref: '#/components/schemas/NullableInstant', description: The oldest waiting evidence item over all of them, not only the sample. }
+        generations:
+          type: array
+          items:
+            type: object
+            required: [generation, state, policyVersion, lexical, vector, embedder, embedderAvailable]
+            additionalProperties: false
+            properties:
+              generation: { type: integer, minimum: 1 }
+              state: { enum: [building, verifying, active, standby] }
+              policyVersion: { type: integer, minimum: 1 }
+              lexical: { type: boolean }
+              vector: { type: boolean }
+              embedder: { $ref: '#/components/schemas/NullableEmbedder' }
+              embedderAvailable: { type: [boolean, 'null'] }
+        rebuild:
+          description: The generation being built or verified, with its rebuild's progress; null when none is.
+          oneOf:
+            - { type: 'null' }
+            - type: object
+              required: [spaceId, collectionId, generation, state, policyVersion, embedder, createdAt, verifyingAt, activatedAt, standbyAt, retiredAt, prunedAt, rebuild]
+              additionalProperties: false
+              properties:
+                spaceId: { type: string }
+                collectionId: { type: string }
+                generation: { type: integer, minimum: 1 }
+                state: { enum: [building, verifying] }
+                policyVersion: { type: integer, minimum: 1 }
+                embedder: { $ref: '#/components/schemas/NullableEmbedder' }
+                createdAt: { $ref: '#/components/schemas/Instant' }
+                verifyingAt: { $ref: '#/components/schemas/NullableInstant' }
+                activatedAt: { $ref: '#/components/schemas/NullableInstant' }
+                standbyAt: { $ref: '#/components/schemas/NullableInstant' }
+                retiredAt: { $ref: '#/components/schemas/NullableInstant' }
+                prunedAt: { $ref: '#/components/schemas/NullableInstant' }
+                rebuild:
+                  type: [object, 'null']
+                  required: [phase, cursor, backfilled, verified, repaired, mismatched, mismatches, attempts, availableAt, lastError, backfilledAt, verifiedAt]
+                  additionalProperties: false
+                  properties:
+                    phase: { enum: [backfill, verify, verified, failed, abandoned] }
+                    cursor:
+                      type: [object, 'null']
+                      required: [kind, id]
+                      additionalProperties: false
+                      properties: { kind: { $ref: '#/components/schemas/RefKind' }, id: { type: string } }
+                    backfilled: { type: integer, minimum: 0 }
+                    verified: { type: integer, minimum: 0 }
+                    repaired: { type: integer, minimum: 0 }
+                    mismatched: { type: integer, minimum: 0 }
+                    mismatches:
+                      type: array
+                      maxItems: 20
+                      items:
+                        type: object
+                        required: [kind, id, reason]
+                        additionalProperties: false
+                        properties: { kind: { $ref: '#/components/schemas/RefKind' }, id: { type: string }, reason: { enum: [failed, incomplete] } }
+                    attempts: { type: integer, minimum: 0 }
+                    availableAt: { $ref: '#/components/schemas/Instant' }
+                    lastError: { type: [string, 'null'] }
+                    backfilledAt: { $ref: '#/components/schemas/NullableInstant' }
+                    verifiedAt: { $ref: '#/components/schemas/NullableInstant' }
     Instant: { type: string, format: date-time }
     NullableInstant: { type: [string, 'null'], format: date-time }
     DeletionErasure:

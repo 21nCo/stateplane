@@ -43,10 +43,11 @@ export function parseV1Path(pathname:string):string[]|null {
   return decoded;
 }
 
-/** Only exact queries and counts are safe POST operations to repeat. */
+/** Exact queries and counts, searches and context bundles are the safe POST operations to repeat. */
 export function isSafeHttpRead(method:string,route:readonly string[]):boolean {
   if (method==='GET') return true;
-  return method==='POST' && route.length===6 && route[0]==='spaces' &&
-    route[2]==='collections' && route[4]==='records' &&
+  if (method!=='POST' || route[0]!=='spaces') return false;
+  if (route.length===3) return route[2]==='search' || route[2]==='bundles';
+  return route.length===6 && route[2]==='collections' && route[4]==='records' &&
     (route[5]==='query' || route[5]==='count');
 }

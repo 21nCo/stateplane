@@ -55,7 +55,11 @@ function fixture() {
       review:record('claims.review',{revision:3}),delete:record('claims.delete',{claimId:'clm_1'}),
       get:record('claims.get',{claimId:'clm_1'}),list:record('claims.list',{claims:[],next:null})},
     links:{create:record('links.create',{linkId:'lnk_1'}),get:record('links.get',{linkId:'lnk_1'}),
-      delete:record('links.delete',{linkId:'lnk_1'}),list:record('links.list',{links:[],next:null})}
+      delete:record('links.delete',{linkId:'lnk_1'}),list:record('links.list',{links:[],next:null})},
+    retrieval:{search:record('retrieval.search',{results:[],complete:false}),
+      bundle:record('retrieval.bundle',{context:'<stateplane-context trust="untrusted" complete="false"></stateplane-context>',
+        excerpts:[{n:1,ref:{id:'rec_1'}}],complete:false}),
+      status:record('retrieval.status',{state:'current',rebuild:null})}
   };
   services.spaces.erasure=record('spaces.erasure',{spaceId:'sp_a',database:'pending',originalBytes:'pending',backups:'retained'});
   let providerDown=false;
@@ -104,7 +108,7 @@ test('the fixed registry publishes the committed manifest and annotations',async
   assert.equal(manifest.hash,committed.hash);
   const names=manifest.tools.map(tool=>tool.name);
   assert.deepEqual(names,[...names].sort());
-  assert.equal(names.length,42,'the registry is fixed; a new tool is a reviewed contract change');
+  assert.equal(names.length,45,'the registry is fixed; a new tool is a reviewed contract change');
   for (const tool of manifest.tools) {
     const own=tools.find(item=>item.name===tool.name);
     assert.equal(tool.annotations.readOnlyHint,own.read,`${tool.name} read annotation matches its error mapping`);
@@ -230,7 +234,9 @@ test('every published x- extension is checked against OpenAPI or the authority',
   const each=(tools,pointer,value)=>{ for (const tool of tools) expected.push(`${tool} ${pointer}=${value}`); };
   // Authority parity: the selector test below and test/integration/mcp-services.test.js.
   each(names.filter(name=>name!=='spaces_list'),'/properties/spaceId/x-utf16MaxLength',512);
-  each(names.filter(name=>!['spaces_list','spaces_get','spaces_erasure','collections_list'].includes(name)),'/properties/collectionId/x-utf16MaxLength',512);
+  // Search and bundles take a space; their collections filter is a body field, as over HTTP.
+  each(names.filter(name=>!['spaces_list','spaces_get','spaces_erasure','collections_list','retrieval_search','retrieval_bundle']
+    .includes(name)),'/properties/collectionId/x-utf16MaxLength',512);
   // Evidence selectors are HTTP path segments, like record IDs.
   each(names.filter(name=>name.startsWith('sources_') && !name.startsWith('sources_ingest')),'/properties/sourceId/x-utf16MaxLength',512);
   each(['uploads_send','uploads_finalize','uploads_revoke'],'/properties/grantId/x-utf16MaxLength',512);
@@ -321,7 +327,12 @@ test('two credentials use one fixed tool list and every tool reaches the shared 
       policy:'detach',from:{kind:'record',collectionId:'entries',id:'r'},to:{kind:'source',collectionId:'entries',id:'src_1'}}]],
     ['links_get',{...s,linkId:'lnk_1'},'links.get',['sp_a','entries','lnk_1']],
     ['links_list',{...s,endpoint:{kind:'record',id:'r'}},'links.list',['sp_a','entries',{endpoint:{kind:'record',id:'r'}}]],
-    ['links_delete',{...s,linkId:'lnk_1'},'links.delete',['sp_a','entries','lnk_1']]
+    ['links_delete',{...s,linkId:'lnk_1'},'links.delete',['sp_a','entries','lnk_1']],
+    ['retrieval_search',{spaceId:'sp_a',query:'fog',collections:['entries'],kinds:['record'],limit:3},'retrieval.search',
+      ['sp_a',{query:'fog',collections:['entries'],kinds:['record'],limit:3}]],
+    ['retrieval_bundle',{spaceId:'sp_a',task:'Summarize fog',budget:{bytes:2048}},'retrieval.bundle',
+      ['sp_a',{task:'Summarize fog',budget:{bytes:2048}}]],
+    ['retrieval_status',s,'retrieval.status',['sp_a','entries']]
   ];
   assert.deepEqual(cases.map(([name])=>name).sort(),listed.map(tool=>tool.name).sort(),'every tool is exercised');
   for (const [tool,args,service,expected] of cases) {
@@ -334,6 +345,10 @@ test('two credentials use one fixed tool list and every tool reaches the shared 
     assert.deepEqual(state.calls[0].actor,agent,`${tool} uses the verified credential, never an argument`);
     assert.deepEqual(JSON.parse(result.content[0].text),result.structuredContent,`${tool} structured/text parity`);
   }
+  // Only the frame reaches a model over MCP; the unescaped excerpt metadata stays with HTTP and CLI callers.
+  const bundle=await first.callTool('retrieval_bundle',{spaceId:'sp_a',query:'fog',budget:{tokens:1024}});
+  assert.deepEqual(bundle.structuredContent,{context:'<stateplane-context trust="untrusted" complete="false"></stateplane-context>',
+    complete:false});
   const count=await first.callTool('records_count',{...s,predicates:[]});
   assert.deepEqual(count.structuredContent,{count:3});
   const receipt=await first.callTool('records_create',{...s,idempotencyKey:'k',data:{}});
