@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PostgresProjectionGenerations } from '../../packages/postgres/dist/index.js';
+import { DeadlineExceededError } from '../../packages/postgres/dist/faults.js';
 import { DeterministicEmbedder, EmbedderUnavailableError, EmbeddingRegistry } from '../../packages/retrieval/dist/index.js';
 import { claims, fixture, healthy, ids, index, pool, rejects, search, spaces } from './retrieval-harness.js';
 
@@ -48,6 +49,30 @@ const receipts = async (f, generation) => (await pool.query(`SELECT ref_kind,ref
 const rows = async (f, generation) => Object.fromEntries(await Promise.all(['lexical_chunks', 'vector_chunks', 'embedding_checkpoints',
   'projection_refs', 'projection_deletion_receipts'].map(async table => [table, (await pool.query(`SELECT count(*)::int AS n FROM ${table}
     WHERE space_id=$1 AND collection_id='alpha' AND generation=$2`, [f.spaceId, generation])).rows[0].n])));
+/**
+ * A pool whose transactions commit as usual, except the first one whose statements `fires` accepts (each statement's SQL
+ * and values, in order): it commits, and then its COMMIT reply is lost with `error`, as a dropped session or a deadline
+ * would lose it. `fired` reports whether it happened.
+ */
+function lostAck(fires, error) {
+  const state = { fired: false };
+  state.connect = async () => {
+    const client = await pool.connect();
+    const { query, release } = client;
+    let statements = [];
+    client.query = async function (sql, values) {
+      if (sql === 'BEGIN') statements = [];
+      else if (typeof sql === 'string' && sql !== 'COMMIT') statements.push({ sql, values: values ?? [] });
+      const result = await query.call(this, sql, values);
+      if (sql === 'COMMIT' && !state.fired && fires(statements)) { state.fired = true; throw error(); }
+      return result;
+    };
+    client.release = function (...args) { client.query = query; client.release = release; return release.apply(this, args); };
+    return client;
+  };
+  return state;
+}
+const reads = (statements, id) => statements.some(({ sql, values }) => sql.includes('FROM records r JOIN spaces s') && values.includes(id));
 const del = (f, recordId) => f.record('alpha', undefined, { recordId, expectedRevision: 1 }, 'delete');
 
 test('a model migration rebuilds every canonical Ref from authority with its provenance, activates atomically and rolls back', async () => {
@@ -254,4 +279,70 @@ test('generation control refuses what would leave a collection without a safe ac
   // A suspended space admits no control.
   await spaces.suspend(f.owner, f.spaceId);
   await rejects(control.rollback(f.spaceId, 'beta'), 'SPACE_UNAVAILABLE');
+});
+
+test('a lost commit reply never rewinds a rebuild, counts a Ref twice or fails a correct verification', async () => {
+  const f = await fixture({ collections: ['alpha'] });
+  const made = [];
+  for (let n = 0; n < 6; n++) made.push(await f.record('alpha', { title: `harbor ${n}` }));
+  await index();
+  const sorted = [...made].sort((a, b) => (a < b ? -1 : 1));
+  const target = new Target();
+  // The backfill's apply of the third Ref, cursor and counters included, commits; its reply is lost with the session.
+  const dropped = lostAck(statements => statements.some(({ sql, values }) => sql.includes('UPDATE projection_rebuilds SET cursor_kind')
+    && values.includes(sorted[2])), () => Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }));
+  const control = new PostgresProjectionGenerations(dropped, { embedders: registry(target) });
+  await control.start(f.spaceId, 'alpha', { embedder: V2 });
+  await control.step({ budgetMs: 30_000 });
+  assert.ok(dropped.fired);
+  const stopped = (await control.list(f.spaceId, 'alpha'))[1].rebuild;
+  // The durable cursor stays on the committed Ref, counted once; the job backs off as an outage.
+  assert.deepEqual([stopped.phase, stopped.cursor, stopped.backfilled], ['backfill', { kind: 'record', id: sorted[2] }, 3]);
+  assert.match(stopped.lastError, /ECONNRESET/);
+  const built = await settle(control, f, 2);
+  assert.deepEqual([built.rebuild.phase, built.rebuild.backfilled, built.rebuild.verified, built.rebuild.mismatched],
+    ['verified', 6, 6, 0]);
+
+  // Verification's read of the fourth Ref reaches its deadline while COMMIT is in flight: not a mismatch, and it resumes.
+  await control.reverify(f.spaceId, 'alpha', 2);
+  let seen = 0;
+  const late = lostAck(statements => reads(statements, sorted[3]) && ++seen === 1,
+    () => new DeadlineExceededError('The time budget ended during the transaction'));
+  const verifier = new PostgresProjectionGenerations(late, { embedders: registry(target) });
+  await due();
+  // The step releases the job due at once, without the Ref's progress, and leases it again from its durable cursor.
+  assert.equal((await verifier.step({ budgetMs: 30_000 })).rebuilds, 2);
+  assert.ok(late.fired);
+  const reverified = (await verifier.list(f.spaceId, 'alpha'))[1].rebuild;
+  assert.deepEqual([reverified.phase, reverified.verified, reverified.mismatched, reverified.lastError], ['verified', 6, 0, null]);
+  await verifier.activate(f.spaceId, 'alpha', 2);
+});
+
+test('pruning passes over a retired generation another step holds and prunes the others in the same step', async () => {
+  const f = await fixture({ collections: ['alpha', 'beta'] });
+  await f.record('alpha', { title: 'harbor one' });
+  await f.record('beta', { title: 'harbor two' });
+  await index();
+  const control = generations(new Target());
+  for (const collection of ['alpha', 'beta']) {
+    await control.start(f.spaceId, collection, { embedder: V2 });
+    await settle(control, f, 2, collection);
+  }
+  // Alpha's generation retires first, so it is the oldest to prune; another session holds its row.
+  await control.retire(f.spaceId, 'alpha', 2);
+  await control.retire(f.spaceId, 'beta', 2);
+  const holder = await pool.connect();
+  try {
+    await holder.query('BEGIN');
+    await holder.query(`SELECT 1 FROM projection_generations WHERE space_id=$1 AND collection_id='alpha' AND generation=2 FOR UPDATE`,
+      [f.spaceId]);
+    const step = await control.step({ budgetMs: 8_000 });
+    assert.ok(step.pruned > 0);
+    const pruned = async collection => (await control.list(f.spaceId, collection)).find(view => view.generation === 2).prunedAt;
+    assert.equal(await pruned('alpha'), null);
+    assert.ok(await pruned('beta'), 'the unlocked retired generation is pruned in the same step');
+    await holder.query('ROLLBACK');
+    await control.step({ budgetMs: 8_000 });
+    assert.ok(await pruned('alpha'));
+  } finally { holder.release(); }
 });

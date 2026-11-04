@@ -57,8 +57,15 @@ interface Job {
   spaceId: string; collectionId: string; generation: number; phase: 'backfill' | 'verify'; lease: string; attempts: number;
   cursor: { kind: RefKind; id: string } | null;
 }
-/** Progress not yet written to the job: the last Ref finished and the counters it moved. */
-interface Progress { cursor: { kind: RefKind; id: string } | null; done: number; repaired: number; mismatches: RebuildMismatch[] }
+type Cursor = { kind: RefKind; id: string } | null;
+/**
+ * Progress not yet written to the job: the cursor it was last written at
+ * (`from`), the last Ref finished since and the counters those Refs moved.
+ * A write applies only while the job's cursor is still `from`, so progress
+ * is written once: after an unacknowledged commit that did land, the same
+ * progress written again changes nothing.
+ */
+interface Progress { from: Cursor; cursor: Cursor; done: number; repaired: number; mismatches: RebuildMismatch[] }
 type Outcome = 'current' | 'applied' | 'mismatch' | 'skipped' | 'changed' | 'closed' | 'lost' | 'gone';
 
 const iso = (value: Date | string | null) => value === null ? null : new Date(value).toISOString();
@@ -101,6 +108,8 @@ async function readRef(query: Query, spaceId: string, collectionId: string, kind
 
 /** The authority fence failed: the Ref changed after it was read. The apply rolls back and the Ref runs again. */
 class RefChanged extends Error {}
+/** The job is no longer at the progress's cursor: the apply rolls back and the step leaves the job. */
+class ProgressDiverged extends Error {}
 
 /**
  * Rebuilds, verification, activation, rollback and retirement of a
@@ -311,31 +320,39 @@ export class PostgresProjectionGenerations {
     return result;
   }
 
-  /** Remove chunks and checkpoints of retired generations in batches until none is left or `until`, counting rows removed. */
+  /**
+   * Remove chunks and checkpoints of retired generations in batches until none is left or `until`, counting rows removed.
+   * A generation another step is pruning, or whose scope closed meanwhile, is passed over for the rest of this step.
+   */
   private async prune(until: number, result: GenerationStep): Promise<void> {
+    const passed: { s: string; c: string; g: number }[] = [];
     while (Date.now() < until) {
       const batch = await inTransaction(this.pool, async db => {
         const query: Query = db.query.bind(db);
         const found = (await query(`SELECT g.space_id,g.collection_id,g.generation FROM projection_generations g
           JOIN spaces s ON s.space_id=g.space_id AND s.lifecycle IN ('active','readOnly')
           JOIN collections c ON c.space_id=g.space_id AND c.collection_id=g.collection_id AND c.lifecycle<>'deleted'
-          WHERE g.state='retired' AND g.pruned_at IS NULL ORDER BY g.retired_at,g.space_id,g.collection_id,g.generation LIMIT 1`)).rows[0];
+          WHERE g.state='retired' AND g.pruned_at IS NULL
+            AND NOT $1::jsonb @> jsonb_build_array(jsonb_build_object('s',g.space_id,'c',g.collection_id,'g',g.generation))
+          ORDER BY g.retired_at,g.space_id,g.collection_id,g.generation LIMIT 1`, [JSON.stringify(passed)])).rows[0];
         if (!found) return null;
-        // The scope fence first, as erasure locks the space first; then the generation, skipped while another step prunes it.
-        if (!await scopeOpen(query, found.space_id, found.collection_id)) return 0;
         const key = [found.space_id, found.collection_id, found.generation];
+        const pass = { pass: { s: found.space_id, c: found.collection_id, g: Number(found.generation) } };
+        // The scope fence first, as erasure locks the space first; then the generation, unless another step prunes it.
+        if (!await scopeOpen(query, found.space_id, found.collection_id)) return pass;
         if (!(await query(`SELECT 1 FROM projection_generations WHERE space_id=$1 AND collection_id=$2 AND generation=$3
-          AND state='retired' AND pruned_at IS NULL FOR UPDATE SKIP LOCKED`, key)).rows[0]) return null;
+          AND state='retired' AND pruned_at IS NULL FOR UPDATE SKIP LOCKED`, key)).rows[0]) return pass;
         let rows = 0;
         for (const table of ['embedding_checkpoints', 'vector_chunks', 'lexical_chunks'])
           rows += (await query(`DELETE FROM ${table} WHERE ctid=ANY(ARRAY(SELECT ctid FROM ${table}
             WHERE space_id=$1 AND collection_id=$2 AND generation=$3 LIMIT ${PRUNE_BATCH}))`, key)).rowCount ?? 0;
         if (rows === 0) await query(`UPDATE projection_generations SET pruned_at=clock_timestamp() WHERE space_id=$1
           AND collection_id=$2 AND generation=$3`, key);
-        return rows;
+        return { rows };
       }, { deadline: until });
       if (batch === null) break;
-      result.pruned += batch;
+      if ('pass' in batch) passed.push(batch.pass);
+      else result.pruned += batch.rows;
     }
   }
 
@@ -392,8 +409,9 @@ export class PostgresProjectionGenerations {
    */
   private async advance(claimed: Job, until: number, outages: Outages): Promise<number> {
     let job = claimed;
-    const progress: Progress = { cursor: job.cursor, done: 0, repaired: 0, mismatches: [] };
-    const reset = () => Object.assign(progress, { done: 0, repaired: 0, mismatches: [] });
+    const progress: Progress = { from: job.cursor, cursor: job.cursor, done: 0, repaired: 0, mismatches: [] };
+    // Progress was written: it is now the job's.
+    const reset = () => Object.assign(progress, { from: progress.cursor, done: 0, repaired: 0, mismatches: [] });
     let finished = 0;
     try {
       for (;;) {
@@ -413,6 +431,8 @@ export class PostgresProjectionGenerations {
           if (until - Date.now() < MIN_REF_MS) { await this.settle(job, progress, 0, null, until); return finished; }
           let outcome: Outcome;
           try { outcome = await this.project(job, generation, ref, progress, until, outages); } catch (error) {
+            // An unacknowledged commit is not the Ref's failure: the job stops and resumes from what is durable.
+            if (error instanceof CommitOutcomeUnknownError) throw error;
             if (job.phase === 'backfill' || transientFault(error)) {
               const retry = retryOf(error, finished ? 1 : job.attempts);
               await this.settle(job, progress, retry.delayMs, retry.error, until);
@@ -438,8 +458,9 @@ export class PostgresProjectionGenerations {
         reset();
       }
     } catch (error) {
+      // After an unacknowledged commit the job may already hold this progress; settling writes it only if not.
       if (cutShort(error)) await this.settle(job, progress, 0, null, until).catch(() => {});
-      else if (!(error instanceof CommitOutcomeUnknownError)) {
+      else {
         const retry = retryOf(error, finished ? 1 : job.attempts);
         await this.settle(job, progress, retry.delayMs, retry.error, until).catch(() => {});
       }
@@ -485,13 +506,15 @@ export class PostgresProjectionGenerations {
         if (blocked.length) throw new ProjectionIncompleteError('Embeddings are missing for this revision');
         const held = await holds(query, target, generation);
         if (!held && job.phase === 'backfill') throw new ProjectionIncompleteError('The generation does not hold the Ref');
-        await this.write(query, job, { cursor: ref, done: progress.done + (held ? 1 : 0),
+        if (!await this.write(query, job, { from: progress.from, cursor: ref, done: progress.done + (held ? 1 : 0),
           repaired: progress.repaired + (held && job.phase === 'verify' ? 1 : 0),
-          mismatches: held ? progress.mismatches : [...progress.mismatches, { kind: ref.kind, id: ref.id, reason: 'incomplete' }] });
+          mismatches: held ? progress.mismatches : [...progress.mismatches, { kind: ref.kind, id: ref.id, reason: 'incomplete' }] }))
+          throw new ProgressDiverged();
         return held ? 'applied' : 'mismatch';
       }, limit());
     } catch (error) {
       if (error instanceof RefChanged) return 'changed';
+      if (error instanceof ProgressDiverged) return 'lost';
       throw error;
     }
   }
@@ -504,23 +527,27 @@ export class PostgresProjectionGenerations {
   }
 
   /**
-   * Write progress under the job's lease: the cursor, the phase's counters
-   * and up to `MISMATCH_SAMPLE` mismatches in all. Progress clears the last
+   * Write progress under the job's lease while the job's cursor is still
+   * the one the progress started from: the cursor, the phase's counters and
+   * up to `MISMATCH_SAMPLE` mismatches in all. Progress clears the last
    * error and counts only this lease as an attempt, so backoff grows only
-   * while the job makes none. False when the lease is gone.
+   * while the job makes none. False when the lease is gone or the job has
+   * moved past the progress (an unacknowledged commit that landed).
    */
   private async write(query: Query, job: Job, progress: Progress): Promise<boolean> {
     const backfill = job.phase === 'backfill';
-    const updated = await query(`UPDATE projection_rebuilds SET cursor_kind=COALESCE($6,cursor_kind),cursor_id=COALESCE($7,cursor_id),
+    const updated = await query(`UPDATE projection_rebuilds SET cursor_kind=$6,cursor_id=$7,
         backfilled=backfilled+$8,verified=verified+$9,repaired=repaired+$10,mismatched=mismatched+jsonb_array_length($11::jsonb),
         mismatches=(SELECT COALESCE(jsonb_agg(m ORDER BY n),'[]') FROM jsonb_array_elements(mismatches || $11::jsonb)
           WITH ORDINALITY AS t(m,n) WHERE n<=${MISMATCH_SAMPLE}),
         attempts=CASE WHEN $8+$9>0 THEN 1 ELSE attempts END,
         last_error=CASE WHEN $8+$9>0 THEN NULL ELSE last_error END,
         last_error_at=CASE WHEN $8+$9>0 THEN NULL ELSE last_error_at END
-      WHERE space_id=$1 AND collection_id=$2 AND generation=$3 AND phase=$4 AND available_at=$5::timestamptz`,
+      WHERE space_id=$1 AND collection_id=$2 AND generation=$3 AND phase=$4 AND available_at=$5::timestamptz
+        AND cursor_kind IS NOT DISTINCT FROM $12::text AND cursor_id IS NOT DISTINCT FROM $13::text`,
     [job.spaceId, job.collectionId, job.generation, job.phase, job.lease, progress.cursor?.kind ?? null, progress.cursor?.id ?? null,
-      backfill ? progress.done : 0, backfill ? 0 : progress.done, progress.repaired, JSON.stringify(progress.mismatches)]);
+      backfill ? progress.done : 0, backfill ? 0 : progress.done, progress.repaired, JSON.stringify(progress.mismatches),
+      progress.from?.kind ?? null, progress.from?.id ?? null]);
     return updated.rowCount === 1;
   }
 
@@ -529,11 +556,15 @@ export class PostgresProjectionGenerations {
     return inTransaction(this.pool, db => this.write(db.query.bind(db), job, progress), { deadline: Math.max(until, Date.now() + 1_000) });
   }
 
-  /** Write progress and release the job, due after `delayMs`, recording `error` when given. Ends at most 1 s after `until`. */
+  /**
+   * Write progress unless the job already moved past it, and release the
+   * job under its lease, due after `delayMs`, recording `error` when given.
+   * Ends at most 1 s after `until`.
+   */
   private async settle(job: Job, progress: Progress, delayMs: number, error: string | null, until: number): Promise<void> {
     await inTransaction(this.pool, async db => {
       const query: Query = db.query.bind(db);
-      if (!await this.write(query, job, progress)) return;
+      await this.write(query, job, progress);
       await query(`UPDATE projection_rebuilds SET available_at=clock_timestamp()+($6::integer * interval '1 millisecond'),
           last_error=COALESCE($7::text,last_error),last_error_at=CASE WHEN $7::text IS NULL THEN last_error_at ELSE clock_timestamp() END
         WHERE space_id=$1 AND collection_id=$2 AND generation=$3 AND phase=$4 AND available_at=$5::timestamptz`,
@@ -551,8 +582,8 @@ export class PostgresProjectionGenerations {
   private async finishPhase(job: Job, progress: Progress, until: number): Promise<boolean> {
     return inTransaction(this.pool, async db => {
       const query: Query = db.query.bind(db);
-      if (!await scopeOpen(query, job.spaceId, job.collectionId) || !await this.leased(query, job)) return false;
-      await this.write(query, job, progress);
+      if (!await scopeOpen(query, job.spaceId, job.collectionId) || !await this.leased(query, job)
+        || !await this.write(query, job, progress)) return false;
       const key = [job.spaceId, job.collectionId, job.generation];
       if (job.phase === 'verify') {
         await query(`UPDATE projection_rebuilds SET phase=CASE WHEN mismatched=0 THEN 'verified' ELSE 'failed' END,
