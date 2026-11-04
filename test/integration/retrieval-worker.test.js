@@ -1598,12 +1598,12 @@ const upgraded = async db => (await db.query(`SELECT (SELECT indisvalid FROM pg_
   (SELECT count(*)::int FROM information_schema.columns WHERE column_name='last_error_at'
     AND table_name IN ('projection_outbox','retrieval_outbox')) AS columns,
   (SELECT array_agg(name ORDER BY name) FROM stateplane_migrations WHERE name >= '046') AS recorded`)).rows[0];
-const AFTER_045 = ['046_retrieval_dispatch_checkpoint.sql', '047_retrieval_outbox_age.sql'];
+const AFTER_045 = ['046_retrieval_dispatch_checkpoint.sql', '047_retrieval_outbox_age.sql', '048_projection_rebuilds.sql'];
 
-test('a cell that applied main\'s migration 045 upgrades without drift and gains migrations 046 and 047', { timeout: 60_000 }, async () => {
+test('a cell that applied main\'s migration 045 upgrades without drift and gains migrations 046 to 048', { timeout: 60_000 }, async () => {
   await atMain045('u', async (db, url) => {
     const output = execFileSync(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: url }, encoding: 'utf8' });
-    assert.match(output, /Applied 046_retrieval_dispatch_checkpoint.sql\nApplied 047_retrieval_outbox_age.sql/);
+    assert.match(output, /Applied 046_retrieval_dispatch_checkpoint.sql\nApplied 047_retrieval_outbox_age.sql\nApplied 048_projection_rebuilds.sql/);
     assert.deepEqual(await upgraded(db), { age: true, columns: 2, recorded: AFTER_045 });
     assert.equal(execFileSync(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: url }, encoding: 'utf8' }), '');
   });
@@ -1686,7 +1686,7 @@ test('the evidence outbox age index builds concurrently over a populated outbox,
       await snapshot.query('COMMIT');
       const retried = await migrateAsync(url);
       assert.equal(retried.status, 0, retried.stderr);
-      assert.equal(retried.stdout, 'Applied 047_retrieval_outbox_age.sql\n');
+      assert.equal(retried.stdout, 'Applied 047_retrieval_outbox_age.sql\nApplied 048_projection_rebuilds.sql\n');
       assert.deepEqual(await upgraded(db), { age: true, columns: 2, recorded: AFTER_045 });
       assert.equal((await db.query(`SELECT count(*)::int AS n FROM retrieval_outbox WHERE delivery_state='pending'`)).rows[0].n, 1335);
       assert.deepEqual(await migrateAsync(url), { status: 0, stdout: '', stderr: '' });

@@ -1,6 +1,6 @@
 import pg from 'pg';
-import { CLIENT_READ_TIMEOUT_MS, PostgresAuthority, PostgresOutbox, PostgresRetrievalWorker, RecordRetrievalProjector,
-  SourceUploadReconciler } from '@stateplane/postgres';
+import { CLIENT_READ_TIMEOUT_MS, PostgresAuthority, PostgresOutbox, PostgresProjectionGenerations, PostgresRetrievalWorker,
+  RecordRetrievalProjector, SourceUploadReconciler } from '@stateplane/postgres';
 import { R2BlobStore } from '@stateplane/storage';
 import { consume, dispatch } from '@stateplane/workers';
 import type { DeliveryMessage } from '@stateplane/workers';
@@ -19,7 +19,9 @@ interface Env {
 // for up to 7 s, settles ended upload attempts for up to 10 s, erases the
 // bytes of deleted sources and erased spaces for up to 5 s, sweeps one page
 // of stored upload bytes for up to 5 s, then projects source and claim work
-// for up to 8 s; docs/durable-outbox.md, docs/evidence-storage.md and
+// for up to 8 s, advancing projection rebuilds and removing retired
+// generations' chunks in whatever of those 8 s the work left (at least 2 s;
+// live work comes first); docs/durable-outbox.md, docs/evidence-storage.md and
 // docs/retrieval-projections.md record the bounds. Each budget is a maximum
 // and a hard end for its step's SQL and sends (a call in flight then is
 // abandoned; cancelling its statement takes at most 1 s more, on the same
@@ -27,9 +29,9 @@ interface Env {
 // whole budget however busy the steps before it are, less any time a
 // cancellation or a step's own setup took, as every step is also cut to what
 // is left of the tick, and skipped with under 2 s left (more than a
-// retrieval item's 1 s minimum plus its claim). The retrieval step may take
-// 1 s past its budget to settle, and teardown at most 5 s, after which every
-// connection still open is ended, so the invocation ends inside its minute:
+// retrieval item's 1 s minimum plus its claim). The retrieval step, or the
+// rebuild step after it, may take 1 s past their budget to settle, and
+// teardown at most 5 s, after which every connection still open is ended, so the invocation ends inside its minute:
 // ticks do not overlap, and a tick holds only the one origin connection
 // scripts/topology.mjs allows it.
 const TICK_BUDGET_MS = 50_000;
@@ -79,7 +81,8 @@ function cell(env: Env, originals = false) {
   // its work due and reported degraded, never holding back the others.
   const projector = new RecordRetrievalProjector(pool);
   const retrieval = new PostgresRetrievalWorker(pool);
-  return { outbox, uploads, projector, retrieval, close: () => pool.end(), abandon };
+  const generations = new PostgresProjectionGenerations(pool);
+  return { outbox, uploads, projector, retrieval, generations, close: () => pool.end(), abandon };
 }
 
 export default {
@@ -90,7 +93,7 @@ export default {
       const ms = Math.min(budgetMs, tickEnd - Date.now());
       return ms >= MIN_STEP_MS ? ms : 0;
     };
-    const { outbox, uploads, retrieval, close, abandon } = cell(env, true);
+    const { outbox, uploads, retrieval, generations, close, abandon } = cell(env, true);
     try {
       const dispatchMs = left(DISPATCH_BUDGET_MS);
       const result = await dispatch(outbox, {
@@ -116,7 +119,12 @@ export default {
       catch (error) { failures.push(error); }
       // Each item settles its own failure; only a failed claim reaches the tick.
       const retrievalMs = left(RETRIEVAL_BUDGET_MS);
+      const retrievalEnd = Date.now() + retrievalMs;
       try { if (retrievalMs) await retrieval.step({ budgetMs: retrievalMs }); }
+      catch (error) { failures.push(error); }
+      // Rebuilds get what live work left of its budget; each Ref settles its own failure.
+      const rebuildMs = Math.min(retrievalEnd, tickEnd) - Date.now();
+      try { if (retrievalMs && rebuildMs >= MIN_STEP_MS) await generations.step({ budgetMs: rebuildMs }); }
       catch (error) { failures.push(error); }
       if (result.error) throw new Error(`Projection dispatch released ${result.released} leases`, {
         cause: failures.length ? new AggregateError([result.error, ...failures], 'Queue send and reconciliation failed') : result.error });

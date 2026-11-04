@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({ closed: 0, connected: 0, failClose: false, denyGrants: false, denyCatalog: false, ownsObject: false, denyVector: false, wrongIdentity: false }));
-const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[], reconcileError: undefined as Error | undefined, uploadPages: [] as number[], uploadSteps: [] as number[], uploadError: undefined as Error | undefined, uploadBudgets: [] as number[], sweeps: [] as number[][], erasures: [] as number[][], originals: [] as unknown[], active: 0, peak: 0, poolInstances: [] as { emit(event: string, error: Error): boolean }[], projectors: [] as unknown[], retrievalSteps: [] as unknown[], retrievalError: undefined as Error | undefined, skew: 0, lag: {} as Record<string, number>, bounds: [] as [string, number][], hangEnd: false }));
+const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[], reconcileError: undefined as Error | undefined, uploadPages: [] as number[], uploadSteps: [] as number[], uploadError: undefined as Error | undefined, uploadBudgets: [] as number[], sweeps: [] as number[][], erasures: [] as number[][], originals: [] as unknown[], active: 0, peak: 0, poolInstances: [] as { emit(event: string, error: Error): boolean }[], projectors: [] as unknown[], retrievalSteps: [] as unknown[], rebuildSteps: [] as unknown[], retrievalError: undefined as Error | undefined, skew: 0, lag: {} as Record<string, number>, bounds: [] as [string, number][], hangEnd: false }));
 // A simulated step: it takes `cell.lag[step]` ms of the simulated clock, but never past `until`, where its store cuts it short.
 const spend = (step: string, until: number) => {
   const cut = Date.now() + (cell.lag[step] ?? 0) > until;
@@ -14,6 +14,9 @@ vi.mock('@stateplane/postgres', async importOriginal => ({
   RecordRetrievalProjector: class { constructor(pool: unknown) { cell.projectors.push(pool); } },
   PostgresRetrievalWorker: class {
     async step(options: { budgetMs: number }) { cell.retrievalSteps.push(options); spend('retrieval', Date.now() + options.budgetMs + 1_000); if (cell.retrievalError) throw cell.retrievalError; return {}; }
+  },
+  PostgresProjectionGenerations: class {
+    async step(options: { budgetMs: number }) { cell.rebuildSteps.push(options); spend('rebuild', Date.now() + options.budgetMs + 1_000); return {}; }
   },
   SourceUploadReconciler: class {
     constructor(sourceCell: { originals: unknown }) { cell.originals.push(sourceCell.originals); }
@@ -198,7 +201,7 @@ describe('cell jobs Worker', () => {
       cell.lag = { claim: 1e9, reconcile: 1e9, upload: 1e9, erase: 1e9, sweep: 1e9, retrieval: 1e9 };
       for (let tick = 0; tick < 3; tick++) {
         cell.claims = []; cell.uploadPages = []; cell.uploadBudgets = []; cell.erasures = []; cell.sweeps = []; cell.retrievalSteps = [];
-        cell.bounds = []; cell.skew = 0;
+        cell.rebuildSteps = []; cell.bounds = []; cell.skew = 0;
         const start = Date.now();
         await jobs.scheduled({} as never, jobsEnv());
         // The claim is bounded by the end of dispatch's 15 s and the reconciliation transaction by its 7 s after.
@@ -210,7 +213,27 @@ describe('cell jobs Worker', () => {
         expect(cell.sweeps.map(([, ms]) => near(ms, 5_000))).toEqual([true]);
         // The retrieval step keeps its whole 8 s: well above an item's 1 s minimum plus its claim.
         expect((cell.retrievalSteps as { budgetMs: number }[]).map(({ budgetMs }) => near(budgetMs, 8_000))).toEqual([true]);
+        // Live work used it all, so no rebuild runs.
+        expect(cell.rebuildSteps).toEqual([]);
         // Steps end by 50 s, plus the retrieval step's 1 s cleanup: inside the minute, before the next tick.
+        expect(Date.now() - start).toBeLessThanOrEqual(51_500);
+      }
+    } finally { clock.mockRestore(); cell.skew = 0; cell.lag = {}; }
+  });
+
+  it('advances projection rebuilds in what live retrieval work leaves of its 8 s, and skips them under 2 s', async () => {
+    const real = Date.now.bind(Date);
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => real() + cell.skew);
+    const near = (value: number, expected: number) => value <= expected && value > expected - 500;
+    try {
+      for (const [lag, expected] of [[0, 8_000], [5_000, 3_000], [6_500, null]] as const) {
+        cell.claims = []; cell.retrievalSteps = []; cell.rebuildSteps = []; cell.skew = 0;
+        cell.lag = { retrieval: lag, rebuild: 1e9 };
+        const start = Date.now();
+        await jobs.scheduled({} as never, jobsEnv());
+        const budgets = (cell.rebuildSteps as { budgetMs: number }[]).map(({ budgetMs }) => budgetMs);
+        expect(expected === null ? budgets : budgets.map(ms => near(ms, expected))).toEqual(expected === null ? [] : [true]);
+        // A rebuild using all its time still ends the tick inside its minute.
         expect(Date.now() - start).toBeLessThanOrEqual(51_500);
       }
     } finally { clock.mockRestore(); cell.skew = 0; cell.lag = {}; }

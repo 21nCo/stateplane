@@ -1,14 +1,16 @@
 import pg from 'pg';
 import { connectionOptions } from './db-connection.mjs';
 
-// Run after migrations 045 and 046 or restore through a protected cell
+// Run after migrations 045, 046 and 048 or restore through a protected cell
 // administration connection. The role is supplied by the protected
 // deployment inventory. Space deletion proves erasure by reading every
 // space-scoped retrieval table (the collection heads are written only by
 // owner-rights triggers). Policy writers insert retrieval policy versions;
 // the projection worker (STA-45 and later) starts and moves generations,
 // advances projected Refs, replaces chunks and checkpoints, records deletion
-// receipts, delivers retrieval work and moves its claim cursor (046).
+// receipts, delivers retrieval work and moves its claim cursor (046), and
+// runs rebuild jobs, activates, rolls back and retires generations and
+// removes retired generations' chunks (048).
 // Migration 045's owner-rights triggers enqueue that work, so the role needs
 // no insert on it. Projected Refs, receipts, generations and work are never
 // deletable: removal stays with the scoped purge routine. Chunks and
@@ -28,6 +30,7 @@ const grants=[
   ['retrieval_collection_heads','SELECT'],
   ['vector_index_strategies','SELECT'],
   ['projection_generations','SELECT, INSERT, UPDATE'],
+  ['projection_rebuilds','SELECT, INSERT, UPDATE'],
   ['projection_refs','SELECT, INSERT, UPDATE'],
   ['projection_deletion_receipts','SELECT, INSERT'],
   ['lexical_chunks','SELECT, INSERT, DELETE'],
