@@ -1,9 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import pg from 'pg';
 import { PostgresProjectionGenerations } from '../../packages/postgres/dist/index.js';
 import { DeadlineExceededError } from '../../packages/postgres/dist/faults.js';
 import { DeterministicEmbedder, EmbedderUnavailableError, EmbeddingRegistry } from '../../packages/retrieval/dist/index.js';
-import { claims, fixture, healthy, ids, index, pool, rejects, search, spaces } from './retrieval-harness.js';
+import { claims, fixture, healthy, hookedPool, ids, index, lockWaited, pool, rejects, search, spaces, target as database }
+  from './retrieval-harness.js';
 
 // STA-48: rebuilds, model migration, verified activation, rollback and
 // retirement on PostgreSQL with pgvector, through the real record, source and
@@ -345,4 +350,142 @@ test('pruning passes over a retired generation another step holds and prunes the
     await control.step({ budgetMs: 8_000 });
     assert.ok(await pruned('alpha'));
   } finally { holder.release(); }
+});
+
+/** A pool whose hooks each run once, just after the first statement containing their `match`, in the transaction that ran it. */
+function hooked(hooks) {
+  return hookedPool(pool, () => hooks, hook => hooks.splice(hooks.indexOf(hook), 1));
+}
+/**
+ * Start `operation` from inside another transaction and wait until it waits for a lock that transaction holds. Returns
+ * `{ outcome }`, a promise of its `{ value }` or `{ error }`.
+ */
+async function blocked(operation, label) {
+  const outcome = operation().then(value => ({ value }), error => ({ error }));
+  await lockWaited(label);
+  return { outcome };
+}
+
+test('the cell role with only the documented retrieval grants starts, steps and controls generations', async () => {
+  const f = await fixture({ collections: ['alpha'] });
+  await f.record('alpha', { title: 'harbor one' });
+  await index();
+  // A nonowner role with every other table, and on the retrieval tables exactly what db:grant-retrieval grants.
+  const tables = ['retrieval_policies', 'retrieval_collection_heads', 'vector_index_strategies', 'projection_generations',
+    'projection_rebuilds', 'projection_refs', 'projection_deletion_receipts', 'lexical_chunks', 'vector_chunks', 'embedding_checkpoints',
+    'retrieval_outbox', 'retrieval_dispatch_checkpoint'];
+  const role = `sta48_cell_${randomUUID().replaceAll('-', '')}`;
+  await pool.query(`CREATE ROLE ${role} NOLOGIN`);
+  const cellPool = new pg.Pool({ connectionString: database.toString(), max: 4, options: `-c role=${role}` });
+  try {
+    await pool.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${role}`);
+    await pool.query(`REVOKE ALL ON ${tables.join(',')} FROM ${role}`);
+    await pool.query(`GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO ${role}`);
+    execFileSync(process.execPath, ['scripts/grant-retrieval.mjs'], { cwd: fileURLToPath(new URL('../..', import.meta.url)), stdio: 'pipe',
+      env: { ...process.env, STATEPLANE_CELL_ADMIN_URL: database.toString(), STATEPLANE_CELL_ROLE: role } });
+    assert.equal((await pool.query(`SELECT has_table_privilege($1,'retrieval_collection_heads','UPDATE') AS u`, [role])).rows[0].u, false);
+    assert.equal((await cellPool.query('SELECT current_user AS who')).rows[0].who, role);
+    const cell = new PostgresProjectionGenerations(cellPool, { embedders: registry(new Target()) });
+
+    // A policy published while the start runs: the start is refused and inserts nothing.
+    const publisher = await pool.connect();
+    try {
+      await publisher.query('BEGIN');
+      await publisher.query(`INSERT INTO retrieval_policies(space_id,collection_id,version,record_fields,source_content,claim_statements,
+        lexical,vector,text_search_config,processing_regions,credential_id) SELECT space_id,collection_id,2,record_fields,source_content,
+        claim_statements,lexical,vector,text_search_config,processing_regions,credential_id FROM retrieval_policies
+        WHERE space_id=$1 AND collection_id='alpha' AND version=1`, [f.spaceId]);
+      const { outcome: racing } = await blocked(() => cell.start(f.spaceId, 'alpha', { embedder: V2 }), 'the start waits for the publication');
+      await publisher.query('COMMIT');
+      assert.equal((await racing).error?.code, 'CONFLICT', (await racing).error?.message);
+    } finally { publisher.release(); }
+    assert.deepEqual(await states(cell, f), [[1, 'active']]);
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM projection_rebuilds WHERE space_id=$1', [f.spaceId])).rows[0].n, 0);
+
+    // Under the published policy: a model migration, its verification and reverification, activation, rollback and pruning.
+    const started = await cell.start(f.spaceId, 'alpha', { embedder: V2 });
+    assert.deepEqual([started.generation, started.policyVersion, started.embedder], [2, 2, V2]);
+    assert.equal((await settle(cell, f, 2)).rebuild.phase, 'verified');
+    await cell.reverify(f.spaceId, 'alpha', 2);
+    assert.equal((await settle(cell, f, 2)).rebuild.phase, 'verified');
+    await cell.activate(f.spaceId, 'alpha', 2);
+    await cell.rollback(f.spaceId, 'alpha');
+    await cell.step({ budgetMs: 5_000 });
+    assert.ok((await cell.list(f.spaceId, 'alpha'))[1].prunedAt, 'the role prunes the retired generation');
+    // A start with the registry's selection, then abandoned.
+    assert.equal((await cell.retire(f.spaceId, 'alpha', (await cell.start(f.spaceId, 'alpha')).generation)).state, 'retired');
+    assert.deepEqual(await states(cell, f), [[1, 'active'], [2, 'retired'], [3, 'retired']]);
+  } finally {
+    await cellPool.end();
+    await pool.query(`DROP OWNED BY ${role}`);
+    await pool.query(`DROP ROLE ${role}`);
+  }
+});
+
+test('an activation and a reverification of the same generation never both succeed', async () => {
+  const f = await fixture({ collections: ['alpha', 'beta'] });
+  await f.record('alpha', { title: 'harbor one' });
+  await f.record('beta', { title: 'harbor two' });
+  await index();
+  const target = new Target();
+  const control = generations(target);
+  for (const collection of ['alpha', 'beta']) {
+    await control.start(f.spaceId, collection, { embedder: V2 });
+    await settle(control, f, 2, collection);
+  }
+  // The activation has read the verified job; the reverification waits for it and then finds the generation active.
+  const first = [];
+  const activating = new PostgresProjectionGenerations(hooked(first), { embedders: registry(target) });
+  let reverified;
+  first.push({ match: 'SELECT phase FROM projection_rebuilds', after: async result => {
+    ({ outcome: reverified } = await blocked(() => control.reverify(f.spaceId, 'alpha', 2), 'the reverification waits for the activation'));
+    return result;
+  } });
+  await activating.activate(f.spaceId, 'alpha', 2);
+  assert.equal((await reverified).error?.code, 'CONFLICT', (await reverified).error?.message);
+  const active = (await control.list(f.spaceId, 'alpha'))[1];
+  assert.deepEqual([active.state, active.rebuild.phase], ['active', 'verified']);
+
+  // The reverification has reset the job; the activation waits for it and then finds verification unfinished.
+  const second = [];
+  const reverifying = new PostgresProjectionGenerations(hooked(second), { embedders: registry(target) });
+  let activated;
+  second.push({ match: "UPDATE projection_rebuilds SET phase='verify'", after: async result => {
+    ({ outcome: activated } = await blocked(() => control.activate(f.spaceId, 'beta', 2), 'the activation waits for the reverification'));
+    return result;
+  } });
+  await reverifying.reverify(f.spaceId, 'beta', 2);
+  assert.equal((await activated).error?.code, 'PRECONDITION_FAILED', (await activated).error?.message);
+  const pending = (await control.list(f.spaceId, 'beta'))[1];
+  assert.deepEqual([pending.state, pending.rebuild.phase], ['verifying', 'verify']);
+});
+
+test('an activation during a re-verification step is refused cleanly and the step goes on', async () => {
+  const f = await fixture({ collections: ['alpha'] });
+  await f.record('alpha', { title: 'harbor one' });
+  await index();
+  const target = new Target();
+  const control = generations(target);
+  await control.start(f.spaceId, 'alpha', { embedder: V2 });
+  await settle(control, f, 2);
+  // Not delivered: the re-verification repairs it, under the job's lease.
+  await f.record('alpha', { title: 'harbor two' });
+  await control.reverify(f.spaceId, 'alpha', 2);
+  // The repair holds the job; the activation then starts and waits for the step's transaction.
+  const hooks = [];
+  const stepping = new PostgresProjectionGenerations(hooked(hooks), { embedders: registry(target) });
+  let activated;
+  hooks.push({ match: 'available_at>clock_timestamp() FOR UPDATE', after: async result => {
+    ({ outcome: activated } = await blocked(() => control.activate(f.spaceId, 'alpha', 2), 'the activation waits for the repair'));
+    return result;
+  } });
+  await due();
+  await stepping.step({ budgetMs: 30_000 });
+  assert.ok(activated, 'the repair ran');
+  assert.equal((await activated).error?.code, 'PRECONDITION_FAILED', (await activated).error?.message);
+  const view = (await control.list(f.spaceId, 'alpha'))[1];
+  assert.deepEqual([view.state, view.rebuild.phase, view.rebuild.repaired, view.rebuild.mismatched, view.rebuild.lastError],
+    ['verifying', 'verified', 1, 0, null]);
+  await control.activate(f.spaceId, 'alpha', 2);
+  assert.deepEqual(await states(control, f), [[1, 'standby'], [2, 'active']]);
 });

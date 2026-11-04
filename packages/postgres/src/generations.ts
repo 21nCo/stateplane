@@ -75,6 +75,10 @@ const control = (until = Infinity) => ({ deadline: Math.min(until, Date.now() + 
 /** A transaction the budget cut short; a step then just ends. */
 const cutShort = (error: unknown) => error instanceof DeadlineExceededError
   || error instanceof CommitOutcomeUnknownError && error.cause instanceof DeadlineExceededError;
+/** The generation insert trigger's refusals when the collection's head moved after `start` read it. */
+const RACED = new Set(['projection_generations_pending', 'projection_generations_policy', 'projection_generations_order']);
+/** A lock wait that ran out, or a deadlock: another session holds the generations or the job. */
+const busy = (error: unknown) => ['55P03', '40P01'].includes((error as { code?: unknown })?.code as string);
 
 function identityOf(value: unknown): EmbedderIdentity {
   const identity = value as EmbedderIdentity;
@@ -145,14 +149,14 @@ export class PostgresProjectionGenerations {
     const wanted = options.embedder === undefined ? null : identityOf(options.embedder);
     const minQuality = options.minQuality ?? 0;
     if (typeof minQuality !== 'number' || !Number.isFinite(minQuality)) throw new AuthorityError('INVALID_ARGUMENT');
-    const generation = await inTransaction(this.pool, async db => {
-      const query: Query = db.query.bind(db);
+    const generation = await this.controlled(async query => {
       await this.open(query, space, collection);
-      // The head row is the one the generation's insert trigger locks and advances; reading it locked keeps both consistent.
+      // Read, not locked: the operational role may only read the head. The insert trigger locks it with owner rights
+      // and refuses the generation when a policy or another generation was published since (CONFLICT, nothing inserted).
       const head = (await query(`SELECT h.policy_version,h.generation,p.vector,p.processing_regions
         FROM retrieval_collection_heads h JOIN retrieval_policies p ON p.space_id=h.space_id AND p.collection_id=h.collection_id
           AND p.version=h.policy_version
-        WHERE h.space_id=$1 AND h.collection_id=$2 FOR UPDATE OF h`, [space, collection])).rows[0];
+        WHERE h.space_id=$1 AND h.collection_id=$2`, [space, collection])).rows[0];
       if (!head) throw new AuthorityError('NOT_FOUND', 'The collection has no retrieval policy');
       let identity: EmbedderIdentity | null = null;
       if (head.vector) {
@@ -170,13 +174,13 @@ export class PostgresProjectionGenerations {
           model_version,dimensions) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [space, collection, next, head.policy_version,
           identity?.embedder ?? null, identity?.model ?? null, identity?.modelVersion ?? null, identity?.dimensions ?? null]);
       } catch (error) {
-        if ((error as { constraint?: unknown }).constraint === 'projection_generations_pending')
-          throw new AuthorityError('CONFLICT', 'Another generation of this collection is being built or verified');
+        if (RACED.has((error as { constraint?: string }).constraint ?? ''))
+          throw new AuthorityError('CONFLICT', 'Another generation of this collection is being built or verified, or its policy changed');
         throw error;
       }
       await query('INSERT INTO projection_rebuilds(space_id,collection_id,generation) VALUES($1,$2,$3)', [space, collection, next]);
       return next;
-    }, control());
+    });
     return (await this.list(space, collection)).find(view => view.generation === generation)!;
   }
 
@@ -211,8 +215,7 @@ export class PostgresProjectionGenerations {
     const space = text(spaceId, 512);
     const collection = text(collectionId, 512);
     const number = bounded(generation, 1, Number.MAX_SAFE_INTEGER);
-    await inTransaction(this.pool, async db => {
-      const query: Query = db.query.bind(db);
+    await this.controlled(async query => {
       const states = await this.lockStates(query, space, collection);
       if (states.get(number) !== 'verifying') throw new AuthorityError('CONFLICT', 'Only a generation being verified can be activated');
       const phase = (await query(`SELECT phase FROM projection_rebuilds WHERE space_id=$1 AND collection_id=$2 AND generation=$3
@@ -222,7 +225,7 @@ export class PostgresProjectionGenerations {
       for (const [from, to] of [['standby', 'retired'], ['active', 'standby']] as const)
         await this.move(query, space, collection, [...states].find(([, state]) => state === from)?.[0], to);
       await this.move(query, space, collection, number, 'active');
-    }, control());
+    });
     return this.list(space, collection);
   }
 
@@ -235,14 +238,13 @@ export class PostgresProjectionGenerations {
   async rollback(spaceId: string, collectionId: string): Promise<GenerationView[]> {
     const space = text(spaceId, 512);
     const collection = text(collectionId, 512);
-    await inTransaction(this.pool, async db => {
-      const query: Query = db.query.bind(db);
+    await this.controlled(async query => {
       const states = [...await this.lockStates(query, space, collection)];
       const standby = states.find(([, state]) => state === 'standby')?.[0];
       if (standby === undefined) throw new AuthorityError('PRECONDITION_FAILED', 'No generation is on standby');
       await this.move(query, space, collection, states.find(([, state]) => state === 'active')?.[0], 'retired');
       await this.move(query, space, collection, standby, 'active');
-    }, control());
+    });
     return this.list(space, collection);
   }
 
@@ -257,15 +259,14 @@ export class PostgresProjectionGenerations {
     const space = text(spaceId, 512);
     const collection = text(collectionId, 512);
     const number = bounded(generation, 1, Number.MAX_SAFE_INTEGER);
-    await inTransaction(this.pool, async db => {
-      const query: Query = db.query.bind(db);
+    await this.controlled(async query => {
       await this.open(query, space, collection);
       const state = (await query(`SELECT state FROM projection_generations WHERE space_id=$1 AND collection_id=$2 AND generation=$3
         FOR UPDATE`, [space, collection, number])).rows[0]?.state;
       if (state === undefined) throw new AuthorityError('NOT_FOUND', 'No such generation');
       if (state === 'active') throw new AuthorityError('CONFLICT', 'The active generation is replaced by rollback or activation');
       if (state !== 'retired') await this.move(query, space, collection, number, 'retired');
-    }, control());
+    });
     return (await this.list(space, collection)).find(view => view.generation === number)!;
   }
 
@@ -278,16 +279,16 @@ export class PostgresProjectionGenerations {
     const space = text(spaceId, 512);
     const collection = text(collectionId, 512);
     const number = bounded(generation, 1, Number.MAX_SAFE_INTEGER);
-    await inTransaction(this.pool, async db => {
-      const query: Query = db.query.bind(db);
+    await this.controlled(async query => {
       await this.open(query, space, collection);
-      const updated = await query(`UPDATE projection_rebuilds r SET phase='verify',cursor_kind=NULL,cursor_id=NULL,verified=0,repaired=0,
-          mismatched=0,mismatches='[]',verified_at=NULL,available_at=clock_timestamp()
-        FROM projection_generations g WHERE r.space_id=$1 AND r.collection_id=$2 AND r.generation=$3
-          AND g.space_id=r.space_id AND g.collection_id=r.collection_id AND g.generation=r.generation
-          AND g.state='verifying' AND r.phase IN ('verified','failed')`, [space, collection, number]);
-      if (updated.rowCount !== 1) throw new AuthorityError('CONFLICT', 'Only a generation with a finished verification can be reverified');
-    }, control());
+      // The generation before its job, as everywhere: an activation either committed first and is seen here, or waits.
+      const state = (await query(`SELECT state FROM projection_generations WHERE space_id=$1 AND collection_id=$2 AND generation=$3
+        FOR SHARE`, [space, collection, number])).rows[0]?.state;
+      const updated = state !== 'verifying' ? null : await query(`UPDATE projection_rebuilds SET phase='verify',cursor_kind=NULL,
+          cursor_id=NULL,verified=0,repaired=0,mismatched=0,mismatches='[]',verified_at=NULL,available_at=clock_timestamp()
+        WHERE space_id=$1 AND collection_id=$2 AND generation=$3 AND phase IN ('verified','failed')`, [space, collection, number]);
+      if (updated?.rowCount !== 1) throw new AuthorityError('CONFLICT', 'Only a generation with a finished verification can be reverified');
+    });
     return (await this.list(space, collection)).find(view => view.generation === number)!;
   }
 
@@ -498,6 +499,7 @@ export class PostgresProjectionGenerations {
       return await inTransaction(this.pool, async (db): Promise<Outcome> => {
         const query: Query = db.query.bind(db);
         if (!await scopeOpen(query, job.spaceId, job.collectionId, target.placement)) return 'closed';
+        if (!await this.inPhase(query, job, 'SHARE')) return 'gone';
         if (!await this.leased(query, job)) return 'lost';
         const blocked = await applyTarget(query, target, generation.generation);
         if (blocked === null) return 'gone';
@@ -517,6 +519,21 @@ export class PostgresProjectionGenerations {
       if (error instanceof ProgressDiverged) return 'lost';
       throw error;
     }
+  }
+
+  /**
+   * Lock the job's generation and report whether it is still in the job's
+   * phase's state (`building` for the backfill, `verifying` for
+   * verification). Every transaction that locks a generation and its job
+   * locks the generation first, after the scope fence: the step's applies
+   * and phase ends here, activation and reverification in their own way. So
+   * none of them waits for another in a cycle, and a control operation that
+   * changes the generation is seen by the next apply, which then stops.
+   */
+  private async inPhase(query: Query, job: Job, lock: 'SHARE' | 'UPDATE'): Promise<boolean> {
+    const state = (await query(`SELECT state FROM projection_generations WHERE space_id=$1 AND collection_id=$2 AND generation=$3
+      FOR ${lock}`, [job.spaceId, job.collectionId, job.generation])).rows[0]?.state;
+    return state === (job.phase === 'backfill' ? 'building' : 'verifying');
   }
 
   /** Whether `job` still holds its lease, locking the job until commit. */
@@ -582,22 +599,33 @@ export class PostgresProjectionGenerations {
   private async finishPhase(job: Job, progress: Progress, until: number): Promise<boolean> {
     return inTransaction(this.pool, async db => {
       const query: Query = db.query.bind(db);
-      if (!await scopeOpen(query, job.spaceId, job.collectionId) || !await this.leased(query, job)
-        || !await this.write(query, job, progress)) return false;
+      // A finished backfill moves its generation, so it locks it for that, waiting for writers already in it as retiring
+      // does; a verification only keeps it in its state.
+      if (!await scopeOpen(query, job.spaceId, job.collectionId) || !await this.inPhase(query, job, job.phase === 'backfill' ? 'UPDATE' : 'SHARE')
+        || !await this.leased(query, job) || !await this.write(query, job, progress)) return false;
       const key = [job.spaceId, job.collectionId, job.generation];
       if (job.phase === 'verify') {
         await query(`UPDATE projection_rebuilds SET phase=CASE WHEN mismatched=0 THEN 'verified' ELSE 'failed' END,
           verified_at=clock_timestamp(),available_at=clock_timestamp() WHERE space_id=$1 AND collection_id=$2 AND generation=$3`, key);
         return true;
       }
-      // Waits for writers already in the generation, as retiring does.
-      const moved = await query(`UPDATE projection_generations SET state='verifying' WHERE space_id=$1 AND collection_id=$2
-        AND generation=$3 AND state='building'`, key);
-      if (moved.rowCount !== 1) return false;
+      await query(`UPDATE projection_generations SET state='verifying' WHERE space_id=$1 AND collection_id=$2 AND generation=$3`, key);
       await query(`UPDATE projection_rebuilds SET phase='verify',cursor_kind=NULL,cursor_id=NULL,backfilled_at=clock_timestamp()
         WHERE space_id=$1 AND collection_id=$2 AND generation=$3`, key);
       return true;
     }, { deadline: Math.max(until, Date.now() + 1_000) });
+  }
+
+  /**
+   * One control transaction, bounded like every other. Its lock waits end
+   * after `CONTROL_LOCK_MS`; one that ends so, or a deadlock, is reported as
+   * `CONFLICT` (nothing changed; try again), never as the raw database error.
+   */
+  private async controlled<T>(fn: (query: Query) => Promise<T>): Promise<T> {
+    try { return await inTransaction(this.pool, db => fn(db.query.bind(db)), control()); } catch (error) {
+      if (busy(error)) throw new AuthorityError('CONFLICT', 'The generations are in use by another operation; try again', undefined, true);
+      throw error;
+    }
   }
 
   /** Take the scope fence, refusing a closed space or collection, then allow control writes to wait for generation writers. */
