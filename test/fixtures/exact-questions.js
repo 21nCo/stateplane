@@ -234,7 +234,9 @@ export const overRefusals = Object.freeze([
   ['Outline the steps the crew took during the storm', "Outline the crew's steps during the storm"],
   ['Summarize the notes the keeper wrote', 'Summarize the notes written by the keeper'],
   // PR review: all lines are also read as one, where a second line's verb and its object are a run-on request.
-  ['Summarize the storm\ndescribe the flood', 'Summarize the storm and describe the flood']]);
+  ['Summarize the storm\ndescribe the flood', 'Summarize the storm and describe the flood'],
+  // PR review: a list idiom is a conjunct naming nothing, so the request is refused like any other subrequest naming nothing.
+  ['Summarize the storms, floods and so on', 'Summarize the storms and floods'], ['notes about storms and the like', 'notes about storms']]);
 
 /**
  * Exact questions the classifier does not recognize, so a bundle serves them. Refusal is best-effort; a bundle for
@@ -246,9 +248,16 @@ export const unrecognizedExact = Object.freeze(['Describe the payment situation 
   'Describe how the repair is going?', 'Summarize the storm confirm invoice two paid']);
 
 /**
- * Nonblank requests holding no subrequest: punctuation, separators, symbols or a request prefix alone. They ask for
- * nothing, so a bundle refuses them as `unrecognized` before searching; they are not joined with served requests,
- * where they are only punctuation.
+ * Nonblank requests that ask for nothing: punctuation, separators, symbols or a request prefix alone, and subrequests whose
+ * words are only function words (`BUNDLE_FUNCTION_WORDS`), an opening request verb or a passage word before a function word.
+ * A bundle refuses them as `unrecognized` before searching. Punctuation joined with a served request is only punctuation.
  */
 export const emptyRequests = Object.freeze(['???', '...', '!!!', '  ?  ', '-', '\u2014', '?!', ';;', '()', '"', '* -', '~', '=>', '->',
-  '#', '\u2192', '\u200b', '\ud83d\udd25', 'please', 'please?', 'can you tell me', 'hey, please...']);
+  '#', '\u2192', '\u200b', '\ud83d\udd25', 'please', 'please?', 'can you tell me', 'hey, please...',
+  'tell me about', 'please tell me about', 'Tell me about the', 'about', 'the', 'of', 'on', 'it', 'this', 'them', 'why', 'a', 'with',
+  'from', 'information on', 'info about', 'details on', 'something about', 'anything about', 'passages about', 'Summarize it',
+  'Explain this', 'Describe that', 'Summarize the', 'Explain about', 'Explain it to me', 'why not', 'Summarize everything']);
+
+/** Requests naming something next to the empty ones, which a bundle serves. */
+export const namedRequests = Object.freeze(['Tell me about refunds', 'Summarize the storm', 'why did the storm happen',
+  'Explain the outage', 'Summarize the draft', 'Explain the outline', 'notes', 'the details of the storm', 'invoice two']);

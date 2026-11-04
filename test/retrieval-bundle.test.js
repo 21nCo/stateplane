@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { assembleBundle, BUNDLE_CLOSE, BUNDLE_OPEN, bundleBounds, exactQuestion } from '../packages/retrieval/dist/index.js';
-import { emptyRequests, exactQuestions, ordinaryRequests, overRefusals } from './fixtures/exact-questions.js';
+import { assembleBundle, BUNDLE_CLOSE, BUNDLE_FUNCTION_WORDS, BUNDLE_OPEN, bundleBounds, exactQuestion } from '../packages/retrieval/dist/index.js';
+import { emptyRequests, exactQuestions, namedRequests, ordinaryRequests, overRefusals } from './fixtures/exact-questions.js';
 
 const points = text => Array.from(text);
 const hit = (id, texts, extra = {}) => ({ ref: { spaceId: 'sp_1', collectionId: 'notes', kind: 'record', id }, revision: 2,
@@ -183,9 +183,25 @@ test('count, status and completeness questions are recognized by structure; ordi
   // One corpus, shared with the service test: every sibling local review raised and new variants of each structure.
   for (const [text, kind] of exactQuestions) assert.equal(exactQuestion(text), kind, JSON.stringify(text));
   for (const text of ordinaryRequests) assert.equal(exactQuestion(text), null, JSON.stringify(text));
-  // Nonblank text holding no subrequest asks for nothing: refused, alone, repeated or spaced; blank text is the caller's to reject.
-  for (const text of emptyRequests) for (const variant of [text, `${text} ${text}`, `\n${text}\n`])
-    assert.equal(exactQuestion(variant), 'unrecognized', JSON.stringify(variant));
+  // Nonblank text asking for nothing is refused: alone, repeated, between line breaks and after a served request. A request
+  // verb is framing only where it opens a subrequest ("Summarize the draft" names a draft), so a row it leads is repeated on
+  // its own line or sentence, not run on. Blank text is the caller's to reject.
+  const verbLed = text => /^(?:summarize|explain|describe|tell me about the)(?![\p{L}\p{N}])/iu.test(text);
+  for (const text of emptyRequests)
+    for (const variant of [text, ...verbLed(text) ? [] : [`${text} ${text}`], `${text}\n${text}`, `${text}. ${text}`, `\n${text}\n`,
+      text.toUpperCase()])
+      assert.equal(exactQuestion(variant), 'unrecognized', JSON.stringify(variant));
+  // After a served request, a request prefix alone is politeness ("Summarize the storm, please"), so only rows with other words.
+  const politeness = new Set(['please', 'please?', 'can you tell me', 'hey, please...']);
+  for (const text of emptyRequests.filter(text => /\p{L}/u.test(text) && !politeness.has(text)))
+    for (const variant of [`Summarize the storm. ${text}`, `Summarize the storm\n${text}`, `harbor lantern; ${text}`])
+      assert.equal(exactQuestion(variant), 'unrecognized', JSON.stringify(variant));
+  for (const text of politeness) assert.equal(exactQuestion(`Summarize the storm, ${text}`), null, text);
+  // The function words form one closed set: each alone, or as all a request prefix leaves, names nothing and is refused
+  // (as `unrecognized`, or by a deny rule first: "every" asks for a set).
+  for (const word of BUNDLE_FUNCTION_WORDS) for (const text of [word, `tell me about ${word}`, `Summarize ${word}`])
+    assert.notEqual(exactQuestion(text), null, JSON.stringify(text));
+  for (const text of namedRequests) assert.equal(exactQuestion(text), null, JSON.stringify(text));
   for (const text of ['', ' ', '\t\n']) assert.equal(exactQuestion(text), null, JSON.stringify(text));
   // Structure, not vocabulary: a yes/no question, an embedded whether-question or a which-question over a participle is
   // refused whatever its verb, behind any request prefix; the same words as an ordinary request are not.

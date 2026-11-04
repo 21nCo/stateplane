@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { PostgresContextBundles } from '../../packages/postgres/dist/index.js';
 import { BUNDLE_CLOSE, BUNDLE_OPEN } from '../../packages/retrieval/dist/index.js';
-import { emptyRequests, exactQuestions, ordinaryRequests, overRefusals, unrecognizedExact } from '../fixtures/exact-questions.js';
+import { emptyRequests, exactQuestions, namedRequests, ordinaryRequests, overRefusals, unrecognizedExact } from '../fixtures/exact-questions.js';
 import { beacons, claims, fixture, healthy, hookedPool, index, LOCK_SPACE, lockWaited, pool, registry, rejects, REREAD, search,
   services, sources, spaces } from './retrieval-harness.js';
 
@@ -233,8 +233,8 @@ test('count, status and completeness requests are refused before anything is sea
   assert.ok(bundle.excerpts.length >= 2);
   assert.equal(bundle.complete, false);
   assert.match(bundle.context, /no count, status or completeness follows from them/);
-  // Every ordinary request of the corpus, and each over-refusal's rephrasing, is served as task and query.
-  for (const text of [...ordinaryRequests, ...overRefusals.map(([, rephrasing]) => rephrasing)]) {
+  // Every ordinary request of the corpus, each over-refusal's rephrasing and each request naming something is served as task and query.
+  for (const text of [...ordinaryRequests, ...overRefusals.map(([, rephrasing]) => rephrasing), ...namedRequests]) {
     const served = await bundles(registry, counting).bundle(f.owner, f.spaceId, { task: text, query: text, budget });
     assert.deepEqual([served.task, served.trust, served.complete], [text, 'untrusted', false]);
   }

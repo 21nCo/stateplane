@@ -350,9 +350,9 @@ const ON = 'about|on|regarding|concerning|re|for|from|by|of|in|mentioning|coveri
   + 'related\\s+to|relating\\s+to';
 const OBJECT = '(?:\\s+(?:me|us))?(?:\\s+(?:the|any|some|a|an|our|my|your|their|his|her|its|those|these|relevant|recent))?';
 const GET_PASSAGES = regex(`^${word(GET)}${OBJECT}(?:\\s+(?!${word(SELECTING)})\\S+){0,3}?\\s+${word(PASSAGE)}\\s+${word(ON)}\\s+\\S`);
+const SUMMARY = 'summary|summaries|overview|description|explanation|outline|recap|background|context|digest|synopsis|account|explainer';
 const GET_SUMMARY = regex(`^${word(GET)}${OBJECT}(?:\\s+(?:brief|short|quick|high\\s+level|detailed|longer|concise))?\\s+`
-  + `${word('summary|summaries|overview|description|explanation|outline|recap|background|context|digest|synopsis|account|explainer')}`
-  + `\\s+${word('of|on|about|for|regarding|concerning|from')}\\s+\\S`);
+  + `${word(SUMMARY)}\\s+${word('of|on|about|for|regarding|concerning|from')}\\s+\\S`);
 // A phrase, up to five words, naming who: no negation in it.
 const AGENT = `(?:(?!${word(`not|never|\\S*n'?t`)})\\S+\\s+){1,5}?`;
 const SAY = 'say|write|note|record|report|describe|mention|think|suggest|recommend|propose|argue|claim|explain';
@@ -670,6 +670,42 @@ function clauses(reading: string): { groups: { head: string; text: string }[]; t
 }
 
 /**
+ * The closed class of English function words a request holds without naming anything: articles and determiners,
+ * prepositions and particles, pronouns (with something, anything and the like), conjunctions, question words, negation and
+ * politeness words. Auxiliaries and modals are function words too. A subrequest naming nothing else asks for nothing.
+ */
+export const BUNDLE_FUNCTION_WORDS: readonly string[] = Object.freeze([
+  'the', 'a', 'an', 'this', 'that', 'these', 'those', 'some', 'any', 'no', 'every', 'each', 'all', 'both', 'either', 'neither',
+  'another', 'other', 'such', 'my', 'our', 'your', 'their', 'his', 'her', 'its', "'s",
+  'about', 'above', 'across', 'after', 'against', 'along', 'amid', 'among', 'amongst', 'around', 'as', 'at', 'before', 'behind',
+  'below', 'beneath', 'beside', 'besides', 'between', 'beyond', 'by', 'concerning', 'despite', 'down', 'during', 'except', 'for',
+  'from', 'in', 'inside', 'into', 'like', 'near', 'of', 'off', 'on', 'onto', 'out', 'outside', 'over', 'per', 're', 'regarding',
+  'since', 'than', 'through', 'throughout', 'till', 'to', 'toward', 'towards', 'under', 'underneath', 'unlike', 'until', 'up',
+  'upon', 'via', 'with', 'within', 'without',
+  'i', 'me', 'mine', 'myself', 'we', 'us', 'ours', 'ourselves', 'you', 'yours', 'yourself', 'yourselves', 'he', 'him', 'himself',
+  'she', 'hers', 'herself', 'it', 'itself', 'they', 'them', 'theirs', 'themselves', 'there', 'here', 'someone', 'somebody',
+  'something', 'anyone', 'anybody', 'anything', 'everyone', 'everybody', 'everything', 'nobody', 'nothing', 'none',
+  'and', 'or', 'nor', 'but', 'so', 'yet', 'if', 'because', 'while', 'whether', 'though', 'although',
+  'what', 'which', 'who', 'whom', 'whose', 'where', 'when', 'why', 'how', 'whatever', 'whichever', 'whoever', 'whomever',
+  'wherever', 'whenever', 'not', 'be', 'been', 'being',
+  'please', 'pls', 'plz', 'kindly', 'thanks', 'thank', 'hey', 'hi', 'hello', 'ok', 'okay']);
+const FUNCTION_WORDS = new Set(BUNDLE_FUNCTION_WORDS);
+// Request verbs opening a subrequest, and passage or summary words before a function word ("information on"): framing only.
+const REQUEST_VERBS = new Set([...EXPLAIN_VERBS, 'find', 'show', 'get', 'give', 'fetch', 'retrieve', 'pull', 'bring', 'look', 'search',
+  'surface', 'provide', 'send', 'share', 'see', 'read', 'tell']);
+const FRAMING = new RegExp(`^(?:${PASSAGE}|${SUMMARY})$`, 'u');
+
+/** Whether a subrequest names something: a word other than a function word, its opening request verb or framing. */
+function named(text: string): boolean {
+  const words = text.split(' ').map(token => token.replace(/^[^\p{L}\p{N}']+|[^\p{L}\p{N}']+$/gu, ''));
+  const framing = (token: string, at: number) => (at === 0 && REQUEST_VERBS.has(token))
+    || (FRAMING.test(token) && FUNCTION_WORDS.has(words[at + 1] ?? ''));
+  return words.some((token, at) => /[\p{L}\p{N}]/u.test(token) && !FUNCTION_WORDS.has(token) && !isAuxiliary(token) && !framing(token, at));
+}
+// Whether text holds a word at all; text holding none (punctuation, symbols) is only punctuation.
+const WORDY = /[\p{L}\p{N}]/u;
+
+/**
  * Why a bundle request text is refused, or null when a bundle serves it.
  * Best-effort defense in depth: a bundle answers no count, status or
  * completeness question by its output contract (cited excerpts only,
@@ -696,10 +732,13 @@ function clauses(reading: string): { groups: { head: string; text: string }[]; t
  * each, all, lists, rosters, existence and what remains), as do the topic
  * cues wherever they occur in it: a state word, before or after its noun,
  * negated or alone; remaining, left, missing or outstanding; a trailing
- * "all"; or a closing participle. Nonblank text with no subrequest holding
- * a letter or digit in any reading (punctuation, separators, symbols or a
- * request prefix alone) asks for nothing, so it is refused as
- * `unrecognized`; blank text is null.
+ * "all"; or a closing participle. A request asks for nothing, so it is
+ * refused as `unrecognized`, when no subrequest holds a letter or digit in any
+ * reading (punctuation, separators, symbols or a request prefix alone), or
+ * when a subrequest or a noun phrase continuing one holds words but names
+ * nothing: only `BUNDLE_FUNCTION_WORDS`, auxiliaries, its opening request verb
+ * and passage or summary words before a function word ("tell me about",
+ * "Summarize it", "information on"). Blank text is null.
  */
 export function exactQuestion(text: string): BundleRefusal | null {
   let found: BundleRefusal | null = null;
@@ -710,15 +749,17 @@ export function exactQuestion(text: string): BundleRefusal | null {
     return null;
   };
   for (const reading of readings(text)) for (const { groups, topics, asked } of clauses(reading)) {
-    asks ||= groups.some(({ text: group }) => /[\p{L}\p{N}]/u.test(group));
+    asks ||= groups.some(({ text: group }) => WORDY.test(group));
     for (const [index, { head, text: group }] of groups.entries()) {
       // The question mark ends the clause's last subrequest.
       const kind = note(refusal(head, group, asked && index === groups.length - 1));
       if (kind) return kind;
+      if (WORDY.test(head) && !named(head)) note('unrecognized');
     }
     for (const topic of topics) {
       const kind = note(hidden(topic, true) ?? topicCue(topic));
       if (kind) return kind;
+      if (WORDY.test(topic) && !named(topic)) note('unrecognized');
     }
   }
   return asks || !text.trim() ? found : 'unrecognized';
