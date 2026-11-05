@@ -1,0 +1,734 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFile, readdir } from 'node:fs/promises';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import pg from 'pg';
+import { memoryAdapter } from '@superfunctions/db/testing';
+import { createAuthFn, createUser, issueSession } from '@authfn/core';
+import { AuthFnAgentKeys, AuthFnIdentityVerifier } from '../../packages/auth/dist/index.js';
+import { PostgresAuthority, PostgresSpaces } from '../../packages/postgres/dist/index.js';
+
+// STA-57 storage only: no service admits or runs analysis jobs yet, so job,
+// page, manifest and slot fixtures use SQL. One database for these tests and
+// one for the upgrade test, both dropped afterwards.
+const root = fileURLToPath(new URL('../..', import.meta.url));
+const password = process.env.DATABASE_URL ? null : (await readFile(new URL('../../.data/local-db-password', import.meta.url), 'utf8')).trim();
+const baseUrl = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT ?? '55432'}/stateplane`;
+const urlFor = name => Object.assign(new URL(baseUrl), { pathname: `/${name}` }).toString();
+const [testDatabase, upgradeDatabase] = ['analysis', 'analysis_upgrade'].map(kind => `stateplane_${kind}_${randomUUID().replaceAll('-', '')}`);
+const admin = async sql => {
+  const client = new pg.Client({ connectionString: baseUrl });
+  await client.connect();
+  try { await client.query(sql); } finally { await client.end(); }
+};
+const dropDatabases = () => Promise.all([testDatabase, upgradeDatabase].map(name => admin(`DROP DATABASE IF EXISTS ${name}`)));
+const migrate = (name, env = {}) => spawnSync(process.execPath, ['scripts/migrate.mjs'],
+  { cwd: root, env: { ...process.env, DATABASE_URL: urlFor(name), ...env }, encoding: 'utf8' });
+try {
+  await Promise.all([testDatabase, upgradeDatabase].map(name => admin(`CREATE DATABASE ${name}`)));
+  assert.equal(migrate(testDatabase).status, 0);
+} catch (error) { await dropDatabases(); throw error; }
+const pool = new pg.Pool({ connectionString: urlFor(testDatabase), max: 6 });
+test.after(async () => { await pool.end(); await dropDatabases(); });
+
+const digest = value => createHash('sha256').update(value).digest('hex');
+const refused = (code, constraint) => error => {
+  assert.equal(error.code, code, error.message);
+  if (constraint) assert.equal(error.constraint, constraint, error.message);
+  return true;
+};
+const check = constraint => refused('23514', constraint);
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+async function inTransaction(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally { client.release(); }
+}
+
+/** Append one event of a record and, unless `publish` is false, publish it to the feed; returns its position. */
+async function write(db, spaceId, collectionId, recordId, revision, { operation = revision === 1 ? 'create' : 'patch',
+  data = `{"v":${revision}}`, publish = true } = {}) {
+  if (revision === 1) {
+    await db.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+      VALUES($1,$2,$3,1,1,'generated',$3,$4::text,$4::jsonb)`, [spaceId, collectionId, recordId, data]);
+  } else {
+    await db.query(`UPDATE records SET revision=$4,canonical_data=$5::text,data=$5::jsonb,tombstone=$6
+      WHERE space_id=$1 AND collection_id=$2 AND record_id=$3`, [spaceId, collectionId, recordId, revision, data, operation === 'delete']);
+  }
+  const eventId = `evt_${randomUUID()}`;
+  await db.query(`INSERT INTO record_events(event_id,space_id,collection_id,record_id,revision,operation,credential_id,schema_version,canonical_data)
+    VALUES($1,$2,$3,$4,$5,$6,'writer',1,$7)`, [eventId, spaceId, collectionId, recordId, revision, operation, data]);
+  if (!publish) return eventId;
+  return publishEvent(db, eventId);
+}
+async function publishEvent(db, eventId) {
+  const row = (await db.query(`INSERT INTO record_event_feed(event_id,space_id,collection_id)
+    SELECT event_id,space_id,collection_id FROM record_event_pending WHERE event_id=$1 RETURNING position`, [eventId])).rows[0];
+  await db.query('DELETE FROM record_event_pending WHERE event_id=$1', [eventId]);
+  return Number(row.position);
+}
+
+/** A space owned by `owner` with collections alpha and beta, one published record event in each; alpha's position is the watermark. */
+async function space() {
+  const spaceId = `sp_${randomUUID()}`;
+  return inTransaction(async db => {
+    await db.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id)
+      VALUES($1,'owner','cell-a','cell-a','target-a')`, [spaceId]);
+    const positions = {};
+    for (const collectionId of ['alpha', 'beta']) {
+      await db.query('INSERT INTO collections(space_id,collection_id) VALUES($1,$2)', [spaceId, collectionId]);
+      await db.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition) VALUES($1,$2,1,'{}')`,
+        [spaceId, collectionId]);
+      positions[collectionId] = await write(db, spaceId, collectionId, 'rec_1', 1);
+    }
+    return { spaceId, watermark: positions.alpha, betaPosition: positions.beta };
+  });
+}
+
+const spec = '{"kind":"export","fields":["/v"]}';
+/** Admit a job; returns its key and binding. */
+async function admit(spaceId, watermark, fields = {}, db = pool) {
+  const job = { job_id: `anj_${randomUUID()}`, collection_id: 'alpha', kind: 'export', principal_id: 'owner',
+    credential_id: 'owner-session', capability: 'records:read', policy_version: 1, placement_generation: 1, schema_version: 1,
+    watermark, canonical_spec: spec, spec_digest: digest(spec), budget_records: 1000, budget_bytes: 4096,
+    budget_runtime_ms: 60000, expires_in: '1 hour', ...fields };
+  const { expires_in: expiresIn, ...columns } = job;
+  const names = Object.keys(columns);
+  await db.query(`INSERT INTO analysis_jobs(space_id,${names.join(',')},expires_at)
+    VALUES($1,${names.map((_, i) => `$${i + 2}`).join(',')},clock_timestamp()+$${names.length + 2}::interval)`,
+  [spaceId, ...Object.values(columns), expiresIn]);
+  return { spaceId, ...job };
+}
+const key = job => [job.spaceId, job.collection_id, job.job_id];
+const jobWhere = 'space_id=$1 AND collection_id=$2 AND job_id=$3';
+const update = (job, set, values = [], db = pool) => db.query(`UPDATE analysis_jobs SET ${set} WHERE ${jobWhere} RETURNING *`,
+  [...key(job), ...values]).then(result => result.rows[0]);
+const run = (job, db = pool) => update(job, `state='running',lease_id='lease-1',leased_until=clock_timestamp()+interval '1 minute',
+  attempts=attempts+1`, [], db);
+const binding = job => [job.spaceId, job.collection_id, job.job_id, job.credential_id, job.spec_digest, job.schema_version, job.watermark];
+async function page(job, number, content, rowOffset, rowCount, byteOffset, { db = pool, override = {} } = {}) {
+  const values = [...binding({ ...job, ...override }), number, rowOffset, rowCount, byteOffset, content,
+    override.content_sha256 ?? digest(content)];
+  await db.query(`INSERT INTO analysis_result_pages(space_id,collection_id,job_id,credential_id,spec_digest,schema_version,watermark,
+    page_number,row_offset,row_count,byte_offset,content,content_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, values);
+}
+async function manifest(job, pages, { db = pool, override = {} } = {}) {
+  const totals = { page_count: pages.length, row_count: pages.reduce((n, p) => n + p.rows, 0),
+    byte_size: pages.reduce((n, p) => n + Buffer.byteLength(p.content), 0),
+    result_sha256: digest(pages.map(p => digest(p.content)).join('')), ...override };
+  await db.query(`INSERT INTO analysis_result_manifests(space_id,collection_id,job_id,credential_id,spec_digest,schema_version,watermark,
+    page_count,row_count,byte_size,result_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+  [...binding({ ...job, ...override }), totals.page_count, totals.row_count, totals.byte_size, totals.result_sha256]);
+}
+const analysisTables = ['analysis_jobs', 'analysis_result_pages', 'analysis_result_manifests', 'analysis_space_slots'];
+const counts = async spaceId => Object.fromEntries(await Promise.all([...analysisTables.map(async table =>
+  [table, (await pool.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`, [spaceId])).rows[0].n]),
+(async () => ['analysis_cell_slots', (await pool.query('SELECT count(*)::int AS n FROM analysis_cell_slots WHERE holder_space_id=$1',
+  [spaceId])).rows[0].n])()]));
+
+/** A completed export of two pages that holds a space slot and a cell slot until it completes, and a running job that still holds both. */
+async function populate(spaceId, watermark, cell) {
+  const done = await admit(spaceId, watermark);
+  const live = await admit(spaceId, watermark);
+  await run(done);
+  await run(live);
+  const pages = [{ content: '{"rec_1":1}\n', rows: 1 }, { content: '{"rec_2":2}\n', rows: 1 }];
+  await page(done, 1, pages[0].content, 0, 1, 0);
+  await page(done, 2, pages[1].content, 1, 1, Buffer.byteLength(pages[0].content));
+  await manifest(done, pages);
+  await page(live, 1, pages[0].content, 0, 1, 0);
+  await pool.query(`INSERT INTO analysis_space_slots(space_id,slot,holder_collection_id,holder_job_id,held_until)
+    VALUES($1,1,'alpha',$2,clock_timestamp()+interval '1 minute'),($1,2,NULL,NULL,NULL)`, [spaceId, live.job_id]);
+  await pool.query(`INSERT INTO analysis_cell_slots(cell_id,slot) VALUES($1,1),($1,2) ON CONFLICT DO NOTHING`, [cell]);
+  const free = (await pool.query(`UPDATE analysis_cell_slots SET holder_space_id=$2,holder_collection_id='alpha',holder_job_id=$3,
+    held_until=clock_timestamp()+interval '1 minute' WHERE (cell_id,slot) = (SELECT cell_id,slot FROM analysis_cell_slots
+    WHERE cell_id=$1 AND holder_job_id IS NULL ORDER BY slot LIMIT 1) RETURNING slot`, [cell, spaceId, live.job_id])).rows[0];
+  assert.ok(free, 'a free cell slot');
+  await update(done, `state='completed'`);
+  return { done, live };
+}
+
+test('a job binds its space, collection, credential and grant, spec digest, schema version, placement and watermark', async () => {
+  const { spaceId, watermark, betaPosition } = await space();
+  const job = await admit(spaceId, watermark);
+  const row = (await pool.query(`SELECT * FROM analysis_jobs WHERE ${jobWhere}`, key(job))).rows[0];
+  assert.deepEqual({ state: row.state, credential: row.credential_id, digest: row.spec_digest, schema: Number(row.schema_version),
+    watermark: Number(row.watermark), policy: Number(row.policy_version), placement: Number(row.placement_generation) },
+  { state: 'queued', credential: 'owner-session', digest: digest(spec), schema: 1, watermark, policy: 1, placement: 1 });
+
+  // Stale bindings and a spec its digest does not name.
+  await assert.rejects(admit(spaceId, watermark, { policy_version: 2 }), check('analysis_jobs_binding'));
+  await assert.rejects(admit(spaceId, watermark, { placement_generation: 2 }), check('analysis_jobs_binding'));
+  await pool.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition) VALUES($1,'alpha',2,'{}')`, [spaceId]);
+  await pool.query(`UPDATE collections SET schema_version=2 WHERE space_id=$1 AND collection_id='alpha'`, [spaceId]);
+  await assert.rejects(admit(spaceId, watermark), check('analysis_jobs_binding'));
+  await admit(spaceId, watermark, { schema_version: 2 });
+  await assert.rejects(admit(spaceId, watermark, { schema_version: 2, spec_digest: digest('{}') }), check('analysis_jobs_spec_digest'));
+  await assert.rejects(admit(spaceId, watermark, { schema_version: 2, canonical_spec: '[]', spec_digest: digest('[]') }),
+    check('analysis_jobs_spec'));
+  // The watermark is a position of the job's own collection's feed, or 0 only before its first event.
+  await assert.rejects(admit(spaceId, betaPosition, { schema_version: 2 }), check('analysis_jobs_watermark'));
+  await assert.rejects(admit(spaceId, watermark + 1000000, { schema_version: 2 }), check('analysis_jobs_watermark'));
+  await assert.rejects(admit(spaceId, 0, { schema_version: 2 }), check('analysis_jobs_watermark'));
+  await inTransaction(async db => {
+    await db.query(`INSERT INTO collections(space_id,collection_id) VALUES($1,'empty')`, [spaceId]);
+    await db.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition) VALUES($1,'empty',1,'{}')`, [spaceId]);
+  });
+  await admit(spaceId, 0, { collection_id: 'empty' });
+
+  // The owner, or a credential whose current grant on the collection includes the job's capability.
+  const agent = { schema_version: 2, principal_id: 'agent', credential_id: 'agent-key' };
+  await assert.rejects(admit(spaceId, watermark, agent), check('analysis_jobs_grant'));
+  await pool.query(`INSERT INTO collection_grants(space_id,collection_id,credential_id,capabilities,expires_at)
+    VALUES($1,'alpha','agent-key',ARRAY['records:read'],clock_timestamp()+interval '1 hour')`, [spaceId]);
+  await admit(spaceId, watermark, agent);
+  await assert.rejects(admit(spaceId, watermark, { ...agent, capability: 'export:read' }), check('analysis_jobs_grant'));
+  await pool.query(`UPDATE collection_grants SET expires_at=clock_timestamp()-interval '1 second' WHERE space_id=$1`, [spaceId]);
+  await assert.rejects(admit(spaceId, watermark, agent), check('analysis_jobs_grant'));
+
+  // A job starts queued with nothing done, in a live space and collection.
+  await assert.rejects(admit(spaceId, watermark, { schema_version: 2, state: 'running' }), check('analysis_jobs_transition'));
+  await assert.rejects(admit(spaceId, watermark, { schema_version: 2, records_scanned: 1 }), check('analysis_jobs_transition'));
+  await assert.rejects(admit(spaceId, watermark, { schema_version: 2, expires_in: '-1 second' }), check('analysis_jobs_expiry'));
+  await pool.query(`UPDATE collections SET lifecycle='deleted' WHERE space_id=$1 AND collection_id='empty'`, [spaceId]);
+  await assert.rejects(admit(spaceId, 0, { collection_id: 'empty' }), check('analysis_jobs_admission'));
+  for (const lifecycle of ['suspended', 'deleting']) {
+    await pool.query('UPDATE spaces SET lifecycle=$2 WHERE space_id=$1', [spaceId, lifecycle]);
+    await assert.rejects(admit(spaceId, watermark, { schema_version: 2 }), check('analysis_jobs_admission'));
+  }
+  await pool.query(`UPDATE spaces SET lifecycle='readOnly' WHERE space_id=$1`, [spaceId]);
+  await admit(spaceId, watermark, { schema_version: 2 });
+
+  // The binding, budgets and expiry never change.
+  for (const set of [`credential_id='other'`, `spec_digest=repeat('0',64)`, `watermark=0`, `schema_version=2`, `budget_bytes=1`,
+    `expires_at=expires_at+interval '1 day'`, `policy_version=2`, `principal_id='agent'`])
+    await assert.rejects(update(job, set), check('analysis_jobs_binding'), set);
+});
+
+test('result pages and manifests carry their job binding, by foreign key', async () => {
+  const { spaceId, watermark } = await space();
+  const job = await admit(spaceId, watermark);
+  await run(job);
+  const binding = refused('23503', 'analysis_result_pages_binding');
+  for (const override of [{ credential_id: 'other' }, { spec_digest: digest('{}') }, { schema_version: 2 }, { watermark: 0 }])
+    await assert.rejects(page(job, 1, 'a', 0, 1, 0, { override }), binding, JSON.stringify(override));
+  await page(job, 1, 'a', 0, 1, 0);
+  for (const override of [{ credential_id: 'other' }, { watermark: 0 }])
+    await assert.rejects(manifest(job, [{ content: 'a', rows: 1 }], { override }), refused('23503', 'analysis_result_manifests_binding'));
+  await manifest(job, [{ content: 'a', rows: 1 }]);
+  const stored = (await pool.query(`SELECT p.credential_id,p.spec_digest,p.schema_version::int,p.watermark::int,
+      m.credential_id AS m_credential,m.spec_digest AS m_digest,m.schema_version::int AS m_schema,m.watermark::int AS m_watermark
+    FROM analysis_result_pages p JOIN analysis_result_manifests m USING (space_id,collection_id,job_id) WHERE p.space_id=$1`, [spaceId])).rows[0];
+  assert.deepEqual({ ...stored }, { credential_id: 'owner-session', spec_digest: digest(spec), schema_version: 1, watermark,
+    m_credential: 'owner-session', m_digest: digest(spec), m_schema: 1, m_watermark: watermark });
+});
+
+test('a job moves forward only, runs under a lease before it expires, and completes only with its manifest', async () => {
+  const { spaceId, watermark } = await space();
+  const job = await admit(spaceId, watermark);
+  // Progress and the lease need a running job.
+  await assert.rejects(update(job, 'records_scanned=1'), check('analysis_jobs_transition'));
+  await assert.rejects(update(job, `state='running'`), check('analysis_jobs_lease'));
+  await assert.rejects(update(job, `state='completed'`), check('analysis_jobs_transition'));
+  const running = await run(job);
+  assert.ok(running.started_at && Number(running.attempts) === 1);
+  // Progress only grows and stays within budget; the checkpoint is an object.
+  await update(job, `records_scanned=10,runtime_ms=5,cursor_record_id='rec_10',checkpoint='{"sum":3}'`);
+  await assert.rejects(update(job, 'records_scanned=9'), check('analysis_jobs_transition'));
+  await assert.rejects(update(job, 'records_scanned=1001'), check('analysis_jobs_budget'));
+  await assert.rejects(update(job, 'runtime_ms=60001'), check('analysis_jobs_budget'));
+  await assert.rejects(update(job, `checkpoint='[]'`), check('analysis_jobs_checkpoint'));
+  await assert.rejects(update(job, `leased_until=expires_at+interval '1 second'`), check('analysis_jobs_expiry'));
+  // A reclaim after an interruption takes a new lease and counts an attempt.
+  assert.equal((await update(job, `lease_id='lease-2',attempts=attempts+1`)).attempts, 2);
+  await assert.rejects(update(job, `state='completed'`), check('analysis_jobs_manifest'));
+  // A worker whose lease has lapsed writes nothing.
+  await update(job, `leased_until=clock_timestamp()-interval '1 second'`);
+  await assert.rejects(manifest(job, []), check('analysis_result_manifests_job'));
+  await assert.rejects(page(job, 1, 'a', 0, 1, 0), check('analysis_result_pages_job'));
+  await update(job, `leased_until=clock_timestamp()+interval '1 minute'`);
+  await manifest(job, []);
+  const completed = await update(job, `state='completed',records_scanned=12`);
+  assert.deepEqual({ lease: completed.lease_id, until: completed.leased_until, scanned: Number(completed.records_scanned) },
+    { lease: null, until: null, scanned: 12 });
+  assert.ok(completed.finished_at);
+  // An ended job is frozen, except that a completed result expires once its expiry passes.
+  for (const set of [`state='running',lease_id='x',leased_until=clock_timestamp()`, `state='failed',failure_code='LATE'`,
+    `cursor_record_id='rec_11'`, `attempts=attempts+1`])
+    await assert.rejects(update(job, set), check('analysis_jobs_transition'), set);
+  await assert.rejects(update(job, `state='expired'`), check('analysis_jobs_expiry'));
+
+  // A queued job can be cancelled directly; a running one through cancelling, which keeps its stamp.
+  const queued = await admit(spaceId, watermark);
+  const cancelled = await update(queued, `state='cancelled'`);
+  assert.ok(cancelled.cancel_requested_at && cancelled.finished_at);
+  const cancelling = await admit(spaceId, watermark);
+  await run(cancelling);
+  const requested = (await update(cancelling, `state='cancelling'`)).cancel_requested_at;
+  await assert.rejects(update(cancelling, 'records_scanned=1'), check('analysis_jobs_transition'));
+  await assert.rejects(update(cancelling, `state='running'`), check('analysis_jobs_transition'));
+  const ended = await update(cancelling, `state='cancelled'`);
+  assert.deepEqual([ended.cancel_requested_at, ended.lease_id], [requested, null]);
+  // A failure names its code, and only a failure does.
+  const failing = await admit(spaceId, watermark);
+  await run(failing);
+  await assert.rejects(update(failing, `state='failed'`), check('analysis_jobs_failure'));
+  await assert.rejects(update(failing, `failure_code='BUDGET_EXCEEDED'`), check('analysis_jobs_failure'));
+  assert.equal((await update(failing, `state='failed',failure_code='BUDGET_EXCEEDED'`)).state, 'failed');
+
+  // Past its expiry a job neither runs nor completes; it expires, and a completed result expires too.
+  const brief = await admit(spaceId, watermark, { expires_in: '400 milliseconds' });
+  const briefDone = await admit(spaceId, watermark, { expires_in: '400 milliseconds' });
+  await assert.rejects(update(brief, `state='expired'`), check('analysis_jobs_expiry'));
+  await pool.query(`UPDATE analysis_jobs SET state='running',lease_id='l',leased_until=expires_at,attempts=1 WHERE ${jobWhere}`, key(briefDone));
+  await manifest(briefDone, []);
+  await update(briefDone, `state='completed'`);
+  await sleep(450);
+  await assert.rejects(run(brief), check('analysis_jobs_expiry'));
+  assert.equal((await update(brief, `state='expired'`)).state, 'expired');
+  const expired = await update(briefDone, `state='expired'`);
+  assert.equal(expired.state, 'expired');
+  assert.ok(expired.finished_at < expired.expires_at, 'the completion time is kept');
+});
+
+test('result pages follow each other within the byte budget, digests are checked, and a manifest seals and states them', async () => {
+  const { spaceId, watermark } = await space();
+  const job = await admit(spaceId, watermark, { budget_bytes: 10 });
+  await assert.rejects(page(job, 1, 'abc', 0, 1, 0), check('analysis_result_pages_job'));
+  await run(job);
+  await assert.rejects(page(job, 2, 'abc', 0, 1, 0), check('analysis_result_pages_order'));
+  await assert.rejects(page(job, 1, 'abc', 1, 1, 0), check('analysis_result_pages_order'));
+  await assert.rejects(page(job, 1, 'abc', 0, 1, 0, { override: { content_sha256: digest('abd') } }), check('analysis_result_pages_digest'));
+  await assert.rejects(page(job, 1, 'x'.repeat(11), 0, 1, 0), check('analysis_result_pages_budget'));
+  await page(job, 1, 'abc', 0, 2, 0);
+  await assert.rejects(page(job, 1, 'abc', 0, 2, 0), refused('23505'));
+  await assert.rejects(page(job, 2, 'défg', 2, 1, 4), check('analysis_result_pages_order'));
+  await assert.rejects(page(job, 2, 'défghij', 2, 1, 3), check('analysis_result_pages_budget'));
+  await page(job, 2, 'défg', 2, 1, 3);
+  assert.deepEqual((await pool.query(`SELECT page_number,byte_size FROM analysis_result_pages WHERE space_id=$1 ORDER BY page_number`,
+    [spaceId])).rows.map(row => [row.page_number, row.byte_size]), [[1, 3], [2, 5]]);
+  await assert.rejects(pool.query(`UPDATE analysis_result_pages SET row_count=9 WHERE space_id=$1`, [spaceId]),
+    check('analysis_result_pages_immutable'));
+  const pages = [{ content: 'abc', rows: 2 }, { content: 'défg', rows: 1 }];
+  for (const override of [{ page_count: 1 }, { row_count: 2 }, { byte_size: 7 }, { result_sha256: digest('abc') }])
+    await assert.rejects(manifest(job, pages, { override }), check('analysis_result_manifests_totals'), JSON.stringify(override));
+  await manifest(job, pages);
+  await assert.rejects(page(job, 3, 'h', 3, 1, 8), check('analysis_result_pages_sealed'));
+  await assert.rejects(pool.query(`UPDATE analysis_result_manifests SET row_count=9 WHERE space_id=$1`, [spaceId]),
+    check('analysis_result_manifests_immutable'));
+  // Results are kept while the job runs or its completed result lives; once it is cancelled, failed or expired they can be removed.
+  await assert.rejects(pool.query('DELETE FROM analysis_result_pages WHERE space_id=$1', [spaceId]), check('analysis_result_pages_kept'));
+  await update(job, `state='completed'`);
+  await assert.rejects(pool.query('DELETE FROM analysis_result_manifests WHERE space_id=$1', [spaceId]), check('analysis_result_manifests_kept'));
+  await assert.rejects(pool.query('TRUNCATE analysis_result_pages'), check('analysis_result_pages_immutable'));
+  await assert.rejects(pool.query('DELETE FROM analysis_jobs WHERE space_id=$1', [spaceId]), check('analysis_jobs_immutable'));
+  const failed = await admit(spaceId, watermark);
+  await run(failed);
+  await page(failed, 1, 'abc', 0, 1, 0);
+  await assert.rejects(pool.query(`DELETE FROM analysis_result_pages WHERE job_id=$1`, [failed.job_id]), check('analysis_result_pages_kept'));
+  await update(failed, `state='failed',failure_code='CANCELLED_BY_BUDGET'`);
+  assert.equal((await pool.query(`DELETE FROM analysis_result_pages WHERE job_id=$1`, [failed.job_id])).rowCount, 1);
+});
+
+for (const isolation of ['READ COMMITTED', 'REPEATABLE READ']) {
+  test(`under ${isolation}, cancelling a job waits for a page write in flight, and a later page is refused`, async () => {
+    const { spaceId, watermark } = await space();
+    const job = await admit(spaceId, watermark);
+    await run(job);
+    const [writer, canceller] = [await pool.connect(), await pool.connect()];
+    try {
+      await writer.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+      await page(job, 1, 'abc', 0, 1, 0, { db: writer });
+      await canceller.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+      const pid = (await canceller.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+      const cancelling = update(job, `state='cancelling'`, [], canceller);
+      await waitsOnLock(pid);
+      await writer.query('COMMIT');
+      assert.equal((await cancelling).state, 'cancelling');
+      await canceller.query('COMMIT');
+      await writer.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+      await assert.rejects(page(job, 2, 'def', 1, 1, 3, { db: writer }), check('analysis_result_pages_job'));
+      await writer.query('ROLLBACK');
+      assert.equal((await pool.query('SELECT count(*)::int AS n FROM analysis_result_pages WHERE space_id=$1', [spaceId])).rows[0].n, 1);
+    } finally {
+      await writer.query('ROLLBACK').catch(() => {});
+      await canceller.query('ROLLBACK').catch(() => {});
+      writer.release();
+      canceller.release();
+    }
+  });
+}
+
+async function waitsOnLock(pid) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const row = (await pool.query('SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1', [pid])).rows[0];
+    if (row?.wait_event_type === 'Lock') return;
+    await sleep(25);
+  }
+  assert.fail(`backend ${pid} never waited on a lock`);
+}
+
+test('a slot is held by one live job of its space or cell, at most one of each kind, and released when the job ends', async () => {
+  const { spaceId, watermark } = await space();
+  const other = await space();
+  const cell = `cell-${randomUUID()}`;
+  await pool.query(`UPDATE spaces SET cell_id=$2 WHERE space_id=$1`, [spaceId, cell]);
+  const job = await admit(spaceId, watermark);
+  const foreign = await admit(other.spaceId, other.watermark);
+  await assert.rejects(pool.query('INSERT INTO analysis_space_slots(space_id,slot) VALUES($1,11)', [spaceId]), check());
+  await assert.rejects(pool.query('INSERT INTO analysis_cell_slots(cell_id,slot) VALUES($1,0)', [cell]), check());
+  await pool.query('INSERT INTO analysis_space_slots(space_id,slot) SELECT $1,generate_series(1,2)', [spaceId]);
+  await pool.query('INSERT INTO analysis_cell_slots(cell_id,slot) SELECT $1,generate_series(1,2)', [cell]);
+  const take = (table, slot, holder, until = `clock_timestamp()+interval '1 minute'`) => table === 'space'
+    ? pool.query(`UPDATE analysis_space_slots SET holder_collection_id='alpha',holder_job_id=$3,held_until=${until}
+      WHERE space_id=$1 AND slot=$2`, [spaceId, slot, holder.job_id])
+    : pool.query(`UPDATE analysis_cell_slots SET holder_space_id=$3,holder_collection_id='alpha',holder_job_id=$4,held_until=${until}
+      WHERE cell_id=$1 AND slot=$2`, [cell, slot, holder.spaceId, holder.job_id]);
+  // Another space's job cannot hold this space's slot (no such job here) or this cell's slot (its space is elsewhere).
+  await assert.rejects(take('space', 1, foreign), check('analysis_space_slots_holder'));
+  await assert.rejects(take('cell', 1, foreign), check('analysis_cell_slots_holder'));
+  await assert.rejects(take('space', 1, job, `clock_timestamp()+interval '2 hours'`), check('analysis_space_slots_holder'));
+  await take('space', 1, job);
+  await take('cell', 1, job);
+  await assert.rejects(take('space', 2, job), refused('23505'));
+  await assert.rejects(take('cell', 2, job), refused('23505'));
+  await assert.rejects(pool.query('UPDATE analysis_space_slots SET slot=3 WHERE space_id=$1 AND slot=1', [spaceId]), check('analysis_space_slots_key'));
+  await assert.rejects(pool.query(`UPDATE analysis_space_slots SET held_until=NULL WHERE space_id=$1 AND slot=1`, [spaceId]), check());
+  // A held slot passes to another job only once its hold has lapsed.
+  const next = await admit(spaceId, watermark);
+  await assert.rejects(take('space', 1, next), check('analysis_space_slots_held'));
+  await assert.rejects(take('cell', 1, next), check('analysis_cell_slots_held'));
+  await pool.query(`UPDATE analysis_space_slots SET held_until=clock_timestamp()-interval '1 second' WHERE space_id=$1 AND slot=1`, [spaceId]);
+  await take('space', 1, next);
+  await pool.query(`UPDATE analysis_space_slots SET holder_job_id=NULL,holder_collection_id=NULL,held_until=NULL WHERE space_id=$1 AND slot=1`,
+    [spaceId]);
+  await take('space', 1, job);
+  await run(job);
+  await update(job, `state='failed',failure_code='WORKER_LOST'`);
+  const held = async () => (await pool.query(`SELECT (SELECT count(*)::int FROM analysis_space_slots WHERE space_id=$1 AND holder_job_id IS NOT NULL)
+    + (SELECT count(*)::int FROM analysis_cell_slots WHERE cell_id=$2 AND holder_job_id IS NOT NULL) AS n`, [spaceId, cell])).rows[0].n;
+  assert.equal(await held(), 0, 'ending the job released both slots');
+  await assert.rejects(take('space', 1, job), check('analysis_space_slots_holder'));
+});
+
+test('as of a watermark, each record is its highest revision published at or below it, read through the as-of index', { timeout: 120000 }, async () => {
+  const { spaceId } = await space();
+  const scope = [spaceId, 'alpha'];
+  // The feed derives each row's record and revision from its event, whatever the publisher sends, and refuses another collection's event.
+  const mismatch = await inTransaction(db => write(db, spaceId, 'beta', 'rec_x', 1, { publish: false }));
+  await assert.rejects(pool.query(`INSERT INTO record_event_feed(event_id,space_id,collection_id) VALUES($1,$2,'alpha')`, [mismatch, spaceId]),
+    refused('23503', 'record_event_feed_event'));
+  const forged = await inTransaction(db => write(db, spaceId, 'alpha', 'rec_2', 1, { publish: false }));
+  const derived = (await pool.query(`INSERT INTO record_event_feed(event_id,space_id,collection_id,record_id,revision)
+    VALUES($1,$2,'alpha','rec_1',9) RETURNING record_id,revision::int`, [forged, spaceId])).rows[0];
+  assert.deepEqual({ ...derived }, { record_id: 'rec_2', revision: 1 });
+
+  // The authority's own publication carries them too.
+  const authority = new PostgresAuthority(pool, 3600);
+  const writer = { spaceId, collectionId: 'alpha', principalId: 'owner', credentialId: 'owner-session', capability: 'records:write',
+    policyVersion: 1, placementGeneration: 1 };
+  const created = await authority.mutate(writer, { operation: 'create', idempotencyKey: 'k1', requestDigest: 'a'.repeat(64),
+    canonicalData: '{"v":1}', unique: [], indexes: [] });
+  await authority.transaction({ ...writer, capability: 'events:read' }, tx => tx.events());
+  assert.deepEqual((await pool.query(`SELECT revision::int FROM record_event_feed WHERE space_id=$1 AND record_id=$2`,
+    [spaceId, created.ref.id])).rows, [{ revision: 1 }]);
+
+  // Before the watermark: rec_a created and patched, rec_b created and deleted, rec_c's revision 2 published before its
+  // revision 1. After it: rec_a patched again, rec_d created, and rec_c's revision 3 written but not yet published.
+  const w = await inTransaction(async db => {
+    await write(db, spaceId, 'alpha', 'rec_a', 1);
+    await write(db, spaceId, 'alpha', 'rec_a', 2);
+    await write(db, spaceId, 'alpha', 'rec_b', 1);
+    await write(db, spaceId, 'alpha', 'rec_b', 2, { operation: 'delete' });
+    const c1 = await write(db, spaceId, 'alpha', 'rec_c', 1, { publish: false });
+    const c2 = await write(db, spaceId, 'alpha', 'rec_c', 2, { publish: false });
+    await publishEvent(db, c2);
+    return publishEvent(db, c1);
+  });
+  await inTransaction(async db => {
+    await write(db, spaceId, 'alpha', 'rec_a', 3);
+    await write(db, spaceId, 'alpha', 'rec_d', 1);
+    await write(db, spaceId, 'alpha', 'rec_c', 3, { publish: false });
+  });
+  const asOf = `SELECT r.record_id, e.revision::int, e.operation
+    FROM records r
+    CROSS JOIN LATERAL (SELECT f.revision FROM record_event_feed f
+      WHERE f.space_id = r.space_id AND f.collection_id = r.collection_id AND f.record_id = r.record_id AND f.position <= $3
+      ORDER BY f.revision DESC LIMIT 1) a
+    JOIN record_events e ON e.space_id = r.space_id AND e.collection_id = r.collection_id AND e.record_id = r.record_id
+      AND e.revision = a.revision
+    WHERE r.space_id = $1 AND r.collection_id = $2 AND r.record_id > $4
+    ORDER BY r.record_id LIMIT $5`;
+  const at = async watermark => (await pool.query(asOf, [...scope, watermark, '', 100])).rows.map(row => [row.record_id, row.revision, row.operation]);
+  assert.deepEqual((await at(w)).filter(([id]) => id.startsWith('rec_') && id.length === 5),
+    [['rec_1', 1, 'create'], ['rec_2', 1, 'create'], ['rec_a', 2, 'patch'], ['rec_b', 2, 'delete'], ['rec_c', 2, 'patch']]);
+
+  // A populated collection: 3,000 records, each 300th updated 200 times after the watermark. The lookup walks only the as-of index.
+  await inTransaction(async db => {
+    await db.query(`INSERT INTO collections(space_id,collection_id) VALUES($1,'bulk')`, [spaceId]);
+    await db.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition) VALUES($1,'bulk',1,'{}')`, [spaceId]);
+  });
+  await pool.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+    SELECT $1,'bulk','b'||lpad(n::text,5,'0'),CASE WHEN n%300=0 THEN 201 ELSE 1 END,1,'generated','b'||n,'{}','{}'::jsonb
+    FROM generate_series(1,3000) n`, [spaceId]);
+  await pool.query(`INSERT INTO record_events(event_id,space_id,collection_id,record_id,revision,operation,credential_id,schema_version,canonical_data)
+    SELECT 'evb_'||n||'_'||r,$1,'bulk','b'||lpad(n::text,5,'0'),r,CASE WHEN r=1 THEN 'create' ELSE 'patch' END,'w',1,'{}'
+    FROM generate_series(1,3000) n CROSS JOIN generate_series(1,201) r WHERE r=1 OR n%300=0`, [spaceId]);
+  await pool.query(`INSERT INTO record_event_feed(event_id,space_id,collection_id) SELECT 'evb_'||n||'_1',$1,'bulk'
+    FROM generate_series(1,3000) n ORDER BY n`, [spaceId]);
+  const bulkWatermark = Number((await pool.query(`SELECT max(position) AS p FROM record_event_feed WHERE space_id=$1 AND collection_id='bulk'`,
+    [spaceId])).rows[0].p);
+  await pool.query(`INSERT INTO record_event_feed(event_id,space_id,collection_id) SELECT 'evb_'||n||'_'||r,$1,'bulk'
+    FROM generate_series(300,3000,300) n CROSS JOIN generate_series(2,201) r ORDER BY r,n`, [spaceId]);
+  await pool.query(`DELETE FROM record_event_pending WHERE space_id=$1 AND collection_id='bulk'`, [spaceId]);
+  await pool.query('ANALYZE records, record_events, record_event_feed');
+  const page = (await pool.query(asOf, [spaceId, 'bulk', bulkWatermark, '', 1000])).rows;
+  assert.equal(page.length, 1000);
+  assert.ok(page.every(row => row.revision === 1), 'later revisions are excluded');
+  const plan = (await pool.query(`EXPLAIN ${asOf}`, [spaceId, 'bulk', bulkWatermark, '', 1000])).rows.map(row => row['QUERY PLAN']).join('\n');
+  assert.match(plan, /Index Only Scan Backward using record_event_feed_as_of on record_event_feed/);
+  assert.doesNotMatch(plan, /Seq Scan on record_event(?:s|_feed)\b/);
+});
+
+const authConfig = { database: memoryAdapter(), namespace: `sta57-${randomUUID()}`, plugins: [] };
+createAuthFn(authConfig);
+const identity = new AuthFnIdentityVerifier(authConfig);
+const verify = token => identity.verify(new Request('https://h.invalid', { headers: { authorization: `Bearer ${token}` } }));
+const spacesFor = cellPool => new PostgresSpaces(pool, new Map([['cell-a', { pool: cellPool, storageTargetId: 'target-a' }]]), 'cell-a',
+  new AuthFnAgentKeys(authConfig), identity, randomBytes(32));
+async function owner() {
+  const user = await createUser(authConfig, { primaryEmail: `owner-${randomUUID()}@example.invalid` });
+  return verify((await issueSession(authConfig, {}, { userId: user.id, methods: ['password'] })).sessionToken);
+}
+/** Give a space created through the services a collection with one published event, as `space()` does. */
+async function seed(spaceId) {
+  return inTransaction(async db => {
+    await db.query('INSERT INTO collections(space_id,collection_id) VALUES($1,$2)', [spaceId, 'alpha']);
+    await db.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition) VALUES($1,'alpha',1,'{}')`, [spaceId]);
+    return write(db, spaceId, 'alpha', 'rec_1', 1);
+  });
+}
+
+test('space erasure removes every job, page, manifest and space slot of that space only, and releases its cell slots', async () => {
+  const erased = await space();
+  const kept = await space();
+  await populate(erased.spaceId, erased.watermark, 'cell-a');
+  await populate(kept.spaceId, kept.watermark, 'cell-a');
+  const keptBefore = await counts(kept.spaceId);
+  assert.ok(Object.values(keptBefore).every(n => n > 0), JSON.stringify(keptBefore));
+  assert.ok(Object.values(await counts(erased.spaceId)).every(n => n > 0));
+  await pool.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1`, [erased.spaceId]);
+  await pool.query('SELECT stateplane_purge_space($1)', [erased.spaceId]);
+  assert.deepEqual(await counts(erased.spaceId), Object.fromEntries([...analysisTables, 'analysis_cell_slots'].map(table => [table, 0])));
+  assert.deepEqual(await counts(kept.spaceId), keptBefore);
+  assert.ok((await pool.query(`SELECT count(*)::int AS n FROM analysis_cell_slots WHERE cell_id='cell-a'`)).rows[0].n >= 2,
+    'cell slots are cell capacity, not space data');
+});
+
+test('a nonowner cell role runs jobs and proves erasure only with the analysis grants', async () => {
+  const actor = await owner();
+  const { spaceId } = await spacesFor(pool).create(actor);
+  const watermark = await seed(spaceId);
+  const role = `sta57_cell_${randomUUID().replaceAll('-', '')}`;
+  await pool.query(`CREATE ROLE ${role} NOLOGIN`);
+  const cellPool = new pg.Pool({ connectionString: urlFor(testDatabase), max: 2, options: `-c role=${role}` });
+  const publicRoutines = (await pool.query(`SELECT p.oid::regprocedure::text AS routine FROM pg_proc p
+    WHERE p.pronamespace='public'::regnamespace AND (p.proacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) a
+      WHERE a.grantee=0 AND a.privilege_type='EXECUTE'))`)).rows.map(row => row.routine);
+  const analysis = [...analysisTables, 'analysis_cell_slots'];
+  try {
+    // A pre-049 cell role: every other table and the purge routine, nothing on the analysis tables, and the hardened
+    // runbook's revocation of PUBLIC routine execution.
+    await pool.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${role}`);
+    await pool.query(`REVOKE ALL ON ${analysis.join(',')} FROM ${role}`);
+    await pool.query(`GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO ${role}`);
+    await pool.query('REVOKE EXECUTE ON ALL ROUTINES IN SCHEMA public FROM PUBLIC');
+    await pool.query(`GRANT EXECUTE ON FUNCTION stateplane_purge_space(text) TO ${role}`);
+    const asRole = async fn => {
+      const client = await cellPool.connect();
+      try { return await fn(client); } finally { client.release(); }
+    };
+    await assert.rejects(asRole(db => admit(spaceId, watermark, { principal_id: actor.userPrincipalId }, db)), refused('42501'));
+    execFileSync(process.execPath, ['scripts/grant-analysis.mjs'], { cwd: root, stdio: 'pipe',
+      env: { ...process.env, STATEPLANE_CELL_ADMIN_URL: urlFor(testDatabase), STATEPLANE_CELL_ROLE: role } });
+    const privileges = Object.fromEntries((await pool.query(`SELECT t, has_table_privilege($1,t,'SELECT') AS r,
+        has_table_privilege($1,t,'INSERT') AS i, has_table_privilege($1,t,'UPDATE') AS u, has_table_privilege($1,t,'DELETE') AS d,
+        has_table_privilege($1,t,'TRUNCATE') AS x FROM unnest($2::text[]) t`, [role, analysis])).rows
+      .map(({ t, ...row }) => [t, Object.entries(row).filter(([, granted]) => granted).map(([privilege]) => privilege).join('')]));
+    assert.deepEqual(privileges, { analysis_jobs: 'riu', analysis_result_pages: 'rid', analysis_result_manifests: 'rid',
+      analysis_space_slots: 'riu', analysis_cell_slots: 'riu' });
+    // The role admits, runs and completes a job, takes and releases slots, and cannot delete a job; the checked digests need
+    // no routine grant.
+    await asRole(async db => {
+      const job = await admit(spaceId, watermark, { principal_id: actor.userPrincipalId }, db);
+      await db.query(`INSERT INTO analysis_space_slots(space_id,slot,holder_collection_id,holder_job_id,held_until)
+        VALUES($1,1,'alpha',$2,clock_timestamp()+interval '1 minute')`, [spaceId, job.job_id]);
+      await run(job, db);
+      await page(job, 1, 'abc', 0, 1, 0, { db });
+      await manifest(job, [{ content: 'abc', rows: 1 }], { db });
+      await update(job, `state='completed'`, [], db);
+      await assert.rejects(db.query('DELETE FROM analysis_jobs WHERE space_id=$1', [spaceId]), refused('42501'));
+      const live = await admit(spaceId, watermark, { principal_id: actor.userPrincipalId }, db);
+      await db.query(`INSERT INTO analysis_cell_slots(cell_id,slot,holder_space_id,holder_collection_id,holder_job_id,held_until)
+        VALUES('cell-a',3,$1,'alpha',$2,clock_timestamp()+interval '1 minute') ON CONFLICT (cell_id,slot) DO UPDATE
+        SET holder_space_id=EXCLUDED.holder_space_id,holder_collection_id=EXCLUDED.holder_collection_id,
+          holder_job_id=EXCLUDED.holder_job_id,held_until=EXCLUDED.held_until`, [spaceId, live.job_id]);
+    });
+    const spaces = spacesFor(cellPool);
+    await spaces.archive(actor, spaceId);
+    await spaces.delete(actor, spaceId);
+    assert.deepEqual(await counts(spaceId), Object.fromEntries(analysis.map(table => [table, 0])));
+    assert.equal((await spaces.erasure(actor, spaceId)).database, 'erased');
+  } finally {
+    await cellPool.end();
+    for (const routine of publicRoutines) await pool.query(`GRANT EXECUTE ON ROUTINE ${routine} TO PUBLIC`);
+    await pool.query(`DROP OWNED BY ${role}`);
+    await pool.query(`DROP ROLE ${role}`);
+  }
+});
+
+test('the erasure report waits for analysis rows that outlive a purge', async () => {
+  const actor = await owner();
+  const spaces = spacesFor(pool);
+  const { spaceId } = await spaces.create(actor);
+  await spaces.archive(actor, spaceId);
+  await spaces.delete(actor, spaceId);
+  assert.equal((await spaces.erasure(actor, spaceId)).database, 'erased');
+  // A row the purge missed, inserted as the owner would restore one, keeps the database pending.
+  const restoreRow = sql => inTransaction(async db => {
+    await db.query("SELECT set_config('session_replication_role','replica',true)");
+    await db.query(sql, [spaceId]);
+  });
+  for (const [insert, remove] of [
+    [`INSERT INTO analysis_space_slots(space_id,slot) VALUES($1,1)`, 'DELETE FROM analysis_space_slots WHERE space_id=$1'],
+    [`INSERT INTO analysis_jobs(space_id,collection_id,job_id,kind,principal_id,credential_id,capability,policy_version,
+      placement_generation,schema_version,watermark,canonical_spec,spec_digest,budget_records,budget_bytes,budget_runtime_ms,expires_at)
+      VALUES($1,'gone','anj_00000000-0000-4000-8000-000000000000','export','o','c','records:read',1,1,1,0,'{}',
+      encode(sha256(convert_to('{}','UTF8')),'hex'),1,1,1,clock_timestamp()+interval '1 hour')`,
+    'DELETE FROM analysis_jobs WHERE space_id=$1']]) {
+    await restoreRow(insert);
+    assert.equal((await spaces.erasure(actor, spaceId)).database, 'pending', insert);
+    await restoreRow(remove);
+  }
+});
+
+/** Apply, in one transaction except 047's concurrent index, every migration that precedes `migration`, recording each. */
+async function applyMigrationsBefore(client, migration) {
+  const directory = new URL('../../migrations/', import.meta.url);
+  const files = (await readdir(directory)).filter(file => file.endsWith('.sql')).sort();
+  assert.ok(files.includes(migration), `${migration} exists`);
+  await client.query('BEGIN; CREATE TABLE stateplane_migrations (name text PRIMARY KEY, sha256 text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())');
+  for (const file of files.slice(0, files.indexOf(migration))) {
+    const sql = await readFile(new URL(file, directory), 'utf8');
+    if (file === '047_retrieval_outbox_age.sql') { await client.query('COMMIT'); await client.query(sql); await client.query('BEGIN'); } // NOSONAR -- 047 cannot run in a transaction
+    else await client.query(sql); // NOSONAR -- migrations apply in order
+    await client.query('INSERT INTO stateplane_migrations(name,sha256) VALUES($1,$2)', [file, digest(sql)]); // NOSONAR -- recorded with its file
+  }
+  await client.query('COMMIT');
+}
+
+test('migration 049 rolls back whole when the feed is busy or populated past its bound, keeps purges in flight working, and backfills the feed', { timeout: 120000 }, async () => {
+  const name = upgradeDatabase;
+  const [db, reader, purger] = [0, 1, 2].map(() => new pg.Client({ connectionString: urlFor(name) }));
+  await Promise.all([db, reader, purger].map(client => client.connect()));
+  try {
+    await applyMigrationsBefore(db, '049_analysis_jobs.sql');
+    // Events published before 049 in a live space, and a space being erased.
+    const positions = {};
+    for (const spaceId of ['sp_upgrade', 'sp_doomed']) {
+      await db.query('BEGIN');
+      await db.query(`INSERT INTO spaces(space_id,owner_principal_id,home_cell_id,cell_id,storage_target_id) VALUES($1,'owner','cell-a','cell-a','target-a')`,
+        [spaceId]);
+      await db.query(`INSERT INTO collections(space_id,collection_id) VALUES($1,'entries')`, [spaceId]);
+      await db.query(`INSERT INTO collection_versions(space_id,collection_id,version,canonical_definition) VALUES($1,'entries',1,'{}')`, [spaceId]);
+      positions[spaceId] = [];
+      for (const [recordId, revision] of [['rec_1', 1], ['rec_1', 2], ['rec_2', 1]])
+        positions[spaceId].push(await write(db, spaceId, 'entries', recordId, revision));
+      await db.query('COMMIT');
+    }
+    await db.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id='sp_doomed'`);
+    const untouched = async () => {
+      assert.equal((await db.query(`SELECT count(*)::int AS n FROM stateplane_migrations WHERE name='049_analysis_jobs.sql'`)).rows[0].n, 0);
+      assert.deepEqual((await db.query(`SELECT to_regclass('public.analysis_jobs') AS jobs,
+        (SELECT count(*)::int FROM information_schema.columns WHERE table_name='record_event_feed' AND column_name='record_id') AS feed`))
+        .rows[0], { jobs: null, feed: 0 });
+    };
+
+    // An event reader holds the feed: nothing of 049 is left behind.
+    await reader.query('BEGIN');
+    await reader.query('SELECT count(*) FROM record_event_feed');
+    const blocked = migrate(name);
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /Analysis job upgrade waits for event feed readers, space purges and collection, schema or space writers/);
+    await reader.query('ROLLBACK');
+    await untouched();
+
+    // Above 50,000 feed rows the backfill's lock hold needs a drained window.
+    await db.query('BEGIN');
+    await db.query('SET LOCAL session_replication_role = replica');
+    await db.query(`INSERT INTO record_event_feed(event_id,space_id,collection_id) SELECT 'bulk_'||n,'sp_upgrade','entries'
+      FROM generate_series(1,50001) n`);
+    await db.query('COMMIT');
+    const populated = migrate(name, { STATEPLANE_POPULATED_INDEX_UPGRADE: '' });
+    assert.equal(populated.status, 1);
+    assert.match(populated.stderr, /Populated analysis job upgrade requires drained traffic above 50000 event feed rows/);
+    await untouched();
+    await db.query('BEGIN');
+    await db.query('SET LOCAL session_replication_role = replica');
+    await db.query(`DELETE FROM record_event_feed WHERE event_id LIKE 'bulk\\_%'`);
+    await db.query('COMMIT');
+
+    // A purge already inside migration 048's routine has removed the doomed space's events, and so its feed rows: 049 waits
+    // for it, the purge completes with that routine (no analysis rows exist yet), and 049 then applies.
+    await purger.query('BEGIN');
+    await purger.query(`SELECT stateplane_purge_space('sp_doomed')`);
+    const applying = new Promise(resolve => {
+      const child = spawn(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: urlFor(name) } });
+      let stdout = '', stderr = '';
+      child.stdout.on('data', data => { stdout += data; });
+      child.stderr.on('data', data => { stderr += data; });
+      child.on('close', status => resolve({ status, stdout, stderr }));
+    });
+    for (let attempt = 0; !(await db.query(`SELECT EXISTS (SELECT 1 FROM pg_locks WHERE NOT granted
+      AND relation=to_regclass('record_event_feed')) AS waiting`)).rows[0].waiting; attempt += 1) {
+      assert.ok(attempt < 1000, 'migration 049 never waited for the purge');
+      await sleep(10);
+    }
+    await purger.query('COMMIT');
+    const applied = await applying;
+    assert.equal(applied.status, 0, applied.stderr);
+    assert.match(applied.stdout, /Applied 049_analysis_jobs.sql/);
+    assert.equal((await db.query(`SELECT lifecycle FROM spaces WHERE space_id='sp_doomed'`)).rows[0].lifecycle, 'deleted');
+
+    // Existing feed rows carry their events' records and revisions.
+    assert.deepEqual((await db.query(`SELECT position::int,record_id,revision::int FROM record_event_feed ORDER BY position`)).rows
+      .map(row => [row.position, row.record_id, row.revision]),
+    positions.sp_upgrade.map((position, i) => [position, ['rec_1', 'rec_1', 'rec_2'][i], [1, 2, 1][i]]));
+    // Upgraded and fresh schemas carry the same columns, constraints, indexes and triggers.
+    const schema = async client => ({
+      columns: (await client.query(`SELECT table_name,column_name,data_type,is_nullable FROM information_schema.columns
+        WHERE table_schema='public' ORDER BY table_name,column_name`)).rows,
+      constraints: (await client.query(`SELECT conrelid::regclass::text AS relation,conname,pg_get_constraintdef(oid) AS definition
+        FROM pg_constraint WHERE connamespace='public'::regnamespace ORDER BY relation,conname`)).rows,
+      indexes: (await client.query(`SELECT indexname,indexdef FROM pg_indexes WHERE schemaname='public' ORDER BY indexname`)).rows,
+      triggers: (await client.query(`SELECT tgrelid::regclass::text AS relation,tgname FROM pg_trigger WHERE NOT tgisinternal
+        ORDER BY relation,tgname`)).rows });
+    const fresh = await pool.connect();
+    try { assert.deepEqual(await schema(db), await schema(fresh)); } finally { fresh.release(); }
+    assert.equal(migrate(name).status, 0, 'a recorded 049 is skipped');
+  } finally {
+    await reader.query('ROLLBACK').catch(() => {});
+    await purger.query('ROLLBACK').catch(() => {});
+    await Promise.allSettled([db, reader, purger].map(client => client.end()));
+  }
+});

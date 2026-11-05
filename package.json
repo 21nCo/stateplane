@@ -31,6 +31,7 @@
     "db:restore-smoke": "node scripts/restore-smoke.mjs",
     "db:upgrade-smoke": "node scripts/migration-upgrade-smoke.mjs",
     "db:backfill-directory": "node scripts/backfill-space-directory.mjs",
+    "db:grant-analysis": "node scripts/grant-analysis.mjs",
     "db:grant-control-journal": "node scripts/grant-control-journal.mjs",
     "db:grant-event-feed": "node scripts/grant-event-feed.mjs",
     "db:grant-evidence": "node scripts/grant-evidence.mjs",
