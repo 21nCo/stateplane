@@ -9,6 +9,9 @@ const client = new pg.Client(connectionOptions(process.env.DATABASE_URL));
 const directory = resolve(import.meta.dirname, '../migrations');
 // Initial protective bound, not measured: one statement of migration 048 (docs/retrieval-projections.md#migration-048).
 const MIGRATION_048_STATEMENT_MS = 15_000;
+// Initial protective bound: an undrained 049 backfills at most 50,000 feed rows, its whole step measured at 0.68 to
+// 0.92 s locally (docs/analysis-jobs.md#migration-049). A drained upgrade, which nothing waits behind, is not bounded.
+const MIGRATION_049_STATEMENT_MS = 15_000;
 let transactionOpen = false;
 let advisoryLockHeld = false;
 try {
@@ -134,12 +137,13 @@ try {
   };
   // 049 takes the event feed exclusively, then collections, schema versions and spaces, and backfills each feed row's
   // record and revision while event publishers, readers and space purges wait (docs/analysis-jobs.md#migration-049).
-  // Take its locks in its own order under the bounded wait, then require the drained acknowledgement above a bound of
-  // feed rows, so the decision holds through commit.
+  // Take its locks in its own order, waiting (bounded) only for the feed and for nothing while holding it, since an
+  // erasure repair holds its space before its purge reaches the feed. Then require the drained acknowledgement above a
+  // bound of feed rows, so the decision holds through commit.
   const ANALYSIS_FEED_BACKFILL_UNDRAINED = 50000;
   const preflightAnalysisJobs = async () => {
     await client.query('LOCK TABLE public.record_event_feed IN ACCESS EXCLUSIVE MODE');
-    await client.query('LOCK TABLE public.collections, public.collection_versions, public.spaces IN SHARE ROW EXCLUSIVE MODE');
+    await client.query('LOCK TABLE public.collections, public.collection_versions, public.spaces IN SHARE ROW EXCLUSIVE MODE NOWAIT');
     const rows = await client.query('SELECT count(*)::int AS n FROM (SELECT 1 FROM public.record_event_feed LIMIT $1) bounded',
       [ANALYSIS_FEED_BACKFILL_UNDRAINED + 1]);
     if (rows.rows[0].n > ANALYSIS_FEED_BACKFILL_UNDRAINED && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained')
@@ -185,13 +189,14 @@ try {
       continue;
     }
     if (name === '033_validate_batch_attempts.sql' || name === '035_validate_batch_receipt_domain.sql' ||
-      name === '046_retrieval_dispatch_checkpoint.sql') {
+      name === '046_retrieval_dispatch_checkpoint.sql' || name === '049_analysis_jobs.sql') {
       // Release the preceding ADD CONSTRAINT schema lock before a populated
       // validation scan. The session advisory lock keeps concurrent migrators
       // serialized through this intentional, retry-safe transaction boundary.
       // 046 alters projection_outbox, which a space purge started while 045
       // applies already holds as it waits for 045's claim locks: 045 commits
       // first, so the purge finishes instead of deadlocking with 046.
+      // 049 waits for the event feed: 048 commits first, so retrieval writes and searches never wait behind it.
       await client.query('COMMIT');
       transactionOpen = false;
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
@@ -216,9 +221,13 @@ try {
     // and search needs that table: bound each of its statements too, not only their lock waits, so a slow one rolls
     // the whole step back and releases the table rather than holding it. Its scans are of projection_generations,
     // one row per generation of a collection (docs/retrieval-projections.md#migration-048).
-    const boundedRun = name === '048_projection_rebuilds.sql';
+    // 049 holds the event feed exclusively likewise, so an undrained 049 is bounded alike.
+    let statementBound = null;
+    if (name === '048_projection_rebuilds.sql') statementBound = MIGRATION_048_STATEMENT_MS;
+    else if (name === '049_analysis_jobs.sql' && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained') statementBound = MIGRATION_049_STATEMENT_MS;
+    const boundedRun = statementBound !== null;
     const priorStatementTimeout = boundedRun ? (await client.query('SHOW statement_timeout')).rows[0].statement_timeout : null; // NOSONAR -- migrations run in order within the current transaction
-    if (boundedRun) await client.query(`SET LOCAL statement_timeout = '${MIGRATION_048_STATEMENT_MS}ms'`); // NOSONAR -- set before this step's DDL, never concurrently
+    if (boundedRun) await client.query(`SET LOCAL statement_timeout = '${statementBound}ms'`); // NOSONAR -- set before this step's DDL, never concurrently
     try {
       if (name === '039_durable_outbox.sql') await preflightDurableOutbox(); // NOSONAR -- preflight locks must precede this migration step
       if (name === '045_retrieval_projections.sql') await preflightRetrievalProjections(); // NOSONAR -- preflight locks must precede this migration step
@@ -260,6 +269,10 @@ try {
         throw new Error(/statement timeout/.test(error.message ?? '')
           ? `Projection generation upgrade ran past its ${MIGRATION_048_STATEMENT_MS / 1000} s statement bound and was rolled back, releasing the generations; retry`
           : 'Projection generation upgrade was cancelled and rolled back, releasing the generations; retry', { cause:error });
+      if (name === '049_analysis_jobs.sql' && error?.code === '57014')
+        throw new Error(/statement timeout/.test(error.message ?? '')
+          ? `Analysis job upgrade ran past its ${MIGRATION_049_STATEMENT_MS / 1000} s statement bound and was rolled back, releasing the event feed; retry`
+          : 'Analysis job upgrade was cancelled and rolled back, releasing the event feed; retry', { cause:error });
       throw error;
     }
     if (boundedDdl) await client.query('SELECT set_config($1,$2,true)', ['lock_timeout',priorLockTimeout]); // NOSONAR -- restore this step's transaction-local timeout before the ledger write

@@ -4,13 +4,15 @@
 -- reconstruction index over record events by feed position
 -- (docs/analysis-jobs.md). No aggregation, job worker or transport.
 --
--- Take this step's locks up front, the event feed first: a space purge deletes
--- record events, and so feed rows, before it deletes collections and updates
--- its space, so taking the feed first never waits while holding a lock that
--- purge needs. The migrator bounds the waits and the feed backfill
--- (scripts/migrate.mjs).
+-- Take this step's locks up front, the event feed first, and never wait for a
+-- lock while holding the feed: a space purge deletes record events, and so
+-- feed rows, before it deletes collections and updates its space, but an
+-- erasure repair updates its space before that purge. So the step waits only
+-- for the feed, then takes the other tables without waiting (55P03 while a
+-- purge, repair or collection, schema or space change holds one; retry). The
+-- migrator bounds the waits and the step's statements (scripts/migrate.mjs).
 LOCK TABLE record_event_feed IN ACCESS EXCLUSIVE MODE;
-LOCK TABLE collections, collection_versions, spaces IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE collections, collection_versions, spaces IN SHARE ROW EXCLUSIVE MODE NOWAIT;
 
 -- As-of reconstruction. A record's state at a watermark (a feed position) is
 -- its highest revision whose event is published at or below the watermark.
@@ -263,8 +265,9 @@ CREATE TRIGGER analysis_jobs_no_truncate BEFORE TRUNCATE ON analysis_jobs
 
 -- One bounded page of a job's result, in order: its rows and bytes follow the
 -- previous page's, its content is at most 1 MiB, its SHA-256 digest is
--- checked, and the job's result bytes stay within its byte budget. Every page
--- carries, and by foreign key equals, its job's binding.
+-- checked, and the job's result bytes stay within its byte budget. A page
+-- holds at least one row and one byte, so a job writes no more pages than its
+-- byte budget. Every page carries, and by foreign key equals, its job's binding.
 CREATE TABLE analysis_result_pages (
   space_id text NOT NULL,
   collection_id text NOT NULL,
@@ -284,7 +287,8 @@ CREATE TABLE analysis_result_pages (
   PRIMARY KEY (space_id, collection_id, job_id, page_number),
   CONSTRAINT analysis_result_pages_binding FOREIGN KEY (space_id, collection_id, job_id, credential_id, spec_digest, schema_version, watermark)
     REFERENCES analysis_jobs(space_id, collection_id, job_id, credential_id, spec_digest, schema_version, watermark),
-  CONSTRAINT analysis_result_pages_digest CHECK (content_sha256 = encode(sha256(convert_to(content, 'UTF8')), 'hex'))
+  CONSTRAINT analysis_result_pages_digest CHECK (content_sha256 = encode(sha256(convert_to(content, 'UTF8')), 'hex')),
+  CONSTRAINT analysis_result_pages_nonempty CHECK (row_count > 0 AND content <> '')
 );
 
 -- A job's complete result: its page count and total rows and bytes, and the
@@ -415,15 +419,17 @@ CREATE TRIGGER analysis_result_manifests_no_truncate BEFORE TRUNCATE ON analysis
 -- jobs, their slots) and a job ending (its row, then the slots it holds) take
 -- them. Taking a slot (a new holder) writes the holder job's row without
 -- changing it, as a result write does, so the taking and the job's ending take
--- turns: a taking that meets an ending waits and is refused (or fails 40001
--- under REPEATABLE READ), and an ending that meets a taking waits and releases
--- the slot (or fails 40001 when the taking committed after its snapshot). An
--- INSERT locks the space, then the job, before its slot row exists. An UPDATE
--- already holds its slot row, so it share-locks the space without waiting
--- (55P03 while a purge or another space change holds it; retry), which keeps a
--- purge from starting, and only then waits for the job, which an ending of
--- that job holds without wanting this slot. Extending a hold (the same holder)
--- locks nothing more: an ending that meets it waits for the slot row and then
+-- turns: an ending that meets a taking waits and releases the slot (or fails
+-- 40001 when the taking committed after its snapshot), and a taking that meets
+-- a committed ending is refused (or fails 40001 under REPEATABLE READ). An
+-- INSERT, and so the insert of an upsert, share-locks the space and writes the
+-- job, waiting for each, before its slot row exists. An UPDATE, and so an
+-- upsert's update, already holds its slot row, so it waits for nothing more:
+-- it share-locks the space and locks the job without waiting, and fails 55P03
+-- (`*_space` while a purge or a lifecycle, policy, placement or cell change
+-- holds the space, `*_holder` while a result write, progress, ending or other
+-- taking holds the job; retry). Extending a hold (the same holder) locks
+-- nothing more: an ending that meets it waits for the slot row and then
 -- releases it, and an extension that meets a release finds the slot free.
 CREATE FUNCTION stateplane_guard_analysis_slot() RETURNS trigger LANGUAGE plpgsql
 SECURITY DEFINER SET search_path = pg_catalog, pg_temp
@@ -432,6 +438,7 @@ DECLARE
   holder jsonb := to_jsonb(NEW);
   holder_space text := COALESCE(to_jsonb(NEW) ->> 'holder_space_id', to_jsonb(NEW) ->> 'space_id');
   taking boolean;
+  waiting text := 'space';
   lifecycle text;
   cell text;
   job record;
@@ -451,10 +458,14 @@ BEGIN
     SELECT s.lifecycle, s.cell_id INTO lifecycle, cell FROM public.spaces s WHERE s.space_id = holder_space FOR SHARE;
   ELSIF taking THEN
     BEGIN
-      SELECT s.lifecycle, s.cell_id INTO lifecycle, cell FROM public.spaces s WHERE s.space_id = holder_space FOR KEY SHARE NOWAIT;
+      SELECT s.lifecycle, s.cell_id INTO lifecycle, cell FROM public.spaces s WHERE s.space_id = holder_space FOR SHARE NOWAIT;
+      waiting := 'holder';
+      PERFORM 1 FROM public.analysis_jobs j
+        WHERE j.space_id = holder_space AND j.collection_id = NEW.holder_collection_id AND j.job_id = NEW.holder_job_id
+        FOR NO KEY UPDATE NOWAIT;
     EXCEPTION WHEN lock_not_available THEN
-      RAISE EXCEPTION 'an analysis slot taken by update does not wait for its space, which a purge or space change holds; retry'
-        USING ERRCODE = 'lock_not_available', CONSTRAINT = TG_TABLE_NAME || '_space';
+      RAISE EXCEPTION 'an analysis slot taken by update waits for neither its space nor its job, which another transaction holds; retry'
+        USING ERRCODE = 'lock_not_available', CONSTRAINT = TG_TABLE_NAME || '_' || waiting;
     END;
   ELSIF NEW.holder_job_id IS NOT NULL THEN
     SELECT s.lifecycle, s.cell_id INTO lifecycle, cell FROM public.spaces s WHERE s.space_id = holder_space;
@@ -494,7 +505,9 @@ CREATE TRIGGER analysis_cell_slots_guard BEFORE INSERT OR UPDATE ON analysis_cel
   FOR EACH ROW EXECUTE FUNCTION stateplane_guard_analysis_slot();
 
 -- Space erasure removes analysis work before the collections it references,
--- as migration 045's routine removes retrieval rows. It locks the space's jobs
+-- as migration 045's routine removes retrieval rows. It runs under READ
+-- COMMITTED, so it removes every row committed before it locks the space, not
+-- only those in an earlier snapshot. It locks the space's jobs
 -- right after its space, in the slot guard's lock order, so a page, manifest
 -- or slot taking in flight finishes first and none starts after, then
 -- releases the cell slots they hold and removes their space slots, pages,
@@ -506,6 +519,9 @@ AS $$
 DECLARE
   writers_end timestamptz;
 BEGIN
+  IF current_setting('transaction_isolation') NOT IN ('read committed', 'read uncommitted') THEN
+    RAISE EXCEPTION 'a space purge runs under READ COMMITTED' USING ERRCODE = 'invalid_transaction_state';
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM public.spaces WHERE space_id=p_space_id AND lifecycle='deleting' FOR UPDATE) THEN
     RAISE EXCEPTION 'space is not deleting';
   END IF;

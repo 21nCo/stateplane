@@ -26,11 +26,23 @@ const admin = async sql => {
 const dropDatabases = () => Promise.all([testDatabase, upgradeDatabase].map(name => admin(`DROP DATABASE IF EXISTS ${name}`)));
 const migrate = (name, env = {}) => spawnSync(process.execPath, ['scripts/migrate.mjs'],
   { cwd: root, env: { ...process.env, DATABASE_URL: urlFor(name), ...env }, encoding: 'utf8' });
-try {
-  await Promise.all([testDatabase, upgradeDatabase].map(name => admin(`CREATE DATABASE ${name}`)));
-  assert.equal(migrate(testDatabase).status, 0);
-} catch (error) { await dropDatabases(); throw error; }
+/** Run the migrator without blocking the test's own sessions; resolves with its exit status and output. */
+const migrateAsync = (name, env = {}) => new Promise(resolve => {
+  const child = spawn(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: urlFor(name), ...env } });
+  let stdout = '', stderr = '';
+  child.stdout.on('data', data => { stdout += data; });
+  child.stderr.on('data', data => { stderr += data; });
+  child.on('close', status => resolve({ status, stdout, stderr }));
+});
 const pool = new pg.Pool({ connectionString: urlFor(testDatabase), max: 6 });
+test.before(async () => {
+  // Both creations settle before the after hook drops them, so neither commits after its cleanup.
+  const failed = (await Promise.allSettled([testDatabase, upgradeDatabase].map(name => admin(`CREATE DATABASE ${name}`))))
+    .find(creation => creation.status === 'rejected');
+  if (failed) throw failed.reason;
+  const migrated = migrate(testDatabase);
+  assert.equal(migrated.status, 0, migrated.stderr);
+});
 test.after(async () => { await pool.end(); await dropDatabases(); });
 
 const digest = value => createHash('sha256').update(value).digest('hex');
@@ -310,6 +322,10 @@ test('result pages follow each other within the byte budget, digests are checked
   await assert.rejects(page(job, 1, 'abc', 1, 1, 0), check('analysis_result_pages_order'));
   await assert.rejects(page(job, 1, 'abc', 0, 1, 0, { override: { content_sha256: digest('abd') } }), check('analysis_result_pages_digest'));
   await assert.rejects(page(job, 1, 'x'.repeat(11), 0, 1, 0), check('analysis_result_pages_budget'));
+  // A page holds a row and a byte, so empty pages cannot pile up outside the byte budget.
+  await assert.rejects(page(job, 1, '', 0, 0, 0), check('analysis_result_pages_nonempty'));
+  await assert.rejects(page(job, 1, '', 0, 1, 0), check('analysis_result_pages_nonempty'));
+  await assert.rejects(page(job, 1, 'abc', 0, 0, 0), check('analysis_result_pages_nonempty'));
   await page(job, 1, 'abc', 0, 2, 0);
   await assert.rejects(page(job, 1, 'abc', 0, 2, 0), refused('23505'));
   await assert.rejects(page(job, 2, 'défg', 2, 1, 4), check('analysis_result_pages_order'));
@@ -562,7 +578,14 @@ async function slotted() {
     'cell INSERT': db => db.query(`INSERT INTO analysis_cell_slots(cell_id,slot,holder_space_id,holder_collection_id,holder_job_id,held_until)
       VALUES($1,2,$2,'alpha',$3,${until})`, [cell, spaceId, job.job_id]),
     'cell UPDATE': db => db.query(`UPDATE analysis_cell_slots SET holder_space_id=$2,holder_collection_id='alpha',holder_job_id=$3,
-      held_until=${until} WHERE cell_id=$1 AND slot=1`, [cell, spaceId, job.job_id])
+      held_until=${until} WHERE cell_id=$1 AND slot=1`, [cell, spaceId, job.job_id]),
+    'space upsert': db => db.query(`INSERT INTO analysis_space_slots(space_id,slot,holder_collection_id,holder_job_id,held_until)
+      VALUES($1,1,'alpha',$2,${until}) ON CONFLICT (space_id,slot) DO UPDATE SET holder_collection_id=EXCLUDED.holder_collection_id,
+      holder_job_id=EXCLUDED.holder_job_id,held_until=EXCLUDED.held_until`, [spaceId, job.job_id]),
+    'cell upsert': db => db.query(`INSERT INTO analysis_cell_slots(cell_id,slot,holder_space_id,holder_collection_id,holder_job_id,held_until)
+      VALUES($1,1,$2,'alpha',$3,${until}) ON CONFLICT (cell_id,slot) DO UPDATE SET holder_space_id=EXCLUDED.holder_space_id,
+      holder_collection_id=EXCLUDED.holder_collection_id,holder_job_id=EXCLUDED.holder_job_id,held_until=EXCLUDED.held_until`,
+    [cell, spaceId, job.job_id])
   };
   const extend = table => db => db.query(`UPDATE analysis_${table}_slots SET held_until=clock_timestamp()+interval '2 minutes'
     WHERE holder_job_id=$1`, [job.job_id]);
@@ -570,7 +593,7 @@ async function slotted() {
     + (SELECT count(*)::int FROM analysis_cell_slots WHERE holder_space_id=$1) AS n`, [spaceId])).rows[0].n;
   const slots = async () => (await pool.query(`SELECT (SELECT count(*)::int FROM analysis_space_slots WHERE space_id=$1)
     + (SELECT count(*)::int FROM analysis_cell_slots WHERE holder_space_id=$1) AS n`, [spaceId])).rows[0].n;
-  return { spaceId, job, takes, extend, held, slots };
+  return { spaceId, cell, job, takes, extend, held, slots };
 }
 const ends = { space: `state='cancelled'`, cell: `state='failed',failure_code='WORKER_LOST'` };
 const noDeadlock = outcome => assert.notEqual(outcome.error?.code, '40P01', outcome.error?.message);
@@ -592,13 +615,14 @@ for (const isolation of ['READ COMMITTED', 'REPEATABLE READ']) {
         } else assert.equal(ending.error, undefined, ending.error?.message);
         assert.equal(await takeFirst.held(), 0, 'the ended job holds no slot');
 
-        // The ending first: the taking waits and is refused.
+        // The ending first: an INSERT waits and is refused; an UPDATE, holding its slot row, is refused at once.
         const endFirst = await slotted();
         const take = await clash({ isolation, stale, first: db => update(endFirst.job, ends[table], [], db),
           second: endFirst.takes[taking] });
         noDeadlock(take);
         assert.ok(take.error, 'the taking is refused');
-        if (repeatable) assert.equal(take.error.code, '40001', take.error.message);
+        if (stale || (repeatable && taking.endsWith('INSERT'))) assert.equal(take.error.code, '40001', take.error.message);
+        else if (taking.endsWith('UPDATE')) refused('55P03', `analysis_${table}_slots_holder`)(take.error);
         else check(`analysis_${table}_slots_holder`)(take.error);
         assert.equal(await endFirst.held(), 0, 'the ended job holds no slot');
       }
@@ -684,9 +708,9 @@ for (const isolation of ['READ COMMITTED', 'REPEATABLE READ']) {
     const [a, b] = [await pool.connect(), await pool.connect()];
     const pids = await Promise.all([a, b].map(async db => (await db.query('SELECT pg_backend_pid() AS pid')).rows[0].pid));
     /** `hold` in a, then `slot` in b, then `finish` in a; returns both outcomes after committing each that succeeded. */
-    const interleave = async (hold, slot, finish) => {
+    const interleave = async (hold, slot, finish, holdIsolation = isolation) => {
       try {
-        await a.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+        await a.query(`BEGIN ISOLATION LEVEL ${holdIsolation}`);
         await b.query(`BEGIN ISOLATION LEVEL ${isolation}`);
         await hold(a);
         const slotting = outcome(slot(b));
@@ -726,7 +750,7 @@ for (const isolation of ['READ COMMITTED', 'REPEATABLE READ']) {
         const purging = await interleave(async db => {
           await db.query('SELECT 1 FROM spaces WHERE space_id=$1 FOR UPDATE', [purged.spaceId]);
           await db.query('SELECT 1 FROM analysis_jobs WHERE space_id=$1 FOR UPDATE', [purged.spaceId]);
-        }, purged.takes[`${table} UPDATE`], db => db.query('SELECT stateplane_purge_space($1)', [purged.spaceId]));
+        }, purged.takes[`${table} UPDATE`], db => db.query('SELECT stateplane_purge_space($1)', [purged.spaceId]), 'READ COMMITTED');
         refused('55P03', `analysis_${table}_slots_space`)(purging.slot.error);
         assert.equal(purging.finish.error, undefined, purging.finish.error?.message);
         assert.equal(await purged.slots(), 0, 'no slot outlives the purge');
@@ -737,6 +761,75 @@ for (const isolation of ['READ COMMITTED', 'REPEATABLE READ']) {
     }
   });
 }
+
+test('a slot taken by update waits for nothing more, so an upsert of its job or a space change in flight refuses it at once', async () => {
+  const outcome = promise => promise.then(result => ({ result }), error => ({ error }));
+  const [a, b] = [await pool.connect(), await pool.connect()];
+  const pid = (await a.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+  try {
+    for (const table of ['space', 'cell']) {
+      // An upsert has written the job and waits for the slot row an update holds; the update then takes the slot for
+      // the same job: it is refused (55P03), not deadlocked, and the upsert takes the slot.
+      const raced = await slotted();
+      await b.query('BEGIN');
+      await b.query(`SELECT 1 FROM analysis_${table}_slots WHERE ${table}_id=$1 AND slot=1 FOR UPDATE`,
+        [table === 'space' ? raced.spaceId : raced.cell]);
+      await a.query('BEGIN');
+      const upserting = outcome(raced.takes[`${table} upsert`](a));
+      await waitsOrSettles(pid, upserting);
+      const updated = await outcome(raced.takes[`${table} UPDATE`](b));
+      await b.query(updated.error ? 'ROLLBACK' : 'COMMIT');
+      const upserted = await upserting;
+      await a.query(upserted.error ? 'ROLLBACK' : 'COMMIT');
+      noDeadlock(updated);
+      noDeadlock(upserted);
+      refused('55P03', `analysis_${table}_slots_holder`)(updated.error);
+      assert.equal(upserted.error, undefined, upserted.error?.message);
+      assert.equal(await raced.held(), 1, 'the upsert holds the slot');
+
+      // A lifecycle or cell change in flight refuses an update taking at once; once committed, the taking is refused.
+      for (const change of [`lifecycle='suspended'`, ...table === 'cell' ? [`cell_id='cell-moved'`] : []]) {
+        const changed = await slotted();
+        await a.query('BEGIN');
+        await a.query(`UPDATE spaces SET ${change} WHERE space_id=$1`, [changed.spaceId]);
+        const inFlight = (await outcome(changed.takes[`${table} UPDATE`](pool))).error;
+        assert.ok(inFlight, `a taking during ${change} went ahead of the space change`);
+        refused('55P03', `analysis_${table}_slots_space`)(inFlight);
+        await a.query('COMMIT');
+        const late = (await outcome(changed.takes[`${table} UPDATE`](pool))).error;
+        check(`analysis_${table}_slots_${change.startsWith('lifecycle') ? 'space' : 'holder'}`)(late);
+        assert.equal(await changed.held(), 0, `no slot is taken across ${change}`);
+      }
+    }
+  } finally {
+    for (const client of [a, b]) {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  }
+});
+
+test('a space purge runs only under READ COMMITTED, so a row committed after an earlier snapshot cannot outlive it', async () => {
+  const { spaceId } = await space();
+  const purger = await pool.connect();
+  try {
+    for (const level of ['REPEATABLE READ', 'SERIALIZABLE']) {
+      // The purger's snapshot predates a free slot that another session adds and commits.
+      await purger.query(`BEGIN ISOLATION LEVEL ${level}`);
+      await purger.query('SELECT 1');
+      await pool.query('INSERT INTO analysis_space_slots(space_id,slot) VALUES($1,1) ON CONFLICT DO NOTHING', [spaceId]);
+      await purger.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1`, [spaceId]);
+      await assert.rejects(purger.query('SELECT stateplane_purge_space($1)', [spaceId]), refused('25000'));
+      await purger.query('ROLLBACK');
+    }
+    await pool.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1`, [spaceId]);
+    await pool.query('SELECT stateplane_purge_space($1)', [spaceId]);
+    assert.deepEqual(await counts(spaceId), Object.fromEntries([...analysisTables, 'analysis_cell_slots'].map(table => [table, 0])));
+  } finally {
+    await purger.query('ROLLBACK').catch(() => {});
+    purger.release();
+  }
+});
 
 test('as of a watermark, each record is its highest revision published at or below it, read through the as-of index', { timeout: 120000 }, async () => {
   const { spaceId } = await space();
@@ -1006,12 +1099,20 @@ async function applyMigrationsBefore(client, migration) {
   await client.query('COMMIT');
 }
 
-test('migration 049 rolls back whole when the feed is busy or populated past its bound, keeps purges in flight working, and backfills the feed', { timeout: 120000 }, async () => {
+test('migration 049 rolls back whole when the feed is busy, populated past its bound or slow, keeps purges in flight working, and backfills the feed', { timeout: 120000 }, async () => {
   const name = upgradeDatabase;
   const [db, reader, purger] = [0, 1, 2].map(() => new pg.Client({ connectionString: urlFor(name) }));
   await Promise.all([db, reader, purger].map(client => client.connect()));
+  const until = async (sql, message) => {
+    for (let attempt = 0; !(await db.query(sql)).rows[0].ok; attempt += 1) {
+      assert.ok(attempt < 1000, message);
+      await sleep(10);
+    }
+  };
+  const here = 'database=(SELECT oid FROM pg_database WHERE datname=current_database())';
+  const feedWaited = `SELECT EXISTS (SELECT 1 FROM pg_locks WHERE NOT granted AND ${here} AND relation=to_regclass('record_event_feed')) AS ok`;
   try {
-    await applyMigrationsBefore(db, '049_analysis_jobs.sql');
+    await applyMigrationsBefore(db, '048_projection_rebuilds.sql');
     // Events published before 049 in a live space, and a space being erased.
     const positions = {};
     for (const spaceId of ['sp_upgrade', 'sp_doomed']) {
@@ -1033,11 +1134,17 @@ test('migration 049 rolls back whole when the feed is busy or populated past its
         .rows[0], { jobs: null, feed: 0 });
     };
 
-    // An event reader holds the feed: nothing of 049 is left behind.
+    // An event reader holds the feed: nothing of 049 is left behind. 048 commits before 049 waits, so retrieval writes
+    // and searches never wait behind the feed.
     await reader.query('BEGIN');
     await reader.query('SELECT count(*) FROM record_event_feed');
-    const blocked = migrate(name);
+    const blocking = migrateAsync(name);
+    await until(feedWaited, 'migration 049 never waited for the feed');
+    assert.equal((await db.query(`SELECT count(*)::int AS n FROM pg_locks WHERE ${here}
+      AND relation=to_regclass('projection_generations') AND pid<>pg_backend_pid()`)).rows[0].n, 0, '048 still holds the generations');
+    const blocked = await blocking;
     assert.equal(blocked.status, 1);
+    assert.equal(blocked.stdout, 'Applied 048_projection_rebuilds.sql\n');
     assert.match(blocked.stderr, /Analysis job upgrade waits for event feed readers, space purges and collection, schema or space writers/);
     await reader.query('ROLLBACK');
     await untouched();
@@ -1057,22 +1164,43 @@ test('migration 049 rolls back whole when the feed is busy or populated past its
     await db.query(`DELETE FROM record_event_feed WHERE event_id LIKE 'bulk\\_%'`);
     await db.query('COMMIT');
 
-    // A purge already inside migration 048's routine has removed the doomed space's events, and so its feed rows: 049 waits
-    // for it, the purge completes with that routine (no analysis rows exist yet), and 049 then applies.
+    // A statement still running once it holds the feed (as a slow backfill would) is cancelled at the bound, rolling
+    // the step back and releasing the feed.
+    await db.query(`CREATE FUNCTION test_slow_feed() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN
+      IF EXISTS (SELECT 1 FROM pg_event_trigger_ddl_commands() WHERE object_identity='public.record_event_feed')
+      THEN PERFORM pg_sleep(600); END IF; END $$`);
+    await db.query(`CREATE EVENT TRIGGER test_slow_feed ON ddl_command_end WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION test_slow_feed()`);
+    const started = Date.now();
+    const slow = await migrateAsync(name, { STATEPLANE_POPULATED_INDEX_UPGRADE: '' });
+    assert.ok(Date.now() - started < 40_000, 'the statement bound never ended the step');
+    assert.equal(slow.status, 1);
+    assert.match(slow.stderr, /^Analysis job upgrade ran past its 15 s statement bound and was rolled back, releasing the event feed; retry/);
+    await db.query('DROP EVENT TRIGGER test_slow_feed; DROP FUNCTION test_slow_feed()');
+    assert.equal((await db.query(`SELECT count(*)::int AS n FROM pg_locks WHERE ${here} AND relation=to_regclass('record_event_feed')
+      AND pid<>pg_backend_pid()`)).rows[0].n, 0, 'the feed is released');
+    await untouched();
+
+    // An erasure repair holds its space before its purge reaches the feed: 049 never waits for the space while holding
+    // the feed, so it is refused at once instead of deadlocking with the purge.
     await purger.query('BEGIN');
-    await purger.query(`SELECT stateplane_purge_space('sp_doomed')`);
-    const applying = new Promise(resolve => {
-      const child = spawn(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: urlFor(name) } });
-      let stdout = '', stderr = '';
-      child.stdout.on('data', data => { stdout += data; });
-      child.stderr.on('data', data => { stderr += data; });
-      child.on('close', status => resolve({ status, stdout, stderr }));
-    });
-    for (let attempt = 0; !(await db.query(`SELECT EXISTS (SELECT 1 FROM pg_locks WHERE NOT granted
-      AND relation=to_regclass('record_event_feed')) AS waiting`)).rows[0].waiting; attempt += 1) {
-      assert.ok(attempt < 1000, 'migration 049 never waited for the purge');
+    await purger.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id='sp_doomed'`);
+    let settled = false;
+    const refusing = migrateAsync(name).finally(() => { settled = true; });
+    while (!settled) {
+      assert.equal((await db.query(`SELECT EXISTS (SELECT 1 FROM pg_locks h JOIN pg_locks w ON w.pid=h.pid AND NOT w.granted
+        WHERE h.granted AND h.${here} AND h.mode='AccessExclusiveLock' AND h.relation=to_regclass('record_event_feed')) AS ok`)).rows[0].ok,
+      false, 'migration 049 waited for a lock while holding the feed');
       await sleep(10);
     }
+    const refusedStep = await refusing;
+    assert.equal(refusedStep.status, 1);
+    assert.match(refusedStep.stderr, /Analysis job upgrade waits for event feed readers, space purges and collection, schema or space writers/);
+    await untouched();
+    // The purge, now past its events, holds the feed: 049 waits for it, the purge completes with 048's routine (no
+    // analysis rows exist yet), and 049 then applies.
+    await purger.query(`SELECT stateplane_purge_space('sp_doomed')`);
+    const applying = migrateAsync(name);
+    await until(feedWaited, 'migration 049 never waited for the purge');
     await purger.query('COMMIT');
     const applied = await applying;
     assert.equal(applied.status, 0, applied.stderr);
