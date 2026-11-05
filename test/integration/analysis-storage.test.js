@@ -1200,19 +1200,32 @@ test('migration 049 rolls back whole when the feed is busy, populated past its b
     await db.query('COMMIT');
 
     // A statement still running once it holds the feed (as a slow backfill would) is cancelled at the bound, rolling
-    // the step back and releasing the feed.
+    // the step back and releasing the feed. The undrained step's own bound replaces a shorter inherited timeout.
     await db.query(`CREATE FUNCTION test_slow_feed() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN
       IF EXISTS (SELECT 1 FROM pg_event_trigger_ddl_commands() WHERE object_identity='public.record_event_feed')
       THEN PERFORM pg_sleep(600); END IF; END $$`);
     await db.query(`CREATE EVENT TRIGGER test_slow_feed ON ddl_command_end WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION test_slow_feed()`);
-    const started = Date.now();
+    await db.query(`ALTER DATABASE ${name} SET statement_timeout = '2s'`);
+    const feedReleased = async () => assert.equal((await db.query(`SELECT count(*)::int AS n FROM pg_locks WHERE ${here}
+      AND relation=to_regclass('record_event_feed') AND pid<>pg_backend_pid()`)).rows[0].n, 0, 'the feed is released');
+    let started = Date.now();
     const slow = await migrateAsync(name, { STATEPLANE_POPULATED_INDEX_UPGRADE: '' });
+    assert.ok(Date.now() - started >= 14_000, 'the inherited timeout, not the step bound, ended the step');
     assert.ok(Date.now() - started < 40_000, 'the statement bound never ended the step');
     assert.equal(slow.status, 1);
     assert.match(slow.stderr, /^Analysis job upgrade ran past its 15 s statement bound and was rolled back, releasing the event feed; retry/);
+    await feedReleased();
+    await untouched();
+    // A drained step installs no bound: the inherited timeout ends it, and the failure does not claim the step's bound.
+    started = Date.now();
+    const inherited = await migrateAsync(name, { STATEPLANE_POPULATED_INDEX_UPGRADE: 'drained' });
+    assert.ok(Date.now() - started < 14_000, 'the inherited timeout never ended the drained step');
+    assert.equal(inherited.status, 1);
+    assert.match(inherited.stderr, /^Analysis job upgrade ran past the inherited statement_timeout \(a drained upgrade installs no bound\) and was rolled back, releasing the event feed/);
+    assert.doesNotMatch(inherited.stderr, /statement bound/);
+    await db.query(`ALTER DATABASE ${name} RESET statement_timeout`);
     await db.query('DROP EVENT TRIGGER test_slow_feed; DROP FUNCTION test_slow_feed()');
-    assert.equal((await db.query(`SELECT count(*)::int AS n FROM pg_locks WHERE ${here} AND relation=to_regclass('record_event_feed')
-      AND pid<>pg_backend_pid()`)).rows[0].n, 0, 'the feed is released');
+    await feedReleased();
     await untouched();
 
     // An erasure repair holds its space before its purge reaches the feed: 049 never waits for the space while holding

@@ -269,10 +269,14 @@ try {
         throw new Error(/statement timeout/.test(error.message ?? '')
           ? `Projection generation upgrade ran past its ${MIGRATION_048_STATEMENT_MS / 1000} s statement bound and was rolled back, releasing the generations; retry`
           : 'Projection generation upgrade was cancelled and rolled back, releasing the generations; retry', { cause:error });
-      if (name === '049_analysis_jobs.sql' && error?.code === '57014')
-        throw new Error(/statement timeout/.test(error.message ?? '')
-          ? `Analysis job upgrade ran past its ${MIGRATION_049_STATEMENT_MS / 1000} s statement bound and was rolled back, releasing the event feed; retry`
-          : 'Analysis job upgrade was cancelled and rolled back, releasing the event feed; retry', { cause:error });
+      // A drained 049 installs no bound, so a statement timeout there is the role's or database's own setting.
+      if (name === '049_analysis_jobs.sql' && error?.code === '57014') {
+        let message = 'Analysis job upgrade was cancelled and rolled back, releasing the event feed; retry';
+        if (/statement timeout/.test(error.message ?? '')) message = boundedRun
+          ? `Analysis job upgrade ran past its ${statementBound / 1000} s statement bound and was rolled back, releasing the event feed; retry`
+          : 'Analysis job upgrade ran past the inherited statement_timeout (a drained upgrade installs no bound) and was rolled back, releasing the event feed; raise it for the migration and retry';
+        throw new Error(message, { cause:error });
+      }
       throw error;
     }
     if (boundedDdl) await client.query('SELECT set_config($1,$2,true)', ['lock_timeout',priorLockTimeout]); // NOSONAR -- restore this step's transaction-local timeout before the ledger write
