@@ -291,8 +291,8 @@ test('projection status refuses a session that expired before its trailing fence
     await assert.rejects(status(f.owner, f.spaceId, 'alpha'), error => { assert.equal(error.code, 'FORBIDDEN', error.message); return true; });
   } finally { Date.now = now; }
   assert.equal(hooks.length, 0, 'the clock stepped just before the trailing COMMIT');
-  // The same expiry without the step still answers, and so does a session that lasts an hour.
-  hooks = [{ match: REBUILDS, run: () => sessionExpiry(new Date(Date.now() + 2_000)) }];
+  // A session updated at the same point that outlives the reads still answers, and so does one that lasts an hour.
+  hooks = [{ match: REBUILDS, run: () => sessionExpiry(new Date(Date.now() + 60_000)) }];
   assert.equal((await status(f.owner, f.spaceId, 'alpha')).collectionId, 'alpha');
   assert.equal(hooks.length, 0);
   await sessionExpiry(new Date(Date.now() + 3_600_000));

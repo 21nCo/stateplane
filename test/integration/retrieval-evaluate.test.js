@@ -42,8 +42,9 @@ test('a failing embedder stops the record and the evidence drain, and a working 
 test('the drain deadline ends a drain that is still making progress', async () => {
   const f = await fixture();
   await f.record('alpha', { title: 'kiln', note: 'tested the workshop kiln' });
+  // The deadline has passed, so the first count races a 0 ms timer: either outcome reports no round run.
   await assert.rejects(drainProjections(pool, authority, registry, { stalls: 5, deadline: Date.now() - 1 }),
-    error => error instanceof DrainStalledError && /^record events: 1 still outstanding at the drain deadline after 0 rounds$/.test(error.message));
+    error => error instanceof DrainStalledError && /^record events: (1|work) still outstanding at the drain deadline after 0 rounds$/.test(error.message));
   await drainProjections(pool, authority, registry, bounded());
 });
 

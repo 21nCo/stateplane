@@ -75,7 +75,8 @@ and the authority.
 | `links_get`, `links_list` | `links.get`, `links.list` | read-only |
 | `links_create` | `links.create` | write, not destructive |
 | `links_delete` | `links.delete` | destructive |
-| `retrieval_search`, `retrieval_bundle`, `retrieval_status` | `retrieval.search`, `retrieval.bundle`, `retrieval.status` (owner sessions only) | read-only |
+| `retrieval_search`, `retrieval_bundle` | `retrieval.search`, `retrieval.bundle` | read-only |
+| `retrieval_status` | `retrieval.status` (owner sessions only) | read-only |
 
 All tools are `openWorldHint: false`. Writes are `idempotentHint: true`
 because an identical repeat has no additional effect: record writes replay

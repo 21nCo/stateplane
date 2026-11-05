@@ -38,18 +38,33 @@ class HttpEmbedder {
     if (response.status === 408 || response.status === 429 || response.status >= 500)
       throw new EmbedderUnavailableError(`Embedding provider answered ${response.status}`);
     if (!response.ok) throw new Error(`Embedding provider refused the request (${response.status})`);
-    return vectorsOf((await response.json())?.data, texts.length);
+    // A body that is not JSON is malformed; the parser's message would quote it, so it is not kept.
+    const reply = await response.json().catch(() => { throw new Error(MALFORMED); });
+    return vectorsOf(reply?.data, texts.length);
   }
 }
 
-/** Exactly one vector per input, placed by its index; any other answer is the provider's malformed reply. */
+const MALFORMED = 'Embedding provider answered with a malformed reply';
+
+/**
+ * Exactly one vector per input, placed by its index: `count` items at distinct in-range integer indexes, each an array
+ * of the configured dimensions of finite numbers. Any other answer is the provider's malformed reply, refused with an
+ * error that quotes none of it.
+ */
 function vectorsOf(data, count) {
   if (!Array.isArray(data) || data.length !== count) throw new Error('Embedding provider answered with the wrong number of vectors');
-  const vectors = new Array(count).fill(null);
+  const vectors = new Array(count);
+  // Seen indexes are tracked apart from the vectors, so no stored value can stand for an unseen index.
+  const seen = new Set();
   for (const item of data) {
-    if (!Number.isSafeInteger(item?.index) || item.index < 0 || item.index >= count || vectors[item.index] !== null)
+    const index = item?.index;
+    if (!Number.isSafeInteger(index) || index < 0 || index >= count || seen.has(index))
       throw new Error('Embedding provider answered with a missing, repeated or out-of-range index');
-    vectors[item.index] = item.embedding;
+    seen.add(index);
+    const embedding = item.embedding;
+    if (!Array.isArray(embedding) || embedding.length !== dimensions) throw new Error(MALFORMED);
+    for (let i = 0; i < dimensions; i++) if (!Number.isFinite(embedding[i])) throw new Error(MALFORMED);
+    vectors[index] = embedding;
   }
   return vectors;
 }

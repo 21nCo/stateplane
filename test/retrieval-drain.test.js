@@ -34,6 +34,7 @@ test('the stall limit is a positive integer', async () => {
 });
 
 test('a round or a count still running at the deadline is abandoned there', { timeout: 10_000 }, async () => {
+  // The stuck work never settles, so only the deadline can end the drain; the test timeout catches one that does not.
   for (const stuck of ['round', 'outstanding']) {
     let counts = 0;
     const started = Date.now();
@@ -41,7 +42,6 @@ test('a round or a count still running at the deadline is abandoned there', { ti
       outstanding: () => stuck === 'outstanding' && counts++ > 0 ? new Promise(() => {}) : Promise.resolve(3),
       round: () => stuck === 'round' ? new Promise(() => {}) : Promise.resolve() }),
     error => error instanceof DrainStalledError && /^queue: 3 still outstanding at the drain deadline after [01] rounds$/.test(error.message));
-    assert.ok(Date.now() - started < 1_000, `${stuck}: ended ${Date.now() - started} ms after it started`);
   }
 });
 

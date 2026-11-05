@@ -12,7 +12,7 @@ test('the evaluation HTTP embedder orders vectors by index and keeps provider te
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
     requests.push({ authorization: req.headers.authorization, body: JSON.parse(Buffer.concat(chunks)) });
     res.writeHead(answer.status, { 'content-type': 'application/json', ...(answer.location ? { location: answer.location } : {}) });
-    res.end(JSON.stringify(answer.body));
+    res.end(answer.raw ?? JSON.stringify(answer.body));
   });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   t.after(() => server.close());
@@ -38,13 +38,44 @@ test('the evaluation HTTP embedder orders vectors by index and keeps provider te
   await assert.rejects(embedBatch(embedder, ['secret input'], AbortSignal.timeout(5_000)), EmbedderFailedError);
   answer = { status: 200, body: { data: [{ index: 0, embedding: unit(0) }] } };
   await assert.rejects(embedBatch(embedder, ['a', 'b'], AbortSignal.timeout(5_000)), 'a missing vector is refused');
-  // Exactly one vector per input, by index: duplicates, extras, out-of-range or malformed items are refused, never chosen among.
-  for (const data of [[{ index: 0, embedding: unit(0) }, { index: 1, embedding: unit(1) }, { index: 1, embedding: unit(2) }],
-    [{ index: 0, embedding: unit(0) }, { index: 0, embedding: unit(2) }], [{ index: 0, embedding: unit(0) }, { index: 2, embedding: unit(1) }],
-    [{ index: 0, embedding: unit(0) }, { index: '1', embedding: unit(1) }], [{ index: 0, embedding: unit(0) }, null], { 0: unit(0), 1: unit(1) }]) {
-    answer = { status: 200, body: { data } };
-    await assert.rejects(embedder.embed(['a', 'b'], AbortSignal.timeout(5_000)), error => !(error instanceof EmbedderUnavailableError),
-      JSON.stringify(data).slice(0, 80));
+  // A valid reply in any order is placed by index, for a direct caller as for embedBatch.
+  answer = { status: 200, body: { data: [{ index: 1, embedding: unit(1) }, { index: 0, embedding: unit(0) }] } };
+  assert.deepEqual(await embedder.embed(['a', 'b'], AbortSignal.timeout(5_000)), [unit(0), unit(1)]);
+  // Exactly one vector of the configured dimensions of finite numbers per input, by index: every other reply is the
+  // provider's malformed answer, refused (not an outage) with an error that quotes none of it, never returned in part.
+  const v = unit(0);
+  const withValue = value => v.map((x, i) => (i === 7 ? value : x));
+  const malformed = {
+    'null embedding': { data: [{ index: 0, embedding: null }, { index: 1, embedding: v }] },
+    'missing embedding': { data: [{ index: 0 }, { index: 1, embedding: v }] },
+    'string embedding': { data: [{ index: 0, embedding: 'secret' }, { index: 1, embedding: v }] },
+    'object embedding': { data: [{ index: 0, embedding: { 0: 1 } }, { index: 1, embedding: v }] },
+    'short embedding': { data: [{ index: 0, embedding: [0.1, 0.2] }, { index: 1, embedding: v }] },
+    'long embedding': { data: [{ index: 0, embedding: [...v, 0] }, { index: 1, embedding: v }] },
+    'string value': { data: [{ index: 0, embedding: withValue('secret') }, { index: 1, embedding: v }] },
+    'null value': { data: [{ index: 0, embedding: v }, { index: 1, embedding: withValue(null) }] },
+    'infinite value': { raw: `{"data":[{"index":0,"embedding":[${withValue('1e999')}]},{"index":1,"embedding":[${v}]}]}` },
+    'repeated index after a null copy': { data: [{ index: 0, embedding: null }, { index: 0, embedding: v }] },
+    'repeated valid index': { data: [{ index: 0, embedding: v }, { index: 0, embedding: v }] },
+    'extra vector': { data: [{ index: 0, embedding: v }, { index: 1, embedding: v }, { index: 1, embedding: v }] },
+    'missing vector': { data: [{ index: 0, embedding: v }] },
+    'out-of-range index': { data: [{ index: 0, embedding: v }, { index: 2, embedding: v }] },
+    'negative index': { data: [{ index: -1, embedding: v }, { index: 0, embedding: v }] },
+    'fractional index': { data: [{ index: 0, embedding: v }, { index: 0.5, embedding: v }] },
+    'string index': { data: [{ index: 0, embedding: v }, { index: '1', embedding: v }] },
+    'missing index': { data: [{ index: 0, embedding: v }, { embedding: v }] },
+    'null item': { data: [{ index: 0, embedding: v }, null] },
+    'object data': { data: { 0: v, 1: v } },
+    'no data': { error: 'secret' },
+    'not JSON': { raw: 'secret is not JSON' },
+  };
+  const generic = new Set(['Embedding provider answered with the wrong number of vectors',
+    'Embedding provider answered with a missing, repeated or out-of-range index', 'Embedding provider answered with a malformed reply']);
+  for (const [shape, reply] of Object.entries(malformed)) {
+    answer = reply.raw ? { status: 200, raw: reply.raw } : { status: 200, body: reply };
+    const outcome = await embedder.embed(['a', 'b'], AbortSignal.timeout(5_000)).then(vectors => ({ vectors }), error => ({ error }));
+    assert.ok(outcome.error, `${shape}: refused, not answered as ${JSON.stringify(outcome.vectors)?.slice(0, 40)}`);
+    assert.ok(!(outcome.error instanceof EmbedderUnavailableError) && generic.has(outcome.error.message), `${shape}: ${outcome.error.message}`);
   }
   // A provider timeout (408) is an outage that embedBatch retries, not a refused input.
   answer = { status: 408, body: { error: 'timed out on secret input' } };
