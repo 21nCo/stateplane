@@ -45,6 +45,8 @@ const evidenceTables=tables.slice(-13);
 const retrievalTables=['retrieval_policies','retrieval_collection_heads','vector_index_strategies','projection_generations',
   'projection_rebuilds','projection_refs','projection_deletion_receipts','lexical_chunks','vector_chunks','embedding_checkpoints','retrieval_outbox'];
 tables.push(...retrievalTables,'retrieval_dispatch_checkpoint');
+const analysisTables=['analysis_jobs','analysis_result_pages','analysis_result_manifests','analysis_space_slots','analysis_cell_slots'];
+tables.push(...analysisTables);
 const embedding=seed=>`[${Array.from({length:384},(_,i)=>Math.sin(seed*31+i*7)||0.5).join(',')}]`;
 // A space erased before the dump, whose blob-store erasure is still pending.
 const erasedSpaceId='sp_restore_erased';
@@ -183,6 +185,36 @@ try {
   await base.query(`INSERT INTO record_event_feed(event_id,space_id,collection_id)
     VALUES($1,$2,$3)`,[feedSeed,spaceId,collectionId]);
   await base.query('DELETE FROM record_event_pending WHERE event_id=$1',[feedSeed]);
+  // Analysis jobs (migration 049): a completed export at the published watermark, with a page and its manifest, and a
+  // running job holding a space slot and a cell slot.
+  const watermark=Number((await base.query('SELECT position FROM record_event_feed WHERE event_id=$1',[feedSeed])).rows[0].position);
+  const spec='{"kind":"export"}';
+  const analysisJob=async jobId=>base.query(`INSERT INTO analysis_jobs(space_id,collection_id,job_id,kind,principal_id,credential_id,
+    capability,policy_version,placement_generation,schema_version,watermark,canonical_spec,spec_digest,budget_records,budget_bytes,
+    budget_runtime_ms,expires_at) SELECT s.space_id,$2,$3,'export','owner','restore','records:read',s.policy_version,
+    s.placement_generation,c.schema_version,$4,$5,encode(sha256(convert_to($5,'UTF8')),'hex'),100,4096,60000,
+    clock_timestamp()+interval '1 day' FROM spaces s JOIN collections c ON c.space_id=s.space_id AND c.collection_id=$2
+    WHERE s.space_id=$1`,[spaceId,collectionId,jobId,watermark,spec]);
+  const doneJob='anj_00000000-0000-4000-8000-000000000001';
+  const liveJob='anj_00000000-0000-4000-8000-000000000002';
+  for (const jobId of [doneJob,liveJob]) {
+    await analysisJob(jobId);
+    await base.query(`UPDATE analysis_jobs SET state='running',lease_id='restore',leased_until=clock_timestamp()+interval '1 hour',
+      attempts=1 WHERE job_id=$1`,[jobId]);
+  }
+  const pageContent='{"label":"two"}\n';
+  await base.query(`INSERT INTO analysis_result_pages(space_id,collection_id,job_id,credential_id,spec_digest,schema_version,watermark,
+    page_number,row_offset,row_count,byte_offset,content,content_sha256) SELECT space_id,collection_id,job_id,credential_id,spec_digest,
+    schema_version,watermark,1,0,1,0,$2,encode(sha256(convert_to($2,'UTF8')),'hex') FROM analysis_jobs WHERE job_id=$1`,[doneJob,pageContent]);
+  await base.query(`INSERT INTO analysis_result_manifests(space_id,collection_id,job_id,credential_id,spec_digest,schema_version,watermark,
+    page_count,row_count,byte_size,result_sha256) SELECT j.space_id,j.collection_id,j.job_id,j.credential_id,j.spec_digest,j.schema_version,
+    j.watermark,1,1,octet_length($2),encode(sha256(convert_to(encode(sha256(convert_to($2,'UTF8')),'hex'),'UTF8')),'hex')
+    FROM analysis_jobs j WHERE j.job_id=$1`,[doneJob,pageContent]);
+  await base.query(`UPDATE analysis_jobs SET state='completed' WHERE job_id=$1`,[doneJob]);
+  await base.query(`INSERT INTO analysis_space_slots(space_id,slot,holder_collection_id,holder_job_id,held_until)
+    VALUES($1,1,$2,$3,clock_timestamp()+interval '1 hour'),($1,2,NULL,NULL,NULL)`,[spaceId,collectionId,liveJob]);
+  await base.query(`INSERT INTO analysis_cell_slots(cell_id,slot,holder_space_id,holder_collection_id,holder_job_id,held_until)
+    VALUES('cell-a',1,$1,$2,$3,clock_timestamp()+interval '1 hour'),('cell-a',2,NULL,NULL,NULL,NULL)`,[spaceId,collectionId,liveJob]);
   const expected = await snapshot(base);
   assert.equal(expected.collection_write_slots.length,8,'restore seed must create all eight write slots');
   assert.ok(expected.records.length && expected.record_events.length && expected.record_event_feed.length===1 &&
@@ -192,7 +224,8 @@ try {
     expected.routing_nonces.length && expected.space_audit.length && expected.space_provisioning_audit.length &&
     expected.projection_heads.length && expected.projection_reconciliations.length &&
     expected.outbox_dispatch_checkpoint.length && expected.outbox_space_rotation.length && expected.outbox_operator_audit.length &&
-    evidenceTables.every(table=>expected[table].length) && retrievalTables.every(table=>expected[table].length),
+    evidenceTables.every(table=>expected[table].length) && retrievalTables.every(table=>expected[table].length) &&
+    analysisTables.every(table=>expected[table].length),
   'expected this restore smoke seed to populate records, outbox, projection state, evidence and owned-space authority');
   const archive = docker(['pg_dump','-U','stateplane','-Fc',sourceName]);
   docker(['createdb','-U','stateplane',name]);
@@ -257,12 +290,26 @@ try {
     error=>error.code==='23503'&&error.constraint==='embedding_checkpoints_live_ref','a checkpoint still blocks deleting its Ref');
   assert.equal((await restored.query(`SELECT count(*)::int AS n FROM pg_indexes WHERE tablename='vector_chunks'
     AND indexname IN (SELECT index_name FROM vector_index_strategies WHERE method='hnsw')`)).rows[0].n,4);
+  // Migration 049's guards are post-data objects too: a completed job's result is sealed and its binding fixed, ending
+  // the running job releases its slots, and the as-of index is back.
+  await assert.rejects(restored.query(`INSERT INTO analysis_result_pages(space_id,collection_id,job_id,credential_id,spec_digest,
+    schema_version,watermark,page_number,row_offset,row_count,byte_offset,content,content_sha256) SELECT space_id,collection_id,job_id,
+    credential_id,spec_digest,schema_version,watermark,2,1,1,octet_length($2),$2,encode(sha256(convert_to($2,'UTF8')),'hex')
+    FROM analysis_jobs WHERE job_id=$1`,[doneJob,'late']),error=>error.code==='23514'&&error.constraint==='analysis_result_pages_job');
+  await assert.rejects(restored.query(`UPDATE analysis_jobs SET watermark=0 WHERE job_id=$1`,[liveJob]),
+    error=>error.code==='23514'&&error.constraint==='analysis_jobs_binding');
+  await assert.rejects(restored.query(`DELETE FROM analysis_result_pages WHERE job_id=$1`,[doneJob]),
+    error=>error.code==='23514'&&error.constraint==='analysis_result_pages_kept');
+  assert.equal((await restored.query('SELECT count(*)::int AS n FROM pg_indexes WHERE indexname=$1',['record_event_feed_as_of'])).rows[0].n,1);
   const restoredAuthority=new PostgresAuthority(restored,3600);
   const resumed=await restoredAuthority.transaction({...scope,capability:'events:read'},tx=>tx.events(feedSeed));
   assert.equal(resumed.events.length,expected.record_event_pending.length,
     'restored pending events follow the previously issued feed cursor');
   assert.ok(resumed.events.every(event=>event.eventId!==feedSeed));
   assert.equal((await restored.query('SELECT count(*)::int AS n FROM record_event_pending')).rows[0].n,0);
+  assert.equal((await restored.query(`SELECT count(*)::int AS n FROM record_event_feed f JOIN record_events e USING (event_id)
+    WHERE f.record_id IS DISTINCT FROM e.record_id OR f.revision IS DISTINCT FROM e.revision`)).rows[0].n,0,
+  'events published after the restore carry their record and revision');
   const journalRole=`sta6_restore_${randomBytes(8).toString('hex')}`;
   await restored.query(`CREATE ROLE ${journalRole} LOGIN`);
   let journalFailure=null;
@@ -277,6 +324,9 @@ try {
       env:{...process.env,STATEPLANE_CELL_ADMIN_URL:targetUrl,STATEPLANE_CELL_ROLE:journalRole},stdio:'inherit'});
     // And the retrieval tables, which space deletion also reads.
     execFileSync(process.execPath,['scripts/grant-retrieval.mjs'],{cwd:root,
+      env:{...process.env,STATEPLANE_CELL_ADMIN_URL:targetUrl,STATEPLANE_CELL_ROLE:journalRole},stdio:'inherit'});
+    // And the analysis tables, which space deletion reads too.
+    execFileSync(process.execPath,['scripts/grant-analysis.mjs'],{cwd:root,
       env:{...process.env,STATEPLANE_CELL_ADMIN_URL:targetUrl,STATEPLANE_CELL_ROLE:journalRole},stdio:'inherit'});
     const operational=await restored.connect();
     const issuance=`iss_restore_${randomBytes(8).toString('hex')}`;
@@ -297,6 +347,15 @@ try {
       for (const table of retrievalTables)
         assert.ok((await operational.query(`SELECT count(*)::int AS n FROM ${table}${table==='vector_index_strategies'?'':' WHERE space_id=$1'}`,
           table==='vector_index_strategies'?[]:[spaceId])).rows[0].n>0,`restored operational role can read ${table} for erasure proof`);
+      for (const table of analysisTables)
+        assert.ok((await operational.query(`SELECT count(*)::int AS n FROM ${table} WHERE ${table==='analysis_cell_slots'?'holder_space_id':'space_id'}=$1`,
+          [spaceId])).rows[0].n>0,`restored operational role can read ${table} for erasure proof`);
+      const ended=(await operational.query(`UPDATE analysis_jobs SET state='failed',failure_code='RESTORE_DRILL' WHERE job_id=$1
+        RETURNING (SELECT count(*)::int FROM analysis_space_slots WHERE holder_job_id=$1) AS before`,[liveJob])).rows[0];
+      assert.equal(ended.before,1,'the slot was held until the job ended');
+      assert.equal((await operational.query(`SELECT (SELECT count(*)::int FROM analysis_space_slots WHERE holder_job_id=$1)
+        + (SELECT count(*)::int FROM analysis_cell_slots WHERE holder_job_id=$1) AS n`,[liveJob])).rows[0].n,0,
+      'restored operational role ends a job, which releases its slots');
       assert.equal((await operational.query(`UPDATE retrieval_outbox SET attempts=attempts+1 WHERE space_id=$1 AND ref_id='clm_restore'
         AND revision=2`,[spaceId])).rowCount,1,'restored operational role can record retrieval delivery');
       assert.equal((await operational.query(`UPDATE projection_rebuilds SET available_at=clock_timestamp() WHERE space_id=$1`,

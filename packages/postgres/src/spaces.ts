@@ -75,7 +75,11 @@ function safeVersion(value: unknown): number {
   return parsed;
 }
 
-async function transaction<T>(pool: PoolLike, fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+// The space purge runs only under READ COMMITTED (migration 049), whatever the cell session's default isolation.
+const PURGE_BEGIN = 'BEGIN ISOLATION LEVEL READ COMMITTED';
+
+/** `begin` fixes an isolation level where the session default must not apply, as the space purge needs READ COMMITTED. */
+async function transaction<T>(pool: PoolLike, fn: (client: pg.PoolClient) => Promise<T>, begin = 'BEGIN'): Promise<T> {
   const client = await pool.connect();
   let begun = false;
   let beginAttempted = false;
@@ -83,7 +87,7 @@ async function transaction<T>(pool: PoolLike, fn: (client: pg.PoolClient) => Pro
   let commitAmbiguous = false;
   try {
     beginAttempted = true;
-    await client.query('BEGIN'); begun = true;
+    await client.query(begin); begun = true;
     const result = await fn(client);
     try { await client.query('COMMIT'); begun = false; }
     catch (error) {
@@ -739,7 +743,7 @@ export class PostgresSpaces {
           VALUES($1,$2,$3,$4,'space:deleted',$5,$6)`,[`aud_${randomUUID()}`,spaceId,owner(actor),actor.credentialId,
           version.rows[0].policy_version,version.rows[0].placement_generation]);
         await this.current(actor);
-      });
+      }, PURGE_BEGIN);
     } else if (local.rows[0]?.lifecycle !== 'deleted') throw new AuthorityError('STALE_PLACEMENT');
     await this.cleanupIssuances(space,true);
     await this.current(actor);
@@ -795,7 +799,7 @@ export class PostgresSpaces {
       [`aud_${randomUUID()}`,spaceId,owner(actor),actor.credentialId,
         version.rows[0].policy_version,version.rows[0].placement_generation]);
       await this.current(actor);
-    });
+    }, PURGE_BEGIN);
   }
   update(actor: VerifiedCredential, spaceId: string, lifecycle: 'active' | 'readOnly' | 'suspended'): Promise<SpaceInfo> {
     if (!['active','readOnly','suspended'].includes(lifecycle)) throw new AuthorityError('INVALID_ARGUMENT');
@@ -822,6 +826,11 @@ export class PostgresSpaces {
 
   private async erased(db: Pick<pg.Pool, 'query'>, spaceId: string): Promise<boolean> {
     const result = await db.query(`SELECT lifecycle='deleted' AND
+      NOT EXISTS (SELECT 1 FROM analysis_cell_slots WHERE holder_space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM analysis_space_slots WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM analysis_result_pages WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM analysis_result_manifests WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM analysis_jobs WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM projection_outbox WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM projection_heads WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM outbox_space_rotation WHERE space_id=$1) AND

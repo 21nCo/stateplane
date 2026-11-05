@@ -161,7 +161,11 @@ try {
     assert.match(output,/Applied 046_retrieval_dispatch_checkpoint.sql/);
     assert.match(output,/Applied 047_retrieval_outbox_age.sql/);
     assert.match(output,/Applied 048_projection_rebuilds.sql/);
+    assert.match(output,/Applied 049_analysis_jobs.sql/);
     assert.deepEqual(await facts(upgraded),before);
+    // Migration 049 backfilled every published event's record and revision into the feed.
+    assert.deepEqual((await upgraded.query(`SELECT count(*)::int AS n, count(*) FILTER (WHERE f.record_id=e.record_id
+      AND f.revision=e.revision)::int AS matched FROM record_event_feed f JOIN record_events e USING (event_id)`)).rows[0],{n:2000,matched:2000});
     assert.deepEqual((await upgraded.query(`SELECT count(*)::int AS n FROM projection_outbox
       WHERE failures<>0 OR started_attempt IS NOT NULL OR dead_lettered_at IS NOT NULL OR outcome IS NOT NULL`)).rows[0].n,0);
     const actor={kind:'session',userPrincipalId:'owner',credentialId:'upgrade-session'};
@@ -205,6 +209,15 @@ try {
         'projection_refs_record'],
       [`SELECT 1 FROM ONLY projection_refs x WHERE $1=space_id AND 'entries'=collection_id AND 'claim'=entity_kind AND 'clm_1'=entity_id
         FOR KEY SHARE OF x`,'projection_refs_entity']]) {
+      const plan=await upgraded.query(`EXPLAIN ${sql}`,['sp_upgrade']); // NOSONAR -- one connection runs its EXPLAINs in turn
+      assert.match(plan.rows.map(row=>row['QUERY PLAN']).join('\n'),new RegExp(String.raw`(?:using|on) ${index}\b`),sql);
+    }
+    // Migration 049's as-of lookup reads only its index, and its purge and erasure check find a space's analysis rows by index.
+    for (const [sql,index] of [[`SELECT revision FROM record_event_feed WHERE space_id=$1 AND collection_id='entries' AND record_id='rec_1'
+      AND position<=10 ORDER BY revision DESC LIMIT 1`,'record_event_feed_as_of'],
+    ['SELECT 1 FROM analysis_jobs WHERE space_id=$1','analysis_jobs_(?:pkey|result_binding)'],
+    ['SELECT 1 FROM analysis_result_pages WHERE space_id=$1','analysis_result_pages_pkey'],
+    ['SELECT 1 FROM analysis_cell_slots WHERE holder_space_id=$1','analysis_cell_slots_one_per_job']]) {
       const plan=await upgraded.query(`EXPLAIN ${sql}`,['sp_upgrade']); // NOSONAR -- one connection runs its EXPLAINs in turn
       assert.match(plan.rows.map(row=>row['QUERY PLAN']).join('\n'),new RegExp(String.raw`(?:using|on) ${index}\b`),sql);
     }
