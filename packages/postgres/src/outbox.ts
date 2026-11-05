@@ -274,7 +274,7 @@ export class PostgresOutbox {
    * superseded without running the projector. A projector
    * failure, overrun or any unclassified error is recorded against the
    * lease; a policy, placement or lifecycle change at completion releases it
-   * so a later claim re-runs it under fresh scope. The budget bounds prepare,
+   * so a later claim re-runs it under fresh scope. The budget bounds the claim, prepare,
    * apply and completion. An infrastructure fault or lock budget with a
    * known rollback, including one from apply's query port, one prepare or
    * apply raises itself, or an error reply to COMMIT, releases the lease
@@ -284,6 +284,10 @@ export class PostgresOutbox {
   async process(message: DeliveryMessage, projector?: Projector): Promise<ProcessOutcome> {
     const { eventId, attempt: hinted } = this.message(message);
     const deadline = Date.now() + this.processingMs;
+    // The budget starts before the claim: its checkout and every statement
+    // end by the deadline too. A claim cut before COMMIT rolls back, so the
+    // hint stays deliverable and no attempt is spent.
+    const signal = AbortSignal.timeout(Math.max(1, deadline - Date.now()));
     const row = await inTransaction(this.pool, async db => {
       // Lock the row alone, then read scope and content in a later statement.
       // A lock wait rechecks only the locked row, so a suspension, delete or
@@ -308,7 +312,7 @@ export class PostgresOutbox {
           available_at=clock_timestamp()+($2::integer * interval '1 millisecond') WHERE event_id=$1`,
       [eventId, PROCESSING_LEASE_MS]);
       return found;
-    });
+    }, { deadline, signal });
     if (!row) return 'lost';
     if (!row.open) return 'released';
     const attempt = Number(row.attempts);
@@ -319,7 +323,6 @@ export class PostgresOutbox {
     const deleted = row.operation === 'delete';
     const change: ProjectionChange = { ref, revision: delivery.revision, generation: delivery.generation, deleted,
       canonicalData: deleted ? null : row.canonical_data };
-    const signal = AbortSignal.timeout(Math.max(1, deadline - Date.now()));
     // Without a current placement, completion only requeues or supersedes,
     // and a revision whose successor already committed is only superseded.
     // A successor that commits after start can still be prepared here, and

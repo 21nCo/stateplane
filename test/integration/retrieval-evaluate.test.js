@@ -82,6 +82,37 @@ test('the drain deadline bounds a started record batch, evidence steps and stall
   await drainProjections(pool, authority, registry, bounded());
 });
 
+test('the drain deadline cuts a stalled outbox claim, which stays deliverable', { timeout: 60_000 }, async () => {
+  const f = await fixture();
+  await f.record('alpha', { title: 'kiln', note: 'tested the workshop kiln' });
+  // The claim statement first sleeps on its own session, far past the deadline and the 5 s statement cap.
+  const CLAIM = /started_attempt IS DISTINCT FROM attempts FOR UPDATE/;
+  let stalled = 0;
+  const bound = (target, name) => typeof target[name] === 'function' ? target[name].bind(target) : target[name];
+  const stalling = new Proxy(pool, { get: (base, name) => name !== 'connect' ? bound(base, name) : async () => {
+    const client = await base.connect();
+    return new Proxy(client, { get: (c, key) => key !== 'query' ? bound(c, key) : async (sql, ...rest) => {
+      if (CLAIM.test(typeof sql === 'string' ? sql : sql?.text ?? '')) { stalled++; await c.query('SELECT pg_sleep(30) /* sta49-claim-stall */'); }
+      return c.query(sql, ...rest);
+    } });
+  } });
+  const deadline = Date.now() + 2_500;
+  const outcome = await drainProjections(stalling, authority, registry, { stalls: 5, deadline }).then(() => 'drained', error => error);
+  assert.ok(outcome instanceof DrainStalledError && /at the drain deadline/.test(outcome.message), String(outcome));
+  assert.ok(Date.now() < deadline + 1_000, `ended ${Date.now() - deadline} ms after the deadline`);
+  assert.ok(stalled > 0, 'the claim was reached');
+  await sleep(deadline + 500 - Date.now());
+  const active = await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity
+    WHERE state='active' AND query LIKE '%sta49-claim-stall%' AND query NOT LIKE '%pg_stat_activity%'`);
+  assert.equal(active.rows[0].n, 0, 'the stalled claim statement still runs 500 ms after the deadline');
+  // The cut claim rolled back: the event is neither started nor dead-lettered, and the next drain projects it.
+  const row = `SELECT count(*)::int AS n FROM projection_outbox
+    WHERE delivery_state<>'delivered' AND dead_lettered_at IS NULL AND started_attempt IS DISTINCT FROM attempts`;
+  assert.equal((await pool.query(row)).rows[0].n, 1);
+  await drainProjections(pool, authority, registry, bounded());
+  assert.deepEqual(await outstanding(), { records: 0, evidence: 0 });
+});
+
 const evaluations = async () => {
   const client = new pg.Client({ connectionString: baseUrl });
   await client.connect();

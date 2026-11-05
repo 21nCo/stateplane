@@ -38,11 +38,17 @@ class HttpEmbedder {
     if (response.status === 408 || response.status === 429 || response.status >= 500)
       throw new EmbedderUnavailableError(`Embedding provider answered ${response.status}`);
     if (!response.ok) throw new Error(`Embedding provider refused the request (${response.status})`);
-    // A reply the transport cut short (a reset or closed connection, the caller's signal) is an outage, kept with
-    // its transport cause, which quotes none of the body.
-    let body;
+    // A body the decoder rejected, with no sign the transport cut it short, was sent complete and is malformed; it
+    // keeps no cause. Any other failed read, a reset or closed connection or the caller's signal included, is an
+    // outage kept with its transport cause, which quotes none of the body. Transport evidence wins over decoding.
+    let body, undecodable = false;
     try { body = await response.text(); }
-    catch (error) { throw new EmbedderUnavailableError('Embedding reply was interrupted', { cause: error }); }
+    catch (error) {
+      const chain = causes(error);
+      undecodable = chain.some(decoding) && !chain.some(transport);
+      if (!undecodable) throw new EmbedderUnavailableError('Embedding reply was interrupted', { cause: error });
+    }
+    if (undecodable) throw new Error(MALFORMED);
     // Only a complete body that is not JSON is malformed; the parser's message would quote it, so it is not kept.
     // JSON never parses to undefined, so undefined marks the SyntaxError.
     let reply;
@@ -54,6 +60,18 @@ class HttpEmbedder {
 }
 
 const MALFORMED = 'Embedding provider answered with a malformed reply';
+
+/** An error and its causes, at most 8 deep. */
+function causes(error) {
+  const chain = [];
+  for (let link = error; typeof link === 'object' && link !== null && chain.length < 8; link = link.cause) chain.push(link);
+  return chain;
+}
+const code = error => (typeof error.code === 'string' ? error.code : '');
+/** node:zlib refused the bytes: a zlib `Z_*` code, or a brotli or zstd decoder code. */
+const decoding = error => /^(Z_|ERR__|ERR_(BROTLI|ZSTD)_)/.test(code(error));
+/** The transport failed: the caller's signal, an undici socket fault or a system errno such as ECONNRESET. */
+const transport = error => ['AbortError', 'TimeoutError'].includes(error.name) || /^(UND_ERR_|E[A-Z0-9]+$)/.test(code(error));
 
 /**
  * Exactly one vector per input, placed by its index: `count` items at distinct in-range integer indexes, each an array

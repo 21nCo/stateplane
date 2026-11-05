@@ -2,8 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
+import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib';
 import { embedBatch, EmbedderFailedError, EmbedderUnavailableError } from '../packages/retrieval/dist/index.js';
 import { infrastructureFault } from '../packages/postgres/dist/faults.js';
+
+const encoders = { gzip: gzipSync, deflate: deflateSync, br: brotliCompressSync };
 
 // The provider-sandbox embedder of the retrieval evaluation, against a local OpenAI-compatible endpoint.
 test('the evaluation HTTP embedder orders vectors by index and keeps provider text out of its errors', async t => {
@@ -12,16 +15,24 @@ test('the evaluation HTTP embedder orders vectors by index and keeps provider te
   const server = createServer(async (req, res) => {
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
     requests.push({ authorization: req.headers.authorization, body: JSON.parse(Buffer.concat(chunks)) });
+    // An encoded reply is compressed unless it is `corrupt`: then its bytes are sent as they are, under the encoding.
+    const coding = answer.encoding && answer.encoding !== 'plain' ? { 'content-encoding': answer.encoding } : {};
+    const encode = bytes => (coding['content-encoding'] && !answer.corrupt ? encoders[answer.encoding](bytes) : bytes);
     if (answer.fault) {
       // 200 headers and part of a longer body, then the transport fails it: a reset, a closed connection or a stall.
-      res.writeHead(200, { 'content-type': 'application/json', 'content-length': '5000' });
-      res.write('{"data":[{"index":0,"embedding":[0.1,"secret');
+      const full = encode(Buffer.from(`{"data":[{"index":0,"embedding":[${Array.from({ length: 384 }, (_, i) => Math.sin(i))}],"note":"secret"}]}`));
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': String(full.length), ...coding });
+      res.write(full.subarray(0, full.length >> 1));
       if (answer.fault === 'rst') setTimeout(() => res.socket.resetAndDestroy(), 20);
       if (answer.fault === 'close') setTimeout(() => res.socket.destroy(), 20);
       return;
     }
-    res.writeHead(answer.status, { 'content-type': 'application/json', ...(answer.location ? { location: answer.location } : {}) });
-    res.end(answer.raw ?? JSON.stringify(answer.body));
+    const sent = encode(Buffer.from(answer.raw ?? JSON.stringify(answer.body)));
+    // A length-complete body cut to half its compressed bytes.
+    const body = answer.truncated ? sent.subarray(0, sent.length >> 1) : sent;
+    res.writeHead(answer.status, { 'content-type': 'application/json', 'content-length': String(body.length), ...coding,
+      ...(answer.location ? { location: answer.location } : {}) });
+    res.end(body);
   });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   t.after(() => { server.closeAllConnections(); server.close(); });
@@ -94,20 +105,45 @@ test('the evaluation HTTP embedder orders vectors by index and keeps provider te
   // malformed refusal: a direct caller sees EmbedderUnavailableError, and embedBatch, with the projection worker's own
   // outage test or its default, retries it and ends unavailable rather than counting the input as failed.
   const workerOutage = error => error instanceof EmbedderUnavailableError || infrastructureFault(error);
-  for (const fault of ['rst', 'close', 'stall']) {
-    answer = { fault };
+  for (const encoding of ['plain', 'gzip']) for (const fault of ['rst', 'close', 'stall']) {
+    answer = { fault, encoding };
     const bound = () => AbortSignal.timeout(fault === 'stall' ? 200 : 5_000);
     const direct = await embedder.embed(['secret input'], bound()).then(() => null, error => error);
-    assert.ok(direct instanceof EmbedderUnavailableError, `${fault}: ${direct?.name} ${direct?.message}`);
-    assert.ok(direct.cause instanceof Error && !direct.message.includes('secret'), `${fault}: transport cause kept, body not quoted`);
+    assert.ok(direct instanceof EmbedderUnavailableError, `${encoding} ${fault}: ${direct?.name} ${direct?.message}`);
+    assert.ok(direct.cause instanceof Error && !direct.message.includes('secret'), `${encoding} ${fault}: transport cause kept, body not quoted`);
     if (fault === 'rst') assert.ok(infrastructureFault(direct), 'a reset reply reaches ECONNRESET through its cause');
     for (const outage of [workerOutage, undefined]) {
       const before = requests.length;
       await assert.rejects(embedBatch(embedder, ['secret input'], bound(), [10, 10], undefined, outage), error =>
-        error instanceof EmbedderUnavailableError, `${fault}: embedBatch ends unavailable`);
-      if (fault !== 'stall') assert.equal(requests.length - before, 3, `${fault}: embedBatch retried the interruption`);
+        error instanceof EmbedderUnavailableError, `${encoding} ${fault}: embedBatch ends unavailable`);
+      if (fault !== 'stall') assert.equal(requests.length - before, 3, `${encoding} ${fault}: embedBatch retried the interruption`);
     }
   }
+  // A complete reply the decoder rejects, a corrupt gzip, deflate or brotli body, is the provider's malformed answer:
+  // refused once, with no cause and none of its text, never retried as an outage. A valid encoded reply is read.
+  answer = { status: 200, encoding: 'gzip', body: { data: [{ index: 0, embedding: unit(0) }] } };
+  assert.deepEqual(await embedder.embed(['a'], AbortSignal.timeout(5_000)), [unit(0)]);
+  const refused = async (label, reply) => {
+    answer = reply;
+    const direct = await embedder.embed(['a'], AbortSignal.timeout(5_000)).then(() => null, error => error);
+    assert.ok(direct && !(direct instanceof EmbedderUnavailableError) && generic.has(direct.message), `${label}: ${direct?.name} ${direct?.message}`);
+    assert.equal(direct.cause, undefined, `${label}: the malformed refusal keeps no cause`);
+    const before = requests.length;
+    await assert.rejects(embedBatch(embedder, ['a'], AbortSignal.timeout(5_000), [10, 10], undefined, workerOutage),
+      EmbedderFailedError, `${label}: embedBatch ends failed`);
+    assert.equal(requests.length - before, 1, `${label}: not retried`);
+  };
+  for (const encoding of ['gzip', 'deflate', 'br']) await refused(`corrupt ${encoding}`, { status: 200, encoding, corrupt: true, raw: 'not compressed, secret' });
+  await refused('truncated gzip', { status: 200, encoding: 'gzip', truncated: true, body: { data: [{ index: 0, embedding: unit(0) }] } });
+  // Should a decoder error ever come with a transport fault in its causes, the transport fault decides: an outage.
+  const original = globalThis.fetch;
+  const mixed = new TypeError('terminated', { cause: Object.assign(new Error('unexpected end of file'),
+    { code: 'Z_BUF_ERROR', cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }) }) });
+  globalThis.fetch = async () => new Response(new ReadableStream({ pull: controller => controller.error(mixed) }), { status: 200 });
+  try {
+    await assert.rejects(embedder.embed(['a'], AbortSignal.timeout(5_000)), error =>
+      error instanceof EmbedderUnavailableError && error.cause === mixed, 'transport evidence wins over decoding');
+  } finally { globalThis.fetch = original; }
   // A redirect, even one that keeps the method, is refused: the inputs never reach another origin.
   answer = { status: 307, body: {}, location: `http://127.0.0.1:${elsewhere.address().port}/v1/embeddings` };
   await assert.rejects(embedder.embed(['secret input'], AbortSignal.timeout(5_000)), EmbedderUnavailableError);

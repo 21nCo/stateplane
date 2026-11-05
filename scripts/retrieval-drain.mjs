@@ -53,7 +53,7 @@ export async function drain(label, { outstanding, round, deadline, stalls, reser
 /**
  * Deliver every record event, then every evidence item, of the database behind `pool`. A dead-lettered record event
  * stays outstanding, so it fails the drain instead of leaving its Ref unprojected. Every statement, message and step
- * is bounded by `deadline`.
+ * is bounded by `deadline`, the outbox's claim of a message included.
  */
 export async function drainProjections(pool, authority, embedders, { deadline, stalls }) {
   const projector = new RecordRetrievalProjector(pool, { embedders });
