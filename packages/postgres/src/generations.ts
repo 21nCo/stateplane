@@ -212,20 +212,7 @@ export class PostgresProjectionGenerations {
   async list(spaceId: string, collectionId: string): Promise<GenerationView[]> {
     const space = text(spaceId, 512);
     const collection = text(collectionId, 512);
-    const rows = (await inTransaction(this.pool, db => db.query(`SELECT g.*,r.phase,r.cursor_kind,r.cursor_id,r.backfilled,
-        r.verified,r.repaired,r.mismatched,r.mismatches,r.attempts,r.available_at,r.last_error,r.backfilled_at,r.verified_at
-      FROM projection_generations g LEFT JOIN projection_rebuilds r USING (space_id,collection_id,generation)
-      WHERE g.space_id=$1 AND g.collection_id=$2 ORDER BY g.generation`, [space, collection]), control())).rows;
-    return rows.map(row => ({ spaceId: space, collectionId: collection, generation: Number(row.generation), state: row.state,
-      policyVersion: Number(row.policy_version), embedder: row.embedder === null ? null : { embedder: row.embedder,
-        model: row.embedding_model, modelVersion: row.model_version, dimensions: Number(row.dimensions) },
-      createdAt: iso(row.created_at)!, verifyingAt: iso(row.verifying_at), activatedAt: iso(row.activated_at),
-      standbyAt: iso(row.standby_at), retiredAt: iso(row.retired_at), prunedAt: iso(row.pruned_at),
-      rebuild: row.phase === null ? null : { phase: row.phase,
-        cursor: row.cursor_kind === null ? null : { kind: row.cursor_kind, id: row.cursor_id },
-        backfilled: Number(row.backfilled), verified: Number(row.verified), repaired: Number(row.repaired),
-        mismatched: Number(row.mismatched), mismatches: row.mismatches, attempts: row.attempts, availableAt: iso(row.available_at)!,
-        lastError: row.last_error, backfilledAt: iso(row.backfilled_at), verifiedAt: iso(row.verified_at) } }));
+    return inTransaction(this.pool, db => generationViews(db.query, space, collection, false), control());
   }
 
   /**
@@ -741,4 +728,26 @@ export class PostgresProjectionGenerations {
     if (generation !== undefined) await query(`UPDATE projection_generations SET state=$4 WHERE space_id=$1 AND collection_id=$2
       AND generation=$3`, [spaceId, collectionId, generation, state]);
   }
+}
+
+/**
+ * The collection's generations with their rebuild progress, oldest first; with `pending`, only the one building or
+ * verifying (at most one, by projection_generations_pending).
+ */
+export async function generationViews(query: Query, space: string, collection: string, pending: boolean): Promise<GenerationView[]> {
+  const rows = (await query(`SELECT g.*,r.phase,r.cursor_kind,r.cursor_id,r.backfilled,
+      r.verified,r.repaired,r.mismatched,r.mismatches,r.attempts,r.available_at,r.last_error,r.backfilled_at,r.verified_at
+    FROM projection_generations g LEFT JOIN projection_rebuilds r USING (space_id,collection_id,generation)
+    WHERE g.space_id=$1 AND g.collection_id=$2 AND (NOT $3::boolean OR g.state IN ('building','verifying'))
+    ORDER BY g.generation`, [space, collection, pending])).rows;
+  return rows.map(row => ({ spaceId: space, collectionId: collection, generation: Number(row.generation), state: row.state,
+    policyVersion: Number(row.policy_version), embedder: row.embedder === null ? null : { embedder: row.embedder,
+      model: row.embedding_model, modelVersion: row.model_version, dimensions: Number(row.dimensions) },
+    createdAt: iso(row.created_at)!, verifyingAt: iso(row.verifying_at), activatedAt: iso(row.activated_at),
+    standbyAt: iso(row.standby_at), retiredAt: iso(row.retired_at), prunedAt: iso(row.pruned_at),
+    rebuild: row.phase === null ? null : { phase: row.phase,
+      cursor: row.cursor_kind === null ? null : { kind: row.cursor_kind, id: row.cursor_id },
+      backfilled: Number(row.backfilled), verified: Number(row.verified), repaired: Number(row.repaired),
+      mismatched: Number(row.mismatched), mismatches: row.mismatches, attempts: row.attempts, availableAt: iso(row.available_at)!,
+      lastError: row.last_error, backfilledAt: iso(row.backfilled_at), verifiedAt: iso(row.verified_at) } }));
 }

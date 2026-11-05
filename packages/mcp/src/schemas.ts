@@ -217,8 +217,33 @@ export const evidenceInputs = {
   links_delete: scoped({ linkId }, ['linkId'])
 } satisfies Record<string, McpFnObjectSchema>;
 
+/* Search and bundle requests (STA-49) follow the OpenAPI SearchRequest and
+ * BundleRequest; their byte bounds are the services' and only described. */
+const retrievalText = (description: string): McpFnJsonSchema => ({ type: 'string', minLength: 1, maxLength: 1000,
+  description: `${description} Nonblank, at most 1,000 code points and 4,000 UTF-8 bytes.` });
+const retrievalFilters = {
+  collections: { type: 'array', minItems: 1, maxItems: 32, items: reference('Collection ID.'),
+    description: 'Search only these collections, each readable for a requested kind (NOT_FOUND otherwise). Every readable one, up to 32, when omitted.' },
+  kinds: { type: 'array', minItems: 1, maxItems: 3, items: { enum: ['record', 'source', 'claim'] },
+    description: 'Kinds to search; all three when omitted. A kind is searched only where the credential may read it.' },
+  limit: { type: 'integer', minimum: 1, maximum: 50, description: 'Hits to return, at most 50; 10 when omitted.' }
+} satisfies Record<string, McpFnJsonSchema>;
+const budgetLimit = (unit: string): McpFnJsonSchema => ({ type: 'integer', minimum: 1024, maximum: 262144,
+  description: `Most ${unit} the context may take, 1,024 to 262,144.` });
+
+export const retrievalInputs = {
+  retrieval_search: object({ spaceId, query: retrievalText('The search text.'), ...retrievalFilters }, ['spaceId', 'query']),
+  // As BundleRequest: a task, a query or both.
+  retrieval_bundle: { ...object({ spaceId, task: retrievalText('The task the excerpts are for; searched when there is no query.'),
+    query: retrievalText('The search text.'), budget: { type: 'object', additionalProperties: false, minProperties: 1,
+      properties: { bytes: budgetLimit('UTF-8 bytes'), tokens: budgetLimit('tokens (enforced as bytes, an upper bound for byte-level tokenizers)') },
+      description: 'At least one limit.' }, ...retrievalFilters }, ['spaceId', 'budget']), anyOf: [{ required: ['task'] }, { required: ['query'] }] },
+  retrieval_status: scoped()
+} satisfies Record<string, McpFnObjectSchema>;
+
 export const inputs = {
   ...evidenceInputs,
+  ...retrievalInputs,
   spaces_list: object({ cursor: cursor('Opaque cursor from a previous spaces_list page.') }, []),
   spaces_get: object({ spaceId }, ['spaceId']),
   collections_list: object({ spaceId, cursor: cursor('Opaque cursor from a previous collections_list page.') }, ['spaceId']),

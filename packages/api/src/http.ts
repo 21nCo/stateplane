@@ -162,6 +162,10 @@ async function dispatch(services:StateplaneServices,actor:VerifiedCredential,req
   if (p[2]==='erasure' && p.length===3 && request.method==='GET')
     return json(await services.spaces.erasure(actor,space));
   if (p[2]==='agent-keys') return agentKeysRoute(services,actor,space,p,request,url);
+  if (p.length===3 && request.method==='POST' && (p[2]==='search' || p[2]==='bundles')) {
+    const body=await retrievalRequest(request);
+    return json(await (p[2]==='search' ? services.retrieval.search(actor,space,body) : services.retrieval.bundle(actor,space,body)));
+  }
   if (p[2]!=='collections') return fail('NOT_FOUND');
   if (p.length===3 && request.method==='GET') return collectionDiscovery(services,actor,space,url);
   return collectionRoute(services,actor,space,p,request,url);
@@ -179,6 +183,8 @@ async function collectionRoute(services:StateplaneServices,actor:VerifiedCredent
     return json(await services.collections.backfill(...prefix,p[5]));
   if (p[4]==='events' && p.length===5 && request.method==='GET')
     return json(await services.events.list(...prefix,url.searchParams.get('cursor')??undefined));
+  if (p[4]==='projections' && p.length===5 && request.method==='GET')
+    return json(await services.retrieval.status(...prefix));
   return evidenceRoute(services,p,request,url,prefix);
 }
 type Prefix = readonly [VerifiedCredential, string, string];
@@ -216,6 +222,13 @@ function query(fields: Record<string, unknown>): Record<string, unknown> {
   for (const [key, value] of Object.entries(fields)) if (value !== undefined) out[key] = value;
   return out;
 }
+
+/* A search or bundle request holds at most two texts of 4,000 bytes and 32
+ * collection IDs of 256 bytes; JSON's six-byte escapes can grow that to
+ * about 100 KiB, so 128 KiB admits every request the services accept. */
+const retrievalBody = 131_072;
+/** Parse a search or bundle body like an evidence body: the service validates it after admission. */
+const retrievalRequest = (req: Request): Promise<unknown> => request(req, retrievalBody);
 
 /** Base64 of a lowercase hex digest, without Node's Buffer. */
 const base64 = (hex: string) => btoa(String.fromCharCode(...(hex.match(/../g) ?? []).map(pair => Number.parseInt(pair, 16))));

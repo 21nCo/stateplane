@@ -82,4 +82,14 @@ export interface StateplaneServices {
     list(actor: VerifiedCredential, spaceId: string, collectionId: string, cursor?: string): Promise<unknown>;
     projection(actor: VerifiedCredential, spaceId: string, collectionId: string, recordId: string): Promise<unknown>;
   };
+  /** Retrieval over derived projections. Every hit and excerpt is reread and
+   * reauthorized at authority before it is returned; none is a complete answer. */
+  retrieval: {
+    /** A ranked page of reauthorized hits; `request` is parsed JSON, validated after admission. */
+    search(actor: VerifiedCredential, spaceId: string, request: unknown): Promise<unknown>;
+    /** Cited excerpts of one search, framed as untrusted data within a budget. */
+    bundle(actor: VerifiedCredential, spaceId: string, request: unknown): Promise<unknown>;
+    /** Owner only: a collection's projection work, generations and rebuild progress. */
+    status(actor: VerifiedCredential, spaceId: string, collectionId: string): Promise<unknown>;
+  };
 }

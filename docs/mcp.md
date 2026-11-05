@@ -14,9 +14,11 @@ scope.
 
 ## Fixed tool registry
 
-`stateplaneMcpDeclaration()` is a side-effect-free McpFn declaration with 42
+`stateplaneMcpDeclaration()` is a side-effect-free McpFn declaration with 45
 fixed tools and one guidance resource: 19 for spaces, collections, records,
-batches and events, and 23 for evidence storage (STA-37). Defining a collection inserts registry
+batches and events, 23 for evidence storage (STA-37) and 3 for retrieval
+(STA-49: `retrieval_search`, `retrieval_bundle` and `retrieval_status`, see
+[retrieval projections](retrieval-projections.md#transports-sta-49)). Defining a collection inserts registry
 data; it never adds a tool. Every credential sees the same list, and access is
 decided per call by the shared services. The public manifest is committed in
 [contracts/mcp-manifest.json](../contracts/mcp-manifest.json); review a change
@@ -73,6 +75,8 @@ and the authority.
 | `links_get`, `links_list` | `links.get`, `links.list` | read-only |
 | `links_create` | `links.create` | write, not destructive |
 | `links_delete` | `links.delete` | destructive |
+| `retrieval_search`, `retrieval_bundle` | `retrieval.search`, `retrieval.bundle` | read-only |
+| `retrieval_status` | `retrieval.status` (owner sessions only) | read-only |
 
 All tools are `openWorldHint: false`. Writes are `idempotentHint: true`
 because an identical repeat has no additional effect: record writes replay
@@ -90,6 +94,10 @@ predicate variant, and the collection definition of both definition tools, are
 compared with OpenAPI by `test/mcp.test.js`. Results are
 the JSON an HTTP client receives, in `structuredContent` and as JSON text;
 `records_count` returns `{count}` because MCP results are objects.
+`retrieval_bundle` leaves out the bundle's `excerpts` list: it holds stored
+strings unescaped, outside the untrusted frame, and an MCP result reaches a
+model, while the frame already names each excerpt's collection, kind, ID,
+revision and range. HTTP and the CLI return it.
 
 ## Arguments and precedence
 
@@ -208,10 +216,11 @@ used: `scopes_supported` is omitted and authorization is the space grant model.
   TypeScript SDK are checked in external acceptance.
 
 These bounds reuse STA-8/9 limits or protocol framing; none is a measured
-Cloudflare or Railway capacity. The committed manifest publishes 42 tools in an
-81,166-byte compact `tools/list` result (81,206 bytes on the wire) plus 1,527
-characters of instructions; STA-37's 23 evidence tools roughly doubled it from
-41,961 bytes for 19 tools.
+Cloudflare or Railway capacity. The committed manifest publishes 45 tools. At 42
+tools, before STA-49's three retrieval tools, it was an 81,166-byte compact
+`tools/list` result (81,206 bytes on the wire) plus 1,527 characters of
+instructions; STA-37's 23 evidence tools roughly doubled it from 41,961 bytes for
+19 tools.
 McpFn bundles the official SDK and schema validators: the app Worker dry-run
 grew from 834.94 KiB (178.06 KiB gzip) at the STA-9 base to 1,905.65 KiB
 (375.36 KiB gzip). This is a local bundle observation, not a deployed limit.

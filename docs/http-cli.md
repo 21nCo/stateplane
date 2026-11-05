@@ -368,6 +368,31 @@ mode 0600 on POSIX systems; on Windows it inherits the destination directory's
 ACL, so choose a private directory. Flag names are lowercase letters, digits and hyphens, such as
 `--sha256`.
 
+## Search, context bundles and projection status
+
+Search, context bundles and a collection's projection status (STA-49) use the
+same services as MCP; [retrieval projections](retrieval-projections.md#transports-sta-49)
+describes their authorization, results and bounds.
+
+| HTTP | CLI | Access |
+| --- | --- | --- |
+| `POST /v1/spaces/{spaceId}/search` | `stateplane retrieval search --data '<SearchRequest>'` | Each kind needs its read capability where it is searched |
+| `POST /v1/spaces/{spaceId}/bundles` | `stateplane retrieval bundle --data '<BundleRequest>'` | As search |
+| `GET /v1/spaces/{spaceId}/collections/{collectionId}/projections` | `stateplane retrieval status --collection ID` | Owner session only |
+
+```sh
+stateplane retrieval search --data '{"query":"harbor beacon","kinds":["record","claim"],"limit":5}'
+stateplane retrieval bundle --file ./bundle.json   # {"task":"Summarize the harbor notes","budget":{"tokens":4096}}
+stateplane retrieval status --collection notes
+```
+
+`--data` or `--file` holds the whole request, exactly the HTTP body, as one
+JSON object of at most 128 KiB (the route's body budget, which every request
+the services accept fits); anything else is refused locally. Search and bundle
+are safe reads: they change nothing, so a retryable failure is repeated like a
+`GET`, and a statement cancellation is `RATE_LIMITED`, never an unknown write
+outcome.
+
 ## Acceptance boundaries
 
 The local contract fixture proves HTTP and packaged CLI parity, authorization

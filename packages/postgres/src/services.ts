@@ -2,10 +2,15 @@ import type pg from 'pg';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import type { BlobStore, StateplaneServices } from '@stateplane/application';
 import type { Capability, VerifiedCredential } from '@stateplane/contracts';
-import { AuthorityError, PostgresAuthority } from './index.js';
+import type { EmbeddingRegistry } from '@stateplane/retrieval';
+import { AuthorityError, AuthorityTransaction, PostgresAuthority } from './index.js';
+import { PostgresContextBundles } from './bundles.js';
+import { generationViews } from './generations.js';
+import { PostgresRetrievalWorker } from './retrieval.js';
+import { PostgresRetrievalSearch } from './search.js';
 import { PostgresClaims } from './claims.js';
 import { PostgresLinks } from './links.js';
-import { PostgresSources } from './sources.js';
+import { PostgresSources, transact } from './sources.js';
 import type { AuthorityScope } from './index.js';
 import { CollectionRegistry, discoveryGrants } from './collections.js';
 import { PostgresSpaces } from './spaces.js';
@@ -88,9 +93,55 @@ function issueRequest(serialized:string):{expiresAt:Date;grants:CollectionGrant[
   })};
 }
 
+/** Optional retrieval wiring. Without embedders (the default), search and bundles answer lexically and say so. */
+export interface ServiceOptions { embedders?: EmbeddingRegistry }
+
+/**
+ * Owner only: a collection's projection work and generations. These are
+ * derived, operational facts (counts, states, embedder identities), never
+ * content, and include work on Refs a key could not read, so no key reads
+ * them; a key sees the state of what it may read in each search's
+ * `collections[]`. The scope fence (space open at the admitted policy and
+ * placement, collection live, owner session current) runs before and after
+ * the projection reads, so a deletion, suspension or ended session committed
+ * before the answer refuses it; as for search, the session's own expiry must
+ * still lie ahead once the trailing fence's COMMIT is acknowledged. The work,
+ * generations and pending rebuild are read in one snapshot.
+ */
+function projectionStatus(spaces:PostgresSpaces,cells:ReadonlyMap<string,ServiceCell>,options:ServiceOptions) {
+  return async(actor:VerifiedCredential,spaceId:string,collectionId:string)=>{
+    const admitted=await spaces.scope(actor,spaceId,collectionId,'records:read');
+    if (actor.kind!=='session') throw new AuthorityError('FORBIDDEN');
+    const cell=cells.get(admitted.cellId);
+    if (!cell) throw new AuthorityError('STALE_PLACEMENT');
+    const fence=async()=>{
+      // The provider's expiry on performance.now()'s clock (measured from before the check) and on its own wall clock.
+      const started=performance.now(), wall=Date.now();
+      const until=await transact(cell.pool,async db=>{
+        const tx=new AuthorityTransaction(db,admitted.scope,1);
+        try {
+          await tx.checkScope();
+          return await spaces.assertCurrentUntil(actor,admitted.ownerPrincipalId);
+        } finally { tx.close(); }
+      });
+      if (until!==null && (performance.now()>=started+until-wall || Date.now()>=until))
+        throw new AuthorityError('FORBIDDEN','Access expired before the status committed');
+    };
+    await fence();
+    const worker=new PostgresRetrievalWorker(cell.pool,{embedders:options.embedders});
+    const {status,pending}=await transact(cell.pool,async db=>{
+      await db.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+      return {status:await worker.status(spaceId,collectionId,db),
+        pending:await generationViews(db.query.bind(db),spaceId,collectionId,true)};
+    });
+    await fence();
+    return {...status,rebuild:pending[0] ?? null};
+  };
+}
+
 /** Composition of the existing authoritative services for HTTP consumers. */
 export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<string,ServiceCell>,
-  receiptRetentionSeconds: number): StateplaneServices {
+  receiptRetentionSeconds: number, options: ServiceOptions = {}): StateplaneServices {
   async function admitted<T>(actor:VerifiedCredential,spaceId:string,collectionId:string|undefined,
     capability:Capability,run:(pool:ServiceCell,scope:AuthorityScope,recheck:(db:pg.PoolClient,result?:unknown)=>Promise<void>)=>Promise<T>,
     discoveryCollectionId?:string):Promise<T> {
@@ -117,6 +168,10 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
   const sources=new PostgresSources(spaces,evidenceCells);
   const claims=new PostgresClaims(spaces,evidenceCells);
   const links=new PostgresLinks(spaces,evidenceCells);
+  // Search admits, rereads and reauthorizes every hit itself; a bundle quotes only what one search returned.
+  const search=new PostgresRetrievalSearch(spaces,new Map([...cells].map(([id,cell])=>[id,{pool:cell.pool}])),
+    options.embedders ? {embedders:options.embedders} : {});
+  const bundles=new PostgresContextBundles(search);
   return {
     spaces: {
       list:(actor,cursor)=>spaces.listPage(actor,cursor), create:(actor,cellId,spaceId)=>spaces.create(actor,cellId,spaceId),
@@ -226,6 +281,11 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
         (cell,scope,recheck)=>authority(cell,recheck).transaction(scope,tx=>tx.events(cursor))),
       projection:(actor,spaceId,collectionId,id)=>admitted(actor,spaceId,collectionId,'records:read',
         (cell,scope,recheck)=>authority(cell,recheck).transaction(scope,tx=>tx.projection(id)))
+    },
+    retrieval: {
+      search:(actor,spaceId,request)=>search.search(actor,spaceId,request),
+      bundle:(actor,spaceId,request)=>bundles.bundle(actor,spaceId,request),
+      status:projectionStatus(spaces,cells,options)
     }
   };
 }

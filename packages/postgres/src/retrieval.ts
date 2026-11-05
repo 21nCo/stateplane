@@ -917,10 +917,11 @@ export class PostgresRetrievalWorker {
    * item is read over all of them. Exact reads and writes never depend on
    * this state.
    */
-  async status(spaceId: string, collectionId: string): Promise<ProjectionStatus> {
+  async status(spaceId: string, collectionId: string, within?: Pick<pg.PoolClient, 'query'>): Promise<ProjectionStatus> {
     const space = text(spaceId, 512);
     const collection = text(collectionId, 512);
-    return inTransaction(this.pool, async db => {
+    // `within` is the caller's transaction, so its other reads can share this snapshot.
+    const read = async (db: Pick<pg.PoolClient, 'query'>) => {
       // Each sample's newest error by when it was recorded (last_error_at; one recorded before migration 046 has
       // none and ranks oldest), ties broken by event, and its time; status reports the newer of the two record samples'.
       const newest = (key: string) => `(array_agg(last_error ORDER BY last_error_at DESC NULLS LAST,${key} DESC)
@@ -960,7 +961,8 @@ export class PostgresRetrievalWorker {
       if (recordsDegraded || evidence.degraded || views.some(entry => entry.embedderAvailable === false)) view.state = 'degraded';
       else if (records.live || evidence.live) view.state = 'pending';
       return view;
-    });
+    };
+    return within ? read(within) : inTransaction(this.pool, read);
   }
 }
 

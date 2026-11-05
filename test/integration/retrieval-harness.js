@@ -20,7 +20,7 @@ import { consume, dispatch } from '../../packages/workers/dist/index.js';
 // cell-wide, so a suite needs one to itself. It is migrated on import and
 // dropped after the suite.
 const password = process.env.DATABASE_URL ? null : (await readFile(new URL('../../.data/local-db-password', import.meta.url), 'utf8')).trim();
-const baseUrl = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT ?? '55432'}/stateplane`;
+export const baseUrl = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT ?? '55432'}/stateplane`;
 const name = `stateplane_retrieval_${randomUUID().replaceAll('-', '')}`;
 /** Run one statement on the server's maintenance connection, which creates and drops the suite's database. */
 async function onServer(sql) {
@@ -153,7 +153,8 @@ async function project(spaceId, collectionId, { lexical = true, vector = true, r
 /** A space with collections alpha and beta, each projected lexically and by vector. */
 export async function fixture({ collections = ['alpha', 'beta'], policy = {} } = {}) {
   const user = await createUser(config, { primaryEmail: `owner-${randomUUID()}@example.invalid` });
-  const owner = await verify((await issueSession(config, {}, { userId: user.id, methods: ['password'] })).sessionToken);
+  const ownerToken = (await issueSession(config, {}, { userId: user.id, methods: ['password'] })).sessionToken;
+  const owner = await verify(ownerToken);
   const spaceId = `sp_${randomUUID()}`;
   await spaces.create(owner, 'cell-a', spaceId);
   for (const id of collections) {
@@ -181,7 +182,7 @@ export async function fixture({ collections = ['alpha', 'beta'], policy = {} } =
       grants.map(([collectionId, capabilities]) => ({ collectionId, capabilities })));
     return Object.assign(await verify(key.secret), { keyId: key.id });
   };
-  return { spaceId, owner, scope, record, source, agent };
+  return { spaceId, owner, ownerToken, scope, record, source, agent };
 }
 export const ids = result => result.results.map(hit => `${hit.ref.collectionId}/${hit.ref.kind}/${hit.ref.id}`);
 
