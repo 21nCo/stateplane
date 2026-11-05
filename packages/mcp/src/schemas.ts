@@ -233,10 +233,11 @@ const budgetLimit = (unit: string): McpFnJsonSchema => ({ type: 'integer', minim
 
 export const retrievalInputs = {
   retrieval_search: object({ spaceId, query: retrievalText('The search text.'), ...retrievalFilters }, ['spaceId', 'query']),
-  retrieval_bundle: object({ spaceId, task: retrievalText('The task the excerpts are for; searched when there is no query.'),
+  // As BundleRequest: a task, a query or both.
+  retrieval_bundle: { ...object({ spaceId, task: retrievalText('The task the excerpts are for; searched when there is no query.'),
     query: retrievalText('The search text.'), budget: { type: 'object', additionalProperties: false, minProperties: 1,
       properties: { bytes: budgetLimit('UTF-8 bytes'), tokens: budgetLimit('tokens (enforced as bytes, an upper bound for byte-level tokenizers)') },
-      description: 'At least one limit.' }, ...retrievalFilters }, ['spaceId', 'budget']),
+      description: 'At least one limit.' }, ...retrievalFilters }, ['spaceId', 'budget']), anyOf: [{ required: ['task'] }, { required: ['query'] }] },
   retrieval_status: scoped()
 } satisfies Record<string, McpFnObjectSchema>;
 

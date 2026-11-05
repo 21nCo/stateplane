@@ -75,6 +75,7 @@ and the authority.
 | `links_get`, `links_list` | `links.get`, `links.list` | read-only |
 | `links_create` | `links.create` | write, not destructive |
 | `links_delete` | `links.delete` | destructive |
+| `retrieval_search`, `retrieval_bundle`, `retrieval_status` | `retrieval.search`, `retrieval.bundle`, `retrieval.status` (owner sessions only) | read-only |
 
 All tools are `openWorldHint: false`. Writes are `idempotentHint: true`
 because an identical repeat has no additional effect: record writes replay
@@ -214,10 +215,11 @@ used: `scopes_supported` is omitted and authorization is the space grant model.
   TypeScript SDK are checked in external acceptance.
 
 These bounds reuse STA-8/9 limits or protocol framing; none is a measured
-Cloudflare or Railway capacity. The committed manifest publishes 42 tools in an
-81,166-byte compact `tools/list` result (81,206 bytes on the wire) plus 1,527
-characters of instructions; STA-37's 23 evidence tools roughly doubled it from
-41,961 bytes for 19 tools.
+Cloudflare or Railway capacity. The committed manifest publishes 45 tools. At 42
+tools, before STA-49's three retrieval tools, it was an 81,166-byte compact
+`tools/list` result (81,206 bytes on the wire) plus 1,527 characters of
+instructions; STA-37's 23 evidence tools roughly doubled it from 41,961 bytes for
+19 tools.
 McpFn bundles the official SDK and schema validators: the app Worker dry-run
 grew from 834.94 KiB (178.06 KiB gzip) at the STA-9 base to 1,905.65 KiB
 (375.36 KiB gzip). This is a local bundle observation, not a deployed limit.

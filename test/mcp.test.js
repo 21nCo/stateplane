@@ -794,3 +794,21 @@ test('a deployed resource accepts only its own or an allowlisted browser origin'
   assert.throws(()=>createMcpHandler({services:state.services,identity:state.identity,resource:'https://stateplane.example/mcp',
     authorizationServers:['http://auth.example']}),/HTTPS/,'a deployed issuer must use HTTPS');
 });
+
+test('the retrieval tools accept exactly the requests the OpenAPI SearchRequest and BundleRequest accept',async()=>{
+  const document=YAML.parse(await readFile(new URL('../contracts/openapi.yaml',import.meta.url),'utf8'));
+  const ajv=new Ajv2020({strict:false,allErrors:true});
+  ajv.addSchema({$id:'openapi',components:document.components});
+  const tools=stateplaneMcpDeclaration().manifest().tools;
+  const budget={bytes:2048};
+  for (const [tool,component,requests] of [
+    ['retrieval_search','SearchRequest',[{query:'fog'},{query:'fog',limit:3,kinds:['record'],collections:['entries']},{},{limit:3},{query:''},
+      {query:'fog',limit:51},{query:'fog',extra:true}]],
+    ['retrieval_bundle','BundleRequest',[{task:'Summarize fog',budget},{query:'fog',budget},{task:'t',query:'q',budget:{tokens:4096}},{budget},
+      {task:'t'},{task:'t',budget:{}},{task:'t',budget:{bytes:1}},{budget,limit:3},{task:'t',budget,extra:true}]]]) {
+    const published=ajv.compile(tools.find(item=>item.name===tool).inputSchema);
+    const openapi=ajv.getSchema(`openapi#/components/schemas/${component}`);
+    for (const request of requests)
+      assert.equal(published({spaceId:'sp_a',...request}),openapi(request),`${tool} ${JSON.stringify(request)}`);
+  }
+});

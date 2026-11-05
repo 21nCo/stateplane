@@ -513,10 +513,11 @@ paths:
         trust="untrusted" complete="false" for a model's context. excerpts
         holds each excerpt's citation for the caller, unescaped and outside
         the frame and budget; do not place it in a model's context. A
-        request asking a count, status or completeness, or outside the allowed
-        request forms, is refused INVALID_ARGUMENT before anything is admitted
-        or searched; the bundle itself carries no count, status or
-        completeness whatever it is asked. Authorization is the search's.
+        request recognized as asking a count, status or completeness, or
+        outside the allowed request forms, is refused INVALID_ARGUMENT before
+        anything is admitted or searched; recognition is best effort, and the
+        bundle itself carries no count, status or completeness whatever it is
+        asked. Authorization is the search's.
         A safe read: repeat it after a retryable error.
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/BundleRequest' } } } }
       responses:

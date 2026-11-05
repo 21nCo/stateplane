@@ -13,7 +13,8 @@
 // is not a semantic model; --embedder MODULE uses the Embedder a module exports as default (for a provider sandbox,
 // scripts/http-embedder.mjs). Projection is drained as scripts/retrieval-drain.mjs bounds it: a queue that makes no
 // progress for --drain-stalls rounds, or work left after --drain-seconds, ends the run with an error and the database
-// is still dropped.
+// is still dropped. Every measured search and bundle must have run hybrid (or lexical, where only that is projected) and
+// current: relevance, bundles and plans fail the run otherwise, and load reports such answers as `degraded`, apart.
 import { readFile, writeFile } from 'node:fs/promises';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -53,21 +54,26 @@ const KINDS = ['record', 'source', 'claim'];
 const password = process.env.DATABASE_URL ? null : (await readFile(new URL('../.data/local-db-password', import.meta.url), 'utf8')).trim();
 const baseUrl = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT ?? '55432'}/stateplane`;
 const name = `stateplane_eval_${randomUUID().replaceAll('-', '')}`;
+// Server statements (create, drop) on their own connection, each bounded.
+const SERVER_MS = 60_000;
 async function onServer(sql) {
-  const client = new pg.Client({ connectionString: baseUrl });
+  const client = new pg.Client({ connectionString: baseUrl, connectionTimeoutMillis: SERVER_MS, query_timeout: SERVER_MS });
   await client.connect();
   try { return await client.query(sql); } finally { await client.end(); }
 }
 await onServer(`CREATE DATABASE ${name}`);
 const target = new URL(baseUrl); target.pathname = `/${name}`;
 const pool = new pg.Pool({ connectionString: target.toString(), max: Math.max(8, concurrency + 2) });
+// Dropping the database ends its sessions, idle ones included.
+pool.on('error', () => {});
 try {
   execFileSync(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: target.toString() }, stdio: 'ignore' });
   const text = `${JSON.stringify(await evaluate(), null, 2)}\n`;
   if (options.out) await writeFile(options.out, text); else process.stdout.write(text);
 } finally {
-  await pool.end();
+  // Work a failed drain abandoned may still hold sessions: FORCE ends them, so cleanup never waits on them.
   await onServer(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+  await Promise.race([pool.end(), new Promise(resolve => setTimeout(resolve, 5_000).unref())]);
 }
 
 async function evaluate() {
@@ -137,8 +143,7 @@ async function evaluate() {
       for (let run = 0; run < runs; run++) {
         const { value, ms } = await timed(() => services.retrieval.search(owner, spaceId, request));
         searchMs.push(ms);
-        if (value.mode !== (policy.vector ? 'hybrid' : 'lexical') || value.state !== 'current')
-          throw new Error(`${mode} ${query.id}: searched ${value.mode} with state ${value.state}`);
+        covered(`${mode} ${query.id}`, policy, value);
         ranked ??= value.results.map(hit => refs.get(`${hit.ref.collectionId}/${hit.ref.kind}/${hit.ref.id}`));
       }
       const outside = ranked.filter(id => {
@@ -157,14 +162,15 @@ async function evaluate() {
       hitsOutsideFilter: filtered.reduce((sum, row) => sum + row.outside.length, 0) };
     const bundleMs = [];
     for (const query of relevanceQueries.filter(item => item.class === 'keyword')) for (let run = 0; run < runs; run++)
-      bundleMs.push((await timed(() => services.retrieval.bundle(owner, spaceId, { query: query.query, budget: { tokens: 4096 } }))).ms);
+      bundleMs.push((await timed(async () => covered(`${mode} bundle`, policy,
+        await services.retrieval.bundle(owner, spaceId, { query: query.query, budget: { tokens: 4096 } })))).ms);
     latencyMs[mode] = { search: latency(searchMs), bundle: latency(bundleMs) };
     // What the budget bounds hold (STA-47 set them as protective bounds, not measured settings).
     budgets[mode] = {};
     for (const tokens of [1024, 4096, 16384]) {
       const bundles = [];
       for (const query of relevanceQueries.filter(item => item.class === 'keyword'))
-        bundles.push(await services.retrieval.bundle(owner, spaceId, { query: query.query, budget: { tokens } }));
+        bundles.push(covered(`${mode} bundle`, policy, await services.retrieval.bundle(owner, spaceId, { query: query.query, budget: { tokens } })));
       budgets[mode][tokens] = { bundles: bundles.length, excerpts: round(mean(bundles.map(bundle => bundle.excerpts.length))),
         bytes: round(mean(bundles.map(bundle => bundle.usage.bytes))), truncated: bundles.filter(bundle => bundle.truncated).length };
     }
@@ -190,8 +196,12 @@ async function atScale(space, spaces, services, owner) {
   const loadSeconds = round((performance.now() - started) / 1000);
   for (const table of ['lexical_chunks', 'vector_chunks', 'projection_refs', 'records', 'entity_refs', 'collections'])
     await pool.query(`ANALYZE ${table}`);
-  const sizes = (await pool.query(`SELECT (SELECT count(*) FROM lexical_chunks)::int AS lexical, (SELECT count(*) FROM vector_chunks)::int AS vector,
-    pg_relation_size('lexical_chunks_tsv') AS gin, pg_relation_size($1::regclass) AS hnsw`, [`vector_chunks_hnsw_${dimensions}`])).rows[0];
+  // Chunks of the scale space only; an index serves every space, so its size is the whole database's. A dimension
+  // searched exactly (vector_index_strategies) has no ANN index.
+  const sizes = (await pool.query(`SELECT (SELECT count(*) FROM lexical_chunks WHERE space_id=$1)::int AS lexical,
+      (SELECT count(*) FROM vector_chunks WHERE space_id=$1)::int AS vector, pg_relation_size('lexical_chunks_tsv') AS gin,
+      v.index_name AS ann, CASE WHEN v.index_name IS NULL THEN NULL ELSE pg_relation_size(v.index_name::regclass) END AS ann_bytes
+    FROM vector_index_strategies v WHERE v.dimensions=$2`, [spaceId, dimensions])).rows[0];
 
   // One search over a pool that records each candidate statement with the transaction's statements before it; each is
   // then replayed under EXPLAIN (ANALYZE, BUFFERS) with the same settings, in a transaction that is rolled back.
@@ -213,8 +223,10 @@ async function atScale(space, spaces, services, owner) {
     } });
   } };
   const query = 'repaired lantern harbor';
-  await new PostgresRetrievalSearch(spaces, new Map([['cell-a', { pool: capturing }]]), { embedders: registry })
-    .search(owner, spaceId, { query, limit: 10 });
+  covered('plan capture', { vector: true }, await new PostgresRetrievalSearch(spaces, new Map([['cell-a', { pool: capturing }]]),
+    { embedders: registry }).search(owner, spaceId, { query, limit: 10 }));
+  if (!['lexical', 'vector'].every(list => captured.some(statement => statement.list === list)))
+    throw new Error(`plan capture: captured ${captured.map(statement => statement.list).join(', ') || 'no'} candidate statements`);
   const plans = [];
   for (const statement of captured) {
     const client = await pool.connect();
@@ -229,24 +241,36 @@ async function atScale(space, spaces, services, owner) {
 
   const queries = [query, 'garden trellis', 'kiln workshop bay', 'lighthouse lens cleaning', 'river flood'];
   const samples = [];
-  let errors = 0, next = 0;
+  let errors = 0, degraded = 0, next = 0;
   const loadStarted = performance.now();
   await Promise.all(Array.from({ length: concurrency }, async () => {
     while (next < load) {
       const text = queries[next++ % queries.length];
-      try { samples.push((await timed(() => services.retrieval.search(owner, spaceId, { query: text, limit: 10 }))).ms); } catch { errors++; }
+      try {
+        const { value, ms } = await timed(() => services.retrieval.search(owner, spaceId, { query: text, limit: 10 }));
+        // A lexical fallback or a degraded answer is not a hybrid sample.
+        if (value.mode === 'hybrid' && value.state === 'current') samples.push(ms); else degraded++;
+      } catch { errors++; }
     }
   }));
   const seconds = (performance.now() - loadStarted) / 1000;
   return { refs: scale + relevanceDocuments.length, kinds: KINDS, indexingSeconds: loadSeconds,
     chunks: { lexical: sizes.lexical, vector: sizes.vector },
-    indexBytes: { lexical_chunks_tsv: Number(sizes.gin), [`vector_chunks_hnsw_${dimensions}`]: Number(sizes.hnsw) }, plans,
-    load: { searches: load, concurrency, errors, throughputPerSecond: round(samples.length / seconds), latencyMs: latency(samples) } };
+    indexBytes: { scope: 'database', lexical_chunks_tsv: Number(sizes.gin),
+      ...(sizes.ann ? { [sizes.ann]: Number(sizes.ann_bytes) } : { vector: 'exact search, no ANN index' }) }, plans,
+    load: { searches: load, concurrency, errors, degraded, throughputPerSecond: round(samples.length / seconds), latencyMs: latency(samples) } };
 }
 
 async function timed(run) { const start = performance.now(); const value = await run(); return { value, ms: performance.now() - start }; }
 function latency(values) {
-  return { samples: values.length, p50: round(percentile(values, 50)), p95: round(percentile(values, 95)), max: round(Math.max(...values)) };
+  return { samples: values.length, p50: round(percentile(values, 50)), p95: round(percentile(values, 95)),
+    max: values.length ? round(Math.max(...values)) : null };
+}
+/** `answer` (a search, or a bundle's coverage), when it ran as `policy` projects and current; the run fails otherwise. */
+function covered(label, policy, answer) {
+  const { mode, state } = answer.coverage ?? answer;
+  if (mode !== (policy.vector ? 'hybrid' : 'lexical') || state !== 'current') throw new Error(`${label}: ran ${mode} with state ${state}`);
+  return answer;
 }
 function summary(rows) {
   return { queries: rows.length, ndcg10: round(mean(rows.map(row => row.ndcg10))), recall10: round(mean(rows.map(row => row.recall10))),
@@ -256,7 +280,7 @@ function summary(rows) {
 function walk(node, key, found = new Set()) {
   if (node[key]) found.add(node[key]);
   for (const child of node.Plans ?? []) walk(child, key, found);
-  return [...found].sort();
+  return [...found].sort((a, b) => (a < b ? -1 : Number(a > b)));
 }
 function memoryR2() {
   const objects = new Map();

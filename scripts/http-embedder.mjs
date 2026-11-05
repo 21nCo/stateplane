@@ -30,19 +30,28 @@ class HttpEmbedder {
   async embed(texts, signal) {
     let response;
     try {
-      response = await fetch(endpoint, { method: 'POST', signal, headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ model, input: texts, dimensions }) });
+      // A redirect is refused, never followed: the inputs and credential go to the configured endpoint only.
+      response = await fetch(endpoint, { method: 'POST', signal, redirect: 'error',
+        headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' }, body: JSON.stringify({ model, input: texts, dimensions }) });
     } catch (error) { throw new EmbedderUnavailableError('Embedding request failed', { cause: error }); }
-    // Overload and server faults are outages; any other refusal is the input's. Neither quotes the provider's body.
-    if (response.status === 429 || response.status >= 500) throw new EmbedderUnavailableError(`Embedding provider answered ${response.status}`);
+    // A provider timeout, overload or server fault is an outage; any other refusal is the input's. Neither quotes the body.
+    if (response.status === 408 || response.status === 429 || response.status >= 500)
+      throw new EmbedderUnavailableError(`Embedding provider answered ${response.status}`);
     if (!response.ok) throw new Error(`Embedding provider refused the request (${response.status})`);
-    const body = await response.json();
-    const vectors = new Array(texts.length).fill(null);
-    for (const item of body?.data ?? []) if (Number.isSafeInteger(item?.index) && item.index >= 0 && item.index < texts.length) vectors[item.index] = item.embedding;
-    // A dense answer: a missing vector is the provider's malformed reply, never a hole for a caller to skip.
-    if (vectors.some(vector => vector === null)) throw new Error('Embedding provider answered without a vector for every input');
-    return vectors;
+    return vectorsOf((await response.json())?.data, texts.length);
   }
+}
+
+/** Exactly one vector per input, placed by its index; any other answer is the provider's malformed reply. */
+function vectorsOf(data, count) {
+  if (!Array.isArray(data) || data.length !== count) throw new Error('Embedding provider answered with the wrong number of vectors');
+  const vectors = new Array(count).fill(null);
+  for (const item of data) {
+    if (!Number.isSafeInteger(item?.index) || item.index < 0 || item.index >= count || vectors[item.index] !== null)
+      throw new Error('Embedding provider answered with a missing, repeated or out-of-range index');
+    vectors[item.index] = item.embedding;
+  }
+  return vectors;
 }
 
 export default new HttpEmbedder();

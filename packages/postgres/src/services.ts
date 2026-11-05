@@ -5,7 +5,7 @@ import type { Capability, VerifiedCredential } from '@stateplane/contracts';
 import type { EmbeddingRegistry } from '@stateplane/retrieval';
 import { AuthorityError, AuthorityTransaction, PostgresAuthority } from './index.js';
 import { PostgresContextBundles } from './bundles.js';
-import { PostgresProjectionGenerations } from './generations.js';
+import { generationViews } from './generations.js';
 import { PostgresRetrievalWorker } from './retrieval.js';
 import { PostgresRetrievalSearch } from './search.js';
 import { PostgresClaims } from './claims.js';
@@ -104,7 +104,9 @@ export interface ServiceOptions { embedders?: EmbeddingRegistry }
  * `collections[]`. The scope fence (space open at the admitted policy and
  * placement, collection live, owner session current) runs before and after
  * the projection reads, so a deletion, suspension or ended session committed
- * before the answer refuses it.
+ * before the answer refuses it; as for search, the session's own expiry must
+ * still lie ahead once the trailing fence's COMMIT is acknowledged. The work,
+ * generations and pending rebuild are read in one snapshot.
  */
 function projectionStatus(spaces:PostgresSpaces,cells:ReadonlyMap<string,ServiceCell>,options:ServiceOptions) {
   return async(actor:VerifiedCredential,spaceId:string,collectionId:string)=>{
@@ -112,21 +114,28 @@ function projectionStatus(spaces:PostgresSpaces,cells:ReadonlyMap<string,Service
     if (actor.kind!=='session') throw new AuthorityError('FORBIDDEN');
     const cell=cells.get(admitted.cellId);
     if (!cell) throw new AuthorityError('STALE_PLACEMENT');
-    const fence=()=>transact(cell.pool,async db=>{
-      const tx=new AuthorityTransaction(db,admitted.scope,1);
-      try {
-        await tx.checkScope();
-        await spaces.assertScopeCurrent(actor,admitted.ownerPrincipalId,admitted.scope,db,collectionId,['records:read']);
-      } finally { tx.close(); }
+    const fence=async()=>{
+      // The provider's expiry on performance.now()'s clock (measured from before the check) and on its own wall clock.
+      const started=performance.now(), wall=Date.now();
+      const until=await transact(cell.pool,async db=>{
+        const tx=new AuthorityTransaction(db,admitted.scope,1);
+        try {
+          await tx.checkScope();
+          return await spaces.assertCurrentUntil(actor,admitted.ownerPrincipalId);
+        } finally { tx.close(); }
+      });
+      if (until!==null && (performance.now()>=started+until-wall || Date.now()>=until))
+        throw new AuthorityError('FORBIDDEN','Access expired before the status committed');
+    };
+    await fence();
+    const worker=new PostgresRetrievalWorker(cell.pool,{embedders:options.embedders});
+    const {status,pending}=await transact(cell.pool,async db=>{
+      await db.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+      return {status:await worker.status(spaceId,collectionId,db),
+        pending:await generationViews(db.query.bind(db),spaceId,collectionId,true)};
     });
     await fence();
-    const settings={embedders:options.embedders};
-    const status=await new PostgresRetrievalWorker(cell.pool,settings).status(spaceId,collectionId);
-    const generations=await new PostgresProjectionGenerations(cell.pool,settings).list(spaceId,collectionId);
-    await fence();
-    // At most one generation is building or verifying (projection_generations_pending).
-    const rebuild=generations.find(view=>view.state==='building' || view.state==='verifying') ?? null;
-    return {...status,rebuild};
+    return {...status,rebuild:pending[0] ?? null};
   };
 }
 

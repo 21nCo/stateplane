@@ -13,7 +13,7 @@ import { McpFnTestClient, authenticatedHttpTarget } from '@mcpfn/testing';
 import { PostgresProjectionGenerations, postgresServices } from '../../packages/postgres/dist/index.js';
 import { createHttpHandler } from '../../packages/api/dist/index.js';
 import { createMcpHandler } from '../../packages/mcp/dist/index.js';
-import { claims, fixture, hookedPool, identity, index, pool, registry, spaces } from './retrieval-harness.js';
+import { claims, config, fixture, hookedPool, identity, index, pool, registry, spaces } from './retrieval-harness.js';
 
 // STA-49: search, bundles and projection status over HTTP, the CLI (which speaks HTTP) and MCP, through one
 // composition of the real services on PostgreSQL 17 + pgvector, with the deterministic embedder configured.
@@ -243,4 +243,58 @@ test('projection status shows a rebuild in progress on every transport and refus
     cursorSecret: randomBytes(32) }]]), 3600, { embedders: registry });
   await assert.rejects(hooked.retrieval.status(f.owner, f.spaceId, 'alpha'), error => { assert.equal(error.code, 'SPACE_UNAVAILABLE', error.message); return true; });
   assert.equal(hooks.length, 0, 'the suspension ran between the reads');
+});
+
+const REBUILDS = 'FROM projection_generations g LEFT JOIN projection_rebuilds';
+const CHECK_SCOPE = 'c.lifecycle AS collection_lifecycle';
+const statusOver = cellPool => {
+  const { retrieval } = postgresServices(spaces, new Map([['cell-a', { pool: cellPool, cursorSecret: randomBytes(32) }]]), 3600,
+    { embedders: registry });
+  return (...args) => retrieval.status(...args);
+};
+
+test('projection status reads its generations and rebuild in one snapshot while generations change between its reads', async () => {
+  const f = await fixture();
+  await f.record('alpha', { title: 'beacon harbor log', note: 'The harbor beacon was relit at dusk.' });
+  await index();
+  const generations = new PostgresProjectionGenerations(pool, { embedders: registry });
+  await generations.start(f.spaceId, 'alpha');
+  await generations.step();
+  let hooks = [];
+  const status = statusOver(hookedPool(pool, () => hooks, used => { hooks = hooks.filter(hook => hook !== used); }));
+  // An activation, then a new rebuild, commits after the status's first read and before its rebuild read.
+  for (const [change, run] of [['activation', () => generations.activate(f.spaceId, 'alpha', 2)],
+    ['rebuild start', () => generations.start(f.spaceId, 'alpha')]]) {
+    hooks = [{ match: REBUILDS, run }];
+    const view = await status(f.owner, f.spaceId, 'alpha');
+    assert.equal(hooks.length, 0, `${change} ran between the reads`);
+    const pending = view.generations.filter(entry => entry.state === 'building' || entry.state === 'verifying');
+    assert.deepEqual(view.rebuild ? [[view.rebuild.generation, view.rebuild.state]] : [],
+      pending.map(entry => [entry.generation, entry.state]), `${change}: rebuild and generations agree ${JSON.stringify(view)}`);
+  }
+});
+
+test('projection status refuses a session that expired before its trailing fence committed', async () => {
+  const f = await fixture();
+  await index();
+  const sessionExpiry = expiresAt => config.database.update({ model: 'sessions', where: [{ field: 'id', operator: 'eq',
+    value: f.owner.credentialId }], data: { expiresAt }, namespace: config.namespace });
+  let hooks = [];
+  const status = statusOver(hookedPool(pool, () => hooks, used => { hooks = hooks.filter(hook => hook !== used); }));
+  const now = Date.now;
+  // The session lasts 2 s more when the trailing fence checks it, and the clock passes that just before its COMMIT.
+  hooks = [{ match: REBUILDS, run: async () => {
+    await sessionExpiry(new Date(Date.now() + 2_000));
+    hooks.push({ match: CHECK_SCOPE, run: async () => { hooks.push({ match: 'COMMIT', run: async () => { Date.now = () => now() + 5_000; } }); } });
+  } }];
+  try {
+    await assert.rejects(status(f.owner, f.spaceId, 'alpha'), error => { assert.equal(error.code, 'FORBIDDEN', error.message); return true; });
+  } finally { Date.now = now; }
+  assert.equal(hooks.length, 0, 'the clock stepped just before the trailing COMMIT');
+  // The same expiry without the step still answers, and so does a session that lasts an hour.
+  hooks = [{ match: REBUILDS, run: () => sessionExpiry(new Date(Date.now() + 2_000)) }];
+  assert.equal((await status(f.owner, f.spaceId, 'alpha')).collectionId, 'alpha');
+  assert.equal(hooks.length, 0);
+  await sessionExpiry(new Date(Date.now() + 3_600_000));
+  assert.equal((await status(f.owner, f.spaceId, 'alpha')).collectionId, 'alpha');
 });

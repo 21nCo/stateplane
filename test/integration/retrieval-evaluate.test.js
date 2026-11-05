@@ -13,27 +13,29 @@ const root = fileURLToPath(new URL('../..', import.meta.url));
 const outstanding = async () => (await pool.query(`SELECT
   (SELECT count(*) FROM projection_outbox WHERE delivery_state<>'delivered')::int AS records,
   (SELECT count(*) FROM retrieval_outbox WHERE delivery_state='pending')::int AS evidence`)).rows[0];
-const bounded = { stalls: 2, deadline: Date.now() + 120_000 };
+// Fresh for each drain, so slow setup or an earlier test never spends a later drain's time.
+const bounded = () => ({ stalls: 2, deadline: Date.now() + 120_000 });
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 test('a failing embedder stops the record and the evidence drain, and a working one then finishes both', async () => {
   const f = await fixture();
   await f.record('alpha', { title: 'lantern', note: 'cleaned the harbor lantern' });
   await f.record('beta', { title: 'trellis', note: 'repaired the garden trellis' });
   // Record events fail first: an outage never spends the delivery's failure budget, so they would retry forever.
-  await assert.rejects(drainProjections(pool, authority, new EmbeddingRegistry([new Spy({ down: true })]), bounded),
+  await assert.rejects(drainProjections(pool, authority, new EmbeddingRegistry([new Spy({ down: true })]), bounded()),
     error => error instanceof DrainStalledError && /^record events: 2 still outstanding after 2 rounds without progress$/.test(error.message));
   assert.deepEqual(await outstanding(), { records: 2, evidence: 0 });
-  await drainProjections(pool, authority, registry, bounded);
+  await drainProjections(pool, authority, registry, bounded());
   assert.deepEqual(await outstanding(), { records: 0, evidence: 0 });
 
   // Evidence reaches only the worker's queue; a refused input there is retried with backoff the drain skips.
   await f.source('alpha', 'The orchard ladder was oiled and stored for winter.');
-  await assert.rejects(drainProjections(pool, authority, new EmbeddingRegistry([new Spy({ fail: true })]), bounded),
+  await assert.rejects(drainProjections(pool, authority, new EmbeddingRegistry([new Spy({ fail: true })]), bounded()),
     error => error instanceof DrainStalledError
       && /^evidence projection jobs: \d+ still outstanding after 2 rounds without progress$/.test(error.message));
   assert.equal((await outstanding()).records, 0);
   assert.ok((await outstanding()).evidence > 0);
-  await drainProjections(pool, authority, registry, bounded);
+  await drainProjections(pool, authority, registry, bounded());
   assert.deepEqual(await outstanding(), { records: 0, evidence: 0 });
 });
 
@@ -42,22 +44,80 @@ test('the drain deadline ends a drain that is still making progress', async () =
   await f.record('alpha', { title: 'kiln', note: 'tested the workshop kiln' });
   await assert.rejects(drainProjections(pool, authority, registry, { stalls: 5, deadline: Date.now() - 1 }),
     error => error instanceof DrainStalledError && /^record events: 1 still outstanding at the drain deadline after 0 rounds$/.test(error.message));
-  await drainProjections(pool, authority, registry, bounded);
+  await drainProjections(pool, authority, registry, bounded());
+});
+
+test('the drain deadline bounds a started record batch, evidence steps and stalled statements', { timeout: 120_000 }, async () => {
+  const f = await fixture();
+  for (let i = 0; i < 10; i++) await f.record('alpha', { title: `bay ${i}`, note: `inspected the pump at bay ${i}` });
+  // Every message of the batch hangs in its embedder: none may outlive the deadline, and none starts after it.
+  const starts = [];
+  const hanging = new EmbeddingRegistry([new Spy({ hang: true, before: async () => { starts.push(Date.now()); } })]);
+  const ends = async (run, deadline, label) => {
+    const outcome = await Promise.race([run.then(() => 'drained', error => error), sleep(deadline - Date.now() + 5_000).then(() => 'still running')]);
+    assert.ok(outcome instanceof DrainStalledError && /at the drain deadline/.test(outcome.message), `${label}: ${outcome}`);
+    assert.ok(Date.now() < deadline + 1_000, `${label}: ended ${Date.now() - deadline} ms after the deadline`);
+  };
+  let deadline = Date.now() + 2_500;
+  await ends(drainProjections(pool, authority, hanging, { stalls: 5, deadline }), deadline, 'record batch');
+  assert.ok(starts.length > 0 && starts.every(at => at < deadline), `embedder calls started at ${starts.map(at => at - deadline)} ms`);
+  // A statement waiting on a lock is cut at the deadline too.
+  const locker = await pool.connect();
+  try {
+    await locker.query('BEGIN'); await locker.query('LOCK TABLE projection_outbox IN ACCESS EXCLUSIVE MODE');
+    deadline = Date.now() + 1_500;
+    await ends(drainProjections(pool, authority, registry, { stalls: 5, deadline }), deadline, 'locked count');
+  } finally { await locker.query('ROLLBACK'); locker.release(); }
+  await sleep(1_000);
+  await drainProjections(pool, authority, registry, bounded());
+  // Evidence: with less left than a step's minimum budget, no step starts and its work is untouched.
+  await f.source('alpha', 'The orchard ladder was oiled and stored for winter.');
+  const jobs = `SELECT count(*)::int AS pending, coalesce(sum(attempts),0)::int AS attempts FROM retrieval_outbox WHERE delivery_state='pending'`;
+  const before = (await pool.query(jobs)).rows[0];
+  assert.ok(before.pending > 0 && (await outstanding()).records === 0, JSON.stringify(before));
+  await assert.rejects(drainProjections(pool, authority, registry, { stalls: 5, deadline: Date.now() + 600 }),
+    error => error instanceof DrainStalledError && /^evidence projection jobs: \d+ still outstanding at the drain deadline after 0 rounds$/.test(error.message));
+  assert.deepEqual((await pool.query(jobs)).rows[0], before);
+  await drainProjections(pool, authority, registry, bounded());
+});
+
+const evaluations = async () => {
+  const client = new pg.Client({ connectionString: baseUrl });
+  await client.connect();
+  try { return (await client.query(`SELECT datname FROM pg_database WHERE datname LIKE 'stateplane\\_eval\\_%' ORDER BY 1`)).rows.map(row => row.datname); }
+  finally { await client.end(); }
+};
+const evaluate = (args, env) => new Promise(resolve => execFile(process.execPath, ['scripts/retrieval-evaluate.mjs',
+  '--embedder', 'test/fixtures/failing-embedder.js', '--runs', '1', ...args],
+{ cwd: root, timeout: 280_000, env: { ...process.env, DATABASE_URL: baseUrl, ...env } },
+(error, stdout, stderr) => resolve({ code: error?.code ?? 0, signal: error?.signal ?? null, stdout, stderr })));
+// Load queries that are not relevance queries.
+const LOAD_ONLY = 'garden trellis|kiln workshop bay';
+
+test('an outage after indexing is measured as degraded load, and fails the run where it would hide a plan', { timeout: 600_000 }, async () => {
+  const before = await evaluations();
+  // 3,072 dimensions are searched exactly: no ANN index, and the measurements are still published.
+  const loaded = await evaluate(['--scale', '30', '--load', '10', '--concurrency', '2'],
+    { FAILING_EMBEDDER_MODE: 'queries', FAILING_EMBEDDER_QUERIES: LOAD_ONLY, FAILING_EMBEDDER_DIMENSIONS: '3072' });
+  assert.equal(loaded.code, 0, loaded.stderr);
+  const { scale } = JSON.parse(loaded.stdout);
+  // Of 10 searches over 5 queries, the 4 of the 2 failing ones fell back to lexical.
+  assert.deepEqual([scale.load.errors, scale.load.degraded, scale.load.latencyMs.samples], [0, 4, 6]);
+  assert.deepEqual(scale.indexBytes.vector, 'exact search, no ANN index');
+  assert.deepEqual(scale.plans.map(plan => plan.list).sort(), ['lexical', 'vector']);
+  // Chunks of the scale space alone, not the relevance spaces before it: one per Ref of this corpus.
+  assert.deepEqual([scale.chunks.lexical, scale.chunks.vector], [scale.refs, scale.refs]);
+  const capture = await evaluate(['--scale', '30', '--load', '1'], { FAILING_EMBEDDER_MODE: 'queries', FAILING_EMBEDDER_QUERIES: 'repaired lantern harbor' });
+  assert.equal(capture.code, 1, capture.stderr);
+  assert.match(capture.stderr, /plan capture: ran lexical with state degraded/);
+  assert.deepEqual(await evaluations(), before);
 });
 
 for (const mode of ['outage', 'refuse']) test(`an evaluation whose embedder keeps failing (${mode}) exits, prints no provider text and drops its database`, async () => {
-  const evaluations = async () => {
-    const client = new pg.Client({ connectionString: baseUrl });
-    await client.connect();
-    try { return (await client.query(`SELECT datname FROM pg_database WHERE datname LIKE 'stateplane\\_eval\\_%' ORDER BY 1`)).rows.map(row => row.datname); }
-    finally { await client.end(); }
-  };
   const before = await evaluations();
   const secret = `provider-secret-${process.pid}-${mode}`;
-  const result = await new Promise(resolve => execFile(process.execPath, ['scripts/retrieval-evaluate.mjs', '--embedder', 'test/fixtures/failing-embedder.js',
-    '--runs', '1', '--scale', '0', '--drain-stalls', '2', '--drain-seconds', '300'],
-  { cwd: root, timeout: 280_000, env: { ...process.env, DATABASE_URL: baseUrl, FAILING_EMBEDDER_SECRET: secret, FAILING_EMBEDDER_MODE: mode } },
-  (error, stdout, stderr) => resolve({ code: error?.code ?? 0, signal: error?.signal ?? null, stdout, stderr })));
+  const result = await evaluate(['--scale', '0', '--drain-stalls', '2', '--drain-seconds', '300'],
+    { FAILING_EMBEDDER_SECRET: secret, FAILING_EMBEDDER_MODE: mode });
   assert.equal(result.signal, null, result.stderr);
   assert.equal(result.code, 1, result.stderr);
   assert.equal(result.stdout, '');
