@@ -266,8 +266,9 @@ CREATE TRIGGER analysis_jobs_no_truncate BEFORE TRUNCATE ON analysis_jobs
 -- One bounded page of a job's result, in order: its rows and bytes follow the
 -- previous page's, its content is at most 1 MiB, its SHA-256 digest is
 -- checked, and the job's result bytes stay within its byte budget. A page
--- holds at least one row and one byte, so a job writes no more pages than its
--- byte budget. Every page carries, and by foreign key equals, its job's binding.
+-- holds at least one row and one byte, and a result has at most 10,000 pages
+-- (numbered without gaps), so sealing reads a bounded number of pages whatever
+-- the byte budget. Every page carries, and by foreign key equals, its job's binding.
 CREATE TABLE analysis_result_pages (
   space_id text NOT NULL,
   collection_id text NOT NULL,
@@ -288,7 +289,9 @@ CREATE TABLE analysis_result_pages (
   CONSTRAINT analysis_result_pages_binding FOREIGN KEY (space_id, collection_id, job_id, credential_id, spec_digest, schema_version, watermark)
     REFERENCES analysis_jobs(space_id, collection_id, job_id, credential_id, spec_digest, schema_version, watermark),
   CONSTRAINT analysis_result_pages_digest CHECK (content_sha256 = encode(sha256(convert_to(content, 'UTF8')), 'hex')),
-  CONSTRAINT analysis_result_pages_nonempty CHECK (row_count > 0 AND content <> '')
+  CONSTRAINT analysis_result_pages_nonempty CHECK (row_count > 0 AND content <> ''),
+  -- Initial protective bound, not measured (docs/analysis-jobs.md#limits).
+  CONSTRAINT analysis_result_pages_count CHECK (page_number <= 10000)
 );
 
 -- A job's complete result: its page count and total rows and bytes, and the

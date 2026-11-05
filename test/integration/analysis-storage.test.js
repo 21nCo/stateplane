@@ -326,6 +326,12 @@ test('result pages follow each other within the byte budget, digests are checked
   await assert.rejects(page(job, 1, '', 0, 0, 0), check('analysis_result_pages_nonempty'));
   await assert.rejects(page(job, 1, '', 0, 1, 0), check('analysis_result_pages_nonempty'));
   await assert.rejects(page(job, 1, 'abc', 0, 0, 0), check('analysis_result_pages_nonempty'));
+  // A result has at most 10,000 pages whatever its byte budget (checked here without the order trigger).
+  await assert.rejects(inTransaction(async db => {
+    await db.query("SET LOCAL session_replication_role = replica");
+    await page(job, 10000, 'a', 0, 1, 0, { db });
+    await page(job, 10001, 'a', 1, 1, 1, { db });
+  }), check('analysis_result_pages_count'));
   await page(job, 1, 'abc', 0, 2, 0);
   await assert.rejects(page(job, 1, 'abc', 0, 2, 0), refused('23505'));
   await assert.rejects(page(job, 2, 'défg', 2, 1, 4), check('analysis_result_pages_order'));
@@ -1056,6 +1062,35 @@ test('a nonowner cell role runs jobs and proves erasure only with the analysis g
     for (const routine of publicRoutines) await pool.query(`GRANT EXECUTE ON ROUTINE ${routine} TO PUBLIC`);
     await pool.query(`DROP OWNED BY ${role}`);
     await pool.query(`DROP ROLE ${role}`);
+  }
+});
+
+test('space deletion and erasure repair purge under READ COMMITTED whatever the session default isolation', async () => {
+  for (const level of ['repeatable read', 'serializable']) {
+    const sessionPool = new pg.Pool({ connectionString: urlFor(testDatabase), max: 2,
+      options: `-c default_transaction_isolation=${level.replace(' ', '\\ ')}` });
+    try {
+      assert.equal((await sessionPool.query('SHOW default_transaction_isolation')).rows[0].default_transaction_isolation, level);
+      const actor = await owner();
+      const spaces = spacesFor(sessionPool);
+      const { spaceId } = await spaces.create(actor);
+      const job = await admit(spaceId, await seed(spaceId), { principal_id: actor.userPrincipalId });
+      await pool.query(`INSERT INTO analysis_space_slots(space_id,slot,holder_collection_id,holder_job_id,held_until)
+        VALUES($1,1,'alpha',$2,clock_timestamp()+interval '1 minute')`, [spaceId, job.job_id]);
+      await spaces.archive(actor, spaceId);
+      await spaces.delete(actor, spaceId);
+      const none = Object.fromEntries([...analysisTables, 'analysis_cell_slots'].map(table => [table, 0]));
+      assert.deepEqual(await counts(spaceId), none, level);
+      // A row the purge missed, restored as the owner would, is erased by the repair under the same default.
+      await inTransaction(async db => {
+        await db.query("SELECT set_config('session_replication_role','replica',true)");
+        await db.query('INSERT INTO analysis_space_slots(space_id,slot) VALUES($1,1)', [spaceId]);
+      });
+      assert.equal((await spaces.erasure(actor, spaceId)).database, 'pending', level);
+      await spaces.repairDeletedErasure(actor, spaceId);
+      assert.deepEqual(await counts(spaceId), none, level);
+      assert.equal((await spaces.erasure(actor, spaceId)).database, 'erased', level);
+    } finally { await sessionPool.end(); }
   }
 });
 
