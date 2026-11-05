@@ -202,6 +202,10 @@ BEGIN
     NEW.created_at := clock_timestamp();
     RETURN NEW;
   END IF;
+  -- An update that changes nothing, as a result write's lock of its job row, passes as is.
+  IF to_jsonb(NEW) = to_jsonb(OLD) THEN
+    RETURN NEW;
+  END IF;
   IF (to_jsonb(NEW) - mutable) IS DISTINCT FROM (to_jsonb(OLD) - mutable) THEN
     RAISE EXCEPTION 'an analysis job''s binding, budgets and expiry never change'
       USING ERRCODE = 'check_violation', CONSTRAINT = 'analysis_jobs_binding';
@@ -300,10 +304,13 @@ CREATE TABLE analysis_result_manifests (
 );
 
 -- Pages and manifests are written by their running job under an unexpired
--- lease before the job expires, under a share lock of the job row, so cancelling, failing or expiring the
--- job waits for a write in flight and a write that meets one in flight is then
--- refused. They never change. They are removed once their job is cancelled,
--- failed or expired, or with their space.
+-- lease before the job expires. Each write first updates its job row without
+-- changing it, so writes of one job's result, and its cancelling, failing,
+-- expiring or completing, take turns: one that meets another in flight waits
+-- and is then checked against it under READ COMMITTED, or fails with a
+-- serialization error (40001) under REPEATABLE READ if the other committed
+-- after its snapshot. So a manifest states exactly the pages committed before
+-- it, and no page commits after it. They never change.
 CREATE FUNCTION stateplane_guard_analysis_result() RETURNS trigger LANGUAGE plpgsql
 SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
@@ -312,22 +319,13 @@ DECLARE
   previous record;
   totals record;
 BEGIN
-  IF TG_OP = 'DELETE' THEN
-    IF (current_user = pg_catalog.pg_get_userbyid((SELECT relowner FROM pg_catalog.pg_class WHERE oid = TG_RELID))
-        AND current_setting('stateplane.erasing_space', true) = OLD.space_id)
-      OR EXISTS (SELECT 1 FROM public.analysis_jobs j WHERE j.space_id = OLD.space_id AND j.collection_id = OLD.collection_id
-        AND j.job_id = OLD.job_id AND j.state IN ('cancelled', 'failed', 'expired')) THEN
-      RETURN OLD;
-    END IF;
-    RAISE EXCEPTION '% rows are kept while their job runs or its completed result lives', TG_TABLE_NAME
-      USING ERRCODE = 'check_violation', CONSTRAINT = TG_TABLE_NAME || '_kept';
-  END IF;
   IF TG_OP = 'UPDATE' THEN
     RAISE EXCEPTION '% rows are immutable', TG_TABLE_NAME
       USING ERRCODE = 'check_violation', CONSTRAINT = TG_TABLE_NAME || '_immutable';
   END IF;
-  SELECT j.state, j.expires_at, j.leased_until, j.budget_bytes INTO job FROM public.analysis_jobs j
-    WHERE j.space_id = NEW.space_id AND j.collection_id = NEW.collection_id AND j.job_id = NEW.job_id FOR SHARE;
+  UPDATE public.analysis_jobs j SET state = j.state
+    WHERE j.space_id = NEW.space_id AND j.collection_id = NEW.collection_id AND j.job_id = NEW.job_id
+    RETURNING j.state, j.expires_at, j.leased_until, j.budget_bytes INTO job;
   IF job.state IS DISTINCT FROM 'running' OR clock_timestamp() >= job.expires_at OR clock_timestamp() >= job.leased_until THEN
     RAISE EXCEPTION '% rows are written by their running job under an unexpired lease before it expires', TG_TABLE_NAME
       USING ERRCODE = 'check_violation', CONSTRAINT = TG_TABLE_NAME || '_job';
@@ -369,12 +367,36 @@ BEGIN
 END;
 $$;
 REVOKE ALL ON FUNCTION stateplane_guard_analysis_result() FROM PUBLIC;
-CREATE TRIGGER analysis_result_pages_guard BEFORE INSERT OR UPDATE OR DELETE ON analysis_result_pages
+
+-- Pages and manifests are removed once their job is cancelled, failed or
+-- expired, or by the purge routine. Invoker rights, as
+-- reject_retrieval_fact_change: only the table owner, as the purge routine
+-- runs, is trusted with the erasing setting, which any session can set.
+CREATE FUNCTION stateplane_keep_analysis_result() RETURNS trigger LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  IF (current_user = pg_catalog.pg_get_userbyid((SELECT relowner FROM pg_catalog.pg_class WHERE oid = TG_RELID))
+      AND current_setting('stateplane.erasing_space', true) = OLD.space_id)
+    OR EXISTS (SELECT 1 FROM public.analysis_jobs j WHERE j.space_id = OLD.space_id AND j.collection_id = OLD.collection_id
+      AND j.job_id = OLD.job_id AND j.state IN ('cancelled', 'failed', 'expired')) THEN
+    RETURN OLD;
+  END IF;
+  RAISE EXCEPTION '% rows are kept while their job runs or its completed result lives', TG_TABLE_NAME
+    USING ERRCODE = 'check_violation', CONSTRAINT = TG_TABLE_NAME || '_kept';
+END;
+$$;
+REVOKE ALL ON FUNCTION stateplane_keep_analysis_result() FROM PUBLIC;
+CREATE TRIGGER analysis_result_pages_guard BEFORE INSERT OR UPDATE ON analysis_result_pages
   FOR EACH ROW EXECUTE FUNCTION stateplane_guard_analysis_result();
+CREATE TRIGGER analysis_result_pages_kept BEFORE DELETE ON analysis_result_pages
+  FOR EACH ROW EXECUTE FUNCTION stateplane_keep_analysis_result();
 CREATE TRIGGER analysis_result_pages_no_truncate BEFORE TRUNCATE ON analysis_result_pages
   FOR EACH STATEMENT EXECUTE FUNCTION reject_retrieval_fact_change();
-CREATE TRIGGER analysis_result_manifests_guard BEFORE INSERT OR UPDATE OR DELETE ON analysis_result_manifests
+CREATE TRIGGER analysis_result_manifests_guard BEFORE INSERT OR UPDATE ON analysis_result_manifests
   FOR EACH ROW EXECUTE FUNCTION stateplane_guard_analysis_result();
+CREATE TRIGGER analysis_result_manifests_kept BEFORE DELETE ON analysis_result_manifests
+  FOR EACH ROW EXECUTE FUNCTION stateplane_keep_analysis_result();
 CREATE TRIGGER analysis_result_manifests_no_truncate BEFORE TRUNCATE ON analysis_result_manifests
   FOR EACH STATEMENT EXECUTE FUNCTION reject_retrieval_fact_change();
 
@@ -383,20 +405,35 @@ CREATE TRIGGER analysis_result_manifests_no_truncate BEFORE TRUNCATE ON analysis
 -- slot's cell, holding it no later than the job expires; the job row is
 -- share-locked, so a job that ends meanwhile waits for the taking and then
 -- releases the slot, and a taking that meets an ending in flight is refused.
--- Lock a job before its slots.
+-- A space slot is added, taken or held only in an active or readOnly space,
+-- under a share lock of the space row as job admission takes, so a purge
+-- (which locks the space first) and a slot write wait for each other and no
+-- slot is added during or after a purge. Lock a space, then its job, before
+-- their slots, in the purge's order.
 CREATE FUNCTION stateplane_guard_analysis_slot() RETURNS trigger LANGUAGE plpgsql
 SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   holder jsonb := to_jsonb(NEW);
   job record;
+  lifecycle text;
 BEGIN
   IF TG_OP = 'UPDATE' AND (to_jsonb(OLD) ->> 'slot', to_jsonb(OLD) ->> 'space_id', to_jsonb(OLD) ->> 'cell_id')
       IS DISTINCT FROM (holder ->> 'slot', holder ->> 'space_id', holder ->> 'cell_id') THEN
     RAISE EXCEPTION 'an analysis slot keeps its number'
       USING ERRCODE = 'check_violation', CONSTRAINT = TG_TABLE_NAME || '_key';
   END IF;
-  IF NEW.holder_job_id IS NULL OR (TG_OP = 'UPDATE' AND to_jsonb(OLD) = holder) THEN
+  IF TG_OP = 'UPDATE' AND to_jsonb(OLD) = holder THEN
+    RETURN NEW;
+  END IF;
+  IF TG_TABLE_NAME = 'analysis_space_slots' AND (TG_OP = 'INSERT' OR NEW.holder_job_id IS NOT NULL) THEN
+    SELECT s.lifecycle INTO lifecycle FROM public.spaces s WHERE s.space_id = NEW.space_id FOR SHARE;
+    IF lifecycle IS NULL OR lifecycle NOT IN ('active', 'readOnly') THEN
+      RAISE EXCEPTION 'an analysis space slot is added or held only in an active or readOnly space'
+        USING ERRCODE = 'check_violation', CONSTRAINT = 'analysis_space_slots_space';
+    END IF;
+  END IF;
+  IF NEW.holder_job_id IS NULL THEN
     RETURN NEW;
   END IF;
   IF TG_OP = 'UPDATE' AND OLD.holder_job_id IS NOT NULL AND OLD.held_until > clock_timestamp()
@@ -425,8 +462,8 @@ CREATE TRIGGER analysis_cell_slots_guard BEFORE INSERT OR UPDATE ON analysis_cel
 
 -- Space erasure removes analysis work before the collections it references,
 -- as migration 045's routine removes retrieval rows. It locks the space's jobs
--- first, so a page, manifest or slot write in flight finishes first and none
--- starts after, releases the cell slots they hold, and then removes their
+-- first (after its space), so a page, manifest or slot write in flight
+-- finishes first and none starts after, releases the cell slots they hold, and then removes their
 -- space slots, pages, manifests and jobs.
 CREATE OR REPLACE FUNCTION stateplane_purge_space(p_space_id text) RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER

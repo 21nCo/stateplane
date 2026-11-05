@@ -340,6 +340,25 @@ test('result pages follow each other within the byte budget, digests are checked
   assert.equal((await pool.query(`DELETE FROM analysis_result_pages WHERE job_id=$1`, [failed.job_id])).rowCount, 1);
 });
 
+test('a spec is at most 64 KiB, and a checkpoint and a page at most 1 MiB', async () => {
+  const { spaceId, watermark } = await space();
+  const specOf = length => `{"a":"${'x'.repeat(length - 8)}"}`;
+  for (const [length, admitted] of [[65536, true], [65537, false]]) {
+    const admission = admit(spaceId, watermark, { canonical_spec: specOf(length), spec_digest: digest(specOf(length)) });
+    if (admitted) await admission;
+    else await assert.rejects(admission, check('analysis_jobs_spec'));
+  }
+  const job = await admit(spaceId, watermark, { budget_bytes: 4 * 1048576 });
+  await run(job);
+  // jsonb renders {"a": "…"}: nine bytes around the value.
+  const checkpoint = length => JSON.stringify({ a: 'x'.repeat(length - 9) });
+  await assert.rejects(update(job, 'checkpoint=$4::jsonb', [checkpoint(1048577)]), check('analysis_jobs_checkpoint'));
+  await update(job, 'checkpoint=$4::jsonb', [checkpoint(1048576)]);
+  await assert.rejects(page(job, 1, 'x'.repeat(1048577), 0, 1, 0), check('analysis_result_pages_content_check'));
+  await page(job, 1, 'x'.repeat(1048576), 0, 1, 0);
+  assert.equal((await pool.query(`SELECT byte_size FROM analysis_result_pages WHERE ${jobWhere}`, key(job))).rows[0].byte_size, 1048576);
+});
+
 for (const isolation of ['READ COMMITTED', 'REPEATABLE READ']) {
   test(`under ${isolation}, cancelling a job waits for a page write in flight, and a later page is refused`, async () => {
     const { spaceId, watermark } = await space();
@@ -351,10 +370,16 @@ for (const isolation of ['READ COMMITTED', 'REPEATABLE READ']) {
       await page(job, 1, 'abc', 0, 1, 0, { db: writer });
       await canceller.query(`BEGIN ISOLATION LEVEL ${isolation}`);
       const pid = (await canceller.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
-      const cancelling = update(job, `state='cancelling'`, [], canceller);
+      const cancelling = update(job, `state='cancelling'`, [], canceller).catch(error => error);
       await waitsOnLock(pid);
       await writer.query('COMMIT');
-      assert.equal((await cancelling).state, 'cancelling');
+      if (isolation === 'REPEATABLE READ') {
+        // The page committed after the canceller's snapshot: it retries.
+        assert.equal((await cancelling).code, '40001');
+        await canceller.query('ROLLBACK');
+        await canceller.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+        assert.equal((await update(job, `state='cancelling'`, [], canceller)).state, 'cancelling');
+      } else assert.equal((await cancelling).state, 'cancelling');
       await canceller.query('COMMIT');
       await writer.query(`BEGIN ISOLATION LEVEL ${isolation}`);
       await assert.rejects(page(job, 2, 'def', 1, 1, 3, { db: writer }), check('analysis_result_pages_job'));
@@ -365,6 +390,69 @@ for (const isolation of ['READ COMMITTED', 'REPEATABLE READ']) {
       await canceller.query('ROLLBACK').catch(() => {});
       writer.release();
       canceller.release();
+    }
+  });
+}
+
+/**
+ * Run `first` in one transaction and `second` in another while the first is in flight, or, if `stale`, once the first
+ * committed after the second's snapshot. Commits both and returns the second's error, if any.
+ */
+async function race(isolation, first, second, stale = false) {
+  const [a, b] = [await pool.connect(), await pool.connect()];
+  try {
+    const pid = (await b.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+    await b.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+    if (stale) await b.query('SELECT 1');
+    await a.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+    await first(a);
+    if (stale) await a.query('COMMIT');
+    const pending = second(b).then(() => null, error => error);
+    if (!stale) {
+      await waitsOnLock(pid);
+      await a.query('COMMIT');
+    }
+    const error = await pending;
+    await b.query(error ? 'ROLLBACK' : 'COMMIT');
+    return error;
+  } finally {
+    for (const client of [a, b]) {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  }
+}
+
+for (const isolation of ['READ COMMITTED', 'REPEATABLE READ']) {
+  test(`under ${isolation}, a manifest and a page write of one job take turns, so the manifest states exactly the committed pages`, async () => {
+    const { spaceId, watermark } = await space();
+    const repeatable = isolation === 'REPEATABLE READ';
+    const stored = async job => (await pool.query(`SELECT (SELECT count(*)::int FROM analysis_result_pages WHERE ${jobWhere}) AS pages,
+      (SELECT page_count FROM analysis_result_manifests WHERE ${jobWhere}) AS stated`, key(job))).rows[0];
+    for (const stale of repeatable ? [false, true] : [false]) {
+      // A page first: a manifest of no pages no longer matches them.
+      const pageFirst = await admit(spaceId, watermark);
+      await run(pageFirst);
+      const sealing = await race(isolation, db => page(pageFirst, 1, 'abc', 0, 1, 0, { db }), db => manifest(pageFirst, [], { db }), stale);
+      assert.ok(sealing, 'the manifest is refused');
+      if (repeatable) assert.equal(sealing.code, '40001', sealing.message);
+      else check('analysis_result_manifests_totals')(sealing);
+      assert.deepEqual(await stored(pageFirst), { pages: 1, stated: null });
+      await assert.rejects(update(pageFirst, `state='completed'`), check('analysis_jobs_manifest'));
+      await manifest(pageFirst, [{ content: 'abc', rows: 1 }]);
+      assert.equal((await update(pageFirst, `state='completed'`)).state, 'completed');
+
+      // The manifest first: a later page is refused.
+      const manifestFirst = await admit(spaceId, watermark);
+      await run(manifestFirst);
+      await page(manifestFirst, 1, 'abc', 0, 1, 0);
+      const writing = await race(isolation, db => manifest(manifestFirst, [{ content: 'abc', rows: 1 }], { db }),
+        db => page(manifestFirst, 2, 'def', 1, 1, 3, { db }), stale);
+      assert.ok(writing, 'the page is refused');
+      if (repeatable) assert.equal(writing.code, '40001', writing.message);
+      else check('analysis_result_pages_sealed')(writing);
+      assert.deepEqual(await stored(manifestFirst), { pages: 1, stated: 1 });
+      assert.equal((await update(manifestFirst, `state='completed'`)).state, 'completed');
     }
   });
 }
@@ -535,6 +623,42 @@ test('space erasure removes every job, page, manifest and space slot of that spa
     'cell slots are cell capacity, not space data');
 });
 
+test('a space slot is added only while its space is live, so none outlives a purge, whichever starts first', async () => {
+  const [purged, raced] = [await space(), await space()];
+  const addSlot = (spaceId, db = pool) => db.query('INSERT INTO analysis_space_slots(space_id,slot) VALUES($1,1)', [spaceId]);
+  const slots = async spaceId => (await pool.query('SELECT count(*)::int AS n FROM analysis_space_slots WHERE space_id=$1', [spaceId])).rows[0].n;
+  const [first, second] = [await pool.connect(), await pool.connect()];
+  try {
+    // A purge in flight: the slot waits for it and is then refused.
+    await pool.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1`, [purged.spaceId]);
+    await assert.rejects(addSlot(purged.spaceId), check('analysis_space_slots_space'));
+    await first.query('BEGIN');
+    await first.query('SELECT stateplane_purge_space($1)', [purged.spaceId]);
+    const pid = (await second.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+    const adding = addSlot(purged.spaceId, second).catch(error => error);
+    await waitsOnLock(pid);
+    await first.query('COMMIT');
+    check('analysis_space_slots_space')(await adding);
+    await assert.rejects(addSlot(purged.spaceId), check('analysis_space_slots_space'));
+    assert.equal(await slots(purged.spaceId), 0);
+
+    // A slot in flight: deleting the space waits for it, and the purge then removes it.
+    await first.query('BEGIN');
+    await addSlot(raced.spaceId, first);
+    const deleting = second.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1`, [raced.spaceId]);
+    await waitsOnLock(pid);
+    await first.query('COMMIT');
+    await deleting;
+    await pool.query('SELECT stateplane_purge_space($1)', [raced.spaceId]);
+    assert.equal(await slots(raced.spaceId), 0);
+  } finally {
+    for (const client of [first, second]) {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  }
+});
+
 test('a nonowner cell role runs jobs and proves erasure only with the analysis grants', async () => {
   const actor = await owner();
   const { spaceId } = await spacesFor(pool).create(actor);
@@ -579,15 +703,31 @@ test('a nonowner cell role runs jobs and proves erasure only with the analysis g
       await update(job, `state='completed'`, [], db);
       await assert.rejects(db.query('DELETE FROM analysis_jobs WHERE space_id=$1', [spaceId]), refused('42501'));
       const live = await admit(spaceId, watermark, { principal_id: actor.userPrincipalId }, db);
+      await run(live, db);
+      await page(live, 1, 'abc', 0, 1, 0, { db });
+      // The erasing setting confers nothing on this role: the results of a completed or running job stay.
+      for (const table of ['analysis_result_pages', 'analysis_result_manifests']) {
+        await db.query('BEGIN');
+        await db.query(`SELECT set_config('stateplane.erasing_space',$1,true)`, [spaceId]);
+        await assert.rejects(db.query(`DELETE FROM ${table} WHERE space_id=$1`, [spaceId]), check(`${table}_kept`));
+        await db.query('ROLLBACK');
+      }
+      // A failed job's results are the role's to remove.
+      await update(live, `state='failed',failure_code='WORKER_LOST'`, [], db);
+      assert.equal((await db.query('DELETE FROM analysis_result_pages WHERE job_id=$1', [live.job_id])).rowCount, 1);
+      assert.equal((await pool.query('SELECT count(*)::int AS n FROM analysis_result_pages WHERE job_id=$1', [job.job_id])).rows[0].n, 1);
+      const holder = await admit(spaceId, watermark, { principal_id: actor.userPrincipalId }, db);
       await db.query(`INSERT INTO analysis_cell_slots(cell_id,slot,holder_space_id,holder_collection_id,holder_job_id,held_until)
         VALUES('cell-a',3,$1,'alpha',$2,clock_timestamp()+interval '1 minute') ON CONFLICT (cell_id,slot) DO UPDATE
         SET holder_space_id=EXCLUDED.holder_space_id,holder_collection_id=EXCLUDED.holder_collection_id,
-          holder_job_id=EXCLUDED.holder_job_id,held_until=EXCLUDED.held_until`, [spaceId, live.job_id]);
+          holder_job_id=EXCLUDED.holder_job_id,held_until=EXCLUDED.held_until`, [spaceId, holder.job_id]);
     });
     const spaces = spacesFor(cellPool);
     await spaces.archive(actor, spaceId);
     await spaces.delete(actor, spaceId);
     assert.deepEqual(await counts(spaceId), Object.fromEntries(analysis.map(table => [table, 0])));
+    await assert.rejects(asRole(db => db.query('INSERT INTO analysis_space_slots(space_id,slot) VALUES($1,1)', [spaceId])),
+      check('analysis_space_slots_space'));
     assert.equal((await spaces.erasure(actor, spaceId)).database, 'erased');
   } finally {
     await cellPool.end();
