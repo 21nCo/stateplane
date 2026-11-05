@@ -4,7 +4,7 @@
 // and search services measures:
 //   1. relevance of the lexical, vector and hybrid lists on the generic corpus in test/fixtures/relevance-corpus.js
 //      (nDCG@10, recall@10, precision@5 and MRR, overall and by query class);
-//   2. filter recall of collection and kind filters, and every hit outside a filter (which must be none);
+//   2. filter recall of collection and kind filters, and every hit outside a filter in any run (which must be none);
 //   3. search and bundle latency on that corpus;
 //   4. at --scale synthetic Refs, the EXPLAIN (ANALYZE, BUFFERS) plans of the lexical and vector candidate statements
 //      exactly as search issues them, and a concurrent search load.
@@ -31,7 +31,7 @@ import { DeterministicEmbedder, EmbeddingRegistry } from '../packages/retrieval/
 import { R2BlobStore } from '../packages/storage/dist/index.js';
 import { relevanceCollections, relevanceDocuments, relevanceQueries } from '../test/fixtures/relevance-corpus.js';
 import { drainProjections } from './retrieval-drain.mjs';
-import { mean, ndcgAt, percentile, precisionAt, recallAt, reciprocalRank, round } from './relevance-metrics.mjs';
+import { mean, ndcgAt, percentile, precisionAt, recallAt, reciprocalRank, repeatSearch, round } from './relevance-metrics.mjs';
 
 const { values: options } = parseArgs({ options: {
   runs: { type: 'string', default: '5' }, scale: { type: 'string', default: '2000' }, load: { type: 'string', default: '200' },
@@ -139,18 +139,13 @@ async function evaluate() {
     const rows = [], searchMs = [];
     for (const query of relevanceQueries) {
       const request = { query: query.query, limit: 10, ...query.filter };
-      let ranked = null;
-      for (let run = 0; run < runs; run++) {
+      // Every run's hits are checked against the filter; relevance ranks the first run's.
+      const { first, outside } = await repeatSearch(runs, async () => {
         const { value, ms } = await timed(() => services.retrieval.search(owner, spaceId, request));
         searchMs.push(ms);
-        covered(`${mode} ${query.id}`, policy, value);
-        ranked ??= value.results.map(hit => refs.get(`${hit.ref.collectionId}/${hit.ref.kind}/${hit.ref.id}`));
-      }
-      const outside = ranked.filter(id => {
-        const document = relevanceDocuments.find(item => item.id === id);
-        return (query.filter?.collections && !query.filter.collections.includes(document.collection))
-          || (query.filter?.kinds && !query.filter.kinds.includes(document.kind));
-      });
+        return covered(`${mode} ${query.id}`, policy, value).results;
+      }, query.filter);
+      const ranked = first.map(hit => refs.get(`${hit.ref.collectionId}/${hit.ref.kind}/${hit.ref.id}`));
       rows.push({ id: query.id, class: query.class, ndcg10: ndcgAt(10, ranked, query.relevant), recall10: recallAt(10, ranked, query.relevant),
         precision5: precisionAt(5, ranked, query.relevant), rr: reciprocalRank(ranked, query.relevant), returned: ranked.length, outside });
     }

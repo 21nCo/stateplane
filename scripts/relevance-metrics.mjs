@@ -40,3 +40,22 @@ export function percentile(values, p) {
 export const mean = values => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
 /** Round to three decimals for a published report. */
 export const round = value => value === null ? null : Math.round(value * 1000) / 1000;
+
+/** Whether a hit's `ref` lies outside a search `filter` of `collections` and `kinds` (an absent list admits any). */
+export const outsideFilter = (filter, ref) => Boolean(filter?.collections && !filter.collections.includes(ref.collectionId))
+  || Boolean(filter?.kinds && !filter.kinds.includes(ref.kind));
+
+/**
+ * Runs `search` (resolving to one search's hits) `runs` times. Relevance ranks the first run's hits (`first`); every
+ * run's hits are checked against `filter`, so `outside` holds each hit outside it from any run, not only the first.
+ */
+export async function repeatSearch(runs, search, filter) {
+  let first = null;
+  const outside = [];
+  for (let run = 0; run < runs; run++) {
+    const hits = await search();
+    first ??= hits;
+    outside.push(...hits.filter(hit => outsideFilter(filter, hit.ref)));
+  }
+  return { first, outside };
+}

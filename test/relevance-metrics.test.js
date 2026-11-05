@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ndcgAt, percentile, precisionAt, recallAt, reciprocalRank } from '../scripts/relevance-metrics.mjs';
+import { ndcgAt, outsideFilter, percentile, precisionAt, recallAt, reciprocalRank, repeatSearch } from '../scripts/relevance-metrics.mjs';
 import { relevanceCollections, relevanceDocuments, relevanceQueries } from './fixtures/relevance-corpus.js';
 
 test('ranking metrics match hand-computed values', () => {
@@ -19,6 +19,25 @@ test('ranking metrics match hand-computed values', () => {
   assert.equal(percentile([5, 1, 3, 2, 4], 50), 3);
   assert.equal(percentile([5, 1, 3, 2, 4], 95), 5);
   assert.equal(percentile([], 50), null);
+});
+
+test('every run of a filtered search is checked against its filter, not only the ranked first run', async () => {
+  const hit = (collectionId, kind, id) => ({ ref: { collectionId, kind, id } });
+  const filter = { collections: ['notes'], kinds: ['record', 'claim'] };
+  assert.equal(outsideFilter(filter, hit('notes', 'record', 'a').ref), false);
+  assert.equal(outsideFilter(filter, hit('tasks', 'record', 'a').ref), true, 'outside the collections');
+  assert.equal(outsideFilter(filter, hit('notes', 'source', 'a').ref), true, 'outside the kinds');
+  assert.equal(outsideFilter({ kinds: ['claim'] }, hit('tasks', 'claim', 'a').ref), false, 'an absent list admits any');
+  assert.equal(outsideFilter(undefined, hit('tasks', 'source', 'a').ref), false, 'no filter admits any');
+
+  const answers = [[hit('notes', 'record', 'a')], [hit('notes', 'record', 'a')],
+    [hit('notes', 'record', 'a'), hit('tasks', 'record', 'b')], [hit('notes', 'source', 'c'), hit('tasks', 'claim', 'd')]];
+  let calls = 0;
+  const { first, outside } = await repeatSearch(answers.length, async () => answers[calls++], filter);
+  assert.equal(calls, 4, 'every run searches');
+  assert.deepEqual(first, answers[0], 'relevance ranks the first run');
+  assert.deepEqual(outside.map(item => item.ref.id), ['b', 'c', 'd'], 'leaks of the later runs are all counted');
+  assert.deepEqual((await repeatSearch(2, async () => [hit('tasks', 'record', 'x')], undefined)).outside, [], 'unfiltered');
 });
 
 test('the relevance corpus judges only documents it holds, inside each query filter', () => {

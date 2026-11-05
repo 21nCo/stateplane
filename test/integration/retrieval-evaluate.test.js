@@ -132,7 +132,9 @@ test('an outage after indexing is measured as degraded load, and fails the run w
   const loaded = await evaluate(['--scale', '30', '--load', '10', '--concurrency', '2'],
     { FAILING_EMBEDDER_MODE: 'queries', FAILING_EMBEDDER_QUERIES: LOAD_ONLY, FAILING_EMBEDDER_DIMENSIONS: '3072' });
   assert.equal(loaded.code, 0, loaded.stderr);
-  const { scale } = JSON.parse(loaded.stdout);
+  const { scale, filters } = JSON.parse(loaded.stdout);
+  // Every run of each filtered query is checked: no hit of any run falls outside its filter.
+  assert.deepEqual(Object.values(filters).map(mode => mode.hitsOutsideFilter), [0, 0, 0]);
   // Of 10 searches over 5 queries, the 4 of the 2 failing ones fell back to lexical.
   assert.deepEqual([scale.load.errors, scale.load.degraded, scale.load.latencyMs.samples], [0, 4, 6]);
   assert.deepEqual(scale.indexBytes.vector, 'exact search, no ANN index');
