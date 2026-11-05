@@ -509,6 +509,235 @@ test('a slot is held by one live job of its space or cell, at most one of each k
   await assert.rejects(take('space', 1, job), check('analysis_space_slots_holder'));
 });
 
+/**
+ * Run `first` in one session and then `second` in another, while the first is in flight (until the second waits on a
+ * lock or settles), or, if `stale`, once the first committed after the second's snapshot. Commits each that succeeds
+ * and returns the second's result or error.
+ */
+async function clash({ first, second, isolation, firstIsolation = isolation, stale = false }) {
+  const [a, b] = [await pool.connect(), await pool.connect()];
+  try {
+    const pid = (await b.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+    await b.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+    if (stale) await b.query('SELECT 1');
+    await a.query(`BEGIN ISOLATION LEVEL ${firstIsolation}`);
+    await first(a);
+    if (stale) await a.query('COMMIT');
+    let settled = false;
+    const pending = second(b).then(result => ({ result }), error => ({ error })).finally(() => { settled = true; });
+    if (!stale) {
+      for (let attempt = 0; !settled; attempt += 1) {
+        const row = (await pool.query('SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1', [pid])).rows[0];
+        if (row?.wait_event_type === 'Lock') break;
+        assert.ok(attempt < 200, `backend ${pid} neither waited nor settled`);
+        await sleep(25);
+      }
+      await a.query('COMMIT');
+    }
+    const outcome = await pending;
+    await b.query(outcome.error ? 'ROLLBACK' : 'COMMIT');
+    return outcome;
+  } finally {
+    for (const client of [a, b]) {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  }
+}
+
+/** A space on its own cell with free space and cell slot 1, and a queued job; `takes` take a slot for it. */
+async function slotted() {
+  const { spaceId, watermark } = await space();
+  const cell = `cell-${randomUUID()}`;
+  await pool.query('UPDATE spaces SET cell_id=$2 WHERE space_id=$1', [spaceId, cell]);
+  await pool.query('INSERT INTO analysis_space_slots(space_id,slot) VALUES($1,1)', [spaceId]);
+  await pool.query('INSERT INTO analysis_cell_slots(cell_id,slot) VALUES($1,1)', [cell]);
+  const job = await admit(spaceId, watermark);
+  const until = `clock_timestamp()+interval '1 minute'`;
+  const takes = {
+    'space INSERT': db => db.query(`INSERT INTO analysis_space_slots(space_id,slot,holder_collection_id,holder_job_id,held_until)
+      VALUES($1,2,'alpha',$2,${until})`, [spaceId, job.job_id]),
+    'space UPDATE': db => db.query(`UPDATE analysis_space_slots SET holder_collection_id='alpha',holder_job_id=$2,held_until=${until}
+      WHERE space_id=$1 AND slot=1`, [spaceId, job.job_id]),
+    'cell INSERT': db => db.query(`INSERT INTO analysis_cell_slots(cell_id,slot,holder_space_id,holder_collection_id,holder_job_id,held_until)
+      VALUES($1,2,$2,'alpha',$3,${until})`, [cell, spaceId, job.job_id]),
+    'cell UPDATE': db => db.query(`UPDATE analysis_cell_slots SET holder_space_id=$2,holder_collection_id='alpha',holder_job_id=$3,
+      held_until=${until} WHERE cell_id=$1 AND slot=1`, [cell, spaceId, job.job_id])
+  };
+  const extend = table => db => db.query(`UPDATE analysis_${table}_slots SET held_until=clock_timestamp()+interval '2 minutes'
+    WHERE holder_job_id=$1`, [job.job_id]);
+  const held = async () => (await pool.query(`SELECT (SELECT count(*)::int FROM analysis_space_slots WHERE space_id=$1 AND holder_job_id IS NOT NULL)
+    + (SELECT count(*)::int FROM analysis_cell_slots WHERE holder_space_id=$1) AS n`, [spaceId])).rows[0].n;
+  const slots = async () => (await pool.query(`SELECT (SELECT count(*)::int FROM analysis_space_slots WHERE space_id=$1)
+    + (SELECT count(*)::int FROM analysis_cell_slots WHERE holder_space_id=$1) AS n`, [spaceId])).rows[0].n;
+  return { spaceId, job, takes, extend, held, slots };
+}
+const ends = { space: `state='cancelled'`, cell: `state='failed',failure_code='WORKER_LOST'` };
+const noDeadlock = outcome => assert.notEqual(outcome.error?.code, '40P01', outcome.error?.message);
+
+for (const isolation of ['READ COMMITTED', 'REPEATABLE READ']) {
+  const repeatable = isolation === 'REPEATABLE READ';
+  for (const taking of ['space INSERT', 'space UPDATE', 'cell INSERT', 'cell UPDATE']) {
+    const table = taking.split(' ')[0];
+    test(`under ${isolation}, a ${taking} slot taking and its job's ending take turns, and the ended job holds no slot`, async () => {
+      for (const stale of repeatable ? [false, true] : [false]) {
+        // The taking first: the ending waits and releases the slot, or retries after 40001.
+        const takeFirst = await slotted();
+        const ending = await clash({ isolation, stale, first: takeFirst.takes[taking],
+          second: db => update(takeFirst.job, ends[table], [], db) });
+        noDeadlock(ending);
+        if (repeatable) {
+          assert.equal(ending.error?.code, '40001', ending.error?.message);
+          await update(takeFirst.job, ends[table]);
+        } else assert.equal(ending.error, undefined, ending.error?.message);
+        assert.equal(await takeFirst.held(), 0, 'the ended job holds no slot');
+
+        // The ending first: the taking waits and is refused.
+        const endFirst = await slotted();
+        const take = await clash({ isolation, stale, first: db => update(endFirst.job, ends[table], [], db),
+          second: endFirst.takes[taking] });
+        noDeadlock(take);
+        assert.ok(take.error, 'the taking is refused');
+        if (repeatable) assert.equal(take.error.code, '40001', take.error.message);
+        else check(`analysis_${table}_slots_holder`)(take.error);
+        assert.equal(await endFirst.held(), 0, 'the ended job holds no slot');
+      }
+    });
+
+    test(`under ${isolation}, a ${taking} slot taking and a purge of its space finish in one order, leaving no slot`, async () => {
+      const purge = spaceId => db => db.query('SELECT stateplane_purge_space($1)', [spaceId]);
+      for (const stale of repeatable ? [false, true] : [false]) {
+        // The taking first: deleting the space and the purge wait for it, and the purge removes the slot.
+        if (!stale) {
+          const live = await slotted();
+          const purgingLive = await clash({ isolation: 'READ COMMITTED', firstIsolation: isolation, first: live.takes[taking],
+            second: async db => {
+              await db.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1`, [live.spaceId]);
+              await purge(live.spaceId)(db);
+            } });
+          noDeadlock(purgingLive);
+          assert.equal(purgingLive.error, undefined, purgingLive.error?.message);
+          assert.equal(await live.slots(), 0, 'the purge removed the slot taken first');
+        }
+
+        // The purge first: the taking is refused or finds no slot.
+        const purgeFirst = await slotted();
+        await pool.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1`, [purgeFirst.spaceId]);
+        const take = await clash({ isolation, firstIsolation: 'READ COMMITTED', stale, first: purge(purgeFirst.spaceId),
+          second: purgeFirst.takes[taking] });
+        noDeadlock(take);
+        // An INSERT waits for the space and finds it deleted; an UPDATE of a space slot waits for the slot the purge
+        // removed; an UPDATE of a free cell slot is refused at once rather than wait while it holds that slot.
+        const [, method] = taking.split(' ');
+        if (repeatable && (stale || method === 'INSERT' || table === 'space')) assert.equal(take.error?.code, '40001', take.error?.message);
+        else if (method === 'INSERT') check(`analysis_${table}_slots_space`)(take.error);
+        else if (table === 'space') assert.equal(take.result.rowCount, 0, 'the purge removed the slot');
+        else refused('55P03', 'analysis_cell_slots_space')(take.error);
+        assert.equal(await purgeFirst.slots(), 0, 'no slot outlives the purge');
+      }
+    });
+  }
+
+  for (const table of ['space', 'cell']) {
+    test(`under ${isolation}, extending a ${table} slot hold and ending its job finish in one order, and the ended job holds no slot`, async () => {
+      for (const stale of repeatable ? [false, true] : [false]) {
+        for (const extendFirst of [true, false]) {
+          const { job, takes, extend, held } = await slotted();
+          await takes[`${table} UPDATE`](pool);
+          await run(job);
+          const failed = `state='failed',failure_code='WORKER_LOST'`;
+          const end = db => update(job, failed, [], db);
+          const outcome = await clash({ isolation, stale, first: extendFirst ? extend(table) : end,
+            second: extendFirst ? end : extend(table) });
+          noDeadlock(outcome);
+          if (repeatable) {
+            assert.equal(outcome.error?.code, '40001', outcome.error?.message);
+            if (extendFirst) await update(job, failed);
+          } else {
+            assert.equal(outcome.error, undefined, outcome.error?.message);
+            if (!extendFirst) assert.equal(outcome.result.rowCount, 0, 'the released slot is not extended');
+          }
+          assert.equal((await pool.query(`SELECT state FROM analysis_jobs WHERE ${jobWhere}`, key(job))).rows[0].state,
+            failed.match(/'(\w+)'/)[1]);
+          assert.equal(await held(), 0, 'the ended job holds no slot');
+        }
+      }
+    });
+  }
+}
+
+/** Wait until backend `pid` waits on a lock or `promise` settles. */
+async function waitsOrSettles(pid, promise) {
+  let settled = false;
+  promise.finally(() => { settled = true; }).catch(() => {});
+  for (let attempt = 0; !settled; attempt += 1) {
+    const row = (await pool.query('SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1', [pid])).rows[0];
+    if (row?.wait_event_type === 'Lock') return;
+    assert.ok(attempt < 200, `backend ${pid} neither waited nor settled`);
+    await sleep(25);
+  }
+}
+
+for (const isolation of ['READ COMMITTED', 'REPEATABLE READ']) {
+  test(`under ${isolation}, a slot statement that meets an ending or purge already holding its job or space never deadlocks`, async () => {
+    const outcome = promise => promise.then(result => ({ result }), error => ({ error }));
+    const [a, b] = [await pool.connect(), await pool.connect()];
+    const pids = await Promise.all([a, b].map(async db => (await db.query('SELECT pg_backend_pid() AS pid')).rows[0].pid));
+    /** `hold` in a, then `slot` in b, then `finish` in a; returns both outcomes after committing each that succeeded. */
+    const interleave = async (hold, slot, finish) => {
+      try {
+        await a.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+        await b.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+        await hold(a);
+        const slotting = outcome(slot(b));
+        await waitsOrSettles(pids[1], slotting);
+        const finishing = outcome(finish(a));
+        await waitsOrSettles(pids[0], finishing);
+        const first = await slotting;
+        await b.query(first.error ? 'ROLLBACK' : 'COMMIT');
+        const last = await finishing;
+        await a.query(last.error ? 'ROLLBACK' : 'COMMIT');
+        noDeadlock(first);
+        noDeadlock(last);
+        return { slot: first, finish: last };
+      } finally {
+        await a.query('ROLLBACK').catch(() => {});
+        await b.query('ROLLBACK').catch(() => {});
+      }
+    };
+    try {
+      for (const table of ['space', 'cell']) {
+        // The ender holds its job row (a progress write) when the holder extends; it then ends the job.
+        const extended = await slotted();
+        await extended.takes[`${table} UPDATE`](pool);
+        await run(extended.job);
+        const ending = await interleave(db => update(extended.job, 'runtime_ms=runtime_ms+1', [], db), extended.extend(table),
+          db => update(extended.job, `state='failed',failure_code='WORKER_LOST'`, [], db));
+        assert.equal(ending.slot.result?.rowCount, 1, 'the extension did not wait for the job');
+        if (isolation === 'REPEATABLE READ') {
+          assert.equal(ending.finish.error?.code, '40001', ending.finish.error?.message);
+          await update(extended.job, `state='failed',failure_code='WORKER_LOST'`);
+        } else assert.equal(ending.finish.error, undefined, ending.finish.error?.message);
+        assert.equal(await extended.held(), 0, 'the ended job holds no slot');
+
+        // The purge holds the space and its jobs, as it does first, when a slot is taken by update; it then finishes.
+        const purged = await slotted();
+        await pool.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1`, [purged.spaceId]);
+        const purging = await interleave(async db => {
+          await db.query('SELECT 1 FROM spaces WHERE space_id=$1 FOR UPDATE', [purged.spaceId]);
+          await db.query('SELECT 1 FROM analysis_jobs WHERE space_id=$1 FOR UPDATE', [purged.spaceId]);
+        }, purged.takes[`${table} UPDATE`], db => db.query('SELECT stateplane_purge_space($1)', [purged.spaceId]));
+        refused('55P03', `analysis_${table}_slots_space`)(purging.slot.error);
+        assert.equal(purging.finish.error, undefined, purging.finish.error?.message);
+        assert.equal(await purged.slots(), 0, 'no slot outlives the purge');
+      }
+    } finally {
+      a.release();
+      b.release();
+    }
+  });
+}
+
 test('as of a watermark, each record is its highest revision published at or below it, read through the as-of index', { timeout: 120000 }, async () => {
   const { spaceId } = await space();
   const scope = [spaceId, 'alpha'];

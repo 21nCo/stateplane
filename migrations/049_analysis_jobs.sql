@@ -51,7 +51,9 @@ CREATE INDEX record_event_feed_as_of ON record_event_feed(space_id, collection_i
 -- version and placement generation it was admitted under, the collection's
 -- schema version, the watermark (a position of the collection's event feed, or
 -- 0 before its first event), the canonical spec and its SHA-256 digest, and
--- its budgets and expiry. Its state moves forward only.
+-- its budgets and expiry. Its state moves forward only. A watermark is a
+-- committed past boundary: later publications may follow it, and 0 is the
+-- boundary before the collection's first published event.
 CREATE TABLE analysis_jobs (
   space_id text NOT NULL,
   collection_id text NOT NULL,
@@ -148,6 +150,10 @@ CREATE TABLE analysis_cell_slots (
 -- collection rows are share-locked, as record writers lock them, so a
 -- lifecycle, policy, placement or schema change waits for the admission and
 -- an admission that meets one in flight waits and is then checked against it.
+-- The watermark check takes no lock: any committed position is a consistent
+-- past boundary, and the zero check is a sequential sanity check that a
+-- concurrent first publication or a stale snapshot can pass, which leaves 0
+-- the boundary before that publication, as a position W is before W+1.
 --
 -- Afterwards only its state, checkpoint, progress, attempts, lease and
 -- failure change. A running job progresses before it expires; it ends
@@ -401,22 +407,34 @@ CREATE TRIGGER analysis_result_manifests_no_truncate BEFORE TRUNCATE ON analysis
   FOR EACH STATEMENT EXECUTE FUNCTION reject_retrieval_fact_change();
 
 -- A slot keeps its number. A held slot passes to another job only once its
--- hold has lapsed. It is taken by a job that has not ended, of a space on the
--- slot's cell, holding it no later than the job expires; the job row is
--- share-locked, so a job that ends meanwhile waits for the taking and then
--- releases the slot, and a taking that meets an ending in flight is refused.
--- A space slot is added, taken or held only in an active or readOnly space,
--- under a share lock of the space row as job admission takes, so a purge
--- (which locks the space first) and a slot write wait for each other and no
--- slot is added during or after a purge. Lock a space, then its job, before
--- their slots, in the purge's order.
+-- hold has lapsed. It is held by a job that has not ended, of a space on the
+-- slot's cell, no later than the job expires. A space slot is added, and any
+-- slot taken, only in an active or readOnly space.
+--
+-- Lock order: a space, then its job, then their slots, as a purge (space, its
+-- jobs, their slots) and a job ending (its row, then the slots it holds) take
+-- them. Taking a slot (a new holder) writes the holder job's row without
+-- changing it, as a result write does, so the taking and the job's ending take
+-- turns: a taking that meets an ending waits and is refused (or fails 40001
+-- under REPEATABLE READ), and an ending that meets a taking waits and releases
+-- the slot (or fails 40001 when the taking committed after its snapshot). An
+-- INSERT locks the space, then the job, before its slot row exists. An UPDATE
+-- already holds its slot row, so it share-locks the space without waiting
+-- (55P03 while a purge or another space change holds it; retry), which keeps a
+-- purge from starting, and only then waits for the job, which an ending of
+-- that job holds without wanting this slot. Extending a hold (the same holder)
+-- locks nothing more: an ending that meets it waits for the slot row and then
+-- releases it, and an extension that meets a release finds the slot free.
 CREATE FUNCTION stateplane_guard_analysis_slot() RETURNS trigger LANGUAGE plpgsql
 SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   holder jsonb := to_jsonb(NEW);
-  job record;
+  holder_space text := COALESCE(to_jsonb(NEW) ->> 'holder_space_id', to_jsonb(NEW) ->> 'space_id');
+  taking boolean;
   lifecycle text;
+  cell text;
+  job record;
 BEGIN
   IF TG_OP = 'UPDATE' AND (to_jsonb(OLD) ->> 'slot', to_jsonb(OLD) ->> 'space_id', to_jsonb(OLD) ->> 'cell_id')
       IS DISTINCT FROM (holder ->> 'slot', holder ->> 'space_id', holder ->> 'cell_id') THEN
@@ -426,28 +444,43 @@ BEGIN
   IF TG_OP = 'UPDATE' AND to_jsonb(OLD) = holder THEN
     RETURN NEW;
   END IF;
-  IF TG_TABLE_NAME = 'analysis_space_slots' AND (TG_OP = 'INSERT' OR NEW.holder_job_id IS NOT NULL) THEN
-    SELECT s.lifecycle INTO lifecycle FROM public.spaces s WHERE s.space_id = NEW.space_id FOR SHARE;
-    IF lifecycle IS NULL OR lifecycle NOT IN ('active', 'readOnly') THEN
-      RAISE EXCEPTION 'an analysis space slot is added or held only in an active or readOnly space'
-        USING ERRCODE = 'check_violation', CONSTRAINT = 'analysis_space_slots_space';
-    END IF;
+  taking := NEW.holder_job_id IS NOT NULL AND (TG_OP = 'INSERT'
+    OR (to_jsonb(OLD) ->> 'holder_space_id', OLD.holder_collection_id, OLD.holder_job_id)
+      IS DISTINCT FROM (holder ->> 'holder_space_id', NEW.holder_collection_id, NEW.holder_job_id));
+  IF TG_OP = 'INSERT' AND holder_space IS NOT NULL THEN
+    SELECT s.lifecycle, s.cell_id INTO lifecycle, cell FROM public.spaces s WHERE s.space_id = holder_space FOR SHARE;
+  ELSIF taking THEN
+    BEGIN
+      SELECT s.lifecycle, s.cell_id INTO lifecycle, cell FROM public.spaces s WHERE s.space_id = holder_space FOR KEY SHARE NOWAIT;
+    EXCEPTION WHEN lock_not_available THEN
+      RAISE EXCEPTION 'an analysis slot taken by update does not wait for its space, which a purge or space change holds; retry'
+        USING ERRCODE = 'lock_not_available', CONSTRAINT = TG_TABLE_NAME || '_space';
+    END;
+  ELSIF NEW.holder_job_id IS NOT NULL THEN
+    SELECT s.lifecycle, s.cell_id INTO lifecycle, cell FROM public.spaces s WHERE s.space_id = holder_space;
+  END IF;
+  IF holder_space IS NOT NULL AND (TG_OP = 'INSERT' OR NEW.holder_job_id IS NOT NULL)
+    AND (lifecycle IS NULL OR lifecycle NOT IN ('active', 'readOnly')) THEN
+    RAISE EXCEPTION 'an analysis slot is added or held only in an active or readOnly space'
+      USING ERRCODE = 'check_violation', CONSTRAINT = TG_TABLE_NAME || '_space';
   END IF;
   IF NEW.holder_job_id IS NULL THEN
     RETURN NEW;
   END IF;
-  IF TG_OP = 'UPDATE' AND OLD.holder_job_id IS NOT NULL AND OLD.held_until > clock_timestamp()
-    AND (to_jsonb(OLD) ->> 'holder_space_id', OLD.holder_collection_id, OLD.holder_job_id)
-      IS DISTINCT FROM (holder ->> 'holder_space_id', NEW.holder_collection_id, NEW.holder_job_id) THEN
+  IF TG_OP = 'UPDATE' AND OLD.holder_job_id IS NOT NULL AND OLD.held_until > clock_timestamp() AND taking THEN
     RAISE EXCEPTION 'an analysis slot passes to another job only once its hold has lapsed'
       USING ERRCODE = 'check_violation', CONSTRAINT = TG_TABLE_NAME || '_held';
   END IF;
-  SELECT j.state, j.expires_at, s.cell_id INTO job FROM public.analysis_jobs j JOIN public.spaces s ON s.space_id = j.space_id
-    WHERE j.space_id = COALESCE(holder ->> 'holder_space_id', holder ->> 'space_id')
-      AND j.collection_id = NEW.holder_collection_id AND j.job_id = NEW.holder_job_id
-    FOR SHARE OF j;
+  IF taking THEN
+    UPDATE public.analysis_jobs j SET state = j.state
+      WHERE j.space_id = holder_space AND j.collection_id = NEW.holder_collection_id AND j.job_id = NEW.holder_job_id
+      RETURNING j.state, j.expires_at INTO job;
+  ELSE
+    SELECT j.state, j.expires_at INTO job FROM public.analysis_jobs j
+      WHERE j.space_id = holder_space AND j.collection_id = NEW.holder_collection_id AND j.job_id = NEW.holder_job_id;
+  END IF;
   IF job.state IS NULL OR job.state NOT IN ('queued', 'running', 'cancelling') OR NEW.held_until > job.expires_at
-    OR (TG_TABLE_NAME = 'analysis_cell_slots' AND job.cell_id IS DISTINCT FROM holder ->> 'cell_id') THEN
+    OR (TG_TABLE_NAME = 'analysis_cell_slots' AND cell IS DISTINCT FROM holder ->> 'cell_id') THEN
     RAISE EXCEPTION 'an analysis slot is held by a job of its space or cell that has not ended, until it expires at the latest'
       USING ERRCODE = 'check_violation', CONSTRAINT = TG_TABLE_NAME || '_holder';
   END IF;
@@ -462,9 +495,10 @@ CREATE TRIGGER analysis_cell_slots_guard BEFORE INSERT OR UPDATE ON analysis_cel
 
 -- Space erasure removes analysis work before the collections it references,
 -- as migration 045's routine removes retrieval rows. It locks the space's jobs
--- first (after its space), so a page, manifest or slot write in flight
--- finishes first and none starts after, releases the cell slots they hold, and then removes their
--- space slots, pages, manifests and jobs.
+-- right after its space, in the slot guard's lock order, so a page, manifest
+-- or slot taking in flight finishes first and none starts after, then
+-- releases the cell slots they hold and removes their space slots, pages,
+-- manifests and jobs.
 CREATE OR REPLACE FUNCTION stateplane_purge_space(p_space_id text) RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
