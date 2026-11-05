@@ -38,8 +38,17 @@ class HttpEmbedder {
     if (response.status === 408 || response.status === 429 || response.status >= 500)
       throw new EmbedderUnavailableError(`Embedding provider answered ${response.status}`);
     if (!response.ok) throw new Error(`Embedding provider refused the request (${response.status})`);
-    // A body that is not JSON is malformed; the parser's message would quote it, so it is not kept.
-    const reply = await response.json().catch(() => { throw new Error(MALFORMED); });
+    // A reply the transport cut short (a reset or closed connection, the caller's signal) is an outage, kept with
+    // its transport cause, which quotes none of the body.
+    let body;
+    try { body = await response.text(); }
+    catch (error) { throw new EmbedderUnavailableError('Embedding reply was interrupted', { cause: error }); }
+    // Only a complete body that is not JSON is malformed; the parser's message would quote it, so it is not kept.
+    // JSON never parses to undefined, so undefined marks the SyntaxError.
+    let reply;
+    try { reply = JSON.parse(body); }
+    catch (error) { if (!(error instanceof SyntaxError)) throw error; }
+    if (reply === undefined) throw new Error(MALFORMED);
     return vectorsOf(reply?.data, texts.length);
   }
 }

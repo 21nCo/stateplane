@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { embedBatch, EmbedderFailedError, EmbedderUnavailableError } from '../packages/retrieval/dist/index.js';
+import { infrastructureFault } from '../packages/postgres/dist/faults.js';
 
 // The provider-sandbox embedder of the retrieval evaluation, against a local OpenAI-compatible endpoint.
 test('the evaluation HTTP embedder orders vectors by index and keeps provider text out of its errors', async t => {
@@ -11,11 +12,19 @@ test('the evaluation HTTP embedder orders vectors by index and keeps provider te
   const server = createServer(async (req, res) => {
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
     requests.push({ authorization: req.headers.authorization, body: JSON.parse(Buffer.concat(chunks)) });
+    if (answer.fault) {
+      // 200 headers and part of a longer body, then the transport fails it: a reset, a closed connection or a stall.
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': '5000' });
+      res.write('{"data":[{"index":0,"embedding":[0.1,"secret');
+      if (answer.fault === 'rst') setTimeout(() => res.socket.resetAndDestroy(), 20);
+      if (answer.fault === 'close') setTimeout(() => res.socket.destroy(), 20);
+      return;
+    }
     res.writeHead(answer.status, { 'content-type': 'application/json', ...(answer.location ? { location: answer.location } : {}) });
     res.end(answer.raw ?? JSON.stringify(answer.body));
   });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
-  t.after(() => server.close());
+  t.after(() => { server.closeAllConnections(); server.close(); });
   // A redirect's destination: it must never receive an input.
   const redirected = [];
   const elsewhere = createServer((req, res) => { redirected.push(req.method); res.writeHead(200).end('{"data":[]}'); });
@@ -81,6 +90,24 @@ test('the evaluation HTTP embedder orders vectors by index and keeps provider te
   answer = { status: 408, body: { error: 'timed out on secret input' } };
   await assert.rejects(embedder.embed(['secret input'], AbortSignal.timeout(5_000)), error =>
     error instanceof EmbedderUnavailableError && !error.message.includes('secret'));
+  // A reply the transport interrupts after its headers is an outage carrying its transport cause, never the
+  // malformed refusal: a direct caller sees EmbedderUnavailableError, and embedBatch, with the projection worker's own
+  // outage test or its default, retries it and ends unavailable rather than counting the input as failed.
+  const workerOutage = error => error instanceof EmbedderUnavailableError || infrastructureFault(error);
+  for (const fault of ['rst', 'close', 'stall']) {
+    answer = { fault };
+    const bound = () => AbortSignal.timeout(fault === 'stall' ? 200 : 5_000);
+    const direct = await embedder.embed(['secret input'], bound()).then(() => null, error => error);
+    assert.ok(direct instanceof EmbedderUnavailableError, `${fault}: ${direct?.name} ${direct?.message}`);
+    assert.ok(direct.cause instanceof Error && !direct.message.includes('secret'), `${fault}: transport cause kept, body not quoted`);
+    if (fault === 'rst') assert.ok(infrastructureFault(direct), 'a reset reply reaches ECONNRESET through its cause');
+    for (const outage of [workerOutage, undefined]) {
+      const before = requests.length;
+      await assert.rejects(embedBatch(embedder, ['secret input'], bound(), [10, 10], undefined, outage), error =>
+        error instanceof EmbedderUnavailableError, `${fault}: embedBatch ends unavailable`);
+      if (fault !== 'stall') assert.equal(requests.length - before, 3, `${fault}: embedBatch retried the interruption`);
+    }
+  }
   // A redirect, even one that keeps the method, is refused: the inputs never reach another origin.
   answer = { status: 307, body: {}, location: `http://127.0.0.1:${elsewhere.address().port}/v1/embeddings` };
   await assert.rejects(embedder.embed(['secret input'], AbortSignal.timeout(5_000)), EmbedderUnavailableError);
