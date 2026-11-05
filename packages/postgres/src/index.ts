@@ -118,6 +118,18 @@ export class AuthorityError extends Error {
     public readonly retryable?: boolean) { super(message); this.name = 'AuthorityError'; }
 }
 class BatchItemFailure extends AuthorityError {}
+/**
+ * An aggregation refused or cancelled at one of its budgets: no free
+ * analytical slot (`BACKPRESSURE`, retryable), or more groups, more result
+ * bytes or more statement time than its caps allow (`RATE_LIMITED`, not
+ * retryable unchanged). No partial result is ever returned.
+ */
+export class AggregationLimitError extends AuthorityError {
+  constructor(readonly limit: 'slots' | 'groups' | 'bytes' | 'time', message: string) {
+    super(limit === 'slots' ? 'BACKPRESSURE' : 'RATE_LIMITED', message, undefined, limit === 'slots');
+    this.name = 'AggregationLimitError';
+  }
+}
 export class CommitOutcomeUnknownError extends Error {
   /** A missing commit acknowledgement requires operation-specific recovery. */
   constructor(cause: unknown) {
@@ -476,8 +488,37 @@ function requestFingerprintFields(fields:Record<string,unknown>,normalized:strin
   return payload;
 }
 
+/**
+ * The AND of scalar predicates over a collection's live records, aliased `r`,
+ * through their indexed values: `$1` and `$2` are the scope's space and
+ * collection, and every predicate value is a bound parameter. Shared by exact
+ * pages, counts, existence and aggregations; callers check readiness.
+ */
+export function predicateFilter(scope: Readonly<AuthorityScope>, predicates: readonly ScalarPredicate[]): { params: unknown[]; where: string } {
+  if (!Array.isArray(predicates) || predicates.length > 16) throw new AuthorityError('INVALID_ARGUMENT');
+  const params: unknown[] = [...scopeIds(scope)];
+  const fragments: string[] = [];
+  for (let index = 0; index < predicates.length; index++) {
+    const predicate = predicates[index];
+    if (!predicate) throw new AuthorityError('INVALID_ARGUMENT');
+    if (!scalarString(predicate.field) || !arrayHas(['null','string','date-time','number','boolean'],predicate.kind)) throw new AuthorityError('INVALID_ARGUMENT');
+    const alias = `v${index}`;
+    params.push(predicate.field,predicate.kind);
+    const fieldParam = `$${params.length - 1}`;
+    const kindParam = `$${params.length}`;
+    let compare = '';
+    if (predicate.kind === 'null') {
+      if (predicate.operator !== 'isNull') throw new AuthorityError('INVALID_ARGUMENT');
+    } else compare = comparison(predicate, alias, params);
+    fragments.push(`EXISTS (SELECT 1 FROM record_index_values ${alias} WHERE ${alias}.space_id=r.space_id
+      AND ${alias}.collection_id=r.collection_id AND ${alias}.record_id=r.record_id
+      AND ${alias}.field_name=${fieldParam} AND ${alias}.value_kind=${kindParam}${compare})`);
+  }
+  return { params, where:'r.space_id=$1 AND r.collection_id=$2 AND NOT r.tombstone ' + fragments.map(x => `AND ${x}`).join(' ') };
+}
+
 /** Reject decorated predicates and retain stable own values for query admission. */
-function snapshotPredicates(source: readonly ScalarPredicate[], trustedParsed=false): readonly ScalarPredicate[] {
+export function snapshotPredicates(source: readonly ScalarPredicate[], trustedParsed=false): readonly ScalarPredicate[] {
   if ((!trustedParsed && !acceptsInProcessObjects) || (!trustedParsed && isInProcessProxy(source)) || !Array.isArray(source) ||
     Object.getPrototypeOf(source)!==Array.prototype || source.length > 16 || Reflect.ownKeys(source).length!==source.length+1)
     throw new AuthorityError('INVALID_ARGUMENT');
@@ -1813,26 +1854,7 @@ export class AuthorityTransaction {
   /** Shared AND predicate compiler for exact page, count and exists statement snapshots. */
   private compilePredicates(predicates: readonly ScalarPredicate[]) {
     if (this.#scope.capability !== 'records:read') throw new AuthorityError('FORBIDDEN');
-    if (!Array.isArray(predicates) || predicates.length > 16) throw new AuthorityError('INVALID_ARGUMENT');
-    const params: unknown[] = [...scopeIds(this.#scope)];
-    const fragments: string[] = [];
-    for (let index = 0; index < predicates.length; index++) {
-      const predicate = predicates[index];
-      if (!predicate) throw new AuthorityError('INVALID_ARGUMENT');
-      if (!scalarString(predicate.field) || !arrayHas(['null','string','date-time','number','boolean'],predicate.kind)) throw new AuthorityError('INVALID_ARGUMENT');
-      const alias = `v${index}`;
-      params.push(predicate.field,predicate.kind);
-      const fieldParam = `$${params.length - 1}`;
-      const kindParam = `$${params.length}`;
-      let compare = '';
-      if (predicate.kind === 'null') {
-        if (predicate.operator !== 'isNull') throw new AuthorityError('INVALID_ARGUMENT');
-      } else compare = comparison(predicate, alias, params);
-      fragments.push(`EXISTS (SELECT 1 FROM record_index_values ${alias} WHERE ${alias}.space_id=r.space_id
-        AND ${alias}.collection_id=r.collection_id AND ${alias}.record_id=r.record_id
-        AND ${alias}.field_name=${fieldParam} AND ${alias}.value_kind=${kindParam}${compare})`);
-    }
-    return { params, where:'r.space_id=$1 AND r.collection_id=$2 AND NOT r.tombstone ' + fragments.map(x => `AND ${x}`).join(' ') };
+    return predicateFilter(this.#scope, predicates);
   }
 
   /** Reject undeclared or partially backfilled filter indexes. */
@@ -2143,3 +2165,6 @@ export type { ProjectionGenerationStatus, ProjectionQueueStatus, ProjectionStatu
 export * from './generations.js';
 export * from './search.js';
 export * from './bundles.js';
+export { aggregationBounds, analyticalSlots, PostgresAggregations } from './aggregations.js';
+export type { AggregationCell, AggregationMetricValue, AggregationOperator, AggregationOptions, AggregationResult, AggregationUnit,
+  GroupKey } from './aggregations.js';

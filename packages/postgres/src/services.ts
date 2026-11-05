@@ -4,6 +4,8 @@ import type { BlobStore, StateplaneServices } from '@stateplane/application';
 import type { Capability, VerifiedCredential } from '@stateplane/contracts';
 import type { EmbeddingRegistry } from '@stateplane/retrieval';
 import { AuthorityError, AuthorityTransaction, PostgresAuthority } from './index.js';
+import { PostgresAggregations } from './aggregations.js';
+import type { AggregationCell } from './aggregations.js';
 import { PostgresContextBundles } from './bundles.js';
 import { generationViews } from './generations.js';
 import { PostgresRetrievalWorker } from './retrieval.js';
@@ -19,8 +21,10 @@ import type { CollectionGrant } from './spaces.js';
 
 /** `originals` is the cell's blob store, such as its R2 `ORIGINALS` binding. Without it, source
  * metadata, claims and links still work, and every operation that needs original bytes fails
- * with nonretryable PROVIDER_UNAVAILABLE. */
-export interface ServiceCell { pool: Pick<pg.Pool,'connect'>; cursorSecret: Uint8Array; originals?: BlobStore }
+ * with nonretryable PROVIDER_UNAVAILABLE. `analytics` is the cell's analytical pool and origin
+ * connection limit; without it, aggregations use `pool` within the slots of the topology's
+ * default limit of 5 (one at a time per process and per cell). */
+export interface ServiceCell { pool: Pick<pg.Pool,'connect'>; cursorSecret: Uint8Array; originals?: BlobStore; analytics?: AggregationCell }
 const unconfigured=():Promise<never>=>Promise.reject(new AuthorityError('PROVIDER_UNAVAILABLE',
   'Original storage is not configured',undefined,false));
 const noOriginals:BlobStore={put:unconfigured,head:unconfigured,get:unconfigured,delete:unconfigured,list:unconfigured};
@@ -172,6 +176,9 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
   const search=new PostgresRetrievalSearch(spaces,new Map([...cells].map(([id,cell])=>[id,{pool:cell.pool}])),
     options.embedders ? {embedders:options.embedders} : {});
   const bundles=new PostgresContextBundles(search);
+  // Aggregations admit, bound and recheck every call themselves, on each cell's analytical slots.
+  const aggregations=new PostgresAggregations(spaces,new Map([...cells].map(([id,cell])=>[id,
+    cell.analytics ?? {pool:cell.pool,originConnectionLimit:5}])));
   return {
     spaces: {
       list:(actor,cursor)=>spaces.listPage(actor,cursor), create:(actor,cellId,spaceId)=>spaces.create(actor,cellId,spaceId),
@@ -286,6 +293,9 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
       search:(actor,spaceId,request)=>search.search(actor,spaceId,request),
       bundle:(actor,spaceId,request)=>bundles.bundle(actor,spaceId,request),
       status:projectionStatus(spaces,cells,options)
+    },
+    analysis: {
+      aggregate:(actor,spaceId,collectionId,request)=>aggregations.aggregate(actor,spaceId,collectionId,request)
     }
   };
 }
