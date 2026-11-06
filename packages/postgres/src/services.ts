@@ -23,10 +23,10 @@ import type { CollectionGrant } from './spaces.js';
  * metadata, claims and links still work, and every operation that needs original bytes fails
  * with nonretryable PROVIDER_UNAVAILABLE. `analytics` is the cell's analytical pool, a pool of
  * its own apart from `pool`, and its origin connection limit; aggregations run only there (and
- * are authorized on `pool` first). Without it, every aggregation fails with nonretryable
+ * are authorized on `pool` first). Without it, every authorized aggregation fails with nonretryable
  * PROVIDER_UNAVAILABLE rather than take capacity interactive reads rely on. */
 export interface ServiceCell { pool: Pick<pg.Pool,'connect'>; cursorSecret: Uint8Array; originals?: BlobStore;
-  analytics?: Omit<AggregationCell,'admission'> }
+  analytics?: { pool: Pick<pg.Pool,'connect'>; originConnectionLimit: number } }
 const unconfigured=():Promise<never>=>Promise.reject(new AuthorityError('PROVIDER_UNAVAILABLE',
   'Original storage is not configured',undefined,false));
 const noOriginals:BlobStore={put:unconfigured,head:unconfigured,get:unconfigured,delete:unconfigured,list:unconfigured};
@@ -181,8 +181,10 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
   // Aggregations admit, bound and recheck every call themselves, on each cell's analytical pool and slots only; the
   // adapter refuses an analytical pool that is the interactive pool.
   const analytical=new Map<string,AggregationCell>();
-  for (const [id,cell] of cells) if (cell.analytics)
-    analytical.set(id,{pool:cell.analytics.pool,originConnectionLimit:cell.analytics.originConnectionLimit,admission:cell.pool});
+  // A cell without analytics is registered without capacity, so its aggregations are still authorized before refusal.
+  for (const [id,cell] of cells) analytical.set(id,cell.analytics
+    ? {pool:cell.analytics.pool,originConnectionLimit:cell.analytics.originConnectionLimit,admission:cell.pool}
+    : {pool:null,admission:cell.pool});
   const aggregations=new PostgresAggregations(spaces,analytical);
   return {
     spaces: {

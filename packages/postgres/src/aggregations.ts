@@ -13,9 +13,12 @@ import type { PostgresSpaces } from './spaces.js';
  * cell's configured Hyperdrive `originConnectionLimit` (5 to 20), from which
  * its analytical slots are derived; and `admission`, the interactive pool on
  * which an aggregation's collection and grant are authorized, in one short
- * transaction, before it takes analytical capacity.
+ * transaction, before it takes analytical capacity. A `pool` of null declares
+ * that the cell has no analytical capacity.
  */
-export interface AggregationCell { pool: Pick<pg.Pool, 'connect'>; admission: Pick<pg.Pool, 'connect'>; originConnectionLimit: number }
+export type AggregationCell = { pool: Pick<pg.Pool, 'connect'>; admission: Pick<pg.Pool, 'connect'>; originConnectionLimit: number }
+  /** A cell without analytical capacity: its aggregations are authorized, then refused with PROVIDER_UNAVAILABLE. */
+  | { pool: null; admission: Pick<pg.Pool, 'connect'> };
 export interface AggregationOptions {
   /** The aggregate statement's `statement_timeout`, 1 to 15,000 ms; 5,000 by default. */
   statementTimeoutMs?: number;
@@ -51,6 +54,93 @@ export interface AggregationResult {
   complete: true;
 }
 
+/*
+ * Every built-in this module calls after load, on caller input, bounds, statement text, result formatting or byte
+ * sizing, is captured here at load and called through the captured Reflect.apply, or replaced by own code; arrays are
+ * built with own data slots and read by index. So a later change to an inherited method (Array, Map, String, RegExp,
+ * Date or Object.prototype, toJSON included) or to a global (Number, BigInt, Date, Map, JSON, Intl, Reflect, Buffer)
+ * never admits input, skips a capacity bound, corrupts a result or its byte check, or yields an untyped error.
+ */
+const apply = Reflect.apply, ownKeys = Reflect.ownKeys;
+const { defineProperty, getOwnPropertyDescriptor: ownDescriptor, getPrototypeOf, hasOwn } = Object;
+const isArray = Array.isArray, ArrayPrototype = Array.prototype;
+const isSafeInteger = Number.isSafeInteger, NativeNumber = Number, NativeBigInt = BigInt, NativeMap = Map, NativeDate = Date;
+const NativeDateTimeFormat = Intl.DateTimeFormat;
+const nativeParse = JSON.parse, nativeStringify = JSON.stringify, NativeJSON = JSON;
+const nativeJoin = Array.prototype.join;
+const nativeMapGet = Map.prototype.get, nativeMapSet = Map.prototype.set, nativeMapHas = Map.prototype.has;
+const nativeMapForEach = Map.prototype.forEach;
+const nativeRegexExec = RegExp.prototype.exec;
+const nativeISOString = Date.prototype.toISOString;
+const nativeSlice = String.prototype.slice, nativeIndexOf = String.prototype.indexOf, nativeCodeUnit = String.prototype.charCodeAt;
+const nativeLowerCase = String.prototype.toLowerCase;
+const joined = (values: readonly string[], separator: string) => apply(nativeJoin, values, [separator]) as string;
+const mapGet = <K, V>(map: ReadonlyMap<K, V>, key: K) => apply(nativeMapGet, map, [key]) as V | undefined;
+const mapHas = <K, V>(map: ReadonlyMap<K, V>, key: K) => apply(nativeMapHas, map, [key]) as boolean;
+const mapSet = <K, V>(map: Map<K, V>, key: K, value: V) => { apply(nativeMapSet, map, [key, value]); };
+const matches = (pattern: RegExp, value: string) => apply(nativeRegexExec, pattern, [value]) !== null;
+const slice = (text: string, start: number, end?: number) =>
+  apply(nativeSlice, text, end === undefined ? [start] : [start, end]) as string;
+const indexOf = (text: string, part: string) => apply(nativeIndexOf, text, [part]) as number;
+const codeUnit = (text: string, i: number) => apply(nativeCodeUnit, text, [i]) as number;
+const lowerCase = (text: string) => apply(nativeLowerCase, text, []) as string;
+/** A primitive's JSON text: JSON.stringify consults no toJSON for a string, number, boolean or null. */
+const primitiveJson = (value: string | number | boolean | null) => apply(nativeStringify, NativeJSON, [value]) as string;
+/** ISO text of epoch milliseconds, or of a driver Date, whose time value the constructor reads without calling any method. */
+const isoString = (time: number | Date) => apply(nativeISOString, new NativeDate(time), []) as string;
+const floorDivide = (value: number, by: number) => (value - value % by) / by; // non-negative integers only
+const zeros = (count: number) => { let text = ''; while (text.length < count) text += '0'; return text; };
+/** Append as an own data slot, never through an inherited push or index setter. */
+const append = <T>(values: T[], value: T) => {
+  defineProperty(values, values.length, { value, writable: true, configurable: true, enumerable: true });
+};
+/** `f` of each own slot of an array this module built or the driver returned, in order. */
+function each<T, U>(values: readonly T[], f: (value: T, index: number) => U): U[] {
+  const result: U[] = [];
+  for (let i = 0; i < values.length; i++) append(result, f(values[i], i));
+  return result;
+}
+/** The distinct values, in first-seen order. */
+function distinct<T>(values: readonly T[]): T[] {
+  const result: T[] = [];
+  for (let i = 0; i < values.length; i++) if (!includes(result, values[i])) append(result, values[i]);
+  return result;
+}
+/** UTF-8 bytes of text, a lone surrogate counted as its 3-byte replacement, as Buffer.byteLength counts. */
+function utf8Bytes(text: string): number {
+  let bytes = 0;
+  for (let i = 0; i < text.length; i++) {
+    const unit = codeUnit(text, i);
+    if (unit < 0x80) bytes += 1;
+    else if (unit < 0x800) bytes += 2;
+    else if (unit >= 0xd800 && unit <= 0xdbff && i + 1 < text.length && codeUnit(text, i + 1) >= 0xdc00 &&
+      codeUnit(text, i + 1) <= 0xdfff) { bytes += 4; i++; }
+    else bytes += 3;
+  }
+  return bytes;
+}
+/**
+ * The UTF-8 bytes of `JSON.stringify(value)` for data this module built (own
+ * array slots, own object fields, primitives), computed without consulting any
+ * toJSON or iterator, so a hook cannot shrink what the byte cap measures.
+ */
+function jsonBytes(value: unknown): number {
+  if (value === null || typeof value !== 'object') return utf8Bytes(primitiveJson(value as string | number | boolean | null));
+  let bytes = 2, first = true;
+  if (isArray(value)) {
+    for (let i = 0; i < value.length; i++) { bytes += (first ? 0 : 1) + jsonBytes(ownDescriptor(value, i)!.value); first = false; }
+    return bytes;
+  }
+  const keys = ownKeys(value);
+  for (let i = 0; i < keys.length; i++) {
+    const key = ownDescriptor(keys, i)!.value as string, member = ownDescriptor(value, key)!.value;
+    if (member === undefined) continue;
+    bytes += (first ? 0 : 1) + utf8Bytes(primitiveJson(key)) + 1 + jsonBytes(member);
+    first = false;
+  }
+  return bytes;
+}
+
 /**
  * Initial protective bounds, not measured capacity (STA-60 measures them):
  * at most 3 group dimensions and 16 metrics, at most 1,000 groups (100 unless
@@ -69,40 +159,10 @@ export const aggregationBounds = Object.freeze({ groupBy: 3, metrics: 16, maxGro
  * reads keep at least 2 of 5 under any analytical load.
  */
 export function analyticalSlots(originConnectionLimit: number): { cell: number; space: number } {
-  if (!Number.isSafeInteger(originConnectionLimit) || originConnectionLimit < 5 || originConnectionLimit > 20)
+  if (!isSafeInteger(originConnectionLimit) || originConnectionLimit < 5 || originConnectionLimit > 20)
     throw new RangeError('Invalid origin connection limit');
-  const cell = Math.floor(originConnectionLimit / 5);
-  return { cell, space: Math.max(1, Math.floor(cell / 2)) };
-}
-
-/*
- * Admission, bounds and statement text use only intrinsics captured here at load and own array slots read by index:
- * a replaced Array.prototype.includes, map, flatMap, join or iterator, Map.prototype.get, set or has, or
- * String.prototype.includes never admits input, skips a capacity bound or yields an untyped error.
- */
-const nativeJoin = Array.prototype.join;
-const nativeMapGet = Map.prototype.get, nativeMapSet = Map.prototype.set, nativeMapHas = Map.prototype.has;
-const nativeMapForEach = Map.prototype.forEach;
-const nativeStringIncludes = String.prototype.includes;
-const joined = (values: readonly string[], separator: string) => Reflect.apply(nativeJoin, values, [separator]) as string;
-const mapGet = <K, V>(map: ReadonlyMap<K, V>, key: K) => Reflect.apply(nativeMapGet, map, [key]) as V | undefined;
-const mapHas = <K, V>(map: ReadonlyMap<K, V>, key: K) => Reflect.apply(nativeMapHas, map, [key]) as boolean;
-const mapSet = <K, V>(map: Map<K, V>, key: K, value: V) => { Reflect.apply(nativeMapSet, map, [key, value]); };
-/** Append as an own data slot, never through an inherited push or index setter. */
-const append = <T>(values: T[], value: T) => {
-  Object.defineProperty(values, values.length, { value, writable: true, configurable: true, enumerable: true });
-};
-/** `f` of each own slot of an array this module built or the driver returned, in order. */
-function each<T, U>(values: readonly T[], f: (value: T, index: number) => U): U[] {
-  const result: U[] = [];
-  for (let i = 0; i < values.length; i++) append(result, f(values[i], i));
-  return result;
-}
-/** The distinct values, in first-seen order. */
-function distinct<T>(values: readonly T[]): T[] {
-  const result: T[] = [];
-  for (let i = 0; i < values.length; i++) if (!includes(result, values[i])) append(result, values[i]);
-  return result;
+  const cell = floorDivide(originConnectionLimit, 5), space = floorDivide(cell, 2);
+  return { cell, space: space < 1 ? 1 : space };
 }
 
 const UNITS: readonly string[] = Object.freeze(['hour', 'day', 'week', 'month', 'quarter', 'year']);
@@ -110,8 +170,8 @@ const OPERATORS: readonly string[] = Object.freeze(['count', 'sum', 'avg', 'min'
 /** What each operator accepts: a sum or average only numbers; a minimum or maximum ordered kinds. */
 const accepts = (op: AggregationOperator, kind: ValueKind) => op === 'sum' || op === 'avg' ? kind === 'number'
   : kind === 'number' || kind === 'string' || kind === 'date-time';
-const COLUMN: Readonly<Record<ValueKind, string>> = Object.freeze({ string: 'string_value', number: 'number_value',
-  boolean: 'boolean_value', 'date-time': 'time_value' });
+const column = (kind: ValueKind) => kind === 'string' ? 'string_value' : kind === 'number' ? 'number_value'
+  : kind === 'boolean' ? 'boolean_value' : 'time_value';
 // An IANA name: letters first, so no POSIX offset string ("+05:00", "UTC+3") with its inverted sign is accepted.
 const ZONE = /^[A-Za-z][A-Za-z0-9_+-]*(?:\/[A-Za-z0-9_+-]+)*$/;
 
@@ -122,25 +182,27 @@ interface Declared { kind: ValueKind; ready: boolean; filterable: boolean; accep
 
 /** A plain array's own items, read by index without an inherited iterator. */
 function items(value: unknown, max: number, name: string, trustedParsed: boolean): unknown[] {
-  if (!value || typeof value !== 'object' || (!trustedParsed && untrusted(value)) || !Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Array.prototype) invalid(`${name} must be an array`);
-  const length = Object.getOwnPropertyDescriptor(value, 'length')!.value as number;
-  if (length < 1 || length > max || Reflect.ownKeys(value).length !== length + 1) invalid(`${name} must hold 1 to ${max} items`);
+  if (!value || typeof value !== 'object' || (!trustedParsed && untrusted(value)) || !isArray(value) ||
+    getPrototypeOf(value) !== ArrayPrototype) invalid(`${name} must be an array`);
+  const length = ownDescriptor(value, 'length')!.value as number;
+  if (length < 1 || length > max || ownKeys(value).length !== length + 1) invalid(`${name} must hold 1 to ${max} items`);
   const result: unknown[] = [];
   for (let i = 0; i < length; i++) {
-    const item = Object.getOwnPropertyDescriptor(value, i);
-    if (!item?.enumerable || !Object.hasOwn(item, 'value')) invalid(`Invalid ${name}`);
+    const item = ownDescriptor(value, i);
+    if (!item?.enumerable || !hasOwn(item, 'value')) invalid(`Invalid ${name}`);
     append(result, item.value);
   }
   return result;
 }
 function field(value: unknown): string {
-  if (!scalarString(value) || !value || Buffer.byteLength(value) > MAX_INDEX_PART_BYTES) invalid('Invalid field');
+  if (!scalarString(value) || !value || utf8Bytes(value) > MAX_INDEX_PART_BYTES) invalid('Invalid field');
   return value;
 }
 function timeZone(value: unknown): string {
-  if (typeof value !== 'string' || value.length > 64 || !ZONE.test(value)) invalid('timeZone must be an IANA time zone name');
-  try { new Intl.DateTimeFormat('en-US', { timeZone: value }); } catch { invalid('timeZone must be an IANA time zone name'); }
+  if (typeof value !== 'string' || value.length > 64 || !matches(ZONE, value)) invalid('timeZone must be an IANA time zone name');
+  // Options without a prototype, so no inherited option can make a valid zone fail or an invalid one pass.
+  try { new NativeDateTimeFormat('en-US', { __proto__: null, timeZone: value } as Intl.DateTimeFormatOptions); }
+  catch { invalid('timeZone must be an IANA time zone name'); }
   return value;
 }
 
@@ -168,12 +230,12 @@ function parse(request: unknown, trustedParsed: boolean): Spec {
       if (metric.field !== undefined) invalid('count counts records and takes no field');
       return { op: 'count' as const, field: null };
     }
-    if (metric.field === undefined) invalid(`${String(metric.op)} needs a field`);
+    if (metric.field === undefined) invalid(`${metric.op as string} needs a field`);
     return { op: metric.op as AggregationOperator, field: field(metric.field) };
   });
   // Only an absent maxGroups takes the default; null or any other non-integer is refused.
   const maxGroups = input.maxGroups === undefined ? aggregationBounds.defaultMaxGroups : input.maxGroups;
-  if (!Number.isSafeInteger(maxGroups) || (maxGroups as number) < 1 || (maxGroups as number) > aggregationBounds.maxGroups)
+  if (!isSafeInteger(maxGroups) || (maxGroups as number) < 1 || (maxGroups as number) > aggregationBounds.maxGroups)
     invalid(`maxGroups must be an integer from 1 to ${aggregationBounds.maxGroups}`);
   return { where, groupBy, metrics, maxGroups: maxGroups as number };
 }
@@ -224,7 +286,7 @@ const instant = (alias: string) => `(CASE WHEN substr(${alias}.time_value,18,2)=
 function statement(scope: Readonly<AuthorityScope>, spec: Spec, declared: ReadonlyMap<string, Declared>) {
   const { params, where } = predicateFilter(scope, spec.where);
   const bind = (value: unknown) => { append(params, value); return `$${params.length}`; };
-  const aliases = new Map<string, string>(), aliased: string[] = [];
+  const aliases = new NativeMap<string, string>(), aliased: string[] = [];
   const joins: string[] = [];
   const kindOf = (name: string) => mapGet(declared, name)!.kind;
   const alias = (name: string) => {
@@ -242,7 +304,7 @@ function statement(scope: Readonly<AuthorityScope>, spec: Spec, declared: Readon
   each(spec.groupBy, (dimension, i) => {
     const a = alias(dimension.field), kind = kindOf(dimension.field);
     const value = dimension.bucket ? `date_trunc(${bind(dimension.bucket.unit)},${instant(a)},${bind(dimension.bucket.timeZone)})`
-      : `${a}.${COLUMN[kind]}`;
+      : `${a}.${column(kind)}`;
     append(grouped, `${a}.value_kind AS k${i}`); append(grouped, `${value} AS v${i}`);
     append(keys, `k${i}`); append(keys, `v${i}`);
     append(texts, `k${i}`);
@@ -264,7 +326,7 @@ function statement(scope: Readonly<AuthorityScope>, spec: Spec, declared: Readon
     if (metric.field === null) { append(grouped, `count(*) AS m${j}`); append(texts, `m${j}::text`); return; }
     const a = alias(metric.field), kind = kindOf(metric.field);
     const present = `FILTER (WHERE ${a}.value_kind=${bind(kind)})`;
-    let value = `${metric.op === 'avg' ? 'sum' : metric.op}(${a}.${COLUMN[kind]}) ${present}`;
+    let value = `${metric.op === 'avg' ? 'sum' : metric.op}(${a}.${column(kind)}) ${present}`;
     if (kind === 'date-time') value = `${metric.op}(stateplane_instant_sort_key(${a}.time_value) COLLATE "C") ${present}`;
     append(grouped, `${value} AS m${j}`); append(grouped, `count(*) ${present} AS m${j}_values`);
     append(grouped, `count(*) FILTER (WHERE ${a}.value_kind='null') AS m${j}_nulls`);
@@ -297,7 +359,12 @@ function statement(scope: Readonly<AuthorityScope>, spec: Spec, declared: Readon
 
 /** A numeric's text without trailing fractional zeros or a negative zero. */
 function decimal(text: string): string {
-  const trimmed = Reflect.apply(nativeStringIncludes, text, ['.']) ? text.replace(/0+$/, '').replace(/\.$/, '') : text;
+  let end = text.length;
+  if (indexOf(text, '.') >= 0) {
+    while (codeUnit(text, end - 1) === 0x30) end--;
+    if (codeUnit(text, end - 1) === 0x2e) end--;
+  }
+  const trimmed = slice(text, 0, end);
   return trimmed === '-0' ? '0' : trimmed;
 }
 
@@ -307,15 +374,15 @@ function decimal(text: string): string {
  */
 function roundedAverage(sum: string, count: number): string | null {
   if (count === 0) return null;
-  const negative = sum.startsWith('-');
-  const parts = (negative ? sum.slice(1) : sum).split('.'), whole = parts[0], fraction = parts.length > 1 ? parts[1] : '';
-  const numerator = BigInt(whole + fraction), denominator = 10n ** BigInt(fraction.length) * BigInt(count);
+  const negative = codeUnit(sum, 0) === 0x2d, body = negative ? slice(sum, 1) : sum, dot = indexOf(body, '.');
+  const whole = dot < 0 ? body : slice(body, 0, dot), fraction = dot < 0 ? '' : slice(body, dot + 1);
+  const numerator = NativeBigInt(whole + fraction), denominator = 10n ** NativeBigInt(fraction.length) * NativeBigInt(count);
   if (numerator === 0n) return '0';
-  const digits = BigInt(aggregationBounds.averageDigits), low = 10n ** (digits - 1n), high = 10n ** digits;
+  const digits = NativeBigInt(aggregationBounds.averageDigits), low = 10n ** (digits - 1n), high = 10n ** digits;
   // value = numerator / denominator; find q = floor(value * 10^shift) with low <= q < high.
-  let shift = aggregationBounds.averageDigits - numerator.toString().length + denominator.toString().length;
-  const scaled = (by: number): [bigint, bigint] => by >= 0 ? [numerator * 10n ** BigInt(by), denominator]
-    : [numerator, denominator * 10n ** BigInt(-by)];
+  let shift = aggregationBounds.averageDigits - `${numerator}`.length + `${denominator}`.length;
+  const scaled = (by: number): [bigint, bigint] => by >= 0 ? [numerator * 10n ** NativeBigInt(by), denominator]
+    : [numerator, denominator * 10n ** NativeBigInt(-by)];
   let pair = scaled(shift);
   while (pair[0] / pair[1] >= high) pair = scaled(--shift);
   while (pair[0] / pair[1] < low) pair = scaled(++shift);
@@ -323,11 +390,11 @@ function roundedAverage(sum: string, count: number): string | null {
   let q = n / d;
   if (2n * (n - q * d) >= d) q++;
   if (q === high) { q /= 10n; shift--; }
-  let text = q.toString();
-  if (shift <= 0) text += '0'.repeat(-shift);
+  let text = `${q}`;
+  if (shift <= 0) text += zeros(-shift);
   else {
-    text = text.padStart(shift + 1, '0');
-    text = `${text.slice(0, -shift)}.${text.slice(-shift)}`;
+    text = zeros(shift + 1 - text.length) + text;
+    text = `${slice(text, 0, -shift)}.${slice(text, -shift)}`;
   }
   return `${negative ? '-' : ''}${decimal(text)}`;
 }
@@ -337,13 +404,13 @@ function roundedAverage(sum: string, count: number): string | null {
  * years: 0000 is 1 BC, and a year past 9999 (only a local label east of UTC
  * can reach one) is written expanded, as +010000, as JavaScript writes it.
  */
-const wallTime = (seconds: number) => new Date(seconds * 1000).toISOString().slice(0, -5);
+const wallTime = (seconds: number) => slice(isoString(seconds * 1000), 0, -5);
 /** A UTC offset in seconds as ±HH:MM (±HH:MM:SS for a historical offset with seconds). */
 function offset(seconds: number): string {
-  const sign = seconds < 0 ? '-' : '+', magnitude = Math.abs(seconds);
-  const part = (value: number) => String(value).padStart(2, '0');
+  const sign = seconds < 0 ? '-' : '+', magnitude = seconds < 0 ? -seconds : seconds;
+  const part = (value: number) => value < 10 ? `0${value}` : `${value}`;
   const rest = magnitude % 60 ? `:${part(magnitude % 60)}` : '';
-  return `${sign}${part(Math.floor(magnitude / 3600))}:${part(Math.floor(magnitude / 60) % 60)}${rest}`;
+  return `${sign}${part(floorDivide(magnitude, 3600))}:${part(floorDivide(magnitude, 60) % 60)}${rest}`;
 }
 
 /** Zone names that are also abbreviations of UTC itself: their IANA zones are UTC at every instant. */
@@ -371,11 +438,11 @@ async function zones(db: Db, spec: Spec): Promise<Spec> {
     if ((error as { code?: string }).code === '22023') invalid('timeZone is not a time zone this database knows');
     throw error;
   }
-  const resolved = new Map<string, string>();
+  const resolved = new NativeMap<string, string>();
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     if (row.offset === null) mapSet(resolved, row.z, row.z);
-    else if (row.offset === 0 && includes(UTC_NAMES, row.z.toLowerCase())) mapSet(resolved, row.z, 'Etc/UTC');
+    else if (row.offset === 0 && includes(UTC_NAMES, lowerCase(row.z))) mapSet(resolved, row.z, 'Etc/UTC');
     else invalid(`timeZone ${row.z} is also a fixed-offset time zone abbreviation; name a region's zone, such as Europe/Paris`);
   }
   return { ...spec, groupBy: each(spec.groupBy, dimension => dimension.bucket ? { field: dimension.field,
@@ -430,17 +497,17 @@ async function provision(db: Db, scope: Readonly<AuthorityScope>, cellId: string
  * with a typed `AggregationLimitError`, never with a partial result.
  */
 export class PostgresAggregations {
-  readonly #running = new Map<string, number>();
+  readonly #running = new NativeMap<string, number>();
   readonly #statementMs: number;
   constructor(private readonly spaces: PostgresSpaces, private readonly cells: ReadonlyMap<string, AggregationCell>,
     options: AggregationOptions = {}) {
-    Reflect.apply(nativeMapForEach, cells, [(cell: AggregationCell, id: string) => {
-      analyticalSlots(cell.originConnectionLimit);
+    apply(nativeMapForEach, cells, [(cell: AggregationCell, id: string) => {
+      if (cell.pool !== null) analyticalSlots(cell.originConnectionLimit);
       // Fail closed: an aggregation never runs on the pool interactive reads are admitted on.
       if (cell.pool === cell.admission) throw new Error(`Cell ${id} needs an analytical pool apart from its admission pool`);
     }]);
     const ms = options.statementTimeoutMs ?? aggregationBounds.statementMs;
-    if (!Number.isSafeInteger(ms) || ms < 1 || ms > aggregationBounds.maxStatementMs) throw new RangeError('Invalid statement time budget');
+    if (!isSafeInteger(ms) || ms < 1 || ms > aggregationBounds.maxStatementMs) throw new RangeError('Invalid statement time budget');
     this.#statementMs = ms;
   }
 
@@ -463,10 +530,12 @@ export class PostgresAggregations {
    */
   aggregateSerialized(actor: VerifiedCredential, spaceId: string, collectionId: string, serialized: string): Promise<AggregationResult> {
     return this.admit(actor, spaceId, collectionId, () => {
-      if (typeof serialized !== 'string' || Buffer.byteLength(serialized) > aggregationBounds.specBytes)
+      // UTF-8 never takes fewer bytes than UTF-16 code units, so longer text is refused before it is measured.
+      if (typeof serialized !== 'string' || serialized.length > aggregationBounds.specBytes ||
+        utf8Bytes(serialized) > aggregationBounds.specBytes)
         invalid(`The spec must be JSON text of at most ${aggregationBounds.specBytes} bytes`);
       let parsed: unknown;
-      try { parsed = JSON.parse(serialized); } catch { invalid('The spec must be JSON text'); }
+      try { parsed = apply(nativeParse, NativeJSON, [serialized]); } catch { invalid('The spec must be JSON text'); }
       return parse(parsed, true);
     });
   }
@@ -474,9 +543,13 @@ export class PostgresAggregations {
   private async admit(actor: VerifiedCredential, spaceId: string, collectionId: string, request: () => Spec): Promise<AggregationResult> {
     const admitted = await this.spaces.scope(actor, spaceId, collectionId, 'records:read');
     const cell = mapGet(this.cells, admitted.cellId);
-    if (!cell) throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Analytical capacity is not configured for this cell', undefined, false);
-    // Authorize the collection and grant before taking capacity, so a caller without records:read, or a collection that does
-    // not exist, is refused as such and never holds or waits on a slot. The analytical transaction locks and checks them again.
+    const unconfigured = () => new AuthorityError('PROVIDER_UNAVAILABLE', 'Analytical capacity is not configured for this cell',
+      undefined, false);
+    // Without any pool of this cell's to authorize on, nothing is disclosed but that the cell is not configured.
+    if (!cell) throw unconfigured();
+    // Authorize the collection and grant before taking or reporting capacity, so a caller without records:read, or a
+    // collection that does not exist, is refused as such and never holds or waits on a slot. The analytical transaction
+    // locks and checks them again.
     await transact(cell.admission, async db => {
       const tx = new AuthorityTransaction(db, admitted.scope, 1);
       try { await tx.checkScope(); } finally { tx.close(); }
@@ -485,15 +558,17 @@ export class PostgresAggregations {
     // predicate is compiled here, so a malformed one is INVALID_ARGUMENT and never a bound parameter or declaration lookup.
     const spec = request();
     predicateFilter(admitted.scope, spec.where);
+    if (cell.pool === null) throw unconfigured();
     const slots = analyticalSlots(cell.originConnectionLimit);
     const running = mapGet(this.#running, admitted.cellId) ?? 0;
     if (running >= slots.cell) throw new AggregationLimitError('slots', 'Analytical capacity is in use; retry later');
     mapSet(this.#running, admitted.cellId, running + 1);
     try {
-      try { return await transact(cell.pool, db => this.run(db, actor, admitted, spec, slots, true)); }
+      const analytical = cell.pool;
+      try { return await transact(analytical, db => this.run(db, actor, admitted, spec, slots, true)); }
       catch (error) { if (!(error instanceof Unprovisioned)) throw error; }
-      await transact(cell.pool, db => provision(db, admitted.scope, admitted.cellId, slots));
-      return await transact(cell.pool, db => this.run(db, actor, admitted, spec, slots, false));
+      await transact(analytical, db => provision(db, admitted.scope, admitted.cellId, slots));
+      return await transact(analytical, db => this.run(db, actor, admitted, spec, slots, false));
     } finally {
       mapSet(this.#running, admitted.cellId, mapGet(this.#running, admitted.cellId)! - 1);
     }
@@ -522,13 +597,13 @@ export class PostgresAggregations {
       FROM collections c LEFT JOIN collection_index_declarations d ON d.space_id=c.space_id AND d.collection_id=c.collection_id
         AND d.field_name=ANY($3::text[])
       WHERE c.space_id=$1 AND c.collection_id=$2`, [scope.spaceId, scope.collectionId, names])).rows;
-    const schemaVersion = Number(rows[0]?.schema_version);
-    if (!Number.isSafeInteger(schemaVersion)) throw new AuthorityError('SCHEMA_CONFLICT');
-    const declared = new Map<string, Declared>();
+    const schemaVersion = NativeNumber(rows[0]?.schema_version);
+    if (!isSafeInteger(schemaVersion)) throw new AuthorityError('SCHEMA_CONFLICT');
+    const declared = new NativeMap<string, Declared>();
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
-      if (row.field_name !== null) mapSet(declared, String(row.field_name), { kind: row.value_kind, ready: row.ready === true,
-        filterable: row.filterable === true, acceptedVersion: Number(row.accepted_version) });
+      if (row.field_name !== null) mapSet(declared, `${row.field_name as string}`, { kind: row.value_kind, ready: row.ready === true,
+        filterable: row.filterable === true, acceptedVersion: NativeNumber(row.accepted_version) });
     }
     admit(spec, declared);
     const { sql, params } = statement(scope, spec, declared);
@@ -545,37 +620,38 @@ export class PostgresAggregations {
     }
     const totals = result.rows[0];
     if (totals.total_inconsistent === true) throw new AuthorityError('SCHEMA_CONFLICT', 'Record index projection incomplete');
-    const groupCount = Number(totals.total_groups);
+    const groupCount = NativeNumber(totals.total_groups);
     if (groupCount > spec.maxGroups)
       throw new AggregationLimitError('groups', `The aggregation has ${groupCount} groups, more than maxGroups (${spec.maxGroups})`);
     const overBytes = () => new AggregationLimitError('bytes', `The aggregation's groups exceed ${aggregationBounds.resultBytes} bytes`);
-    if (Number(totals.total_bytes) > aggregationBounds.resultBytes) throw overBytes();
+    if (NativeNumber(totals.total_bytes) > aggregationBounds.resultBytes) throw overBytes();
     const kindOf = (name: string) => mapGet(declared, name)!.kind;
     const groups = groupCount === 0 ? [] : each(result.rows, row => ({
       key: each(spec.groupBy, (dimension, i): GroupKey => {
         if (row[`k${i}`] === 'null' || row[`k${i}`] === 'missing') return { kind: row[`k${i}`] };
         if (dimension.bucket) {
-          const start = Number(row[`e${i}`]), shift = Number(row[`o${i}`]);
+          const start = NativeNumber(row[`e${i}`]), shift = NativeNumber(row[`o${i}`]);
           return { kind: 'value', value: `${wallTime(start)}Z`, local: `${wallTime(start + shift)}${offset(shift)}` };
         }
         const kind = kindOf(dimension.field);
-        return { kind: 'value', value: kind === 'number' ? Number(row[`v${i}`]) : row[`v${i}`] };
+        return { kind: 'value', value: kind === 'number' ? NativeNumber(row[`v${i}`]) : row[`v${i}`] };
       }),
-      count: Number(row.n),
+      count: NativeNumber(row.n),
       metrics: each(spec.metrics, (metric, j): AggregationMetricValue => {
-        if (metric.field === null) return { value: Number(row[`m${j}`]), values: null, nulls: null, missing: null };
-        const raw = row[`m${j}`] as string | null, values = Number(row[`m${j}_values`]);
+        if (metric.field === null) return { value: NativeNumber(row[`m${j}`]), values: null, nulls: null, missing: null };
+        const raw = row[`m${j}`] as string | null, values = NativeNumber(row[`m${j}_values`]);
         let value: string | number | null = raw;
         if (raw !== null && metric.op === 'sum') value = decimal(raw);
         else if (metric.op === 'avg') value = roundedAverage(raw ?? '0', values);
-        else if (raw !== null && kindOf(metric.field) === 'number') value = Number(raw);
+        else if (raw !== null && kindOf(metric.field) === 'number') value = NativeNumber(raw);
         else if (raw !== null && kindOf(metric.field) === 'date-time') value = `${raw}Z`;
         if (metric.op === 'sum' && raw === null) value = '0';
-        return { value, values, nulls: Number(row[`m${j}_nulls`]), missing: Number(row[`m${j}_missing`]) };
+        return { value, values, nulls: NativeNumber(row[`m${j}_nulls`]), missing: NativeNumber(row[`m${j}_missing`]) };
       })
     }));
-    // The cap holds for every returned key and metric value, counts and rounded averages included.
-    if (Buffer.byteLength(JSON.stringify(groups)) > aggregationBounds.resultBytes) throw overBytes();
+    // The cap holds for every returned key and metric value, counts and rounded averages included, measured as the
+    // groups' JSON text without any toJSON hook.
+    if (jsonBytes(groups) > aggregationBounds.resultBytes) throw overBytes();
     await db.query(`SET LOCAL statement_timeout = '${aggregationBounds.statementMs}ms'`);
     await this.spaces.assertScopeCurrent(actor, ownerPrincipalId, scope, db, scope.collectionId, ['records:read']);
     const measured: string[] = each(spec.groupBy, item => item.field);
@@ -586,7 +662,7 @@ export class PostgresAggregations {
         policyVersion: scope.policyVersion, placementGeneration: scope.placementGeneration },
       collection: { schemaVersion, fields: each(used, name => ({ field: name, kind: kindOf(name),
         acceptedVersion: mapGet(declared, name)!.acceptedVersion })) },
-      snapshot: { scope: 'statement', takenAt: new Date(totals.taken_at).toISOString() },
+      snapshot: { scope: 'statement', takenAt: isoString(totals.taken_at as Date) },
       groupBy: each(spec.groupBy, dimension => ({ field: dimension.field, kind: kindOf(dimension.field), bucket: dimension.bucket,
         semantics: dimension.bucket ? 'derived' : 'exact' })),
       metrics: each(spec.metrics, metric => ({ op: metric.op, field: metric.field, semantics: metric.op === 'avg' ? 'derived' : 'exact',

@@ -398,9 +398,13 @@ test('a typed spec admits only declared ready index fields, allowlisted operator
   for (const text of ['{', 'null', '[]', JSON.stringify({ metrics: [{ op: 'count' }], sql: 'x' }), ' '.repeat(32_769), 42])
     await rejects(analyticServices.analysis.aggregate(f.owner, f.spaceId, 'items', text), 'INVALID_ARGUMENT');
   await rejects(analyticServices.analysis.aggregate(writer, f.spaceId, 'items', '{'), 'FORBIDDEN');
-  // Without an analytical pool of its own a cell runs no aggregation at all, rather than borrow interactive capacity.
+  // Without an analytical pool of its own a cell runs no aggregation at all, rather than borrow interactive capacity; it
+  // still authorizes first, so a caller without records:read or a missing collection is refused as such.
   await rejects(services.analysis.aggregate(f.owner, f.spaceId, 'items', JSON.stringify({ metrics: [{ op: 'count' }] })),
     'PROVIDER_UNAVAILABLE', error => assert.equal(error.retryable, false));
+  await rejects(services.analysis.aggregate(writer, f.spaceId, 'items', JSON.stringify({ metrics: [{ op: 'count' }] })), 'FORBIDDEN');
+  await rejects(services.analysis.aggregate(f.owner, f.spaceId, 'missing', JSON.stringify({ metrics: [{ op: 'count' }] })), 'NOT_FOUND');
+  await rejects(services.analysis.aggregate(f.owner, f.spaceId, 'items', '{'), 'INVALID_ARGUMENT');
   assert.throws(() => postgresServices(spaces, new Map([['cell-a', { pool, cursorSecret: randomBytes(32),
     analytics: { pool, originConnectionLimit: 5 } }]]), 3600), /analytical pool apart/);
   // The adapter itself refuses an analytical pool that is its admission pool, whoever composes it.
@@ -480,56 +484,127 @@ test('an IN value proxy is refused before any inspection, through aggregations a
   assert.equal(await authority.transaction(scope, tx => tx.countRecords([{ field: 'score', kind: 'number', operator: 'in', value: [1] }])), 1);
 });
 
-test('replaced includes and Map intrinsics never admit a spec, skip the slot bound or escape untyped', async () => {
-  const f = await fixture();
-  await f.write('items', { operation: 'create', data: { team: 'red', score: 2, active: true, at: '2026-01-01T00:00:00Z' } });
+test('replaced built-ins never admit a spec, corrupt a result, hide bytes, skip the slot bound or escape untyped', async () => {
+  const f = await fixture(['items', 'counts']);
+  for (const data of [{ team: 'red', score: 0.1, active: true, at: '2026-01-01T00:00:00Z' },
+    { team: 'red', score: 0.2, active: false, at: '2026-01-01T05:00:00Z' }, { team: 'blue', score: -0.5, at: '2026-03-01T00:00:00Z' }])
+    await f.write('items', { operation: 'create', data });
+  await bulk(f.spaceId, 1000, n => `k${n}`, 'counts');
   const service = aggregations();
-  const refused = [{ metrics: [{ op: 'count' }], groupBy: [{ field: 'at', bucket: { unit: 'decade', timeZone: 'UTC' } }] },
+  const count = [{ op: 'count' }], longField = 'x'.repeat(300), byDay = timeZone => [{ field: 'at', bucket: { unit: 'day', timeZone } }];
+  // Each spec is refused by an allowlist, bound or zone rule that one of the replacements below would otherwise defeat.
+  const refused = [{ metrics: count, groupBy: [{ field: 'at', bucket: { unit: 'decade', timeZone: 'UTC' } }] },
     { metrics: [{ op: 'sum', field: 'active' }] }, { metrics: [{ op: 'avg', field: 'active' }] }, { metrics: [{ op: 'median', field: 'score' }] },
-    { metrics: [{ op: 'count' }], groupBy: [{ field: 'at', bucket: { unit: 'day', timeZone: 'WET' } }] }];
-  const control = { metrics: [{ op: 'count' }, { op: 'sum', field: 'score' }], where: [{ field: 'team', kind: 'string', operator: 'eq', value: 'red' }],
-    groupBy: [{ field: 'team' }, { field: 'at', bucket: { unit: 'year', timeZone: 'UTC' } }] };
-  const original = { includes: Array.prototype.includes, get: Map.prototype.get };
-  let answered;
+    { metrics: count, groupBy: byDay('WET') }, { metrics: count, groupBy: byDay('+05:00') }, { metrics: count, groupBy: byDay('UTC+3') },
+    { metrics: count, maxGroups: 1.5 }, { metrics: count, maxGroups: '1' }, { metrics: [{ op: 'max', field: longField }] }];
+  const texts = refused.map(spec => JSON.stringify(spec));
+  const padded = `${' '.repeat(32_768)}${JSON.stringify({ metrics: count })}`, zeroGroups = JSON.stringify({ metrics: count, maxGroups: 0 });
+  const counts = { groupBy: [{ field: 'team' }], metrics: Array.from({ length: 16 }, () => ({ op: 'count' })), maxGroups: 1000 };
+  const countsText = JSON.stringify(counts);
+  const control = { groupBy: [{ field: 'team' }, { field: 'at', bucket: { unit: 'day', timeZone: 'Asia/Kolkata' } }],
+    metrics: [{ op: 'count' }, { op: 'sum', field: 'score' }, { op: 'avg', field: 'score' }, { op: 'min', field: 'score' }] };
+  const controlText = JSON.stringify(control);
+  const original = { includes: Array.prototype.includes, get: Map.prototype.get, isSafeInteger: Number.isSafeInteger,
+    test: RegExp.prototype.test, exec: RegExp.prototype.exec, DateTimeFormat: Intl.DateTimeFormat, parse: JSON.parse,
+    stringify: JSON.stringify, byteLength: Buffer.byteLength, toISOString: Date.prototype.toISOString,
+    strings: Object.fromEntries(['replace', 'startsWith', 'split', 'slice', 'padStart', 'toLowerCase', 'includes', 'indexOf']
+      .map(name => [name, String.prototype[name]])) };
+  const numeric = value => typeof value === 'string' && Reflect.apply(original.test, /^-?[0-9]+\.[0-9]+$/, [value]);
+  const tampered = new Set(['2025-12-31T18:30:00.000Z', '2026-01-01T00:00:00.000Z', '2026-02-28T18:30:00.000Z', '2026-03-01T00:00:00.000Z']);
+  const outcomes = [];
   try {
-    // The tamper admits exactly the values an allowlist must refuse; every other membership answers as before.
+    // Every replacement admits exactly what a rule must refuse, or corrupts exactly what the control must report; any
+    // other call answers as before, so the database driver and the authority checks keep working.
     Array.prototype.includes = function (value) {
       if (value === 'decade' || value === 'boolean' || value === 'median' || value === 'wet') return true;
       return Reflect.apply(original.includes, this, [value]);
     };
-    // A tampered Map forgets every running count and presents every declared index as a number.
     Map.prototype.get = function (key) {
       const value = Reflect.apply(original.get, this, [key]);
       if (typeof value === 'number') return 0;
       if (value && typeof value === 'object' && Object.hasOwn(value, 'kind') && Object.hasOwn(value, 'ready')) return { ...value, kind: 'number' };
       return value;
     };
-    for (const spec of refused) {
-      await rejects(service.aggregate(f.owner, f.spaceId, 'items', spec), 'INVALID_ARGUMENT');
-      await rejects(service.aggregateSerialized(f.owner, f.spaceId, 'items', JSON.stringify(spec)), 'INVALID_ARGUMENT');
-      await rejects(analyticServices.analysis.aggregate(f.owner, f.spaceId, 'items', JSON.stringify(spec)), 'INVALID_ARGUMENT');
+    Number.isSafeInteger = value => Number.isNaN(value) || value === 1.5 || value === '1' || original.isSafeInteger(value);
+    RegExp.prototype.test = function (value) { return value === '+05:00' || Reflect.apply(original.test, this, [value]); };
+    RegExp.prototype.exec = function (value) { return value === '+05:00' ? ['+05:00'] : Reflect.apply(original.exec, this, [value]); };
+    Intl.DateTimeFormat = function (locale, options) {
+      return options?.timeZone === 'UTC+3' || options?.timeZone === '+05:00' ? {} : new original.DateTimeFormat(locale, options);
+    };
+    JSON.parse = (text, reviver) => text === zeroGroups ? { metrics: [{ op: 'count' }] } : original.parse(text, reviver);
+    JSON.stringify = (value, ...rest) => Array.isArray(value) && value.length >= 1000 ? '[]' : original.stringify(value, ...rest);
+    Object.defineProperty(Array.prototype, 'toJSON', { configurable: true, writable: true,
+      value() { return this.length >= 1000 ? [] : this; } });
+    // Only the long field name and the padded spec are undercounted; the driver sizes its own messages with byteLength.
+    Buffer.byteLength = (value, encoding) => value === longField || value === padded ? 1 : original.byteLength(value, encoding);
+    Date.prototype.toISOString = function () {
+      const text = Reflect.apply(original.toISOString, this, []);
+      return tampered.has(text) ? '1999-01-01T00:00:00.000Z' : text;
+    };
+    const strings = original.strings, corrupt = {
+      replace: () => '0', startsWith: () => false, split: function () { return [Reflect.apply(strings.slice, this, [0, 1])]; },
+      slice: () => 'sliced', includes: () => false, indexOf: () => -1 };
+    for (const [name, value] of Object.entries(corrupt))
+      String.prototype[name] = function (...args) { return numeric(this) ? value.apply(this, args) : Reflect.apply(strings[name], this, args); };
+    String.prototype.slice = function (...args) {
+      return numeric(this) || tampered.has(`${this}`) || Reflect.apply(strings.startsWith, `${this}`, ['202']) && args[1] === -5
+        ? 'sliced' : Reflect.apply(strings.slice, this, args);
+    };
+    String.prototype.padStart = function (...args) { return args[1] === '0' ? '#' : Reflect.apply(strings.padStart, this, args); };
+    String.prototype.toLowerCase = function () { return `${this}` === 'WET' ? 'utc' : Reflect.apply(strings.toLowerCase, this, []); };
+
+    for (let i = 0; i < refused.length; i++) {
+      await rejects(service.aggregate(f.owner, f.spaceId, 'items', refused[i]), 'INVALID_ARGUMENT');
+      await rejects(service.aggregateSerialized(f.owner, f.spaceId, 'items', texts[i]), 'INVALID_ARGUMENT');
+      await rejects(analyticServices.analysis.aggregate(f.owner, f.spaceId, 'items', texts[i]), 'INVALID_ARGUMENT');
     }
+    await rejects(service.aggregate(f.owner, f.spaceId, 'items', { metrics: count, maxGroups: NaN }), 'INVALID_ARGUMENT');
+    for (const text of [padded, zeroGroups]) {
+      await rejects(service.aggregateSerialized(f.owner, f.spaceId, 'items', text), 'INVALID_ARGUMENT');
+      await rejects(analyticServices.analysis.aggregate(f.owner, f.spaceId, 'items', text), 'INVALID_ARGUMENT');
+    }
+    // 16 counts over 1,000 keys are past the byte cap, whatever an inherited toJSON or a replaced stringify reports.
+    await limited(service.aggregate(f.owner, f.spaceId, 'counts', counts), 'bytes');
+    await limited(service.aggregateSerialized(f.owner, f.spaceId, 'counts', countsText), 'bytes');
+    await limited(analyticServices.analysis.aggregate(f.owner, f.spaceId, 'counts', countsText), 'bytes');
     // The per-process bound still holds: with one slot (origin limit 5), a second aggregation while the first waits on its
     // analytical connection is refused, not admitted by a forgotten count.
     let release, connected;
     const held = new Promise(resolve => { release = resolve; }), arrived = new Promise(resolve => { connected = resolve; });
     gates.push(release);
     const single = aggregations({ connect: async () => { connected(); await held; return analyticalPool.connect(); } }, 5);
-    const first = single.aggregate(f.owner, f.spaceId, 'items', { metrics: [{ op: 'count' }] });
+    const first = single.aggregate(f.owner, f.spaceId, 'items', { metrics: count });
     await arrived;
-    await limited(single.aggregate(f.owner, f.spaceId, 'items', { metrics: [{ op: 'count' }] }), 'slots');
+    await limited(single.aggregate(f.owner, f.spaceId, 'items', { metrics: count }), 'slots');
     release();
-    assert.equal((await first).groups[0].count, 1);
-    answered = await service.aggregateSerialized(f.owner, f.spaceId, 'items', JSON.stringify(control));
+    outcomes.push((await first).groups[0].count);
+    outcomes.push(await service.aggregate(f.owner, f.spaceId, 'items', control));
+    outcomes.push(await service.aggregateSerialized(f.owner, f.spaceId, 'items', controlText));
+    outcomes.push(await analyticServices.analysis.aggregate(f.owner, f.spaceId, 'items', controlText));
   } finally {
     Array.prototype.includes = original.includes;
     Map.prototype.get = original.get;
+    Number.isSafeInteger = original.isSafeInteger;
+    RegExp.prototype.test = original.test;
+    RegExp.prototype.exec = original.exec;
+    Intl.DateTimeFormat = original.DateTimeFormat;
+    JSON.parse = original.parse;
+    JSON.stringify = original.stringify;
+    delete Array.prototype.toJSON;
+    Buffer.byteLength = original.byteLength;
+    Date.prototype.toISOString = original.toISOString;
+    for (const [name, value] of Object.entries(original.strings)) String.prototype[name] = value;
   }
-  assert.equal(answered.groups.length, 1);
-  assert.deepEqual(answered.groups[0].key, [{ kind: 'value', value: 'red' },
-    { kind: 'value', value: '2026-01-01T00:00:00Z', local: '2026-01-01T00:00:00+00:00' }]);
-  assert.deepEqual(answered.groups[0].metrics.map(metric => metric.value), [1, '2']);
-  assert.deepEqual(answered.collection.fields.map(item => [item.field, item.kind]), [['team', 'string'], ['at', 'date-time'], ['score', 'number']]);
+  assert.equal(outcomes[0], 3);
+  for (const answered of outcomes.slice(1)) {
+    assert.deepEqual(answered.groups.map(group => [group.key, group.count, group.metrics.map(metric => metric.value)]), [
+      [[{ kind: 'value', value: 'blue' }, { kind: 'value', value: '2026-02-28T18:30:00Z', local: '2026-03-01T00:00:00+05:30' }], 1,
+        [1, '-0.5', '-0.5', -0.5]],
+      [[{ kind: 'value', value: 'red' }, { kind: 'value', value: '2025-12-31T18:30:00Z', local: '2026-01-01T00:00:00+05:30' }], 2,
+        [2, '0.3', '0.15', 0.1]]]);
+    assert.deepEqual(answered.collection.fields.map(item => [item.field, item.kind]), [['team', 'string'], ['at', 'date-time'], ['score', 'number']]);
+    assert.match(answered.snapshot.takenAt, /^20[2-9][0-9]-[0-9]{2}-[0-9]{2}T[0-9:.]+Z$/);
+  }
 });
 
 test('a runtime without proxy detection aggregates serialized specs and refuses object specs', () => {
@@ -588,7 +663,11 @@ test('time buckets follow IANA zone rules, never a fixed-offset abbreviation of 
     const result = await service.aggregate(f.owner, f.spaceId, 'items', byDay(timeZone));
     assert.deepEqual(result.groupBy[0].bucket, { unit: 'day', timeZone: 'Etc/UTC' });
     sameAsOracle(result, records, byDay('Etc/UTC'));
-  }
+  }  // Where DST skips midnight, the day starts when it resumes: America/Santiago's 2026-09-06 starts at 01:00 local, 04:00Z.
+  const g = await fixture();
+  await g.write('items', { operation: 'create', data: { at: '2026-09-06T12:00:00Z' } });
+  assert.deepEqual((await service.aggregate(g.owner, g.spaceId, 'items', byDay('America/Santiago'))).groups.map(group => group.key[0]),
+    [{ kind: 'value', value: '2026-09-06T04:00:00Z', local: '2026-09-06T01:00:00-03:00' }]);
 });
 
 test('bucket starts and local labels agree in proleptic ISO years at both ends of the instant range', async () => {
