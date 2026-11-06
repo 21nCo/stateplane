@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import { types } from 'node:util';
 import { AuthorityError } from './index.js';
 import type { IndexValue, UniqueValue } from './index.js';
+import { append, apply, hasOwn as own, isFiniteNumber, isSafeInteger, NativeDate, ownDescriptor, setAdd, setDelete,
+  setHas } from './intrinsics.js';
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export interface SchemaNode {
@@ -28,10 +30,9 @@ const maxFields = 256;
 export const MAX_INDEX_PART_BYTES = 256;
 export const MAX_INDEX_VALUE_BYTES = 512;
 const withinBytes = (value:string, limit:number):boolean => Buffer.byteLength(value,'utf8') <= limit;
-const own = Object.hasOwn;
-const isFiniteNumber = Number.isFinite;
+// The predicate and aggregation admission helpers below (includes, any, distinct, scalarLength, scalarString, utcInstant)
+// call built-ins only through ./intrinsics.js and these load-time captures, so a later replacement cannot change what they admit.
 const isIntegerNumber = Number.isInteger;
-const isSafeInteger = Number.isSafeInteger;
 const normalize = String.prototype.normalize;
 const codeUnit = String.prototype.charCodeAt;
 const slice = String.prototype.slice;
@@ -40,10 +41,6 @@ const endsWith = String.prototype.endsWith;
 const nativeSort = Array.prototype.sort;
 const nativeJoin = Array.prototype.join;
 const nativeRegexExec = RegExp.prototype.exec;
-const nativeSetHas = Set.prototype.has;
-const nativeSetAdd = Set.prototype.add;
-const nativeSetDelete = Set.prototype.delete;
-const NativeDate = Date;
 const nativeGetTime = Date.prototype.getTime;
 const nativeISOString = Date.prototype.toISOString;
 const proxyDetector=(()=>{
@@ -57,29 +54,25 @@ export const acceptsInProcessObjects=proxyDetector!==null;
 /** Treat objects as unsafe when the runtime cannot reliably detect proxies. */
 export const isInProcessProxy = (value:unknown):boolean => proxyDetector ? proxyDetector(value) : true;
 const compare = (a: string,b: string) => Buffer.compare(Buffer.from(a),Buffer.from(b));
-const append = <T>(values:T[],value:T):void => { Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
 /** Compare own array slots without invoking a replaced iterator or includes method. */
 export const includes = <T>(values:readonly T[],value:T):boolean => {
-  for (let i=0;i<values.length;i++) if (Object.getOwnPropertyDescriptor(values,i)?.value===value) return true;
+  for (let i=0;i<values.length;i++) if (ownDescriptor(values,i)?.value===value) return true;
   return false;
 };
 const distinct = (values:readonly unknown[]):boolean => {
-  for (let i=0;i<values.length;i++) for (let j=0;j<i;j++) if (Object.getOwnPropertyDescriptor(values,i)?.value===Object.getOwnPropertyDescriptor(values,j)?.value) return false;
+  for (let i=0;i<values.length;i++) for (let j=0;j<i;j++) if (ownDescriptor(values,i)?.value===ownDescriptor(values,j)?.value) return false;
   return true;
 };
 const any = <T>(values:readonly T[],predicate:(value:T)=>boolean):boolean => {
-  for (let i=0;i<values.length;i++) if (predicate(Object.getOwnPropertyDescriptor(values,i)!.value)) return true;
+  for (let i=0;i<values.length;i++) if (predicate(ownDescriptor(values,i)!.value)) return true;
   return false;
 };
-const sorted = <T>(values:T[],comparison:(a:T,b:T)=>number):T[] => Reflect.apply(nativeSort,values,[comparison]) as T[];
-const joined = (values:readonly string[],separator:string):string => Reflect.apply(nativeJoin,values,[separator]) as string;
-const setHas = <T>(set:Set<T>,value:T):boolean => Reflect.apply(nativeSetHas,set,[value]) as boolean;
-const setAdd = <T>(set:Set<T>,value:T):void => { Reflect.apply(nativeSetAdd,set,[value]); };
-const setDelete = <T>(set:Set<T>,value:T):void => { Reflect.apply(nativeSetDelete,set,[value]); };
+const sorted = <T>(values:T[],comparison:(a:T,b:T)=>number):T[] => apply(nativeSort,values,[comparison]) as T[];
+const joined = (values:readonly string[],separator:string):string => apply(nativeJoin,values,[separator]) as string;
 const scalarLength=(value:string):number=>{
   let count=0;
   for (let i=0;i<value.length;i++) {
-    const unit=Reflect.apply(codeUnit,value,[i]) as number;
+    const unit=apply(codeUnit,value,[i]) as number;
     if (unit>=0xd800 && unit<=0xdbff) i++;
     count++;
   }
@@ -94,10 +87,10 @@ const fail = (code: string, message?: string): never => { throw new AuthorityErr
 export function scalarString(value: unknown, allowNul = false): value is string {
   if (typeof value !== 'string') return false;
   for (let i=0;i<value.length;i++) {
-    const unit = Reflect.apply(codeUnit,value,[i]) as number;
+    const unit = apply(codeUnit,value,[i]) as number;
     if ((!allowNul && unit === 0) || (unit >= 0xdc00 && unit <= 0xdfff)) return false;
     if (unit >= 0xd800 && unit <= 0xdbff) {
-      const next = Reflect.apply(codeUnit,value,[++i]) as number;
+      const next = apply(codeUnit,value,[++i]) as number;
       if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
     }
   }
@@ -290,19 +283,19 @@ function validateNodeEnum(node:SchemaNode,depth:number):void {
 const leapDays = new Set(['1972-06-30','1972-12-31','1973-12-31','1974-12-31','1975-12-31','1976-12-31','1977-12-31','1978-12-31','1979-12-31','1981-06-30','1982-06-30','1983-06-30','1985-06-30','1987-12-31','1989-12-31','1990-12-31','1992-06-30','1993-06-30','1994-06-30','1995-12-31','1997-06-30','1998-12-31','2005-12-31','2008-12-31','2012-06-30','2015-06-30','2016-12-31']);
 /** Normalize an accepted UTC instant while preserving precise fractional ordering. */
 export function utcInstant(value: string): string {
-  const match=Reflect.apply(nativeRegexExec,/^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z$/,[value]) as RegExpExecArray | null;
-  if (!match || Reflect.apply(startsWith,match[1],['0000-'])) fail('SCHEMA_INVALID');
+  const match=apply(nativeRegexExec,/^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z$/,[value]) as RegExpExecArray | null;
+  if (!match || apply(startsWith,match[1],['0000-'])) fail('SCHEMA_INVALID');
   const checkedMatch=match!;
-  const leap=Reflect.apply(endsWith,checkedMatch[1],['T23:59:60']) as boolean;
-  if (Reflect.apply(endsWith,checkedMatch[1],[':60']) &&
-    (!leap || !setHas(leapDays,Reflect.apply(slice,checkedMatch[1],[0,10]) as string))) fail('SCHEMA_INVALID');
-  const checked=leap ? `${Reflect.apply(slice,checkedMatch[1],[0,-2])}59` : checkedMatch[1];
+  const leap=apply(endsWith,checkedMatch[1],['T23:59:60']) as boolean;
+  if (apply(endsWith,checkedMatch[1],[':60']) &&
+    (!leap || !setHas(leapDays,apply(slice,checkedMatch[1],[0,10]) as string))) fail('SCHEMA_INVALID');
+  const checked=leap ? `${apply(slice,checkedMatch[1],[0,-2])}59` : checkedMatch[1];
   const instant=new NativeDate(`${checked}Z`);
-  if (!isFiniteNumber(Reflect.apply(nativeGetTime,instant,[])) ||
-    (Reflect.apply(slice,Reflect.apply(nativeISOString,instant,[]) as string,[0,19]) as string)!==checked) fail('SCHEMA_INVALID');
+  if (!isFiniteNumber(apply(nativeGetTime,instant,[])) ||
+    (apply(slice,apply(nativeISOString,instant,[]) as string,[0,19]) as string)!==checked) fail('SCHEMA_INVALID');
   let fraction=checkedMatch[2]??'';
-  while (fraction.length && Reflect.apply(codeUnit,fraction,[fraction.length-1])===48)
-    fraction=Reflect.apply(slice,fraction,[0,-1]) as string;
+  while (fraction.length && apply(codeUnit,fraction,[fraction.length-1])===48)
+    fraction=apply(slice,fraction,[0,-1]) as string;
   const suffix=fraction ? '.'+fraction : '';
   return `${checkedMatch[1]}${suffix}Z`;
 }
@@ -494,11 +487,11 @@ for (let i=0x2000;i<=0x200a;i++) whites.add(i);
 /** Normalize a caller key using the fixed v1 Unicode trim and NFC rule. */
 export function externalKey(value: unknown): string {
   if (!scalarString(value)) fail('INVALID_ARGUMENT');
-  const n=Reflect.apply(normalize,value,['NFC']) as string;
+  const n=apply(normalize,value,['NFC']) as string;
   let start=0,end=n.length;
-  while (start<end && setHas(whites,Reflect.apply(codeUnit,n,[start]) as number)) start++;
-  while (end>start && setHas(whites,Reflect.apply(codeUnit,n,[end-1]) as number)) end--;
-  const result=Reflect.apply(slice,n,[start,end]) as string;
+  while (start<end && setHas(whites,apply(codeUnit,n,[start]) as number)) start++;
+  while (end>start && setHas(whites,apply(codeUnit,n,[end-1]) as number)) end--;
+  const result=apply(slice,n,[start,end]) as string;
   if (!result || !withinBytes(result,MAX_INDEX_PART_BYTES)) fail('INVALID_ARGUMENT','External key exceeds indexed byte limit');
   return result;
 }
@@ -548,7 +541,7 @@ function encodeUniqueTuple(data:Record<string,Json>,definition:CollectionDefinit
     let normalized:string;
     if (typeof value!=='string') normalized=canonical(value);
     else if (own(field,'format') && field.format==='date-time') normalized=utcInstant(value);
-    else normalized=Reflect.apply(normalize,value,['NFC']) as string;
+    else normalized=apply(normalize,value,['NFC']) as string;
     append(parts,`${tag}:${Buffer.byteLength(normalized)}:${normalized}`);
   }
   const encodedValue=joined(parts,'');

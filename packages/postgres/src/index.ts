@@ -5,6 +5,8 @@ import { claimOutboxSql, failOutboxSql, LIVE_OUTBOX } from './outbox-sql.js';
 import { parseRevision } from '@stateplane/contracts';
 import type { Capability, CollectionId, RecordRef, Revision, SpaceId } from '@stateplane/contracts';
 import { acceptsInProcessObjects, canonical, derivedParsedValues, externalKey, fingerprint, isInProcessProxy, MAX_INDEX_PART_BYTES, MAX_INDEX_VALUE_BYTES, plainJson, scalarString as unicodeString, utcInstant, validateParsedValue } from './schema.js';
+import { append, apply, ArrayPrototype, freeze, hasOwn, isArray, isFiniteNumber, isSafeInteger, mapClear, mapForEach, mapGet, mapHas,
+  mapSet, NativeNumber, ObjectPrototype, ownDescriptor, ownKeys, parseJson, prototypeOf, setAdd, setClear, setForEach, setHas, utf8Bytes } from './intrinsics.js';
 import type { CollectionDefinition, Json } from './schema.js';
 export { CollectionRegistry } from './collections.js';
 export { externalKey, validateDefinition, validateValue, compatible, derivedValues } from './schema.js';
@@ -72,11 +74,19 @@ interface PageCursor {
 
 /** Compile one typed comparison after checking its scalar parameter. */
 function comparison(predicate: Exclude<ScalarPredicate, { kind: 'null' }>, alias: string, params: unknown[]): string {
-  const column = { string:'string_value','date-time':'time_value',number:'number_value',boolean:'boolean_value' }[predicate.kind];
+  const column = predicateColumn(predicate.kind);
+  if (typeof predicate.operator!=='string' || !arrayHas(COMPARISON_OPERATORS,predicate.operator)) throw new AuthorityError('INVALID_ARGUMENT');
   if (predicate.operator==='in') {
-    if (!Array.isArray(predicate.value) || predicate.value.length<1 || predicate.value.length>16 ||
-      predicate.value.some(value=>!validPredicateValue(predicate.kind,value))) throw new AuthorityError('INVALID_ARGUMENT');
-    params.push(predicate.value);
+    const choices: unknown = predicate.value;
+    if (!isArray(choices) || choices.length<1 || choices.length>16) throw new AuthorityError('INVALID_ARGUMENT');
+    // The bound list is a fresh copy of the checked own slots, so nothing inherited supplies or rewrites a member.
+    const bound: unknown[]=[];
+    for (let i=0;i<choices.length;i++) {
+      const choice=ownDescriptor(choices,i)?.value;
+      if (!validPredicateValue(predicate.kind,choice)) throw new AuthorityError('INVALID_ARGUMENT');
+      append(bound,choice);
+    }
+    append(params,bound);
     let arrayType='text';
     if (predicate.kind==='number') arrayType='numeric';
     else if (predicate.kind==='boolean') arrayType='boolean';
@@ -84,21 +94,41 @@ function comparison(predicate: Exclude<ScalarPredicate, { kind: 'null' }>, alias
       WHERE stateplane_instant_sort_key(${alias}.${column}) COLLATE "C" = stateplane_instant_sort_key(choice.value) COLLATE "C")`;
     return ` AND ${alias}.${column} = ANY($${params.length}::${arrayType}[])`;
   }
-  const operator = { eq:'=',lt:'<',lte:'<=',gt:'>',gte:'>=' }[predicate.operator];
-  if (!operator) throw new AuthorityError('INVALID_ARGUMENT');
+  const operator = sqlOperator(predicate.operator);
   if (!validPredicateValue(predicate.kind,predicate.value)) throw new AuthorityError('INVALID_ARGUMENT');
-  params.push(predicate.value);
+  append(params,predicate.value);
   if (predicate.kind === 'date-time') {
     return ` AND stateplane_instant_sort_key(${alias}.${column}) COLLATE "C" ${operator} stateplane_instant_sort_key($${params.length}::text) COLLATE "C"`;
   }
   return ` AND ${alias}.${column} ${operator} $${params.length}`;
 }
+/** Operators a non-null predicate accepts; compared by identity, never used as a property key. */
+const COMPARISON_OPERATORS: readonly string[] = Object.freeze(['eq','lt','lte','gt','gte','in']);
+function predicateColumn(kind: unknown): string {
+  switch (kind) {
+    case 'string': return 'string_value';
+    case 'date-time': return 'time_value';
+    case 'number': return 'number_value';
+    case 'boolean': return 'boolean_value';
+    default: throw new AuthorityError('INVALID_ARGUMENT');
+  }
+}
+function sqlOperator(operator: unknown): string {
+  switch (operator) {
+    case 'eq': return '=';
+    case 'lt': return '<';
+    case 'lte': return '<=';
+    case 'gt': return '>';
+    case 'gte': return '>=';
+    default: throw new AuthorityError('INVALID_ARGUMENT');
+  }
+}
 function validPredicateValue(kind:string,value:unknown):boolean {
   if (kind==='number') return typeof value==='number' && isFiniteNumber(value);
   if (kind==='boolean') return typeof value==='boolean';
-  if (kind==='string') return valueString(value) && Buffer.byteLength(value)<=MAX_INDEX_VALUE_BYTES;
+  if (kind==='string') return valueString(value) && utf8Bytes(value)<=MAX_INDEX_VALUE_BYTES;
   if (kind==='date-time') {
-    if (!scalarString(value) || Buffer.byteLength(value)>MAX_INDEX_VALUE_BYTES) return false;
+    if (!scalarString(value) || utf8Bytes(value)>MAX_INDEX_VALUE_BYTES) return false;
     try { utcInstant(value); return true; } catch { return false; }
   }
   return false;
@@ -118,6 +148,18 @@ export class AuthorityError extends Error {
     public readonly retryable?: boolean) { super(message); this.name = 'AuthorityError'; }
 }
 class BatchItemFailure extends AuthorityError {}
+/**
+ * An aggregation refused or cancelled at one of its budgets: no free
+ * analytical slot (`BACKPRESSURE`, retryable), or more groups, more result
+ * bytes or more statement time than its caps allow (`RATE_LIMITED`, not
+ * retryable unchanged). No partial result is ever returned.
+ */
+export class AggregationLimitError extends AuthorityError {
+  constructor(readonly limit: 'slots' | 'groups' | 'bytes' | 'time', message: string) {
+    super(limit === 'slots' ? 'BACKPRESSURE' : 'RATE_LIMITED', message, undefined, limit === 'slots');
+    this.name = 'AggregationLimitError';
+  }
+}
 export class CommitOutcomeUnknownError extends Error {
   /** A missing commit acknowledgement requires operation-specific recovery. */
   constructor(cause: unknown) {
@@ -135,44 +177,28 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const retryCodes = new Set(['40P01', '40001']);
 const validDigest = /^[0-9a-f]{64}$/;
 const serializedMarker=Symbol('stateplane parsed JSON');
-const isFiniteNumber = Number.isFinite;
-const isSafeInteger = Number.isSafeInteger;
+// The predicate compiler, its snapshot helpers and the transaction lifecycle call built-ins only through the load-time
+// captures in ./intrinsics.js and build arrays with own data slots, so a later replacement cannot admit, rewrite or
+// misbind a predicate, or make a transaction's cleanup fail untyped.
 const nativeStringIncludes = String.prototype.includes;
-const nativeSetHas=Set.prototype.has;
-const nativeSetAdd=Set.prototype.add;
-const nativeSetClear=Set.prototype.clear;
-const nativeSetForEach=Set.prototype.forEach;
-const nativeMapGet=Map.prototype.get;
-const nativeMapSet=Map.prototype.set;
-const nativeMapHas=Map.prototype.has;
-const nativeMapClear=Map.prototype.clear;
-const nativeMapForEach=Map.prototype.forEach;
 /** Compare own array slots without invoking a replaced includes method. */
 const arrayHas=(values:readonly unknown[],wanted:unknown):boolean=>{
-  for (let i=0;i<values.length;i++) if (Object.getOwnPropertyDescriptor(values,i)?.value===wanted) return true;
+  for (let i=0;i<values.length;i++) if (ownDescriptor(values,i)?.value===wanted) return true;
   return false;
 };
-const append=<T>(values:T[],value:T):void=>{ Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
-const setHas=<T>(values:Set<T>,wanted:T):boolean=>Reflect.apply(nativeSetHas,values,[wanted]) as boolean;
-const setAdd=<T>(values:Set<T>,wanted:T):void=>{ Reflect.apply(nativeSetAdd,values,[wanted]); };
-const setClear=<T>(values:Set<T>):void=>{ Reflect.apply(nativeSetClear,values,[]); };
-const mapGet=<T>(values:Map<string,T>,key:string):T|undefined=>Reflect.apply(nativeMapGet,values,[key]) as T|undefined;
-const mapSet=<T>(values:Map<string,T>,key:string,value:T):void=>{ Reflect.apply(nativeMapSet,values,[key,value]); };
-const mapHas=<T>(values:Map<string,T>,key:string):boolean=>Reflect.apply(nativeMapHas,values,[key]) as boolean;
-const mapClear=<T>(values:Map<string,T>):void=>{ Reflect.apply(nativeMapClear,values,[]); };
 const mapValues=<T>(source:Map<string,T>):T[]=>{
   const values:T[]=[];
-  Reflect.apply(nativeMapForEach,source,[(value:T)=>append(values,value)]);
+  mapForEach(source,(value:T)=>append(values,value));
   return values;
 };
 const setValues=<T>(source:Set<T>):T[]=>{
   const values:T[]=[];
-  Reflect.apply(nativeSetForEach,source,[(value:T)=>append(values,value)]);
+  setForEach(source,(value:T)=>append(values,value));
   return values;
 };
 /** Find a JSON string containing U+0000 before choosing the jsonb projection. */
 function containsNul(value: Json): boolean {
-  if (typeof value==='string') return Reflect.apply(nativeStringIncludes,value,['\0']) as boolean;
+  if (typeof value==='string') return apply(nativeStringIncludes,value,['\0']) as boolean;
   if (value===null || typeof value!=='object') return false;
   const keys=Object.keys(value);
   for (let i=0;i<keys.length;i++) if (containsNul((value as Record<string,Json>)[keys[i]])) return true; // NOSONAR -- own-slot scan avoids replaced array iterators
@@ -180,13 +206,13 @@ function containsNul(value: Json): boolean {
 }
 /** PostgreSQL jsonb cannot represent U+0000. The canonical text remains the authority. */
 function jsonbProjection(canonicalData:string):string|null {
-  return Reflect.apply(nativeStringIncludes,canonicalData,[String.raw`\u0000`]) && containsNul(JSON.parse(canonicalData) as Json) ? null : canonicalData;
+  return apply(nativeStringIncludes,canonicalData,[String.raw`\u0000`]) && containsNul(JSON.parse(canonicalData) as Json) ? null : canonicalData;
 }
 const validScope=(scope:AuthorityScope):boolean =>
-  scalarString(scope.spaceId) && Buffer.byteLength(scope.spaceId)<=MAX_SCOPE_ID_BYTES &&
-  scalarString(scope.collectionId) && Buffer.byteLength(scope.collectionId)<=MAX_INDEX_PART_BYTES &&
-  scalarString(scope.principalId) && Buffer.byteLength(scope.principalId)<=MAX_SCOPE_ID_BYTES &&
-  scalarString(scope.credentialId) && Buffer.byteLength(scope.credentialId)<=MAX_SCOPE_ID_BYTES &&
+  scalarString(scope.spaceId) && utf8Bytes(scope.spaceId)<=MAX_SCOPE_ID_BYTES &&
+  scalarString(scope.collectionId) && utf8Bytes(scope.collectionId)<=MAX_INDEX_PART_BYTES &&
+  scalarString(scope.principalId) && utf8Bytes(scope.principalId)<=MAX_SCOPE_ID_BYTES &&
+  scalarString(scope.credentialId) && utf8Bytes(scope.credentialId)<=MAX_SCOPE_ID_BYTES &&
   isSafeInteger(scope.policyVersion) && scope.policyVersion>0 &&
   isSafeInteger(scope.placementGeneration) && scope.placementGeneration>0;
 /** Detach nested receipt fields before exposing them to callers. */
@@ -476,60 +502,95 @@ function requestFingerprintFields(fields:Record<string,unknown>,normalized:strin
   return payload;
 }
 
+/**
+ * The AND of scalar predicates over a collection's live records, aliased `r`,
+ * through their indexed values: `$1` and `$2` are the scope's space and
+ * collection, and every predicate value is a bound parameter. Shared by exact
+ * pages, counts, existence and aggregations; callers check readiness.
+ */
+export function predicateFilter(scope: Readonly<AuthorityScope>, predicates: readonly ScalarPredicate[]): { params: unknown[]; where: string } {
+  if (!isArray(predicates) || predicates.length > 16) throw new AuthorityError('INVALID_ARGUMENT');
+  // Own slots, own-slot appends and string concatenation only: no replaced array method or iterator shapes the filter.
+  const params: unknown[] = [scope.spaceId,scope.collectionId];
+  let filter='r.space_id=$1 AND r.collection_id=$2 AND NOT r.tombstone ';
+  for (let index = 0; index < predicates.length; index++) {
+    const predicate: ScalarPredicate | undefined = ownDescriptor(predicates,index)?.value;
+    if (!predicate) throw new AuthorityError('INVALID_ARGUMENT');
+    if (!scalarString(predicate.field) || !arrayHas(['null','string','date-time','number','boolean'],predicate.kind)) throw new AuthorityError('INVALID_ARGUMENT');
+    const alias = `v${index}`;
+    append(params,predicate.field);
+    append(params,predicate.kind);
+    const fieldParam = `$${params.length - 1}`;
+    const kindParam = `$${params.length}`;
+    let compare = '';
+    if (predicate.kind === 'null') {
+      if (predicate.operator !== 'isNull') throw new AuthorityError('INVALID_ARGUMENT');
+    } else compare = comparison(predicate, alias, params);
+    filter+=`${index ? ' ' : ''}AND EXISTS (SELECT 1 FROM record_index_values ${alias} WHERE ${alias}.space_id=r.space_id
+      AND ${alias}.collection_id=r.collection_id AND ${alias}.record_id=r.record_id
+      AND ${alias}.field_name=${fieldParam} AND ${alias}.value_kind=${kindParam}${compare})`;
+  }
+  return { params, where:filter };
+}
+
 /** Reject decorated predicates and retain stable own values for query admission. */
-function snapshotPredicates(source: readonly ScalarPredicate[], trustedParsed=false): readonly ScalarPredicate[] {
-  if ((!trustedParsed && !acceptsInProcessObjects) || (!trustedParsed && isInProcessProxy(source)) || !Array.isArray(source) ||
-    Object.getPrototypeOf(source)!==Array.prototype || source.length > 16 || Reflect.ownKeys(source).length!==source.length+1)
+export function snapshotPredicates(source: readonly ScalarPredicate[], trustedParsed=false): readonly ScalarPredicate[] {
+  if ((!trustedParsed && !acceptsInProcessObjects) || (!trustedParsed && isInProcessProxy(source)) || !isArray(source) ||
+    prototypeOf(source)!==ArrayPrototype || source.length > 16 || ownKeys(source).length!==source.length+1)
     throw new AuthorityError('INVALID_ARGUMENT');
   const result: ScalarPredicate[]=[];
   for (let i=0;i<source.length;i++) {
-    const item=Object.getOwnPropertyDescriptor(source,i)?.value;
+    const item=ownDescriptor(source,i)?.value;
     append(result,snapshotPredicate(item,trustedParsed));
   }
-  return Object.freeze(result);
+  return freeze(result);
 }
 function parseSerializedPredicates(serialized:string):readonly ScalarPredicate[] {
-  if (typeof serialized!=='string' || Buffer.byteLength(serialized)>32_768) throw new AuthorityError('INVALID_ARGUMENT');
-  try { return snapshotPredicates(JSON.parse(serialized),true); }
+  if (typeof serialized!=='string' || utf8Bytes(serialized)>32_768) throw new AuthorityError('INVALID_ARGUMENT');
+  try { return snapshotPredicates(parseJson(serialized) as readonly ScalarPredicate[],true); }
   catch { throw new AuthorityError('INVALID_ARGUMENT'); }
 }
 /** Retain a predicate's own data properties and reject decorated objects. */
 function predicateDataKeys(item:object,kind:unknown):void {
   const accepted=kind==='null' ? ['field','kind','operator'] : ['field','kind','operator','value'];
-  const keys=Reflect.ownKeys(item);
+  const keys=ownKeys(item);
   if (keys.length!==accepted.length) throw new AuthorityError('INVALID_ARGUMENT');
   for (let j=0;j<keys.length;j++) { // NOSONAR -- own-slot scan avoids replaced array iterators
-    const key=keys[j],descriptor=Object.getOwnPropertyDescriptor(item,key);
-    if (typeof key!=='string' || !arrayHas(accepted,key) || !descriptor?.enumerable || !Object.hasOwn(descriptor,'value'))
+    const key=keys[j],descriptor=ownDescriptor(item,key);
+    if (typeof key!=='string' || !arrayHas(accepted,key) || !descriptor?.enumerable || !hasOwn(descriptor,'value'))
       throw new AuthorityError('INVALID_ARGUMENT');
   }
 }
 function snapshotInValues(value:unknown,kind:string,trustedParsed:boolean):readonly (string|number|boolean)[] {
-  if (!Array.isArray(value) || (!trustedParsed && isInProcessProxy(value)) ||
-    Object.getPrototypeOf(value)!==Array.prototype || value.length<1 || value.length>16 ||
-    Reflect.ownKeys(value).length!==value.length+1) throw new AuthorityError('INVALID_ARGUMENT');
+  // A proxy is refused before any other inspection, so neither a trap nor a revoked proxy's TypeError is reached.
+  if (!value || typeof value!=='object' || (!trustedParsed && isInProcessProxy(value)) || !isArray(value) ||
+    prototypeOf(value)!==ArrayPrototype || value.length<1 || value.length>16 ||
+    ownKeys(value).length!==value.length+1) throw new AuthorityError('INVALID_ARGUMENT');
   const values:(string|number|boolean)[]=[];
   for (let i=0;i<value.length;i++) {
-    const descriptor=Object.getOwnPropertyDescriptor(value,i);
-    if (!descriptor?.enumerable || !Object.hasOwn(descriptor,'value') || !validPredicateValue(kind,descriptor.value))
+    const descriptor=ownDescriptor(value,i);
+    if (!descriptor?.enumerable || !hasOwn(descriptor,'value') || !validPredicateValue(kind,descriptor.value))
       throw new AuthorityError('INVALID_ARGUMENT');
     append(values,descriptor.value);
   }
-  return Object.freeze(values);
+  return freeze(values);
 }
 function snapshotPredicate(item:unknown,trustedParsed=false):ScalarPredicate {
   if (!item || typeof item!=='object' || (!trustedParsed && isInProcessProxy(item)) ||
-    (Object.getPrototypeOf(item)!==Object.prototype && Object.getPrototypeOf(item)!==null)) throw new AuthorityError('INVALID_ARGUMENT');
-  const field=Object.getOwnPropertyDescriptor(item,'field')?.value;
-  const kind=Object.getOwnPropertyDescriptor(item,'kind')?.value;
-  const operator=Object.getOwnPropertyDescriptor(item,'operator')?.value;
-  const value=Object.getOwnPropertyDescriptor(item,'value')?.value;
+    (prototypeOf(item)!==ObjectPrototype && prototypeOf(item)!==null)) throw new AuthorityError('INVALID_ARGUMENT');
+  const field=ownDescriptor(item,'field')?.value;
+  const kind=ownDescriptor(item,'kind')?.value;
+  const operator=ownDescriptor(item,'operator')?.value;
+  const value=ownDescriptor(item,'value')?.value;
   predicateDataKeys(item,kind);
-  if (kind==='null') return Object.freeze({field,kind,operator}) as ScalarPredicate;
+  // A primitive allowlisted operator before any coercion, lookup or SQL text.
+  if (!scalarString(field) || typeof operator!=='string' ||
+    (kind==='null' ? operator!=='isNull' : !arrayHas(COMPARISON_OPERATORS,operator))) throw new AuthorityError('INVALID_ARGUMENT');
+  if (kind==='null') return freeze({field,kind,operator}) as ScalarPredicate;
   if (operator==='in') {
-    return Object.freeze({field,kind,operator,value:snapshotInValues(value,kind,trustedParsed)}) as ScalarPredicate;
+    return freeze({field,kind,operator,value:snapshotInValues(value,kind,trustedParsed)}) as ScalarPredicate;
   }
-  return Object.freeze({field,kind,operator,value}) as ScalarPredicate;
+  return freeze({field,kind,operator,value}) as ScalarPredicate;
 }
 /** Match a declared index using only trusted own result-array slots. */
 function findDeclaration(rows:readonly Record<string,unknown>[],field:string):Record<string,unknown>|undefined {
@@ -748,14 +809,17 @@ export class PostgresAuthority {
       // Only a missing COMMIT acknowledgement has an ambiguous outcome.
       await client.query(`SET LOCAL statement_timeout = '${Math.max(1,deadlineMs-Date.now())}ms'`);
       if (Date.now()>=deadlineMs) throw new AuthorityError('RATE_LIMITED','Request time budget exceeded');
+      let sent = false;
       try {
-        await commitBeforeDeadline(client,deadlineMs); begun = false;
+        await commitBeforeDeadline(client,deadlineMs,()=>{ sent = true; },()=>Date.now()); begun = false;
       }
       catch (error) {
         discard = true;
         if ((error as {code?:string}).code==='PZ003') throw new AuthorityError('SCHEMA_CONFLICT','Record index projection incomplete');
         if (error instanceof CommitNotSentDeadlineExceeded) throw new AuthorityError('RATE_LIMITED','Request time budget exceeded');
         if (error instanceof AuthorityError) throw error;
+        // COMMIT never reached the session, so nothing committed: retryable, never an unknown outcome.
+        if (!sent) throw new AuthorityError('PROVIDER_UNAVAILABLE','Database session failed before commit; retry the request',undefined,true);
         commitAmbiguous = true;
         throw new CommitOutcomeUnknownError(error);
       }
@@ -1187,7 +1251,7 @@ export class AuthorityTransaction {
       WHERE s.space_id=$1 AND c.collection_id=$2 FOR SHARE OF s,c`, [spaceId, collectionId, credentialId, principalId]);
     const row = result.rows[0];
     if (!row) throw new AuthorityError('NOT_FOUND');
-    if (Number(row.policy_version) !== policyVersion || Number(row.placement_generation) !== placementGeneration) throw new AuthorityError('FORBIDDEN', 'Policy or placement changed');
+    if (NativeNumber(row.policy_version) !== policyVersion || NativeNumber(row.placement_generation) !== placementGeneration) throw new AuthorityError('FORBIDDEN', 'Policy or placement changed');
     if (arrayHas(['suspended','deleting','deleted'],row.lifecycle)) throw new AuthorityError('SPACE_UNAVAILABLE');
     if (row.collection_lifecycle === 'deleted') throw new AuthorityError('NOT_FOUND');
     if (capability === 'outbox:worker' && (principalId !== 'system:projection' || credentialId !== 'system:projection'))
@@ -1196,7 +1260,7 @@ export class AuthorityTransaction {
     if (capability === 'outbox:worker' && row.lifecycle !== 'active' && row.lifecycle !== 'readOnly')
       throw new AuthorityError('SPACE_UNAVAILABLE');
     if (row.owner_principal_id !== principalId && capability !== 'outbox:worker' &&
-      (!Array.isArray(row.capabilities) || !arrayHas(row.capabilities,capability) || (row.expires_at && !row.grant_current))) throw new AuthorityError('FORBIDDEN');
+      (!isArray(row.capabilities) || !arrayHas(row.capabilities,capability) || (row.expires_at && !row.grant_current))) throw new AuthorityError('FORBIDDEN');
     if (row.collection_lifecycle === 'readOnly' && (capability === 'records:write' || capability === 'claims:review')) throw new AuthorityError('SPACE_UNAVAILABLE');
   }
 
@@ -1813,26 +1877,7 @@ export class AuthorityTransaction {
   /** Shared AND predicate compiler for exact page, count and exists statement snapshots. */
   private compilePredicates(predicates: readonly ScalarPredicate[]) {
     if (this.#scope.capability !== 'records:read') throw new AuthorityError('FORBIDDEN');
-    if (!Array.isArray(predicates) || predicates.length > 16) throw new AuthorityError('INVALID_ARGUMENT');
-    const params: unknown[] = [...scopeIds(this.#scope)];
-    const fragments: string[] = [];
-    for (let index = 0; index < predicates.length; index++) {
-      const predicate = predicates[index];
-      if (!predicate) throw new AuthorityError('INVALID_ARGUMENT');
-      if (!scalarString(predicate.field) || !arrayHas(['null','string','date-time','number','boolean'],predicate.kind)) throw new AuthorityError('INVALID_ARGUMENT');
-      const alias = `v${index}`;
-      params.push(predicate.field,predicate.kind);
-      const fieldParam = `$${params.length - 1}`;
-      const kindParam = `$${params.length}`;
-      let compare = '';
-      if (predicate.kind === 'null') {
-        if (predicate.operator !== 'isNull') throw new AuthorityError('INVALID_ARGUMENT');
-      } else compare = comparison(predicate, alias, params);
-      fragments.push(`EXISTS (SELECT 1 FROM record_index_values ${alias} WHERE ${alias}.space_id=r.space_id
-        AND ${alias}.collection_id=r.collection_id AND ${alias}.record_id=r.record_id
-        AND ${alias}.field_name=${fieldParam} AND ${alias}.value_kind=${kindParam}${compare})`);
-    }
-    return { params, where:'r.space_id=$1 AND r.collection_id=$2 AND NOT r.tombstone ' + fragments.map(x => `AND ${x}`).join(' ') };
+    return predicateFilter(this.#scope, predicates);
   }
 
   /** Reject undeclared or partially backfilled filter indexes. */
@@ -2143,3 +2188,6 @@ export type { ProjectionGenerationStatus, ProjectionQueueStatus, ProjectionStatu
 export * from './generations.js';
 export * from './search.js';
 export * from './bundles.js';
+export { aggregationBounds, analyticalSlots, PostgresAggregations } from './aggregations.js';
+export type { AggregationCell, AggregationMetricValue, AggregationOperator, AggregationOptions, AggregationResult, AggregationUnit,
+  GroupKey } from './aggregations.js';
