@@ -489,12 +489,15 @@ function bounded(pool: Pick<pg.Pool, 'connect'>): Pick<pg.Pool, 'connect'> {
       hold(pool, 1);
       reject(new AggregationLimitError('slots', `No analytical session was free within ${aggregationBounds.checkoutMs} ms; retry later`));
     }, aggregationBounds.checkoutMs);
-    pool.connect().then(client => {
-      nativeClearTimeout(timer);
-      if (!expired) return resolve(client);
-      hold(pool, -1);
-      client.release();
-    }, (error: unknown) => { nativeClearTimeout(timer); if (expired) hold(pool, -1); else reject(error); });
+    // A checkout that fails at once leaves nothing pending, so its timer never takes a hold.
+    try {
+      pool.connect().then(client => {
+        nativeClearTimeout(timer);
+        if (!expired) return resolve(client);
+        hold(pool, -1);
+        client.release();
+      }, (error: unknown) => { nativeClearTimeout(timer); if (expired) hold(pool, -1); else reject(error); });
+    } catch (error) { nativeClearTimeout(timer); reject(error); }
   });
   return { connect } as Pick<pg.Pool, 'connect'>;
 }

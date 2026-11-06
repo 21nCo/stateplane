@@ -1064,10 +1064,11 @@ test('a stalled analytical checkout is bounded, and services sharing an analytic
   const count = JSON.stringify({ metrics: [{ op: 'count' }] });
   // Checkouts listed in `stalls` (1-based, per aggregation) never answer in time; each answers with a client after the
   // deadline, which must be released unused. Every other checkout is a real analytical session.
-  let stalls = new Set(), checkouts = 0, released = 0;
+  let stalls = new Set(), checkouts = 0, released = 0, throwsAt = 0;
   const late = [];
   const shared = { connect: () => {
-    if (!stalls.has(++checkouts)) return analyticalPool.connect();
+    if (++checkouts === throwsAt) throw new Error('checkout failed at once');
+    if (!stalls.has(checkouts)) return analyticalPool.connect();
     return new Promise((resolve, reject) => late.push(fail => fail ? reject(new Error('late checkout failed'))
       : resolve({ release: () => { released++; }, query: () => { throw new Error('a late session was used'); }, on() {}, removeListener() {} })));
   } };
@@ -1109,8 +1110,19 @@ test('a stalled analytical checkout is bounded, and services sharing an analytic
   await stalled(3, () => one.analysis.aggregate(g.owner, g.spaceId, 'items', count));
   // A checkout that fails after its deadline also gives its slot back.
   await stalled(1, () => two.analysis.aggregate(f.owner, f.spaceId, 'items', count), true);
-  // Every reservation was given back: without stalls, both services and the adapter answer through the shared pool.
+  // A checkout that throws at once, on the first attempt, the provisioning or the retry, holds nothing after its deadline.
   stalls = new Set();
+  for (const at of [1, 2, 3]) {
+    const h = at === 1 ? f : await fixture();
+    if (at !== 1) await h.write('items', { operation: 'create', data: { team: 'red' } });
+    throwsAt = at; checkouts = 0;
+    await assert.rejects(one.analysis.aggregate(h.owner, h.spaceId, 'items', count));
+    assert.equal(checkouts, at);
+    throwsAt = 0;
+    await new Promise(resolve => setTimeout(resolve, aggregationBounds.checkoutMs + 100));
+    assert.equal((await two.analysis.aggregate(h.owner, h.spaceId, 'items', count)).groups[0].count, 1, `recovered after a throw at ${at}`);
+  }
+  // Every reservation was given back: without stalls, both services and the adapter answer through the shared pool.
   for (const answer of [await one.analysis.aggregate(g.owner, g.spaceId, 'items', count),
     await two.analysis.aggregate(f.owner, f.spaceId, 'items', count), await direct.aggregateSerialized(g.owner, g.spaceId, 'items', count)])
     assert.equal(answer.groups[0].count, 1);
