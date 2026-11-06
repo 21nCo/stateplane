@@ -178,12 +178,11 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
   const search=new PostgresRetrievalSearch(spaces,new Map([...cells].map(([id,cell])=>[id,{pool:cell.pool}])),
     options.embedders ? {embedders:options.embedders} : {});
   const bundles=new PostgresContextBundles(search);
-  // Aggregations admit, bound and recheck every call themselves, on each cell's analytical pool and slots only.
+  // Aggregations admit, bound and recheck every call themselves, on each cell's analytical pool and slots only; the
+  // adapter refuses an analytical pool that is the interactive pool.
   const analytical=new Map<string,AggregationCell>();
-  for (const [id,cell] of cells) if (cell.analytics) {
-    if (cell.analytics.pool===cell.pool) throw new Error(`Cell ${id} needs an analytical pool apart from its interactive pool`);
+  for (const [id,cell] of cells) if (cell.analytics)
     analytical.set(id,{pool:cell.analytics.pool,originConnectionLimit:cell.analytics.originConnectionLimit,admission:cell.pool});
-  }
   const aggregations=new PostgresAggregations(spaces,analytical);
   return {
     spaces: {

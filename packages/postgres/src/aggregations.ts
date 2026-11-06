@@ -141,7 +141,8 @@ function parse(request: unknown, trustedParsed: boolean): Spec {
     if (metric.field === undefined) invalid(`${String(metric.op)} needs a field`);
     return { op: metric.op as AggregationOperator, field: field(metric.field) };
   });
-  const maxGroups = input.maxGroups ?? aggregationBounds.defaultMaxGroups;
+  // Only an absent maxGroups takes the default; null or any other non-integer is refused.
+  const maxGroups = input.maxGroups === undefined ? aggregationBounds.defaultMaxGroups : input.maxGroups;
   if (!Number.isSafeInteger(maxGroups) || (maxGroups as number) < 1 || (maxGroups as number) > aggregationBounds.maxGroups)
     invalid(`maxGroups must be an integer from 1 to ${aggregationBounds.maxGroups}`);
   return { where, groupBy, metrics, maxGroups: maxGroups as number };
@@ -217,12 +218,12 @@ function statement(scope: Readonly<AuthorityScope>, spec: Spec, declared: Readon
     if (dimension.bucket) {
       // A bucket's local label is its start at its UTC offset: for an hour, its members' own offset (date_trunc keeps it,
       // so ambiguous and shifted hours stay apart, and it is one offset per bucket); for a day or more, the offset at its start.
+      // Its start leaves as epoch seconds, formatted with proleptic ISO years (to_char would write 1 BC as 0001).
       const zone = bind(dimension.bucket.timeZone);
       const at = (instant: string) => `EXTRACT(EPOCH FROM (${instant} AT TIME ZONE ${zone})-(${instant} AT TIME ZONE 'UTC'))::int`;
-      const hour = dimension.bucket.unit === 'hour', seconds = hour ? `o${i}` : at(`v${i}`);
+      const hour = dimension.bucket.unit === 'hour';
       if (hour) grouped.push(`min(${at(instant(a))}) AS o${i}`);
-      labels.push(`to_char(v${i} AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS') AS u${i}`, ...(hour ? [] : [`${seconds} AS o${i}`]),
-        `to_char((v${i} AT TIME ZONE 'UTC')+make_interval(secs=>${seconds}),'YYYY-MM-DD"T"HH24:MI:SS') AS l${i}`);
+      labels.push(`EXTRACT(EPOCH FROM v${i})::bigint AS e${i}`, ...(hour ? [] : [`${at(`v${i}`)} AS o${i}`]));
     }
   });
   spec.metrics.forEach((metric, j) => {
@@ -295,6 +296,12 @@ function roundedAverage(sum: string, count: number): string | null {
   return `${negative ? '-' : ''}${decimal(text)}`;
 }
 
+/**
+ * Epoch seconds as ISO 8601 date and time without zone, in proleptic Gregorian
+ * years: 0000 is 1 BC, and a year past 9999 (only a local label east of UTC
+ * can reach one) is written expanded, as +010000, as JavaScript writes it.
+ */
+const wallTime = (seconds: number) => new Date(seconds * 1000).toISOString().slice(0, -5);
 /** A UTC offset in seconds as ±HH:MM (±HH:MM:SS for a historical offset with seconds). */
 function offset(seconds: number): string {
   const sign = seconds < 0 ? '-' : '+', magnitude = Math.abs(seconds);
@@ -347,9 +354,14 @@ class Unprovisioned extends Error {}
 /**
  * Add the missing slots up to the derived limits, in a transaction of its
  * own, so no aggregation ever waits for another's uncommitted slot rows. Rows
- * past a limit are ignored, so lowering the limit lowers capacity.
+ * past a limit are ignored, so lowering the limit lowers capacity. The scope
+ * is locked and checked first, so a space suspended or deleted meanwhile is
+ * refused with its typed authority error, never a slot constraint violation.
  */
-async function provision(db: Db, cellId: string, spaceId: string, slots: { cell: number; space: number }): Promise<void> {
+async function provision(db: Db, scope: Readonly<AuthorityScope>, cellId: string, slots: { cell: number; space: number }): Promise<void> {
+  const spaceId = scope.spaceId;
+  const tx = new AuthorityTransaction(db, scope, 1);
+  try { await tx.checkScope(); } finally { tx.close(); }
   await db.query(`INSERT INTO analysis_cell_slots(cell_id,slot) SELECT $1,s FROM generate_series(1,$2::int) s
     WHERE NOT EXISTS (SELECT 1 FROM analysis_cell_slots x WHERE x.cell_id=$1 AND x.slot=s) ON CONFLICT DO NOTHING`, [cellId, slots.cell]);
   await db.query(`INSERT INTO analysis_space_slots(space_id,slot) SELECT $1,s FROM generate_series(1,$2::int) s
@@ -381,7 +393,11 @@ export class PostgresAggregations {
   readonly #statementMs: number;
   constructor(private readonly spaces: PostgresSpaces, private readonly cells: ReadonlyMap<string, AggregationCell>,
     options: AggregationOptions = {}) {
-    for (const cell of cells.values()) analyticalSlots(cell.originConnectionLimit);
+    for (const [id, cell] of cells) {
+      analyticalSlots(cell.originConnectionLimit);
+      // Fail closed: an aggregation never runs on the pool interactive reads are admitted on.
+      if (cell.pool === cell.admission) throw new Error(`Cell ${id} needs an analytical pool apart from its admission pool`);
+    }
     const ms = options.statementTimeoutMs ?? aggregationBounds.statementMs;
     if (!Number.isSafeInteger(ms) || ms < 1 || ms > aggregationBounds.maxStatementMs) throw new RangeError('Invalid statement time budget');
     this.#statementMs = ms;
@@ -424,28 +440,38 @@ export class PostgresAggregations {
       const tx = new AuthorityTransaction(db, admitted.scope, 1);
       try { await tx.checkScope(); } finally { tx.close(); }
     });
+    // The spec is validated once authorized, before any capacity is taken and before any member reaches a query: every
+    // predicate is compiled here, so a malformed one is INVALID_ARGUMENT and never a bound parameter or declaration lookup.
+    const spec = request();
+    predicateFilter(admitted.scope, spec.where);
     const slots = analyticalSlots(cell.originConnectionLimit);
     const running = this.#running.get(admitted.cellId) ?? 0;
     if (running >= slots.cell) throw new AggregationLimitError('slots', 'Analytical capacity is in use; retry later');
     this.#running.set(admitted.cellId, running + 1);
     try {
-      try { return await transact(cell.pool, db => this.run(db, actor, admitted, request, slots, true)); }
+      try { return await transact(cell.pool, db => this.run(db, actor, admitted, spec, slots, true)); }
       catch (error) { if (!(error instanceof Unprovisioned)) throw error; }
-      await transact(cell.pool, db => provision(db, admitted.cellId, admitted.scope.spaceId, slots));
-      return await transact(cell.pool, db => this.run(db, actor, admitted, request, slots, false));
+      await transact(cell.pool, db => provision(db, admitted.scope, admitted.cellId, slots));
+      return await transact(cell.pool, db => this.run(db, actor, admitted, spec, slots, false));
     } finally {
       this.#running.set(admitted.cellId, this.#running.get(admitted.cellId)! - 1);
     }
   }
 
-  private async run(db: Db, actor: VerifiedCredential, admitted: Awaited<ReturnType<PostgresSpaces['scope']>>, request: () => Spec,
+  private async run(db: Db, actor: VerifiedCredential, admitted: Awaited<ReturnType<PostgresSpaces['scope']>>, admittedSpec: Spec,
     slots: { cell: number; space: number }, provisionable: boolean): Promise<AggregationResult> {
     const { scope, cellId, ownerPrincipalId } = admitted;
-    // Space, collection and grant first, as every reader takes them, then the slots (a purge locks its space before its slots).
-    // The collection is authorized before the request is validated.
+    // Space, collection and grant first, as every reader takes them, then at once the slots (a purge locks its space before
+    // its slots), so all further analytical work on this connection is within the slot budget.
     const tx = new AuthorityTransaction(db, scope, 1);
     try { await tx.checkScope(); } finally { tx.close(); }
-    const spec = await zones(db, request());
+    const held = (await db.query(lockSlots, [cellId, slots.cell, scope.spaceId, slots.space])).rows[0];
+    const missing = held.cell_rows < slots.cell || held.space_rows < slots.space;
+    if (held.cell_slot === null || held.space_slot === null) {
+      if (missing && provisionable) throw new Unprovisioned();
+      throw new AggregationLimitError('slots', `The ${held.cell_slot === null ? "cell's" : "space's"} analytical slots are in use; retry later`);
+    }
+    const spec = await zones(db, admittedSpec);
     const names = [...new Set([...spec.where.map(item => item.field), ...spec.groupBy.map(item => item.field),
       ...spec.metrics.flatMap(item => item.field === null ? [] : [item.field])])];
     const rows = (await db.query(`SELECT c.schema_version,d.field_name,d.value_kind,d.ready,d.filterable,d.accepted_version
@@ -459,12 +485,6 @@ export class PostgresAggregations {
         acceptedVersion: Number(row.accepted_version) }]));
     admit(spec, declared);
     const { sql, params } = statement(scope, spec, declared);
-    const held = (await db.query(lockSlots, [cellId, slots.cell, scope.spaceId, slots.space])).rows[0];
-    const missing = held.cell_rows < slots.cell || held.space_rows < slots.space;
-    if (held.cell_slot === null || held.space_slot === null) {
-      if (missing && provisionable) throw new Unprovisioned();
-      throw new AggregationLimitError('slots', `The ${held.cell_slot === null ? "cell's" : "space's"} analytical slots are in use; retry later`);
-    }
 
     // One slot is one backend: no parallel workers outside the analytical budget.
     await db.query('SET LOCAL max_parallel_workers_per_gather = 0');
@@ -487,7 +507,10 @@ export class PostgresAggregations {
     const groups = groupCount === 0 ? [] : result.rows.map(row => ({
       key: spec.groupBy.map((dimension, i): GroupKey => {
         if (row[`k${i}`] === 'null' || row[`k${i}`] === 'missing') return { kind: row[`k${i}`] };
-        if (dimension.bucket) return { kind: 'value', value: `${row[`u${i}`]}Z`, local: `${row[`l${i}`]}${offset(row[`o${i}`])}` };
+        if (dimension.bucket) {
+          const start = Number(row[`e${i}`]), shift = Number(row[`o${i}`]);
+          return { kind: 'value', value: `${wallTime(start)}Z`, local: `${wallTime(start + shift)}${offset(shift)}` };
+        }
         const kind = kindOf(dimension.field);
         return { kind: 'value', value: kind === 'number' ? Number(row[`v${i}`]) : row[`v${i}`] };
       }),

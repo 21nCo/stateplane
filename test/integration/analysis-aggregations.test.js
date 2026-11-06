@@ -43,7 +43,9 @@ const services = postgresServices(spaces, new Map([['cell-a', { pool, cursorSecr
 const analyticServices = postgresServices(spaces, new Map([['cell-a', { pool, cursorSecret: randomBytes(32),
   analytics: { pool: newPool(1), originConnectionLimit: 5 } }]]), 3600);
 const verify = token => identity.verify(new Request('https://h.invalid', { headers: { authorization: `Bearer ${token}` } }));
-const aggregations = (cellPool = pool, originConnectionLimit = 5, options = {}) =>
+// The direct adapter runs on an analytical pool of its own, as in production; `pool` is only its admission (interactive) pool.
+const analyticalPool = newPool(6);
+const aggregations = (cellPool = analyticalPool, originConnectionLimit = 5, options = {}) =>
   new PostgresAggregations(spaces, new Map([['cell-a', { pool: cellPool, admission: pool, originConnectionLimit }]]), options);
 const rejects = (promise, code, check = () => {}) => assert.rejects(promise, error => {
   assert.equal(error.code, code, error.message); check(error); return true;
@@ -401,6 +403,39 @@ test('a typed spec admits only declared ready index fields, allowlisted operator
     'PROVIDER_UNAVAILABLE', error => assert.equal(error.retryable, false));
   assert.throws(() => postgresServices(spaces, new Map([['cell-a', { pool, cursorSecret: randomBytes(32),
     analytics: { pool, originConnectionLimit: 5 } }]]), 3600), /analytical pool apart/);
+  // The adapter itself refuses an analytical pool that is its admission pool, whoever composes it.
+  assert.throws(() => new PostgresAggregations(spaces, new Map([['cell-a', { pool, admission: pool, originConnectionLimit: 5 }]])),
+    /analytical pool apart/);
+});
+
+test('every predicate member is validated before it reaches a query, through both entrypoints', async () => {
+  const f = await fixture();
+  await f.write('items', { operation: 'create', data: { team: 'red', score: 1 } });
+  const service = aggregations();
+  const count = where => ({ metrics: [{ op: 'count' }], where });
+  // Malformed fields are INVALID_ARGUMENT, never a schema conflict from a declaration lookup.
+  for (const where of [[{ field: 42, kind: 'string', operator: 'eq', value: 'red' }],
+    [{ field: {}, kind: 'string', operator: 'eq', value: 'red' }], [{ field: 'team', kind: 'text', operator: 'eq', value: 'red' }],
+    [{ field: 'team', kind: 'string', operator: 'like', value: 'red' }], [{ field: 'team', kind: 'string', operator: 'eq', value: 1 }],
+    [{ field: 'team', kind: 'null', operator: 'eq' }], [{ field: 'score', kind: 'number', operator: 'in', value: [1, '2'] }]]) {
+    await rejects(service.aggregateSerialized(f.owner, f.spaceId, 'items', JSON.stringify(count(where))), 'INVALID_ARGUMENT');
+    await rejects(service.aggregate(f.owner, f.spaceId, 'items', count(where)), 'INVALID_ARGUMENT');
+    await rejects(analyticServices.analysis.aggregate(f.owner, f.spaceId, 'items', JSON.stringify(count(where))), 'INVALID_ARGUMENT');
+  }
+  // An object field with its own serialization hooks is refused before any of them runs.
+  const ran = [];
+  const hooked = { toPostgres: () => { ran.push('toPostgres'); return 'team'; }, toJSON: () => { ran.push('toJSON'); return 'team'; },
+    toString: () => { ran.push('toString'); return 'team'; } };
+  await rejects(service.aggregate(f.owner, f.spaceId, 'items', count([{ field: hooked, kind: 'string', operator: 'eq', value: 'red' }])),
+    'INVALID_ARGUMENT');
+  await rejects(service.aggregate(f.owner, f.spaceId, 'items', count([{ field: 'team', kind: 'string', operator: 'eq', value: hooked }])),
+    'INVALID_ARGUMENT');
+  assert.deepEqual(ran, []);
+  // Only an absent maxGroups takes the default: null is refused through both entrypoints.
+  await rejects(service.aggregate(f.owner, f.spaceId, 'items', { metrics: [{ op: 'count' }], maxGroups: null }), 'INVALID_ARGUMENT');
+  await rejects(service.aggregateSerialized(f.owner, f.spaceId, 'items', JSON.stringify({ metrics: [{ op: 'count' }], maxGroups: null })),
+    'INVALID_ARGUMENT');
+  assert.equal((await service.aggregate(f.owner, f.spaceId, 'items', { metrics: [{ op: 'count' }] })).groups[0].count, 1);
 });
 
 test('a runtime without proxy detection aggregates serialized specs and refuses object specs', () => {
@@ -462,6 +497,36 @@ test('time buckets follow IANA zone rules, never a fixed-offset abbreviation of 
   }
 });
 
+test('bucket starts and local labels agree in proleptic ISO years at both ends of the instant range', async () => {
+  const f = await fixture();
+  for (const at of ['0001-01-01T00:30:00Z', '0001-01-01T03:00:00Z', '9999-12-31T12:00:00Z'])
+    await f.write('items', { operation: 'create', data: { at } });
+  const service = aggregations();
+  const keys = async (unit, timeZone) => (await service.aggregate(f.owner, f.spaceId, 'items',
+    { groupBy: [{ field: 'at', bucket: { unit, timeZone } }], metrics: [{ op: 'count' }] })).groups.map(group => [group.key[0], group.count]);
+  // A label minus its offset is its start: parse both by their own fields, years 0000 and +010000 included.
+  const seconds = text => {
+    const [, year, rest, zone] = /^([+-]\d{6}|\d{4})(-.+?)(Z|[+-]\d{2}:\d{2}(?::\d{2})?)$/.exec(text);
+    const [sign, h, m, s = '0'] = zone === 'Z' ? ['+', '0', '0'] : [zone[0], ...zone.slice(1).split(':')];
+    const date = new Date(`2000${rest}Z`);
+    date.setUTCFullYear(Number(year));
+    return date.getTime() / 1000 - (sign === '-' ? -1 : 1) * (Number(h) * 3600 + Number(m) * 60 + Number(s));
+  };
+  const agree = list => { for (const [key] of list) assert.equal(seconds(key.local), seconds(key.value), JSON.stringify(key)); };
+  // East of UTC, the first instant's local day starts in 1 BC: year 0000, never 0001-12-31.
+  const east = await keys('day', 'Etc/GMT-1');
+  assert.deepEqual(east, [[{ kind: 'value', value: '0000-12-31T23:00:00Z', local: '0001-01-01T00:00:00+01:00' }, 2],
+    [{ kind: 'value', value: '9999-12-30T23:00:00Z', local: '9999-12-31T00:00:00+01:00' }, 1]]);
+  // West of UTC, at New York's local mean time, the first two instants' local year is 1 BC.
+  const west = await keys('year', 'America/New_York');
+  assert.deepEqual(west, [[{ kind: 'value', value: '0000-01-01T04:56:02Z', local: '0000-01-01T00:00:00-04:56:02' }, 2],
+    [{ kind: 'value', value: '9999-01-01T05:00:00Z', local: '9999-01-01T00:00:00-05:00' }, 1]]);
+  // At +14, the last instant's local day is in year 10000, written expanded; its start is still in 9999 UTC.
+  const kiritimati = await keys('day', 'Pacific/Kiritimati');
+  assert.deepEqual(kiritimati.at(-1), [{ kind: 'value', value: '9999-12-31T10:00:00Z', local: '+010000-01-01T00:00:00+14:00' }, 1]);
+  for (const list of [east, west, kiritimati, await keys('hour', 'Pacific/Kiritimati'), await keys('week', 'Etc/GMT-1')]) agree(list);
+});
+
 /** Insert `count` records into `collectionId` of `spaceId` directly, with their index values, in one transaction. */
 async function bulk(spaceId, count, team = n => `team-${n % 7}`, collectionId = 'bulk', score = n => n + 1) {
   const teams = Array.from({ length: count }, (_, n) => team(n)), scores = Array.from({ length: count }, (_, n) => score(n));
@@ -518,14 +583,14 @@ test('over-cardinality, over-byte and over-time aggregations fail with typed err
   await limited(analyticServices.analysis.aggregate(f.owner, f.spaceId, 'thirds', JSON.stringify(thirds('avg'))), 'bytes');
   // The statement budget cancels a long aggregation.
   await bulk(f.spaceId, 60_000, undefined, 'large');
-  const slow = aggregations(pool, 5, { statementTimeoutMs: 5 });
+  const slow = aggregations(analyticalPool, 5, { statementTimeoutMs: 5 });
   await limited(slow.aggregate(f.owner, f.spaceId, 'large', { groupBy: [{ field: 'team' }], metrics: [{ op: 'count' }, { op: 'sum', field: 'score' }] }),
     'time');
   // Nothing stays held: the same service answers next, within the default budget.
   const answered = await service.aggregate(f.owner, f.spaceId, 'large', { metrics: [{ op: 'count' }, { op: 'sum', field: 'score' }] });
   assert.deepEqual(answered.groups[0].metrics.map(metric => metric.value), [60_000, String(60_000 * 60_001 / 2)]);
-  assert.throws(() => aggregations(pool, 5, { statementTimeoutMs: 0 }), RangeError);
-  assert.throws(() => aggregations(pool, 4), RangeError);
+  assert.throws(() => aggregations(analyticalPool, 5, { statementTimeoutMs: 0 }), RangeError);
+  assert.throws(() => aggregations(analyticalPool, 4), RangeError);
 });
 
 /** Every gate a test opened, released after it so a failed assertion reports instead of holding a session forever. */
@@ -572,7 +637,7 @@ test('analytical slots bound aggregations per process, per cell and per space, a
   // In process: the second aggregation is refused before it takes a connection.
   const writer = await f.agent(['records:write']);
   const counted = { connects: 0 };
-  const paused = pausingPool(pool);
+  const paused = pausingPool(analyticalPool);
   const one = aggregations({ connect: () => { counted.connects++; return paused.pool.connect(); } }, 5);
   const hold = paused.pause();
   const first = one.aggregate(f.owner, f.spaceId, 'items', count);
@@ -587,7 +652,7 @@ test('analytical slots bound aggregations per process, per cell and per space, a
   await rejects(one.aggregate(f.owner, f.spaceId, 'nothing', count), 'NOT_FOUND');
   assert.equal(counted.connects, connected, 'refusals took no analytical connection');
   // Across processes: another service (another isolate) finds the cell's only slot locked and is refused at once.
-  const other = aggregations(pool, 5);
+  const other = aggregations(analyticalPool, 5);
   await limited(other.aggregate(g.owner, g.spaceId, 'items', count), 'slots');
   // Interactive authoritative reads are untouched by the held analytical slot.
   assert.equal(await services.records.count(g.owner, g.spaceId, 'items', JSON.stringify([])), 1);
@@ -596,7 +661,7 @@ test('analytical slots bound aggregations per process, per cell and per space, a
   assert.equal((await other.aggregate(g.owner, g.spaceId, 'items', count)).groups[0].count, 1, 'the slot is free after commit');
 
   // At an origin limit of 20 a cell has 4 slots and a space 2: a third aggregation in one space waits for its space, not the cell.
-  const wide = pausingPool(pool);
+  const wide = pausingPool(analyticalPool);
   const service = aggregations(wide.pool, 20);
   const holds = [wide.pause(), wide.pause()];
   const running = [service.aggregate(f.owner, f.spaceId, 'items', count), service.aggregate(f.owner, f.spaceId, 'items', count)];
@@ -610,13 +675,13 @@ test('analytical slots bound aggregations per process, per cell and per space, a
     (SELECT count(*)::int FROM analysis_space_slots WHERE space_id=$1) AS space`, [f.spaceId])).rows[0];
   assert.deepEqual(slots, { cell: 4, space: 2 });
   // With every slot held, a refusal waits for none.
-  const gate = pausingPool(pool);
+  const gate = pausingPool(analyticalPool);
   const only = aggregations(gate.pool, 5);
   const blocked = gate.pause();
   const holding = only.aggregate(f.owner, f.spaceId, 'items', count);
   await blocked.arrived;
   const started = performance.now();
-  await limited(aggregations(pool, 5).aggregate(g.owner, g.spaceId, 'items', count), 'slots');
+  await limited(aggregations(analyticalPool, 5).aggregate(g.owner, g.spaceId, 'items', count), 'slots');
   assert.ok(performance.now() - started < 1_000, 'a refusal never waits for a slot');
   blocked.release();
   await holding;
@@ -730,7 +795,7 @@ test('aggregations read one statement snapshot while writes commit concurrently'
   })();
   const spec = { groupBy: [{ field: 'team' }], metrics: [{ op: 'count' }, { op: 'sum', field: 'score' }, { op: 'avg', field: 'score' },
     { op: 'min', field: 'score' }, { op: 'max', field: 'score' }, { op: 'max', field: 'team' }] };
-  const service = aggregations(pool, 20);
+  const service = aggregations(analyticalPool, 20);
   let checked = 0;
   try {
   while (!done) {
@@ -745,6 +810,24 @@ test('aggregations read one statement snapshot while writes commit concurrently'
   } catch (error) { failed = true; throw error; } finally { await writer.catch(() => {}); }
   assert.ok(checked >= 10, `${checked} aggregations ran during the writes`);
   sameAsOracle(await service.aggregate(f.owner, f.spaceId, 'items', spec), states.at(-1), spec);
+});
+
+test('a space suspended before its slots are added is refused with a typed authority error', async () => {
+  const f = await fixture();
+  await f.write('items', { operation: 'create', data: { team: 'red' } });
+  // The first attempt finds no slot rows for the new space; the space is suspended just before the provisioning transaction.
+  let connects = 0;
+  const service = aggregations({ connect: async () => {
+    if (++connects === 2) await spaces.suspend(f.owner, f.spaceId);
+    return analyticalPool.connect();
+  } });
+  await assert.rejects(service.aggregate(f.owner, f.spaceId, 'items', { metrics: [{ op: 'count' }] }), error => {
+    assert.equal(error.name, 'AuthorityError', `${error.name}: ${error.message}`);
+    assert.equal(typeof error.code, 'string');
+    return true;
+  });
+  assert.equal(connects, 2, 'refused in the provisioning transaction');
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM analysis_space_slots WHERE space_id=$1', [f.spaceId])).rows[0].n, 0);
 });
 
 test('bounds are the documented protective values', () => {
