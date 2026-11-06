@@ -75,8 +75,9 @@ function comparison(predicate: Exclude<ScalarPredicate, { kind: 'null' }>, alias
   const column = predicateColumn(predicate.kind);
   if (typeof predicate.operator!=='string' || !arrayHas(COMPARISON_OPERATORS,predicate.operator)) throw new AuthorityError('INVALID_ARGUMENT');
   if (predicate.operator==='in') {
-    if (!Array.isArray(predicate.value) || predicate.value.length<1 || predicate.value.length>16 ||
-      predicate.value.some(value=>!validPredicateValue(predicate.kind,value))) throw new AuthorityError('INVALID_ARGUMENT');
+    if (!Array.isArray(predicate.value) || predicate.value.length<1 || predicate.value.length>16) throw new AuthorityError('INVALID_ARGUMENT');
+    for (let i=0;i<predicate.value.length;i++)
+      if (!validPredicateValue(predicate.kind,Object.getOwnPropertyDescriptor(predicate.value,i)?.value)) throw new AuthorityError('INVALID_ARGUMENT');
     params.push(predicate.value);
     let arrayType='text';
     if (predicate.kind==='number') arrayType='numeric';
@@ -517,8 +518,9 @@ function requestFingerprintFields(fields:Record<string,unknown>,normalized:strin
  */
 export function predicateFilter(scope: Readonly<AuthorityScope>, predicates: readonly ScalarPredicate[]): { params: unknown[]; where: string } {
   if (!Array.isArray(predicates) || predicates.length > 16) throw new AuthorityError('INVALID_ARGUMENT');
-  const params: unknown[] = [...scopeIds(scope)];
-  const fragments: string[] = [];
+  // Own slots and string concatenation only: no replaced array method or iterator shapes the filter.
+  const params: unknown[] = [scope.spaceId,scope.collectionId];
+  let filter='r.space_id=$1 AND r.collection_id=$2 AND NOT r.tombstone ';
   for (let index = 0; index < predicates.length; index++) {
     const predicate = predicates[index];
     if (!predicate) throw new AuthorityError('INVALID_ARGUMENT');
@@ -531,11 +533,11 @@ export function predicateFilter(scope: Readonly<AuthorityScope>, predicates: rea
     if (predicate.kind === 'null') {
       if (predicate.operator !== 'isNull') throw new AuthorityError('INVALID_ARGUMENT');
     } else compare = comparison(predicate, alias, params);
-    fragments.push(`EXISTS (SELECT 1 FROM record_index_values ${alias} WHERE ${alias}.space_id=r.space_id
+    filter+=`${index ? ' ' : ''}AND EXISTS (SELECT 1 FROM record_index_values ${alias} WHERE ${alias}.space_id=r.space_id
       AND ${alias}.collection_id=r.collection_id AND ${alias}.record_id=r.record_id
-      AND ${alias}.field_name=${fieldParam} AND ${alias}.value_kind=${kindParam}${compare})`);
+      AND ${alias}.field_name=${fieldParam} AND ${alias}.value_kind=${kindParam}${compare})`;
   }
-  return { params, where:'r.space_id=$1 AND r.collection_id=$2 AND NOT r.tombstone ' + fragments.map(x => `AND ${x}`).join(' ') };
+  return { params, where:filter };
 }
 
 /** Reject decorated predicates and retain stable own values for query admission. */
@@ -567,7 +569,8 @@ function predicateDataKeys(item:object,kind:unknown):void {
   }
 }
 function snapshotInValues(value:unknown,kind:string,trustedParsed:boolean):readonly (string|number|boolean)[] {
-  if (!Array.isArray(value) || (!trustedParsed && isInProcessProxy(value)) ||
+  // A proxy is refused before any other inspection, so neither a trap nor a revoked proxy's TypeError is reached.
+  if (!value || typeof value!=='object' || (!trustedParsed && isInProcessProxy(value)) || !Array.isArray(value) ||
     Object.getPrototypeOf(value)!==Array.prototype || value.length<1 || value.length>16 ||
     Reflect.ownKeys(value).length!==value.length+1) throw new AuthorityError('INVALID_ARGUMENT');
   const values:(string|number|boolean)[]=[];

@@ -2,7 +2,7 @@ import type pg from 'pg';
 import type { VerifiedCredential } from '@stateplane/contracts';
 import { AggregationLimitError, AuthorityError, AuthorityTransaction, predicateFilter, snapshotPredicates } from './index.js';
 import type { AuthorityScope, ScalarPredicate } from './index.js';
-import { MAX_INDEX_PART_BYTES, scalarString } from './schema.js';
+import { includes, MAX_INDEX_PART_BYTES, scalarString } from './schema.js';
 import { fields, invalid, transact, untrusted } from './sources.js';
 import type { Db } from './sources.js';
 import type { PostgresSpaces } from './spaces.js';
@@ -75,11 +75,41 @@ export function analyticalSlots(originConnectionLimit: number): { cell: number; 
   return { cell, space: Math.max(1, Math.floor(cell / 2)) };
 }
 
+/*
+ * Admission, bounds and statement text use only intrinsics captured here at load and own array slots read by index:
+ * a replaced Array.prototype.includes, map, flatMap, join or iterator, Map.prototype.get, set or has, or
+ * String.prototype.includes never admits input, skips a capacity bound or yields an untyped error.
+ */
+const nativeJoin = Array.prototype.join;
+const nativeMapGet = Map.prototype.get, nativeMapSet = Map.prototype.set, nativeMapHas = Map.prototype.has;
+const nativeMapForEach = Map.prototype.forEach;
+const nativeStringIncludes = String.prototype.includes;
+const joined = (values: readonly string[], separator: string) => Reflect.apply(nativeJoin, values, [separator]) as string;
+const mapGet = <K, V>(map: ReadonlyMap<K, V>, key: K) => Reflect.apply(nativeMapGet, map, [key]) as V | undefined;
+const mapHas = <K, V>(map: ReadonlyMap<K, V>, key: K) => Reflect.apply(nativeMapHas, map, [key]) as boolean;
+const mapSet = <K, V>(map: Map<K, V>, key: K, value: V) => { Reflect.apply(nativeMapSet, map, [key, value]); };
+/** Append as an own data slot, never through an inherited push or index setter. */
+const append = <T>(values: T[], value: T) => {
+  Object.defineProperty(values, values.length, { value, writable: true, configurable: true, enumerable: true });
+};
+/** `f` of each own slot of an array this module built or the driver returned, in order. */
+function each<T, U>(values: readonly T[], f: (value: T, index: number) => U): U[] {
+  const result: U[] = [];
+  for (let i = 0; i < values.length; i++) append(result, f(values[i], i));
+  return result;
+}
+/** The distinct values, in first-seen order. */
+function distinct<T>(values: readonly T[]): T[] {
+  const result: T[] = [];
+  for (let i = 0; i < values.length; i++) if (!includes(result, values[i])) append(result, values[i]);
+  return result;
+}
+
 const UNITS: readonly string[] = Object.freeze(['hour', 'day', 'week', 'month', 'quarter', 'year']);
 const OPERATORS: readonly string[] = Object.freeze(['count', 'sum', 'avg', 'min', 'max']);
 /** What each operator accepts: a sum or average only numbers; a minimum or maximum ordered kinds. */
-const ACCEPTS: Readonly<Record<string, readonly ValueKind[]>> = Object.freeze({ sum: ['number'], avg: ['number'],
-  min: ['number', 'string', 'date-time'], max: ['number', 'string', 'date-time'] });
+const accepts = (op: AggregationOperator, kind: ValueKind) => op === 'sum' || op === 'avg' ? kind === 'number'
+  : kind === 'number' || kind === 'string' || kind === 'date-time';
 const COLUMN: Readonly<Record<ValueKind, string>> = Object.freeze({ string: 'string_value', number: 'number_value',
   boolean: 'boolean_value', 'date-time': 'time_value' });
 // An IANA name: letters first, so no POSIX offset string ("+05:00", "UTC+3") with its inverted sign is accepted.
@@ -100,7 +130,7 @@ function items(value: unknown, max: number, name: string, trustedParsed: boolean
   for (let i = 0; i < length; i++) {
     const item = Object.getOwnPropertyDescriptor(value, i);
     if (!item?.enumerable || !Object.hasOwn(item, 'value')) invalid(`Invalid ${name}`);
-    result.push(item.value);
+    append(result, item.value);
   }
   return result;
 }
@@ -123,17 +153,17 @@ function timeZone(value: unknown): string {
 function parse(request: unknown, trustedParsed: boolean): Spec {
   const input = fields(request, ['where', 'groupBy', 'metrics', 'maxGroups'], ['metrics'], trustedParsed);
   const where = input.where === undefined ? [] : snapshotPredicates(input.where as ScalarPredicate[], trustedParsed);
-  const groupBy = input.groupBy === undefined ? [] : items(input.groupBy, aggregationBounds.groupBy, 'groupBy', trustedParsed).map(item => {
+  const groupBy = input.groupBy === undefined ? [] : each(items(input.groupBy, aggregationBounds.groupBy, 'groupBy', trustedParsed), item => {
     const dimension = fields(item, ['field', 'bucket'], ['field'], trustedParsed);
     if (dimension.bucket === undefined) return { field: field(dimension.field), bucket: null };
     const bucket = fields(dimension.bucket, ['unit', 'timeZone'], ['unit', 'timeZone'], trustedParsed);
-    if (!UNITS.includes(bucket.unit as string)) invalid(`bucket unit must be one of ${UNITS.join(', ')}`);
+    if (typeof bucket.unit !== 'string' || !includes(UNITS, bucket.unit)) invalid(`bucket unit must be one of ${joined(UNITS, ', ')}`);
     return { field: field(dimension.field), bucket: { unit: bucket.unit as AggregationUnit, timeZone: timeZone(bucket.timeZone) } };
   });
-  if (new Set(groupBy.map(dimension => dimension.field)).size !== groupBy.length) invalid('A field is grouped at most once');
-  const metrics = items(input.metrics, aggregationBounds.metrics, 'metrics', trustedParsed).map(item => {
+  if (distinct(each(groupBy, dimension => dimension.field)).length !== groupBy.length) invalid('A field is grouped at most once');
+  const metrics = each(items(input.metrics, aggregationBounds.metrics, 'metrics', trustedParsed), item => {
     const metric = fields(item, ['op', 'field'], ['op'], trustedParsed);
-    if (!OPERATORS.includes(metric.op as string)) invalid(`op must be one of ${OPERATORS.join(', ')}`);
+    if (typeof metric.op !== 'string' || !includes(OPERATORS, metric.op)) invalid(`op must be one of ${joined(OPERATORS, ', ')}`);
     if (metric.op === 'count') {
       if (metric.field !== undefined) invalid('count counts records and takes no field');
       return { op: 'count' as const, field: null };
@@ -150,25 +180,26 @@ function parse(request: unknown, trustedParsed: boolean): Spec {
 
 /** Check every field against its ready declaration and every operator against its kind. */
 function admit(spec: Spec, declared: ReadonlyMap<string, Declared>): void {
-  for (const predicate of spec.where) {
-    const declaration = declared.get(predicate.field);
+  for (let i = 0; i < spec.where.length; i++) {
+    const predicate = spec.where[i], declaration = mapGet(declared, predicate.field);
     if (!declaration?.ready || !declaration.filterable || (predicate.kind !== 'null' && declaration.kind !== predicate.kind))
       throw new AuthorityError('SCHEMA_CONFLICT', 'Filter index is not ready');
   }
   const ready = (name: string) => {
-    const declaration = declared.get(name);
+    const declaration = mapGet(declared, name);
     if (!declaration?.ready) throw new AuthorityError('SCHEMA_CONFLICT', `Aggregated field ${name} is not a ready declared index`);
     return declaration.kind;
   };
-  for (const dimension of spec.groupBy) {
-    const kind = ready(dimension.field);
+  for (let i = 0; i < spec.groupBy.length; i++) {
+    const dimension = spec.groupBy[i], kind = ready(dimension.field);
     if (dimension.bucket ? kind !== 'date-time' : kind === 'date-time')
       invalid(`${dimension.field} is a ${kind} index: date-time fields are grouped by time bucket only, and only they are`);
   }
-  for (const metric of spec.metrics) {
+  for (let i = 0; i < spec.metrics.length; i++) {
+    const metric = spec.metrics[i];
     if (metric.field === null) continue;
     const kind = ready(metric.field);
-    if (!ACCEPTS[metric.op].includes(kind)) invalid(`${metric.op} does not accept the ${kind} index ${metric.field}`);
+    if (!accepts(metric.op, kind)) invalid(`${metric.op} does not accept the ${kind} index ${metric.field}`);
   }
 }
 
@@ -192,29 +223,31 @@ const instant = (alias: string) => `(CASE WHEN substr(${alias}.time_value,18,2)=
  */
 function statement(scope: Readonly<AuthorityScope>, spec: Spec, declared: ReadonlyMap<string, Declared>) {
   const { params, where } = predicateFilter(scope, spec.where);
-  const bind = (value: unknown) => { params.push(value); return `$${params.length}`; };
-  const aliases = new Map<string, string>();
+  const bind = (value: unknown) => { append(params, value); return `$${params.length}`; };
+  const aliases = new Map<string, string>(), aliased: string[] = [];
   const joins: string[] = [];
+  const kindOf = (name: string) => mapGet(declared, name)!.kind;
   const alias = (name: string) => {
-    if (!aliases.has(name)) {
-      const next = `f${aliases.size}`;
-      aliases.set(name, next);
-      joins.push(`LEFT JOIN record_index_values ${next} ON ${next}.space_id=r.space_id AND ${next}.collection_id=r.collection_id
+    if (!mapHas(aliases, name)) {
+      const next = `f${aliased.length}`;
+      mapSet(aliases, name, next);
+      append(aliased, name);
+      append(joins, `LEFT JOIN record_index_values ${next} ON ${next}.space_id=r.space_id AND ${next}.collection_id=r.collection_id
         AND ${next}.record_id=r.record_id AND ${next}.field_name=${bind(name)}`);
     }
-    return aliases.get(name)!;
+    return mapGet(aliases, name)!;
   };
   const grouped: string[] = ['count(*) AS n'], keys: string[] = [], texts: string[] = ['n::text'], labels: string[] = [],
     order: string[] = [];
-  spec.groupBy.forEach((dimension, i) => {
-    const a = alias(dimension.field);
+  each(spec.groupBy, (dimension, i) => {
+    const a = alias(dimension.field), kind = kindOf(dimension.field);
     const value = dimension.bucket ? `date_trunc(${bind(dimension.bucket.unit)},${instant(a)},${bind(dimension.bucket.timeZone)})`
-      : `${a}.${COLUMN[declared.get(dimension.field)!.kind]}`;
-    grouped.push(`${a}.value_kind AS k${i}`, `${value} AS v${i}`);
-    keys.push(`k${i}`, `v${i}`);
-    const kind = declared.get(dimension.field)!.kind;
-    texts.push(`k${i}`, ...(kind === 'string' || kind === 'boolean' ? [`v${i}::text`] : []));
-    order.push(`CASE s.k${i} WHEN 'null' THEN 1 WHEN 'missing' THEN 2 ELSE 0 END`, `s.v${i}`);
+      : `${a}.${COLUMN[kind]}`;
+    append(grouped, `${a}.value_kind AS k${i}`); append(grouped, `${value} AS v${i}`);
+    append(keys, `k${i}`); append(keys, `v${i}`);
+    append(texts, `k${i}`);
+    if (kind === 'string' || kind === 'boolean') append(texts, `v${i}::text`);
+    append(order, `CASE s.k${i} WHEN 'null' THEN 1 WHEN 'missing' THEN 2 ELSE 0 END`); append(order, `s.v${i}`);
     if (dimension.bucket) {
       // A bucket's local label is its start at its UTC offset: for an hour, its members' own offset (date_trunc keeps it,
       // so ambiguous and shifted hours stay apart, and it is one offset per bucket); for a day or more, the offset at its start.
@@ -222,32 +255,34 @@ function statement(scope: Readonly<AuthorityScope>, spec: Spec, declared: Readon
       const zone = bind(dimension.bucket.timeZone);
       const at = (instant: string) => `EXTRACT(EPOCH FROM (${instant} AT TIME ZONE ${zone})-(${instant} AT TIME ZONE 'UTC'))::int`;
       const hour = dimension.bucket.unit === 'hour';
-      if (hour) grouped.push(`min(${at(instant(a))}) AS o${i}`);
-      labels.push(`EXTRACT(EPOCH FROM v${i})::bigint AS e${i}`, ...(hour ? [] : [`${at(`v${i}`)} AS o${i}`]));
+      if (hour) append(grouped, `min(${at(instant(a))}) AS o${i}`);
+      append(labels, `EXTRACT(EPOCH FROM v${i})::bigint AS e${i}`);
+      if (!hour) append(labels, `${at(`v${i}`)} AS o${i}`);
     }
   });
-  spec.metrics.forEach((metric, j) => {
-    if (metric.field === null) { grouped.push(`count(*) AS m${j}`); texts.push(`m${j}::text`); return; }
-    const a = alias(metric.field), kind = declared.get(metric.field)!.kind;
+  each(spec.metrics, (metric, j) => {
+    if (metric.field === null) { append(grouped, `count(*) AS m${j}`); append(texts, `m${j}::text`); return; }
+    const a = alias(metric.field), kind = kindOf(metric.field);
     const present = `FILTER (WHERE ${a}.value_kind=${bind(kind)})`;
     let value = `${metric.op === 'avg' ? 'sum' : metric.op}(${a}.${COLUMN[kind]}) ${present}`;
     if (kind === 'date-time') value = `${metric.op}(stateplane_instant_sort_key(${a}.time_value) COLLATE "C") ${present}`;
-    grouped.push(`${value} AS m${j}`, `count(*) ${present} AS m${j}_values`,
-      `count(*) FILTER (WHERE ${a}.value_kind='null') AS m${j}_nulls`, `count(*) FILTER (WHERE ${a}.value_kind='missing') AS m${j}_missing`);
-    texts.push(`m${j}_values::text`, `m${j}_nulls::text`, `m${j}_missing::text`);
-    if (metric.op === 'sum') texts.push(`trim_scale(m${j})::text`);
-    else if (metric.op !== 'avg' && kind !== 'number') texts.push(`m${j}::text`);
+    append(grouped, `${value} AS m${j}`); append(grouped, `count(*) ${present} AS m${j}_values`);
+    append(grouped, `count(*) FILTER (WHERE ${a}.value_kind='null') AS m${j}_nulls`);
+    append(grouped, `count(*) FILTER (WHERE ${a}.value_kind='missing') AS m${j}_missing`);
+    append(texts, `m${j}_values::text`); append(texts, `m${j}_nulls::text`); append(texts, `m${j}_missing::text`);
+    if (metric.op === 'sum') append(texts, `trim_scale(m${j})::text`);
+    else if (metric.op !== 'avg' && kind !== 'number') append(texts, `m${j}::text`);
   });
   // Readiness promises one value row per live record and declared field, of its kind, null or missing; anything else fails.
-  const consistent = [...aliases].map(([name, a]) =>
-    `COALESCE(${a}.value_kind IN (${bind(declared.get(name)!.kind)},'null','missing'),false)`);
-  grouped.push(`bool_or(NOT (${consistent.length ? consistent.join(' AND ') : 'true'})) AS inconsistent`);
+  const consistent = each(aliased, name =>
+    `COALESCE(${mapGet(aliases, name)!}.value_kind IN (${bind(kindOf(name))},'null','missing'),false)`);
+  append(grouped, `bool_or(NOT (${consistent.length ? joined(consistent, ' AND ') : 'true'})) AS inconsistent`);
   const maxGroups = bind(spec.maxGroups), maxBytes = bind(aggregationBounds.resultBytes);
   const sql = `WITH grouped AS (
-      SELECT ${grouped.join(',')} FROM records r ${joins.join(' ')}
-      WHERE ${where}${keys.length ? ` GROUP BY ${keys.join(',')}` : ''}
+      SELECT ${joined(grouped, ',')} FROM records r ${joined(joins, ' ')}
+      WHERE ${where}${keys.length ? ` GROUP BY ${joined(keys, ',')}` : ''}
     ), sized AS (
-      SELECT g.*,${labels.length ? `${labels.join(',')},` : ''}octet_length(concat(${texts.length ? texts.join(',') : `''`})) AS bytes
+      SELECT g.*,${labels.length ? `${joined(labels, ',')},` : ''}octet_length(concat(${texts.length ? joined(texts, ',') : `''`})) AS bytes
       FROM grouped g
     ), totals AS (
       SELECT count(*) AS total_groups,COALESCE(sum(bytes),0) AS total_bytes,COALESCE(bool_or(inconsistent),false) AS total_inconsistent,
@@ -256,13 +291,13 @@ function statement(scope: Readonly<AuthorityScope>, spec: Spec, declared: Readon
     SELECT t.*,s.* FROM totals t
     LEFT JOIN LATERAL (SELECT * FROM sized WHERE t.total_groups<=${maxGroups} AND t.total_bytes<=${maxBytes}
       AND NOT t.total_inconsistent) s ON true
-    ${order.length ? `ORDER BY ${order.join(',')}` : ''}`;
+    ${order.length ? `ORDER BY ${joined(order, ',')}` : ''}`;
   return { sql, params };
 }
 
 /** A numeric's text without trailing fractional zeros or a negative zero. */
 function decimal(text: string): string {
-  const trimmed = text.includes('.') ? text.replace(/0+$/, '').replace(/\.$/, '') : text;
+  const trimmed = Reflect.apply(nativeStringIncludes, text, ['.']) ? text.replace(/0+$/, '').replace(/\.$/, '') : text;
   return trimmed === '-0' ? '0' : trimmed;
 }
 
@@ -273,7 +308,7 @@ function decimal(text: string): string {
 function roundedAverage(sum: string, count: number): string | null {
   if (count === 0) return null;
   const negative = sum.startsWith('-');
-  const [whole, fraction = ''] = (negative ? sum.slice(1) : sum).split('.');
+  const parts = (negative ? sum.slice(1) : sum).split('.'), whole = parts[0], fraction = parts.length > 1 ? parts[1] : '';
   const numerator = BigInt(whole + fraction), denominator = 10n ** BigInt(fraction.length) * BigInt(count);
   if (numerator === 0n) return '0';
   const digits = BigInt(aggregationBounds.averageDigits), low = 10n ** (digits - 1n), high = 10n ** digits;
@@ -281,9 +316,10 @@ function roundedAverage(sum: string, count: number): string | null {
   let shift = aggregationBounds.averageDigits - numerator.toString().length + denominator.toString().length;
   const scaled = (by: number): [bigint, bigint] => by >= 0 ? [numerator * 10n ** BigInt(by), denominator]
     : [numerator, denominator * 10n ** BigInt(-by)];
-  let [n, d] = scaled(shift);
-  while (n / d >= high) [n, d] = scaled(--shift);
-  while (n / d < low) [n, d] = scaled(++shift);
+  let pair = scaled(shift);
+  while (pair[0] / pair[1] >= high) pair = scaled(--shift);
+  while (pair[0] / pair[1] < low) pair = scaled(++shift);
+  const n = pair[0], d = pair[1];
   let q = n / d;
   if (2n * (n - q * d) >= d) q++;
   if (q === high) { q /= 10n; shift--; }
@@ -321,7 +357,11 @@ const UTC_NAMES: readonly string[] = Object.freeze(['utc', 'uct', 'zulu', 'gmt']
  * `Etc/UTC`; so is a name the database's time zone database does not know.
  */
 async function zones(db: Db, spec: Spec): Promise<Spec> {
-  const names = [...new Set(spec.groupBy.flatMap(item => item.bucket ? [item.bucket.timeZone] : []))];
+  const names: string[] = [];
+  for (let i = 0; i < spec.groupBy.length; i++) {
+    const bucket = spec.groupBy[i].bucket;
+    if (bucket && !includes(names, bucket.timeZone)) append(names, bucket.timeZone);
+  }
   if (!names.length) return spec;
   let rows: { z: string; offset: number | null }[];
   try {
@@ -332,13 +372,14 @@ async function zones(db: Db, spec: Spec): Promise<Spec> {
     throw error;
   }
   const resolved = new Map<string, string>();
-  for (const row of rows) {
-    if (row.offset === null) resolved.set(row.z, row.z);
-    else if (row.offset === 0 && UTC_NAMES.includes(row.z.toLowerCase())) resolved.set(row.z, 'Etc/UTC');
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (row.offset === null) mapSet(resolved, row.z, row.z);
+    else if (row.offset === 0 && includes(UTC_NAMES, row.z.toLowerCase())) mapSet(resolved, row.z, 'Etc/UTC');
     else invalid(`timeZone ${row.z} is also a fixed-offset time zone abbreviation; name a region's zone, such as Europe/Paris`);
   }
-  return { ...spec, groupBy: spec.groupBy.map(dimension => dimension.bucket ? { field: dimension.field,
-    bucket: { unit: dimension.bucket.unit, timeZone: resolved.get(dimension.bucket.timeZone)! } } : dimension) };
+  return { ...spec, groupBy: each(spec.groupBy, dimension => dimension.bucket ? { field: dimension.field,
+    bucket: { unit: dimension.bucket.unit, timeZone: mapGet(resolved, dimension.bucket.timeZone)! } } : dimension) };
 }
 
 const lockSlots = `SELECT
@@ -393,11 +434,11 @@ export class PostgresAggregations {
   readonly #statementMs: number;
   constructor(private readonly spaces: PostgresSpaces, private readonly cells: ReadonlyMap<string, AggregationCell>,
     options: AggregationOptions = {}) {
-    for (const [id, cell] of cells) {
+    Reflect.apply(nativeMapForEach, cells, [(cell: AggregationCell, id: string) => {
       analyticalSlots(cell.originConnectionLimit);
       // Fail closed: an aggregation never runs on the pool interactive reads are admitted on.
       if (cell.pool === cell.admission) throw new Error(`Cell ${id} needs an analytical pool apart from its admission pool`);
-    }
+    }]);
     const ms = options.statementTimeoutMs ?? aggregationBounds.statementMs;
     if (!Number.isSafeInteger(ms) || ms < 1 || ms > aggregationBounds.maxStatementMs) throw new RangeError('Invalid statement time budget');
     this.#statementMs = ms;
@@ -432,7 +473,7 @@ export class PostgresAggregations {
 
   private async admit(actor: VerifiedCredential, spaceId: string, collectionId: string, request: () => Spec): Promise<AggregationResult> {
     const admitted = await this.spaces.scope(actor, spaceId, collectionId, 'records:read');
-    const cell = this.cells.get(admitted.cellId);
+    const cell = mapGet(this.cells, admitted.cellId);
     if (!cell) throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Analytical capacity is not configured for this cell', undefined, false);
     // Authorize the collection and grant before taking capacity, so a caller without records:read, or a collection that does
     // not exist, is refused as such and never holds or waits on a slot. The analytical transaction locks and checks them again.
@@ -445,16 +486,16 @@ export class PostgresAggregations {
     const spec = request();
     predicateFilter(admitted.scope, spec.where);
     const slots = analyticalSlots(cell.originConnectionLimit);
-    const running = this.#running.get(admitted.cellId) ?? 0;
+    const running = mapGet(this.#running, admitted.cellId) ?? 0;
     if (running >= slots.cell) throw new AggregationLimitError('slots', 'Analytical capacity is in use; retry later');
-    this.#running.set(admitted.cellId, running + 1);
+    mapSet(this.#running, admitted.cellId, running + 1);
     try {
       try { return await transact(cell.pool, db => this.run(db, actor, admitted, spec, slots, true)); }
       catch (error) { if (!(error instanceof Unprovisioned)) throw error; }
       await transact(cell.pool, db => provision(db, admitted.scope, admitted.cellId, slots));
       return await transact(cell.pool, db => this.run(db, actor, admitted, spec, slots, false));
     } finally {
-      this.#running.set(admitted.cellId, this.#running.get(admitted.cellId)! - 1);
+      mapSet(this.#running, admitted.cellId, mapGet(this.#running, admitted.cellId)! - 1);
     }
   }
 
@@ -472,17 +513,23 @@ export class PostgresAggregations {
       throw new AggregationLimitError('slots', `The ${held.cell_slot === null ? "cell's" : "space's"} analytical slots are in use; retry later`);
     }
     const spec = await zones(db, admittedSpec);
-    const names = [...new Set([...spec.where.map(item => item.field), ...spec.groupBy.map(item => item.field),
-      ...spec.metrics.flatMap(item => item.field === null ? [] : [item.field])])];
+    const named: string[] = [];
+    for (let i = 0; i < spec.where.length; i++) append(named, spec.where[i].field);
+    for (let i = 0; i < spec.groupBy.length; i++) append(named, spec.groupBy[i].field);
+    for (let i = 0; i < spec.metrics.length; i++) if (spec.metrics[i].field !== null) append(named, spec.metrics[i].field!);
+    const names = distinct(named);
     const rows = (await db.query(`SELECT c.schema_version,d.field_name,d.value_kind,d.ready,d.filterable,d.accepted_version
       FROM collections c LEFT JOIN collection_index_declarations d ON d.space_id=c.space_id AND d.collection_id=c.collection_id
         AND d.field_name=ANY($3::text[])
       WHERE c.space_id=$1 AND c.collection_id=$2`, [scope.spaceId, scope.collectionId, names])).rows;
     const schemaVersion = Number(rows[0]?.schema_version);
     if (!Number.isSafeInteger(schemaVersion)) throw new AuthorityError('SCHEMA_CONFLICT');
-    const declared = new Map<string, Declared>(rows.filter(row => row.field_name !== null).map(row => [String(row.field_name),
-      { kind: row.value_kind, ready: row.ready === true, filterable: row.filterable === true,
-        acceptedVersion: Number(row.accepted_version) }]));
+    const declared = new Map<string, Declared>();
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      if (row.field_name !== null) mapSet(declared, String(row.field_name), { kind: row.value_kind, ready: row.ready === true,
+        filterable: row.filterable === true, acceptedVersion: Number(row.accepted_version) });
+    }
     admit(spec, declared);
     const { sql, params } = statement(scope, spec, declared);
 
@@ -503,9 +550,9 @@ export class PostgresAggregations {
       throw new AggregationLimitError('groups', `The aggregation has ${groupCount} groups, more than maxGroups (${spec.maxGroups})`);
     const overBytes = () => new AggregationLimitError('bytes', `The aggregation's groups exceed ${aggregationBounds.resultBytes} bytes`);
     if (Number(totals.total_bytes) > aggregationBounds.resultBytes) throw overBytes();
-    const kindOf = (name: string) => declared.get(name)!.kind;
-    const groups = groupCount === 0 ? [] : result.rows.map(row => ({
-      key: spec.groupBy.map((dimension, i): GroupKey => {
+    const kindOf = (name: string) => mapGet(declared, name)!.kind;
+    const groups = groupCount === 0 ? [] : each(result.rows, row => ({
+      key: each(spec.groupBy, (dimension, i): GroupKey => {
         if (row[`k${i}`] === 'null' || row[`k${i}`] === 'missing') return { kind: row[`k${i}`] };
         if (dimension.bucket) {
           const start = Number(row[`e${i}`]), shift = Number(row[`o${i}`]);
@@ -515,7 +562,7 @@ export class PostgresAggregations {
         return { kind: 'value', value: kind === 'number' ? Number(row[`v${i}`]) : row[`v${i}`] };
       }),
       count: Number(row.n),
-      metrics: spec.metrics.map((metric, j): AggregationMetricValue => {
+      metrics: each(spec.metrics, (metric, j): AggregationMetricValue => {
         if (metric.field === null) return { value: Number(row[`m${j}`]), values: null, nulls: null, missing: null };
         const raw = row[`m${j}`] as string | null, values = Number(row[`m${j}_values`]);
         let value: string | number | null = raw;
@@ -531,16 +578,18 @@ export class PostgresAggregations {
     if (Buffer.byteLength(JSON.stringify(groups)) > aggregationBounds.resultBytes) throw overBytes();
     await db.query(`SET LOCAL statement_timeout = '${aggregationBounds.statementMs}ms'`);
     await this.spaces.assertScopeCurrent(actor, ownerPrincipalId, scope, db, scope.collectionId, ['records:read']);
-    const used = [...new Set([...spec.groupBy.map(item => item.field), ...spec.metrics.flatMap(item => item.field ?? [])])];
+    const measured: string[] = each(spec.groupBy, item => item.field);
+    for (let i = 0; i < spec.metrics.length; i++) if (spec.metrics[i].field !== null) append(measured, spec.metrics[i].field!);
+    const used = distinct(measured);
     return {
-      source: { spaceId: scope.spaceId, collectionId: scope.collectionId, records: 'live', where: [...spec.where],
+      source: { spaceId: scope.spaceId, collectionId: scope.collectionId, records: 'live', where: each(spec.where, item => item),
         policyVersion: scope.policyVersion, placementGeneration: scope.placementGeneration },
-      collection: { schemaVersion, fields: used.map(name => ({ field: name, kind: kindOf(name),
-        acceptedVersion: declared.get(name)!.acceptedVersion })) },
+      collection: { schemaVersion, fields: each(used, name => ({ field: name, kind: kindOf(name),
+        acceptedVersion: mapGet(declared, name)!.acceptedVersion })) },
       snapshot: { scope: 'statement', takenAt: new Date(totals.taken_at).toISOString() },
-      groupBy: spec.groupBy.map(dimension => ({ field: dimension.field, kind: kindOf(dimension.field), bucket: dimension.bucket,
+      groupBy: each(spec.groupBy, dimension => ({ field: dimension.field, kind: kindOf(dimension.field), bucket: dimension.bucket,
         semantics: dimension.bucket ? 'derived' : 'exact' })),
-      metrics: spec.metrics.map(metric => ({ op: metric.op, field: metric.field, semantics: metric.op === 'avg' ? 'derived' : 'exact',
+      metrics: each(spec.metrics, metric => ({ op: metric.op, field: metric.field, semantics: metric.op === 'avg' ? 'derived' : 'exact',
         precision: metric.op === 'avg' ? `${aggregationBounds.averageDigits} significant digits, half away from zero` : null })),
       groups, complete: true
     };

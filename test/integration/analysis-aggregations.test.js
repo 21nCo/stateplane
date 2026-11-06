@@ -8,8 +8,8 @@ import pg from 'pg';
 import { memoryAdapter } from '@superfunctions/db/testing';
 import { createAuthFn, createUser, issueSession } from '@authfn/core';
 import { AuthFnAgentKeys, AuthFnIdentityVerifier } from '../../packages/auth/dist/index.js';
-import { AggregationLimitError, PostgresAggregations, PostgresSpaces, aggregationBounds, analyticalSlots, postgresServices }
-  from '../../packages/postgres/dist/index.js';
+import { AggregationLimitError, PostgresAggregations, PostgresAuthority, PostgresSpaces, aggregationBounds, analyticalSlots,
+  postgresServices } from '../../packages/postgres/dist/index.js';
 
 // STA-58: bounded interactive aggregations, checked against an independent
 // reference oracle computed in JavaScript from the data the tests wrote
@@ -457,6 +457,79 @@ test('every predicate member is validated before it reaches a query, through bot
   await rejects(service.aggregateSerialized(f.owner, f.spaceId, 'items', JSON.stringify({ metrics: [{ op: 'count' }], maxGroups: null })),
     'INVALID_ARGUMENT');
   assert.equal((await service.aggregate(f.owner, f.spaceId, 'items', { metrics: [{ op: 'count' }] })).groups[0].count, 1);
+});
+
+test('an IN value proxy is refused before any inspection, through aggregations and object record reads', async () => {
+  const f = await fixture();
+  await f.write('items', { operation: 'create', data: { team: 'red', score: 1 } });
+  const service = aggregations();
+  const { scope } = await spaces.scope(f.owner, f.spaceId, 'items', 'records:read');
+  const authority = new PostgresAuthority(pool, 3600);
+  const revocable = Proxy.revocable([1], {});
+  revocable.revoke();
+  const ran = [];
+  const trapped = new Proxy([1], Object.fromEntries(['get', 'has', 'ownKeys', 'getOwnPropertyDescriptor', 'getPrototypeOf']
+    .map(trap => [trap, (...args) => { ran.push(trap); return Reflect[trap](...args); }])));
+  for (const value of [revocable.proxy, trapped]) {
+    const where = [{ field: 'score', kind: 'number', operator: 'in', value }];
+    await rejects(service.aggregate(f.owner, f.spaceId, 'items', { metrics: [{ op: 'count' }], where }), 'INVALID_ARGUMENT');
+    await rejects(authority.transaction(scope, tx => tx.countRecords(where)), 'INVALID_ARGUMENT');
+    await rejects(authority.transaction(scope, tx => tx.queryRecords(where, 10)), 'INVALID_ARGUMENT');
+  }
+  assert.deepEqual(ran, []);
+  assert.equal(await authority.transaction(scope, tx => tx.countRecords([{ field: 'score', kind: 'number', operator: 'in', value: [1] }])), 1);
+});
+
+test('replaced includes and Map intrinsics never admit a spec, skip the slot bound or escape untyped', async () => {
+  const f = await fixture();
+  await f.write('items', { operation: 'create', data: { team: 'red', score: 2, active: true, at: '2026-01-01T00:00:00Z' } });
+  const service = aggregations();
+  const refused = [{ metrics: [{ op: 'count' }], groupBy: [{ field: 'at', bucket: { unit: 'decade', timeZone: 'UTC' } }] },
+    { metrics: [{ op: 'sum', field: 'active' }] }, { metrics: [{ op: 'avg', field: 'active' }] }, { metrics: [{ op: 'median', field: 'score' }] },
+    { metrics: [{ op: 'count' }], groupBy: [{ field: 'at', bucket: { unit: 'day', timeZone: 'WET' } }] }];
+  const control = { metrics: [{ op: 'count' }, { op: 'sum', field: 'score' }], where: [{ field: 'team', kind: 'string', operator: 'eq', value: 'red' }],
+    groupBy: [{ field: 'team' }, { field: 'at', bucket: { unit: 'year', timeZone: 'UTC' } }] };
+  const original = { includes: Array.prototype.includes, get: Map.prototype.get };
+  let answered;
+  try {
+    // The tamper admits exactly the values an allowlist must refuse; every other membership answers as before.
+    Array.prototype.includes = function (value) {
+      if (value === 'decade' || value === 'boolean' || value === 'median' || value === 'wet') return true;
+      return Reflect.apply(original.includes, this, [value]);
+    };
+    // A tampered Map forgets every running count and presents every declared index as a number.
+    Map.prototype.get = function (key) {
+      const value = Reflect.apply(original.get, this, [key]);
+      if (typeof value === 'number') return 0;
+      if (value && typeof value === 'object' && Object.hasOwn(value, 'kind') && Object.hasOwn(value, 'ready')) return { ...value, kind: 'number' };
+      return value;
+    };
+    for (const spec of refused) {
+      await rejects(service.aggregate(f.owner, f.spaceId, 'items', spec), 'INVALID_ARGUMENT');
+      await rejects(service.aggregateSerialized(f.owner, f.spaceId, 'items', JSON.stringify(spec)), 'INVALID_ARGUMENT');
+      await rejects(analyticServices.analysis.aggregate(f.owner, f.spaceId, 'items', JSON.stringify(spec)), 'INVALID_ARGUMENT');
+    }
+    // The per-process bound still holds: with one slot (origin limit 5), a second aggregation while the first waits on its
+    // analytical connection is refused, not admitted by a forgotten count.
+    let release, connected;
+    const held = new Promise(resolve => { release = resolve; }), arrived = new Promise(resolve => { connected = resolve; });
+    gates.push(release);
+    const single = aggregations({ connect: async () => { connected(); await held; return analyticalPool.connect(); } }, 5);
+    const first = single.aggregate(f.owner, f.spaceId, 'items', { metrics: [{ op: 'count' }] });
+    await arrived;
+    await limited(single.aggregate(f.owner, f.spaceId, 'items', { metrics: [{ op: 'count' }] }), 'slots');
+    release();
+    assert.equal((await first).groups[0].count, 1);
+    answered = await service.aggregateSerialized(f.owner, f.spaceId, 'items', JSON.stringify(control));
+  } finally {
+    Array.prototype.includes = original.includes;
+    Map.prototype.get = original.get;
+  }
+  assert.equal(answered.groups.length, 1);
+  assert.deepEqual(answered.groups[0].key, [{ kind: 'value', value: 'red' },
+    { kind: 'value', value: '2026-01-01T00:00:00Z', local: '2026-01-01T00:00:00+00:00' }]);
+  assert.deepEqual(answered.groups[0].metrics.map(metric => metric.value), [1, '2']);
+  assert.deepEqual(answered.collection.fields.map(item => [item.field, item.kind]), [['team', 'string'], ['at', 'date-time'], ['score', 'number']]);
 });
 
 test('a runtime without proxy detection aggregates serialized specs and refuses object specs', () => {
