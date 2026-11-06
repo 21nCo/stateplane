@@ -431,6 +431,27 @@ test('every predicate member is validated before it reaches a query, through bot
   await rejects(service.aggregate(f.owner, f.spaceId, 'items', count([{ field: 'team', kind: 'string', operator: 'eq', value: hooked }])),
     'INVALID_ARGUMENT');
   assert.deepEqual(ran, []);
+  // An operator is a primitive allowlisted string: inherited names, arrays and objects never reach a lookup or SQL text.
+  for (const operator of ['constructor', 'toString', '__proto__', 'hasOwnProperty', ['eq'], {}]) {
+    const where = [{ field: 'team', kind: 'string', operator, value: 'red' }];
+    await rejects(service.aggregateSerialized(f.owner, f.spaceId, 'items', JSON.stringify(count(where))), 'INVALID_ARGUMENT');
+    await rejects(analyticServices.analysis.aggregate(f.owner, f.spaceId, 'items', JSON.stringify(count(where))), 'INVALID_ARGUMENT');
+    await rejects(analyticServices.records.count(f.owner, f.spaceId, 'items', JSON.stringify(where)), 'INVALID_ARGUMENT');
+    await rejects(analyticServices.records.query(f.owner, f.spaceId, 'items', JSON.stringify({ predicates: where, limit: 10 })),
+      'INVALID_ARGUMENT');
+  }
+  await rejects(analyticServices.records.count(f.owner, f.spaceId, 'items',
+    JSON.stringify([{ field: 'team', kind: 'null', operator: 'constructor' }])), 'INVALID_ARGUMENT');
+  const trapped = new Proxy({}, { get: (_, key) => { ran.push(`get ${String(key)}`); return undefined; },
+    getPrototypeOf: () => { ran.push('getPrototypeOf'); return Object.prototype; } });
+  for (const operator of [{ toString: () => { ran.push('toString'); return 'eq'; } },
+    { [Symbol.toPrimitive]: () => { ran.push('toPrimitive'); return 'eq'; } }, trapped]) {
+    await rejects(service.aggregate(f.owner, f.spaceId, 'items', count([{ field: 'team', kind: 'string', operator, value: 'red' }])),
+      'INVALID_ARGUMENT');
+  }
+  assert.deepEqual(ran, []);
+  assert.equal(await analyticServices.records.count(f.owner, f.spaceId, 'items',
+    JSON.stringify([{ field: 'team', kind: 'string', operator: 'eq', value: 'red' }])), 1);
   // Only an absent maxGroups takes the default: null is refused through both entrypoints.
   await rejects(service.aggregate(f.owner, f.spaceId, 'items', { metrics: [{ op: 'count' }], maxGroups: null }), 'INVALID_ARGUMENT');
   await rejects(service.aggregateSerialized(f.owner, f.spaceId, 'items', JSON.stringify({ metrics: [{ op: 'count' }], maxGroups: null })),
@@ -823,7 +844,8 @@ test('a space suspended before its slots are added is refused with a typed autho
   } });
   await assert.rejects(service.aggregate(f.owner, f.spaceId, 'items', { metrics: [{ op: 'count' }] }), error => {
     assert.equal(error.name, 'AuthorityError', `${error.name}: ${error.message}`);
-    assert.equal(typeof error.code, 'string');
+    // Suspension advances the space's policy version, so the stale scope is refused before its lifecycle is read.
+    assert.deepEqual([error.code, error.message], ['FORBIDDEN', 'Policy or placement changed']);
     return true;
   });
   assert.equal(connects, 2, 'refused in the provisioning transaction');

@@ -72,7 +72,8 @@ interface PageCursor {
 
 /** Compile one typed comparison after checking its scalar parameter. */
 function comparison(predicate: Exclude<ScalarPredicate, { kind: 'null' }>, alias: string, params: unknown[]): string {
-  const column = { string:'string_value','date-time':'time_value',number:'number_value',boolean:'boolean_value' }[predicate.kind];
+  const column = predicateColumn(predicate.kind);
+  if (typeof predicate.operator!=='string' || !arrayHas(COMPARISON_OPERATORS,predicate.operator)) throw new AuthorityError('INVALID_ARGUMENT');
   if (predicate.operator==='in') {
     if (!Array.isArray(predicate.value) || predicate.value.length<1 || predicate.value.length>16 ||
       predicate.value.some(value=>!validPredicateValue(predicate.kind,value))) throw new AuthorityError('INVALID_ARGUMENT');
@@ -84,14 +85,34 @@ function comparison(predicate: Exclude<ScalarPredicate, { kind: 'null' }>, alias
       WHERE stateplane_instant_sort_key(${alias}.${column}) COLLATE "C" = stateplane_instant_sort_key(choice.value) COLLATE "C")`;
     return ` AND ${alias}.${column} = ANY($${params.length}::${arrayType}[])`;
   }
-  const operator = { eq:'=',lt:'<',lte:'<=',gt:'>',gte:'>=' }[predicate.operator];
-  if (!operator) throw new AuthorityError('INVALID_ARGUMENT');
+  const operator = sqlOperator(predicate.operator);
   if (!validPredicateValue(predicate.kind,predicate.value)) throw new AuthorityError('INVALID_ARGUMENT');
   params.push(predicate.value);
   if (predicate.kind === 'date-time') {
     return ` AND stateplane_instant_sort_key(${alias}.${column}) COLLATE "C" ${operator} stateplane_instant_sort_key($${params.length}::text) COLLATE "C"`;
   }
   return ` AND ${alias}.${column} ${operator} $${params.length}`;
+}
+/** Operators a non-null predicate accepts; compared by identity, never used as a property key. */
+const COMPARISON_OPERATORS: readonly string[] = Object.freeze(['eq','lt','lte','gt','gte','in']);
+function predicateColumn(kind: unknown): string {
+  switch (kind) {
+    case 'string': return 'string_value';
+    case 'date-time': return 'time_value';
+    case 'number': return 'number_value';
+    case 'boolean': return 'boolean_value';
+    default: throw new AuthorityError('INVALID_ARGUMENT');
+  }
+}
+function sqlOperator(operator: unknown): string {
+  switch (operator) {
+    case 'eq': return '=';
+    case 'lt': return '<';
+    case 'lte': return '<=';
+    case 'gt': return '>';
+    case 'gte': return '>=';
+    default: throw new AuthorityError('INVALID_ARGUMENT');
+  }
 }
 function validPredicateValue(kind:string,value:unknown):boolean {
   if (kind==='number') return typeof value==='number' && isFiniteNumber(value);
@@ -566,6 +587,9 @@ function snapshotPredicate(item:unknown,trustedParsed=false):ScalarPredicate {
   const operator=Object.getOwnPropertyDescriptor(item,'operator')?.value;
   const value=Object.getOwnPropertyDescriptor(item,'value')?.value;
   predicateDataKeys(item,kind);
+  // A primitive allowlisted operator before any coercion, lookup or SQL text.
+  if (!scalarString(field) || typeof operator!=='string' ||
+    (kind==='null' ? operator!=='isNull' : !arrayHas(COMPARISON_OPERATORS,operator))) throw new AuthorityError('INVALID_ARGUMENT');
   if (kind==='null') return Object.freeze({field,kind,operator}) as ScalarPredicate;
   if (operator==='in') {
     return Object.freeze({field,kind,operator,value:snapshotInValues(value,kind,trustedParsed)}) as ScalarPredicate;
