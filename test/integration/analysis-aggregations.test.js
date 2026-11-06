@@ -47,8 +47,8 @@ const verify = token => identity.verify(new Request('https://h.invalid', { heade
 const analyticalPool = newPool(6);
 const aggregations = (cellPool = analyticalPool, originConnectionLimit = 5, options = {}) =>
   new PostgresAggregations(spaces, new Map([['cell-a', { pool: cellPool, admission: pool, originConnectionLimit }]]), options);
-const rejects = (promise, code, check = () => {}) => assert.rejects(promise, error => {
-  assert.equal(error.code, code, error.message); check(error); return true;
+const rejects = (promise, code, check = () => {}, label = '') => assert.rejects(promise, error => {
+  assert.equal(error.code, code, `${label} ${error.message}`); check(error); return true;
 });
 const limited = (promise, limit) => rejects(promise, limit === 'slots' ? 'BACKPRESSURE' : 'RATE_LIMITED', error => {
   assert.ok(error instanceof AggregationLimitError, error.message);
@@ -675,6 +675,136 @@ test('replaced built-ins on the shared predicate compiler never rewrite, misbind
   }
 });
 
+test('replaced Reflect.apply and polluted descriptors never misbind, admit or escape untyped, through every reader', async () => {
+  const f = await fixture();
+  for (const data of [{ team: 'red', score: 17, active: true }, { team: 'blue', score: 42 }, { team: 'blue', score: 43, active: false }])
+    await f.write('items', { operation: 'create', data });
+  const service = aggregations();
+  const { scope } = await spaces.scope(f.owner, f.spaceId, 'items', 'records:read');
+  const authority = new PostgresAuthority(pool, 3600);
+  const where = [{ field: 'team', kind: 'string', operator: 'eq', value: 'red' },
+    { field: 'score', kind: 'number', operator: 'in', value: [17] }, { field: 'active', kind: 'boolean', operator: 'eq', value: true }];
+  const spec = { where, groupBy: [{ field: 'team' }], metrics: [{ op: 'count' }, { op: 'sum', field: 'score' }] };
+  const specText = JSON.stringify(spec), whereText = JSON.stringify(where);
+  const refused = [{ metrics: [{ op: 'sum', field: 'active' }] }, { metrics: [{ op: 'median', field: 'score' }] },
+    { metrics: [{ op: 'count' }], where: [{ field: 'team', kind: 'string', operator: 'eq', value: 'x'.repeat(600) }] }];
+  const refusedTexts = refused.map(item => JSON.stringify(item));
+  const answers = async () => [await service.aggregate(f.owner, f.spaceId, 'items', spec),
+    await service.aggregateSerialized(f.owner, f.spaceId, 'items', specText),
+    await analyticServices.analysis.aggregate(f.owner, f.spaceId, 'items', specText),
+    await authority.transaction(scope, tx => tx.countRecords(where)),
+    (await authority.transaction(scope, tx => tx.queryRecords(where, 10))).length,
+    await authority.transaction(scope, tx => tx.existsRecord(where)),
+    await services.records.count(f.owner, f.spaceId, 'items', whereText)];
+  const expected = await answers();
+  // The driver builds a new session's parameters with ordinary descriptors, so every pool is filled first and only reused.
+  for (const item of [pool, ...extraPools]) {
+    const clients = await Promise.all(Array.from({ length: item.options.max }, () => item.connect()));
+    for (const client of clients) client.release();
+  }
+  // Every method of Map, Set, WeakMap, Array and String fails when called through the global Reflect.apply; descriptors
+  // inherit get and set; arrays inherit an index past every list and a toJSON. Driver and runtime internals use their own.
+  const originalApply = Reflect.apply, blocked = new Set();
+  for (const prototype of [Map.prototype, Set.prototype, WeakMap.prototype, Array.prototype, String.prototype])
+    for (const key of Reflect.ownKeys(prototype)) {
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, key);
+      if (typeof descriptor.value === 'function') blocked.add(descriptor.value);
+    }
+  const polluted = { get() { throw new Error('inherited get'); }, set() { throw new Error('inherited set'); } };
+  const outcomes = [], errors = [];
+  try {
+    Reflect.apply = (target, self, args) => {
+      if (blocked.has(target)) throw new Error('replaced apply');
+      return originalApply(target, self, args);
+    };
+    for (const [key, value] of Object.entries(polluted)) Object.defineProperty(Object.prototype, key, { __proto__: null, configurable: true, value });
+    Object.defineProperty(Array.prototype, 16, { __proto__: null, configurable: true, value: { field: 'team', kind: 'string', operator: 'eq', value: 'blue' } });
+    Object.defineProperty(Array.prototype, 'toJSON', { __proto__: null, configurable: true, value() { return []; } });
+    outcomes.push(...await answers());
+    for (let i = 0; i < refused.length; i++) {
+      errors.push(...await Promise.all([service.aggregate(f.owner, f.spaceId, 'items', refused[i]),
+        service.aggregateSerialized(f.owner, f.spaceId, 'items', refusedTexts[i]),
+        analyticServices.analysis.aggregate(f.owner, f.spaceId, 'items', refusedTexts[i])].map(item => item.then(() => null, error => error))));
+    }
+  } finally {
+    Reflect.apply = originalApply;
+    for (const key of Object.keys(polluted)) delete Object.prototype[key];
+    delete Array.prototype[16];
+    delete Array.prototype.toJSON;
+  }
+  assert.equal(outcomes.length, expected.length);
+  for (let i = 0; i < 3; i++) {
+    assert.deepEqual(outcomes[i].groups.map(group => [group.key, group.count, group.metrics.map(metric => metric.value)]),
+      [[[{ kind: 'value', value: 'red' }], 1, [1, '17']]], `aggregation ${i}`);
+    assert.deepEqual(outcomes[i].source.where, where);
+    assert.deepEqual(outcomes[i], { ...expected[i], snapshot: outcomes[i].snapshot });
+  }
+  assert.deepEqual(outcomes.slice(3), [1, 1, true, 1]);
+  assert.deepEqual(outcomes.slice(3), expected.slice(3));
+  assert.deepEqual(errors.map(error => error?.code), refused.flatMap(() => Array(3).fill('INVALID_ARGUMENT')));
+});
+
+test('a spec is checked against its declarations before any capacity is taken or reported', async () => {
+  const f = await fixture();
+  await f.write('items', { operation: 'create', data: { team: 'red', score: 1, active: true } });
+  // Each is well formed, but names a field kind its operator does not take, or a field that is not a filter index.
+  const conflicts = [[{ metrics: [{ op: 'sum', field: 'active' }] }, 'INVALID_ARGUMENT'],
+    [{ metrics: [{ op: 'avg', field: 'team' }] }, 'INVALID_ARGUMENT'], [{ metrics: [{ op: 'count' }], groupBy: [{ field: 'at' }] }, 'INVALID_ARGUMENT'],
+    [{ metrics: [{ op: 'count' }], where: [{ field: 'note', kind: 'string', operator: 'eq', value: 'x' }] }, 'SCHEMA_CONFLICT'],
+    [{ metrics: [{ op: 'count' }], groupBy: [{ field: 'at', bucket: { unit: 'day', timeZone: 'WET' } }] }, 'INVALID_ARGUMENT']];
+  const check = async (label, adapter) => {
+    for (const [request, code] of conflicts) {
+      await rejects(adapter.aggregate(f.owner, f.spaceId, 'items', request), code, () => {}, label);
+      await rejects(adapter.aggregateSerialized(f.owner, f.spaceId, 'items', JSON.stringify(request)), code);
+    }
+  };
+  // Available capacity: refused without an analytical session.
+  const counted = { connects: 0 };
+  await check('available', aggregations({ connect: () => { counted.connects++; return analyticalPool.connect(); } }, 5));
+  assert.equal(counted.connects, 0, 'refused before any analytical session');
+  // Saturated capacity: with the only slot held, the caller still learns what is wrong with its spec, not to retry.
+  const paused = pausingPool(analyticalPool);
+  const saturated = aggregations(paused.pool, 5);
+  const hold = paused.pause();
+  const holding = saturated.aggregate(f.owner, f.spaceId, 'items', { metrics: [{ op: 'count' }] });
+  await hold.arrived;
+  await check('saturated', saturated);
+  await limited(saturated.aggregate(f.owner, f.spaceId, 'items', { metrics: [{ op: 'count' }] }), 'slots');
+  hold.release();
+  assert.equal((await holding).groups[0].count, 1);
+  // Unconfigured capacity: the same refusals, through the composed services, before PROVIDER_UNAVAILABLE.
+  for (const [request, code] of conflicts)
+    await rejects(services.analysis.aggregate(f.owner, f.spaceId, 'items', JSON.stringify(request)), code);
+  await check('unconfigured', new PostgresAggregations(spaces, new Map()));
+});
+
+test('an empty groupBy equals omission, and filter-only fields are reported with their declarations', async () => {
+  const f = await fixture();
+  for (const data of [{ team: 'red', score: 1, active: true }, { team: 'blue', score: 2, active: false }, { team: 'red', score: 4 }])
+    await f.write('items', { operation: 'create', data });
+  const service = aggregations();
+  const entrypoints = [request => service.aggregate(f.owner, f.spaceId, 'items', request),
+    request => service.aggregateSerialized(f.owner, f.spaceId, 'items', JSON.stringify(request)),
+    request => analyticServices.analysis.aggregate(f.owner, f.spaceId, 'items', JSON.stringify(request))];
+  const declared = new Map((await pool.query(`SELECT field_name,accepted_version FROM collection_index_declarations
+    WHERE space_id=$1 AND collection_id='items'`, [f.spaceId])).rows.map(row => [row.field_name, Number(row.accepted_version)]));
+  const metrics = [{ op: 'count' }, { op: 'max', field: 'score' }];
+  const where = [{ field: 'team', kind: 'string', operator: 'eq', value: 'red' }, { field: 'score', kind: 'number', operator: 'gte', value: 0 }];
+  for (const run of entrypoints) {
+    const omitted = await run({ metrics }), empty = await run({ groupBy: [], metrics });
+    assert.deepEqual({ ...empty, snapshot: null }, { ...omitted, snapshot: null });
+    assert.deepEqual(empty.groups.map(group => [group.key, group.count, group.metrics.map(metric => metric.value)]), [[[], 3, [3, 4]]]);
+    await rejects(run({ groupBy: [], metrics: [] }), 'INVALID_ARGUMENT');
+    // Filtered by team and score, grouped by active, measuring score: each field once, in grouped, measured, filtered order.
+    const filtered = await run({ where, groupBy: [{ field: 'active' }], metrics });
+    assert.deepEqual(filtered.collection.fields, [['active', 'boolean'], ['score', 'number'], ['team', 'string']]
+      .map(([field, kind]) => ({ field, kind, acceptedVersion: declared.get(field) })));
+    const counted = await run({ where, metrics: [{ op: 'count' }] });
+    assert.deepEqual(counted.collection.fields.map(item => [item.field, item.kind]), [['team', 'string'], ['score', 'number']]);
+  }
+  await rejects(service.aggregate(f.owner, f.spaceId, 'items', { groupBy: Object.assign([], { extra: 1 }), metrics }), 'INVALID_ARGUMENT');
+});
+
 test('a runtime without proxy detection aggregates serialized specs and refuses object specs', () => {
   const script = `import assert from 'node:assert/strict';
     import { types } from 'node:util';
@@ -928,6 +1058,56 @@ test('analytical slots bound aggregations per process, per cell and per space, a
   await holding;
 });
 
+test('a stalled analytical checkout is bounded, and services sharing an analytical pool share its per-process slots', async () => {
+  const f = await fixture();
+  await f.write('items', { operation: 'create', data: { team: 'red' } });
+  const count = JSON.stringify({ metrics: [{ op: 'count' }] });
+  // Checkouts listed in `stalls` (1-based, per aggregation) never answer in time; each answers with a client after the
+  // deadline, which must be released unused. Every other checkout is a real analytical session.
+  let stalls = new Set(), checkouts = 0, released = 0;
+  const late = [];
+  const shared = { connect: () => {
+    if (!stalls.has(++checkouts)) return analyticalPool.connect();
+    return new Promise(resolve => late.push(() => resolve({ release: () => { released++; },
+      query: () => { throw new Error('a late session was used'); }, on() {}, removeListener() {} })));
+  } };
+  const compose = () => postgresServices(spaces, new Map([['cell-a', { pool, cursorSecret: randomBytes(32),
+    analytics: { pool: shared, originConnectionLimit: 5 } }]]), 3600);
+  const [one, two] = [compose(), compose()];
+  const direct = aggregations(shared, 5);
+  const stalled = async (stall, run) => {
+    stalls = new Set([stall]); checkouts = 0;
+    const started = performance.now();
+    const pending = run();
+    // While it waits for its session, separately composed services and adapters on the same pool are refused at once.
+    while (checkouts < stall) await new Promise(resolve => setImmediate(resolve));
+    const before = checkouts;
+    await limited(two.analysis.aggregate(f.owner, f.spaceId, 'items', count), 'slots');
+    await limited(direct.aggregateSerialized(f.owner, f.spaceId, 'items', count), 'slots');
+    assert.equal(checkouts, before, 'refused without a checkout');
+    await limited(pending, 'slots');
+    const waited = performance.now() - started;
+    assert.ok(waited >= aggregationBounds.checkoutMs - 5 && waited < aggregationBounds.checkoutMs + 1_500, `waited ${waited} ms`);
+    const before2 = released;
+    late.shift()();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(released, before2 + 1, 'the late session is released unused');
+  };
+  // The first attempt's checkout stalls.
+  await stalled(1, () => one.analysis.aggregate(f.owner, f.spaceId, 'items', count));
+  // A new space has no slot rows: its first attempt finds none, then the provisioning checkout stalls, then the retry's.
+  const g = await fixture();
+  await g.write('items', { operation: 'create', data: { team: 'red' } });
+  await stalled(2, () => one.analysis.aggregate(g.owner, g.spaceId, 'items', count));
+  await stalled(3, () => one.analysis.aggregate(g.owner, g.spaceId, 'items', count));
+  // Every reservation was given back: without stalls, both services and the adapter answer through the shared pool.
+  stalls = new Set();
+  for (const answer of [await one.analysis.aggregate(g.owner, g.spaceId, 'items', count),
+    await two.analysis.aggregate(f.owner, f.spaceId, 'items', count), await direct.aggregateSerialized(g.owner, g.spaceId, 'items', count)])
+    assert.equal(answer.groups[0].count, 1);
+  assert.equal(released, 3);
+});
+
 test('interactive reads stay within their budget while analytical load saturates its slots', async t => {
   const f = await fixture(['items', 'bulk']);
   const ids = [];
@@ -1074,5 +1254,5 @@ test('a space suspended before its slots are added is refused with a typed autho
 
 test('bounds are the documented protective values', () => {
   assert.deepEqual({ ...aggregationBounds }, { groupBy: 3, metrics: 16, maxGroups: 1_000, defaultMaxGroups: 100, resultBytes: 262_144,
-    statementMs: 5_000, maxStatementMs: 15_000, averageDigits: 20, specBytes: 32_768 });
+    statementMs: 5_000, maxStatementMs: 15_000, averageDigits: 20, specBytes: 32_768, checkoutMs: 2_000 });
 });

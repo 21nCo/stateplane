@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import { types } from 'node:util';
 import { AuthorityError } from './index.js';
 import type { IndexValue, UniqueValue } from './index.js';
+import { append, apply, hasOwn as own, isFiniteNumber, isSafeInteger, NativeDate, ownDescriptor, setAdd, setDelete,
+  setHas } from './intrinsics.js';
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export interface SchemaNode {
@@ -28,14 +30,9 @@ const maxFields = 256;
 export const MAX_INDEX_PART_BYTES = 256;
 export const MAX_INDEX_VALUE_BYTES = 512;
 const withinBytes = (value:string, limit:number):boolean => Buffer.byteLength(value,'utf8') <= limit;
-// The predicate and aggregation admission helpers below (includes, utf8Bytes, scalarString, utcInstant) call built-ins
-// only through these load-time captures, so a later replacement cannot change what they admit.
-const apply = Reflect.apply;
-const ownDescriptor = Object.getOwnPropertyDescriptor;
-const own = Object.hasOwn;
-const isFiniteNumber = Number.isFinite;
+// The predicate and aggregation admission helpers below (includes, any, distinct, scalarLength, scalarString, utcInstant)
+// call built-ins only through ./intrinsics.js and these load-time captures, so a later replacement cannot change what they admit.
 const isIntegerNumber = Number.isInteger;
-const isSafeInteger = Number.isSafeInteger;
 const normalize = String.prototype.normalize;
 const codeUnit = String.prototype.charCodeAt;
 const slice = String.prototype.slice;
@@ -44,10 +41,6 @@ const endsWith = String.prototype.endsWith;
 const nativeSort = Array.prototype.sort;
 const nativeJoin = Array.prototype.join;
 const nativeRegexExec = RegExp.prototype.exec;
-const nativeSetHas = Set.prototype.has;
-const nativeSetAdd = Set.prototype.add;
-const nativeSetDelete = Set.prototype.delete;
-const NativeDate = Date;
 const nativeGetTime = Date.prototype.getTime;
 const nativeISOString = Date.prototype.toISOString;
 const proxyDetector=(()=>{
@@ -61,42 +54,25 @@ export const acceptsInProcessObjects=proxyDetector!==null;
 /** Treat objects as unsafe when the runtime cannot reliably detect proxies. */
 export const isInProcessProxy = (value:unknown):boolean => proxyDetector ? proxyDetector(value) : true;
 const compare = (a: string,b: string) => Buffer.compare(Buffer.from(a),Buffer.from(b));
-const append = <T>(values:T[],value:T):void => { Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
 /** Compare own array slots without invoking a replaced iterator or includes method. */
 export const includes = <T>(values:readonly T[],value:T):boolean => {
   for (let i=0;i<values.length;i++) if (ownDescriptor(values,i)?.value===value) return true;
   return false;
 };
-/** UTF-8 bytes of text, a lone surrogate counted as its 3-byte replacement, as Buffer.byteLength counts. */
-export function utf8Bytes(text: string): number {
-  let bytes = 0;
-  for (let i = 0; i < text.length; i++) {
-    const unit = apply(codeUnit,text,[i]) as number;
-    if (unit < 0x80) bytes += 1;
-    else if (unit < 0x800) bytes += 2;
-    else if (unit >= 0xd800 && unit <= 0xdbff && i + 1 < text.length && (apply(codeUnit,text,[i + 1]) as number) >= 0xdc00 &&
-      (apply(codeUnit,text,[i + 1]) as number) <= 0xdfff) { bytes += 4; i++; }
-    else bytes += 3;
-  }
-  return bytes;
-}
 const distinct = (values:readonly unknown[]):boolean => {
-  for (let i=0;i<values.length;i++) for (let j=0;j<i;j++) if (Object.getOwnPropertyDescriptor(values,i)?.value===Object.getOwnPropertyDescriptor(values,j)?.value) return false;
+  for (let i=0;i<values.length;i++) for (let j=0;j<i;j++) if (ownDescriptor(values,i)?.value===ownDescriptor(values,j)?.value) return false;
   return true;
 };
 const any = <T>(values:readonly T[],predicate:(value:T)=>boolean):boolean => {
-  for (let i=0;i<values.length;i++) if (predicate(Object.getOwnPropertyDescriptor(values,i)!.value)) return true;
+  for (let i=0;i<values.length;i++) if (predicate(ownDescriptor(values,i)!.value)) return true;
   return false;
 };
-const sorted = <T>(values:T[],comparison:(a:T,b:T)=>number):T[] => Reflect.apply(nativeSort,values,[comparison]) as T[];
-const joined = (values:readonly string[],separator:string):string => Reflect.apply(nativeJoin,values,[separator]) as string;
-const setHas = <T>(set:Set<T>,value:T):boolean => apply(nativeSetHas,set,[value]) as boolean;
-const setAdd = <T>(set:Set<T>,value:T):void => { apply(nativeSetAdd,set,[value]); };
-const setDelete = <T>(set:Set<T>,value:T):void => { apply(nativeSetDelete,set,[value]); };
+const sorted = <T>(values:T[],comparison:(a:T,b:T)=>number):T[] => apply(nativeSort,values,[comparison]) as T[];
+const joined = (values:readonly string[],separator:string):string => apply(nativeJoin,values,[separator]) as string;
 const scalarLength=(value:string):number=>{
   let count=0;
   for (let i=0;i<value.length;i++) {
-    const unit=Reflect.apply(codeUnit,value,[i]) as number;
+    const unit=apply(codeUnit,value,[i]) as number;
     if (unit>=0xd800 && unit<=0xdbff) i++;
     count++;
   }
@@ -511,11 +487,11 @@ for (let i=0x2000;i<=0x200a;i++) whites.add(i);
 /** Normalize a caller key using the fixed v1 Unicode trim and NFC rule. */
 export function externalKey(value: unknown): string {
   if (!scalarString(value)) fail('INVALID_ARGUMENT');
-  const n=Reflect.apply(normalize,value,['NFC']) as string;
+  const n=apply(normalize,value,['NFC']) as string;
   let start=0,end=n.length;
-  while (start<end && setHas(whites,Reflect.apply(codeUnit,n,[start]) as number)) start++;
-  while (end>start && setHas(whites,Reflect.apply(codeUnit,n,[end-1]) as number)) end--;
-  const result=Reflect.apply(slice,n,[start,end]) as string;
+  while (start<end && setHas(whites,apply(codeUnit,n,[start]) as number)) start++;
+  while (end>start && setHas(whites,apply(codeUnit,n,[end-1]) as number)) end--;
+  const result=apply(slice,n,[start,end]) as string;
   if (!result || !withinBytes(result,MAX_INDEX_PART_BYTES)) fail('INVALID_ARGUMENT','External key exceeds indexed byte limit');
   return result;
 }
@@ -565,7 +541,7 @@ function encodeUniqueTuple(data:Record<string,Json>,definition:CollectionDefinit
     let normalized:string;
     if (typeof value!=='string') normalized=canonical(value);
     else if (own(field,'format') && field.format==='date-time') normalized=utcInstant(value);
-    else normalized=Reflect.apply(normalize,value,['NFC']) as string;
+    else normalized=apply(normalize,value,['NFC']) as string;
     append(parts,`${tag}:${Buffer.byteLength(normalized)}:${normalized}`);
   }
   const encodedValue=joined(parts,'');

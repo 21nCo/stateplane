@@ -4,7 +4,9 @@ import { commitBeforeDeadline, CommitNotSentDeadlineExceeded } from './commit-de
 import { claimOutboxSql, failOutboxSql, LIVE_OUTBOX } from './outbox-sql.js';
 import { parseRevision } from '@stateplane/contracts';
 import type { Capability, CollectionId, RecordRef, Revision, SpaceId } from '@stateplane/contracts';
-import { acceptsInProcessObjects, canonical, derivedParsedValues, externalKey, fingerprint, isInProcessProxy, MAX_INDEX_PART_BYTES, MAX_INDEX_VALUE_BYTES, plainJson, scalarString as unicodeString, utcInstant, utf8Bytes, validateParsedValue } from './schema.js';
+import { acceptsInProcessObjects, canonical, derivedParsedValues, externalKey, fingerprint, isInProcessProxy, MAX_INDEX_PART_BYTES, MAX_INDEX_VALUE_BYTES, plainJson, scalarString as unicodeString, utcInstant, validateParsedValue } from './schema.js';
+import { append, apply, ArrayPrototype, freeze, hasOwn, isArray, isFiniteNumber, isSafeInteger, mapClear, mapForEach, mapGet, mapHas,
+  mapSet, ObjectPrototype, ownDescriptor, ownKeys, parseJson, prototypeOf, setAdd, setClear, setForEach, setHas, utf8Bytes } from './intrinsics.js';
 import type { CollectionDefinition, Json } from './schema.js';
 export { CollectionRegistry } from './collections.js';
 export { externalKey, validateDefinition, validateValue, compatible, derivedValues } from './schema.js';
@@ -175,49 +177,28 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const retryCodes = new Set(['40P01', '40001']);
 const validDigest = /^[0-9a-f]{64}$/;
 const serializedMarker=Symbol('stateplane parsed JSON');
-const isFiniteNumber = Number.isFinite;
-const isSafeInteger = Number.isSafeInteger;
-// The predicate compiler and its snapshot helpers call built-ins only through these load-time captures and build
-// arrays with own data slots, so a later replacement cannot admit, rewrite or misbind a predicate.
-const isArray = Array.isArray, ArrayPrototype = Array.prototype, ObjectPrototype = Object.prototype;
-const ownDescriptor = Object.getOwnPropertyDescriptor, defineOwn = Object.defineProperty, prototypeOf = Object.getPrototypeOf;
-const hasOwn = Object.hasOwn, freeze = Object.freeze, ownKeys = Reflect.ownKeys;
+// The predicate compiler, its snapshot helpers and the transaction lifecycle call built-ins only through the load-time
+// captures in ./intrinsics.js and build arrays with own data slots, so a later replacement cannot admit, rewrite or
+// misbind a predicate, or make a transaction's cleanup fail untyped.
 const nativeStringIncludes = String.prototype.includes;
-const nativeSetHas=Set.prototype.has;
-const nativeSetAdd=Set.prototype.add;
-const nativeSetClear=Set.prototype.clear;
-const nativeSetForEach=Set.prototype.forEach;
-const nativeMapGet=Map.prototype.get;
-const nativeMapSet=Map.prototype.set;
-const nativeMapHas=Map.prototype.has;
-const nativeMapClear=Map.prototype.clear;
-const nativeMapForEach=Map.prototype.forEach;
 /** Compare own array slots without invoking a replaced includes method. */
 const arrayHas=(values:readonly unknown[],wanted:unknown):boolean=>{
   for (let i=0;i<values.length;i++) if (ownDescriptor(values,i)?.value===wanted) return true;
   return false;
 };
-const append=<T>(values:T[],value:T):void=>{ defineOwn(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
-const setHas=<T>(values:Set<T>,wanted:T):boolean=>Reflect.apply(nativeSetHas,values,[wanted]) as boolean;
-const setAdd=<T>(values:Set<T>,wanted:T):void=>{ Reflect.apply(nativeSetAdd,values,[wanted]); };
-const setClear=<T>(values:Set<T>):void=>{ Reflect.apply(nativeSetClear,values,[]); };
-const mapGet=<T>(values:Map<string,T>,key:string):T|undefined=>Reflect.apply(nativeMapGet,values,[key]) as T|undefined;
-const mapSet=<T>(values:Map<string,T>,key:string,value:T):void=>{ Reflect.apply(nativeMapSet,values,[key,value]); };
-const mapHas=<T>(values:Map<string,T>,key:string):boolean=>Reflect.apply(nativeMapHas,values,[key]) as boolean;
-const mapClear=<T>(values:Map<string,T>):void=>{ Reflect.apply(nativeMapClear,values,[]); };
 const mapValues=<T>(source:Map<string,T>):T[]=>{
   const values:T[]=[];
-  Reflect.apply(nativeMapForEach,source,[(value:T)=>append(values,value)]);
+  mapForEach(source,(value:T)=>append(values,value));
   return values;
 };
 const setValues=<T>(source:Set<T>):T[]=>{
   const values:T[]=[];
-  Reflect.apply(nativeSetForEach,source,[(value:T)=>append(values,value)]);
+  setForEach(source,(value:T)=>append(values,value));
   return values;
 };
 /** Find a JSON string containing U+0000 before choosing the jsonb projection. */
 function containsNul(value: Json): boolean {
-  if (typeof value==='string') return Reflect.apply(nativeStringIncludes,value,['\0']) as boolean;
+  if (typeof value==='string') return apply(nativeStringIncludes,value,['\0']) as boolean;
   if (value===null || typeof value!=='object') return false;
   const keys=Object.keys(value);
   for (let i=0;i<keys.length;i++) if (containsNul((value as Record<string,Json>)[keys[i]])) return true; // NOSONAR -- own-slot scan avoids replaced array iterators
@@ -225,13 +206,13 @@ function containsNul(value: Json): boolean {
 }
 /** PostgreSQL jsonb cannot represent U+0000. The canonical text remains the authority. */
 function jsonbProjection(canonicalData:string):string|null {
-  return Reflect.apply(nativeStringIncludes,canonicalData,[String.raw`\u0000`]) && containsNul(JSON.parse(canonicalData) as Json) ? null : canonicalData;
+  return apply(nativeStringIncludes,canonicalData,[String.raw`\u0000`]) && containsNul(JSON.parse(canonicalData) as Json) ? null : canonicalData;
 }
 const validScope=(scope:AuthorityScope):boolean =>
-  scalarString(scope.spaceId) && Buffer.byteLength(scope.spaceId)<=MAX_SCOPE_ID_BYTES &&
-  scalarString(scope.collectionId) && Buffer.byteLength(scope.collectionId)<=MAX_INDEX_PART_BYTES &&
-  scalarString(scope.principalId) && Buffer.byteLength(scope.principalId)<=MAX_SCOPE_ID_BYTES &&
-  scalarString(scope.credentialId) && Buffer.byteLength(scope.credentialId)<=MAX_SCOPE_ID_BYTES &&
+  scalarString(scope.spaceId) && utf8Bytes(scope.spaceId)<=MAX_SCOPE_ID_BYTES &&
+  scalarString(scope.collectionId) && utf8Bytes(scope.collectionId)<=MAX_INDEX_PART_BYTES &&
+  scalarString(scope.principalId) && utf8Bytes(scope.principalId)<=MAX_SCOPE_ID_BYTES &&
+  scalarString(scope.credentialId) && utf8Bytes(scope.credentialId)<=MAX_SCOPE_ID_BYTES &&
   isSafeInteger(scope.policyVersion) && scope.policyVersion>0 &&
   isSafeInteger(scope.placementGeneration) && scope.placementGeneration>0;
 /** Detach nested receipt fields before exposing them to callers. */
@@ -565,8 +546,8 @@ export function snapshotPredicates(source: readonly ScalarPredicate[], trustedPa
   return freeze(result);
 }
 function parseSerializedPredicates(serialized:string):readonly ScalarPredicate[] {
-  if (typeof serialized!=='string' || Buffer.byteLength(serialized)>32_768) throw new AuthorityError('INVALID_ARGUMENT');
-  try { return snapshotPredicates(JSON.parse(serialized),true); }
+  if (typeof serialized!=='string' || utf8Bytes(serialized)>32_768) throw new AuthorityError('INVALID_ARGUMENT');
+  try { return snapshotPredicates(parseJson(serialized) as readonly ScalarPredicate[],true); }
   catch { throw new AuthorityError('INVALID_ARGUMENT'); }
 }
 /** Retain a predicate's own data properties and reject decorated objects. */

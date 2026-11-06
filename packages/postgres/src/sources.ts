@@ -7,6 +7,8 @@ import { commitBeforeDeadline, CommitNotSentDeadlineExceeded } from './commit-de
 import { AuthorityError, AuthorityTransaction, clientReadTimedOut, CommitOutcomeUnknownError, linkRestricted } from './index.js';
 import type { AuthorityScope } from './index.js';
 import { acceptsInProcessObjects, includes, isInProcessProxy, scalarString, utcInstant } from './schema.js';
+import { apply, ceil, createObject, hasOwn, isArray, isSafeInteger, max, min, monotonicNow, ObjectPrototype, ownDescriptor, ownKeys,
+  prototypeOf, wallNow as now } from './intrinsics.js';
 import type { PostgresSpaces } from './spaces.js';
 
 /** One cell's authority pool and original-bytes store. */
@@ -60,8 +62,6 @@ const sha256Pattern = /^[0-9a-f]{64}$/;
 const mimePattern = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/;
 // Decisions on caller input use intrinsics captured at module load, so a later
 // change to an inherited method or a global cannot alter what a request means.
-const apply = Reflect.apply;
-const isSafeInteger = Number.isSafeInteger;
 const stringify = JSON.stringify;
 const nativeIndexOf = String.prototype.indexOf;
 const nativeSlice = String.prototype.slice;
@@ -69,16 +69,12 @@ const nativeTrim = String.prototype.trim;
 const nativeLowerCase = String.prototype.toLowerCase;
 const nativeStartsWith = String.prototype.startsWith;
 const nativeRegexExec = RegExp.prototype.exec;
-const isArray = Array.isArray, ObjectPrototype = Object.prototype, createObject = Object.create;
-const prototypeOf = Object.getPrototypeOf, ownDescriptor = Object.getOwnPropertyDescriptor, hasOwn = Object.hasOwn;
-const ownKeys = Reflect.ownKeys;
-const { min, max, ceil } = Math, now = Date.now;
 const matches = (pattern: RegExp, value: string) => apply(nativeRegexExec, pattern, [value]) !== null;
 const startsWith = (value: string, prefix: string) => apply(nativeStartsWith, value, [prefix]) as boolean;
 /** `JSON.stringify` of a string list, read by own index rather than through the array's iterator or `toJSON`. */
 export function serialized(parts: readonly string[]): string {
   let text = '[';
-  for (let i = 0; i < parts.length; i++) text += (i ? ',' : '') + stringify(Object.getOwnPropertyDescriptor(parts, i)!.value);
+  for (let i = 0; i < parts.length; i++) text += (i ? ',' : '') + stringify(ownDescriptor(parts, i)!.value);
   return `${text}]`;
 }
 export type Db = pg.PoolClient;
@@ -191,20 +187,20 @@ class CleanupTimeout extends Error {
  */
 async function within<T>(until: number, start: () => Promise<T>, late: (value: T) => void = () => {},
   budget = until): Promise<T> {
-  if (performance.now() >= until) throw new CleanupTimeout(performance.now() >= budget);
+  if (monotonicNow() >= until) throw new CleanupTimeout(monotonicNow() >= budget);
   const pending = start();
   let timedOut = false;
   void pending.then(value => { if (timedOut) late(value); }, () => {});
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = min(until, performance.now() + CLEANUP_CALL_MS);
+  const deadline = min(until, monotonicNow() + CLEANUP_CALL_MS);
   const atBudget = budget <= deadline;
   const timeout = new Promise<never>((_, reject) => {
     const expire = () => {
-      const left = deadline - performance.now();
+      const left = deadline - monotonicNow();
       if (left > 0) timer = setTimeout(expire, ceil(left));
       else { timedOut = true; reject(new CleanupTimeout(atBudget)); }
     };
-    timer = setTimeout(expire, max(0, deadline - performance.now()));
+    timer = setTimeout(expire, max(0, deadline - monotonicNow()));
   });
   try { return await Promise.race([pending, timeout]); } finally { clearTimeout(timer); }
 }
@@ -233,9 +229,9 @@ async function within<T>(until: number, start: () => Promise<T>, late: (value: T
  * Its server timeouts round up, so they never fire before `until` does.
  */
 export async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promise<T>, until?: number): Promise<T> {
-  const end = until === undefined ? undefined : min(until, performance.now() + CLEANUP_CALL_MS);
-  const remaining = () => end === undefined ? REQUEST_BUDGET_MS : max(1, ceil(end - performance.now()));
-  if (end !== undefined && performance.now() >= end) throw new CleanupTimeout(performance.now() >= until!);
+  const end = until === undefined ? undefined : min(until, monotonicNow() + CLEANUP_CALL_MS);
+  const remaining = () => end === undefined ? REQUEST_BUDGET_MS : max(1, ceil(end - monotonicNow()));
+  if (end !== undefined && monotonicNow() >= end) throw new CleanupTimeout(monotonicNow() >= until!);
   const deadline = now() + REQUEST_BUDGET_MS;
   const client = end === undefined ? await pool.connect() :
     await within(end, () => pool.connect(), late => late.release(), until);

@@ -2,7 +2,10 @@ import type pg from 'pg';
 import type { VerifiedCredential } from '@stateplane/contracts';
 import { AggregationLimitError, AuthorityError, AuthorityTransaction, predicateFilter, snapshotPredicates } from './index.js';
 import type { AuthorityScope, ScalarPredicate } from './index.js';
-import { includes, MAX_INDEX_PART_BYTES, scalarString, utf8Bytes } from './schema.js';
+import { includes, MAX_INDEX_PART_BYTES, scalarString } from './schema.js';
+import { append, apply, ArrayPrototype, freeze, hasOwn, isArray, isSafeInteger, joined, mapForEach, mapGet, mapHas, mapSet,
+  NativeBigInt, NativeDate, NativeDateTimeFormat, NativeMap, NativeNumber, NativeWeakMap, ownDescriptor, ownKeys, parseJson,
+  primitiveJson, prototypeOf, utf8Bytes, weakGet, weakSet } from './intrinsics.js';
 import { fields, invalid, transact, untrusted } from './sources.js';
 import type { Db } from './sources.js';
 import type { PostgresSpaces } from './spaces.js';
@@ -42,7 +45,7 @@ export interface AggregationResult {
   /** The records aggregated: the collection's live (not deleted) records matching every `where` predicate. */
   source: { spaceId: string; collectionId: string; records: 'live'; where: ScalarPredicate[]; policyVersion: number;
     placementGeneration: number };
-  /** The schema version the statement read, and the declared index of each grouped or measured field. */
+  /** The schema version the statement read, and the declared index of each grouped, measured or filtered field, in that order. */
   collection: { schemaVersion: number; fields: { field: string; kind: ValueKind; acceptedVersion: number }[] };
   /** Every group and metric comes from this one statement's snapshot, taken at `takenAt`. */
   snapshot: { scope: 'statement'; takenAt: string };
@@ -56,44 +59,26 @@ export interface AggregationResult {
 
 /*
  * Every built-in this module calls after load, on caller input, bounds, statement text, result formatting or byte
- * sizing, is captured here at load and called through the captured Reflect.apply, or replaced by own code; arrays are
- * built with own data slots and read by index. So a later change to an inherited method (Array, Map, String, RegExp,
- * Date or Object.prototype, toJSON included) or to a global (Number, BigInt, Date, Map, JSON, Intl, Reflect, Buffer)
+ * sizing, comes from ./intrinsics.js or is captured here at load, and is called through the captured Reflect.apply, or
+ * replaced by own code; arrays are built with own data slots and read by index. So a later change to an inherited
+ * method (Array, Map, String, RegExp, Date or Object.prototype, toJSON and descriptor members included) or to a global
  * never admits input, skips a capacity bound, corrupts a result or its byte check, or yields an untyped error.
  */
-const apply = Reflect.apply, ownKeys = Reflect.ownKeys;
-const { defineProperty, getOwnPropertyDescriptor: ownDescriptor, getPrototypeOf, hasOwn } = Object;
-const isArray = Array.isArray, ArrayPrototype = Array.prototype;
-const isSafeInteger = Number.isSafeInteger, NativeNumber = Number, NativeBigInt = BigInt, NativeMap = Map, NativeDate = Date;
-const NativeDateTimeFormat = Intl.DateTimeFormat;
-const nativeParse = JSON.parse, nativeStringify = JSON.stringify, NativeJSON = JSON;
-const nativeJoin = Array.prototype.join;
-const nativeMapGet = Map.prototype.get, nativeMapSet = Map.prototype.set, nativeMapHas = Map.prototype.has;
-const nativeMapForEach = Map.prototype.forEach;
 const nativeRegexExec = RegExp.prototype.exec;
 const nativeISOString = Date.prototype.toISOString;
 const nativeSlice = String.prototype.slice, nativeIndexOf = String.prototype.indexOf, nativeCodeUnit = String.prototype.charCodeAt;
 const nativeLowerCase = String.prototype.toLowerCase;
-const joined = (values: readonly string[], separator: string) => apply(nativeJoin, values, [separator]) as string;
-const mapGet = <K, V>(map: ReadonlyMap<K, V>, key: K) => apply(nativeMapGet, map, [key]) as V | undefined;
-const mapHas = <K, V>(map: ReadonlyMap<K, V>, key: K) => apply(nativeMapHas, map, [key]) as boolean;
-const mapSet = <K, V>(map: Map<K, V>, key: K, value: V) => { apply(nativeMapSet, map, [key, value]); };
+const nativeSetTimeout = setTimeout, nativeClearTimeout = clearTimeout, NativePromise = Promise;
 const matches = (pattern: RegExp, value: string) => apply(nativeRegexExec, pattern, [value]) !== null;
 const slice = (text: string, start: number, end?: number) =>
   apply(nativeSlice, text, end === undefined ? [start] : [start, end]) as string;
 const indexOf = (text: string, part: string) => apply(nativeIndexOf, text, [part]) as number;
 const codeUnit = (text: string, i: number) => apply(nativeCodeUnit, text, [i]) as number;
 const lowerCase = (text: string) => apply(nativeLowerCase, text, []) as string;
-/** A primitive's JSON text: JSON.stringify consults no toJSON for a string, number, boolean or null. */
-const primitiveJson = (value: string | number | boolean | null) => apply(nativeStringify, NativeJSON, [value]) as string;
 /** ISO text of epoch milliseconds, or of a driver Date, whose time value the constructor reads without calling any method. */
 const isoString = (time: number | Date) => apply(nativeISOString, new NativeDate(time), []) as string;
 const floorDivide = (value: number, by: number) => (value - value % by) / by; // non-negative integers only
 const zeros = (count: number) => { let text = ''; while (text.length < count) text += '0'; return text; };
-/** Append as an own data slot, never through an inherited push or index setter. */
-const append = <T>(values: T[], value: T) => {
-  defineProperty(values, values.length, { value, writable: true, configurable: true, enumerable: true });
-};
 /** `f` of each own slot of an array this module built or the driver returned, in order. */
 function each<T, U>(values: readonly T[], f: (value: T, index: number) => U): U[] {
   const result: U[] = [];
@@ -133,10 +118,10 @@ function jsonBytes(value: unknown): number {
  * at most 3 group dimensions and 16 metrics, at most 1,000 groups (100 unless
  * `maxGroups` says otherwise), 256 KiB of groups as JSON text, 5 s of
  * statement time, averages to 20 significant digits, and a serialized spec of
- * at most 32 KiB.
+ * at most 32 KiB, and 2 s to check out an analytical session.
  */
-export const aggregationBounds = Object.freeze({ groupBy: 3, metrics: 16, maxGroups: 1_000, defaultMaxGroups: 100,
-  resultBytes: 262_144, statementMs: 5_000, maxStatementMs: 15_000, averageDigits: 20, specBytes: 32_768 });
+export const aggregationBounds = freeze({ groupBy: 3, metrics: 16, maxGroups: 1_000, defaultMaxGroups: 100,
+  resultBytes: 262_144, statementMs: 5_000, maxStatementMs: 15_000, averageDigits: 20, specBytes: 32_768, checkoutMs: 2_000 });
 
 /**
  * A cell's analytical slots for an origin connection limit of 5 to 20: one
@@ -152,8 +137,8 @@ export function analyticalSlots(originConnectionLimit: number): { cell: number; 
   return { cell, space: space < 1 ? 1 : space };
 }
 
-const UNITS: readonly string[] = Object.freeze(['hour', 'day', 'week', 'month', 'quarter', 'year']);
-const OPERATORS: readonly string[] = Object.freeze(['count', 'sum', 'avg', 'min', 'max']);
+const UNITS: readonly string[] = freeze(['hour', 'day', 'week', 'month', 'quarter', 'year']);
+const OPERATORS: readonly string[] = freeze(['count', 'sum', 'avg', 'min', 'max']);
 /** What each operator accepts: a sum or average only numbers; a minimum or maximum ordered kinds. */
 const accepts = (op: AggregationOperator, kind: ValueKind) => op === 'sum' || op === 'avg' ? kind === 'number'
   : kind === 'number' || kind === 'string' || kind === 'date-time';
@@ -168,11 +153,11 @@ interface Spec { where: readonly ScalarPredicate[]; groupBy: Dimension[]; metric
 interface Declared { kind: ValueKind; ready: boolean; filterable: boolean; acceptedVersion: number }
 
 /** A plain array's own items, read by index without an inherited iterator. */
-function items(value: unknown, max: number, name: string, trustedParsed: boolean): unknown[] {
+function items(value: unknown, min: number, max: number, name: string, trustedParsed: boolean): unknown[] {
   if (!value || typeof value !== 'object' || (!trustedParsed && untrusted(value)) || !isArray(value) ||
-    getPrototypeOf(value) !== ArrayPrototype) invalid(`${name} must be an array`);
+    prototypeOf(value) !== ArrayPrototype) invalid(`${name} must be an array`);
   const length = ownDescriptor(value, 'length')!.value as number;
-  if (length < 1 || length > max || ownKeys(value).length !== length + 1) invalid(`${name} must hold 1 to ${max} items`);
+  if (length < min || length > max || ownKeys(value).length !== length + 1) invalid(`${name} must hold ${min} to ${max} items`);
   const result: unknown[] = [];
   for (let i = 0; i < length; i++) {
     const item = ownDescriptor(value, i);
@@ -202,7 +187,7 @@ function timeZone(value: unknown): string {
 function parse(request: unknown, trustedParsed: boolean): Spec {
   const input = fields(request, ['where', 'groupBy', 'metrics', 'maxGroups'], ['metrics'], trustedParsed);
   const where = input.where === undefined ? [] : snapshotPredicates(input.where as ScalarPredicate[], trustedParsed);
-  const groupBy = input.groupBy === undefined ? [] : each(items(input.groupBy, aggregationBounds.groupBy, 'groupBy', trustedParsed), item => {
+  const groupBy = input.groupBy === undefined ? [] : each(items(input.groupBy, 0, aggregationBounds.groupBy, 'groupBy', trustedParsed), item => {
     const dimension = fields(item, ['field', 'bucket'], ['field'], trustedParsed);
     if (dimension.bucket === undefined) return { field: field(dimension.field), bucket: null };
     const bucket = fields(dimension.bucket, ['unit', 'timeZone'], ['unit', 'timeZone'], trustedParsed);
@@ -210,7 +195,7 @@ function parse(request: unknown, trustedParsed: boolean): Spec {
     return { field: field(dimension.field), bucket: { unit: bucket.unit as AggregationUnit, timeZone: timeZone(bucket.timeZone) } };
   });
   if (distinct(each(groupBy, dimension => dimension.field)).length !== groupBy.length) invalid('A field is grouped at most once');
-  const metrics = each(items(input.metrics, aggregationBounds.metrics, 'metrics', trustedParsed), item => {
+  const metrics = each(items(input.metrics, 1, aggregationBounds.metrics, 'metrics', trustedParsed), item => {
     const metric = fields(item, ['op', 'field'], ['op'], trustedParsed);
     if (typeof metric.op !== 'string' || !includes(OPERATORS, metric.op)) invalid(`op must be one of ${joined(OPERATORS, ', ')}`);
     if (metric.op === 'count') {
@@ -401,7 +386,7 @@ function offset(seconds: number): string {
 }
 
 /** Zone names that are also abbreviations of UTC itself: their IANA zones are UTC at every instant. */
-const UTC_NAMES: readonly string[] = Object.freeze(['utc', 'uct', 'zulu', 'gmt']);
+const UTC_NAMES: readonly string[] = freeze(['utc', 'uct', 'zulu', 'gmt']);
 /**
  * Each bucket's time zone, resolved by IANA rules only. PostgreSQL reads a
  * zone name as a `timezone_abbreviations` entry (a fixed offset) before its
@@ -463,6 +448,46 @@ async function provision(db: Db, scope: Readonly<AuthorityScope>, cellId: string
     WHERE NOT EXISTS (SELECT 1 FROM analysis_space_slots x WHERE x.space_id=$1 AND x.slot=s) ON CONFLICT DO NOTHING`, [spaceId, slots.space]);
 }
 
+/** The collection's schema version and the declaration of every field the spec filters, groups or measures. */
+async function declarations(db: Db, scope: Readonly<AuthorityScope>, spec: Spec) {
+  const named: string[] = [];
+  for (let i = 0; i < spec.where.length; i++) append(named, spec.where[i].field);
+  for (let i = 0; i < spec.groupBy.length; i++) append(named, spec.groupBy[i].field);
+  for (let i = 0; i < spec.metrics.length; i++) if (spec.metrics[i].field !== null) append(named, spec.metrics[i].field!);
+  const rows = (await db.query(`SELECT c.schema_version,d.field_name,d.value_kind,d.ready,d.filterable,d.accepted_version
+    FROM collections c LEFT JOIN collection_index_declarations d ON d.space_id=c.space_id AND d.collection_id=c.collection_id
+      AND d.field_name=ANY($3::text[])
+    WHERE c.space_id=$1 AND c.collection_id=$2`, [scope.spaceId, scope.collectionId, distinct(named)])).rows;
+  const schemaVersion = NativeNumber(rows[0]?.schema_version);
+  if (!isSafeInteger(schemaVersion)) throw new AuthorityError('SCHEMA_CONFLICT');
+  const declared = new NativeMap<string, Declared>();
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (row.field_name !== null) mapSet(declared, `${row.field_name as string}`, { kind: row.value_kind, ready: row.ready === true,
+      filterable: row.filterable === true, acceptedVersion: NativeNumber(row.accepted_version) });
+  }
+  return { schemaVersion, declared };
+}
+
+/**
+ * `pool`, whose checkout fails with BACKPRESSURE once `aggregationBounds.checkoutMs` pass without a session, so a
+ * stalled pool never keeps an aggregation's reservation; a session that arrives after that is released unused.
+ */
+function bounded(pool: Pick<pg.Pool, 'connect'>): Pick<pg.Pool, 'connect'> {
+  const connect = () => new NativePromise<pg.PoolClient>((resolve, reject) => {
+    let expired = false;
+    const timer = nativeSetTimeout(() => {
+      expired = true;
+      reject(new AggregationLimitError('slots', `No analytical session was free within ${aggregationBounds.checkoutMs} ms; retry later`));
+    }, aggregationBounds.checkoutMs);
+    pool.connect().then(client => { nativeClearTimeout(timer); if (expired) client.release(); else resolve(client); },
+      (error: unknown) => { nativeClearTimeout(timer); reject(error); });
+  });
+  return { connect } as Pick<pg.Pool, 'connect'>;
+}
+/** Aggregations this process runs on each analytical pool, whichever adapter or composed services started them. */
+const running = new NativeWeakMap<object, number>();
+
 /**
  * Bounded interactive aggregations over one collection's declared index
  * fields: count, sum, average, minimum and maximum, grouped by up to three
@@ -475,24 +500,25 @@ async function provision(db: Db, scope: Readonly<AuthorityScope>, cellId: string
  * (the space at the admitted policy and placement, the collection, a key's
  * grant) through commit and finally rechecks the caller's credential. It runs
  * only on analytical capacity, after the collection and grant are authorized
- * on the interactive admission pool: on the cell's analytical pool, at most
- * `analyticalSlots(...).cell` at once per process before it connects, and in
- * the database a free slot of the cell and of the space (migration 049),
- * held by row lock for its transaction, so
+ * and the spec is checked against the declarations on the interactive
+ * admission pool: on the cell's analytical pool, at most
+ * `analyticalSlots(...).cell` at once per process and pool before it connects
+ * (whichever adapter started them), with a session checked out within
+ * `aggregationBounds.checkoutMs`, and in the database a free slot of the cell
+ * and of the space (migration 049), held by row lock for its transaction, so
  * aggregations across processes stay within the cell's analytical budget.
  * Over budget, over its group or byte cap or past its statement time, it fails
  * with a typed `AggregationLimitError`, never with a partial result.
  */
 export class PostgresAggregations {
-  readonly #running = new NativeMap<string, number>();
   readonly #statementMs: number;
   constructor(private readonly spaces: PostgresSpaces, private readonly cells: ReadonlyMap<string, AggregationCell>,
     options: AggregationOptions = {}) {
-    apply(nativeMapForEach, cells, [(cell: AggregationCell, id: string) => {
+    mapForEach(cells, (cell, id) => {
       if (cell.pool !== null) analyticalSlots(cell.originConnectionLimit);
       // Fail closed: an aggregation never runs on the pool interactive reads are admitted on.
       if (cell.pool === cell.admission) throw new Error(`Cell ${id} needs an analytical pool apart from its admission pool`);
-    }]);
+    });
     const ms = options.statementTimeoutMs ?? aggregationBounds.statementMs;
     if (!isSafeInteger(ms) || ms < 1 || ms > aggregationBounds.maxStatementMs) throw new RangeError('Invalid statement time budget');
     this.#statementMs = ms;
@@ -522,7 +548,7 @@ export class PostgresAggregations {
         utf8Bytes(serialized) > aggregationBounds.specBytes)
         invalid(`The spec must be JSON text of at most ${aggregationBounds.specBytes} bytes`);
       let parsed: unknown;
-      try { parsed = apply(nativeParse, NativeJSON, [serialized]); } catch { invalid('The spec must be JSON text'); }
+      try { parsed = parseJson(serialized); } catch { invalid('The spec must be JSON text'); }
       return parse(parsed, true);
     });
   }
@@ -533,36 +559,38 @@ export class PostgresAggregations {
     // interactive pool for that cell, so the caller still learns FORBIDDEN or NOT_FOUND before that.
     const cell: AggregationCell = mapGet(this.cells, admitted.cellId) ??
       { pool: null, admission: this.spaces.interactivePool(admitted.cellId) };
-    const unconfigured = () => new AuthorityError('PROVIDER_UNAVAILABLE', 'Analytical capacity is not configured for this cell',
-      undefined, false);
-    // Authorize the collection and grant before taking or reporting capacity, so a caller without records:read, or a
-    // collection that does not exist, is refused as such and never holds or waits on a slot. The analytical transaction
-    // locks and checks them again.
-    await transact(cell.admission, async db => {
+    // Authorize the collection and grant, then validate the spec and check it against the collection's declarations,
+    // before taking or reporting capacity: a caller without records:read or an unknown collection is refused as such,
+    // and a malformed spec, a field that is not a ready declared index or an operator its kind does not take is refused
+    // as such, never told to retry and never holding or waiting on a slot. The analytical transaction checks them again.
+    const spec = await transact(cell.admission, async db => {
       const tx = new AuthorityTransaction(db, admitted.scope, 1);
       try { await tx.checkScope(); } finally { tx.close(); }
+      const parsed = request();
+      predicateFilter(admitted.scope, parsed.where);
+      const resolved = await zones(db, parsed);
+      admit(resolved, (await declarations(db, admitted.scope, resolved)).declared);
+      return resolved;
     });
-    // The spec is validated once authorized, before any capacity is taken and before any member reaches a query: every
-    // predicate is compiled here, so a malformed one is INVALID_ARGUMENT and never a bound parameter or declaration lookup.
-    const spec = request();
-    predicateFilter(admitted.scope, spec.where);
-    if (cell.pool === null) throw unconfigured();
-    const slots = analyticalSlots(cell.originConnectionLimit);
-    const running = mapGet(this.#running, admitted.cellId) ?? 0;
-    if (running >= slots.cell) throw new AggregationLimitError('slots', 'Analytical capacity is in use; retry later');
-    mapSet(this.#running, admitted.cellId, running + 1);
+    if (cell.pool === null)
+      throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Analytical capacity is not configured for this cell', undefined, false);
+    const slots = analyticalSlots(cell.originConnectionLimit), pool = cell.pool;
+    // Counted per analytical pool, so separately composed services that share one stay within its cell's slots together.
+    const held = weakGet(running, pool) ?? 0;
+    if (held >= slots.cell) throw new AggregationLimitError('slots', 'Analytical capacity is in use; retry later');
+    weakSet(running, pool, held + 1);
     try {
-      const analytical = cell.pool;
+      const analytical = bounded(pool);
       try { return await transact(analytical, db => this.run(db, actor, admitted, spec, slots, true)); }
       catch (error) { if (!(error instanceof Unprovisioned)) throw error; }
       await transact(analytical, db => provision(db, admitted.scope, admitted.cellId, slots));
       return await transact(analytical, db => this.run(db, actor, admitted, spec, slots, false));
     } finally {
-      mapSet(this.#running, admitted.cellId, mapGet(this.#running, admitted.cellId)! - 1);
+      weakSet(running, pool, weakGet(running, pool)! - 1);
     }
   }
 
-  private async run(db: Db, actor: VerifiedCredential, admitted: Awaited<ReturnType<PostgresSpaces['scope']>>, admittedSpec: Spec,
+  private async run(db: Db, actor: VerifiedCredential, admitted: Awaited<ReturnType<PostgresSpaces['scope']>>, spec: Spec,
     slots: { cell: number; space: number }, provisionable: boolean): Promise<AggregationResult> {
     const { scope, cellId, ownerPrincipalId } = admitted;
     // Space, collection and grant first, as every reader takes them, then at once the slots (a purge locks its space before
@@ -575,24 +603,8 @@ export class PostgresAggregations {
       if (missing && provisionable) throw new Unprovisioned();
       throw new AggregationLimitError('slots', `The ${held.cell_slot === null ? "cell's" : "space's"} analytical slots are in use; retry later`);
     }
-    const spec = await zones(db, admittedSpec);
-    const named: string[] = [];
-    for (let i = 0; i < spec.where.length; i++) append(named, spec.where[i].field);
-    for (let i = 0; i < spec.groupBy.length; i++) append(named, spec.groupBy[i].field);
-    for (let i = 0; i < spec.metrics.length; i++) if (spec.metrics[i].field !== null) append(named, spec.metrics[i].field!);
-    const names = distinct(named);
-    const rows = (await db.query(`SELECT c.schema_version,d.field_name,d.value_kind,d.ready,d.filterable,d.accepted_version
-      FROM collections c LEFT JOIN collection_index_declarations d ON d.space_id=c.space_id AND d.collection_id=c.collection_id
-        AND d.field_name=ANY($3::text[])
-      WHERE c.space_id=$1 AND c.collection_id=$2`, [scope.spaceId, scope.collectionId, names])).rows;
-    const schemaVersion = NativeNumber(rows[0]?.schema_version);
-    if (!isSafeInteger(schemaVersion)) throw new AuthorityError('SCHEMA_CONFLICT');
-    const declared = new NativeMap<string, Declared>();
-    for (let i = 0; i < rows.length; i++) {
-      const row = rows[i];
-      if (row.field_name !== null) mapSet(declared, `${row.field_name as string}`, { kind: row.value_kind, ready: row.ready === true,
-        filterable: row.filterable === true, acceptedVersion: NativeNumber(row.accepted_version) });
-    }
+    // The spec's zones were resolved at admission; its fields are checked again against this snapshot's declarations.
+    const { schemaVersion, declared } = await declarations(db, scope, spec);
     admit(spec, declared);
     const { sql, params } = statement(scope, spec, declared);
 
@@ -644,6 +656,7 @@ export class PostgresAggregations {
     await this.spaces.assertScopeCurrent(actor, ownerPrincipalId, scope, db, scope.collectionId, ['records:read']);
     const measured: string[] = each(spec.groupBy, item => item.field);
     for (let i = 0; i < spec.metrics.length; i++) if (spec.metrics[i].field !== null) append(measured, spec.metrics[i].field!);
+    for (let i = 0; i < spec.where.length; i++) append(measured, spec.where[i].field);
     const used = distinct(measured);
     return {
       source: { spaceId: scope.spaceId, collectionId: scope.collectionId, records: 'live', where: each(spec.where, item => item),
