@@ -111,9 +111,12 @@ export const untrusted = (value: object) => !acceptsInProcessObjects || isInProc
  * accessor is invoked. A field given as `undefined` is supplied, not omitted,
  * so it is refused like any other invalid value. Keys and lists are read by
  * own index, never through an inherited iterator or array method.
+ * `trustedParsed` admits ordinary data this process just parsed from JSON
+ * text, so a runtime without a proxy detector still accepts serialized input.
  */
-export function fields(value: unknown, allowed: readonly string[], required: readonly string[]): Record<string, unknown> {
-  if (!value || typeof value !== 'object' || untrusted(value) || Array.isArray(value)) invalid();
+export function fields(value: unknown, allowed: readonly string[], required: readonly string[],
+  trustedParsed = false): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || (!trustedParsed && untrusted(value)) || Array.isArray(value)) invalid();
   const prototype = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) invalid();
   const copy: Record<string, unknown> = Object.create(null);

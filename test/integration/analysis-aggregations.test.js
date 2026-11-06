@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { memoryAdapter } from '@superfunctions/db/testing';
@@ -30,7 +30,7 @@ const migrated = spawnSync(process.execPath, ['scripts/migrate.mjs'], { cwd: roo
 if (migrated.status !== 0) { await admin(`DROP DATABASE IF EXISTS ${name}`); throw new Error(migrated.stderr); }
 const pool = new pg.Pool({ connectionString: url, max: 8 });
 const extraPools = [];
-const analyticsPool = (max = 2) => { const created = new pg.Pool({ connectionString: url, max }); extraPools.push(created); return created; };
+const newPool = (max = 2) => { const created = new pg.Pool({ connectionString: url, max }); extraPools.push(created); return created; };
 test.after(async () => { await Promise.all([pool, ...extraPools].map(item => item.end())); await admin(`DROP DATABASE IF EXISTS ${name}`); });
 
 const config = { database: memoryAdapter(), namespace: `aggregations-${randomUUID()}`, plugins: [] };
@@ -38,10 +38,13 @@ createAuthFn(config);
 const identity = new AuthFnIdentityVerifier(config);
 const spaces = new PostgresSpaces(pool, new Map([['cell-a', { pool, storageTargetId: 'target-a' }]]), 'cell-a',
   new AuthFnAgentKeys(config), identity, randomBytes(32));
+// The fixture services configure no analytical pool, so they refuse every aggregation; analyticServices configure one.
 const services = postgresServices(spaces, new Map([['cell-a', { pool, cursorSecret: randomBytes(32) }]]), 3600);
+const analyticServices = postgresServices(spaces, new Map([['cell-a', { pool, cursorSecret: randomBytes(32),
+  analytics: { pool: newPool(1), originConnectionLimit: 5 } }]]), 3600);
 const verify = token => identity.verify(new Request('https://h.invalid', { headers: { authorization: `Bearer ${token}` } }));
 const aggregations = (cellPool = pool, originConnectionLimit = 5, options = {}) =>
-  new PostgresAggregations(spaces, new Map([['cell-a', { pool: cellPool, originConnectionLimit }]]), options);
+  new PostgresAggregations(spaces, new Map([['cell-a', { pool: cellPool, admission: pool, originConnectionLimit }]]), options);
 const rejects = (promise, code, check = () => {}) => assert.rejects(promise, error => {
   assert.equal(error.code, code, error.message); check(error); return true;
 });
@@ -385,34 +388,106 @@ test('a typed spec admits only declared ready index fields, allowlisted operator
   const reader = await f.agent(['records:read']);
   assert.equal((await service.aggregate(reader, f.spaceId, 'items', { metrics: [{ op: 'count' }] })).groups[0].count, 1);
   await rejects(service.aggregate(reader, f.spaceId, 'missing', { metrics: [{ op: 'count' }] }), 'NOT_FOUND');
-  // The application service composes the same aggregation.
-  assert.equal((await services.analysis.aggregate(f.owner, f.spaceId, 'items', { metrics: [{ op: 'count' }] })).groups[0].count, 1);
+  // The application service composes the same aggregation from JSON text, parsed only after authorization.
+  const serialized = spec => analyticServices.analysis.aggregate(f.owner, f.spaceId, 'items', JSON.stringify(spec));
+  assert.equal((await serialized({ metrics: [{ op: 'count' }] })).groups[0].count, 1);
+  assert.equal((await service.aggregateSerialized(reader, f.spaceId, 'items', JSON.stringify({ metrics: [{ op: 'count' }] })))
+    .groups[0].count, 1);
+  for (const text of ['{', 'null', '[]', JSON.stringify({ metrics: [{ op: 'count' }], sql: 'x' }), ' '.repeat(32_769), 42])
+    await rejects(analyticServices.analysis.aggregate(f.owner, f.spaceId, 'items', text), 'INVALID_ARGUMENT');
+  await rejects(analyticServices.analysis.aggregate(writer, f.spaceId, 'items', '{'), 'FORBIDDEN');
+  // Without an analytical pool of its own a cell runs no aggregation at all, rather than borrow interactive capacity.
+  await rejects(services.analysis.aggregate(f.owner, f.spaceId, 'items', JSON.stringify({ metrics: [{ op: 'count' }] })),
+    'PROVIDER_UNAVAILABLE', error => assert.equal(error.retryable, false));
+  assert.throws(() => postgresServices(spaces, new Map([['cell-a', { pool, cursorSecret: randomBytes(32),
+    analytics: { pool, originConnectionLimit: 5 } }]]), 3600), /analytical pool apart/);
+});
+
+test('a runtime without proxy detection aggregates serialized specs and refuses object specs', () => {
+  const script = `import assert from 'node:assert/strict';
+    import { types } from 'node:util';
+    import pg from 'pg';
+    types.isProxy = undefined;
+    const { PostgresAggregations, PostgresSpaces, postgresServices } = await import('./packages/postgres/dist/index.js');
+    const { url, owner, spaceId } = JSON.parse(process.env.STA58_TEST_CONTEXT);
+    const interactive = new pg.Pool({ connectionString: url, max: 2 }), analytical = new pg.Pool({ connectionString: url, max: 1 });
+    try {
+      const spaces = new PostgresSpaces(interactive, new Map([['cell-a', { pool: interactive, storageTargetId: 'target-a' }]]), 'cell-a',
+        {}, { current: async () => true });
+      const services = postgresServices(spaces, new Map([['cell-a', { pool: interactive, cursorSecret: new Uint8Array(32),
+        analytics: { pool: analytical, originConnectionLimit: 5 } }]]), 3600);
+      const spec = { where: [{ field: 'team', kind: 'string', operator: 'eq', value: 'red' }],
+        groupBy: [{ field: 'at', bucket: { unit: 'day', timeZone: 'Europe/Paris' } }], metrics: [{ op: 'count' }, { op: 'sum', field: 'score' }] };
+      const result = await services.analysis.aggregate(owner, spaceId, 'items', JSON.stringify(spec));
+      assert.deepEqual(result.groups.map(group => [group.key[0].local, group.count, group.metrics[1].value]),
+        [['2026-07-02T00:00:00+02:00', 1, '2']]);
+      const direct = new PostgresAggregations(spaces, new Map([['cell-a', { pool: analytical, admission: interactive, originConnectionLimit: 5 }]]));
+      await assert.rejects(direct.aggregate(owner, spaceId, 'items', spec), { code: 'INVALID_ARGUMENT' });
+      assert.equal((await direct.aggregateSerialized(owner, spaceId, 'items', JSON.stringify(spec))).groups[0].count, 1);
+    } finally { await Promise.all([interactive.end(), analytical.end()]); }
+    process.stdout.write('closed');`;
+  return (async () => {
+    const f = await fixture();
+    await f.write('items', { operation: 'create', data: { team: 'red', score: 2, at: '2026-07-01T22:30:00Z' } });
+    assert.equal(execFileSync(process.execPath, ['--input-type=module', '-e', script], { cwd: root, encoding: 'utf8',
+      env: { ...process.env, STA58_TEST_CONTEXT: JSON.stringify({ url, owner: f.owner, spaceId: f.spaceId }) } }), 'closed');
+  })();
+});
+
+test('time buckets follow IANA zone rules, never a fixed-offset abbreviation of the same name', async () => {
+  const f = await fixture();
+  // A summer instant: an abbreviation's fixed winter offset would put it on another day (or hour) than the zone's own rules.
+  const records = new Map();
+  for (const at of ['2026-07-01T22:30:00Z', '2026-07-01T21:30:00Z', '2026-07-02T06:30:00Z', '2026-01-15T23:30:00Z']) {
+    const data = { at };
+    records.set(await f.write('items', { operation: 'create', data }), data);
+  }
+  const service = aggregations();
+  const byDay = timeZone => ({ groupBy: [{ field: 'at', bucket: { unit: 'day', timeZone } }], metrics: [{ op: 'count' }] });
+  for (const timeZone of ['Europe/Paris', 'Europe/Athens', 'Europe/Lisbon', 'America/Los_Angeles', 'Etc/UTC'])
+    sameAsOracle(await service.aggregate(f.owner, f.spaceId, 'items', byDay(timeZone)), records, byDay(timeZone));
+  const paris = await service.aggregate(f.owner, f.spaceId, 'items', byDay('Europe/Paris'));
+  assert.deepEqual(paris.groups.map(group => group.key[0].local), ['2026-01-16T00:00:00+01:00', '2026-07-01T00:00:00+02:00',
+    '2026-07-02T00:00:00+02:00']);
+  // CET, EET, MET, WET and PST are also PostgreSQL abbreviations with fixed offsets: refused, never bucketed at those offsets.
+  for (const timeZone of ['CET', 'EET', 'MET', 'WET', 'PST', 'cet', 'EST', 'MST', 'HST'])
+    await rejects(service.aggregate(f.owner, f.spaceId, 'items', byDay(timeZone)), 'INVALID_ARGUMENT',
+      error => assert.match(error.message, /abbreviation/, timeZone));
+  await rejects(service.aggregateSerialized(f.owner, f.spaceId, 'items', JSON.stringify(byDay('CET'))), 'INVALID_ARGUMENT');
+  // Names of UTC itself run as Etc/UTC, and the result reports the zone it used.
+  for (const timeZone of ['UTC', 'utc', 'GMT', 'Zulu', 'UCT']) {
+    const result = await service.aggregate(f.owner, f.spaceId, 'items', byDay(timeZone));
+    assert.deepEqual(result.groupBy[0].bucket, { unit: 'day', timeZone: 'Etc/UTC' });
+    sameAsOracle(result, records, byDay('Etc/UTC'));
+  }
 });
 
 /** Insert `count` records into `collectionId` of `spaceId` directly, with their index values, in one transaction. */
-async function bulk(spaceId, count, team = n => `team-${n % 7}`, collectionId = 'bulk') {
-  const teams = Array.from({ length: count }, (_, n) => team(n));
+async function bulk(spaceId, count, team = n => `team-${n % 7}`, collectionId = 'bulk', score = n => n + 1) {
+  const teams = Array.from({ length: count }, (_, n) => team(n)), scores = Array.from({ length: count }, (_, n) => score(n));
   // One transaction: the deferred projection check requires every record's index values at commit. Fresh statistics
   // keep the per-row foreign key and projection checks on their indexes.
   const db = await pool.connect();
   try {
   await db.query('BEGIN');
   await db.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
-    SELECT $1,$3,r.id,1,1,'generated',r.id,json_build_object('score',r.n,'team',r.team)::text,jsonb_build_object('score',r.n,'team',r.team)
-    FROM (SELECT 'rec_'||lpad(n::text,8,'0') AS id,n,t AS team FROM unnest($2::text[]) WITH ORDINALITY u(t,n)) r`, [spaceId, teams, collectionId]);
+    SELECT $1,$3,r.id,1,1,'generated',r.id,json_build_object('score',r.s,'team',r.team)::text,jsonb_build_object('score',r.s,'team',r.team)
+    FROM (SELECT 'rec_'||lpad(n::text,8,'0') AS id,s,t AS team FROM unnest($2::text[],$4::numeric[]) WITH ORDINALITY u(t,s,n)) r`,
+  [spaceId, teams, collectionId, scores]);
   await db.query('ANALYZE records');
   await db.query(`INSERT INTO record_index_values(space_id,collection_id,record_id,field_name,value_kind,string_value,number_value,boolean_value,time_value)
     SELECT $1,$3,'rec_'||lpad(n::text,8,'0'),f.field,
       CASE f.field WHEN 'team' THEN 'string' WHEN 'score' THEN 'number' ELSE 'missing' END,
-      CASE WHEN f.field='team' THEN t END, CASE WHEN f.field='score' THEN n END, NULL, NULL
-    FROM unnest($2::text[]) WITH ORDINALITY u(t,n) CROSS JOIN unnest(ARRAY['team','score','active','at']) f(field)`, [spaceId, teams, collectionId]);
+      CASE WHEN f.field='team' THEN t END, CASE WHEN f.field='score' THEN s END, NULL, NULL
+    FROM unnest($2::text[],$4::numeric[]) WITH ORDINALITY u(t,s,n) CROSS JOIN unnest(ARRAY['team','score','active','at']) f(field)`,
+  [spaceId, teams, collectionId, scores]);
   await db.query('ANALYZE record_index_values');
   await db.query('COMMIT');
   } catch (error) { await db.query('ROLLBACK'); throw error; } finally { db.release(); }
 }
 
 test('over-cardinality, over-byte and over-time aggregations fail with typed errors and never return partial results', async () => {
-  const f = await fixture(['items', 'bulk', 'large']);
+  const f = await fixture(['items', 'bulk', 'large', 'counts', 'thirds']);
   for (let n = 0; n < 5; n++) await f.write('items', { operation: 'create', data: { team: `t${n}`, score: n } });
   const service = aggregations();
   await limited(service.aggregate(f.owner, f.spaceId, 'items', { groupBy: [{ field: 'team' }], metrics: [{ op: 'count' }], maxGroups: 4 }),
@@ -426,6 +501,21 @@ test('over-cardinality, over-byte and over-time aggregations fail with typed err
   const fits = await service.aggregate(f.owner, f.spaceId, 'bulk', { where: [{ field: 'score', kind: 'number', operator: 'lte', value: 400 }],
     groupBy: [{ field: 'team' }], metrics: [{ op: 'count' }], maxGroups: 1000 });
   assert.equal(fits.groups.length, 400);
+  assert.ok(Buffer.byteLength(JSON.stringify(fits.groups)) <= aggregationBounds.resultBytes);
+  // Every returned value counts: 16 counts over 1,000 short keys pass the cap only through their metrics.
+  await bulk(f.spaceId, 1000, n => `k${n}`, 'counts');
+  const counts = { groupBy: [{ field: 'team' }], metrics: Array.from({ length: 16 }, () => ({ op: 'count' })), maxGroups: 1000 };
+  await limited(service.aggregate(f.owner, f.spaceId, 'counts', counts), 'bytes');
+  assert.equal((await service.aggregate(f.owner, f.spaceId, 'counts', { ...counts, metrics: [{ op: 'count' }] })).groups.length, 1000);
+  // Averages are sized as returned: 300 groups of [1, 0, 0] fit as 16 sums of "1" but not as 16 averages of 0.333...
+  await bulk(f.spaceId, 900, n => `g${String(Math.floor(n / 3)).padStart(3, '0')}`, 'thirds', n => (n % 3 === 0 ? 1 : 0));
+  const thirds = op => ({ groupBy: [{ field: 'team' }], metrics: Array.from({ length: 16 }, () => ({ op, field: 'score' })), maxGroups: 1000 });
+  const sums = await service.aggregate(f.owner, f.spaceId, 'thirds', thirds('sum'));
+  assert.equal(sums.groups.length, 300);
+  assert.ok(sums.groups.every(group => group.metrics.every(metric => metric.value === '1')));
+  assert.ok(Buffer.byteLength(JSON.stringify(sums.groups)) <= aggregationBounds.resultBytes);
+  await limited(service.aggregate(f.owner, f.spaceId, 'thirds', thirds('avg')), 'bytes');
+  await limited(analyticServices.analysis.aggregate(f.owner, f.spaceId, 'thirds', JSON.stringify(thirds('avg'))), 'bytes');
   // The statement budget cancels a long aggregation.
   await bulk(f.spaceId, 60_000, undefined, 'large');
   const slow = aggregations(pool, 5, { statementTimeoutMs: 5 });
@@ -480,6 +570,7 @@ test('analytical slots bound aggregations per process, per cell and per space, a
   const count = { metrics: [{ op: 'count' }] };
 
   // In process: the second aggregation is refused before it takes a connection.
+  const writer = await f.agent(['records:write']);
   const counted = { connects: 0 };
   const paused = pausingPool(pool);
   const one = aggregations({ connect: () => { counted.connects++; return paused.pool.connect(); } }, 5);
@@ -489,6 +580,12 @@ test('analytical slots bound aggregations per process, per cell and per space, a
   const connected = counted.connects;
   await limited(one.aggregate(g.owner, g.spaceId, 'items', count), 'slots');
   assert.equal(counted.connects, connected, 'refused without connecting');
+  // Authorization comes before capacity: with the slot held, a key without records:read and an unknown collection are refused as
+  // such, not told to retry, and take no analytical connection.
+  await rejects(one.aggregate(writer, f.spaceId, 'items', count), 'FORBIDDEN');
+  await rejects(one.aggregateSerialized(writer, f.spaceId, 'items', '{'), 'FORBIDDEN');
+  await rejects(one.aggregate(f.owner, f.spaceId, 'nothing', count), 'NOT_FOUND');
+  assert.equal(counted.connects, connected, 'refusals took no analytical connection');
   // Across processes: another service (another isolate) finds the cell's only slot locked and is refused at once.
   const other = aggregations(pool, 5);
   await limited(other.aggregate(g.owner, g.spaceId, 'items', count), 'slots');
@@ -530,15 +627,24 @@ test('interactive reads stay within their budget while analytical load saturates
   const ids = [];
   for (let n = 0; n < 5; n++) ids.push(await f.write('items', { operation: 'create', data: { team: 'red', score: n } }));
   await bulk(f.spaceId, 60_000);
-  // Two isolates' worth of analytical services, each with its own analytical pool.
-  const isolates = [aggregations(analyticsPool(2), 5), aggregations(analyticsPool(2), 5)];
-  const heavy = { groupBy: [{ field: 'team' }], metrics: [{ op: 'count' }, { op: 'avg', field: 'score' }, { op: 'max', field: 'team' }] };
+  // Two isolates' application services as composed in production: each has a constrained interactive pool of 2 connections and
+  // an analytical pool of its own. The interactive reads below go through the first isolate's services and its interactive pool.
+  const isolate = () => {
+    const interactive = newPool(2);
+    const own = new PostgresSpaces(interactive, new Map([['cell-a', { pool: interactive, storageTargetId: 'target-a' }]]), 'cell-a',
+      new AuthFnAgentKeys(config), identity, randomBytes(32));
+    return postgresServices(own, new Map([['cell-a', { pool: interactive, cursorSecret: randomBytes(32),
+      analytics: { pool: newPool(1), originConnectionLimit: 5 } }]]), 3600);
+  };
+  const isolates = [isolate(), isolate()];
+  const heavy = JSON.stringify({ groupBy: [{ field: 'team' }], metrics: [{ op: 'count' }, { op: 'avg', field: 'score' },
+    { op: 'max', field: 'team' }] });
   let stop = false, peak = 0;
   const outcomes = { ok: 0, refused: 0 };
-  const load = isolates.flatMap(service => Array.from({ length: 6 }, async () => {
+  const load = isolates.flatMap(composed => Array.from({ length: 6 }, async () => {
     while (!stop) {
       try {
-        const result = await service.aggregate(f.owner, f.spaceId, 'bulk', heavy);
+        const result = await composed.analysis.aggregate(f.owner, f.spaceId, 'bulk', heavy);
         assert.equal(result.groups.reduce((sum, group) => sum + group.count, 0), 60_000);
         outcomes.ok++;
       } catch (error) {
@@ -565,9 +671,9 @@ test('interactive reads stay within their budget while analytical load saturates
   while (performance.now() < deadline) {
     const started = performance.now();
     await Promise.all([
-      services.records.count(f.owner, f.spaceId, 'items', JSON.stringify([{ field: 'team', kind: 'string', operator: 'eq', value: 'red' }]))
+      isolates[0].records.count(f.owner, f.spaceId, 'items', JSON.stringify([{ field: 'team', kind: 'string', operator: 'eq', value: 'red' }]))
         .then(total => assert.equal(total, 5)),
-      services.records.get(f.owner, f.spaceId, 'items', ids[0]).then(record => assert.equal(record.ref.id, ids[0]))]);
+      isolates[0].records.get(f.owner, f.spaceId, 'items', ids[0]).then(record => assert.equal(record.ref.id, ids[0]))]);
     latencies.push(performance.now() - started);
   }
   stop = true;
@@ -643,5 +749,5 @@ test('aggregations read one statement snapshot while writes commit concurrently'
 
 test('bounds are the documented protective values', () => {
   assert.deepEqual({ ...aggregationBounds }, { groupBy: 3, metrics: 16, maxGroups: 1_000, defaultMaxGroups: 100, resultBytes: 262_144,
-    statementMs: 5_000, maxStatementMs: 15_000, averageDigits: 20 });
+    statementMs: 5_000, maxStatementMs: 15_000, averageDigits: 20, specBytes: 32_768 });
 });

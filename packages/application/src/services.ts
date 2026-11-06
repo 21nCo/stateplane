@@ -94,7 +94,8 @@ export interface StateplaneServices {
   };
   /** Bounded analytical reads on analytical capacity, apart from interactive authoritative reads. */
   analysis: {
-    /** One typed aggregation over a collection's declared index fields, in one statement snapshot; `request` is parsed JSON. */
-    aggregate(actor: VerifiedCredential, spaceId: string, collectionId: string, request: unknown): Promise<unknown>;
+    /** One typed aggregation over a collection's declared index fields, in one statement snapshot; `serialized` is
+     * the spec as JSON text, parsed after the collection is authorized. */
+    aggregate(actor: VerifiedCredential, spaceId: string, collectionId: string, serialized: string): Promise<unknown>;
   };
 }

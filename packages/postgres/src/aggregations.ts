@@ -8,12 +8,14 @@ import type { Db } from './sources.js';
 import type { PostgresSpaces } from './spaces.js';
 
 /**
- * One cell's analytical capacity: the pool aggregations use (a pool of its
- * own, sized to `analyticalSlots(...).cell`, keeps them off the interactive
- * pool) and the cell's configured Hyperdrive `originConnectionLimit` (5 to
- * 20), from which its analytical slots are derived.
+ * One cell's analytical capacity: `pool`, the cell's analytical pool, apart
+ * from its interactive pool and sized to `analyticalSlots(...).cell`; the
+ * cell's configured Hyperdrive `originConnectionLimit` (5 to 20), from which
+ * its analytical slots are derived; and `admission`, the interactive pool on
+ * which an aggregation's collection and grant are authorized, in one short
+ * transaction, before it takes analytical capacity.
  */
-export interface AggregationCell { pool: Pick<pg.Pool, 'connect'>; originConnectionLimit: number }
+export interface AggregationCell { pool: Pick<pg.Pool, 'connect'>; admission: Pick<pg.Pool, 'connect'>; originConnectionLimit: number }
 export interface AggregationOptions {
   /** The aggregate statement's `statement_timeout`, 1 to 15,000 ms; 5,000 by default. */
   statementTimeoutMs?: number;
@@ -52,11 +54,12 @@ export interface AggregationResult {
 /**
  * Initial protective bounds, not measured capacity (STA-60 measures them):
  * at most 3 group dimensions and 16 metrics, at most 1,000 groups (100 unless
- * `maxGroups` says otherwise), 256 KiB of group keys and metric values (as
- * text), 5 s of statement time, and averages to 20 significant digits.
+ * `maxGroups` says otherwise), 256 KiB of groups as JSON text, 5 s of
+ * statement time, averages to 20 significant digits, and a serialized spec of
+ * at most 32 KiB.
  */
 export const aggregationBounds = Object.freeze({ groupBy: 3, metrics: 16, maxGroups: 1_000, defaultMaxGroups: 100,
-  resultBytes: 262_144, statementMs: 5_000, maxStatementMs: 15_000, averageDigits: 20 });
+  resultBytes: 262_144, statementMs: 5_000, maxStatementMs: 15_000, averageDigits: 20, specBytes: 32_768 });
 
 /**
  * A cell's analytical slots for an origin connection limit of 5 to 20: one
@@ -88,8 +91,8 @@ interface Spec { where: readonly ScalarPredicate[]; groupBy: Dimension[]; metric
 interface Declared { kind: ValueKind; ready: boolean; filterable: boolean; acceptedVersion: number }
 
 /** A plain array's own items, read by index without an inherited iterator. */
-function items(value: unknown, max: number, name: string): unknown[] {
-  if (!value || typeof value !== 'object' || untrusted(value) || !Array.isArray(value) ||
+function items(value: unknown, max: number, name: string, trustedParsed: boolean): unknown[] {
+  if (!value || typeof value !== 'object' || (!trustedParsed && untrusted(value)) || !Array.isArray(value) ||
     Object.getPrototypeOf(value) !== Array.prototype) invalid(`${name} must be an array`);
   const length = Object.getOwnPropertyDescriptor(value, 'length')!.value as number;
   if (length < 1 || length > max || Reflect.ownKeys(value).length !== length + 1) invalid(`${name} must hold 1 to ${max} items`);
@@ -111,20 +114,25 @@ function timeZone(value: unknown): string {
   return value;
 }
 
-/** Admit a typed spec: declared field names, allowlisted operators and units, AND-only scalar predicates. */
-function parse(request: unknown): Spec {
-  const input = fields(request, ['where', 'groupBy', 'metrics', 'maxGroups'], ['metrics']);
-  const where = input.where === undefined ? [] : snapshotPredicates(input.where as ScalarPredicate[]);
-  const groupBy = input.groupBy === undefined ? [] : items(input.groupBy, aggregationBounds.groupBy, 'groupBy').map(item => {
-    const dimension = fields(item, ['field', 'bucket'], ['field']);
+/**
+ * Admit a typed spec: declared field names, allowlisted operators and units,
+ * AND-only scalar predicates. An object from the caller is admitted only where
+ * the runtime detects proxies; `trustedParsed` data, just parsed from JSON
+ * text, everywhere.
+ */
+function parse(request: unknown, trustedParsed: boolean): Spec {
+  const input = fields(request, ['where', 'groupBy', 'metrics', 'maxGroups'], ['metrics'], trustedParsed);
+  const where = input.where === undefined ? [] : snapshotPredicates(input.where as ScalarPredicate[], trustedParsed);
+  const groupBy = input.groupBy === undefined ? [] : items(input.groupBy, aggregationBounds.groupBy, 'groupBy', trustedParsed).map(item => {
+    const dimension = fields(item, ['field', 'bucket'], ['field'], trustedParsed);
     if (dimension.bucket === undefined) return { field: field(dimension.field), bucket: null };
-    const bucket = fields(dimension.bucket, ['unit', 'timeZone'], ['unit', 'timeZone']);
+    const bucket = fields(dimension.bucket, ['unit', 'timeZone'], ['unit', 'timeZone'], trustedParsed);
     if (!UNITS.includes(bucket.unit as string)) invalid(`bucket unit must be one of ${UNITS.join(', ')}`);
     return { field: field(dimension.field), bucket: { unit: bucket.unit as AggregationUnit, timeZone: timeZone(bucket.timeZone) } };
   });
   if (new Set(groupBy.map(dimension => dimension.field)).size !== groupBy.length) invalid('A field is grouped at most once');
-  const metrics = items(input.metrics, aggregationBounds.metrics, 'metrics').map(item => {
-    const metric = fields(item, ['op', 'field'], ['op']);
+  const metrics = items(input.metrics, aggregationBounds.metrics, 'metrics', trustedParsed).map(item => {
+    const metric = fields(item, ['op', 'field'], ['op'], trustedParsed);
     if (!OPERATORS.includes(metric.op as string)) invalid(`op must be one of ${OPERATORS.join(', ')}`);
     if (metric.op === 'count') {
       if (metric.field !== undefined) invalid('count counts records and takes no field');
@@ -172,7 +180,15 @@ const instant = (alias: string) => `(CASE WHEN substr(${alias}.time_value,18,2)=
   THEN substr(${alias}.time_value,1,17)||'59.999999Z'
   ELSE substring(${alias}.time_value from '^.{19}(?:\\.[0-9]{1,6})?')||'Z' END)::timestamptz`;
 
-/** The one aggregate statement: grouped, measured, sized and checked against its caps in one snapshot. */
+/**
+ * The one aggregate statement: grouped, measured, sized and checked against
+ * its caps in one snapshot. Its size of a group is a lower bound of the group's
+ * JSON: the text of its key kinds and string and boolean keys, its counts, its
+ * sums and its string and date-time extremes, each no longer than in the JSON
+ * (numbers, averages and buckets are left to the full check after formatting).
+ * So a result it refuses is over the byte cap, and it never sends one far
+ * past it.
+ */
 function statement(scope: Readonly<AuthorityScope>, spec: Spec, declared: ReadonlyMap<string, Declared>) {
   const { params, where } = predicateFilter(scope, spec.where);
   const bind = (value: unknown) => { params.push(value); return `$${params.length}`; };
@@ -187,14 +203,16 @@ function statement(scope: Readonly<AuthorityScope>, spec: Spec, declared: Readon
     }
     return aliases.get(name)!;
   };
-  const grouped: string[] = ['count(*) AS n'], keys: string[] = [], texts: string[] = [], labels: string[] = [], order: string[] = [];
+  const grouped: string[] = ['count(*) AS n'], keys: string[] = [], texts: string[] = ['n::text'], labels: string[] = [],
+    order: string[] = [];
   spec.groupBy.forEach((dimension, i) => {
     const a = alias(dimension.field);
     const value = dimension.bucket ? `date_trunc(${bind(dimension.bucket.unit)},${instant(a)},${bind(dimension.bucket.timeZone)})`
       : `${a}.${COLUMN[declared.get(dimension.field)!.kind]}`;
     grouped.push(`${a}.value_kind AS k${i}`, `${value} AS v${i}`);
     keys.push(`k${i}`, `v${i}`);
-    texts.push(`k${i}`, `v${i}::text`);
+    const kind = declared.get(dimension.field)!.kind;
+    texts.push(`k${i}`, ...(kind === 'string' || kind === 'boolean' ? [`v${i}::text`] : []));
     order.push(`CASE s.k${i} WHEN 'null' THEN 1 WHEN 'missing' THEN 2 ELSE 0 END`, `s.v${i}`);
     if (dimension.bucket) {
       // A bucket's local label is its start at its UTC offset: for an hour, its members' own offset (date_trunc keeps it,
@@ -208,14 +226,16 @@ function statement(scope: Readonly<AuthorityScope>, spec: Spec, declared: Readon
     }
   });
   spec.metrics.forEach((metric, j) => {
-    if (metric.field === null) { grouped.push(`count(*) AS m${j}`); return; }
+    if (metric.field === null) { grouped.push(`count(*) AS m${j}`); texts.push(`m${j}::text`); return; }
     const a = alias(metric.field), kind = declared.get(metric.field)!.kind;
     const present = `FILTER (WHERE ${a}.value_kind=${bind(kind)})`;
     let value = `${metric.op === 'avg' ? 'sum' : metric.op}(${a}.${COLUMN[kind]}) ${present}`;
     if (kind === 'date-time') value = `${metric.op}(stateplane_instant_sort_key(${a}.time_value) COLLATE "C") ${present}`;
     grouped.push(`${value} AS m${j}`, `count(*) ${present} AS m${j}_values`,
       `count(*) FILTER (WHERE ${a}.value_kind='null') AS m${j}_nulls`, `count(*) FILTER (WHERE ${a}.value_kind='missing') AS m${j}_missing`);
-    texts.push(`m${j}::text`);
+    texts.push(`m${j}_values::text`, `m${j}_nulls::text`, `m${j}_missing::text`);
+    if (metric.op === 'sum') texts.push(`trim_scale(m${j})::text`);
+    else if (metric.op !== 'avg' && kind !== 'number') texts.push(`m${j}::text`);
   });
   // Readiness promises one value row per live record and declared field, of its kind, null or missing; anything else fails.
   const consistent = [...aliases].map(([name, a]) =>
@@ -283,6 +303,37 @@ function offset(seconds: number): string {
   return `${sign}${part(Math.floor(magnitude / 3600))}:${part(Math.floor(magnitude / 60) % 60)}${rest}`;
 }
 
+/** Zone names that are also abbreviations of UTC itself: their IANA zones are UTC at every instant. */
+const UTC_NAMES: readonly string[] = Object.freeze(['utc', 'uct', 'zulu', 'gmt']);
+/**
+ * Each bucket's time zone, resolved by IANA rules only. PostgreSQL reads a
+ * zone name as a `timezone_abbreviations` entry (a fixed offset) before its
+ * time zone database, so a CET, EET, MET, WET or PST bucket would keep its
+ * winter offset all summer. A name that is such an abbreviation is refused,
+ * except UTC, UCT, Zulu and GMT, which name UTC either way and become
+ * `Etc/UTC`; so is a name the database's time zone database does not know.
+ */
+async function zones(db: Db, spec: Spec): Promise<Spec> {
+  const names = [...new Set(spec.groupBy.flatMap(item => item.bucket ? [item.bucket.timeZone] : []))];
+  if (!names.length) return spec;
+  let rows: { z: string; offset: number | null }[];
+  try {
+    rows = (await db.query(`SELECT z,(SELECT EXTRACT(EPOCH FROM utc_offset)::int FROM pg_timezone_abbrevs WHERE lower(abbrev)=lower(z)
+      LIMIT 1) AS offset,clock_timestamp() AT TIME ZONE z AS probe FROM unnest($1::text[]) z`, [names])).rows;
+  } catch (error) {
+    if ((error as { code?: string }).code === '22023') invalid('timeZone is not a time zone this database knows');
+    throw error;
+  }
+  const resolved = new Map<string, string>();
+  for (const row of rows) {
+    if (row.offset === null) resolved.set(row.z, row.z);
+    else if (row.offset === 0 && UTC_NAMES.includes(row.z.toLowerCase())) resolved.set(row.z, 'Etc/UTC');
+    else invalid(`timeZone ${row.z} is also a fixed-offset time zone abbreviation; name a region's zone, such as Europe/Paris`);
+  }
+  return { ...spec, groupBy: spec.groupBy.map(dimension => dimension.bucket ? { field: dimension.field,
+    bucket: { unit: dimension.bucket.unit, timeZone: resolved.get(dimension.bucket.timeZone)! } } : dimension) };
+}
+
 const lockSlots = `SELECT
   (SELECT slot FROM analysis_cell_slots WHERE cell_id=$1 AND slot<=$2
     AND (holder_job_id IS NULL OR held_until<=clock_timestamp()) ORDER BY slot LIMIT 1 FOR UPDATE SKIP LOCKED) AS cell_slot,
@@ -316,9 +367,11 @@ async function provision(db: Db, cellId: string, spaceId: string, slots: { cell:
  * snapshot, in one READ COMMITTED transaction that first share locks the scope
  * (the space at the admitted policy and placement, the collection, a key's
  * grant) through commit and finally rechecks the caller's credential. It runs
- * only on analytical capacity: at most `analyticalSlots(...).cell` at once per
- * process before it connects, and in the database a free slot of the cell and
- * of the space (migration 049), held by row lock for its transaction, so
+ * only on analytical capacity, after the collection and grant are authorized
+ * on the interactive admission pool: on the cell's analytical pool, at most
+ * `analyticalSlots(...).cell` at once per process before it connects, and in
+ * the database a free slot of the cell and of the space (migration 049),
+ * held by row lock for its transaction, so
  * aggregations across processes stay within the cell's analytical budget.
  * Over budget, over its group or byte cap or past its statement time, it fails
  * with a typed `AggregationLimitError`, never with a partial result.
@@ -339,12 +392,38 @@ export class PostgresAggregations {
    * `where` is the exact query's scalar predicates (AND); `groupBy` holds
    * `{ field }` or `{ field, bucket: { unit, timeZone } }`; `metrics` holds
    * `{ op: 'count' }` or `{ op: 'sum' | 'avg' | 'min' | 'max', field }`.
-   * Requires `records:read` on the collection.
+   * Requires `records:read` on the collection. An object request is refused
+   * (INVALID_ARGUMENT) where the runtime cannot detect proxies, such as a
+   * Worker: use `aggregateSerialized` there.
    */
-  async aggregate(actor: VerifiedCredential, spaceId: string, collectionId: string, request: unknown): Promise<AggregationResult> {
+  aggregate(actor: VerifiedCredential, spaceId: string, collectionId: string, request: unknown): Promise<AggregationResult> {
+    return this.admit(actor, spaceId, collectionId, () => parse(request, false));
+  }
+
+  /**
+   * As `aggregate`, for the spec as JSON text (at most 32 KiB), parsed only
+   * after the collection is authorized: the entrypoint for every runtime.
+   */
+  aggregateSerialized(actor: VerifiedCredential, spaceId: string, collectionId: string, serialized: string): Promise<AggregationResult> {
+    return this.admit(actor, spaceId, collectionId, () => {
+      if (typeof serialized !== 'string' || Buffer.byteLength(serialized) > aggregationBounds.specBytes)
+        invalid(`The spec must be JSON text of at most ${aggregationBounds.specBytes} bytes`);
+      let parsed: unknown;
+      try { parsed = JSON.parse(serialized); } catch { invalid('The spec must be JSON text'); }
+      return parse(parsed, true);
+    });
+  }
+
+  private async admit(actor: VerifiedCredential, spaceId: string, collectionId: string, request: () => Spec): Promise<AggregationResult> {
     const admitted = await this.spaces.scope(actor, spaceId, collectionId, 'records:read');
     const cell = this.cells.get(admitted.cellId);
-    if (!cell) throw new AuthorityError('STALE_PLACEMENT');
+    if (!cell) throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Analytical capacity is not configured for this cell', undefined, false);
+    // Authorize the collection and grant before taking capacity, so a caller without records:read, or a collection that does
+    // not exist, is refused as such and never holds or waits on a slot. The analytical transaction locks and checks them again.
+    await transact(cell.admission, async db => {
+      const tx = new AuthorityTransaction(db, admitted.scope, 1);
+      try { await tx.checkScope(); } finally { tx.close(); }
+    });
     const slots = analyticalSlots(cell.originConnectionLimit);
     const running = this.#running.get(admitted.cellId) ?? 0;
     if (running >= slots.cell) throw new AggregationLimitError('slots', 'Analytical capacity is in use; retry later');
@@ -359,14 +438,14 @@ export class PostgresAggregations {
     }
   }
 
-  private async run(db: Db, actor: VerifiedCredential, admitted: Awaited<ReturnType<PostgresSpaces['scope']>>, request: unknown,
+  private async run(db: Db, actor: VerifiedCredential, admitted: Awaited<ReturnType<PostgresSpaces['scope']>>, request: () => Spec,
     slots: { cell: number; space: number }, provisionable: boolean): Promise<AggregationResult> {
     const { scope, cellId, ownerPrincipalId } = admitted;
     // Space, collection and grant first, as every reader takes them, then the slots (a purge locks its space before its slots).
     // The collection is authorized before the request is validated.
     const tx = new AuthorityTransaction(db, scope, 1);
     try { await tx.checkScope(); } finally { tx.close(); }
-    const spec = parse(request);
+    const spec = await zones(db, request());
     const names = [...new Set([...spec.where.map(item => item.field), ...spec.groupBy.map(item => item.field),
       ...spec.metrics.flatMap(item => item.field === null ? [] : [item.field])])];
     const rows = (await db.query(`SELECT c.schema_version,d.field_name,d.value_kind,d.ready,d.filterable,d.accepted_version
@@ -379,14 +458,6 @@ export class PostgresAggregations {
       { kind: row.value_kind, ready: row.ready === true, filterable: row.filterable === true,
         acceptedVersion: Number(row.accepted_version) }]));
     admit(spec, declared);
-    const zones = [...new Set(spec.groupBy.flatMap(item => item.bucket ? [item.bucket.timeZone] : []))];
-    if (zones.length) {
-      try { await db.query('SELECT count(clock_timestamp() AT TIME ZONE z) FROM unnest($1::text[]) z', [zones]); }
-      catch (error) {
-        if ((error as { code?: string }).code === '22023') invalid('timeZone is not a time zone this database knows');
-        throw error;
-      }
-    }
     const { sql, params } = statement(scope, spec, declared);
     const held = (await db.query(lockSlots, [cellId, slots.cell, scope.spaceId, slots.space])).rows[0];
     const missing = held.cell_rows < slots.cell || held.space_rows < slots.space;
@@ -410,11 +481,8 @@ export class PostgresAggregations {
     const groupCount = Number(totals.total_groups);
     if (groupCount > spec.maxGroups)
       throw new AggregationLimitError('groups', `The aggregation has ${groupCount} groups, more than maxGroups (${spec.maxGroups})`);
-    if (Number(totals.total_bytes) > aggregationBounds.resultBytes)
-      throw new AggregationLimitError('bytes', `The aggregation's groups exceed ${aggregationBounds.resultBytes} bytes`);
-    await db.query(`SET LOCAL statement_timeout = '${aggregationBounds.statementMs}ms'`);
-    await this.spaces.assertScopeCurrent(actor, ownerPrincipalId, scope, db, scope.collectionId, ['records:read']);
-
+    const overBytes = () => new AggregationLimitError('bytes', `The aggregation's groups exceed ${aggregationBounds.resultBytes} bytes`);
+    if (Number(totals.total_bytes) > aggregationBounds.resultBytes) throw overBytes();
     const kindOf = (name: string) => declared.get(name)!.kind;
     const groups = groupCount === 0 ? [] : result.rows.map(row => ({
       key: spec.groupBy.map((dimension, i): GroupKey => {
@@ -436,6 +504,10 @@ export class PostgresAggregations {
         return { value, values, nulls: Number(row[`m${j}_nulls`]), missing: Number(row[`m${j}_missing`]) };
       })
     }));
+    // The cap holds for every returned key and metric value, counts and rounded averages included.
+    if (Buffer.byteLength(JSON.stringify(groups)) > aggregationBounds.resultBytes) throw overBytes();
+    await db.query(`SET LOCAL statement_timeout = '${aggregationBounds.statementMs}ms'`);
+    await this.spaces.assertScopeCurrent(actor, ownerPrincipalId, scope, db, scope.collectionId, ['records:read']);
     const used = [...new Set([...spec.groupBy.map(item => item.field), ...spec.metrics.flatMap(item => item.field ?? [])])];
     return {
       source: { spaceId: scope.spaceId, collectionId: scope.collectionId, records: 'live', where: [...spec.where],
