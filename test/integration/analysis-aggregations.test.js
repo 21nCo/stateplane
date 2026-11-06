@@ -10,6 +10,7 @@ import { createAuthFn, createUser, issueSession } from '@authfn/core';
 import { AuthFnAgentKeys, AuthFnIdentityVerifier } from '../../packages/auth/dist/index.js';
 import { AggregationLimitError, PostgresAggregations, PostgresAuthority, PostgresSpaces, aggregationBounds, analyticalSlots,
   postgresServices } from '../../packages/postgres/dist/index.js';
+import { COVERED, coveredLines, sourceText } from '../covered-paths.js';
 
 // STA-58: bounded interactive aggregations, checked against an independent
 // reference oracle computed in JavaScript from the data the tests wrote
@@ -744,6 +745,143 @@ test('replaced Reflect.apply and polluted descriptors never misbind, admit or es
   assert.deepEqual(errors.map(error => error?.code), refused.flatMap(() => Array(3).fill('INVALID_ARGUMENT')));
 });
 
+// Each covered path's line ranges in the build the tests run, so a replaced built-in can tell a covered caller.
+const NativeError = Error;
+const coveredBuild = Object.entries(COVERED).map(([file, names]) => {
+  const built = file.replace(/\.ts$/, '.js');
+  return [`/packages/postgres/dist/${built}`, coveredLines(built, sourceText(built, 'dist'), names)];
+});
+/** The nearest caller with a source location, past the replaced built-in (and any built-in calling it), if covered. */
+function coveredCaller() {
+  for (const frame of new NativeError().stack.split('\n').slice(3)) {
+    const at = /\(?(?:file:\/\/)?([^\s()]+):(\d+):\d+\)?$/.exec(frame);
+    if (!at || at[1].startsWith('node:')) continue;
+    const ranges = coveredBuild.find(([path]) => at[1].endsWith(path))?.[1];
+    return ranges?.some(([first, last]) => Number(at[2]) >= first && Number(at[2]) <= last) ? frame.trim() : null;
+  }
+  return null;
+}
+
+test('replaced clocks, timers and promise settlement never change a covered path\'s answer, through every reader', async () => {
+  const f = await fixture();
+  for (const data of [{ team: 'red', score: 17, active: true }, { team: 'blue', score: 42 }]) await f.write('items', { operation: 'create', data });
+  const service = aggregations();
+  const { scope } = await spaces.scope(f.owner, f.spaceId, 'items', 'records:read');
+  const authority = new PostgresAuthority(pool, 3600);
+  const where = [{ field: 'team', kind: 'string', operator: 'eq', value: 'red' }];
+  const spec = { where, groupBy: [{ field: 'team' }], metrics: [{ op: 'count' }] };
+  const specText = JSON.stringify(spec), whereText = JSON.stringify(where);
+  const readers = [() => service.aggregate(f.owner, f.spaceId, 'items', spec),
+    () => service.aggregateSerialized(f.owner, f.spaceId, 'items', specText),
+    () => analyticServices.analysis.aggregate(f.owner, f.spaceId, 'items', specText),
+    () => authority.transaction(scope, tx => tx.countRecords(where)),
+    async () => (await authority.transaction(scope, tx => tx.queryRecords(where, 10))).length,
+    () => authority.transaction(scope, tx => tx.existsRecord(where)),
+    () => services.records.count(f.owner, f.spaceId, 'items', whereText)];
+  const answer = async read => { try { return await read(); } catch (error) { return error; } };
+  const expected = [];
+  for (const read of readers) expected.push(await answer(read));
+  const original = { now: Date.now, setTimeout, clearTimeout, race: Promise.race, then: Promise.prototype.then };
+  // Each replacement misbehaves only for a covered caller, and records it; the driver, the runtime, the credential
+  // provider and the record readers' own transaction keep the original.
+  const hits = [];
+  const replaced = (name, misbehave, otherwise) => function (...args) {
+    const caller = coveredCaller();
+    if (caller === null) return otherwise.apply(this, args);
+    hits.push(`${name} from ${caller}`);
+    return misbehave.apply(this, args);
+  };
+  const fail = name => () => { throw new Error(`replaced ${name}`); };
+  const modes = {
+    'Date.now throws': () => { Date.now = replaced('Date.now', fail('Date.now'), original.now); },
+    'Date.now ahead': () => { Date.now = replaced('Date.now', () => original.now() + 1e9, original.now); },
+    'Date.now behind': () => { Date.now = replaced('Date.now', () => original.now() - 1e9, original.now); },
+    'timers throw': () => {
+      globalThis.setTimeout = replaced('setTimeout', fail('setTimeout'), original.setTimeout);
+      globalThis.clearTimeout = replaced('clearTimeout', fail('clearTimeout'), original.clearTimeout);
+    },
+    'Promise.race throws': () => { Promise.race = replaced('Promise.race', fail('Promise.race'), original.race); },
+    'then throws': () => { Promise.prototype.then = replaced('then', fail('then'), original.then); }
+  };
+  const restore = () => {
+    Date.now = original.now; globalThis.setTimeout = original.setTimeout; globalThis.clearTimeout = original.clearTimeout;
+    Promise.race = original.race; Promise.prototype.then = original.then;
+  };
+  const shape = value => value instanceof Error ? `${value.name} ${value.code} ${value.message}`
+    : typeof value === 'object' ? [value.groups.map(group => [group.key, group.count]), value.source.where, value.collection] : value;
+  for (const [mode, install] of Object.entries(modes)) {
+    const outcomes = [];
+    for (const read of readers) {
+      install();
+      try { outcomes.push(await answer(read)); } finally { restore(); }
+    }
+    assert.deepEqual(outcomes.map(shape), expected.map(shape), mode);
+    assert.deepEqual(hits, [], mode);
+  }
+  assert.deepEqual(expected.map(shape).slice(3), [1, 1, true, 1]);
+  assert.deepEqual(expected[0].groups.map(group => [group.key, group.count]), [[[{ kind: 'value', value: 'red' }], 1]]);
+  // Restored: the control answers the same again.
+  assert.deepEqual((await answer(readers[1])).groups, expected[1].groups);
+});
+
+test('the final credential recheck is bounded, and a late answer never queries a released session', async t => {
+  const f = await fixture();
+  await f.write('items', { operation: 'create', data: { team: 'red' } });
+  const agent = await f.agent(['records:read']);
+  // The provider holds its answer to the final recheck (the call from assertScopeCurrent) until the test gives it.
+  let holding = false;
+  const held = [], unhandled = [];
+  const answerLater = answer => {
+    if (!holding || !new Error().stack.includes('assertScopeCurrent')) return answer();
+    return new Promise((resolve, reject) => held.push(outcome => outcome === 'fail' ? reject(new Error('late provider failure'))
+      : answer().then(resolve, reject)));
+  };
+  const provider = { current: (...args) => answerLater(() => identity.current(...args)),
+    currentUntil: (...args) => answerLater(() => identity.currentUntil(...args)) };
+  const recheckSpaces = new PostgresSpaces(pool, new Map([['cell-a', { pool, storageTargetId: 'target-a' }]]), 'cell-a',
+    new AuthFnAgentKeys(config), provider, randomBytes(32));
+  // One analytical session, so a session never given back would stall every later aggregation.
+  const base = newPool(1);
+  let lateQueries = 0;
+  const watched = { connect: async () => {
+    const client = await base.connect();
+    let released = false;
+    return { query: (...args) => { if (released) lateQueries++; return client.query(...args); },
+      release: error => { released = true; client.release(error); },
+      on: (...args) => client.on(...args), removeListener: (...args) => client.removeListener(...args) };
+  } };
+  const statementTimeoutMs = 300;
+  const adapter = new PostgresAggregations(recheckSpaces, new Map([['cell-a', { pool: watched, admission: pool, originConnectionLimit: 5 }]]),
+    { statementTimeoutMs });
+  const count = JSON.stringify({ metrics: [{ op: 'count' }] });
+  const onUnhandled = reason => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  t.after(() => process.off('unhandledRejection', onUnhandled));
+  const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const bounded = promise => {
+    let timer;
+    const waiting = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('the aggregation is still waiting')), 5_000); });
+    return Promise.race([promise, waiting]).finally(() => clearTimeout(timer));
+  };
+  for (const late of ['success', 'fail']) {
+    holding = true;
+    const started = performance.now();
+    await rejects(bounded(adapter.aggregateSerialized(agent, f.spaceId, 'items', count)), 'PROVIDER_UNAVAILABLE',
+      error => assert.equal(error.retryable, true), late);
+    const waited = performance.now() - started;
+    assert.ok(waited >= statementTimeoutMs - 5, `waited ${waited} ms`);
+    assert.equal(held.length, 1, 'the recheck was held');
+    holding = false;
+    held.shift()(late);
+    // A late success reaches the key's grant query; it is refused, never run on the released session.
+    await pause(100);
+    assert.equal(lateQueries, 0, `late ${late}`);
+    // The session, its slots and the reservation were given back.
+    assert.equal((await bounded(adapter.aggregateSerialized(agent, f.spaceId, 'items', count))).groups[0].count, 1);
+  }
+  assert.deepEqual(unhandled, []);
+});
+
 test('a spec is checked against its declarations before any capacity is taken or reported', async () => {
   const f = await fixture();
   await f.write('items', { operation: 'create', data: { team: 'red', score: 1, active: true } });
@@ -1058,35 +1196,45 @@ test('analytical slots bound aggregations per process, per cell and per space, a
   await holding;
 });
 
-test('a stalled analytical checkout is bounded, and services sharing an analytical pool share its per-process slots', async () => {
+test('a stalled analytical checkout is bounded, and services sharing an analytical pool share its per-process slots', async t => {
   const f = await fixture();
   await f.write('items', { operation: 'create', data: { team: 'red' } });
   const count = JSON.stringify({ metrics: [{ op: 'count' }] });
   // Checkouts listed in `stalls` (1-based, per aggregation) never answer in time; each answers with a client after the
   // deadline, which must be released unused. Every other checkout is a real analytical session.
-  let stalls = new Set(), checkouts = 0, released = 0, throwsAt = 0;
-  const late = [];
+  // A late session's release can throw, as a throwing pool 'release' listener makes it.
+  let stalls = new Set(), checkouts = 0, released = 0, ended = 0, throwsAt = 0;
+  const late = [], unhandled = [];
   const shared = { connect: () => {
     if (++checkouts === throwsAt) throw new Error('checkout failed at once');
     if (!stalls.has(checkouts)) return analyticalPool.connect();
-    return new Promise((resolve, reject) => late.push(fail => fail ? reject(new Error('late checkout failed'))
-      : resolve({ release: () => { released++; }, query: () => { throw new Error('a late session was used'); }, on() {}, removeListener() {} })));
+    return new Promise((resolve, reject) => late.push(answer => answer === 'fail' ? reject(new Error('late checkout failed'))
+      : resolve({ release: () => { released++; if (answer === 'throwing release') throw new Error('a release listener failed'); },
+        end: async () => { ended++; }, query: () => { throw new Error('a late session was used'); }, on() {}, removeListener() {} })));
   } };
+  const onUnhandled = reason => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  t.after(() => process.off('unhandledRejection', onUnhandled));
   const compose = () => postgresServices(spaces, new Map([['cell-a', { pool, cursorSecret: randomBytes(32),
     analytics: { pool: shared, originConnectionLimit: 5 } }]]), 3600);
   const [one, two] = [compose(), compose()];
   const direct = aggregations(shared, 5);
-  const stalled = async (stall, run, fail = false) => {
+  const stalled = async (stall, run, answer = 'session') => {
     stalls = new Set([stall]); checkouts = 0;
     const started = performance.now();
-    const pending = run();
+    // Its outcome is observed at once, so a failure before the stalled checkout ends the wait below instead of hanging it.
+    let settled = false;
+    const outcome = run().then(value => ({ value }), error => ({ error })).finally(() => { settled = true; });
+    const waitUntil = performance.now() + 10_000;
+    while (checkouts < stall && !settled && performance.now() < waitUntil) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(checkouts, stall, `checkout ${stall} started while the aggregation waited`);
     // While it waits for its session, separately composed services and adapters on the same pool are refused at once.
-    while (checkouts < stall) await new Promise(resolve => setImmediate(resolve));
     const before = checkouts;
     await limited(two.analysis.aggregate(f.owner, f.spaceId, 'items', count), 'slots');
     await limited(direct.aggregateSerialized(f.owner, f.spaceId, 'items', count), 'slots');
     assert.equal(checkouts, before, 'refused without a checkout');
-    await limited(pending, 'slots');
+    const { value, error } = await outcome;
+    await limited(error ? Promise.reject(error) : Promise.resolve(value), 'slots');
     const waited = performance.now() - started;
     assert.ok(waited >= aggregationBounds.checkoutMs - 5 && waited < aggregationBounds.checkoutMs + 1_500, `waited ${waited} ms`);
     // Until the pool answers the expired checkout it keeps the pool's slot: retries are refused at once, never queued.
@@ -1096,10 +1244,11 @@ test('a stalled analytical checkout is bounded, and services sharing an analytic
       await limited(direct.aggregateSerialized(f.owner, f.spaceId, 'items', count), 'slots');
     }
     assert.equal(checkouts, expired, 'no checkout is queued behind an unanswered expired one');
-    const before2 = released;
-    late.shift()(fail);
+    const before2 = released, ended2 = ended;
+    late.shift()(answer);
     await new Promise(resolve => setImmediate(resolve));
-    assert.equal(released, before2 + (fail ? 0 : 1), 'a late session is released unused');
+    assert.equal(released, before2 + (answer === 'fail' ? 0 : 1), 'a late session is released unused');
+    assert.equal(ended, ended2 + (answer === 'throwing release' ? 1 : 0), 'a late session whose release throws is closed');
   };
   // The first attempt's checkout stalls.
   await stalled(1, () => one.analysis.aggregate(f.owner, f.spaceId, 'items', count));
@@ -1109,7 +1258,9 @@ test('a stalled analytical checkout is bounded, and services sharing an analytic
   await stalled(2, () => one.analysis.aggregate(g.owner, g.spaceId, 'items', count));
   await stalled(3, () => one.analysis.aggregate(g.owner, g.spaceId, 'items', count));
   // A checkout that fails after its deadline also gives its slot back.
-  await stalled(1, () => two.analysis.aggregate(f.owner, f.spaceId, 'items', count), true);
+  await stalled(1, () => two.analysis.aggregate(f.owner, f.spaceId, 'items', count), 'fail');
+  // A late session whose release throws is closed, its slot given back, and nothing rejects unhandled.
+  await stalled(1, () => one.analysis.aggregate(f.owner, f.spaceId, 'items', count), 'throwing release');
   // A checkout that throws at once, on the first attempt, the provisioning or the retry, holds nothing after its deadline.
   stalls = new Set();
   for (const at of [1, 2, 3]) {
@@ -1126,7 +1277,8 @@ test('a stalled analytical checkout is bounded, and services sharing an analytic
   for (const answer of [await one.analysis.aggregate(g.owner, g.spaceId, 'items', count),
     await two.analysis.aggregate(f.owner, f.spaceId, 'items', count), await direct.aggregateSerialized(g.owner, g.spaceId, 'items', count)])
     assert.equal(answer.groups[0].count, 1);
-  assert.equal(released, 3);
+  assert.equal(released, 4);
+  assert.deepEqual(unhandled, []);
 });
 
 test('interactive reads stay within their budget while analytical load saturates its slots', async t => {

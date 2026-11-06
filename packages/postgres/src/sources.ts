@@ -7,8 +7,8 @@ import { commitBeforeDeadline, CommitNotSentDeadlineExceeded } from './commit-de
 import { AuthorityError, AuthorityTransaction, clientReadTimedOut, CommitOutcomeUnknownError, linkRestricted } from './index.js';
 import type { AuthorityScope } from './index.js';
 import { acceptsInProcessObjects, includes, isInProcessProxy, scalarString, utcInstant } from './schema.js';
-import { apply, ceil, createObject, hasOwn, isArray, isSafeInteger, max, min, monotonicNow, ObjectPrototype, ownDescriptor, ownKeys,
-  prototypeOf, wallNow as now } from './intrinsics.js';
+import { apply, ceil, createObject, hasOwn, isArray, isSafeInteger, max, min, monotonicNow, NativePromise, ObjectPrototype, ownDescriptor,
+  ownKeys, prototypeOf, race, settle, startTimer, stopTimer, wallNow as now } from './intrinsics.js';
 import type { PostgresSpaces } from './spaces.js';
 
 /** One cell's authority pool and original-bytes store. */
@@ -190,19 +190,19 @@ async function within<T>(until: number, start: () => Promise<T>, late: (value: T
   if (monotonicNow() >= until) throw new CleanupTimeout(monotonicNow() >= budget);
   const pending = start();
   let timedOut = false;
-  void pending.then(value => { if (timedOut) late(value); }, () => {});
+  settle(pending, value => { if (timedOut) late(value); }, () => {});
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = min(until, monotonicNow() + CLEANUP_CALL_MS);
   const atBudget = budget <= deadline;
-  const timeout = new Promise<never>((_, reject) => {
+  const timeout = new NativePromise<never>((_, reject) => {
     const expire = () => {
       const left = deadline - monotonicNow();
-      if (left > 0) timer = setTimeout(expire, ceil(left));
+      if (left > 0) timer = startTimer(expire, ceil(left));
       else { timedOut = true; reject(new CleanupTimeout(atBudget)); }
     };
-    timer = setTimeout(expire, max(0, deadline - monotonicNow()));
+    timer = startTimer(expire, max(0, deadline - monotonicNow()));
   });
-  try { return await Promise.race([pending, timeout]); } finally { clearTimeout(timer); }
+  try { return await race([pending, timeout]); } finally { stopTimer(timer); }
 }
 
 /**
@@ -253,14 +253,15 @@ export async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) =
     // Only the caller's own budget makes a cut-off call unfinished; the per-call bound is a stall.
     const result = end === undefined ? await work() : await within(end, work, () => {}, until);
     begun = false;
-    commitSent = true;
     try {
-      if (end === undefined) await commitBeforeDeadline(client, deadline);
-      else await within(end, () => client.query('COMMIT'), () => {}, until);
+      if (end === undefined) await commitBeforeDeadline(client, deadline, () => { commitSent = true; });
+      else { commitSent = true; await within(end, () => client.query('COMMIT'), () => {}, until); }
     } catch (error) {
       discard = true;
       if (error instanceof CleanupTimeout) throw error;
       if (error instanceof CommitNotSentDeadlineExceeded) throw new AuthorityError('RATE_LIMITED', 'Request time budget exceeded');
+      // COMMIT never reached the session, so nothing committed: retryable, never an unknown outcome.
+      if (!commitSent) throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Database session failed before commit; retry the request', undefined, true);
       // Migration 041's commit-time check: the transition reached COMMIT after its grant expired, so it rolled back.
       if (error instanceof pg.DatabaseError && error.constraint === 'source_upload_attempts_expiry') throw grantExpired();
       if (error instanceof pg.DatabaseError && matches(/^(?:23|40)/, error.code ?? '')) throw error;

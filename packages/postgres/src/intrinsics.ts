@@ -1,6 +1,7 @@
 /*
  * The built-ins that admission, predicate compilation, aggregation, transaction
- * lifecycle and result sizing call, captured once when the package loads and
+ * lifecycle, commit deadlines and result sizing call (clocks, timers and
+ * promise settlement included), captured once when the package loads and
  * called only through the captured `Reflect.apply`. Descriptors handed to
  * `Object.defineProperty` have no prototype. So a later replacement of a
  * global or an inherited method, or an `Object.prototype` member such as
@@ -16,6 +17,9 @@ export const isSafeInteger = Number.isSafeInteger, isFiniteNumber = Number.isFin
 export const NativeNumber = Number, NativeBigInt = BigInt, NativeDate = Date, NativeMap = Map, NativeWeakMap = WeakMap;
 export const NativeDateTimeFormat = Intl.DateTimeFormat;
 export const { min, max, ceil } = Math;
+export const NativePromise = Promise;
+const nativeThen = Promise.prototype.then;
+const nativeSetTimeout = setTimeout, nativeClearTimeout = clearTimeout;
 const NativeJSON = JSON, nativeParse = JSON.parse, nativeStringify = JSON.stringify;
 const NativeBuffer = Buffer, nativeByteLength = Buffer.byteLength;
 const clock = performance, nativeNow = performance.now, nativeDateNow = Date.now;
@@ -49,4 +53,13 @@ export const setHas = <T>(set: ReadonlySet<T>, value: T) => apply(nativeSetHas, 
 export const setAdd = <T>(set: Set<T>, value: T): void => { apply(nativeSetAdd, set, [value]); };
 export const setDelete = <T>(set: Set<T>, value: T): void => { apply(nativeSetDelete, set, [value]); };
 export const setClear = <T>(set: Set<T>): void => { apply(nativeSetClear, set, []); };
+/** `promise.then(fulfilled, rejected)` through the native method. */
+export const settle = <T>(promise: Promise<T>, fulfilled?: (value: T) => unknown, rejected?: (error: unknown) => unknown) =>
+  apply(nativeThen, promise, [fulfilled, rejected]) as Promise<unknown>;
+/** Settle as the first of `promises` settles, as `Promise.race` does, through the native `then`. */
+export const race = <T>(promises: readonly Promise<T>[]) => new NativePromise<T>((resolve, reject) => {
+  for (let i = 0; i < promises.length; i++) settle(promises[i], resolve, reject);
+});
+export const startTimer = (callback: () => void, ms: number) => nativeSetTimeout(callback, ms);
+export const stopTimer = (timer: ReturnType<typeof setTimeout> | undefined): void => { nativeClearTimeout(timer); };
 export const setForEach = <T>(set: ReadonlySet<T>, f: (value: T) => void): void => { apply(nativeSetForEach, set, [f]); };

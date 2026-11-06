@@ -1,71 +1,61 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { COVERED, documentedCovered, guardViolations, sourceText } from './covered-paths.js';
+import { transact } from '../packages/postgres/dist/sources.js';
 
-// STA-58: the aggregation module, and every helper an aggregation or a record read reaches in the predicate compiler,
-// request snapshot, scalar checks and transaction lifecycle, calls built-ins only through the load-time captures in
-// packages/postgres/src/intrinsics.ts (or captures of its own made at load), never a live global or inherited method.
-const source = file => readFileSync(new URL(`../packages/postgres/src/${file}`, import.meta.url), 'utf8');
-const FORBIDDEN = [/\bReflect\.\w/, /\bObject\.\w/, /\bArray\.(?:isArray|from|of)\b/, /\b(?:Number|JSON|Math|Buffer|Intl|performance)\.\w/,
-  /\bDate\.now\b/, /\b(?:Array|String|RegExp|Map|Set|WeakMap|Date)\.prototype\b/, /\bnew (?:Map|Set|WeakMap|Date)\b/,
-  /\b(?:Number|String|BigInt)\(/,
-  /\.(?:push|pop|map|filter|forEach|some|every|reduce|includes|indexOf|join|slice|splice|concat|find|sort|replace|split|startsWith|endsWith|padStart|toLowerCase|trim|test|exec|toISOString|getTime|clear)\(/];
-// Comments and type assertions (`as Intl.DateTimeFormatOptions`) are not calls.
-const stripped = text => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`\\])\/\/.*$/gm, '$1').replace(/\bas [\w.]+/g, '');
-
-/** The text of a top-level function or const, or a class method, from its first line until its braces close. */
-function region(text, name) {
-  const lines = text.split('\n');
-  const find = pattern => lines.findIndex(line => new RegExp(pattern).test(line));
-  let start = find(`^(?:export )?(?:async )?function ${name}\\b|^(?:export )?const ${name}\\s*=`);
-  if (start < 0) start = find(`^  (?:private |async )*${name}\\(.*\\{`);
-  assert.ok(start >= 0, `${name} not found`);
-  let depth = 0, opened = false;
-  for (let i = start; i < lines.length; i++) {
-    for (const char of lines[i]) {
-      if (char === '{') { depth++; opened = true; } else if (char === '}') depth--;
-    }
-    if ((opened && depth === 0) || (!opened && /;\s*$/.test(lines[i]))) return lines.slice(start, i + 1).join('\n');
-  }
-  throw new Error(`${name} does not close`);
-}
-const violations = (label, text) => {
-  const found = [];
-  for (const line of stripped(text).split('\n')) for (const pattern of FORBIDDEN) if (pattern.test(line)) found.push(`${label}: ${line.trim()}`);
-  return found;
-};
-export const COVERED = {
-  'index.ts': ['comparison', 'predicateColumn', 'sqlOperator', 'validPredicateValue', 'valueString', 'scalarString', 'predicateFilter',
-    'snapshotPredicates', 'parseSerializedPredicates', 'predicateDataKeys', 'snapshotInValues', 'snapshotPredicate', 'arrayHas',
-    'validScope', 'mapValues', 'setValues', 'close', 'checkScope', 'compilePredicates'],
-  'schema.ts': ['includes', 'distinct', 'any', 'scalarLength', 'scalarString', 'utcInstant'],
-  'sources.ts': ['serialized', 'fields', 'within', 'transact']
-};
-/** Every violation in the covered sources, or in `override` text standing in for one file. */
-export function guardViolations(override = {}) {
-  const text = file => override[file] ?? source(file);
-  // The whole aggregation module, apart from its load-time captures of prototype methods and timers.
-  const module = text('aggregations.ts').split('\n').filter(line => !/^const native\w+ = /.test(line)).join('\n');
-  const found = violations('aggregations.ts', module);
-  for (const [file, names] of Object.entries(COVERED)) for (const name of names) found.push(...violations(`${file} ${name}`, region(text(file), name)));
-  return found;
-}
+// STA-58: every path in COVERED (test/covered-paths.js) calls built-ins only through load-time captures, never a live
+// global or inherited method, and docs/analysis-aggregations.md states exactly that list.
 
 test('aggregation and shared predicate paths call built-ins only through load-time captures', () => {
   assert.deepEqual(guardViolations(), []);
 });
 
-test('the guard fails when a covered path calls a live built-in again', () => {
-  const index = source('index.ts'), aggregations = source('aggregations.ts'), sources = source('sources.ts');
+test('the guard fails when a covered path calls a live built-in again, in any syntax', () => {
+  const index = sourceText('index.ts'), aggregations = sourceText('aggregations.ts'), sources = sourceText('sources.ts');
+  const commit = sourceText('commit-deadline.ts');
+  const clock = 'const remaining=deadline-now();';
   const reintroduced = [
     ['index.ts', index.replace('mapClear(this.reservedIdentities);', 'Reflect.apply(Map.prototype.clear, this.reservedIdentities, []);')],
     ['index.ts', index.replace('append(params,predicate.value);', 'params.push(predicate.value);')],
     ['aggregations.ts', aggregations.replace('const length = ownDescriptor(value, \'length\')!.value as number;',
       'const length = Object.getOwnPropertyDescriptor(value, \'length\')!.value as number;')],
     ['sources.ts', sources.replace('const end = until === undefined ? undefined : min(until, monotonicNow() + CLEANUP_CALL_MS);',
-      'const end = until === undefined ? undefined : Math.min(until, performance.now() + CLEANUP_CALL_MS);')]];
-  for (const [file, text] of reintroduced) {
-    assert.notEqual(text, source(file), `${file} mutation applies`);
-    assert.ok(guardViolations({ [file]: text }).length > 0, `${file} mutation is caught`);
+      'const end = until === undefined ? undefined : Math.min(until, performance.now() + CLEANUP_CALL_MS);')],
+    ['commit-deadline.ts', commit.replace(clock, 'const remaining=deadline-Date.now();')],
+    ['commit-deadline.ts', commit.replace(clock, `${clock} const x: unknown[] = []; x['push'](remaining);`)],
+    ['commit-deadline.ts', commit.replace(clock, `${clock} const x: unknown[] = []; x.push (remaining);`)],
+    ['commit-deadline.ts', commit.replace(clock, `${clock} const x: unknown[] = []; x.push\n  (remaining);`)],
+    ['commit-deadline.ts', commit.replace(clock, 'const remaining=deadline-globalThis.Date.now();')],
+    ['commit-deadline.ts', commit.replace(clock, 'const remaining=deadline-Date [\'now\']();')],
+    ['commit-deadline.ts', commit.replace(clock, `${clock} void new Promise(resolve => resolve(remaining));`)],
+    ['commit-deadline.ts', commit.replace('settle(committed,undefined,()=>{});', 'void committed\n      .catch(()=>{});')],
+    ['sources.ts', sources.replace('try { return await race([pending, timeout]); }', 'try { return await Promise.race([pending, timeout]); }')]];
+  for (let i = 0; i < reintroduced.length; i++) {
+    const [file, text] = reintroduced[i];
+    assert.notEqual(text, sourceText(file), `${file} mutation ${i} applies`);
+    assert.ok(guardViolations({ [file]: text }).length > 0, `${file} mutation ${i} is caught`);
   }
+});
+
+test('the documented covered paths are exactly the guarded list', () => {
+  assert.deepEqual(documentedCovered(), COVERED);
+  const documented = documentedCovered();
+  documented['index.ts'] = documented['index.ts'].slice(1);
+  assert.notDeepEqual(documented, COVERED, 'an entry missing from the docs fails');
+  assert.notDeepEqual(documentedCovered(), { ...COVERED, 'schema.ts': COVERED['schema.ts'].slice(1) }, 'an entry missing from the list fails');
+});
+
+test('a COMMIT that never reached the session is retryable, never an unknown outcome', async () => {
+  const session = commit => ({ query: sql => sql === 'COMMIT' ? commit() : Promise.resolve({ rows: [] }),
+    release() {}, on() {}, removeListener() {} });
+  // Refused before dispatch: the driver throws instead of sending.
+  await assert.rejects(transact({ connect: async () => session(() => { throw new Error('not sent'); }) }, async () => 1), error => {
+    assert.equal(error.code, 'PROVIDER_UNAVAILABLE');
+    assert.equal(error.retryable, true);
+    return true;
+  });
+  // Sent, then the session failed: the outcome is unknown.
+  await assert.rejects(transact({ connect: async () => session(() => Promise.reject(new Error('lost after send'))) }, async () => 1),
+    error => error.name === 'CommitOutcomeUnknownError' || /Commit outcome unknown/.test(error.message));
+  assert.equal(await transact({ connect: async () => session(() => Promise.resolve({ rows: [] })) }, async () => 1), 1);
 });

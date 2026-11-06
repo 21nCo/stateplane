@@ -809,14 +809,17 @@ export class PostgresAuthority {
       // Only a missing COMMIT acknowledgement has an ambiguous outcome.
       await client.query(`SET LOCAL statement_timeout = '${Math.max(1,deadlineMs-Date.now())}ms'`);
       if (Date.now()>=deadlineMs) throw new AuthorityError('RATE_LIMITED','Request time budget exceeded');
+      let sent = false;
       try {
-        await commitBeforeDeadline(client,deadlineMs); begun = false;
+        await commitBeforeDeadline(client,deadlineMs,()=>{ sent = true; },()=>Date.now()); begun = false;
       }
       catch (error) {
         discard = true;
         if ((error as {code?:string}).code==='PZ003') throw new AuthorityError('SCHEMA_CONFLICT','Record index projection incomplete');
         if (error instanceof CommitNotSentDeadlineExceeded) throw new AuthorityError('RATE_LIMITED','Request time budget exceeded');
         if (error instanceof AuthorityError) throw error;
+        // COMMIT never reached the session, so nothing committed: retryable, never an unknown outcome.
+        if (!sent) throw new AuthorityError('PROVIDER_UNAVAILABLE','Database session failed before commit; retry the request',undefined,true);
         commitAmbiguous = true;
         throw new CommitOutcomeUnknownError(error);
       }

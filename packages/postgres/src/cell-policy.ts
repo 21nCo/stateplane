@@ -129,7 +129,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       await client.query(`SET LOCAL statement_timeout = '${this.remaining(deadline)}ms'`);
       this.remaining(deadline);
       try {
-        await commitBeforeDeadline(client,deadline); begun = false;
+        await commitBeforeDeadline(client,deadline,undefined,()=>Date.now()); begun = false;
       } catch (error) {
         discard = true;
         if (error instanceof CommitNotSentDeadlineExceeded)
@@ -366,7 +366,7 @@ export class PostgresCellPolicy implements CellPolicy<AuthorizedCellContext> {
       await client.query(`SET LOCAL statement_timeout = '${this.remaining(deadline)}ms'`);
       this.remaining(deadline);
       try {
-        await commitBeforeDeadline(client,deadline); begun = false;
+        await commitBeforeDeadline(client,deadline,undefined,()=>Date.now()); begun = false;
       }
       catch (error) {
         discard = true;

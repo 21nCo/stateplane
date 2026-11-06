@@ -4,8 +4,8 @@ import { AggregationLimitError, AuthorityError, AuthorityTransaction, predicateF
 import type { AuthorityScope, ScalarPredicate } from './index.js';
 import { includes, MAX_INDEX_PART_BYTES, scalarString } from './schema.js';
 import { append, apply, ArrayPrototype, freeze, hasOwn, isArray, isSafeInteger, joined, mapForEach, mapGet, mapHas, mapSet,
-  NativeBigInt, NativeDate, NativeDateTimeFormat, NativeMap, NativeNumber, NativeWeakMap, ownDescriptor, ownKeys, parseJson,
-  primitiveJson, prototypeOf, utf8Bytes, weakGet, weakSet } from './intrinsics.js';
+  NativeBigInt, NativeDate, NativeDateTimeFormat, NativeMap, NativeNumber, NativePromise, NativeWeakMap, ownDescriptor, ownKeys,
+  parseJson, primitiveJson, prototypeOf, race, settle, startTimer, stopTimer, utf8Bytes, weakGet, weakSet } from './intrinsics.js';
 import { fields, invalid, transact, untrusted } from './sources.js';
 import type { Db } from './sources.js';
 import type { PostgresSpaces } from './spaces.js';
@@ -35,8 +35,9 @@ export type GroupKey = { kind: 'missing' } | { kind: 'null' } | { kind: 'value';
  * One metric of one group: `count` is the group's record count; for a field
  * metric, `values`, `nulls` and `missing` count the group's records whose
  * field holds a value, an explicit null or nothing, and `value` is computed
- * over the values only (null when there are none). A sum and an average are
- * decimal strings; a minimum or maximum has the field's own type.
+ * over the values only (null when there are none, except a sum, which is
+ * then "0"). A sum and an average are decimal strings; a minimum or maximum
+ * has the field's own type.
  */
 export interface AggregationMetricValue {
   value: string | number | null; values: number | null; nulls: number | null; missing: number | null;
@@ -68,7 +69,6 @@ const nativeRegexExec = RegExp.prototype.exec;
 const nativeISOString = Date.prototype.toISOString;
 const nativeSlice = String.prototype.slice, nativeIndexOf = String.prototype.indexOf, nativeCodeUnit = String.prototype.charCodeAt;
 const nativeLowerCase = String.prototype.toLowerCase;
-const nativeSetTimeout = setTimeout, nativeClearTimeout = clearTimeout, NativePromise = Promise;
 const matches = (pattern: RegExp, value: string) => apply(nativeRegexExec, pattern, [value]) !== null;
 const slice = (text: string, start: number, end?: number) =>
   apply(nativeSlice, text, end === undefined ? [start] : [start, end]) as string;
@@ -144,7 +144,8 @@ const accepts = (op: AggregationOperator, kind: ValueKind) => op === 'sum' || op
   : kind === 'number' || kind === 'string' || kind === 'date-time';
 const column = (kind: ValueKind) => kind === 'string' ? 'string_value' : kind === 'number' ? 'number_value'
   : kind === 'boolean' ? 'boolean_value' : 'time_value';
-// An IANA name: letters first, so no POSIX offset string ("+05:00", "UTC+3") with its inverted sign is accepted.
+// An IANA name's shape: letters first, so no bare offset ("+05:00"). A POSIX string such as "UTC+3", whose sign the
+// database inverts, matches it; the Intl probe in timeZone() refuses that, so that probe is required.
 const ZONE = /^[A-Za-z][A-Za-z0-9_+-]*(?:\/[A-Za-z0-9_+-]+)*$/;
 
 interface Dimension { field: string; bucket: { unit: AggregationUnit; timeZone: string } | null }
@@ -484,22 +485,45 @@ const hold = (pool: object, by: number) => { weakSet(running, pool, (weakGet(run
 function bounded(pool: Pick<pg.Pool, 'connect'>): Pick<pg.Pool, 'connect'> {
   const connect = () => new NativePromise<pg.PoolClient>((resolve, reject) => {
     let expired = false;
-    const timer = nativeSetTimeout(() => {
+    const timer = startTimer(() => {
       expired = true;
       hold(pool, 1);
       reject(new AggregationLimitError('slots', `No analytical session was free within ${aggregationBounds.checkoutMs} ms; retry later`));
     }, aggregationBounds.checkoutMs);
+    let pending: Promise<pg.PoolClient>;
     // A checkout that fails at once leaves nothing pending, so its timer never takes a hold.
-    try {
-      pool.connect().then(client => {
-        nativeClearTimeout(timer);
-        if (!expired) return resolve(client);
-        hold(pool, -1);
-        client.release();
-      }, (error: unknown) => { nativeClearTimeout(timer); if (expired) hold(pool, -1); else reject(error); });
-    } catch (error) { nativeClearTimeout(timer); reject(error); }
+    try { pending = pool.connect(); } catch (error) { stopTimer(timer); return reject(error); }
+    settle(pending, client => {
+      stopTimer(timer);
+      if (!expired) return resolve(client);
+      // The hold is given back first. A release that throws (a throwing pool 'release' listener) closes the unused
+      // session instead, so it is neither lost open nor a rejection nobody handles.
+      hold(pool, -1);
+      try { client.release(); }
+      catch { try { settle((client as pg.PoolClient & Pick<pg.Client, 'end'>).end(), undefined, () => {}); } catch { /* closed */ } }
+    }, (error: unknown) => { stopTimer(timer); if (expired) hold(pool, -1); else reject(error); });
   });
   return { connect } as Pick<pg.Pool, 'connect'>;
+}
+
+/**
+ * The final credential recheck, bounded by `ms`: past it the aggregation fails with a retryable PROVIDER_UNAVAILABLE
+ * and rolls back. The session the recheck was given refuses every query from then on, so a provider that answers late
+ * can never run a statement on a session already released.
+ */
+async function recheckWithin(ms: number, db: Db, recheck: (session: Pick<pg.PoolClient, 'query'>) => Promise<void>): Promise<void> {
+  let open = true;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = () => new AuthorityError('PROVIDER_UNAVAILABLE',
+    `The credential check did not answer within ${ms} ms; retry the request`, undefined, true);
+  const session = { query: async (sql: string, values?: unknown[]) => {
+    if (!open) throw late();
+    return await db.query(sql, values);
+  } } as unknown as Pick<pg.PoolClient, 'query'>;
+  const timed = new NativePromise<never>((_, reject) => { timer = startTimer(() => { open = false; reject(late()); }, ms); });
+  const checked = recheck(session);
+  try { await race<unknown>([checked, timed]); }
+  finally { stopTimer(timer); open = false; settle(checked, undefined, () => {}); }
 }
 
 /**
@@ -512,7 +536,8 @@ function bounded(pool: Pick<pg.Pool, 'connect'>): Pick<pg.Pool, 'connect'> {
  * Each aggregation is one statement, so every group and metric comes from one
  * snapshot, in one READ COMMITTED transaction that first share locks the scope
  * (the space at the admitted policy and placement, the collection, a key's
- * grant) through commit and finally rechecks the caller's credential. It runs
+ * grant) through commit and finally rechecks the caller's credential, within
+ * the statement time, on a session that refuses a late answer's query. It runs
  * only on analytical capacity, after the collection and grant are authorized
  * and the spec is checked against the declarations on the interactive
  * admission pool: on the cell's analytical pool, at most
@@ -667,7 +692,8 @@ export class PostgresAggregations {
     // groups' JSON text without any toJSON hook.
     if (jsonBytes(groups) > aggregationBounds.resultBytes) throw overBytes();
     await db.query(`SET LOCAL statement_timeout = '${aggregationBounds.statementMs}ms'`);
-    await this.spaces.assertScopeCurrent(actor, ownerPrincipalId, scope, db, scope.collectionId, ['records:read']);
+    await recheckWithin(this.#statementMs, db, session =>
+      this.spaces.assertScopeCurrent(actor, ownerPrincipalId, scope, session, scope.collectionId, ['records:read']));
     const measured: string[] = each(spec.groupBy, item => item.field);
     for (let i = 0; i < spec.metrics.length; i++) if (spec.metrics[i].field !== null) append(measured, spec.metrics[i].field!);
     for (let i = 0; i < spec.where.length; i++) append(measured, spec.where[i].field);
