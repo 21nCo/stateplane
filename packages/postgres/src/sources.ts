@@ -504,7 +504,7 @@ async function insertGrant(db: Db, scope: AuthorityScope, grantId: string, mimeT
  * added to a reading taken before the query was sent.
  */
 async function lockGrant(db: Db, scope: AuthorityScope, grantId: string, ownerPrincipalId?: string): Promise<Record<string, unknown>> {
-  const sent = performance.now();
+  const sent = monotonicNow();
   const row = (await db.query(`SELECT *,expires_at<=clock_timestamp() AS expired,
       GREATEST(0,EXTRACT(EPOCH FROM expires_at-clock_timestamp())*1000) AS remaining_ms
     FROM source_upload_grants WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 FOR UPDATE`,
@@ -520,7 +520,7 @@ async function lockGrant(db: Db, scope: AuthorityScope, grantId: string, ownerPr
  */
 function writeWindow(deadline: number): { signal: AbortSignal; close: () => void } {
   const controller = new AbortController();
-  const remaining = deadline - performance.now();
+  const remaining = deadline - monotonicNow();
   if (remaining <= 0) { controller.abort(); return { signal: controller.signal, close: () => {} }; }
   const timer = setTimeout(() => controller.abort(), Math.floor(remaining));
   return { signal: controller.signal, close: () => clearTimeout(timer) };
@@ -1012,7 +1012,7 @@ export class PostgresSources {
       });
     } catch (error) { throw evidenceRefusal(error); }
     // Bytes are removed only once the deletion committed, so a refused COMMIT never starts a removal.
-    const until = performance.now() + CLEANUP_CALL_MS;
+    const until = monotonicNow() + CLEANUP_CALL_MS;
     const removed = outcome.stored && await eraseOriginal(admitted.cell, [scope.spaceId, scope.collectionId, sourceId], until,
       until + CLEANUP_CALL_MS, sourceBounds.reconcileGraceSeconds).catch(() => false);
     return { sourceId, collectionId: scope.collectionId, deletedAt: outcome.deletedAt, replayed: outcome.replayed,
@@ -1196,7 +1196,7 @@ async function insertExtraction(db: Db, scope: AuthorityScope, sourceId: string,
  * within `EXTRACT_READ_MS`. On any failure the store's body is cancelled.
  */
 async function originalBytes(blobs: BlobStore, objectKey: string | null, sha256: string, bytes: number): Promise<Uint8Array> {
-  const window = writeWindow(performance.now() + EXTRACT_READ_MS);
+  const window = writeWindow(monotonicNow() + EXTRACT_READ_MS);
   try {
     const stored = objectKey === null ? null : await beforeAbort(blobs.get(objectKey), window.signal,
       late => void late?.body.cancel().catch(() => {}));
@@ -1356,7 +1356,7 @@ async function eraseOriginal(cell: SourceCell, ids: readonly string[], storeUnti
   const remove = async (key: string): Promise<boolean> => {
     if (deleted.has(key)) return true;
     if (missed.has(key)) return false;
-    if (performance.now() >= storeUntil) { cut = true; return false; }
+    if (monotonicNow() >= storeUntil) { cut = true; return false; }
     try { await within(storeUntil, () => cell.originals.delete(key)); }
     catch (error) {
       missed.add(key);
@@ -1489,7 +1489,7 @@ export class SourceUploadReconciler {
   async step(limit = 25, budgetMs = 10_000): Promise<number> {
     if (!isSafeInteger(limit) || limit < 1 || limit > 500) throw new RangeError('Invalid reconciliation limit');
     if (!isSafeInteger(budgetMs) || budgetMs < 1) throw new RangeError('Invalid reconciliation budget');
-    const until = performance.now() + budgetMs;
+    const until = monotonicNow() + budgetMs;
     const due = await transact(this.cell.pool, db => db.query(`SELECT a.space_id,a.collection_id,a.grant_id,a.attempt_id
       FROM source_upload_attempts a JOIN source_upload_grants g USING (space_id,collection_id,grant_id)
       WHERE a.staging_removed_at IS NULL AND g.expires_at < clock_timestamp()-make_interval(secs=>$2)
@@ -1497,7 +1497,7 @@ export class SourceUploadReconciler {
     const errors: unknown[] = [];
     let failed = 0;
     for (const row of due.rows) {
-      if (performance.now() >= until) break;
+      if (monotonicNow() >= until) break;
       const key: Key = [row.space_id, row.collection_id, row.grant_id, row.attempt_id];
       try {
         const attempt = await transact(this.cell.pool, async db => {
@@ -1517,7 +1517,7 @@ export class SourceUploadReconciler {
         failed++;
         errors.push(error);
         // No deferral starts after the budget; the attempt is retried on a later tick.
-        if (performance.now() >= until) break;
+        if (monotonicNow() >= until) break;
         await transact(this.cell.pool, db => db.query(`UPDATE source_upload_attempts SET updated_at=clock_timestamp()
           WHERE space_id=$1 AND collection_id=$2 AND grant_id=$3 AND attempt_id=$4 AND staging_removed_at IS NULL`, key), until)
           .catch((deferral: unknown) => { errors.push(deferral); });
@@ -1566,7 +1566,7 @@ export class SourceUploadReconciler {
   async erase(limit = 25, budgetMs = 10_000): Promise<number> {
     if (!isSafeInteger(limit) || limit < 1 || limit > 500) throw new RangeError('Invalid erasure limit');
     if (!isSafeInteger(budgetMs) || budgetMs < 1) throw new RangeError('Invalid erasure budget');
-    const start = performance.now();
+    const start = monotonicNow();
     const until = start + budgetMs;
     // Fixed from the start: the source page's end, the latest source store end, the space page's end and the space
     // store calls' end, so no slow call moves a later phase's window.
@@ -1589,10 +1589,10 @@ export class SourceUploadReconciler {
     // call, but it never moves past its fixed latest end: the spaces' window starts by `sourcesEnd` however slow the
     // source calls are. With none due, the spaces' windows are theirs: store calls by `spacesStop`, records by `until`.
     const spacesDue = sources.some(row => row.spaces_due !== false);
-    const sourcesStop = spacesDue ? Math.min(sourcesLatest, performance.now() + budgetMs * 20 / 50) : spacesStop;
+    const sourcesStop = spacesDue ? Math.min(sourcesLatest, monotonicNow() + budgetMs * 20 / 50) : spacesStop;
     const sourcesEnd = spacesDue ? sourcesStop + budgetMs * 4 / 50 : until;
     for (const row of sources) {
-      if (performance.now() >= sourcesStop) break;
+      if (monotonicNow() >= sourcesStop) break;
       const ids = [row.space_id, row.collection_id, row.source_id];
       try { await eraseOriginal(this.cell, ids, sourcesStop, sourcesEnd, grace, row); }
       catch (error) {
@@ -1604,26 +1604,26 @@ export class SourceUploadReconciler {
     }
     // A space page that cannot be read is reported with the sources' failures; one its deadline cut short is
     // unfinished, and the spaces keep their place.
-    const spaces = performance.now() >= spacePageEnd ? [] : await transact(pool, db => db.query(`SELECT space_id,observed::text AS observed,
+    const spaces = monotonicNow() >= spacePageEnd ? [] : await transact(pool, db => db.query(`SELECT space_id,observed::text AS observed,
         to_char(requested_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS requested,
         clock_timestamp()>=writers_end_at+make_interval(secs=>$2) AS settled
       FROM space_erasures WHERE originals_removed_at IS NULL AND next_attempt_at<=clock_timestamp()
       ORDER BY next_attempt_at,space_id LIMIT $1`, [limit, grace]), spacePageEnd)
       .then(result => result.rows, (error: unknown) => { failed(error); return []; });
     for (const row of spaces) {
-      if (performance.now() >= spacesStop) break;
+      if (monotonicNow() >= spacesStop) break;
       const spaceId = String(row.space_id);
       let found = false;
       let finished = true;
       try {
         for (const prefix of keyPrefixes(spaceId)) {
-          if (performance.now() >= spacesStop) { finished = false; break; }
+          if (monotonicNow() >= spacesStop) { finished = false; break; }
           // Store calls end by `spacesStop`, so the tenth after it records this space's progress or retry turn.
           const page = await within(spacesStop, () => this.cell.originals.list(prefix, 100));
           for (const key of page.keys) {
             if (!startsWith(key, prefix)) break;
             found = true;
-            if (performance.now() >= spacesStop) break;
+            if (monotonicNow() >= spacesStop) break;
             await within(spacesStop, () => this.cell.originals.delete(key));
           }
         }
@@ -1664,7 +1664,7 @@ export class SourceUploadReconciler {
   async sweep(limit = 100, budgetMs = 5_000): Promise<number> {
     if (!isSafeInteger(limit) || limit < 1 || limit > 1000) throw new RangeError('Invalid sweep limit');
     if (!isSafeInteger(budgetMs) || budgetMs < 1) throw new RangeError('Invalid sweep budget');
-    const until = performance.now() + budgetMs;
+    const until = monotonicNow() + budgetMs;
     const blobs = this.cell.originals;
     const stored = await within(until, () => blobs.get(SWEEP_CURSOR), late => void late?.body.cancel().catch(() => {}));
     const cursor = stored ? await readCursor(stored.body, until) : '';
@@ -1701,7 +1701,7 @@ export class SourceUploadReconciler {
     const deletesUntil = until - budgetMs / 5;
     let examined = 0;
     for (const [index, key] of page.keys.entries()) {
-      if (performance.now() >= deletesUntil) break;
+      if (monotonicNow() >= deletesUntil) break;
       if (ended.has(index)) await within(deletesUntil, () => blobs.delete(key)).catch((error: unknown) => { errors.push(error); });
       examined++;
     }

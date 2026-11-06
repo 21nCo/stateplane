@@ -470,23 +470,34 @@ async function declarations(db: Db, scope: Readonly<AuthorityScope>, spec: Spec)
 }
 
 /**
- * `pool`, whose checkout fails with BACKPRESSURE once `aggregationBounds.checkoutMs` pass without a session, so a
- * stalled pool never keeps an aggregation's reservation; a session that arrives after that is released unused.
+ * Aggregations this process runs on each analytical pool, whichever adapter or composed services started them, plus
+ * the checkouts they gave up on that the pool has not yet answered.
+ */
+const running = new NativeWeakMap<object, number>();
+const hold = (pool: object, by: number) => { weakSet(running, pool, (weakGet(running, pool) ?? 0) + by); };
+
+/**
+ * `pool`, whose checkout fails with BACKPRESSURE once `aggregationBounds.checkoutMs` pass without a session. The
+ * checkout it gave up on stays counted against the pool's slots until the pool answers it, and a session that arrives
+ * then is released unused, so a stalled pool refuses further aggregations instead of queueing more checkouts.
  */
 function bounded(pool: Pick<pg.Pool, 'connect'>): Pick<pg.Pool, 'connect'> {
   const connect = () => new NativePromise<pg.PoolClient>((resolve, reject) => {
     let expired = false;
     const timer = nativeSetTimeout(() => {
       expired = true;
+      hold(pool, 1);
       reject(new AggregationLimitError('slots', `No analytical session was free within ${aggregationBounds.checkoutMs} ms; retry later`));
     }, aggregationBounds.checkoutMs);
-    pool.connect().then(client => { nativeClearTimeout(timer); if (expired) client.release(); else resolve(client); },
-      (error: unknown) => { nativeClearTimeout(timer); reject(error); });
+    pool.connect().then(client => {
+      nativeClearTimeout(timer);
+      if (!expired) return resolve(client);
+      hold(pool, -1);
+      client.release();
+    }, (error: unknown) => { nativeClearTimeout(timer); if (expired) hold(pool, -1); else reject(error); });
   });
   return { connect } as Pick<pg.Pool, 'connect'>;
 }
-/** Aggregations this process runs on each analytical pool, whichever adapter or composed services started them. */
-const running = new NativeWeakMap<object, number>();
 
 /**
  * Bounded interactive aggregations over one collection's declared index
@@ -576,9 +587,8 @@ export class PostgresAggregations {
       throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Analytical capacity is not configured for this cell', undefined, false);
     const slots = analyticalSlots(cell.originConnectionLimit), pool = cell.pool;
     // Counted per analytical pool, so separately composed services that share one stay within its cell's slots together.
-    const held = weakGet(running, pool) ?? 0;
-    if (held >= slots.cell) throw new AggregationLimitError('slots', 'Analytical capacity is in use; retry later');
-    weakSet(running, pool, held + 1);
+    if ((weakGet(running, pool) ?? 0) >= slots.cell) throw new AggregationLimitError('slots', 'Analytical capacity is in use; retry later');
+    hold(pool, 1);
     try {
       const analytical = bounded(pool);
       try { return await transact(analytical, db => this.run(db, actor, admitted, spec, slots, true)); }
@@ -586,11 +596,11 @@ export class PostgresAggregations {
       await transact(analytical, db => provision(db, admitted.scope, admitted.cellId, slots));
       return await transact(analytical, db => this.run(db, actor, admitted, spec, slots, false));
     } finally {
-      weakSet(running, pool, weakGet(running, pool)! - 1);
+      hold(pool, -1);
     }
   }
 
-  private async run(db: Db, actor: VerifiedCredential, admitted: Awaited<ReturnType<PostgresSpaces['scope']>>, spec: Spec,
+  private async run(db: Db, actor: VerifiedCredential, admitted: Awaited<ReturnType<PostgresSpaces['scope']>>, admittedSpec: Spec,
     slots: { cell: number; space: number }, provisionable: boolean): Promise<AggregationResult> {
     const { scope, cellId, ownerPrincipalId } = admitted;
     // Space, collection and grant first, as every reader takes them, then at once the slots (a purge locks its space before
@@ -603,7 +613,8 @@ export class PostgresAggregations {
       if (missing && provisionable) throw new Unprovisioned();
       throw new AggregationLimitError('slots', `The ${held.cell_slot === null ? "cell's" : "space's"} analytical slots are in use; retry later`);
     }
-    // The spec's zones were resolved at admission; its fields are checked again against this snapshot's declarations.
+    // Zones are resolved again on this session, which runs the statement, and fields checked against this snapshot.
+    const spec = await zones(db, admittedSpec);
     const { schemaVersion, declared } = await declarations(db, scope, spec);
     admit(spec, declared);
     const { sql, params } = statement(scope, spec, declared);

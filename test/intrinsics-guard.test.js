@@ -37,7 +37,7 @@ const violations = (label, text) => {
 export const COVERED = {
   'index.ts': ['comparison', 'predicateColumn', 'sqlOperator', 'validPredicateValue', 'valueString', 'scalarString', 'predicateFilter',
     'snapshotPredicates', 'parseSerializedPredicates', 'predicateDataKeys', 'snapshotInValues', 'snapshotPredicate', 'arrayHas',
-    'validScope', 'mapValues', 'setValues', 'close', 'compilePredicates'],
+    'validScope', 'mapValues', 'setValues', 'close', 'checkScope', 'compilePredicates'],
   'schema.ts': ['includes', 'distinct', 'any', 'scalarLength', 'scalarString', 'utcInstant'],
   'sources.ts': ['serialized', 'fields', 'within', 'transact']
 };

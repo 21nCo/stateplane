@@ -6,7 +6,7 @@ import { parseRevision } from '@stateplane/contracts';
 import type { Capability, CollectionId, RecordRef, Revision, SpaceId } from '@stateplane/contracts';
 import { acceptsInProcessObjects, canonical, derivedParsedValues, externalKey, fingerprint, isInProcessProxy, MAX_INDEX_PART_BYTES, MAX_INDEX_VALUE_BYTES, plainJson, scalarString as unicodeString, utcInstant, validateParsedValue } from './schema.js';
 import { append, apply, ArrayPrototype, freeze, hasOwn, isArray, isFiniteNumber, isSafeInteger, mapClear, mapForEach, mapGet, mapHas,
-  mapSet, ObjectPrototype, ownDescriptor, ownKeys, parseJson, prototypeOf, setAdd, setClear, setForEach, setHas, utf8Bytes } from './intrinsics.js';
+  mapSet, NativeNumber, ObjectPrototype, ownDescriptor, ownKeys, parseJson, prototypeOf, setAdd, setClear, setForEach, setHas, utf8Bytes } from './intrinsics.js';
 import type { CollectionDefinition, Json } from './schema.js';
 export { CollectionRegistry } from './collections.js';
 export { externalKey, validateDefinition, validateValue, compatible, derivedValues } from './schema.js';
@@ -1248,7 +1248,7 @@ export class AuthorityTransaction {
       WHERE s.space_id=$1 AND c.collection_id=$2 FOR SHARE OF s,c`, [spaceId, collectionId, credentialId, principalId]);
     const row = result.rows[0];
     if (!row) throw new AuthorityError('NOT_FOUND');
-    if (Number(row.policy_version) !== policyVersion || Number(row.placement_generation) !== placementGeneration) throw new AuthorityError('FORBIDDEN', 'Policy or placement changed');
+    if (NativeNumber(row.policy_version) !== policyVersion || NativeNumber(row.placement_generation) !== placementGeneration) throw new AuthorityError('FORBIDDEN', 'Policy or placement changed');
     if (arrayHas(['suspended','deleting','deleted'],row.lifecycle)) throw new AuthorityError('SPACE_UNAVAILABLE');
     if (row.collection_lifecycle === 'deleted') throw new AuthorityError('NOT_FOUND');
     if (capability === 'outbox:worker' && (principalId !== 'system:projection' || credentialId !== 'system:projection'))
@@ -1257,7 +1257,7 @@ export class AuthorityTransaction {
     if (capability === 'outbox:worker' && row.lifecycle !== 'active' && row.lifecycle !== 'readOnly')
       throw new AuthorityError('SPACE_UNAVAILABLE');
     if (row.owner_principal_id !== principalId && capability !== 'outbox:worker' &&
-      (!Array.isArray(row.capabilities) || !arrayHas(row.capabilities,capability) || (row.expires_at && !row.grant_current))) throw new AuthorityError('FORBIDDEN');
+      (!isArray(row.capabilities) || !arrayHas(row.capabilities,capability) || (row.expires_at && !row.grant_current))) throw new AuthorityError('FORBIDDEN');
     if (row.collection_lifecycle === 'readOnly' && (capability === 'records:write' || capability === 'claims:review')) throw new AuthorityError('SPACE_UNAVAILABLE');
   }
 

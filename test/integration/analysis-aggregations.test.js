@@ -1068,14 +1068,14 @@ test('a stalled analytical checkout is bounded, and services sharing an analytic
   const late = [];
   const shared = { connect: () => {
     if (!stalls.has(++checkouts)) return analyticalPool.connect();
-    return new Promise(resolve => late.push(() => resolve({ release: () => { released++; },
-      query: () => { throw new Error('a late session was used'); }, on() {}, removeListener() {} })));
+    return new Promise((resolve, reject) => late.push(fail => fail ? reject(new Error('late checkout failed'))
+      : resolve({ release: () => { released++; }, query: () => { throw new Error('a late session was used'); }, on() {}, removeListener() {} })));
   } };
   const compose = () => postgresServices(spaces, new Map([['cell-a', { pool, cursorSecret: randomBytes(32),
     analytics: { pool: shared, originConnectionLimit: 5 } }]]), 3600);
   const [one, two] = [compose(), compose()];
   const direct = aggregations(shared, 5);
-  const stalled = async (stall, run) => {
+  const stalled = async (stall, run, fail = false) => {
     stalls = new Set([stall]); checkouts = 0;
     const started = performance.now();
     const pending = run();
@@ -1088,10 +1088,17 @@ test('a stalled analytical checkout is bounded, and services sharing an analytic
     await limited(pending, 'slots');
     const waited = performance.now() - started;
     assert.ok(waited >= aggregationBounds.checkoutMs - 5 && waited < aggregationBounds.checkoutMs + 1_500, `waited ${waited} ms`);
+    // Until the pool answers the expired checkout it keeps the pool's slot: retries are refused at once, never queued.
+    const expired = checkouts;
+    for (let retry = 0; retry < 3; retry++) {
+      await limited(one.analysis.aggregate(f.owner, f.spaceId, 'items', count), 'slots');
+      await limited(direct.aggregateSerialized(f.owner, f.spaceId, 'items', count), 'slots');
+    }
+    assert.equal(checkouts, expired, 'no checkout is queued behind an unanswered expired one');
     const before2 = released;
-    late.shift()();
+    late.shift()(fail);
     await new Promise(resolve => setImmediate(resolve));
-    assert.equal(released, before2 + 1, 'the late session is released unused');
+    assert.equal(released, before2 + (fail ? 0 : 1), 'a late session is released unused');
   };
   // The first attempt's checkout stalls.
   await stalled(1, () => one.analysis.aggregate(f.owner, f.spaceId, 'items', count));
@@ -1100,6 +1107,8 @@ test('a stalled analytical checkout is bounded, and services sharing an analytic
   await g.write('items', { operation: 'create', data: { team: 'red' } });
   await stalled(2, () => one.analysis.aggregate(g.owner, g.spaceId, 'items', count));
   await stalled(3, () => one.analysis.aggregate(g.owner, g.spaceId, 'items', count));
+  // A checkout that fails after its deadline also gives its slot back.
+  await stalled(1, () => two.analysis.aggregate(f.owner, f.spaceId, 'items', count), true);
   // Every reservation was given back: without stalls, both services and the adapter answer through the shared pool.
   stalls = new Set();
   for (const answer of [await one.analysis.aggregate(g.owner, g.spaceId, 'items', count),
