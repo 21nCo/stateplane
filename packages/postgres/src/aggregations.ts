@@ -2,7 +2,7 @@ import type pg from 'pg';
 import type { VerifiedCredential } from '@stateplane/contracts';
 import { AggregationLimitError, AuthorityError, AuthorityTransaction, predicateFilter, snapshotPredicates } from './index.js';
 import type { AuthorityScope, ScalarPredicate } from './index.js';
-import { includes, MAX_INDEX_PART_BYTES, scalarString } from './schema.js';
+import { includes, MAX_INDEX_PART_BYTES, scalarString, utf8Bytes } from './schema.js';
 import { fields, invalid, transact, untrusted } from './sources.js';
 import type { Db } from './sources.js';
 import type { PostgresSpaces } from './spaces.js';
@@ -105,19 +105,6 @@ function distinct<T>(values: readonly T[]): T[] {
   const result: T[] = [];
   for (let i = 0; i < values.length; i++) if (!includes(result, values[i])) append(result, values[i]);
   return result;
-}
-/** UTF-8 bytes of text, a lone surrogate counted as its 3-byte replacement, as Buffer.byteLength counts. */
-function utf8Bytes(text: string): number {
-  let bytes = 0;
-  for (let i = 0; i < text.length; i++) {
-    const unit = codeUnit(text, i);
-    if (unit < 0x80) bytes += 1;
-    else if (unit < 0x800) bytes += 2;
-    else if (unit >= 0xd800 && unit <= 0xdbff && i + 1 < text.length && codeUnit(text, i + 1) >= 0xdc00 &&
-      codeUnit(text, i + 1) <= 0xdfff) { bytes += 4; i++; }
-    else bytes += 3;
-  }
-  return bytes;
 }
 /**
  * The UTF-8 bytes of `JSON.stringify(value)` for data this module built (own
@@ -542,11 +529,12 @@ export class PostgresAggregations {
 
   private async admit(actor: VerifiedCredential, spaceId: string, collectionId: string, request: () => Spec): Promise<AggregationResult> {
     const admitted = await this.spaces.scope(actor, spaceId, collectionId, 'records:read');
-    const cell = mapGet(this.cells, admitted.cellId);
+    // A cell this adapter was not given has no analytical capacity; it is authorized on the spaces adapter's own
+    // interactive pool for that cell, so the caller still learns FORBIDDEN or NOT_FOUND before that.
+    const cell: AggregationCell = mapGet(this.cells, admitted.cellId) ??
+      { pool: null, admission: this.spaces.interactivePool(admitted.cellId) };
     const unconfigured = () => new AuthorityError('PROVIDER_UNAVAILABLE', 'Analytical capacity is not configured for this cell',
       undefined, false);
-    // Without any pool of this cell's to authorize on, nothing is disclosed but that the cell is not configured.
-    if (!cell) throw unconfigured();
     // Authorize the collection and grant before taking or reporting capacity, so a caller without records:read, or a
     // collection that does not exist, is refused as such and never holds or waits on a slot. The analytical transaction
     // locks and checks them again.

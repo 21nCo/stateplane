@@ -69,6 +69,10 @@ const nativeTrim = String.prototype.trim;
 const nativeLowerCase = String.prototype.toLowerCase;
 const nativeStartsWith = String.prototype.startsWith;
 const nativeRegexExec = RegExp.prototype.exec;
+const isArray = Array.isArray, ObjectPrototype = Object.prototype, createObject = Object.create;
+const prototypeOf = Object.getPrototypeOf, ownDescriptor = Object.getOwnPropertyDescriptor, hasOwn = Object.hasOwn;
+const ownKeys = Reflect.ownKeys;
+const { min, max, ceil } = Math, now = Date.now;
 const matches = (pattern: RegExp, value: string) => apply(nativeRegexExec, pattern, [value]) !== null;
 const startsWith = (value: string, prefix: string) => apply(nativeStartsWith, value, [prefix]) as boolean;
 /** `JSON.stringify` of a string list, read by own index rather than through the array's iterator or `toJSON`. */
@@ -116,19 +120,19 @@ export const untrusted = (value: object) => !acceptsInProcessObjects || isInProc
  */
 export function fields(value: unknown, allowed: readonly string[], required: readonly string[],
   trustedParsed = false): Record<string, unknown> {
-  if (!value || typeof value !== 'object' || (!trustedParsed && untrusted(value)) || Array.isArray(value)) invalid();
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) invalid();
-  const copy: Record<string, unknown> = Object.create(null);
-  const keys = Reflect.ownKeys(value);
+  if (!value || typeof value !== 'object' || (!trustedParsed && untrusted(value)) || isArray(value)) invalid();
+  const prototype = prototypeOf(value);
+  if (prototype !== ObjectPrototype && prototype !== null) invalid();
+  const copy: Record<string, unknown> = createObject(null);
+  const keys = ownKeys(value);
   for (let i = 0; i < keys.length; i++) {
-    const key = Object.getOwnPropertyDescriptor(keys, i)!.value as PropertyKey;
+    const key = ownDescriptor(keys, i)!.value as PropertyKey;
     if (typeof key !== 'string' || !includes(allowed, key)) invalid();
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value') || descriptor.value === undefined) invalid();
+    const descriptor = ownDescriptor(value, key);
+    if (!descriptor?.enumerable || !hasOwn(descriptor, 'value') || descriptor.value === undefined) invalid();
     copy[key] = descriptor.value;
   }
-  for (let i = 0; i < required.length; i++) if (!Object.hasOwn(copy, Object.getOwnPropertyDescriptor(required, i)!.value)) invalid();
+  for (let i = 0; i < required.length; i++) if (!hasOwn(copy, ownDescriptor(required, i)!.value)) invalid();
   return copy;
 }
 /** Well-formed Unicode text without NUL, within a UTF-8 byte bound. */
@@ -192,15 +196,15 @@ async function within<T>(until: number, start: () => Promise<T>, late: (value: T
   let timedOut = false;
   void pending.then(value => { if (timedOut) late(value); }, () => {});
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = Math.min(until, performance.now() + CLEANUP_CALL_MS);
+  const deadline = min(until, performance.now() + CLEANUP_CALL_MS);
   const atBudget = budget <= deadline;
   const timeout = new Promise<never>((_, reject) => {
     const expire = () => {
       const left = deadline - performance.now();
-      if (left > 0) timer = setTimeout(expire, Math.ceil(left));
+      if (left > 0) timer = setTimeout(expire, ceil(left));
       else { timedOut = true; reject(new CleanupTimeout(atBudget)); }
     };
-    timer = setTimeout(expire, Math.max(0, deadline - performance.now()));
+    timer = setTimeout(expire, max(0, deadline - performance.now()));
   });
   try { return await Promise.race([pending, timeout]); } finally { clearTimeout(timer); }
 }
@@ -229,10 +233,10 @@ async function within<T>(until: number, start: () => Promise<T>, late: (value: T
  * Its server timeouts round up, so they never fire before `until` does.
  */
 export async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) => Promise<T>, until?: number): Promise<T> {
-  const end = until === undefined ? undefined : Math.min(until, performance.now() + CLEANUP_CALL_MS);
-  const remaining = () => end === undefined ? REQUEST_BUDGET_MS : Math.max(1, Math.ceil(end - performance.now()));
+  const end = until === undefined ? undefined : min(until, performance.now() + CLEANUP_CALL_MS);
+  const remaining = () => end === undefined ? REQUEST_BUDGET_MS : max(1, ceil(end - performance.now()));
   if (end !== undefined && performance.now() >= end) throw new CleanupTimeout(performance.now() >= until!);
-  const deadline = Date.now() + REQUEST_BUDGET_MS;
+  const deadline = now() + REQUEST_BUDGET_MS;
   const client = end === undefined ? await pool.connect() :
     await within(end, () => pool.connect(), late => late.release(), until);
   let beginAttempted = false;
@@ -246,8 +250,8 @@ export async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) =
     beginAttempted = true;
     const work = async () => {
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED'); begun = true;
-      await client.query(`SET LOCAL statement_timeout = '${Math.min(STATEMENT_MS, remaining())}ms'`);
-      await client.query(`SET LOCAL lock_timeout = '${Math.min(LOCK_MS, remaining())}ms'`);
+      await client.query(`SET LOCAL statement_timeout = '${min(STATEMENT_MS, remaining())}ms'`);
+      await client.query(`SET LOCAL lock_timeout = '${min(LOCK_MS, remaining())}ms'`);
       return fn(client);
     };
     // Only the caller's own budget makes a cut-off call unfinished; the per-call bound is a stall.

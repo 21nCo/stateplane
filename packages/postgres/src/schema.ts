@@ -28,6 +28,10 @@ const maxFields = 256;
 export const MAX_INDEX_PART_BYTES = 256;
 export const MAX_INDEX_VALUE_BYTES = 512;
 const withinBytes = (value:string, limit:number):boolean => Buffer.byteLength(value,'utf8') <= limit;
+// The predicate and aggregation admission helpers below (includes, utf8Bytes, scalarString, utcInstant) call built-ins
+// only through these load-time captures, so a later replacement cannot change what they admit.
+const apply = Reflect.apply;
+const ownDescriptor = Object.getOwnPropertyDescriptor;
 const own = Object.hasOwn;
 const isFiniteNumber = Number.isFinite;
 const isIntegerNumber = Number.isInteger;
@@ -60,9 +64,22 @@ const compare = (a: string,b: string) => Buffer.compare(Buffer.from(a),Buffer.fr
 const append = <T>(values:T[],value:T):void => { Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
 /** Compare own array slots without invoking a replaced iterator or includes method. */
 export const includes = <T>(values:readonly T[],value:T):boolean => {
-  for (let i=0;i<values.length;i++) if (Object.getOwnPropertyDescriptor(values,i)?.value===value) return true;
+  for (let i=0;i<values.length;i++) if (ownDescriptor(values,i)?.value===value) return true;
   return false;
 };
+/** UTF-8 bytes of text, a lone surrogate counted as its 3-byte replacement, as Buffer.byteLength counts. */
+export function utf8Bytes(text: string): number {
+  let bytes = 0;
+  for (let i = 0; i < text.length; i++) {
+    const unit = apply(codeUnit,text,[i]) as number;
+    if (unit < 0x80) bytes += 1;
+    else if (unit < 0x800) bytes += 2;
+    else if (unit >= 0xd800 && unit <= 0xdbff && i + 1 < text.length && (apply(codeUnit,text,[i + 1]) as number) >= 0xdc00 &&
+      (apply(codeUnit,text,[i + 1]) as number) <= 0xdfff) { bytes += 4; i++; }
+    else bytes += 3;
+  }
+  return bytes;
+}
 const distinct = (values:readonly unknown[]):boolean => {
   for (let i=0;i<values.length;i++) for (let j=0;j<i;j++) if (Object.getOwnPropertyDescriptor(values,i)?.value===Object.getOwnPropertyDescriptor(values,j)?.value) return false;
   return true;
@@ -73,9 +90,9 @@ const any = <T>(values:readonly T[],predicate:(value:T)=>boolean):boolean => {
 };
 const sorted = <T>(values:T[],comparison:(a:T,b:T)=>number):T[] => Reflect.apply(nativeSort,values,[comparison]) as T[];
 const joined = (values:readonly string[],separator:string):string => Reflect.apply(nativeJoin,values,[separator]) as string;
-const setHas = <T>(set:Set<T>,value:T):boolean => Reflect.apply(nativeSetHas,set,[value]) as boolean;
-const setAdd = <T>(set:Set<T>,value:T):void => { Reflect.apply(nativeSetAdd,set,[value]); };
-const setDelete = <T>(set:Set<T>,value:T):void => { Reflect.apply(nativeSetDelete,set,[value]); };
+const setHas = <T>(set:Set<T>,value:T):boolean => apply(nativeSetHas,set,[value]) as boolean;
+const setAdd = <T>(set:Set<T>,value:T):void => { apply(nativeSetAdd,set,[value]); };
+const setDelete = <T>(set:Set<T>,value:T):void => { apply(nativeSetDelete,set,[value]); };
 const scalarLength=(value:string):number=>{
   let count=0;
   for (let i=0;i<value.length;i++) {
@@ -94,10 +111,10 @@ const fail = (code: string, message?: string): never => { throw new AuthorityErr
 export function scalarString(value: unknown, allowNul = false): value is string {
   if (typeof value !== 'string') return false;
   for (let i=0;i<value.length;i++) {
-    const unit = Reflect.apply(codeUnit,value,[i]) as number;
+    const unit = apply(codeUnit,value,[i]) as number;
     if ((!allowNul && unit === 0) || (unit >= 0xdc00 && unit <= 0xdfff)) return false;
     if (unit >= 0xd800 && unit <= 0xdbff) {
-      const next = Reflect.apply(codeUnit,value,[++i]) as number;
+      const next = apply(codeUnit,value,[++i]) as number;
       if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
     }
   }
@@ -290,19 +307,19 @@ function validateNodeEnum(node:SchemaNode,depth:number):void {
 const leapDays = new Set(['1972-06-30','1972-12-31','1973-12-31','1974-12-31','1975-12-31','1976-12-31','1977-12-31','1978-12-31','1979-12-31','1981-06-30','1982-06-30','1983-06-30','1985-06-30','1987-12-31','1989-12-31','1990-12-31','1992-06-30','1993-06-30','1994-06-30','1995-12-31','1997-06-30','1998-12-31','2005-12-31','2008-12-31','2012-06-30','2015-06-30','2016-12-31']);
 /** Normalize an accepted UTC instant while preserving precise fractional ordering. */
 export function utcInstant(value: string): string {
-  const match=Reflect.apply(nativeRegexExec,/^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z$/,[value]) as RegExpExecArray | null;
-  if (!match || Reflect.apply(startsWith,match[1],['0000-'])) fail('SCHEMA_INVALID');
+  const match=apply(nativeRegexExec,/^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z$/,[value]) as RegExpExecArray | null;
+  if (!match || apply(startsWith,match[1],['0000-'])) fail('SCHEMA_INVALID');
   const checkedMatch=match!;
-  const leap=Reflect.apply(endsWith,checkedMatch[1],['T23:59:60']) as boolean;
-  if (Reflect.apply(endsWith,checkedMatch[1],[':60']) &&
-    (!leap || !setHas(leapDays,Reflect.apply(slice,checkedMatch[1],[0,10]) as string))) fail('SCHEMA_INVALID');
-  const checked=leap ? `${Reflect.apply(slice,checkedMatch[1],[0,-2])}59` : checkedMatch[1];
+  const leap=apply(endsWith,checkedMatch[1],['T23:59:60']) as boolean;
+  if (apply(endsWith,checkedMatch[1],[':60']) &&
+    (!leap || !setHas(leapDays,apply(slice,checkedMatch[1],[0,10]) as string))) fail('SCHEMA_INVALID');
+  const checked=leap ? `${apply(slice,checkedMatch[1],[0,-2])}59` : checkedMatch[1];
   const instant=new NativeDate(`${checked}Z`);
-  if (!isFiniteNumber(Reflect.apply(nativeGetTime,instant,[])) ||
-    (Reflect.apply(slice,Reflect.apply(nativeISOString,instant,[]) as string,[0,19]) as string)!==checked) fail('SCHEMA_INVALID');
+  if (!isFiniteNumber(apply(nativeGetTime,instant,[])) ||
+    (apply(slice,apply(nativeISOString,instant,[]) as string,[0,19]) as string)!==checked) fail('SCHEMA_INVALID');
   let fraction=checkedMatch[2]??'';
-  while (fraction.length && Reflect.apply(codeUnit,fraction,[fraction.length-1])===48)
-    fraction=Reflect.apply(slice,fraction,[0,-1]) as string;
+  while (fraction.length && apply(codeUnit,fraction,[fraction.length-1])===48)
+    fraction=apply(slice,fraction,[0,-1]) as string;
   const suffix=fraction ? '.'+fraction : '';
   return `${checkedMatch[1]}${suffix}Z`;
 }

@@ -4,7 +4,7 @@ import { commitBeforeDeadline, CommitNotSentDeadlineExceeded } from './commit-de
 import { claimOutboxSql, failOutboxSql, LIVE_OUTBOX } from './outbox-sql.js';
 import { parseRevision } from '@stateplane/contracts';
 import type { Capability, CollectionId, RecordRef, Revision, SpaceId } from '@stateplane/contracts';
-import { acceptsInProcessObjects, canonical, derivedParsedValues, externalKey, fingerprint, isInProcessProxy, MAX_INDEX_PART_BYTES, MAX_INDEX_VALUE_BYTES, plainJson, scalarString as unicodeString, utcInstant, validateParsedValue } from './schema.js';
+import { acceptsInProcessObjects, canonical, derivedParsedValues, externalKey, fingerprint, isInProcessProxy, MAX_INDEX_PART_BYTES, MAX_INDEX_VALUE_BYTES, plainJson, scalarString as unicodeString, utcInstant, utf8Bytes, validateParsedValue } from './schema.js';
 import type { CollectionDefinition, Json } from './schema.js';
 export { CollectionRegistry } from './collections.js';
 export { externalKey, validateDefinition, validateValue, compatible, derivedValues } from './schema.js';
@@ -75,10 +75,16 @@ function comparison(predicate: Exclude<ScalarPredicate, { kind: 'null' }>, alias
   const column = predicateColumn(predicate.kind);
   if (typeof predicate.operator!=='string' || !arrayHas(COMPARISON_OPERATORS,predicate.operator)) throw new AuthorityError('INVALID_ARGUMENT');
   if (predicate.operator==='in') {
-    if (!Array.isArray(predicate.value) || predicate.value.length<1 || predicate.value.length>16) throw new AuthorityError('INVALID_ARGUMENT');
-    for (let i=0;i<predicate.value.length;i++)
-      if (!validPredicateValue(predicate.kind,Object.getOwnPropertyDescriptor(predicate.value,i)?.value)) throw new AuthorityError('INVALID_ARGUMENT');
-    params.push(predicate.value);
+    const choices: unknown = predicate.value;
+    if (!isArray(choices) || choices.length<1 || choices.length>16) throw new AuthorityError('INVALID_ARGUMENT');
+    // The bound list is a fresh copy of the checked own slots, so nothing inherited supplies or rewrites a member.
+    const bound: unknown[]=[];
+    for (let i=0;i<choices.length;i++) {
+      const choice=ownDescriptor(choices,i)?.value;
+      if (!validPredicateValue(predicate.kind,choice)) throw new AuthorityError('INVALID_ARGUMENT');
+      append(bound,choice);
+    }
+    append(params,bound);
     let arrayType='text';
     if (predicate.kind==='number') arrayType='numeric';
     else if (predicate.kind==='boolean') arrayType='boolean';
@@ -88,7 +94,7 @@ function comparison(predicate: Exclude<ScalarPredicate, { kind: 'null' }>, alias
   }
   const operator = sqlOperator(predicate.operator);
   if (!validPredicateValue(predicate.kind,predicate.value)) throw new AuthorityError('INVALID_ARGUMENT');
-  params.push(predicate.value);
+  append(params,predicate.value);
   if (predicate.kind === 'date-time') {
     return ` AND stateplane_instant_sort_key(${alias}.${column}) COLLATE "C" ${operator} stateplane_instant_sort_key($${params.length}::text) COLLATE "C"`;
   }
@@ -118,9 +124,9 @@ function sqlOperator(operator: unknown): string {
 function validPredicateValue(kind:string,value:unknown):boolean {
   if (kind==='number') return typeof value==='number' && isFiniteNumber(value);
   if (kind==='boolean') return typeof value==='boolean';
-  if (kind==='string') return valueString(value) && Buffer.byteLength(value)<=MAX_INDEX_VALUE_BYTES;
+  if (kind==='string') return valueString(value) && utf8Bytes(value)<=MAX_INDEX_VALUE_BYTES;
   if (kind==='date-time') {
-    if (!scalarString(value) || Buffer.byteLength(value)>MAX_INDEX_VALUE_BYTES) return false;
+    if (!scalarString(value) || utf8Bytes(value)>MAX_INDEX_VALUE_BYTES) return false;
     try { utcInstant(value); return true; } catch { return false; }
   }
   return false;
@@ -171,6 +177,11 @@ const validDigest = /^[0-9a-f]{64}$/;
 const serializedMarker=Symbol('stateplane parsed JSON');
 const isFiniteNumber = Number.isFinite;
 const isSafeInteger = Number.isSafeInteger;
+// The predicate compiler and its snapshot helpers call built-ins only through these load-time captures and build
+// arrays with own data slots, so a later replacement cannot admit, rewrite or misbind a predicate.
+const isArray = Array.isArray, ArrayPrototype = Array.prototype, ObjectPrototype = Object.prototype;
+const ownDescriptor = Object.getOwnPropertyDescriptor, defineOwn = Object.defineProperty, prototypeOf = Object.getPrototypeOf;
+const hasOwn = Object.hasOwn, freeze = Object.freeze, ownKeys = Reflect.ownKeys;
 const nativeStringIncludes = String.prototype.includes;
 const nativeSetHas=Set.prototype.has;
 const nativeSetAdd=Set.prototype.add;
@@ -183,10 +194,10 @@ const nativeMapClear=Map.prototype.clear;
 const nativeMapForEach=Map.prototype.forEach;
 /** Compare own array slots without invoking a replaced includes method. */
 const arrayHas=(values:readonly unknown[],wanted:unknown):boolean=>{
-  for (let i=0;i<values.length;i++) if (Object.getOwnPropertyDescriptor(values,i)?.value===wanted) return true;
+  for (let i=0;i<values.length;i++) if (ownDescriptor(values,i)?.value===wanted) return true;
   return false;
 };
-const append=<T>(values:T[],value:T):void=>{ Object.defineProperty(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
+const append=<T>(values:T[],value:T):void=>{ defineOwn(values,values.length,{value,writable:true,configurable:true,enumerable:true}); };
 const setHas=<T>(values:Set<T>,wanted:T):boolean=>Reflect.apply(nativeSetHas,values,[wanted]) as boolean;
 const setAdd=<T>(values:Set<T>,wanted:T):void=>{ Reflect.apply(nativeSetAdd,values,[wanted]); };
 const setClear=<T>(values:Set<T>):void=>{ Reflect.apply(nativeSetClear,values,[]); };
@@ -517,16 +528,17 @@ function requestFingerprintFields(fields:Record<string,unknown>,normalized:strin
  * pages, counts, existence and aggregations; callers check readiness.
  */
 export function predicateFilter(scope: Readonly<AuthorityScope>, predicates: readonly ScalarPredicate[]): { params: unknown[]; where: string } {
-  if (!Array.isArray(predicates) || predicates.length > 16) throw new AuthorityError('INVALID_ARGUMENT');
-  // Own slots and string concatenation only: no replaced array method or iterator shapes the filter.
+  if (!isArray(predicates) || predicates.length > 16) throw new AuthorityError('INVALID_ARGUMENT');
+  // Own slots, own-slot appends and string concatenation only: no replaced array method or iterator shapes the filter.
   const params: unknown[] = [scope.spaceId,scope.collectionId];
   let filter='r.space_id=$1 AND r.collection_id=$2 AND NOT r.tombstone ';
   for (let index = 0; index < predicates.length; index++) {
-    const predicate = predicates[index];
+    const predicate: ScalarPredicate | undefined = ownDescriptor(predicates,index)?.value;
     if (!predicate) throw new AuthorityError('INVALID_ARGUMENT');
     if (!scalarString(predicate.field) || !arrayHas(['null','string','date-time','number','boolean'],predicate.kind)) throw new AuthorityError('INVALID_ARGUMENT');
     const alias = `v${index}`;
-    params.push(predicate.field,predicate.kind);
+    append(params,predicate.field);
+    append(params,predicate.kind);
     const fieldParam = `$${params.length - 1}`;
     const kindParam = `$${params.length}`;
     let compare = '';
@@ -542,15 +554,15 @@ export function predicateFilter(scope: Readonly<AuthorityScope>, predicates: rea
 
 /** Reject decorated predicates and retain stable own values for query admission. */
 export function snapshotPredicates(source: readonly ScalarPredicate[], trustedParsed=false): readonly ScalarPredicate[] {
-  if ((!trustedParsed && !acceptsInProcessObjects) || (!trustedParsed && isInProcessProxy(source)) || !Array.isArray(source) ||
-    Object.getPrototypeOf(source)!==Array.prototype || source.length > 16 || Reflect.ownKeys(source).length!==source.length+1)
+  if ((!trustedParsed && !acceptsInProcessObjects) || (!trustedParsed && isInProcessProxy(source)) || !isArray(source) ||
+    prototypeOf(source)!==ArrayPrototype || source.length > 16 || ownKeys(source).length!==source.length+1)
     throw new AuthorityError('INVALID_ARGUMENT');
   const result: ScalarPredicate[]=[];
   for (let i=0;i<source.length;i++) {
-    const item=Object.getOwnPropertyDescriptor(source,i)?.value;
+    const item=ownDescriptor(source,i)?.value;
     append(result,snapshotPredicate(item,trustedParsed));
   }
-  return Object.freeze(result);
+  return freeze(result);
 }
 function parseSerializedPredicates(serialized:string):readonly ScalarPredicate[] {
   if (typeof serialized!=='string' || Buffer.byteLength(serialized)>32_768) throw new AuthorityError('INVALID_ARGUMENT');
@@ -560,44 +572,44 @@ function parseSerializedPredicates(serialized:string):readonly ScalarPredicate[]
 /** Retain a predicate's own data properties and reject decorated objects. */
 function predicateDataKeys(item:object,kind:unknown):void {
   const accepted=kind==='null' ? ['field','kind','operator'] : ['field','kind','operator','value'];
-  const keys=Reflect.ownKeys(item);
+  const keys=ownKeys(item);
   if (keys.length!==accepted.length) throw new AuthorityError('INVALID_ARGUMENT');
   for (let j=0;j<keys.length;j++) { // NOSONAR -- own-slot scan avoids replaced array iterators
-    const key=keys[j],descriptor=Object.getOwnPropertyDescriptor(item,key);
-    if (typeof key!=='string' || !arrayHas(accepted,key) || !descriptor?.enumerable || !Object.hasOwn(descriptor,'value'))
+    const key=keys[j],descriptor=ownDescriptor(item,key);
+    if (typeof key!=='string' || !arrayHas(accepted,key) || !descriptor?.enumerable || !hasOwn(descriptor,'value'))
       throw new AuthorityError('INVALID_ARGUMENT');
   }
 }
 function snapshotInValues(value:unknown,kind:string,trustedParsed:boolean):readonly (string|number|boolean)[] {
   // A proxy is refused before any other inspection, so neither a trap nor a revoked proxy's TypeError is reached.
-  if (!value || typeof value!=='object' || (!trustedParsed && isInProcessProxy(value)) || !Array.isArray(value) ||
-    Object.getPrototypeOf(value)!==Array.prototype || value.length<1 || value.length>16 ||
-    Reflect.ownKeys(value).length!==value.length+1) throw new AuthorityError('INVALID_ARGUMENT');
+  if (!value || typeof value!=='object' || (!trustedParsed && isInProcessProxy(value)) || !isArray(value) ||
+    prototypeOf(value)!==ArrayPrototype || value.length<1 || value.length>16 ||
+    ownKeys(value).length!==value.length+1) throw new AuthorityError('INVALID_ARGUMENT');
   const values:(string|number|boolean)[]=[];
   for (let i=0;i<value.length;i++) {
-    const descriptor=Object.getOwnPropertyDescriptor(value,i);
-    if (!descriptor?.enumerable || !Object.hasOwn(descriptor,'value') || !validPredicateValue(kind,descriptor.value))
+    const descriptor=ownDescriptor(value,i);
+    if (!descriptor?.enumerable || !hasOwn(descriptor,'value') || !validPredicateValue(kind,descriptor.value))
       throw new AuthorityError('INVALID_ARGUMENT');
     append(values,descriptor.value);
   }
-  return Object.freeze(values);
+  return freeze(values);
 }
 function snapshotPredicate(item:unknown,trustedParsed=false):ScalarPredicate {
   if (!item || typeof item!=='object' || (!trustedParsed && isInProcessProxy(item)) ||
-    (Object.getPrototypeOf(item)!==Object.prototype && Object.getPrototypeOf(item)!==null)) throw new AuthorityError('INVALID_ARGUMENT');
-  const field=Object.getOwnPropertyDescriptor(item,'field')?.value;
-  const kind=Object.getOwnPropertyDescriptor(item,'kind')?.value;
-  const operator=Object.getOwnPropertyDescriptor(item,'operator')?.value;
-  const value=Object.getOwnPropertyDescriptor(item,'value')?.value;
+    (prototypeOf(item)!==ObjectPrototype && prototypeOf(item)!==null)) throw new AuthorityError('INVALID_ARGUMENT');
+  const field=ownDescriptor(item,'field')?.value;
+  const kind=ownDescriptor(item,'kind')?.value;
+  const operator=ownDescriptor(item,'operator')?.value;
+  const value=ownDescriptor(item,'value')?.value;
   predicateDataKeys(item,kind);
   // A primitive allowlisted operator before any coercion, lookup or SQL text.
   if (!scalarString(field) || typeof operator!=='string' ||
     (kind==='null' ? operator!=='isNull' : !arrayHas(COMPARISON_OPERATORS,operator))) throw new AuthorityError('INVALID_ARGUMENT');
-  if (kind==='null') return Object.freeze({field,kind,operator}) as ScalarPredicate;
+  if (kind==='null') return freeze({field,kind,operator}) as ScalarPredicate;
   if (operator==='in') {
-    return Object.freeze({field,kind,operator,value:snapshotInValues(value,kind,trustedParsed)}) as ScalarPredicate;
+    return freeze({field,kind,operator,value:snapshotInValues(value,kind,trustedParsed)}) as ScalarPredicate;
   }
-  return Object.freeze({field,kind,operator,value}) as ScalarPredicate;
+  return freeze({field,kind,operator,value}) as ScalarPredicate;
 }
 /** Match a declared index using only trusted own result-array slots. */
 function findDeclaration(rows:readonly Record<string,unknown>[],field:string):Record<string,unknown>|undefined {

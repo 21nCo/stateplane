@@ -405,6 +405,15 @@ test('a typed spec admits only declared ready index fields, allowlisted operator
   await rejects(services.analysis.aggregate(writer, f.spaceId, 'items', JSON.stringify({ metrics: [{ op: 'count' }] })), 'FORBIDDEN');
   await rejects(services.analysis.aggregate(f.owner, f.spaceId, 'missing', JSON.stringify({ metrics: [{ op: 'count' }] })), 'NOT_FOUND');
   await rejects(services.analysis.aggregate(f.owner, f.spaceId, 'items', '{'), 'INVALID_ARGUMENT');
+  // A directly composed adapter given no entry for the space's cell authorizes on the spaces adapter's own interactive
+  // pool for that cell, so it too reports FORBIDDEN and NOT_FOUND before unconfigured capacity.
+  const unmapped = new PostgresAggregations(spaces, new Map());
+  const countText = JSON.stringify({ metrics: [{ op: 'count' }] });
+  await rejects(unmapped.aggregateSerialized(writer, f.spaceId, 'items', countText), 'FORBIDDEN');
+  await rejects(unmapped.aggregateSerialized(f.owner, f.spaceId, 'missing', countText), 'NOT_FOUND');
+  await rejects(unmapped.aggregate(f.owner, f.spaceId, 'items', { metrics: 'x' }), 'INVALID_ARGUMENT');
+  await rejects(unmapped.aggregateSerialized(f.owner, f.spaceId, 'items', countText), 'PROVIDER_UNAVAILABLE',
+    error => assert.equal(error.retryable, false));
   assert.throws(() => postgresServices(spaces, new Map([['cell-a', { pool, cursorSecret: randomBytes(32),
     analytics: { pool, originConnectionLimit: 5 } }]]), 3600), /analytical pool apart/);
   // The adapter itself refuses an analytical pool that is its admission pool, whoever composes it.
@@ -604,6 +613,65 @@ test('replaced built-ins never admit a spec, corrupt a result, hide bytes, skip 
         [2, '0.3', '0.15', 0.1]]]);
     assert.deepEqual(answered.collection.fields.map(item => [item.field, item.kind]), [['team', 'string'], ['at', 'date-time'], ['score', 'number']]);
     assert.match(answered.snapshot.takenAt, /^20[2-9][0-9]-[0-9]{2}-[0-9]{2}T[0-9:.]+Z$/);
+  }
+});
+
+test('replaced built-ins on the shared predicate compiler never rewrite, misbind or admit a predicate', async () => {
+  const f = await fixture();
+  for (const data of [{ team: 'red', score: 17, active: true }, { team: 'blue', score: 42 }, { team: 'blue', score: 43, active: false }])
+    await f.write('items', { operation: 'create', data });
+  const service = aggregations();
+  const { scope } = await spaces.scope(f.owner, f.spaceId, 'items', 'records:read');
+  const authority = new PostgresAuthority(pool, 3600);
+  // Every predicate of the control matches only the red record; each replacement below targets one of its members.
+  const where = [{ field: 'team', kind: 'string', operator: 'eq', value: 'red' },
+    { field: 'score', kind: 'number', operator: 'in', value: [17] }, { field: 'active', kind: 'boolean', operator: 'eq', value: true }];
+  const spec = { where, groupBy: [{ field: 'team' }], metrics: [{ op: 'count' }] }, specText = JSON.stringify(spec);
+  const targeted = item => item === 'red' || item === 'active' || (Array.isArray(item) && item.length === 1 && item[0] === 17);
+  const rewrite = item => {
+    if (item === 'red') return 'blue';
+    if (item === 'active') return 'note';
+    return Array.isArray(item) && item.length === 1 && item[0] === 17 ? [42, 43] : item;
+  };
+  const longText = 'x'.repeat(600), longInstant = `2026-01-01T00:00:00.${'0'.repeat(600)}Z`;
+  const oversized = [{ metrics: [{ op: 'count' }], where: [{ field: 'team', kind: 'string', operator: 'eq', value: longText }] },
+    { metrics: [{ op: 'count' }], where: [{ field: 'at', kind: 'date-time', operator: 'gte', value: longInstant }] },
+    { metrics: [{ op: 'count' }], where: [{ field: 'team', kind: 'string', operator: 'in', value: ['red', longText] }] }];
+  const push = Array.prototype.push, byteLength = Buffer.byteLength;
+  // Only the control's members are affected, so the database driver and every other caller keep working.
+  const pushes = {
+    rewriting(...items) { return Reflect.apply(push, this, items.map(rewrite)); },
+    dropping(...items) { return Reflect.apply(push, this, items.filter(item => !targeted(item))); },
+    throwing(...items) { if (items.some(targeted)) throw new Error('replaced push'); return Reflect.apply(push, this, items); } };
+  const outcomes = [];
+  try {
+    for (const [name, replaced] of Object.entries(pushes)) {
+      Array.prototype.push = replaced;
+      try {
+        outcomes.push([name, await service.aggregate(f.owner, f.spaceId, 'items', spec)]);
+        outcomes.push([name, await service.aggregateSerialized(f.owner, f.spaceId, 'items', specText)]);
+        outcomes.push([name, await analyticServices.analysis.aggregate(f.owner, f.spaceId, 'items', specText)]);
+        outcomes.push([name, await authority.transaction(scope, tx => tx.countRecords(where))]);
+        outcomes.push([name, (await authority.transaction(scope, tx => tx.queryRecords(where, 10))).length]);
+      } finally { Array.prototype.push = push; }
+    }
+    // A string or date-time predicate value past 512 UTF-8 bytes is refused whatever Buffer.byteLength reports for it.
+    Buffer.byteLength = (value, encoding) => value === longText || value === longInstant ? 1 : byteLength(value, encoding);
+    for (const item of oversized) {
+      await rejects(service.aggregate(f.owner, f.spaceId, 'items', item), 'INVALID_ARGUMENT');
+      await rejects(service.aggregateSerialized(f.owner, f.spaceId, 'items', JSON.stringify(item)), 'INVALID_ARGUMENT');
+      await rejects(analyticServices.analysis.aggregate(f.owner, f.spaceId, 'items', JSON.stringify(item)), 'INVALID_ARGUMENT');
+      await rejects(authority.transaction(scope, tx => tx.countRecords(item.where)), 'INVALID_ARGUMENT');
+    }
+  } finally {
+    Array.prototype.push = push;
+    Buffer.byteLength = byteLength;
+  }
+  assert.equal(outcomes.length, 15);
+  for (const [name, outcome] of outcomes) {
+    if (typeof outcome === 'number') { assert.equal(outcome, 1, name); continue; }
+    assert.deepEqual(outcome.groups.map(group => [group.key, group.count]), [[[{ kind: 'value', value: 'red' }], 1]], name);
+    assert.deepEqual(outcome.source.where, where, name);
   }
 });
 
