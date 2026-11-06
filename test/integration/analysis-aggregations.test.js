@@ -801,7 +801,16 @@ test('replaced clocks, timers and promise settlement never change a covered path
       globalThis.clearTimeout = replaced('clearTimeout', fail('clearTimeout'), original.clearTimeout);
     },
     'Promise.race throws': () => { Promise.race = replaced('Promise.race', fail('Promise.race'), original.race); },
-    'then throws': () => { Promise.prototype.then = replaced('then', fail('then'), original.then); }
+    'then throws': () => { Promise.prototype.then = replaced('then', fail('then'), original.then); },
+    // Every caller, the engine's own resolution of an async function's returned promise included: a result passed
+    // through a looked-up `then` is emptied.
+    'then rewrites results': () => {
+      Promise.prototype.then = function (fulfilled, rejected) {
+        const rewrite = typeof fulfilled !== 'function' ? fulfilled
+          : value => fulfilled(value !== null && typeof value === 'object' && value.complete === true ? { ...value, groups: [] } : value);
+        return original.then.call(this, rewrite, rejected);
+      };
+    }
   };
   const restore = () => {
     Date.now = original.now; globalThis.setTimeout = original.setTimeout; globalThis.clearTimeout = original.clearTimeout;
@@ -822,6 +831,36 @@ test('replaced clocks, timers and promise settlement never change a covered path
   assert.deepEqual(expected[0].groups.map(group => [group.key, group.count]), [[[{ kind: 'value', value: 'red' }], 1]]);
   // Restored: the control answers the same again.
   assert.deepEqual((await answer(readers[1])).groups, expected[1].groups);
+});
+
+test('a driver with its own promise library, and a COMMIT that fails in the client, through both transaction consumers', async () => {
+  const f = await fixture();
+  await f.write('items', { operation: 'create', data: { team: 'red' } });
+  const { scope } = await spaces.scope(f.owner, f.spaceId, 'items', 'records:read');
+  const where = [{ field: 'team', kind: 'string', operator: 'eq', value: 'red' }];
+  const count = JSON.stringify({ where, metrics: [{ op: 'count' }] });
+  // Thenables that are not native promises, as a pool built with { Promise } of another library answers.
+  const thenable = promise => ({ then: (fulfilled, rejected) => promise.then(fulfilled, rejected) });
+  const wrapped = (base, commit) => ({ connect: () => thenable(base.connect().then(client => ({
+    query: (sql, values) => sql === 'COMMIT' && commit ? commit(client) : thenable(client.query(sql, values)),
+    release: error => client.release(error), on: (...args) => client.on(...args), removeListener: (...args) => client.removeListener(...args)
+  }))) });
+  const read = pool => new PostgresAuthority(pool, 3600).transaction(scope, tx => tx.countRecords(where));
+  const analytical = newPool(1);
+  const foreign = aggregations(wrapped(analytical), 5);
+  // More aggregations than the pool's slot: each checkout's hold is given back.
+  for (let i = 0; i < 3; i++) assert.equal((await foreign.aggregateSerialized(f.owner, f.spaceId, 'items', count)).groups[0].count, 1);
+  assert.equal(await read(wrapped(pool)), 1);
+  // A synchronous failure as COMMIT is handed over, before or after a wrapper forwards it, may have committed.
+  const unknown = error => error.name === 'CommitOutcomeUnknownError' || /Commit outcome unknown/.test(error.message);
+  for (const commit of [() => { throw new Error('before forwarding'); },
+    client => { client.query('COMMIT').catch(() => {}); throw new Error('after forwarding'); }]) {
+    await assert.rejects(aggregations(wrapped(analytical, commit), 5).aggregateSerialized(f.owner, f.spaceId, 'items', count), unknown);
+    await assert.rejects(read(wrapped(pool, commit)), unknown);
+  }
+  // Each such session was discarded; both pools still answer.
+  assert.equal((await foreign.aggregateSerialized(f.owner, f.spaceId, 'items', count)).groups[0].count, 1);
+  assert.equal(await read(pool), 1);
 });
 
 test('the final credential recheck is bounded, and a late answer never queries a released session', async t => {
@@ -1210,7 +1249,8 @@ test('a stalled analytical checkout is bounded, and services sharing an analytic
     if (!stalls.has(checkouts)) return analyticalPool.connect();
     return new Promise((resolve, reject) => late.push(answer => answer === 'fail' ? reject(new Error('late checkout failed'))
       : resolve({ release: () => { released++; if (answer === 'throwing release') throw new Error('a release listener failed'); },
-        end: async () => { ended++; }, query: () => { throw new Error('a late session was used'); }, on() {}, removeListener() {} })));
+        end: async () => { ended++; }, emit: () => false, query: () => { throw new Error('a late session was used'); }, on() {},
+        removeListener() {} })));
   } };
   const onUnhandled = reason => unhandled.push(reason);
   process.on('unhandledRejection', onUnhandled);
@@ -1273,6 +1313,24 @@ test('a stalled analytical checkout is bounded, and services sharing an analytic
     await new Promise(resolve => setTimeout(resolve, aggregationBounds.checkoutMs + 100));
     assert.equal((await two.analysis.aggregate(h.owner, h.spaceId, 'items', count)).groups[0].count, 1, `recovered after a throw at ${at}`);
   }
+  // A real one-session pool whose 'release' listener throws for the late session evicts that session, so its capacity
+  // returns and the next aggregation checks a session out of the same pool.
+  const single = newPool(1), poolErrors = [], deferred = [];
+  let lateSession, stallNext = true;
+  single.on('error', error => poolErrors.push(error));
+  single.on('release', (_, client) => { if (client === lateSession) throw new Error('a release listener failed'); });
+  const realShared = { connect: () => {
+    if (!stallNext) return single.connect();
+    stallNext = false;
+    return new Promise(resolve => deferred.push(async () => { lateSession = await single.connect(); resolve(lateSession); }));
+  } };
+  const real = aggregations(realShared, 5);
+  await limited(real.aggregateSerialized(f.owner, f.spaceId, 'items', count), 'slots');
+  await deferred.shift()();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(single.totalCount, 0, 'the stranded session was evicted');
+  assert.equal(poolErrors.length, 1);
+  assert.equal((await real.aggregateSerialized(f.owner, f.spaceId, 'items', count)).groups[0].count, 1);
   // Every reservation was given back: without stalls, both services and the adapter answer through the shared pool.
   for (const answer of [await one.analysis.aggregate(g.owner, g.spaceId, 'items', count),
     await two.analysis.aggregate(f.owner, f.spaceId, 'items', count), await direct.aggregateSerialized(g.owner, g.spaceId, 'items', count)])

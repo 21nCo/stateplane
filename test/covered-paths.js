@@ -59,6 +59,9 @@ export function coveredLines(file, text, names = COVERED[file]) {
     root.getLineAndCharacterOfPosition(node.getEnd()).line + 1]);
 }
 
+const skipParentheses = node => ts.isParenthesizedExpression(node) ? skipParentheses(node.expression) : node;
+const enclosingFunction = node => { let at = node.parent; while (at && !ts.isFunctionLike(at)) at = at.parent; return at; };
+const asyncFunction = node => node !== undefined && (ts.getCombinedModifierFlags(node) & ts.ModifierFlags.Async) !== 0;
 const literalName = node => ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) ? node.text : undefined;
 /** Every live-global reference or inherited-method call in the nodes, whatever its spacing or property syntax. */
 function violationsIn(label, root, nodes) {
@@ -72,6 +75,13 @@ function violationsIn(label, root, nodes) {
         || ((ts.isVariableDeclaration(parent) || ts.isParameter(parent) || ts.isFunctionDeclaration(parent) || ts.isMethodDeclaration(parent)
           || ts.isPropertyDeclaration(parent) || ts.isClassDeclaration(parent)) && parent.name === node);
       if (!named) flag(parent);
+    }
+    // An async function that returns a call's promise is resolved through a lookup of that promise's `then`.
+    const returned = ts.isReturnStatement(node) ? node.expression
+      : ts.isArrowFunction(node) && !ts.isBlock(node.body) && asyncFunction(node) ? node.body : undefined;
+    if (returned !== undefined && asyncFunction(ts.isReturnStatement(node) ? enclosingFunction(node) : node)) {
+      const value = skipParentheses(returned);
+      if (ts.isCallExpression(value) || ts.isNewExpression(value)) flag(node);
     }
     if (ts.isCallExpression(node)) {
       const callee = ts.isParenthesizedExpression(node.expression) ? node.expression.expression : node.expression;

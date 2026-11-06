@@ -496,11 +496,17 @@ function bounded(pool: Pick<pg.Pool, 'connect'>): Pick<pg.Pool, 'connect'> {
     settle(pending, client => {
       stopTimer(timer);
       if (!expired) return resolve(client);
-      // The hold is given back first. A release that throws (a throwing pool 'release' listener) closes the unused
-      // session instead, so it is neither lost open nor a rejection nobody handles.
+      // The hold is given back first. pg-pool emits 'release' before it keeps or evicts a session, so a throwing
+      // listener strands it: reported as the session's error, the pool's idle listener evicts and closes it, which
+      // frees its capacity. A session no listener answers is closed here. Nothing is left to reject unhandled.
       hold(pool, -1);
       try { client.release(); }
-      catch { try { settle((client as pg.PoolClient & Pick<pg.Client, 'end'>).end(), undefined, () => {}); } catch { /* closed */ } }
+      catch (error) {
+        let evicted: boolean;
+        try { evicted = client.emit('error', new Error('A late analytical session could not be released', { cause: error })); }
+        catch { evicted = typeof client.emit === 'function'; }
+        if (!evicted) try { settle((client as pg.PoolClient & Pick<pg.Client, 'end'>).end(), undefined, () => {}); } catch { /* closed */ }
+      }
     }, (error: unknown) => { stopTimer(timer); if (expired) hold(pool, -1); else reject(error); });
   });
   return { connect } as Pick<pg.Pool, 'connect'>;

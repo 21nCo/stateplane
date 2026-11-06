@@ -248,7 +248,8 @@ export async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) =
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED'); begun = true;
       await client.query(`SET LOCAL statement_timeout = '${min(STATEMENT_MS, remaining())}ms'`);
       await client.query(`SET LOCAL lock_timeout = '${min(LOCK_MS, remaining())}ms'`);
-      return fn(client);
+      // Awaited, so the result never reaches this promise through a lookup of its `then`.
+      return await fn(client);
     };
     // Only the caller's own budget makes a cut-off call unfinished; the per-call bound is a stall.
     const result = end === undefined ? await work() : await within(end, work, () => {}, until);

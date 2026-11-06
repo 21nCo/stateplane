@@ -53,11 +53,20 @@ export const setHas = <T>(set: ReadonlySet<T>, value: T) => apply(nativeSetHas, 
 export const setAdd = <T>(set: Set<T>, value: T): void => { apply(nativeSetAdd, set, [value]); };
 export const setDelete = <T>(set: Set<T>, value: T): void => { apply(nativeSetDelete, set, [value]); };
 export const setClear = <T>(set: Set<T>): void => { apply(nativeSetClear, set, []); };
-/** `promise.then(fulfilled, rejected)` through the native method. */
-export const settle = <T>(promise: Promise<T>, fulfilled?: (value: T) => unknown, rejected?: (error: unknown) => unknown) =>
-  apply(nativeThen, promise, [fulfilled, rejected]) as Promise<unknown>;
+/**
+ * `promise.then(fulfilled, rejected)` through the native method. A thenable that is not a native promise (a driver
+ * built with its own promise library), which the native method refuses, is first adopted through its own `then`.
+ */
+export const settle = <T>(promise: PromiseLike<T>, fulfilled?: (value: T) => unknown, rejected?: (error: unknown) => unknown):
+  Promise<unknown> => {
+  try { return apply(nativeThen, promise, [fulfilled, rejected]) as Promise<unknown>; }
+  catch {
+    const adopted = new NativePromise<T>((resolve, reject) => { apply(promise.then, promise, [resolve, reject]); });
+    return apply(nativeThen, adopted, [fulfilled, rejected]) as Promise<unknown>;
+  }
+};
 /** Settle as the first of `promises` settles, as `Promise.race` does, through the native `then`. */
-export const race = <T>(promises: readonly Promise<T>[]) => new NativePromise<T>((resolve, reject) => {
+export const race = <T>(promises: readonly PromiseLike<T>[]) => new NativePromise<T>((resolve, reject) => {
   for (let i = 0; i < promises.length; i++) settle(promises[i], resolve, reject);
 });
 export const startTimer = (callback: () => void, ms: number) => nativeSetTimeout(callback, ms);
