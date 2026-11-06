@@ -18,7 +18,6 @@ export const NativeNumber = Number, NativeBigInt = BigInt, NativeDate = Date, Na
 export const NativeDateTimeFormat = Intl.DateTimeFormat;
 export const { min, max, ceil } = Math;
 export const NativePromise = Promise;
-const nativeThen = Promise.prototype.then;
 const nativeSetTimeout = setTimeout, nativeClearTimeout = clearTimeout;
 const NativeJSON = JSON, nativeParse = JSON.parse, nativeStringify = JSON.stringify;
 const NativeBuffer = Buffer, nativeByteLength = Buffer.byteLength;
@@ -54,16 +53,16 @@ export const setAdd = <T>(set: Set<T>, value: T): void => { apply(nativeSetAdd, 
 export const setDelete = <T>(set: Set<T>, value: T): void => { apply(nativeSetDelete, set, [value]); };
 export const setClear = <T>(set: Set<T>): void => { apply(nativeSetClear, set, []); };
 /**
- * `promise.then(fulfilled, rejected)` through the native method. A thenable that is not a native promise (a driver
- * built with its own promise library), which the native method refuses, is first adopted through its own `then`.
+ * `promise.then(fulfilled, rejected)`, through `await`: a native promise is followed without looking up its `then` or
+ * species constructor, and a thenable that is not one (a driver built with its own promise library) is adopted through
+ * its own `then`. It never throws; it returns a promise, as `then` does.
  */
-export const settle = <T>(promise: PromiseLike<T>, fulfilled?: (value: T) => unknown, rejected?: (error: unknown) => unknown):
+export const settle = async <T>(promise: PromiseLike<T>, fulfilled?: (value: T) => unknown, rejected?: (error: unknown) => unknown):
   Promise<unknown> => {
-  try { return apply(nativeThen, promise, [fulfilled, rejected]) as Promise<unknown>; }
-  catch {
-    const adopted = new NativePromise<T>((resolve, reject) => { apply(promise.then, promise, [resolve, reject]); });
-    return apply(nativeThen, adopted, [fulfilled, rejected]) as Promise<unknown>;
-  }
+  let value: T;
+  try { value = await promise; }
+  catch (error) { if (rejected === undefined) throw error; return rejected(error); }
+  return fulfilled === undefined ? value : fulfilled(value);
 };
 /** Settle as the first of `promises` settles, as `Promise.race` does, through the native `then`. */
 export const race = <T>(promises: readonly PromiseLike<T>[]) => new NativePromise<T>((resolve, reject) => {

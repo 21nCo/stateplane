@@ -497,15 +497,17 @@ function bounded(pool: Pick<pg.Pool, 'connect'>): Pick<pg.Pool, 'connect'> {
       stopTimer(timer);
       if (!expired) return resolve(client);
       // The hold is given back first. pg-pool emits 'release' before it keeps or evicts a session, so a throwing
-      // listener strands it: reported as the session's error, the pool's idle listener evicts and closes it, which
-      // frees its capacity. A session no listener answers is closed here. Nothing is left to reject unhandled.
+      // listener strands it. Each of the session's 'error' listeners, pg-pool's idle listener among them, which evicts
+      // it and frees its capacity, is then told on its own, so one that throws stops none of the others; the session is
+      // closed whatever they do. Nothing is left to reject unhandled.
       hold(pool, -1);
       try { client.release(); }
       catch (error) {
-        let evicted: boolean;
-        try { evicted = client.emit('error', new Error('A late analytical session could not be released', { cause: error })); }
-        catch { evicted = typeof client.emit === 'function'; }
-        if (!evicted) try { settle((client as pg.PoolClient & Pick<pg.Client, 'end'>).end(), undefined, () => {}); } catch { /* closed */ }
+        const failure = new Error('A late analytical session could not be released', { cause: error });
+        let listeners: ((error: Error) => void)[] = [];
+        try { listeners = client.listeners('error') as ((error: Error) => void)[]; } catch { /* not an event emitter */ }
+        for (let i = 0; i < listeners.length; i++) try { apply(listeners[i], client, [failure]); } catch { /* the next one */ }
+        try { settle((client as pg.PoolClient & Pick<pg.Client, 'end'>).end(), undefined, () => {}); } catch { /* closed */ }
       }
     }, (error: unknown) => { stopTimer(timer); if (expired) hold(pool, -1); else reject(error); });
   });
@@ -515,18 +517,24 @@ function bounded(pool: Pick<pg.Pool, 'connect'>): Pick<pg.Pool, 'connect'> {
 /**
  * The final credential recheck, bounded by `ms`: past it the aggregation fails with a retryable PROVIDER_UNAVAILABLE
  * and rolls back. The session the recheck was given refuses every query from then on, so a provider that answers late
- * can never run a statement on a session already released.
+ * can never run a statement on a session already released; a recheck statement still running then is ended by
+ * closing the session, so neither it nor the ROLLBACK queued behind it holds the aggregation's capacity.
  */
 async function recheckWithin(ms: number, db: Db, recheck: (session: Pick<pg.PoolClient, 'query'>) => Promise<void>): Promise<void> {
-  let open = true;
+  let open = true, running = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const late = () => new AuthorityError('PROVIDER_UNAVAILABLE',
     `The credential check did not answer within ${ms} ms; retry the request`, undefined, true);
   const session = { query: async (sql: string, values?: unknown[]) => {
     if (!open) throw late();
-    return await db.query(sql, values);
+    running++;
+    try { return await db.query(sql, values); } finally { running--; }
   } } as unknown as Pick<pg.PoolClient, 'query'>;
-  const timed = new NativePromise<never>((_, reject) => { timer = startTimer(() => { open = false; reject(late()); }, ms); });
+  const timed = new NativePromise<never>((_, reject) => { timer = startTimer(() => {
+    open = false;
+    if (running > 0) try { settle((db as Db & Pick<pg.Client, 'end'>).end(), undefined, () => {}); } catch { /* closed */ }
+    reject(late());
+  }, ms); });
   const checked = recheck(session);
   try { await race<unknown>([checked, timed]); }
   finally { stopTimer(timer); open = false; settle(checked, undefined, () => {}); }
@@ -543,7 +551,8 @@ async function recheckWithin(ms: number, db: Db, recheck: (session: Pick<pg.Pool
  * snapshot, in one READ COMMITTED transaction that first share locks the scope
  * (the space at the admitted policy and placement, the collection, a key's
  * grant) through commit and finally rechecks the caller's credential, within
- * the statement time, on a session that refuses a late answer's query. It runs
+ * `aggregationBounds.statementMs`, on a session that refuses a late answer's
+ * query. It runs
  * only on analytical capacity, after the collection and grant are authorized
  * and the spec is checked against the declarations on the interactive
  * admission pool: on the cell's analytical pool, at most
@@ -697,8 +706,9 @@ export class PostgresAggregations {
     // The cap holds for every returned key and metric value, counts and rounded averages included, measured as the
     // groups' JSON text without any toJSON hook.
     if (jsonBytes(groups) > aggregationBounds.resultBytes) throw overBytes();
+    // The recheck, its provider call included, gets the time its statement has on the server.
     await db.query(`SET LOCAL statement_timeout = '${aggregationBounds.statementMs}ms'`);
-    await recheckWithin(this.#statementMs, db, session =>
+    await recheckWithin(aggregationBounds.statementMs, db, session =>
       this.spaces.assertScopeCurrent(actor, ownerPrincipalId, scope, session, scope.collectionId, ['records:read']));
     const measured: string[] = each(spec.groupBy, item => item.field);
     for (let i = 0; i < spec.metrics.length; i++) if (spec.metrics[i].field !== null) append(measured, spec.metrics[i].field!);

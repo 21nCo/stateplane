@@ -747,10 +747,11 @@ test('replaced Reflect.apply and polluted descriptors never misbind, admit or es
 
 // Each covered path's line ranges in the build the tests run, so a replaced built-in can tell a covered caller.
 const NativeError = Error;
-const coveredBuild = Object.entries(COVERED).map(([file, names]) => {
+// The capture module itself counts as covered: past load, it calls only what it captured.
+const coveredBuild = [...Object.entries(COVERED).map(([file, names]) => {
   const built = file.replace(/\.ts$/, '.js');
   return [`/packages/postgres/dist/${built}`, coveredLines(built, sourceText(built, 'dist'), names)];
-});
+}), ['/packages/postgres/dist/intrinsics.js', [[1, Infinity]]]];
 /** The nearest caller with a source location, past the replaced built-in (and any built-in calling it), if covered. */
 function coveredCaller() {
   for (const frame of new NativeError().stack.split('\n').slice(3)) {
@@ -781,7 +782,8 @@ test('replaced clocks, timers and promise settlement never change a covered path
   const answer = async read => { try { return await read(); } catch (error) { return error; } };
   const expected = [];
   for (const read of readers) expected.push(await answer(read));
-  const original = { now: Date.now, setTimeout, clearTimeout, race: Promise.race, then: Promise.prototype.then };
+  const original = { now: Date.now, setTimeout, clearTimeout, race: Promise.race, then: Promise.prototype.then,
+    species: Object.getOwnPropertyDescriptor(Promise, Symbol.species) };
   // Each replacement misbehaves only for a covered caller, and records it; the driver, the runtime, the credential
   // provider and the record readers' own transaction keep the original.
   const hits = [];
@@ -802,6 +804,8 @@ test('replaced clocks, timers and promise settlement never change a covered path
     },
     'Promise.race throws': () => { Promise.race = replaced('Promise.race', fail('Promise.race'), original.race); },
     'then throws': () => { Promise.prototype.then = replaced('then', fail('then'), original.then); },
+    'Promise species throws': () => Object.defineProperty(Promise, Symbol.species, { configurable: true,
+      get: replaced('Promise[Symbol.species]', fail('species'), original.species.get) }),
     // Every caller, the engine's own resolution of an async function's returned promise included: a result passed
     // through a looked-up `then` is emptied.
     'then rewrites results': () => {
@@ -815,6 +819,7 @@ test('replaced clocks, timers and promise settlement never change a covered path
   const restore = () => {
     Date.now = original.now; globalThis.setTimeout = original.setTimeout; globalThis.clearTimeout = original.clearTimeout;
     Promise.race = original.race; Promise.prototype.then = original.then;
+    Object.defineProperty(Promise, Symbol.species, original.species);
   };
   const shape = value => value instanceof Error ? `${value.name} ${value.code} ${value.message}`
     : typeof value === 'object' ? [value.groups.map(group => [group.key, group.count]), value.source.where, value.collection] : value;
@@ -881,17 +886,21 @@ test('the final credential recheck is bounded, and a late answer never queries a
     new AuthFnAgentKeys(config), provider, randomBytes(32));
   // One analytical session, so a session never given back would stall every later aggregation.
   const base = newPool(1);
-  let lateQueries = 0;
+  let lateQueries = 0, stallGrant = false;
   const watched = { connect: async () => {
     const client = await base.connect();
     let released = false;
-    return { query: (...args) => { if (released) lateQueries++; return client.query(...args); },
-      release: error => { released = true; client.release(error); },
+    return { query: (sql, values) => {
+      if (released) lateQueries++;
+      // The key's grant query, a response stalled past the recheck's deadline and past the server's statement time.
+      if (stallGrant && /space_credentials/.test(sql))
+        return client.query('SET LOCAL statement_timeout = 0').then(() => client.query('SELECT pg_sleep(12)'));
+      return client.query(sql, values);
+    }, release: error => { released = true; client.release(error); }, end: () => client.end(),
       on: (...args) => client.on(...args), removeListener: (...args) => client.removeListener(...args) };
   } };
-  const statementTimeoutMs = 300;
-  const adapter = new PostgresAggregations(recheckSpaces, new Map([['cell-a', { pool: watched, admission: pool, originConnectionLimit: 5 }]]),
-    { statementTimeoutMs });
+  const recheckMs = aggregationBounds.statementMs;
+  const adapter = new PostgresAggregations(recheckSpaces, new Map([['cell-a', { pool: watched, admission: pool, originConnectionLimit: 5 }]]));
   const count = JSON.stringify({ metrics: [{ op: 'count' }] });
   const onUnhandled = reason => unhandled.push(reason);
   process.on('unhandledRejection', onUnhandled);
@@ -899,7 +908,7 @@ test('the final credential recheck is bounded, and a late answer never queries a
   const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
   const bounded = promise => {
     let timer;
-    const waiting = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('the aggregation is still waiting')), 5_000); });
+    const waiting = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('the aggregation is still waiting')), recheckMs + 3_000); });
     return Promise.race([promise, waiting]).finally(() => clearTimeout(timer));
   };
   for (const late of ['success', 'fail']) {
@@ -908,7 +917,7 @@ test('the final credential recheck is bounded, and a late answer never queries a
     await rejects(bounded(adapter.aggregateSerialized(agent, f.spaceId, 'items', count)), 'PROVIDER_UNAVAILABLE',
       error => assert.equal(error.retryable, true), late);
     const waited = performance.now() - started;
-    assert.ok(waited >= statementTimeoutMs - 5, `waited ${waited} ms`);
+    assert.ok(waited >= recheckMs - 5, `waited ${waited} ms`);
     assert.equal(held.length, 1, 'the recheck was held');
     holding = false;
     held.shift()(late);
@@ -918,6 +927,26 @@ test('the final credential recheck is bounded, and a late answer never queries a
     // The session, its slots and the reservation were given back.
     assert.equal((await bounded(adapter.aggregateSerialized(agent, f.spaceId, 'items', count))).groups[0].count, 1);
   }
+  // The provider answers in time, but the grant query is still running at the deadline: the session is closed, so the
+  // aggregation fails at once instead of waiting for that statement and a ROLLBACK queued behind it.
+  stallGrant = true;
+  const started = performance.now();
+  await rejects(bounded(adapter.aggregateSerialized(agent, f.spaceId, 'items', count)), 'PROVIDER_UNAVAILABLE',
+    error => assert.equal(error.retryable, true), 'running statement');
+  const waited = performance.now() - started;
+  assert.ok(waited < recheckMs + 1_000, `waited ${waited} ms`);
+  stallGrant = false;
+  // The abandoned backend still holds its slot until the database ends its statement, as a dropped connection's
+  // timeout would; ending it here frees the slot, and the next aggregation runs on the same one-session pool.
+  await pool.query(`SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE datname = current_database()
+    AND query = 'SELECT pg_sleep(12)'`);
+  const retryUntil = performance.now() + 3_000;
+  let recovered;
+  while (recovered === undefined) {
+    try { recovered = await bounded(adapter.aggregateSerialized(agent, f.spaceId, 'items', count)); }
+    catch (error) { if (error.code !== 'BACKPRESSURE' || performance.now() > retryUntil) throw error; await pause(50); }
+  }
+  assert.equal(recovered.groups[0].count, 1);
   assert.deepEqual(unhandled, []);
 });
 
@@ -1249,7 +1278,7 @@ test('a stalled analytical checkout is bounded, and services sharing an analytic
     if (!stalls.has(checkouts)) return analyticalPool.connect();
     return new Promise((resolve, reject) => late.push(answer => answer === 'fail' ? reject(new Error('late checkout failed'))
       : resolve({ release: () => { released++; if (answer === 'throwing release') throw new Error('a release listener failed'); },
-        end: async () => { ended++; }, emit: () => false, query: () => { throw new Error('a late session was used'); }, on() {},
+        end: async () => { ended++; }, listeners: () => [], query: () => { throw new Error('a late session was used'); }, on() {},
         removeListener() {} })));
   } };
   const onUnhandled = reason => unhandled.push(reason);
@@ -1313,8 +1342,9 @@ test('a stalled analytical checkout is bounded, and services sharing an analytic
     await new Promise(resolve => setTimeout(resolve, aggregationBounds.checkoutMs + 100));
     assert.equal((await two.analysis.aggregate(h.owner, h.spaceId, 'items', count)).groups[0].count, 1, `recovered after a throw at ${at}`);
   }
-  // A real one-session pool whose 'release' listener throws for the late session evicts that session, so its capacity
-  // returns and the next aggregation checks a session out of the same pool.
+  // A real one-session pool whose 'release' listener throws for the late session evicts that session, even when an
+  // 'error' listener added before the pool's own also throws, so its capacity returns and the next aggregation checks a
+  // session out of the same pool.
   const single = newPool(1), poolErrors = [], deferred = [];
   let lateSession, stallNext = true;
   single.on('error', error => poolErrors.push(error));
@@ -1322,7 +1352,11 @@ test('a stalled analytical checkout is bounded, and services sharing an analytic
   const realShared = { connect: () => {
     if (!stallNext) return single.connect();
     stallNext = false;
-    return new Promise(resolve => deferred.push(async () => { lateSession = await single.connect(); resolve(lateSession); }));
+    return new Promise(resolve => deferred.push(async () => {
+      lateSession = await single.connect();
+      lateSession.on('error', () => { throw new Error('an error listener failed'); });
+      resolve(lateSession);
+    }));
   } };
   const real = aggregations(realShared, 5);
   await limited(real.aggregateSerialized(f.owner, f.spaceId, 'items', count), 'slots');
