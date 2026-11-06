@@ -873,10 +873,12 @@ test('the final credential recheck is bounded, and a late answer never queries a
   await f.write('items', { operation: 'create', data: { team: 'red' } });
   const agent = await f.agent(['records:read']);
   // The provider holds its answer to the final recheck (the call from assertScopeCurrent) until the test gives it.
-  let holding = false;
+  const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+  let holding = false, slowly = false;
   const held = [], unhandled = [];
   const answerLater = answer => {
-    if (!holding || !new Error().stack.includes('assertScopeCurrent')) return answer();
+    if ((!holding && !slowly) || !new Error().stack.includes('assertScopeCurrent')) return answer();
+    if (slowly) return pause(2_000).then(answer);
     return new Promise((resolve, reject) => held.push(outcome => outcome === 'fail' ? reject(new Error('late provider failure'))
       : answer().then(resolve, reject)));
   };
@@ -892,9 +894,8 @@ test('the final credential recheck is bounded, and a late answer never queries a
     let released = false;
     return { query: (sql, values) => {
       if (released) lateQueries++;
-      // The key's grant query, a response stalled past the recheck's deadline and past the server's statement time.
-      if (stallGrant && /space_credentials/.test(sql))
-        return client.query('SET LOCAL statement_timeout = 0').then(() => client.query('SELECT pg_sleep(12)'));
+      // The key's grant query, still running at the recheck's deadline, until the server's statement time ends it.
+      if (stallGrant && /space_credentials/.test(sql)) return client.query('SELECT pg_sleep(30)');
       return client.query(sql, values);
     }, release: error => { released = true; client.release(error); }, end: () => client.end(),
       on: (...args) => client.on(...args), removeListener: (...args) => client.removeListener(...args) };
@@ -905,7 +906,8 @@ test('the final credential recheck is bounded, and a late answer never queries a
   const onUnhandled = reason => unhandled.push(reason);
   process.on('unhandledRejection', onUnhandled);
   t.after(() => process.off('unhandledRejection', onUnhandled));
-  const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const sleeping = async () => Number((await pool.query(`SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()
+    AND state = 'active' AND query = 'SELECT pg_sleep(30)'`)).rows[0].count);
   const bounded = promise => {
     let timer;
     const waiting = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('the aggregation is still waiting')), recheckMs + 3_000); });
@@ -927,26 +929,17 @@ test('the final credential recheck is bounded, and a late answer never queries a
     // The session, its slots and the reservation were given back.
     assert.equal((await bounded(adapter.aggregateSerialized(agent, f.spaceId, 'items', count))).groups[0].count, 1);
   }
-  // The provider answers in time, but the grant query is still running at the deadline: the session is closed, so the
-  // aggregation fails at once instead of waiting for that statement and a ROLLBACK queued behind it.
-  stallGrant = true;
+  // The provider answers after 2 s, and the grant query is still running at the deadline: the aggregation fails, but its
+  // session, slots and reservation are given back only once the server has ended that statement at its own time.
+  stallGrant = true; slowly = true;
   const started = performance.now();
   await rejects(bounded(adapter.aggregateSerialized(agent, f.spaceId, 'items', count)), 'PROVIDER_UNAVAILABLE',
     error => assert.equal(error.retryable, true), 'running statement');
   const waited = performance.now() - started;
-  assert.ok(waited < recheckMs + 1_000, `waited ${waited} ms`);
-  stallGrant = false;
-  // The abandoned backend still holds its slot until the database ends its statement, as a dropped connection's
-  // timeout would; ending it here frees the slot, and the next aggregation runs on the same one-session pool.
-  await pool.query(`SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE datname = current_database()
-    AND query = 'SELECT pg_sleep(12)'`);
-  const retryUntil = performance.now() + 3_000;
-  let recovered;
-  while (recovered === undefined) {
-    try { recovered = await bounded(adapter.aggregateSerialized(agent, f.spaceId, 'items', count)); }
-    catch (error) { if (error.code !== 'BACKPRESSURE' || performance.now() > retryUntil) throw error; await pause(50); }
-  }
-  assert.equal(recovered.groups[0].count, 1);
+  assert.equal(await sleeping(), 0, 'no recheck statement runs once its capacity is given back');
+  assert.ok(waited >= recheckMs && waited < 2 * recheckMs + 1_000, `waited ${waited} ms`);
+  stallGrant = false; slowly = false;
+  assert.equal((await bounded(adapter.aggregateSerialized(agent, f.spaceId, 'items', count))).groups[0].count, 1);
   assert.deepEqual(unhandled, []);
 });
 
@@ -1360,8 +1353,18 @@ test('a stalled analytical checkout is bounded, and services sharing an analytic
   } };
   const real = aggregations(realShared, 5);
   await limited(real.aggregateSerialized(f.owner, f.spaceId, 'items', count), 'slots');
-  await deferred.shift()();
-  await new Promise(resolve => setImmediate(resolve));
+  // A global Error replaced after load, which refuses to build the late-release report, changes none of it.
+  const OriginalError = Error;
+  const ReplacedError = function (message, options) {
+    if (message === 'A late analytical session could not be released') throw new OriginalError('replaced Error');
+    return new OriginalError(message, options);
+  };
+  ReplacedError.prototype = OriginalError.prototype;
+  try {
+    globalThis.Error = ReplacedError;
+    await deferred.shift()();
+    await new Promise(resolve => setImmediate(resolve));
+  } finally { globalThis.Error = OriginalError; }
   assert.equal(single.totalCount, 0, 'the stranded session was evicted');
   assert.equal(poolErrors.length, 1);
   assert.equal((await real.aggregateSerialized(f.owner, f.spaceId, 'items', count)).groups[0].count, 1);

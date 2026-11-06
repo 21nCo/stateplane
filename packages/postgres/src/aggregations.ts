@@ -4,7 +4,7 @@ import { AggregationLimitError, AuthorityError, AuthorityTransaction, predicateF
 import type { AuthorityScope, ScalarPredicate } from './index.js';
 import { includes, MAX_INDEX_PART_BYTES, scalarString } from './schema.js';
 import { append, apply, ArrayPrototype, freeze, hasOwn, isArray, isSafeInteger, joined, mapForEach, mapGet, mapHas, mapSet,
-  NativeBigInt, NativeDate, NativeDateTimeFormat, NativeMap, NativeNumber, NativePromise, NativeWeakMap, ownDescriptor, ownKeys,
+  NativeBigInt, NativeDate, NativeDateTimeFormat, NativeError, NativeMap, NativeNumber, NativePromise, NativeWeakMap, ownDescriptor, ownKeys,
   parseJson, primitiveJson, prototypeOf, race, settle, startTimer, stopTimer, utf8Bytes, weakGet, weakSet } from './intrinsics.js';
 import { fields, invalid, transact, untrusted } from './sources.js';
 import type { Db } from './sources.js';
@@ -503,7 +503,7 @@ function bounded(pool: Pick<pg.Pool, 'connect'>): Pick<pg.Pool, 'connect'> {
       hold(pool, -1);
       try { client.release(); }
       catch (error) {
-        const failure = new Error('A late analytical session could not be released', { cause: error });
+        const failure = new NativeError('A late analytical session could not be released', { cause: error });
         let listeners: ((error: Error) => void)[] = [];
         try { listeners = client.listeners('error') as ((error: Error) => void)[]; } catch { /* not an event emitter */ }
         for (let i = 0; i < listeners.length; i++) try { apply(listeners[i], client, [failure]); } catch { /* the next one */ }
@@ -517,24 +517,20 @@ function bounded(pool: Pick<pg.Pool, 'connect'>): Pick<pg.Pool, 'connect'> {
 /**
  * The final credential recheck, bounded by `ms`: past it the aggregation fails with a retryable PROVIDER_UNAVAILABLE
  * and rolls back. The session the recheck was given refuses every query from then on, so a provider that answers late
- * can never run a statement on a session already released; a recheck statement still running then is ended by
- * closing the session, so neither it nor the ROLLBACK queued behind it holds the aggregation's capacity.
+ * can never run a statement on a session already released. A recheck statement still running then keeps the session,
+ * and so its capacity, until the server ends it at its own statement time, so capacity is never given back while its
+ * backend may still run.
  */
 async function recheckWithin(ms: number, db: Db, recheck: (session: Pick<pg.PoolClient, 'query'>) => Promise<void>): Promise<void> {
-  let open = true, running = 0;
+  let open = true;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const late = () => new AuthorityError('PROVIDER_UNAVAILABLE',
     `The credential check did not answer within ${ms} ms; retry the request`, undefined, true);
   const session = { query: async (sql: string, values?: unknown[]) => {
     if (!open) throw late();
-    running++;
-    try { return await db.query(sql, values); } finally { running--; }
+    return await db.query(sql, values);
   } } as unknown as Pick<pg.PoolClient, 'query'>;
-  const timed = new NativePromise<never>((_, reject) => { timer = startTimer(() => {
-    open = false;
-    if (running > 0) try { settle((db as Db & Pick<pg.Client, 'end'>).end(), undefined, () => {}); } catch { /* closed */ }
-    reject(late());
-  }, ms); });
+  const timed = new NativePromise<never>((_, reject) => { timer = startTimer(() => { open = false; reject(late()); }, ms); });
   const checked = recheck(session);
   try { await race<unknown>([checked, timed]); }
   finally { stopTimer(timer); open = false; settle(checked, undefined, () => {}); }
@@ -571,7 +567,7 @@ export class PostgresAggregations {
     mapForEach(cells, (cell, id) => {
       if (cell.pool !== null) analyticalSlots(cell.originConnectionLimit);
       // Fail closed: an aggregation never runs on the pool interactive reads are admitted on.
-      if (cell.pool === cell.admission) throw new Error(`Cell ${id} needs an analytical pool apart from its admission pool`);
+      if (cell.pool === cell.admission) throw new NativeError(`Cell ${id} needs an analytical pool apart from its admission pool`);
     });
     const ms = options.statementTimeoutMs ?? aggregationBounds.statementMs;
     if (!isSafeInteger(ms) || ms < 1 || ms > aggregationBounds.maxStatementMs) throw new RangeError('Invalid statement time budget');

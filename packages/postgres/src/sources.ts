@@ -7,7 +7,7 @@ import { commitBeforeDeadline, CommitNotSentDeadlineExceeded } from './commit-de
 import { AuthorityError, AuthorityTransaction, clientReadTimedOut, CommitOutcomeUnknownError, linkRestricted } from './index.js';
 import type { AuthorityScope } from './index.js';
 import { acceptsInProcessObjects, includes, isInProcessProxy, scalarString, utcInstant } from './schema.js';
-import { apply, ceil, createObject, hasOwn, isArray, isSafeInteger, max, min, monotonicNow, NativePromise, ObjectPrototype, ownDescriptor,
+import { apply, ceil, createObject, hasOwn, isArray, isSafeInteger, max, min, monotonicNow, NativeError, NativePromise, ObjectPrototype, ownDescriptor,
   ownKeys, prototypeOf, race, settle, startTimer, stopTimer, wallNow as now } from './intrinsics.js';
 import type { PostgresSpaces } from './spaces.js';
 
@@ -278,7 +278,7 @@ export async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) =
     if (pgCode(error) === '57014') throw new AuthorityError('RATE_LIMITED', 'Database statement time limit exceeded');
     if (pgCode(error) === '55P03') throw new AuthorityError('BACKPRESSURE', 'Database lock budget exceeded');
     if (!commitSent && !(error instanceof AuthorityError) && !(error instanceof pg.DatabaseError) &&
-      (lost || clientReadTimedOut(error) || (error instanceof Error && error.name === 'HostProviderTimeoutError')))
+      (lost || clientReadTimedOut(error) || (error instanceof NativeError && error.name === 'HostProviderTimeoutError')))
       throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Database session failed before commit; retry the request', undefined, true);
     throw error;
   } finally { client.release(discard); client.removeListener?.('error', onError); }

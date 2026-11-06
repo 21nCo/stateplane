@@ -17,7 +17,7 @@ export const isSafeInteger = Number.isSafeInteger, isFiniteNumber = Number.isFin
 export const NativeNumber = Number, NativeBigInt = BigInt, NativeDate = Date, NativeMap = Map, NativeWeakMap = WeakMap;
 export const NativeDateTimeFormat = Intl.DateTimeFormat;
 export const { min, max, ceil } = Math;
-export const NativePromise = Promise;
+export const NativePromise = Promise, NativeError = Error;
 const nativeSetTimeout = setTimeout, nativeClearTimeout = clearTimeout;
 const NativeJSON = JSON, nativeParse = JSON.parse, nativeStringify = JSON.stringify;
 const NativeBuffer = Buffer, nativeByteLength = Buffer.byteLength;

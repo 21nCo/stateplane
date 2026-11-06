@@ -17,7 +17,7 @@ export const COVERED = {
 };
 
 /** Globals a covered path never names: their statics, constructors and functions can all be replaced after load. */
-const GLOBALS = new Set(['globalThis', 'Reflect', 'Object', 'Array', 'Number', 'String', 'Boolean', 'BigInt', 'Symbol', 'JSON',
+const GLOBALS = new Set(['globalThis', 'Error', 'Reflect', 'Object', 'Array', 'Number', 'String', 'Boolean', 'BigInt', 'Symbol', 'JSON',
   'Math', 'Buffer', 'Intl', 'performance', 'Date', 'Promise', 'RegExp', 'Map', 'Set', 'WeakMap', 'WeakSet', 'setTimeout',
   'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'queueMicrotask']);
 /** Inherited methods a covered path never calls, by dot or by computed name. */
@@ -73,7 +73,9 @@ function violationsIn(label, root, nodes) {
       const parent = node.parent;
       const named = (ts.isPropertyAccessExpression(parent) && parent.name === node) || (ts.isPropertyAssignment(parent) && parent.name === node)
         || ((ts.isVariableDeclaration(parent) || ts.isParameter(parent) || ts.isFunctionDeclaration(parent) || ts.isMethodDeclaration(parent)
-          || ts.isPropertyDeclaration(parent) || ts.isClassDeclaration(parent)) && parent.name === node);
+          || ts.isPropertyDeclaration(parent) || ts.isClassDeclaration(parent)) && parent.name === node)
+        // A class's `extends` clause is evaluated once, when the module loads.
+        || (ts.isExpressionWithTypeArguments(parent) && ts.isHeritageClause(parent.parent));
       if (!named) flag(parent);
     }
     // An async function that returns a call's promise is resolved through a lookup of that promise's `then`.
