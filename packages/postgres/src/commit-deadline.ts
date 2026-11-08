@@ -1,5 +1,5 @@
 import type pg from 'pg';
-import { NativePromise, race, settle, startTimer, stopTimer, wallNow } from './intrinsics.js';
+import { NativePromise, observe, race, startTimer, stopTimer, wallNow } from './intrinsics.js';
 
 /** COMMIT was sent, but its acknowledgement did not arrive before the budget. */
 export class CommitDeadlineExceeded extends Error {
@@ -31,6 +31,6 @@ export async function commitBeforeDeadline(client:Pick<pg.PoolClient,'query'>,de
   finally {
     stopTimer(timer);
     // The database may answer after the timer; consume its late rejection.
-    settle(committed,undefined,()=>{});
+    observe(committed);
   }
 }

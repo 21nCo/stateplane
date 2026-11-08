@@ -6,7 +6,9 @@
  * `Object.defineProperty` have no prototype. So a later replacement of a
  * global or an inherited method, or an `Object.prototype` member such as
  * `get`, `set` or `value`, cannot change what these paths admit or return, or
- * make them fail untyped. `test/intrinsics-guard.test.js` keeps their callers
+ * make them fail untyped. The promise machinery itself (the `then` and
+ * `constructor` lookups `await` and promise resolution make) is the runtime's,
+ * outside that guarantee. `test/intrinsics-guard.test.js` keeps their callers
  * on these captures.
  */
 export const apply = Reflect.apply, ownKeys = Reflect.ownKeys;
@@ -64,10 +66,18 @@ export const settle = async <T>(promise: PromiseLike<T>, fulfilled?: (value: T) 
   catch (error) { if (rejected === undefined) throw error; return rejected(error); }
   return fulfilled === undefined ? value : fulfilled(value);
 };
-/** Settle as the first of `promises` settles, as `Promise.race` does, through the native `then`. */
+/** Settle as the first of `promises` settles, as `Promise.race` does, following each through `settle`. */
 export const race = <T>(promises: readonly PromiseLike<T>[]) => new NativePromise<T>((resolve, reject) => {
-  for (let i = 0; i < promises.length; i++) settle(promises[i], resolve, reject);
+  // resolve and reject never throw, so no settle here can reject.
+  for (let i = 0; i < promises.length; i++) void settle(promises[i], resolve, reject);
 });
+/**
+ * Follow `promise` only for `fulfilled`, which runs on its value. Its rejection, and a throw from `fulfilled`, end
+ * there, so an observed promise never rejects unhandled.
+ */
+export const observe = <T>(promise: PromiseLike<T>, fulfilled: (value: T) => void = () => {}): void => {
+  void settle(promise, value => { try { fulfilled(value); } catch { /* the observer's own failure */ } }, () => {});
+};
 export const startTimer = (callback: () => void, ms: number) => nativeSetTimeout(callback, ms);
 export const stopTimer = (timer: ReturnType<typeof setTimeout> | undefined): void => { nativeClearTimeout(timer); };
 export const setForEach = <T>(set: ReadonlySet<T>, f: (value: T) => void): void => { apply(nativeSetForEach, set, [f]); };

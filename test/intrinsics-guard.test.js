@@ -29,15 +29,41 @@ test('the guard fails when a covered path calls a live built-in again, in any sy
     ['commit-deadline.ts', commit.replace(clock, 'const remaining=deadline-globalThis.Date.now();')],
     ['commit-deadline.ts', commit.replace(clock, 'const remaining=deadline-Date [\'now\']();')],
     ['commit-deadline.ts', commit.replace(clock, `${clock} void new Promise(resolve => resolve(remaining));`)],
-    ['commit-deadline.ts', commit.replace('settle(committed,undefined,()=>{});', 'void committed\n      .catch(()=>{});')],
+    ['commit-deadline.ts', commit.replace('observe(committed);', 'void committed\n      .catch(()=>{});')],
     ['sources.ts', sources.replace('try { return await race([pending, timeout]); }', 'try { return await Promise.race([pending, timeout]); }')],
     ['sources.ts', sources.replace('return await fn(client);', 'return fn(client);')],
-    ['sources.ts', sources.replace('return await fn(client);', 'return (fn(client));')]];
+    ['sources.ts', sources.replace('return await fn(client);', 'return (fn(client));')],
+    // A returned promise through a local alias, a branch or an operand.
+    ['sources.ts', sources.replace('return await fn(client);', 'const pending = fn(client); return pending;')],
+    ['sources.ts', sources.replace('return await fn(client);', 'let pending; pending = fn(client); return pending;')],
+    ['sources.ts', sources.replace('return await fn(client);', 'return begun ? fn(client) : await fn(client);')],
+    ['sources.ts', sources.replace('return await fn(client);', 'return (begun, fn(client) as Promise<T>);')],
+    // A native-prefixed name that is not a plain reference to a built-in, in a whole module or beside named paths.
+    ['index.ts', index.replace('const nativeStringIncludes = String.prototype.includes;',
+      'const nativeStringIncludes = String.prototype.includes;\nconst nativeClock = () => Date.now();')],
+    ['aggregations.ts', aggregations.replace('const nativeLowerCase = String.prototype.toLowerCase;',
+      'const nativeLowerCase = String.prototype.toLowerCase;\nconst nativeClock = () => performance.now();')],
+    // Any built-in prototype method, not only a listed few.
+    ['aggregations.ts', aggregations.replace('apply(nativeCodeUnit, text, [i]) as number;', 'text.charCodeAt(i);')],
+    ['aggregations.ts', aggregations.replace('apply(nativeLowerCase, text, []) as string;', 'text.toString();')],
+    // Iteration through an inherited Symbol.iterator.
+    ['commit-deadline.ts', commit.replace(clock, `${clock} for (const left of [remaining]) void left;`)],
+    ['commit-deadline.ts', commit.replace(clock, `${clock} void [...[remaining]];`)],
+    ['commit-deadline.ts', commit.replace(clock, `${clock} const [left] = [remaining]; void left;`)],
+    ['commit-deadline.ts', commit.replace(clock, `${clock} let left = 0; [left] = [remaining]; void left;`)],
+    // A value converted to a primitive that is not typed one: interpolated, an operand, a key.
+    ['commit-deadline.ts', commit.replace(clock, `${clock} void \`\${client}\`;`)],
+    ['commit-deadline.ts', commit.replace(clock, `${clock} const late: any = client; void (late > remaining);`)],
+    ['commit-deadline.ts', commit.replace(clock, `${clock} void (remaining + (client as unknown as number[]).length + (client as object as never));`)],
+    ['commit-deadline.ts', commit.replace(clock, `${clock} const slots: Record<string, number> = {}; void slots[client as never];`)]];
   for (let i = 0; i < reintroduced.length; i++) {
     const [file, text] = reintroduced[i];
     assert.notEqual(text, sourceText(file), `${file} mutation ${i} applies`);
     assert.ok(guardViolations({ [file]: text }).length > 0, `${file} mutation ${i} is caught`);
   }
+  // A primitive interpolated, added or used as a key calls nothing inherited.
+  assert.deepEqual(guardViolations({ 'commit-deadline.ts': commit.replace(clock,
+    `${clock} const slots: Record<string, number> = {}; void \`\${remaining}\`; void (remaining + 1 > 0); void slots[\`\${remaining}\`];`) }), []);
 });
 
 test('the documented covered paths are exactly the guarded list', () => {
@@ -76,4 +102,27 @@ test('transact reports a COMMIT that failed in the client as of unknown outcome,
   // A driver with its own promise library: every statement, COMMIT included, answers with a thenable that is not a native promise.
   assert.equal(await transact({ connect: () => thenable(session(() => thenable({ rows: [] }), thenable)) }, async () => 1), 1);
   assert.equal(await transact({ connect: async () => session(() => Promise.resolve({ rows: [] })) }, async () => 1), 1);
+});
+
+test('a session whose release throws is closed, the transaction keeps its own outcome, and nothing rejects unhandled', async t => {
+  // A throwing pool 'release' listener makes release throw; that is driver-pool behaviour, so the session is closed.
+  const unhandled = [];
+  const onUnhandled = reason => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  t.after(() => process.off('unhandledRejection', onUnhandled));
+  let ended = 0;
+  const session = () => ({ query: async () => ({ rows: [] }), release() { throw new Error('a release listener failed'); },
+    end: async () => { ended++; }, on() {}, removeListener() {} });
+  assert.equal(await transact({ connect: async () => session() }, async () => 7), 7);
+  await assert.rejects(transact({ connect: async () => session() }, async () => { throw new TypeError('its own failure'); }),
+    error => error instanceof TypeError && error.message === 'its own failure');
+  assert.equal(ended, 2);
+  // A cleanup checkout that answers after its budget is handed back, and closed when its release throws.
+  let deliver;
+  const late = transact({ connect: () => new Promise(resolve => { deliver = resolve; }) }, async () => 1, performance.now() + 20);
+  await assert.rejects(late, /cleanup call timed out/);
+  deliver(session());
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(ended, 3);
+  assert.deepEqual(unhandled, []);
 });

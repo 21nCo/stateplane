@@ -4,9 +4,9 @@ import { AggregationLimitError, AuthorityError, AuthorityTransaction, predicateF
 import type { AuthorityScope, ScalarPredicate } from './index.js';
 import { includes, MAX_INDEX_PART_BYTES, scalarString } from './schema.js';
 import { append, apply, ArrayPrototype, freeze, hasOwn, isArray, isSafeInteger, joined, mapForEach, mapGet, mapHas, mapSet,
-  NativeBigInt, NativeDate, NativeDateTimeFormat, NativeError, NativeMap, NativeNumber, NativePromise, NativeWeakMap, ownDescriptor, ownKeys,
+  NativeBigInt, NativeDate, NativeDateTimeFormat, NativeError, NativeMap, NativeNumber, NativePromise, NativeWeakMap, observe, ownDescriptor, ownKeys,
   parseJson, primitiveJson, prototypeOf, race, settle, startTimer, stopTimer, utf8Bytes, weakGet, weakSet } from './intrinsics.js';
-import { fields, invalid, transact, untrusted } from './sources.js';
+import { fields, handBack, invalid, transact, untrusted } from './sources.js';
 import type { Db } from './sources.js';
 import type { PostgresSpaces } from './spaces.js';
 
@@ -480,7 +480,8 @@ const hold = (pool: object, by: number) => { weakSet(running, pool, (weakGet(run
 /**
  * `pool`, whose checkout fails with BACKPRESSURE once `aggregationBounds.checkoutMs` pass without a session. The
  * checkout it gave up on stays counted against the pool's slots until the pool answers it, and a session that arrives
- * then is released unused, so a stalled pool refuses further aggregations instead of queueing more checkouts.
+ * then is handed back unused (`handBack`), so a stalled pool refuses further aggregations instead of queueing more
+ * checkouts.
  */
 function bounded(pool: Pick<pg.Pool, 'connect'>): Pick<pg.Pool, 'connect'> {
   const connect = () => new NativePromise<pg.PoolClient>((resolve, reject) => {
@@ -493,22 +494,13 @@ function bounded(pool: Pick<pg.Pool, 'connect'>): Pick<pg.Pool, 'connect'> {
     let pending: Promise<pg.PoolClient>;
     // A checkout that fails at once leaves nothing pending, so its timer never takes a hold.
     try { pending = pool.connect(); } catch (error) { stopTimer(timer); return reject(error); }
-    settle(pending, client => {
+    // Neither callback can throw, so this never rejects.
+    void settle(pending, client => {
       stopTimer(timer);
       if (!expired) return resolve(client);
-      // The hold is given back first. pg-pool emits 'release' before it keeps or evicts a session, so a throwing
-      // listener strands it. Each of the session's 'error' listeners, pg-pool's idle listener among them, which evicts
-      // it and frees its capacity, is then told on its own, so one that throws stops none of the others; the session is
-      // closed whatever they do. Nothing is left to reject unhandled.
+      // The hold is given back first; handBack closes a session a throwing pool 'release' listener strands.
       hold(pool, -1);
-      try { client.release(); }
-      catch (error) {
-        const failure = new NativeError('A late analytical session could not be released', { cause: error });
-        let listeners: ((error: Error) => void)[] = [];
-        try { listeners = client.listeners('error') as ((error: Error) => void)[]; } catch { /* not an event emitter */ }
-        for (let i = 0; i < listeners.length; i++) try { apply(listeners[i], client, [failure]); } catch { /* the next one */ }
-        try { settle((client as pg.PoolClient & Pick<pg.Client, 'end'>).end(), undefined, () => {}); } catch { /* closed */ }
-      }
+      handBack(client);
     }, (error: unknown) => { stopTimer(timer); if (expired) hold(pool, -1); else reject(error); });
   });
   return { connect } as Pick<pg.Pool, 'connect'>;
@@ -533,7 +525,7 @@ async function recheckWithin(ms: number, db: Db, recheck: (session: Pick<pg.Pool
   const timed = new NativePromise<never>((_, reject) => { timer = startTimer(() => { open = false; reject(late()); }, ms); });
   const checked = recheck(session);
   try { await race<unknown>([checked, timed]); }
-  finally { stopTimer(timer); open = false; settle(checked, undefined, () => {}); }
+  finally { stopTimer(timer); open = false; observe(checked); }
 }
 
 /**
@@ -647,7 +639,7 @@ export class PostgresAggregations {
     const tx = new AuthorityTransaction(db, scope, 1);
     try { await tx.checkScope(); } finally { tx.close(); }
     const held = (await db.query(lockSlots, [cellId, slots.cell, scope.spaceId, slots.space])).rows[0];
-    const missing = held.cell_rows < slots.cell || held.space_rows < slots.space;
+    const missing = NativeNumber(held.cell_rows) < slots.cell || NativeNumber(held.space_rows) < slots.space;
     if (held.cell_slot === null || held.space_slot === null) {
       if (missing && provisionable) throw new Unprovisioned();
       throw new AggregationLimitError('slots', `The ${held.cell_slot === null ? "cell's" : "space's"} analytical slots are in use; retry later`);

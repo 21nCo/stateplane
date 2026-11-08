@@ -8,7 +8,7 @@ import { AuthorityError, AuthorityTransaction, clientReadTimedOut, CommitOutcome
 import type { AuthorityScope } from './index.js';
 import { acceptsInProcessObjects, includes, isInProcessProxy, scalarString, utcInstant } from './schema.js';
 import { apply, ceil, createObject, hasOwn, isArray, isSafeInteger, max, min, monotonicNow, NativeError, NativePromise, ObjectPrototype, ownDescriptor,
-  ownKeys, prototypeOf, race, settle, startTimer, stopTimer, wallNow as now } from './intrinsics.js';
+  observe, ownKeys, prototypeOf, race, startTimer, stopTimer, wallNow as now } from './intrinsics.js';
 import type { PostgresSpaces } from './spaces.js';
 
 /** One cell's authority pool and original-bytes store. */
@@ -190,7 +190,7 @@ async function within<T>(until: number, start: () => Promise<T>, late: (value: T
   if (monotonicNow() >= until) throw new CleanupTimeout(monotonicNow() >= budget);
   const pending = start();
   let timedOut = false;
-  settle(pending, value => { if (timedOut) late(value); }, () => {});
+  observe(pending, value => { if (timedOut) late(value); });
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = min(until, monotonicNow() + CLEANUP_CALL_MS);
   const atBudget = budget <= deadline;
@@ -203,6 +203,18 @@ async function within<T>(until: number, start: () => Promise<T>, late: (value: T
     timer = startTimer(expire, max(0, deadline - monotonicNow()));
   });
   try { return await race([pending, timeout]); } finally { stopTimer(timer); }
+}
+
+/**
+ * Give `client` back to its pool once, never throwing, so the caller's own outcome stands. A pool 'release' listener
+ * that throws (driver-pool behaviour, outside the documented guarantee) leaves the session checked out of the pool, so
+ * it is closed instead and runs no further statement.
+ */
+export function handBack(client: Pick<pg.PoolClient, 'release'>, discard?: boolean): void {
+  try { client.release(discard); }
+  catch {
+    try { observe((client as Pick<pg.PoolClient, 'release'> & Pick<pg.Client, 'end'>).end()); } catch { /* already closed */ }
+  }
 }
 
 /**
@@ -234,7 +246,7 @@ export async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) =
   if (end !== undefined && monotonicNow() >= end) throw new CleanupTimeout(monotonicNow() >= until!);
   const deadline = now() + REQUEST_BUDGET_MS;
   const client = end === undefined ? await pool.connect() :
-    await within(end, () => pool.connect(), late => late.release(), until);
+    await within(end, () => pool.connect(), late => handBack(late), until);
   let beginAttempted = false;
   let begun = false;
   let discard = false;
@@ -256,7 +268,7 @@ export async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) =
     begun = false;
     try {
       if (end === undefined) await commitBeforeDeadline(client, deadline, () => { commitSent = true; });
-      else { commitSent = true; await within(end, () => client.query('COMMIT'), () => {}, until); }
+      else await within(end, () => { commitSent = true; return client.query('COMMIT'); }, () => {}, until);
     } catch (error) {
       discard = true;
       if (error instanceof CleanupTimeout) throw error;
@@ -281,7 +293,7 @@ export async function transact<T>(pool: Pick<pg.Pool, 'connect'>, fn: (db: Db) =
       (lost || clientReadTimedOut(error) || (error instanceof NativeError && error.name === 'HostProviderTimeoutError')))
       throw new AuthorityError('PROVIDER_UNAVAILABLE', 'Database session failed before commit; retry the request', undefined, true);
     throw error;
-  } finally { client.release(discard); client.removeListener?.('error', onError); }
+  } finally { handBack(client, discard); client.removeListener?.('error', onError); }
 }
 
 export async function writable(db: Db, scope: AuthorityScope): Promise<void> {

@@ -1335,11 +1335,13 @@ test('a stalled analytical checkout is bounded, and services sharing an analytic
     await new Promise(resolve => setTimeout(resolve, aggregationBounds.checkoutMs + 100));
     assert.equal((await two.analysis.aggregate(h.owner, h.spaceId, 'items', count)).groups[0].count, 1, `recovered after a throw at ${at}`);
   }
-  // A real one-session pool whose 'release' listener throws for the late session evicts that session, even when an
-  // 'error' listener added before the pool's own also throws, so its capacity returns and the next aggregation checks a
-  // session out of the same pool.
-  const single = newPool(1), poolErrors = [], deferred = [];
-  let lateSession, stallNext = true;
+  // A real one-session pool whose 'release' listener throws for the late session. That is driver-pool behaviour, outside
+  // the guarantee: the pool keeps counting the session. The adapter closes it, gives its reservation back and leaves
+  // nothing unhandled, never touching the pool's own state, and the next aggregation on that pool is refused with a typed
+  // BACKPRESSURE within its checkout bound instead of hanging. The pool is not ended after the test: its own listener left
+  // a session it still counts, so its end() would wait for it.
+  const single = new pg.Pool({ connectionString: url, max: 1 }), poolErrors = [], deferred = [];
+  let lateSession, closed, stallNext = true;
   single.on('error', error => poolErrors.push(error));
   single.on('release', (_, client) => { if (client === lateSession) throw new Error('a release listener failed'); });
   const realShared = { connect: () => {
@@ -1347,27 +1349,22 @@ test('a stalled analytical checkout is bounded, and services sharing an analytic
     stallNext = false;
     return new Promise(resolve => deferred.push(async () => {
       lateSession = await single.connect();
-      lateSession.on('error', () => { throw new Error('an error listener failed'); });
+      closed = new Promise(ended => lateSession.once('end', ended));
       resolve(lateSession);
     }));
   } };
   const real = aggregations(realShared, 5);
   await limited(real.aggregateSerialized(f.owner, f.spaceId, 'items', count), 'slots');
-  // A global Error replaced after load, which refuses to build the late-release report, changes none of it.
-  const OriginalError = Error;
-  const ReplacedError = function (message, options) {
-    if (message === 'A late analytical session could not be released') throw new OriginalError('replaced Error');
-    return new OriginalError(message, options);
-  };
-  ReplacedError.prototype = OriginalError.prototype;
-  try {
-    globalThis.Error = ReplacedError;
-    await deferred.shift()();
-    await new Promise(resolve => setImmediate(resolve));
-  } finally { globalThis.Error = OriginalError; }
-  assert.equal(single.totalCount, 0, 'the stranded session was evicted');
-  assert.equal(poolErrors.length, 1);
-  assert.equal((await real.aggregateSerialized(f.owner, f.spaceId, 'items', count)).groups[0].count, 1);
+  await deferred.shift()();
+  let closeTimer;
+  await Promise.race([closed, new Promise((_, reject) => { closeTimer = setTimeout(() => reject(new Error('the late session stayed open')), 5_000); })])
+    .finally(() => clearTimeout(closeTimer));
+  assert.equal(single.totalCount, 1, 'the pool still counts the session its own listener stranded');
+  assert.equal(poolErrors.length, 0, 'the pool was not told of an error it did not have');
+  const refusedAt = performance.now();
+  await limited(real.aggregateSerialized(f.owner, f.spaceId, 'items', count), 'slots');
+  const refusedIn = performance.now() - refusedAt;
+  assert.ok(refusedIn < aggregationBounds.checkoutMs + 1_500, `refused after ${refusedIn} ms`);
   // Every reservation was given back: without stalls, both services and the adapter answer through the shared pool.
   for (const answer of [await one.analysis.aggregate(g.owner, g.spaceId, 'items', count),
     await two.analysis.aggregate(f.owner, f.spaceId, 'items', count), await direct.aggregateSerialized(g.owner, g.spaceId, 'items', count)])
