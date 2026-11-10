@@ -246,6 +246,8 @@ export class PostgresSpaces {
     if (!cell) throw new AuthorityError('INVALID_ARGUMENT', 'Home cell is not selectable');
     return cell;
   }
+  /** A configured cell's interactive pool, on which a sibling adapter authorizes a scope before it reports its own capacity. */
+  interactivePool(cellId: string): Pick<pg.Pool, 'connect'> { return this.cell(cellId).pool; }
   private async current(actor: VerifiedCredential, ownerPrincipalId: string = owner(actor)): Promise<void> {
     if (!await this.credentials.current(actor,ownerPrincipalId)) throw new AuthorityError('FORBIDDEN');
   }
