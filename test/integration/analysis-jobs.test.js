@@ -45,13 +45,14 @@ const rejects = (promise, code, label = '') => assert.rejects(promise, error => 
 
 /**
  * A jobs Worker on a one-connection pool of its own, as in the cell's jobs Worker. `fault(sql)` may throw to model
- * a step interrupted at that statement, as a crashed isolate or a lost connection would leave it.
+ * a step interrupted at that statement, as a crashed isolate or a lost connection would leave it, or return SQL to run in
+ * its place on the worker's connection (in the same transaction).
  */
 function worker(fault = () => {}) {
   const own = newPool(1);
   own.on('connect', client => {
     const query = client.query.bind(client);
-    client.query = (sql, ...rest) => { fault(typeof sql === 'string' ? sql : sql.text); return query(sql, ...rest); };
+    client.query = (sql, ...rest) => query(fault(typeof sql === 'string' ? sql : sql.text) ?? sql, ...rest);
   });
   return new PostgresAnalysisWorker(own, { originConnectionLimit: 5 });
 }
@@ -328,6 +329,62 @@ test('a page error every retry would meet fails its job at once, releasing its s
   assert.deepEqual(await failed(overflow.jobId), { state: 'failed', failure_code: 'UNPROCESSABLE', pages: 0 });
   assert.equal((await services.analysis.status(f.owner, f.spaceId, 'items', export_.jobId)).complete, true);
   assert.equal((await slots()).some(slot => slot.holder_job_id === overflow.jobId && slot.held), false);
+});
+
+const settledRow = async jobId => (await pool.query(`SELECT state,failure_code,(SELECT count(*)::int FROM analysis_result_pages p
+  WHERE p.job_id=j.job_id) AS pages FROM analysis_jobs j WHERE job_id=$1`, [jobId])).rows[0];
+const holds = async jobId => (await slots()).some(slot => slot.holder_job_id === jobId && slot.held);
+
+test('a page its job\'s expiry overtakes ends the job expired, not failed, releasing its slots and removing its pages', async () => {
+  const f = await fixture();
+  await f.bulk(generic(1_200));
+  const submitted = await services.analysis.submit(f.owner, f.spaceId, 'items', 'export');
+  // A job admitted with a 4 s lifetime (the submitted one's binding copied, the submitted one set aside) whose second
+  // page is slow just before it writes: its expiry passes meanwhile, so migration 049 refuses the page.
+  const short = `anj_${randomUUID()}`;
+  await pool.query(`INSERT INTO analysis_jobs(space_id,collection_id,job_id,kind,principal_id,credential_id,capability,policy_version,
+      placement_generation,schema_version,watermark,canonical_spec,spec_digest,budget_records,budget_bytes,budget_runtime_ms,expires_at)
+    SELECT space_id,collection_id,$2,kind,principal_id,credential_id,capability,policy_version,placement_generation,schema_version,
+      watermark,canonical_spec,spec_digest,budget_records,budget_bytes,budget_runtime_ms,clock_timestamp()+interval '4 seconds'
+    FROM analysis_jobs WHERE job_id=$1`, [submitted.jobId, short]);
+  await pool.query(`UPDATE analysis_jobs SET state='failed',failure_code='TEST_RESET' WHERE job_id=$1`, [submitted.jobId]);
+  let writes = 0;
+  const slow = worker(sql => {
+    if (!/^INSERT INTO analysis_result_pages/.test(sql) || ++writes !== 2) return;
+    for (const end = Date.now() + 4_500; Date.now() < end;);
+  });
+  const expiring = await slow.step({ budgetMs: 15_000 });
+  assert.equal(writes, 2);
+  assert.deepEqual([expiring.claimed, expiring.expired, expiring.failed, expiring.pages], [1, 1, 0, 1]);
+  assert.deepEqual(await settledRow(short), { state: 'expired', failure_code: null, pages: 0 });
+  assert.equal((await services.analysis.status(f.owner, f.spaceId, 'items', short)).state, 'expired');
+  assert.equal(await holds(short), false);
+});
+
+test('a page that outlives its lease fails no job: the job stays running and a later step reclaims and completes it', async () => {
+  const f = await fixture();
+  const ids = await f.bulk(generic(40));
+  // The lease and slot holds lapse in the page's transaction before it writes, as a page running past 30 s would leave
+  // them, so migration 049 refuses the page.
+  const job = await services.analysis.submit(f.owner, f.spaceId, 'items', 'export');
+  let lapsed = false;
+  assert.match(job.jobId, /^anj_[0-9a-f-]{36}$/);
+  const outlived = worker(sql => {
+    if (lapsed || sql !== 'SAVEPOINT analysis_page') return;
+    lapsed = true;
+    return `UPDATE analysis_jobs SET leased_until=clock_timestamp() WHERE job_id='${job.jobId}';
+      UPDATE analysis_cell_slots SET held_until=clock_timestamp() WHERE holder_job_id='${job.jobId}';
+      UPDATE analysis_space_slots SET held_until=clock_timestamp() WHERE holder_job_id='${job.jobId}'; ${sql}`;
+  });
+  const outliving = await outlived.step({ budgetMs: 5_000 });
+  assert.equal(lapsed, true);
+  assert.deepEqual([outliving.claimed, outliving.failed, outliving.pages, outliving.completed], [1, 0, 0, 0]);
+  assert.deepEqual(await settledRow(job.jobId), { state: 'running', failure_code: null, pages: 0 });
+  assert.equal(await holds(job.jobId), false);
+  await drain();
+  const { status, pages } = await result(f.owner, f.spaceId, job.jobId);
+  assert.equal(status.progress.attempts, 2);
+  assert.deepEqual([...exported(pages).keys()].sort(), [...ids.keys()].sort());
 });
 
 test('an aggregate job over several pages states the same groups as one interactive aggregation of the same data', async () => {

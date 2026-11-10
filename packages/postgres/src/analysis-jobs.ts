@@ -345,14 +345,19 @@ function indexed(data: Record<string, unknown>, field: string, kind: ValueKind):
 
 /** A job failure the step records: the job ends failed with `code`. */
 class JobFailure extends Error { constructor(readonly code: string, message: string) { super(message); } }
+/** Migration 049's guards that refuse a job's write only because its expiry or its lease passed meanwhile. */
+const TIMED = new Set(['analysis_jobs_expiry', 'analysis_result_pages_job', 'analysis_result_manifests_job']);
+const timed = (error: unknown) => TIMED.has((error as { constraint?: unknown } | null)?.constraint as string);
 /**
  * The failure code of a page error that every retry would meet again, or
  * null for one a later step may not: a data or integrity violation or a
- * program limit of the database (SQLSTATE classes 22, 23 and 54), or a fault
- * of the job's own reconstruction (a type, range or syntax error).
+ * program limit of the database (SQLSTATE classes 22, 23 and 54) other than
+ * a guard of the job's expiry or lease, or a fault of the job's own
+ * reconstruction (a type, range or syntax error).
  */
 function settled(error: unknown): string | null {
   if (error instanceof JobFailure) return error.code;
+  if (timed(error)) return null;
   const code = (error as { code?: unknown } | null)?.code;
   if (typeof code === 'string' && /^(22|23|54)[0-9A-Z]{3}$/.test(code)) return 'UNPROCESSABLE';
   return error instanceof TypeError || error instanceof RangeError || error instanceof SyntaxError ? 'UNPROCESSABLE' : null;
@@ -618,12 +623,13 @@ export class PostgresAnalysisWorker {
   private async run(claimed: Row, until: number, result: AnalysisStep): Promise<void> {
     try {
       while (until - RELEASE_MS - Date.now() >= MIN_PAGE_MS) {
-        let outcome: 'page' | 'completed' | 'failed' | 'lost';
+        let outcome: 'page' | 'completed' | 'failed' | 'expired' | 'lost';
         try { outcome = await inTransaction(this.pool, db => this.page(db, claimed), { deadline: until - RELEASE_MS }); }
         catch (error) { if (cutShort(error)) break; throw error; }
         if (outcome === 'page') { result.pages++; continue; }
         if (outcome === 'completed') result.completed++;
         if (outcome === 'failed') result.failed++;
+        if (outcome === 'expired') result.expired++;
         return;
       }
     } finally {
@@ -648,7 +654,7 @@ export class PostgresAnalysisWorker {
   }
 
   /** One page of the job under its exact lease, committed with its checkpoint; or its manifest once no record is left. */
-  private async page(db: Session, claimed: Row): Promise<'page' | 'completed' | 'failed' | 'lost'> {
+  private async page(db: Session, claimed: Row): Promise<'page' | 'completed' | 'failed' | 'expired' | 'lost'> {
     const started = Date.now();
     const key = pk(claimed);
     const failure = await binding(db, claimed);
@@ -673,8 +679,18 @@ export class PostgresAnalysisWorker {
       return await this.advance(db, job, started);
     } catch (error) {
       const code = settled(error);
-      if (code === null) throw error;
+      if (code === null && !timed(error)) throw error;
       await db.query('ROLLBACK TO SAVEPOINT analysis_page');
+      // The job's clock decides first: a page its expiry overtook ends the job expired; one that outlived its lease is
+      // left to a later claim, as an interrupted page is. Only a job still within both fails.
+      const clock = (await db.query(`SELECT expires_at<=clock_timestamp() AS expired,leased_until<=clock_timestamp() AS lapsed
+        FROM analysis_jobs WHERE space_id=$1 AND collection_id=$2 AND job_id=$3`, key)).rows[0];
+      if (clock.expired) {
+        await db.query(`UPDATE analysis_jobs SET state='expired' WHERE space_id=$1 AND collection_id=$2 AND job_id=$3`, key);
+        await discard(db, key);
+        return 'expired';
+      }
+      if (clock.lapsed || code === null) return 'lost';
       await this.fail(db, job, code);
       return 'failed';
     }
