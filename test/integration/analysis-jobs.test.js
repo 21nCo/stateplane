@@ -8,6 +8,7 @@ import pg from 'pg';
 import { memoryAdapter } from '@superfunctions/db/testing';
 import { createAuthFn, createUser, issueSession } from '@authfn/core';
 import { AuthFnAgentKeys, AuthFnIdentityVerifier } from '../../packages/auth/dist/index.js';
+import { inTransaction } from '../../packages/postgres/dist/faults.js';
 import { aggregationBounds, analysisJobBounds, PostgresAnalysisJobs, PostgresAnalysisWorker, PostgresSpaces,
   postgresServices } from '../../packages/postgres/dist/index.js';
 
@@ -318,13 +319,14 @@ test('a page error every retry would meet fails its job at once, releasing its s
     WHERE p.job_id=j.job_id) AS pages FROM analysis_jobs j WHERE job_id=$1`, [jobId])).rows[0];
   assert.deepEqual(await failed(job.jobId), { state: 'failed', failure_code: 'RESULT_TOO_LARGE', pages: 0 });
   assert.equal((await slots()).some(slot => slot.holder_job_id === job.jobId && slot.held), false);
-  // A database refusal that would recur (here a numeric overflow, injected) fails the job on the page it meets; the step goes on.
+  // A database refusal that would recur (here an integer overflow the server raises after 300 ms of work, at the jobs
+  // Worker's 5 s budget, so the bounded session has lowered its statement bound meanwhile) fails the job on the page it
+  // meets; the step goes on.
   const narrow = JSON.stringify({ metrics: [{ op: 'sum', field: 'score' }] });
   const overflow = await services.analysis.submit(f.owner, f.spaceId, 'items', 'aggregate', narrow);
   const export_ = await services.analysis.submit(f.owner, f.spaceId, 'items', 'export');
-  const refusing = worker(sql => {
-    if (/^WITH records AS/.test(sql)) throw Object.assign(new Error('numeric field overflow'), { code: '22003' });
-  });
+  const refusing = worker(sql => /^WITH records AS/.test(sql)
+    ? `SELECT * FROM (${sql}) q WHERE (SELECT count(*)::int FROM pg_sleep(0.3))*2147483647*2>0` : undefined);
   const second = await refusing.step({ budgetMs: 5_000 });
   assert.deepEqual([second.failed, second.completed], [1, 1]);
   assert.deepEqual(await failed(overflow.jobId), { state: 'failed', failure_code: 'UNPROCESSABLE', pages: 0 });
@@ -335,6 +337,9 @@ test('a page error every retry would meet fails its job at once, releasing its s
 const settledRow = async jobId => (await pool.query(`SELECT state,failure_code,(SELECT count(*)::int FROM analysis_result_pages p
   WHERE p.job_id=j.job_id) AS pages FROM analysis_jobs j WHERE job_id=$1`, [jobId])).rows[0];
 const holds = async jobId => (await slots()).some(slot => slot.holder_job_id === jobId && slot.held);
+/** The page write, made to work `seconds` on the server before migration 049's guard decides it (its hash unchanged). */
+const slowWrite = (sql, seconds) => /^INSERT INTO analysis_result_pages/.test(sql)
+  ? sql.replace(/,\$13\)$/, `,$13||(SELECT '' FROM pg_sleep(${seconds})))`) : undefined;
 
 test('a page its job\'s expiry overtakes ends the job expired, not failed, releasing its slots and removing its pages', async () => {
   const f = await fixture();
@@ -362,6 +367,55 @@ test('a page its job\'s expiry overtakes ends the job expired, not failed, relea
   assert.equal(await holds(short), false);
 });
 
+test('at the jobs Worker budget, a page its job\'s expiry overtakes on the server ends the job expired within the step', async () => {
+  const f = await fixture();
+  await f.bulk(generic(40));
+  const submitted = await services.analysis.submit(f.owner, f.spaceId, 'items', 'export');
+  // A 1.5 s job whose first page write works 1.6 s on the server, at the jobs Worker's 5 s budget: migration 049 refuses
+  // it, and the rollback to the savepoint is the next statement on the session, not a lowered statement bound.
+  const short = `anj_${randomUUID()}`;
+  await pool.query(`INSERT INTO analysis_jobs(space_id,collection_id,job_id,kind,principal_id,credential_id,capability,policy_version,
+      placement_generation,schema_version,watermark,canonical_spec,spec_digest,budget_records,budget_bytes,budget_runtime_ms,expires_at)
+    SELECT space_id,collection_id,$2,kind,principal_id,credential_id,capability,policy_version,placement_generation,schema_version,
+      watermark,canonical_spec,spec_digest,budget_records,budget_bytes,budget_runtime_ms,clock_timestamp()+interval '1.5 seconds'
+    FROM analysis_jobs WHERE job_id=$1`, [submitted.jobId, short]);
+  await pool.query(`UPDATE analysis_jobs SET state='failed',failure_code='TEST_RESET' WHERE job_id=$1`, [submitted.jobId]);
+  let slowed = false;
+  const slow = worker(sql => {
+    const replaced = slowed ? undefined : slowWrite(sql, 1.6);
+    if (replaced) slowed = true;
+    return replaced;
+  });
+  const expiring = await slow.step({ budgetMs: 5_000 });
+  assert.equal(slowed, true);
+  assert.deepEqual([expiring.claimed, expiring.expired, expiring.failed, expiring.pages], [1, 1, 0, 0]);
+  assert.deepEqual(await settledRow(short), { state: 'expired', failure_code: null, pages: 0 });
+  assert.equal(await holds(short), false);
+});
+
+test('a bounded session sends a failed statement\'s rollback to its savepoint first, then bounds the next statement again', async () => {
+  const sent = [];
+  const own = newPool(1);
+  own.on('connect', client => {
+    const query = client.query.bind(client);
+    client.query = (sql, ...rest) => { sent.push(sql); return query(sql, ...rest); };
+  });
+  const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const shown = await inTransaction(own, async db => {
+    await db.query('SAVEPOINT s');
+    await pause(300);
+    // The bound due now is set before this statement, which then fails on the server after 300 ms more.
+    await assert.rejects(db.query('SELECT 1/(count(*)::int-1) FROM pg_sleep(0.3)'), error => error.code === '22012');
+    sent.length = 0;
+    await db.query('ROLLBACK TO SAVEPOINT s');
+    // The rollback undid the bound set after the savepoint; the next statement sets it again first.
+    return Number((await db.query(`SELECT setting FROM pg_settings WHERE name='statement_timeout'`)).rows[0].setting);
+  }, { deadline: Date.now() + 5_000 });
+  assert.equal(sent[0], 'ROLLBACK TO SAVEPOINT s');
+  assert.match(sent[1], /^SET LOCAL statement_timeout = '\d+ms'$/);
+  assert.ok(shown > 0 && shown <= 4_700, String(shown));
+});
+
 test('a page that outlives its lease fails no job: the job stays running and a later step reclaims and completes it', async () => {
   const f = await fixture();
   const ids = await f.bulk(generic(40));
@@ -370,7 +424,11 @@ test('a page that outlives its lease fails no job: the job stays running and a l
   const job = await services.analysis.submit(f.owner, f.spaceId, 'items', 'export');
   let lapsed = false;
   assert.match(job.jobId, /^anj_[0-9a-f-]{36}$/);
+  // The refused write works 300 ms on the server first, at the jobs Worker's 5 s budget, so the session's statement bound
+  // is due to be lowered when the rollback to the savepoint follows it.
+  let slowed = false;
   const outlived = worker(sql => {
+    if (lapsed && !slowed && slowWrite(sql, 0.3)) { slowed = true; return slowWrite(sql, 0.3); }
     if (lapsed || sql !== 'SAVEPOINT analysis_page') return;
     lapsed = true;
     return `UPDATE analysis_jobs SET leased_until=clock_timestamp() WHERE job_id='${job.jobId}';
@@ -378,7 +436,7 @@ test('a page that outlives its lease fails no job: the job stays running and a l
       UPDATE analysis_space_slots SET held_until=clock_timestamp() WHERE holder_job_id='${job.jobId}'; ${sql}`;
   });
   const outliving = await outlived.step({ budgetMs: 5_000 });
-  assert.equal(lapsed, true);
+  assert.deepEqual([lapsed, slowed], [true, true]);
   assert.deepEqual([outliving.claimed, outliving.failed, outliving.pages, outliving.completed], [1, 0, 0, 0]);
   assert.deepEqual(await settledRow(job.jobId), { state: 'running', failure_code: null, pages: 0 });
   assert.equal(await holds(job.jobId), false);

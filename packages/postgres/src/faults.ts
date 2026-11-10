@@ -107,7 +107,9 @@ export interface Limit { deadline: number; signal?: AbortSignal }
  * to COMMIT or ROLLBACK, is sent only before the budget ends and awaited
  * only until it does, and the body's statements are each bounded by the
  * time left when they start (`statement_timeout`, lowered again whenever
- * the time left falls more than `STATEMENT_SLACK_MS` below it). Checking the
+ * the time left falls more than `STATEMENT_SLACK_MS` below it; after a
+ * statement error, only once a rollback has gone through, as the aborted
+ * transaction refuses anything else). Checking the
  * session out is bounded too. When the budget ends, the statement in flight
  * is abandoned and cancelled from another session and this session is
  * discarded, so the transaction's locks go then, or at the latest when that
@@ -140,13 +142,25 @@ export async function inTransaction<T>(pool: PoolLike, fn: (db: never) => Promis
   expired.catch(() => {});
   const timer = limit ? setTimeout(expire, Math.max(0, limit.deadline - Date.now())) : undefined;
   limit?.signal?.addEventListener('abort', expire, { once: true });
+  // A statement failed: the transaction takes nothing but a rollback until one succeeds, so no bound is set before it.
+  let aborted = false;
+  // A rollback to a savepoint also undoes the bounds set since it: the next statement sets its bound again.
+  let unbound = false;
   const guarded = async (sql: string, values?: unknown[]) => {
     const remaining = limit!.deadline - Date.now();
-    if (remaining < statementMs - STATEMENT_SLACK_MS) {
-      statementMs = Math.max(1, remaining);
+    if (!aborted && (unbound || remaining < statementMs - STATEMENT_SLACK_MS)) {
+      statementMs = Math.max(1, Math.min(statementMs, remaining));
       await run(`SET LOCAL statement_timeout = '${statementMs}ms'`);
+      unbound = false;
     }
-    return run(sql, values);
+    try {
+      const result = await run(sql, values);
+      if (aborted) { aborted = false; unbound = true; }
+      return result;
+    } catch (error) {
+      if (!(error instanceof DeadlineExceededError)) aborted = true;
+      throw error;
+    }
   };
   // This session's backend and transaction, read at BEGIN when the transaction is bounded.
   let backend: { pid: number; began: string } | undefined;
