@@ -393,7 +393,7 @@ test('at the jobs Worker budget, a page its job\'s expiry overtakes on the serve
   assert.equal(await holds(short), false);
 });
 
-test('a bounded session sends a failed statement\'s rollback to its savepoint first, then bounds the next statement again', async () => {
+test('a bounded session sends a rollback to its savepoint first, then bounds the next statement again', async () => {
   const sent = [];
   const own = newPool(1);
   own.on('connect', client => {
@@ -401,19 +401,30 @@ test('a bounded session sends a failed statement\'s rollback to its savepoint fi
     client.query = (sql, ...rest) => { sent.push(sql); return query(sql, ...rest); };
   });
   const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
-  const shown = await inTransaction(own, async db => {
-    await db.query('SAVEPOINT s');
-    await pause(300);
-    // The bound due now is set before this statement, which then fails on the server after 300 ms more.
-    await assert.rejects(db.query('SELECT 1/(count(*)::int-1) FROM pg_sleep(0.3)'), error => error.code === '22012');
+  const bound = async db => Number((await db.query(`SELECT setting FROM pg_settings WHERE name='statement_timeout'`)).rows[0].setting);
+  // The statement after the pause is bounded anew (its bound lowered past the savepoint); it then fails on the server
+  // after 300 ms, fails at once, or succeeds and the caller fails after it (as a JobFailure does); the rollback follows.
+  for (const [label, statement] of [['slow failure', 'SELECT 1/(count(*)::int-1) FROM pg_sleep(0.3)'], ['failure', 'SELECT 1/0'],
+    ['caller failure', 'SELECT 1']]) {
     sent.length = 0;
-    await db.query('ROLLBACK TO SAVEPOINT s');
-    // The rollback undid the bound set after the savepoint; the next statement sets it again first.
-    return Number((await db.query(`SELECT setting FROM pg_settings WHERE name='statement_timeout'`)).rows[0].setting);
-  }, { deadline: Date.now() + 5_000 });
-  assert.equal(sent[0], 'ROLLBACK TO SAVEPOINT s');
-  assert.match(sent[1], /^SET LOCAL statement_timeout = '\d+ms'$/);
-  assert.ok(shown > 0 && shown <= 4_700, String(shown));
+    const { lowered, after } = await inTransaction(own, async db => {
+      await db.query('SAVEPOINT s');
+      await pause(300);
+      try {
+        await db.query(statement);
+        if (label === 'caller failure') throw new RangeError('refused in the caller');
+      } catch (error) { if (!['22012', undefined].includes(error.code)) throw error; }
+      const lowered = Number(/'(\d+)ms'/.exec(sent.findLast(sql => sql.startsWith('SET LOCAL statement_timeout')))[1]);
+      const at = sent.length;
+      await db.query('ROLLBACK TO SAVEPOINT s');
+      const after = await bound(db);
+      assert.equal(sent[at], 'ROLLBACK TO SAVEPOINT s', label);
+      assert.match(sent[at + 1], /^SET LOCAL statement_timeout = '\d+ms'$/, label);
+      return { lowered, after };
+    }, { deadline: Date.now() + 5_000 });
+    // The rollback undid the lowered bound; the next statement runs under one no looser than it, not the savepoint's.
+    assert.ok(lowered <= 4_750 && after > 0 && after <= lowered, `${label}: ${lowered} ${after}`);
+  }
 });
 
 test('a page that outlives its lease fails no job: the job stays running and a later step reclaims and completes it', async () => {
