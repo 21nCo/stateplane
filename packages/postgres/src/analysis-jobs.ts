@@ -133,7 +133,8 @@ async function aggregateSpec(db: Db, scope: Readonly<AuthorityScope>, serialized
   predicateFilter(scope, spec.where);
   const { declared } = await declarations(db, scope, spec);
   admit(spec, declared);
-  const fields: Record<string, ValueKind> = {};
+  // A dictionary without a prototype, so every field name, `__proto__` included, is its own entry.
+  const fields: Record<string, ValueKind> = Object.create(null);
   for (const name of named(spec)) fields[name] = declared.get(name)!.kind;
   return JSON.stringify({ kind: 'aggregate', spec: { where: spec.where,
     groupBy: spec.groupBy.map(d => d.bucket ? { field: d.field, bucket: d.bucket } : { field: d.field }),
@@ -310,19 +311,21 @@ async function binding(db: Session, job: Row): Promise<string | null> {
 }
 
 /**
- * The collection's records after `cursor`, in key order, as of `watermark`:
- * each record's highest revision published at or below it (migration 049's
- * as-of index), with its operation and canonical data; a record without one
- * did not exist then. At most `limit` records, and no more once the data read
- * reaches `bytes` (always at least one).
+ * The collection's records that existed at `watermark`, after `cursor`, in
+ * key order: each one's highest revision published at or below it (migration
+ * 049's as-of index), with its operation and canonical data. A record first
+ * written later is no candidate at all, so it takes no place in the `limit`
+ * and pages cut the same whatever is written after the watermark. At most
+ * `limit` records, and no more once the data read reaches `bytes` (always at
+ * least one).
  */
 async function asOf(db: Session, job: Row, cursor: string, limit: number, bytes: number): Promise<Row[]> {
   return (await db.query(`SELECT * FROM (
       SELECT x.*,sum(octet_length(COALESCE(x.canonical_data,''))) OVER (ORDER BY x.record_id) AS running FROM (
         SELECT r.record_id,e.revision,e.operation,e.canonical_data FROM records r
-        LEFT JOIN LATERAL (SELECT f.revision FROM record_event_feed f WHERE f.space_id=r.space_id AND f.collection_id=r.collection_id
-          AND f.record_id=r.record_id AND f.position<=$3 ORDER BY f.revision DESC LIMIT 1) a ON true
-        LEFT JOIN record_events e ON e.space_id=r.space_id AND e.collection_id=r.collection_id AND e.record_id=r.record_id
+        CROSS JOIN LATERAL (SELECT f.revision FROM record_event_feed f WHERE f.space_id=r.space_id AND f.collection_id=r.collection_id
+          AND f.record_id=r.record_id AND f.position<=$3 ORDER BY f.revision DESC LIMIT 1) a
+        JOIN record_events e ON e.space_id=r.space_id AND e.collection_id=r.collection_id AND e.record_id=r.record_id
           AND e.revision=a.revision
         WHERE r.space_id=$1 AND r.collection_id=$2 AND r.record_id>$4 ORDER BY r.record_id LIMIT $5) x
     ) y WHERE y.running-octet_length(COALESCE(y.canonical_data,''))<$6 ORDER BY y.record_id`,
@@ -342,6 +345,18 @@ function indexed(data: Record<string, unknown>, field: string, kind: ValueKind):
 
 /** A job failure the step records: the job ends failed with `code`. */
 class JobFailure extends Error { constructor(readonly code: string, message: string) { super(message); } }
+/**
+ * The failure code of a page error that every retry would meet again, or
+ * null for one a later step may not: a data or integrity violation or a
+ * program limit of the database (SQLSTATE classes 22, 23 and 54), or a fault
+ * of the job's own reconstruction (a type, range or syntax error).
+ */
+function settled(error: unknown): string | null {
+  if (error instanceof JobFailure) return error.code;
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === 'string' && /^(22|23|54)[0-9A-Z]{3}$/.test(code)) return 'UNPROCESSABLE';
+  return error instanceof TypeError || error instanceof RangeError || error instanceof SyntaxError ? 'UNPROCESSABLE' : null;
+}
 
 /** Exact sum of two decimal texts (no exponent), as PostgreSQL numeric text. */
 function addDecimal(a: string | null, b: string | null): string | null {
@@ -652,11 +667,15 @@ export class PostgresAnalysisWorker {
       AND holder_job_id=$3`, [...key, job.until]);
     if (!cellHeld.rowCount || !spaceHeld.rowCount) return 'lost';
     await db.query('UPDATE analysis_jobs SET leased_until=$4 WHERE space_id=$1 AND collection_id=$2 AND job_id=$3', [...key, job.until]);
+    // A page error that would recur ends the job failed (its partial page undone), rather than retry it until expiry.
+    await db.query('SAVEPOINT analysis_page');
     try {
       return await this.advance(db, job, started);
     } catch (error) {
-      if (!(error instanceof JobFailure)) throw error;
-      await this.fail(db, job, error.code);
+      const code = settled(error);
+      if (code === null) throw error;
+      await db.query('ROLLBACK TO SAVEPOINT analysis_page');
+      await this.fail(db, job, code);
       return 'failed';
     }
   }
@@ -681,7 +700,7 @@ export class PostgresAnalysisWorker {
     };
     const canonical = JSON.parse(job.canonical_spec);
     const spec = canonical.kind === 'aggregate' ? parse(canonical.spec, true) : null;
-    const kinds: Record<string, ValueKind> = canonical.fields ?? {};
+    const kinds: Record<string, ValueKind> = Object.assign(Object.create(null), canonical.fields);
     if (!rows.length) {
       // No record is left: seal the result. An aggregate's one page is its merged groups, formatted as STA-58 formats them.
       if (spec) {
@@ -712,18 +731,20 @@ export class PostgresAnalysisWorker {
     let consumed = 0, checkpoint: Row | null = job.checkpoint;
     if (spec) {
       const groups = new Groups(spec, kinds, job.checkpoint?.groups ?? []);
-      for (const row of await aggregatePage(db, job, spec, kinds, rows.filter(row => row.operation && row.operation !== 'delete')))
+      for (const row of await aggregatePage(db, job, spec, kinds, rows.filter(row => row.operation !== 'delete')))
         groups.add(row);
       if (groups.rows.length > spec.maxGroups) throw new JobFailure('GROUP_LIMIT', `More than ${spec.maxGroups} groups`);
       checkpoint = { groups: groups.rows };
-      if (Buffer.byteLength(JSON.stringify(checkpoint)) > analysisJobBounds.checkpointBytes)
+      // Measured as migration 049's bound measures it: the stored jsonb's text, which spaces its members.
+      const stored = (await db.query('SELECT octet_length($1::jsonb::text) AS n', [JSON.stringify(checkpoint)])).rows[0].n;
+      if (Number(stored) > analysisJobBounds.checkpointBytes)
         throw new JobFailure('RESULT_TOO_LARGE', 'The partial groups exceed the checkpoint bound');
       consumed = rows.length;
     } else {
       // One NDJSON line per record live at the watermark, as many as fit one page; a page is a function of its cursor alone.
       let content = '', lines = 0;
       for (const row of rows) {
-        if (row.operation && row.operation !== 'delete') {
+        if (row.operation !== 'delete') {
           const line = `{"id":${JSON.stringify(row.record_id)},"revision":${Number(row.revision)},"data":${row.canonical_data}}\n`;
           if (Buffer.byteLength(content) + Buffer.byteLength(line) > analysisJobBounds.pageBytes) {
             if (!lines) throw new JobFailure('RESULT_TOO_LARGE', `Record ${row.record_id} does not fit one ${analysisJobBounds.pageBytes}-byte page`);

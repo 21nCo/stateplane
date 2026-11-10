@@ -113,11 +113,11 @@ function generic(count, large = []) {
   });
 }
 /** Every page of a completed job, read through the services, with the job's manifest. */
-async function result(actor, spaceId, jobId) {
-  const status = await services.analysis.status(actor, spaceId, 'items', jobId);
+async function result(actor, spaceId, jobId, collectionId = 'items') {
+  const status = await services.analysis.status(actor, spaceId, collectionId, jobId);
   assert.equal(status.state, 'completed', JSON.stringify(status));
   const pages = [];
-  for (let n = 1; n <= status.manifest.pageCount; n++) pages.push(await services.analysis.page(actor, spaceId, 'items', jobId, n));
+  for (let n = 1; n <= status.manifest.pageCount; n++) pages.push(await services.analysis.page(actor, spaceId, collectionId, jobId, n));
   return { status, pages };
 }
 /** The records an export states, by ID, from its NDJSON pages. */
@@ -224,6 +224,110 @@ test('a job interrupted at any page and resumed writes the same pages and manife
     assert.deepEqual(two.status.manifest, one.status.manifest);
     assert.deepEqual(two.pages.map(page => page.page), one.pages.map(page => page.page));
   }
+});
+
+test('records created and deleted after the watermark, ahead of an interrupted job\'s checkpoint, change none of its pages', async () => {
+  const f = await fixture();
+  await f.bulk(generic(2_100));
+  const spec = JSON.stringify({ groupBy: [{ field: 'team' }], metrics: [{ op: 'count' }, { op: 'sum', field: 'score' }, { op: 'max', field: 'at' }] });
+  const straight = [await services.analysis.submit(f.owner, f.spaceId, 'items', 'export'),
+    await services.analysis.submit(f.owner, f.spaceId, 'items', 'aggregate', spec)];
+  const resumed = [await services.analysis.submit(f.owner, f.spaceId, 'items', 'export'),
+    await services.analysis.submit(f.owner, f.spaceId, 'items', 'aggregate', spec)];
+  const resumedIds = resumed.map(job => job.jobId);
+  const hold = await pool.connect();
+  try {
+    await hold.query('BEGIN');
+    await hold.query('SELECT 1 FROM analysis_jobs WHERE job_id=ANY($1) FOR UPDATE', [resumedIds]);
+    await drain();
+  } finally { await hold.query('ROLLBACK'); hold.release(); }
+  // Each resumed job commits its first page, then its isolate is lost at the second checkpoint.
+  for (let i = 0; i < 2; i++) {
+    let checkpoints = 0;
+    await worker(sql => {
+      if (/SET cursor_record_id=/.test(sql) && ++checkpoints === 2) throw new Error('isolate lost');
+      if (/leased_until=clock_timestamp\(\) WHERE/.test(sql)) throw new Error('isolate lost');
+    }).step({ budgetMs: 3_000 }).catch(error => { if (error.message !== 'isolate lost') throw error; });
+    await lapse(resumedIds);
+  }
+  const saved = (await pool.query('SELECT job_id,cursor_record_id,records_scanned FROM analysis_jobs WHERE job_id=ANY($1)', [resumedIds])).rows;
+  assert.deepEqual(saved.map(row => Number(row.records_scanned)), [1_000, 1_000]);
+  // Later writes: creates throughout the key range, and deletes and patches of records past both checkpoints.
+  await f.bulk(generic(900));
+  const cursor = saved.map(row => row.cursor_record_id).sort().at(-1);
+  const ahead = (await pool.query(`SELECT record_id FROM records WHERE space_id=$1 AND collection_id='items' AND record_id>$2
+    AND revision=1 ORDER BY record_id LIMIT 60`, [f.spaceId, cursor])).rows.map(row => row.record_id);
+  for (const [i, id] of ahead.entries()) {
+    if (i % 2) await f.write({ operation: 'delete', id, expectedRevision: 1 });
+    else await f.write({ operation: 'patch', id, expectedRevision: 1, set: { team: 'later', score: 1e6 }, unset: [] });
+  }
+  await drain();
+  for (const [i, job] of resumed.entries()) {
+    const one = await result(f.owner, f.spaceId, straight[i].jobId), two = await result(f.owner, f.spaceId, job.jobId);
+    assert.ok(two.status.progress.attempts > 1, `${two.status.progress.attempts} attempts`);
+    assert.deepEqual(two.status.manifest, one.status.manifest);
+    assert.deepEqual(two.pages.map(page => page.page), one.pages.map(page => page.page));
+    assert.equal(two.status.progress.recordsScanned, one.status.progress.recordsScanned);
+    assert.equal(one.status.progress.recordsScanned, 2_100);
+  }
+  const first = await result(f.owner, f.spaceId, resumed[0].jobId);
+  assert.deepEqual(first.pages.map(page => page.page.rowCount), [1_000, 1_000, 100]);
+});
+
+test('a job over a field named __proto__ states the same groups as the interactive aggregation', async () => {
+  const f = await fixture();
+  // Computed keys, so the field is an own property of the schema and of each record.
+  const odd = { $schema: 'https://json-schema.org/draft/2020-12/schema', type: 'object', additionalProperties: false,
+    properties: { ['__proto__']: { type: ['string', 'null'] }, n: { type: 'number' } } };
+  await services.collections.define(f.owner, f.spaceId, 'odd', JSON.stringify({ slug: 'odd', version: 1, schema: odd, unique: [],
+    filterable: ['__proto__', 'n'], sortable: [] }));
+  for (const field of ['__proto__', 'n']) await services.collections.backfill(f.owner, f.spaceId, 'odd', field);
+  for (let i = 0; i < 30; i++) {
+    const data = { n: i };
+    if (i % 5) Object.defineProperty(data, '__proto__', { value: ['a', 'b', null][i % 3], enumerable: true, writable: true, configurable: true });
+    await services.records.mutate(f.owner, f.spaceId, 'odd', JSON.stringify({ idempotencyKey: randomUUID(), operation: 'create', data }));
+  }
+  const specs = [
+    { where: [{ field: '__proto__', kind: 'string', operator: 'eq', value: 'a' }], metrics: [{ op: 'count' }, { op: 'sum', field: 'n' }] },
+    { groupBy: [{ field: '__proto__' }], metrics: [{ op: 'count' }, { op: 'max', field: '__proto__' }, { op: 'avg', field: 'n' }] }
+  ];
+  const jobs = [];
+  for (const spec of specs) jobs.push(await services.analysis.submit(f.owner, f.spaceId, 'odd', 'aggregate', JSON.stringify(spec)));
+  await drain();
+  for (const [i, spec] of specs.entries()) {
+    const interactive = await services.analysis.aggregate(f.owner, f.spaceId, 'odd', JSON.stringify(spec));
+    const job = JSON.parse((await result(f.owner, f.spaceId, jobs[i].jobId, 'odd')).pages[0].page.content);
+    assert.deepEqual(job.groups, interactive.groups, `spec ${i}`);
+    assert.ok(interactive.groups.length >= (i ? 3 : 1) && interactive.groups.every(group => group.count > 0), JSON.stringify(interactive.groups));
+    assert.deepEqual(job.collection.fields.map(field => field.field).sort(), ['__proto__', 'n']);
+  }
+});
+
+test('a page error every retry would meet fails its job at once, releasing its slots, instead of retrying it until expiry', async () => {
+  const f = await fixture();
+  // 1,000 groups of sixteen sums: about 960 KB as compact JSON, past 1 MiB as the stored jsonb text the bound measures.
+  await f.bulk(Array.from({ length: 1_000 }, (_, i) => ({ team: `t${String(i).padStart(99, '0')}`, score: 1, note: 'n' })));
+  const wide = JSON.stringify({ groupBy: [{ field: 'team' }], maxGroups: 1_000,
+    metrics: Array.from({ length: 16 }, () => ({ op: 'sum', field: 'score' })) });
+  const job = await services.analysis.submit(f.owner, f.spaceId, 'items', 'aggregate', wide);
+  const step = await worker().step({ budgetMs: 5_000 });
+  assert.equal(step.failed, 1);
+  const failed = async jobId => (await pool.query(`SELECT state,failure_code,(SELECT count(*)::int FROM analysis_result_pages p
+    WHERE p.job_id=j.job_id) AS pages FROM analysis_jobs j WHERE job_id=$1`, [jobId])).rows[0];
+  assert.deepEqual(await failed(job.jobId), { state: 'failed', failure_code: 'RESULT_TOO_LARGE', pages: 0 });
+  assert.equal((await slots()).some(slot => slot.holder_job_id === job.jobId && slot.held), false);
+  // A database refusal that would recur (here a numeric overflow, injected) fails the job on the page it meets; the step goes on.
+  const narrow = JSON.stringify({ metrics: [{ op: 'sum', field: 'score' }] });
+  const overflow = await services.analysis.submit(f.owner, f.spaceId, 'items', 'aggregate', narrow);
+  const export_ = await services.analysis.submit(f.owner, f.spaceId, 'items', 'export');
+  const refusing = worker(sql => {
+    if (/^WITH records AS/.test(sql)) throw Object.assign(new Error('numeric field overflow'), { code: '22003' });
+  });
+  const second = await refusing.step({ budgetMs: 5_000 });
+  assert.deepEqual([second.failed, second.completed], [1, 1]);
+  assert.deepEqual(await failed(overflow.jobId), { state: 'failed', failure_code: 'UNPROCESSABLE', pages: 0 });
+  assert.equal((await services.analysis.status(f.owner, f.spaceId, 'items', export_.jobId)).complete, true);
+  assert.equal((await slots()).some(slot => slot.holder_job_id === overflow.jobId && slot.held), false);
 });
 
 test('an aggregate job over several pages states the same groups as one interactive aggregation of the same data', async () => {
