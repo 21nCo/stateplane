@@ -556,7 +556,7 @@ function bounded(pool: Pick<pg.Pool, 'connect'>): Pick<pg.Pool, 'connect'> {
  * and so its capacity, until the server ends it at its own statement time, so capacity is never given back while its
  * backend may still run.
  */
-async function recheckWithin(ms: number, db: Db, recheck: (session: Pick<pg.PoolClient, 'query'>) => Promise<void>): Promise<void> {
+export async function recheckWithin(ms: number, db: Db, recheck: (session: Pick<pg.PoolClient, 'query'>) => Promise<void>): Promise<void> {
   let open = true;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const late = () => new AuthorityError('PROVIDER_UNAVAILABLE',

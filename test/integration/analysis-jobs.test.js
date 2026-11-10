@@ -8,7 +8,8 @@ import pg from 'pg';
 import { memoryAdapter } from '@superfunctions/db/testing';
 import { createAuthFn, createUser, issueSession } from '@authfn/core';
 import { AuthFnAgentKeys, AuthFnIdentityVerifier } from '../../packages/auth/dist/index.js';
-import { analysisJobBounds, PostgresAnalysisWorker, PostgresSpaces, postgresServices } from '../../packages/postgres/dist/index.js';
+import { aggregationBounds, analysisJobBounds, PostgresAnalysisJobs, PostgresAnalysisWorker, PostgresSpaces,
+  postgresServices } from '../../packages/postgres/dist/index.js';
 
 // STA-59: snapshot analysis and export jobs. Exports are checked against the
 // records as the tests wrote them before the job was submitted, never against
@@ -587,4 +588,176 @@ test('mixed load: interactive reads keep answering while the jobs Worker runs a 
   assert.ok(latencies.length >= 3, `${latencies.length} reads`);
   console.log(`mixed load: ${latencies.length} interactive read pairs, median ${latencies[latencies.length >> 1].toFixed(1)} ms, ` +
     `max ${latencies.at(-1).toFixed(1)} ms, job ${status.progress.runtimeMs} ms over ${status.progress.attempts} claims`);
+});
+
+/**
+ * Jobs on a one-connection pool of their own whose COMMIT, while `control.holdMs` is set, reaches the server only that
+ * long after it is sent; whose provider states `control.providerUntil` (ms since the epoch) as every credential's expiry
+ * when set; and whose provider answers nothing, until the test gives each answer, while `control.stall` is set and the
+ * pool's transaction is open (the final check: admission runs on the shared pool, outside it).
+ */
+function fenced() {
+  const control = { holdMs: 0, providerUntil: null, stall: false, held: [], open: false, queries: 0, pid: null, commits: [] };
+  const answer = run => {
+    if (!control.stall || !control.open) return run();
+    return new Promise((resolve, reject) => control.held.push(outcome => outcome === 'fail'
+      ? reject(new Error('late provider failure')) : run().then(resolve, reject)));
+  };
+  const provider = { current: (...args) => answer(() => identity.current(...args)),
+    currentUntil: (...args) => answer(async () => {
+      const until = await identity.currentUntil(...args);
+      return until === false || control.providerUntil === null ? until : control.providerUntil;
+    }) };
+  const own = newPool(1);
+  own.on('connect', client => {
+    control.pid = client.processID;
+    const query = client.query.bind(client);
+    client.query = (sql, ...rest) => {
+      control.queries++;
+      if (typeof sql === 'string' && sql.startsWith('BEGIN')) control.open = true;
+      if (sql === 'COMMIT' || sql === 'ROLLBACK') control.open = false;
+      if (sql === 'COMMIT' && control.holdMs) {
+        control.commits.push(Date.now());
+        return new Promise(resolve => setTimeout(resolve, control.holdMs)).then(() => query(sql, ...rest));
+      }
+      return query(sql, ...rest);
+    };
+  });
+  const ownSpaces = new PostgresSpaces(pool, new Map([['cell-a', { pool, storageTargetId: 'target-a' }]]), 'cell-a',
+    new AuthFnAgentKeys(config), provider, randomBytes(32));
+  return { control, jobs: new PostgresAnalysisJobs(ownSpaces, new Map([['cell-a', { pool: own }]])) };
+}
+
+test('a job reply is released only while the key, grant and provider credential it relied on are unexpired at COMMIT', async () => {
+  const f = await fixture();
+  await f.bulk(generic(20));
+  const { control, jobs } = fenced();
+  const reads = { page: (actor, jobId) => jobs.page(actor, f.spaceId, 'items', jobId, 1),
+    status: (actor, jobId) => jobs.status(actor, f.spaceId, 'items', jobId) };
+  /** `read` with COMMIT held 1.5 s past the moment `lapse` makes an expiry 0.8 s ahead; the final check ran before it. */
+  const heldPast = async (read, lapse) => {
+    control.commits = [];
+    const set = Date.now();
+    await lapse();
+    control.holdMs = 1_500;
+    try { return await read(); } finally {
+      control.holdMs = 0;
+      assert.equal(control.commits.length, 1, 'COMMIT was held');
+      assert.ok(control.commits[0] - set < 800, `the final check ran before the expiry (${control.commits[0] - set} ms)`);
+    }
+  };
+  for (const [lapsed, table] of [['grant', 'collection_grants'], ['key', 'space_credentials']]) {
+    for (const [name, read] of Object.entries(reads)) {
+      const key = await f.agent(['export:read']);
+      const job = await jobs.submit(key.actor, f.spaceId, 'items', 'export');
+      await drain();
+      // Unexpired at COMMIT: the same held COMMIT releases the reply.
+      assert.equal((await heldPast(() => read(key.actor, job.jobId), async () => {})).jobId, job.jobId, `${name} control`);
+      await rejects(heldPast(() => read(key.actor, job.jobId), () => pool.query(`UPDATE ${table}
+        SET expires_at=clock_timestamp()+interval '800 milliseconds' WHERE credential_id=$1`, [key.actor.credentialId])),
+      'FORBIDDEN', `${name} with its ${lapsed} lapsed before COMMIT`);
+    }
+  }
+  // A provider credential (here the owner's session) whose stated expiry passes before COMMIT: reads and the submission.
+  const job = await jobs.submit(f.owner, f.spaceId, 'items', 'export');
+  await drain();
+  for (const [name, read] of Object.entries({ ...reads, submit: () => jobs.submit(f.owner, f.spaceId, 'items', 'export') })) {
+    try {
+      await rejects(heldPast(() => read(f.owner, job.jobId), async () => { control.providerUntil = Date.now() + 800; }), 'FORBIDDEN',
+        `${name} with the provider credential lapsed before COMMIT`);
+    } finally { control.providerUntil = null; }
+  }
+  assert.equal((await jobs.page(f.owner, f.spaceId, 'items', job.jobId, 1)).complete, true);
+});
+
+test('a stalled final provider check fails a job read or submission within its bound, and its late answer runs nothing', async t => {
+  const f = await fixture();
+  await f.bulk(generic(20));
+  const { control, jobs } = fenced();
+  const job = await jobs.submit(f.owner, f.spaceId, 'items', 'export');
+  await drain();
+  const unhandled = [], onUnhandled = reason => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  t.after(() => process.off('unhandledRejection', onUnhandled));
+  const recheckMs = aggregationBounds.statementMs;
+  const bounded = promise => {
+    let timer;
+    const waiting = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('the request is still waiting')), recheckMs + 3_000); });
+    return Promise.race([promise, waiting]).finally(() => clearTimeout(timer));
+  };
+  const jobCount = async () => (await pool.query('SELECT count(*)::int AS n FROM analysis_jobs WHERE space_id=$1', [f.spaceId])).rows[0].n;
+  const calls = { page: () => jobs.page(f.owner, f.spaceId, 'items', job.jobId, 1), submit: () => jobs.submit(f.owner, f.spaceId, 'items', 'export') };
+  for (const [[name, call], late] of [[Object.entries(calls)[0], 'success'], [Object.entries(calls)[1], 'fail']]) {
+    const before = await jobCount();
+    control.stall = true;
+    const started = performance.now();
+    await assert.rejects(bounded(call()), error => {
+      assert.equal(error.code, 'PROVIDER_UNAVAILABLE', `${name} ${error.message}`);
+      assert.equal(error.retryable, true);
+      return true;
+    });
+    control.stall = false;
+    assert.ok(performance.now() - started >= recheckMs - 5, `${name} waited for the provider`);
+    assert.equal(control.held.length, 1, `${name}: the final check was held`);
+    // Rolled back and given back: the one session is not left in a transaction, and nothing of a submission stays.
+    const state = (await pool.query('SELECT state FROM pg_stat_activity WHERE pid=$1', [control.pid])).rows[0]?.state ?? 'closed';
+    assert.notEqual(state, 'idle in transaction', name);
+    assert.equal(await jobCount(), before, `${name} left no job`);
+    // The provider answers late: that answer runs no statement on the released session.
+    const queries = control.queries;
+    control.held.shift()(late);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(control.queries, queries, `${name}: a late ${late} ran a statement`);
+    // The next request on the same one-connection pool succeeds.
+    assert.equal((await bounded(jobs.page(f.owner, f.spaceId, 'items', job.jobId, 1))).complete, true, `${name} then a page`);
+  }
+  assert.deepEqual(unhandled, []);
+});
+
+test('exports page in record ID byte order whatever the database collation, straight through and resumed', async () => {
+  const f = await fixture();
+  await services.collections.define(f.owner, f.spaceId, 'plain', JSON.stringify({ slug: 'plain', version: 1,
+    schema: { $schema: 'https://json-schema.org/draft/2020-12/schema', type: 'object', additionalProperties: false,
+      properties: { note: { type: 'string' } } }, unique: [], filterable: [], sortable: [] }));
+  // IDs the default collation (en_US.utf8 here) orders apart from byte order: case-insensitively, `a2` before `B3`.
+  const ids = Array.from({ length: 1_200 }, (_, i) => `${i % 2 ? 'a' : 'B'}${String(i).padStart(5, '0')}`);
+  const same = (await pool.query(`SELECT array_agg(id ORDER BY id) = array_agg(id ORDER BY id COLLATE "C") AS same
+    FROM unnest($1::text[]) id`, [ids])).rows[0].same;
+  console.log(`the default collation orders these IDs ${same ? 'as' : 'unlike'} byte order`);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`INSERT INTO records(space_id,collection_id,record_id,revision,schema_version,key_mode,normalized_key,canonical_data,data)
+      SELECT $1,'plain',id,1,1,'generated',id,format('{"note":%s}',to_json(id)),jsonb_build_object('note',id) FROM unnest($2::text[]) id`,
+    [f.spaceId, ids]);
+    await client.query(`INSERT INTO record_events(event_id,space_id,collection_id,record_id,revision,operation,credential_id,schema_version,
+        canonical_data) SELECT 'evt_'||md5($1||id),$1,'plain',id,1,'create','test',1,format('{"note":%s}',to_json(id)) FROM unnest($2::text[]) id`,
+    [f.spaceId, ids]);
+    await client.query('COMMIT');
+  } finally { client.release(); }
+  const straight = await services.analysis.submit(f.owner, f.spaceId, 'plain', 'export');
+  const resumed = await services.analysis.submit(f.owner, f.spaceId, 'plain', 'export');
+  const hold = await pool.connect();
+  try {
+    await hold.query('BEGIN');
+    await hold.query('SELECT 1 FROM analysis_jobs WHERE job_id=$1 FOR UPDATE', [resumed.jobId]);
+    await drain();
+  } finally { await hold.query('ROLLBACK'); hold.release(); }
+  // The resumed job commits its first page, then its isolate is lost at the second checkpoint.
+  let checkpoints = 0;
+  await worker(sql => {
+    if (/SET cursor_record_id=/.test(sql) && ++checkpoints === 2) throw new Error('isolate lost');
+    if (/leased_until=clock_timestamp\(\) WHERE/.test(sql)) throw new Error('isolate lost');
+  }).step({ budgetMs: 3_000 }).catch(error => { if (error.message !== 'isolate lost') throw error; });
+  await lapse([resumed.jobId]);
+  assert.equal(Number((await pool.query('SELECT records_scanned FROM analysis_jobs WHERE job_id=$1', [resumed.jobId])).rows[0].records_scanned), 1_000);
+  await drain();
+  const bytes = [...ids].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+  const one = await result(f.owner, f.spaceId, straight.jobId, 'plain'), two = await result(f.owner, f.spaceId, resumed.jobId, 'plain');
+  const order = pages => pages.flatMap(page => page.page.content.trimEnd().split('\n').map(line => JSON.parse(line).id));
+  assert.deepEqual(order(one.pages), bytes);
+  assert.deepEqual(one.pages.map(page => page.page.rowCount), [1_000, 200]);
+  assert.ok(two.status.progress.attempts > 1);
+  assert.deepEqual(two.status.manifest, one.status.manifest);
+  assert.deepEqual(two.pages.map(page => page.page), one.pages.map(page => page.page));
 });

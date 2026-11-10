@@ -2,8 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { Capability, VerifiedCredential } from '@stateplane/contracts';
 import { AuthorityError, AuthorityTransaction, predicateFilter } from './index.js';
 import type { AuthorityScope } from './index.js';
-import { admit, aggregationBounds, analyticalSlots, declarations, describe, formatGroups, jsonBytes, parse, statement,
-  zones } from './aggregations.js';
+import { admit, aggregationBounds, analyticalSlots, declarations, describe, formatGroups, jsonBytes, parse, recheckWithin,
+  statement, zones } from './aggregations.js';
 import type { Declared, Spec, ValueKind } from './aggregations.js';
 import { bounded, DeadlineExceededError, inTransaction } from './faults.js';
 import type { PoolLike, Session } from './faults.js';
@@ -95,6 +95,60 @@ function view(row: Row): AnalysisJobStatus {
     budgets: { records: Number(row.budget_records), bytes: Number(row.budget_bytes), runtimeMs: Number(row.budget_runtime_ms) },
     createdAt: iso(row.created_at)!, startedAt: iso(row.started_at), finishedAt: iso(row.finished_at), expiresAt: iso(row.expires_at)!,
     manifest: sealed, complete: sealed !== null };
+}
+
+/**
+ * When the caller's access lapses, as search states it: `monotonic`, the
+ * earliest expiry on `performance.now()`'s clock, each measured from before
+ * its read, and `wallUntil`, the provider credential's own absolute expiry
+ * (Infinity when none), so a wall-clock step past it is caught too.
+ */
+interface Deadline { monotonic: number; wallUntil: number }
+const lapsed = (deadline: Deadline) => performance.now() >= deadline.monotonic || Date.now() >= deadline.wallUntil;
+/** The final credential check's bound, STA-58's: its provider call and statement together. */
+const RECHECK_MS = aggregationBounds.statementMs;
+
+/**
+ * The final credential check of a job transaction, after its last read:
+ * the provider confirms the credential (a session or a key) with its expiry,
+ * then, for a key, one statement against one clock reading confirms the
+ * regional key and its grant of `capability` on the collection. Bounded as
+ * STA-58's recheck: past `RECHECK_MS` the request fails with retryable
+ * PROVIDER_UNAVAILABLE and rolls back, and a late provider answer runs no
+ * statement. Returns the `Deadline` the caller requires unexpired once COMMIT
+ * is acknowledged: locks fence revocation, not time.
+ */
+async function finalCheck(spaces: PostgresSpaces, db: Db, actor: VerifiedCredential, ownerPrincipalId: string,
+  scope: Readonly<AuthorityScope>, capability: Capability): Promise<Deadline> {
+  await db.query(`SET LOCAL statement_timeout = '${RECHECK_MS}ms'`);
+  let deadline: Deadline = { monotonic: -Infinity, wallUntil: -Infinity };
+  await recheckWithin(RECHECK_MS, db, async session => {
+    const started = performance.now(), wall = Date.now();
+    const until = await spaces.assertCurrentUntil(actor, ownerPrincipalId);
+    const provider = until === null ? Infinity : started + until - wall, wallUntil = until ?? Infinity;
+    if (actor.kind !== 'api-key') { deadline = { monotonic: provider, wallUntil }; return; }
+    const at = performance.now();
+    // The latest-lasting grant holding the capability; the key's expiry is finite, so the earlier of the two is too.
+    const row = (await session.query(`WITH t AS MATERIALIZED (SELECT clock_timestamp() AS now)
+      SELECT EXTRACT(EPOCH FROM LEAST(sc.expires_at,g.until)-t.now)*1000 AS remaining_ms
+      FROM t CROSS JOIN space_credentials sc
+      CROSS JOIN LATERAL (SELECT max(COALESCE(g.expires_at,'infinity'::timestamptz)) AS until FROM collection_grants g
+        JOIN collections c ON c.space_id=g.space_id AND c.collection_id=g.collection_id
+        WHERE g.space_id=sc.space_id AND g.credential_id=sc.credential_id AND g.collection_id=$4 AND $5::text=ANY(g.capabilities)
+          AND c.lifecycle<>'deleted' AND (g.expires_at IS NULL OR g.expires_at>t.now)) g
+      WHERE sc.space_id=$1 AND sc.credential_id=$2 AND sc.owner_principal_id=$3 AND sc.activated_at IS NOT NULL
+        AND sc.confirmed_at IS NOT NULL AND sc.revoked_at IS NULL AND sc.expires_at>t.now AND g.until IS NOT NULL`,
+    [scope.spaceId, actor.credentialId, ownerPrincipalId, scope.collectionId, capability])).rows[0];
+    const remainingMs = Number(row?.remaining_ms);
+    if (!Number.isFinite(remainingMs) || remainingMs <= 0) throw new AuthorityError('FORBIDDEN');
+    deadline = { monotonic: Math.min(provider, at + remainingMs), wallUntil };
+  });
+  return deadline;
+}
+/** A reply is released only while the access its final check relied on is unexpired, once COMMIT was acknowledged. */
+function released<T>({ value, deadline }: { value: T; deadline: Deadline }): T {
+  if (lapsed(deadline)) throw new AuthorityError('FORBIDDEN', 'Access expired before the request committed');
+  return value;
 }
 
 /** Remove an ended job's pages and manifest: cancelled, failed and expired results are never read again. */
@@ -208,10 +262,10 @@ export class PostgresAnalysisJobs {
         [spaceId, collectionId, `anj_${randomUUID()}`, kind, scope.principalId, actor.credentialId, capability, scope.policyVersion,
           scope.placementGeneration, watermark, canonical, sha256(canonical), analysisJobBounds.budgetRecords,
           analysisJobBounds.budgetBytes, analysisJobBounds.budgetRuntimeMs, analysisJobBounds.lifetimeMs])).rows[0];
-        await this.spaces.assertScopeCurrent(actor, admitted.ownerPrincipalId, scope, db, collectionId, [capability]);
-        return view({ ...inserted, effective: inserted.state, pages_written: 0 });
+        return { value: view({ ...inserted, effective: inserted.state, pages_written: 0 }),
+          deadline: await finalCheck(this.spaces, db, actor, admitted.ownerPrincipalId, scope, capability) };
       });
-      if (submitted) return submitted;
+      if (submitted) return released(submitted);
     }
     throw new AuthorityError('BACKPRESSURE', 'The collection has more unpublished events than one submission publishes; retry',
       undefined, true);
@@ -269,13 +323,14 @@ export class PostgresAnalysisJobs {
   /**
    * Authorize a read of the caller's own job: the directory and credential,
    * then the scope locks and grant for the job's capability, and, after `run`,
-   * the credential again inside the same transaction, as every read is.
+   * the bounded final check inside the same transaction, whose deadline must
+   * still lie ahead once COMMIT is acknowledged.
    */
   private async access<T>(actor: VerifiedCredential, spaceId: string, collectionId: string, jobId: string,
     run: (db: Db, key: string[]) => Promise<T>): Promise<T> {
     if (typeof jobId !== 'string' || !JOB_ID.test(jobId)) throw new AuthorityError('NOT_FOUND');
     const admitted = await this.spaces.scope(actor, spaceId, collectionId, 'records:read');
-    return transact(this.pool(admitted.cellId), async db => {
+    return released(await transact(this.pool(admitted.cellId), async db => {
       const key = [spaceId, collectionId, jobId];
       const job = (await db.query(`SELECT principal_id,credential_id,capability FROM analysis_jobs
         WHERE space_id=$1 AND collection_id=$2 AND job_id=$3`, key)).rows[0];
@@ -286,9 +341,8 @@ export class PostgresAnalysisJobs {
       const tx = new AuthorityTransaction(db, scope, 1);
       try { await tx.checkScope(); } finally { tx.close(); }
       const value = await run(db, key);
-      await this.spaces.assertScopeCurrent(actor, admitted.ownerPrincipalId, scope, db, collectionId, [job.capability]);
-      return value;
-    });
+      return { value, deadline: await finalCheck(this.spaces, db, actor, admitted.ownerPrincipalId, scope, job.capability) };
+    }));
   }
 }
 
@@ -312,7 +366,9 @@ async function binding(db: Session, job: Row): Promise<string | null> {
 
 /**
  * The collection's records that existed at `watermark`, after `cursor`, in
- * key order: each one's highest revision published at or below it (migration
+ * record ID byte order (`COLLATE "C"` throughout, read through migration
+ * 050's index, so neither page cuts nor output depend on the database's
+ * default collation): each one's highest revision published at or below it (migration
  * 049's as-of index), with its operation and canonical data. A record first
  * written later is no candidate at all, so it takes no place in the `limit`
  * and pages cut the same whatever is written after the watermark. At most
@@ -321,14 +377,15 @@ async function binding(db: Session, job: Row): Promise<string | null> {
  */
 async function asOf(db: Session, job: Row, cursor: string, limit: number, bytes: number): Promise<Row[]> {
   return (await db.query(`SELECT * FROM (
-      SELECT x.*,sum(octet_length(COALESCE(x.canonical_data,''))) OVER (ORDER BY x.record_id) AS running FROM (
+      SELECT x.*,sum(octet_length(COALESCE(x.canonical_data,''))) OVER (ORDER BY x.record_id COLLATE "C") AS running FROM (
         SELECT r.record_id,e.revision,e.operation,e.canonical_data FROM records r
         CROSS JOIN LATERAL (SELECT f.revision FROM record_event_feed f WHERE f.space_id=r.space_id AND f.collection_id=r.collection_id
           AND f.record_id=r.record_id AND f.position<=$3 ORDER BY f.revision DESC LIMIT 1) a
         JOIN record_events e ON e.space_id=r.space_id AND e.collection_id=r.collection_id AND e.record_id=r.record_id
           AND e.revision=a.revision
-        WHERE r.space_id=$1 AND r.collection_id=$2 AND r.record_id>$4 ORDER BY r.record_id LIMIT $5) x
-    ) y WHERE y.running-octet_length(COALESCE(y.canonical_data,''))<$6 ORDER BY y.record_id`,
+        WHERE r.space_id=$1 AND r.collection_id=$2 AND r.record_id COLLATE "C">$4::text COLLATE "C"
+        ORDER BY r.record_id COLLATE "C" LIMIT $5) x
+    ) y WHERE y.running-octet_length(COALESCE(y.canonical_data,''))<$6 ORDER BY y.record_id COLLATE "C"`,
   [job.space_id, job.collection_id, job.watermark, cursor, limit, bytes])).rows;
 }
 

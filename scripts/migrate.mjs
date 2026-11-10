@@ -156,7 +156,8 @@ try {
   // row: the next run drops it concurrently, builds again, and records the
   // file only once the index is valid. The session advisory lock keeps any
   // other migrator from building or dropping it meanwhile.
-  const concurrentIndexes = new Map([['047_retrieval_outbox_age.sql', 'public.retrieval_outbox_age']]);
+  const concurrentIndexes = new Map([['047_retrieval_outbox_age.sql', 'public.retrieval_outbox_age'],
+    ['050_records_byte_order.sql', 'public.records_byte_order']]);
   const indexValid = async index => (await client.query(
     'SELECT indisvalid AS valid FROM pg_index WHERE indexrelid = to_regclass($1)', [index])).rows[0]?.valid;
   const buildConcurrentIndex = async (name, sql, index) => {
