@@ -28,7 +28,7 @@ export interface AggregationOptions {
 }
 export type AggregationUnit = 'hour' | 'day' | 'week' | 'month' | 'quarter' | 'year';
 export type AggregationOperator = 'count' | 'sum' | 'avg' | 'min' | 'max';
-type ValueKind = 'string' | 'number' | 'boolean' | 'date-time';
+export type ValueKind = 'string' | 'number' | 'boolean' | 'date-time';
 /** One group's value of one `groupBy` dimension; a time bucket's value is its start instant, with its local wall time. */
 export type GroupKey = { kind: 'missing' } | { kind: 'null' } | { kind: 'value'; value: string | number | boolean; local?: string };
 /**
@@ -96,7 +96,7 @@ function distinct<T>(values: readonly T[]): T[] {
  * array slots, own object fields, primitives), computed without consulting any
  * toJSON or iterator, so a hook cannot shrink what the byte cap measures.
  */
-function jsonBytes(value: unknown): number {
+export function jsonBytes(value: unknown): number {
   if (value === null || typeof value !== 'object') return utf8Bytes(primitiveJson(value as string | number | boolean | null));
   let bytes = 2, first = true;
   if (isArray(value)) {
@@ -150,8 +150,8 @@ const ZONE = /^[A-Za-z][A-Za-z0-9_+-]*(?:\/[A-Za-z0-9_+-]+)*$/;
 
 interface Dimension { field: string; bucket: { unit: AggregationUnit; timeZone: string } | null }
 interface Metric { op: AggregationOperator; field: string | null }
-interface Spec { where: readonly ScalarPredicate[]; groupBy: Dimension[]; metrics: Metric[]; maxGroups: number }
-interface Declared { kind: ValueKind; ready: boolean; filterable: boolean; acceptedVersion: number }
+export interface Spec { where: readonly ScalarPredicate[]; groupBy: Dimension[]; metrics: Metric[]; maxGroups: number }
+export interface Declared { kind: ValueKind; ready: boolean; filterable: boolean; acceptedVersion: number }
 
 /** A plain array's own items, read by index without an inherited iterator. */
 function items(value: unknown, min: number, max: number, name: string, trustedParsed: boolean): unknown[] {
@@ -185,7 +185,7 @@ function timeZone(value: unknown): string {
  * the runtime detects proxies; `trustedParsed` data, just parsed from JSON
  * text, everywhere.
  */
-function parse(request: unknown, trustedParsed: boolean): Spec {
+export function parse(request: unknown, trustedParsed: boolean): Spec {
   const input = fields(request, ['where', 'groupBy', 'metrics', 'maxGroups'], ['metrics'], trustedParsed);
   const where = input.where === undefined ? [] : snapshotPredicates(input.where as ScalarPredicate[], trustedParsed);
   const groupBy = input.groupBy === undefined ? [] : each(items(input.groupBy, 0, aggregationBounds.groupBy, 'groupBy', trustedParsed), item => {
@@ -214,7 +214,7 @@ function parse(request: unknown, trustedParsed: boolean): Spec {
 }
 
 /** Check every field against its ready declaration and every operator against its kind. */
-function admit(spec: Spec, declared: ReadonlyMap<string, Declared>): void {
+export function admit(spec: Spec, declared: ReadonlyMap<string, Declared>): void {
   for (let i = 0; i < spec.where.length; i++) {
     const predicate = spec.where[i], declaration = mapGet(declared, predicate.field);
     if (!declaration?.ready || !declaration.filterable || (predicate.kind !== 'null' && declaration.kind !== predicate.kind))
@@ -256,7 +256,8 @@ const instant = (alias: string) => `(CASE WHEN substr(${alias}.time_value,18,2)=
  * So a result it refuses is over the byte cap, and it never sends one far
  * past it.
  */
-function statement(scope: Readonly<AuthorityScope>, spec: Spec, declared: ReadonlyMap<string, Declared>) {
+export function statement(scope: Readonly<AuthorityScope>, spec: Spec, declared: ReadonlyMap<string, Declared>,
+  resultBytes: number = aggregationBounds.resultBytes) {
   const { params, where } = predicateFilter(scope, spec.where);
   const bind = (value: unknown) => { append(params, value); return `$${params.length}`; };
   const aliases = new NativeMap<string, string>(), aliased: string[] = [];
@@ -312,7 +313,7 @@ function statement(scope: Readonly<AuthorityScope>, spec: Spec, declared: Readon
   const consistent = each(aliased, name =>
     `COALESCE(${mapGet(aliases, name)!}.value_kind IN (${bind(kindOf(name))},'null','missing'),false)`);
   append(grouped, `bool_or(NOT (${consistent.length ? joined(consistent, ' AND ') : 'true'})) AS inconsistent`);
-  const maxGroups = bind(spec.maxGroups), maxBytes = bind(aggregationBounds.resultBytes);
+  const maxGroups = bind(spec.maxGroups), maxBytes = bind(resultBytes);
   const sql = `WITH grouped AS (
       SELECT ${joined(grouped, ',')} FROM records r ${joined(joins, ' ')}
       WHERE ${where}${keys.length ? ` GROUP BY ${joined(keys, ',')}` : ''}
@@ -386,6 +387,48 @@ function offset(seconds: number): string {
   return `${sign}${part(floorDivide(magnitude, 3600))}:${part(floorDivide(magnitude, 60) % 60)}${rest}`;
 }
 
+/**
+ * The groups of rows of the aggregate statement's shape (`k`, `v`, `e` and `o` per dimension, `n`, and `m` with its
+ * value, null and missing counts per metric), in the rows' order, formatted as a result returns them.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- driver rows, read by column name
+export function formatGroups(spec: Spec, kindOf: (name: string) => ValueKind, rows: readonly Record<string, any>[]):
+  AggregationResult['groups'] {
+  return each(rows, row => ({
+    key: each(spec.groupBy, (dimension, i): GroupKey => {
+      if (row[`k${i}`] === 'null' || row[`k${i}`] === 'missing') return { kind: row[`k${i}`] };
+      if (dimension.bucket) {
+        const start = NativeNumber(row[`e${i}`]), shift = NativeNumber(row[`o${i}`]);
+        return { kind: 'value', value: `${wallTime(start)}Z`, local: `${wallTime(start + shift)}${offset(shift)}` };
+      }
+      const kind = kindOf(dimension.field);
+      return { kind: 'value', value: kind === 'number' ? NativeNumber(row[`v${i}`]) : row[`v${i}`] };
+    }),
+    count: NativeNumber(row.n),
+    metrics: each(spec.metrics, (metric, j): AggregationMetricValue => {
+      if (metric.field === null) return { value: NativeNumber(row[`m${j}`]), values: null, nulls: null, missing: null };
+      const raw = row[`m${j}`] as string | null, values = NativeNumber(row[`m${j}_values`]);
+      let value: string | number | null = raw;
+      if (raw !== null && metric.op === 'sum') value = decimal(raw);
+      else if (metric.op === 'avg') value = roundedAverage(raw ?? '0', values);
+      else if (raw !== null && kindOf(metric.field) === 'number') value = NativeNumber(raw);
+      else if (raw !== null && kindOf(metric.field) === 'date-time') value = `${raw}Z`;
+      if (metric.op === 'sum' && raw === null) value = '0';
+      return { value, values, nulls: NativeNumber(row[`m${j}_nulls`]), missing: NativeNumber(row[`m${j}_missing`]) };
+    })
+  }));
+}
+
+/** Each dimension's and metric's semantics, as a result reports them. */
+export function describe(spec: Spec, kindOf: (name: string) => ValueKind): Pick<AggregationResult, 'groupBy' | 'metrics'> {
+  return {
+    groupBy: each(spec.groupBy, dimension => ({ field: dimension.field, kind: kindOf(dimension.field), bucket: dimension.bucket,
+      semantics: dimension.bucket ? 'derived' : 'exact' })),
+    metrics: each(spec.metrics, metric => ({ op: metric.op, field: metric.field, semantics: metric.op === 'avg' ? 'derived' : 'exact',
+      precision: metric.op === 'avg' ? `${aggregationBounds.averageDigits} significant digits, half away from zero` : null }))
+  };
+}
+
 /** Zone names that are also abbreviations of UTC itself: their IANA zones are UTC at every instant. */
 const UTC_NAMES: readonly string[] = freeze(['utc', 'uct', 'zulu', 'gmt']);
 /**
@@ -396,7 +439,7 @@ const UTC_NAMES: readonly string[] = freeze(['utc', 'uct', 'zulu', 'gmt']);
  * except UTC, UCT, Zulu and GMT, which name UTC either way and become
  * `Etc/UTC`; so is a name the database's time zone database does not know.
  */
-async function zones(db: Db, spec: Spec): Promise<Spec> {
+export async function zones(db: Db, spec: Spec): Promise<Spec> {
   const names: string[] = [];
   for (let i = 0; i < spec.groupBy.length; i++) {
     const bucket = spec.groupBy[i].bucket;
@@ -450,7 +493,7 @@ async function provision(db: Db, scope: Readonly<AuthorityScope>, cellId: string
 }
 
 /** The collection's schema version and the declaration of every field the spec filters, groups or measures. */
-async function declarations(db: Db, scope: Readonly<AuthorityScope>, spec: Spec) {
+export async function declarations(db: Db, scope: Readonly<AuthorityScope>, spec: Spec) {
   const named: string[] = [];
   for (let i = 0; i < spec.where.length; i++) append(named, spec.where[i].field);
   for (let i = 0; i < spec.groupBy.length; i++) append(named, spec.groupBy[i].field);
@@ -668,29 +711,7 @@ export class PostgresAggregations {
     const overBytes = () => new AggregationLimitError('bytes', `The aggregation's groups exceed ${aggregationBounds.resultBytes} bytes`);
     if (NativeNumber(totals.total_bytes) > aggregationBounds.resultBytes) throw overBytes();
     const kindOf = (name: string) => mapGet(declared, name)!.kind;
-    const groups = groupCount === 0 ? [] : each(result.rows, row => ({
-      key: each(spec.groupBy, (dimension, i): GroupKey => {
-        if (row[`k${i}`] === 'null' || row[`k${i}`] === 'missing') return { kind: row[`k${i}`] };
-        if (dimension.bucket) {
-          const start = NativeNumber(row[`e${i}`]), shift = NativeNumber(row[`o${i}`]);
-          return { kind: 'value', value: `${wallTime(start)}Z`, local: `${wallTime(start + shift)}${offset(shift)}` };
-        }
-        const kind = kindOf(dimension.field);
-        return { kind: 'value', value: kind === 'number' ? NativeNumber(row[`v${i}`]) : row[`v${i}`] };
-      }),
-      count: NativeNumber(row.n),
-      metrics: each(spec.metrics, (metric, j): AggregationMetricValue => {
-        if (metric.field === null) return { value: NativeNumber(row[`m${j}`]), values: null, nulls: null, missing: null };
-        const raw = row[`m${j}`] as string | null, values = NativeNumber(row[`m${j}_values`]);
-        let value: string | number | null = raw;
-        if (raw !== null && metric.op === 'sum') value = decimal(raw);
-        else if (metric.op === 'avg') value = roundedAverage(raw ?? '0', values);
-        else if (raw !== null && kindOf(metric.field) === 'number') value = NativeNumber(raw);
-        else if (raw !== null && kindOf(metric.field) === 'date-time') value = `${raw}Z`;
-        if (metric.op === 'sum' && raw === null) value = '0';
-        return { value, values, nulls: NativeNumber(row[`m${j}_nulls`]), missing: NativeNumber(row[`m${j}_missing`]) };
-      })
-    }));
+    const groups = groupCount === 0 ? [] : formatGroups(spec, kindOf, result.rows);
     // The cap holds for every returned key and metric value, counts and rounded averages included, measured as the
     // groups' JSON text without any toJSON hook.
     if (jsonBytes(groups) > aggregationBounds.resultBytes) throw overBytes();
@@ -702,16 +723,14 @@ export class PostgresAggregations {
     for (let i = 0; i < spec.metrics.length; i++) if (spec.metrics[i].field !== null) append(measured, spec.metrics[i].field!);
     for (let i = 0; i < spec.where.length; i++) append(measured, spec.where[i].field);
     const used = distinct(measured);
+    const described = describe(spec, kindOf);
     return {
       source: { spaceId: scope.spaceId, collectionId: scope.collectionId, records: 'live', where: each(spec.where, item => item),
         policyVersion: scope.policyVersion, placementGeneration: scope.placementGeneration },
       collection: { schemaVersion, fields: each(used, name => ({ field: name, kind: kindOf(name),
         acceptedVersion: mapGet(declared, name)!.acceptedVersion })) },
       snapshot: { scope: 'statement', takenAt: isoString(totals.taken_at as Date) },
-      groupBy: each(spec.groupBy, dimension => ({ field: dimension.field, kind: kindOf(dimension.field), bucket: dimension.bucket,
-        semantics: dimension.bucket ? 'derived' : 'exact' })),
-      metrics: each(spec.metrics, metric => ({ op: metric.op, field: metric.field, semantics: metric.op === 'avg' ? 'derived' : 'exact',
-        precision: metric.op === 'avg' ? `${aggregationBounds.averageDigits} significant digits, half away from zero` : null })),
+      groupBy: described.groupBy, metrics: described.metrics,
       groups, complete: true
     };
   }

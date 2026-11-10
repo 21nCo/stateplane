@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({ closed: 0, connected: 0, failClose: false, denyGrants: false, denyCatalog: false, ownsObject: false, denyVector: false, wrongIdentity: false }));
-const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[], reconcileError: undefined as Error | undefined, uploadPages: [] as number[], uploadSteps: [] as number[], uploadError: undefined as Error | undefined, uploadBudgets: [] as number[], sweeps: [] as number[][], erasures: [] as number[][], originals: [] as unknown[], active: 0, peak: 0, poolInstances: [] as { emit(event: string, error: Error): boolean }[], projectors: [] as unknown[], retrievalSteps: [] as unknown[], rebuildSteps: [] as unknown[], retrievalError: undefined as Error | undefined, skew: 0, lag: {} as Record<string, number>, bounds: [] as [string, number][], hangEnd: false }));
+const cell = vi.hoisted(() => ({ pools: 0, ended: 0, poolOptions: [] as unknown[], claims: [] as unknown[][], released: [] as unknown[], stepped: 0, processed: [] as unknown[], reconcileError: undefined as Error | undefined, uploadPages: [] as number[], uploadSteps: [] as number[], uploadError: undefined as Error | undefined, uploadBudgets: [] as number[], sweeps: [] as number[][], erasures: [] as number[][], originals: [] as unknown[], active: 0, peak: 0, poolInstances: [] as { emit(event: string, error: Error): boolean }[], projectors: [] as unknown[], retrievalSteps: [] as unknown[], rebuildSteps: [] as unknown[], analysisSteps: [] as unknown[], analysisLimits: [] as unknown[], analysisError: undefined as Error | undefined, retrievalError: undefined as Error | undefined, skew: 0, lag: {} as Record<string, number>, bounds: [] as [string, number][], hangEnd: false }));
 // A simulated step: it takes `cell.lag[step]` ms of the simulated clock, but never past `until`, where its store cuts it short.
 const spend = (step: string, until: number) => {
   const cut = Date.now() + (cell.lag[step] ?? 0) > until;
@@ -14,6 +14,13 @@ vi.mock('@stateplane/postgres', async importOriginal => ({
   RecordRetrievalProjector: class { constructor(pool: unknown) { cell.projectors.push(pool); } },
   PostgresRetrievalWorker: class {
     async step(options: { budgetMs: number }) { cell.retrievalSteps.push(options); spend('retrieval', Date.now() + options.budgetMs + 1_000); if (cell.retrievalError) throw cell.retrievalError; return {}; }
+  },
+  PostgresAnalysisWorker: class {
+    constructor(_pool: unknown, options: { originConnectionLimit: number }) {
+      if (!Number.isSafeInteger(options.originConnectionLimit)) throw new RangeError('Invalid origin connection limit');
+      cell.analysisLimits.push(options.originConnectionLimit);
+    }
+    async step(options: { budgetMs: number }) { cell.analysisSteps.push(options); spend('analysis', Date.now() + options.budgetMs + 1_000); if (cell.analysisError) throw cell.analysisError; return {}; }
   },
   PostgresProjectionGenerations: class {
     async step(options: { budgetMs: number }) { cell.rebuildSteps.push(options); spend('rebuild', Date.now() + options.budgetMs + 1_000); return {}; }
@@ -81,7 +88,7 @@ function batch(bodies: unknown[]) {
   return { settled, value: { messages } as never };
 }
 const jobsEnv = (sendBatch = vi.fn(async () => ({}))) => ({ AUTHORITY: { connectionString: 'postgres://example/cell' },
-  PROJECTION_JOBS: { sendBatch }, ORIGINALS: { head: vi.fn() } }) as never;
+  PROJECTION_JOBS: { sendBatch }, ORIGINALS: { head: vi.fn() }, STATEPLANE_ORIGIN_CONNECTION_LIMIT: '5' }) as never;
 
 describe('cell jobs Worker', () => {
   it('fails closed without its authority binding so Cloudflare redelivers the batch', async () => {
@@ -156,8 +163,8 @@ describe('cell jobs Worker', () => {
     cell.claims = []; cell.uploadSteps = []; cell.uploadBudgets = []; cell.sweeps = []; cell.erasures = []; cell.uploadPages = [25, 25, 3];
     await jobs.scheduled({} as never, jobsEnv());
     expect(cell.uploadSteps).toEqual([25, 25, 25]);
-    // Each step gets what remains of the 10 s allocation, and one sweep page follows within its own 5 s.
-    expect(cell.uploadBudgets.every((budget, i) => budget > 0 && budget <= 10_000 && (i === 0 || budget <= cell.uploadBudgets[i - 1]))).toBe(true);
+    // Each step gets what remains of the 5 s allocation, and one sweep page follows within its own 5 s.
+    expect(cell.uploadBudgets.every((budget, i) => budget > 0 && budget <= 5_000 && (i === 0 || budget <= cell.uploadBudgets[i - 1]))).toBe(true);
     expect(cell.erasures).toEqual([[25, 5_000]]);
     expect(cell.sweeps).toEqual([[100, 5_000]]);
     cell.uploadSteps = []; cell.uploadPages = [0];
@@ -190,6 +197,21 @@ describe('cell jobs Worker', () => {
     expect(cell.retrievalSteps).toHaveLength(2);
   });
 
+  it('advances analysis jobs last, within 5 s on the cell\'s analytical slots, and reports a missing limit with the tick', async () => {
+    cell.claims = []; cell.analysisSteps = []; cell.analysisLimits = []; cell.retrievalSteps = [];
+    await jobs.scheduled({} as never, jobsEnv());
+    expect([cell.analysisLimits, cell.analysisSteps]).toEqual([[5], [{ budgetMs: 5_000 }]]);
+    const failed = new Error('analysis page statement timeout');
+    cell.analysisError = failed;
+    try { await expect(jobs.scheduled({} as never, jobsEnv())).rejects.toBe(failed); }
+    finally { cell.analysisError = undefined; }
+    // Without the limit only the analysis step fails; every other step still ran on that tick.
+    cell.retrievalSteps = [];
+    const unconfigured = { ...(jobsEnv() as Record<string, unknown>), STATEPLANE_ORIGIN_CONNECTION_LIMIT: undefined } as never;
+    await expect(jobs.scheduled({} as never, unconfigured)).rejects.toThrow('Invalid origin connection limit');
+    expect([cell.retrievalSteps.length, cell.analysisSteps.length]).toEqual([1, 2]);
+  });
+
   it('gives every step its whole budget on every tick, however busy the earlier steps, and ends each tick inside its minute', async () => {
     // A simulated clock: each mocked step takes `cell.lag[step]` ms, cut at the hard end its store or budget sets.
     const real = Date.now.bind(Date);
@@ -198,24 +220,26 @@ describe('cell jobs Worker', () => {
     try {
       // Every step stalls on every tick: a claim and a reconciliation transaction that never finish, uploads,
       // erasure, sweep and the retrieval step using all of their time.
-      cell.lag = { claim: 1e9, reconcile: 1e9, upload: 1e9, erase: 1e9, sweep: 1e9, retrieval: 1e9 };
+      cell.lag = { claim: 1e9, reconcile: 1e9, upload: 1e9, erase: 1e9, sweep: 1e9, retrieval: 1e9, analysis: 1e9 };
       for (let tick = 0; tick < 3; tick++) {
         cell.claims = []; cell.uploadPages = []; cell.uploadBudgets = []; cell.erasures = []; cell.sweeps = []; cell.retrievalSteps = [];
-        cell.rebuildSteps = []; cell.bounds = []; cell.skew = 0;
+        cell.rebuildSteps = []; cell.analysisSteps = []; cell.bounds = []; cell.skew = 0;
         const start = Date.now();
         await jobs.scheduled({} as never, jobsEnv());
         // The claim is bounded by the end of dispatch's 15 s and the reconciliation transaction by its 7 s after.
         const after = (ms: number, expected: number) => ms >= expected && ms < expected + 500;
         expect(cell.bounds.map(([step, deadline]) => [step, after(deadline - start, step === 'claim' ? 15_000 : 22_000)]))
           .toEqual([['claim', true], ['reconcile', true]]);
-        expect(cell.uploadBudgets.map(ms => near(ms, 10_000))).toEqual([true]);
+        expect(cell.uploadBudgets.map(ms => near(ms, 5_000))).toEqual([true]);
         expect(cell.erasures.map(([, ms]) => near(ms, 5_000))).toEqual([true]);
         expect(cell.sweeps.map(([, ms]) => near(ms, 5_000))).toEqual([true]);
         // The retrieval step keeps its whole 8 s: well above an item's 1 s minimum plus its claim.
         expect((cell.retrievalSteps as { budgetMs: number }[]).map(({ budgetMs }) => near(budgetMs, 8_000))).toEqual([true]);
         // Live work used it all, so no rebuild runs.
         expect(cell.rebuildSteps).toEqual([]);
-        // Steps end by 50 s, plus the retrieval step's 1 s cleanup: inside the minute, before the next tick.
+        // Analysis jobs run last, in what the tick leaves: their 5 s less the retrieval step's 1 s settle.
+        expect((cell.analysisSteps as { budgetMs: number }[]).map(({ budgetMs }) => near(budgetMs, 4_000))).toEqual([true]);
+        // Steps end by 50 s, plus the analysis step's 1 s cleanup: inside the minute, before the next tick.
         expect(Date.now() - start).toBeLessThanOrEqual(51_500);
       }
     } finally { clock.mockRestore(); cell.skew = 0; cell.lag = {}; }

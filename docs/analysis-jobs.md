@@ -1,6 +1,6 @@
 # Analysis job storage (STA-57)
 
-Migration `049_analysis_jobs.sql` adds the storage for bounded analytical work: analysis and export jobs pinned to a consistent boundary, their bounded result pages and manifests, analytical concurrency slots per space and per cell, and an as-of reconstruction index over record events by feed position. It is the first of five slices of STA-15. Bounded interactive aggregations ([STA-58](analysis-aggregations.md)) use its analytical slots; the snapshot job worker with submission, status, cancellation and result retrieval (STA-59), measured projections (STA-60) and transports (STA-61) follow. Nothing in this slice runs a job, or is reachable over HTTP, the CLI or MCP.
+Migration `049_analysis_jobs.sql` adds the storage for bounded analytical work: analysis and export jobs pinned to a consistent boundary, their bounded result pages and manifests, analytical concurrency slots per space and per cell, and an as-of reconstruction index over record events by feed position. It is the first of five slices of STA-15. Bounded interactive aggregations ([STA-58](analysis-aggregations.md)) use its analytical slots; [snapshot jobs](#jobs-sta-59) with submission, status, cancellation, result retrieval and the jobs Worker step that runs them (STA-59) are below; measured projections (STA-60) and transports (STA-61) follow. Nothing is reachable over HTTP, the CLI or MCP yet.
 
 The [contract](../contracts/v1.md) requires complete exports and long analyses to use a pinned consistent watermark and a resumable job ID bound to authorization and placement generation, with results reauthorized at fetch. This schema stores that binding and enforces its invariants; the worker that reauthorizes each fetch is STA-59's.
 
@@ -116,3 +116,67 @@ Run `pnpm db:grant-analysis` after migration 049 and after every restore, throug
 `pnpm db:restore-smoke` seeds every analysis table (a completed export with a page and manifest, a running job holding a space slot and a cell slot), compares them across the dump and restore, proves the restored guards and as-of index, and has the restored operational role read each table for erasure and end the running job, which releases its slots. `pnpm db:upgrade-smoke` applies 049 to the 2,000-event upgrade fixture, checks every feed row's backfilled record and revision, plans the as-of lookup and the erasure lookups by index, and compares the upgraded schema with a fresh install. `test/integration/analysis-storage.test.js` (in `pnpm test:postgres`) covers admission and binding, transitions, results and their size bounds, slots, a cancel and a manifest racing a page write in either order under `READ COMMITTED` and `REPEATABLE READ`, slot takings by insert, update and upsert racing each other, endings, space changes and purges, a purge refused above `READ COMMITTED`, a spoofed erasing setting and a slot added after a purge, as-of reconstruction and its plan, erasure through a nonowner role, and a real upgrade from before 048 that commits 048 before 049 waits, rolls 049 back whole when the feed is busy, above its bound or slow past its statement bound (or, drained, past an inherited timeout, reported as such), is refused rather than wait while an erasure repair holds its space, and completes a purge already past its events.
 
 These are local PostgreSQL checks. Railway Postgres acceptance of the migration, the grant script, the restore and the purge through the operational role remains external evidence.
+
+## Jobs (STA-59)
+
+`PostgresAnalysisJobs` (`packages/postgres/src/analysis-jobs.ts`) submits, reports, cancels and serves snapshot jobs; `PostgresAnalysisWorker` is the [jobs Worker step](#worker) that computes them. The application boundary exposes them as `StateplaneServices.analysis.submit`, `status`, `cancel` and `page`; no HTTP, CLI or MCP surface reaches them yet (STA-61).
+
+| Operation | Contract |
+| --- | --- |
+| `submit(actor, space, collection, kind, serialized?)` | `kind` is `export` (needs `export:read`, takes no spec) or `aggregate` (needs `records:read`; `serialized` is an [interactive aggregation](analysis-aggregations.md#spec) spec, parsed, admitted and checked against the declarations exactly as STA-58 does, after the collection is authorized). Returns the queued job's status. |
+| `status(actor, space, collection, job)` | State, failure code, progress (records scanned, step time, claims, pages written), budgets, times, the [boundary](#consistent-boundary), and the manifest once, and only once, the result is complete. |
+| `cancel(actor, space, collection, job)` | A queued job ends `cancelled`, a running one through `cancelling` to `cancelled`, in one transaction: its slots are released and its pages removed at once. A worker writing a page meanwhile finishes it first, then finds the job ended and stops. A job past its expiry ends `expired` instead; a completed or ended job is reported as it is. |
+| `page(actor, space, collection, job, n)` | Page `n` (1 to the manifest's page count) of a complete, unexpired result, with the boundary and manifest. A job without a sealed result is `CONFLICT` (its state says why), a page outside the manifest `NOT_FOUND`, a page number that is not an integer from 1 to 10,000 `INVALID_ARGUMENT`. |
+
+### Consistent boundary
+
+Submission pins the boundary every page and the manifest derive from. In one `READ COMMITTED` transaction that share-locks the space, collection and grant (`AuthorityTransaction.checkScope`), it publishes the collection's pending record events to its feed under the same advisory lock `events()` publishes under, takes the feed's last position as the watermark, and inserts the job with the policy version, placement generation, schema version, principal, credential and capability it was admitted under (migration 049's admission checks them again), then rechecks the credential before commit. One publishing statement sees every pending event committed before it, so every write committed before the submission is at or below the watermark and every later one above it, a multi-record write wholly on one side. A backlog of more than 5,000 unpublished events is published in committed rounds of 5,000, at most 20 per submission; past that the submission is refused with retryable `BACKPRESSURE` and the next one continues where it stopped.
+
+The result is the collection's records as of the watermark ([as-of reconstruction](#as-of-reconstruction)): each record at its highest revision published at or below it, a record whose revision there is a delete excluded, a record first written later absent. It is never `updatedAt <= watermark` over current rows: a record replaced, patched or deleted after the watermark is reported as it was. The status and every page report the boundary: `{ spaceId, collectionId, watermark, records: 'as-of-watermark', schemaVersion, policyVersion, placementGeneration, capability, specDigest }`. The schema version is the collection's at submission; the records are as written then, under whatever version each was written.
+
+### Results
+
+- **Export**: NDJSON pages (`application/x-ndjson`), one line `{"id","revision","data"}` per record live at the watermark, in record ID order (UTF-8 byte order), `data` the revision's canonical JSON. A page holds at most 1,000 records and 1 MiB; it is cut at the first record that does not fit, so each page is a function of the checkpoint it starts from. A record whose line alone exceeds 1 MiB (data near the authority's own 1 MiB record bound) fails the job with `RESULT_TOO_LARGE` rather than be split or skipped.
+- **Aggregate**: one JSON page (`application/json`) in STA-58's result shape, `groups` formatted by the same code, with `source.records: 'as-of-watermark'` and `snapshot: { scope: 'watermark', watermark }`. Each page of records is aggregated by STA-58's own statement (`statement` in `aggregations.ts`), with that page's records as of the watermark and their index values (derived from each revision's data, as the writer derives them, for the declared kind pinned at submission) in place of the `records` and `record_index_values` tables; the partial groups (counts, exact decimal sums, extremes by the statement's order, hour-bucket offsets) are merged into the checkpoint. A value the pinned kind does not take fails the job with `SCHEMA_CONFLICT`, more than `maxGroups` groups with `GROUP_LIMIT`, groups past 256 KiB with `RESULT_TOO_LARGE`; never a partial result.
+
+The manifest (page count, rows, bytes, `resultSha256`, format) is written once no record is left and seals the result (migration 049 checks its totals against the pages); a job's pages are never presented as a result before it, `complete` is true only with it, and a cancelled, failed or expired job serves no page.
+
+### Authorization at every read
+
+Each `status`, `cancel` and `page` authorizes again: the directory and provider credential (`PostgresSpaces.scope`), the space, collection and grant locks for the job's own capability (`checkScope`) and, after the read, the provider and regional key and grant again inside the same transaction (`assertScopeCurrent`). So a revoked key reads nothing (`NOT_FOUND`), a grant without the job's capability `FORBIDDEN`, and a suspended or deleting space `SPACE_UNAVAILABLE`, however complete the result already is. A job belongs to the principal that submitted it and, for an agent key, to that key: another key, or the owner, finds no such job (`NOT_FOUND`); any owner session reads the owner's jobs.
+
+### Worker
+
+The cell jobs Worker's once-a-minute tick runs `PostgresAnalysisWorker.step` last, for up to 5 s (or what the tick has left after the retrieval step's 1 s settle, at least 4 s), on its one connection; the upload reconciliation step gave up 5 of its 10 s for it, so the steps still total the 50 s tick budget. The analytical slots derive from the cell's origin connection limit (`STATEPLANE_ORIGIN_CONNECTION_LIMIT`, set by `scripts/topology.mjs`; without a valid one only this step fails, and says so with the tick's error). Each step:
+
+1. Ends jobs past their expiry, one per transaction, in its first quarter: `expired` releases their slots (migration 049's trigger) and their pages and manifest are removed, a completed result's included.
+2. Claims the next due job (queued, or running with a lapsed lease; least recently run first), in one transaction that share-locks the space and collection, checks the job's binding, then locks the job (`SKIP LOCKED`) and takes a slot of its cell and of its space until its lease ends (one it still holds, else a free or lapsed one, never one an interactive aggregation holds by row lock), adding missing slot rows up to the derived limits in a transaction of its own first if needed, and moves it to `running` with a new 30 s lease. No free cell slot ends the step; no free space slot passes that job over for the step.
+3. Runs it page by page. Each page is one transaction bounded by the step's deadline that share-locks the space and collection, locks the job at its exact lease, extends the lease and slot holds (a job that no longer holds both stops), checks the binding, reads the next records after the checkpoint as of the watermark (at most 1,000 records and, past the first, 1 MiB of data, by the as-of index), and commits the page (export) or merged groups (aggregate) with the checkpoint, records scanned and step time. With no record left it writes the manifest and the job completes. An interruption anywhere (a lost isolate, a cut statement, a crash before commit) rolls back that page only: the lease lapses, a later step reclaims the job (counting a claim), and continues from the last committed checkpoint, writing the same pages and manifest.
+4. Gives the lease and slot holds back when it stops, so the next step, or an interactive aggregation, can take the slots at once.
+
+A binding that no longer authorizes the job fails it with `NOT_FOUND` (collection deleted), `SPACE_UNAVAILABLE` (space not active or read-only), `STALE_PLACEMENT` (placement generation changed) or `FORBIDDEN` (the submitting key revoked or expired, or its grant no longer including the capability; the space owner's jobs need no grant), and removes whatever it wrote. A job past its budgets fails with `BUDGET_EXCEEDED`.
+
+### Budgets
+
+Initial protective values, not measured capacity (STA-60 measures, STA-61 records them with evidence):
+
+| Budget | Value | On excess |
+| --- | --- | --- |
+| Records scanned per job | 10,000,000 | `BUDGET_EXCEEDED` |
+| Result bytes per job | 64 MiB (so its pages are removed in one bounded transaction) | `BUDGET_EXCEEDED` |
+| Step time per job, summed over pages | 600,000 ms | `BUDGET_EXCEEDED` |
+| Lifetime, result retention included | 24 h from submission | `expired`; results removed |
+| Unfinished jobs per space | 8 (submissions to a space take turns) | Submission `BACKPRESSURE`, retryable |
+| Page | 1,000 records, 1 MiB; at most 10,000 pages | Next page; `RESULT_TOO_LARGE` past 10,000 |
+| Aggregate checkpoint | 1 MiB of partial groups | `RESULT_TOO_LARGE` |
+| Lease | 30 s, extended by every page; a page starts only with at least 1 s of the step left | Lapses; reclaimed |
+| Step | 5 s per tick in the jobs Worker (2 to 60 s accepted) | Next tick |
+| Event publication at submission | 20 rounds of 5,000 | `BACKPRESSURE`, retryable |
+
+Each page runs without parallel workers, so a job's work is one backend on its slot, apart from the interactive pools.
+
+### Evidence
+
+`test/integration/analysis-jobs.test.js` (in `pnpm test:postgres`) checks exports against the records as the test wrote them before submission (unpublished writes included; replaces, patches, deletes and creates during and after the run excluded; pages chained, bounded, digested and cut by bytes), aggregate jobs over several pages against STA-58's interactive aggregation of the same unchanged data (an empty spec, two-field groups with every metric, hour buckets across New York's spring-forward night with a range predicate, day buckets in Berlin, an empty collection), an aggregate job against the state before later writes, a job crashed at page writes, manifests and checkpoints and reclaimed against one run straight through (same manifest and pages), cancellation and expiry of running and completed jobs (slots released, pages removed, nothing served, a waiting job admitted to the freed slot), reauthorization (revoked key, narrowed grant, another key, the owner, a key revoked before its job runs), submission bounds and refusals, a suspended space, and interactive reads on the interactive pool while the jobs Worker runs five jobs. `test/operational-worker.test.ts` checks the tick's step order and budgets.
+
+These are local PostgreSQL checks. The jobs Worker cron on Cloudflare Preview against Railway Postgres through Hyperdrive, with its measured page and step latency, remains external evidence (STA-61).
