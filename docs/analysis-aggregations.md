@@ -1,6 +1,6 @@
 # Interactive aggregations (STA-58)
 
-`PostgresAggregations` (`packages/postgres/src/aggregations.ts`) answers bounded, typed aggregations over one collection's declared index fields in one statement snapshot, on analytical capacity apart from interactive authoritative reads. It is the second of five slices of STA-15, after the [analysis job storage](analysis-jobs.md) (STA-57). The application boundary exposes it as `StateplaneServices.analysis.aggregate`, which takes the spec as JSON text; no HTTP, CLI or MCP surface reaches it yet (STA-61). Long or complete analyses that need a pinned watermark are STA-59's jobs, not this.
+`PostgresAggregations` (`packages/postgres/src/aggregations.ts`) answers bounded, typed aggregations over one collection's declared index fields in one statement snapshot, on analytical capacity apart from interactive authoritative reads. It is the second of five slices of STA-15, after the [analysis job storage](analysis-jobs.md) (STA-57). The application boundary exposes it as `StateplaneServices.analysis.aggregate`, which takes the spec as JSON text; no HTTP, CLI or MCP surface reaches it yet (STA-61). Long or complete analyses that need a pinned watermark are [snapshot jobs](analysis-jobs.md#jobs-sta-59) (STA-59), not this; they reuse this spec, its admission, its statement and its result formatting over the records as of their watermark.
 
 ## Spec
 

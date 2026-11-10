@@ -255,7 +255,8 @@ export function renderTopology(topology, environment, inventory, counterpart, ou
     output[`${suffix}-jobs.json`] = {
       ...common(out, n.jobs, 'deployment/workers/jobs.ts', 'cell-jobs', environment, projectRoot),
       placement: { mode: 'smart' },
-      vars: { STATEPLANE_ENV: environment, STATEPLANE_ROLE: 'cell-jobs', STATEPLANE_CELL: cell.id },
+      vars: { STATEPLANE_ENV: environment, STATEPLANE_ROLE: 'cell-jobs', STATEPLANE_CELL: cell.id,
+        STATEPLANE_ORIGIN_CONNECTION_LIMIT: String(cell.originConnectionLimit) },
       hyperdrive: binding(id),
       r2_buckets: [{ binding: 'ORIGINALS', bucket_name: n.bucket }],
       // The cron tick leases due SQL outbox rows and sends hints; the consumer

@@ -97,5 +97,13 @@ export interface StateplaneServices {
     /** One typed aggregation over a collection's declared index fields, in one statement snapshot; `serialized` is
      * the spec as JSON text, parsed after the collection is authorized. */
     aggregate(actor: VerifiedCredential, spaceId: string, collectionId: string, serialized: string): Promise<unknown>;
+    /** Submit a snapshot job as of a watermark pinned now: an `export` of the collection's records (`export:read`, no
+     * spec) or an `aggregate` of the `serialized` aggregation spec (`records:read`). */
+    submit(actor: VerifiedCredential, spaceId: string, collectionId: string, kind: 'aggregate' | 'export', serialized?: string): Promise<unknown>;
+    /** A job's state, progress and consistent boundary, with its manifest once the result is complete. */
+    status(actor: VerifiedCredential, spaceId: string, collectionId: string, jobId: string): Promise<unknown>;
+    cancel(actor: VerifiedCredential, spaceId: string, collectionId: string, jobId: string): Promise<unknown>;
+    /** One page of a complete result, reauthorized at every fetch. */
+    page(actor: VerifiedCredential, spaceId: string, collectionId: string, jobId: string, page: number): Promise<unknown>;
   };
 }

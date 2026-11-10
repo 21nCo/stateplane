@@ -1,5 +1,5 @@
 import pg from 'pg';
-import { CLIENT_READ_TIMEOUT_MS, PostgresAuthority, PostgresOutbox, PostgresProjectionGenerations, PostgresRetrievalWorker,
+import { CLIENT_READ_TIMEOUT_MS, PostgresAnalysisWorker, PostgresAuthority, PostgresOutbox, PostgresProjectionGenerations, PostgresRetrievalWorker,
   RecordRetrievalProjector, SourceUploadReconciler } from '@stateplane/postgres';
 import { R2BlobStore } from '@stateplane/storage';
 import { consume, dispatch } from '@stateplane/workers';
@@ -9,6 +9,8 @@ interface Env {
   AUTHORITY: Hyperdrive;
   PROJECTION_JOBS: Queue<DeliveryMessage>;
   ORIGINALS: R2Bucket;
+  /** The cell's Hyperdrive origin connection limit, from which its analytical slots derive (scripts/topology.mjs). */
+  STATEPLANE_ORIGIN_CONNECTION_LIMIT?: string;
 }
 
 // SQL is the durable job authority. A Queue message is a hint naming one
@@ -16,13 +18,14 @@ interface Env {
 // Record completion projects each record revision into the collection's
 // retrieval generations (docs/retrieval-projections.md#indexing-worker).
 // Each once-a-minute tick dispatches for up to 15 s, advances reconciliations
-// for up to 7 s, settles ended upload attempts for up to 10 s, erases the
+// for up to 7 s, settles ended upload attempts for up to 5 s, erases the
 // bytes of deleted sources and erased spaces for up to 5 s, sweeps one page
 // of stored upload bytes for up to 5 s, then projects source and claim work
 // for up to 8 s, advancing projection rebuilds and removing retired
 // generations' chunks in whatever of those 8 s the work left (at least 2 s;
-// live work comes first); docs/durable-outbox.md, docs/evidence-storage.md and
-// docs/retrieval-projections.md record the bounds. Each budget is a maximum
+// live work comes first), then advances snapshot analysis and export jobs for
+// up to 5 s; docs/durable-outbox.md, docs/evidence-storage.md,
+// docs/retrieval-projections.md and docs/analysis-jobs.md record the bounds. Each budget is a maximum
 // and a hard end for its step's SQL and sends (a call in flight then is
 // abandoned; cancelling its statement takes at most 1 s more, on the same
 // connection). The budgets sum to the 50 s tick budget, so each step gets its
@@ -39,13 +42,14 @@ const MIN_STEP_MS = 2_000;
 const CLOSE_MS = 5_000;
 const DISPATCH_BUDGET_MS = 15_000;
 const RECONCILE_BUDGET_MS = 7_000;
-const UPLOAD_BUDGET_MS = 10_000;
+const UPLOAD_BUDGET_MS = 5_000;
 const UPLOAD_PAGE = 25;
 const ERASE_BUDGET_MS = 5_000;
 const ERASE_PAGE = 25;
 const SWEEP_BUDGET_MS = 5_000;
 const SWEEP_PAGE = 100;
 const RETRIEVAL_BUDGET_MS = 8_000;
+const ANALYSIS_BUDGET_MS = 5_000;
 function cell(env: Env, originals = false) {
   if (!env.AUTHORITY?.connectionString) throw new Error('Cell authority binding is missing');
   if (originals && !env.ORIGINALS) throw new Error('Cell originals binding is missing');
@@ -82,7 +86,10 @@ function cell(env: Env, originals = false) {
   const projector = new RecordRetrievalProjector(pool);
   const retrieval = new PostgresRetrievalWorker(pool);
   const generations = new PostgresProjectionGenerations(pool);
-  return { outbox, uploads, projector, retrieval, generations, close: () => pool.end(), abandon };
+  // Analysis jobs take the cell's analytical slots, derived from its origin connection limit (a missing or invalid one
+  // fails only the analysis step, when it runs).
+  const analysis = () => new PostgresAnalysisWorker(pool, { originConnectionLimit: Number(env.STATEPLANE_ORIGIN_CONNECTION_LIMIT) });
+  return { outbox, uploads, projector, retrieval, generations, analysis, close: () => pool.end(), abandon };
 }
 
 export default {
@@ -93,7 +100,7 @@ export default {
       const ms = Math.min(budgetMs, tickEnd - Date.now());
       return ms >= MIN_STEP_MS ? ms : 0;
     };
-    const { outbox, uploads, retrieval, generations, close, abandon } = cell(env, true);
+    const { outbox, uploads, retrieval, generations, analysis, close, abandon } = cell(env, true);
     try {
       const dispatchMs = left(DISPATCH_BUDGET_MS);
       const result = await dispatch(outbox, {
@@ -125,6 +132,10 @@ export default {
       // Rebuilds get what live work left of its budget; each Ref settles its own failure.
       const rebuildMs = Math.min(retrievalEnd, tickEnd) - Date.now();
       try { if (retrievalMs && rebuildMs >= MIN_STEP_MS) await generations.step({ budgetMs: rebuildMs }); }
+      catch (error) { failures.push(error); }
+      // Each page settles a job's own failure; a cell without its connection limit runs no job and says so.
+      const analysisMs = left(ANALYSIS_BUDGET_MS);
+      try { if (analysisMs) await analysis().step({ budgetMs: analysisMs }); }
       catch (error) { failures.push(error); }
       if (result.error) throw new Error(`Projection dispatch released ${result.released} leases`, {
         cause: failures.length ? new AggregateError([result.error, ...failures], 'Queue send and reconciliation failed') : result.error });

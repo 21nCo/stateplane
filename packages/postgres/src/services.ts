@@ -6,6 +6,7 @@ import type { EmbeddingRegistry } from '@stateplane/retrieval';
 import { AuthorityError, AuthorityTransaction, PostgresAuthority } from './index.js';
 import { PostgresAggregations } from './aggregations.js';
 import type { AggregationCell } from './aggregations.js';
+import { PostgresAnalysisJobs } from './analysis-jobs.js';
 import { PostgresContextBundles } from './bundles.js';
 import { generationViews } from './generations.js';
 import { PostgresRetrievalWorker } from './retrieval.js';
@@ -186,6 +187,8 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
     ? {pool:cell.analytics.pool,originConnectionLimit:cell.analytics.originConnectionLimit,admission:cell.pool}
     : {pool:null,admission:cell.pool});
   const aggregations=new PostgresAggregations(spaces,analytical);
+  // Jobs admit, authorize and recheck every call themselves on the interactive pool; the jobs Worker computes them.
+  const jobs=new PostgresAnalysisJobs(spaces,new Map([...cells].map(([id,cell])=>[id,{pool:cell.pool}])));
   return {
     spaces: {
       list:(actor,cursor)=>spaces.listPage(actor,cursor), create:(actor,cellId,spaceId)=>spaces.create(actor,cellId,spaceId),
@@ -302,7 +305,11 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
       status:projectionStatus(spaces,cells,options)
     },
     analysis: {
-      aggregate:(actor,spaceId,collectionId,serialized)=>aggregations.aggregateSerialized(actor,spaceId,collectionId,serialized)
+      aggregate:(actor,spaceId,collectionId,serialized)=>aggregations.aggregateSerialized(actor,spaceId,collectionId,serialized),
+      submit:(actor,spaceId,collectionId,kind,serialized)=>jobs.submit(actor,spaceId,collectionId,kind,serialized),
+      status:(actor,spaceId,collectionId,jobId)=>jobs.status(actor,spaceId,collectionId,jobId),
+      cancel:(actor,spaceId,collectionId,jobId)=>jobs.cancel(actor,spaceId,collectionId,jobId),
+      page:(actor,spaceId,collectionId,jobId,page)=>jobs.page(actor,spaceId,collectionId,jobId,page)
     }
   };
 }
