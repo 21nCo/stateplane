@@ -3,9 +3,12 @@
  * and the CLI (which bundles this package), so every transport decides them
  * from one representation in one order.
  *
- * - `bodyBytes`: the text as sent that HTTP reads and the CLI accepts, MCP's
- *   JSON-RPC request bound (`maxRequestBytes`), so whitespace, escapes and a
- *   number's spelling never decide a refusal the compact form would not.
+ * - `bodyBytes`: the text as sent that HTTP reads and the CLI accepts, eight
+ *   times `specBytes`: room for a request of `requestBytes` with every
+ *   character `\u`-escaped (six bytes each), so within it whitespace, escapes
+ *   and a number's spelling never decide a refusal, the compact form does. It
+ *   leaves MCP (whose arguments arrive parsed) over 3.7 MiB of its 4 MiB
+ *   JSON-RPC bound for framing, so the same text decides alike there.
  * - `specBytes`: an aggregation spec, alone or as a job's `spec` (the
  *   service's `aggregationBounds.specBytes`, the records query budget).
  * - `requestBytes`: a job request, that spec in its `{"kind","spec"}` envelope.
@@ -15,7 +18,7 @@
  *   grow while every recursive JSON encoder or decoder behind admission stays
  *   far inside its stack (a 10,000-level spec overflowed them at STA-61 review).
  */
-export const analysisBounds = Object.freeze({ bodyBytes: 4_194_304, specBytes: 32_768, requestBytes: 33_792, specDepth: 16 });
+export const analysisBounds = Object.freeze({ bodyBytes: 262_144, specBytes: 32_768, requestBytes: 33_792, specDepth: 16 });
 
 /** A refusal before admission: a size (not retryable) or an invalid request. */
 export type AnalysisRefusal = 'RATE_LIMITED' | 'INVALID_ARGUMENT';
@@ -119,25 +122,24 @@ export function admitAggregation(spec: unknown): AdmittedAggregation {
 
 /**
  * Admit a parsed job request `{ kind, spec? }`, or refuse it before admission,
- * in this order: its compact text over `requestBytes` is `RATE_LIMITED`;
- * nested past `specDepth` (plus the envelope), not an object of those two
- * members, or another kind, `INVALID_ARGUMENT`; its spec's compact text over
- * `specBytes`, `RATE_LIMITED`; a spec that is not an object, or holds a number
- * that overflows, `INVALID_ARGUMENT`. Returns the kind and the spec's compact
- * text.
+ * in this order: its compact text over `requestBytes` is `RATE_LIMITED`; not
+ * an object of those two members, or another kind, `INVALID_ARGUMENT`; then its
+ * spec as `admitAggregation` checks one: over `specBytes`, `RATE_LIMITED`;
+ * nested past `specDepth`, not an object, or holding a number that overflows,
+ * `INVALID_ARGUMENT`. So a spec gets one code as an aggregation and in a job.
+ * Returns the kind and the spec's compact text.
  */
 export function admitAnalysisJob(request: unknown): AdmittedAnalysisJob {
   const encoded = encode(request, analysisBounds.requestBytes);
   if (!encoded) return { refused: 'INVALID_ARGUMENT' };
   if (encoded === 'over') return { refused: 'RATE_LIMITED' };
-  if (encoded.depth > analysisBounds.specDepth + 1 || !object(request) ||
-    Object.keys(request).some(key => key !== 'kind' && key !== 'spec')) return { refused: 'INVALID_ARGUMENT' };
+  if (!object(request) || Object.keys(request).some(key => key !== 'kind' && key !== 'spec')) return { refused: 'INVALID_ARGUMENT' };
   const kind = Object.hasOwn(request, 'kind') ? request.kind : undefined;
   if (kind !== 'aggregate' && kind !== 'export') return { refused: 'INVALID_ARGUMENT' };
   if (!Object.hasOwn(request, 'spec')) return { kind, spec: undefined };
   // A member of a request that encoded within its limit encodes too.
   const spec = encode(request.spec, analysisBounds.specBytes) as Encoded | 'over';
   if (spec === 'over') return { refused: 'RATE_LIMITED' };
-  if (!object(request.spec) || !spec.finite) return { refused: 'INVALID_ARGUMENT' };
+  if (spec.depth > analysisBounds.specDepth || !object(request.spec) || !spec.finite) return { refused: 'INVALID_ARGUMENT' };
   return { kind, spec: spec.text };
 }

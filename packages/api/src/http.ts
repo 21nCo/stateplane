@@ -190,8 +190,8 @@ async function collectionRoute(services:StateplaneServices,actor:VerifiedCredent
   if (p[4]==='jobs') return jobsRoute(services,p,request,prefix);
   return evidenceRoute(services,p,request,url,prefix);
 }
-/** An interactive aggregation. An analysis body is read as sent up to MCP's request bound (RATE_LIMITED beyond) and is
- * null when it does not parse; the shared checks then measure its compact text, nesting and values before admission. */
+/** An interactive aggregation. An analysis body is read as sent up to analysisBounds.bodyBytes (RATE_LIMITED beyond)
+ * and is null when it does not parse; the shared checks then measure its compact text, nesting and values before admission. */
 async function aggregateRoute(services:StateplaneServices,req:Request,prefix:Prefix):Promise<Response> {
   return json(await services.analysis.aggregate(...prefix,analysisAggregation(await request(req,analysisBounds.bodyBytes))));
 }

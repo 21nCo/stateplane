@@ -156,8 +156,9 @@ async function caller(t, origin, temp, token, label, spaceId) {
     aggregate: async spec => ({ http: await api('POST', `${collection}/aggregate`, spec), mcp: await mcp('analysis_aggregate', spec),
       cli: await cli(['aggregate', '--data', JSON.stringify(spec)]) }),
     // A spec as JSON text, so a literal such as 1e400 reaches each transport as written: the raw HTTP body, raw MCP
-    // JSON-RPC (a client would re-encode it as null; skipped for text that is not JSON) and the CLI's --data and --file.
-    literal: async (kind, text, viaMcp = true) => {
+    // JSON-RPC (a client would re-encode it as null; skipped for text that is not JSON) and the CLI's --data (skipped for
+    // text past an argument's length on Linux) and --file.
+    literal: async (kind, text, { viaMcp = true, viaData = true } = {}) => {
       const file = join(home, 'literal.json');
       await writeFile(file, text);
       const scope = `"spaceId":${JSON.stringify(spaceId)},"collectionId":"items"`;
@@ -168,7 +169,7 @@ async function caller(t, origin, temp, token, label, spaceId) {
       const argv = kind ? ['submit', '--kind', kind] : ['aggregate'];
       return { http: kind ? await api('POST', `${collection}/jobs`, `{"kind":${JSON.stringify(kind)},"spec":${text}}`)
         : await api('POST', `${collection}/aggregate`, text), ...(rpc ? { mcp: (await rpc.json()).result.structuredContent } : {}),
-      cli: await cli([...argv, '--data', text]), cliFile: await cli([...argv, '--file', file]) };
+      ...(viaData ? { cli: await cli([...argv, '--data', text]) } : {}), cliFile: await cli([...argv, '--file', file]) };
     },
     // The CLI sends {kind} or {kind, spec}; a request it cannot express is compared over HTTP and MCP only. `encode` writes
     // the HTTP body and the CLI's --data as sent; MCP's arguments are objects.
@@ -388,12 +389,15 @@ test('HTTP, CLI and MCP give one outcome for job submission, status, pages and c
   const expanding = `{"metrics":[{"op":"count"}],"x":[${Array.from({ length: 1_700 }, () => '1e20').join(',')}]}`;
   const table = [
     ['envelope-edge 1e400', edge, 'RATE_LIMITED'], ['compact form over the budget', expanding, 'RATE_LIMITED'],
-    ['unparseable', '{"metrics":[{"op":"count"}]', 'INVALID_ARGUMENT', false],
+    ['unparseable', '{"metrics":[{"op":"count"}]', 'INVALID_ARGUMENT', { viaMcp: false }],
+    // Over the spec bound and the nesting limit: the size is checked first, as an aggregation and in a job alike.
+    ['oversized and nested past the limit', `{"metrics":[{"op":"count"}],"x":${'['.repeat(17)}"${'p'.repeat(32_800)}"${']'.repeat(17)}}`,
+      'RATE_LIMITED'],
     ['nested past the limit', nested(17), 'INVALID_ARGUMENT'], ['nested past the stack', nested(10_001), 'INVALID_ARGUMENT']];
-  for (const [row, text, code, viaMcp] of table) for (const label of ['owner', 'reader', 'exporter', 'foreignOwner'])
+  for (const [row, text, code, options] of table) for (const label of ['owner', 'reader', 'exporter', 'foreignOwner'])
     for (const kind of [undefined, 'aggregate']) {
       const operation = `${label} ${row} ${kind ? 'aggregate job' : 'aggregation'}`;
-      assert.deepEqual(same(operation, await callers[label].literal(kind, text, viaMcp), kind ? 'AnalysisJobStatus' : 'AggregationResult'),
+      assert.deepEqual(same(operation, await callers[label].literal(kind, text, options), kind ? 'AnalysisJobStatus' : 'AggregationResult'),
         { error: code, retryable: false }, operation);
     }
   // Admitted on every transport, where the service then authorizes before it refuses the field: a spec at the nesting
@@ -405,6 +409,25 @@ test('HTTP, CLI and MCP give one outcome for job submission, status, pages and c
       ['foreignOwner', 'NOT_FOUND']]) for (const kind of [undefined, 'aggregate'])
       assert.deepEqual(same(`${label} ${row} ${kind ?? ''}`, await callers[label].literal(kind, text),
         kind ? 'AnalysisJobStatus' : 'AggregationResult'), { error: code, retryable: false }, `${label} ${row} ${kind ?? ''}`);
+  // A body is read as sent up to 262,144 bytes (eight times the spec bound), whitespace and all, on HTTP and from the
+  // CLI's --file: at the bound it is decided by its compact form on every transport, MCP included (its message, with the
+  // framing, is well within MCP's 4 MiB); one byte over, HTTP and the CLI refuse it RATE_LIMITED before parsing it.
+  const padded = (bytes, around = text => text) => {
+    const spec = gap => `{"metrics":[{"op":"count"}]${' '.repeat(gap)}}`;
+    return spec(bytes - Buffer.byteLength(around(spec(0))));
+  };
+  for (const kind of [undefined, 'aggregate']) {
+    const around = kind ? envelope : undefined;
+    const atBound = padded(262_144, around), overBound = padded(262_145, around);
+    assert.equal(Buffer.byteLength(kind ? envelope(atBound) : atBound), 262_144);
+    for (const [label, code] of [['exporter', 'FORBIDDEN'], ['foreignOwner', 'NOT_FOUND']]) {
+      const schemaName = kind ? 'AnalysisJobStatus' : 'AggregationResult';
+      assert.deepEqual(same(`${label} at the body bound ${kind ?? ''}`, await callers[label].literal(kind, atBound, { viaData: false }), schemaName),
+        { error: code, retryable: false }, `${label} at the body bound ${kind ?? ''}`);
+      assert.deepEqual(same(`${label} over the body bound ${kind ?? ''}`, await callers[label].literal(kind, overBound,
+        { viaMcp: false, viaData: false }), schemaName), { error: 'RATE_LIMITED', retryable: false }, `${label} over the body bound ${kind ?? ''}`);
+    }
+  }
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM analysis_jobs WHERE space_id=$1', [f.spaceId])).rows[0].n, jobsBefore,
     'no refused spec queues a job');
   const deep = nested(10_001);
