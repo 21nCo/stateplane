@@ -12,11 +12,13 @@
 //      isolates) at an origin connection limit of 5.
 // The fixture's other space (--noise records) keeps the measured collection a fraction of the shared tables, as in a
 // cell holding many spaces. With --reconciliation-only it seeds the fixture at the largest scale and measures only the
-// reconciliation, --runs times. The report (JSON on stdout, or --out FILE, a file inside the current directory) measures this
-// fixture and this server only; it is no guarantee. The database is dropped at the end, also after a failure; when the drop
+// reconciliation, --runs times. The report (JSON on stdout, or --out FILE: a new or regular file, never a symbolic link or
+// directory, whose real directory is inside the real current directory) measures this fixture and this server only; it is
+// no guarantee. The database is dropped at the end, also after a failure; when the drop
 // itself fails, the run's own failure is still the one thrown, with the undropped database named on it (`cleanup`).
-import { readFile, writeFile } from 'node:fs/promises';
-import { resolve, sep } from 'node:path';
+import { constants } from 'node:fs';
+import { lstat, open, readFile, realpath } from 'node:fs/promises';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { cpus, loadavg } from 'node:os';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -29,7 +31,7 @@ import { memoryAdapter } from '@superfunctions/db/testing';
 import { createAuthFn, createUser, issueSession } from '@authfn/core';
 import { AuthFnAgentKeys, AuthFnIdentityVerifier } from '../packages/auth/dist/index.js';
 import { aggregationBounds, analysisJobBounds, analyticalSlots, PostgresAggregations, PostgresAnalysisJobs, PostgresAnalysisWorker,
-  PostgresSpaces, postgresServices, reconcileIndexes } from '../packages/postgres/dist/index.js';
+  PostgresSpaces, postgresServices, reconcileIndexes, reconciliationBounds } from '../packages/postgres/dist/index.js';
 import { connectionOptions } from './db-connection.mjs';
 import { percentile, round } from './relevance-metrics.mjs';
 
@@ -70,23 +72,45 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     if (!Number.isSafeInteger(value) || value < min) throw new RangeError(`--${name} must be an integer of at least ${min}`);
     return value;
   };
-  // The report is written only inside the directory the operator runs from (docs/measurements/ from the repository root).
-  const cwd = process.cwd(), out = options.out === undefined ? null : resolve(cwd, options.out);
-  if (out !== null && !out.startsWith(`${cwd}${sep}`)) throw new RangeError('--out must name a file inside the current directory');
+  const out = options.out === undefined ? null : await reportDestination(options.out);
   const settings = { scales: options.scales.split(',').map(text => count(text, 'scales', 1)), noise: count(options.noise, 'noise', 0),
     runs: count(options.runs, 'runs', 1), loadSeconds: count(options['load-seconds'], 'load-seconds', 1),
     writes: count(options.writes, 'writes', 1), reconciliationOnly: options['reconciliation-only'] };
   const text = `${JSON.stringify(await measure(settings), null, 2)}\n`;
-  if (out === null) process.stdout.write(text); else await writeFile(out, text);
+  if (out === null) process.stdout.write(text);
+  else {
+    // O_NOFOLLOW: a symbolic link put in the destination's place meanwhile is refused, not followed.
+    const file = await open(out, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | (constants.O_NOFOLLOW ?? 0));
+    try { await file.writeFile(text); } finally { await file.close(); }
+  }
+}
+
+/**
+ * Where --out writes, checked before anything connects: only inside the directory the operator runs from
+ * (docs/measurements/ from the repository root), by real paths, so a symbolic link in the path cannot lead outside it; a
+ * new file or an existing regular one, never a symbolic link or a directory.
+ */
+export async function reportDestination(out, cwd = process.cwd()) {
+  const refused = () => new RangeError('--out must name a file inside the current directory');
+  const base = await realpath(cwd), target = resolve(cwd, out);
+  const parent = await realpath(dirname(target)).catch(() => { throw refused(); });
+  const file = join(parent, basename(target));
+  if (!file.startsWith(base.endsWith(sep) ? base : `${base}${sep}`)) throw refused();
+  const existing = await lstat(file).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  if (existing && !existing.isFile()) throw refused();
+  return file;
 }
 
 /**
  * Run every measurement in a disposable database and return the report. `scales` must be strictly ascending: the last is
- * the largest, which the jobs, reconciliation, mixed load and limits measure.
+ * the largest, which the jobs, reconciliation, mixed load and limits measure, at most reconciliationBounds.maxRecords.
  */
 export async function measure(settings) {
   if (!settings.scales.length || settings.scales.some((scale, i) => i > 0 && scale <= settings.scales[i - 1]))
     throw new RangeError('scales must be strictly ascending');
+  // The largest scale is reconciled in one call: refused before any database is created, not after seeding.
+  if (settings.scales.at(-1) > reconciliationBounds.maxRecords)
+    throw new RangeError(`the largest scale must be at most ${reconciliationBounds.maxRecords}, the reconciliation bound`);
   const root = fileURLToPath(new URL('..', import.meta.url));
   const password = process.env.DATABASE_URL ? null : (await readFile(new URL('../.data/local-db-password', import.meta.url), 'utf8')).trim();
   const baseUrl = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT ?? '55432'}/stateplane`;

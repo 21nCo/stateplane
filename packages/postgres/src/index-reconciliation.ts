@@ -42,7 +42,7 @@ export interface IndexReconciliation {
   fields: string[];
   /** Records checked (live and deleted), after `after`, in record ID order. */
   checked: number; after: string | null;
-  /** The last record checked when more may follow, to pass as `after`; null once the collection was read to its end. */
+  /** The last record checked when a record follows it, to pass as `after`; null once the collection was read to its end. */
   next: string | null;
   driftCount: number; drift: IndexDrift[];
 }
@@ -80,13 +80,14 @@ export async function reconcileIndexes(pool: PoolLike, spaceId: string, collecti
       const fields: string[] = (await db.query(`SELECT field_name FROM collection_index_declarations
         WHERE space_id=$1 AND collection_id=$2 AND ready ORDER BY field_name COLLATE "C"`, [spaceId, collectionId])).rows
         .map(row => row.field_name);
-      // At most `limit` records and pageBytes of canonical data, the first record always (octet_length reads the stored size only).
+      // At most `limit` records and pageBytes of canonical data, the first record always (octet_length reads the stored size
+      // only). One record past `limit` is read and not taken: it shows, in this snapshot, whether any record follows the page.
       const records = (await db.query(`SELECT record_id,tombstone,canonical_data,fetched FROM (
           SELECT record_id,tombstone,canonical_data,sum(octet_length(COALESCE(canonical_data,''))) OVER (ORDER BY record_id) AS running,
             row_number() OVER (ORDER BY record_id) AS position,count(*) OVER () AS fetched FROM (
             SELECT record_id,tombstone,canonical_data FROM records
-            WHERE space_id=$1 AND collection_id=$2 AND ($3::text IS NULL OR record_id>$3) ORDER BY record_id LIMIT $4) x
-        ) y WHERE running<=$5 OR position=1 ORDER BY record_id`,
+            WHERE space_id=$1 AND collection_id=$2 AND ($3::text IS NULL OR record_id>$3) ORDER BY record_id LIMIT $4::int+1) x
+        ) y WHERE position<=$4::int AND (running<=$5 OR position=1) ORDER BY record_id`,
       [spaceId, collectionId, cursor, limit, reconciliationBounds.pageBytes])).rows;
       const { drift, expected, owners } = expectedRows(records, fields, definition);
       const valueOf = (value: IndexValue, kind: string) => value.kind === kind && 'value' in value ? value.value : null;
@@ -117,9 +118,8 @@ export async function reconcileIndexes(pool: PoolLike, spaceId: string, collecti
         drift.push({ recordId: row.record_id, field: row.field_name, reason: driftReason(row.expected_kind, row.actual_kind),
           expectedKind: row.expected_kind, actualKind: row.actual_kind });
       }
-      // A full page, or one cut by its byte bound, is not known to be the collection's end.
-      const fetched = records.length ? Number(records[0].fetched) : 0;
-      const more = fetched === limit || fetched > records.length;
+      // More follows exactly when a record read past the page (by its record or byte bound) exists.
+      const more = records.length > 0 && Number(records[0].fetched) > records.length;
       return { fields, records: records.length, more, last: records.length ? records[records.length - 1].record_id as string : null, drift };
     });
     // A declaration that turned ready during the call was not checked on its earlier pages: list only fields every page checked.
@@ -146,13 +146,17 @@ function expectedRows(records: { record_id: string; tombstone: boolean; canonica
     const data = parsedObject(record.canonical_data);
     const rejected = data ? rejectedFields(data, definition.schema, fields) : new Set(fields);
     for (const field of fields) {
-      let value: IndexValue | null = null;
-      try { if (data && !rejected.has(field)) value = derivedIndexValue(data, definition, field); } catch { /* underivable */ }
+      const value = data && !rejected.has(field) ? derivedOrNull(data, definition, field) : null;
       if (value) { expected.push(value); owners.push(record.record_id); }
       else drift.push({ recordId: record.record_id, field, reason: 'underivable', expectedKind: null, actualKind: null });
     }
   }
   return { drift, expected, owners };
+}
+
+/** The row an accepted record derives for a field, or null when it derives none (a value past the index's byte limit). */
+function derivedOrNull(data: Record<string, Json>, definition: CollectionDefinition, field: string): IndexValue | null {
+  try { return derivedIndexValue(data, definition, field); } catch { return null; }
 }
 
 /** Stored canonical data as a JSON object, or null when it is not JSON or not an object. */

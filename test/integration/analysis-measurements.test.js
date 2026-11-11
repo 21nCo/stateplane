@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, symlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, relative } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -297,6 +299,26 @@ test('the reconciliation command reads the collection to its end unless bounded,
   assert.deepEqual([continued.status, continued.report.checked, continued.report.next, continued.report.driftCount], [2, 50, null, 1]);
   const tail = cli('--after', 'rec_00010040');
   assert.deepEqual([tail.status, tail.report.checked, tail.report.next, tail.report.driftCount], [0, 9, null, 0]);
+  // A bound ending exactly at the collection's end is complete; one record short of it is not, and continues to it.
+  const exact = cli('--after', 'rec_00010040', '--max-records', '9');
+  assert.deepEqual([exact.status, exact.report.checked, exact.report.next], [0, 9, null], exact.stderr);
+  const short = cli('--after', 'rec_00010040', '--max-records', '8');
+  assert.deepEqual([short.status, short.report.checked, short.report.next], [3, 8, 'rec_00010048'], short.stderr);
+  const last = cli('--after', short.report.next, '--max-records', '8');
+  assert.deepEqual([last.status, last.report.checked, last.report.next], [0, 1, null], last.stderr);
+});
+
+test('a reconciliation call is complete exactly when no record follows its last: a bound or page ending at the end is complete', async () => {
+  const f = await fixture();
+  await seed(pool, f.spaceId, 'items', reconciliationBounds.pageRecords, false);
+  for (const maxRecords of [undefined, reconciliationBounds.pageRecords, reconciliationBounds.pageRecords + 1]) {
+    const report = await reconcileIndexes(pool, f.spaceId, 'items', { maxRecords });
+    assert.deepEqual([report.checked, report.next, report.driftCount], [reconciliationBounds.pageRecords, null, 0], `${maxRecords}`);
+  }
+  const short = await reconcileIndexes(pool, f.spaceId, 'items', { maxRecords: reconciliationBounds.pageRecords - 1 });
+  assert.deepEqual([short.checked, short.next], [reconciliationBounds.pageRecords - 1, 'rec_00000998']);
+  const rest = await reconcileIndexes(pool, f.spaceId, 'items', { after: short.next, maxRecords: 1 });
+  assert.deepEqual([rest.checked, rest.next], [1, null]);
 });
 
 test('reconciliation checks ready fields only: a field still backfilling is not reported as drift', async () => {
@@ -456,25 +478,54 @@ test('a load failure during a measurement phase (an aggregation, the jobs Worker
   } finally { process.off('unhandledRejection', record); }
 });
 
-test('the measurement script takes its scales in ascending order and writes its report only inside the current directory', async () => {
+test('the measurement script takes its scales in ascending order up to the reconciliation bound, refused before any database', async () => {
   const databases = async () => (await admin("SELECT count(*)::int AS n FROM pg_database WHERE datname LIKE 'stateplane_measure_%'")).rows[0].n;
   const before = await databases();
   // The last scale is the one the jobs, reconciliation, mixed load and limits measure: it must be the largest.
   for (const scales of [[200, 100], [100, 100], []])
     await assert.rejects(measure({ scales, noise: 0, runs: 1, loadSeconds: 1, writes: 1 }), /scales must be strictly ascending/);
-  const descending = spawnSync(process.execPath, ['scripts/analysis-measure.mjs', '--scales', '500,100', '--noise', '0'],
-    { cwd: root, env: { ...process.env, DATABASE_URL: baseUrl }, encoding: 'utf8' });
-  assert.notEqual(descending.status, 0);
-  assert.match(descending.stderr, /scales must be strictly ascending/);
+  // It is reconciled in one call, so it is at most that call's bound.
+  const oversized = reconciliationBounds.maxRecords + 1;
+  for (const reconciliationOnly of [false, true])
+    await assert.rejects(measure({ scales: [10, oversized], noise: 0, runs: 1, loadSeconds: 1, writes: 1, reconciliationOnly }),
+      /the largest scale must be at most 1000000, the reconciliation bound/);
+  for (const [scales, refusal] of [['500,100', /scales must be strictly ascending/], [`10,${oversized}`, /reconciliation bound/]]) {
+    const run = spawnSync(process.execPath, ['scripts/analysis-measure.mjs', '--scales', scales, '--noise', '0'],
+      { cwd: root, env: { ...process.env, DATABASE_URL: baseUrl }, encoding: 'utf8' });
+    assert.notEqual(run.status, 0, scales);
+    assert.match(run.stderr, refusal, scales);
+  }
   assert.equal(await databases(), before, 'refused before creating a database');
-  // The .invalid host never resolves: reaching a connection would fail with ENOTFOUND, not the destination policy.
-  for (const out of ['../outside-report.json', '/tmp/outside-report.json', '.']) {
-    const run = spawnSync(process.execPath, ['scripts/analysis-measure.mjs', '--scales', '10', '--noise', '0', '--out', out],
-      { cwd: root, env: { ...process.env, DATABASE_URL: 'postgres://u:p@db.example.invalid:5432/stateplane?sslmode=verify-full' },
-        encoding: 'utf8' });
-    assert.notEqual(run.status, 0, out);
-    assert.match(run.stderr, /--out must name a file inside the current directory/, out);
-    assert.doesNotMatch(run.stderr, /ENOTFOUND/, out);
+});
+
+test('the measurement script writes its report only to a file inside the current directory by real paths, checked before connecting', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'stateplane-out-')), outside = await mkdtemp(join(tmpdir(), 'stateplane-outside-'));
+  try {
+    await mkdir(join(dir, 'reports'));
+    await symlink(outside, join(dir, 'linked'));
+    await symlink(join(outside, 'target.json'), join(dir, 'report-link.json'));
+    // The .invalid host never resolves: an accepted destination fails at the connection (ENOTFOUND), a refused one before it.
+    const run = (out, cwd = dir) => spawnSync(process.execPath, [join(root, 'scripts/analysis-measure.mjs'), '--scales', '10', '--noise', '0',
+      '--out', out], { cwd, env: { ...process.env, DATABASE_URL: 'postgres://u:p@db.example.invalid:5432/stateplane?sslmode=verify-full' },
+      encoding: 'utf8' });
+    for (const out of ['../outside-report.json', join(outside, 'report.json'), '.', 'reports', 'reports/', 'linked/report.json',
+      'report-link.json', 'missing/report.json']) {
+      const refused = run(out);
+      assert.notEqual(refused.status, 0, out);
+      assert.match(refused.stderr, /--out must name a file inside the current directory/, out);
+      assert.doesNotMatch(refused.stderr, /ENOTFOUND/, out);
+    }
+    await assert.rejects(stat(join(outside, 'target.json')), { code: 'ENOENT' });
+    // Ordinary descendants are accepted, also from the root directory.
+    for (const [out, cwd] of [['report.json', dir], ['reports/report.json', dir], [relative('/', join(dir, 'reports', 'r.json')), '/']]) {
+      const accepted = run(out, cwd);
+      assert.notEqual(accepted.status, 0, out);
+      assert.doesNotMatch(accepted.stderr, /--out must name/, out);
+      assert.match(accepted.stderr, /ENOTFOUND/, out);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
   }
 });
 
@@ -484,32 +535,36 @@ test('a failed drop of the measurement database never replaces the run\'s own fa
     if (typeof sql === 'string' && sql.startsWith('DROP DATABASE')) return Promise.reject(new Error('injected drop failure'));
     return original.query.call(this, sql, ...rest);
   };
+  // Each database left behind is registered as soon as its error arrives and dropped at the end, also when an assertion fails.
   const left = [];
+  const leaving = error => {
+    const database = error?.cleanup?.database ?? error?.database;
+    if (/^stateplane_measure_[0-9a-f]{32}$/.test(database)) left.push(database);
+    return error;
+  };
+  const exists = async database => (await admin(`SELECT count(*)::int AS n FROM pg_database WHERE datname='${database}'`)).rows[0].n;
   try {
     // The run and the drop both fail: the run's failure is thrown, the drop's attached to it.
     PostgresSpaces.prototype.create = () => Promise.reject(new Error('injected run failure'));
-    const both = await measure({ scales: [10], noise: 0, runs: 1, loadSeconds: 1, writes: 1 }).then(() => null, error => error);
+    const both = await measure({ scales: [10], noise: 0, runs: 1, loadSeconds: 1, writes: 1 }).then(() => null, leaving);
     PostgresSpaces.prototype.create = original.create;
     assert.match(both?.message, /injected run failure/);
     assert.match(both.cleanup.database, /^stateplane_measure_[0-9a-f]{32}$/);
     assert.match(both.cleanup.message, new RegExp(`${both.cleanup.database} was not dropped`));
     assert.match(both.cleanup.cause.message, /injected drop failure/);
-    left.push(both.cleanup.database);
     // Only the drop fails: its failure is thrown, naming the database.
     const only = await measure({ scales: [10], noise: 0, runs: 1, loadSeconds: 1, writes: 1, reconciliationOnly: true })
-      .then(() => null, error => error);
+      .then(() => null, leaving);
     assert.match(only?.message, /^The measurement database stateplane_measure_[0-9a-f]{32} was not dropped/);
     assert.match(only.cause.message, /injected drop failure/);
-    left.push(only.database);
+    assert.deepEqual(left, [both.cleanup.database, only.database]);
+    for (const database of left) assert.equal(await exists(database), 1, 'the named database is the one left behind');
   } finally {
     pg.Client.prototype.query = original.query;
     PostgresSpaces.prototype.create = original.create;
+    for (const database of left) await admin(`DROP DATABASE IF EXISTS ${database} WITH (FORCE)`);
   }
-  const exists = async database => (await admin(`SELECT count(*)::int AS n FROM pg_database WHERE datname='${database}'`)).rows[0].n;
-  for (const database of left) {
-    assert.equal(await exists(database), 1, 'the named database is the one left behind');
-    await admin(`DROP DATABASE ${database} WITH (FORCE)`);
-  }
+  for (const database of left) assert.equal(await exists(database), 0);
 });
 
 test('mixed load counts the job result pages written in its interval: a step returning after it counts, a page written after it does not', async () => {
