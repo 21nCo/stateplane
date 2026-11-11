@@ -80,6 +80,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   if (out === null) process.stdout.write(text); else await writeReport(options.out, out, text);
 }
 
+/** The one refusal of a --out destination, from the check before connecting and from the one when the report is written. */
 function destinationRefused() { return new RangeError('--out must name a file inside the current directory'); }
 
 /**
@@ -98,20 +99,26 @@ export async function reportDestination(out, cwd = process.cwd()) {
 }
 
 /**
- * Write the report where reportDestination placed it at the start, after checking it again: the run takes minutes, and a
- * parent replaced meanwhile by a symbolic link leading outside is refused before anything is opened. The file is opened
- * without following a final symbolic link and without truncating, and written only when it is the file at the checked real
- * path and its directory is still that real directory, so a file outside is never truncated or written.
+ * Write the report where reportDestination placed it at the start, after checking it again (the run takes minutes). The
+ * write is bound to the checked directory itself, not to its path: the process enters it, reads back where the directory
+ * it entered really is (getcwd), refuses unless that is the checked real directory, and opens only the final component
+ * relative to it, never following a symbolic link there. A parent replaced by a link leading outside, before or after the
+ * check, so never redirects the creation, truncation or write of the report outside the current directory.
  */
 export async function writeReport(requested, checked, text) {
   if (await reportDestination(requested) !== checked) throw destinationRefused();
-  const file = await open(checked, constants.O_WRONLY | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0));
+  const previous = process.cwd();
+  process.chdir(dirname(checked));
   try {
-    const [opened, current, parent] = await Promise.all([file.stat(), lstat(checked), realpath(dirname(checked))]);
-    if (opened.dev !== current.dev || opened.ino !== current.ino || parent !== dirname(checked)) throw destinationRefused();
-    await file.truncate(0);
-    await file.writeFile(text);
-  } finally { await file.close(); }
+    if (process.cwd() !== dirname(checked)) throw destinationRefused();
+    const file = await open(basename(checked), constants.O_WRONLY | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0))
+      .catch(error => { throw error.code === 'ELOOP' ? destinationRefused() : error; });
+    try {
+      if (!(await file.stat()).isFile()) throw destinationRefused();
+      await file.truncate(0);
+      await file.writeFile(text);
+    } finally { await file.close(); }
+  } finally { process.chdir(previous); }
 }
 
 /**

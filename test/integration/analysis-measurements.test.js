@@ -2,7 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import fsp from 'node:fs/promises';
+import { renameSync, symlinkSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { dirname, join, relative } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -12,7 +15,7 @@ import { createAuthFn, createUser, issueSession } from '@authfn/core';
 import { AuthFnAgentKeys, AuthFnIdentityVerifier } from '../../packages/auth/dist/index.js';
 import { PostgresAggregations, PostgresAnalysisWorker, PostgresSpaces, postgresServices, reconcileIndexes, reconciliationBounds }
   from '../../packages/postgres/dist/index.js';
-import { measure, seed, SHAPES, underLoad } from '../../scripts/analysis-measure.mjs';
+import { measure, reportDestination, seed, SHAPES, underLoad, writeReport } from '../../scripts/analysis-measure.mjs';
 import { connectionOptions } from '../../scripts/db-connection.mjs';
 
 // STA-60: the typed index reconciliation against records' canonical data, and the measurement script's report. The
@@ -538,7 +541,8 @@ test('the measurement script writes its report where it checked it: a parent rep
       '--load-seconds', '1', '--writes', '1', '--out', 'reports/report.json'], { cwd: dir, env: { ...process.env, DATABASE_URL: baseUrl } });
     let stderr = '';
     child.stderr.on('data', chunk => { stderr += chunk; });
-    return { child, exited: new Promise(resolve => child.on('exit', status => resolve({ status, stderr }))) };
+    // 'close': the child's stderr is complete, which 'exit' does not promise.
+    return { child, exited: new Promise(resolve => child.on('close', status => resolve({ status, stderr }))) };
   };
   try {
     await mkdir(join(dir, 'reports'));
@@ -571,6 +575,47 @@ test('the measurement script writes its report where it checked it: a parent rep
   }
 });
 
+test('the report write is bound to the checked directory: a parent replaced by a link outside, before or after it is entered, never leads it outside', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'stateplane-out-')), outside = await mkdtemp(join(tmpdir(), 'stateplane-outside-'));
+  const cwd = process.cwd(), realOpen = fsp.open, realChdir = process.chdir;
+  /** Replace the checked directory by a link to the one outside, keeping it as `moved`. */
+  const replace = () => { renameSync(join(dir, 'reports'), join(dir, 'moved')); symlinkSync(outside, join(dir, 'reports')); };
+  try {
+    await mkdir(join(dir, 'reports'));
+    process.chdir(dir);
+    const checked = await reportDestination('reports/report.json');
+    // Replaced once the directory is entered, as the file is opened: the report is written in the checked directory (now
+    // `moved`), and nothing is created outside.
+    fsp.open = async (...args) => { replace(); return realOpen(...args); };
+    syncBuiltinESMExports();
+    await writeReport('reports/report.json', checked, 'report\n');
+    fsp.open = realOpen;
+    syncBuiltinESMExports();
+    assert.equal(await readFile(join(dir, 'moved', 'report.json'), 'utf8'), 'report\n');
+    await assert.rejects(stat(join(outside, 'report.json')), { code: 'ENOENT' });
+    await rm(join(dir, 'reports'));
+    await rename(join(dir, 'moved'), join(dir, 'reports'));
+    await rm(join(dir, 'reports', 'report.json'));
+    // Replaced after the check, as the directory is entered: the directory entered is outside, and the write is refused.
+    process.chdir = function (directory) {
+      if (directory === dirname(checked)) replace();
+      return realChdir.call(this, directory);
+    };
+    await assert.rejects(writeReport('reports/report.json', checked, 'report\n'), /--out must name a file inside the current directory/);
+    process.chdir = realChdir;
+    await assert.rejects(stat(join(outside, 'report.json')), { code: 'ENOENT' });
+    await assert.rejects(stat(join(dir, 'moved', 'report.json')), { code: 'ENOENT' });
+    assert.equal(process.cwd(), await fsp.realpath(dir), 'the working directory is restored');
+  } finally {
+    fsp.open = realOpen;
+    syncBuiltinESMExports();
+    process.chdir = realChdir;
+    process.chdir(cwd);
+    await rm(dir, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
 test('a failed drop of the measurement database never replaces the run\'s own failure, and names the database either way', async () => {
   const original = { query: pg.Client.prototype.query, create: PostgresSpaces.prototype.create };
   pg.Client.prototype.query = function (sql, ...rest) {
@@ -579,11 +624,13 @@ test('a failed drop of the measurement database never replaces the run\'s own fa
   };
   // Each database left behind is registered as soon as its error arrives and dropped at the end, also when an assertion fails.
   const left = [];
+  /** Register the database a measurement error names as left behind, and return the error. */
   const leaving = error => {
     const database = error?.cleanup?.database ?? error?.database;
     if (/^stateplane_measure_[0-9a-f]{32}$/.test(database)) left.push(database);
     return error;
   };
+  /** 1 when the named database exists, else 0. */
   const exists = async database => (await admin(`SELECT count(*)::int AS n FROM pg_database WHERE datname='${database}'`)).rows[0].n;
   try {
     // The run and the drop both fail: the run's failure is thrown, the drop's attached to it.
