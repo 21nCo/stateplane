@@ -512,20 +512,38 @@ test('a failed drop of the measurement database never replaces the run\'s own fa
   }
 });
 
-test('mixed load counts the job result pages committed in its interval, also by a Worker step that returns after it', async () => {
-  const step = PostgresAnalysisWorker.prototype.step;
-  // Each phase step returns 1.5 s after it ends, after the 1 s of interactive reads; its page committed well within them.
-  PostgresAnalysisWorker.prototype.step = async function (options, ...rest) {
-    const result = await step.call(this, options, ...rest);
-    if (options?.budgetMs === 2_000) await new Promise(resolve => setTimeout(resolve, 1_500));
-    return result;
-  };
+test('mixed load counts the job result pages written in its interval: a step returning after it counts, a page written after it does not', async () => {
+  const step = PostgresAnalysisWorker.prototype.step, query = pg.Pool.prototype.query;
+  const settings = { scales: [300], noise: 0, runs: 1, loadSeconds: 1, writes: 1 };
+  const phaseStep = options => options?.budgetMs === 2_000;
   try {
-    const report = await measure({ scales: [300], noise: 0, runs: 1, loadSeconds: 1, writes: 1 });
+    // Each phase step returns 1.5 s after it ends, after the 1 s of interactive reads; its page was written well within them.
+    PostgresAnalysisWorker.prototype.step = async function (options, ...rest) {
+      const result = await step.call(this, options, ...rest);
+      if (phaseStep(options)) await new Promise(resolve => setTimeout(resolve, 1_500));
+      return result;
+    };
+    const early = await measure(settings);
     // The phase's export of 300 records is one result page.
-    assert.equal(report.mixedLoad.phases.jobsOnly.jobPagesWritten, 1);
-    assert.equal(report.mixedLoad.phases.alone.jobPagesWritten, 0);
-  } finally { PostgresAnalysisWorker.prototype.step = step; }
+    assert.equal(early.mixedLoad.phases.jobsOnly.jobPagesWritten, 1);
+    assert.equal(early.mixedLoad.phases.alone.jobPagesWritten, 0);
+    // Each phase step starts 1.3 s into the phase, after the reads, and any count of result pages is 900 ms late: the page
+    // written after the reads is outside the interval however late the count runs.
+    PostgresAnalysisWorker.prototype.step = async function (options, ...rest) {
+      if (phaseStep(options)) await new Promise(resolve => setTimeout(resolve, 1_300));
+      return step.call(this, options, ...rest);
+    };
+    pg.Pool.prototype.query = async function (sql, ...rest) {
+      if (typeof sql === 'string' && sql.includes('FROM analysis_result_pages')) await new Promise(resolve => setTimeout(resolve, 900));
+      return query.call(this, sql, ...rest);
+    };
+    const late = await measure(settings);
+    assert.equal(late.mixedLoad.phases.jobsOnly.jobPagesWritten, 0);
+    assert.ok(late.mixedLoad.phases.jobsOnly.pageCutoffLagMs >= 0);
+  } finally {
+    PostgresAnalysisWorker.prototype.step = step;
+    pg.Pool.prototype.query = query;
+  }
 });
 
 test('the measurement script reports plans as issued, the candidate index, jobs, reconciliation, mixed load and limits, and drops its database', async () => {

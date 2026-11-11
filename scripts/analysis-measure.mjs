@@ -320,9 +320,10 @@ async function run(settings, newPool) {
   const loadJobs = new PostgresAnalysisJobs(spaces, new Map([['cell-a', { pool }]]));
   const loadWorker = new PostgresAnalysisWorker(newPool(2), { originConnectionLimit: 5 });
   const heavy = JSON.stringify(SHAPES.byValue);
-  // Result pages are counted as committed, whichever step wrote them and whenever that step returns.
-  const committedPages = async () => Number((await pool.query(`SELECT count(*) AS n FROM analysis_result_pages
-    WHERE space_id=$1 AND collection_id=$2`, [spaceId, collectionId])).rows[0].n);
+  // Job result pages written within [after, until] (database clock), whichever step wrote them and whenever it returned.
+  const pagesWithin = async (after, until) => Number((await pool.query(`SELECT count(*) AS n FROM analysis_result_pages
+    WHERE space_id=$1 AND collection_id=$2 AND created_at>$3::timestamptz AND created_at<=$4::timestamptz`,
+  [spaceId, collectionId, after, until])).rows[0].n);
   const aggregationLoop = (composed, retryMs, outcomes) => async load => {
     while (!load.stop) {
       try { await composed.analysis.aggregate(owner, spaceId, collectionId, heavy); outcomes.answered++; } catch (error) {
@@ -335,29 +336,39 @@ async function run(settings, newPool) {
   /**
    * Interactive reads while the given analytical load runs: aggregation loops, each retrying a refusal after `retryMs`, and
    * jobs Worker steps. Every outcome is counted over one interval, from the phase's start to the end of its interactive
-   * reads: aggregations answered or refused, and the job result pages committed, in it.
+   * reads: the read pairs and aggregations answered or refused that completed in it, and the job result pages written
+   * (`created_at`, the database's clock) in it, counted once the phase has settled. The interval's ends on the database's
+   * clock are read on a connection held for the phase; `pageCutoffLagMs` is how long after the last read pair its end was
+   * read, the only time a page written after the reads can still be counted.
    */
   const phase = async ({ aggregating, stepping, retryMs = 5 }) => {
     let peak = 0;
     const outcomes = { answered: 0, refused: 0 };
     if (stepping) await loadJobs.submit(owner, spaceId, collectionId, 'export');
-    const pagesBefore = await committedPages();
-    return underLoad([
-      ...(aggregating ? isolates : []).flatMap(composed => Array.from({ length: 6 }, () => aggregationLoop(composed, retryMs, outcomes))),
-      ...(stepping ? [async load => { while (!load.stop) await loadWorker.step({ budgetMs: 2_000 }); }] : []),
-      async load => {
-        while (!load.stop) {
-          const running = (await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname=current_database()
-            AND state='active' AND query LIKE 'WITH grouped AS%'`)).rows[0].n;
-          peak = Math.max(peak, running);
-          await sleep(5);
-        }
-      }], async load => {
-      const interactiveReadPairMs = await reads(settings.loadSeconds, () => !load.stop);
-      const aggregations = { answered: outcomes.answered, refused: outcomes.refused, peakConcurrentStatements: peak };
-      return { retryAfterRefusalMs: aggregating ? retryMs : null, interactiveReadPairMs, aggregations,
-        jobPagesWritten: (await committedPages()) - pagesBefore };
-    });
+    const marker = await pool.connect();
+    try {
+      const clock = async () => (await marker.query('SELECT clock_timestamp()::text AS at')).rows[0].at;
+      const startedAt = await clock();
+      const { endedAt, ...result } = await underLoad([
+        ...(aggregating ? isolates : []).flatMap(composed => Array.from({ length: 6 }, () => aggregationLoop(composed, retryMs, outcomes))),
+        ...(stepping ? [async load => { while (!load.stop) await loadWorker.step({ budgetMs: 2_000 }); }] : []),
+        async load => {
+          while (!load.stop) {
+            const running = (await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname=current_database()
+              AND state='active' AND query LIKE 'WITH grouped AS%'`)).rows[0].n;
+            peak = Math.max(peak, running);
+            await sleep(5);
+          }
+        }], async load => {
+        const interactiveReadPairMs = await reads(settings.loadSeconds, () => !load.stop);
+        const readsEnded = performance.now();
+        const aggregations = { answered: outcomes.answered, refused: outcomes.refused, peakConcurrentStatements: peak };
+        const at = await clock();
+        return { retryAfterRefusalMs: aggregating ? retryMs : null, interactiveReadPairMs, aggregations, endedAt: at,
+          pageCutoffLagMs: round(performance.now() - readsEnded) };
+      });
+      return { ...result, jobPagesWritten: await pagesWithin(startedAt, endedAt) };
+    } finally { marker.release(); }
   };
   const phases = { alone: await phase({}), jobsOnly: await phase({ stepping: true }),
     aggregationsOnly: await phase({ aggregating: true }), aggregationsBackingOff: await phase({ aggregating: true, retryMs: 250 }),
