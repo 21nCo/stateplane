@@ -16,8 +16,10 @@ export const reconciliationBounds = Object.freeze({ pageRecords: 1_000, defaultR
  * One typed index row that differs from what the record's canonical data
  * derives: `missing` (a live record has no row for a ready field),
  * `unexpected` (a deleted record still has one), `kind` or `value` (the row
- * holds another kind or value), or `underivable` (the stored data no longer
- * derives a value under the current definition). Kinds only, never values.
+ * holds another kind or value), or `underivable` (the stored data derives no
+ * value under the current definition: an invalid value, a field holding an
+ * object or array, or canonical data that is not a JSON object). Kinds only,
+ * never values.
  */
 export interface IndexDrift {
   recordId: string; field: string; reason: 'missing' | 'unexpected' | 'kind' | 'value' | 'underivable';
@@ -25,7 +27,10 @@ export interface IndexDrift {
 }
 export interface IndexReconciliation {
   spaceId: string; collectionId: string;
-  /** The ready declared fields checked, in name order; a field still backfilling is not checked. */
+  /**
+   * The ready declared fields checked on every page, in name order; a field still backfilling is not checked, and one that
+   * turned ready during the call is not listed.
+   */
   fields: string[];
   /** Records checked (live and deleted), after `after`, in record ID order. */
   checked: number; after: string | null;
@@ -74,11 +79,20 @@ export async function reconcileIndexes(pool: PoolLike, spaceId: string, collecti
       const expected: IndexValue[] = [], owners: string[] = [];
       for (const record of records) {
         if (record.tombstone) continue;
-        const data = JSON.parse(record.canonical_data) as Record<string, Json>;
+        // Damaged stored data (not JSON, not an object, or a field holding no scalar) derives nothing: it is drift of each
+        // ready field, never a failure of the whole call.
+        let data: Record<string, Json> | null = null;
+        try {
+          const parsed = JSON.parse(record.canonical_data) as Json;
+          if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) data = parsed as Record<string, Json>;
+        } catch { /* reported below */ }
         for (const field of fields) {
-          let value: IndexValue;
-          try { value = derivedIndexValue(data, definition, field); }
-          catch { drift.push({ recordId: record.record_id, field, reason: 'underivable', expectedKind: null, actualKind: null }); continue; }
+          let value: IndexValue | null = null;
+          try { if (data) value = derivedIndexValue(data, definition, field); } catch { /* reported below */ }
+          if (!value || (value.kind === 'number' && !Number.isFinite(value.value))) {
+            drift.push({ recordId: record.record_id, field, reason: 'underivable', expectedKind: null, actualKind: null });
+            continue;
+          }
           expected.push(value); owners.push(record.record_id);
         }
       }
@@ -113,7 +127,8 @@ export async function reconcileIndexes(pool: PoolLike, spaceId: string, collecti
       }
       return { fields, records: records.length, last: records.length ? records[records.length - 1].record_id as string : null, drift };
     });
-    result.fields = page.fields;
+    // A declaration that turned ready during the call was not checked on its earlier pages: list only fields every page checked.
+    result.fields = result.checked ? result.fields.filter(field => page.fields.includes(field)) : page.fields;
     result.checked += page.records;
     result.driftCount += page.drift.length;
     for (const item of page.drift) if (result.drift.length < reconciliationBounds.samples) result.drift.push(item);

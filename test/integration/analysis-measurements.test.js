@@ -105,11 +105,15 @@ test('reconciliation finds a typed index that matches its records\' data clean a
   assert.deepEqual(reasons(drifted).sort((a, b) => (key(a) < key(b) ? -1 : 1)), expected.sort((a, b) => (key(a) < key(b) ? -1 : 1)));
   assert.ok(!JSON.stringify(drifted).includes('moved') && !JSON.stringify(drifted).includes('yesterday'), 'drift states kinds, never values');
 
-  // The operator entrypoint prints the same report and exits 1 on drift.
+  // The operator entrypoint prints the same report and exits 2 on drift; a failed check exits 1 with no report.
   const cli = spawnSync(process.execPath, ['scripts/reconcile-indexes.mjs', '--space', f.spaceId, '--collection', 'items'],
     { cwd: root, env: { ...process.env, DATABASE_URL: url }, encoding: 'utf8' });
-  assert.equal(cli.status, 1, cli.stderr);
+  assert.equal(cli.status, 2, cli.stderr);
   assert.deepEqual(JSON.parse(cli.stdout), drifted);
+  const failed = spawnSync(process.execPath, ['scripts/reconcile-indexes.mjs', '--space', f.spaceId, '--collection', 'none'],
+    { cwd: root, env: { ...process.env, DATABASE_URL: url }, encoding: 'utf8' });
+  assert.deepEqual([failed.status, failed.stdout], [1, '']);
+  assert.match(failed.stderr, /No such collection/);
 
   // Pages: a bounded call returns where to continue, and the continuation finds the rest.
   const first = await reconcileIndexes(pool, f.spaceId, 'items', { maxRecords: 5 });
@@ -120,6 +124,31 @@ test('reconciliation finds a typed index that matches its records\' data clean a
   for (const bad of [0, 1.5, reconciliationBounds.maxRecords + 1]) await assert.rejects(reconcileIndexes(pool, f.spaceId, 'items',
     { maxRecords: bad }), RangeError);
   await assert.rejects(reconcileIndexes(pool, f.spaceId, 'none'), RangeError);
+});
+
+test('reconciliation reports damaged canonical data as underivable drift per record and field, beside other drift, without failing', async () => {
+  const f = await fixture();
+  const ids = [];
+  for (let n = 0; n < 6; n++) ids.push(await f.write({ operation: 'create', data: { team: `t${n}`, score: n, active: true,
+    at: '2026-03-08T01:30:00Z' } }));
+  const data = (id, sql) => damage(`UPDATE records SET canonical_data=${sql} WHERE space_id=$1 AND collection_id='items' AND record_id=$2`,
+    [f.spaceId, id]);
+  // A number field holding an object, a string field holding an array, data that is a JSON array, a JSON string, not JSON.
+  await data(ids[0], `jsonb_set(canonical_data::jsonb,'{score}','{"n":1}')::text`);
+  await data(ids[1], `jsonb_set(canonical_data::jsonb,'{team}','["t1"]')::text`);
+  await data(ids[2], `'[1,2]'`);
+  await data(ids[3], `'"text"'`);
+  await data(ids[4], `'{"team":'`);
+  await damage(`UPDATE record_index_values SET number_value=number_value+1
+    WHERE space_id=$1 AND collection_id='items' AND record_id=$2 AND field_name='score'`, [f.spaceId, ids[5]]);
+  const report = await reconcileIndexes(pool, f.spaceId, 'items');
+  const whole = id => INDEXED.map(field => [id, field, 'underivable', null, null]);
+  const expected = [[ids[0], 'score', 'underivable', null, null], [ids[1], 'team', 'underivable', null, null], ...whole(ids[2]),
+    ...whole(ids[3]), ...whole(ids[4]), [ids[5], 'score', 'value', 'number', 'number']];
+  const key = item => `${item[0]} ${item[1]}`;
+  const order = (a, b) => (key(a) < key(b) ? -1 : 1);
+  assert.deepEqual([report.checked, report.driftCount], [6, expected.length]);
+  assert.deepEqual(reasons(report).sort(order), expected.sort(order));
 });
 
 test('reconciliation checks ready fields only: a field still backfilling is not reported as drift', async () => {
@@ -143,13 +172,16 @@ test('reconciliation reads each page in one snapshot: a write committing between
   const f = await fixture();
   const ids = [];
   for (let n = 0; n < 3; n++) ids.push(await f.write({ operation: 'create', data: { team: 'a', score: n } }));
-  // A pool whose session runs `between` once, right after the page's records are read and before their rows are.
-  let between = null;
+  // A pool whose session runs `between` once, right after the page's records are read and before their rows are; with
+  // `isolation`, it reads at that level instead of the snapshot reconciliation asks for.
+  let between = null, isolation = null;
   const pausing = { connect: async () => {
     const client = await pool.connect();
     return new Proxy(client, { get(object, property) {
       if (property !== 'query') return typeof object[property] === 'function' ? object[property].bind(object) : object[property];
       return async (sql, values) => {
+        if (isolation && typeof sql === 'string' && /^SET TRANSACTION ISOLATION LEVEL/.test(sql))
+          sql = `SET TRANSACTION ISOLATION LEVEL ${isolation}, READ ONLY`;
         const result = await object.query(sql, values);
         if (between && typeof sql === 'string' && /tombstone,canonical_data FROM records/.test(sql)) {
           const run = between;
@@ -167,6 +199,27 @@ test('reconciliation reads each page in one snapshot: a write committing between
   // The next reconciliation reads the written record, data and rows together.
   assert.equal((await reconcileIndexes(pool, f.spaceId, 'items')).driftCount, 0);
   assert.equal((await pool.query('SELECT revision FROM records WHERE space_id=$1 AND record_id=$2', [f.spaceId, ids[0]])).rows[0].revision, '2');
+  // The same interleaving read at READ COMMITTED sees the old data beside the new rows and reports false drift, so the
+  // snapshot is what keeps it out.
+  isolation = 'READ COMMITTED';
+  between = () => f.write({ operation: 'replace', id: ids[0], expectedRevision: 2, data: { team: 'c', score: 7, active: false } });
+  const unsnapshotted = await reconcileIndexes(pausing, f.spaceId, 'items');
+  assert.equal(between, null);
+  assert.deepEqual(unsnapshotted.drift.map(item => [item.recordId, item.field, item.reason]),
+    [[ids[0], 'active', 'value'], [ids[0], 'score', 'value'], [ids[0], 'team', 'value']]);
+});
+
+test('the measurement script refuses a server URL outside the TLS policy before connecting', () => {
+  // The .invalid host never resolves: a connection attempt fails with ENOTFOUND, not the policy's refusal.
+  for (const [target, message] of [['postgres://u:p@db.example.invalid:5432/stateplane', /requires sslmode=verify-full/],
+    ['postgres://u:p@db.example.invalid:5432/stateplane?sslmode=require', /requires sslmode=verify-full/],
+    ['postgres://u:p@127.0.0.1:1/stateplane?sslmode=require', /Loopback DATABASE_URL only permits sslmode=disable/]]) {
+    const run = spawnSync(process.execPath, ['scripts/analysis-measure.mjs', '--scales', '10', '--noise', '0'],
+      { cwd: root, env: { ...process.env, DATABASE_URL: target }, encoding: 'utf8' });
+    assert.notEqual(run.status, 0, target);
+    assert.match(run.stderr, message, target);
+    assert.doesNotMatch(run.stderr, /ENOTFOUND|ECONNREFUSED/, target);
+  }
 });
 
 test('the measurement script reports plans as issued, the candidate index, jobs, reconciliation, mixed load and limits, and drops its database', async () => {
@@ -195,7 +248,10 @@ test('the measurement script reports plans as issued, the candidate index, jobs,
   }
   assert.deepEqual([report.reconciliation.records, report.reconciliation.driftCount], [900, 0]);
   const load = report.mixedLoad;
-  assert.deepEqual(Object.keys(load.phases), ['alone', 'jobsOnly', 'aggregationsOnly', 'aggregationsBackingOff', 'both']);
+  assert.deepEqual(Object.keys(load.phases), ['alone', 'jobsOnly', 'aggregationsOnly', 'aggregationsBackingOff', 'both',
+    'bothBackingOff']);
+  assert.deepEqual(Object.entries(load.phases).map(([label, phase]) => [label, phase.retryAfterRefusalMs]), [['alone', null],
+    ['jobsOnly', null], ['aggregationsOnly', 5], ['aggregationsBackingOff', 250], ['both', 5], ['bothBackingOff', 250]]);
   for (const [label, phase] of Object.entries(load.phases)) {
     assert.ok(phase.interactiveReadPairMs.samples > 0, label);
     // At most the cell's analytical slots ran at once, however many loops asked.

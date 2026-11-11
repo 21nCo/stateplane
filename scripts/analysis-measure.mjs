@@ -8,7 +8,8 @@
 //   3. at the largest scale, an export and an aggregate snapshot job run to completion by the jobs Worker step, with
 //      the plan of its as-of page read, and the typed index reconciliation over the collection;
 //   4. mixed load: interactive reads alone, then while the jobs Worker step, aggregations, or both saturate analytical
-//      capacity, from two composed application services (two isolates) at an origin connection limit of 5.
+//      capacity (aggregations retrying a refusal after 5 or after 250 ms), from two composed application services (two
+//      isolates) at an origin connection limit of 5.
 // The fixture's other space (--noise records) keeps the measured collection a fraction of the shared tables, as in a
 // cell holding many spaces. The report (JSON on stdout, or --out FILE) measures this fixture and this server only; it
 // is no guarantee. The database is dropped at the end, also after a failure.
@@ -25,6 +26,7 @@ import { createAuthFn, createUser, issueSession } from '@authfn/core';
 import { AuthFnAgentKeys, AuthFnIdentityVerifier } from '../packages/auth/dist/index.js';
 import { aggregationBounds, analysisJobBounds, analyticalSlots, PostgresAggregations, PostgresAnalysisJobs, PostgresAnalysisWorker,
   PostgresSpaces, postgresServices, reconcileIndexes } from '../packages/postgres/dist/index.js';
+import { connectionOptions } from './db-connection.mjs';
 import { percentile, round } from './relevance-metrics.mjs';
 
 export const FIXTURE = 'analysis-fixture/v1';
@@ -77,15 +79,18 @@ export async function measure(settings) {
   const password = process.env.DATABASE_URL ? null : (await readFile(new URL('../.data/local-db-password', import.meta.url), 'utf8')).trim();
   const baseUrl = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT ?? '55432'}/stateplane`;
   const name = `stateplane_measure_${randomUUID().replaceAll('-', '')}`;
+  // Every connection takes the operator scripts' TLS policy (loopback plaintext, otherwise sslmode=verify-full), checked for
+  // the server and the run's database before anything connects; migrate.mjs applies it to the same URL.
+  const url = Object.assign(new URL(baseUrl), { pathname: `/${name}` }).toString();
+  const adminOptions = { ...connectionOptions(baseUrl), connectionTimeoutMillis: 60_000, query_timeout: 60_000 }, database = connectionOptions(url);
   const onServer = async sql => {
-    const client = new pg.Client({ connectionString: baseUrl, connectionTimeoutMillis: 60_000, query_timeout: 60_000 });
+    const client = new pg.Client(adminOptions);
     await client.connect();
     try { return await client.query(sql); } finally { await client.end(); }
   };
   await onServer(`CREATE DATABASE ${name}`);
-  const url = Object.assign(new URL(baseUrl), { pathname: `/${name}` }).toString();
   const pools = [];
-  const newPool = max => { const pool = new pg.Pool({ connectionString: url, max }); pool.on('error', () => {}); pools.push(pool); return pool; };
+  const newPool = max => { const pool = new pg.Pool({ ...database, max }); pool.on('error', () => {}); pools.push(pool); return pool; };
   try {
     execFileSync(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: url }, stdio: 'ignore' });
     return await run(settings, newPool);
@@ -308,7 +313,8 @@ async function run(settings, newPool) {
   };
   const phases = { alone: await phase({}), jobsOnly: await phase({ stepping: true }),
     aggregationsOnly: await phase({ aggregating: true }), aggregationsBackingOff: await phase({ aggregating: true, retryMs: 250 }),
-    both: await phase({ aggregating: true, stepping: true }) };
+    both: await phase({ aggregating: true, stepping: true }),
+    bothBackingOff: await phase({ aggregating: true, stepping: true, retryMs: 250 }) };
 
   const largest = scales.at(-1);
   return { contractVersion: '1', kind: 'stateplane.analysis-measurements', measuredAt: new Date().toISOString(),
