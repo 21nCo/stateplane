@@ -1,0 +1,2369 @@
+{
+  "contractVersion": "1",
+  "kind": "stateplane.analysis-measurements",
+  "measuredAt": "2026-11-11T14:43:36.790Z",
+  "note": "Measurements of this fixture on this server only; not guarantees.",
+  "environment": {
+    "server": "PostgreSQL 17.11 (Debian 17.11-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+    "node": "v23.11.1",
+    "statementTimeoutMs": 15000,
+    "parallelWorkers": 0,
+    "host": {
+      "cpus": 8,
+      "loadAverage": {
+        "start": [
+          8.112,
+          14.492,
+          12.01
+        ],
+        "end": [
+          22.784,
+          19.056,
+          15.258
+        ]
+      }
+    }
+  },
+  "fixture": {
+    "name": "analysis-fixture/v1",
+    "fields": {
+      "team": "string, 20 values",
+      "score": "number, null every 11th",
+      "active": "boolean, missing every 13th",
+      "at": "date-time, every 97 s from 2020-01-01T00:00:00Z"
+    },
+    "noiseRecords": 1000000,
+    "scales": [
+      50000
+    ],
+    "runs": 1
+  },
+  "aggregations": [
+    {
+      "records": 50000,
+      "seedSeconds": 208.039,
+      "baseline": {
+        "count": {
+          "groups": 1,
+          "serviceMs": {
+            "samples": 1,
+            "p50": 103.47,
+            "p95": 103.47,
+            "max": 103.47
+          },
+          "usPerRecord": 2.069,
+          "explain": {
+            "settings": [
+              "SET LOCAL statement_timeout = '5000ms'",
+              "SET LOCAL lock_timeout = '2000ms'",
+              "SET LOCAL max_parallel_workers_per_gather = 0",
+              "SET LOCAL statement_timeout = '15000ms'"
+            ],
+            "planningMs": 0.133,
+            "executionMs": 10.468,
+            "sharedHit": 1141,
+            "sharedRead": 0,
+            "indexes": [
+              "records_live_order"
+            ],
+            "plan": {
+              "node": "Nested Loop",
+              "join": "Left",
+              "rows": 1,
+              "loops": 1,
+              "ms": 10.447,
+              "hit": 1141,
+              "read": 0,
+              "children": [
+                {
+                  "node": "Subquery Scan",
+                  "rows": 1,
+                  "loops": 1,
+                  "ms": 10.439,
+                  "hit": 1141,
+                  "read": 0,
+                  "children": [
+                    {
+                      "node": "Aggregate",
+                      "rows": 1,
+                      "loops": 1,
+                      "ms": 10.434,
+                      "hit": 1141,
+                      "read": 0,
+                      "children": [
+                        {
+                          "node": "Index Only Scan",
+                          "relation": "records",
+                          "index": "records_live_order",
+                          "rows": 50000,
+                          "loops": 1,
+                          "ms": 7.89,
+                          "hit": 1141,
+                          "read": 0
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "node": "Aggregate",
+                  "rows": 1,
+                  "loops": 1,
+                  "ms": 10.445,
+                  "hit": 1141,
+                  "read": 0,
+                  "children": [
+                    {
+                      "node": "CTE Scan",
+                      "rows": 1,
+                      "loops": 1,
+                      "ms": 10.442,
+                      "hit": 1141,
+                      "read": 0
+                    }
+                  ]
+                },
+                {
+                  "node": "CTE Scan",
+                  "rows": 1,
+                  "loops": 1,
+                  "ms": 0,
+                  "hit": 0,
+                  "read": 0
+                }
+              ]
+            }
+          }
+        },
+        "byValue": {
+          "groups": 20,
+          "serviceMs": {
+            "samples": 1,
+            "p50": 146.347,
+            "p95": 146.347,
+            "max": 146.347
+          },
+          "usPerRecord": 2.927,
+          "explain": {
+            "settings": [
+              "SET LOCAL statement_timeout = '5000ms'",
+              "SET LOCAL lock_timeout = '2000ms'",
+              "SET LOCAL max_parallel_workers_per_gather = 0",
+              "SET LOCAL statement_timeout = '15000ms'"
+            ],
+            "planningMs": 0.338,
+            "executionMs": 143.261,
+            "sharedHit": 7224,
+            "sharedRead": 0,
+            "indexes": [
+              "record_index_values_pkey",
+              "records_live_order"
+            ],
+            "plan": {
+              "node": "Sort",
+              "rows": 20,
+              "loops": 1,
+              "ms": 142.519,
+              "hit": 7224,
+              "read": 0,
+              "children": [
+                {
+                  "node": "Subquery Scan",
+                  "rows": 20,
+                  "loops": 1,
+                  "ms": 142.481,
+                  "hit": 7224,
+                  "read": 0,
+                  "children": [
+                    {
+                      "node": "Aggregate",
+                      "rows": 20,
+                      "loops": 1,
+                      "ms": 142.461,
+                      "hit": 7224,
+                      "read": 0,
+                      "children": [
+                        {
+                          "node": "Sort",
+                          "rows": 50000,
+                          "loops": 1,
+                          "ms": 130.575,
+                          "hit": 7224,
+                          "read": 0,
+                          "children": [
+                            {
+                              "node": "Merge Join",
+                              "join": "Left",
+                              "rows": 50000,
+                              "loops": 1,
+                              "ms": 114.12,
+                              "hit": 7224,
+                              "read": 0,
+                              "children": [
+                                {
+                                  "node": "Merge Join",
+                                  "join": "Left",
+                                  "rows": 50000,
+                                  "loops": 1,
+                                  "ms": 79.018,
+                                  "hit": 4188,
+                                  "read": 0,
+                                  "children": [
+                                    {
+                                      "node": "Sort",
+                                      "rows": 50000,
+                                      "loops": 1,
+                                      "ms": 36.733,
+                                      "hit": 1141,
+                                      "read": 0,
+                                      "children": [
+                                        {
+                                          "node": "Index Only Scan",
+                                          "relation": "records",
+                                          "index": "records_live_order",
+                                          "rows": 50000,
+                                          "loops": 1,
+                                          "ms": 7.894,
+                                          "hit": 1141,
+                                          "read": 0
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "node": "Index Scan",
+                                      "relation": "record_index_values",
+                                      "index": "record_index_values_pkey",
+                                      "rows": 50000,
+                                      "loops": 1,
+                                      "ms": 20.877,
+                                      "hit": 3047,
+                                      "read": 0
+                                    }
+                                  ]
+                                },
+                                {
+                                  "node": "Index Scan",
+                                  "relation": "record_index_values",
+                                  "index": "record_index_values_pkey",
+                                  "rows": 50000,
+                                  "loops": 1,
+                                  "ms": 14.712,
+                                  "hit": 3036,
+                                  "read": 0
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "node": "Nested Loop",
+                  "join": "Left",
+                  "rows": 20,
+                  "loops": 1,
+                  "ms": 142.506,
+                  "hit": 7224,
+                  "read": 0,
+                  "children": [
+                    {
+                      "node": "Aggregate",
+                      "rows": 1,
+                      "loops": 1,
+                      "ms": 142.497,
+                      "hit": 7224,
+                      "read": 0,
+                      "children": [
+                        {
+                          "node": "CTE Scan",
+                          "rows": 20,
+                          "loops": 1,
+                          "ms": 142.488,
+                          "hit": 7224,
+                          "read": 0
+                        }
+                      ]
+                    },
+                    {
+                      "node": "CTE Scan",
+                      "rows": 20,
+                      "loops": 1,
+                      "ms": 0.002,
+                      "hit": 0,
+                      "read": 0
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "byMonth": {
+          "groups": 3,
+          "serviceMs": {
+            "samples": 1,
+            "p50": 262.314,
+            "p95": 262.314,
+            "max": 262.314
+          },
+          "usPerRecord": 5.246,
+          "explain": {
+            "settings": [
+              "SET LOCAL statement_timeout = '5000ms'",
+              "SET LOCAL lock_timeout = '2000ms'",
+              "SET LOCAL max_parallel_workers_per_gather = 0",
+              "SET LOCAL statement_timeout = '15000ms'"
+            ],
+            "planningMs": 0.351,
+            "executionMs": 261.744,
+            "sharedHit": 7317,
+            "sharedRead": 0,
+            "indexes": [
+              "record_index_values_pkey",
+              "records_live_order"
+            ],
+            "plan": {
+              "node": "Sort",
+              "rows": 3,
+              "loops": 1,
+              "ms": 260.899,
+              "hit": 7317,
+              "read": 0,
+              "children": [
+                {
+                  "node": "Subquery Scan",
+                  "rows": 3,
+                  "loops": 1,
+                  "ms": 260.874,
+                  "hit": 7317,
+                  "read": 0,
+                  "children": [
+                    {
+                      "node": "Aggregate",
+                      "rows": 3,
+                      "loops": 1,
+                      "ms": 260.827,
+                      "hit": 7317,
+                      "read": 0,
+                      "children": [
+                        {
+                          "node": "Sort",
+                          "rows": 50000,
+                          "loops": 1,
+                          "ms": 247.772,
+                          "hit": 7317,
+                          "read": 0,
+                          "children": [
+                            {
+                              "node": "Merge Join",
+                              "join": "Left",
+                              "rows": 50000,
+                              "loops": 1,
+                              "ms": 236.987,
+                              "hit": 7317,
+                              "read": 0,
+                              "children": [
+                                {
+                                  "node": "Merge Join",
+                                  "join": "Left",
+                                  "rows": 50000,
+                                  "loops": 1,
+                                  "ms": 72.65,
+                                  "hit": 4281,
+                                  "read": 0,
+                                  "children": [
+                                    {
+                                      "node": "Sort",
+                                      "rows": 50000,
+                                      "loops": 1,
+                                      "ms": 31.983,
+                                      "hit": 1141,
+                                      "read": 0,
+                                      "children": [
+                                        {
+                                          "node": "Index Only Scan",
+                                          "relation": "records",
+                                          "index": "records_live_order",
+                                          "rows": 50000,
+                                          "loops": 1,
+                                          "ms": 6.689,
+                                          "hit": 1141,
+                                          "read": 0
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "node": "Index Scan",
+                                      "relation": "record_index_values",
+                                      "index": "record_index_values_pkey",
+                                      "rows": 50000,
+                                      "loops": 1,
+                                      "ms": 18.551,
+                                      "hit": 3140,
+                                      "read": 0
+                                    }
+                                  ]
+                                },
+                                {
+                                  "node": "Index Scan",
+                                  "relation": "record_index_values",
+                                  "index": "record_index_values_pkey",
+                                  "rows": 50000,
+                                  "loops": 1,
+                                  "ms": 14.473,
+                                  "hit": 3036,
+                                  "read": 0
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "node": "Nested Loop",
+                  "join": "Left",
+                  "rows": 3,
+                  "loops": 1,
+                  "ms": 260.891,
+                  "hit": 7317,
+                  "read": 0,
+                  "children": [
+                    {
+                      "node": "Aggregate",
+                      "rows": 1,
+                      "loops": 1,
+                      "ms": 260.885,
+                      "hit": 7317,
+                      "read": 0,
+                      "children": [
+                        {
+                          "node": "CTE Scan",
+                          "rows": 3,
+                          "loops": 1,
+                          "ms": 260.879,
+                          "hit": 7317,
+                          "read": 0
+                        }
+                      ]
+                    },
+                    {
+                      "node": "CTE Scan",
+                      "rows": 3,
+                      "loops": 1,
+                      "ms": 0.001,
+                      "hit": 0,
+                      "read": 0
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "threeDimensions": {
+          "groups": 40,
+          "serviceMs": {
+            "samples": 1,
+            "p50": 399.161,
+            "p95": 399.161,
+            "max": 399.161
+          },
+          "usPerRecord": 7.983,
+          "explain": {
+            "settings": [
+              "SET LOCAL statement_timeout = '5000ms'",
+              "SET LOCAL lock_timeout = '2000ms'",
+              "SET LOCAL max_parallel_workers_per_gather = 0",
+              "SET LOCAL statement_timeout = '15000ms'"
+            ],
+            "planningMs": 0.506,
+            "executionMs": 598.561,
+            "sharedHit": 10375,
+            "sharedRead": 0,
+            "indexes": [
+              "record_index_values_pkey",
+              "records_live_order"
+            ],
+            "plan": {
+              "node": "Sort",
+              "rows": 40,
+              "loops": 1,
+              "ms": 596.655,
+              "hit": 10375,
+              "read": 0,
+              "children": [
+                {
+                  "node": "Subquery Scan",
+                  "rows": 40,
+                  "loops": 1,
+                  "ms": 596.486,
+                  "hit": 10375,
+                  "read": 0,
+                  "children": [
+                    {
+                      "node": "Aggregate",
+                      "rows": 40,
+                      "loops": 1,
+                      "ms": 596.069,
+                      "hit": 10375,
+                      "read": 0,
+                      "children": [
+                        {
+                          "node": "Sort",
+                          "rows": 50000,
+                          "loops": 1,
+                          "ms": 364.465,
+                          "hit": 10375,
+                          "read": 0,
+                          "children": [
+                            {
+                              "node": "Merge Join",
+                              "join": "Left",
+                              "rows": 50000,
+                              "loops": 1,
+                              "ms": 310.507,
+                              "hit": 10375,
+                              "read": 0,
+                              "children": [
+                                {
+                                  "node": "Merge Join",
+                                  "join": "Left",
+                                  "rows": 50000,
+                                  "loops": 1,
+                                  "ms": 122.82,
+                                  "hit": 7235,
+                                  "read": 0,
+                                  "children": [
+                                    {
+                                      "node": "Merge Join",
+                                      "join": "Left",
+                                      "rows": 50000,
+                                      "loops": 1,
+                                      "ms": 81.63,
+                                      "hit": 4188,
+                                      "read": 0,
+                                      "children": [
+                                        {
+                                          "node": "Sort",
+                                          "rows": 50000,
+                                          "loops": 1,
+                                          "ms": 33.885,
+                                          "hit": 1141,
+                                          "read": 0,
+                                          "children": [
+                                            {
+                                              "node": "Index Only Scan",
+                                              "relation": "records",
+                                              "index": "records_live_order",
+                                              "rows": 50000,
+                                              "loops": 1,
+                                              "ms": 6.814,
+                                              "hit": 1141,
+                                              "read": 0
+                                            }
+                                          ]
+                                        },
+                                        {
+                                          "node": "Index Scan",
+                                          "relation": "record_index_values",
+                                          "index": "record_index_values_pkey",
+                                          "rows": 50000,
+                                          "loops": 1,
+                                          "ms": 22.372,
+                                          "hit": 3047,
+                                          "read": 0
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "node": "Index Scan",
+                                      "relation": "record_index_values",
+                                      "index": "record_index_values_pkey",
+                                      "rows": 50000,
+                                      "loops": 1,
+                                      "ms": 17.555,
+                                      "hit": 3047,
+                                      "read": 0
+                                    }
+                                  ]
+                                },
+                                {
+                                  "node": "Index Scan",
+                                  "relation": "record_index_values",
+                                  "index": "record_index_values_pkey",
+                                  "rows": 50000,
+                                  "loops": 1,
+                                  "ms": 17.363,
+                                  "hit": 3140,
+                                  "read": 0
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "node": "Nested Loop",
+                  "join": "Left",
+                  "rows": 40,
+                  "loops": 1,
+                  "ms": 596.616,
+                  "hit": 10375,
+                  "read": 0,
+                  "children": [
+                    {
+                      "node": "Aggregate",
+                      "rows": 1,
+                      "loops": 1,
+                      "ms": 596.568,
+                      "hit": 10375,
+                      "read": 0,
+                      "children": [
+                        {
+                          "node": "CTE Scan",
+                          "rows": 40,
+                          "loops": 1,
+                          "ms": 596.536,
+                          "hit": 10375,
+                          "read": 0
+                        }
+                      ]
+                    },
+                    {
+                      "node": "CTE Scan",
+                      "rows": 40,
+                      "loops": 1,
+                      "ms": 0.006,
+                      "hit": 0,
+                      "read": 0
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "filteredBroad": {
+          "groups": 2,
+          "serviceMs": {
+            "samples": 1,
+            "p50": 64.496,
+            "p95": 64.496,
+            "max": 64.496
+          },
+          "usPerRecord": 1.29,
+          "explain": {
+            "settings": [
+              "SET LOCAL statement_timeout = '5000ms'",
+              "SET LOCAL lock_timeout = '2000ms'",
+              "SET LOCAL max_parallel_workers_per_gather = 0",
+              "SET LOCAL statement_timeout = '15000ms'"
+            ],
+            "planningMs": 0.706,
+            "executionMs": 38.221,
+            "sharedHit": 25061,
+            "sharedRead": 0,
+            "indexes": [
+              "record_index_string",
+              "record_index_values_pkey",
+              "records_pkey"
+            ],
+            "plan": {
+              "node": "Sort",
+              "rows": 2,
+              "loops": 1,
+              "ms": 38.171,
+              "hit": 25061,
+              "read": 0,
+              "children": [
+                {
+                  "node": "Subquery Scan",
+                  "rows": 2,
+                  "loops": 1,
+                  "ms": 38.157,
+                  "hit": 25061,
+                  "read": 0,
+                  "children": [
+                    {
+                      "node": "Aggregate",
+                      "rows": 2,
+                      "loops": 1,
+                      "ms": 38.151,
+                      "hit": 25061,
+                      "read": 0,
+                      "children": [
+                        {
+                          "node": "Sort",
+                          "rows": 2500,
+                          "loops": 1,
+                          "ms": 37.876,
+                          "hit": 25061,
+                          "read": 0,
+                          "children": [
+                            {
+                              "node": "Nested Loop",
+                              "join": "Left",
+                              "rows": 2500,
+                              "loops": 1,
+                              "ms": 37.096,
+                              "hit": 25061,
+                              "read": 0,
+                              "children": [
+                                {
+                                  "node": "Nested Loop",
+                                  "join": "Inner",
+                                  "rows": 2500,
+                                  "loops": 1,
+                                  "ms": 18.632,
+                                  "hit": 12561,
+                                  "read": 0,
+                                  "children": [
+                                    {
+                                      "node": "Index Only Scan",
+                                      "relation": "record_index_values",
+                                      "index": "record_index_string",
+                                      "rows": 2500,
+                                      "loops": 1,
+                                      "ms": 0.87,
+                                      "hit": 61,
+                                      "read": 0
+                                    },
+                                    {
+                                      "node": "Index Scan",
+                                      "relation": "records",
+                                      "index": "records_pkey",
+                                      "rows": 1,
+                                      "loops": 2500,
+                                      "ms": 0.007,
+                                      "hit": 12500,
+                                      "read": 0
+                                    }
+                                  ]
+                                },
+                                {
+                                  "node": "Index Scan",
+                                  "relation": "record_index_values",
+                                  "index": "record_index_values_pkey",
+                                  "rows": 1,
+                                  "loops": 2500,
+                                  "ms": 0.007,
+                                  "hit": 12500,
+                                  "read": 0
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "node": "Nested Loop",
+                  "join": "Left",
+                  "rows": 2,
+                  "loops": 1,
+                  "ms": 38.164,
+                  "hit": 25061,
+                  "read": 0,
+                  "children": [
+                    {
+                      "node": "Aggregate",
+                      "rows": 1,
+                      "loops": 1,
+                      "ms": 38.161,
+                      "hit": 25061,
+                      "read": 0,
+                      "children": [
+                        {
+                          "node": "CTE Scan",
+                          "rows": 2,
+                          "loops": 1,
+                          "ms": 38.158,
+                          "hit": 25061,
+                          "read": 0
+                        }
+                      ]
+                    },
+                    {
+                      "node": "CTE Scan",
+                      "rows": 2,
+                      "loops": 1,
+                      "ms": 0,
+                      "hit": 0,
+                      "read": 0
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "filteredSelective": {
+          "groups": 1,
+          "serviceMs": {
+            "samples": 1,
+            "p50": 28.875,
+            "p95": 28.875,
+            "max": 28.875
+          },
+          "usPerRecord": 0.578,
+          "explain": {
+            "settings": [
+              "SET LOCAL statement_timeout = '5000ms'",
+              "SET LOCAL lock_timeout = '2000ms'",
+              "SET LOCAL max_parallel_workers_per_gather = 0",
+              "SET LOCAL statement_timeout = '15000ms'"
+            ],
+            "planningMs": 0.334,
+            "executionMs": 9.184,
+            "sharedHit": 9115,
+            "sharedRead": 0,
+            "indexes": [
+              "record_index_number",
+              "record_index_values_pkey",
+              "records_pkey"
+            ],
+            "plan": {
+              "node": "Nested Loop",
+              "join": "Left",
+              "rows": 1,
+              "loops": 1,
+              "ms": 9.152,
+              "hit": 9115,
+              "read": 0,
+              "children": [
+                {
+                  "node": "Subquery Scan",
+                  "rows": 1,
+                  "loops": 1,
+                  "ms": 9.143,
+                  "hit": 9115,
+                  "read": 0,
+                  "children": [
+                    {
+                      "node": "Aggregate",
+                      "rows": 1,
+                      "loops": 1,
+                      "ms": 9.135,
+                      "hit": 9115,
+                      "read": 0,
+                      "children": [
+                        {
+                          "node": "Nested Loop",
+                          "join": "Left",
+                          "rows": 909,
+                          "loops": 1,
+                          "ms": 8.963,
+                          "hit": 9115,
+                          "read": 0,
+                          "children": [
+                            {
+                              "node": "Nested Loop",
+                              "join": "Inner",
+                              "rows": 909,
+                              "loops": 1,
+                              "ms": 4.35,
+                              "hit": 4570,
+                              "read": 0,
+                              "children": [
+                                {
+                                  "node": "Index Only Scan",
+                                  "relation": "record_index_values",
+                                  "index": "record_index_number",
+                                  "rows": 909,
+                                  "loops": 1,
+                                  "ms": 0.165,
+                                  "hit": 25,
+                                  "read": 0
+                                },
+                                {
+                                  "node": "Index Scan",
+                                  "relation": "records",
+                                  "index": "records_pkey",
+                                  "rows": 1,
+                                  "loops": 909,
+                                  "ms": 0.004,
+                                  "hit": 4545,
+                                  "read": 0
+                                }
+                              ]
+                            },
+                            {
+                              "node": "Index Scan",
+                              "relation": "record_index_values",
+                              "index": "record_index_values_pkey",
+                              "rows": 1,
+                              "loops": 909,
+                              "ms": 0.005,
+                              "hit": 4545,
+                              "read": 0
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "node": "Aggregate",
+                  "rows": 1,
+                  "loops": 1,
+                  "ms": 9.148,
+                  "hit": 9115,
+                  "read": 0,
+                  "children": [
+                    {
+                      "node": "CTE Scan",
+                      "rows": 1,
+                      "loops": 1,
+                      "ms": 9.145,
+                      "hit": 9115,
+                      "read": 0
+                    }
+                  ]
+                },
+                {
+                  "node": "CTE Scan",
+                  "rows": 1,
+                  "loops": 1,
+                  "ms": 0,
+                  "hit": 0,
+                  "read": 0
+                }
+              ]
+            }
+          }
+        }
+      },
+      "candidate": {
+        "buildMs": 18522.994,
+        "shapes": {
+          "count": {
+            "groups": 1,
+            "serviceMs": {
+              "samples": 1,
+              "p50": 37.049,
+              "p95": 37.049,
+              "max": 37.049
+            },
+            "usPerRecord": 0.741,
+            "explain": {
+              "settings": [
+                "SET LOCAL statement_timeout = '5000ms'",
+                "SET LOCAL lock_timeout = '2000ms'",
+                "SET LOCAL max_parallel_workers_per_gather = 0",
+                "SET LOCAL statement_timeout = '15000ms'"
+              ],
+              "planningMs": 0.197,
+              "executionMs": 11.161,
+              "sharedHit": 1141,
+              "sharedRead": 0,
+              "indexes": [
+                "records_live_order"
+              ],
+              "plan": {
+                "node": "Nested Loop",
+                "join": "Left",
+                "rows": 1,
+                "loops": 1,
+                "ms": 11.118,
+                "hit": 1141,
+                "read": 0,
+                "children": [
+                  {
+                    "node": "Subquery Scan",
+                    "rows": 1,
+                    "loops": 1,
+                    "ms": 11.111,
+                    "hit": 1141,
+                    "read": 0,
+                    "children": [
+                      {
+                        "node": "Aggregate",
+                        "rows": 1,
+                        "loops": 1,
+                        "ms": 11.108,
+                        "hit": 1141,
+                        "read": 0,
+                        "children": [
+                          {
+                            "node": "Index Only Scan",
+                            "relation": "records",
+                            "index": "records_live_order",
+                            "rows": 50000,
+                            "loops": 1,
+                            "ms": 8.442,
+                            "hit": 1141,
+                            "read": 0
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "node": "Aggregate",
+                    "rows": 1,
+                    "loops": 1,
+                    "ms": 11.115,
+                    "hit": 1141,
+                    "read": 0,
+                    "children": [
+                      {
+                        "node": "CTE Scan",
+                        "rows": 1,
+                        "loops": 1,
+                        "ms": 11.113,
+                        "hit": 1141,
+                        "read": 0
+                      }
+                    ]
+                  },
+                  {
+                    "node": "CTE Scan",
+                    "rows": 1,
+                    "loops": 1,
+                    "ms": 0,
+                    "hit": 0,
+                    "read": 0
+                  }
+                ]
+              }
+            }
+          },
+          "byValue": {
+            "groups": 20,
+            "serviceMs": {
+              "samples": 1,
+              "p50": 132.101,
+              "p95": 132.101,
+              "max": 132.101
+            },
+            "usPerRecord": 2.642,
+            "explain": {
+              "settings": [
+                "SET LOCAL statement_timeout = '5000ms'",
+                "SET LOCAL lock_timeout = '2000ms'",
+                "SET LOCAL max_parallel_workers_per_gather = 0",
+                "SET LOCAL statement_timeout = '15000ms'"
+              ],
+              "planningMs": 0.427,
+              "executionMs": 106.495,
+              "sharedHit": 2633,
+              "sharedRead": 0,
+              "indexes": [
+                "record_index_by_field",
+                "records_live_order"
+              ],
+              "plan": {
+                "node": "Sort",
+                "rows": 20,
+                "loops": 1,
+                "ms": 106.358,
+                "hit": 2633,
+                "read": 0,
+                "children": [
+                  {
+                    "node": "Subquery Scan",
+                    "rows": 20,
+                    "loops": 1,
+                    "ms": 106.309,
+                    "hit": 2633,
+                    "read": 0,
+                    "children": [
+                      {
+                        "node": "Aggregate",
+                        "rows": 20,
+                        "loops": 1,
+                        "ms": 106.285,
+                        "hit": 2633,
+                        "read": 0,
+                        "children": [
+                          {
+                            "node": "Hash Join",
+                            "join": "Left",
+                            "rows": 50000,
+                            "loops": 1,
+                            "ms": 88.932,
+                            "hit": 2633,
+                            "read": 0,
+                            "children": [
+                              {
+                                "node": "Hash Join",
+                                "join": "Right",
+                                "rows": 50000,
+                                "loops": 1,
+                                "ms": 48.803,
+                                "hit": 1882,
+                                "read": 0,
+                                "children": [
+                                  {
+                                    "node": "Index Only Scan",
+                                    "relation": "record_index_values",
+                                    "index": "record_index_by_field",
+                                    "rows": 50000,
+                                    "loops": 1,
+                                    "ms": 10.376,
+                                    "hit": 741,
+                                    "read": 0
+                                  },
+                                  {
+                                    "node": "Hash",
+                                    "rows": 50000,
+                                    "loops": 1,
+                                    "ms": 20.282,
+                                    "hit": 1141,
+                                    "read": 0,
+                                    "children": [
+                                      {
+                                        "node": "Index Only Scan",
+                                        "relation": "records",
+                                        "index": "records_live_order",
+                                        "rows": 50000,
+                                        "loops": 1,
+                                        "ms": 11.371,
+                                        "hit": 1141,
+                                        "read": 0
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "node": "Hash",
+                                "rows": 50000,
+                                "loops": 1,
+                                "ms": 23.854,
+                                "hit": 751,
+                                "read": 0,
+                                "children": [
+                                  {
+                                    "node": "Index Only Scan",
+                                    "relation": "record_index_values",
+                                    "index": "record_index_by_field",
+                                    "rows": 50000,
+                                    "loops": 1,
+                                    "ms": 13.087,
+                                    "hit": 751,
+                                    "read": 0
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "node": "Nested Loop",
+                    "join": "Left",
+                    "rows": 20,
+                    "loops": 1,
+                    "ms": 106.338,
+                    "hit": 2633,
+                    "read": 0,
+                    "children": [
+                      {
+                        "node": "Aggregate",
+                        "rows": 1,
+                        "loops": 1,
+                        "ms": 106.327,
+                        "hit": 2633,
+                        "read": 0,
+                        "children": [
+                          {
+                            "node": "CTE Scan",
+                            "rows": 20,
+                            "loops": 1,
+                            "ms": 106.32,
+                            "hit": 2633,
+                            "read": 0
+                          }
+                        ]
+                      },
+                      {
+                        "node": "CTE Scan",
+                        "rows": 20,
+                        "loops": 1,
+                        "ms": 0.002,
+                        "hit": 0,
+                        "read": 0
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          },
+          "byMonth": {
+            "groups": 3,
+            "serviceMs": {
+              "samples": 1,
+              "p50": 260.49,
+              "p95": 260.49,
+              "max": 260.49
+            },
+            "usPerRecord": 5.21,
+            "explain": {
+              "settings": [
+                "SET LOCAL statement_timeout = '5000ms'",
+                "SET LOCAL lock_timeout = '2000ms'",
+                "SET LOCAL max_parallel_workers_per_gather = 0",
+                "SET LOCAL statement_timeout = '15000ms'"
+              ],
+              "planningMs": 0.537,
+              "executionMs": 251.44,
+              "sharedHit": 2734,
+              "sharedRead": 0,
+              "indexes": [
+                "record_index_by_field",
+                "records_live_order"
+              ],
+              "plan": {
+                "node": "Sort",
+                "rows": 3,
+                "loops": 1,
+                "ms": 251.323,
+                "hit": 2734,
+                "read": 0,
+                "children": [
+                  {
+                    "node": "Subquery Scan",
+                    "rows": 3,
+                    "loops": 1,
+                    "ms": 251.304,
+                    "hit": 2734,
+                    "read": 0,
+                    "children": [
+                      {
+                        "node": "Aggregate",
+                        "rows": 3,
+                        "loops": 1,
+                        "ms": 251.29,
+                        "hit": 2734,
+                        "read": 0,
+                        "children": [
+                          {
+                            "node": "Hash Join",
+                            "join": "Left",
+                            "rows": 50000,
+                            "loops": 1,
+                            "ms": 230.902,
+                            "hit": 2734,
+                            "read": 0,
+                            "children": [
+                              {
+                                "node": "Hash Join",
+                                "join": "Right",
+                                "rows": 50000,
+                                "loops": 1,
+                                "ms": 51.121,
+                                "hit": 1882,
+                                "read": 0,
+                                "children": [
+                                  {
+                                    "node": "Index Only Scan",
+                                    "relation": "record_index_values",
+                                    "index": "record_index_by_field",
+                                    "rows": 50000,
+                                    "loops": 1,
+                                    "ms": 8.279,
+                                    "hit": 741,
+                                    "read": 0
+                                  },
+                                  {
+                                    "node": "Hash",
+                                    "rows": 50000,
+                                    "loops": 1,
+                                    "ms": 20.387,
+                                    "hit": 1141,
+                                    "read": 0,
+                                    "children": [
+                                      {
+                                        "node": "Index Only Scan",
+                                        "relation": "records",
+                                        "index": "records_live_order",
+                                        "rows": 50000,
+                                        "loops": 1,
+                                        "ms": 10.565,
+                                        "hit": 1141,
+                                        "read": 0
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "node": "Hash",
+                                "rows": 50000,
+                                "loops": 1,
+                                "ms": 25.701,
+                                "hit": 852,
+                                "read": 0,
+                                "children": [
+                                  {
+                                    "node": "Index Only Scan",
+                                    "relation": "record_index_values",
+                                    "index": "record_index_by_field",
+                                    "rows": 50000,
+                                    "loops": 1,
+                                    "ms": 14.153,
+                                    "hit": 852,
+                                    "read": 0
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "node": "Nested Loop",
+                    "join": "Left",
+                    "rows": 3,
+                    "loops": 1,
+                    "ms": 251.314,
+                    "hit": 2734,
+                    "read": 0,
+                    "children": [
+                      {
+                        "node": "Aggregate",
+                        "rows": 1,
+                        "loops": 1,
+                        "ms": 251.309,
+                        "hit": 2734,
+                        "read": 0,
+                        "children": [
+                          {
+                            "node": "CTE Scan",
+                            "rows": 3,
+                            "loops": 1,
+                            "ms": 251.306,
+                            "hit": 2734,
+                            "read": 0
+                          }
+                        ]
+                      },
+                      {
+                        "node": "CTE Scan",
+                        "rows": 3,
+                        "loops": 1,
+                        "ms": 0.001,
+                        "hit": 0,
+                        "read": 0
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          },
+          "threeDimensions": {
+            "groups": 40,
+            "serviceMs": {
+              "samples": 1,
+              "p50": 418.83,
+              "p95": 418.83,
+              "max": 418.83
+            },
+            "usPerRecord": 8.377,
+            "explain": {
+              "settings": [
+                "SET LOCAL statement_timeout = '5000ms'",
+                "SET LOCAL lock_timeout = '2000ms'",
+                "SET LOCAL max_parallel_workers_per_gather = 0",
+                "SET LOCAL statement_timeout = '15000ms'"
+              ],
+              "planningMs": 0.494,
+              "executionMs": 359.631,
+              "sharedHit": 3495,
+              "sharedRead": 0,
+              "indexes": [
+                "record_index_by_field",
+                "records_live_order"
+              ],
+              "plan": {
+                "node": "Sort",
+                "rows": 40,
+                "loops": 1,
+                "ms": 359.472,
+                "hit": 3495,
+                "read": 0,
+                "children": [
+                  {
+                    "node": "Subquery Scan",
+                    "rows": 40,
+                    "loops": 1,
+                    "ms": 359.388,
+                    "hit": 3495,
+                    "read": 0,
+                    "children": [
+                      {
+                        "node": "Aggregate",
+                        "rows": 40,
+                        "loops": 1,
+                        "ms": 359.343,
+                        "hit": 3495,
+                        "read": 0,
+                        "children": [
+                          {
+                            "node": "Hash Join",
+                            "join": "Left",
+                            "rows": 50000,
+                            "loops": 1,
+                            "ms": 249.885,
+                            "hit": 3495,
+                            "read": 0,
+                            "children": [
+                              {
+                                "node": "Hash Join",
+                                "join": "Left",
+                                "rows": 50000,
+                                "loops": 1,
+                                "ms": 86.062,
+                                "hit": 2643,
+                                "read": 0,
+                                "children": [
+                                  {
+                                    "node": "Hash Join",
+                                    "join": "Right",
+                                    "rows": 50000,
+                                    "loops": 1,
+                                    "ms": 48.726,
+                                    "hit": 1892,
+                                    "read": 0,
+                                    "children": [
+                                      {
+                                        "node": "Index Only Scan",
+                                        "relation": "record_index_values",
+                                        "index": "record_index_by_field",
+                                        "rows": 50000,
+                                        "loops": 1,
+                                        "ms": 10.964,
+                                        "hit": 751,
+                                        "read": 0
+                                      },
+                                      {
+                                        "node": "Hash",
+                                        "rows": 50000,
+                                        "loops": 1,
+                                        "ms": 15.287,
+                                        "hit": 1141,
+                                        "read": 0,
+                                        "children": [
+                                          {
+                                            "node": "Index Only Scan",
+                                            "relation": "records",
+                                            "index": "records_live_order",
+                                            "rows": 50000,
+                                            "loops": 1,
+                                            "ms": 7.912,
+                                            "hit": 1141,
+                                            "read": 0
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "node": "Hash",
+                                    "rows": 50000,
+                                    "loops": 1,
+                                    "ms": 17.423,
+                                    "hit": 751,
+                                    "read": 0,
+                                    "children": [
+                                      {
+                                        "node": "Index Only Scan",
+                                        "relation": "record_index_values",
+                                        "index": "record_index_by_field",
+                                        "rows": 50000,
+                                        "loops": 1,
+                                        "ms": 8.725,
+                                        "hit": 751,
+                                        "read": 0
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "node": "Hash",
+                                "rows": 50000,
+                                "loops": 1,
+                                "ms": 18.744,
+                                "hit": 852,
+                                "read": 0,
+                                "children": [
+                                  {
+                                    "node": "Index Only Scan",
+                                    "relation": "record_index_values",
+                                    "index": "record_index_by_field",
+                                    "rows": 50000,
+                                    "loops": 1,
+                                    "ms": 8.721,
+                                    "hit": 852,
+                                    "read": 0
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "node": "Nested Loop",
+                    "join": "Left",
+                    "rows": 40,
+                    "loops": 1,
+                    "ms": 359.433,
+                    "hit": 3495,
+                    "read": 0,
+                    "children": [
+                      {
+                        "node": "Aggregate",
+                        "rows": 1,
+                        "loops": 1,
+                        "ms": 359.409,
+                        "hit": 3495,
+                        "read": 0,
+                        "children": [
+                          {
+                            "node": "CTE Scan",
+                            "rows": 40,
+                            "loops": 1,
+                            "ms": 359.401,
+                            "hit": 3495,
+                            "read": 0
+                          }
+                        ]
+                      },
+                      {
+                        "node": "CTE Scan",
+                        "rows": 40,
+                        "loops": 1,
+                        "ms": 0.005,
+                        "hit": 0,
+                        "read": 0
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          },
+          "filteredBroad": {
+            "groups": 2,
+            "serviceMs": {
+              "samples": 1,
+              "p50": 89.73,
+              "p95": 89.73,
+              "max": 89.73
+            },
+            "usPerRecord": 1.795,
+            "explain": {
+              "settings": [
+                "SET LOCAL statement_timeout = '5000ms'",
+                "SET LOCAL lock_timeout = '2000ms'",
+                "SET LOCAL max_parallel_workers_per_gather = 0",
+                "SET LOCAL statement_timeout = '15000ms'"
+              ],
+              "planningMs": 0.416,
+              "executionMs": 48.564,
+              "sharedHit": 22562,
+              "sharedRead": 0,
+              "indexes": [
+                "record_index_by_field",
+                "record_index_string",
+                "records_pkey"
+              ],
+              "plan": {
+                "node": "Sort",
+                "rows": 2,
+                "loops": 1,
+                "ms": 48.52,
+                "hit": 22562,
+                "read": 0,
+                "children": [
+                  {
+                    "node": "Subquery Scan",
+                    "rows": 2,
+                    "loops": 1,
+                    "ms": 48.507,
+                    "hit": 22562,
+                    "read": 0,
+                    "children": [
+                      {
+                        "node": "Aggregate",
+                        "rows": 2,
+                        "loops": 1,
+                        "ms": 48.503,
+                        "hit": 22562,
+                        "read": 0,
+                        "children": [
+                          {
+                            "node": "Sort",
+                            "rows": 2500,
+                            "loops": 1,
+                            "ms": 48.233,
+                            "hit": 22562,
+                            "read": 0,
+                            "children": [
+                              {
+                                "node": "Nested Loop",
+                                "join": "Left",
+                                "rows": 2500,
+                                "loops": 1,
+                                "ms": 47.427,
+                                "hit": 22562,
+                                "read": 0,
+                                "children": [
+                                  {
+                                    "node": "Nested Loop",
+                                    "join": "Inner",
+                                    "rows": 2500,
+                                    "loops": 1,
+                                    "ms": 27.065,
+                                    "hit": 12561,
+                                    "read": 0,
+                                    "children": [
+                                      {
+                                        "node": "Index Only Scan",
+                                        "relation": "record_index_values",
+                                        "index": "record_index_string",
+                                        "rows": 2500,
+                                        "loops": 1,
+                                        "ms": 0.661,
+                                        "hit": 61,
+                                        "read": 0
+                                      },
+                                      {
+                                        "node": "Index Scan",
+                                        "relation": "records",
+                                        "index": "records_pkey",
+                                        "rows": 1,
+                                        "loops": 2500,
+                                        "ms": 0.01,
+                                        "hit": 12500,
+                                        "read": 0
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "node": "Index Only Scan",
+                                    "relation": "record_index_values",
+                                    "index": "record_index_by_field",
+                                    "rows": 1,
+                                    "loops": 2500,
+                                    "ms": 0.008,
+                                    "hit": 10001,
+                                    "read": 0
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "node": "Nested Loop",
+                    "join": "Left",
+                    "rows": 2,
+                    "loops": 1,
+                    "ms": 48.515,
+                    "hit": 22562,
+                    "read": 0,
+                    "children": [
+                      {
+                        "node": "Aggregate",
+                        "rows": 1,
+                        "loops": 1,
+                        "ms": 48.511,
+                        "hit": 22562,
+                        "read": 0,
+                        "children": [
+                          {
+                            "node": "CTE Scan",
+                            "rows": 2,
+                            "loops": 1,
+                            "ms": 48.509,
+                            "hit": 22562,
+                            "read": 0
+                          }
+                        ]
+                      },
+                      {
+                        "node": "CTE Scan",
+                        "rows": 2,
+                        "loops": 1,
+                        "ms": 0,
+                        "hit": 0,
+                        "read": 0
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          },
+          "filteredSelective": {
+            "groups": 1,
+            "serviceMs": {
+              "samples": 1,
+              "p50": 35.431,
+              "p95": 35.431,
+              "max": 35.431
+            },
+            "usPerRecord": 0.709,
+            "explain": {
+              "settings": [
+                "SET LOCAL statement_timeout = '5000ms'",
+                "SET LOCAL lock_timeout = '2000ms'",
+                "SET LOCAL max_parallel_workers_per_gather = 0",
+                "SET LOCAL statement_timeout = '15000ms'"
+              ],
+              "planningMs": 0.306,
+              "executionMs": 10.845,
+              "sharedHit": 8207,
+              "sharedRead": 0,
+              "indexes": [
+                "record_index_by_field",
+                "record_index_number",
+                "records_pkey"
+              ],
+              "plan": {
+                "node": "Nested Loop",
+                "join": "Left",
+                "rows": 1,
+                "loops": 1,
+                "ms": 10.808,
+                "hit": 8207,
+                "read": 0,
+                "children": [
+                  {
+                    "node": "Subquery Scan",
+                    "rows": 1,
+                    "loops": 1,
+                    "ms": 10.802,
+                    "hit": 8207,
+                    "read": 0,
+                    "children": [
+                      {
+                        "node": "Aggregate",
+                        "rows": 1,
+                        "loops": 1,
+                        "ms": 10.797,
+                        "hit": 8207,
+                        "read": 0,
+                        "children": [
+                          {
+                            "node": "Nested Loop",
+                            "join": "Left",
+                            "rows": 909,
+                            "loops": 1,
+                            "ms": 10.543,
+                            "hit": 8207,
+                            "read": 0,
+                            "children": [
+                              {
+                                "node": "Nested Loop",
+                                "join": "Inner",
+                                "rows": 909,
+                                "loops": 1,
+                                "ms": 5.025,
+                                "hit": 4570,
+                                "read": 0,
+                                "children": [
+                                  {
+                                    "node": "Index Only Scan",
+                                    "relation": "record_index_values",
+                                    "index": "record_index_number",
+                                    "rows": 909,
+                                    "loops": 1,
+                                    "ms": 0.159,
+                                    "hit": 25,
+                                    "read": 0
+                                  },
+                                  {
+                                    "node": "Index Scan",
+                                    "relation": "records",
+                                    "index": "records_pkey",
+                                    "rows": 1,
+                                    "loops": 909,
+                                    "ms": 0.005,
+                                    "hit": 4545,
+                                    "read": 0
+                                  }
+                                ]
+                              },
+                              {
+                                "node": "Index Only Scan",
+                                "relation": "record_index_values",
+                                "index": "record_index_by_field",
+                                "rows": 1,
+                                "loops": 909,
+                                "ms": 0.006,
+                                "hit": 3637,
+                                "read": 0
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "node": "Aggregate",
+                    "rows": 1,
+                    "loops": 1,
+                    "ms": 10.805,
+                    "hit": 8207,
+                    "read": 0,
+                    "children": [
+                      {
+                        "node": "CTE Scan",
+                        "rows": 1,
+                        "loops": 1,
+                        "ms": 10.803,
+                        "hit": 8207,
+                        "read": 0
+                      }
+                    ]
+                  },
+                  {
+                    "node": "CTE Scan",
+                    "rows": 1,
+                    "loops": 1,
+                    "ms": 0.001,
+                    "hit": 0,
+                    "read": 0
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "speedup": {
+          "count": 2.793,
+          "byValue": 1.108,
+          "byMonth": 1.007,
+          "threeDimensions": 0.953,
+          "filteredBroad": 0.719,
+          "filteredSelective": 0.815
+        }
+      }
+    }
+  ],
+  "candidateIndex": {
+    "sql": "CREATE INDEX record_index_by_field ON record_index_values(space_id,collection_id,field_name,record_id) INCLUDE (value_kind,string_value,number_value,boolean_value,time_value)",
+    "recordWriteMs": {
+      "without": [
+        {
+          "samples": 300,
+          "p50": 29.512,
+          "p95": 125.302,
+          "max": 223.767
+        },
+        {
+          "samples": 300,
+          "p50": 16.018,
+          "p95": 59.584,
+          "max": 109.214
+        }
+      ],
+      "with": [
+        {
+          "samples": 300,
+          "p50": 17.097,
+          "p95": 60.776,
+          "max": 117.482
+        },
+        {
+          "samples": 300,
+          "p50": 30.741,
+          "p95": 107.235,
+          "max": 174.893
+        }
+      ]
+    },
+    "bytes": {
+      "candidate": 499482624,
+      "table": 509214720,
+      "existingIndexes": 939032576
+    }
+  },
+  "byteOrderIndex": {
+    "sql": "CREATE INDEX records_byte_order ON records(space_id, collection_id, record_id COLLATE \"C\")",
+    "recordWriteMs": {
+      "with": [
+        {
+          "samples": 300,
+          "p50": 24.68,
+          "p95": 104.477,
+          "max": 128.892
+        },
+        {
+          "samples": 300,
+          "p50": 13.597,
+          "p95": 40.034,
+          "max": 74.596
+        }
+      ],
+      "without": [
+        {
+          "samples": 300,
+          "p50": 16.861,
+          "p95": 66.472,
+          "max": 117.794
+        },
+        {
+          "samples": 300,
+          "p50": 13.098,
+          "p95": 28.624,
+          "max": 88.725
+        }
+      ]
+    }
+  },
+  "jobs": [
+    {
+      "kind": "export",
+      "records": 50000,
+      "pagesWritten": 50,
+      "steps": 1,
+      "pageTransactions": 50,
+      "seconds": 1.791,
+      "recordsPerSecond": 27914.423,
+      "stepRuntimeMs": 1552,
+      "manifest": {
+        "pageCount": 50,
+        "byteSize": 6121881
+      },
+      "freshness": "exact",
+      "asOfPagePlan": {
+        "settings": [
+          "SET LOCAL max_parallel_workers_per_gather = 0"
+        ],
+        "planningMs": 0.291,
+        "executionMs": 10.075,
+        "sharedHit": 7005,
+        "sharedRead": 12,
+        "indexes": [
+          "record_event_feed_as_of",
+          "record_events_space_id_collection_id_record_id_revision_key",
+          "records_byte_order"
+        ],
+        "plan": {
+          "node": "Subquery Scan",
+          "rows": 1000,
+          "loops": 1,
+          "ms": 9.996,
+          "hit": 7005,
+          "read": 12,
+          "children": [
+            {
+              "node": "WindowAgg",
+              "rows": 1000,
+              "loops": 1,
+              "ms": 9.857,
+              "hit": 7005,
+              "read": 12,
+              "children": [
+                {
+                  "node": "Subquery Scan",
+                  "rows": 1000,
+                  "loops": 1,
+                  "ms": 9.333,
+                  "hit": 7005,
+                  "read": 12,
+                  "children": [
+                    {
+                      "node": "Limit",
+                      "rows": 1000,
+                      "loops": 1,
+                      "ms": 9.228,
+                      "hit": 7005,
+                      "read": 12,
+                      "children": [
+                        {
+                          "node": "Nested Loop",
+                          "join": "Inner",
+                          "rows": 1000,
+                          "loops": 1,
+                          "ms": 9.14,
+                          "hit": 7005,
+                          "read": 12,
+                          "children": [
+                            {
+                              "node": "Nested Loop",
+                              "join": "Inner",
+                              "rows": 1000,
+                              "loops": 1,
+                              "ms": 4.635,
+                              "hit": 3005,
+                              "read": 12,
+                              "children": [
+                                {
+                                  "node": "Index Only Scan",
+                                  "relation": "records",
+                                  "index": "records_byte_order",
+                                  "rows": 1000,
+                                  "loops": 1,
+                                  "ms": 0.297,
+                                  "hit": 4,
+                                  "read": 12
+                                },
+                                {
+                                  "node": "Limit",
+                                  "rows": 1,
+                                  "loops": 1000,
+                                  "ms": 0.004,
+                                  "hit": 3001,
+                                  "read": 0,
+                                  "children": [
+                                    {
+                                      "node": "Index Only Scan",
+                                      "relation": "record_event_feed",
+                                      "index": "record_event_feed_as_of",
+                                      "rows": 1,
+                                      "loops": 1000,
+                                      "ms": 0.004,
+                                      "hit": 3001,
+                                      "read": 0
+                                    }
+                                  ]
+                                }
+                              ]
+                            },
+                            {
+                              "node": "Index Scan",
+                              "relation": "record_events",
+                              "index": "record_events_space_id_collection_id_record_id_revision_key",
+                              "rows": 1,
+                              "loops": 1000,
+                              "ms": 0.004,
+                              "hit": 4000,
+                              "read": 0
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "kind": "aggregate",
+      "records": 50000,
+      "pagesWritten": 1,
+      "steps": 1,
+      "pageTransactions": 50,
+      "seconds": 3.828,
+      "recordsPerSecond": 13061.09,
+      "stepRuntimeMs": 3070,
+      "manifest": {
+        "pageCount": 1,
+        "byteSize": 5811
+      },
+      "freshness": "exact",
+      "asOfPagePlan": {
+        "settings": [
+          "SET LOCAL max_parallel_workers_per_gather = 0"
+        ],
+        "planningMs": 0.349,
+        "executionMs": 12.987,
+        "sharedHit": 7017,
+        "sharedRead": 0,
+        "indexes": [
+          "record_event_feed_as_of",
+          "record_events_space_id_collection_id_record_id_revision_key",
+          "records_byte_order"
+        ],
+        "plan": {
+          "node": "Subquery Scan",
+          "rows": 1000,
+          "loops": 1,
+          "ms": 12.878,
+          "hit": 7017,
+          "read": 0,
+          "children": [
+            {
+              "node": "WindowAgg",
+              "rows": 1000,
+              "loops": 1,
+              "ms": 12.723,
+              "hit": 7017,
+              "read": 0,
+              "children": [
+                {
+                  "node": "Subquery Scan",
+                  "rows": 1000,
+                  "loops": 1,
+                  "ms": 12.082,
+                  "hit": 7017,
+                  "read": 0,
+                  "children": [
+                    {
+                      "node": "Limit",
+                      "rows": 1000,
+                      "loops": 1,
+                      "ms": 11.963,
+                      "hit": 7017,
+                      "read": 0,
+                      "children": [
+                        {
+                          "node": "Nested Loop",
+                          "join": "Inner",
+                          "rows": 1000,
+                          "loops": 1,
+                          "ms": 11.87,
+                          "hit": 7017,
+                          "read": 0,
+                          "children": [
+                            {
+                              "node": "Nested Loop",
+                              "join": "Inner",
+                              "rows": 1000,
+                              "loops": 1,
+                              "ms": 6.877,
+                              "hit": 3017,
+                              "read": 0,
+                              "children": [
+                                {
+                                  "node": "Index Only Scan",
+                                  "relation": "records",
+                                  "index": "records_byte_order",
+                                  "rows": 1000,
+                                  "loops": 1,
+                                  "ms": 0.174,
+                                  "hit": 16,
+                                  "read": 0
+                                },
+                                {
+                                  "node": "Limit",
+                                  "rows": 1,
+                                  "loops": 1000,
+                                  "ms": 0.006,
+                                  "hit": 3001,
+                                  "read": 0,
+                                  "children": [
+                                    {
+                                      "node": "Index Only Scan",
+                                      "relation": "record_event_feed",
+                                      "index": "record_event_feed_as_of",
+                                      "rows": 1,
+                                      "loops": 1000,
+                                      "ms": 0.006,
+                                      "hit": 3001,
+                                      "read": 0
+                                    }
+                                  ]
+                                }
+                              ]
+                            },
+                            {
+                              "node": "Index Scan",
+                              "relation": "record_events",
+                              "index": "record_events_space_id_collection_id_record_id_revision_key",
+                              "rows": 1,
+                              "loops": 1000,
+                              "ms": 0.005,
+                              "hit": 4000,
+                              "read": 0
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "reconciliation": {
+    "records": 50000,
+    "fields": [
+      "active",
+      "at",
+      "score",
+      "team"
+    ],
+    "driftCount": 0,
+    "seconds": 4.734,
+    "recordsPerSecond": 10561.806
+  },
+  "mixedLoad": {
+    "originConnectionLimit": 5,
+    "analyticalSlots": {
+      "cell": 1,
+      "space": 1
+    },
+    "isolates": 2,
+    "interactivePoolPerIsolate": 2,
+    "aggregationLoopsPerIsolate": 6,
+    "records": 50000,
+    "phases": {
+      "alone": {
+        "retryAfterRefusalMs": null,
+        "interactiveReadPairMs": {
+          "samples": 67,
+          "p50": 21.232,
+          "p95": 71.567,
+          "max": 155.817
+        },
+        "aggregations": {
+          "answered": 0,
+          "refused": 0,
+          "peakConcurrentStatements": 0
+        },
+        "pageCutoffLagMs": 2.01,
+        "jobPagesWritten": 0
+      },
+      "jobsOnly": {
+        "retryAfterRefusalMs": null,
+        "interactiveReadPairMs": {
+          "samples": 38,
+          "p50": 38.692,
+          "p95": 153.31,
+          "max": 162.902
+        },
+        "aggregations": {
+          "answered": 0,
+          "refused": 0,
+          "peakConcurrentStatements": 0
+        },
+        "pageCutoffLagMs": 3.196,
+        "jobPagesWritten": 18
+      },
+      "aggregationsOnly": {
+        "retryAfterRefusalMs": 5,
+        "interactiveReadPairMs": {
+          "samples": 19,
+          "p50": 79.489,
+          "p95": 278.447,
+          "max": 278.447
+        },
+        "aggregations": {
+          "answered": 10,
+          "refused": 251,
+          "peakConcurrentStatements": 1
+        },
+        "pageCutoffLagMs": 1.589,
+        "jobPagesWritten": 0
+      },
+      "aggregationsBackingOff": {
+        "retryAfterRefusalMs": 250,
+        "interactiveReadPairMs": {
+          "samples": 57,
+          "p50": 21.391,
+          "p95": 105.417,
+          "max": 167.273
+        },
+        "aggregations": {
+          "answered": 12,
+          "refused": 79,
+          "peakConcurrentStatements": 1
+        },
+        "pageCutoffLagMs": 1.611,
+        "jobPagesWritten": 0
+      },
+      "both": {
+        "retryAfterRefusalMs": 5,
+        "interactiveReadPairMs": {
+          "samples": 21,
+          "p50": 66.932,
+          "p95": 267.321,
+          "max": 326.885
+        },
+        "aggregations": {
+          "answered": 8,
+          "refused": 284,
+          "peakConcurrentStatements": 1
+        },
+        "pageCutoffLagMs": 2.109,
+        "jobPagesWritten": 4
+      },
+      "bothBackingOff": {
+        "retryAfterRefusalMs": 250,
+        "interactiveReadPairMs": {
+          "samples": 31,
+          "p50": 39.904,
+          "p95": 191.638,
+          "max": 337.646
+        },
+        "aggregations": {
+          "answered": 1,
+          "refused": 71,
+          "peakConcurrentStatements": 1
+        },
+        "pageCutoffLagMs": 0.924,
+        "jobPagesWritten": 16
+      }
+    }
+  },
+  "limits": {
+    "statementMs": 5000,
+    "interactive": {
+      "count": {
+        "usPerRecord": 2.069,
+        "recordsWithinStatementBudget": 2416626,
+        "largestMeasuredWithinBudget": 50000
+      },
+      "byValue": {
+        "usPerRecord": 2.927,
+        "recordsWithinStatementBudget": 1708233,
+        "largestMeasuredWithinBudget": 50000
+      },
+      "byMonth": {
+        "usPerRecord": 5.246,
+        "recordsWithinStatementBudget": 953107,
+        "largestMeasuredWithinBudget": 50000
+      },
+      "threeDimensions": {
+        "usPerRecord": 7.983,
+        "recordsWithinStatementBudget": 626330,
+        "largestMeasuredWithinBudget": 50000
+      }
+    },
+    "jobs": {
+      "export": {
+        "recordsPerStepSecond": 32216.495,
+        "recordsWithinRuntimeBudget": 19329896,
+        "resultBytesPerRecord": 122.438,
+        "recordsWithinByteBudget": 548106,
+        "budgetRecords": 10000000
+      },
+      "aggregate": {
+        "recordsPerStepSecond": 16286.645,
+        "recordsWithinRuntimeBudget": 9771986,
+        "resultBytesPerRecord": 0.116,
+        "recordsWithinByteBudget": 577429564,
+        "budgetRecords": 10000000
+      }
+    }
+  }
+}
