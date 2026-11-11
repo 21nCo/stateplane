@@ -552,10 +552,11 @@ paths:
         5,000 ms of statement time is RATE_LIMITED with retryable false. No
         free analytical slot is BACKPRESSURE (retryable); a cell without
         analytical capacity is PROVIDER_UNAVAILABLE with retryable false.
-        The body is at most 32,768 bytes as sent and in compact JSON with its
-        literals kept (RATE_LIMITED, retryable false, beyond); then a body that
-        does not parse, nests more than 16 levels, is not an object, or holds
-        a number that overflows (such as 1e400), is INVALID_ARGUMENT, all
+        The body is at most 32,768 bytes in compact JSON with its literals
+        kept, and 4 MiB as sent (RATE_LIMITED, retryable false, beyond);
+        then a body that does not parse, nests more than 16 levels, is not an
+        object, or holds a number that overflows (such as 1e400), is
+        INVALID_ARGUMENT, all
         before the collection is authorized. A safe read: repeat it after a
         retryable error.
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AggregationSpec' } } } }
@@ -577,7 +578,7 @@ paths:
         unfinished jobs is BACKPRESSURE (retryable). Not idempotent: after
         COMMIT_OUTCOME_UNKNOWN submit again; a job whose ID was lost runs
         and expires 24 hours after submission. The body is at most 33,792
-        bytes as sent and in compact JSON with its literals kept
+        bytes in compact JSON with its literals kept, and 4 MiB as sent
         (RATE_LIMITED, retryable false, beyond); a body that does not parse
         or nests more than 17 levels is INVALID_ARGUMENT; then the request
         shape and kind; its spec's compact JSON is at most 32,768 bytes, as

@@ -396,11 +396,15 @@ test('HTTP, CLI and MCP give one outcome for job submission, status, pages and c
       assert.deepEqual(same(operation, await callers[label].literal(kind, text, viaMcp), kind ? 'AnalysisJobStatus' : 'AggregationResult'),
         { error: code, retryable: false }, operation);
     }
-  // A spec at the nesting limit is admitted on every transport: the service then authorizes before it refuses the field.
-  for (const [label, code] of [['owner', 'INVALID_ARGUMENT'], ['reader', 'INVALID_ARGUMENT'], ['exporter', 'FORBIDDEN'],
-    ['foreignOwner', 'NOT_FOUND']]) for (const kind of [undefined, 'aggregate'])
-    assert.deepEqual(same(`${label} at the nesting limit ${kind ?? ''}`, await callers[label].literal(kind, nested(16)),
-      kind ? 'AnalysisJobStatus' : 'AggregationResult'), { error: code, retryable: false }, `${label} at the nesting limit ${kind ?? ''}`);
+  // Admitted on every transport, where the service then authorizes before it refuses the field: a spec at the nesting
+  // limit, and one whose escapes make it over 33,792 bytes as sent but about 6,000 in compact form, which MCP measures.
+  const escaped = `{"metrics":[{"op":"count"}],"x":"${'\\u0078'.repeat(6_000)}"}`;
+  assert.ok(Buffer.byteLength(envelope(escaped)) > 33_792 && Buffer.byteLength(JSON.stringify(JSON.parse(escaped))) < 6_100);
+  for (const [row, text] of [['at the nesting limit', nested(16)], ['escaped', escaped]])
+    for (const [label, code] of [['owner', 'INVALID_ARGUMENT'], ['reader', 'INVALID_ARGUMENT'], ['exporter', 'FORBIDDEN'],
+      ['foreignOwner', 'NOT_FOUND']]) for (const kind of [undefined, 'aggregate'])
+      assert.deepEqual(same(`${label} ${row} ${kind ?? ''}`, await callers[label].literal(kind, text),
+        kind ? 'AnalysisJobStatus' : 'AggregationResult'), { error: code, retryable: false }, `${label} ${row} ${kind ?? ''}`);
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM analysis_jobs WHERE space_id=$1', [f.spaceId])).rows[0].n, jobsBefore,
     'no refused spec queues a job');
   const deep = nested(10_001);

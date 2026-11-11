@@ -416,12 +416,13 @@ stateplane analysis status --collection entries --job anj_...      # poll until 
 stateplane analysis page --collection entries --job anj_... --page 1
 ```
 
-`--data` or `--file` holds the spec as one JSON object of at most 32 KiB (a
-submission sends `{"kind","spec"}` of at most 33 KiB), nested at most 16
-levels. The CLI refuses anything else locally with the check HTTP and MCP make
+`--data` or `--file` holds the spec as one JSON object of at most 32 KiB in
+compact form (a submission sends `{"kind","spec"}` of at most 33 KiB), nested
+at most 16 levels. The CLI refuses anything else locally with the check HTTP and MCP make
 before admission (`@stateplane/contracts`, bundled): the text as the HTTP body
-it stands for, then the compact JSON with its literals kept, are bounded
-(`RATE_LIMITED`, not retryable, whether aggregated or submitted); unparseable
+it stands for is accepted up to 4 MiB, then the compact JSON with its literals
+kept is bounded (`RATE_LIMITED`, not retryable, whether aggregated or
+submitted), so whitespace and escapes do not count; unparseable
 text, deeper nesting, and a spec that is not an object or holds a number that
 overflows, such as `1e400`, are `INVALID_ARGUMENT` (see the admission order in
 `docs/analysis-jobs.md`).

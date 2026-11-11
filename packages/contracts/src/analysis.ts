@@ -3,6 +3,9 @@
  * and the CLI (which bundles this package), so every transport decides them
  * from one representation in one order.
  *
+ * - `bodyBytes`: the text as sent that HTTP reads and the CLI accepts, MCP's
+ *   JSON-RPC request bound (`maxRequestBytes`), so whitespace, escapes and a
+ *   number's spelling never decide a refusal the compact form would not.
  * - `specBytes`: an aggregation spec, alone or as a job's `spec` (the
  *   service's `aggregationBounds.specBytes`, the records query budget).
  * - `requestBytes`: a job request, that spec in its `{"kind","spec"}` envelope.
@@ -12,18 +15,30 @@
  *   grow while every recursive JSON encoder or decoder behind admission stays
  *   far inside its stack (a 10,000-level spec overflowed them at STA-61 review).
  */
-export const analysisBounds = Object.freeze({ specBytes: 32_768, requestBytes: 33_792, specDepth: 16 });
+export const analysisBounds = Object.freeze({ bodyBytes: 4_194_304, specBytes: 32_768, requestBytes: 33_792, specDepth: 16 });
 
 /** A refusal before admission: a size (not retryable) or an invalid request. */
 export type AnalysisRefusal = 'RATE_LIMITED' | 'INVALID_ARGUMENT';
 export type AdmittedAggregation = { spec: string } | { refused: AnalysisRefusal };
 export type AdmittedAnalysisJob = { kind: 'aggregate' | 'export'; spec: string | undefined } | { refused: AnalysisRefusal };
 
-const utf8 = new TextEncoder();
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
 
-interface Encoded { text: string; bytes: number; depth: number; finite: boolean }
+interface Encoded { text: string; depth: number; finite: boolean }
 interface Frame { node: object; keys: string[] | null; index: number }
+
+/** UTF-8 bytes of JSON text (a lone surrogate, which JSON escapes, would be 3, as TextEncoder writes it). */
+function utf8Bytes(text: string): number {
+  let bytes = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code < 0xdc00 && (text.charCodeAt(i + 1) & 0xfc00) === 0xdc00) { bytes += 4; i++; }
+    else bytes += 3;
+  }
+  return bytes;
+}
 
 /**
  * A parsed JSON value's compact text as written, iteratively, so no nesting
@@ -31,53 +46,60 @@ interface Frame { node: object; keys: string[] | null; index: number }
  * `-1e400`) rather than `JSON.stringify`'s `null`, and `-0` stays `-0`, as
  * MCP's `serializeJson` writes them. Every transport measures this text, so a
  * spec has one size whether it arrived as an HTTP body, MCP arguments or CLI
- * input. Undefined for a value JSON cannot hold.
+ * input. Writing stops at the first byte past `limit` (`'over'`), so the text,
+ * the open containers (each wrote a byte) and the objects tracked are all
+ * bounded by it, whatever the input. Undefined for a value JSON cannot hold.
  */
-function encode(value: unknown): Encoded | undefined {
+function encode(value: unknown, limit: number): Encoded | 'over' | undefined {
   const parts: string[] = [];
   const stack: Frame[] = [];
   const active = new Set<object>();
-  let depth = 0, finite = true;
-  const emit = (item: unknown): boolean => {
-    if (item === null) parts.push('null');
-    else if (typeof item === 'string') parts.push(JSON.stringify(item));
-    else if (typeof item === 'boolean') parts.push(item ? 'true' : 'false');
+  let bytes = 0, depth = 0, finite = true;
+  // False once past the limit. A string is at least as many bytes as it has code units, so a longer one is not encoded.
+  const write = (text: string): boolean => { parts.push(text); bytes += utf8Bytes(text); return bytes <= limit; };
+  const string = (text: string): boolean => text.length <= limit - bytes && write(JSON.stringify(text));
+  type Step = 'ok' | 'over' | 'invalid';
+  const emit = (item: unknown): Step => {
+    let written: boolean;
+    if (item === null) written = write('null');
+    else if (typeof item === 'string') written = string(item);
+    else if (typeof item === 'boolean') written = write(item ? 'true' : 'false');
     else if (typeof item === 'number') {
-      if (Number.isNaN(item)) return false;
+      if (Number.isNaN(item)) return 'invalid';
       if (!Number.isFinite(item)) finite = false;
-      parts.push(item === Infinity ? '1e400' : item === -Infinity ? '-1e400' : Object.is(item, -0) ? '-0' : JSON.stringify(item));
+      written = write(item === Infinity ? '1e400' : item === -Infinity ? '-1e400' : Object.is(item, -0) ? '-0' : JSON.stringify(item));
     } else if (item && typeof item === 'object') {
-      if (active.has(item)) return false;
+      if (active.has(item)) return 'invalid';
       active.add(item);
       const keys = Array.isArray(item) ? null : Object.keys(item);
-      parts.push(keys ? '{' : '[');
       stack.push({ node: item, keys, index: 0 });
       if (stack.length > depth) depth = stack.length;
-    } else return false;
-    return true;
+      written = write(keys ? '{' : '[');
+    } else return 'invalid';
+    return written ? 'ok' : 'over';
   };
-  if (!emit(value)) return undefined;
-  while (stack.length) {
+  let step = emit(value);
+  while (step === 'ok' && stack.length) {
     const frame = stack[stack.length - 1]!;
     const length = frame.keys ? frame.keys.length : (frame.node as unknown[]).length;
     if (frame.index === length) {
-      parts.push(frame.keys ? '}' : ']');
       active.delete(frame.node);
       stack.pop();
+      if (!write(frame.keys ? '}' : ']')) step = 'over';
       continue;
     }
-    if (frame.index) parts.push(',');
+    if (frame.index && !write(',')) { step = 'over'; continue; }
     const at = frame.index++;
     let item: unknown;
     if (frame.keys) {
       const key = frame.keys[at]!;
-      parts.push(JSON.stringify(key), ':');
+      if (!string(key) || !write(':')) { step = 'over'; continue; }
       item = (frame.node as Record<string, unknown>)[key];
     } else item = (frame.node as unknown[])[at];
-    if (!emit(item)) return undefined;
+    step = emit(item);
   }
-  const text = parts.join('');
-  return { text, bytes: utf8.encode(text).byteLength, depth, finite };
+  if (step !== 'ok') return step === 'over' ? 'over' : undefined;
+  return { text: parts.join(''), depth, finite };
 }
 
 /**
@@ -88,9 +110,9 @@ function encode(value: unknown): Encoded | undefined {
  * null (refused as not an object). Returns the compact text to hand on.
  */
 export function admitAggregation(spec: unknown): AdmittedAggregation {
-  const encoded = encode(spec);
+  const encoded = encode(spec, analysisBounds.specBytes);
   if (!encoded) return { refused: 'INVALID_ARGUMENT' };
-  if (encoded.bytes > analysisBounds.specBytes) return { refused: 'RATE_LIMITED' };
+  if (encoded === 'over') return { refused: 'RATE_LIMITED' };
   if (encoded.depth > analysisBounds.specDepth || !object(spec) || !encoded.finite) return { refused: 'INVALID_ARGUMENT' };
   return { spec: encoded.text };
 }
@@ -105,16 +127,17 @@ export function admitAggregation(spec: unknown): AdmittedAggregation {
  * text.
  */
 export function admitAnalysisJob(request: unknown): AdmittedAnalysisJob {
-  const encoded = encode(request);
+  const encoded = encode(request, analysisBounds.requestBytes);
   if (!encoded) return { refused: 'INVALID_ARGUMENT' };
-  if (encoded.bytes > analysisBounds.requestBytes) return { refused: 'RATE_LIMITED' };
+  if (encoded === 'over') return { refused: 'RATE_LIMITED' };
   if (encoded.depth > analysisBounds.specDepth + 1 || !object(request) ||
     Object.keys(request).some(key => key !== 'kind' && key !== 'spec')) return { refused: 'INVALID_ARGUMENT' };
   const kind = Object.hasOwn(request, 'kind') ? request.kind : undefined;
   if (kind !== 'aggregate' && kind !== 'export') return { refused: 'INVALID_ARGUMENT' };
   if (!Object.hasOwn(request, 'spec')) return { kind, spec: undefined };
-  const spec = encode(request.spec)!;
-  if (spec.bytes > analysisBounds.specBytes) return { refused: 'RATE_LIMITED' };
+  // A member of a request that encoded within its limit encodes too.
+  const spec = encode(request.spec, analysisBounds.specBytes) as Encoded | 'over';
+  if (spec === 'over') return { refused: 'RATE_LIMITED' };
   if (!object(request.spec) || !spec.finite) return { refused: 'INVALID_ARGUMENT' };
   return { kind, spec: spec.text };
 }

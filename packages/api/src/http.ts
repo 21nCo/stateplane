@@ -190,15 +190,15 @@ async function collectionRoute(services:StateplaneServices,actor:VerifiedCredent
   if (p[4]==='jobs') return jobsRoute(services,p,request,prefix);
   return evidenceRoute(services,p,request,url,prefix);
 }
-/** An interactive aggregation. An analysis body is read as sent up to its budget (RATE_LIMITED beyond) and is null
- * when it does not parse; the shared checks then measure its compact text, nesting and values before admission. */
+/** An interactive aggregation. An analysis body is read as sent up to MCP's request bound (RATE_LIMITED beyond) and is
+ * null when it does not parse; the shared checks then measure its compact text, nesting and values before admission. */
 async function aggregateRoute(services:StateplaneServices,req:Request,prefix:Prefix):Promise<Response> {
-  return json(await services.analysis.aggregate(...prefix,analysisAggregation(await request(req,analysisBounds.specBytes))));
+  return json(await services.analysis.aggregate(...prefix,analysisAggregation(await request(req,analysisBounds.bodyBytes))));
 }
 /** Snapshot analysis and export jobs: submit, status, cancel and result pages, each reauthorized by the service. */
 async function jobsRoute(services:StateplaneServices,p:string[],req:Request,prefix:Prefix):Promise<Response> {
   if (p.length===5 && req.method==='POST') {
-    const {kind,spec}=analysisSubmission(await request(req,analysisBounds.requestBytes));
+    const {kind,spec}=analysisSubmission(await request(req,analysisBounds.bodyBytes));
     return json(await services.analysis.submit(...prefix,kind,spec),202);
   }
   const job=p[5];

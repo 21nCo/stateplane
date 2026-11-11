@@ -547,8 +547,9 @@ async function runRetrieval(client:StateplaneHttpClient,action:string|undefined,
 
 /** Aggregations and snapshot jobs of one collection. A spec is the JSON of --data or --file; a submission sends
  * {kind, spec} as the HTTP body. Before sending, the text given is bounded as the HTTP body it stands for (the spec, or
- * the spec in its envelope; RATE_LIMITED), and text that does not parse is null, as over HTTP; then the checks HTTP and
- * MCP make before admission (@stateplane/contracts) decide, so every transport refuses a request alike. */
+ * the spec in its envelope) by the bound HTTP reads (RATE_LIMITED), and text that does not parse is null, as over HTTP;
+ * then the checks HTTP and MCP make before admission (@stateplane/contracts) decide, so every transport refuses a
+ * request alike. */
 async function runAnalysis(client:StateplaneHttpClient,action:string|undefined,flags:Flags,collectionPath:string):Promise<unknown> {
   const refuse=(code:string):never=>{ throw new StateplaneCliError(code,undefined,undefined,false); };
   const given=async(maxBytes:number,around=(text:string)=>text):Promise<unknown>=>{
@@ -557,7 +558,7 @@ async function runAnalysis(client:StateplaneHttpClient,action:string|undefined,f
     try { return JSON.parse(text); } catch { return null; }
   };
   if (action==='aggregate') {
-    const spec=await given(analysisBounds.specBytes);
+    const spec=await given(analysisBounds.bodyBytes);
     const admitted=admitAggregation(spec);
     if ('refused' in admitted) return refuse(admitted.refused);
     return client.request('POST',`${collectionPath}/aggregate`,spec);
@@ -565,7 +566,7 @@ async function runAnalysis(client:StateplaneHttpClient,action:string|undefined,f
   if (action==='submit') {
     const kind=required(flags,'kind');
     const request=flags.data===undefined && flags.file===undefined ? {kind}
-      : {kind,spec:await given(analysisBounds.requestBytes,text=>`{"kind":${JSON.stringify(kind)},"spec":${text}}`)};
+      : {kind,spec:await given(analysisBounds.bodyBytes,text=>`{"kind":${JSON.stringify(kind)},"spec":${text}}`)};
     const admitted=admitAnalysisJob(request);
     if ('refused' in admitted) return refuse(admitted.refused);
     return client.request('POST',`${collectionPath}/jobs`,request);
