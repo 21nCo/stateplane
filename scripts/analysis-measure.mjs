@@ -12,13 +12,12 @@
 //      isolates) at an origin connection limit of 5.
 // The fixture's other space (--noise records) keeps the measured collection a fraction of the shared tables, as in a
 // cell holding many spaces. With --reconciliation-only it seeds the fixture at the largest scale and measures only the
-// reconciliation, --runs times. The report (JSON on stdout, or --out FILE: a new or regular file, never a symbolic link or
-// directory, whose real directory is inside the real current directory) measures this fixture and this server only; it is
-// no guarantee. The database is dropped at the end, also after a failure; when the drop
+// reconciliation, --runs times. The report is written once, as JSON on stdout, after the run and its cleanup (diagnostics go
+// to stderr; redirect stdout to keep it): the script names no file and writes none. When stdout cannot be written the
+// report goes to stderr instead and the exit status is 1. It measures this fixture and this server only; it is no
+// guarantee. The database is dropped at the end, also after a failure; when the drop
 // itself fails, the run's own failure is still the one thrown, with the undropped database named on it (`cleanup`).
-import { constants } from 'node:fs';
-import { lstat, open, readFile, realpath } from 'node:fs/promises';
-import { basename, dirname, join, resolve, sep } from 'node:path';
+import { readFile } from 'node:fs/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { cpus, loadavg } from 'node:os';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -66,59 +65,33 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const { values: options } = parseArgs({ options: {
     scales: { type: 'string', default: '50000,200000' }, noise: { type: 'string', default: '1000000' },
     runs: { type: 'string', default: '3' }, 'load-seconds': { type: 'string', default: '5' }, writes: { type: 'string', default: '300' },
-    'reconciliation-only': { type: 'boolean', default: false }, out: { type: 'string' } } });
+    'reconciliation-only': { type: 'boolean', default: false } } });
   const count = (text, name, min) => {
     const value = Number(text);
     if (!Number.isSafeInteger(value) || value < min) throw new RangeError(`--${name} must be an integer of at least ${min}`);
     return value;
   };
-  const out = options.out === undefined ? null : await reportDestination(options.out);
   const settings = { scales: options.scales.split(',').map(text => count(text, 'scales', 1)), noise: count(options.noise, 'noise', 0),
     runs: count(options.runs, 'runs', 1), loadSeconds: count(options['load-seconds'], 'load-seconds', 1),
     writes: count(options.writes, 'writes', 1), reconciliationOnly: options['reconciliation-only'] };
-  const text = `${JSON.stringify(await measure(settings), null, 2)}\n`;
-  if (out === null) process.stdout.write(text); else await writeReport(options.out, out, text);
-}
-
-/** The one refusal of a --out destination, from the check before connecting and from the one when the report is written. */
-function destinationRefused() { return new RangeError('--out must name a file inside the current directory'); }
-
-/**
- * Where --out writes, checked before anything connects: only inside the directory the operator runs from
- * (docs/measurements/ from the repository root), by real paths, so a symbolic link in the path cannot lead outside it; a
- * new file or an existing regular one, never a symbolic link or a directory.
- */
-export async function reportDestination(out, cwd = process.cwd()) {
-  const refused = destinationRefused, base = await realpath(cwd), target = resolve(cwd, out);
-  const parent = await realpath(dirname(target)).catch(() => { throw refused(); });
-  const file = join(parent, basename(target));
-  if (!file.startsWith(base.endsWith(sep) ? base : `${base}${sep}`)) throw refused();
-  const existing = await lstat(file).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
-  if (existing && !existing.isFile()) throw refused();
-  return file;
+  process.exitCode = await emitReport(await measure(settings));
 }
 
 /**
- * Write the report where reportDestination placed it at the start, after checking it again (the run takes minutes). The
- * write is bound to the checked directory itself, not to its path: the process enters it, reads back where the directory
- * it entered really is (getcwd), refuses unless that is the checked real directory, and opens only the final component
- * relative to it, never following a symbolic link there. A parent replaced by a link leading outside, before or after the
- * check, so never redirects the creation, truncation or write of the report outside the current directory.
+ * Write the report, as JSON, to `stdout` once. When that write fails (a closed pipe, a full disk behind a redirect) the
+ * completed report is not lost: it goes to `stderr` after the reason, and the result is 1, the exit status; otherwise 0.
  */
-export async function writeReport(requested, checked, text) {
-  if (await reportDestination(requested) !== checked) throw destinationRefused();
-  const previous = process.cwd();
-  process.chdir(dirname(checked));
-  try {
-    if (process.cwd() !== dirname(checked)) throw destinationRefused();
-    const file = await open(basename(checked), constants.O_WRONLY | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0))
-      .catch(error => { throw error.code === 'ELOOP' ? destinationRefused() : error; });
-    try {
-      if (!(await file.stat()).isFile()) throw destinationRefused();
-      await file.truncate(0);
-      await file.writeFile(text);
-    } finally { await file.close(); }
-  } finally { process.chdir(previous); }
+export async function emitReport(report, stdout = process.stdout, stderr = process.stderr) {
+  const text = `${JSON.stringify(report, null, 2)}\n`;
+  // A failed write may be thrown (a file written synchronously), passed to the callback and emitted as 'error': each is
+  // handled, the first decides.
+  const failure = await new Promise(resolve => {
+    stdout.on('error', resolve);
+    try { stdout.write(text, resolve); } catch (error) { resolve(error); }
+  });
+  if (!failure) return 0;
+  stderr.write(`The report could not be written to stdout (${failure.message ?? failure}); it follows on stderr.\n${text}`);
+  return 1;
 }
 
 /**

@@ -1,11 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import fsp from 'node:fs/promises';
-import { renameSync, symlinkSync } from 'node:fs';
-import { syncBuiltinESMExports } from 'node:module';
-import { dirname, join, relative } from 'node:path';
+import { Writable } from 'node:stream';
+import { dirname, join } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -15,7 +13,7 @@ import { createAuthFn, createUser, issueSession } from '@authfn/core';
 import { AuthFnAgentKeys, AuthFnIdentityVerifier } from '../../packages/auth/dist/index.js';
 import { PostgresAggregations, PostgresAnalysisWorker, PostgresSpaces, postgresServices, reconcileIndexes, reconciliationBounds }
   from '../../packages/postgres/dist/index.js';
-import { measure, reportDestination, seed, SHAPES, underLoad, writeReport } from '../../scripts/analysis-measure.mjs';
+import { emitReport, measure, seed, SHAPES, underLoad } from '../../scripts/analysis-measure.mjs';
 import { connectionOptions } from '../../scripts/db-connection.mjs';
 
 // STA-60: the typed index reconciliation against records' canonical data, and the measurement script's report. The
@@ -501,118 +499,77 @@ test('the measurement script takes its scales in ascending order up to the recon
   assert.equal(await databases(), before, 'refused before creating a database');
 });
 
-test('the measurement script writes its report only to a file inside the current directory by real paths, checked before connecting', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'stateplane-out-')), outside = await mkdtemp(join(tmpdir(), 'stateplane-outside-'));
+test('the measurement script names no output file: --out is an unknown option, refused before connecting, and nothing is created', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'stateplane-out-'));
   try {
-    await mkdir(join(dir, 'reports'));
-    await symlink(outside, join(dir, 'linked'));
-    await symlink(join(outside, 'target.json'), join(dir, 'report-link.json'));
-    // The .invalid host never resolves: an accepted destination fails at the connection (ENOTFOUND), a refused one before it.
-    const run = (out, cwd = dir) => spawnSync(process.execPath, [join(root, 'scripts/analysis-measure.mjs'), '--scales', '10', '--noise', '0',
-      '--out', out], { cwd, env: { ...process.env, DATABASE_URL: 'postgres://u:p@db.example.invalid:5432/stateplane?sslmode=verify-full' },
-      encoding: 'utf8' });
-    for (const out of ['../outside-report.json', join(outside, 'report.json'), '.', 'reports', 'reports/', 'linked/report.json',
-      'report-link.json', 'missing/report.json']) {
-      const refused = run(out);
-      assert.notEqual(refused.status, 0, out);
-      assert.match(refused.stderr, /--out must name a file inside the current directory/, out);
-      assert.doesNotMatch(refused.stderr, /ENOTFOUND/, out);
+    // The .invalid host never resolves: a run that got as far as connecting would fail with ENOTFOUND.
+    for (const out of ['report.json', join(dir, 'absolute.json'), '../outside.json']) {
+      const run = spawnSync(process.execPath, [join(root, 'scripts/analysis-measure.mjs'), '--scales', '10', '--noise', '0', '--out', out],
+        { cwd: dir, env: { ...process.env, DATABASE_URL: 'postgres://u:p@db.example.invalid:5432/stateplane?sslmode=verify-full' },
+          encoding: 'utf8' });
+      assert.notEqual(run.status, 0, out);
+      assert.match(run.stderr, /Unknown option '--out'/, out);
+      assert.doesNotMatch(run.stderr, /ENOTFOUND/, out);
+      assert.equal(run.stdout, '', out);
     }
-    await assert.rejects(stat(join(outside, 'target.json')), { code: 'ENOENT' });
-    // Ordinary descendants are accepted, also from the root directory.
-    for (const [out, cwd] of [['report.json', dir], ['reports/report.json', dir], [relative('/', join(dir, 'reports', 'r.json')), '/']]) {
-      const accepted = run(out, cwd);
-      assert.notEqual(accepted.status, 0, out);
-      assert.doesNotMatch(accepted.stderr, /--out must name/, out);
-      assert.match(accepted.stderr, /ENOTFOUND/, out);
-    }
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-    await rm(outside, { recursive: true, force: true });
-  }
+    assert.deepEqual(await readdir(dir), []);
+    await assert.rejects(stat(join(dirname(dir), 'outside.json')), { code: 'ENOENT' });
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test('the measurement script writes its report where it checked it: a parent replaced by a link outside during the run is refused', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'stateplane-out-')), outside = await mkdtemp(join(tmpdir(), 'stateplane-outside-'));
-  const runs = async () => new Set((await admin("SELECT datname FROM pg_database WHERE datname ~ '^stateplane_measure_[0-9a-f]{32}$'"))
-    .rows.map(row => row.datname));
-  const cli = () => {
-    const child = spawn(process.execPath, [join(root, 'scripts/analysis-measure.mjs'), '--scales', '10', '--noise', '0', '--runs', '1',
-      '--load-seconds', '1', '--writes', '1', '--out', 'reports/report.json'], { cwd: dir, env: { ...process.env, DATABASE_URL: baseUrl } });
-    let stderr = '';
+test('the measurement script writes one JSON report to stdout, and to stderr with exit 1 when stdout cannot take it', async () => {
+  const databases = async () => (await admin("SELECT count(*)::int AS n FROM pg_database WHERE datname LIKE 'stateplane_measure_%'")).rows[0].n;
+  const before = await databases();
+  /** Run the command at a small scale; `closed` closes its stdout's reading end first, so writing the report fails (EPIPE). */
+  const cli = (args, closed = false) => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['scripts/analysis-measure.mjs', '--noise', '0', '--runs', '1', ...args],
+      { cwd: root, env: { ...process.env, DATABASE_URL: baseUrl } });
+    let stdout = '', stderr = '';
+    if (closed) child.stdout.destroy(); else child.stdout.on('data', chunk => { stdout += chunk; });
     child.stderr.on('data', chunk => { stderr += chunk; });
-    // 'close': the child's stderr is complete, which 'exit' does not promise.
-    return { child, exited: new Promise(resolve => child.on('close', status => resolve({ status, stderr }))) };
-  };
-  try {
-    await mkdir(join(dir, 'reports'));
-    await writeFile(join(outside, 'report.json'), 'kept');
-    const before = await runs();
-    const { exited } = cli();
-    let ended = null;
-    exited.then(result => { ended = result; });
-    // Once the run's database exists the destination was checked: replace its directory by a link to one outside.
-    while (!ended && [...await runs()].every(name => before.has(name))) await new Promise(resolve => setTimeout(resolve, 50));
-    assert.equal(ended, null, 'the run was still going when its directory was replaced');
-    await rename(join(dir, 'reports'), join(dir, 'moved'));
-    await symlink(outside, join(dir, 'reports'));
-    const replaced = await exited;
-    assert.notEqual(replaced.status, 0);
-    assert.match(replaced.stderr, /--out must name a file inside the current directory/);
-    assert.equal(await readFile(join(outside, 'report.json'), 'utf8'), 'kept', 'the file outside is neither truncated nor written');
-    await assert.rejects(stat(join(dir, 'moved', 'report.json')), { code: 'ENOENT' });
-    // With its directory in place the report is written there.
-    await rm(join(dir, 'reports'));
-    await rename(join(dir, 'moved'), join(dir, 'reports'));
-    await writeFile(join(dir, 'reports', 'report.json'), 'x'.repeat(100_000));
-    const written = await cli().exited;
-    assert.equal(written.status, 0, written.stderr);
-    assert.equal(JSON.parse(await readFile(join(dir, 'reports', 'report.json'), 'utf8')).fixture.name, 'analysis-fixture/v1');
-    assert.equal(await readFile(join(outside, 'report.json'), 'utf8'), 'kept');
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-    await rm(outside, { recursive: true, force: true });
-  }
+    child.on('error', reject);
+    // 'close': the child's output is complete, which 'exit' does not promise.
+    child.on('close', status => resolve({ status, stdout, stderr }));
+  });
+  // Nothing but the report on stdout: the whole of it parses as one JSON document, the shape of the committed reports.
+  const full = await cli(['--scales', '10', '--load-seconds', '1', '--writes', '1']);
+  assert.equal(full.status, 0, full.stderr);
+  const report = JSON.parse(full.stdout);
+  assert.equal(report.kind, 'stateplane.analysis-measurements');
+  assert.deepEqual(Object.keys(report), ['contractVersion', 'kind', 'measuredAt', 'note', 'environment', 'fixture', 'aggregations',
+    'candidateIndex', 'jobs', 'reconciliation', 'mixedLoad', 'limits']);
+  // A completed report whose stdout write fails is kept: whole on stderr after the reason, and the run exits 1.
+  const lost = await cli(['--reconciliation-only', '--scales', '10'], true);
+  assert.equal(lost.status, 1, lost.stderr);
+  const [reason, ...rest] = lost.stderr.split('\n');
+  assert.match(reason, /^The report could not be written to stdout \(.*EPIPE.*\); it follows on stderr\.$/);
+  const kept = JSON.parse(rest.join('\n'));
+  assert.equal(kept.kind, 'stateplane.analysis-reconciliation-measurements');
+  assert.deepEqual(kept.reconciliation.runs.map(run => [run.records, run.driftCount]), [[10, 0]]);
+  assert.equal(await databases(), before, 'both runs drop their databases');
 });
 
-test('the report write is bound to the checked directory: a parent replaced by a link outside, before or after it is entered, never leads it outside', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'stateplane-out-')), outside = await mkdtemp(join(tmpdir(), 'stateplane-outside-'));
-  const cwd = process.cwd(), realOpen = fsp.open, realChdir = process.chdir;
-  /** Replace the checked directory by a link to the one outside, keeping it as `moved`. */
-  const replace = () => { renameSync(join(dir, 'reports'), join(dir, 'moved')); symlinkSync(outside, join(dir, 'reports')); };
-  try {
-    await mkdir(join(dir, 'reports'));
-    process.chdir(dir);
-    const checked = await reportDestination('reports/report.json');
-    // Replaced once the directory is entered, as the file is opened: the report is written in the checked directory (now
-    // `moved`), and nothing is created outside.
-    fsp.open = async (...args) => { replace(); return realOpen(...args); };
-    syncBuiltinESMExports();
-    await writeReport('reports/report.json', checked, 'report\n');
-    fsp.open = realOpen;
-    syncBuiltinESMExports();
-    assert.equal(await readFile(join(dir, 'moved', 'report.json'), 'utf8'), 'report\n');
-    await assert.rejects(stat(join(outside, 'report.json')), { code: 'ENOENT' });
-    await rm(join(dir, 'reports'));
-    await rename(join(dir, 'moved'), join(dir, 'reports'));
-    await rm(join(dir, 'reports', 'report.json'));
-    // Replaced after the check, as the directory is entered: the directory entered is outside, and the write is refused.
-    process.chdir = function (directory) {
-      if (directory === dirname(checked)) replace();
-      return realChdir.call(this, directory);
-    };
-    await assert.rejects(writeReport('reports/report.json', checked, 'report\n'), /--out must name a file inside the current directory/);
-    process.chdir = realChdir;
-    await assert.rejects(stat(join(outside, 'report.json')), { code: 'ENOENT' });
-    await assert.rejects(stat(join(dir, 'moved', 'report.json')), { code: 'ENOENT' });
-    assert.equal(process.cwd(), await fsp.realpath(dir), 'the working directory is restored');
-  } finally {
-    fsp.open = realOpen;
-    syncBuiltinESMExports();
-    process.chdir = realChdir;
-    process.chdir(cwd);
-    await rm(dir, { recursive: true, force: true });
-    await rm(outside, { recursive: true, force: true });
+test('the report is emitted once: exit 0 when stdout takes it, else the full report on stderr and exit 1, however the write fails', async () => {
+  const report = { kind: 'stateplane.analysis-measurements', values: [1, 2, 3] }, text = `${JSON.stringify(report, null, 2)}\n`;
+  /** A stream recording what it is given, whose writes fail in the given way. */
+  const stream = fail => {
+    const written = [];
+    const writable = new Writable({ write(chunk, encoding, done) {
+      if (fail === 'callback') return done(new Error('injected callback failure'));
+      written.push(String(chunk));
+      return done();
+    } });
+    if (fail === 'throw') writable.write = () => { throw new Error('injected thrown failure'); };
+    return Object.assign(writable, { written });
+  };
+  const ok = stream(null), quiet = stream(null);
+  assert.equal(await emitReport(report, ok, quiet), 0);
+  assert.deepEqual([ok.written.join(''), quiet.written.join('')], [text, '']);
+  for (const fail of ['callback', 'throw']) {
+    const stdout = stream(fail), stderr = stream(null);
+    assert.equal(await emitReport(report, stdout, stderr), 1, fail);
+    assert.equal(stderr.written.join(''), `The report could not be written to stdout (injected ${fail === 'throw' ? 'thrown' : 'callback'} failure); it follows on stderr.\n${text}`, fail);
+    assert.deepEqual(stdout.written, [], fail);
   }
 });
 

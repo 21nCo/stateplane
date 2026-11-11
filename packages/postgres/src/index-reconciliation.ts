@@ -82,6 +82,8 @@ export async function reconcileIndexes(pool: PoolLike, spaceId: string, collecti
         .map(row => row.field_name);
       // At most `limit` records and pageBytes of canonical data, the first record always (octet_length reads the stored size
       // only). One record past `limit` is read and not taken: it shows, in this snapshot, whether any record follows the page.
+      // The window runs over all `limit`+1 candidates before the byte cut, and a page cut by bytes starts the next one at its
+      // first untaken record, so large records are read again by the following pages: at most `limit`+1 per page.
       const records = (await db.query(`SELECT record_id,tombstone,canonical_data,fetched FROM (
           SELECT record_id,tombstone,canonical_data,sum(octet_length(COALESCE(canonical_data,''))) OVER (ORDER BY record_id) AS running,
             row_number() OVER (ORDER BY record_id) AS position,count(*) OVER () AS fetched FROM (
@@ -154,7 +156,10 @@ function expectedRows(records: { record_id: string; tombstone: boolean; canonica
   return { drift, expected, owners };
 }
 
-/** The row an accepted record derives for a field, or null when it derives none (a value past the index's byte limit). */
+/**
+ * The row an accepted record derives for a field, or null when it derives none: a value past the index's byte limit, or a
+ * string with a character the database cannot store.
+ */
 function derivedOrNull(data: Record<string, Json>, definition: CollectionDefinition, field: string): IndexValue | null {
   try { return derivedIndexValue(data, definition, field); } catch { return null; }
 }
