@@ -1,0 +1,82 @@
+{
+  "contractVersion": "1",
+  "kind": "stateplane.analysis-reconciliation-measurements",
+  "measuredAt": "2026-11-11T03:19:46.773Z",
+  "note": "Measurements of this fixture on this server only; not guarantees.",
+  "environment": {
+    "server": "PostgreSQL 17.11 (Debian 17.11-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+    "node": "v23.11.1",
+    "statementTimeoutMs": 15000,
+    "parallelWorkers": 0,
+    "host": {
+      "cpus": 8,
+      "loadAverage": {
+        "start": [
+          3.41,
+          4.961,
+          5.315
+        ],
+        "end": [
+          3.379,
+          4.501,
+          5.068
+        ]
+      }
+    }
+  },
+  "fixture": {
+    "name": "analysis-fixture/v1",
+    "fields": {
+      "team": "string, 20 values",
+      "score": "number, null every 11th",
+      "active": "boolean, missing every 13th",
+      "at": "date-time, every 97 s from 2020-01-01T00:00:00Z"
+    },
+    "noiseRecords": 1000000,
+    "scales": [
+      500000
+    ],
+    "runs": 3
+  },
+  "reconciliation": {
+    "seedSeconds": 114.357,
+    "runs": [
+      {
+        "records": 500000,
+        "fields": [
+          "active",
+          "at",
+          "score",
+          "team"
+        ],
+        "driftCount": 0,
+        "seconds": 10.384,
+        "recordsPerSecond": 48150.686
+      },
+      {
+        "records": 500000,
+        "fields": [
+          "active",
+          "at",
+          "score",
+          "team"
+        ],
+        "driftCount": 0,
+        "seconds": 9.598,
+        "recordsPerSecond": 52092.445
+      },
+      {
+        "records": 500000,
+        "fields": [
+          "active",
+          "at",
+          "score",
+          "team"
+        ],
+        "driftCount": 0,
+        "seconds": 9.766,
+        "recordsPerSecond": 51196.903
+      }
+    ]
+  }
+}

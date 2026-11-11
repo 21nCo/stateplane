@@ -10,6 +10,7 @@ import { createAuthFn, createUser, issueSession } from '@authfn/core';
 import { AuthFnAgentKeys, AuthFnIdentityVerifier } from '../../packages/auth/dist/index.js';
 import { PostgresSpaces, postgresServices, reconcileIndexes, reconciliationBounds } from '../../packages/postgres/dist/index.js';
 import { measure, SHAPES } from '../../scripts/analysis-measure.mjs';
+import { connectionOptions } from '../../scripts/db-connection.mjs';
 
 // STA-60: the typed index reconciliation against records' canonical data, and the measurement script's report. The
 // suite owns its database; the measurement makes and drops its own.
@@ -19,14 +20,14 @@ const baseUrl = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURICo
 const name = `stateplane_measurements_${randomUUID().replaceAll('-', '')}`;
 const url = Object.assign(new URL(baseUrl), { pathname: `/${name}` }).toString();
 const admin = async sql => {
-  const client = new pg.Client({ connectionString: baseUrl });
+  const client = new pg.Client(connectionOptions(baseUrl));
   await client.connect();
   try { return await client.query(sql); } finally { await client.end(); }
 };
 await admin(`CREATE DATABASE ${name}`);
 const migrated = spawnSync(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: url }, encoding: 'utf8' });
 if (migrated.status !== 0) { await admin(`DROP DATABASE IF EXISTS ${name}`); throw new Error(migrated.stderr); }
-const pool = new pg.Pool({ connectionString: url, max: 8 });
+const pool = new pg.Pool({ ...connectionOptions(url), max: 8 });
 test.after(async () => { await pool.end(); await admin(`DROP DATABASE IF EXISTS ${name}`); });
 
 const config = { database: memoryAdapter(), namespace: `measurements-${randomUUID()}`, plugins: [] };
@@ -151,6 +152,63 @@ test('reconciliation reports damaged canonical data as underivable drift per rec
   assert.deepEqual(reasons(report).sort(order), expected.sort(order));
 });
 
+test('reconciliation expects what the writers accept: a stored value they would reject is underivable, never kind drift or clean', async () => {
+  const f = await fixture();
+  // A collection with constraints: required fields (one not indexed), non-nullable, bounded, integer, enumerated.
+  const strict = { $schema: schema.$schema, type: 'object', additionalProperties: false, required: ['code', 'tag'], properties: {
+    count: { type: 'number' }, flag: { type: 'boolean' }, at: { type: 'string', format: 'date-time' },
+    code: { type: 'string', maxLength: 3 }, level: { type: 'integer', minimum: 0 }, kind: { type: 'string', enum: ['a', 'b'] },
+    tag: { type: 'string' } } };
+  const fields = ['at', 'code', 'count', 'flag', 'kind', 'level'];
+  await services.collections.define(f.owner, f.spaceId, 'strict', JSON.stringify({ slug: 'strict', version: 1, schema: strict,
+    unique: [], filterable: fields, sortable: [] }));
+  for (const field of fields) await services.collections.backfill(f.owner, f.spaceId, 'strict', field);
+  const ids = [];
+  for (let n = 0; n < 13; n++) ids.push((await services.records.mutate(f.owner, f.spaceId, 'strict', JSON.stringify({
+    idempotencyKey: randomUUID(), operation: 'create', data: { count: n, flag: true, at: '2026-03-08T01:30:00Z', code: 'abc', level: 1,
+      kind: 'a', tag: 't' } }))).ref.id);
+  const where = `space_id=$1 AND collection_id='strict' AND record_id=$2`;
+  const data = (id, patch) => damage(`UPDATE records SET canonical_data=(canonical_data::jsonb || $3::jsonb)::text WHERE ${where}`,
+    [f.spaceId, id, JSON.stringify(patch)]);
+  const without = (id, member) => damage(`UPDATE records SET canonical_data=(canonical_data::jsonb - $3::text)::text WHERE ${where}`,
+    [f.spaceId, id, member]);
+  // The row a faulty writer would have derived from the damaged value, so that only validation tells them apart.
+  const row = (id, field, kind, column, value) => damage(`UPDATE record_index_values SET value_kind=$4,string_value=$5::text,
+    number_value=$6::numeric,boolean_value=NULL,time_value=NULL WHERE ${where} AND field_name=$3`,
+  [f.spaceId, id, field, kind, column === 'string_value' ? value : null, column === 'number_value' ? value : null]);
+  await data(ids[0], { count: '7' }); // a number field holding a string, its row untouched
+  await data(ids[1], { count: '7' }); // the same with a matching string row
+  await row(ids[1], 'count', 'string', 'string_value', '7');
+  await data(ids[2], { flag: 1 }); // a boolean field holding a number, with a matching row
+  await row(ids[2], 'flag', 'number', 'number_value', 1);
+  await data(ids[3], { at: 5 }); // a date-time field holding a number, its row untouched
+  await data(ids[4], { code: 'abcdef' }); // past maxLength, with a matching row
+  await row(ids[4], 'code', 'string', 'string_value', 'abcdef');
+  await data(ids[5], { level: 2.5 }); // not an integer, with a matching row
+  await row(ids[5], 'level', 'number', 'number_value', 2.5);
+  await data(ids[6], { level: -1 }); // below minimum, with a matching row
+  await row(ids[6], 'level', 'number', 'number_value', -1);
+  await data(ids[7], { kind: 'c' }); // outside enum, with a matching row
+  await row(ids[7], 'kind', 'string', 'string_value', 'c');
+  await without(ids[8], 'code'); // a required ready field missing, with a matching missing row
+  await row(ids[8], 'code', 'missing');
+  await data(ids[9], { count: null }); // null on a non-nullable field, with a matching null row
+  await row(ids[9], 'count', 'null');
+  await data(ids[10], { extra: 1 }); // an undeclared root property: the record is rejected, so is every ready field
+  await without(ids[11], 'tag'); // a required field outside the ready ones missing: the same
+  await damage(`UPDATE record_index_values SET number_value=number_value+1 WHERE ${where} AND field_name='count'`, [f.spaceId, ids[12]]);
+  const report = await reconcileIndexes(pool, f.spaceId, 'strict');
+  const underivable = (id, field) => [id, field, 'underivable', null, null];
+  const expected = [underivable(ids[0], 'count'), underivable(ids[1], 'count'), underivable(ids[2], 'flag'), underivable(ids[3], 'at'),
+    underivable(ids[4], 'code'), underivable(ids[5], 'level'), underivable(ids[6], 'level'), underivable(ids[7], 'kind'),
+    underivable(ids[8], 'code'), underivable(ids[9], 'count'), ...fields.map(field => underivable(ids[10], field)),
+    ...fields.map(field => underivable(ids[11], field)), [ids[12], 'count', 'value', 'number', 'number']];
+  const key = item => `${item[0]} ${item[1]}`;
+  const order = (a, b) => (key(a) < key(b) ? -1 : 1);
+  assert.deepEqual([report.fields, report.checked, report.driftCount], [fields, 13, expected.length]);
+  assert.deepEqual(reasons(report).sort(order), expected.sort(order));
+});
+
 test('reconciliation checks ready fields only: a field still backfilling is not reported as drift', async () => {
   const f = await fixture();
   for (let n = 0; n < 5; n++) await f.write({ operation: 'create', data: { team: `t${n}`, note: `n${n}` } });
@@ -264,6 +322,11 @@ test('the measurement script reports plans as issued, the candidate index, jobs,
   assert.deepEqual(Object.keys(report.limits.interactive), ['count', 'byValue', 'byMonth', 'threeDimensions']);
   assert.ok(report.limits.interactive.byValue.recordsWithinStatementBudget > 0);
   assert.ok(report.limits.jobs.export.recordsWithinRuntimeBudget > 0 && report.limits.jobs.export.recordsWithinByteBudget > 0);
+  // Reconciliation only: the fixture at the largest scale, reconciled --runs times, each finding the seed clean.
+  const only = await measure({ scales: [400, 700], noise: 100, runs: 2, loadSeconds: 1, writes: 1, reconciliationOnly: true });
+  assert.equal(only.kind, 'stateplane.analysis-reconciliation-measurements');
+  assert.deepEqual(only.reconciliation.runs.map(run => [run.records, run.driftCount, run.fields.length]), [[700, 0, 4], [700, 0, 4]]);
+  assert.equal(only.aggregations, undefined);
   const after = (await admin("SELECT count(*)::int AS n FROM pg_database WHERE datname LIKE 'stateplane_measure_%'")).rows[0].n;
-  assert.equal(after, before, 'the measurement database is dropped');
+  assert.equal(after, before, 'the measurement databases are dropped');
 });

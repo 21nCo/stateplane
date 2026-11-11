@@ -11,7 +11,8 @@
 //      capacity (aggregations retrying a refusal after 5 or after 250 ms), from two composed application services (two
 //      isolates) at an origin connection limit of 5.
 // The fixture's other space (--noise records) keeps the measured collection a fraction of the shared tables, as in a
-// cell holding many spaces. The report (JSON on stdout, or --out FILE) measures this fixture and this server only; it
+// cell holding many spaces. With --reconciliation-only it seeds the fixture at the largest scale and measures only the
+// reconciliation, --runs times. The report (JSON on stdout, or --out FILE) measures this fixture and this server only; it
 // is no guarantee. The database is dropped at the end, also after a failure.
 import { readFile, writeFile } from 'node:fs/promises';
 import { cpus, loadavg } from 'node:os';
@@ -60,7 +61,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const { values: options } = parseArgs({ options: {
     scales: { type: 'string', default: '50000,200000' }, noise: { type: 'string', default: '1000000' },
     runs: { type: 'string', default: '3' }, 'load-seconds': { type: 'string', default: '5' }, writes: { type: 'string', default: '300' },
-    out: { type: 'string' } } });
+    'reconciliation-only': { type: 'boolean', default: false }, out: { type: 'string' } } });
   const count = (text, name, min) => {
     const value = Number(text);
     if (!Number.isSafeInteger(value) || value < min) throw new RangeError(`--${name} must be an integer of at least ${min}`);
@@ -68,7 +69,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   };
   const settings = { scales: options.scales.split(',').map(text => count(text, 'scales', 1)), noise: count(options.noise, 'noise', 0),
     runs: count(options.runs, 'runs', 1), loadSeconds: count(options['load-seconds'], 'load-seconds', 1),
-    writes: count(options.writes, 'writes', 1) };
+    writes: count(options.writes, 'writes', 1), reconciliationOnly: options['reconciliation-only'] };
   const text = `${JSON.stringify(await measure(settings), null, 2)}\n`;
   if (options.out) await writeFile(options.out, text); else process.stdout.write(text);
 }
@@ -125,6 +126,27 @@ async function run(settings, newPool) {
   const noiseSpace = await space();
   if (settings.noise) { await define(noiseSpace, 'noise'); await seed(pool, noiseSpace, 'noise', settings.noise, false); }
   const spaceId = await space();
+  const report = kind => ({ contractVersion: '1', kind, measuredAt: new Date().toISOString(),
+    note: 'Measurements of this fixture on this server only; not guarantees.',
+    environment: { server, node: process.version, statementTimeoutMs: aggregationBounds.maxStatementMs, parallelWorkers: 0,
+      host: { cpus: cpus().length, loadAverage: { start: loadAtStart, end: loadavg().map(round) } } },
+    fixture: { name: FIXTURE, fields: { team: 'string, 20 values', score: 'number, null every 11th', active: 'boolean, missing every 13th',
+      at: 'date-time, every 97 s from 2020-01-01T00:00:00Z' }, noiseRecords: settings.noise, scales: settings.scales, runs: settings.runs } });
+  const reconcile = async (collectionId, records) => {
+    const started = performance.now();
+    const reconciliation = await reconcileIndexes(pool, spaceId, collectionId, { maxRecords: records });
+    const seconds = (performance.now() - started) / 1000;
+    return { records: reconciliation.checked, fields: reconciliation.fields, driftCount: reconciliation.driftCount, seconds: round(seconds),
+      recordsPerSecond: round(reconciliation.checked / seconds) };
+  };
+  if (settings.reconciliationOnly) {
+    const records = settings.scales.at(-1), collectionId = `measured-${records}`;
+    await define(spaceId, collectionId);
+    const seedSeconds = await seed(pool, spaceId, collectionId, records, true);
+    const runs = [];
+    for (let i = 0; i < settings.runs; i++) runs.push(await reconcile(collectionId, records));
+    return { ...report('stateplane.analysis-reconciliation-measurements'), reconciliation: { seedSeconds, runs } };
+  }
 
   // Aggregations run on an analytical pool that records each statement with the transaction's settings before it.
   const captured = [];
@@ -250,9 +272,7 @@ async function run(settings, newPool) {
   const exportJob = await job('export');
   const aggregateJob = await job('aggregate', SHAPES.byValue);
 
-  const reconciled = performance.now();
-  const reconciliation = await reconcileIndexes(pool, spaceId, collectionId, { maxRecords: records });
-  const reconcileSeconds = (performance.now() - reconciled) / 1000;
+  const reconciliation = await reconcile(collectionId, records);
 
   // Mixed load: interactive reads from the first isolate, alone and then under each analytical load from both isolates.
   const isolate = () => {
@@ -317,18 +337,11 @@ async function run(settings, newPool) {
     bothBackingOff: await phase({ aggregating: true, stepping: true, retryMs: 250 }) };
 
   const largest = scales.at(-1);
-  return { contractVersion: '1', kind: 'stateplane.analysis-measurements', measuredAt: new Date().toISOString(),
-    note: 'Measurements of this fixture on this server only; not guarantees.',
-    environment: { server, node: process.version, statementTimeoutMs: aggregationBounds.maxStatementMs, parallelWorkers: 0,
-      host: { cpus: cpus().length, loadAverage: { start: loadAtStart, end: loadavg().map(round) } } },
-    fixture: { name: FIXTURE, fields: { team: 'string, 20 values', score: 'number, null every 11th', active: 'boolean, missing every 13th',
-      at: 'date-time, every 97 s from 2020-01-01T00:00:00Z' }, noiseRecords: settings.noise, scales: settings.scales, runs: settings.runs },
-    aggregations: scales,
+  return { ...report('stateplane.analysis-measurements'), aggregations: scales,
     candidateIndex: { sql: CANDIDATE.replace(/\s+/g, ' '), recordWriteMs: rounds,
       bytes: { candidate: candidateBytes, table: Number(indexBytes.heap), existingIndexes: Number(indexBytes.indexes) } },
     jobs: [exportJob, aggregateJob],
-    reconciliation: { records: reconciliation.checked, fields: reconciliation.fields, driftCount: reconciliation.driftCount,
-      seconds: round(reconcileSeconds), recordsPerSecond: round(reconciliation.checked / reconcileSeconds) },
+    reconciliation,
     mixedLoad: { originConnectionLimit: 5, analyticalSlots: analyticalSlots(5), isolates: 2, interactivePoolPerIsolate: 2,
       aggregationLoopsPerIsolate: 6, records: largest.records, phases },
     limits: limits(scales, [exportJob, aggregateJob]) };

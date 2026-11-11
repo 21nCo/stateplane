@@ -1,8 +1,8 @@
 import { inTransaction } from './faults.js';
 import type { PoolLike } from './faults.js';
 import type { IndexValue } from './index.js';
-import { derivedIndexValue } from './schema.js';
-import type { CollectionDefinition, Json } from './schema.js';
+import { derivedIndexValue, validateParsedValue } from './schema.js';
+import type { CollectionDefinition, Json, SchemaNode } from './schema.js';
 
 /**
  * Bounds of one reconciliation call (docs/analysis-measurements.md#reconciliation):
@@ -16,10 +16,13 @@ export const reconciliationBounds = Object.freeze({ pageRecords: 1_000, defaultR
  * One typed index row that differs from what the record's canonical data
  * derives: `missing` (a live record has no row for a ready field),
  * `unexpected` (a deleted record still has one), `kind` or `value` (the row
- * holds another kind or value), or `underivable` (the stored data derives no
- * value under the current definition: an invalid value, a field holding an
- * object or array, or canonical data that is not a JSON object). Kinds only,
- * never values.
+ * holds another kind or value), or `underivable` (the record writers would not
+ * accept the stored value under the current definition, so it derives no row:
+ * a value outside its field's schema, a required field missing, a null on a
+ * non-nullable field, or one past the index's byte limit; for every ready
+ * field when the rest of the record is not accepted either, such as an
+ * undeclared property, a required field missing outside the ready fields, or
+ * canonical data that is not a JSON object). Kinds only, never values.
  */
 export interface IndexDrift {
   recordId: string; field: string; reason: 'missing' | 'unexpected' | 'kind' | 'value' | 'underivable';
@@ -79,17 +82,17 @@ export async function reconcileIndexes(pool: PoolLike, spaceId: string, collecti
       const expected: IndexValue[] = [], owners: string[] = [];
       for (const record of records) {
         if (record.tombstone) continue;
-        // Damaged stored data (not JSON, not an object, or a field holding no scalar) derives nothing: it is drift of each
-        // ready field, never a failure of the whole call.
+        // Damaged stored data derives nothing: it is drift of its ready fields, never a failure of the whole call.
         let data: Record<string, Json> | null = null;
         try {
           const parsed = JSON.parse(record.canonical_data) as Json;
           if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) data = parsed as Record<string, Json>;
         } catch { /* reported below */ }
+        const rejected = data ? rejectedFields(data, definition.schema, fields) : new Set(fields);
         for (const field of fields) {
           let value: IndexValue | null = null;
-          try { if (data) value = derivedIndexValue(data, definition, field); } catch { /* reported below */ }
-          if (!value || (value.kind === 'number' && !Number.isFinite(value.value))) {
+          try { if (!rejected.has(field)) value = derivedIndexValue(data!, definition, field); } catch { /* reported below */ }
+          if (!value) {
             drift.push({ recordId: record.record_id, field, reason: 'underivable', expectedKind: null, actualKind: null });
             continue;
           }
@@ -136,4 +139,28 @@ export async function reconcileIndexes(pool: PoolLike, spaceId: string, collecti
     cursor = page.last;
     if (result.checked >= maxRecords) { result.next = cursor; return result; }
   }
+}
+
+/**
+ * The ready fields whose stored value the record writers would reject under the current definition, validated as they
+ * validate it (`validateParsedValue`): each ready field against its own schema (a missing one only when required); every
+ * ready field when the rest of the record is rejected (an undeclared property, a required field missing, an invalid value
+ * of a field not checked here). Definitions only add optional fields, so data a writer accepted stays accepted.
+ */
+function rejectedFields(data: Record<string, Json>, schema: SchemaNode, fields: string[]): Set<string> {
+  const required = schema.required ?? [], properties = schema.properties ?? {};
+  try {
+    // fromEntries keeps a `__proto__` member an own property, as the parsed data holds it.
+    const rest = Object.fromEntries(Object.entries(data).filter(([key]) => !fields.includes(key))) as Json;
+    validateParsedValue(rest, { ...schema, required: required.filter(name => !fields.includes(name)) });
+  } catch { return new Set(fields); }
+  const rejected = new Set<string>();
+  for (const field of fields) {
+    try {
+      if (!Object.hasOwn(properties, field)) rejected.add(field);
+      else if (Object.hasOwn(data, field)) validateParsedValue(data[field], properties[field]);
+      else if (required.includes(field)) rejected.add(field);
+    } catch { rejected.add(field); }
+  }
+  return rejected;
 }
