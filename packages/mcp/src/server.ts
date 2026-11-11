@@ -44,7 +44,8 @@ const messages: Record<string, string> = {
   RATE_LIMITED: 'The request exceeds a time, capacity or size limit.',
   // Each write tool replaces this with its own recovery step.
   COMMIT_OUTCOME_UNKNOWN: 'The write may have committed. Read the current state before writing again.',
-  STALE_PLACEMENT: 'The space placement or policy changed during the request.'
+  STALE_PLACEMENT: 'The space placement or policy changed during the request.',
+  CONFLICT: 'The resource is not in a state that allows this operation, such as a job without a complete result. Read its status.'
 };
 const validationCodes = new Set(['INVALID_ARGUMENT', 'SCHEMA_INVALID', 'SCHEMA_UNSUPPORTED']);
 

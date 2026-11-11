@@ -537,7 +537,7 @@ test('the measurement script writes one JSON report to stdout, and to stderr wit
   const report = JSON.parse(full.stdout);
   assert.equal(report.kind, 'stateplane.analysis-measurements');
   assert.deepEqual(Object.keys(report), ['contractVersion', 'kind', 'measuredAt', 'note', 'environment', 'fixture', 'aggregations',
-    'candidateIndex', 'jobs', 'reconciliation', 'mixedLoad', 'limits']);
+    'candidateIndex', 'byteOrderIndex', 'jobs', 'reconciliation', 'mixedLoad', 'limits']);
   // A completed report whose stdout write fails is kept: whole on stderr after the reason, and the run exits 1.
   const lost = await cli(['--reconciliation-only', '--scales', '10'], true);
   assert.equal(lost.status, 1, lost.stderr);
@@ -710,6 +710,7 @@ test('the measurement script reports plans as issued, the candidate index, jobs,
   assert.equal(load.phases.alone.aggregations.answered + load.phases.alone.aggregations.refused, 0);
   assert.ok(load.phases.aggregationsOnly.aggregations.answered + load.phases.aggregationsOnly.aggregations.refused > 0);
   assert.deepEqual(report.candidateIndex.recordWriteMs.with.map(round => round.samples), [5, 5]);
+  assert.deepEqual(Object.values(report.byteOrderIndex.recordWriteMs).map(rounds => rounds.map(round => round.samples)), [[5, 5], [5, 5]]);
   assert.ok(report.candidateIndex.bytes.candidate > 0);
   assert.deepEqual(Object.keys(report.limits.interactive), ['count', 'byValue', 'byMonth', 'threeDimensions']);
   assert.ok(report.limits.interactive.byValue.recordsWithinStatementBudget > 0);

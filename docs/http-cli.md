@@ -393,6 +393,37 @@ are safe reads: they change nothing, so a retryable failure is repeated like a
 `GET`, and a statement cancellation is `RATE_LIMITED`, never an unknown write
 outcome.
 
+## Aggregations and analysis jobs
+
+Interactive aggregations and snapshot analysis and export jobs (STA-61) use the
+same services as MCP; [analysis jobs](analysis-jobs.md#transports-sta-61)
+describes their authorization, results, errors and bounds.
+
+| HTTP | CLI | Access |
+| --- | --- | --- |
+| `POST /v1/spaces/{spaceId}/collections/{collectionId}/aggregate` | `stateplane analysis aggregate --data '<AggregationSpec>'` | `records:read` |
+| `POST /v1/spaces/{spaceId}/collections/{collectionId}/jobs` | `stateplane analysis submit --kind export` or `--kind aggregate --data '<AggregationSpec>'` | `export:read` or `records:read` |
+| `GET /v1/spaces/{spaceId}/collections/{collectionId}/jobs/{jobId}` | `stateplane analysis status --job ID` | The submitting credential |
+| `DELETE /v1/spaces/{spaceId}/collections/{collectionId}/jobs/{jobId}` | `stateplane analysis cancel --job ID` | The submitting credential |
+| `GET /v1/spaces/{spaceId}/collections/{collectionId}/jobs/{jobId}/pages/{page}` | `stateplane analysis page --job ID --page N` | The submitting credential |
+
+Every `analysis` command takes `--collection ID`.
+
+```sh
+stateplane analysis aggregate --collection entries --data '{"groupBy":[{"field":"state"}],"metrics":[{"op":"count"}]}'
+stateplane analysis submit --collection entries --kind export      # 202 with the queued job's jobId
+stateplane analysis status --collection entries --job anj_...      # poll until complete is true
+stateplane analysis page --collection entries --job anj_... --page 1
+```
+
+`--data` or `--file` holds the spec as one JSON object of at most 32 KiB (a
+submission sends `{"kind","spec"}` of at most 33 KiB); anything else is
+refused locally. Aggregation, status and page are safe reads, repeated after a
+retryable failure like a `GET`. A submission and a cancellation are writes and
+are never repeated: after an unknown outcome, submit again (a lost job expires
+on its own) or read the status before cancelling again. A page of a job
+without a complete result is `CONFLICT` (409); read the status.
+
 ## Acceptance boundaries
 
 The local contract fixture proves HTTP and packaged CLI parity, authorization

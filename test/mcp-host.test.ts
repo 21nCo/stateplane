@@ -4,16 +4,22 @@ import { beforeEach, expect, it, vi } from 'vitest';
  * which endpoint and services each /mcp request used; the real endpoint's
  * scope handling is covered by test/mcp.test.js. */
 const state = vi.hoisted(() => ({ endpoints: 0, pools: 0, ended: 0, resources: [] as string[],
+  poolOptions: [] as Array<{ max?: number }>, cells: [] as Array<Map<string, { pool: unknown; analytics?: { pool: unknown; originConnectionLimit: number } }>>,
   scopes: [] as Array<{ services: unknown; identity: unknown; onTimeout?: () => void }>,
   services: [] as unknown[], http: null as null | ((request: Request) => Response) }));
 vi.mock('pg', () => ({ default: { Pool: class {
-  constructor() { state.pools++; }
+  constructor(options: { max?: number }) { state.pools++; state.poolOptions.push(options); }
   on() { return this; }
   async end() { state.ended++; }
 } } }));
 vi.mock('../packages/postgres/dist/index.js', () => ({
   PostgresSpaces: class {},
-  postgresServices: () => { const services = { request: state.services.length + 1 }; state.services.push(services); return services; }
+  // Not the real slots (1 at a limit of 5), so the test sees the host size its analytical pool by this function.
+  analyticalSlots: (limit: number) => ({ cell: limit === 5 ? 3 : 0, space: 1 }),
+  postgresServices: (_spaces: unknown, cells: (typeof state.cells)[number]) => {
+    state.cells.push(cells);
+    const services = { request: state.services.length + 1 }; state.services.push(services); return services;
+  }
 }));
 vi.mock('../packages/api/dist/index.js', () => ({ createHttpHandler: () => async (request: Request) =>
   state.http ? state.http(request) : new Response(null, { status: 204 }) }));
@@ -233,3 +239,22 @@ it('a Worker page render shares one host and pool, which the hook retires after 
   event.locals.hostLease?.retire();
   expect(state.ended - before.ended).toBe(2);
 });
+
+it('a host gives aggregations an analytical pool of their own only for a valid origin connection limit, and ends it too', async () => {
+  for (const [limit, expected] of [['5', 3], [undefined, null], ['4', null], ['21', null], ['5.5', null], ['x', null]] as const) {
+    const before = { pools: state.pools, ended: state.ended, cells: state.cells.length };
+    await stateplaneHost({ ...env, STATEPLANE_ORIGIN_CONNECTION_LIMIT: limit } as never)!.http(new Request('https://preview.example/v1/spaces'));
+    const cell = state.cells[before.cells].get('cell-a')!;
+    if (expected === null) {
+      expect(cell.analytics, String(limit)).toBeUndefined();
+      expect(state.pools - before.pools).toBe(1);
+      continue;
+    }
+    expect(cell.analytics!.originConnectionLimit).toBe(5);
+    expect(cell.analytics!.pool).not.toBe(cell.pool);
+    expect(state.poolOptions.at(-1)!.max).toBe(expected);
+    // Both pools are this request's and both end with it.
+    expect([state.pools - before.pools, state.ended - before.ended]).toEqual([2, 2]);
+  }
+});
+

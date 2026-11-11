@@ -59,7 +59,10 @@ function fixture() {
     retrieval:{search:record('retrieval.search',{results:[],complete:false}),
       bundle:record('retrieval.bundle',{context:'<stateplane-context trust="untrusted" complete="false"></stateplane-context>',
         excerpts:[{n:1,ref:{id:'rec_1'}}],complete:false}),
-      status:record('retrieval.status',{state:'current',rebuild:null})}
+      status:record('retrieval.status',{state:'current',rebuild:null})},
+    analysis:{aggregate:record('analysis.aggregate',{groups:[],complete:true}),submit:record('analysis.submit',{jobId:'anj_1',state:'queued'}),
+      status:record('analysis.status',{jobId:'anj_1',state:'running'}),cancel:record('analysis.cancel',{jobId:'anj_1',state:'cancelled'}),
+      page:record('analysis.page',{jobId:'anj_1',complete:true})}
   };
   services.spaces.erasure=record('spaces.erasure',{spaceId:'sp_a',database:'pending',originalBytes:'pending',backups:'retained'});
   let providerDown=false;
@@ -108,7 +111,7 @@ test('the fixed registry publishes the committed manifest and annotations',async
   assert.equal(manifest.hash,committed.hash);
   const names=manifest.tools.map(tool=>tool.name);
   assert.deepEqual(names,[...names].sort());
-  assert.equal(names.length,45,'the registry is fixed; a new tool is a reviewed contract change');
+  assert.equal(names.length,50,'the registry is fixed; a new tool is a reviewed contract change');
   for (const tool of manifest.tools) {
     const own=tools.find(item=>item.name===tool.name);
     assert.equal(tool.annotations.readOnlyHint,own.read,`${tool.name} read annotation matches its error mapping`);
@@ -117,11 +120,11 @@ test('the fixed registry publishes the committed manifest and annotations',async
     if (own.read) assert.equal(tool.annotations.destructiveHint,false);
   }
   for (const name of ['records_replace','records_patch','records_delete','batches_ingest','batches_cancel',
-    'sources_delete','uploads_revoke','claims_delete','links_delete'])
+    'sources_delete','uploads_revoke','claims_delete','links_delete','analysis_cancel'])
     assert.equal(manifest.tools.find(tool=>tool.name===name).annotations.destructiveHint,true,name);
   // Each call issues a new grant or attempt, so an identical repeat is not free of effects.
   for (const name of names) assert.equal(manifest.tools.find(tool=>tool.name===name).annotations.idempotentHint,
-    !['uploads_create','uploads_send'].includes(name),name);
+    !['uploads_create','uploads_send','analysis_submit'].includes(name),name);
   assert.ok(!names.some(name=>/entries|collection_[a-z]/.test(name)),'no tool is named after a collection');
   assert.equal(manifest.resources[0].uri,guidanceUri);
   assert.match(manifest.server.instructions,/untrusted data/);
@@ -248,8 +251,13 @@ test('every published x- extension is checked against OpenAPI or the authority',
   // OpenAPI parity above; predicate string and instant values in scalar and `in` form.
   each(['records_create','records_replace','records_patch','records_delete'],'/properties/idempotencyKey/x-utf8MaxBytes',256);
   each(['records_create'],'/properties/externalKey/x-nfcTrimmedUtf8MaxBytes',256);
-  for (const variant of ['1/properties/value','2/properties/value/items','7/properties/value','8/properties/value/items'])
+  for (const variant of ['1/properties/value','2/properties/value/items','7/properties/value','8/properties/value/items']) {
     each(['records_query','records_count'],`/properties/predicates/items/oneOf/${variant}/x-utf8MaxBytes`,512);
+    // An aggregation's where takes the same predicates, directly or inside a job request's spec.
+    each(['analysis_aggregate'],`/properties/where/items/oneOf/${variant}/x-utf8MaxBytes`,512);
+    each(['analysis_submit'],`/properties/spec/properties/where/items/oneOf/${variant}/x-utf8MaxBytes`,512);
+  }
+  each(['analysis_status','analysis_cancel','analysis_page'],'/properties/jobId/x-utf16MaxLength',512);
   assert.deepEqual(extensions(manifest),expected.sort(),'a new extension needs a parity check');
   // Each mutation repeats a name, key and value published elsewhere, so only the tool and pointer reveal it.
   const mutate=change=>{ const copy=structuredClone(manifest); change(name=>copy.tools.find(tool=>tool.name===name).inputSchema); return extensions(copy); };
@@ -332,7 +340,14 @@ test('two credentials use one fixed tool list and every tool reaches the shared 
       ['sp_a',{query:'fog',collections:['entries'],kinds:['record'],limit:3}]],
     ['retrieval_bundle',{spaceId:'sp_a',task:'Summarize fog',budget:{bytes:2048}},'retrieval.bundle',
       ['sp_a',{task:'Summarize fog',budget:{bytes:2048}}]],
-    ['retrieval_status',s,'retrieval.status',['sp_a','entries']]
+    ['retrieval_status',s,'retrieval.status',['sp_a','entries']],
+    ['analysis_aggregate',{...s,groupBy:[{field:'team'}],metrics:[{op:'count'}]},'analysis.aggregate',
+      ['sp_a','entries','{"groupBy":[{"field":"team"}],"metrics":[{"op":"count"}]}']],
+    ['analysis_submit',{...s,kind:'aggregate',spec:{metrics:[{op:'count'}]}},'analysis.submit',
+      ['sp_a','entries','aggregate','{"metrics":[{"op":"count"}]}']],
+    ['analysis_status',{...s,jobId:'anj_1'},'analysis.status',['sp_a','entries','anj_1']],
+    ['analysis_cancel',{...s,jobId:'anj_1'},'analysis.cancel',['sp_a','entries','anj_1']],
+    ['analysis_page',{...s,jobId:'anj_1',page:2},'analysis.page',['sp_a','entries','anj_1',2]]
   ];
   assert.deepEqual(cases.map(([name])=>name).sort(),listed.map(tool=>tool.name).sort(),'every tool is exercised');
   for (const [tool,args,service,expected] of cases) {
@@ -811,4 +826,67 @@ test('the retrieval tools accept exactly the requests the OpenAPI SearchRequest 
     for (const request of requests)
       assert.equal(published({spaceId:'sp_a',...request}),openapi(request),`${tool} ${JSON.stringify(request)}`);
   }
+});
+
+test('the analysis tools accept exactly the requests the OpenAPI AggregationSpec and AnalysisJobRequest accept',async()=>{
+  const document=YAML.parse(await readFile(new URL('../contracts/openapi.yaml',import.meta.url),'utf8'));
+  const ajv=new Ajv2020({strict:false,allErrors:true});
+  ajv.addSchema({$id:'openapi',components:document.components});
+  const tools=stateplaneMcpDeclaration().manifest().tools;
+  const count={op:'count'};
+  const specs=[{metrics:[count]},
+    {where:[{field:'team',kind:'string',operator:'eq',value:'red'}],groupBy:[{field:'team'},{field:'at',bucket:{unit:'day',timeZone:'Europe/Paris'}}],
+      metrics:[count,{op:'sum',field:'score'},{op:'avg',field:'score'},{op:'min',field:'at'},{op:'max',field:'team'}],maxGroups:1000},
+    {groupBy:[],metrics:[count]},{},{metrics:[]},{metrics:Array(17).fill(count)},{metrics:[{op:'count',field:'score'}]},{metrics:[{op:'sum'}]},
+    {metrics:[{op:'median',field:'score'}]},{metrics:[count],maxGroups:0},{metrics:[count],maxGroups:1001},{metrics:[count],maxGroups:null},
+    {metrics:[count],groupBy:[{field:'a'},{field:'b'},{field:'c'},{field:'d'}]},{metrics:[count],groupBy:[{field:'at',bucket:{unit:'minute',timeZone:'UTC'}}]},
+    {metrics:[count],groupBy:[{field:'at',bucket:{unit:'day',timeZone:'+05:00'}}]},{metrics:[count],groupBy:[{field:'at',bucket:{unit:'day'}}]},
+    {metrics:[count],groupBy:[{field:''}]},{metrics:[count],where:[{field:'team',kind:'string',operator:'like',value:'r'}]},{metrics:[count],extra:true}];
+  for (const [tool,component,requests] of [
+    ['analysis_aggregate','AggregationSpec',specs],
+    ['analysis_submit','AnalysisJobRequest',[{kind:'export'},{kind:'aggregate',spec:specs[1]},{kind:'aggregate'},{kind:'export',spec:specs[0]},
+      {kind:'aggregate',spec:specs[4]},{kind:'snapshot'},{},{kind:'export',extra:true}]]]) {
+    const published=ajv.compile(tools.find(item=>item.name===tool).inputSchema);
+    const openapi=ajv.getSchema(`openapi#/components/schemas/${component}`);
+    let accepted=0;
+    for (const request of requests) {
+      const valid=openapi(request);
+      accepted+=valid?1:0;
+      assert.equal(published({spaceId:'sp_a',collectionId:'entries',...request}),valid,`${tool} ${JSON.stringify(request)}`);
+    }
+    assert.ok(accepted>=2 && accepted<requests.length,`${tool} cases cover both outcomes`);
+  }
+});
+
+test('analysis tools fail as HTTP does: reads as reads, a submission and a cancellation as writes',async t=>{
+  const state=fixture();
+  const {server,url}=await mcpServer(state);
+  t.after(()=>server.close());
+  const mcp=await client(url,'agent-token');
+  t.after(()=>mcp.close());
+  const s={spaceId:'sp_a',collectionId:'entries'};
+  // The codes and retryability test/http-cli.test.js requires of the same routes.
+  for (const [tool,args,code,retryable] of [['analysis_aggregate',{...s,metrics:[{op:'count'}]},'RATE_LIMITED',true],
+    ['analysis_status',{...s,jobId:'anj_1'},'RATE_LIMITED',true],['analysis_page',{...s,jobId:'anj_1',page:1},'RATE_LIMITED',true],
+    ['analysis_submit',{...s,kind:'export'},'COMMIT_OUTCOME_UNKNOWN',false],['analysis_cancel',{...s,jobId:'anj_1'},'COMMIT_OUTCOME_UNKNOWN',false]]) {
+    state.fail(Object.assign(new Error('private cause'),{code:'57014'}));
+    const result=await mcp.callTool(tool,args);
+    assert.deepEqual([result.isError,result.structuredContent.error.code,result.structuredContent.error.retryable],[true,code,retryable],tool);
+    assert.doesNotMatch(result.content[0].text,/private cause/);
+  }
+  state.fail(Object.assign(new Error('The job has no complete result (state running)'),{code:'CONFLICT'}));
+  const conflict=(await mcp.callTool('analysis_page',{...s,jobId:'anj_1',page:1})).structuredContent.error;
+  assert.deepEqual([conflict.code,conflict.retryable],['CONFLICT',false]);
+  assert.doesNotMatch(conflict.message,/state running/);
+  state.fail(null);
+  // A job request that is not {kind, spec?}, or past the body budget, is refused before any service call.
+  state.calls.length=0;
+  for (const [args,code] of [[{...s,kind:'snapshot'},'INVALID_ARGUMENT'],[{...s,kind:'export',extra:1},'INVALID_ARGUMENT'],
+    [{...s,kind:'aggregate',spec:{metrics:[{op:'count'}],x:'x'.repeat(33_792)}},'RATE_LIMITED']]) {
+    const error=(await mcp.callTool('analysis_submit',args)).structuredContent.error;
+    assert.deepEqual([error.code,error.retryable],[code,false],JSON.stringify(args).slice(0,80));
+  }
+  const oversized=(await mcp.callTool('analysis_aggregate',{...s,metrics:[{op:'count'}],x:'x'.repeat(32_768)})).structuredContent.error;
+  assert.deepEqual([oversized.code,oversized.retryable],['RATE_LIMITED',false]);
+  assert.deepEqual(state.calls,[]);
 });

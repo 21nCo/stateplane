@@ -42,6 +42,9 @@ const largeBody = 3_145_728;
 const smallBody = 32_768;
 /** The search and bundle body budget (retrievalBody in packages/api/src/http.ts). */
 const retrievalBody = 131_072;
+/** The aggregation spec and job request budgets (aggregationBody and jobBody in packages/api/src/http.ts). */
+const aggregationBody = 32_768;
+const jobBody = 33_792;
 /** The service's upload bound (sourceBounds.uploadBytes, 25 MiB). */
 const uploadBytes = 26_214_400;
 /** The service's text bound (1 MiB of UTF-8). */
@@ -96,6 +99,10 @@ const allowed:Record<string,readonly string[]>={
   'events list':['space','collection','cursor'],
   'retrieval search':['space','data','file'], 'retrieval bundle':['space','data','file'],
   'retrieval status':['space','collection'],
+  'analysis aggregate':['space','collection','data','file'],
+  'analysis submit':['space','collection','kind','data','file'],
+  'analysis status':['space','collection','job'], 'analysis cancel':['space','collection','job'],
+  'analysis page':['space','collection','job','page'],
   ...evidenceCommands
 };
 function validateFlags(resource:string,action:string|undefined,flags:Flags):void {
@@ -180,7 +187,7 @@ function endpoint(value:string):string {
 }
 function output(value:unknown):void { process.stdout.write(JSON.stringify(value)+'\n'); }
 function help():void {
-  output({usage:'stateplane <config|auth|spaces|collections|records|batches|events|sources|uploads|claims|links|retrieval> <command> [--space ID] [--collection ID] [options]',
+  output({usage:'stateplane <config|auth|spaces|collections|records|batches|events|sources|uploads|claims|links|retrieval|analysis> <command> [--space ID] [--collection ID] [options]',
     docs:'See docs/http-cli.md for examples and recovery rules.'});
 }
 
@@ -517,6 +524,7 @@ async function runCollectionResource(client:StateplaneHttpClient,resource:string
   if (resource==='records') return runRecords(client,action,flags,`${collectionPath}/records`);
   if (resource==='batches') return runBatches(client,action,flags,collectionPath);
   if (['sources','uploads','claims','links'].includes(resource)) return runEvidence(client,resource,action,flags,collectionPath);
+  if (resource==='analysis') return runAnalysis(client,action,flags,collectionPath);
   if (resource==='events' && action==='list') {
     const suffix=flags.cursor!==undefined ? `?cursor=${encoded(cursor(flags))}` : '';
     return client.request('GET',`${collectionPath}/events${suffix}`);
@@ -531,6 +539,27 @@ async function runRetrieval(client:StateplaneHttpClient,action:string|undefined,
   const data=await payload(flags,retrievalBody);
   if (!data || typeof data!=='object' || Array.isArray(data)) throw new StateplaneCliError('INVALID_ARGUMENT');
   return client.request('POST',`${spacePath}/${action==='search' ? 'search' : 'bundles'}`,withinWireBudget(data,retrievalBody));
+}
+
+/** Aggregations and snapshot jobs of one collection. A spec is the JSON object of --data or --file; a submission
+ * sends {kind, spec} as the HTTP body, so every transport passes the service the same request. */
+async function runAnalysis(client:StateplaneHttpClient,action:string|undefined,flags:Flags,collectionPath:string):Promise<unknown> {
+  const spec=async(maxBytes:number)=>{
+    const data=await payload(flags,maxBytes);
+    if (!data || typeof data!=='object' || Array.isArray(data)) throw new StateplaneCliError('INVALID_ARGUMENT');
+    return data;
+  };
+  if (action==='aggregate') return client.request('POST',`${collectionPath}/aggregate`,withinWireBudget(await spec(aggregationBody),aggregationBody));
+  if (action==='submit') {
+    const kind=required(flags,'kind');
+    const request=flags.data===undefined && flags.file===undefined ? {kind} : {kind,spec:await spec(jobBody)};
+    return client.request('POST',`${collectionPath}/jobs`,withinWireBudget(request,jobBody));
+  }
+  const job=`${collectionPath}/jobs/${encoded(required(flags,'job'))}`;
+  if (action==='status') return client.request('GET',job);
+  if (action==='cancel') return client.request('DELETE',job);
+  if (action==='page') return client.request('GET',`${job}/pages/${encoded(required(flags,'page'))}`);
+  throw new StateplaneCliError('INVALID_ARGUMENT');
 }
 
 /** Capture endpoint, selected space and token as one cross-process snapshot. */

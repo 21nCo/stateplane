@@ -7,7 +7,7 @@ The fourth of five slices of STA-15, after [analysis job storage](analysis-jobs.
 - Every aggregation and snapshot job result states its [freshness](#freshness): `exact`, or `stale` once the collection was written after the job's watermark (published or awaiting publication) or its schema version changed.
 - `reconcileIndexes` (`pnpm db:reconcile-indexes`) [reconciles](#reconciliation) the typed index projection that every exact filter, sort and aggregation over a declared field reads (an unfiltered count reads no index values) against what each record's canonical data derives, and reports drift.
 
-No HTTP, CLI or MCP surface reaches aggregations or jobs yet (STA-61).
+HTTP, the CLI and MCP reach aggregations and jobs through the same services ([transports](analysis-jobs.md#transports-sta-61), STA-61).
 
 ## Fixture and method
 
@@ -103,7 +103,7 @@ Each analytical bound, its value and what the measurements say about it. All val
 | Analytical session checkout | 2,000 ms | STA-58's bounded checkout tests | Kept |
 | Job records scanned | 10,000,000 | Not reached by the measurements. At this run's rates it binds before the step time (which covers about 20,000,000 records); under the loaded run's rates the step time binds first | Kept, the outer bound on an unloaded server |
 | Job step time | 600,000 ms | 36,695 (export) and 33,084 (aggregate) records per second of step time (loaded run: 4,371 and 5,780), so about 22,000,000 and 19,850,000 records (loaded run: 2,620,000 and 3,470,000) | Kept. On a loaded server it ends an aggregate job first |
-| Job result bytes | 64 MiB | 123 bytes of NDJSON per fixture record, so an export of about 544,000 such records; an aggregate's one page is a few KiB | Kept. It ends an export first: a larger export fails with `BUDGET_EXCEEDED` (STA-61 records the export limits on its transports) |
+| Job result bytes | 64 MiB | 123 bytes of NDJSON per fixture record, so an export of about 544,000 such records; an aggregate's one page is a few KiB | Kept. It ends an export first: a larger export fails with `BUDGET_EXCEEDED` ([the export limits through the transports](analysis-jobs.md#limits-of-an-export-through-the-transports), STA-61) |
 | Page | 1,000 records and 1 MiB | The as-of read takes 13.3 ms under `EXPLAIN ANALYZE`, in export page transactions of 27 ms on average (loaded run: 23.5 of 229) | Kept |
 | Lease | 30 s, extended by every page | Page transactions of 0.027 to 0.030 s on average (0.17 to 0.23 s in the loaded run) | Kept |
 | Jobs Worker analysis step | 5 s per tick | 33,084 to 36,695 records per step-second: about 165,000 to 183,000 records a minute per cell, so a 500,000-record export in 3 ticks (loaded run: 4,371 to 5,780, about 22,000 to 29,000 a minute, 18 to 23 ticks) | Kept |
@@ -156,4 +156,4 @@ On the measured fixture the first three do not hold. The last holds at an origin
 - `test/integration/analysis-jobs.test.js`: a job is exact when submitted and once complete (its groups equal the interactive aggregation's), stays exact after a write to another collection, turns stale with `unpublished` at once after a committed but unpublished delete, then by position once it is published (its page unchanged), a job pinned later is exact again until the schema version changes; the interactive aggregation states `exact` at its statement time.
 - The committed reports, measured before the script dropped its `--out` option and now produced by the same measurement with stdout redirected (after `pnpm --filter @stateplane/auth... --filter @stateplane/postgres... build`; `pnpm analysis:measure` itself prints its build on stdout, so the redirect runs the script directly): the report, by `node scripts/analysis-measure.mjs --scales 50000,200000,500000 --noise 1000000 --runs 3 --load-seconds 10 --writes 300 > docs/measurements/analysis-measurements-local.json`, the recount run by the same command redirected to `docs/measurements/analysis-measurements-local-recount.json`, and the reconciliation report, by `node scripts/analysis-measure.mjs --reconciliation-only --scales 500000 --noise 1000000 --runs 3 > docs/measurements/analysis-reconciliation-local.json`.
 
-These are local measurements. Railway Postgres is measured by the same script in external acceptance; the jobs Worker cron through Hyperdrive on Cloudflare Preview is STA-61's.
+These are local measurements. Railway Postgres is measured by the same script in external acceptance; the jobs Worker cron through Hyperdrive on Cloudflare Preview is STA-61's [external acceptance](analysis-jobs.md#acceptance-boundaries).

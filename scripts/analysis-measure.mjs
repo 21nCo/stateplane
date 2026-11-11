@@ -4,7 +4,7 @@
 //   1. each aggregation shape at each --scales collection size: service latency and the EXPLAIN (ANALYZE, BUFFERS)
 //      plan of its statement exactly as the service issues it (captured, then replayed with the same settings);
 //   2. the same with the candidate covering index (CANDIDATE) built, its build time, and the record write cost with
-//      and without it;
+//      and without it, and without and with migration 050's records_byte_order;
 //   3. at the largest scale, an export and an aggregate snapshot job run to completion by the jobs Worker step, with
 //      the plan of its as-of page read, and the typed index reconciliation over the collection;
 //   4. mixed load: interactive reads alone, then while the jobs Worker step, aggregations, or both saturate analytical
@@ -38,6 +38,8 @@ export const FIXTURE = 'analysis-fixture/v1';
 /** The candidate typed index: each declared field's rows of a collection in record order, with their values. */
 export const CANDIDATE = `CREATE INDEX record_index_by_field ON record_index_values(space_id,collection_id,field_name,record_id)
   INCLUDE (value_kind,string_value,number_value,boolean_value,time_value)`;
+/** Migration 050's index, rebuilt as the migration builds it, less CONCURRENTLY: nothing else writes meanwhile. */
+const BYTE_ORDER = 'CREATE INDEX records_byte_order ON records(space_id, collection_id, record_id COLLATE "C")';
 /** The fixture's aggregation shapes: an ungrouped count, value and time-bucket groupings, and filtered ones. */
 export const SHAPES = {
   count: { metrics: [{ op: 'count' }] },
@@ -277,9 +279,10 @@ async function run(settings, newPool) {
 
   // Record writes through the real write path, in a small collection of the same shape, without and with the candidate.
   await define(spaceId, 'writes');
-  const rounds = { without: [], with: [] };
+  const rounds = { without: [], with: [] }, byteOrder = { with: [], without: [] };
+  let written = 0;
   const writes = async () => {
-    const ms = [], offset = rounds.without.length + rounds.with.length;
+    const ms = [], offset = written++;
     for (let n = offset * settings.writes; n < (offset + 1) * settings.writes; n++) {
       const started = performance.now();
       await services.records.mutate(owner, spaceId, 'writes', JSON.stringify({ idempotencyKey: randomUUID(), operation: 'create',
@@ -296,6 +299,13 @@ async function run(settings, newPool) {
     candidateBytes = Number((await pool.query("SELECT pg_relation_size('record_index_by_field') AS n")).rows[0].n);
     rounds.with.push(await writes());
     await pool.query('DROP INDEX record_index_by_field');
+  }
+  // Migration 050's records_byte_order, which every record write maintains, likewise: with it, then without it.
+  for (let round = 0; round < 2; round++) {
+    byteOrder.with.push(await writes());
+    await pool.query('DROP INDEX records_byte_order');
+    byteOrder.without.push(await writes());
+    await pool.query(BYTE_ORDER);
   }
   const indexBytes = (await pool.query(`SELECT pg_relation_size('record_index_values') AS heap,
     (SELECT sum(pg_relation_size(i.indexrelid)) FROM pg_index i WHERE i.indrelid='record_index_values'::regclass) AS indexes`)).rows[0];
@@ -408,6 +418,7 @@ async function run(settings, newPool) {
   return { ...report('stateplane.analysis-measurements'), aggregations: scales,
     candidateIndex: { sql: CANDIDATE.replace(/\s+/g, ' '), recordWriteMs: rounds,
       bytes: { candidate: candidateBytes, table: Number(indexBytes.heap), existingIndexes: Number(indexBytes.indexes) } },
+    byteOrderIndex: { sql: BYTE_ORDER, recordWriteMs: byteOrder },
     jobs: [exportJob, aggregateJob],
     reconciliation,
     mixedLoad: { originConnectionLimit: 5, analyticalSlots: analyticalSlots(5), isolates: 2, interactivePoolPerIsolate: 2,

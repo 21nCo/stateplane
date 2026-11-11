@@ -19,6 +19,7 @@ declare global {
         STATEPLANE_TEST_PROVIDER_FAULT_URL?: string;
         STATEPLANE_MCP_AUTHORIZATION_SERVER?: string;
         STATEPLANE_MCP_RESOURCE?: string;
+        STATEPLANE_ORIGIN_CONNECTION_LIMIT?: string;
         AUTHORITY?: Hyperdrive;
       };
     }

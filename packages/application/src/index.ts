@@ -6,6 +6,7 @@ export interface ApplicationPorts { authorizer: Authorizer; unitOfWork: UnitOfWo
 export function createApplication(ports: ApplicationPorts): ApplicationPorts { return ports; }
 export * from './routing.js';
 export * from './errors.js';
+export * from './analysis.js';
 export type { SourceContent, StateplaneServices } from './services.js';
 export * from './blobs.js';
 export * from './extraction.js';

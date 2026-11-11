@@ -5,7 +5,7 @@ import { createHttpHandler } from '@stateplane/api';
 import { isSafeHttpRead, parseV1Path } from '@stateplane/contracts';
 import { createMcpEndpoint } from '@stateplane/mcp';
 import type { McpEndpoint } from '@stateplane/mcp';
-import { PostgresSpaces, postgresServices } from '@stateplane/postgres';
+import { PostgresSpaces, analyticalSlots, postgresServices } from '@stateplane/postgres';
 import { R2BlobStore } from '@stateplane/storage';
 import { receiptRetentionSeconds } from './receipts';
 
@@ -130,7 +130,7 @@ export function stateplaneHost(env:Bindings,lease?:(lease:HostLease)=>void):Host
     env.STATEPLANE_TEST_TOKEN,env.STATEPLANE_TEST_OWNER,env.STATEPLANE_TEST_CREDENTIAL,
     env.STATEPLANE_TEST_CURSOR_SECRET,env.STATEPLANE_TEST_AGENT_TOKEN,
     env.STATEPLANE_TEST_AGENT_CREDENTIAL,env.STATEPLANE_MCP_AUTHORIZATION_SERVER,
-    env.STATEPLANE_MCP_RESOURCE])).digest('hex');
+    env.STATEPLANE_MCP_RESOURCE,env.STATEPLANE_ORIGIN_CONNECTION_LIMIT])).digest('hex');
   // A Worker cannot reuse one request's socket in another request, so it gets a
   // pool per request; only the Node development host keeps one across requests.
   const perRequest=!!env.AUTHORITY || globalThis.navigator?.userAgent==='Cloudflare-Workers';
@@ -209,14 +209,23 @@ export function stateplaneHost(env:Bindings,lease?:(lease:HostLease)=>void):Host
     create:unconfigured,find:()=>Promise.resolve(null),revoke:unconfigured
   },identity,Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex'));
   // Source bytes go to the cell's R2 binding; without it, operations on original bytes fail closed.
+  // Aggregations run only on a pool of their own, sized to the cell's analytical slots; without a valid origin
+  // connection limit (5 to 20) there is none, and each authorized aggregation fails PROVIDER_UNAVAILABLE.
+  const originConnectionLimit=Number(env.STATEPLANE_ORIGIN_CONNECTION_LIMIT);
+  const analytics=Number.isSafeInteger(originConnectionLimit) && originConnectionLimit>=5 && originConnectionLimit<=20 ?
+    {pool:new pg.Pool({connectionString,max:analyticalSlots(originConnectionLimit).cell,connectionTimeoutMillis:providerTimeoutMs}),
+      originConnectionLimit} : undefined;
+  analytics?.pool.on('connect',client=>{ client.on('error',()=>{}); });
+  analytics?.pool.on('error',()=>{});
   const services=postgresServices(spaces,new Map([[cellId,{pool,cursorSecret:Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex'),
-    originals:env.ORIGINALS ? new R2BlobStore(env.ORIGINALS) : undefined}]]),receiptRetentionSeconds);
+    originals:env.ORIGINALS ? new R2BlobStore(env.ORIGINALS) : undefined,analytics}]]),receiptRetentionSeconds);
   const serve=createHttpHandler({services,identity});
   let active=0;let retired=false;let ended=false;
   const closeIfIdle=()=>{
     if (retired && active===0 && !ended) {
       ended=true;
       void pool.end().catch(()=>{});
+      void analytics?.pool.end().catch(()=>{});
     }
   };
   const retire=()=>{

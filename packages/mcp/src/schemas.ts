@@ -241,9 +241,44 @@ export const retrievalInputs = {
   retrieval_status: scoped()
 } satisfies Record<string, McpFnObjectSchema>;
 
+/* Aggregation specs and job requests (STA-61) follow the OpenAPI AggregationSpec and AnalysisJobRequest; a field's
+ * readiness and kind, a time zone's validity and the 32 KiB spec bound are the service's and only described. */
+const aggregationField: McpFnJsonSchema = { type: 'string', minLength: 1, pattern: scalarPattern,
+  description: 'A ready declared index field (filterable or sortable); SCHEMA_CONFLICT otherwise.' };
+const aggregationSpec = {
+  where: { ...predicates, description: 'Up to 16 typed predicates on ready filterable fields, combined with AND; every live record when omitted or [].' },
+  groupBy: { type: 'array', maxItems: 3, description: 'Up to 3 distinct fields; one group of every matching record when omitted or [].',
+    items: { type: 'object', required: ['field'], additionalProperties: false, properties: { field: aggregationField,
+      bucket: { type: 'object', required: ['unit', 'timeZone'], additionalProperties: false,
+        properties: { unit: { enum: ['hour', 'day', 'week', 'month', 'quarter', 'year'] },
+          timeZone: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z][A-Za-z0-9_+-]*(?:/[A-Za-z0-9_+-]+)*$',
+            description: 'An IANA time zone name, such as Europe/Paris; a name that is also a fixed-offset abbreviation (CET, EST) is refused.' } },
+        description: 'Required for a date-time field and refused for any other: group by the local start of this unit in the zone.' } } } },
+  metrics: { type: 'array', minItems: 1, maxItems: 16, description: '1 to 16 metrics: count (records), sum and avg (number fields), min and max (number, string and date-time fields).',
+    items: { oneOf: [
+      { type: 'object', required: ['op'], additionalProperties: false, properties: { op: { const: 'count' } } },
+      { type: 'object', required: ['op', 'field'], additionalProperties: false,
+        properties: { op: { enum: ['sum', 'avg', 'min', 'max'] }, field: aggregationField } }] } },
+  maxGroups: { type: 'integer', minimum: 1, maximum: 1000, description: 'Most groups to return, 1 to 1,000; 100 when omitted. More fail RATE_LIMITED.' }
+} satisfies Record<string, McpFnJsonSchema>;
+const jobId = selector('Analysis job ID from analysis_submit.');
+export const analysisInputs = {
+  analysis_aggregate: scoped(aggregationSpec, ['metrics']),
+  // As AnalysisJobRequest: an export takes no spec, an aggregate needs one.
+  analysis_submit: { ...scoped({ kind: { enum: ['export', 'aggregate'], description: 'export needs export:read; aggregate needs records:read.' },
+    spec: { ...object(aggregationSpec, ['metrics']), description: 'For kind aggregate only: the aggregation, as analysis_aggregate takes it.' } },
+  ['kind']), oneOf: [{ properties: { kind: { const: 'export' } }, not: { required: ['spec'] } },
+    { properties: { kind: { const: 'aggregate' } }, required: ['spec'] }] },
+  analysis_status: scoped({ jobId }, ['jobId']),
+  analysis_cancel: scoped({ jobId }, ['jobId']),
+  analysis_page: scoped({ jobId, page: { type: 'integer', minimum: 1, maximum: 10000, description: 'Page number, 1 to the manifest\'s pageCount.' } },
+    ['jobId', 'page'])
+} satisfies Record<string, McpFnObjectSchema>;
+
 export const inputs = {
   ...evidenceInputs,
   ...retrievalInputs,
+  ...analysisInputs,
   spaces_list: object({ cursor: cursor('Opaque cursor from a previous spaces_list page.') }, []),
   spaces_get: object({ spaceId }, ['spaceId']),
   collections_list: object({ spaceId, cursor: cursor('Opaque cursor from a previous collections_list page.') }, ['spaceId']),
