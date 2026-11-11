@@ -1,5 +1,5 @@
 import type { StateplaneServices } from '@stateplane/application';
-import { TransportFailure, analysisSubmission, classifyError } from '@stateplane/application';
+import { TransportFailure, analysisAggregation, analysisSubmission, classifyError } from '@stateplane/application';
 import type { IdentityVerifier } from '@stateplane/auth';
 import type { VerifiedCredential } from '@stateplane/contracts';
 import { isSafeHttpRead, parseV1Path } from '@stateplane/contracts';
@@ -186,7 +186,7 @@ async function collectionRoute(services:StateplaneServices,actor:VerifiedCredent
   if (p[4]==='projections' && p.length===5 && request.method==='GET')
     return json(await services.retrieval.status(...prefix));
   if (p[4]==='aggregate' && p.length===5 && request.method==='POST')
-    return json(await services.analysis.aggregate(...prefix,await body(request,aggregationBody)));
+    return json(await services.analysis.aggregate(...prefix,analysisAggregation(await body(request,aggregationBody))));
   if (p[4]==='jobs') return jobsRoute(services,p,request,prefix);
   return evidenceRoute(services,p,request,url,prefix);
 }

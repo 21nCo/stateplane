@@ -553,7 +553,10 @@ paths:
         free analytical slot is BACKPRESSURE (retryable); a cell without
         analytical capacity is PROVIDER_UNAVAILABLE with retryable false.
         The body is at most 32,768 bytes (RATE_LIMITED, retryable false,
-        beyond). A safe read: repeat it after a retryable error.
+        beyond); then a JSON body that is not an object, or holds a number that
+        overflows (such as 1e400), is INVALID_ARGUMENT, both before the
+        collection is authorized. A safe read: repeat it after a retryable
+        error.
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AggregationSpec' } } } }
       responses:
         '200': { description: Every group from one statement snapshot, content: { application/json: { schema: { $ref: '#/components/schemas/AggregationResult' } } } }
@@ -569,13 +572,15 @@ paths:
         an AggregationSpec over those records. Pages derive from that
         boundary however long the job runs. A request that is not
         {kind, spec?}, or names another kind, is INVALID_ARGUMENT before
-        admission; the spec is checked after it. A space with 8 unfinished
-        jobs is BACKPRESSURE (retryable). Not idempotent: after
+        admission; the spec's fields are checked after it. A space with 8
+        unfinished jobs is BACKPRESSURE (retryable). Not idempotent: after
         COMMIT_OUTCOME_UNKNOWN submit again; a job whose ID was lost runs
         and expires 24 hours after submission. The body is at most 33,792
         bytes and its re-encoded spec at most 32,768, as for an aggregation
-        (RATE_LIMITED, retryable false, beyond, checked before the
-        collection is authorized).
+        (RATE_LIMITED, retryable false, beyond); then a spec that is not an
+        object, or holds a number that overflows (such as 1e400), is
+        INVALID_ARGUMENT. All of these are checked, in this order, before
+        the collection is authorized.
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AnalysisJobRequest' } } } }
       responses:
         '202': { description: The queued job, content: { application/json: { schema: { $ref: '#/components/schemas/AnalysisJobStatus' } } } }

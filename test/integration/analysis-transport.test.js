@@ -155,6 +155,21 @@ async function caller(t, origin, temp, token, label, spaceId) {
     status: () => lastStatus,
     aggregate: async spec => ({ http: await api('POST', `${collection}/aggregate`, spec), mcp: await mcp('analysis_aggregate', spec),
       cli: await cli(['aggregate', '--data', JSON.stringify(spec)]) }),
+    // A spec as JSON text, so a literal such as 1e400 reaches each transport as written: the raw HTTP body, raw MCP
+    // JSON-RPC (a client would re-encode it as null) and the CLI's --data and --file.
+    literal: async (kind, text) => {
+      const file = join(home, 'literal.json');
+      await writeFile(file, text);
+      const scope = `"spaceId":${JSON.stringify(spaceId)},"collectionId":"items"`;
+      const args = kind ? `{${scope},"kind":${JSON.stringify(kind)},"spec":${text}}` : `{${scope},${text.slice(1)}`;
+      const rpc = await fetch(`${origin}/mcp`, { method: 'POST', headers: { authorization: `Bearer ${token}`,
+        'content-type': 'application/json', accept: 'application/json, text/event-stream', 'mcp-protocol-version': '2025-06-18' },
+      body: `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"${kind ? 'analysis_submit' : 'analysis_aggregate'}","arguments":${args}}}` });
+      const argv = kind ? ['submit', '--kind', kind] : ['aggregate'];
+      return { http: kind ? await api('POST', `${collection}/jobs`, `{"kind":${JSON.stringify(kind)},"spec":${text}}`)
+        : await api('POST', `${collection}/aggregate`, text), mcp: (await rpc.json()).result.structuredContent,
+      cli: await cli([...argv, '--data', text]), cliFile: await cli([...argv, '--file', file]) };
+    },
     // The CLI sends {kind} or {kind, spec}; a request it cannot express is compared over HTTP and MCP only. `encode` writes
     // the HTTP body and the CLI's --data as sent; MCP's arguments are objects.
     submit: async (request, viaCli = true, encode = value => JSON.stringify(value)) => ({
@@ -177,7 +192,7 @@ const outcome = value => value.error ? { error: value.error.code, retryable: val
 /** Require one outcome from every transport, check the HTTP body against OpenAPI, and return it. */
 function same(label, results, schemaName, comparable = outcome) {
   const outcomes = Object.fromEntries(Object.entries(results).map(([transport, value]) => [transport, comparable(value)]));
-  for (const transport of ['mcp', 'cli']) if (transport in outcomes)
+  for (const transport of ['mcp', 'cli', 'cliFile']) if (transport in outcomes)
     assert.deepEqual(outcomes[transport], outcomes.http, `${label}: ${transport} matches HTTP`);
   if (!results.http.error) conforms(schemaName, results.http);
   return outcomes.http;
@@ -335,6 +350,36 @@ test('HTTP, CLI and MCP give one outcome for job submission, status, pages and c
   for (const argv of [['aggregate'], ['submit', '--kind', 'aggregate']])
     assert.deepEqual(outcome(await cliRun(offline, ['analysis', ...argv, '--collection', 'items', '--data', JSON.stringify(oversized)])),
       { error: 'RATE_LIMITED', retryable: false }, `the CLI refuses an oversized spec to ${argv[0]} locally`);
+
+  // Sizes come before the spec's values: an oversized spec holding 1e400 is RATE_LIMITED too, on every transport and
+  // from an offline CLI, and one within the budget is INVALID_ARGUMENT before admission for every caller, never sent
+  // on as null (JSON's re-encoding of the Infinity it parses as). No job is queued for any of them.
+  const infinite = value => JSON.stringify(value).replace('"value":"INFINITE"', '"value":1e400');
+  const overflowing = infinite({ ...oversized, where: [{ field: 'score', kind: 'number', operator: 'gte', value: 'INFINITE' },
+    ...oversized.where] });
+  const finiteBytes = Buffer.byteLength(overflowing.replace('1e400', 'null'));
+  assert.ok(overflowing.includes('1e400') && finiteBytes > 32_768 && Buffer.byteLength(`{"kind":"aggregate","spec":${overflowing}}`) <= 33_700,
+    `${finiteBytes}`);
+  const small = infinite({ metrics: [{ op: 'count' }], where: [{ field: 'score', kind: 'number', operator: 'gte', value: 'INFINITE' }] });
+  const jobsBefore = (await pool.query('SELECT count(*)::int AS n FROM analysis_jobs WHERE space_id=$1', [f.spaceId])).rows[0].n;
+  for (const label of ['owner', 'reader', 'exporter', 'foreignOwner']) for (const kind of [undefined, 'aggregate']) {
+    const operation = kind ? 'aggregate job' : 'aggregation';
+    const schemaName = kind ? 'AnalysisJobStatus' : 'AggregationResult';
+    assert.deepEqual(same(`${label} oversized 1e400 ${operation}`, await callers[label].literal(kind, overflowing), schemaName),
+      { error: 'RATE_LIMITED', retryable: false }, `${label} oversized 1e400 ${operation}`);
+    assert.equal(callers[label].status(), 429);
+    assert.deepEqual(same(`${label} 1e400 ${operation}`, await callers[label].literal(kind, small), schemaName),
+      { error: 'INVALID_ARGUMENT', retryable: false }, `${label} 1e400 ${operation}`);
+  }
+  // A spec that is not an object is refused before admission as well: a foreign owner learns no more than the CLI says.
+  assert.deepEqual(same('foreign array spec', await callers.foreignOwner.submit({ kind: 'aggregate', spec: [1] }), 'AnalysisJobStatus',
+    comparableJob), { error: 'INVALID_ARGUMENT', retryable: false });
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM analysis_jobs WHERE space_id=$1', [f.spaceId])).rows[0].n, jobsBefore,
+    'no refused spec queues a job');
+  for (const [text, code] of [[overflowing, 'RATE_LIMITED'], [small, 'INVALID_ARGUMENT']]) for (const argv of [['aggregate'],
+    ['submit', '--kind', 'aggregate']])
+    assert.deepEqual(outcome(await cliRun(offline, ['analysis', ...argv, '--collection', 'items', '--data', text])),
+      { error: code, retryable: false }, `the CLI refuses a ${code} 1e400 spec to ${argv[0]} locally`);
 
   // A request envelope the CLI cannot send is refused alike over HTTP and MCP.
   assert.deepEqual(same('envelope', await owner.submit({ kind: 'export', extra: true }, false), 'AnalysisJobStatus', comparableJob),

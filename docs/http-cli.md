@@ -419,8 +419,11 @@ stateplane analysis page --collection entries --job anj_... --page 1
 `--data` or `--file` holds the spec as one JSON object of at most 32 KiB (a
 submission sends `{"kind","spec"}` of at most 33 KiB); anything else is
 refused locally, a larger spec `RATE_LIMITED` (not retryable) whether it is
-aggregated or submitted. Aggregation, status and page are safe reads, repeated after a
-retryable failure like a `GET`. A submission and a cancellation are writes and
+aggregated or submitted. Sizes are checked first, then the spec: a number that
+overflows, such as `1e400`, is refused `INVALID_ARGUMENT` only after them, as
+HTTP and MCP refuse it (see the admission order in `docs/analysis-jobs.md`).
+Aggregation, status and page are safe reads, repeated after a retryable
+failure like a `GET`. A submission and a cancellation are writes and
 are never repeated: after an unknown outcome, submit again (a lost job expires
 on its own) or read the status before cancelling again. A page of a job
 without a complete result is `CONFLICT` (409); read the status.

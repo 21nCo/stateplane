@@ -162,12 +162,13 @@ async function input(path:string,maxBytes:number,keepBom=false):Promise<string> 
   catch { throw new StateplaneCliError('INVALID_ARGUMENT'); }
 }
 /** The JSON of --data or --file, at most maxBytes: by default the record and
- * schema budget; an evidence command passes its route's body budget. */
-async function payload(flags:Flags,maxBytes=1_048_576):Promise<unknown> {
+ * schema budget; an evidence command passes its route's body budget. An
+ * analysis command passes parse, to check every size before any value. */
+async function payload(flags:Flags,maxBytes=1_048_576,parse=parsed):Promise<unknown> {
   if (flags.data!==undefined && flags.file!==undefined) throw new StateplaneCliError('INVALID_ARGUMENT');
   const text=flags.file!==undefined ? await input(required(flags,'file'),maxBytes) : required(flags,'data');
   if (Buffer.byteLength(text)>maxBytes) throw new StateplaneCliError('RATE_LIMITED',undefined,undefined,false);
-  return parsed(text);
+  return parse(text);
 }
 function withinWireBudget<T>(value:T,maxBytes:number):T {
   // Match StateplaneHttpClient's JSON serialization for every JSON value.
@@ -542,22 +543,32 @@ async function runRetrieval(client:StateplaneHttpClient,action:string|undefined,
 }
 
 /** Aggregations and snapshot jobs of one collection. A spec is the JSON object of --data or --file; a submission
- * sends {kind, spec} as the HTTP body, so every transport passes the service the same request. */
+ * sends {kind, spec} as the HTTP body, so every transport passes the service the same request. Before sending, in
+ * analysisSubmission's order: the sizes (RATE_LIMITED), then the spec's shape and numbers (INVALID_ARGUMENT). */
 async function runAnalysis(client:StateplaneHttpClient,action:string|undefined,flags:Flags,collectionPath:string):Promise<unknown> {
-  const spec=async(maxBytes:number)=>{
-    const data=await payload(flags,maxBytes);
-    if (!data || typeof data!=='object' || Array.isArray(data)) throw new StateplaneCliError('INVALID_ARGUMENT');
-    return data;
+  // A number that overflows to Infinity is kept until every size is checked, then refused with a spec that is not an
+  // object, as HTTP and MCP refuse it, never sent as the null JSON would make it. parsed() refuses it at once.
+  const lenient=(text:string):unknown=>{ try { return JSON.parse(text); } catch { throw new StateplaneCliError('INVALID_ARGUMENT'); } };
+  const admissible=(spec:unknown)=>{
+    if (!spec || typeof spec!=='object' || Array.isArray(spec)) throw new StateplaneCliError('INVALID_ARGUMENT');
+    const pending:unknown[]=[spec];
+    while (pending.length) {
+      const item=pending.pop();
+      if (typeof item==='number' && !Number.isFinite(item)) throw new StateplaneCliError('INVALID_ARGUMENT');
+      if (item && typeof item==='object') for (const value of Object.values(item)) pending.push(value);
+    }
+    return spec;
   };
-  if (action==='aggregate') return client.request('POST',`${collectionPath}/aggregate`,withinWireBudget(await spec(aggregationBody),aggregationBody));
+  if (action==='aggregate') {
+    const spec=withinWireBudget(await payload(flags,aggregationBody,lenient),aggregationBody);
+    return client.request('POST',`${collectionPath}/aggregate`,admissible(spec));
+  }
   if (action==='submit') {
     const kind=required(flags,'kind');
-    const request=withinWireBudget(flags.data===undefined && flags.file===undefined ? {kind} : {kind,spec:await payload(flags,jobBody)},jobBody);
-    // In analysisSubmission's order: the envelope, the kind, the re-encoded spec's size (an aggregation's), then its shape.
-    if ((kind==='aggregate' || kind==='export') && 'spec' in request) {
-      const data=withinWireBudget(request.spec,aggregationBody);
-      if (!data || typeof data!=='object' || Array.isArray(data)) throw new StateplaneCliError('INVALID_ARGUMENT');
-    }
+    const request=withinWireBudget(flags.data===undefined && flags.file===undefined ? {kind} : {kind,spec:await payload(flags,jobBody,lenient)},jobBody);
+    // The envelope, the kind (the server refuses another, whatever its spec), the re-encoded spec's size (an
+    // aggregation's), then the spec's shape and numbers.
+    if ((kind==='aggregate' || kind==='export') && 'spec' in request) admissible(withinWireBudget(request.spec,aggregationBody));
     return client.request('POST',`${collectionPath}/jobs`,request);
   }
   const job=`${collectionPath}/jobs/${encoded(required(flags,'job'))}`;

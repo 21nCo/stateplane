@@ -1,5 +1,5 @@
 import type { McpFnObjectSchema, McpFnToolDefinition } from '@mcpfn/core';
-import { TransportFailure, analysisSubmission } from '@stateplane/application';
+import { TransportFailure, analysisAggregation, analysisSubmission } from '@stateplane/application';
 import type { StateplaneServices } from '@stateplane/application';
 import type { VerifiedCredential } from '@stateplane/contracts';
 import { serializeJson } from './json.js';
@@ -412,7 +412,7 @@ const analysisTools: readonly StateplaneTool[] = [
     async (services, actor, args) => {
       const [spaceId, collectionId] = scope(args);
       return result(await services.analysis.aggregate(actor, spaceId, collectionId,
-        serialized(without(args, ['spaceId', 'collectionId']), aggregationBody)));
+        analysisAggregation(serialized(without(args, ['spaceId', 'collectionId']), aggregationBody))));
     }),
   tool('analysis_submit', 'Submit an analysis job', nonIdempotent,
     'Queue a snapshot job over a collection as of a watermark pinned now: kind export (needs export:read; no spec) writes NDJSON pages of every record live at the watermark, kind aggregate (needs records:read) computes spec, an analysis_aggregate spec, over those records. Returns the job\'s status with its jobId and boundary. Poll analysis_status until complete, then read analysis_page 1 to manifest.pageCount. A space holds at most 8 unfinished jobs (BACKPRESSURE, retryable); a job and its result expire 24 hours after submission.',
