@@ -77,13 +77,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     runs: count(options.runs, 'runs', 1), loadSeconds: count(options['load-seconds'], 'load-seconds', 1),
     writes: count(options.writes, 'writes', 1), reconciliationOnly: options['reconciliation-only'] };
   const text = `${JSON.stringify(await measure(settings), null, 2)}\n`;
-  if (out === null) process.stdout.write(text);
-  else {
-    // O_NOFOLLOW: a symbolic link put in the destination's place meanwhile is refused, not followed.
-    const file = await open(out, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | (constants.O_NOFOLLOW ?? 0));
-    try { await file.writeFile(text); } finally { await file.close(); }
-  }
+  if (out === null) process.stdout.write(text); else await writeReport(options.out, out, text);
 }
+
+function destinationRefused() { return new RangeError('--out must name a file inside the current directory'); }
 
 /**
  * Where --out writes, checked before anything connects: only inside the directory the operator runs from
@@ -91,14 +88,30 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
  * new file or an existing regular one, never a symbolic link or a directory.
  */
 export async function reportDestination(out, cwd = process.cwd()) {
-  const refused = () => new RangeError('--out must name a file inside the current directory');
-  const base = await realpath(cwd), target = resolve(cwd, out);
+  const refused = destinationRefused, base = await realpath(cwd), target = resolve(cwd, out);
   const parent = await realpath(dirname(target)).catch(() => { throw refused(); });
   const file = join(parent, basename(target));
   if (!file.startsWith(base.endsWith(sep) ? base : `${base}${sep}`)) throw refused();
   const existing = await lstat(file).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
   if (existing && !existing.isFile()) throw refused();
   return file;
+}
+
+/**
+ * Write the report where reportDestination placed it at the start, after checking it again: the run takes minutes, and a
+ * parent replaced meanwhile by a symbolic link leading outside is refused before anything is opened. The file is opened
+ * without following a final symbolic link and without truncating, and written only when it is the file at the checked real
+ * path and its directory is still that real directory, so a file outside is never truncated or written.
+ */
+export async function writeReport(requested, checked, text) {
+  if (await reportDestination(requested) !== checked) throw destinationRefused();
+  const file = await open(checked, constants.O_WRONLY | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const [opened, current, parent] = await Promise.all([file.stat(), lstat(checked), realpath(dirname(checked))]);
+    if (opened.dev !== current.dev || opened.ino !== current.ino || parent !== dirname(checked)) throw destinationRefused();
+    await file.truncate(0);
+    await file.writeFile(text);
+  } finally { await file.close(); }
 }
 
 /**

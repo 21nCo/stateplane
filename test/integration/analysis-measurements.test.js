@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, stat, symlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { memoryAdapter } from '@superfunctions/db/testing';
@@ -523,6 +523,48 @@ test('the measurement script writes its report only to a file inside the current
       assert.doesNotMatch(accepted.stderr, /--out must name/, out);
       assert.match(accepted.stderr, /ENOTFOUND/, out);
     }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test('the measurement script writes its report where it checked it: a parent replaced by a link outside during the run is refused', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'stateplane-out-')), outside = await mkdtemp(join(tmpdir(), 'stateplane-outside-'));
+  const runs = async () => new Set((await admin("SELECT datname FROM pg_database WHERE datname ~ '^stateplane_measure_[0-9a-f]{32}$'"))
+    .rows.map(row => row.datname));
+  const cli = () => {
+    const child = spawn(process.execPath, [join(root, 'scripts/analysis-measure.mjs'), '--scales', '10', '--noise', '0', '--runs', '1',
+      '--load-seconds', '1', '--writes', '1', '--out', 'reports/report.json'], { cwd: dir, env: { ...process.env, DATABASE_URL: baseUrl } });
+    let stderr = '';
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    return { child, exited: new Promise(resolve => child.on('exit', status => resolve({ status, stderr }))) };
+  };
+  try {
+    await mkdir(join(dir, 'reports'));
+    await writeFile(join(outside, 'report.json'), 'kept');
+    const before = await runs();
+    const { exited } = cli();
+    let ended = null;
+    exited.then(result => { ended = result; });
+    // Once the run's database exists the destination was checked: replace its directory by a link to one outside.
+    while (!ended && [...await runs()].every(name => before.has(name))) await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(ended, null, 'the run was still going when its directory was replaced');
+    await rename(join(dir, 'reports'), join(dir, 'moved'));
+    await symlink(outside, join(dir, 'reports'));
+    const replaced = await exited;
+    assert.notEqual(replaced.status, 0);
+    assert.match(replaced.stderr, /--out must name a file inside the current directory/);
+    assert.equal(await readFile(join(outside, 'report.json'), 'utf8'), 'kept', 'the file outside is neither truncated nor written');
+    await assert.rejects(stat(join(dir, 'moved', 'report.json')), { code: 'ENOENT' });
+    // With its directory in place the report is written there.
+    await rm(join(dir, 'reports'));
+    await rename(join(dir, 'moved'), join(dir, 'reports'));
+    await writeFile(join(dir, 'reports', 'report.json'), 'x'.repeat(100_000));
+    const written = await cli().exited;
+    assert.equal(written.status, 0, written.stderr);
+    assert.equal(JSON.parse(await readFile(join(dir, 'reports', 'report.json'), 'utf8')).fixture.name, 'analysis-fixture/v1');
+    assert.equal(await readFile(join(outside, 'report.json'), 'utf8'), 'kept');
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });
