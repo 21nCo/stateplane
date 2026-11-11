@@ -401,10 +401,8 @@ const retrievalTools: readonly StateplaneTool[] = [
     })
 ];
 /* Analysis tools (STA-61): the same aggregation and job services as HTTP. An aggregation spec is every argument but
- * the scope, and a job request {kind, spec} likewise, each re-encoded within its HTTP body budget, so the services
- * admit the caller before they refuse a field. */
-const aggregationBody = 32_768;
-const jobBody = 33_792;
+ * the scope, and a job request {kind, spec} likewise, each checked before admission by the checks HTTP and the CLI make
+ * (sizes of its compact text, nesting, values), so the services admit the caller before they refuse a field. */
 const job = (args: Args) => [...scope(args), selector(args, 'jobId')] as const;
 const analysisTools: readonly StateplaneTool[] = [
   tool('analysis_aggregate', 'Aggregate records', read,
@@ -412,13 +410,13 @@ const analysisTools: readonly StateplaneTool[] = [
     async (services, actor, args) => {
       const [spaceId, collectionId] = scope(args);
       return result(await services.analysis.aggregate(actor, spaceId, collectionId,
-        analysisAggregation(serialized(without(args, ['spaceId', 'collectionId']), aggregationBody))));
+        analysisAggregation(without(args, ['spaceId', 'collectionId']))));
     }),
   tool('analysis_submit', 'Submit an analysis job', nonIdempotent,
     'Queue a snapshot job over a collection as of a watermark pinned now: kind export (needs export:read; no spec) writes NDJSON pages of every record live at the watermark, kind aggregate (needs records:read) computes spec, an analysis_aggregate spec, over those records. Returns the job\'s status with its jobId and boundary. Poll analysis_status until complete, then read analysis_page 1 to manifest.pageCount. A space holds at most 8 unfinished jobs (BACKPRESSURE, retryable); a job and its result expire 24 hours after submission.',
     async (services, actor, args) => {
       const [spaceId, collectionId] = scope(args);
-      const { kind, spec } = analysisSubmission(JSON.parse(serialized(without(args, ['spaceId', 'collectionId']), jobBody)), aggregationBody);
+      const { kind, spec } = analysisSubmission(without(args, ['spaceId', 'collectionId']));
       return result(await services.analysis.submit(actor, spaceId, collectionId, kind, spec));
     },
     'The job may have been queued, but its jobId was not returned. Submit again: an unreturned job runs and expires within 24 hours, and until it ends it counts toward the space\'s 8 unfinished jobs.'),

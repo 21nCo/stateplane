@@ -156,18 +156,18 @@ async function caller(t, origin, temp, token, label, spaceId) {
     aggregate: async spec => ({ http: await api('POST', `${collection}/aggregate`, spec), mcp: await mcp('analysis_aggregate', spec),
       cli: await cli(['aggregate', '--data', JSON.stringify(spec)]) }),
     // A spec as JSON text, so a literal such as 1e400 reaches each transport as written: the raw HTTP body, raw MCP
-    // JSON-RPC (a client would re-encode it as null) and the CLI's --data and --file.
-    literal: async (kind, text) => {
+    // JSON-RPC (a client would re-encode it as null; skipped for text that is not JSON) and the CLI's --data and --file.
+    literal: async (kind, text, viaMcp = true) => {
       const file = join(home, 'literal.json');
       await writeFile(file, text);
       const scope = `"spaceId":${JSON.stringify(spaceId)},"collectionId":"items"`;
       const args = kind ? `{${scope},"kind":${JSON.stringify(kind)},"spec":${text}}` : `{${scope},${text.slice(1)}`;
-      const rpc = await fetch(`${origin}/mcp`, { method: 'POST', headers: { authorization: `Bearer ${token}`,
+      const rpc = viaMcp && await fetch(`${origin}/mcp`, { method: 'POST', headers: { authorization: `Bearer ${token}`,
         'content-type': 'application/json', accept: 'application/json, text/event-stream', 'mcp-protocol-version': '2025-06-18' },
       body: `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"${kind ? 'analysis_submit' : 'analysis_aggregate'}","arguments":${args}}}` });
       const argv = kind ? ['submit', '--kind', kind] : ['aggregate'];
       return { http: kind ? await api('POST', `${collection}/jobs`, `{"kind":${JSON.stringify(kind)},"spec":${text}}`)
-        : await api('POST', `${collection}/aggregate`, text), mcp: (await rpc.json()).result.structuredContent,
+        : await api('POST', `${collection}/aggregate`, text), ...(rpc ? { mcp: (await rpc.json()).result.structuredContent } : {}),
       cli: await cli([...argv, '--data', text]), cliFile: await cli([...argv, '--file', file]) };
     },
     // The CLI sends {kind} or {kind, spec}; a request it cannot express is compared over HTTP and MCP only. `encode` writes
@@ -374,14 +374,38 @@ test('HTTP, CLI and MCP give one outcome for job submission, status, pages and c
   // A spec that is not an object is refused before admission as well: a foreign owner learns no more than the CLI says.
   assert.deepEqual(same('foreign array spec', await callers.foreignOwner.submit({ kind: 'aggregate', spec: [1] }), 'AnalysisJobStatus',
     comparableJob), { error: 'INVALID_ARGUMENT', retryable: false });
+
+  // One table of texts, each sent as written as an aggregation and as an aggregate job by every caller: the checks before
+  // admission measure the compact text with its literals (1e400 stays 1e400, never JSON's null), then its syntax, nesting
+  // (at most 16 levels in a spec) and values, so each is refused with one code on every transport, before admission.
+  const nested = levels => `{"metrics":[{"op":"count"}],"x":${'['.repeat(levels - 1)}0${']'.repeat(levels - 1)}}`;
+  const literals = `{"metrics":[{"op":"count"}],"x":[${Array.from({ length: 1_300 }, () => '1e400').join(',')}],"pad":"`;
+  const envelope = text => `{"kind":"aggregate","spec":${text}}`;
+  const edge = `${literals}${'p'.repeat(33_793 - Buffer.byteLength(envelope(`${literals}"}`)))}"}`;
+  assert.ok(Buffer.byteLength(envelope(edge)) === 33_793 && Buffer.byteLength(JSON.stringify(JSON.parse(edge))) <= 32_768,
+    'over the envelope as written, within the spec bound as JSON would re-encode it');
+  // Each 1e20 is 4 bytes as written and 21 in compact JSON: within every body budget as sent, over both once encoded.
+  const expanding = `{"metrics":[{"op":"count"}],"x":[${Array.from({ length: 1_700 }, () => '1e20').join(',')}]}`;
+  const table = [
+    ['envelope-edge 1e400', edge, 'RATE_LIMITED'], ['compact form over the budget', expanding, 'RATE_LIMITED'],
+    ['unparseable', '{"metrics":[{"op":"count"}]', 'INVALID_ARGUMENT', false],
+    ['nested past the limit', nested(17), 'INVALID_ARGUMENT'], ['nested past the stack', nested(10_001), 'INVALID_ARGUMENT']];
+  for (const [row, text, code, viaMcp] of table) for (const label of ['owner', 'reader', 'exporter', 'foreignOwner'])
+    for (const kind of [undefined, 'aggregate']) {
+      const operation = `${label} ${row} ${kind ? 'aggregate job' : 'aggregation'}`;
+      assert.deepEqual(same(operation, await callers[label].literal(kind, text, viaMcp), kind ? 'AnalysisJobStatus' : 'AggregationResult'),
+        { error: code, retryable: false }, operation);
+    }
+  // A spec at the nesting limit is admitted on every transport: the service then authorizes before it refuses the field.
+  for (const [label, code] of [['owner', 'INVALID_ARGUMENT'], ['reader', 'INVALID_ARGUMENT'], ['exporter', 'FORBIDDEN'],
+    ['foreignOwner', 'NOT_FOUND']]) for (const kind of [undefined, 'aggregate'])
+    assert.deepEqual(same(`${label} at the nesting limit ${kind ?? ''}`, await callers[label].literal(kind, nested(16)),
+      kind ? 'AnalysisJobStatus' : 'AggregationResult'), { error: code, retryable: false }, `${label} at the nesting limit ${kind ?? ''}`);
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM analysis_jobs WHERE space_id=$1', [f.spaceId])).rows[0].n, jobsBefore,
     'no refused spec queues a job');
-  // A spec nested past the serializer's stack is invalid, not a retryable failure, on every transport.
-  const deep = `{"metrics":[{"op":"count"}],"x":${'['.repeat(10_000)}0${']'.repeat(10_000)}}`;
-  for (const kind of [undefined, 'aggregate'])
-    assert.deepEqual(same(`deep ${kind ?? 'aggregation'}`, await owner.literal(kind, deep), kind ? 'AnalysisJobStatus' : 'AggregationResult'),
-      { error: 'INVALID_ARGUMENT', retryable: false }, `deep ${kind ?? 'aggregation'}`);
-  for (const [text, code] of [[overflowing, 'RATE_LIMITED'], [small, 'INVALID_ARGUMENT'], [deep, 'INVALID_ARGUMENT']]) for (const argv of [['aggregate'],
+  const deep = nested(10_001);
+  for (const [text, code] of [[overflowing, 'RATE_LIMITED'], [small, 'INVALID_ARGUMENT'], [deep, 'INVALID_ARGUMENT'],
+    ...table.map(([, value, refusal]) => [value, refusal])]) for (const argv of [['aggregate'],
     ['submit', '--kind', 'aggregate']])
     assert.deepEqual(outcome(await cliRun(offline, ['analysis', ...argv, '--collection', 'items', '--data', text])),
       { error: code, retryable: false }, `the CLI refuses a ${code} 1e400 spec to ${argv[0]} locally`);

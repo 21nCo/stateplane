@@ -4,6 +4,7 @@ import { open, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { readConfig, saveConfig, configureToken, loadToken, logoutConfig, removeTrackedTokens, withConfigMutation } from './config.js';
 import type { CliConfig } from './config.js';
+import { admitAggregation, admitAnalysisJob, analysisBounds } from '@stateplane/contracts';
 import { StateplaneCliError, StateplaneHttpClient } from './transport.js';
 import type { Deadline } from './transport.js';
 
@@ -42,9 +43,6 @@ const largeBody = 3_145_728;
 const smallBody = 32_768;
 /** The search and bundle body budget (retrievalBody in packages/api/src/http.ts). */
 const retrievalBody = 131_072;
-/** The aggregation spec and job request budgets (aggregationBody and jobBody in packages/api/src/http.ts). */
-const aggregationBody = 32_768;
-const jobBody = 33_792;
 /** The service's upload bound (sourceBounds.uploadBytes, 25 MiB). */
 const uploadBytes = 26_214_400;
 /** The service's text bound (1 MiB of UTF-8). */
@@ -162,13 +160,16 @@ async function input(path:string,maxBytes:number,keepBom=false):Promise<string> 
   catch { throw new StateplaneCliError('INVALID_ARGUMENT'); }
 }
 /** The JSON of --data or --file, at most maxBytes: by default the record and
- * schema budget; an evidence command passes its route's body budget. An
- * analysis command passes parse, to check every size before any value. */
-async function payload(flags:Flags,maxBytes=1_048_576,parse=parsed):Promise<unknown> {
+ * schema budget; an evidence command passes its route's body budget. */
+async function payload(flags:Flags,maxBytes=1_048_576):Promise<unknown> {
+  return parsed(await payloadText(flags,maxBytes));
+}
+/** The text of --data or --file, at most maxBytes. */
+async function payloadText(flags:Flags,maxBytes:number):Promise<string> {
   if (flags.data!==undefined && flags.file!==undefined) throw new StateplaneCliError('INVALID_ARGUMENT');
   const text=flags.file!==undefined ? await input(required(flags,'file'),maxBytes) : required(flags,'data');
   if (Buffer.byteLength(text)>maxBytes) throw new StateplaneCliError('RATE_LIMITED',undefined,undefined,false);
-  return parse(text);
+  return text;
 }
 function withinWireBudget<T>(value:T,maxBytes:number):T {
   // Match StateplaneHttpClient's JSON serialization for every JSON value. One it cannot serialize (nested past the
@@ -544,33 +545,29 @@ async function runRetrieval(client:StateplaneHttpClient,action:string|undefined,
   return client.request('POST',`${spacePath}/${action==='search' ? 'search' : 'bundles'}`,withinWireBudget(data,retrievalBody));
 }
 
-/** Aggregations and snapshot jobs of one collection. A spec is the JSON object of --data or --file; a submission
- * sends {kind, spec} as the HTTP body, so every transport passes the service the same request. Before sending, in
- * analysisSubmission's order: the sizes (RATE_LIMITED), then the spec's shape and numbers (INVALID_ARGUMENT). */
+/** Aggregations and snapshot jobs of one collection. A spec is the JSON of --data or --file; a submission sends
+ * {kind, spec} as the HTTP body. Before sending, the text given is bounded as the HTTP body it stands for (the spec, or
+ * the spec in its envelope; RATE_LIMITED), and text that does not parse is null, as over HTTP; then the checks HTTP and
+ * MCP make before admission (@stateplane/contracts) decide, so every transport refuses a request alike. */
 async function runAnalysis(client:StateplaneHttpClient,action:string|undefined,flags:Flags,collectionPath:string):Promise<unknown> {
-  // A number that overflows to Infinity is kept until every size is checked, then refused with a spec that is not an
-  // object, as HTTP and MCP refuse it, never sent as the null JSON would make it. parsed() refuses it at once.
-  const lenient=(text:string):unknown=>{ try { return JSON.parse(text); } catch { throw new StateplaneCliError('INVALID_ARGUMENT'); } };
-  const admissible=(spec:unknown)=>{
-    if (!spec || typeof spec!=='object' || Array.isArray(spec)) throw new StateplaneCliError('INVALID_ARGUMENT');
-    const pending:unknown[]=[spec];
-    while (pending.length) {
-      const item=pending.pop();
-      if (typeof item==='number' && !Number.isFinite(item)) throw new StateplaneCliError('INVALID_ARGUMENT');
-      if (item && typeof item==='object') for (const value of Object.values(item)) pending.push(value);
-    }
-    return spec;
+  const refuse=(code:string):never=>{ throw new StateplaneCliError(code,undefined,undefined,false); };
+  const given=async(maxBytes:number,around=(text:string)=>text):Promise<unknown>=>{
+    const text=await payloadText(flags,maxBytes);
+    if (Buffer.byteLength(around(text))>maxBytes) refuse('RATE_LIMITED');
+    try { return JSON.parse(text); } catch { return null; }
   };
   if (action==='aggregate') {
-    const spec=withinWireBudget(await payload(flags,aggregationBody,lenient),aggregationBody);
-    return client.request('POST',`${collectionPath}/aggregate`,admissible(spec));
+    const spec=await given(analysisBounds.specBytes);
+    const admitted=admitAggregation(spec);
+    if ('refused' in admitted) return refuse(admitted.refused);
+    return client.request('POST',`${collectionPath}/aggregate`,spec);
   }
   if (action==='submit') {
     const kind=required(flags,'kind');
-    const request=withinWireBudget(flags.data===undefined && flags.file===undefined ? {kind} : {kind,spec:await payload(flags,jobBody,lenient)},jobBody);
-    // The envelope, the kind (the server refuses another, whatever its spec), the re-encoded spec's size (an
-    // aggregation's), then the spec's shape and numbers.
-    if ((kind==='aggregate' || kind==='export') && 'spec' in request) admissible(withinWireBudget(request.spec,aggregationBody));
+    const request=flags.data===undefined && flags.file===undefined ? {kind}
+      : {kind,spec:await given(analysisBounds.requestBytes,text=>`{"kind":${JSON.stringify(kind)},"spec":${text}}`)};
+    const admitted=admitAnalysisJob(request);
+    if ('refused' in admitted) return refuse(admitted.refused);
     return client.request('POST',`${collectionPath}/jobs`,request);
   }
   const job=`${collectionPath}/jobs/${encoded(required(flags,'job'))}`;

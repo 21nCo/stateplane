@@ -52,3 +52,4 @@ export function isSafeHttpRead(method:string,route:readonly string[]):boolean {
   return route.length===6 && route[2]==='collections' && route[4]==='records' &&
     (route[5]==='query' || route[5]==='count');
 }
+export * from './analysis.js';

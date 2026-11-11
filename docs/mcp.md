@@ -141,8 +141,10 @@ revision and range. HTTP and the CLI return it.
   the spec inside an analysis job request), 33 KiB for an analysis job request,
   3 MiB for a batch envelope.
   An oversized request returns nonretryable `RATE_LIMITED`. The analysis tools
-  then refuse a spec holding `1e400` with `INVALID_ARGUMENT` before admission,
-  as HTTP does (the admission order in `docs/analysis-jobs.md`).
+  instead check their arguments with the function HTTP and the CLI use
+  (`@stateplane/contracts`): the compact text with literals kept is bounded,
+  a spec nested past 16 levels or holding `1e400` is `INVALID_ARGUMENT`, all
+  before admission (the admission order in `docs/analysis-jobs.md`).
 - A cursor that is present but not a string returns `CURSOR_INVALID`; omit it
   for the first page.
 

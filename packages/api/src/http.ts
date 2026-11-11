@@ -2,7 +2,7 @@ import type { StateplaneServices } from '@stateplane/application';
 import { TransportFailure, analysisAggregation, analysisSubmission, classifyError } from '@stateplane/application';
 import type { IdentityVerifier } from '@stateplane/auth';
 import type { VerifiedCredential } from '@stateplane/contracts';
-import { isSafeHttpRead, parseV1Path } from '@stateplane/contracts';
+import { analysisBounds, isSafeHttpRead, parseV1Path } from '@stateplane/contracts';
 
 const headers = { 'Cache-Control':'no-store', 'Content-Type':'application/json; charset=utf-8' };
 const status:Record<string,number> = {
@@ -186,18 +186,19 @@ async function collectionRoute(services:StateplaneServices,actor:VerifiedCredent
   if (p[4]==='projections' && p.length===5 && request.method==='GET')
     return json(await services.retrieval.status(...prefix));
   if (p[4]==='aggregate' && p.length===5 && request.method==='POST')
-    return json(await services.analysis.aggregate(...prefix,analysisAggregation(await body(request,aggregationBody))));
+    return aggregateRoute(services,request,prefix);
   if (p[4]==='jobs') return jobsRoute(services,p,request,prefix);
   return evidenceRoute(services,p,request,url,prefix);
 }
-/* An aggregation spec is JSON text of at most 32 KiB (aggregationBounds.specBytes), the
- * records query budget; a job request is that spec inside its {"kind","spec"} envelope. */
-const aggregationBody=32_768;
-const jobBody=33_792;
+/** An interactive aggregation. An analysis body is read as sent up to its budget (RATE_LIMITED beyond) and is null
+ * when it does not parse; the shared checks then measure its compact text, nesting and values before admission. */
+async function aggregateRoute(services:StateplaneServices,req:Request,prefix:Prefix):Promise<Response> {
+  return json(await services.analysis.aggregate(...prefix,analysisAggregation(await request(req,analysisBounds.specBytes))));
+}
 /** Snapshot analysis and export jobs: submit, status, cancel and result pages, each reauthorized by the service. */
 async function jobsRoute(services:StateplaneServices,p:string[],req:Request,prefix:Prefix):Promise<Response> {
   if (p.length===5 && req.method==='POST') {
-    const {kind,spec}=analysisSubmission(await request(req,jobBody),aggregationBody);
+    const {kind,spec}=analysisSubmission(await request(req,analysisBounds.requestBytes));
     return json(await services.analysis.submit(...prefix,kind,spec),202);
   }
   const job=p[5];

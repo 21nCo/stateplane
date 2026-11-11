@@ -1737,8 +1737,8 @@ test('aggregations and analysis jobs reach their services over HTTP and CLI, rea
   await http('DELETE',`${collection}/jobs/anj_1`);
   await http('GET',`${collection}/jobs/anj_1/pages/2`);
   await http('GET',`${collection}/jobs/anj_1/pages/02`);
-  // The aggregation spec reaches the service as the text sent, parsed only after admission; a job's spec re-encoded.
-  assert.deepEqual(calls,[['aggregate','sp_a','entries',spec],['submit','sp_a','entries','aggregate','{"groupBy":[{"field":"team"}],"metrics":[{"op":"count"}]}'],
+  // An aggregation spec and a job's spec reach the service in the compact form every transport measures.
+  assert.deepEqual(calls,[['aggregate','sp_a','entries','{"groupBy":[{"field":"team"}],"metrics":[{"op":"count"}]}'],['submit','sp_a','entries','aggregate','{"groupBy":[{"field":"team"}],"metrics":[{"op":"count"}]}'],
     ['submit','sp_a','entries','export',undefined],['status','sp_a','entries','anj_1'],['cancel','sp_a','entries','anj_1'],
     ['page','sp_a','entries','anj_1',2],['page','sp_a','entries','anj_1',Number.NaN]]);
   calls.length=0;
