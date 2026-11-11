@@ -738,7 +738,8 @@ test('replaced Reflect.apply and polluted descriptors never misbind, admit or es
     assert.deepEqual(outcomes[i].groups.map(group => [group.key, group.count, group.metrics.map(metric => metric.value)]),
       [[[{ kind: 'value', value: 'red' }], 1, [1, '17']]], `aggregation ${i}`);
     assert.deepEqual(outcomes[i].source.where, where);
-    assert.deepEqual(outcomes[i], { ...expected[i], snapshot: outcomes[i].snapshot });
+    assert.deepEqual(outcomes[i], { ...expected[i], snapshot: outcomes[i].snapshot,
+      freshness: { state: 'exact', checkedAt: outcomes[i].snapshot.takenAt } });
   }
   assert.deepEqual(outcomes.slice(3), [1, 1, true, 1]);
   assert.deepEqual(outcomes.slice(3), expected.slice(3));
@@ -991,7 +992,8 @@ test('an empty groupBy equals omission, and filter-only fields are reported with
   const where = [{ field: 'team', kind: 'string', operator: 'eq', value: 'red' }, { field: 'score', kind: 'number', operator: 'gte', value: 0 }];
   for (const run of entrypoints) {
     const omitted = await run({ metrics }), empty = await run({ groupBy: [], metrics });
-    assert.deepEqual({ ...empty, snapshot: null }, { ...omitted, snapshot: null });
+    assert.deepEqual({ ...empty, snapshot: null, freshness: null }, { ...omitted, snapshot: null, freshness: null });
+    assert.deepEqual(empty.freshness, { state: 'exact', checkedAt: empty.snapshot.takenAt });
     assert.deepEqual(empty.groups.map(group => [group.key, group.count, group.metrics.map(metric => metric.value)]), [[[], 3, [3, 4]]]);
     await rejects(run({ groupBy: [], metrics: [] }), 'INVALID_ARGUMENT');
     // Filtered by team and score, grouped by active, measuring score: each field once, in grouped, measured, filtered order.

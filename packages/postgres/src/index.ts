@@ -2190,7 +2190,9 @@ export * from './search.js';
 export * from './bundles.js';
 export { aggregationBounds, analyticalSlots, PostgresAggregations } from './aggregations.js';
 export { analysisJobBounds, PostgresAnalysisJobs, PostgresAnalysisWorker } from './analysis-jobs.js';
-export type { AnalysisBoundary, AnalysisJobKind, AnalysisJobState, AnalysisJobStatus, AnalysisManifest, AnalysisPage, AnalysisStep,
+export type { AnalysisBoundary, AnalysisFreshness, AnalysisJobKind, AnalysisJobState, AnalysisJobStatus, AnalysisManifest, AnalysisPage, AnalysisStep,
   AnalysisWorkerOptions } from './analysis-jobs.js';
+export { reconcileIndexes, reconciliationBounds } from './index-reconciliation.js';
+export type { IndexDrift, IndexReconciliation } from './index-reconciliation.js';
 export type { AggregationCell, AggregationMetricValue, AggregationOperator, AggregationOptions, AggregationResult, AggregationUnit,
   GroupKey } from './aggregations.js';

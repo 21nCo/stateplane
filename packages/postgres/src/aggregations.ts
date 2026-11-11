@@ -50,6 +50,12 @@ export interface AggregationResult {
   collection: { schemaVersion: number; fields: { field: string; kind: ValueKind; acceptedVersion: number }[] };
   /** Every group and metric comes from this one statement's snapshot, taken at `takenAt`. */
   snapshot: { scope: 'statement'; takenAt: string };
+  /**
+   * Always `exact`: the groups are the live records' own as the statement read them, a declared field's values through
+   * the typed index the writers keep in the same transactions as the records, never a materialized copy (a snapshot
+   * job's result, by contrast, says whether later writes made it stale).
+   */
+  freshness: { state: 'exact'; checkedAt: string };
   groupBy: { field: string; kind: ValueKind; bucket: { unit: AggregationUnit; timeZone: string } | null;
     semantics: 'exact' | 'derived' }[];
   metrics: { op: AggregationOperator; field: string | null; semantics: 'exact' | 'derived'; precision: string | null }[];
@@ -114,7 +120,8 @@ export function jsonBytes(value: unknown): number {
 }
 
 /**
- * Initial protective bounds, not measured capacity (STA-60 measures them):
+ * Protective bounds, each recorded with its measured evidence in
+ * docs/analysis-measurements.md#limits (STA-60):
  * at most 3 group dimensions and 16 metrics, at most 1,000 groups (100 unless
  * `maxGroups` says otherwise), 256 KiB of groups as JSON text, 5 s of
  * statement time, averages to 20 significant digits, and a serialized spec of
@@ -730,6 +737,7 @@ export class PostgresAggregations {
       collection: { schemaVersion, fields: each(used, name => ({ field: name, kind: kindOf(name),
         acceptedVersion: mapGet(declared, name)!.acceptedVersion })) },
       snapshot: { scope: 'statement', takenAt: isoString(totals.taken_at as Date) },
+      freshness: { state: 'exact', checkedAt: isoString(totals.taken_at as Date) },
       groupBy: described.groupBy, metrics: described.metrics,
       groups, complete: true
     };
