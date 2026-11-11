@@ -418,7 +418,7 @@ const analysisTools: readonly StateplaneTool[] = [
     'Queue a snapshot job over a collection as of a watermark pinned now: kind export (needs export:read; no spec) writes NDJSON pages of every record live at the watermark, kind aggregate (needs records:read) computes spec, an analysis_aggregate spec, over those records. Returns the job\'s status with its jobId and boundary. Poll analysis_status until complete, then read analysis_page 1 to manifest.pageCount. A space holds at most 8 unfinished jobs (BACKPRESSURE, retryable); a job and its result expire 24 hours after submission.',
     async (services, actor, args) => {
       const [spaceId, collectionId] = scope(args);
-      const { kind, spec } = analysisSubmission(JSON.parse(serialized(without(args, ['spaceId', 'collectionId']), jobBody)));
+      const { kind, spec } = analysisSubmission(JSON.parse(serialized(without(args, ['spaceId', 'collectionId']), jobBody)), aggregationBody);
       return result(await services.analysis.submit(actor, spaceId, collectionId, kind, spec));
     },
     'The job may have been queued, but its jobId was not returned. Submit again: an unreturned job runs and expires within 24 hours, and until it ends it counts toward the space\'s 8 unfinished jobs.'),

@@ -197,7 +197,7 @@ const jobBody=33_792;
 /** Snapshot analysis and export jobs: submit, status, cancel and result pages, each reauthorized by the service. */
 async function jobsRoute(services:StateplaneServices,p:string[],req:Request,prefix:Prefix):Promise<Response> {
   if (p.length===5 && req.method==='POST') {
-    const {kind,spec}=analysisSubmission(await request(req,jobBody));
+    const {kind,spec}=analysisSubmission(await request(req,jobBody),aggregationBody);
     return json(await services.analysis.submit(...prefix,kind,spec),202);
   }
   const job=p[5];

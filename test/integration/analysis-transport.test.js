@@ -304,6 +304,29 @@ test('HTTP, CLI and MCP give one outcome for job submission, status, pages and c
   for (const [label, request, code] of refusals)
     assert.deepEqual(same(`${label} submit ${JSON.stringify(request)}`, await callers[label].submit(request), 'AnalysisJobStatus', comparableJob),
       { error: code, retryable: false }, `${label} ${JSON.stringify(request)}`);
+  // A spec over the 32,768-byte spec bound but inside a job request's 33,792-byte envelope: alone or in an aggregate
+  // job, every transport refuses it RATE_LIMITED (HTTP 429, not retryable) for every authenticated caller.
+  const oversized = { metrics: [{ op: 'count' }], where: [{ field: 'team', kind: 'string', operator: 'in',
+    value: Array.from({ length: 162 }, () => 'x'.repeat(200)) }] };
+  const specBytes = Buffer.byteLength(JSON.stringify(oversized));
+  assert.ok(specBytes > 32_768 && Buffer.byteLength(JSON.stringify({ kind: 'aggregate', spec: oversized })) <= 33_700, `${specBytes}`);
+  for (const label of ['owner', 'reader', 'exporter', 'foreignOwner']) {
+    assert.deepEqual(same(`${label} oversized aggregation`, await callers[label].aggregate(oversized), 'AggregationResult'),
+      { error: 'RATE_LIMITED', retryable: false }, `${label} oversized aggregation`);
+    assert.equal(callers[label].status(), 429);
+    assert.deepEqual(same(`${label} oversized job`, await callers[label].submit({ kind: 'aggregate', spec: oversized }), 'AnalysisJobStatus',
+      comparableJob), { error: 'RATE_LIMITED', retryable: false }, `${label} oversized aggregate job`);
+    assert.equal(callers[label].status(), 429);
+  }
+  // The CLI refuses it before sending anything: its endpoint here has nothing listening.
+  const offline = join(temp, 'offline');
+  await cliRun(offline, ['config', 'endpoint', '--url', 'http://127.0.0.1:9/']);
+  await cliRun(offline, ['auth', 'import', '--token-stdin', '--store', 'file'], `${f.ownerToken}\n`);
+  await cliRun(offline, ['spaces', 'select', '--space', f.spaceId]);
+  for (const argv of [['aggregate'], ['submit', '--kind', 'aggregate']])
+    assert.deepEqual(outcome(await cliRun(offline, ['analysis', ...argv, '--collection', 'items', '--data', JSON.stringify(oversized)])),
+      { error: 'RATE_LIMITED', retryable: false }, `the CLI refuses an oversized spec to ${argv[0]} locally`);
+
   // A request envelope the CLI cannot send is refused alike over HTTP and MCP.
   assert.deepEqual(same('envelope', await owner.submit({ kind: 'export', extra: true }, false), 'AnalysisJobStatus', comparableJob),
     { error: 'INVALID_ARGUMENT', retryable: false });

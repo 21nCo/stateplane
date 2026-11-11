@@ -137,8 +137,9 @@ revision and range. HTTP and the CLI return it.
   `"__proto__"` field stays data. The serialized request, not an object, crosses
   the authority boundary.
 - The HTTP byte budgets apply to the re-encoded request: 1 MiB for record and
-  definition bodies, 32 KiB for query, count and an aggregation spec, 33 KiB
-  for an analysis job request, 3 MiB for a batch envelope.
+  definition bodies, 32 KiB for query, count and an aggregation spec (also
+  the spec inside an analysis job request), 33 KiB for an analysis job request,
+  3 MiB for a batch envelope.
   An oversized request returns nonretryable `RATE_LIMITED`.
 - A cursor that is present but not a string returns `CURSOR_INVALID`; omit it
   for the first page.
