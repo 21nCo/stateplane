@@ -376,7 +376,12 @@ test('HTTP, CLI and MCP give one outcome for job submission, status, pages and c
     comparableJob), { error: 'INVALID_ARGUMENT', retryable: false });
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM analysis_jobs WHERE space_id=$1', [f.spaceId])).rows[0].n, jobsBefore,
     'no refused spec queues a job');
-  for (const [text, code] of [[overflowing, 'RATE_LIMITED'], [small, 'INVALID_ARGUMENT']]) for (const argv of [['aggregate'],
+  // A spec nested past the serializer's stack is invalid, not a retryable failure, on every transport.
+  const deep = `{"metrics":[{"op":"count"}],"x":${'['.repeat(10_000)}0${']'.repeat(10_000)}}`;
+  for (const kind of [undefined, 'aggregate'])
+    assert.deepEqual(same(`deep ${kind ?? 'aggregation'}`, await owner.literal(kind, deep), kind ? 'AnalysisJobStatus' : 'AggregationResult'),
+      { error: 'INVALID_ARGUMENT', retryable: false }, `deep ${kind ?? 'aggregation'}`);
+  for (const [text, code] of [[overflowing, 'RATE_LIMITED'], [small, 'INVALID_ARGUMENT'], [deep, 'INVALID_ARGUMENT']]) for (const argv of [['aggregate'],
     ['submit', '--kind', 'aggregate']])
     assert.deepEqual(outcome(await cliRun(offline, ['analysis', ...argv, '--collection', 'items', '--data', text])),
       { error: code, retryable: false }, `the CLI refuses a ${code} 1e400 spec to ${argv[0]} locally`);

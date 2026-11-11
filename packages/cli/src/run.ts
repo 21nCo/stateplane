@@ -171,8 +171,10 @@ async function payload(flags:Flags,maxBytes=1_048_576,parse=parsed):Promise<unkn
   return parse(text);
 }
 function withinWireBudget<T>(value:T,maxBytes:number):T {
-  // Match StateplaneHttpClient's JSON serialization for every JSON value.
-  const serialized=JSON.stringify(value);
+  // Match StateplaneHttpClient's JSON serialization for every JSON value. One it cannot serialize (nested past the
+  // stack) is refused as invalid, never reported as a retryable failure.
+  let serialized:string|undefined;
+  try { serialized=JSON.stringify(value); } catch { throw new StateplaneCliError('INVALID_ARGUMENT'); }
   if (serialized===undefined) throw new StateplaneCliError('INVALID_ARGUMENT');
   if (Buffer.byteLength(serialized)>maxBytes)
     throw new StateplaneCliError('RATE_LIMITED',undefined,undefined,false);
