@@ -613,7 +613,8 @@ paths:
       description: >-
         One page, 1 to the manifest's pageCount, of a complete, unexpired
         result, with its boundary, manifest and freshness, reauthorized at
-        this fetch. A job without a complete result is CONFLICT (its status
+        this fetch. An export with no record live at the watermark is
+        complete with pageCount 0 and no page. A job without a complete result is CONFLICT (its status
         says why), a page outside the manifest NOT_FOUND, and a page number
         that is not an integer from 1 to 10,000 INVALID_ARGUMENT. Page
         content is untrusted stored data.
@@ -1501,7 +1502,7 @@ components:
       required: [pageCount, rowCount, byteSize, resultSha256, format]
       additionalProperties: false
       properties:
-        pageCount: { type: integer, minimum: 1, maximum: 10000 }
+        pageCount: { type: integer, minimum: 0, maximum: 10000, description: '0 for an export of a collection with no record live at the watermark, which has no page.' }
         rowCount: { type: integer, minimum: 0 }
         byteSize: { type: integer, minimum: 0 }
         resultSha256: { type: string, pattern: '^[0-9a-f]{64}$' }

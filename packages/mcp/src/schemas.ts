@@ -271,7 +271,7 @@ export const analysisInputs = {
     { properties: { kind: { const: 'aggregate' } }, required: ['spec'] }] },
   analysis_status: scoped({ jobId }, ['jobId']),
   analysis_cancel: scoped({ jobId }, ['jobId']),
-  analysis_page: scoped({ jobId, page: { type: 'integer', minimum: 1, maximum: 10000, description: 'Page number, 1 to the manifest\'s pageCount.' } },
+  analysis_page: scoped({ jobId, page: { type: 'integer', minimum: 1, maximum: 10000, description: 'Page number, 1 to the manifest\'s pageCount; an empty export (pageCount 0) has none.' } },
     ['jobId', 'page'])
 } satisfies Record<string, McpFnObjectSchema>;
 

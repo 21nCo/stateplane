@@ -40,7 +40,7 @@ export const guidance = `# Stateplane MCP guide (contract v1)
 
 ## Aggregations and analysis jobs
 - analysis_aggregate counts, sums, averages and takes extremes over live records, grouped by declared index fields, in one statement snapshot. It is exact or fails: past maxGroups, 256 KiB of groups or 5 s it fails RATE_LIMITED, never with part of the groups. BACKPRESSURE means no analytical slot was free; retry shortly.
-- analysis_submit pins a watermark and queues an export or aggregate job; the result is the collection's records as of that watermark, however long the job runs. Poll analysis_status until complete is true, then read analysis_page 1 to manifest.pageCount. A failed, cancelled or expired job has no result, and analysis_page fails CONFLICT until a result is complete.
+- analysis_submit pins a watermark and queues an export or aggregate job; the result is the collection's records as of that watermark, however long the job runs. Poll analysis_status until complete is true, then read analysis_page 1 to manifest.pageCount (an export with no record live at the watermark has pageCount 0 and no page). A failed, cancelled or expired job has no result, and analysis_page fails CONFLICT until a result is complete.
 - A job's freshness is stale once the collection changed after its watermark: its result is still exact as of the watermark. Submit a new job for the current records. Jobs and results expire 24 hours after submission, and only the submitting credential finds a job.
 - After COMMIT_OUTCOME_UNKNOWN from analysis_submit, submit again: the lost job's ID cannot be recovered, and it expires on its own.
 

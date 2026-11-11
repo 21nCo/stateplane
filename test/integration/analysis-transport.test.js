@@ -317,7 +317,16 @@ test('HTTP, CLI and MCP give one outcome for job submission, status, pages and c
   assert.equal(owner.status(), 409);
   assert.equal(same('queued status', await owner.jobStatus(exportJob), 'AnalysisJobStatus').state, 'queued');
 
+  // The foreign owner's collection has no record: its export completes with no page.
+  const empty = await caller(t, origin, temp, foreign.ownerToken, 'foreign-own', foreign.spaceId);
+  const emptyJob = (await empty.submit({ kind: 'export' }, false)).http.jobId;
+
   await drain();
+  const emptyStatus = same('empty export status', await empty.jobStatus(emptyJob), 'AnalysisJobStatus');
+  assert.deepEqual([emptyStatus.state, emptyStatus.complete, emptyStatus.manifest], ['completed', true, { pageCount: 0, rowCount: 0,
+    byteSize: 0, resultSha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', format: 'application/x-ndjson' }]);
+  assert.deepEqual(same('empty export page', await empty.page(emptyJob, 1), 'AnalysisPage'), { error: 'NOT_FOUND', retryable: false },
+    'an empty export has no page 1');
   const status = same('completed status', await owner.jobStatus(exportJob), 'AnalysisJobStatus');
   assert.deepEqual([status.state, status.complete, status.manifest.pageCount, status.manifest.rowCount], ['completed', true, 1, 3]);
   const page = same('export page', await owner.page(exportJob, 1), 'AnalysisPage');

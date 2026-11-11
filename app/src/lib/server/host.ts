@@ -84,6 +84,45 @@ function mcpEndpoint(resource:string,issuer:string,local:boolean):McpEndpoint {
 class HostProviderTimeoutError extends Error {
   constructor() { super('Provider socket timeout'); this.name='HostProviderTimeoutError'; }
 }
+/** Bound every query on a pool's clients by `socketTimeoutMs`, and consume its connection errors. */
+function boundQueries(pool:pg.Pool) {
+  // An absolute query timer belongs to that query, not to a checked-out
+  // client or an idle pool entry. A transaction may pause between statements.
+  pool.on('connect',client=>{
+    // pg-pool only listens for errors while a client is idle. A destroyed
+    // checked-out socket can also emit a client error after rejecting query().
+    client.on('error',()=>{});
+    const stream=(client as pg.PoolClient & {connection:{stream:Socket}}).connection.stream;
+    const query=client.query.bind(client) as (...args:unknown[])=>unknown;
+    client.query=((...args:unknown[])=>{
+      // Destroying the stream marks pg's client unqueryable; pg-pool discards
+      // it on release instead of reusing a query that may still be executing.
+      const timer=setTimeout(()=>stream.destroy(new HostProviderTimeoutError()),socketTimeoutMs);
+      let finished=false;
+      const finish=()=>{
+        if (finished) return;
+        finished=true;
+        clearTimeout(timer);
+      };
+      const last=args.length-1;
+      if (typeof args[last]==='function') {
+        const callback=args[last] as (...values:unknown[])=>void;
+        args[last]=(...values:unknown[])=>{ finish(); callback(...values); };
+      }
+      try {
+        const result=query(...args);
+        if (typeof args[last]!=='function' && result &&
+            typeof (result as Promise<unknown>).then==='function')
+          return (result as Promise<unknown>).finally(finish);
+        return result;
+      } catch (error) { finish(); throw error; }
+    }) as typeof client.query;
+  });
+  // An idle connection can fail after a successful request when the provider
+  // goes away. The pool removes that client; consume the event without logging
+  // provider diagnostics or allowing an unhandled error to kill the host.
+  pool.on('error',()=>{});
+}
 
 function safeRead(request:Request):boolean {
   const route=parseV1Path(new URL(request.url).pathname);
@@ -140,42 +179,7 @@ export function stateplaneHost(env:Bindings,lease?:(lease:HostLease)=>void):Host
   // an authenticated HTTP request pending indefinitely.
   const pool=new pg.Pool({connectionString,max:4,connectionTimeoutMillis:providerTimeoutMs,
     statement_timeout:providerTimeoutMs});
-  // An absolute query timer belongs to that query, not to a checked-out
-  // client or an idle pool entry. A transaction may pause between statements.
-  pool.on('connect',client=>{
-    // pg-pool only listens for errors while a client is idle. A destroyed
-    // checked-out socket can also emit a client error after rejecting query().
-    client.on('error',()=>{});
-    const stream=(client as pg.PoolClient & {connection:{stream:Socket}}).connection.stream;
-    const query=client.query.bind(client) as (...args:unknown[])=>unknown;
-    client.query=((...args:unknown[])=>{
-      // Destroying the stream marks pg's client unqueryable; pg-pool discards
-      // it on release instead of reusing a query that may still be executing.
-      const timer=setTimeout(()=>stream.destroy(new HostProviderTimeoutError()),socketTimeoutMs);
-      let finished=false;
-      const finish=()=>{
-        if (finished) return;
-        finished=true;
-        clearTimeout(timer);
-      };
-      const last=args.length-1;
-      if (typeof args[last]==='function') {
-        const callback=args[last] as (...values:unknown[])=>void;
-        args[last]=(...values:unknown[])=>{ finish(); callback(...values); };
-      }
-      try {
-        const result=query(...args);
-        if (typeof args[last]!=='function' && result &&
-            typeof (result as Promise<unknown>).then==='function')
-          return (result as Promise<unknown>).finally(finish);
-        return result;
-      } catch (error) { finish(); throw error; }
-    }) as typeof client.query;
-  });
-  // An idle connection can fail after a successful request when the provider
-  // goes away. The pool removes that client; consume the event without logging
-  // provider diagnostics or allowing an unhandled error to kill the host.
-  pool.on('error',()=>{});
+  boundQueries(pool);
   const keys=perRequest ? null : fixtureStore??=fixtureKeys(env.STATEPLANE_ENV==='local' ?
     env.STATEPLANE_TEST_PROVIDER_FAULT_URL : undefined);
   const tokenDigest=createHash('sha256').update(env.STATEPLANE_TEST_TOKEN).digest();
@@ -215,8 +219,9 @@ export function stateplaneHost(env:Bindings,lease?:(lease:HostLease)=>void):Host
   const analytics=Number.isSafeInteger(originConnectionLimit) && originConnectionLimit>=5 && originConnectionLimit<=20 ?
     {pool:new pg.Pool({connectionString,max:analyticalSlots(originConnectionLimit).cell,connectionTimeoutMillis:providerTimeoutMs}),
       originConnectionLimit} : undefined;
-  analytics?.pool.on('connect',client=>{ client.on('error',()=>{}); });
-  analytics?.pool.on('error',()=>{});
+  // The same per-query socket deadline: otherwise a silent provider strands a checked-out analytical client, and
+  // ending the retired host's pools waits for it indefinitely.
+  if (analytics) boundQueries(analytics.pool);
   const services=postgresServices(spaces,new Map([[cellId,{pool,cursorSecret:Buffer.from(env.STATEPLANE_TEST_CURSOR_SECRET,'hex'),
     originals:env.ORIGINALS ? new R2BlobStore(env.ORIGINALS) : undefined,analytics}]]),receiptRetentionSeconds);
   const serve=createHttpHandler({services,identity});
