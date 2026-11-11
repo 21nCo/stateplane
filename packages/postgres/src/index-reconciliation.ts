@@ -49,8 +49,8 @@ export interface IndexReconciliation {
 
 /**
  * Compare a collection's typed index projection (`record_index_values`, which
- * record writers and backfill maintain and every exact query, count and
- * interactive aggregation reads) with what each record's canonical data
+ * record writers and backfill maintain and every exact filter, sort and
+ * aggregation over a declared field reads) with what each record's canonical data
  * derives under the collection's current definition, as the writers and
  * backfill derive it. Each page reads the records, their index rows, the
  * definition and the declarations in one REPEATABLE READ, READ ONLY
@@ -80,35 +80,15 @@ export async function reconcileIndexes(pool: PoolLike, spaceId: string, collecti
       const fields: string[] = (await db.query(`SELECT field_name FROM collection_index_declarations
         WHERE space_id=$1 AND collection_id=$2 AND ready ORDER BY field_name COLLATE "C"`, [spaceId, collectionId])).rows
         .map(row => row.field_name);
-      // At most `limit` records and, past the first, pageBytes of canonical data (octet_length reads the stored size only).
+      // At most `limit` records and pageBytes of canonical data, the first record always (octet_length reads the stored size only).
       const records = (await db.query(`SELECT record_id,tombstone,canonical_data,fetched FROM (
           SELECT record_id,tombstone,canonical_data,sum(octet_length(COALESCE(canonical_data,''))) OVER (ORDER BY record_id) AS running,
-            count(*) OVER () AS fetched FROM (
+            row_number() OVER (ORDER BY record_id) AS position,count(*) OVER () AS fetched FROM (
             SELECT record_id,tombstone,canonical_data FROM records
             WHERE space_id=$1 AND collection_id=$2 AND ($3::text IS NULL OR record_id>$3) ORDER BY record_id LIMIT $4) x
-        ) y WHERE running-octet_length(COALESCE(canonical_data,''))<$5 ORDER BY record_id`,
+        ) y WHERE running<=$5 OR position=1 ORDER BY record_id`,
       [spaceId, collectionId, cursor, limit, reconciliationBounds.pageBytes])).rows;
-      const drift: IndexDrift[] = [];
-      const expected: IndexValue[] = [], owners: string[] = [];
-      for (const record of records) {
-        if (record.tombstone) continue;
-        // Damaged stored data derives nothing: it is drift of its ready fields, never a failure of the whole call.
-        let data: Record<string, Json> | null = null;
-        try {
-          const parsed = JSON.parse(record.canonical_data) as Json;
-          if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) data = parsed as Record<string, Json>;
-        } catch { /* reported below */ }
-        const rejected = data ? rejectedFields(data, definition.schema, fields) : new Set(fields);
-        for (const field of fields) {
-          let value: IndexValue | null = null;
-          try { if (!rejected.has(field)) value = derivedIndexValue(data!, definition, field); } catch { /* reported below */ }
-          if (!value) {
-            drift.push({ recordId: record.record_id, field, reason: 'underivable', expectedKind: null, actualKind: null });
-            continue;
-          }
-          expected.push(value); owners.push(record.record_id);
-        }
-      }
+      const { drift, expected, owners } = expectedRows(records, fields, definition);
       const valueOf = (value: IndexValue, kind: string) => value.kind === kind && 'value' in value ? value.value : null;
       // Expected rows of the live records against every row the page's records hold for a ready field, both read in this
       // snapshot; values compare in the database's own types (numeric, text COLLATE "C", boolean), as the writers store them.
@@ -134,9 +114,8 @@ export async function reconcileIndexes(pool: PoolLike, spaceId: string, collecti
       for (const row of differing) {
         // A row the data no longer derives is reported once, as underivable.
         if (underivable.has(`${row.record_id}\u0000${row.field_name}`)) continue;
-        const reason = row.expected_kind === null ? 'unexpected' : row.actual_kind === null ? 'missing'
-          : row.expected_kind !== row.actual_kind ? 'kind' : 'value';
-        drift.push({ recordId: row.record_id, field: row.field_name, reason, expectedKind: row.expected_kind, actualKind: row.actual_kind });
+        drift.push({ recordId: row.record_id, field: row.field_name, reason: driftReason(row.expected_kind, row.actual_kind),
+          expectedKind: row.expected_kind, actualKind: row.actual_kind });
       }
       // A full page, or one cut by its byte bound, is not known to be the collection's end.
       const fetched = records.length ? Number(records[0].fetched) : 0;
@@ -152,6 +131,43 @@ export async function reconcileIndexes(pool: PoolLike, spaceId: string, collecti
     cursor = page.last;
     if (result.checked >= maxRecords) { result.next = cursor; return result; }
   }
+}
+
+/**
+ * The typed index rows the page's live records derive for the ready fields, with the record owning each, and an
+ * `underivable` drift for each ready field a record derives no row for. Damaged stored data derives nothing: it is drift of
+ * its ready fields, never a failure of the whole call.
+ */
+function expectedRows(records: { record_id: string; tombstone: boolean; canonical_data: string | null }[], fields: string[],
+  definition: CollectionDefinition): { drift: IndexDrift[]; expected: IndexValue[]; owners: string[] } {
+  const drift: IndexDrift[] = [], expected: IndexValue[] = [], owners: string[] = [];
+  for (const record of records) {
+    if (record.tombstone) continue;
+    const data = parsedObject(record.canonical_data);
+    const rejected = data ? rejectedFields(data, definition.schema, fields) : new Set(fields);
+    for (const field of fields) {
+      let value: IndexValue | null = null;
+      try { if (data && !rejected.has(field)) value = derivedIndexValue(data, definition, field); } catch { /* underivable */ }
+      if (value) { expected.push(value); owners.push(record.record_id); }
+      else drift.push({ recordId: record.record_id, field, reason: 'underivable', expectedKind: null, actualKind: null });
+    }
+  }
+  return { drift, expected, owners };
+}
+
+/** Stored canonical data as a JSON object, or null when it is not JSON or not an object. */
+function parsedObject(text: string | null): Record<string, Json> | null {
+  try {
+    const parsed = JSON.parse(text ?? '') as Json;
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, Json> : null;
+  } catch { return null; }
+}
+
+/** Why a row differs from the expected one: no expected row, no actual row, another kind, or another value. */
+function driftReason(expectedKind: string | null, actualKind: string | null): IndexDrift['reason'] {
+  if (expectedKind === null) return 'unexpected';
+  if (actualKind === null) return 'missing';
+  return expectedKind === actualKind ? 'value' : 'kind';
 }
 
 /**

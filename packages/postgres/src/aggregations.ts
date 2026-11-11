@@ -51,8 +51,9 @@ export interface AggregationResult {
   /** Every group and metric comes from this one statement's snapshot, taken at `takenAt`. */
   snapshot: { scope: 'statement'; takenAt: string };
   /**
-   * Always `exact`: the groups are the live records' own as the statement read them, never a materialized or
-   * derived copy (a snapshot job's result, by contrast, says whether later writes made it stale).
+   * Always `exact`: the groups are the live records' own as the statement read them, a declared field's values through
+   * the typed index the writers keep in the same transactions as the records, never a materialized copy (a snapshot
+   * job's result, by contrast, says whether later writes made it stale).
    */
   freshness: { state: 'exact'; checkedAt: string };
   groupBy: { field: string; kind: ValueKind; bucket: { unit: AggregationUnit; timeZone: string } | null;

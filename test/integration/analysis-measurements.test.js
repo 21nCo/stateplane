@@ -10,7 +10,7 @@ import { createAuthFn, createUser, issueSession } from '@authfn/core';
 import { AuthFnAgentKeys, AuthFnIdentityVerifier } from '../../packages/auth/dist/index.js';
 import { PostgresAggregations, PostgresAnalysisWorker, PostgresSpaces, postgresServices, reconcileIndexes, reconciliationBounds }
   from '../../packages/postgres/dist/index.js';
-import { measure, SHAPES, underLoad } from '../../scripts/analysis-measure.mjs';
+import { measure, seed, SHAPES, underLoad } from '../../scripts/analysis-measure.mjs';
 import { connectionOptions } from '../../scripts/db-connection.mjs';
 
 // STA-60: the typed index reconciliation against records' canonical data, and the measurement script's report. The
@@ -236,26 +236,67 @@ test('reconciliation validates the whole record as the writers do: a whole-recor
 test('reconciliation pages are bounded by canonical data bytes as well as records, and continue to the collection\'s end', async () => {
   const f = await fixture();
   const ids = [];
-  // About 300 kB each: a 1 MiB page holds four.
-  for (let n = 0; n < 6; n++) ids.push(await f.write({ operation: 'create', data: { team: `t${n}`, note: String(n).repeat(300_000) } }));
+  for (let n = 0; n < 7; n++) ids.push(await f.write({ operation: 'create', data: { team: `t${n}`, note: 'x' } }));
   ids.sort();
-  let pages = 0;
+  // Canonical data sizes in record order: one nearly filling a page, four of 300 kB, 900 kB, 100 kB (still derivable).
+  const sizes = [1_040_000, 300_000, 300_000, 300_000, 300_000, 900_000, 100_000];
+  for (const [i, size] of sizes.entries()) {
+    await damage(`UPDATE records SET canonical_data=jsonb_set(canonical_data::jsonb,'{note}',to_jsonb(repeat('n',$3::int)))::text
+      WHERE space_id=$1 AND collection_id='items' AND record_id=$2`, [f.spaceId, ids[i], size]);
+  }
+  let pages = [];
   const counting = { connect: async () => {
     const client = await pool.connect();
     return new Proxy(client, { get(object, property) {
       if (property !== 'query') return typeof object[property] === 'function' ? object[property].bind(object) : object[property];
-      return (sql, values) => {
-        if (typeof sql === 'string' && sql.startsWith('SET TRANSACTION')) pages++;
-        return object.query(sql, values);
+      return async (sql, values) => {
+        const result = await object.query(sql, values);
+        if (typeof sql === 'string' && /tombstone,canonical_data,fetched FROM/.test(sql))
+          pages.push(result.rows.map(row => Buffer.byteLength(row.canonical_data)));
+        return result;
       };
     } });
   } };
   const all = await reconcileIndexes(counting, f.spaceId, 'items');
-  assert.deepEqual([pages, all.checked, all.next, all.driftCount], [2, 6, null, 0]);
+  assert.deepEqual([all.checked, all.next, all.driftCount], [7, null, 0]);
+  // The record that would take a page past 1 MiB starts the next one; a first record is always taken.
+  assert.deepEqual(pages.map(page => page.length), [1, 3, 1, 2]);
+  for (const page of pages) assert.ok(page.length === 1 || page.reduce((a, b) => a + b) <= reconciliationBounds.pageBytes, `${page}`);
   // A page cut by bytes within a bounded call is not its end either.
-  pages = 0;
+  pages = [];
   const bounded = await reconcileIndexes(counting, f.spaceId, 'items', { maxRecords: 5 });
-  assert.deepEqual([pages, bounded.checked, bounded.next], [2, 5, ids[4]]);
+  assert.deepEqual([pages.map(page => page.length), bounded.checked, bounded.next], [[1, 3, 1], 5, ids[4]]);
+  const rest = await reconcileIndexes(counting, f.spaceId, 'items', { after: bounded.next });
+  assert.deepEqual([rest.checked, rest.next], [2, null]);
+});
+
+test('the reconciliation command reads the collection to its end unless bounded, and a bounded clean run exits incomplete', async () => {
+  const f = await fixture();
+  // Past the 10,000 records one call checks by default.
+  await seed(pool, f.spaceId, 'items', 10_050, false);
+  const cli = (...args) => {
+    const run = spawnSync(process.execPath, ['scripts/reconcile-indexes.mjs', '--space', f.spaceId, '--collection', 'items', ...args],
+      { cwd: root, env: { ...process.env, DATABASE_URL: url }, encoding: 'utf8' });
+    return { status: run.status, stderr: run.stderr, report: run.stdout ? JSON.parse(run.stdout) : null };
+  };
+  const clean = cli();
+  assert.deepEqual([clean.status, clean.report.checked, clean.report.next, clean.report.driftCount], [0, 10_050, null, 0], clean.stderr);
+  await damage(`UPDATE record_index_values SET number_value=number_value+1 WHERE space_id=$1 AND collection_id='items'
+    AND record_id='rec_00010040' AND field_name='score'`, [f.spaceId]);
+  // One call with the default bound stops before the drift; the command does not.
+  const prefix = await reconcileIndexes(pool, f.spaceId, 'items');
+  assert.deepEqual([prefix.checked, prefix.next, prefix.driftCount], [reconciliationBounds.defaultRecords, 'rec_00009999', 0]);
+  const whole = cli();
+  assert.deepEqual([whole.status, whole.report.checked, whole.report.after, whole.report.next, whole.report.driftCount,
+    whole.report.fields], [2, 10_050, null, null, 1, ['active', 'at', 'score', 'team']], whole.stderr);
+  assert.deepEqual(reasons(whole.report), [['rec_00010040', 'score', 'value', 'number', 'number']]);
+  // Bounded: a clean prefix exits 3 with where to continue; the continuation finds the drift.
+  const bounded = cli('--max-records', '10000');
+  assert.deepEqual([bounded.status, bounded.report.checked, bounded.report.next, bounded.report.driftCount], [3, 10_000, 'rec_00009999', 0]);
+  const continued = cli('--after', bounded.report.next, '--max-records', '100');
+  assert.deepEqual([continued.status, continued.report.checked, continued.report.next, continued.report.driftCount], [2, 50, null, 1]);
+  const tail = cli('--after', 'rec_00010040');
+  assert.deepEqual([tail.status, tail.report.checked, tail.report.next, tail.report.driftCount], [0, 9, null, 0]);
 });
 
 test('reconciliation checks ready fields only: a field still backfilling is not reported as drift', async () => {
@@ -413,6 +454,78 @@ test('a load failure during a measurement phase (an aggregation, the jobs Worker
     }
     assert.deepEqual(unobserved, []);
   } finally { process.off('unhandledRejection', record); }
+});
+
+test('the measurement script takes its scales in ascending order and writes its report only inside the current directory', async () => {
+  const databases = async () => (await admin("SELECT count(*)::int AS n FROM pg_database WHERE datname LIKE 'stateplane_measure_%'")).rows[0].n;
+  const before = await databases();
+  // The last scale is the one the jobs, reconciliation, mixed load and limits measure: it must be the largest.
+  for (const scales of [[200, 100], [100, 100], []])
+    await assert.rejects(measure({ scales, noise: 0, runs: 1, loadSeconds: 1, writes: 1 }), /scales must be strictly ascending/);
+  const descending = spawnSync(process.execPath, ['scripts/analysis-measure.mjs', '--scales', '500,100', '--noise', '0'],
+    { cwd: root, env: { ...process.env, DATABASE_URL: baseUrl }, encoding: 'utf8' });
+  assert.notEqual(descending.status, 0);
+  assert.match(descending.stderr, /scales must be strictly ascending/);
+  assert.equal(await databases(), before, 'refused before creating a database');
+  // The .invalid host never resolves: reaching a connection would fail with ENOTFOUND, not the destination policy.
+  for (const out of ['../outside-report.json', '/tmp/outside-report.json', '.']) {
+    const run = spawnSync(process.execPath, ['scripts/analysis-measure.mjs', '--scales', '10', '--noise', '0', '--out', out],
+      { cwd: root, env: { ...process.env, DATABASE_URL: 'postgres://u:p@db.example.invalid:5432/stateplane?sslmode=verify-full' },
+        encoding: 'utf8' });
+    assert.notEqual(run.status, 0, out);
+    assert.match(run.stderr, /--out must name a file inside the current directory/, out);
+    assert.doesNotMatch(run.stderr, /ENOTFOUND/, out);
+  }
+});
+
+test('a failed drop of the measurement database never replaces the run\'s own failure, and names the database either way', async () => {
+  const original = { query: pg.Client.prototype.query, create: PostgresSpaces.prototype.create };
+  pg.Client.prototype.query = function (sql, ...rest) {
+    if (typeof sql === 'string' && sql.startsWith('DROP DATABASE')) return Promise.reject(new Error('injected drop failure'));
+    return original.query.call(this, sql, ...rest);
+  };
+  const left = [];
+  try {
+    // The run and the drop both fail: the run's failure is thrown, the drop's attached to it.
+    PostgresSpaces.prototype.create = () => Promise.reject(new Error('injected run failure'));
+    const both = await measure({ scales: [10], noise: 0, runs: 1, loadSeconds: 1, writes: 1 }).then(() => null, error => error);
+    PostgresSpaces.prototype.create = original.create;
+    assert.match(both?.message, /injected run failure/);
+    assert.match(both.cleanup.database, /^stateplane_measure_[0-9a-f]{32}$/);
+    assert.match(both.cleanup.message, new RegExp(`${both.cleanup.database} was not dropped`));
+    assert.match(both.cleanup.cause.message, /injected drop failure/);
+    left.push(both.cleanup.database);
+    // Only the drop fails: its failure is thrown, naming the database.
+    const only = await measure({ scales: [10], noise: 0, runs: 1, loadSeconds: 1, writes: 1, reconciliationOnly: true })
+      .then(() => null, error => error);
+    assert.match(only?.message, /^The measurement database stateplane_measure_[0-9a-f]{32} was not dropped/);
+    assert.match(only.cause.message, /injected drop failure/);
+    left.push(only.database);
+  } finally {
+    pg.Client.prototype.query = original.query;
+    PostgresSpaces.prototype.create = original.create;
+  }
+  const exists = async database => (await admin(`SELECT count(*)::int AS n FROM pg_database WHERE datname='${database}'`)).rows[0].n;
+  for (const database of left) {
+    assert.equal(await exists(database), 1, 'the named database is the one left behind');
+    await admin(`DROP DATABASE ${database} WITH (FORCE)`);
+  }
+});
+
+test('mixed load counts the job result pages committed in its interval, also by a Worker step that returns after it', async () => {
+  const step = PostgresAnalysisWorker.prototype.step;
+  // Each phase step returns 1.5 s after it ends, after the 1 s of interactive reads; its page committed well within them.
+  PostgresAnalysisWorker.prototype.step = async function (options, ...rest) {
+    const result = await step.call(this, options, ...rest);
+    if (options?.budgetMs === 2_000) await new Promise(resolve => setTimeout(resolve, 1_500));
+    return result;
+  };
+  try {
+    const report = await measure({ scales: [300], noise: 0, runs: 1, loadSeconds: 1, writes: 1 });
+    // The phase's export of 300 records is one result page.
+    assert.equal(report.mixedLoad.phases.jobsOnly.jobPagesWritten, 1);
+    assert.equal(report.mixedLoad.phases.alone.jobPagesWritten, 0);
+  } finally { PostgresAnalysisWorker.prototype.step = step; }
 });
 
 test('the measurement script reports plans as issued, the candidate index, jobs, reconciliation, mixed load and limits, and drops its database', async () => {

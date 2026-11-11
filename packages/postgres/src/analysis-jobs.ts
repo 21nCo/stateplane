@@ -13,8 +13,8 @@ import type { Db } from './sources.js';
 import type { PostgresSpaces } from './spaces.js';
 
 /**
- * Protective bounds, each recorded with its measured evidence in
- * docs/analysis-measurements.md#limits (STA-60): per job, 10,000,000 records
+ * Protective bounds, with their evidence (or that a bound is structural and
+ * not measured) in docs/analysis-measurements.md#limits (STA-60): per job, 10,000,000 records
  * scanned, 64 MiB of result pages, 600,000 ms of step time and a 24 h
  * lifetime; at most 8 unfinished jobs per space; pages of at most 1,000
  * records and 1 MiB (the page bound of migration 049); a 30 s lease,

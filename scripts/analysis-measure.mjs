@@ -12,9 +12,12 @@
 //      isolates) at an origin connection limit of 5.
 // The fixture's other space (--noise records) keeps the measured collection a fraction of the shared tables, as in a
 // cell holding many spaces. With --reconciliation-only it seeds the fixture at the largest scale and measures only the
-// reconciliation, --runs times. The report (JSON on stdout, or --out FILE) measures this fixture and this server only; it
-// is no guarantee. The database is dropped at the end, also after a failure.
+// reconciliation, --runs times. The report (JSON on stdout, or --out FILE, a file inside the current directory) measures this
+// fixture and this server only; it is no guarantee. The database is dropped at the end, also after a failure; when the drop
+// itself fails, the run's own failure is still the one thrown, with the undropped database named on it (`cleanup`).
 import { readFile, writeFile } from 'node:fs/promises';
+import { resolve, sep } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { cpus, loadavg } from 'node:os';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -67,15 +70,23 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     if (!Number.isSafeInteger(value) || value < min) throw new RangeError(`--${name} must be an integer of at least ${min}`);
     return value;
   };
+  // The report is written only inside the directory the operator runs from (docs/measurements/ from the repository root).
+  const cwd = process.cwd(), out = options.out === undefined ? null : resolve(cwd, options.out);
+  if (out !== null && !out.startsWith(`${cwd}${sep}`)) throw new RangeError('--out must name a file inside the current directory');
   const settings = { scales: options.scales.split(',').map(text => count(text, 'scales', 1)), noise: count(options.noise, 'noise', 0),
     runs: count(options.runs, 'runs', 1), loadSeconds: count(options['load-seconds'], 'load-seconds', 1),
     writes: count(options.writes, 'writes', 1), reconciliationOnly: options['reconciliation-only'] };
   const text = `${JSON.stringify(await measure(settings), null, 2)}\n`;
-  if (options.out) await writeFile(options.out, text); else process.stdout.write(text);
+  if (out === null) process.stdout.write(text); else await writeFile(out, text);
 }
 
-/** Run every measurement in a disposable database and return the report. */
+/**
+ * Run every measurement in a disposable database and return the report. `scales` must be strictly ascending: the last is
+ * the largest, which the jobs, reconciliation, mixed load and limits measure.
+ */
 export async function measure(settings) {
+  if (!settings.scales.length || settings.scales.some((scale, i) => i > 0 && scale <= settings.scales[i - 1]))
+    throw new RangeError('scales must be strictly ascending');
   const root = fileURLToPath(new URL('..', import.meta.url));
   const password = process.env.DATABASE_URL ? null : (await readFile(new URL('../.data/local-db-password', import.meta.url), 'utf8')).trim();
   const baseUrl = process.env.DATABASE_URL ?? `postgres://stateplane:${encodeURIComponent(password)}@127.0.0.1:${process.env.STATEPLANE_LOCAL_DB_PORT ?? '55432'}/stateplane`;
@@ -92,13 +103,25 @@ export async function measure(settings) {
   await onServer(`CREATE DATABASE ${name}`);
   const pools = [];
   const newPool = max => { const pool = new pg.Pool({ ...database, max }); pool.on('error', () => {}); pools.push(pool); return pool; };
+  let failure = null, result;
   try {
     execFileSync(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: url }, stdio: 'ignore' });
-    return await run(settings, newPool);
-  } finally {
-    await Promise.race([Promise.all(pools.map(pool => pool.end())), new Promise(resolve => setTimeout(resolve, 5_000).unref())]);
-    await onServer(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+    result = await run(settings, newPool);
+  } catch (error) { failure = { error }; }
+  await Promise.race([Promise.all(pools.map(pool => pool.end())), sleep(5_000, undefined, { ref: false })]);
+  let cleanup = null;
+  try { await onServer(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`); } catch (error) {
+    cleanup = Object.assign(new Error(`The measurement database ${name} was not dropped; drop it by hand`, { cause: error }),
+      { database: name });
   }
+  // A failed drop never replaces the run's own failure: it is attached to it.
+  if (failure) {
+    if (cleanup && failure.error !== null && typeof failure.error === 'object') failure.error.cleanup = cleanup;
+    else if (cleanup) process.stderr.write(`${cleanup.message}: ${cleanup.cause}\n`);
+    throw failure.error;
+  }
+  if (cleanup) throw cleanup;
+  return result;
 }
 
 async function run(settings, newPool) {
@@ -297,37 +320,43 @@ async function run(settings, newPool) {
   const loadJobs = new PostgresAnalysisJobs(spaces, new Map([['cell-a', { pool }]]));
   const loadWorker = new PostgresAnalysisWorker(newPool(2), { originConnectionLimit: 5 });
   const heavy = JSON.stringify(SHAPES.byValue);
+  // Result pages are counted as committed, whichever step wrote them and whenever that step returns.
+  const committedPages = async () => Number((await pool.query(`SELECT count(*) AS n FROM analysis_result_pages
+    WHERE space_id=$1 AND collection_id=$2`, [spaceId, collectionId])).rows[0].n);
+  const aggregationLoop = (composed, retryMs, outcomes) => async load => {
+    while (!load.stop) {
+      try { await composed.analysis.aggregate(owner, spaceId, collectionId, heavy); outcomes.answered++; } catch (error) {
+        if (error?.limit !== 'slots' && error?.limit !== 'time') throw error;
+        outcomes.refused++;
+        await sleep(retryMs);
+      }
+    }
+  };
   /**
    * Interactive reads while the given analytical load runs: aggregation loops, each retrying a refusal after `retryMs`, and
-   * jobs Worker steps.
+   * jobs Worker steps. Every outcome is counted over one interval, from the phase's start to the end of its interactive
+   * reads: aggregations answered or refused, and the job result pages committed, in it.
    */
   const phase = async ({ aggregating, stepping, retryMs = 5 }) => {
     let peak = 0;
-    const outcomes = { answered: 0, refused: 0, jobPages: 0 };
+    const outcomes = { answered: 0, refused: 0 };
     if (stepping) await loadJobs.submit(owner, spaceId, collectionId, 'export');
+    const pagesBefore = await committedPages();
     return underLoad([
-      ...(aggregating ? isolates : []).flatMap(composed => Array.from({ length: 6 }, () => async load => {
-        while (!load.stop) {
-          try { await composed.analysis.aggregate(owner, spaceId, collectionId, heavy); outcomes.answered++; }
-          catch (error) {
-            if (error?.limit !== 'slots' && error?.limit !== 'time') throw error;
-            outcomes.refused++;
-            await new Promise(resolve => setTimeout(resolve, retryMs));
-          }
-        }
-      })),
-      ...(stepping ? [async load => { while (!load.stop) outcomes.jobPages += (await loadWorker.step({ budgetMs: 2_000 })).pages; }] : []),
+      ...(aggregating ? isolates : []).flatMap(composed => Array.from({ length: 6 }, () => aggregationLoop(composed, retryMs, outcomes))),
+      ...(stepping ? [async load => { while (!load.stop) await loadWorker.step({ budgetMs: 2_000 }); }] : []),
       async load => {
         while (!load.stop) {
           const running = (await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname=current_database()
             AND state='active' AND query LIKE 'WITH grouped AS%'`)).rows[0].n;
           peak = Math.max(peak, running);
-          await new Promise(resolve => setTimeout(resolve, 5));
+          await sleep(5);
         }
       }], async load => {
       const interactiveReadPairMs = await reads(settings.loadSeconds, () => !load.stop);
-      return { retryAfterRefusalMs: aggregating ? retryMs : null, interactiveReadPairMs, aggregations: { answered: outcomes.answered,
-        refused: outcomes.refused, peakConcurrentStatements: peak }, jobPagesWritten: outcomes.jobPages };
+      const aggregations = { answered: outcomes.answered, refused: outcomes.refused, peakConcurrentStatements: peak };
+      return { retryAfterRefusalMs: aggregating ? retryMs : null, interactiveReadPairMs, aggregations,
+        jobPagesWritten: (await committedPages()) - pagesBefore };
     });
   };
   const phases = { alone: await phase({}), jobsOnly: await phase({ stepping: true }),
@@ -369,7 +398,7 @@ export async function underLoad(loops, body) {
  * Seed `count` fixture records into a collection directly, with their index values and (for `events`) their create
  * events published to the feed, in one transaction per 100,000; returns the seconds taken.
  */
-async function seed(pool, spaceId, collectionId, count, events) {
+export async function seed(pool, spaceId, collectionId, count, events) {
   const started = performance.now();
   for (let start = 0; start < count; start += 100_000) {
     const end = Math.min(count, start + 100_000) - 1, args = [spaceId, collectionId, start, end];
