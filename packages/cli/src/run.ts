@@ -544,17 +544,18 @@ async function runRetrieval(client:StateplaneHttpClient,action:string|undefined,
 /** Aggregations and snapshot jobs of one collection. A spec is the JSON object of --data or --file; a submission
  * sends {kind, spec} as the HTTP body, so every transport passes the service the same request. */
 async function runAnalysis(client:StateplaneHttpClient,action:string|undefined,flags:Flags,collectionPath:string):Promise<unknown> {
-  // A spec is bounded as the service bounds it, alone or in a job request, so a larger one is refused here.
-  const spec=async()=>{
-    const data=await payload(flags,aggregationBody);
+  const spec=async(maxBytes:number)=>{
+    const data=await payload(flags,maxBytes);
     if (!data || typeof data!=='object' || Array.isArray(data)) throw new StateplaneCliError('INVALID_ARGUMENT');
-    return withinWireBudget(data,aggregationBody);
+    return data;
   };
-  if (action==='aggregate') return client.request('POST',`${collectionPath}/aggregate`,await spec());
+  if (action==='aggregate') return client.request('POST',`${collectionPath}/aggregate`,withinWireBudget(await spec(aggregationBody),aggregationBody));
   if (action==='submit') {
     const kind=required(flags,'kind');
-    const request=flags.data===undefined && flags.file===undefined ? {kind} : {kind,spec:await spec()};
-    return client.request('POST',`${collectionPath}/jobs`,withinWireBudget(request,jobBody));
+    const request=withinWireBudget(flags.data===undefined && flags.file===undefined ? {kind} : {kind,spec:await spec(jobBody)},jobBody);
+    // In analysisSubmission's order: the envelope, then the kind, then the re-encoded spec, bounded as an aggregation's.
+    if ((kind==='aggregate' || kind==='export') && 'spec' in request) withinWireBudget(request.spec,aggregationBody);
+    return client.request('POST',`${collectionPath}/jobs`,request);
   }
   const job=`${collectionPath}/jobs/${encoded(required(flags,'job'))}`;
   if (action==='status') return client.request('GET',job);

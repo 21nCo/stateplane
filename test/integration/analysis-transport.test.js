@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -155,10 +155,12 @@ async function caller(t, origin, temp, token, label, spaceId) {
     status: () => lastStatus,
     aggregate: async spec => ({ http: await api('POST', `${collection}/aggregate`, spec), mcp: await mcp('analysis_aggregate', spec),
       cli: await cli(['aggregate', '--data', JSON.stringify(spec)]) }),
-    // The CLI sends {kind} or {kind, spec}; a request it cannot express is compared over HTTP and MCP only.
-    submit: async (request, viaCli = true) => ({ http: await api('POST', `${collection}/jobs`, request), mcp: await mcp('analysis_submit', request),
+    // The CLI sends {kind} or {kind, spec}; a request it cannot express is compared over HTTP and MCP only. `encode` writes
+    // the HTTP body and the CLI's --data as sent; MCP's arguments are objects.
+    submit: async (request, viaCli = true, encode = value => JSON.stringify(value)) => ({
+      http: await api('POST', `${collection}/jobs`, encode(request)), mcp: await mcp('analysis_submit', request),
       ...(viaCli ? { cli: await cli(['submit', '--kind', request.kind,
-        ...(Object.hasOwn(request, 'spec') ? ['--data', JSON.stringify(request.spec)] : [])]) } : {}) }),
+        ...(Object.hasOwn(request, 'spec') ? ['--data', encode(request.spec)] : [])]) } : {}) }),
     jobStatus: async id => ({ http: await api('GET', job(id)), mcp: await mcp('analysis_status', { jobId: id }),
       cli: await cli(['status', '--job', id]) }),
     cancel: async id => ({ http: await api('DELETE', job(id)), mcp: await mcp('analysis_cancel', { jobId: id }),
@@ -318,6 +320,9 @@ test('HTTP, CLI and MCP give one outcome for job submission, status, pages and c
       comparableJob), { error: 'RATE_LIMITED', retryable: false }, `${label} oversized aggregate job`);
     assert.equal(callers[label].status(), 429);
   }
+  // The kind is checked before the spec's size, on every transport.
+  assert.deepEqual(same('unknown kind, oversized spec', await owner.submit({ kind: 'snapshot', spec: oversized }), 'AnalysisJobStatus',
+    comparableJob), { error: 'INVALID_ARGUMENT', retryable: false });
   // The CLI refuses it before sending anything: its endpoint here has nothing listening.
   const offline = join(temp, 'offline');
   await cliRun(offline, ['config', 'endpoint', '--url', 'http://127.0.0.1:9/']);
@@ -370,6 +375,21 @@ test('HTTP, CLI and MCP give one outcome for job submission, status, pages and c
   }
   for (const job of ['anj_not-a-job', `anj_${randomUUID()}`])
     assert.deepEqual(same(`unknown job ${job}`, await owner.jobStatus(job), 'AnalysisJobStatus'), { error: 'NOT_FOUND', retryable: false });
+
+  // The spec bound applies to the re-encoded spec: one sent formatted, over 32,768 bytes as sent but within them re-encoded,
+  // in an envelope within 33,792 bytes, is queued on every transport, from the CLI's --data and --file alike.
+  const wide = { metrics: [{ op: 'count' }], where: Array.from({ length: 4 }, () => ({ field: 'team', kind: 'string', operator: 'in',
+    value: Array.from({ length: 16 }, () => 'x'.repeat(500)) })) };
+  const pretty = value => JSON.stringify(value, null, 2);
+  assert.ok(Buffer.byteLength(JSON.stringify(wide)) <= 32_768 && Buffer.byteLength(pretty(wide)) > 32_768 &&
+    Buffer.byteLength(pretty({ kind: 'aggregate', spec: wide })) <= 33_792);
+  const formatted = await owner.submit({ kind: 'aggregate', spec: wide }, true, pretty);
+  same('formatted spec', formatted, 'AnalysisJobStatus', comparableJob);
+  assert.equal(formatted.http.state, 'queued');
+  const wideFile = join(temp, 'wide.json');
+  await writeFile(wideFile, pretty(wide));
+  assert.equal((await cliRun(join(temp, 'owner'), ['analysis', 'submit', '--kind', 'aggregate', '--file', wideFile, '--collection', 'items']))
+    .state, 'queued', 'a formatted --file spec is queued');
 
   // Cancellation: the first transport cancels and removes the pages; the others report the ended job as it is.
   const [cancellable] = Object.values(await owner.submit({ kind: 'export' }, false)).map(value => value.jobId);
