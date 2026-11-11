@@ -19,8 +19,9 @@ export const reconciliationBounds = Object.freeze({ pageRecords: 1_000, pageByte
  * derives: `missing` (a live record has no row for a ready field),
  * `unexpected` (a deleted record still has one), `kind` or `value` (the row
  * holds another kind or value), or `underivable` (the record writers would not
- * accept the record under the current definition, or its value past the
- * index's byte limit, so it derives no row). A rejected record is underivable
+ * accept the record under the current definition, or its value is past the
+ * index's byte limit or holds a character the database cannot store, so it
+ * derives no row). A rejected record is underivable
  * for the ready fields that explain the rejection (a value outside its field's
  * schema, a required field missing, a null on a non-nullable field), and for
  * every ready field when the rejection is the whole record's: an undeclared
