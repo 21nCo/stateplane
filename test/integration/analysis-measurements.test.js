@@ -560,17 +560,42 @@ test('the report is emitted once: exit 0 when stdout takes it, else the full rep
       return done();
     } });
     if (fail === 'throw') writable.write = () => { throw new Error('injected thrown failure'); };
+    // The failure is only emitted as 'error', on a later tick; the callback is never called.
+    if (fail === 'emitted') writable.write = () => { process.nextTick(() => writable.emit('error', new Error('injected emitted failure'))); return true; };
     return Object.assign(writable, { written });
   };
   const ok = stream(null), quiet = stream(null);
   assert.equal(await emitReport(report, ok, quiet), 0);
   assert.deepEqual([ok.written.join(''), quiet.written.join('')], [text, '']);
-  for (const fail of ['callback', 'throw']) {
+  for (const fail of ['callback', 'throw', 'emitted']) {
     const stdout = stream(fail), stderr = stream(null);
     assert.equal(await emitReport(report, stdout, stderr), 1, fail);
-    assert.equal(stderr.written.join(''), `The report could not be written to stdout (injected ${fail === 'throw' ? 'thrown' : 'callback'} failure); it follows on stderr.\n${text}`, fail);
+    assert.equal(stderr.written.join(''), `The report could not be written to stdout (injected ${{ throw: 'thrown' }[fail] ?? fail} failure); it follows on stderr.\n${text}`, fail);
     assert.deepEqual(stdout.written, [], fail);
   }
+});
+
+test('emitReport leaves no listener of its own on stdout: repeated calls add none, and a later error after a failure is handled', async () => {
+  const report = { kind: 'stateplane.analysis-measurements' };
+  const warnings = [], onWarning = warning => warnings.push(warning.name);
+  process.on('warning', onWarning);
+  try {
+    const sink = () => new Writable({ write(chunk, encoding, done) { done(); } });
+    const stdout = sink(), stderr = sink(), baseline = stdout.listenerCount('error');
+    for (let call = 1; call <= 15; call++) {
+      assert.equal(await emitReport(report, stdout, stderr), 0, `call ${call}`);
+      assert.equal(stdout.listenerCount('error'), baseline, `call ${call}`);
+    }
+    // A failed stream keeps one handler however often it fails, and an 'error' it emits after the call is not unhandled.
+    const broken = new Writable({ write(chunk, encoding, done) { done(new Error('injected callback failure')); } });
+    for (let call = 1; call <= 12; call++) {
+      assert.equal(await emitReport(report, broken, stderr), 1, `failed call ${call}`);
+      assert.equal(broken.listenerCount('error'), 1, `failed call ${call}`);
+      assert.doesNotThrow(() => broken.emit('error', new Error('late failure')), `failed call ${call}`);
+    }
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(warnings.filter(name => name === 'MaxListenersExceededWarning'), []);
+  } finally { process.off('warning', onWarning); }
 });
 
 test('a failed drop of the measurement database never replaces the run\'s own failure, and names the database either way', async () => {

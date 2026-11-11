@@ -78,18 +78,30 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 }
 
 /**
+ * Handles an 'error' a stream emits after its failed write was already reported: the failure is not reported twice. A
+ * declaration, so it exists when the command above reaches emitReport before this module finishes evaluating.
+ */
+function lateError() {}
+
+/**
  * Write the report, as JSON, to `stdout` once. When that write fails (a closed pipe, a full disk behind a redirect) the
  * completed report is not lost: it goes to `stderr` after the reason, and the result is 1, the exit status; otherwise 0.
+ * The call's own 'error' listener is removed once the write settles, so repeated calls on one stream add none; after a
+ * failure the stream keeps one shared handler (added once per stream), so an 'error' it emits later is never unhandled.
  */
 export async function emitReport(report, stdout = process.stdout, stderr = process.stderr) {
   const text = `${JSON.stringify(report, null, 2)}\n`;
   // A failed write may be thrown (a file written synchronously), passed to the callback and emitted as 'error': each is
   // handled, the first decides.
+  let settle;
   const failure = await new Promise(resolve => {
-    stdout.on('error', resolve);
-    try { stdout.write(text, resolve); } catch (error) { resolve(error); }
+    settle = resolve;
+    stdout.on('error', settle);
+    try { stdout.write(text, settle); } catch (error) { settle(error); }
   });
+  stdout.off('error', settle);
   if (!failure) return 0;
+  if (!stdout.listeners('error').includes(lateError)) stdout.on('error', lateError);
   stderr.write(`The report could not be written to stdout (${failure.message ?? failure}); it follows on stderr.\n${text}`);
   return 1;
 }
