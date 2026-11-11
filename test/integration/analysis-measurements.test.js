@@ -8,8 +8,9 @@ import pg from 'pg';
 import { memoryAdapter } from '@superfunctions/db/testing';
 import { createAuthFn, createUser, issueSession } from '@authfn/core';
 import { AuthFnAgentKeys, AuthFnIdentityVerifier } from '../../packages/auth/dist/index.js';
-import { PostgresSpaces, postgresServices, reconcileIndexes, reconciliationBounds } from '../../packages/postgres/dist/index.js';
-import { measure, SHAPES } from '../../scripts/analysis-measure.mjs';
+import { PostgresAggregations, PostgresAnalysisWorker, PostgresSpaces, postgresServices, reconcileIndexes, reconciliationBounds }
+  from '../../packages/postgres/dist/index.js';
+import { measure, SHAPES, underLoad } from '../../scripts/analysis-measure.mjs';
 import { connectionOptions } from '../../scripts/db-connection.mjs';
 
 // STA-60: the typed index reconciliation against records' canonical data, and the measurement script's report. The
@@ -209,6 +210,54 @@ test('reconciliation expects what the writers accept: a stored value they would 
   assert.deepEqual(reasons(report).sort(order), expected.sort(order));
 });
 
+test('reconciliation validates the whole record as the writers do: a whole-record constraint is never split across fields', async () => {
+  const f = await fixture();
+  const define = async (collectionId, root) => {
+    await services.collections.define(f.owner, f.spaceId, collectionId, JSON.stringify({ slug: collectionId, version: 1, schema: {
+      $schema: schema.$schema, type: 'object', additionalProperties: false, properties: { score: { type: 'number' } }, ...root },
+    unique: [], filterable: ['score'], sortable: [] }));
+    await services.collections.backfill(f.owner, f.spaceId, collectionId, 'score');
+    return (await services.records.mutate(f.owner, f.spaceId, collectionId, JSON.stringify({ idempotencyKey: randomUUID(),
+      operation: 'create', data: { score: 1 } }))).ref.id;
+  };
+  // A root enum the record satisfies, with a required field: the writers accepted it, so it reconciles clean.
+  await define('accepted', { required: ['score'], enum: [{ score: 1 }] });
+  const accepted = await reconcileIndexes(pool, f.spaceId, 'accepted');
+  assert.deepEqual([accepted.checked, accepted.driftCount, accepted.drift], [1, 0, []]);
+  // A root enum the damaged record leaves although its field is valid alone, with the row a faulty writer would derive.
+  const id = await define('rejected', { enum: [{}, { score: 1 }] });
+  const where = `space_id=$1 AND collection_id='rejected' AND record_id=$2`;
+  await damage(`UPDATE records SET canonical_data='{"score":2}' WHERE ${where}`, [f.spaceId, id]);
+  await damage(`UPDATE record_index_values SET number_value=2 WHERE ${where} AND field_name='score'`, [f.spaceId, id]);
+  const rejected = await reconcileIndexes(pool, f.spaceId, 'rejected');
+  assert.deepEqual([rejected.driftCount, reasons(rejected)], [1, [[id, 'score', 'underivable', null, null]]]);
+});
+
+test('reconciliation pages are bounded by canonical data bytes as well as records, and continue to the collection\'s end', async () => {
+  const f = await fixture();
+  const ids = [];
+  // About 300 kB each: a 1 MiB page holds four.
+  for (let n = 0; n < 6; n++) ids.push(await f.write({ operation: 'create', data: { team: `t${n}`, note: String(n).repeat(300_000) } }));
+  ids.sort();
+  let pages = 0;
+  const counting = { connect: async () => {
+    const client = await pool.connect();
+    return new Proxy(client, { get(object, property) {
+      if (property !== 'query') return typeof object[property] === 'function' ? object[property].bind(object) : object[property];
+      return (sql, values) => {
+        if (typeof sql === 'string' && sql.startsWith('SET TRANSACTION')) pages++;
+        return object.query(sql, values);
+      };
+    } });
+  } };
+  const all = await reconcileIndexes(counting, f.spaceId, 'items');
+  assert.deepEqual([pages, all.checked, all.next, all.driftCount], [2, 6, null, 0]);
+  // A page cut by bytes within a bounded call is not its end either.
+  pages = 0;
+  const bounded = await reconcileIndexes(counting, f.spaceId, 'items', { maxRecords: 5 });
+  assert.deepEqual([pages, bounded.checked, bounded.next], [2, 5, ids[4]]);
+});
+
 test('reconciliation checks ready fields only: a field still backfilling is not reported as drift', async () => {
   const f = await fixture();
   for (let n = 0; n < 5; n++) await f.write({ operation: 'create', data: { team: `t${n}`, note: `n${n}` } });
@@ -278,6 +327,92 @@ test('the measurement script refuses a server URL outside the TLS policy before 
     assert.match(run.stderr, message, target);
     assert.doesNotMatch(run.stderr, /ENOTFOUND|ECONNREFUSED/, target);
   }
+});
+
+test('a measurement load failure stops the phase and every loop, is thrown once they settle, and never goes unobserved', async () => {
+  const unobserved = [];
+  const record = reason => unobserved.push(reason);
+  process.on('unhandledRejection', record);
+  try {
+    for (const failing of [0, 1, 2]) {
+      const settled = [];
+      const failure = new Error(`load ${failing}`);
+      const loop = n => async load => {
+        try {
+          for (let round = 0; !load.stop; round++) {
+            await new Promise(resolve => setTimeout(resolve, 2));
+            if (n === failing && round === 3) throw failure;
+          }
+        } finally { settled.push(n); }
+      };
+      let bodyStopped = false;
+      await assert.rejects(underLoad([loop(0), loop(1), loop(2)], async load => {
+        while (!load.stop) await new Promise(resolve => setTimeout(resolve, 2));
+        bodyStopped = true;
+        return 'never returned';
+      }), failure);
+      assert.ok(bodyStopped, 'the body saw the stop');
+      assert.deepEqual(settled.sort(), [0, 1, 2], 'every loop settled before the failure was thrown');
+    }
+    // A failure of the body stops the loops the same way.
+    const settled = [];
+    await assert.rejects(underLoad([async load => { try { while (!load.stop) await new Promise(r => setTimeout(r, 2)); } finally { settled.push(0); } }],
+      async () => { throw new Error('body'); }), /body/);
+    assert.deepEqual(settled, [0]);
+    assert.equal(await underLoad([async () => {}], async () => 'answered'), 'answered');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(unobserved, []);
+  } finally { process.off('unhandledRejection', record); }
+});
+
+test('a load failure during a measurement phase (an aggregation, the jobs Worker step, the monitor) fails the run and still drops its database', async () => {
+  const databases = async () => (await admin("SELECT count(*)::int AS n FROM pg_database WHERE datname LIKE 'stateplane_measure_%'")).rows[0].n;
+  const before = await databases();
+  const unobserved = [];
+  const record = reason => unobserved.push(reason);
+  process.on('unhandledRejection', record);
+  const originals = { aggregate: PostgresAggregations.prototype.aggregateSerialized, step: PostgresAnalysisWorker.prototype.step,
+    query: pg.Pool.prototype.query };
+  // Phases are the only callers of the pg_stat_activity monitor and of 2 s Worker steps; aggregations fail only once a phase runs.
+  let inPhase = false;
+  const monitor = sql => typeof sql === 'string' && sql.includes('FROM pg_stat_activity');
+  const faults = {
+    aggregation: () => {
+      pg.Pool.prototype.query = function (sql, ...rest) { if (monitor(sql)) inPhase = true; return originals.query.call(this, sql, ...rest); };
+      PostgresAggregations.prototype.aggregateSerialized = function (...args) {
+        if (inPhase) return Promise.reject(new Error('injected aggregation failure'));
+        return originals.aggregate.apply(this, args);
+      };
+    },
+    step: () => {
+      PostgresAnalysisWorker.prototype.step = function (options, ...rest) {
+        if (options?.budgetMs === 2_000) return Promise.reject(new Error('injected step failure'));
+        return originals.step.call(this, options, ...rest);
+      };
+    },
+    monitor: () => {
+      pg.Pool.prototype.query = function (sql, ...rest) {
+        if (monitor(sql)) return Promise.reject(new Error('injected monitor failure'));
+        return originals.query.call(this, sql, ...rest);
+      };
+    }
+  };
+  try {
+    for (const [name, inject] of Object.entries(faults)) {
+      inPhase = false;
+      inject();
+      try {
+        await assert.rejects(measure({ scales: [60], noise: 0, runs: 1, loadSeconds: 1, writes: 1 }),
+          new RegExp(`injected ${name} failure`));
+      } finally {
+        PostgresAggregations.prototype.aggregateSerialized = originals.aggregate;
+        PostgresAnalysisWorker.prototype.step = originals.step;
+        pg.Pool.prototype.query = originals.query;
+      }
+      assert.equal(await databases(), before, `${name}: the run's database is dropped`);
+    }
+    assert.deepEqual(unobserved, []);
+  } finally { process.off('unhandledRejection', record); }
 });
 
 test('the measurement script reports plans as issued, the candidate index, jobs, reconciliation, mixed load and limits, and drops its database', async () => {

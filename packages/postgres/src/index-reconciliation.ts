@@ -6,23 +6,28 @@ import type { CollectionDefinition, Json, SchemaNode } from './schema.js';
 
 /**
  * Bounds of one reconciliation call (docs/analysis-measurements.md#reconciliation):
- * pages of 1,000 records, each one read-only snapshot; 10,000 records per call
- * unless `maxRecords` says otherwise (at most 1,000,000); at most 100 drift
- * samples reported, every drifted row counted.
+ * pages of at most 1,000 records and 1 MiB of canonical data (at least one
+ * record), as snapshot job pages, each one read-only snapshot; 10,000 records
+ * per call unless `maxRecords` says otherwise (at most 1,000,000); at most 100
+ * drift samples reported, every drifted row counted.
  */
-export const reconciliationBounds = Object.freeze({ pageRecords: 1_000, defaultRecords: 10_000, maxRecords: 1_000_000, samples: 100 });
+export const reconciliationBounds = Object.freeze({ pageRecords: 1_000, pageBytes: 1_048_576, defaultRecords: 10_000,
+  maxRecords: 1_000_000, samples: 100 });
 
 /**
  * One typed index row that differs from what the record's canonical data
  * derives: `missing` (a live record has no row for a ready field),
  * `unexpected` (a deleted record still has one), `kind` or `value` (the row
  * holds another kind or value), or `underivable` (the record writers would not
- * accept the stored value under the current definition, so it derives no row:
- * a value outside its field's schema, a required field missing, a null on a
- * non-nullable field, or one past the index's byte limit; for every ready
- * field when the rest of the record is not accepted either, such as an
- * undeclared property, a required field missing outside the ready fields, or
- * canonical data that is not a JSON object). Kinds only, never values.
+ * accept the record under the current definition, or its value past the
+ * index's byte limit, so it derives no row). A rejected record is underivable
+ * for the ready fields that explain the rejection (a value outside its field's
+ * schema, a required field missing, a null on a non-nullable field), and for
+ * every ready field when the rejection is the whole record's: an undeclared
+ * property, a field outside the ready ones invalid or required and missing, a
+ * whole-record constraint such as a root `enum`, or canonical data that is not
+ * a JSON object. A record the writers accept is never underivable for a schema
+ * reason. Kinds only, never values.
  */
 export interface IndexDrift {
   recordId: string; field: string; reason: 'missing' | 'unexpected' | 'kind' | 'value' | 'underivable';
@@ -75,9 +80,14 @@ export async function reconcileIndexes(pool: PoolLike, spaceId: string, collecti
       const fields: string[] = (await db.query(`SELECT field_name FROM collection_index_declarations
         WHERE space_id=$1 AND collection_id=$2 AND ready ORDER BY field_name COLLATE "C"`, [spaceId, collectionId])).rows
         .map(row => row.field_name);
-      const records = (await db.query(`SELECT record_id,tombstone,canonical_data FROM records
-        WHERE space_id=$1 AND collection_id=$2 AND ($3::text IS NULL OR record_id>$3) ORDER BY record_id LIMIT $4`,
-      [spaceId, collectionId, cursor, limit])).rows;
+      // At most `limit` records and, past the first, pageBytes of canonical data (octet_length reads the stored size only).
+      const records = (await db.query(`SELECT record_id,tombstone,canonical_data,fetched FROM (
+          SELECT record_id,tombstone,canonical_data,sum(octet_length(COALESCE(canonical_data,''))) OVER (ORDER BY record_id) AS running,
+            count(*) OVER () AS fetched FROM (
+            SELECT record_id,tombstone,canonical_data FROM records
+            WHERE space_id=$1 AND collection_id=$2 AND ($3::text IS NULL OR record_id>$3) ORDER BY record_id LIMIT $4) x
+        ) y WHERE running-octet_length(COALESCE(canonical_data,''))<$5 ORDER BY record_id`,
+      [spaceId, collectionId, cursor, limit, reconciliationBounds.pageBytes])).rows;
       const drift: IndexDrift[] = [];
       const expected: IndexValue[] = [], owners: string[] = [];
       for (const record of records) {
@@ -128,26 +138,34 @@ export async function reconcileIndexes(pool: PoolLike, spaceId: string, collecti
           : row.expected_kind !== row.actual_kind ? 'kind' : 'value';
         drift.push({ recordId: row.record_id, field: row.field_name, reason, expectedKind: row.expected_kind, actualKind: row.actual_kind });
       }
-      return { fields, records: records.length, last: records.length ? records[records.length - 1].record_id as string : null, drift };
+      // A full page, or one cut by its byte bound, is not known to be the collection's end.
+      const fetched = records.length ? Number(records[0].fetched) : 0;
+      const more = fetched === limit || fetched > records.length;
+      return { fields, records: records.length, more, last: records.length ? records[records.length - 1].record_id as string : null, drift };
     });
     // A declaration that turned ready during the call was not checked on its earlier pages: list only fields every page checked.
     result.fields = result.checked ? result.fields.filter(field => page.fields.includes(field)) : page.fields;
     result.checked += page.records;
     result.driftCount += page.drift.length;
     for (const item of page.drift) if (result.drift.length < reconciliationBounds.samples) result.drift.push(item);
-    if (page.records < limit) { result.next = null; return result; }
+    if (!page.more) { result.next = null; return result; }
     cursor = page.last;
     if (result.checked >= maxRecords) { result.next = cursor; return result; }
   }
 }
 
 /**
- * The ready fields whose stored value the record writers would reject under the current definition, validated as they
- * validate it (`validateParsedValue`): each ready field against its own schema (a missing one only when required); every
- * ready field when the rest of the record is rejected (an undeclared property, a required field missing, an invalid value
- * of a field not checked here). Definitions only add optional fields, so data a writer accepted stays accepted.
+ * The ready fields of a record the writers would reject under the current definition, validated as they validate it
+ * (`validateParsedValue` of the whole record): none when the record is accepted. A rejected record is attributed to the
+ * ready fields that fail their own schema (a missing one only when required) when the root holds only per-field
+ * constraints and the rest of the record is accepted; otherwise (a root `enum`, an undeclared property, a field outside
+ * the ready ones invalid or required and missing) to every ready field. Definitions only add optional fields, so data a
+ * writer accepted stays accepted.
  */
 function rejectedFields(data: Record<string, Json>, schema: SchemaNode, fields: string[]): Set<string> {
+  try { validateParsedValue(data, schema); return new Set(); } catch { /* attributed below */ }
+  // A whole-record constraint cannot be attributed to fields: the record is rejected as a whole.
+  if (Object.hasOwn(schema, 'enum')) return new Set(fields);
   const required = schema.required ?? [], properties = schema.properties ?? {};
   try {
     // fromEntries keeps a `__proto__` member an own property, as the parsed data holds it.
@@ -162,5 +180,6 @@ function rejectedFields(data: Record<string, Json>, schema: SchemaNode, fields: 
       else if (required.includes(field)) rejected.add(field);
     } catch { rejected.add(field); }
   }
-  return rejected;
+  // A rejection no ready field explains is the whole record's.
+  return rejected.size ? rejected : new Set(fields);
 }

@@ -1,7 +1,7 @@
 {
   "contractVersion": "1",
   "kind": "stateplane.analysis-reconciliation-measurements",
-  "measuredAt": "2026-11-11T03:19:46.773Z",
+  "measuredAt": "2026-11-11T03:54:26.194Z",
   "note": "Measurements of this fixture on this server only; not guarantees.",
   "environment": {
     "server": "PostgreSQL 17.11 (Debian 17.11-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
@@ -12,14 +12,14 @@
       "cpus": 8,
       "loadAverage": {
         "start": [
-          3.41,
-          4.961,
-          5.315
+          3.898,
+          3.098,
+          3.617
         ],
         "end": [
-          3.379,
-          4.501,
-          5.068
+          8.241,
+          8.712,
+          6.125
         ]
       }
     }
@@ -39,7 +39,7 @@
     "runs": 3
   },
   "reconciliation": {
-    "seedSeconds": 114.357,
+    "seedSeconds": 139.832,
     "runs": [
       {
         "records": 500000,
@@ -50,8 +50,8 @@
           "team"
         ],
         "driftCount": 0,
-        "seconds": 10.384,
-        "recordsPerSecond": 48150.686
+        "seconds": 11.012,
+        "recordsPerSecond": 45406.208
       },
       {
         "records": 500000,
@@ -62,8 +62,8 @@
           "team"
         ],
         "driftCount": 0,
-        "seconds": 9.598,
-        "recordsPerSecond": 52092.445
+        "seconds": 11.177,
+        "recordsPerSecond": 44735.41
       },
       {
         "records": 500000,
@@ -74,8 +74,8 @@
           "team"
         ],
         "driftCount": 0,
-        "seconds": 9.766,
-        "recordsPerSecond": 51196.903
+        "seconds": 11.546,
+        "recordsPerSecond": 43304.144
       }
     ]
   }

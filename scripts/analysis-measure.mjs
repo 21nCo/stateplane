@@ -302,12 +302,12 @@ async function run(settings, newPool) {
    * jobs Worker steps.
    */
   const phase = async ({ aggregating, stepping, retryMs = 5 }) => {
-    let stop = false, peak = 0;
+    let peak = 0;
     const outcomes = { answered: 0, refused: 0, jobPages: 0 };
     if (stepping) await loadJobs.submit(owner, spaceId, collectionId, 'export');
-    const load = [
-      ...(aggregating ? isolates : []).flatMap(composed => Array.from({ length: 6 }, async () => {
-        while (!stop) {
+    return underLoad([
+      ...(aggregating ? isolates : []).flatMap(composed => Array.from({ length: 6 }, () => async load => {
+        while (!load.stop) {
           try { await composed.analysis.aggregate(owner, spaceId, collectionId, heavy); outcomes.answered++; }
           catch (error) {
             if (error?.limit !== 'slots' && error?.limit !== 'time') throw error;
@@ -316,20 +316,19 @@ async function run(settings, newPool) {
           }
         }
       })),
-      ...(stepping ? [(async () => { while (!stop) outcomes.jobPages += (await loadWorker.step({ budgetMs: 2_000 })).pages; })()] : []),
-      (async () => {
-        while (!stop) {
+      ...(stepping ? [async load => { while (!load.stop) outcomes.jobPages += (await loadWorker.step({ budgetMs: 2_000 })).pages; }] : []),
+      async load => {
+        while (!load.stop) {
           const running = (await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname=current_database()
             AND state='active' AND query LIKE 'WITH grouped AS%'`)).rows[0].n;
           peak = Math.max(peak, running);
           await new Promise(resolve => setTimeout(resolve, 5));
         }
-      })()];
-    try {
-      const interactiveReadPairMs = await reads(settings.loadSeconds);
+      }], async load => {
+      const interactiveReadPairMs = await reads(settings.loadSeconds, () => !load.stop);
       return { retryAfterRefusalMs: aggregating ? retryMs : null, interactiveReadPairMs, aggregations: { answered: outcomes.answered,
         refused: outcomes.refused, peakConcurrentStatements: peak }, jobPagesWritten: outcomes.jobPages };
-    } finally { stop = true; await Promise.all(load); }
+    });
   };
   const phases = { alone: await phase({}), jobsOnly: await phase({ stepping: true }),
     aggregationsOnly: await phase({ aggregating: true }), aggregationsBackingOff: await phase({ aggregating: true, retryMs: 250 }),
@@ -345,6 +344,25 @@ async function run(settings, newPool) {
     mixedLoad: { originConnectionLimit: 5, analyticalSlots: analyticalSlots(5), isolates: 2, interactivePoolPerIsolate: 2,
       aggregationLoopsPerIsolate: 6, records: largest.records, phases },
     limits: limits(scales, [exportJob, aggregateJob]) };
+}
+
+/**
+ * Run `body` while every load loop runs until `stop` is set; each gets and the body gets the same `{ stop }`. The first
+ * failure of a loop sets `stop` at once, so the body and the other loops end, and is thrown once every loop has settled; a
+ * failure of the body does the same. No loop's failure goes unobserved, so the caller's cleanup (dropping the run's
+ * database) always runs.
+ */
+export async function underLoad(loops, body) {
+  const load = { stop: false };
+  let failed = null;
+  const fail = error => { failed ??= { error }; load.stop = true; };
+  const settled = Promise.all(loops.map(loop => Promise.resolve().then(() => loop(load)).catch(fail)));
+  let result;
+  try { result = await body(load); } catch (error) { fail(error); }
+  load.stop = true;
+  await settled;
+  if (failed) throw failed.error;
+  return result;
 }
 
 /**
