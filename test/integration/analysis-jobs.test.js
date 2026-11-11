@@ -830,3 +830,48 @@ test('exports page in record ID byte order whatever the database collation, stra
   assert.deepEqual(two.status.manifest, one.status.manifest);
   assert.deepEqual(two.pages.map(page => page.page), one.pages.map(page => page.page));
 });
+
+test('a materialized result states exact while nothing was written after its watermark and stale once anything was (STA-60)', async () => {
+  const f = await fixture();
+  const other = `other-${randomUUID().slice(0, 8)}`;
+  await services.collections.define(f.owner, f.spaceId, other, JSON.stringify({ slug: other, version: 1, schema, unique: [],
+    filterable: [], sortable: [] }));
+  const ids = [...(await f.bulk(generic(40))).keys()];
+  const spec = JSON.stringify({ groupBy: [{ field: 'team' }], metrics: [{ op: 'count' }] });
+  const job = await services.analysis.submit(f.owner, f.spaceId, 'items', 'aggregate', spec);
+  assert.equal(job.freshness.state, 'exact', 'a job is exact when submitted');
+  assert.equal(job.freshness.latestPosition, job.boundary.watermark);
+  await drain();
+  const fresh = await result(f.owner, f.spaceId, job.jobId);
+  const interactive = await services.analysis.aggregate(f.owner, f.spaceId, 'items', spec);
+  assert.deepEqual(JSON.parse(fresh.pages[0].page.content).groups, interactive.groups, 'an exact result equals the live answer');
+  for (const reply of [fresh.status, fresh.pages[0]]) {
+    assert.deepEqual({ ...reply.freshness, checkedAt: undefined }, { state: 'exact', checkedAt: undefined,
+      latestPosition: job.boundary.watermark, unpublished: false, schemaVersion: 1 });
+    assert.ok(Math.abs(Date.parse(reply.freshness.checkedAt) - Date.now()) < 60_000);
+  }
+  assert.equal(interactive.freshness.state, 'exact');
+  assert.equal(interactive.freshness.checkedAt, interactive.snapshot.takenAt);
+  // A write to another collection of the space leaves it exact.
+  await services.records.mutate(f.owner, f.spaceId, other, JSON.stringify({ idempotencyKey: randomUUID(), operation: 'create', data: {} }));
+  await services.events.list(f.owner, f.spaceId, other);
+  assert.equal((await services.analysis.status(f.owner, f.spaceId, 'items', job.jobId)).freshness.state, 'exact');
+  // A committed write not yet published to the feed makes it stale at once, before any position passes the watermark.
+  await f.write({ operation: 'delete', id: ids[0], expectedRevision: 1 });
+  const pending = (await services.analysis.status(f.owner, f.spaceId, 'items', job.jobId)).freshness;
+  assert.deepEqual([pending.state, pending.unpublished, pending.latestPosition], ['stale', true, job.boundary.watermark]);
+  // Once published, it stays stale by position; the result itself is unchanged, exact as of its watermark.
+  await services.events.list(f.owner, f.spaceId, 'items');
+  const published = await services.analysis.page(f.owner, f.spaceId, 'items', job.jobId, 1);
+  assert.equal(published.freshness.state, 'stale');
+  assert.equal(published.freshness.unpublished, false);
+  assert.ok(published.freshness.latestPosition > job.boundary.watermark);
+  assert.equal(published.page.content, fresh.pages[0].page.content);
+  // A job pinned after that write is exact again, until the collection's schema version changes.
+  const later = await services.analysis.submit(f.owner, f.spaceId, 'items', 'export');
+  assert.equal(later.freshness.state, 'exact');
+  await services.collections.revise(f.owner, f.spaceId, 'items', 1, JSON.stringify({ slug: 'items', version: 2,
+    schema: { ...schema, properties: { ...schema.properties, extra: { type: 'string' } } }, unique: [], filterable: INDEXED, sortable: ['score'] }));
+  const revised = (await services.analysis.status(f.owner, f.spaceId, 'items', later.jobId)).freshness;
+  assert.deepEqual([revised.state, revised.schemaVersion, revised.unpublished], ['stale', 2, false]);
+});

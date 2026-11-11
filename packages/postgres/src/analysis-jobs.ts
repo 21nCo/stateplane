@@ -13,12 +13,13 @@ import type { Db } from './sources.js';
 import type { PostgresSpaces } from './spaces.js';
 
 /**
- * Initial protective bounds, not measured capacity (STA-61 records them with
- * evidence): per job, 10,000,000 records scanned, 64 MiB of result pages,
- * 600,000 ms of step time and a 24 h lifetime; at most 8 unfinished jobs per
- * space; pages of at most 1,000 records and 1 MiB (the page bound of
- * migration 049); a 30 s lease, extended by every page; event publication
- * before pinning in rounds of 5,000 events, at most 20 rounds per submission.
+ * Protective bounds, each recorded with its measured evidence in
+ * docs/analysis-measurements.md#limits (STA-60): per job, 10,000,000 records
+ * scanned, 64 MiB of result pages, 600,000 ms of step time and a 24 h
+ * lifetime; at most 8 unfinished jobs per space; pages of at most 1,000
+ * records and 1 MiB (the page bound of migration 049); a 30 s lease,
+ * extended by every page; event publication before pinning in rounds of
+ * 5,000 events, at most 20 rounds per submission.
  */
 export const analysisJobBounds = Object.freeze({ budgetRecords: 10_000_000, budgetBytes: 67_108_864, budgetRuntimeMs: 600_000,
   lifetimeMs: 86_400_000, activePerSpace: 8, pageRecords: 1_000, pageBytes: 1_048_576, maxPages: 10_000, leaseMs: 30_000,
@@ -33,11 +34,24 @@ export interface AnalysisBoundary {
   watermark: number; records: 'as-of-watermark';
   schemaVersion: number; policyVersion: number; placementGeneration: number; capability: Capability; specDigest: string;
 }
+/**
+ * Whether a job's records are still the collection's, read when the status or
+ * page is: `exact` when no write to the collection was published past the
+ * watermark, none awaits publication and the schema version is the one
+ * pinned, as of `checkedAt` (the reading statement's snapshot); otherwise
+ * `stale`: the result is exact as of its watermark only, and later writes are
+ * not in it. `latestPosition` is the collection's last published feed position
+ * (0 before its first), `unpublished` whether committed events await
+ * publication, `schemaVersion` the collection's current one.
+ */
+export interface AnalysisFreshness {
+  state: 'exact' | 'stale'; checkedAt: string; latestPosition: number; unpublished: boolean; schemaVersion: number;
+}
 export interface AnalysisManifest { pageCount: number; rowCount: number; byteSize: number; resultSha256: string;
   format: 'application/x-ndjson' | 'application/json' }
 export interface AnalysisJobStatus {
   jobId: string; kind: AnalysisJobKind; state: AnalysisJobState; failureCode: string | null;
-  spec: unknown; boundary: AnalysisBoundary;
+  spec: unknown; boundary: AnalysisBoundary; freshness: AnalysisFreshness;
   progress: { recordsScanned: number; runtimeMs: number; attempts: number; pagesWritten: number };
   budgets: { records: number; bytes: number; runtimeMs: number };
   createdAt: string; startedAt: string | null; finishedAt: string | null; expiresAt: string;
@@ -46,7 +60,7 @@ export interface AnalysisJobStatus {
   complete: boolean;
 }
 export interface AnalysisPage {
-  jobId: string; boundary: AnalysisBoundary; manifest: AnalysisManifest;
+  jobId: string; boundary: AnalysisBoundary; freshness: AnalysisFreshness; manifest: AnalysisManifest;
   page: { number: number; rowOffset: number; rowCount: number; byteOffset: number; byteSize: number; sha256: string; content: string };
   complete: true;
 }
@@ -70,7 +84,12 @@ const cutShort = (error: unknown) => error instanceof DeadlineExceededError;
 const STATUS = `SELECT j.*,CASE WHEN j.state IN ${ACTIVE} AND j.expires_at<=clock_timestamp() THEN 'expired' ELSE j.state END AS effective,
     (SELECT count(*) FROM analysis_result_pages p WHERE p.space_id=j.space_id AND p.collection_id=j.collection_id
       AND p.job_id=j.job_id)::int AS pages_written,
-    m.page_count,m.row_count AS manifest_rows,m.byte_size AS manifest_bytes,m.result_sha256
+    m.page_count,m.row_count AS manifest_rows,m.byte_size AS manifest_bytes,m.result_sha256,
+    (SELECT COALESCE(max(f.position),0) FROM record_event_feed f WHERE f.space_id=j.space_id
+      AND f.collection_id=j.collection_id)::text AS latest_position,
+    EXISTS (SELECT 1 FROM record_event_pending q WHERE q.space_id=j.space_id AND q.collection_id=j.collection_id) AS unpublished,
+    (SELECT c.schema_version FROM collections c WHERE c.space_id=j.space_id AND c.collection_id=j.collection_id) AS current_schema_version,
+    statement_timestamp() AS checked_at
   FROM analysis_jobs j LEFT JOIN analysis_result_manifests m
     ON m.space_id=j.space_id AND m.collection_id=j.collection_id AND m.job_id=j.job_id
   WHERE j.space_id=$1 AND j.collection_id=$2 AND j.job_id=$3`;
@@ -86,10 +105,17 @@ function manifest(row: Row): AnalysisManifest | null {
   return { pageCount: Number(row.page_count), rowCount: Number(row.manifest_rows), byteSize: Number(row.manifest_bytes),
     resultSha256: row.result_sha256, format: row.kind === 'export' ? 'application/x-ndjson' : 'application/json' };
 }
+/** The job's records against the collection's now (`STATUS` reads both in one statement). */
+function freshness(row: Row): AnalysisFreshness {
+  const latestPosition = Number(row.latest_position), schemaVersion = Number(row.current_schema_version);
+  const exact = latestPosition <= Number(row.watermark) && row.unpublished === false && schemaVersion === Number(row.schema_version);
+  return { state: exact ? 'exact' : 'stale', checkedAt: iso(row.checked_at)!, latestPosition, unpublished: row.unpublished === true,
+    schemaVersion };
+}
 function view(row: Row): AnalysisJobStatus {
   const sealed = manifest(row);
   return { jobId: row.job_id, kind: row.kind, state: row.effective, failureCode: row.failure_code ?? null,
-    spec: JSON.parse(row.canonical_spec), boundary: boundary(row),
+    spec: JSON.parse(row.canonical_spec), boundary: boundary(row), freshness: freshness(row),
     progress: { recordsScanned: Number(row.records_scanned), runtimeMs: Number(row.runtime_ms), attempts: Number(row.attempts),
       pagesWritten: Number(row.pages_written ?? 0) },
     budgets: { records: Number(row.budget_records), bytes: Number(row.budget_bytes), runtimeMs: Number(row.budget_runtime_ms) },
@@ -262,7 +288,7 @@ export class PostgresAnalysisJobs {
         [spaceId, collectionId, `anj_${randomUUID()}`, kind, scope.principalId, actor.credentialId, capability, scope.policyVersion,
           scope.placementGeneration, watermark, canonical, sha256(canonical), analysisJobBounds.budgetRecords,
           analysisJobBounds.budgetBytes, analysisJobBounds.budgetRuntimeMs, analysisJobBounds.lifetimeMs])).rows[0];
-        return { value: view({ ...inserted, effective: inserted.state, pages_written: 0 }),
+        return { value: view((await db.query(STATUS, [spaceId, collectionId, inserted.job_id])).rows[0]),
           deadline: await finalCheck(this.spaces, db, actor, admitted.ownerPrincipalId, scope, capability) };
       });
       if (submitted) return released(submitted);
@@ -314,7 +340,7 @@ export class PostgresAnalysisJobs {
       const page = (await db.query(`SELECT page_number,row_offset,row_count,byte_offset,byte_size,content_sha256,content
         FROM analysis_result_pages WHERE space_id=$1 AND collection_id=$2 AND job_id=$3 AND page_number=$4`, [...key, pageNumber])).rows[0];
       if (!page) throw new AuthorityError('NOT_FOUND', `The result has ${sealed.pageCount} pages`);
-      return { jobId: row.job_id, boundary: boundary(row), manifest: sealed, complete: true as const,
+      return { jobId: row.job_id, boundary: boundary(row), freshness: freshness(row), manifest: sealed, complete: true as const,
         page: { number: page.page_number, rowOffset: Number(page.row_offset), rowCount: page.row_count,
           byteOffset: Number(page.byte_offset), byteSize: page.byte_size, sha256: page.content_sha256, content: page.content } };
     });
