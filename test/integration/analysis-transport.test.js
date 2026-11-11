@@ -320,6 +320,10 @@ test('HTTP, CLI and MCP give one outcome for job submission, status, pages and c
       comparableJob), { error: 'RATE_LIMITED', retryable: false }, `${label} oversized aggregate job`);
     assert.equal(callers[label].status(), 429);
   }
+  // The size is checked before the spec's shape: an oversized array or string is RATE_LIMITED too, for either kind.
+  for (const spec of [['x'.repeat(32_950)], 'x'.repeat(32_950)]) for (const kind of ['aggregate', 'export'])
+    assert.deepEqual(same(`oversized ${Array.isArray(spec) ? 'array' : 'string'} ${kind}`, await owner.submit({ kind, spec }),
+      'AnalysisJobStatus', comparableJob), { error: 'RATE_LIMITED', retryable: false });
   // The kind is checked before the spec's size, on every transport.
   assert.deepEqual(same('unknown kind, oversized spec', await owner.submit({ kind: 'snapshot', spec: oversized }), 'AnalysisJobStatus',
     comparableJob), { error: 'INVALID_ARGUMENT', retryable: false });

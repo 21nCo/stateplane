@@ -552,9 +552,12 @@ async function runAnalysis(client:StateplaneHttpClient,action:string|undefined,f
   if (action==='aggregate') return client.request('POST',`${collectionPath}/aggregate`,withinWireBudget(await spec(aggregationBody),aggregationBody));
   if (action==='submit') {
     const kind=required(flags,'kind');
-    const request=withinWireBudget(flags.data===undefined && flags.file===undefined ? {kind} : {kind,spec:await spec(jobBody)},jobBody);
-    // In analysisSubmission's order: the envelope, then the kind, then the re-encoded spec, bounded as an aggregation's.
-    if ((kind==='aggregate' || kind==='export') && 'spec' in request) withinWireBudget(request.spec,aggregationBody);
+    const request=withinWireBudget(flags.data===undefined && flags.file===undefined ? {kind} : {kind,spec:await payload(flags,jobBody)},jobBody);
+    // In analysisSubmission's order: the envelope, the kind, the re-encoded spec's size (an aggregation's), then its shape.
+    if ((kind==='aggregate' || kind==='export') && 'spec' in request) {
+      const data=withinWireBudget(request.spec,aggregationBody);
+      if (!data || typeof data!=='object' || Array.isArray(data)) throw new StateplaneCliError('INVALID_ARGUMENT');
+    }
     return client.request('POST',`${collectionPath}/jobs`,request);
   }
   const job=`${collectionPath}/jobs/${encoded(required(flags,'job'))}`;
