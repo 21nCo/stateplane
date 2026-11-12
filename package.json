@@ -38,6 +38,7 @@
     "db:grant-event-feed": "node scripts/grant-event-feed.mjs",
     "db:grant-evidence": "node scripts/grant-evidence.mjs",
     "db:grant-outbox": "node scripts/grant-outbox.mjs",
+    "db:grant-portability": "node scripts/grant-portability.mjs",
     "db:grant-retrieval": "node scripts/grant-retrieval.mjs",
     "db:outbox": "node scripts/outbox.mjs",
     "db:index-race-smoke": "node scripts/migration-index-race-smoke.mjs",
