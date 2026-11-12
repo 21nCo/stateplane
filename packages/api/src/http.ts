@@ -1,15 +1,15 @@
 import type { StateplaneServices } from '@stateplane/application';
-import { TransportFailure, classifyError } from '@stateplane/application';
+import { TransportFailure, analysisAggregation, analysisSubmission, classifyError } from '@stateplane/application';
 import type { IdentityVerifier } from '@stateplane/auth';
 import type { VerifiedCredential } from '@stateplane/contracts';
-import { isSafeHttpRead, parseV1Path } from '@stateplane/contracts';
+import { analysisBounds, isSafeHttpRead, parseV1Path } from '@stateplane/contracts';
 
 const headers = { 'Cache-Control':'no-store', 'Content-Type':'application/json; charset=utf-8' };
 const status:Record<string,number> = {
   INVALID_ARGUMENT:400,SCHEMA_INVALID:400,SCHEMA_UNSUPPORTED:400,SCHEMA_BREAKING:400,CURSOR_INVALID:400,
   UNAUTHENTICATED:401,FORBIDDEN:403,NOT_FOUND:404,SPACE_UNAVAILABLE:423,
   REVISION_CONFLICT:409,UNIQUE_CONFLICT:409,KEY_RESERVED:409,LINK_RESTRICTED:409,
-  IDEMPOTENCY_MISMATCH:409,SCHEMA_CONFLICT:409,BATCH_CONFLICT:409,BATCH_CANCELLED:409,RECEIPT_EXPIRED:409,
+  IDEMPOTENCY_MISMATCH:409,SCHEMA_CONFLICT:409,CONFLICT:409,BATCH_CONFLICT:409,BATCH_CANCELLED:409,RECEIPT_EXPIRED:409,
   RECEIPT_PENDING:503,PROVIDER_UNAVAILABLE:503,BACKPRESSURE:503,RATE_LIMITED:429,
   COMMIT_OUTCOME_UNKNOWN:503,STALE_PLACEMENT:503
 };
@@ -185,7 +185,31 @@ async function collectionRoute(services:StateplaneServices,actor:VerifiedCredent
     return json(await services.events.list(...prefix,url.searchParams.get('cursor')??undefined));
   if (p[4]==='projections' && p.length===5 && request.method==='GET')
     return json(await services.retrieval.status(...prefix));
+  if (p[4]==='aggregate' && p.length===5 && request.method==='POST')
+    return aggregateRoute(services,request,prefix);
+  if (p[4]==='jobs') return jobsRoute(services,p,request,prefix);
   return evidenceRoute(services,p,request,url,prefix);
+}
+/** An interactive aggregation. An analysis body is read as sent up to analysisBounds.bodyBytes (RATE_LIMITED beyond)
+ * and is null when it does not parse; the shared checks then measure its compact text, nesting and values before admission. */
+async function aggregateRoute(services:StateplaneServices,req:Request,prefix:Prefix):Promise<Response> {
+  return json(await services.analysis.aggregate(...prefix,analysisAggregation(await request(req,analysisBounds.bodyBytes))));
+}
+/** Snapshot analysis and export jobs: submit, status, cancel and result pages, each reauthorized by the service. */
+async function jobsRoute(services:StateplaneServices,p:string[],req:Request,prefix:Prefix):Promise<Response> {
+  if (p.length===5 && req.method==='POST') {
+    const {kind,spec}=analysisSubmission(await request(req,analysisBounds.bodyBytes));
+    return json(await services.analysis.submit(...prefix,kind,spec),202);
+  }
+  const job=p[5];
+  if (p.length===6 && req.method==='GET') return json(await services.analysis.status(...prefix,job));
+  if (p.length===6 && req.method==='DELETE') return json(await services.analysis.cancel(...prefix,job));
+  if (p.length===8 && p[6]==='pages' && req.method==='GET') {
+    // A page number that is not a canonical decimal integer is NaN, which the service refuses.
+    const page=integer(p[7]);
+    return json(await services.analysis.page(...prefix,job,typeof page==='number' ? page : Number.NaN));
+  }
+  return fail('NOT_FOUND');
 }
 type Prefix = readonly [VerifiedCredential, string, string];
 /* Body budgets. A text, claim or correction holds up to 1 MiB of text plus its

@@ -4,6 +4,7 @@ import { open, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { readConfig, saveConfig, configureToken, loadToken, logoutConfig, removeTrackedTokens, withConfigMutation } from './config.js';
 import type { CliConfig } from './config.js';
+import { admitAggregation, admitAnalysisJob, analysisBounds } from '@stateplane/contracts';
 import { StateplaneCliError, StateplaneHttpClient } from './transport.js';
 import type { Deadline } from './transport.js';
 
@@ -96,6 +97,10 @@ const allowed:Record<string,readonly string[]>={
   'events list':['space','collection','cursor'],
   'retrieval search':['space','data','file'], 'retrieval bundle':['space','data','file'],
   'retrieval status':['space','collection'],
+  'analysis aggregate':['space','collection','data','file'],
+  'analysis submit':['space','collection','kind','data','file'],
+  'analysis status':['space','collection','job'], 'analysis cancel':['space','collection','job'],
+  'analysis page':['space','collection','job','page'],
   ...evidenceCommands
 };
 function validateFlags(resource:string,action:string|undefined,flags:Flags):void {
@@ -157,14 +162,20 @@ async function input(path:string,maxBytes:number,keepBom=false):Promise<string> 
 /** The JSON of --data or --file, at most maxBytes: by default the record and
  * schema budget; an evidence command passes its route's body budget. */
 async function payload(flags:Flags,maxBytes=1_048_576):Promise<unknown> {
+  return parsed(await payloadText(flags,maxBytes));
+}
+/** The text of --data or --file, at most maxBytes. */
+async function payloadText(flags:Flags,maxBytes:number):Promise<string> {
   if (flags.data!==undefined && flags.file!==undefined) throw new StateplaneCliError('INVALID_ARGUMENT');
   const text=flags.file!==undefined ? await input(required(flags,'file'),maxBytes) : required(flags,'data');
   if (Buffer.byteLength(text)>maxBytes) throw new StateplaneCliError('RATE_LIMITED',undefined,undefined,false);
-  return parsed(text);
+  return text;
 }
 function withinWireBudget<T>(value:T,maxBytes:number):T {
-  // Match StateplaneHttpClient's JSON serialization for every JSON value.
-  const serialized=JSON.stringify(value);
+  // Match StateplaneHttpClient's JSON serialization for every JSON value. One it cannot serialize (nested past the
+  // stack) is refused as invalid, never reported as a retryable failure.
+  let serialized:string|undefined;
+  try { serialized=JSON.stringify(value); } catch { throw new StateplaneCliError('INVALID_ARGUMENT'); }
   if (serialized===undefined) throw new StateplaneCliError('INVALID_ARGUMENT');
   if (Buffer.byteLength(serialized)>maxBytes)
     throw new StateplaneCliError('RATE_LIMITED',undefined,undefined,false);
@@ -180,7 +191,7 @@ function endpoint(value:string):string {
 }
 function output(value:unknown):void { process.stdout.write(JSON.stringify(value)+'\n'); }
 function help():void {
-  output({usage:'stateplane <config|auth|spaces|collections|records|batches|events|sources|uploads|claims|links|retrieval> <command> [--space ID] [--collection ID] [options]',
+  output({usage:'stateplane <config|auth|spaces|collections|records|batches|events|sources|uploads|claims|links|retrieval|analysis> <command> [--space ID] [--collection ID] [options]',
     docs:'See docs/http-cli.md for examples and recovery rules.'});
 }
 
@@ -517,6 +528,7 @@ async function runCollectionResource(client:StateplaneHttpClient,resource:string
   if (resource==='records') return runRecords(client,action,flags,`${collectionPath}/records`);
   if (resource==='batches') return runBatches(client,action,flags,collectionPath);
   if (['sources','uploads','claims','links'].includes(resource)) return runEvidence(client,resource,action,flags,collectionPath);
+  if (resource==='analysis') return runAnalysis(client,action,flags,collectionPath);
   if (resource==='events' && action==='list') {
     const suffix=flags.cursor!==undefined ? `?cursor=${encoded(cursor(flags))}` : '';
     return client.request('GET',`${collectionPath}/events${suffix}`);
@@ -531,6 +543,39 @@ async function runRetrieval(client:StateplaneHttpClient,action:string|undefined,
   const data=await payload(flags,retrievalBody);
   if (!data || typeof data!=='object' || Array.isArray(data)) throw new StateplaneCliError('INVALID_ARGUMENT');
   return client.request('POST',`${spacePath}/${action==='search' ? 'search' : 'bundles'}`,withinWireBudget(data,retrievalBody));
+}
+
+/** Aggregations and snapshot jobs of one collection. A spec is the JSON of --data or --file; a submission sends
+ * {kind, spec} as the HTTP body. Before sending, the text given is bounded as the HTTP body it stands for (the spec, or
+ * the spec in its envelope) by the bound HTTP reads (RATE_LIMITED), and text that does not parse is null, as over HTTP;
+ * then the checks HTTP and MCP make before admission (@stateplane/contracts) decide, so every transport refuses a
+ * request alike. */
+async function runAnalysis(client:StateplaneHttpClient,action:string|undefined,flags:Flags,collectionPath:string):Promise<unknown> {
+  const refuse=(code:string):never=>{ throw new StateplaneCliError(code,undefined,undefined,false); };
+  const given=async(maxBytes:number,around=(text:string)=>text):Promise<unknown>=>{
+    const text=await payloadText(flags,maxBytes);
+    if (Buffer.byteLength(around(text))>maxBytes) refuse('RATE_LIMITED');
+    try { return JSON.parse(text); } catch { return null; }
+  };
+  if (action==='aggregate') {
+    const spec=await given(analysisBounds.bodyBytes);
+    const admitted=admitAggregation(spec);
+    if ('refused' in admitted) return refuse(admitted.refused);
+    return client.request('POST',`${collectionPath}/aggregate`,spec);
+  }
+  if (action==='submit') {
+    const kind=required(flags,'kind');
+    const request=flags.data===undefined && flags.file===undefined ? {kind}
+      : {kind,spec:await given(analysisBounds.bodyBytes,text=>`{"kind":${JSON.stringify(kind)},"spec":${text}}`)};
+    const admitted=admitAnalysisJob(request);
+    if ('refused' in admitted) return refuse(admitted.refused);
+    return client.request('POST',`${collectionPath}/jobs`,request);
+  }
+  const job=`${collectionPath}/jobs/${encoded(required(flags,'job'))}`;
+  if (action==='status') return client.request('GET',job);
+  if (action==='cancel') return client.request('DELETE',job);
+  if (action==='page') return client.request('GET',`${job}/pages/${encoded(required(flags,'page'))}`);
+  throw new StateplaneCliError('INVALID_ARGUMENT');
 }
 
 /** Capture endpoint, selected space and token as one cross-process snapshot. */

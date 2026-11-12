@@ -1707,3 +1707,97 @@ test('search, bundle and projection status reach their services over HTTP and CL
   }
   assert.deepEqual(calls,[]);
 });
+
+test('aggregations and analysis jobs reach their services over HTTP and CLI, reads failing as reads and writes as writes',async t=>{
+  const state=fixture();
+  const calls=[];
+  let fault=null;
+  const record=(name,result)=>async(_actor,...args)=>{
+    calls.push([name,...args]);
+    if (fault) { const error=fault; fault=null; throw error; }
+    return result;
+  };
+  state.services.analysis={aggregate:record('aggregate',{groups:[],complete:true}),submit:record('submit',{jobId:'anj_1',state:'queued'}),
+    status:record('status',{jobId:'anj_1',state:'running'}),cancel:record('cancel',{jobId:'anj_1',state:'cancelled'}),
+    page:record('page',{jobId:'anj_1',complete:true})};
+  const handler=createHttpHandler(state);
+  const {server,endpoint}=await serve(handler);
+  t.after(()=>server.close());
+  const http=async(method,path,body,type='application/json')=>{
+    const response=await handler(new Request(`https://stateplane.example.invalid${path}`,{method,
+      headers:{Authorization:'Bearer secret-test-token',...(body===undefined?{}:{'Content-Type':type})},body}));
+    return [response.status,await response.json(),response.headers.get('Retry-After')];
+  };
+  const collection='/v1/spaces/sp_a/collections/entries';
+  const spec='{"groupBy":[{"field":"team"}], "metrics":[{"op":"count"}]}';
+  assert.deepEqual(await http('POST',`${collection}/aggregate`,spec),[200,{groups:[],complete:true},null]);
+  assert.deepEqual((await http('POST',`${collection}/jobs`,JSON.stringify({kind:'aggregate',spec:JSON.parse(spec)})))[0],202);
+  await http('POST',`${collection}/jobs`,'{"kind":"export"}');
+  await http('GET',`${collection}/jobs/anj_1`);
+  await http('DELETE',`${collection}/jobs/anj_1`);
+  await http('GET',`${collection}/jobs/anj_1/pages/2`);
+  await http('GET',`${collection}/jobs/anj_1/pages/02`);
+  // An aggregation spec and a job's spec reach the service in the compact form every transport measures.
+  assert.deepEqual(calls,[['aggregate','sp_a','entries','{"groupBy":[{"field":"team"}],"metrics":[{"op":"count"}]}'],['submit','sp_a','entries','aggregate','{"groupBy":[{"field":"team"}],"metrics":[{"op":"count"}]}'],
+    ['submit','sp_a','entries','export',undefined],['status','sp_a','entries','anj_1'],['cancel','sp_a','entries','anj_1'],
+    ['page','sp_a','entries','anj_1',2],['page','sp_a','entries','anj_1',Number.NaN]]);
+  calls.length=0;
+  // A job request that is not {kind, spec?} is refused before any service call, as an unknown kind is.
+  for (const body of ['{','[]','{"kind":"snapshot"}','{"kind":"export","extra":1}','{"spec":{}}']) {
+    const [status,response]=await http('POST',`${collection}/jobs`,body);
+    assert.deepEqual([status,response.error.code,response.error.retryable],[400,'INVALID_ARGUMENT',false],body);
+  }
+  assert.deepEqual(calls,[]);
+  // A statement cancellation: a read's retryable RATE_LIMITED, a submission's or cancellation's unknown outcome.
+  for (const [method,path,body,expected] of [['POST',`${collection}/aggregate`,spec,[429,'RATE_LIMITED',true,'1']],
+    ['GET',`${collection}/jobs/anj_1`,undefined,[429,'RATE_LIMITED',true,'1']],
+    ['GET',`${collection}/jobs/anj_1/pages/1`,undefined,[429,'RATE_LIMITED',true,'1']],
+    ['POST',`${collection}/jobs`,'{"kind":"export"}',[503,'COMMIT_OUTCOME_UNKNOWN',false,null]],
+    ['DELETE',`${collection}/jobs/anj_1`,undefined,[503,'COMMIT_OUTCOME_UNKNOWN',false,null]]]) {
+    fault=Object.assign(new Error('private cause'),{code:'57014'});
+    const [status,response,retryAfter]=await http(method,path,body);
+    assert.deepEqual([status,response.error.code,response.error.retryable,retryAfter],expected,`${method} ${path}`);
+  }
+  // A job without a complete result is a stable 409 CONFLICT, not a retryable provider failure.
+  fault=Object.assign(new Error('The job has no complete result (state running)'),{code:'CONFLICT'});
+  const conflict=await http('GET',`${collection}/jobs/anj_1/pages/1`);
+  assert.deepEqual([conflict[0],conflict[1].error.code,conflict[1].error.retryable,conflict[1].error.message],[409,'CONFLICT',false,'CONFLICT']);
+  for (const [path,size] of [['aggregate',32_769],['jobs',33_793]]) {
+    const oversized=await http('POST',`${collection}/${path}`,`{"kind":"export","x":"${'x'.repeat(size)}"}`);
+    assert.deepEqual([oversized[0],oversized[1].error.code,oversized[1].error.retryable],[429,'RATE_LIMITED',false],path);
+  }
+  for (const [method,path] of [['GET',`${collection}/aggregate`],['PUT',`${collection}/jobs`],['POST',`${collection}/jobs/anj_1`],
+    ['GET',`${collection}/jobs/anj_1/pages`],['GET',`${collection}/jobs/anj_1/results/1`]])
+    assert.equal((await http(method,path,method==='GET'?undefined:'{}'))[1].error.code,'NOT_FOUND',`${method} ${path}`);
+  calls.length=0;
+
+  const root=await mkdtemp(join(tmpdir(),'stateplane-cli-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  const cli=(argv,input)=>cliProcess(root,argv,input);
+  assert.equal((await cli(['config','endpoint','--url',endpoint])).status,0);
+  assert.equal((await cliProcess(root,['auth','import','--token-stdin','--store','file'],'secret-test-token\n')).status,0);
+  assert.equal((await cli(['spaces','select','--space','sp_a'])).status,0);
+  const file=join(root,'spec.json');
+  await writeFile(file,spec);
+  const c=['--collection','entries'];
+  const outputs=[await cli(['analysis','aggregate',...c,'--file',file]),await cli(['analysis','submit',...c,'--kind','export']),
+    await cli(['analysis','submit',...c,'--kind','aggregate','--data',spec]),await cli(['analysis','status',...c,'--job','anj_1']),
+    await cli(['analysis','cancel',...c,'--job','anj_1']),await cli(['analysis','page',...c,'--job','anj_1','--page','3'])];
+  for (const output of outputs) assert.equal(output.status,0,output.stderr);
+  assert.deepEqual(JSON.parse(outputs[0].stdout),{groups:[],complete:true});
+  const compact='{"groupBy":[{"field":"team"}],"metrics":[{"op":"count"}]}';
+  assert.deepEqual(calls,[['aggregate','sp_a','entries',compact],['submit','sp_a','entries','export',undefined],
+    ['submit','sp_a','entries','aggregate',compact],['status','sp_a','entries','anj_1'],['cancel','sp_a','entries','anj_1'],
+    ['page','sp_a','entries','anj_1',3]]);
+  calls.length=0;
+  // A spec that is not a JSON object, a missing collection, job or kind, or an unknown flag fails locally before any HTTP call.
+  for (const argv of [['analysis','aggregate',...c,'--data','[1]'],['analysis','aggregate','--data','{}'],['analysis','submit',...c],
+    ['analysis','submit',...c,'--kind','aggregate','--data','"x"'],['analysis','status',...c],['analysis','page',...c,'--job','anj_1'],
+    ['analysis','status',...c,'--job','anj_1','--page','1'],['analysis','export',...c]]) {
+    const failed=await cli(argv);
+    assert.equal(JSON.parse(failed.stderr).error.code,'INVALID_ARGUMENT',argv.join(' '));
+  }
+  const oversized=await cli(['analysis','aggregate',...c,'--data',JSON.stringify({metrics:[{op:'count'}],x:'x'.repeat(32_768)})]);
+  assert.deepEqual([JSON.parse(oversized.stderr).error.code,JSON.parse(oversized.stderr).error.retryable],['RATE_LIMITED',false]);
+  assert.deepEqual(calls,[]);
+});

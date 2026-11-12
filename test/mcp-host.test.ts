@@ -4,16 +4,23 @@ import { beforeEach, expect, it, vi } from 'vitest';
  * which endpoint and services each /mcp request used; the real endpoint's
  * scope handling is covered by test/mcp.test.js. */
 const state = vi.hoisted(() => ({ endpoints: 0, pools: 0, ended: 0, resources: [] as string[],
+  poolOptions: [] as Array<{ max?: number }>, listeners: [] as Array<Map<string, (value: unknown) => void>>, cells: [] as Array<Map<string, { pool: unknown; analytics?: { pool: unknown; originConnectionLimit: number } }>>,
   scopes: [] as Array<{ services: unknown; identity: unknown; onTimeout?: () => void }>,
   services: [] as unknown[], http: null as null | ((request: Request) => Response) }));
 vi.mock('pg', () => ({ default: { Pool: class {
-  constructor() { state.pools++; }
-  on() { return this; }
+  readonly listeners = new Map<string, (value: unknown) => void>();
+  constructor(options: { max?: number }) { state.pools++; state.poolOptions.push(options); state.listeners.push(this.listeners); }
+  on(event: string, listener: (value: unknown) => void) { this.listeners.set(event, listener); return this; }
   async end() { state.ended++; }
 } } }));
 vi.mock('../packages/postgres/dist/index.js', () => ({
   PostgresSpaces: class {},
-  postgresServices: () => { const services = { request: state.services.length + 1 }; state.services.push(services); return services; }
+  // Not the real slots (1 at a limit of 5), so the test sees the host size its analytical pool by this function.
+  analyticalSlots: (limit: number) => ({ cell: limit === 5 ? 3 : 0, space: 1 }),
+  postgresServices: (_spaces: unknown, cells: (typeof state.cells)[number]) => {
+    state.cells.push(cells);
+    const services = { request: state.services.length + 1 }; state.services.push(services); return services;
+  }
 }));
 vi.mock('../packages/api/dist/index.js', () => ({ createHttpHandler: () => async (request: Request) =>
   state.http ? state.http(request) : new Response(null, { status: 204 }) }));
@@ -232,4 +239,50 @@ it('a Worker page render shares one host and pool, which the hook retires after 
   expect(state.pools - before.pools).toBe(2);
   event.locals.hostLease?.retire();
   expect(state.ended - before.ended).toBe(2);
+});
+
+it('a host gives aggregations an analytical pool of their own only for a valid origin connection limit, and ends it too', async () => {
+  for (const [limit, expected] of [['5', 3], [undefined, null], ['4', null], ['21', null], ['5.5', null], ['x', null]] as const) {
+    const before = { pools: state.pools, ended: state.ended, cells: state.cells.length };
+    await stateplaneHost({ ...env, STATEPLANE_ORIGIN_CONNECTION_LIMIT: limit } as never)!.http(new Request('https://preview.example/v1/spaces'));
+    const cell = state.cells[before.cells].get('cell-a')!;
+    if (expected === null) {
+      expect(cell.analytics, String(limit)).toBeUndefined();
+      expect(state.pools - before.pools).toBe(1);
+      continue;
+    }
+    expect(cell.analytics!.originConnectionLimit).toBe(5);
+    expect(cell.analytics!.pool).not.toBe(cell.pool);
+    expect(state.poolOptions.at(-1)!.max).toBe(expected);
+    // Both pools are this request's and both end with it.
+    expect([state.pools - before.pools, state.ended - before.ended]).toEqual([2, 2]);
+  }
+});
+
+it('a query on either pool that the provider never answers has its socket destroyed at the same deadline', async () => {
+  vi.useFakeTimers();
+  try {
+    const before = state.listeners.length;
+    await stateplaneHost({ ...env, STATEPLANE_ORIGIN_CONNECTION_LIMIT: '5' } as never)!.http(new Request('https://preview.example/v1/spaces'));
+    const [interactive, analytical] = state.listeners.slice(before);
+    expect(analytical, 'the analytical pool').toBeDefined();
+    for (const [label, listeners] of [['interactive', interactive], ['analytical', analytical]] as const) {
+      // A client whose provider went silent: a query settles only when its socket is destroyed.
+      let fail: (error: Error) => void = () => {};
+      const destroy = vi.fn((error: Error) => fail(error));
+      const client = { on: () => client, connection: { stream: { destroy } },
+        query: (sql: string) => sql === 'SELECT 1' ? Promise.resolve({ rows: [] }) : new Promise((_, reject) => { fail = reject; }) };
+      listeners.get('connect')!(client);
+      expect(listeners.has('error'), `${label} pool errors are consumed`).toBe(true);
+      // An answered query clears its deadline.
+      await client.query('SELECT 1');
+      const stalled = client.query('SELECT pg_sleep(60)').catch((error: Error) => error);
+      await vi.advanceTimersByTimeAsync(6_999);
+      expect(destroy, label).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(destroy, label).toHaveBeenCalledTimes(1);
+      // The caller's query rejects, so it releases the client and the retired pool can end.
+      expect(((await stalled) as Error).name, label).toBe('HostProviderTimeoutError');
+    }
+  } finally { vi.useRealTimers(); }
 });

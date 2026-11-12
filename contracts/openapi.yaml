@@ -536,6 +536,102 @@ paths:
       responses:
         '200': { description: Projection status, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectionStatus' } } } }
         default: { $ref: '#/components/responses/Error' }
+  /v1/spaces/{spaceId}/collections/{collectionId}/aggregate:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
+    post:
+      operationId: aggregateRecords
+      description: >-
+        Counts, exact decimal sums, derived averages and exact extremes over
+        the collection's live records matching every predicate, grouped by
+        up to 3 ready declared index fields (a date-time field only by a
+        time bucket in an IANA zone), in one statement snapshot on analytical
+        capacity apart from interactive reads. Needs records:read, checked
+        before the spec is validated; a field that is not a ready declared
+        index is SCHEMA_CONFLICT. Every group is returned or none: more than
+        maxGroups groups, more than 262,144 bytes of groups or more than
+        5,000 ms of statement time is RATE_LIMITED with retryable false. No
+        free analytical slot is BACKPRESSURE (retryable); a cell without
+        analytical capacity is PROVIDER_UNAVAILABLE with retryable false.
+        The body is at most 32,768 bytes in compact JSON with its literals
+        kept, and 262,144 bytes as sent (RATE_LIMITED, retryable false,
+        beyond); then a body that does not parse, nests more than 16 levels,
+        is not an object, or holds a number that overflows (such as 1e400),
+        is INVALID_ARGUMENT, all before the collection is authorized. A safe
+        read: repeat it after a retryable error.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AggregationSpec' } } } }
+      responses:
+        '200': { description: Every group from one statement snapshot, content: { application/json: { schema: { $ref: '#/components/schemas/AggregationResult' } } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/spaces/{spaceId}/collections/{collectionId}/jobs:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' } ]
+    post:
+      operationId: submitAnalysisJob
+      description: >-
+        Queues a snapshot job over the collection as of a watermark pinned
+        now: an export (needs export:read) of every record live at the
+        watermark as NDJSON pages, or an aggregate (needs records:read) of
+        an AggregationSpec over those records. Pages derive from that
+        boundary however long the job runs. A request that is not
+        {kind, spec?}, or names another kind, is INVALID_ARGUMENT before
+        admission; the spec's fields are checked after it. A space with 8
+        unfinished jobs is BACKPRESSURE (retryable). Not idempotent: after
+        COMMIT_OUTCOME_UNKNOWN submit again; a job whose ID was lost runs
+        and expires 24 hours after submission. The body is at most 33,792
+        bytes in compact JSON with its literals kept, and 262,144 bytes as
+        sent (RATE_LIMITED, retryable false, beyond); a body that does not
+        parse, is not {kind, spec?} or names another kind is
+        INVALID_ARGUMENT; then the spec, as for an aggregation: its compact
+        JSON is at most 32,768 bytes (RATE_LIMITED), and a spec that nests
+        more than 16 levels, is not an object, or holds a number that
+        overflows (such as 1e400), is INVALID_ARGUMENT. All of these are checked, in this order, before
+        the collection is authorized.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AnalysisJobRequest' } } } }
+      responses:
+        '202': { description: The queued job, content: { application/json: { schema: { $ref: '#/components/schemas/AnalysisJobStatus' } } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/spaces/{spaceId}/collections/{collectionId}/jobs/{jobId}:
+    parameters: [ { $ref: '#/components/parameters/spaceId' }, { $ref: '#/components/parameters/collectionId' }, { $ref: '#/components/parameters/jobId' } ]
+    get:
+      operationId: getAnalysisJob
+      description: >-
+        The job's state, failure code, progress, budgets, boundary and
+        freshness, and its manifest once, and only once, the result is
+        complete. Reauthorized at every read for the job's capability: a
+        job is found only by the credential that submitted it (any owner
+        session for the owner's jobs), and a revoked key, another key or
+        an unknown job is NOT_FOUND.
+      responses:
+        '200': { description: Job status, content: { application/json: { schema: { $ref: '#/components/schemas/AnalysisJobStatus' } } } }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      operationId: cancelAnalysisJob
+      description: >-
+        Cancels a queued or running job: it ends cancelled and its pages are
+        removed at once. A job past its expiry ends expired; a completed or
+        ended job is reported as it is, so a repeat after
+        COMMIT_OUTCOME_UNKNOWN is safe. Reauthorized as a status read.
+      responses:
+        '200': { description: Job status after cancellation, content: { application/json: { schema: { $ref: '#/components/schemas/AnalysisJobStatus' } } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/spaces/{spaceId}/collections/{collectionId}/jobs/{jobId}/pages/{page}:
+    parameters:
+      - { $ref: '#/components/parameters/spaceId' }
+      - { $ref: '#/components/parameters/collectionId' }
+      - { $ref: '#/components/parameters/jobId' }
+      - { name: page, in: path, required: true, schema: { type: integer, minimum: 1, maximum: 10000 } }
+    get:
+      operationId: getAnalysisPage
+      description: >-
+        One page, 1 to the manifest's pageCount, of a complete, unexpired
+        result, with its boundary, manifest and freshness, reauthorized at
+        this fetch. An export with no record live at the watermark is
+        complete with pageCount 0 and no page. A job without a complete result is CONFLICT (its status
+        says why), a page outside the manifest NOT_FOUND, and a page number
+        that is not an integer from 1 to 10,000 INVALID_ARGUMENT. Page
+        content is untrusted stored data.
+      responses:
+        '200': { description: One result page, content: { application/json: { schema: { $ref: '#/components/schemas/AnalysisPage' } } } }
+        default: { $ref: '#/components/responses/Error' }
 components:
   schemas:
     SpaceLifecycle:
@@ -1244,6 +1340,241 @@ components:
                     lastError: { type: [string, 'null'] }
                     backfilledAt: { $ref: '#/components/schemas/NullableInstant' }
                     verifiedAt: { $ref: '#/components/schemas/NullableInstant' }
+    AggregationSpec:
+      type: object
+      required: [metrics]
+      additionalProperties: false
+      properties:
+        where: { type: array, maxItems: 16, items: { $ref: '#/components/schemas/Predicate' }, description: Typed predicates on ready filterable fields, combined with AND. }
+        groupBy:
+          type: array
+          maxItems: 3
+          description: Up to 3 distinct fields; one group of every matching record when omitted or empty.
+          items:
+            type: object
+            required: [field]
+            additionalProperties: false
+            properties:
+              field: { $ref: '#/components/schemas/AggregationField' }
+              bucket: { $ref: '#/components/schemas/AggregationBucket' }
+        metrics:
+          type: array
+          minItems: 1
+          maxItems: 16
+          items:
+            oneOf:
+              - { type: object, required: [op], additionalProperties: false, properties: { op: { const: count } } }
+              - { type: object, required: [op, field], additionalProperties: false, properties: { op: { enum: [sum, avg, min, max] }, field: { $ref: '#/components/schemas/AggregationField' } } }
+        maxGroups: { type: integer, minimum: 1, maximum: 1000, description: 100 when omitted. }
+    AggregationField: { type: string, minLength: 1, pattern: '^(?:[^\u0000\uD800-\uDFFF]|[\uD800-\uDBFF][\uDC00-\uDFFF])+$', description: A ready declared index field. }
+    AggregationBucket:
+      type: object
+      required: [unit, timeZone]
+      additionalProperties: false
+      description: Required for a date-time field and refused for any other.
+      properties:
+        unit: { enum: [hour, day, week, month, quarter, year] }
+        timeZone: { type: string, minLength: 1, maxLength: 64, pattern: '^[A-Za-z][A-Za-z0-9_+-]*(?:/[A-Za-z0-9_+-]+)*$', description: An IANA zone name; one that is also a fixed-offset abbreviation (CET, EST) is refused. }
+    AggregationKind: { enum: [string, number, boolean, date-time] }
+    AggregationResult:
+      type: object
+      required: [source, collection, snapshot, freshness, groupBy, metrics, groups, complete]
+      additionalProperties: false
+      properties:
+        source:
+          type: object
+          required: [spaceId, collectionId, records, where, policyVersion, placementGeneration]
+          additionalProperties: false
+          properties:
+            spaceId: { type: string }
+            collectionId: { type: string }
+            records: { const: live }
+            where: { type: array, items: { $ref: '#/components/schemas/Predicate' } }
+            policyVersion: { type: integer, minimum: 1 }
+            placementGeneration: { type: integer, minimum: 1 }
+        collection:
+          type: object
+          required: [schemaVersion, fields]
+          additionalProperties: false
+          properties:
+            schemaVersion: { type: integer, minimum: 1 }
+            fields:
+              type: array
+              items:
+                type: object
+                required: [field, kind, acceptedVersion]
+                additionalProperties: false
+                properties:
+                  field: { type: string }
+                  kind: { $ref: '#/components/schemas/AggregationKind' }
+                  acceptedVersion: { type: integer, minimum: 1 }
+        snapshot:
+          type: object
+          required: [scope, takenAt]
+          additionalProperties: false
+          properties:
+            scope: { const: statement }
+            takenAt: { $ref: '#/components/schemas/Instant' }
+        freshness:
+          type: object
+          required: [state, checkedAt]
+          additionalProperties: false
+          properties:
+            state: { const: exact }
+            checkedAt: { $ref: '#/components/schemas/Instant' }
+        groupBy:
+          type: array
+          items:
+            type: object
+            required: [field, kind, bucket, semantics]
+            additionalProperties: false
+            properties:
+              field: { type: string }
+              kind: { $ref: '#/components/schemas/AggregationKind' }
+              bucket: { oneOf: [ { type: 'null' }, { $ref: '#/components/schemas/AggregationBucket' } ] }
+              semantics: { enum: [exact, derived] }
+        metrics:
+          type: array
+          items:
+            type: object
+            required: [op, field, semantics, precision]
+            additionalProperties: false
+            properties:
+              op: { enum: [count, sum, avg, min, max] }
+              field: { type: [string, 'null'] }
+              semantics: { enum: [exact, derived] }
+              precision: { type: [string, 'null'] }
+        groups:
+          type: array
+          maxItems: 1000
+          description: Every group in key order, values ascending, then null, then missing. Never truncated.
+          items:
+            type: object
+            required: [key, count, metrics]
+            additionalProperties: false
+            properties:
+              key:
+                type: array
+                items:
+                  oneOf:
+                    - { type: object, required: [kind], additionalProperties: false, properties: { kind: { enum: ['null', missing] } } }
+                    - type: object
+                      required: [kind, value]
+                      additionalProperties: false
+                      properties:
+                        kind: { const: value }
+                        value: { type: [string, number, boolean] }
+                        local: { type: string, description: A time bucket's local start with its UTC offset; value is its start instant. }
+              count: { type: integer, minimum: 0 }
+              metrics:
+                type: array
+                items:
+                  type: object
+                  required: [value, values, nulls, missing]
+                  additionalProperties: false
+                  description: A sum and an average are decimal strings; a minimum or maximum has the field's type. values, nulls and missing are null for count.
+                  properties:
+                    value: { type: [string, number, 'null'] }
+                    values: { type: [integer, 'null'], minimum: 0 }
+                    nulls: { type: [integer, 'null'], minimum: 0 }
+                    missing: { type: [integer, 'null'], minimum: 0 }
+        complete: { const: true }
+    AnalysisJobRequest:
+      oneOf:
+        - { type: object, required: [kind], additionalProperties: false, properties: { kind: { const: export } } }
+        - { type: object, required: [kind, spec], additionalProperties: false, properties: { kind: { const: aggregate }, spec: { $ref: '#/components/schemas/AggregationSpec' } } }
+    AnalysisBoundary:
+      type: object
+      required: [spaceId, collectionId, watermark, records, schemaVersion, policyVersion, placementGeneration, capability, specDigest]
+      additionalProperties: false
+      properties:
+        spaceId: { type: string }
+        collectionId: { type: string }
+        watermark: { type: integer, minimum: 0, description: The collection's event feed position the result is as of. }
+        records: { const: as-of-watermark }
+        schemaVersion: { type: integer, minimum: 1 }
+        policyVersion: { type: integer, minimum: 1 }
+        placementGeneration: { type: integer, minimum: 1 }
+        capability: { enum: ['export:read', 'records:read'] }
+        specDigest: { type: string, pattern: '^[0-9a-f]{64}$' }
+    AnalysisFreshness:
+      type: object
+      required: [state, checkedAt, latestPosition, unpublished, schemaVersion]
+      additionalProperties: false
+      description: exact while nothing was written to the collection after the watermark and its schema version is the pinned one; stale otherwise, when the result is still exact as of its watermark.
+      properties:
+        state: { enum: [exact, stale] }
+        checkedAt: { $ref: '#/components/schemas/Instant' }
+        latestPosition: { type: integer, minimum: 0 }
+        unpublished: { type: boolean }
+        schemaVersion: { type: integer, minimum: 1 }
+    AnalysisManifest:
+      type: object
+      required: [pageCount, rowCount, byteSize, resultSha256, format]
+      additionalProperties: false
+      properties:
+        pageCount: { type: integer, minimum: 0, maximum: 10000, description: '0 for an export of a collection with no record live at the watermark, which has no page.' }
+        rowCount: { type: integer, minimum: 0 }
+        byteSize: { type: integer, minimum: 0 }
+        resultSha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        format: { enum: [application/x-ndjson, application/json] }
+    AnalysisJobStatus:
+      type: object
+      required: [jobId, kind, state, failureCode, spec, boundary, freshness, progress, budgets, createdAt, startedAt, finishedAt, expiresAt, manifest, complete]
+      additionalProperties: false
+      properties:
+        jobId: { type: string }
+        kind: { enum: [export, aggregate] }
+        state: { enum: [queued, running, cancelling, cancelled, completed, failed, expired] }
+        failureCode: { type: [string, 'null'], description: Why a failed job failed, such as BUDGET_EXCEEDED, RESULT_TOO_LARGE, GROUP_LIMIT, SCHEMA_CONFLICT, UNPROCESSABLE, FORBIDDEN or NOT_FOUND. }
+        spec: { type: object, description: The canonical request the job was admitted with. }
+        boundary: { $ref: '#/components/schemas/AnalysisBoundary' }
+        freshness: { $ref: '#/components/schemas/AnalysisFreshness' }
+        progress:
+          type: object
+          required: [recordsScanned, runtimeMs, attempts, pagesWritten]
+          additionalProperties: false
+          properties:
+            recordsScanned: { type: integer, minimum: 0 }
+            runtimeMs: { type: integer, minimum: 0 }
+            attempts: { type: integer, minimum: 0 }
+            pagesWritten: { type: integer, minimum: 0 }
+        budgets:
+          type: object
+          required: [records, bytes, runtimeMs]
+          additionalProperties: false
+          properties:
+            records: { type: integer, minimum: 1 }
+            bytes: { type: integer, minimum: 1 }
+            runtimeMs: { type: integer, minimum: 1 }
+        createdAt: { $ref: '#/components/schemas/Instant' }
+        startedAt: { $ref: '#/components/schemas/NullableInstant' }
+        finishedAt: { $ref: '#/components/schemas/NullableInstant' }
+        expiresAt: { $ref: '#/components/schemas/Instant' }
+        manifest: { oneOf: [ { type: 'null' }, { $ref: '#/components/schemas/AnalysisManifest' } ], description: Present only once a complete result is sealed. }
+        complete: { type: boolean }
+    AnalysisPage:
+      type: object
+      required: [jobId, boundary, freshness, manifest, page, complete]
+      additionalProperties: false
+      properties:
+        jobId: { type: string }
+        boundary: { $ref: '#/components/schemas/AnalysisBoundary' }
+        freshness: { $ref: '#/components/schemas/AnalysisFreshness' }
+        manifest: { $ref: '#/components/schemas/AnalysisManifest' }
+        page:
+          type: object
+          required: [number, rowOffset, rowCount, byteOffset, byteSize, sha256, content]
+          additionalProperties: false
+          properties:
+            number: { type: integer, minimum: 1, maximum: 10000 }
+            rowOffset: { type: integer, minimum: 0 }
+            rowCount: { type: integer, minimum: 0 }
+            byteOffset: { type: integer, minimum: 0 }
+            byteSize: { type: integer, minimum: 0, maximum: 1048576 }
+            sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+            content: { type: string, description: 'For an export, NDJSON lines {"id","revision","data"} in record ID order; for an aggregate, the JSON text of one AggregationResult-shaped object whose source.records is as-of-watermark and whose snapshot is {scope: watermark, watermark}.' }
+        complete: { const: true }
     Instant: { type: string, format: date-time }
     NullableInstant: { type: [string, 'null'], format: date-time }
     DeletionErasure:
@@ -1459,6 +1790,7 @@ components:
     grantId: { name: grantId, in: path, required: true, schema: { type: string } }
     claimId: { name: claimId, in: path, required: true, schema: { type: string } }
     linkId: { name: linkId, in: path, required: true, schema: { type: string } }
+    jobId: { name: jobId, in: path, required: true, schema: { type: string } }
   requestBodies:
     SpaceLifecycle:
       required: true
