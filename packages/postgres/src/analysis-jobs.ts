@@ -588,10 +588,15 @@ export interface AnalysisWorkerOptions {
  * step gives its lease and slot holds back when it stops, so the next step
  * (or an interactive aggregation) can take them at once.
  *
- * The same step writes owner space exports (`PortabilityExportWorker`): when
- * one is due, analysis jobs stop at three fifths of the budget and exports
- * take the rest (at least 2 s of the jobs Worker's 5 s); otherwise analysis
- * jobs take it all.
+ * The same step writes owner space exports (`PortabilityExportWorker`,
+ * docs/portability-export.md#worker). With none due, analysis jobs take the
+ * whole budget. With one due, the kind whose next due job has waited longer
+ * goes first: at a budget of 5 s or more it stops at its share (analysis
+ * three fifths, exports two fifths, each at least 2 s), below that it takes
+ * the whole budget; the other kind takes what is left. Every turn moves its
+ * job's wait to now, so the other kind goes first next, and neither starves
+ * at any budget. A failure of either kind (its probe included) never stops
+ * the other: the step throws it once both have run.
  */
 export class PostgresAnalysisWorker {
   readonly #slots: { cell: number; space: number };
@@ -606,11 +611,47 @@ export class PostgresAnalysisWorker {
     const end = Date.now() + budgetMs;
     const result: AnalysisStep = { expired: 0, claimed: 0, pages: 0, completed: 0, failed: 0,
       exports: { expired: 0, claimed: 0, parts: 0, completed: 0, failed: 0 } };
-    let exportsDue = false;
-    try { exportsDue = await this.#exports.due(end); } catch (error) { if (!cutShort(error)) throw error; }
-    // Exports keep two fifths of the budget when one is due, so neither kind of job starves the other.
-    const until = exportsDue ? end - Math.floor(budgetMs * 2 / 5) : end;
-    try { await this.expire(Date.now() + Math.floor(budgetMs / 4), result); } catch (error) { if (!cutShort(error)) throw error; }
+    const failures: unknown[] = [];
+    const settle = async (run: () => Promise<void>) => {
+      try { await run(); } catch (error) { if (!cutShort(error)) failures.push(error); }
+    };
+    // A probe that fails or is cut short finds nothing due.
+    const probe = async (read: () => Promise<number | null>) => {
+      try { return await read(); } catch (error) { if (!cutShort(error)) failures.push(error); return null; }
+    };
+    const exportsSince = await probe(() => this.#exports.waiting(end));
+    const analysis = (until: number) => settle(() => this.analyse(until, budgetMs, result));
+    const exports = (until: number) => settle(async () => { result.exports = await this.#exports.step(until); });
+    if (exportsSince === null) await analysis(end);
+    else {
+      const analysisSince = await probe(() => this.waiting(end));
+      const shared = Math.floor(budgetMs * 2 / 5) >= MIN_STEP_MS;
+      if (analysisSince === null || exportsSince <= analysisSince) {
+        await exports(shared ? end - Math.floor(budgetMs * 3 / 5) : end);
+        await analysis(end);
+      } else {
+        await analysis(shared ? end - Math.floor(budgetMs * 2 / 5) : end);
+        await exports(end);
+      }
+    }
+    if (failures.length > 1) throw new AggregateError(failures, 'The analysis and export steps failed');
+    if (failures.length) throw failures[0];
+    return result;
+  }
+
+  /** When the analysis job the step would claim next began waiting (epoch ms), or null when none is due. */
+  private async waiting(until: number): Promise<number | null> {
+    const since = (await inTransaction(this.pool, db => db.query(`SELECT (extract(epoch FROM least(
+        (SELECT min(created_at) FROM analysis_jobs WHERE state='queued' AND expires_at>clock_timestamp()),
+        (SELECT min(leased_until) FROM analysis_jobs WHERE state='running' AND leased_until<=clock_timestamp()
+          AND expires_at>clock_timestamp())))*1000)::float8 AS since`), { deadline: until })).rows[0].since;
+    return since === null ? null : Number(since);
+  }
+
+  /** Expire, then claim and run analysis jobs until `until`. */
+  private async analyse(until: number, budgetMs: number, result: AnalysisStep): Promise<void> {
+    try { await this.expire(Math.min(until, Date.now() + Math.floor(budgetMs / 4)), result); }
+    catch (error) { if (!cutShort(error)) throw error; }
     const passed: { s: string; c: string; j: string }[] = [];
     while (until - RELEASE_MS - Date.now() >= MIN_PAGE_MS) {
       let job: Row | null | 'busy' | 'failed';
@@ -621,8 +662,6 @@ export class PostgresAnalysisWorker {
       result.claimed++;
       await this.run(job, until, result);
     }
-    if (exportsDue) result.exports = await this.#exports.step(end);
-    return result;
   }
 
   /** End jobs past their expiry, one per transaction, removing their results; their slots are released as they end. */

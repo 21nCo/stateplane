@@ -76,6 +76,7 @@ const notDeleted = (kind: string, collection: string, id: string) => `NOT EXISTS
 const withRaw = (fields: object, name: string, raw: string | null) =>
   `${JSON.stringify(fields).slice(0, -1)},${JSON.stringify(name)}:${raw ?? 'null'}}`;
 const at = (value: Date | null, snapshot = true) => snapshot ? iso(value) : null;
+const integer = (value: unknown) => value === null || value === undefined ? null : Number(value);
 
 const SECTIONS: Record<typeof exportSections[number], Section> = {
   // Identifiers, times and grants only: no credential row holds secret material, and none is read. Grants have no
@@ -143,8 +144,9 @@ const SECTIONS: Record<typeof exportSections[number], Section> = {
     WHERE e.space_id=$1 AND r.committed_at<=$2 AND ${notDeleted('claim', 'e.collection_id', 'e.claim_id')}
       AND AFTER(e.collection_id,e.claim_id,e.revision,e.ordinal) ORDER BY e.collection_id,e.claim_id,e.revision,e.ordinal`,
   line: r => JSON.stringify({ collectionId: r.k1, claimId: r.k2, revision: Number(r.k3), ordinal: r.k4,
-    source: { collectionId: r.source_collection_id, sourceId: r.source_id, extractionVersion: Number(r.extraction_version),
-      startOffset: Number(r.start_offset), endOffset: Number(r.end_offset) } }) },
+    // A whole-source citation has no extraction version and no offsets, a whole-extraction one no offsets: null as stored.
+    source: { collectionId: r.source_collection_id, sourceId: r.source_id, extractionVersion: integer(r.extraction_version),
+      startOffset: integer(r.start_offset), endOffset: integer(r.end_offset) } }) },
   // A link tombstoned after the snapshot was live at it, one revision earlier (a tombstone adds one).
   links: { keys: 2, sql: `SELECT l.collection_id AS k1,l.link_id AS k2,l.link_type,l.deletion_policy,l.from_kind,l.from_collection_id,
       l.from_id,l.to_kind,l.to_collection_id,l.to_id,l.credential_id,l.created_at,
@@ -162,22 +164,28 @@ const SECTIONS: Record<typeof exportSections[number], Section> = {
     operation: r.operation, credentialId: r.credential_id, committedAt: iso(r.committed_at) }) },
   // Each record at its highest revision published at or below the watermark (migration 049's as-of index, as STA-59
   // reads it); a record deleted there is passed with no line, one first written later is no candidate.
-  records: { keys: 2, sql: `SELECT r.collection_id AS k1,r.record_id AS k2,e.revision,e.operation,e.schema_version,e.canonical_data,
-      octet_length(COALESCE(e.canonical_data,'')) AS size
+  // A record's key mode and normalized key are set when it is created and never change, so the record row states them
+  // at any boundary; an external key is the record's identity to an importer.
+  records: { keys: 2, sql: `SELECT r.collection_id AS k1,r.record_id AS k2,r.key_mode,r.normalized_key,e.revision,e.operation,
+      e.schema_version,e.canonical_data,octet_length(COALESCE(e.canonical_data,''))+octet_length(r.normalized_key) AS size
     FROM records r CROSS JOIN LATERAL (SELECT f.revision FROM record_event_feed f WHERE f.space_id=r.space_id
       AND f.collection_id=r.collection_id AND f.record_id=r.record_id AND f.position<=$3 ORDER BY f.revision DESC LIMIT 1) a
     JOIN record_events e ON e.space_id=r.space_id AND e.collection_id=r.collection_id AND e.record_id=r.record_id
       AND e.revision=a.revision
     WHERE r.space_id=$1 AND AFTER(r.collection_id,r.record_id) ORDER BY r.collection_id,r.record_id`,
-  line: r => r.operation === 'delete' ? '' : withRaw({ collectionId: r.k1, id: r.k2, revision: Number(r.revision),
-    schemaVersion: Number(r.schema_version) }, 'data', r.canonical_data) },
-  // Every record event published at or below the watermark, deletions included, with its feed position.
+  line: r => r.operation === 'delete' ? '' : withRaw({ collectionId: r.k1, id: r.k2, keyMode: r.key_mode, key: r.normalized_key,
+    revision: Number(r.revision), schemaVersion: Number(r.schema_version) }, 'data', r.canonical_data) },
+  // Every record event published at or below the watermark, deletions included, with its feed position and the
+  // record's key, so a record deleted by then (and so absent from records) keeps its external key.
   revisions: { keys: 3, sql: `SELECT e.collection_id AS k1,e.record_id AS k2,e.revision AS k3,e.event_id,e.operation,e.schema_version,
-      e.canonical_data,e.credential_id,e.committed_at,f.position,octet_length(COALESCE(e.canonical_data,'')) AS size
+      e.canonical_data,e.credential_id,e.committed_at,f.position,r.key_mode,r.normalized_key,
+      octet_length(COALESCE(e.canonical_data,''))+octet_length(r.normalized_key) AS size
     FROM record_events e JOIN record_event_feed f ON f.event_id=e.event_id
+      JOIN records r ON r.space_id=e.space_id AND r.collection_id=e.collection_id AND r.record_id=e.record_id
     WHERE e.space_id=$1 AND f.position<=$3 AND AFTER(e.collection_id,e.record_id,e.revision)
     ORDER BY e.collection_id,e.record_id,e.revision`,
-  line: r => withRaw({ collectionId: r.k1, id: r.k2, revision: Number(r.k3), eventId: r.event_id, position: Number(r.position),
+  line: r => withRaw({ collectionId: r.k1, id: r.k2, keyMode: r.key_mode, key: r.normalized_key, revision: Number(r.k3),
+    eventId: r.event_id, position: Number(r.position),
     operation: r.operation, schemaVersion: Number(r.schema_version), credentialId: r.credential_id, committedAt: iso(r.committed_at) },
   'data', r.canonical_data) }
 };
@@ -204,7 +212,9 @@ async function discard(db: Session, key: unknown[]): Promise<void> {
   await db.query('DELETE FROM portability_parts WHERE space_id=$1 AND job_id=$2', key);
 }
 
-const STATUS = `SELECT j.*,CASE WHEN j.state IN ('queued','running','completed') AND j.expires_at<=clock_timestamp() THEN 'expired'
+/** The snapshot instant as UTC RFC 3339 text to the microsecond, as the database stores it (a Date keeps milliseconds). */
+const SNAPSHOT_AT = `to_char(j.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS snapshot_at`;
+const STATUS = `SELECT j.*,${SNAPSHOT_AT},CASE WHEN j.state IN ('queued','running','completed') AND j.expires_at<=clock_timestamp() THEN 'expired'
     ELSE j.state END AS effective,
     (SELECT count(*) FROM portability_parts p WHERE p.space_id=j.space_id AND p.job_id=j.job_id)::int AS parts_written
   FROM portability_jobs j WHERE j.space_id=$1 AND j.job_id=$2 AND j.kind='export'`;
@@ -212,7 +222,7 @@ function view(row: Row): PortabilityExportStatus {
   const sealed = row.effective === 'completed' ? { sha256: row.manifest_sha256 as string, partCount: Number(row.part_count) } : null;
   const checkpoint = row.checkpoint ?? {};
   return { jobId: row.job_id, kind: 'export', state: row.effective, failureCode: row.failure_code ?? null,
-    boundary: { spaceId: row.space_id, watermark: Number(row.watermark), snapshotAt: iso(row.created_at)!, records: 'as-of-watermark',
+    boundary: { spaceId: row.space_id, watermark: Number(row.watermark), snapshotAt: row.snapshot_at, records: 'as-of-watermark',
       evidence: 'as-of-snapshot', policyVersion: Number(row.policy_version), placementGeneration: Number(row.placement_generation),
       formatVersion: Number(row.format_version) },
     progress: { section: row.state === 'completed' ? null : exportSections[checkpoint.section ?? 0] ?? null,
@@ -315,9 +325,18 @@ export class PostgresPortabilityExports {
             clock_timestamp()+$9::int*interval '1 millisecond')`,
         [spaceId, jobId, scope.principalId, actor.credentialId, scope.policyVersion, scope.placementGeneration,
           portabilityFormatVersion, watermark, portabilityExportBounds.lifetimeMs]);
-        return { value: view((await db.query(STATUS, [spaceId, jobId])).rows[0]), deadline: await this.recheck(db, actor, admitted) };
+        return view((await db.query(STATUS, [spaceId, jobId])).rows[0]);
       });
-      if (submitted) return released(submitted);
+      if (!submitted) continue;
+      // The final credential check runs after the hold is released, so writers never wait on the provider: an owner
+      // whose credential no longer holds is refused, and the export it queued is cancelled before any worker runs it.
+      try {
+        return released(await transact(pool, async db => ({ value: submitted, deadline: await this.recheck(db, actor, admitted) })));
+      } catch (error) {
+        await transact(pool, db => db.query(`UPDATE portability_jobs SET state='cancelled' WHERE space_id=$1 AND job_id=$2
+          AND state='queued'`, [spaceId, submitted.jobId])).catch(() => {});
+        throw error;
+      }
     }
     throw new AuthorityError('BACKPRESSURE', 'The space has more unpublished events than one submission publishes; retry',
       undefined, true);
@@ -423,11 +442,18 @@ interface Checkpoint { section: number; cursor: unknown[] | null; offset: number
 export class PortabilityExportWorker {
   constructor(private readonly pool: PoolLike) {}
 
-  /** Whether an export is due or past its expiry, so the step keeps time for it. */
-  async due(until: number): Promise<boolean> {
-    return (await inTransaction(this.pool, db => db.query(`SELECT 1 FROM portability_jobs WHERE kind='export'
-      AND ((state IN ${UNFINISHED} AND (state='queued' OR leased_until<=clock_timestamp() OR expires_at<=clock_timestamp()))
-        OR (state='completed' AND expires_at<=clock_timestamp())) LIMIT 1`), { deadline: until })).rows.length > 0;
+  /**
+   * When the longest-waiting due export began waiting (epoch ms: a queued
+   * one since submission, one with a lapsed lease since its lease ended, one
+   * past its expiry since its expiry), or null when none is due.
+   */
+  async waiting(until: number): Promise<number | null> {
+    const since = (await inTransaction(this.pool, db => db.query(`SELECT (extract(epoch FROM min(CASE
+        WHEN expires_at<=clock_timestamp() THEN expires_at ELSE COALESCE(leased_until,created_at) END))*1000)::float8 AS since
+      FROM portability_jobs WHERE kind='export'
+        AND ((state IN ${UNFINISHED} AND (state='queued' OR leased_until<=clock_timestamp() OR expires_at<=clock_timestamp()))
+          OR (state='completed' AND expires_at<=clock_timestamp()))`), { deadline: until })).rows[0].since;
+    return since === null ? null : Number(since);
   }
 
   async step(until: number): Promise<PortabilityStep> {
@@ -524,8 +550,8 @@ export class PortabilityExportWorker {
     const permissions = ((reading?.checkpoint as Checkpoint | null)?.section ?? 0) <= exportSections.indexOf('permissions');
     const failure = await spaceCheck(db, claimed.space_id, { principal: claimed.principal_id,
       placement: Number(claimed.placement_generation), policy: permissions ? Number(claimed.policy_version) : undefined });
-    const job = (await db.query(`SELECT *,created_at::text AS snapshot,least(clock_timestamp()+$4::int*interval '1 millisecond',expires_at) AS until
-      FROM portability_jobs WHERE space_id=$1 AND job_id=$2 AND state='running' AND lease_id=$3
+    const job = (await db.query(`SELECT j.*,j.created_at::text AS snapshot,${SNAPSHOT_AT},least(clock_timestamp()+$4::int*interval '1 millisecond',expires_at) AS until
+      FROM portability_jobs j WHERE space_id=$1 AND job_id=$2 AND state='running' AND lease_id=$3
         AND leased_until>clock_timestamp() AND expires_at>clock_timestamp() FOR UPDATE`,
     [...key, claimed.lease_id, portabilityExportBounds.leaseMs])).rows[0];
     if (!job) return 'lost';
@@ -606,7 +632,7 @@ export class PortabilityExportWorker {
     const manifest: ExportManifest = { format: portabilityFormat, formatVersion: Number(job.format_version), jobId: job.job_id,
       space: { spaceId: job.space_id, ownerPrincipalId: space.owner_principal_id, policyVersion: Number(job.policy_version),
         placementGeneration: Number(job.placement_generation) },
-      boundary: { watermark: Number(job.watermark), snapshotAt: iso(job.created_at)!, records: 'as-of-watermark', evidence: 'as-of-snapshot' },
+      boundary: { watermark: Number(job.watermark), snapshotAt: job.snapshot_at, records: 'as-of-watermark', evidence: 'as-of-snapshot' },
       sections: exportSections.map(name => {
         const own = parts.filter(p => p.section === name);
         return { name, rows: own.reduce((n, p) => n + p.row_count, 0), bytes: own.reduce((n, p) => n + p.byte_size, 0), accelerator: false };

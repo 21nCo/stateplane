@@ -44,8 +44,23 @@ export type ManifestVerification =
   | { ok: false; reason: string };
 
 const HEX64 = /^[0-9a-f]{64}$/;
+const JOB_ID = /^exp_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const SECTION_NAME = /^[a-z][a-z0-9_]{0,62}$/;
+// RFC 3339 date-time, as the schema's `format: date-time` names it.
+const INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/i;
+/** The manifest schema's limits: 11 evidence sections and at most 1 accelerator; 4,095 data parts of 1 to 1 MiB. */
+const MAX_DATA_PARTS = 4_095;
+const MAX_PART_BYTES = 1_048_576;
 const encoder = new TextEncoder();
 const isCount = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
+const isPositive = (value: unknown): value is number => isCount(value) && value >= 1;
+const isId = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
+/** A JSON object with exactly the members `names`, as every object of the format is closed and its members required. */
+const closed = (value: unknown, names: readonly string[]): value is Record<string, unknown> => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const members = Object.keys(value);
+  return members.length === names.length && names.every(name => Object.prototype.hasOwnProperty.call(value, name));
+};
 
 /** The lowercase hex SHA-256 of `content`'s UTF-8 bytes. */
 export async function sha256Hex(content: string): Promise<string> {
@@ -53,30 +68,49 @@ export async function sha256Hex(content: string): Promise<string> {
   return Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
-/** The structure a manifest must have before its parts are trusted; the reason it fails, or null. */
+/**
+ * The reason `value` is not a manifest of format version 1, or null: every
+ * rule of contracts/portability-manifest.schema.json (required members,
+ * closed objects, types, patterns and limits) and the rules the schema cannot
+ * state (section order, part numbering and section totals).
+ */
 function malformed(value: unknown): string | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return 'the manifest is not a JSON object';
-  const m = value as Partial<ExportManifest>;
+  if (!closed(value, ['format', 'formatVersion', 'jobId', 'space', 'boundary', 'sections', 'parts', 'excluded']))
+    return 'the manifest is not a closed object with exactly the version 1 members';
+  const m = value as unknown as ExportManifest;
   if (m.format !== portabilityFormat) return `format is not ${portabilityFormat}`;
   if (m.formatVersion !== portabilityFormatVersion) return `formatVersion ${String(m.formatVersion)} is not supported`;
+  if (typeof m.jobId !== 'string' || !JOB_ID.test(m.jobId)) return 'jobId is malformed';
+  const s = m.space;
+  if (!closed(s, ['spaceId', 'ownerPrincipalId', 'policyVersion', 'placementGeneration']) || !isId(s.spaceId)
+    || !isId(s.ownerPrincipalId) || !isPositive(s.policyVersion) || !isPositive(s.placementGeneration)) return 'space is malformed';
   const b = m.boundary;
-  if (!b || !isCount(b.watermark) || typeof b.snapshotAt !== 'string' || Number.isNaN(Date.parse(b.snapshotAt))
+  if (!closed(b, ['watermark', 'snapshotAt', 'records', 'evidence']) || !isCount(b.watermark) || typeof b.snapshotAt !== 'string'
+    || !INSTANT.test(b.snapshotAt) || Number.isNaN(Date.parse(b.snapshotAt))
     || b.records !== 'as-of-watermark' || b.evidence !== 'as-of-snapshot') return 'the boundary is malformed';
+  if (!Array.isArray(m.excluded) || m.excluded.some(item => typeof item !== 'string')) return 'excluded is malformed';
   if (!Array.isArray(m.parts) || !Array.isArray(m.sections)) return 'parts and sections must be arrays';
+  if (m.parts.length > MAX_DATA_PARTS) return `more than ${MAX_DATA_PARTS} data parts`;
   const known: readonly string[] = [...exportSections, ...acceleratorSections];
-  const order = m.sections.map(s => s?.name);
-  if (order.some(name => !known.includes(name as string)) || new Set(order).size !== order.length)
+  if (m.sections.length < exportSections.length || m.sections.length > known.length) return 'sections has the wrong length';
+  for (const section of m.sections)
+    if (!closed(section, ['name', 'rows', 'bytes', 'accelerator']) || !isCount(section.rows) || !isCount(section.bytes)
+      || typeof section.accelerator !== 'boolean') return 'a section is malformed';
+  const order = m.sections.map(section => section.name);
+  if (order.some(name => !known.includes(name)) || new Set(order).size !== order.length)
     return 'sections name an unknown or repeated section';
   // Sections appear in the format's order; an accelerator is optional and every evidence section is present.
-  const ranked = order.map(name => known.indexOf(name as string));
+  const ranked = order.map(name => known.indexOf(name));
   if (ranked.some((rank, i) => i > 0 && rank < ranked[i - 1])) return 'sections are out of order';
   if (exportSections.some(name => !order.includes(name))) return 'an evidence section is missing';
-  if (m.sections.some(s => s.accelerator !== (acceleratorSections as readonly string[]).includes(s.name)))
+  if (m.sections.some(section => section.accelerator !== (acceleratorSections as readonly string[]).includes(section.name)))
     return 'only embeddings is an accelerator';
-  const totals = new Map<string, { rows: number; bytes: number }>(order.map(name => [name as string, { rows: 0, bytes: 0 }]));
+  const totals = new Map<string, { rows: number; bytes: number }>(order.map(name => [name, { rows: 0, bytes: 0 }]));
   let at = -1;
   for (const [i, part] of m.parts.entries()) {
-    if (!part || part.number !== i + 1 || !isCount(part.rows) || !isCount(part.bytes) || part.bytes < 1 || !HEX64.test(part.sha256 ?? ''))
+    if (!closed(part, ['number', 'section', 'rows', 'bytes', 'sha256']) || part.number !== i + 1 || !isCount(part.rows)
+      || !isPositive(part.bytes) || part.bytes > MAX_PART_BYTES || typeof part.section !== 'string' || !SECTION_NAME.test(part.section)
+      || typeof part.sha256 !== 'string' || !HEX64.test(part.sha256))
       return `part ${i + 1} is malformed or out of sequence`;
     const rank = order.indexOf(part.section);
     // A section's parts are contiguous, in the sections' order.
@@ -85,9 +119,9 @@ function malformed(value: unknown): string | null {
     const total = totals.get(part.section)!;
     total.rows += part.rows; total.bytes += part.bytes;
   }
-  for (const s of m.sections)
-    if (!isCount(s.rows) || !isCount(s.bytes) || totals.get(s.name)!.rows !== s.rows || totals.get(s.name)!.bytes !== s.bytes)
-      return `section ${s.name} does not total its parts`;
+  for (const section of m.sections)
+    if (totals.get(section.name)!.rows !== section.rows || totals.get(section.name)!.bytes !== section.bytes)
+      return `section ${section.name} does not total its parts`;
   return null;
 }
 

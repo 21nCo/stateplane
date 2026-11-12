@@ -61,6 +61,7 @@
     "instant": { "type": "string", "format": "date-time" },
     "optionalInstant": { "type": ["string", "null"], "format": "date-time" },
     "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "keyMode": { "description": "How a record is keyed: external (key is its normalized external key, reserved even once the record is deleted) or generated (key is its ID).", "enum": ["generated", "external"] },
     "json": { "description": "Canonical JSON, kept byte for byte." },
     "schemas": {
       "description": "One accepted version of a collection's definition.",
@@ -127,13 +128,18 @@
         "committedAt": { "$ref": "#/$defs/instant" } }
     },
     "provenance": {
-      "description": "One evidence span a claim revision cites: a source's extraction version and offsets.",
+      "description": "One evidence a claim revision cites: a whole source (extractionVersion, startOffset and endOffset null), a whole extraction version (offsets null), or a span of one (startOffset at most endOffset), exactly as stored.",
       "type": "object", "additionalProperties": false, "required": ["collectionId", "claimId", "revision", "ordinal", "source"],
       "properties": { "collectionId": { "$ref": "#/$defs/id" }, "claimId": { "$ref": "#/$defs/id" }, "revision": { "$ref": "#/$defs/positive" },
         "ordinal": { "$ref": "#/$defs/count" },
         "source": { "type": "object", "additionalProperties": false, "required": ["collectionId", "sourceId", "extractionVersion", "startOffset", "endOffset"],
           "properties": { "collectionId": { "$ref": "#/$defs/id" }, "sourceId": { "$ref": "#/$defs/id" },
-            "extractionVersion": { "$ref": "#/$defs/positive" }, "startOffset": { "$ref": "#/$defs/count" }, "endOffset": { "$ref": "#/$defs/count" } } } }
+            "extractionVersion": { "type": ["integer", "null"], "minimum": 1 },
+            "startOffset": { "type": ["integer", "null"], "minimum": 0 }, "endOffset": { "type": ["integer", "null"], "minimum": 0 } },
+          "anyOf": [
+            { "properties": { "startOffset": { "type": "null" }, "endOffset": { "type": "null" } } },
+            { "properties": { "extractionVersion": { "type": "integer" }, "startOffset": { "type": "integer" }, "endOffset": { "type": "integer" } } }
+          ] } }
     },
     "links": {
       "description": "One link live at the snapshot, at its revision there.",
@@ -147,24 +153,27 @@
     "endpoint": { "type": "object", "additionalProperties": false, "required": ["kind", "collectionId", "id"],
       "properties": { "kind": { "type": "string" }, "collectionId": { "$ref": "#/$defs/id" }, "id": { "$ref": "#/$defs/id" } } },
     "events": {
-      "description": "One evidence lifecycle event (source, claim or link) committed at or before the snapshot; a deleted source or claim appears only here.",
+      "description": "One evidence lifecycle event committed at or before the snapshot: a source's or claim's deletion, or a link's creation, deletion or detachment (detachment has no credential). A deleted source or claim appears only here.",
       "type": "object", "additionalProperties": false,
       "required": ["eventId", "collectionId", "kind", "entityId", "revision", "operation", "credentialId", "committedAt"],
       "properties": { "eventId": { "$ref": "#/$defs/id" }, "collectionId": { "$ref": "#/$defs/id" }, "kind": { "enum": ["source", "claim", "link"] },
         "entityId": { "$ref": "#/$defs/id" }, "revision": { "$ref": "#/$defs/positive" }, "operation": { "enum": ["create", "delete", "detach"] },
-        "credentialId": { "type": ["string", "null"] }, "committedAt": { "$ref": "#/$defs/instant" } }
+        "credentialId": { "type": ["string", "null"] }, "committedAt": { "$ref": "#/$defs/instant" } },
+      "anyOf": [{ "properties": { "kind": { "const": "link" } } }, { "properties": { "operation": { "const": "delete" } } }]
     },
     "records": {
-      "description": "One record live at the watermark, at its revision there.",
-      "type": "object", "additionalProperties": false, "required": ["collectionId", "id", "revision", "schemaVersion", "data"],
-      "properties": { "collectionId": { "$ref": "#/$defs/id" }, "id": { "$ref": "#/$defs/id" }, "revision": { "$ref": "#/$defs/positive" },
+      "description": "One record live at the watermark, at its revision there, with its key: its normalized external key, or its own ID when generated.",
+      "type": "object", "additionalProperties": false, "required": ["collectionId", "id", "keyMode", "key", "revision", "schemaVersion", "data"],
+      "properties": { "collectionId": { "$ref": "#/$defs/id" }, "id": { "$ref": "#/$defs/id" },
+        "keyMode": { "$ref": "#/$defs/keyMode" }, "key": { "$ref": "#/$defs/id" }, "revision": { "$ref": "#/$defs/positive" },
         "schemaVersion": { "$ref": "#/$defs/positive" }, "data": { "$ref": "#/$defs/json" } }
     },
     "revisions": {
-      "description": "One record event published at or below the watermark, deletions included (data null), with its feed position.",
+      "description": "One record event published at or below the watermark, deletions included (data null), with its feed position and its record's key, which a deleted record keeps.",
       "type": "object", "additionalProperties": false,
-      "required": ["collectionId", "id", "revision", "eventId", "position", "operation", "schemaVersion", "credentialId", "committedAt", "data"],
-      "properties": { "collectionId": { "$ref": "#/$defs/id" }, "id": { "$ref": "#/$defs/id" }, "revision": { "$ref": "#/$defs/positive" },
+      "required": ["collectionId", "id", "keyMode", "key", "revision", "eventId", "position", "operation", "schemaVersion", "credentialId", "committedAt", "data"],
+      "properties": { "collectionId": { "$ref": "#/$defs/id" }, "id": { "$ref": "#/$defs/id" },
+        "keyMode": { "$ref": "#/$defs/keyMode" }, "key": { "$ref": "#/$defs/id" }, "revision": { "$ref": "#/$defs/positive" },
         "eventId": { "$ref": "#/$defs/id" }, "position": { "$ref": "#/$defs/positive" }, "operation": { "type": "string" },
         "schemaVersion": { "$ref": "#/$defs/positive" }, "credentialId": { "type": ["string", "null"] },
         "committedAt": { "$ref": "#/$defs/instant" }, "data": { "$ref": "#/$defs/json" } }

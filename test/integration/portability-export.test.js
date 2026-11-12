@@ -65,7 +65,8 @@ createAuthFn(config);
 const identity = new AuthFnIdentityVerifier(config);
 const spaces = new PostgresSpaces(pool, new Map([['cell-a', { pool, storageTargetId: 'target-a' }]]), 'cell-a',
   new AuthFnAgentKeys(config), identity, randomBytes(32));
-const services = postgresServices(spaces, new Map([['cell-a', { pool, cursorSecret: randomBytes(32) }]]), 3600);
+const services = postgresServices(spaces, new Map([['cell-a', { pool, cursorSecret: randomBytes(32),
+  analytics: { pool: newPool(1), originConnectionLimit: 5 } }]]), 3600);
 const cell = { pool, originals: new R2BlobStore(new MemoryR2()) };
 const sources = new PostgresSources(spaces, new Map([['cell-a', cell]]));
 const claims = new PostgresClaims(spaces, new Map([['cell-a', { pool }]]));
@@ -138,13 +139,18 @@ test('an owner export carries the space as of its boundary, verifies against its
   const r3 = (await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: 'three' } })).ref.id;
   await mutate(actor, spaceId, 'alpha', { operation: 'delete', id: r3, expectedRevision: 1 });
   const b1 = (await mutate(actor, spaceId, 'beta', { operation: 'create', data: { label: 'beta é' } })).ref.id;
+  // External keys: one live, one held by a record deleted before the boundary (the key stays reserved).
+  const e1 = (await mutate(actor, spaceId, 'beta', { operation: 'create', externalKey: ' Ext-é ', data: { label: 'keyed' } })).ref.id;
+  const e2 = (await mutate(actor, spaceId, 'beta', { operation: 'create', externalKey: 'ext-gone', data: { label: 'keyed, gone' } })).ref.id;
+  await mutate(actor, spaceId, 'beta', { operation: 'delete', id: e2, expectedRevision: 1 });
   const text = 'The alpha report says the bridge opened in 1932.';
   const source = (await sources.ingestText(actor, spaceId, 'alpha', { idempotencyKey: 'src-1', text })).sourceId;
   await sources.extract(actor, spaceId, 'alpha', source);
   const gone = (await sources.ingestText(actor, spaceId, 'alpha', { idempotencyKey: 'src-2', text: 'Removed before.' })).sourceId;
   await sources.delete(actor, spaceId, 'alpha', gone);
   const claim = await claims.create(agent, spaceId, 'alpha', { idempotencyKey: 'c1', statement: 'The bridge opened in 1932.',
-    attributedTo: 'city archive', evidence: [{ collectionId: 'alpha', sourceId: source, extractionVersion: 1, start: 4, end: 16 }] });
+    attributedTo: 'city archive', evidence: [{ collectionId: 'alpha', sourceId: source, extractionVersion: 1, start: 4, end: 16 },
+      { collectionId: 'alpha', sourceId: source, extractionVersion: 1 }, { collectionId: 'alpha', sourceId: source }] });
   const dropped = await claims.create(actor, spaceId, 'alpha', { idempotencyKey: 'c2', statement: 'Withdrawn.', attributedTo: 'x' });
   await claims.delete(actor, spaceId, 'alpha', dropped.claimId, { baseRevision: dropped.revision });
   const ref = (collectionId, id) => ({ kind: 'record', collectionId, id });
@@ -171,9 +177,17 @@ test('an owner export carries the space as of its boundary, verifies against its
   const { status, parts, manifestText, manifest, lines } = await result(actor, spaceId, submitted.jobId);
   // Records as of the watermark: r1 at its replacement, r2 before its later replacement, r3 deleted, b1 live (deleted later).
   assert.deepEqual(lines.records.map(({ collectionId, id, revision, data }) => [collectionId, id, revision, data]).sort(),
-    [['alpha', r1, 2, { label: 'one, revised' }], ['alpha', r2, 1, { label: 'two' }], ['beta', b1, 1, { label: 'beta é' }]].sort());
+    [['alpha', r1, 2, { label: 'one, revised' }], ['alpha', r2, 1, { label: 'two' }], ['beta', b1, 1, { label: 'beta é' }],
+      ['beta', e1, 1, { label: 'keyed' }]].sort());
   assert.deepEqual(lines.revisions.map(({ id, revision, operation }) => [id, revision, operation]).sort(),
-    [[r1, 1, 'create'], [r1, 2, 'replace'], [r2, 1, 'create'], [r3, 1, 'create'], [r3, 2, 'delete'], [b1, 1, 'create']].sort());
+    [[r1, 1, 'create'], [r1, 2, 'replace'], [r2, 1, 'create'], [r3, 1, 'create'], [r3, 2, 'delete'], [b1, 1, 'create'],
+      [e1, 1, 'create'], [e2, 1, 'create'], [e2, 2, 'delete']].sort());
+  // Each record's identity: the normalized external key, or its own ID when generated; a deleted record keeps its key.
+  assert.deepEqual(lines.records.map(({ id, keyMode, key }) => [id, keyMode, key]).sort(),
+    [[r1, 'generated', r1], [r2, 'generated', r2], [b1, 'generated', b1], [e1, 'external', 'Ext-é']].sort());
+  assert.deepEqual([...new Set(lines.revisions.filter(line => line.id === e2 || line.id === r3)
+    .map(({ id, keyMode, key }) => JSON.stringify([id, keyMode, key])))].sort(),
+  [JSON.stringify([e2, 'external', 'ext-gone']), JSON.stringify([r3, 'generated', r3])].sort());
   assert.ok(lines.revisions.every(line => line.position <= status.boundary.watermark));
   assert.equal(lines.revisions.find(line => line.id === r2).credentialId, key.id, 'provenance keeps the writing credential');
   assert.deepEqual(lines.schemas.map(({ collectionId, version }) => [collectionId, version]), [['alpha', 1], ['beta', 1]]);
@@ -184,8 +198,15 @@ test('an owner export carries the space as of its boundary, verifies against its
   // The claim at its revision before the later review; the claim deleted before is only its event.
   assert.deepEqual(lines.claims.map(line => [line.claimId, line.revision, line.statement, line.reviewStatus]),
     [[claim.claimId, claim.revision, 'The bridge opened in 1932.', 'unreviewed']]);
-  assert.deepEqual(lines.provenance.map(line => [line.claimId, line.source.sourceId, line.source.startOffset, line.source.endOffset]),
-    [[claim.claimId, source, 4, 16]]);
+  // Provenance exactly as cited: a span, a whole extraction version (no offsets) and a whole source (no version either).
+  assert.deepEqual(lines.provenance.map(line => [line.claimId, line.ordinal, line.source.sourceId, line.source.extractionVersion,
+    line.source.startOffset, line.source.endOffset]),
+  [[claim.claimId, 0, source, 1, 4, 16], [claim.claimId, 1, source, 1, null, null], [claim.claimId, 2, source, null, null, null]]);
+  // The schema refuses what the old export invented for a whole-source citation, and offsets without a version.
+  const cited = lines.provenance[2];
+  for (const invented of [{ extractionVersion: 0, startOffset: 0, endOffset: 0 }, { extractionVersion: null, startOffset: 0, endOffset: 1 },
+    { extractionVersion: 1, startOffset: 0, endOffset: null }])
+    assert.equal(validators.provenance({ ...cited, source: { ...cited.source, ...invented } }), false, JSON.stringify(invented));
   // The link detached later (b1's deletion) is live at the boundary at its revision there.
   assert.deepEqual(lines.links.map(line => [line.linkId, line.revision, line.to.id]), [[kept.linkId, 1, b1]]);
   const events = lines.events.map(line => [line.kind, line.entityId, line.operation]);
@@ -201,6 +222,11 @@ test('an owner export carries the space as of its boundary, verifies against its
   assert.ok(validManifest(manifest), JSON.stringify(validManifest.errors));
   assert.deepEqual([manifest.space.spaceId, manifest.space.ownerPrincipalId, manifest.boundary.watermark],
     [spaceId, actor.userPrincipalId, status.boundary.watermark]);
+  // The boundary instant is published exactly as stored, to the microsecond, in the manifest and the status alike.
+  const stored = (await pool.query(`SELECT to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS at
+    FROM portability_jobs WHERE job_id=$1`, [submitted.jobId])).rows[0].at;
+  assert.deepEqual([manifest.boundary.snapshotAt, status.boundary.snapshotAt, submitted.boundary.snapshotAt], [stored, stored, stored]);
+  assert.match(stored, /\.\d{6}Z$/);
   assert.equal(sha(manifestText), status.manifest.sha256);
   const contents = parts.map(part => part.content);
   assert.deepEqual(await verifyExportManifest(manifestText, status.manifest.sha256, contents), { ok: true, manifest });
@@ -331,6 +357,17 @@ test('only the owner exports, every read authorizes again, and cancellation and 
   await rejects(portability.exportPart(actor, spaceId, third.jobId, done.manifest.partCount + 1), 'NOT_FOUND');
   await rejects(portability.exportPart(actor, spaceId, third.jobId, 0), 'INVALID_ARGUMENT');
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM portability_parts WHERE job_id=$1', [cancelled.jobId])).rows[0].n, 0);
+  // Cancelling a running export removes the parts it has already written, and no later step writes more.
+  const running = await portability.submitExport(actor, spaceId);
+  let partWrites = 0;
+  await assert.rejects(worker(sql => { if (/^\s*INSERT INTO portability_parts/.test(sql) && ++partWrites === 2) throw new Error('cut'); })
+    .step({ budgetMs: 10_000 }), /cut/);
+  const partsOf = async jobId => (await pool.query('SELECT count(*)::int AS n FROM portability_parts WHERE job_id=$1', [jobId])).rows[0].n;
+  assert.deepEqual([(await portability.exportStatus(actor, spaceId, running.jobId)).state, await partsOf(running.jobId)], ['running', 1]);
+  assert.equal((await portability.cancelExport(actor, spaceId, running.jobId)).state, 'cancelled');
+  await pool.query(`UPDATE portability_jobs SET leased_until=clock_timestamp() WHERE job_id=$1 AND state='running'`, [running.jobId]);
+  await drain();
+  assert.deepEqual([(await portability.exportStatus(actor, spaceId, running.jobId)).state, await partsOf(running.jobId)], ['cancelled', 0]);
 
   // A read-only space exports; a suspended one fails its queued export and serves nothing.
   await services.spaces.update(actor, spaceId, 'readOnly');
@@ -387,4 +424,43 @@ test('submission waits for writes to the space in flight, so each lands wholly o
     // Stamped before the snapshot instant and committed before it was taken: inside the boundary.
     assert.deepEqual(lines.schemas.map(({ collectionId, version }) => [collectionId, version]), [['alpha', 1], ['beta', 1], ['beta', 2]]);
   } finally { writer.release(); }
+});
+
+test('exports and analysis jobs share the jobs Worker step: neither starves at the minimum budget, and an export failure never stops analysis', async () => {
+  const actor = await owner();
+  const spaceId = await space(actor);
+  // Four records of about 700 KB: an analysis export job of four pages and a manifest, a space export of several parts.
+  for (let i = 0; i < 4; i++)
+    await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: `big ${i}`, body: `${'x'.repeat(700_000)}${i}` } });
+  const analysisJob = await services.analysis.submit(actor, spaceId, 'alpha', 'export');
+  const exportJob = await portability.submitExport(actor, spaceId);
+  // Every page and part write takes 700 ms, so at the 2 s minimum budget one turn writes one of them and leaves no room
+  // for the other kind: the step must choose, and the choice must alternate.
+  const spin = ms => { const until = Date.now() + ms; while (Date.now() < until); };
+  const slow = worker(sql => { if (/^\s*INSERT INTO (portability_parts|analysis_result_pages|analysis_result_manifests)/.test(sql)) spin(700); });
+  const turns = [];
+  for (let i = 0; i < 4; i++) {
+    const step = await slow.step({ budgetMs: 2_000 });
+    turns.push([step.pages + step.completed > 0 ? 'analysis' : '', step.exports.parts + step.exports.completed > 0 ? 'export' : ''].join(''));
+  }
+  // The analysis job was submitted first, so it waited longer and goes first; each turn then moves its kind's wait to now.
+  assert.deepEqual(turns, ['analysis', 'export', 'analysis', 'export']);
+  const analysisState = async () => (await services.analysis.status(actor, spaceId, 'alpha', analysisJob.jobId)).state;
+  assert.equal(await analysisState(), 'running', 'the analysis job has work left');
+
+  // A failed export probe (a role without its portability grant) is reported, but the analysis job still runs to completion.
+  const denied = worker(sql => {
+    if (/portability_jobs/.test(sql)) throw Object.assign(new Error('permission denied for table portability_jobs'), { code: '42501' });
+  });
+  await assert.rejects(denied.step({ budgetMs: 10_000 }), /permission denied for table portability_jobs/);
+  assert.equal(await analysisState(), 'completed');
+  // A failing export step is reported too, and a queued analysis job submitted after the export still runs in the same step.
+  const later = await services.analysis.submit(actor, spaceId, 'alpha', 'export');
+  await assert.rejects(worker(sql => { if (/^\s*INSERT INTO portability_parts/.test(sql)) throw new Error('export part failed'); })
+    .step({ budgetMs: 10_000 }), /export part failed/);
+  assert.equal((await services.analysis.status(actor, spaceId, 'alpha', later.jobId)).state, 'completed');
+  await pool.query(`UPDATE portability_jobs SET leased_until=clock_timestamp() WHERE job_id=$1 AND state='running'`, [exportJob.jobId]);
+  await drain();
+  const { status, parts, manifestText } = await result(actor, spaceId, exportJob.jobId);
+  assert.equal((await verifyExportManifest(manifestText, status.manifest.sha256, parts.map(part => part.content))).ok, true);
 });
