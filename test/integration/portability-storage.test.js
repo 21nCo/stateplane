@@ -559,6 +559,53 @@ test('an owner mapping and its import\'s completion take turns: completion sees 
   }
 });
 
+test('under REPEATABLE READ an owner mapping and its import\'s completion still take turns, retrying with 40001 rather than refusing', async () => {
+  const { spaceId } = await space();
+  const [writer, completer] = [await pool.connect(), await pool.connect()];
+  const outcome = promise => promise.then(() => 'done', error => error);
+  try {
+    // The completion's snapshot predates an owner mapping in flight: it waits, then fails 40001, never 23514.
+    const job = await admit(spaceId, 'import', { part_count: 0 });
+    await run(job);
+    await completer.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+    await completer.query('SELECT count(*) FROM portability_principal_map');
+    await writer.query('BEGIN');
+    await map(job, 'src_owner', 'owner', 'owner', null, writer);
+    const completing = outcome(update(job, `state='completed'`, [], completer));
+    await waiting(completer);
+    await writer.query('COMMIT');
+    const stale = await completing;
+    await completer.query('ROLLBACK');
+    assert.ok(stale instanceof Error && stale.code === '40001', String(stale));
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM portability_principal_map WHERE job_id=$1 AND role='owner'`,
+      [job.job_id])).rows[0].n, 1);
+    // Its retry sees the owner row and completes.
+    await completer.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+    assert.equal((await update(job, `state='completed'`, [], completer)).state, 'completed');
+    await completer.query('COMMIT');
+    // A completion in flight, then a REPEATABLE READ mapping: the mapping waits and fails 40001, and none follows.
+    const other = await admit(spaceId, 'import', { part_count: 0 });
+    await run(other);
+    await map(other, 'src_owner', 'owner', 'owner');
+    await writer.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+    await writer.query('SELECT count(*) FROM portability_principal_map');
+    await completer.query('BEGIN');
+    await update(other, `state='completed'`, [], completer);
+    const late = outcome(map(other, 'src_agent', 'agent', null, null, writer));
+    await waiting(writer);
+    await completer.query('COMMIT');
+    const refusal = await late;
+    await writer.query('ROLLBACK');
+    assert.ok(refusal instanceof Error && refusal.code === '40001', String(refusal));
+    await assert.rejects(map(other, 'src_agent', 'agent', null), check('portability_principal_map_job'));
+  } finally {
+    await writer.query('ROLLBACK').catch(() => {});
+    await completer.query('ROLLBACK').catch(() => {});
+    writer.release();
+    completer.release();
+  }
+});
+
 test('an import maps its source owner to the importing owner and each grant holder once to a live reissued credential', async () => {
   const { spaceId, positions } = await space();
   const job = await admit(spaceId, 'import');

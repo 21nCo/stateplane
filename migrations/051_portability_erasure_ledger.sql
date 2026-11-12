@@ -244,7 +244,7 @@ BEGIN
     NEW.created_at := clock_timestamp();
     RETURN NEW;
   END IF;
-  -- An update that changes nothing, as a part write's lock of its job row, passes as is.
+  -- An update that changes nothing, as a part or mapping write's lock of its job row, passes as is.
   IF to_jsonb(NEW) = to_jsonb(OLD) THEN
     RETURN NEW;
   END IF;
@@ -412,9 +412,13 @@ CREATE UNIQUE INDEX portability_principal_map_owner ON portability_principal_map
 -- Rows are written while their import is queued or running. The owner row
 -- maps to the import's own principal; a grant holder's target is set once,
 -- to a confirmed, unrevoked credential reissued in this space and that
--- credential's own principal. Nothing else changes. The job and credential rows are share
--- locked, so an ending import or a revocation waits for the write, and a
--- completion then sees the owner row it requires.
+-- credential's own principal. Nothing else changes. Each write first updates
+-- its job row without changing it, as a part write does, so mappings of one
+-- import and its ending take turns: one that meets another in flight waits and
+-- is then checked against it under READ COMMITTED, or fails with a
+-- serialization error (40001) under REPEATABLE READ. So a completion sees the
+-- owner row committed before it, and no mapping commits after it. The
+-- credential row is share locked, so a revocation waits for the write.
 CREATE FUNCTION stateplane_guard_portability_principal() RETURNS trigger LANGUAGE plpgsql
 SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
@@ -428,8 +432,8 @@ BEGIN
     RAISE EXCEPTION 'a principal mapping is set once'
       USING ERRCODE = 'check_violation', CONSTRAINT = 'portability_principal_map_immutable';
   END IF;
-  SELECT j.state, j.principal_id INTO job FROM public.portability_jobs j
-    WHERE j.space_id = NEW.space_id AND j.job_id = NEW.job_id FOR SHARE;
+  UPDATE public.portability_jobs j SET state = j.state WHERE j.space_id = NEW.space_id AND j.job_id = NEW.job_id
+    RETURNING j.state, j.principal_id INTO job;
   IF job.state IS NULL OR job.state NOT IN ('queued', 'running') THEN
     RAISE EXCEPTION 'principal mappings are written while their import is queued or running'
       USING ERRCODE = 'check_violation', CONSTRAINT = 'portability_principal_map_job';

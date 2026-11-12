@@ -62,7 +62,7 @@ Parts are written only by their running job under an unexpired lease before the 
 - the source **owner** maps to the importing owner, the job's own principal; one owner row per import (`portability_principal_map_owner`);
 - each source **grant holder** (`agent`) maps, once issued, to a credential reissued in this space and that credential's own principal. The credential must be confirmed and unrevoked, and maps one source principal per import (`portability_principal_map_credential`). A source credential or secret is never copied; the map stores identifiers only.
 
-Rows are written while their import is queued or running (`portability_principal_map_job`); a grant holder's target is set once, and nothing else changes (`portability_principal_map_immutable`). The guard share-locks the job and the credential, so an ending import or a revocation waits for the write, and a completing import then sees the owner row it requires.
+Rows are written while their import is queued or running (`portability_principal_map_job`); a grant holder's target is set once, and nothing else changes (`portability_principal_map_immutable`). Each write first updates its job row without changing it, as a part write does, so mappings and the import's ending take turns: a completion sees the owner row committed before it, and no mapping commits after it. A session that meets the other in flight waits, then under READ COMMITTED is checked against it (a late mapping is refused), and under REPEATABLE READ or SERIALIZABLE fails with a retryable serialization error (`40001`), never a `portability_jobs_principals` refusal for a mapped owner. The guard share-locks the credential, so a revocation waits for the write.
 
 ## Limits
 
