@@ -18,11 +18,13 @@ import type { PostgresSpaces } from './spaces.js';
  * lifetime, completed result included; at most 2 unfinished exports per
  * space; parts of at most 1 MiB (migration 051's bound) read 1,000 rows at a
  * time; a 30 s lease extended by every part; pending record events published
- * at submission in rounds of 5,000, at most 20.
+ * at submission in rounds of 5,000, at most 20; 30 s for a submission's
+ * final credential check to admit its queued export, after which a worker
+ * cancels it unrun.
  */
 export const portabilityExportBounds = Object.freeze({ budgetBytes: 1_073_741_824, maxParts: 4_096, budgetRuntimeMs: 3_600_000,
   lifetimeMs: 86_400_000, activePerSpace: 2, partBytes: 1_048_576, readRows: 1_000, leaseMs: 30_000, publishBatch: 5_000,
-  publishRounds: 20 });
+  publishRounds: 20, admissionMs: 30_000 });
 
 export type PortabilityJobState = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'expired';
 /** The state a space export is read at: records as of the watermark, everything else as of the snapshot instant. */
@@ -43,13 +45,26 @@ export interface PortabilityExportPart {
   jobId: string; manifest: { sha256: string; partCount: number };
   part: { number: number; section: string; rowCount: number; byteSize: number; sha256: string; content: string };
 }
-export interface PortabilityStep { expired: number; claimed: number; parts: number; completed: number; failed: number }
+export interface PortabilityStep {
+  expired: number; claimed: number; parts: number; completed: number; failed: number;
+  /** Exports whose submission never admitted them (its final check failed or never finished), cancelled unrun. */
+  unadmitted: number;
+}
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- driver rows, read by column name
 type Row = Record<string, any>;
 
 const JOB_ID = /^exp_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const UNFINISHED = `('queued','running')`;
+/**
+ * Admission. Submission inserts an export `queued` and, once its final
+ * credential check passes, admits it in the same transaction as that check:
+ * `running` with no attempt yet and a lease that has already ended, so it is
+ * due at once. Workers claim only admitted exports; a queued export is never
+ * run. One still queued once `admissionMs` has passed was never admitted (its
+ * check failed, or its submitter stopped) and a worker cancels it.
+ */
+const UNADMITTED = `(j.state='queued' AND j.created_at<=clock_timestamp()-${portabilityExportBounds.admissionMs}*interval '1 millisecond')`;
 const MIN_PART_MS = 1_000;
 const RELEASE_MS = 500;
 const iso = (value: Date | string | null) => value === null ? null : new Date(value).toISOString();
@@ -214,8 +229,9 @@ async function discard(db: Session, key: unknown[]): Promise<void> {
 
 /** The snapshot instant as UTC RFC 3339 text to the microsecond, as the database stores it (a Date keeps milliseconds). */
 const SNAPSHOT_AT = `to_char(j.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS snapshot_at`;
+// An admitted export no worker has claimed yet is still queued to its owner.
 const STATUS = `SELECT j.*,${SNAPSHOT_AT},CASE WHEN j.state IN ('queued','running','completed') AND j.expires_at<=clock_timestamp() THEN 'expired'
-    ELSE j.state END AS effective,
+    WHEN j.state='running' AND j.attempts=0 THEN 'queued' ELSE j.state END AS effective,
     (SELECT count(*) FROM portability_parts p WHERE p.space_id=j.space_id AND p.job_id=j.job_id)::int AS parts_written
   FROM portability_jobs j WHERE j.space_id=$1 AND j.job_id=$2 AND j.kind='export'`;
 function view(row: Row): PortabilityExportStatus {
@@ -229,7 +245,7 @@ function view(row: Row): PortabilityExportStatus {
       partsWritten: Number(row.parts_written ?? 0), attempts: Number(row.attempts), runtimeMs: Number(checkpoint.runtimeMs ?? 0) },
     budgets: { bytes: portabilityExportBounds.budgetBytes, parts: portabilityExportBounds.maxParts,
       runtimeMs: portabilityExportBounds.budgetRuntimeMs },
-    createdAt: iso(row.created_at)!, startedAt: iso(row.started_at), finishedAt: iso(row.finished_at), expiresAt: iso(row.expires_at)!,
+    createdAt: iso(row.created_at)!, startedAt: Number(row.attempts) > 0 ? iso(row.started_at) : null, finishedAt: iso(row.finished_at), expiresAt: iso(row.expires_at)!,
     manifest: sealed, complete: sealed !== null };
 }
 
@@ -303,8 +319,8 @@ export class PostgresPortabilityExports {
           policy: scope.policyVersion }, 'FOR NO KEY UPDATE');
         if (refused && refused !== 'NOT_FOUND' && refused !== 'SPACE_UNAVAILABLE') throw new AuthorityError('FORBIDDEN', 'Policy or placement changed');
         if (refused) throw new AuthorityError(refused);
-        const active = (await db.query(`SELECT count(*)::int AS n FROM portability_jobs WHERE space_id=$1 AND kind='export'
-          AND state IN ${UNFINISHED} AND expires_at>clock_timestamp()`, [spaceId])).rows[0].n;
+        const active = (await db.query(`SELECT count(*)::int AS n FROM portability_jobs j WHERE j.space_id=$1 AND j.kind='export'
+          AND j.state IN ${UNFINISHED} AND j.expires_at>clock_timestamp() AND NOT ${UNADMITTED}`, [spaceId])).rows[0].n;
         if (active >= portabilityExportBounds.activePerSpace)
           throw new AuthorityError('BACKPRESSURE', `The space has ${active} unfinished exports; retry later`, undefined, true);
         const collections = (await db.query('SELECT collection_id FROM collections WHERE space_id=$1 ORDER BY collection_id',
@@ -328,13 +344,28 @@ export class PostgresPortabilityExports {
         return view((await db.query(STATUS, [spaceId, jobId])).rows[0]);
       });
       if (!submitted) continue;
-      // The final credential check runs after the hold is released, so writers never wait on the provider: an owner
-      // whose credential no longer holds is refused, and the export it queued is cancelled before any worker runs it.
+      // The final credential check runs after the hold is released, so writers never wait on the provider. The export
+      // is admitted in the check's own transaction (locked meanwhile, so no worker cancels it), so a refused or
+      // interrupted check leaves it queued, which no worker runs; a refused owner's export is cancelled here at once.
       try {
-        return released(await transact(pool, async db => ({ value: submitted, deadline: await this.recheck(db, actor, admitted) })));
+        return released(await transact(pool, async db => {
+          const admission = await db.query(`UPDATE portability_jobs j SET state='running',lease_id=$3,leased_until=clock_timestamp()
+            WHERE j.space_id=$1 AND j.job_id=$2 AND NOT ${UNADMITTED} AND j.state='queued' RETURNING j.job_id`,
+          [spaceId, submitted.jobId, randomUUID()]);
+          if (!admission.rowCount) throw new AuthorityError('BACKPRESSURE', 'The export was not admitted in time; submit again', undefined, true);
+          return { value: submitted, deadline: await this.recheck(db, actor, admitted) };
+        }));
       } catch (error) {
-        await transact(pool, db => db.query(`UPDATE portability_jobs SET state='cancelled' WHERE space_id=$1 AND job_id=$2
-          AND state='queued'`, [spaceId, submitted.jobId])).catch(() => {});
+        try {
+          await transact(pool, async db => {
+            await db.query(`UPDATE portability_jobs SET state='cancelled' WHERE space_id=$1 AND job_id=$2 AND state IN ${UNFINISHED}`,
+              [spaceId, submitted.jobId]);
+            await discard(db, [spaceId, submitted.jobId]);
+          });
+        } catch (cleanup) {
+          // An export whose check never committed is still queued: never run, and cancelled once its admission time passes.
+          throw new AggregateError([error, cleanup], 'The export was refused and could not be cancelled at once', { cause: cleanup });
+        }
         throw error;
       }
     }
@@ -443,21 +474,24 @@ export class PortabilityExportWorker {
   constructor(private readonly pool: PoolLike) {}
 
   /**
-   * When the longest-waiting due export began waiting (epoch ms: a queued
-   * one since submission, one with a lapsed lease since its lease ended, one
-   * past its expiry since its expiry), or null when none is due.
+   * When the longest-waiting due export began waiting (epoch ms: an admitted
+   * one since admission, one whose lease ended since then, one past its
+   * expiry since its expiry, one never admitted since its admission time
+   * passed), or null when none is due.
    */
   async waiting(until: number): Promise<number | null> {
     const since = (await inTransaction(this.pool, db => db.query(`SELECT (extract(epoch FROM min(CASE
-        WHEN expires_at<=clock_timestamp() THEN expires_at ELSE COALESCE(leased_until,created_at) END))*1000)::float8 AS since
-      FROM portability_jobs WHERE kind='export'
-        AND ((state IN ${UNFINISHED} AND (state='queued' OR leased_until<=clock_timestamp() OR expires_at<=clock_timestamp()))
-          OR (state='completed' AND expires_at<=clock_timestamp()))`), { deadline: until })).rows[0].since;
+        WHEN j.expires_at<=clock_timestamp() THEN j.expires_at WHEN j.state='queued'
+        THEN j.created_at+${portabilityExportBounds.admissionMs}*interval '1 millisecond' ELSE j.leased_until END))*1000)::float8 AS since
+      FROM portability_jobs j WHERE j.kind='export'
+        AND ((j.state IN ${UNFINISHED} AND (j.expires_at<=clock_timestamp() OR ${UNADMITTED}
+            OR (j.state='running' AND j.leased_until<=clock_timestamp())))
+          OR (j.state='completed' AND j.expires_at<=clock_timestamp()))`), { deadline: until })).rows[0].since;
     return since === null ? null : Number(since);
   }
 
   async step(until: number): Promise<PortabilityStep> {
-    const result: PortabilityStep = { expired: 0, claimed: 0, parts: 0, completed: 0, failed: 0 };
+    const result: PortabilityStep = { expired: 0, claimed: 0, parts: 0, completed: 0, failed: 0, unadmitted: 0 };
     try { await this.expire(until, result); } catch (error) { if (!cutShort(error)) throw error; }
     const passed: string[] = [];
     while (until - RELEASE_MS - Date.now() >= MIN_PART_MS) {
@@ -472,28 +506,34 @@ export class PortabilityExportWorker {
     return result;
   }
 
-  /** End exports past their expiry, one per transaction, removing their parts. */
+  /**
+   * End exports past their expiry (`expired`) and those never admitted
+   * (`cancelled`), one per transaction, removing their parts. A submission
+   * admitting its export holds it locked, so is never cancelled under it.
+   */
   private async expire(until: number, result: PortabilityStep): Promise<void> {
     while (Date.now() < until) {
       const ended = await inTransaction(this.pool, async db => {
-        const due = (await db.query(`SELECT space_id,job_id FROM portability_jobs WHERE kind='export'
-          AND state IN ('queued','running','completed') AND expires_at<=clock_timestamp() ORDER BY expires_at LIMIT 1
-          FOR UPDATE SKIP LOCKED`)).rows[0];
-        if (!due) return false;
-        await db.query(`UPDATE portability_jobs SET state='expired' WHERE space_id=$1 AND job_id=$2`, pk(due));
+        const due = (await db.query(`SELECT j.space_id,j.job_id,j.expires_at<=clock_timestamp() AS expired FROM portability_jobs j
+          WHERE j.kind='export' AND ((j.state IN ('queued','running','completed') AND j.expires_at<=clock_timestamp()) OR ${UNADMITTED})
+          ORDER BY least(j.expires_at,j.created_at) LIMIT 1 FOR UPDATE SKIP LOCKED`)).rows[0];
+        if (!due) return null;
+        await db.query(`UPDATE portability_jobs SET state=$3 WHERE space_id=$1 AND job_id=$2`,
+          [...pk(due), due.expired ? 'expired' : 'cancelled']);
         await discard(db, pk(due));
-        return true;
+        return due.expired ? 'expired' : 'unadmitted';
       }, { deadline: until });
       if (!ended) return;
-      result.expired++;
+      result[ended]++;
     }
   }
 
   /** Claim the next due export not passed over in this step: null when none, `busy` when taken meanwhile, `failed` when its binding failed it. */
   private async claim(until: number, passed: string[]): Promise<Row | null | 'busy' | 'failed'> {
+    // Only admitted exports: running (from admission or a lost lease) with their lease ended. A queued one is never run.
     const next = (await inTransaction(this.pool, db => db.query(`SELECT space_id,job_id FROM portability_jobs
-      WHERE kind='export' AND (state='queued' OR (state='running' AND leased_until<=clock_timestamp())) AND expires_at>clock_timestamp()
-        AND NOT job_id=ANY($1::text[]) ORDER BY leased_until NULLS FIRST,created_at,job_id LIMIT 1`, [passed]), { deadline: until })).rows[0];
+      WHERE kind='export' AND state='running' AND leased_until<=clock_timestamp() AND expires_at>clock_timestamp()
+        AND NOT job_id=ANY($1::text[]) ORDER BY leased_until,created_at,job_id LIMIT 1`, [passed]), { deadline: until })).rows[0];
     if (!next) return null;
     passed.push(next.job_id);
     return inTransaction(this.pool, async db => {
@@ -502,7 +542,7 @@ export class PortabilityExportWorker {
       const failure = await spaceCheck(db, job.space_id, { principal: job.principal_id, placement: Number(job.placement_generation) });
       const locked = (await db.query(`SELECT *,least(clock_timestamp()+$3::int*interval '1 millisecond',expires_at) AS until
         FROM portability_jobs WHERE space_id=$1 AND job_id=$2
-          AND (state='queued' OR (state='running' AND leased_until<=clock_timestamp())) AND expires_at>clock_timestamp()
+          AND state='running' AND leased_until<=clock_timestamp() AND expires_at>clock_timestamp()
         FOR UPDATE SKIP LOCKED`, [...pk(next), portabilityExportBounds.leaseMs])).rows[0];
       if (!locked) return 'busy' as const;
       if (failure) { await this.fail(db, locked, failure); return 'failed' as const; }

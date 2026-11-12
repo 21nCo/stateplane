@@ -589,9 +589,9 @@ export interface AnalysisWorkerOptions {
  * (or an interactive aggregation) can take them at once.
  *
  * The same step writes owner space exports (`PortabilityExportWorker`,
- * docs/portability-export.md#worker). With none due, analysis jobs take the
- * whole budget. With one due, the kind whose next due job has waited longer
- * goes first: at a budget of 5 s or more it stops at its share (analysis
+ * docs/portability-export.md#worker). A kind due alone takes the whole
+ * budget. With both due, the kind whose next due job has waited longer goes
+ * first: at a budget of 5 s or more it stops at its share (analysis
  * three fifths, exports two fifths, each at least 2 s), below that it takes
  * the whole budget; the other kind takes what is left. Every turn moves its
  * job's wait to now, so the other kind goes first next, and neither starves
@@ -599,18 +599,19 @@ export interface AnalysisWorkerOptions {
  * the other: the step throws it once both have run.
  */
 export class PostgresAnalysisWorker {
-  readonly #slots: { cell: number; space: number };
   readonly #exports: PortabilityExportWorker;
-  constructor(private readonly pool: PoolLike, options: AnalysisWorkerOptions) {
-    this.#slots = analyticalSlots(options.originConnectionLimit);
+  constructor(private readonly pool: PoolLike, private readonly options: AnalysisWorkerOptions) {
     this.#exports = new PortabilityExportWorker(pool);
   }
+
+  /** The cell's analytical slots, derived when analysis runs: an invalid origin limit fails analysis only, never exports. */
+  get #slots(): { cell: number; space: number } { return analyticalSlots(this.options.originConnectionLimit); }
 
   async step(settings: { budgetMs?: number } = {}): Promise<AnalysisStep> {
     const budgetMs = bounded(settings.budgetMs ?? 5_000, MIN_STEP_MS, 60_000);
     const end = Date.now() + budgetMs;
     const result: AnalysisStep = { expired: 0, claimed: 0, pages: 0, completed: 0, failed: 0,
-      exports: { expired: 0, claimed: 0, parts: 0, completed: 0, failed: 0 } };
+      exports: { expired: 0, claimed: 0, parts: 0, completed: 0, failed: 0, unadmitted: 0 } };
     const failures: unknown[] = [];
     const settle = async (run: () => Promise<void>) => {
       try { await run(); } catch (error) { if (!cutShort(error)) failures.push(error); }
@@ -625,7 +626,8 @@ export class PostgresAnalysisWorker {
     if (exportsSince === null) await analysis(end);
     else {
       const analysisSince = await probe(() => this.waiting(end));
-      const shared = Math.floor(budgetMs * 2 / 5) >= MIN_STEP_MS;
+      // Only two kinds both due share the budget; a lone kind takes all of it.
+      const shared = analysisSince !== null && Math.floor(budgetMs * 2 / 5) >= MIN_STEP_MS;
       if (analysisSince === null || exportsSince <= analysisSince) {
         await exports(shared ? end - Math.floor(budgetMs * 3 / 5) : end);
         await analysis(end);
@@ -650,6 +652,8 @@ export class PostgresAnalysisWorker {
 
   /** Expire, then claim and run analysis jobs until `until`. */
   private async analyse(until: number, budgetMs: number, result: AnalysisStep): Promise<void> {
+    // An invalid origin connection limit fails the analysis half here, and the step reports it once exports have run.
+    analyticalSlots(this.options.originConnectionLimit);
     try { await this.expire(Math.min(until, Date.now() + Math.floor(budgetMs / 4)), result); }
     catch (error) { if (!cutShort(error)) throw error; }
     const passed: { s: string; c: string; j: string }[] = [];

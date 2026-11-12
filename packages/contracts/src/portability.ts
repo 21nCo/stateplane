@@ -46,8 +46,22 @@ export type ManifestVerification =
 const HEX64 = /^[0-9a-f]{64}$/;
 const JOB_ID = /^exp_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SECTION_NAME = /^[a-z][a-z0-9_]{0,62}$/;
-// RFC 3339 date-time, as the schema's `format: date-time` names it.
-const INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/i;
+// RFC 3339 date-time, as the schema's `format: date-time` names it: a calendar date, a time of day and an offset.
+const INSTANT = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|([+-])(\d{2}):(\d{2}))$/i;
+const DAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+/** RFC 3339 section 5.7: the day exists in its month and year, and a second of 60 is only a leap second, 23:59:60 UTC. */
+function isInstant(value: unknown): boolean {
+  const match = typeof value === 'string' ? INSTANT.exec(value) : null;
+  if (!match) return false;
+  const [year, month, day, hour, minute, second, , offsetHour, offsetMinute] = match.slice(1).map(part => Number(part ?? 0));
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  if (month < 1 || month > 12 || day < 1 || day > (month === 2 && leap ? 29 : DAYS[month - 1])) return false;
+  if (offsetHour > 23 || offsetMinute > 59) return false;
+  if (hour <= 23 && minute <= 59 && second <= 59) return true;
+  const sign = match[7] === '-' ? -1 : 1, utcMinute = minute - offsetMinute * sign;
+  const utcHour = hour - offsetHour * sign - (utcMinute < 0 ? 1 : 0);
+  return second === 60 && (utcHour === 23 || utcHour === -1) && (utcMinute === 59 || utcMinute === -1);
+}
 /** The manifest schema's limits: 11 evidence sections and at most 1 accelerator; 4,095 data parts of 1 to 1 MiB. */
 const MAX_DATA_PARTS = 4_095;
 const MAX_PART_BYTES = 1_048_576;
@@ -85,8 +99,7 @@ function malformed(value: unknown): string | null {
   if (!closed(s, ['spaceId', 'ownerPrincipalId', 'policyVersion', 'placementGeneration']) || !isId(s.spaceId)
     || !isId(s.ownerPrincipalId) || !isPositive(s.policyVersion) || !isPositive(s.placementGeneration)) return 'space is malformed';
   const b = m.boundary;
-  if (!closed(b, ['watermark', 'snapshotAt', 'records', 'evidence']) || !isCount(b.watermark) || typeof b.snapshotAt !== 'string'
-    || !INSTANT.test(b.snapshotAt) || Number.isNaN(Date.parse(b.snapshotAt))
+  if (!closed(b, ['watermark', 'snapshotAt', 'records', 'evidence']) || !isCount(b.watermark) || !isInstant(b.snapshotAt)
     || b.records !== 'as-of-watermark' || b.evidence !== 'as-of-snapshot') return 'the boundary is malformed';
   if (!Array.isArray(m.excluded) || m.excluded.some(item => typeof item !== 'string')) return 'excluded is malformed';
   if (!Array.isArray(m.parts) || !Array.isArray(m.sections)) return 'parts and sections must be arrays';

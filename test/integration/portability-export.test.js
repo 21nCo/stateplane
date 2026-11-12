@@ -6,12 +6,13 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import Ajv2020 from 'ajv/dist/2020.js';
+import addFormats from 'ajv-formats';
 import { memoryAdapter } from '@superfunctions/db/testing';
 import { createAuthFn, createUser, issueSession } from '@authfn/core';
 import { AuthFnAgentKeys, AuthFnIdentityVerifier } from '../../packages/auth/dist/index.js';
 import { exportSections, verifyExportManifest } from '../../packages/contracts/dist/index.js';
-import { PostgresAnalysisWorker, PostgresClaims, PostgresLinks, PostgresSources, PostgresSpaces,
-  postgresServices } from '../../packages/postgres/dist/index.js';
+import { AuthorityError, PostgresAnalysisWorker, PostgresClaims, PostgresLinks, PostgresPortabilityExports, PostgresSources,
+  PostgresSpaces, portabilityExportBounds, postgresServices } from '../../packages/postgres/dist/index.js';
 import { R2BlobStore } from '../../packages/storage/dist/index.js';
 
 // STA-70: owner exports of a whole space in the open versioned format. Every
@@ -79,7 +80,8 @@ const definition = slug => JSON.stringify({ slug, version: 1, schema: { $schema:
   unique: [], filterable: [], sortable: [] });
 
 const schema = JSON.parse(await readFile(new URL('../../contracts/portability-manifest.schema.json', import.meta.url), 'utf8'));
-const ajv = new Ajv2020({ strict: false, allErrors: true, validateFormats: false });
+const ajv = new Ajv2020({ strict: false, allErrors: true });
+addFormats(ajv);
 ajv.addSchema(schema, 'manifest');
 const validators = Object.fromEntries([...exportSections].map(section => [section, ajv.getSchema(`manifest#/$defs/${section}`)]));
 const validManifest = ajv.getSchema('manifest');
@@ -402,6 +404,71 @@ test('only the owner exports, every read authorizes again, and cancellation and 
   assert.deepEqual(job, { state: 'failed', failure_code: 'SPACE_UNAVAILABLE' });
 });
 
+test('an export is never run unless its submission\'s final check admits it: a refused or interrupted submission leaves nothing runnable', async () => {
+  const actor = await owner();
+  const spaceId = await space(actor);
+  await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: 'x' } });
+  const jobOf = async () => (await pool.query(`SELECT job_id,state FROM portability_jobs WHERE space_id=$1 ORDER BY created_at DESC
+    LIMIT 1`, [spaceId])).rows[0];
+  const partsOf = async jobId => (await pool.query('SELECT count(*)::int AS n FROM portability_parts WHERE job_id=$1', [jobId])).rows[0].n;
+
+  // The provider's final check pauses, then refuses the owner. A worker step meanwhile finds nothing to run.
+  let reach, release;
+  const reached = new Promise(resolve => { reach = resolve; }), gate = new Promise(resolve => { release = resolve; });
+  const refusing = { scope: (...args) => spaces.scope(...args), assertCurrentUntil: async () => {
+    reach(); await gate; throw new AuthorityError('FORBIDDEN', 'The session was revoked');
+  } };
+  const exports = new PostgresPortabilityExports(refusing, new Map([['cell-a', { pool }]]));
+  const refused = exports.submit(actor, spaceId);
+  await reached;
+  const paused = await jobOf();
+  assert.equal(paused.state, 'queued');
+  const meanwhile = await worker().step({ budgetMs: 2_000 });
+  assert.deepEqual([meanwhile.exports.claimed, meanwhile.exports.parts, await partsOf(paused.job_id)], [0, 0, 0],
+    'no worker runs an export its final check has not admitted');
+  release();
+  await rejects(refused, 'FORBIDDEN');
+  assert.deepEqual(await jobOf(), { job_id: paused.job_id, state: 'cancelled' });
+  await drain();
+  assert.deepEqual([(await jobOf()).state, await partsOf(paused.job_id)], ['cancelled', 0]);
+
+  // The submitter stops right after pinning the boundary: neither its check nor its cleanup reaches the database.
+  let gone = false;
+  const dying = { connect: async () => {
+    if (gone) throw new Error('the submitter stopped');
+    const client = await pool.connect(), query = client.query.bind(client);
+    client.query = async (sql, ...rest) => { const done = await query(sql, ...rest); if (sql === 'COMMIT') gone = true; return done; };
+    const release = client.release.bind(client);
+    client.release = (...args) => { client.query = query; client.release = release; return release(...args); };
+    return client;
+  } };
+  await assert.rejects(new PostgresPortabilityExports(spaces, new Map([['cell-a', { pool: dying }]])).submit(actor, spaceId),
+    error => error instanceof AggregateError && error.errors.every(item => /the submitter stopped/.test(item.message)));
+  const orphan = await jobOf();
+  assert.equal(orphan.state, 'queued');
+  assert.equal((await worker().step({ budgetMs: 2_000 })).exports.claimed, 0, 'an unadmitted export is never claimed');
+  assert.equal((await portability.exportStatus(actor, spaceId, orphan.job_id)).state, 'queued');
+  // Once its admission time has passed (backdated here; migration 051 keeps created_at, so its trigger is bypassed),
+  // a worker cancels it unrun, and it no longer holds one of the space's two export slots.
+  const backdate = await pool.connect();
+  try {
+    await backdate.query('BEGIN');
+    await backdate.query("SET LOCAL session_replication_role = 'replica'");
+    await backdate.query(`UPDATE portability_jobs SET created_at=created_at-$2::int*interval '1 millisecond' WHERE job_id=$1`,
+      [orphan.job_id, portabilityExportBounds.admissionMs + 1_000]);
+    await backdate.query('COMMIT');
+  } finally { backdate.release(); }
+  const swept = await worker().step({ budgetMs: 2_000 });
+  assert.deepEqual([swept.exports.unadmitted, swept.exports.claimed], [1, 0]);
+  assert.deepEqual([(await jobOf()).state, await partsOf(orphan.job_id)], ['cancelled', 0]);
+  // An admitted export reads as queued until a worker claims it, then runs to completion.
+  const admitted = await portability.submitExport(actor, spaceId);
+  const waiting = await portability.exportStatus(actor, spaceId, admitted.jobId);
+  assert.deepEqual([waiting.state, waiting.startedAt], ['queued', null]);
+  await drain();
+  assert.equal((await portability.exportStatus(actor, spaceId, admitted.jobId)).state, 'completed');
+});
+
 test('submission waits for writes to the space in flight, so each lands wholly on one side of the boundary', async () => {
   const actor = await owner();
   const spaceId = await space(actor);
@@ -462,5 +529,28 @@ test('exports and analysis jobs share the jobs Worker step: neither starves at t
   await pool.query(`UPDATE portability_jobs SET leased_until=clock_timestamp() WHERE job_id=$1 AND state='running'`, [exportJob.jobId]);
   await drain();
   const { status, parts, manifestText } = await result(actor, spaceId, exportJob.jobId);
+  assert.equal((await verifyExportManifest(manifestText, status.manifest.sha256, parts.map(part => part.content))).ok, true);
+});
+
+test('an export due alone takes the whole step budget, and an invalid origin connection limit fails analysis only', async () => {
+  const actor = await owner();
+  const spaceId = await space(actor);
+  for (let i = 0; i < 4; i++)
+    await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: `big ${i}`, body: `${'x'.repeat(700_000)}${i}` } });
+  const { jobId } = await portability.submitExport(actor, spaceId);
+  // Every part write takes 700 ms. Capped at exports' 2 s share, a step would write one; with no analysis job due, the
+  // export takes all 5 s.
+  const spin = ms => { const until = Date.now() + ms; while (Date.now() < until); };
+  const step = await worker(sql => { if (/^\s*INSERT INTO portability_parts/.test(sql)) spin(700); }).step({ budgetMs: 5_000 });
+  assert.ok(step.exports.parts >= 3, `a lone export wrote ${step.exports.parts} parts in a 5 s step`);
+  await pool.query(`UPDATE portability_jobs SET leased_until=clock_timestamp() WHERE job_id=$1 AND state='running'`, [jobId]);
+
+  // A cell with an invalid origin connection limit still runs its exports; the step then reports the analysis failure.
+  const own = newPool(1);
+  const misconfigured = new PostgresAnalysisWorker(own, { originConnectionLimit: Number(undefined) });
+  // One unhindered step finishes the export's few remaining parts and seals it.
+  await assert.rejects(misconfigured.step({ budgetMs: 10_000 }), error => error instanceof RangeError
+    && /Invalid origin connection limit/.test(error.message));
+  const { status, parts, manifestText } = await result(actor, spaceId, jobId);
   assert.equal((await verifyExportManifest(manifestText, status.manifest.sha256, parts.map(part => part.content))).ok, true);
 });

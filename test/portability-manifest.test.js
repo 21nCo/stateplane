@@ -3,12 +3,14 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import Ajv2020 from 'ajv/dist/2020.js';
+import addFormats from 'ajv-formats';
 import { exportSections, verifyExportManifest } from '../packages/contracts/dist/index.js';
 
 // STA-70: verifyExportManifest accepts exactly the manifests the published JSON Schema accepts (plus the rules the
 // schema cannot state), even when the manifest's digest is correct: a digest proves the bytes, not the format.
 const schema = JSON.parse(await readFile(new URL('../contracts/portability-manifest.schema.json', import.meta.url), 'utf8'));
-const ajv = new Ajv2020({ strict: false, allErrors: true, validateFormats: false });
+const ajv = new Ajv2020({ strict: false, allErrors: true });
+addFormats(ajv);
 const valid = ajv.compile(schema);
 const sha = text => createHash('sha256').update(text, 'utf8').digest('hex');
 
@@ -33,6 +35,16 @@ test('a well-formed manifest verifies and matches the schema', async () => {
   assert.deepEqual(await verifyExportManifest(text, digest, [content]), { ok: true, manifest: value });
 });
 
+test('every RFC 3339 instant the schema accepts verifies, leap days and leap seconds included', async () => {
+  for (const instant of ['2024-02-29T00:00:00Z', '2000-02-29T23:59:59.999999Z', '2016-12-31T23:59:60Z',
+    '2017-01-01T00:59:60+01:00', '2026-11-13T01:02:03.5-05:30']) {
+    const value = edit(m => { m.boundary.snapshotAt = instant; });
+    assert.ok(valid(value), `the schema refuses ${instant}`);
+    const [text, digest] = sealed(value);
+    assert.equal((await verifyExportManifest(text, digest)).ok, true, `the verifier refuses ${instant}`);
+  }
+});
+
 test('a correctly hashed manifest the schema refuses is refused, whatever member is wrong', async () => {
   const many = Array.from({ length: 4_096 }, (_, i) => ({ number: i + 1, section: 'schemas', rows: 0, bytes: 1, sha256: sha('x') }));
   const cases = {
@@ -50,6 +62,13 @@ test('a correctly hashed manifest the schema refuses is refused, whatever member
     'a fractional placement generation': m => { m.space.placementGeneration = 1.5; },
     'a non-string excluded item': m => { m.excluded = [1]; },
     'a snapshot instant that is not a date-time': m => { m.boundary.snapshotAt = 'yesterday'; },
+    'a snapshot instant on a day its month lacks': m => { m.boundary.snapshotAt = '2026-02-30T01:02:03Z'; },
+    'a snapshot instant on 29 February of a common year': m => { m.boundary.snapshotAt = '2100-02-29T01:02:03Z'; },
+    'a snapshot instant in month 13': m => { m.boundary.snapshotAt = '2026-13-01T01:02:03Z'; },
+    'a snapshot instant at hour 24': m => { m.boundary.snapshotAt = '2026-11-13T24:00:00Z'; },
+    'a snapshot instant at minute 60': m => { m.boundary.snapshotAt = '2026-11-13T01:60:00Z'; },
+    'a snapshot instant with a second of 60 that is no leap second': m => { m.boundary.snapshotAt = '2026-11-13T01:02:60Z'; },
+    'a snapshot instant with an offset of 24 hours': m => { m.boundary.snapshotAt = '2026-11-13T01:02:03+24:00'; },
     'a part of zero bytes': m => { m.parts[0].bytes = 0; m.sections[1].bytes = 0; },
     'a part over 1 MiB': m => { m.parts[0].bytes = 1_048_577; m.sections[1].bytes = 1_048_577; },
     'a non-boolean accelerator': m => { m.sections[0].accelerator = 0; },
@@ -57,8 +76,8 @@ test('a correctly hashed manifest the schema refuses is refused, whatever member
   };
   for (const [label, change] of Object.entries(cases)) {
     const value = edit(change);
-    // The schema itself refuses each (snapshotAt by its date-time format, which this validator leaves unchecked).
-    if (label !== 'a snapshot instant that is not a date-time') assert.equal(valid(value), false, `the schema accepts ${label}`);
+    // The schema itself refuses each (snapshotAt by its date-time format).
+    assert.equal(valid(value), false, `the schema accepts ${label}`);
     const [text, digest] = sealed(value);
     const verdict = await verifyExportManifest(text, digest);
     assert.equal(verdict.ok, false, `the verifier accepts ${label}`);
