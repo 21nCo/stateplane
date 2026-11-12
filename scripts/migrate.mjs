@@ -215,7 +215,8 @@ try {
       name === '039_durable_outbox.sql' || name === '040_evidence_storage.sql' || name === '041_original_object_keys.sql' ||
       name === '042_claim_revision_recorder.sql' || name === '043_claim_commit_authority.sql' ||
       name === '044_links_deletion_retention.sql' || name === '045_retrieval_projections.sql' ||
-      name === '046_retrieval_dispatch_checkpoint.sql' || name === '048_projection_rebuilds.sql' || name === '049_analysis_jobs.sql';
+      name === '046_retrieval_dispatch_checkpoint.sql' || name === '048_projection_rebuilds.sql' || name === '049_analysis_jobs.sql' ||
+      name === '051_portability_erasure_ledger.sql';
     const priorLockTimeout = boundedDdl ? (await client.query('SHOW lock_timeout')).rows[0].lock_timeout : null; // NOSONAR -- migrations run in order within the current transaction
     if (boundedDdl) await client.query("SET LOCAL lock_timeout = '5s'"); // NOSONAR -- set before this step's DDL, never concurrently
     // 048 holds projection_generations exclusively from its first statement to its commit, and every retrieval write
@@ -265,6 +266,9 @@ try {
       // 049 waits for event publishers and readers on the feed, then for collection, schema and space writers.
       if (name === '049_analysis_jobs.sql' && (error?.code === '55P03' || error?.code === '40P01'))
         throw new Error('Analysis job upgrade waits for event feed readers, space purges and collection, schema or space writers; retry when long transactions finish', { cause:error });
+      // 051 alters the space directory and references spaces and credentials, and replaces the purge routine.
+      if (name === '051_portability_erasure_ledger.sql' && (error?.code === '55P03' || error?.code === '40P01'))
+        throw new Error('Portability and erasure ledger upgrade waits for space directory, space and credential writers and space purges; retry when long transactions finish', { cause:error });
       // 57014 is also an explicit or infrastructure cancellation; only PostgreSQL's statement timeout message names the bound.
       if (name === '048_projection_rebuilds.sql' && error?.code === '57014')
         throw new Error(/statement timeout/.test(error.message ?? '')

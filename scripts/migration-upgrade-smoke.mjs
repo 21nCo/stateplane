@@ -162,6 +162,7 @@ try {
     assert.match(output,/Applied 047_retrieval_outbox_age.sql/);
     assert.match(output,/Applied 048_projection_rebuilds.sql/);
     assert.match(output,/Applied 049_analysis_jobs.sql/);
+    assert.match(output,/Applied 051_portability_erasure_ledger.sql/);
     assert.deepEqual(await facts(upgraded),before);
     // Migration 049 backfilled every published event's record and revision into the feed.
     assert.deepEqual((await upgraded.query(`SELECT count(*)::int AS n, count(*) FILTER (WHERE f.record_id=e.record_id
@@ -217,7 +218,11 @@ try {
       AND position<=10 ORDER BY revision DESC LIMIT 1`,'record_event_feed_as_of'],
     ['SELECT 1 FROM analysis_jobs WHERE space_id=$1','analysis_jobs_(?:pkey|result_binding)'],
     ['SELECT 1 FROM analysis_result_pages WHERE space_id=$1','analysis_result_pages_pkey'],
-    ['SELECT 1 FROM analysis_cell_slots WHERE holder_space_id=$1','analysis_cell_slots_one_per_job']]) {
+    ['SELECT 1 FROM analysis_cell_slots WHERE holder_space_id=$1','analysis_cell_slots_one_per_job'],
+    // Migration 051's purge and erasure check find a space's portability rows by index.
+    ['SELECT 1 FROM portability_jobs WHERE space_id=$1','portability_jobs_(?:pkey|kind_key)'],
+    ['SELECT 1 FROM portability_parts WHERE space_id=$1','portability_parts_pkey'],
+    ['SELECT 1 FROM portability_principal_map WHERE space_id=$1','portability_principal_map_(?:pkey|credential|owner)']]) {
       const plan=await upgraded.query(`EXPLAIN ${sql}`,['sp_upgrade']); // NOSONAR -- one connection runs its EXPLAINs in turn
       assert.match(plan.rows.map(row=>row['QUERY PLAN']).join('\n'),new RegExp(String.raw`(?:using|on) ${index}\b`),sql);
     }

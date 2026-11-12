@@ -14,12 +14,16 @@ try {
   const found=await client.query('SELECT 1 FROM pg_roles WHERE rolname=$1',[role]);
   if (found.rowCount!==1) throw new Error('Control operational role does not exist');
   await client.query(`GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_key_issuances TO "${role}"`);
+  // The erasure ledger (migration 051) is append-only: no UPDATE, DELETE or TRUNCATE.
+  await client.query(`GRANT SELECT, INSERT ON TABLE public.erasure_ledger TO "${role}"`);
   const grants=await client.query(`SELECT has_table_privilege($1,'public.agent_key_issuances','SELECT') AS can_read,
     has_table_privilege($1,'public.agent_key_issuances','INSERT') AS can_create,
-    has_table_privilege($1,'public.agent_key_issuances','UPDATE') AS can_update`,[role]);
+    has_table_privilege($1,'public.agent_key_issuances','UPDATE') AS can_update,
+    has_table_privilege($1,'public.erasure_ledger','SELECT') AS can_read_ledger,
+    has_table_privilege($1,'public.erasure_ledger','INSERT') AS can_append_ledger`,[role]);
   if (!Object.values(grants.rows[0]).every(value=>value===true)) throw new Error('Control journal grant readback failed');
   await client.query('COMMIT');
-  console.log('Verified control journal SELECT, INSERT and UPDATE grants');
+  console.log('Verified control journal SELECT, INSERT and UPDATE and erasure ledger SELECT and INSERT grants');
 } catch (error) {
   await client.query('ROLLBACK').catch(()=>{});
   throw error;

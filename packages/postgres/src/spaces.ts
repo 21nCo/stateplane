@@ -828,6 +828,9 @@ export class PostgresSpaces {
 
   private async erased(db: Pick<pg.Pool, 'query'>, spaceId: string): Promise<boolean> {
     const result = await db.query(`SELECT lifecycle='deleted' AND
+      NOT EXISTS (SELECT 1 FROM portability_principal_map WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM portability_parts WHERE space_id=$1) AND
+      NOT EXISTS (SELECT 1 FROM portability_jobs WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM analysis_cell_slots WHERE holder_space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM analysis_space_slots WHERE space_id=$1) AND
       NOT EXISTS (SELECT 1 FROM analysis_result_pages WHERE space_id=$1) AND

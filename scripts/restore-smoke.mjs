@@ -47,6 +47,8 @@ const retrievalTables=['retrieval_policies','retrieval_collection_heads','vector
 tables.push(...retrievalTables,'retrieval_dispatch_checkpoint');
 const analysisTables=['analysis_jobs','analysis_result_pages','analysis_result_manifests','analysis_space_slots','analysis_cell_slots'];
 tables.push(...analysisTables);
+const portabilityTables=['portability_jobs','portability_parts','portability_principal_map'];
+tables.push(...portabilityTables,'erasure_ledger');
 const embedding=seed=>`[${Array.from({length:384},(_,i)=>Math.sin(seed*31+i*7)||0.5).join(',')}]`;
 // A space erased before the dump, whose blob-store erasure is still pending.
 const erasedSpaceId='sp_restore_erased';
@@ -215,6 +217,26 @@ try {
     VALUES($1,1,$2,$3,clock_timestamp()+interval '1 hour'),($1,2,NULL,NULL,NULL)`,[spaceId,collectionId,liveJob]);
   await base.query(`INSERT INTO analysis_cell_slots(cell_id,slot,holder_space_id,holder_collection_id,holder_job_id,held_until)
     VALUES('cell-a',1,$1,$2,$3,clock_timestamp()+interval '1 hour'),('cell-a',2,NULL,NULL,NULL,NULL)`,[spaceId,collectionId,liveJob]);
+  // Portability (migration 051): a completed export at the same watermark with its one part, a running import with one
+  // applied part and its owner and grant-holder mappings, and the retired space's entry in the control erasure ledger.
+  const doneExport='exp_00000000-0000-4000-8000-000000000001';
+  const liveImport='imp_00000000-0000-4000-8000-000000000002';
+  const partContent='{"section":"records"}\n';
+  for (const [jobId,kind] of [[doneExport,'export'],[liveImport,'import']])
+    await base.query(`INSERT INTO portability_jobs(space_id,job_id,kind,principal_id,credential_id,policy_version,placement_generation,
+      format_version,watermark,manifest_sha256,part_count,expires_at) SELECT space_id,$2,$3,'owner','restore',policy_version,
+      placement_generation,1,$4,$5,$6,clock_timestamp()+interval '1 day' FROM spaces WHERE space_id=$1`,
+    [spaceId,jobId,kind,watermark,kind==='import'?'f'.repeat(64):null,kind==='import'?2:null]);
+  await base.query(`UPDATE portability_jobs SET state='running',lease_id='restore',leased_until=clock_timestamp()+interval '1 hour',
+    attempts=1 WHERE space_id=$1`,[spaceId]);
+  await base.query(`INSERT INTO portability_parts(space_id,job_id,kind,part_number,section,row_count,byte_size,content_sha256,content)
+    VALUES($1,$2,'export',1,'records',1,octet_length($3),encode(sha256(convert_to($3,'UTF8')),'hex'),$3),
+      ($1,$4,'import',1,'records',1,7,$5,NULL)`,[spaceId,doneExport,partContent,liveImport,'a'.repeat(64)]);
+  await base.query(`UPDATE portability_jobs SET state='completed',manifest_sha256=$2,part_count=1 WHERE job_id=$1`,[doneExport,'b'.repeat(64)]);
+  await base.query(`INSERT INTO portability_principal_map(space_id,job_id,source_principal_id,role,target_principal_id,target_credential_id)
+    VALUES($1,$2,'source-owner','owner','owner',NULL),($1,$2,'source-agent','agent','agent','restore-agent')`,[spaceId,liveImport]);
+  await base.query(`INSERT INTO erasure_ledger(scope,space_id,cell_id) VALUES('space',$1,'cell-a')`,[retiredSpaceId]);
+  await base.query('UPDATE space_directory SET hard_erased_at=clock_timestamp() WHERE space_id=$1',[retiredSpaceId]);
   const expected = await snapshot(base);
   assert.equal(expected.collection_write_slots.length,8,'restore seed must create all eight write slots');
   assert.ok(expected.records.length && expected.record_events.length && expected.record_event_feed.length===1 &&
@@ -225,7 +247,8 @@ try {
     expected.projection_heads.length && expected.projection_reconciliations.length &&
     expected.outbox_dispatch_checkpoint.length && expected.outbox_space_rotation.length && expected.outbox_operator_audit.length &&
     evidenceTables.every(table=>expected[table].length) && retrievalTables.every(table=>expected[table].length) &&
-    analysisTables.every(table=>expected[table].length),
+    analysisTables.every(table=>expected[table].length) && portabilityTables.every(table=>expected[table].length) &&
+    expected.erasure_ledger.length===1,
   'expected this restore smoke seed to populate records, outbox, projection state, evidence and owned-space authority');
   const archive = docker(['pg_dump','-U','stateplane','-Fc',sourceName]);
   docker(['createdb','-U','stateplane',name]);
@@ -301,6 +324,22 @@ try {
   await assert.rejects(restored.query(`DELETE FROM analysis_result_pages WHERE job_id=$1`,[doneJob]),
     error=>error.code==='23514'&&error.constraint==='analysis_result_pages_kept');
   assert.equal((await restored.query('SELECT count(*)::int AS n FROM pg_indexes WHERE indexname=$1',['record_event_feed_as_of'])).rows[0].n,1);
+  // Migration 051's guards are post-data objects too: the ledger and a hard erasure are final, a completed
+  // export's parts are sealed and its binding fixed, and an import maps one owner.
+  for (const sql of ['UPDATE erasure_ledger SET cell_id=$1','DELETE FROM erasure_ledger WHERE cell_id=$1'])
+    await assert.rejects(restored.query(sql,['cell-a']),error=>error.code==='23514'&&error.constraint==='erasure_ledger_immutable',sql);
+  await assert.rejects(restored.query('TRUNCATE erasure_ledger'),error=>error.constraint==='erasure_ledger_immutable');
+  await assert.rejects(restored.query(`UPDATE space_directory SET lifecycle='active' WHERE space_id=$1`,[retiredSpaceId]),
+    error=>error.code==='23514'&&error.constraint==='space_directory_hard_erased');
+  await assert.rejects(restored.query(`INSERT INTO portability_parts(space_id,job_id,kind,part_number,section,row_count,byte_size,
+    content_sha256,content) VALUES($1,$2,'export',2,'records',1,4,encode(sha256(convert_to('late','UTF8')),'hex'),'late')`,
+  [spaceId,doneExport]),error=>error.code==='23514'&&error.constraint==='portability_parts_job');
+  await assert.rejects(restored.query(`UPDATE portability_jobs SET watermark=0 WHERE job_id=$1`,[liveImport]),
+    error=>error.code==='23514'&&error.constraint==='portability_jobs_binding');
+  await assert.rejects(restored.query(`DELETE FROM portability_parts WHERE job_id=$1`,[doneExport]),
+    error=>error.code==='23514'&&error.constraint==='portability_parts_kept');
+  await assert.rejects(restored.query(`INSERT INTO portability_principal_map(space_id,job_id,source_principal_id,role,target_principal_id)
+    VALUES($1,$2,'second-owner','owner','owner')`,[spaceId,liveImport]),error=>error.code==='23505');
   const restoredAuthority=new PostgresAuthority(restored,3600);
   const resumed=await restoredAuthority.transaction({...scope,capability:'events:read'},tx=>tx.events(feedSeed));
   assert.equal(resumed.events.length,expected.record_event_pending.length,
@@ -328,6 +367,9 @@ try {
     // And the analysis tables, which space deletion reads too.
     execFileSync(process.execPath,['scripts/grant-analysis.mjs'],{cwd:root,
       env:{...process.env,STATEPLANE_CELL_ADMIN_URL:targetUrl,STATEPLANE_CELL_ROLE:journalRole},stdio:'inherit'});
+    // And the portability tables, which space deletion reads too.
+    execFileSync(process.execPath,['scripts/grant-portability.mjs'],{cwd:root,
+      env:{...process.env,STATEPLANE_CELL_ADMIN_URL:targetUrl,STATEPLANE_CELL_ROLE:journalRole},stdio:'inherit'});
     const operational=await restored.connect();
     const issuance=`iss_restore_${randomBytes(8).toString('hex')}`;
     try {
@@ -350,6 +392,16 @@ try {
       for (const table of analysisTables)
         assert.ok((await operational.query(`SELECT count(*)::int AS n FROM ${table} WHERE ${table==='analysis_cell_slots'?'holder_space_id':'space_id'}=$1`,
           [spaceId])).rows[0].n>0,`restored operational role can read ${table} for erasure proof`);
+      for (const table of portabilityTables)
+        assert.ok((await operational.query(`SELECT count(*)::int AS n FROM ${table} WHERE space_id=$1`,[spaceId])).rows[0].n>0,
+          `restored operational role can read ${table} for erasure proof`);
+      assert.equal((await operational.query(`UPDATE portability_jobs SET state='failed',failure_code='RESTORE_DRILL' WHERE job_id=$1`,
+        [liveImport])).rowCount,1,'restored operational role ends an import');
+      // The control grant appends to the erasure ledger and reads it; nothing removes an entry.
+      assert.equal((await operational.query('SELECT count(*)::int AS n FROM erasure_ledger WHERE space_id=$1',[retiredSpaceId]))
+        .rows[0].n,1,'restored control role reads the erasure ledger');
+      await assert.rejects(operational.query('DELETE FROM erasure_ledger WHERE space_id=$1',[retiredSpaceId]),
+        error=>error.code==='42501','the control role holds no ledger DELETE');
       const ended=(await operational.query(`UPDATE analysis_jobs SET state='failed',failure_code='RESTORE_DRILL' WHERE job_id=$1
         RETURNING (SELECT count(*)::int FROM analysis_space_slots WHERE holder_job_id=$1) AS before`,[liveJob])).rows[0];
       assert.equal(ended.before,1,'the slot was held until the job ended');
@@ -414,12 +466,13 @@ try {
       env:{...process.env,STATEPLANE_CONTROL_URL:targetUrl,STATEPLANE_CONTROL_ROLE:'select'},stdio:'inherit'});
     const grants=(await restored.query(`SELECT has_table_privilege('select','public.agent_key_issuances','SELECT') AS can_read,
       has_table_privilege('select','public.agent_key_issuances','INSERT') AS can_create,
-      has_table_privilege('select','public.agent_key_issuances','UPDATE') AS can_update`)).rows[0];
-    assert.deepEqual(grants,{can_read:true,can_create:true,can_update:true});
+      has_table_privilege('select','public.agent_key_issuances','UPDATE') AS can_update,
+      has_table_privilege('select','public.erasure_ledger','INSERT') AS can_append_ledger`)).rows[0];
+    assert.deepEqual(grants,{can_read:true,can_create:true,can_update:true,can_append_ledger:true});
   } finally {
     try {
       if (ownedRole) {
-        await reservedRole.query('REVOKE ALL ON agent_key_issuances FROM "select"').catch(()=>{});
+        await reservedRole.query('REVOKE ALL ON agent_key_issuances, erasure_ledger FROM "select"').catch(()=>{});
         // A killed earlier run may still have a disposable database dependency.
         // Retain only our marked role so the next run can reuse it safely.
         await reservedRole.query('DROP ROLE IF EXISTS "select"').catch(error=>{
