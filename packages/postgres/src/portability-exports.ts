@@ -3,7 +3,7 @@ import { exportSections, portabilityFormat, portabilityFormatVersion } from '@st
 import type { ExportManifest, VerifiedCredential } from '@stateplane/contracts';
 import { AuthorityError } from './index.js';
 import type { AuthorityScope } from './index.js';
-import { finalCheck, publish, released } from './analysis-jobs.js';
+import { finalCheck, probing, publish, released } from './analysis-jobs.js';
 import type { Deadline } from './analysis-jobs.js';
 import { DeadlineExceededError, inTransaction } from './faults.js';
 import type { PoolLike, Session } from './faults.js';
@@ -36,6 +36,10 @@ export interface PortabilityExportStatus {
   jobId: string; kind: 'export'; state: PortabilityJobState; failureCode: string | null; boundary: PortabilityBoundary;
   progress: { section: string | null; partsWritten: number; attempts: number; runtimeMs: number };
   budgets: { bytes: number; parts: number; runtimeMs: number };
+  /**
+   * UTC to the microsecond, as stored. `createdAt` is the snapshot instant; `startedAt` is when the export was admitted
+   * to run (its submission's final check passed), shown only once a worker has claimed it.
+   */
   createdAt: string; startedAt: string | null; finishedAt: string | null; expiresAt: string;
   /** Present only once the manifest, the last part, has sealed a complete export. */
   manifest: { sha256: string; partCount: number } | null;
@@ -67,7 +71,20 @@ const UNFINISHED = `('queued','running')`;
 const UNADMITTED = `(j.state='queued' AND j.created_at<=clock_timestamp()-${portabilityExportBounds.admissionMs}*interval '1 millisecond')`;
 const MIN_PART_MS = 1_000;
 const RELEASE_MS = 500;
-const iso = (value: Date | string | null) => value === null ? null : new Date(value).toISOString();
+/**
+ * A timestamptz as UTC RFC 3339 text to the microsecond, exactly as the database stores it: every instant an export or
+ * a status carries is read this way, never through a JavaScript Date, which keeps milliseconds only. An infinite value
+ * reads as its own text, which `instant` refuses.
+ */
+const utc = (column: string) =>
+  `CASE WHEN isfinite(${column}) THEN to_char((${column}) AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') ELSE (${column})::text END`;
+const STORED_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
+/** An instant `utc` read, or null; anything else (an infinite timestamp) is no instant the format carries. */
+function instant(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'string' || !STORED_INSTANT.test(value)) throw new TypeError(`An instant the export format cannot carry: ${String(value)}`);
+  return value;
+}
 const sha256 = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
 const cutShort = (error: unknown) => error instanceof DeadlineExceededError;
 /** What no export carries, whatever the space holds: the manifest states it. */
@@ -90,68 +107,74 @@ const notDeleted = (kind: string, collection: string, id: string) => `NOT EXISTS
 /** A JSON line with `raw`, canonical JSON text kept byte for byte, as its last member. */
 const withRaw = (fields: object, name: string, raw: string | null) =>
   `${JSON.stringify(fields).slice(0, -1)},${JSON.stringify(name)}:${raw ?? 'null'}}`;
-const at = (value: Date | null, snapshot = true) => snapshot ? iso(value) : null;
+const at = (value: unknown, snapshot = true) => snapshot ? instant(value) : null;
 const integer = (value: unknown) => value === null || value === undefined ? null : Number(value);
 
 const SECTIONS: Record<typeof exportSections[number], Section> = {
   // Identifiers, times and grants only: no credential row holds secret material, and none is read. Grants have no
   // history (issuance adds them after the credential row, revocation removes them), and every change of them changes
   // the policy version, so this section is read first and only under the policy version the export was admitted under.
-  permissions: { keys: 1, sql: `SELECT sc.credential_id AS k1,sc.principal_id,sc.created_at,sc.expires_at,
-      sc.activated_at<=$2 AS activated,sc.activated_at,sc.confirmed_at<=$2 AS confirmed,sc.confirmed_at,
-      sc.revoked_at<=$2 AS revoked,sc.revoked_at,
+  permissions: { keys: 1, sql: `SELECT sc.credential_id AS k1,sc.principal_id,${utc('sc.created_at')} AS created_at,
+      ${utc('sc.expires_at')} AS expires_at,sc.activated_at<=$2 AS activated,${utc('sc.activated_at')} AS activated_at,
+      sc.confirmed_at<=$2 AS confirmed,${utc('sc.confirmed_at')} AS confirmed_at,sc.revoked_at<=$2 AS revoked,
+      ${utc('sc.revoked_at')} AS revoked_at,
       COALESCE((SELECT json_agg(json_build_object('collectionId',g.collection_id,'capabilities',g.capabilities,
-        'expiresAt',g.expires_at) ORDER BY g.collection_id) FROM collection_grants g
+        'expiresAt',${utc('g.expires_at')}) ORDER BY g.collection_id) FROM collection_grants g
         WHERE g.space_id=sc.space_id AND g.credential_id=sc.credential_id),'[]') AS grants,256 AS size
     FROM space_credentials sc WHERE sc.space_id=$1 AND sc.created_at<=$2 AND AFTER(sc.credential_id) ORDER BY sc.credential_id`,
-  line: r => JSON.stringify({ credentialId: r.k1, principalId: r.principal_id, createdAt: iso(r.created_at), expiresAt: iso(r.expires_at),
+  line: r => JSON.stringify({ credentialId: r.k1, principalId: r.principal_id, createdAt: instant(r.created_at), expiresAt: instant(r.expires_at),
     activatedAt: at(r.activated_at, r.activated === true), confirmedAt: at(r.confirmed_at, r.confirmed === true),
     revokedAt: at(r.revoked_at, r.revoked === true),
     grants: (r.grants as Row[]).map(g => ({ collectionId: g.collectionId, capabilities: g.capabilities,
-      expiresAt: g.expiresAt === null ? null : iso(g.expiresAt) })) }) },
-  schemas: { keys: 2, sql: `SELECT v.collection_id AS k1,v.version AS k2,v.accepted_at,v.canonical_definition,
+      expiresAt: instant(g.expiresAt) })) }) },
+  schemas: { keys: 2, sql: `SELECT v.collection_id AS k1,v.version AS k2,${utc('v.accepted_at')} AS accepted_at,v.canonical_definition,
       octet_length(v.canonical_definition) AS size
     FROM collection_versions v WHERE v.space_id=$1 AND v.accepted_at<=$2 AND AFTER(v.collection_id,v.version)
     ORDER BY v.collection_id,v.version`,
-  line: r => withRaw({ collectionId: r.k1, version: Number(r.k2), acceptedAt: iso(r.accepted_at) }, 'definition', r.canonical_definition) },
+  line: r => withRaw({ collectionId: r.k1, version: Number(r.k2), acceptedAt: instant(r.accepted_at) }, 'definition', r.canonical_definition) },
   retrieval: { keys: 2, sql: `SELECT p.collection_id AS k1,p.version AS k2,p.previous_version,p.record_fields,p.source_content,
-      p.claim_statements,p.lexical,p.vector,p.text_search_config,p.processing_regions,p.credential_id,p.created_at,256 AS size
+      p.claim_statements,p.lexical,p.vector,p.text_search_config,p.processing_regions,p.credential_id,
+      ${utc('p.created_at')} AS created_at,256 AS size
     FROM retrieval_policies p WHERE p.space_id=$1 AND p.created_at<=$2 AND AFTER(p.collection_id,p.version)
     ORDER BY p.collection_id,p.version`,
   line: r => JSON.stringify({ collectionId: r.k1, version: Number(r.k2), previousVersion: r.previous_version === null ? null : Number(r.previous_version),
     recordFields: r.record_fields, sourceContent: r.source_content, claimStatements: r.claim_statements, lexical: r.lexical,
     vector: r.vector, textSearchConfig: r.text_search_config, processingRegions: r.processing_regions, credentialId: r.credential_id,
-    createdAt: iso(r.created_at) }) },
+    createdAt: instant(r.created_at) }) },
   // A source's original is its digest, size and type; its bytes and storage key are never in an export.
-  sources: { keys: 2, sql: `SELECT s.collection_id AS k1,s.source_id AS k2,s.kind,s.locator,s.principal_id,s.credential_id,s.created_at,
-      o.reference_only,o.sha256,o.byte_size,o.mime_type,o.captured_at,o.observed_at,octet_length(s.locator) AS size
+  sources: { keys: 2, sql: `SELECT s.collection_id AS k1,s.source_id AS k2,s.kind,s.locator,s.principal_id,s.credential_id,
+      ${utc('s.created_at')} AS created_at,o.reference_only,o.sha256,o.byte_size,o.mime_type,${utc('o.captured_at')} AS captured_at,
+      ${utc('o.observed_at')} AS observed_at,octet_length(s.locator) AS size
     FROM sources s LEFT JOIN original_objects o ON o.space_id=s.space_id AND o.collection_id=s.collection_id AND o.source_id=s.source_id
     WHERE s.space_id=$1 AND s.created_at<=$2 AND ${notDeleted('source', 's.collection_id', 's.source_id')}
       AND AFTER(s.collection_id,s.source_id) ORDER BY s.collection_id,s.source_id`,
   line: r => JSON.stringify({ collectionId: r.k1, sourceId: r.k2, kind: r.kind, locator: r.locator, principalId: r.principal_id,
-    credentialId: r.credential_id, createdAt: iso(r.created_at), original: { referenceOnly: r.reference_only ?? true,
+    credentialId: r.credential_id, createdAt: instant(r.created_at), original: { referenceOnly: r.reference_only ?? true,
       sha256: r.sha256 ?? null, byteSize: r.byte_size === null || r.byte_size === undefined ? null : Number(r.byte_size),
-      mimeType: r.mime_type ?? null, capturedAt: iso(r.captured_at ?? null), observedAt: iso(r.observed_at ?? null) } }) },
+      mimeType: r.mime_type ?? null, capturedAt: instant(r.captured_at), observedAt: instant(r.observed_at) } }) },
   extractions: { keys: 3, sql: `SELECT x.collection_id AS k1,x.source_id AS k2,x.version AS k3,x.previous_version,x.source_sha256,
-      x.parser,x.parser_version,x.content,x.source_offsets::text AS source_offsets,x.credential_id,x.created_at,
+      x.parser,x.parser_version,x.content,x.source_offsets::text AS source_offsets,x.credential_id,${utc('x.created_at')} AS created_at,
       octet_length(x.content)+octet_length(x.source_offsets::text) AS size
     FROM extraction_versions x WHERE x.space_id=$1 AND x.created_at<=$2 AND ${notDeleted('source', 'x.collection_id', 'x.source_id')}
       AND AFTER(x.collection_id,x.source_id,x.version) ORDER BY x.collection_id,x.source_id,x.version`,
   line: r => withRaw({ collectionId: r.k1, sourceId: r.k2, version: Number(r.k3),
     previousVersion: r.previous_version === null ? null : Number(r.previous_version), sourceSha256: r.source_sha256, parser: r.parser,
-    parserVersion: r.parser_version, credentialId: r.credential_id, createdAt: iso(r.created_at), content: r.content },
+    parserVersion: r.parser_version, credentialId: r.credential_id, createdAt: instant(r.created_at), content: r.content },
   'sourceOffsets', r.source_offsets) },
-  claims: { keys: 3, sql: `SELECT r.collection_id AS k1,r.claim_id AS k2,r.revision AS k3,c.kind,c.principal_id,c.created_at,
-      r.previous_revision,r.statement,r.attributed_to,r.credential_id,r.recorded_by,r.observed_at,r.valid_from,r.valid_until,
-      r.review_status,r.reviewed_by,r.reviewed_at,r.committed_at,octet_length(r.statement) AS size
+  claims: { keys: 3, sql: `SELECT r.collection_id AS k1,r.claim_id AS k2,r.revision AS k3,c.kind,c.principal_id,
+      ${utc('c.created_at')} AS created_at,r.previous_revision,r.statement,r.attributed_to,r.credential_id,r.recorded_by,
+      ${utc('r.observed_at')} AS observed_at,${utc('r.valid_from')} AS valid_from,${utc('r.valid_until')} AS valid_until,
+      r.review_status,r.reviewed_by,${utc('r.reviewed_at')} AS reviewed_at,${utc('r.committed_at')} AS committed_at,
+      octet_length(r.statement) AS size
     FROM claim_revisions r JOIN claims c ON c.space_id=r.space_id AND c.collection_id=r.collection_id AND c.claim_id=r.claim_id
     WHERE r.space_id=$1 AND r.committed_at<=$2 AND ${notDeleted('claim', 'r.collection_id', 'r.claim_id')}
       AND AFTER(r.collection_id,r.claim_id,r.revision) ORDER BY r.collection_id,r.claim_id,r.revision`,
   line: r => JSON.stringify({ collectionId: r.k1, claimId: r.k2, revision: Number(r.k3), kind: r.kind, principalId: r.principal_id,
-    createdAt: iso(r.created_at), previousRevision: r.previous_revision === null ? null : Number(r.previous_revision),
+    createdAt: instant(r.created_at), previousRevision: r.previous_revision === null ? null : Number(r.previous_revision),
     statement: r.statement, attributedTo: r.attributed_to, credentialId: r.credential_id, recordedBy: r.recorded_by,
-    observedAt: iso(r.observed_at), validFrom: iso(r.valid_from), validUntil: iso(r.valid_until), reviewStatus: r.review_status,
-    reviewedBy: r.reviewed_by, reviewedAt: iso(r.reviewed_at), committedAt: iso(r.committed_at) }) },
+    observedAt: instant(r.observed_at), validFrom: instant(r.valid_from), validUntil: instant(r.valid_until),
+    reviewStatus: r.review_status, reviewedBy: r.reviewed_by, reviewedAt: instant(r.reviewed_at),
+    committedAt: instant(r.committed_at) }) },
   provenance: { keys: 4, sql: `SELECT e.collection_id AS k1,e.claim_id AS k2,e.revision AS k3,e.ordinal AS k4,e.source_collection_id,
       e.source_id,e.extraction_version,e.start_offset,e.end_offset,128 AS size
     FROM claim_evidence e JOIN claim_revisions r ON r.space_id=e.space_id AND r.collection_id=e.collection_id
@@ -164,19 +187,19 @@ const SECTIONS: Record<typeof exportSections[number], Section> = {
       startOffset: integer(r.start_offset), endOffset: integer(r.end_offset) } }) },
   // A link tombstoned after the snapshot was live at it, one revision earlier (a tombstone adds one).
   links: { keys: 2, sql: `SELECT l.collection_id AS k1,l.link_id AS k2,l.link_type,l.deletion_policy,l.from_kind,l.from_collection_id,
-      l.from_id,l.to_kind,l.to_collection_id,l.to_id,l.credential_id,l.created_at,
+      l.from_id,l.to_kind,l.to_collection_id,l.to_id,l.credential_id,${utc('l.created_at')} AS created_at,
       l.revision-CASE WHEN l.tombstone THEN 1 ELSE 0 END AS revision,128 AS size
     FROM links l WHERE l.space_id=$1 AND l.created_at<=$2 AND (NOT l.tombstone OR l.tombstoned_at>$2)
       AND AFTER(l.collection_id,l.link_id) ORDER BY l.collection_id,l.link_id`,
   line: r => JSON.stringify({ collectionId: r.k1, linkId: r.k2, revision: Number(r.revision), linkType: r.link_type,
     deletionPolicy: r.deletion_policy, from: { kind: r.from_kind, collectionId: r.from_collection_id, id: r.from_id },
-    to: { kind: r.to_kind, collectionId: r.to_collection_id, id: r.to_id }, credentialId: r.credential_id, createdAt: iso(r.created_at) }) },
+    to: { kind: r.to_kind, collectionId: r.to_collection_id, id: r.to_id }, credentialId: r.credential_id, createdAt: instant(r.created_at) }) },
   events: { keys: 4, sql: `SELECT v.collection_id AS k1,v.kind AS k2,v.entity_id AS k3,v.revision AS k4,v.event_id,v.operation,
-      v.credential_id,v.committed_at,128 AS size
+      v.credential_id,${utc('v.committed_at')} AS committed_at,128 AS size
     FROM evidence_events v WHERE v.space_id=$1 AND v.committed_at<=$2 AND AFTER(v.collection_id,v.kind,v.entity_id,v.revision)
     ORDER BY v.collection_id,v.kind,v.entity_id,v.revision`,
   line: r => JSON.stringify({ eventId: r.event_id, collectionId: r.k1, kind: r.k2, entityId: r.k3, revision: Number(r.k4),
-    operation: r.operation, credentialId: r.credential_id, committedAt: iso(r.committed_at) }) },
+    operation: r.operation, credentialId: r.credential_id, committedAt: instant(r.committed_at) }) },
   // Each record at its highest revision published at or below the watermark (migration 049's as-of index, as STA-59
   // reads it); a record deleted there is passed with no line, one first written later is no candidate.
   // A record's key mode and normalized key are set when it is created and never change, so the record row states them
@@ -193,7 +216,7 @@ const SECTIONS: Record<typeof exportSections[number], Section> = {
   // Every record event published at or below the watermark, deletions included, with its feed position and the
   // record's key, so a record deleted by then (and so absent from records) keeps its external key.
   revisions: { keys: 3, sql: `SELECT e.collection_id AS k1,e.record_id AS k2,e.revision AS k3,e.event_id,e.operation,e.schema_version,
-      e.canonical_data,e.credential_id,e.committed_at,f.position,r.key_mode,r.normalized_key,
+      e.canonical_data,e.credential_id,${utc('e.committed_at')} AS committed_at,f.position,r.key_mode,r.normalized_key,
       octet_length(COALESCE(e.canonical_data,''))+octet_length(r.normalized_key) AS size
     FROM record_events e JOIN record_event_feed f ON f.event_id=e.event_id
       JOIN records r ON r.space_id=e.space_id AND r.collection_id=e.collection_id AND r.record_id=e.record_id
@@ -201,7 +224,7 @@ const SECTIONS: Record<typeof exportSections[number], Section> = {
     ORDER BY e.collection_id,e.record_id,e.revision`,
   line: r => withRaw({ collectionId: r.k1, id: r.k2, keyMode: r.key_mode, key: r.normalized_key, revision: Number(r.k3),
     eventId: r.event_id, position: Number(r.position),
-    operation: r.operation, schemaVersion: Number(r.schema_version), credentialId: r.credential_id, committedAt: iso(r.committed_at) },
+    operation: r.operation, schemaVersion: Number(r.schema_version), credentialId: r.credential_id, committedAt: instant(r.committed_at) },
   'data', r.canonical_data) }
 };
 
@@ -228,9 +251,10 @@ async function discard(db: Session, key: unknown[]): Promise<void> {
 }
 
 /** The snapshot instant as UTC RFC 3339 text to the microsecond, as the database stores it (a Date keeps milliseconds). */
-const SNAPSHOT_AT = `to_char(j.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS snapshot_at`;
+const SNAPSHOT_AT = `${utc('j.created_at')} AS snapshot_at`;
 // An admitted export no worker has claimed yet is still queued to its owner.
-const STATUS = `SELECT j.*,${SNAPSHOT_AT},CASE WHEN j.state IN ('queued','running','completed') AND j.expires_at<=clock_timestamp() THEN 'expired'
+const STATUS = `SELECT j.*,${SNAPSHOT_AT},${utc('j.started_at')} AS started_text,${utc('j.finished_at')} AS finished_text,
+    ${utc('j.expires_at')} AS expires_text,CASE WHEN j.state IN ('queued','running','completed') AND j.expires_at<=clock_timestamp() THEN 'expired'
     WHEN j.state='running' AND j.attempts=0 THEN 'queued' ELSE j.state END AS effective,
     (SELECT count(*) FROM portability_parts p WHERE p.space_id=j.space_id AND p.job_id=j.job_id)::int AS parts_written
   FROM portability_jobs j WHERE j.space_id=$1 AND j.job_id=$2 AND j.kind='export'`;
@@ -245,7 +269,9 @@ function view(row: Row): PortabilityExportStatus {
       partsWritten: Number(row.parts_written ?? 0), attempts: Number(row.attempts), runtimeMs: Number(checkpoint.runtimeMs ?? 0) },
     budgets: { bytes: portabilityExportBounds.budgetBytes, parts: portabilityExportBounds.maxParts,
       runtimeMs: portabilityExportBounds.budgetRuntimeMs },
-    createdAt: iso(row.created_at)!, startedAt: Number(row.attempts) > 0 ? iso(row.started_at) : null, finishedAt: iso(row.finished_at), expiresAt: iso(row.expires_at)!,
+    // Migration 051 stamps started_at when the export first runs, which is its admission: shown once a worker has claimed it.
+    createdAt: row.snapshot_at, startedAt: Number(row.attempts) > 0 ? instant(row.started_text) : null,
+    finishedAt: instant(row.finished_text), expiresAt: row.expires_text,
     manifest: sealed, complete: sealed !== null };
 }
 
@@ -358,9 +384,12 @@ export class PostgresPortabilityExports {
       } catch (error) {
         try {
           await transact(pool, async db => {
-            await db.query(`UPDATE portability_jobs SET state='cancelled' WHERE space_id=$1 AND job_id=$2 AND state IN ${UNFINISHED}`,
-              [spaceId, submitted.jobId]);
-            await discard(db, [spaceId, submitted.jobId]);
+            const cancelled = await db.query(`UPDATE portability_jobs SET state='cancelled' WHERE space_id=$1 AND job_id=$2
+              AND state IN ${UNFINISHED} RETURNING job_id`, [spaceId, submitted.jobId]);
+            // Only the export cancelled here has parts to remove. One already ended had them removed as it ended, and
+            // one already completed (its admission committed, but the call failed after, and a worker finished it
+            // meanwhile) keeps its result: owner-only, readable only through reads that authorize again, until it expires.
+            if (cancelled.rowCount) await discard(db, [spaceId, submitted.jobId]);
           });
         } catch (cleanup) {
           // An export whose check never committed is still queued: never run, and cancelled once its admission time passes.
@@ -480,7 +509,7 @@ export class PortabilityExportWorker {
    * passed), or null when none is due.
    */
   async waiting(until: number): Promise<number | null> {
-    const since = (await inTransaction(this.pool, db => db.query(`SELECT (extract(epoch FROM min(CASE
+    const since = (await inTransaction(this.pool, async db => (await probing(db)).query(`SELECT (extract(epoch FROM min(CASE
         WHEN j.expires_at<=clock_timestamp() THEN j.expires_at WHEN j.state='queued'
         THEN j.created_at+${portabilityExportBounds.admissionMs}*interval '1 millisecond' ELSE j.leased_until END))*1000)::float8 AS since
       FROM portability_jobs j WHERE j.kind='export'

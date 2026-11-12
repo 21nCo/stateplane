@@ -23,7 +23,7 @@
       "type": "object", "additionalProperties": false,
       "required": ["watermark", "snapshotAt", "records", "evidence"],
       "properties": {
-        "watermark": { "$ref": "#/$defs/count" }, "snapshotAt": { "$ref": "#/$defs/instant" },
+        "watermark": { "$ref": "#/$defs/count" }, "snapshotAt": { "$ref": "#/$defs/rfc3339" },
         "records": { "const": "as-of-watermark" }, "evidence": { "const": "as-of-snapshot" }
       }
     },
@@ -58,8 +58,11 @@
     "id": { "type": "string", "minLength": 1 },
     "count": { "type": "integer", "minimum": 0 },
     "positive": { "type": "integer", "minimum": 1 },
-    "instant": { "type": "string", "format": "date-time" },
-    "optionalInstant": { "type": ["string", "null"], "format": "date-time" },
+    "rfc3339": { "description": "An RFC 3339 date-time: a calendar date, T, a time of day (hour 00 to 23, minute 00 to 59, a second of 60 only as a leap second) and Z or a +HH:MM offset.", "type": "string", "format": "date-time",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])[Tt]([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\\.[0-9]+)?([Zz]|[+-]([01][0-9]|2[0-3]):[0-5][0-9])$" },
+    "instant": { "description": "A stored instant exactly as the database holds it: UTC, to the microsecond.", "$ref": "#/$defs/rfc3339",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{6}Z$" },
+    "optionalInstant": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/instant" }] },
     "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "keyMode": { "description": "How a record is keyed: external (key is its normalized external key, reserved even once the record is deleted) or generated (key is its ID).", "enum": ["generated", "external"] },
     "json": { "description": "Canonical JSON, kept byte for byte." },

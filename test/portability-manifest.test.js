@@ -6,8 +6,11 @@ import Ajv2020 from 'ajv/dist/2020.js';
 import addFormats from 'ajv-formats';
 import { exportSections, verifyExportManifest } from '../packages/contracts/dist/index.js';
 
-// STA-70: verifyExportManifest accepts exactly the manifests the published JSON Schema accepts (plus the rules the
-// schema cannot state), even when the manifest's digest is correct: a digest proves the bytes, not the format.
+// STA-70: verifyExportManifest refuses every manifest the published JSON Schema refuses (plus the rules the schema
+// cannot state), even when the manifest's digest is correct: a digest proves the bytes, not the format. The schema is
+// checked with ajv-formats' date-time format and its own instant pattern; the pattern refuses what ajv-formats alone
+// accepts (an hour or minute out of range before a leap second, a space separator, an offset without a colon), so both
+// accept the same instants.
 const schema = JSON.parse(await readFile(new URL('../contracts/portability-manifest.schema.json', import.meta.url), 'utf8'));
 const ajv = new Ajv2020({ strict: false, allErrors: true });
 addFormats(ajv);
@@ -69,6 +72,11 @@ test('a correctly hashed manifest the schema refuses is refused, whatever member
     'a snapshot instant at minute 60': m => { m.boundary.snapshotAt = '2026-11-13T01:60:00Z'; },
     'a snapshot instant with a second of 60 that is no leap second': m => { m.boundary.snapshotAt = '2026-11-13T01:02:60Z'; },
     'a snapshot instant with an offset of 24 hours': m => { m.boundary.snapshotAt = '2026-11-13T01:02:03+24:00'; },
+    'a leap second at local hour 24': m => { m.boundary.snapshotAt = '2026-11-13T24:59:60+01:00'; },
+    'a leap second at minute 99': m => { m.boundary.snapshotAt = '2026-11-13T23:99:60+00:40'; },
+    'a snapshot instant with a space separator': m => { m.boundary.snapshotAt = '2026-11-13 01:02:03Z'; },
+    'a snapshot instant with an offset without a colon': m => { m.boundary.snapshotAt = '2026-11-13T01:02:03+0100'; },
+    'a snapshot instant with an hour-only offset': m => { m.boundary.snapshotAt = '2026-11-13T01:02:03+01'; },
     'a part of zero bytes': m => { m.parts[0].bytes = 0; m.sections[1].bytes = 0; },
     'a part over 1 MiB': m => { m.parts[0].bytes = 1_048_577; m.sections[1].bytes = 1_048_577; },
     'a non-boolean accelerator': m => { m.sections[0].accelerator = 0; },
@@ -76,12 +84,21 @@ test('a correctly hashed manifest the schema refuses is refused, whatever member
   };
   for (const [label, change] of Object.entries(cases)) {
     const value = edit(change);
-    // The schema itself refuses each (snapshotAt by its date-time format).
+    // The schema itself refuses each (snapshotAt by its date-time format or its pattern).
     assert.equal(valid(value), false, `the schema accepts ${label}`);
     const [text, digest] = sealed(value);
     const verdict = await verifyExportManifest(text, digest);
     assert.equal(verdict.ok, false, `the verifier accepts ${label}`);
   }
+});
+
+test('the instant pattern refuses what the date-time format alone accepts', () => {
+  // Pins why the schema carries a pattern: ajv-formats alone accepts these, the schema and the verifier do not.
+  const format = new Ajv2020({ strict: false });
+  addFormats(format);
+  const dateTime = format.compile({ type: 'string', format: 'date-time' });
+  for (const instant of ['2026-11-13T24:59:60+01:00', '2026-11-13T23:99:60+00:40', '2026-11-13 01:02:03Z', '2026-11-13T01:02:03+0100'])
+    assert.equal(dateTime(instant), true, `ajv-formats now refuses ${instant}; the pattern may be simplified`);
 });
 
 test('the rules the schema cannot state are refused too', async () => {

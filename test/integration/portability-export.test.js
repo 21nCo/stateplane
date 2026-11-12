@@ -150,8 +150,10 @@ test('an owner export carries the space as of its boundary, verifies against its
   await sources.extract(actor, spaceId, 'alpha', source);
   const gone = (await sources.ingestText(actor, spaceId, 'alpha', { idempotencyKey: 'src-2', text: 'Removed before.' })).sourceId;
   await sources.delete(actor, spaceId, 'alpha', gone);
+  // Claim instants are given to the millisecond; the export states every instant to the microsecond.
   const claim = await claims.create(agent, spaceId, 'alpha', { idempotencyKey: 'c1', statement: 'The bridge opened in 1932.',
-    attributedTo: 'city archive', evidence: [{ collectionId: 'alpha', sourceId: source, extractionVersion: 1, start: 4, end: 16 },
+    attributedTo: 'city archive', observedAt: '2026-01-02T03:04:05.123Z', validFrom: '1932-05-01T00:00:00Z',
+    validUntil: '2099-12-31T23:59:59.999Z', evidence: [{ collectionId: 'alpha', sourceId: source, extractionVersion: 1, start: 4, end: 16 },
       { collectionId: 'alpha', sourceId: source, extractionVersion: 1 }, { collectionId: 'alpha', sourceId: source }] });
   const dropped = await claims.create(actor, spaceId, 'alpha', { idempotencyKey: 'c2', statement: 'Withdrawn.', attributedTo: 'x' });
   await claims.delete(actor, spaceId, 'alpha', dropped.claimId, { baseRevision: dropped.revision });
@@ -159,6 +161,16 @@ test('an owner export carries the space as of its boundary, verifies against its
   const kept = await links.create(actor, spaceId, 'alpha', { idempotencyKey: 'l1', type: 'cites', policy: 'detach', from: ref('alpha', r1), to: ref('beta', b1) });
   const removed = await links.create(actor, spaceId, 'alpha', { idempotencyKey: 'l2', type: 'cites', policy: 'detach', from: ref('alpha', r2), to: ref('beta', b1) });
   await links.delete(actor, spaceId, 'alpha', removed.linkId);
+  // A stamp with non-zero sub-millisecond digits, set exactly (and earlier than it was, so still before the boundary);
+  // migration-time guards keep created_at, so they are bypassed here.
+  const stamp = await pool.connect();
+  try {
+    await stamp.query('BEGIN');
+    await stamp.query("SET LOCAL session_replication_role = 'replica'");
+    await stamp.query(`UPDATE links SET created_at=date_trunc('second',created_at)-interval '1 second'+interval '0.123456 second'
+      WHERE space_id=$1 AND link_id=$2`, [spaceId, kept.linkId]);
+    await stamp.query('COMMIT');
+  } finally { stamp.release(); }
 
   const submitted = await portability.submitExport(actor, spaceId);
   assert.equal(submitted.state, 'queued');
@@ -229,6 +241,61 @@ test('an owner export carries the space as of its boundary, verifies against its
     FROM portability_jobs WHERE job_id=$1`, [submitted.jobId])).rows[0].at;
   assert.deepEqual([manifest.boundary.snapshotAt, status.boundary.snapshotAt, submitted.boundary.snapshotAt], [stored, stored, stored]);
   assert.match(stored, /\.\d{6}Z$/);
+  assert.equal(status.createdAt, stored);
+  const [expires] = (await pool.query(`SELECT to_char(expires_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS at
+    FROM portability_jobs WHERE job_id=$1`, [submitted.jobId])).rows;
+  assert.equal(status.expiresAt, expires.at);
+  // Every instant in every section is exported exactly as stored, to the microsecond, never through a millisecond Date.
+  assert.deepEqual([lines.claims[0].observedAt, lines.claims[0].validFrom, lines.claims[0].validUntil],
+    ['2026-01-02T03:04:05.123000Z', '1932-05-01T00:00:00.000000Z', '2099-12-31T23:59:59.999000Z']);
+  assert.match(lines.links[0].createdAt, /:\d{2}\.123456Z$/, 'sub-millisecond digits survive');
+  const us = column => `to_char(${column} AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
+  const storedInstants = {
+    permissions: line => [`SELECT ${us('created_at')} AS "createdAt",${us('expires_at')} AS "expiresAt",
+      ${us('activated_at')} AS "activatedAt",${us('confirmed_at')} AS "confirmedAt",${us('revoked_at')} AS "revokedAt"
+      FROM space_credentials WHERE space_id=$1 AND credential_id=$2`, [line.credentialId]],
+    schemas: line => [`SELECT ${us('accepted_at')} AS "acceptedAt" FROM collection_versions WHERE space_id=$1 AND collection_id=$2
+      AND version=$3`, [line.collectionId, line.version]],
+    retrieval: line => [`SELECT ${us('created_at')} AS "createdAt" FROM retrieval_policies WHERE space_id=$1 AND collection_id=$2
+      AND version=$3`, [line.collectionId, line.version]],
+    sources: line => [`SELECT ${us('s.created_at')} AS "createdAt",${us('o.captured_at')} AS "original.capturedAt",
+      ${us('o.observed_at')} AS "original.observedAt" FROM sources s LEFT JOIN original_objects o ON o.space_id=s.space_id
+      AND o.collection_id=s.collection_id AND o.source_id=s.source_id WHERE s.space_id=$1 AND s.collection_id=$2 AND s.source_id=$3`,
+    [line.collectionId, line.sourceId]],
+    extractions: line => [`SELECT ${us('created_at')} AS "createdAt" FROM extraction_versions WHERE space_id=$1 AND collection_id=$2
+      AND source_id=$3 AND version=$4`, [line.collectionId, line.sourceId, line.version]],
+    claims: line => [`SELECT ${us('c.created_at')} AS "createdAt",${us('r.observed_at')} AS "observedAt",
+      ${us('r.valid_from')} AS "validFrom",${us('r.valid_until')} AS "validUntil",${us('r.reviewed_at')} AS "reviewedAt",
+      ${us('r.committed_at')} AS "committedAt" FROM claim_revisions r JOIN claims c ON c.space_id=r.space_id
+      AND c.collection_id=r.collection_id AND c.claim_id=r.claim_id WHERE r.space_id=$1 AND r.collection_id=$2 AND r.claim_id=$3
+      AND r.revision=$4`, [line.collectionId, line.claimId, line.revision]],
+    links: line => [`SELECT ${us('created_at')} AS "createdAt" FROM links WHERE space_id=$1 AND collection_id=$2 AND link_id=$3`,
+      [line.collectionId, line.linkId]],
+    events: line => [`SELECT ${us('committed_at')} AS "committedAt" FROM evidence_events WHERE space_id=$1 AND event_id=$2`,
+      [line.eventId]],
+    revisions: line => [`SELECT ${us('committed_at')} AS "committedAt" FROM record_events WHERE space_id=$1 AND event_id=$2`,
+      [line.eventId]]
+  };
+  const pick = (line, path) => path.split('.').reduce((value, member) => value?.[member], line);
+  const compared = {};
+  for (const [section, query] of Object.entries(storedInstants)) for (const line of lines[section]) {
+    const [sql, params] = query(line);
+    const [row] = (await pool.query(sql, [spaceId, ...params])).rows;
+    assert.ok(row, `${section}: no stored row for ${JSON.stringify(line)}`);
+    for (const [path, value] of Object.entries(row)) {
+      // An instant after the snapshot (a later activation, say) is exported as null; every other one exactly as stored.
+      if (pick(line, path) === null) continue;
+      assert.equal(pick(line, path), value, `${section} ${path}`);
+      compared[section] = (compared[section] ?? 0) + 1;
+    }
+    for (const grant of line.grants ?? []) {
+      const [stored] = (await pool.query(`SELECT ${us('expires_at')} AS at FROM collection_grants WHERE space_id=$1
+        AND credential_id=$2 AND collection_id=$3`, [spaceId, line.credentialId, grant.collectionId])).rows;
+      assert.equal(grant.expiresAt, stored.at, 'grant expiresAt');
+    }
+  }
+  for (const section of ['permissions', 'schemas', 'sources', 'extractions', 'claims', 'links', 'events', 'revisions'])
+    assert.ok(compared[section] > 0, `${section} carries instants`);
   assert.equal(sha(manifestText), status.manifest.sha256);
   const contents = parts.map(part => part.content);
   assert.deepEqual(await verifyExportManifest(manifestText, status.manifest.sha256, contents), { ok: true, manifest });
@@ -469,6 +536,35 @@ test('an export is never run unless its submission\'s final check admits it: a r
   assert.equal((await portability.exportStatus(actor, spaceId, admitted.jobId)).state, 'completed');
 });
 
+test('a submission whose admission committed but whose call then failed leaves an export a worker completed meanwhile as it is', async () => {
+  const actor = await owner();
+  const spaceId = await space(actor);
+  await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: 'x' } });
+  // The admission's COMMIT (the submission's second) reaches the database, a worker completes the export, and only then
+  // is the acknowledgement lost.
+  let commits = 0;
+  const lossy = { connect: async () => {
+    const client = await pool.connect(), query = client.query.bind(client);
+    client.query = async (sql, ...rest) => {
+      const done = await query(sql, ...rest);
+      if (sql === 'COMMIT' && ++commits === 2) { await drain(); throw new Error('the connection dropped after COMMIT'); }
+      return done;
+    };
+    const release = client.release.bind(client);
+    client.release = (...args) => { client.query = query; client.release = release; return release(...args); };
+    return client;
+  } };
+  // The call fails with its own error alone: the compensation finds the export completed and leaves it and its parts.
+  await assert.rejects(new PostgresPortabilityExports(spaces, new Map([['cell-a', { pool: lossy }]])).submit(actor, spaceId),
+    error => !(error instanceof AggregateError) && /the connection dropped after COMMIT/.test(`${error.message} ${error.cause?.message}`));
+  const [job] = (await pool.query(`SELECT job_id,state,part_count,(SELECT count(*)::int FROM portability_parts p
+    WHERE p.job_id=j.job_id) AS parts FROM portability_jobs j WHERE space_id=$1`, [spaceId])).rows;
+  assert.deepEqual([job.state, job.parts], ['completed', job.part_count]);
+  // It stays the owner's, read only through reads that authorize again, until it expires.
+  const { status, parts, manifestText } = await result(actor, spaceId, job.job_id);
+  assert.equal((await verifyExportManifest(manifestText, status.manifest.sha256, parts.map(part => part.content))).ok, true);
+});
+
 test('submission waits for writes to the space in flight, so each lands wholly on one side of the boundary', async () => {
   const actor = await owner();
   const spaceId = await space(actor);
@@ -530,6 +626,36 @@ test('exports and analysis jobs share the jobs Worker step: neither starves at t
   await drain();
   const { status, parts, manifestText } = await result(actor, spaceId, exportJob.jobId);
   assert.equal((await verifyExportManifest(manifestText, status.manifest.sha256, parts.map(part => part.content))).ok, true);
+});
+
+test('a probe stalled on a table lock leaves the other kind its window', async () => {
+  const actor = await owner();
+  const spaceId = await space(actor);
+  await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: 'x' } });
+  const analysisJob = await services.analysis.submit(actor, spaceId, 'alpha', 'export');
+  const holder = await pool.connect();
+  try {
+    // Maintenance holds the export table: the export probe gives up at its lock bound, and analysis still runs.
+    await holder.query('BEGIN');
+    await holder.query('LOCK TABLE portability_jobs IN ACCESS EXCLUSIVE MODE');
+    const step = await worker().step({ budgetMs: 2_000 });
+    assert.equal(step.claimed, 1, 'the analysis job is claimed while the export table is locked');
+    assert.ok(step.pages + step.completed > 0, JSON.stringify(step));
+    await holder.query('COMMIT');
+    // And the other way round: with the analysis table locked, a due export still writes its parts.
+    const { jobId } = await portability.submitExport(actor, spaceId);
+    await holder.query('BEGIN');
+    await holder.query('LOCK TABLE analysis_jobs IN ACCESS EXCLUSIVE MODE');
+    const other = await worker().step({ budgetMs: 2_000 });
+    assert.equal(other.exports.claimed, 1, JSON.stringify(other));
+    assert.ok(other.exports.parts + other.exports.completed > 0, JSON.stringify(other));
+    await holder.query('COMMIT');
+    await drain();
+    assert.equal((await portability.exportStatus(actor, spaceId, jobId)).state, 'completed');
+  } finally { await holder.query('ROLLBACK').catch(() => {}); holder.release(); }
+  for (let i = 0; i < 20 && (await services.analysis.status(actor, spaceId, 'alpha', analysisJob.jobId)).state !== 'completed'; i++)
+    await worker().step({ budgetMs: 5_000 });
+  assert.equal((await services.analysis.status(actor, spaceId, 'alpha', analysisJob.jobId)).state, 'completed');
 });
 
 test('an export due alone takes the whole step budget, and an invalid origin connection limit fails analysis only', async () => {

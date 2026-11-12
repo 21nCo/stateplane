@@ -574,6 +574,18 @@ export interface AnalysisWorkerOptions {
 }
 
 /**
+ * How long a step's probe of one kind waits for a lock on its job table (an `ACCESS EXCLUSIVE` lock from DDL,
+ * `VACUUM FULL` or `LOCK TABLE`): past that it finds nothing of that kind due this step, so a stalled probe never
+ * takes the other kind's window. A probe is one aggregate that takes no row locks, so it waits only on such a lock.
+ */
+const PROBE_LOCK_MS = 100;
+export async function probing<T extends Session>(db: T): Promise<T> {
+  await db.query(`SET LOCAL lock_timeout = '${PROBE_LOCK_MS}ms'`);
+  return db;
+}
+const lockedOut = (error: unknown) => (error as { code?: unknown } | null)?.code === '55P03';
+
+/**
  * The jobs Worker's analysis step (docs/analysis-jobs.md#worker). Each step
  * expires jobs past their expiry, then claims due jobs one at a time (queued,
  * or running with a lapsed lease; least recently run first), each with one
@@ -596,7 +608,8 @@ export interface AnalysisWorkerOptions {
  * the whole budget; the other kind takes what is left. Every turn moves its
  * job's wait to now, so the other kind goes first next, and neither starves
  * at any budget. A failure of either kind (its probe included) never stops
- * the other: the step throws it once both have run.
+ * the other: the step throws it once both have run. A probe stalled on a
+ * table lock past `PROBE_LOCK_MS` leaves its kind for the next step.
  */
 export class PostgresAnalysisWorker {
   readonly #exports: PortabilityExportWorker;
@@ -616,9 +629,9 @@ export class PostgresAnalysisWorker {
     const settle = async (run: () => Promise<void>) => {
       try { await run(); } catch (error) { if (!cutShort(error)) failures.push(error); }
     };
-    // A probe that fails or is cut short finds nothing due.
+    // A probe that fails, is cut short or waits on a table lock past its bound finds nothing due; only a failure is reported.
     const probe = async (read: () => Promise<number | null>) => {
-      try { return await read(); } catch (error) { if (!cutShort(error)) failures.push(error); return null; }
+      try { return await read(); } catch (error) { if (!cutShort(error) && !lockedOut(error)) failures.push(error); return null; }
     };
     const exportsSince = await probe(() => this.#exports.waiting(end));
     const analysis = (until: number) => settle(() => this.analyse(until, budgetMs, result));
@@ -643,7 +656,7 @@ export class PostgresAnalysisWorker {
 
   /** When the analysis job the step would claim next began waiting (epoch ms), or null when none is due. */
   private async waiting(until: number): Promise<number | null> {
-    const since = (await inTransaction(this.pool, db => db.query(`SELECT (extract(epoch FROM least(
+    const since = (await inTransaction(this.pool, async db => (await probing(db)).query(`SELECT (extract(epoch FROM least(
         (SELECT min(created_at) FROM analysis_jobs WHERE state='queued' AND expires_at>clock_timestamp()),
         (SELECT min(leased_until) FROM analysis_jobs WHERE state='running' AND leased_until<=clock_timestamp()
           AND expires_at>clock_timestamp())))*1000)::float8 AS since`), { deadline: until })).rows[0].since;
