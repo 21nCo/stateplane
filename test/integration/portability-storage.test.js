@@ -171,9 +171,9 @@ test('migration 051 applies on the current schema, waiting boundedly for directo
     assert.equal(applied.status, 0, applied.stderr);
     assert.equal(applied.stdout, 'Applied 051_portability_erasure_ledger.sql\n');
     // Archived and deleted spaces take their last publication time; the others have no stamp.
-    const stamps = (await upgraded.query(`SELECT space_id,archived_at::text AS archived,tombstoned_at::text AS tombstoned,
-      hard_erased_at AS erased FROM space_directory ORDER BY space_id`)).rows;
-    const at = '2026-01-02 03:04:05.123456+00';
+    const stamps = (await upgraded.query(`SELECT space_id,(archived_at AT TIME ZONE 'UTC')::text AS archived,
+      (tombstoned_at AT TIME ZONE 'UTC')::text AS tombstoned,hard_erased_at AS erased FROM space_directory ORDER BY space_id`)).rows;
+    const at = '2026-01-02 03:04:05.123456';
     assert.deepEqual(stamps, [
       { space_id: 'sp_active', archived: null, tombstoned: null, erased: null },
       { space_id: 'sp_archived', archived: at, tombstoned: null, erased: null },
@@ -407,13 +407,20 @@ test('a portability job keeps its binding, moves forward only, and completes wit
     check('portability_jobs_transition'));
   await assert.rejects(update(job, `state='expired'`), check('portability_jobs_expiry'));
 
-  // An import completes once all of its manifest's parts are applied; a failure needs a code.
+  // An import completes once all of its manifest's parts are applied and its source owner is mapped; a failure needs a code.
   const imported = await admit(spaceId, 'import');
   await run(imported);
   await part(imported, 1);
   await assert.rejects(update(imported, `state='completed'`), check('portability_jobs_parts'));
+  await part(imported, 2);
+  await map(imported, 'src_agent', 'agent', null);
+  await assert.rejects(update(imported, `state='completed'`), check('portability_jobs_principals'));
   await assert.rejects(update(imported, `state='failed'`), check('portability_jobs_failure'));
-  await update(imported, `state='cancelled'`);
+  await map(imported, 'src_owner', 'owner', 'owner');
+  assert.equal((await update(imported, `state='completed'`)).state, 'completed');
+  const cancelled = await admit(spaceId, 'import');
+  await run(cancelled);
+  await update(cancelled, `state='cancelled'`);
 
   // Expiry: nothing runs or completes once it has passed, and only then does a job expire.
   const brief = await admit(spaceId, 'export', { watermark: positions[0], expires_at: new Date(Date.now() + 300) });
@@ -516,6 +523,36 @@ test('a part write and its job\'s completion take turns: completion counts a par
     const refusal = await late;
     assert.ok(refusal instanceof Error && refusal.constraint === 'portability_parts_job', String(refusal));
     assert.equal((await pool.query('SELECT count(*)::int AS n FROM portability_parts WHERE job_id=$1', [job.job_id])).rows[0].n, 2);
+  } finally {
+    writer.release();
+    completer.release();
+  }
+});
+
+test('an owner mapping and its import\'s completion take turns: completion sees a mapping in flight, and no mapping follows completion', async () => {
+  const { spaceId } = await space();
+  const [writer, completer] = [await pool.connect(), await pool.connect()];
+  try {
+    const job = await admit(spaceId, 'import', { part_count: 0 });
+    await run(job);
+    // The owner mapping in flight holds the job row; the completion waits, then sees it and completes.
+    await writer.query('BEGIN');
+    await map(job, 'src_owner', 'owner', 'owner', null, writer);
+    const completing = update(job, `state='completed'`, [], completer).then(row => row.state, error => error);
+    await waiting(completer);
+    await writer.query('COMMIT');
+    assert.equal(await completing, 'completed');
+    // A completion in flight, then a mapping: the mapping waits and is refused once the import has completed.
+    const other = await admit(spaceId, 'import', { part_count: 0 });
+    await run(other);
+    await map(other, 'src_owner', 'owner', 'owner');
+    await completer.query('BEGIN');
+    await update(other, `state='completed'`, [], completer);
+    const late = map(other, 'src_agent', 'agent', null, null, writer).then(() => 'mapped', error => error);
+    await waiting(writer);
+    await completer.query('COMMIT');
+    const refusal = await late;
+    assert.ok(refusal instanceof Error && refusal.constraint === 'portability_principal_map_job', String(refusal));
   } finally {
     writer.release();
     completer.release();

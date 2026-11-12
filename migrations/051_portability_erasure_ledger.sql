@@ -201,8 +201,9 @@ CREATE TABLE portability_jobs (
 -- Afterwards only its state, checkpoint, attempts, lease, failure and stamps
 -- change, and an export's manifest digest and part count as it completes. A
 -- running job progresses before it expires; it ends completed (with all its
--- parts), failed (with a code), cancelled or expired (once its expiry has
--- passed, also after completing). Ending a job clears its lease.
+-- parts and, for an import, its owner row in the principal map), failed (with
+-- a code), cancelled or expired (once its expiry has passed, also after
+-- completing). Ending a job clears its lease.
 CREATE FUNCTION stateplane_guard_portability_job() RETURNS trigger LANGUAGE plpgsql
 SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
@@ -271,6 +272,11 @@ BEGIN
       FROM public.portability_parts p WHERE p.space_id = NEW.space_id AND p.job_id = NEW.job_id) THEN
     RAISE EXCEPTION 'a portability job completes with all of its parts'
       USING ERRCODE = 'check_violation', CONSTRAINT = 'portability_jobs_parts';
+  END IF;
+  IF NEW.kind = 'import' AND NEW.state = 'completed' AND OLD.state <> 'completed' AND NOT EXISTS (SELECT 1
+      FROM public.portability_principal_map m WHERE m.space_id = NEW.space_id AND m.job_id = NEW.job_id AND m.role = 'owner') THEN
+    RAISE EXCEPTION 'an import completes with its source owner mapped'
+      USING ERRCODE = 'check_violation', CONSTRAINT = 'portability_jobs_principals';
   END IF;
   NEW.started_at := COALESCE(OLD.started_at, CASE WHEN NEW.state = 'running' THEN clock_timestamp() END);
   NEW.finished_at := CASE WHEN NEW.state = ANY (ended) AND OLD.state <> ALL (ended) THEN clock_timestamp() ELSE OLD.finished_at END;
@@ -407,7 +413,8 @@ CREATE UNIQUE INDEX portability_principal_map_owner ON portability_principal_map
 -- maps to the import's own principal; a grant holder's target is set once,
 -- to a confirmed, unrevoked credential reissued in this space and that
 -- credential's own principal. Nothing else changes. The job and credential rows are share
--- locked, so an ending import or a revocation waits for the write.
+-- locked, so an ending import or a revocation waits for the write, and a
+-- completion then sees the owner row it requires.
 CREATE FUNCTION stateplane_guard_portability_principal() RETURNS trigger LANGUAGE plpgsql
 SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
