@@ -2192,6 +2192,9 @@ export { aggregationBounds, analyticalSlots, PostgresAggregations } from './aggr
 export { analysisJobBounds, PostgresAnalysisJobs, PostgresAnalysisWorker } from './analysis-jobs.js';
 export type { AnalysisBoundary, AnalysisFreshness, AnalysisJobKind, AnalysisJobState, AnalysisJobStatus, AnalysisManifest, AnalysisPage, AnalysisStep,
   AnalysisWorkerOptions } from './analysis-jobs.js';
+export { PortabilityExportWorker, portabilityExportBounds, PostgresPortabilityExports } from './portability-exports.js';
+export type { PortabilityBoundary, PortabilityExportPart, PortabilityExportStatus, PortabilityJobState,
+  PortabilityStep } from './portability-exports.js';
 export { reconcileIndexes, reconciliationBounds } from './index-reconciliation.js';
 export type { IndexDrift, IndexReconciliation } from './index-reconciliation.js';
 export type { AggregationCell, AggregationMetricValue, AggregationOperator, AggregationOptions, AggregationResult, AggregationUnit,

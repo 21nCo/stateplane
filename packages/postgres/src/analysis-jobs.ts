@@ -11,6 +11,8 @@ import { scalarString, utcInstant } from './schema.js';
 import { invalid, transact } from './sources.js';
 import type { Db } from './sources.js';
 import type { PostgresSpaces } from './spaces.js';
+import { PortabilityExportWorker } from './portability-exports.js';
+import type { PortabilityStep } from './portability-exports.js';
 
 /**
  * Protective bounds, with their evidence (or that a bound is structural and
@@ -64,7 +66,9 @@ export interface AnalysisPage {
   page: { number: number; rowOffset: number; rowCount: number; byteOffset: number; byteSize: number; sha256: string; content: string };
   complete: true;
 }
-export interface AnalysisStep { expired: number; claimed: number; pages: number; completed: number; failed: number }
+export interface AnalysisStep { expired: number; claimed: number; pages: number; completed: number; failed: number;
+  /** Owner space exports the same step advanced (docs/portability-export.md#worker). */
+  exports: PortabilityStep }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- driver rows, read by column name
 type Row = Record<string, any>;
@@ -129,7 +133,7 @@ function view(row: Row): AnalysisJobStatus {
  * its read, and `wallUntil`, the provider credential's own absolute expiry
  * (Infinity when none), so a wall-clock step past it is caught too.
  */
-interface Deadline { monotonic: number; wallUntil: number }
+export interface Deadline { monotonic: number; wallUntil: number }
 const lapsed = (deadline: Deadline) => performance.now() >= deadline.monotonic || Date.now() >= deadline.wallUntil;
 /** The final credential check's bound, STA-58's: its provider call and statement together. */
 const RECHECK_MS = aggregationBounds.statementMs;
@@ -144,7 +148,7 @@ const RECHECK_MS = aggregationBounds.statementMs;
  * statement. Returns the `Deadline` the caller requires unexpired once COMMIT
  * is acknowledged: locks fence revocation, not time.
  */
-async function finalCheck(spaces: PostgresSpaces, db: Db, actor: VerifiedCredential, ownerPrincipalId: string,
+export async function finalCheck(spaces: PostgresSpaces, db: Db, actor: VerifiedCredential, ownerPrincipalId: string,
   scope: Readonly<AuthorityScope>, capability: Capability): Promise<Deadline> {
   await db.query(`SET LOCAL statement_timeout = '${RECHECK_MS}ms'`);
   let deadline: Deadline = { monotonic: -Infinity, wallUntil: -Infinity };
@@ -172,7 +176,7 @@ async function finalCheck(spaces: PostgresSpaces, db: Db, actor: VerifiedCredent
   return deadline;
 }
 /** A reply is released only while the access its final check relied on is unexpired, once COMMIT was acknowledged. */
-function released<T>({ value, deadline }: { value: T; deadline: Deadline }): T {
+export function released<T>({ value, deadline }: { value: T; deadline: Deadline }): T {
   if (lapsed(deadline)) throw new AuthorityError('FORBIDDEN', 'Access expired before the request committed');
   return value;
 }
@@ -189,7 +193,7 @@ async function discard(db: Session, key: unknown[]): Promise<void> {
  * turns. One statement sees every pending event committed before it, so a
  * writer's events are published together or after the boundary pinned next.
  */
-async function publish(db: Session, scope: Readonly<AuthorityScope>, limit: number): Promise<number> {
+export async function publish(db: Session, scope: Readonly<Pick<AuthorityScope, 'spaceId' | 'collectionId'>>, limit: number): Promise<number> {
   await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 1))', [JSON.stringify([scope.spaceId, scope.collectionId])]);
   const published = await db.query(`WITH next AS (
       SELECT event_id,space_id,collection_id FROM record_event_pending WHERE space_id=$1 AND collection_id=$2
@@ -583,17 +587,29 @@ export interface AnalysisWorkerOptions {
  * no record is left, the manifest seals the result and the job completes. A
  * step gives its lease and slot holds back when it stops, so the next step
  * (or an interactive aggregation) can take them at once.
+ *
+ * The same step writes owner space exports (`PortabilityExportWorker`): when
+ * one is due, analysis jobs stop at three fifths of the budget and exports
+ * take the rest (at least 2 s of the jobs Worker's 5 s); otherwise analysis
+ * jobs take it all.
  */
 export class PostgresAnalysisWorker {
   readonly #slots: { cell: number; space: number };
+  readonly #exports: PortabilityExportWorker;
   constructor(private readonly pool: PoolLike, options: AnalysisWorkerOptions) {
     this.#slots = analyticalSlots(options.originConnectionLimit);
+    this.#exports = new PortabilityExportWorker(pool);
   }
 
   async step(settings: { budgetMs?: number } = {}): Promise<AnalysisStep> {
     const budgetMs = bounded(settings.budgetMs ?? 5_000, MIN_STEP_MS, 60_000);
-    const until = Date.now() + budgetMs;
-    const result: AnalysisStep = { expired: 0, claimed: 0, pages: 0, completed: 0, failed: 0 };
+    const end = Date.now() + budgetMs;
+    const result: AnalysisStep = { expired: 0, claimed: 0, pages: 0, completed: 0, failed: 0,
+      exports: { expired: 0, claimed: 0, parts: 0, completed: 0, failed: 0 } };
+    let exportsDue = false;
+    try { exportsDue = await this.#exports.due(end); } catch (error) { if (!cutShort(error)) throw error; }
+    // Exports keep two fifths of the budget when one is due, so neither kind of job starves the other.
+    const until = exportsDue ? end - Math.floor(budgetMs * 2 / 5) : end;
     try { await this.expire(Date.now() + Math.floor(budgetMs / 4), result); } catch (error) { if (!cutShort(error)) throw error; }
     const passed: { s: string; c: string; j: string }[] = [];
     while (until - RELEASE_MS - Date.now() >= MIN_PAGE_MS) {
@@ -605,6 +621,7 @@ export class PostgresAnalysisWorker {
       result.claimed++;
       await this.run(job, until, result);
     }
+    if (exportsDue) result.exports = await this.#exports.step(end);
     return result;
   }
 

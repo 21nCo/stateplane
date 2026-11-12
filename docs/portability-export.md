@@ -1,0 +1,101 @@
+# Space export: open versioned format and resumable owner export (STA-70)
+
+An owner exports a whole space as an ordered set of parts sealed by a manifest, in an open, versioned format whose JSON Schema is [`contracts/portability-manifest.schema.json`](../contracts/portability-manifest.schema.json). It is the second of six slices of STA-17, after the [portability storage](portability-storage.md) (STA-69) it writes into. Import to a clean deployment and the retrieval rebuild are STA-71, erasure receipts and ledger replay STA-72, backups and restore drills STA-73, and HTTP, CLI and MCP transports STA-74. This slice adds the Postgres adapter (`PostgresPortabilityExports`, `packages/postgres/src/portability-exports.ts`), the application service `StateplaneServices.portability`, the export half of the jobs Worker's snapshot job step, and the format's verifier `verifyExportManifest` in `@stateplane/contracts`.
+
+| Operation | Contract |
+| --- | --- |
+| `submitExport(actor, space)` | The space owner's session only: an agent key is `FORBIDDEN` whatever it holds (`export:read` included), another account's session `NOT_FOUND`. Pins the [boundary](#consistent-boundary) and returns the queued export's status. A space with 2 unfinished exports, or more unpublished record events than 20 rounds of 5,000, is retryable `BACKPRESSURE`; so is a space whose writers do not let the boundary be pinned within the lock budget. |
+| `exportStatus(actor, space, job)` | State, failure code, boundary, progress (current section, parts written, claims, step time), budgets, times, and the manifest's SHA-256 digest and part count once, and only once, the export is complete. |
+| `cancelExport(actor, space, job)` | A queued or running export ends `cancelled` and its parts are removed in the same transaction; a worker writing a part meanwhile finishes it, then finds the export ended. One past its expiry ends `expired`. A completed or ended export is reported as it is. |
+| `exportPart(actor, space, job, n)` | Part `n` (1 to the part count; the last is the manifest) of a complete, unexpired export, with the manifest digest. Without a manifest `CONFLICT`, outside the part count `NOT_FOUND`, not an integer from 1 to 4,096 `INVALID_ARGUMENT`. |
+
+Every call authorizes again: the directory and the owner's provider credential, the space share-locked under the request's policy version and placement generation (a change is `FORBIDDEN`, a suspended or deleting space `SPACE_UNAVAILABLE`), and after the read the same bounded final credential check STA-59's job reads make, whose expiry must still lie ahead once COMMIT is acknowledged ([analysis jobs](analysis-jobs.md#authorization-at-every-read)). An export belongs to the space's owner; any of the owner's sessions reads it.
+
+## Consistent boundary
+
+An export is one state of the space. Records are read as of a **watermark**, a position of the cell's record event feed, exactly as an STA-59 snapshot job reads one collection ([as-of reconstruction](analysis-jobs.md#as-of-reconstruction)). Everything else (schemas, retrieval policies, credentials and grants, sources, extractions, claims, provenance, links and evidence events) has no feed, so it is read as of the **snapshot instant**: the database clock reading migration 051 stamps as the export's `created_at`.
+
+The two name the same state because submission pins both while the space's writes are held. In one `READ COMMITTED` transaction it locks the space row `FOR NO KEY UPDATE`, which waits for every transaction holding the space's share lock and holds new ones until COMMIT (every authority writer and reader share-locks the space first: `AuthorityTransaction.checkScope`, the collection, source, claim and link writers, and credential issuance and revocation, which update the space row). It then publishes every collection's pending record events under the lock `events()` publishes under, takes the space's last feed position as the watermark, and inserts the export, whose `created_at` is stamped then. So:
+
+- every write committed before submission is at or below the watermark and stamped (`clock_timestamp()`, the default of every timestamp an export compares) before the snapshot instant;
+- every later write takes its share lock after submission commits, so its stamps come after the snapshot instant and its record events after the watermark.
+
+Sections reconstruct the snapshot instant from those stamps: a row created after it is left out; a revision committed after it is left out; a source or claim deleted after it (its deletion event committed after it) is exported live; a link tombstoned after it is exported live at the revision before its tombstone; a credential activated, confirmed or revoked after it shows that time as `null`. The comparison is microsecond-exact (the instant is passed back as the database's own text). It relies on the database clock not stepping backwards while writers wait, as every timestamp comparison in the authority does. Holding writes costs at most the lock budget (`55P03` becomes retryable `BACKPRESSURE`) plus one round of event publication.
+
+Grants alone have no history: issuance adds them in a transaction after the credential row is stamped, and revocation deletes them. Every such change increments the space's policy version, so the `permissions` section is written first, and each of its parts checks, with the space share-locked, that the policy version is still the one the export was admitted under. A key issued or revoked (or a lifecycle change) before the section is complete fails the export with `POLICY_CHANGED`, never a guessed grant; submit again. Once the section is complete (the transaction that finds it exhausted moves on to the next section), later policy changes do not affect the export.
+
+A placement change fails an export with `STALE_PLACEMENT`, a space no longer active or read-only with `SPACE_UNAVAILABLE`, and an owner change with `FORBIDDEN`. Export is admitted into an active or read-only space (migration 051).
+
+## Format (version 1)
+
+An export is parts 1 to n. Parts 1 to n−1 are data parts; part n is the manifest. Each data part holds one section's NDJSON (UTF-8, one JSON object per line, `\n` after each) from where that section's previous part stopped. A part holds at most 1 MiB and never splits a character, but a line may continue into the next part, so no row is too large to export; a part's `rows` counts the lines that end in it. Concatenating a section's parts in order gives the section's NDJSON. Sections appear in this order, each only if it has rows:
+
+| Section | One line per | As of |
+| --- | --- | --- |
+| `permissions` | agent credential: its ID, principal, times and collection grants | created at or before the instant; later activation, confirmation or revocation shown as `null`; grants read under the submission's policy version |
+| `schemas` | accepted collection definition version (`definition` is the canonical JSON as accepted) | accepted at or before the instant |
+| `retrieval` | retrieval policy version (what is projected, never a projection) | created at or before the instant |
+| `sources` | live source: locator, author, and its original's SHA-256 digest, size and type | live at the instant |
+| `extractions` | extraction version of a live source, with its content and offsets | created at or before the instant |
+| `claims` | revision of a live claim, with attribution, validity, review and commit time | committed at or before the instant |
+| `provenance` | evidence span a claim revision cites: source, extraction version and offsets | as its claim revision |
+| `links` | live link, its type, deletion policy and endpoints | live at the instant, at its revision there |
+| `events` | evidence lifecycle event (source, claim or link creation, deletion or detachment) | committed at or before the instant |
+| `records` | record live at the watermark: revision, schema version and canonical data | as of the watermark |
+| `revisions` | record event published at or below the watermark, deletions included, with its feed position and credential | at or below the watermark |
+
+A source or claim deleted at the instant is present only as its deletion event, never as content. Original bytes never travel inside an export: a source states its original's digest and size, and an importer (STA-71) refuses an original whose bytes do not match them.
+
+**Manifest.** The last part is one JSON object: `format` (`stateplane.space-export`), `formatVersion` (1), `jobId`, `space` (ID, owner principal, policy version and placement generation at submission), `boundary` (`watermark`, `snapshotAt`, `records: as-of-watermark`, `evidence: as-of-snapshot`), `sections` (every evidence section in order with its total rows and bytes, zero for an empty one, and `accelerator`), `parts` (each data part's number, section, rows, bytes and SHA-256 digest) and `excluded`. Its own SHA-256 digest is the export's: the job states it (`manifest.sha256`), migration 051 stores it, and the manifest part's own digest equals it.
+
+**Verification.** `verifyExportManifest(manifestText, sha256, parts?)` accepts the manifest only if its bytes hash to the digest the job states, it is format version 1 with every evidence section in order and accelerators marked, its parts are numbered without gaps, contiguous per section and total to its sections, and, when the data parts are given, each matches the bytes and digest the manifest lists. Changing any byte of the manifest or of a listed part, dropping or reordering a part, or presenting a manifest re-sealed without a part fails. It uses only Web Crypto, so it runs in Workers, browsers and Node alike.
+
+**Embeddings are accelerators only.** The schema defines an optional `embeddings` section (an embedding with its embedder, model, version, dimensions and the digest of the chunk it embeds), marked `accelerator: true`. It is never the only copy of anything: every chunk it could embed is rebuilt from the evidence sections, an importer may use a stored embedding only where the chunk it rebuilds has the same digest, and may ignore the section. A manifest without every evidence section is refused even if it carries embeddings. This exporter writes no accelerator section; STA-71 rebuilds projections from authority.
+
+**Excluded material.** No export carries credential secrets or their hashes, session tokens, storage object keys, original bytes or derived projections, and the manifest says so (`excluded`). Credentials appear only as identifiers, principals, times and grants (no cell table holds a secret; the provider keeps them), and an importer reissues credentials rather than copying them ([principal map](portability-storage.md#principal-map)). Every object of the format is closed (`additionalProperties: false`), so a line with any other member is not a valid version 1 export.
+
+## Worker
+
+The cell jobs Worker's snapshot step, `PostgresAnalysisWorker.step` ([analysis jobs](analysis-jobs.md#worker)), also writes exports, on the same connection and within the same 5 s. When an export is due (queued, running with a lapsed lease, or past its expiry), analysis jobs stop at three fifths of the budget and exports take the rest, at least 2 s of the jobs Worker's 5 s; otherwise analysis jobs take it all, as before. The export step:
+
+1. Ends exports past their expiry, one per transaction: `expired`, parts removed, a completed export's included.
+2. Claims the next due export, least recently run first, in a transaction that share-locks the space and checks the binding (placement generation, lifecycle, owner, and the policy version until permissions are complete), then locks the export (`SKIP LOCKED`) and moves it to `running` with a new 30 s lease. Exports take no analytical slot: the jobs Worker's one connection runs one part at a time.
+3. Writes one part per transaction, bounded by the step's deadline: the space share-locked and the binding checked, the export locked at its exact lease and the lease extended, the next rows of the current section after the checkpoint read (at most 1,000 rows and about 1 MiB of lines), the part written, and the checkpoint (section, last whole row's key, bytes of the next row already written, step time) committed with it. A section with nothing left moves to the next in the same transaction; rows read but producing no line (a record deleted at the watermark) only advance the checkpoint. When no section has rows left, the manifest part is written and the export completes with its digest and part count (migration 051 checks the count).
+4. Gives the lease back when it stops.
+
+Reads are deterministic given the boundary and the checkpoint, so an interruption anywhere rolls back that part only, and a later claim continues from the last committed checkpoint and writes the same parts, digests and cuts. A binding that no longer holds fails the export (`STALE_PLACEMENT`, `SPACE_UNAVAILABLE`, `FORBIDDEN`, `NOT_FOUND`, `POLICY_CHANGED`) and removes its parts. Part errors settle as STA-59's page errors do: a data, integrity or program-limit error fails the export `UNPROCESSABLE`; one its expiry overtook ends it `expired`; one that outlived its lease leaves it to a later claim; anything else leaves the part to a later step.
+
+The due-export query reads `portability_jobs` without an index of its own: export rows stay until their space is erased (migration 051), and an index belongs with a migration of its own if that ever measures slow.
+
+## Budgets
+
+Initial protective values, not capacity:
+
+| Budget | Value | On excess |
+| --- | --- | --- |
+| Part bytes | 1 MiB, migration 051's bound; a line continues into the next part | Next part |
+| Rows read per part | 1,000 (and about 1 MiB of lines) | Next part |
+| Parts per export | 4,096, the manifest included, so the manifest's part list stays under half its own 1 MiB bound | `RESULT_TOO_LARGE` |
+| Part bytes per export | 1 GiB, held in the cell database until the export expires | `BUDGET_EXCEEDED` |
+| Step time per export | 3,600,000 ms, summed over parts | `BUDGET_EXCEEDED` |
+| Lifetime, completed result included | 24 h from submission | `expired`; parts removed |
+| Unfinished exports per space | 2 | Submission `BACKPRESSURE`, retryable |
+| Lease | 30 s, extended by every part; a part starts only with at least 1 s of the step left | Lapses; reclaimed |
+| Event publication at submission | 20 rounds of 5,000 events across the space's collections | `BACKPRESSURE`, retryable |
+
+Measured locally on PostgreSQL 17 (Docker on an Apple-silicon laptop), one space of 20,000 records of 2 KB written in batches of 20 and not yet published, exported by the jobs Worker step at its 5 s budget: submission, publishing all 20,000 events in four committed rounds of 5,000 under the write hold, took 710 ms (so each hold lasted about 180 ms); the export wrote 88 parts and 88,662,385 bytes (records and revisions, about 1 MiB each) in 2,766 ms of step time over 2 steps, about 30 MiB per second of step time, with each part's insert taking 14 ms at the median and 25 ms at most. At that rate the 1 GiB byte budget is about 35 s of step time (7 ticks of a jobs Worker with nothing else due, 18 at the 2 s share), well inside the 3,600,000 ms runtime budget and the 24 h lifetime; the runtime budget instead bounds an export slowed by a loaded database. Exports of many small rows reach the part limit before the byte budget (1,000 rows of about 100 bytes make a 100 KB part), so the part limit, not bytes, is the first bound for such spaces. Production values against Railway Postgres through Hyperdrive are part of this slice's [acceptance](#evidence).
+
+## Evidence
+
+`test/integration/portability-export.test.js` (in `pnpm test:postgres`) checks, against what the test wrote rather than what the worker read:
+
+- a real export of a space with records created, replaced and deleted in two collections, a source with an extraction, a cited claim, links and agent keys, followed after submission by record writes, a record deletion that detaches a link, a claim review, a new claim, a source deletion, a new source and a new key: every section holds the state at the boundary only, every line and the manifest match the JSON Schema, and the manifest verifies against the digest the job states, with every part;
+- the same manifest with one byte changed fails against its digest, a changed part fails against the manifest, a missing part fails, and a manifest re-sealed without a part's entry fails for its structure;
+- on a real export with a key that wrote records and a revoked key, neither key secret, the owner's session token, the source's storage object key, nor any 16-character fragment of them appears in any part or the manifest, while the credentials' identifiers do; no member anywhere is named for secret material;
+- an export of records near 1 MiB of two-byte characters, cut once at a checkpoint and twice at part writes, resumes and writes the same parts, digests and cuts as one run straight through, with lines continuing across parts and no part over 1 MiB;
+- only the owner exports or reads (an agent key with `export:read` is refused), cancellation removes parts, the part bounds and states, a key issued before permissions are read fails the export with `POLICY_CHANGED` while a key revoked after they are read does not, a read-only space exports, and a suspended space fails a queued export and serves nothing;
+- a writer holding the space's share lock delays submission until it commits, and its write is inside the boundary.
+
+`test/integration/analysis-jobs.test.js` still passes unchanged with the shared step.
+
+These are local PostgreSQL 17 checks. Exact-head acceptance still needs Railway Postgres: migrations through 051 on a disposable cell database, `pnpm db:grant-portability` against the operational role, and this suite's real export run there (manifest digest verification and the credential exclusion check against an export written under the operational role, not the migration owner). The jobs Worker's cron advancing an export on Cloudflare Preview through Hyperdrive belongs with the transports (STA-74), which make an export reachable from outside the process. No connected provider sandbox or browser path changes in this slice.
