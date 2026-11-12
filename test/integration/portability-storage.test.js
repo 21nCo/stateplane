@@ -294,6 +294,35 @@ test('the erasure ledger names a current cell and an allowed directory state, re
   await assert.rejects(pool.query('DELETE FROM space_directory WHERE space_id=$1', [deleting]), refused('23503'));
 });
 
+test('under REPEATABLE READ a hard erasure whose snapshot predates its space entry in flight retries with 40001 rather than refusing', async () => {
+  const spaceId = `sp_${randomUUID()}`;
+  await directoryRow(spaceId, 'deleted');
+  const [writer, eraser] = [await pool.connect(), await pool.connect()];
+  try {
+    await eraser.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+    await eraser.query('SELECT count(*) FROM erasure_ledger');
+    await writer.query('BEGIN');
+    await writer.query(`INSERT INTO erasure_ledger(scope,space_id,cell_id) VALUES('space',$1,'cell-a')`, [spaceId]);
+    const erasing = eraser.query('UPDATE space_directory SET hard_erased_at=clock_timestamp() WHERE space_id=$1', [spaceId])
+      .then(() => 'erased', error => error);
+    await waiting(eraser);
+    await writer.query('COMMIT');
+    const stale = await erasing;
+    await eraser.query('ROLLBACK');
+    assert.ok(stale instanceof Error && stale.code === '40001', String(stale));
+    // Its retry sees the entry and stamps the hard erasure.
+    await eraser.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+    await eraser.query('UPDATE space_directory SET hard_erased_at=clock_timestamp() WHERE space_id=$1', [spaceId]);
+    await eraser.query('COMMIT');
+    assert.ok((await directory(spaceId)).hard_erased_at);
+  } finally {
+    await writer.query('ROLLBACK').catch(() => {});
+    await eraser.query('ROLLBACK').catch(() => {});
+    writer.release();
+    eraser.release();
+  }
+});
+
 test('directory lifecycle stamps follow the spaces service through archive, restore, deletion and hard erasure', async () => {
   const actor = await owner();
   const spaces = spacesFor(pool, pool);

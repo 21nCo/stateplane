@@ -59,9 +59,11 @@ CREATE TABLE erasure_ledger (
 CREATE INDEX erasure_ledger_cell ON erasure_ledger(cell_id, erasure_id);
 
 -- An entry names its space's current cell and a directory state that allows
--- it. The directory row is share locked, so a placement or lifecycle change
--- waits for the entry and an entry that meets one in flight is checked
--- against it.
+-- it. Each entry first updates its directory row without changing a stamped
+-- column, so entries and directory changes take turns: one that meets another
+-- in flight waits and is then checked against it under READ COMMITTED, or
+-- fails with a serialization error (40001) under REPEATABLE READ. So a hard
+-- erasure sees the space entry committed before it.
 CREATE FUNCTION stateplane_guard_erasure_ledger() RETURNS trigger LANGUAGE plpgsql
 SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
@@ -72,7 +74,8 @@ BEGIN
     RAISE EXCEPTION 'erasure ledger entries are never changed or removed'
       USING ERRCODE = 'check_violation', CONSTRAINT = 'erasure_ledger_immutable';
   END IF;
-  SELECT d.cell_id, d.lifecycle INTO directory FROM public.space_directory d WHERE d.space_id = NEW.space_id FOR SHARE;
+  UPDATE public.space_directory d SET updated_at = d.updated_at WHERE d.space_id = NEW.space_id
+    RETURNING d.cell_id, d.lifecycle INTO directory;
   IF directory.cell_id IS DISTINCT FROM NEW.cell_id THEN
     RAISE EXCEPTION 'an erasure ledger entry names its space''s current cell'
       USING ERRCODE = 'check_violation', CONSTRAINT = 'erasure_ledger_cell';

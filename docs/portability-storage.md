@@ -19,7 +19,7 @@ One row per erased object, recorded before or as its cell erases it, and never c
 - `scope` `space` (a whole space; `collection_id` and `source_id` null) or `source` (one source's original bytes and extracted content; both set) (`erasure_ledger_target`);
 - `space_id` references `space_directory`, so a directory row with an entry is never removed;
 - `cell_id` is the space's current cell when recorded (`erasure_ledger_cell`): the cell whose restore must replay the entry;
-- a `space` entry needs the directory row `deleting` or `deleted`, a `source` entry a published space (`erasure_ledger_lifecycle`). The guard share-locks the directory row, so a placement or lifecycle change waits for the entry and an entry that meets one in flight is checked against it;
+- a `space` entry needs the directory row `deleting` or `deleted`, a `source` entry a published space (`erasure_ledger_lifecycle`). The guard first updates the directory row without changing a stamped column, so a placement, lifecycle or hard-erasure change and an entry take turns: one that meets the other in flight waits, then under READ COMMITTED is checked against it, and under REPEATABLE READ or SERIALIZABLE fails with a retryable serialization error (`40001`);
 - each object is recorded once (`erasure_ledger_once`, `23505`);
 - `erasure_id` is an always-generated identity and `recorded_at` the database clock. IDs order entries by insertion, not commit, so replay reads every entry of a cell (index `erasure_ledger_cell`) rather than continuing past an ID.
 
