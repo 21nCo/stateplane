@@ -8,6 +8,8 @@ Every database receives every migration. The erasure ledger and stamps are used 
 
 Erased data must not come back when a cell is restored from a backup or point-in-time recovery taken before the erasure. Each cell restores independently, and its backups keep earlier copies until their own retention ends ([owned spaces](owned-spaces.md#state-races-and-recovery)). A record of the erasure kept in the cell would be rolled back with the data it records. So `erasure_ledger` lives in the control database, beside `space_directory`, outside every regional cell's restorable data: restoring a cell replaces that cell's database and leaves the ledger, and the directory's tombstone and hard-erasure stamps, untouched. After a cell restore, the ledger's entries for that cell name what must be erased again; STA-72 replays them, and until then `PostgresSpaces.erasure` reports a resurrected space's database `pending`, not `erased`.
 
+Only the control database's ledger is authoritative. Every database receives every migration, so `erasure_ledger` and its guard exist in each cell too, and the guard checks only the local `space_directory`: it cannot tell a control database from a cell. A fresh cell has no directory rows and refuses every entry (`erasure_ledger_cell`), but a cell upgraded across migration 016 keeps the directory rows 016 copied from its `spaces`, with their lifecycle and cell as of then, and accepts entries for those spaces. Such an entry sits in restorable cell data, a restore of the cell removes it, and nothing reads it. Writers (STA-72) must record entries through the control connection, never a cell's.
+
 This guarantee covers regional restores. A restore of the control database itself is a separate procedure that STA-73 defines; it must not roll the ledger back past entries already applied to cells.
 
 ## Erasure ledger
@@ -16,7 +18,7 @@ One row per erased object, recorded before or as its cell erases it, and never c
 
 - `scope` `space` (a whole space; `collection_id` and `source_id` null) or `source` (one source's original bytes and extracted content; both set) (`erasure_ledger_target`);
 - `space_id` references `space_directory`, so a directory row with an entry is never removed;
-- `cell_id` is the space's current cell when recorded (`erasure_ledger_cell`): the cell whose restore must replay the entry. A cell database has no directory row to name, so it cannot hold an entry;
+- `cell_id` is the space's current cell when recorded (`erasure_ledger_cell`): the cell whose restore must replay the entry.;
 - a `space` entry needs the directory row `deleting` or `deleted`, a `source` entry a published space (`erasure_ledger_lifecycle`). The guard share-locks the directory row, so a placement or lifecycle change waits for the entry and an entry that meets one in flight is checked against it;
 - each object is recorded once (`erasure_ledger_once`, `23505`);
 - `erasure_id` is an always-generated identity and `recorded_at` the database clock. IDs order entries by insertion, not commit, so replay reads every entry of a cell (index `erasure_ledger_cell`) rather than continuing past an ID.
@@ -78,6 +80,6 @@ Run `pnpm db:grant-control-journal` after migration 051 and after every restore 
 
 ## Verification
 
-`node --test test/integration/portability-storage.test.js` (part of `pnpm test:postgres`) covers applying 051 on a populated pre-051 schema (bounded wait, rollback, stamp backfill) and from empty with identical constraints, triggers, indexes, routines and privileges; restoring a separate cell database from its backup after an erasure, which resurrects the space while the control ledger entries and stamps stay identical; every ledger, stamp, job, part and map guard; the race between a part write and its job's completion; the purge and erasure report; and both grant scripts. `pnpm db:upgrade-smoke` and `pnpm db:restore-smoke` cover the upgrade path and a dump restore of every new table and guard.
+`node --test test/integration/portability-storage.test.js` (part of `pnpm test:postgres`) covers applying 051 on a populated pre-051 schema (bounded wait, rollback, stamp backfill) and from empty with identical constraints, triggers, indexes, routines and privileges; restoring a separate cell database from its backup after an erasure, which resurrects the space and drops entries a cell accepted for stale pre-016-style directory rows, while the control ledger entries and stamps stay identical; every ledger, stamp, job, part and map guard; the race between a part write and its job's completion; the purge and erasure report; and both grant scripts. `pnpm db:upgrade-smoke` and `pnpm db:restore-smoke` cover the upgrade path and a dump restore of every new table and guard.
 
 These are local PostgreSQL 17 results. Exact-head acceptance still needs Railway Postgres: migration 051 applied to a disposable control and cell database migrated through 050, both grant scripts against separate operational roles, and a cell restore that leaves the control ledger intact. No Cloudflare Preview, connected provider sandbox or browser path changes in this slice.

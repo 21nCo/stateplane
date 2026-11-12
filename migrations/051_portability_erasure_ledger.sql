@@ -12,7 +12,12 @@
 -- reissued credentials. Space erasure removes them with the rest.
 --
 -- Every database receives every migration; in a single-database installation
--- control and cell tables share it (docs/owned-spaces.md).
+-- control and cell tables share it (docs/owned-spaces.md). So erasure_ledger
+-- exists in every database, and only the control database's is authoritative.
+-- Its guard checks the local directory and cannot tell which database it runs
+-- in: a cell upgraded across 016 keeps the directory rows 016 copied from its
+-- spaces, and accepts entries for them that a restore of the cell rolls back.
+-- Writers (STA-72) record entries through the control connection only.
 
 -- Lifecycle stamps. `archived_at` is when the space last entered `readOnly`
 -- (archive); it is kept through suspension and deletion and cleared when the

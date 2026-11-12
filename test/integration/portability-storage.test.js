@@ -228,9 +228,17 @@ test('restoring a cell from its backup brings the erased space back but leaves t
     const stampsBefore = await directory(spaceId, control);
     assert.ok(stampsBefore.archived_at && stampsBefore.tombstoned_at && stampsBefore.hard_erased_at);
     assert.equal((await cell.query('SELECT count(*)::int AS n FROM records WHERE space_id=$1', [spaceId])).rows[0].n, 0);
-    // A cell database cannot hold a ledger entry: it has no directory row to name.
+    // The guard checks only the local directory, not which database it runs in. A fresh cell has no directory row to name ...
     await assert.rejects(cell.query(`INSERT INTO erasure_ledger(scope,space_id,cell_id) VALUES('space',$1,'cell-a')`, [spaceId]),
       check('erasure_ledger_cell'));
+    // ... but a cell upgraded across migration 016 keeps the stale directory rows 016 copied from its spaces, and accepts
+    // entries for them. Such an entry is not authoritative: it lives in restorable cell data, and the restore below drops it.
+    const [staleDeleted, staleActive] = [`sp_${randomUUID()}`, `sp_${randomUUID()}`];
+    await directoryRow(staleDeleted, 'deleted', cell);
+    await directoryRow(staleActive, 'active', cell);
+    await cell.query(`INSERT INTO erasure_ledger(scope,space_id,cell_id,collection_id,source_id)
+      VALUES('space',$1,'cell-a',NULL,NULL),('source',$2,'cell-a','alpha','src_1')`, [staleDeleted, staleActive]);
+    assert.equal((await cell.query('SELECT count(*)::int AS n FROM erasure_ledger')).rows[0].n, 2);
 
     // Restore the regional data: the cell database is replaced by its backup.
     await cell.end();
@@ -241,6 +249,7 @@ test('restoring a cell from its backup brings the erased space back but leaves t
     // The backup resurrected the space and its content ...
     assert.deepEqual((await cell.query(`SELECT s.lifecycle,count(r.*)::int AS records FROM spaces s LEFT JOIN records r USING (space_id)
       WHERE s.space_id=$1 GROUP BY s.lifecycle`, [spaceId])).rows, [{ lifecycle: 'readOnly', records: 1 }]);
+    // The cell's own entries went with the restore ...
     assert.equal((await cell.query('SELECT count(*)::int AS n FROM erasure_ledger')).rows[0].n, 0);
     // ... while the control ledger keeps every entry, naming the restored cell to replay, and the directory keeps its stamps.
     assert.deepEqual((await control.query('SELECT * FROM erasure_ledger ORDER BY erasure_id')).rows, ledgerBefore);
