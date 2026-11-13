@@ -1,0 +1,23 @@
+docs/owned-spaces.md
+  s_489ac6fd559658::t_91c78cba6d97c8 37
+docs/regional-topology.md
+  s_489ac6fd559658::t_9a6935bb35837f 5
+scripts/grant-analysis.mjs
+  s_489ac6fd559658::t_57ccdd6728cb37 11-15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "acdbb5684fd6968d5a19c5c582e3642d7cfa6eb5",
+  "prompts": {},
+  "sessions": {
+    "s_489ac6fd559658": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a5c021bf-434b-4a1a-81a0-4a067793b163",
+        "model": "unknown"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
