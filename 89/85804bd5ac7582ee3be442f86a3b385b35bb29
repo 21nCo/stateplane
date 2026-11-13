@@ -1,0 +1,45 @@
+docs/portability-export.md
+  s_6d506af7178ff1::t_503265c2939ac6 7,9,61-62,67,87,89,104,106-110,114
+migrations/052_portability_live_exports.sql
+  s_57e886b389d039::t_1fea1fcf4168de 11-18
+packages/postgres/src/analysis-jobs.ts
+  s_6d506af7178ff1::t_670e91f27ced23 616-620,652,662-669,680-683,685-690,703-704,711-715
+test/integration/portability-export.test.js
+  s_d205c3d7cfaa2d::t_36319205a9a96b 118-123,637-675,701-706,935,982,1008,1039-1214
+docs/analysis-jobs.md
+  s_6d506af7178ff1::t_29ff528afa9609 161
+packages/postgres/src/portability-exports.ts
+  s_6d506af7178ff1::t_901215fcc520fa 19-22,29,58-59,257-279,328-338,373-374,393-394,397-398,453-455,499-503,510-511,617-618,641-649,652,654,658-670,672-676,737
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8985804bd5ac7582ee3be442f86a3b385b35bb29",
+  "prompts": {},
+  "sessions": {
+    "s_57e886b389d039": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7ab7d8d5-d5a5-48b6-94aa-845d47f6876e",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    },
+    "s_6d506af7178ff1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1ae48a8c-b6c6-4a02-bed0-392d5d41c7ad",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    },
+    "s_d205c3d7cfaa2d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1d3ec-f33f-7251-a5ff-f7459c0ac47c",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
