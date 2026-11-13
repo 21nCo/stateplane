@@ -8,6 +8,14 @@
 CREATE INDEX IF NOT EXISTS portability_jobs_live ON portability_jobs(leased_until)
   WHERE kind = 'export' AND state IN ('queued', 'running', 'completed');
 
+-- An ended export's parts are removed in committed batches, highest first, so
+-- it still holds parts exactly while its part 1 is there. This index has one
+-- entry per export holding parts (held exports are bounded per space), so the
+-- step finds ended exports to remove, and submission counts them as held,
+-- without reading the parts themselves or the retained job history.
+CREATE INDEX IF NOT EXISTS portability_parts_held ON portability_parts(space_id, job_id)
+  WHERE kind = 'export' AND part_number = 1;
+
 -- The same step's turn order (docs/portability-export.md#worker): when a step
 -- has room for one turn only, the kind this row names goes first and the step
 -- names the other, so analysis jobs and exports alternate across steps,

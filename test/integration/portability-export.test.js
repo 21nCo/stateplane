@@ -115,6 +115,12 @@ function committing(n, after) {
     return client;
   } };
 }
+/** End every export due to end and remove every ended export's parts, as a step's expiry passes would given the time. */
+async function sweep() {
+  const step = { expired: 0, claimed: 0, parts: 0, completed: 0, failed: 0, unadmitted: 0, removed: 0 };
+  assert.equal(await new PortabilityExportWorker(newPool(1)).expire(Date.now() + 30_000, step), true, 'the sweep finished');
+  return step;
+}
 /** Run steps until no export is left to claim, as successive ticks would. */
 async function drain(jobs = worker()) {
   for (let i = 0; i < 200; i++) if (!(await jobs.step({ budgetMs: 10_000 })).exports.claimed) return;
@@ -628,6 +634,45 @@ test('an export becomes claimable only once its submission\'s authorization is r
   assert.deepEqual([refusedCheck.state, refusedCheck.parts], ['cancelled', 0]);
 });
 
+test('an admission kept waiting on its locked space is retryable BACKPRESSURE, and one whose access lapses meanwhile FORBIDDEN', async () => {
+  const actor = await owner();
+  const spaceId = await space(actor);
+  await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: 'x' } });
+  const holders = [];
+  /** A cell pool whose admission finds the space row locked by another transaction until the submission settles. */
+  const contended = { connect: async () => {
+    const client = await pool.connect(), query = client.query.bind(client), release = client.release.bind(client);
+    client.query = async (sql, ...rest) => {
+      if (sql === 'SELECT 1 FROM spaces WHERE space_id=$1 FOR SHARE') {
+        const holder = await pool.connect();
+        holders.push(holder);
+        await holder.query('BEGIN');
+        await holder.query('SELECT 1 FROM spaces WHERE space_id=$1 FOR UPDATE', [spaceId]);
+      }
+      return query(sql, ...rest);
+    };
+    client.release = (...args) => { client.query = query; client.release = release; return release(...args); };
+    return client;
+  } };
+  const brief = { scope: (...args) => spaces.scope(...args), assertCurrentUntil: async () => Date.now() + 300 };
+  // With access for 300 ms, the access lapsed while it waited: FORBIDDEN. With access unexpired, the space stayed busy
+  // past the admission's bound: retryable BACKPRESSURE. Either way the export is cancelled unrun.
+  for (const [authority, code, retryable] of [[brief, 'FORBIDDEN', false], [spaces, 'BACKPRESSURE', true]]) {
+    try {
+      await assert.rejects(new PostgresPortabilityExports(authority, new Map([['cell-a', { pool: contended }]])).submit(actor, spaceId),
+        error => { assert.deepEqual([error.code, error.retryable === true], [code, retryable], error.message); return true; });
+    } finally {
+      for (const holder of holders.splice(0)) { await holder.query('ROLLBACK'); holder.release(); }
+    }
+    const job = (await pool.query(`SELECT state,(SELECT count(*)::int FROM portability_parts p WHERE p.job_id=j.job_id) AS parts
+      FROM portability_jobs j WHERE space_id=$1 ORDER BY created_at DESC LIMIT 1`, [spaceId])).rows[0];
+    assert.deepEqual(job, { state: 'cancelled', parts: 0 });
+  }
+  // Uncontended, the space takes an export at once.
+  assert.equal((await portability.submitExport(actor, spaceId)).state, 'queued');
+  await drain();
+});
+
 test('a space holds at most 4 exports at once, completed ones until they expire, and the byte budget holds the manifest', async () => {
   const actor = await owner();
   const spaceId = await space(actor);
@@ -653,7 +698,12 @@ test('a space holds at most 4 exports at once, completed ones until they expire,
     const ended = await portability.exportStatus(actor, spaceId, jobId);
     assert.deepEqual([ended.state, ended.failureCode, await partsOf(jobId)],
       expected === 'completed' ? ['completed', null, parts.length + 1] : ['failed', 'BUDGET_EXCEEDED', 0], `a budget of ${budget} bytes`);
-    if (expected === 'completed') await bypassing(`UPDATE portability_jobs SET state='expired',finished_at=clock_timestamp() WHERE job_id=$1`, [jobId]);
+    if (expected === 'completed') {
+      await bypassing(`UPDATE portability_jobs SET state='expired',finished_at=clock_timestamp() WHERE job_id=$1`, [jobId]);
+      // Ended, it is held until a step removes its parts.
+      await rejects(portability.submitExport(actor, spaceId), 'BACKPRESSURE', 'an ended export holds its parts until they are removed');
+      assert.equal((await sweep()).removed, parts.length + 1);
+    }
   }
 });
 
@@ -882,6 +932,7 @@ test('a slow due probe of either kind is cut at its bound, and the other kind st
       UNION ALL SELECT job_id,state FROM portability_jobs WHERE space_id=$1 AND state NOT IN ('completed','expired')`, [spaceId]);
     assert.deepEqual(unfinished.rows, [], 'every job of both kinds completes in later steps');
     await bypassing(`UPDATE portability_jobs SET state='expired' WHERE space_id=$1 AND state='completed'`, [spaceId]);
+    await sweep();
   };
   const freshAnalysis = () => services.analysis.submit(actor, spaceId, 'alpha', 'export');
   const freshExport = () => portability.submitExport(actor, spaceId);
@@ -928,7 +979,7 @@ test('a slow due probe of either kind is cut at its bound, and the other kind st
   await finish();
 });
 
-test('each kind ends its expired jobs in one pass per step, in its own slice and then with what its claims leave', async () => {
+test('each kind ends its expired jobs in one pass per step, in its own slice and then in what both turns leave', async () => {
   const actor = await owner();
   const spaceId = await space(actor);
   for (let i = 0; i < 4; i++)
@@ -954,22 +1005,7 @@ test('each kind ends its expired jobs in one pass per step, in its own slice and
     await worker().step({ budgetMs: 5_000 });
   assert.equal((await services.analysis.status(actor, spaceId, 'alpha', analysisJob.jobId)).state, 'completed');
 
-  // An expiry pass its slice cannot finish (each export's part removal takes longer than a tenth of the budget) continues
-  // in its kind's turn: two expired exports end within two steps, their parts removed, and the space takes exports again.
-  for (const budgetMs of [2_000, 5_000]) {
-    const expiring = await space(actor);
-    await mutate(actor, expiring, 'alpha', { operation: 'create', data: { label: 'x' } });
-    const ended = [];
-    for (let i = 0; i < 2; i++) { ended.push((await portability.submitExport(actor, expiring)).jobId); await drain(); }
-    await bypassing(`UPDATE portability_jobs SET created_at=created_at-interval '25 hours',expires_at=expires_at-interval '24 hours',
-      started_at=started_at-interval '25 hours',finished_at=finished_at-interval '25 hours' WHERE job_id=ANY($1)`, [ended]);
-    const removing = worker(sql => { if (/^\s*DELETE FROM portability_parts/.test(sql)) spin(budgetMs / 10 + 100); });
-    for (let i = 0; i < 2 && (await pool.query(`SELECT 1 FROM portability_jobs WHERE job_id=ANY($1) AND state<>'expired'`, [ended])).rowCount; i++)
-      await removing.step({ budgetMs });
-    assert.deepEqual(await Promise.all(ended.map(async jobId => [(await portability.exportStatus(actor, expiring, jobId)).state, await partsOf(jobId)])),
-      [['expired', 0], ['expired', 0]], `both expired exports ended at a ${budgetMs} ms budget`);
-  }
-  // A removal that outlasts every turn gets only what the claims leave, so it never takes the kind's live work: another
+  // A removal that outlasts every turn gets only what the turns leave, so it never takes the kind's live work: another
   // space's admitted export writes parts within two steps at 2 s and at 5 s, while the expired export keeps its parts.
   const stuckSpace = await space(actor), liveSpace = await space(actor);
   await mutate(actor, stuckSpace, 'alpha', { operation: 'create', data: { label: 'x' } });
@@ -998,6 +1034,182 @@ test('each kind ends its expired jobs in one pass per step, in its own slice and
   assert.ok(await partsOf(stuck) > 0, 'the expired export whose removal never fits keeps its parts');
   await drain();
   assert.deepEqual([await partsOf(stuck), (await portability.exportStatus(actor, liveSpace, live)).state], [0, 'completed']);
+});
+
+/**
+ * Part removal that costs `ms` a part in `spaceId` (a trigger sleeping before each part's DELETE), as a large export's
+ * removal costs on a slow disk; 0 removes the cost.
+ */
+async function slowRemoval(spaceId, ms) {
+  await pool.query(`CREATE TABLE IF NOT EXISTS test_slow_removal (space_id text PRIMARY KEY, ms integer NOT NULL);
+    CREATE OR REPLACE FUNCTION test_slow_removal() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN PERFORM pg_sleep(r.ms / 1000.0) FROM test_slow_removal r WHERE r.space_id = OLD.space_id; RETURN OLD; END $$;
+    CREATE OR REPLACE TRIGGER test_slow_removal BEFORE DELETE ON portability_parts FOR EACH ROW EXECUTE FUNCTION test_slow_removal();`);
+  await pool.query(`INSERT INTO test_slow_removal VALUES ($1,$2) ON CONFLICT (space_id) DO UPDATE SET ms=EXCLUDED.ms`, [spaceId, ms]);
+}
+/** A space of `n` records of 700 KB, whose export holds well over one part per record (its records and revisions sections). */
+async function bulky(actor, n) {
+  const spaceId = await space(actor);
+  for (let i = 0; i < n; i++)
+    await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: `big ${i}`, body: `${'x'.repeat(700_000)}${i}` } });
+  return spaceId;
+}
+const pastExpiry = jobIds => bypassing(`UPDATE portability_jobs SET created_at=created_at-interval '25 hours',
+  expires_at=expires_at-interval '24 hours',started_at=started_at-interval '25 hours',finished_at=finished_at-interval '25 hours'
+  WHERE job_id=ANY($1)`, [jobIds]);
+/** The export's parts left: how many, and whether they are numbered 1 to that many. */
+const left = async jobId => {
+  const row = (await pool.query(`SELECT count(*)::int AS n,COALESCE(max(part_number),0)::int AS top FROM portability_parts
+    WHERE job_id=$1`, [jobId])).rows[0];
+  assert.equal(row.top, row.n, 'the parts left are numbered from 1 without gaps');
+  return row.n;
+};
+
+test('an expired export\'s parts go in committed batches that fit any step, held until the last, while other spaces\' expired exports end and live exports run', async () => {
+  for (const budgetMs of [5_000, 2_000]) {
+    const actor = await owner();
+    // Space A: four completed exports of about 30 parts each, the oldest past its expiry and each of its parts taking a
+    // twentieth of the budget to remove, so its whole removal (over a budget) never fits one transaction of any step.
+    const a = await bulky(actor, 20);
+    const held = [];
+    for (let i = 0; i < portabilityExportBounds.heldPerSpace; i++) { held.push((await portability.submitExport(actor, a)).jobId); await drain(); }
+    const [oversized] = held, total = await left(oversized);
+    assert.ok(total * budgetMs / 20 > budgetMs, `${total} parts`);
+    // Space B: a small expired export. Space L: a live export whose every part takes 700 ms to write, so it fills each turn.
+    const b = await space(actor);
+    await mutate(actor, b, 'alpha', { operation: 'create', data: { label: 'x' } });
+    const smallExport = (await portability.submitExport(actor, b)).jobId;
+    await drain();
+    await pastExpiry([oversized, smallExport]);
+    await slowRemoval(a, budgetMs / 20);
+    const live = (await portability.submitExport(actor, await bulky(actor, 8))).jobId;
+    const jobs = slow();
+    // A batch removes at most 16 parts and each step's expiry slice and what its turns leave make progress, so the
+    // oversized export is gone within N = ceil(parts / 2) steps (at least two parts a step, measured margin aside).
+    const most = Math.ceil(total / 2);
+    let previous = total, steps = 0, idle = 0;
+    while (await left(oversized) > 0) {
+      assert.ok(++steps <= most, `the oversized export was removed within ${most} steps at ${budgetMs} ms`);
+      // Ticks come a minute apart, so the next finds the live export's 30 s lease lapsed even when a step had no time
+      // left to give it back.
+      await pool.query(`UPDATE portability_jobs SET leased_until=clock_timestamp() WHERE job_id=$1 AND state='running'
+        AND leased_until>clock_timestamp()`, [live]);
+      const liveBefore = await partsOf(live), liveState = (await pool.query('SELECT state FROM portability_jobs WHERE job_id=$1', [live])).rows[0].state;
+      const started = Date.now();
+      const step = await jobs.step({ budgetMs });
+      assert.ok(Date.now() - started < budgetMs + 500, `the step took ${Date.now() - started} ms`);
+      const now = await left(oversized);
+      assert.ok(now <= previous, `parts left only fall: ${previous} then ${now}`);
+      previous = now;
+      // Ended at the first step, it is never readable, verifiable or claimable again while its parts are removed.
+      const status = await portability.exportStatus(actor, a, oversized);
+      assert.deepEqual([status.state, status.manifest, status.complete, status.progress.partsWritten],
+        ['expired', null, false, now]);
+      if (now > 0) {
+        await rejects(portability.exportPart(actor, a, oversized, 1), 'CONFLICT', 'a part of an export being removed');
+        await rejects(portability.submitExport(actor, a), 'BACKPRESSURE', 'the space holds the export until its last part is removed');
+      }
+      // The small expired export in another space ends, its parts removed, at the first step, while the oversized one is
+      // still being removed.
+      if (steps === 1) {
+        assert.ok(now > 0, 'the oversized export is still being removed after one step');
+        assert.deepEqual([(await portability.exportStatus(actor, b, smallExport)).state, await partsOf(smallExport)], ['expired', 0]);
+      }
+      // The live export writes a part at least every two steps while it runs.
+      if (liveState === 'running') idle = step.exports.parts + step.exports.completed > 0 ? 0 : idle + 1;
+      assert.ok(idle < 2, `the live export wrote nothing for ${idle} steps at ${budgetMs} ms`);
+      assert.ok(await partsOf(live) >= liveBefore);
+    }
+    assert.ok(steps >= 2, `the removal spanned ${steps} steps`);
+    // Its last part gone, the space takes an export again.
+    assert.equal((await portability.submitExport(actor, a)).state, 'queued');
+    await slowRemoval(a, 0);
+    await drain();
+  }
+});
+
+test('cleanup never takes analysis\'s window: an export kind with only a removal that does not fit leaves analysis its pages', async () => {
+  const actor = await owner();
+  const removing = await bulky(actor, 10);
+  const expired = (await portability.submitExport(actor, removing)).jobId;
+  await drain();
+  await pastExpiry([expired]);
+  // Every part takes 400 ms to remove (the export's whole removal over 6 s) and every analysis page 700 ms to write.
+  await slowRemoval(removing, 400);
+  const events = [];
+  const jobs = worker(sql => {
+    if (/^\s*DELETE FROM portability_parts/.test(sql)) events.push(['remove', Date.now()]);
+    if (/^\s*INSERT INTO analysis_result_pages/.test(sql)) { const at = Date.now(); spin(700); events.push(['page', at, Date.now()]); }
+  });
+  // Pages a step writes for a backlogged analysis job, with the export removal pending (`during`) and then without.
+  const pages = async () => {
+    const analysed = await bulky(actor, 10);
+    const { jobId } = await services.analysis.submit(actor, analysed, 'alpha', 'export');
+    const written = [];
+    for (const budgetMs of [5_000, 2_000]) {
+      events.length = 0;
+      const step = await jobs.step({ budgetMs });
+      written.push(step.pages);
+      const page = events.filter(([kind]) => kind === 'page');
+      assert.ok(page.length > 0, `analysis wrote a page at ${budgetMs} ms`);
+      // No removal runs between analysis's first page and its last page's end: only before its turn or after it.
+      const from = page[0][1], to = page.at(-1)[2];
+      assert.deepEqual(events.filter(([kind, at]) => kind === 'remove' && at > from && at < to), [], `removal inside analysis's turn at ${budgetMs} ms`);
+    }
+    return { written, jobId, analysed };
+  };
+  const during = await pages();
+  assert.ok(await partsOf(expired) > 0, 'the removal was still pending through both steps');
+  await slowRemoval(removing, 0);
+  await sweep();
+  const without = await pages();
+  for (const [i, budgetMs] of [5_000, 2_000].entries())
+    assert.ok(during.written[i] >= without.written[i] - 1, `${budgetMs} ms: ${during.written[i]} pages with the removal pending, ${without.written[i]} without`);
+  // Both analysis jobs run to their end, so no later step meets them.
+  for (const { jobId, analysed } of [during, without]) {
+    for (let i = 0; i < 40 && (await services.analysis.status(actor, analysed, 'alpha', jobId)).state !== 'completed'; i++)
+      await worker().step({ budgetMs: 5_000 });
+    assert.equal((await services.analysis.status(actor, analysed, 'alpha', jobId)).state, 'completed');
+  }
+});
+
+test('cancelling an export with many parts returns at once; a worker removes them in batches and the space holds it until then', async () => {
+  const actor = await owner();
+  const spaceId = await bulky(actor, 10);
+  const completed = (await portability.submitExport(actor, spaceId)).jobId;
+  await drain();
+  // A running export with parts written, cut at its fourth part.
+  const running = (await portability.submitExport(actor, spaceId)).jobId;
+  let writes = 0;
+  await assert.rejects(worker(sql => { if (/^\s*INSERT INTO portability_parts/.test(sql) && ++writes === 4) throw new Error('cut'); })
+    .step({ budgetMs: 10_000 }), /cut/);
+  await pool.query(`UPDATE portability_jobs SET leased_until=clock_timestamp() WHERE job_id=$1 AND state='running'`, [running]);
+  await pastExpiry([completed]);
+  // Each part takes 150 ms to remove: removing the completed export's in the request would take over 2 s.
+  await slowRemoval(spaceId, 150);
+  const before = { completed: await left(completed), running: await left(running) };
+  assert.ok(before.completed >= 15 && before.running === 3, JSON.stringify(before));
+  for (const [jobId, state] of [[completed, 'expired'], [running, 'cancelled']]) {
+    const started = Date.now();
+    assert.equal((await portability.cancelExport(actor, spaceId, jobId)).state, state);
+    assert.ok(Date.now() - started < 1_000, `cancelling took ${Date.now() - started} ms`);
+    await rejects(portability.exportPart(actor, spaceId, jobId, 1), 'CONFLICT');
+  }
+  assert.deepEqual({ completed: await left(completed), running: await left(running) }, before, 'cancellation removes no part itself');
+  // Both are held until their parts are removed: with two more exports submitted, the space holds four.
+  for (let i = 0; i < 2; i++) await portability.submitExport(actor, spaceId);
+  await assert.rejects(portability.submitExport(actor, spaceId), error => error.code === 'BACKPRESSURE'
+    && /holds 4 exports, 2 of them unfinished/.test(error.message), 'cancelled and expired exports hold their parts');
+  for (let i = 0; i < 20 && (await left(completed)) + (await left(running)) > 0; i++) {
+    const was = (await left(completed)) + (await left(running));
+    await worker().step({ budgetMs: 2_000 });
+    assert.ok((await left(completed)) + (await left(running)) <= was);
+  }
+  assert.deepEqual([await left(completed), await left(running)], [0, 0]);
+  await slowRemoval(spaceId, 0);
+  await drain();
+  assert.equal((await portability.submitExport(actor, spaceId)).state, 'queued', 'removed, they no longer count');
+  await drain();
 });
 
 test('a probe stalled on a table lock leaves the other kind its window', async () => {
