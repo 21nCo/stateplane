@@ -12,6 +12,14 @@ LOCK TABLE portability_jobs, analysis_jobs IN SHARE ROW EXCLUSIVE MODE;
 CREATE INDEX IF NOT EXISTS portability_jobs_live ON portability_jobs(leased_until)
   WHERE kind = 'export' AND state IN ('queued', 'running', 'completed');
 
+-- The expiry pass ends exports past their expiry, and those never admitted,
+-- through these two, so finding the next to end reads only those due, never
+-- the retained completed exports (bounded per space, not per cell).
+CREATE INDEX IF NOT EXISTS portability_jobs_expiry ON portability_jobs(expires_at)
+  WHERE kind = 'export' AND state IN ('queued', 'running', 'completed');
+CREATE INDEX IF NOT EXISTS portability_jobs_queued ON portability_jobs(created_at)
+  WHERE kind = 'export' AND state = 'queued';
+
 -- Submission counts its space's live exports, read by space through this
 -- index, never through the space's retained ended history.
 CREATE INDEX IF NOT EXISTS portability_jobs_live_space ON portability_jobs(space_id)
@@ -23,8 +31,10 @@ CREATE INDEX IF NOT EXISTS portability_jobs_live_space ON portability_jobs(space
 -- one row per job with its rows left as its order, so the step finds the next
 -- job to clear by reading the queue alone (jobs waiting for removal, never the
 -- retained completed results or ended history), and submission counts its
--- space's exports there as held. A trigger queues the job in the same
--- transaction that ends it, whichever path ends it; the last batch removes it
+-- space's exports there as held. A trigger queues the job at the commit of
+-- the transaction that ends it, whichever path ends it, if it still holds
+-- rows then (an analysis job's cancellation or failure removes its pages in
+-- that transaction, so it is never queued); the last batch removes it
 -- from the queue, and a space purge removes it with its job. No ended job
 -- holds rows before this slice (they went with the transaction that ended
 -- them), so nothing is backfilled.
@@ -73,11 +83,14 @@ BEGIN
 END;
 $$;
 REVOKE ALL ON FUNCTION stateplane_queue_removal() FROM PUBLIC;
-CREATE OR REPLACE TRIGGER portability_jobs_removal AFTER UPDATE OF state ON portability_jobs FOR EACH ROW
-  WHEN (NEW.kind = 'export' AND NEW.state IN ('cancelled', 'failed', 'expired') AND OLD.state NOT IN ('cancelled', 'failed', 'expired'))
+DROP TRIGGER IF EXISTS portability_jobs_removal ON portability_jobs;
+CREATE CONSTRAINT TRIGGER portability_jobs_removal AFTER UPDATE OF state ON portability_jobs DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW WHEN (NEW.kind = 'export' AND NEW.state IN ('cancelled', 'failed', 'expired')
+    AND OLD.state NOT IN ('cancelled', 'failed', 'expired'))
   EXECUTE FUNCTION stateplane_queue_removal();
-CREATE OR REPLACE TRIGGER analysis_jobs_removal AFTER UPDATE OF state ON analysis_jobs FOR EACH ROW
-  WHEN (NEW.state IN ('cancelled', 'failed', 'expired') AND OLD.state NOT IN ('cancelled', 'failed', 'expired'))
+DROP TRIGGER IF EXISTS analysis_jobs_removal ON analysis_jobs;
+CREATE CONSTRAINT TRIGGER analysis_jobs_removal AFTER UPDATE OF state ON analysis_jobs DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW WHEN (NEW.state IN ('cancelled', 'failed', 'expired') AND OLD.state NOT IN ('cancelled', 'failed', 'expired'))
   EXECUTE FUNCTION stateplane_queue_removal();
 
 -- The same step's turn order (docs/portability-export.md#worker): when a step

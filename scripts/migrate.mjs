@@ -13,7 +13,7 @@ const MIGRATION_048_STATEMENT_MS = 15_000;
 // 0.92 s locally (docs/analysis-jobs.md#migration-049). A drained upgrade, which nothing waits behind, is not bounded.
 const MIGRATION_049_STATEMENT_MS = 15_000;
 // Initial protective bound, not measured: 052 holds the export and analysis job tables against writers while it
-// builds two partial indexes over portability_jobs, which no writer filled before it (docs/portability-export.md#migration-052).
+// builds its partial indexes over portability_jobs, which no writer filled before it (docs/portability-export.md#migration-052).
 const MIGRATION_052_STATEMENT_MS = 15_000;
 let transactionOpen = false;
 let advisoryLockHeld = false;

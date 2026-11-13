@@ -76,8 +76,16 @@ const UNFINISHED = `('queued','running')`;
 const UNADMITTED = `(j.state='queued' AND j.created_at<=clock_timestamp()-${portabilityExportBounds.admissionMs}*interval '1 millisecond')`;
 /** An admitted export a worker may claim: running, its lease ended, before its expiry. */
 const CLAIMABLE = `j.kind='export' AND j.state='running' AND j.leased_until<=clock_timestamp() AND j.expires_at>clock_timestamp()`;
-/** An export a worker ends: past its expiry (a completed one included), or never admitted. */
-const ENDING = `j.kind='export' AND ((j.state IN ('queued','running','completed') AND j.expires_at<=clock_timestamp()) OR ${UNADMITTED})`;
+/**
+ * The next export a worker ends, by `now()` (the transaction's start, so each bound is an index range over migration
+ * 052's `portability_jobs_expiry` and `portability_jobs_queued`, never a scan of the retained completed exports): one
+ * past its expiry (a completed one included), else one never admitted.
+ */
+const ENDING = [`SELECT j.space_id,j.job_id,true AS expired FROM portability_jobs j WHERE j.kind='export'
+    AND j.state IN ('queued','running','completed') AND j.expires_at<=now() ORDER BY j.expires_at LIMIT 1 FOR UPDATE SKIP LOCKED`,
+  `SELECT j.space_id,j.job_id,false AS expired FROM portability_jobs j WHERE j.kind='export' AND j.state='queued'
+    AND j.created_at<=now()-${portabilityExportBounds.admissionMs}*interval '1 millisecond' ORDER BY j.created_at LIMIT 1
+    FOR UPDATE SKIP LOCKED`];
 const MIN_PART_MS = 1_000;
 const RELEASE_MS = 500;
 /**
@@ -273,14 +281,17 @@ const removals = {
     key: ['space_id', 'collection_id', 'job_id'] } };
 export async function removeNext(db: Session, kind: keyof typeof removals, until: number, passed: string[]): Promise<number | null> {
   const { queue, jobs, rows, number, key } = removals[kind];
+  const chosen = Date.now();
   const next = (await db.query(`SELECT ${key.map(c => `r.${c}`).join(',')} FROM ${queue} r
       JOIN ${jobs} j ON ${key.map(c => `j.${c}=r.${c}`).join(' AND ')}
     WHERE NOT r.job_id=ANY($1::text[]) ORDER BY r.rows_left,r.job_id LIMIT 1 FOR UPDATE OF r,j SKIP LOCKED`, [passed])).rows[0];
   if (!next) return null;
   passed.push(next.job_id);
   const values = key.map(c => next[c]), match = key.map((c, i) => `${c}=$${i + 1}`).join(' AND ');
-  let removed = 0, slowest = 0;
-  while (removed < portabilityExportBounds.removeParts && (removed === 0 || Date.now() + 2 * slowest < until)) {
+  // Another row only while the time left holds it, the queue write and COMMIT, each as slow as the slowest statement
+  // yet (the selection's included), so the batch commits by `until`.
+  let removed = 0, slowest = Date.now() - chosen;
+  while (removed < portabilityExportBounds.removeParts && (removed === 0 || Date.now() + 3 * slowest < until)) {
     const started = Date.now();
     const gone = (await db.query(`DELETE FROM ${rows} WHERE ${match} AND ${number}=(SELECT max(${number}) FROM ${rows}
       WHERE ${match})`, values)).rowCount;
@@ -288,10 +299,10 @@ export async function removeNext(db: Session, kind: keyof typeof removals, until
     removed++;
     slowest = Math.max(slowest, Date.now() - started);
   }
-  // What is left orders the job in its queue; with nothing left (or a stale entry, its rows already gone) it leaves it.
-  const left = (await db.query(`SELECT max(${number}) AS n FROM ${rows} WHERE ${match}`, values)).rows[0].n;
-  if (left === null) await db.query(`DELETE FROM ${queue} WHERE ${match}`, values);
-  else await db.query(`UPDATE ${queue} SET rows_left=$${values.length + 1} WHERE ${match}`, [...values, left]);
+  // What is left orders the job in its queue; with nothing left it leaves the queue. One statement.
+  await db.query(`WITH last AS (SELECT max(${number}) AS n FROM ${rows} WHERE ${match}),
+      gone AS (DELETE FROM ${queue} WHERE ${match} AND (SELECT n FROM last) IS NULL)
+    UPDATE ${queue} SET rows_left=(SELECT n FROM last) WHERE ${match} AND (SELECT n FROM last) IS NOT NULL`, values);
   return removed;
 }
 
@@ -476,9 +487,12 @@ export class PostgresPortabilityExports {
         // Sent but unacknowledged, the admission may have committed: the caller reads or cancels the export it names.
         if (error instanceof CommitOutcomeUnknownError) throw Object.assign(error, { jobId: submitted.jobId });
         // Cut short by its deadline or its statement bound (a space held locked meanwhile), it rolled back before COMMIT.
-        // The deadline is the access's when that comes first; the statement bound is the access's once it has passed.
+        // The deadline is the access's when that comes first; the statement bound is the access's once it has passed. A
+        // cancellation (57014 not naming the statement timeout) is neither, whatever the cut is reported as.
         const timedOut = cutShort(error) || (error as { code?: unknown } | null)?.code === '57014';
-        const accessEnded = (cutShort(error) && accessUntil <= admitUntil) || Date.now() >= accessUntil;
+        const cause = (error as { cause?: { code?: unknown; message?: unknown } } | null)?.cause;
+        const cancelled = cause?.code === '57014' && !/statement timeout/.test(String(cause.message ?? ''));
+        const accessEnded = (cutShort(error) && !cancelled && accessUntil <= admitUntil) || Date.now() >= accessUntil;
         throw await this.refusal(pool, spaceId, submitted.jobId, timedOut ? admissionRefusal(deadline, accessEnded) : error);
       }
       if (!admission.rowCount)
@@ -680,8 +694,7 @@ export class PortabilityExportWorker {
     while (Date.now() < until) {
       const done = await inTransaction(this.pool, async db => {
         if (lockBound) await probing(db);
-        const due = (await db.query(`SELECT j.space_id,j.job_id,j.expires_at<=clock_timestamp() AS expired FROM portability_jobs j
-          WHERE ${ENDING} ORDER BY least(j.expires_at,j.created_at) LIMIT 1 FOR UPDATE SKIP LOCKED`)).rows[0];
+        const due = (await db.query(ENDING[0])).rows[0] ?? (await db.query(ENDING[1])).rows[0];
         if (due) {
           await db.query(`UPDATE portability_jobs SET state=$3 WHERE space_id=$1 AND job_id=$2`,
             [...pk(due), due.expired ? 'expired' : 'cancelled']);

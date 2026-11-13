@@ -770,8 +770,10 @@ export class PostgresAnalysisWorker {
     while (Date.now() < until) {
       const done = await inTransaction(this.pool, async db => {
         if (lockBound) await probing(db);
+        // By `now()`, the transaction's start, so the bound is a range of `analysis_jobs_expiry`, never a scan of every
+        // completed result the cell retains.
         const due = (await db.query(`SELECT space_id,collection_id,job_id FROM analysis_jobs
-          WHERE state IN ${ACTIVE} AND expires_at<=clock_timestamp() ORDER BY expires_at LIMIT 1 FOR UPDATE SKIP LOCKED`)).rows[0];
+          WHERE state IN ${ACTIVE} AND expires_at<=now() ORDER BY expires_at LIMIT 1 FOR UPDATE SKIP LOCKED`)).rows[0];
         if (due) {
           await db.query(`UPDATE analysis_jobs SET state='expired' WHERE space_id=$1 AND collection_id=$2 AND job_id=$3`, pk(due));
           await db.query('DELETE FROM analysis_result_manifests WHERE space_id=$1 AND collection_id=$2 AND job_id=$3', pk(due));
