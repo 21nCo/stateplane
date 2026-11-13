@@ -614,10 +614,12 @@ export const lockedOut = (error: unknown) => (error as { code?: unknown } | null
  * The same step writes owner space exports (`PortabilityExportWorker`,
  * docs/portability-export.md#worker). Every step first ends expired jobs of
  * each kind, each in a slice of its own (a tenth of the budget, within the
- * preparation time), whichever kind claims first; a pass its slice did not
- * finish continues only in what both turns leave, and a finished one is not
+ * preparation time), whichever kind claims first, and a finished pass is not
  * repeated. An ended export's parts go in committed batches, so every slice
- * makes progress. It then probes each kind,
+ * makes progress and an unfinished export pass continues only in what both
+ * turns leave; an analysis job's whole result goes in one transaction, so an
+ * unfinished analysis pass makes analysis due and continues in its own turn.
+ * It then probes each kind,
  * bounded alone, for the wait of the job its claim would take next (one whose
  * row, space or collection is locked is not due). All of that ends early
  * enough to leave one turn; a kind whose probe is locked out or fails is not
@@ -665,8 +667,10 @@ export class PostgresAnalysisWorker {
     // (120 ms each there when both are used up) and the probes keep the rest. An export's parts go in committed batches, so every
     // slice makes progress however large the export. Then each kind's due probe, bounded alone: a kind whose probe is
     // locked out or fails (reported) is not due this step, and one left unprobed or whose probe is cut short is due
-    // with its wait unknown. Cleanup never makes a kind due: an expiry pass its slice did not finish continues only in
-    // what both kinds' turns leave.
+    // with its wait unknown. An export's unfinished expiry pass never makes exports due: it continues only in what both
+    // kinds' turns leave. An analysis job ends with its whole result removed in one transaction (its 64 MiB result
+    // budget bounds that), which needs a window of its own: an unfinished analysis pass makes analysis due, and
+    // continues in analysis's own turn after its claims, never in the window kept for exports.
     const readyBy = end - TURN_MS - TAKE_MS;
     const unfinished = new Set<'analysis' | 'exports'>();
     const finishing = (pass: Promise<boolean>) => pass.catch((error: unknown) => { if (ended(error)) return false; throw error; });
@@ -688,7 +692,7 @@ export class PostgresAnalysisWorker {
         if (!lockedOut(error) && !failures.has(kind)) failures.set(kind, error);
         return null;
       });
-      if (since !== null) due.push({ kind, share, since });
+      if (since !== null || (kind === 'analysis' && unfinished.has(kind))) due.push({ kind, share, since: since ?? Infinity });
     }
     // Two kinds due share the step when it has room for a turn of each: the one waiting longer first, stopping at its share
     // and never later than leaves the other its turn. Otherwise they alternate, step by step, whatever their waits: the
@@ -700,19 +704,24 @@ export class PostgresAnalysisWorker {
       if ((due[0].kind === 'exports') !== exportsFirst) due.reverse();
       this.#alternate = exportsFirst ? 0 : 1;
     }
-    const turn = (kind: 'analysis' | 'exports', until: number) => settle(kind, () =>
-      kind === 'analysis' ? this.analyse(until, result) : this.#exports.turn(until, result.exports));
+    const continuing = (expire: (until: number, lockBound: boolean) => Promise<boolean>, until: number) =>
+      finishing(expire(until, true)).catch((error: unknown) => { if (lockedOut(error)) return false; throw error; });
+    const turn = (kind: 'analysis' | 'exports', until: number) => settle(kind, async () => {
+      if (kind === 'exports') return this.#exports.turn(until, result.exports);
+      await this.analyse(until, result);
+      if (unfinished.has(kind) && Date.now() < until && await continuing(kinds.find(entry => entry.kind === kind)!.expire, until))
+        unfinished.delete(kind);
+    });
     const [first, second] = due;
     if (first) await turn(first.kind, shared
       ? Math.min(end - TURN_MS, Date.now() + Math.max(TURN_MS, Math.floor(left * first.share / 5))) : end);
     if (second) await turn(second.kind, end);
     // What the second kind left unused (nothing it could run, or a failure) goes back to the first.
     if (shared && end - RELEASE_MS - Date.now() >= MIN_PAGE_MS) await turn(first.kind, end);
-    // Only now, in what both turns left, do the expiry passes their slices did not finish continue, in the step's order;
-    // each transaction waits at most the lock bound, so a locked table ends the pass.
+    // Only now, in what both turns left, do the expiry passes still unfinished continue, in the step's order; each
+    // transaction waits at most the lock bound, so a locked table ends the pass.
     for (const { kind, expire } of kinds)
-      if (unfinished.has(kind) && Date.now() < end)
-        await settle(kind, () => finishing(expire(end, true)).catch((error: unknown) => { if (lockedOut(error)) return false; throw error; }));
+      if (unfinished.has(kind) && Date.now() < end) await settle(kind, () => continuing(expire, end));
     if (failures.size > 1) throw new AggregateError([...failures.values()], 'The analysis and export steps failed');
     if (failures.size) throw [...failures.values()][0];
     return result;

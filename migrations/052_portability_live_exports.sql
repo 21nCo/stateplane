@@ -8,11 +8,17 @@
 CREATE INDEX IF NOT EXISTS portability_jobs_live ON portability_jobs(leased_until)
   WHERE kind = 'export' AND state IN ('queued', 'running', 'completed');
 
+-- Submission counts its space's live exports, read by space through this
+-- index, never through the space's retained ended history.
+CREATE INDEX IF NOT EXISTS portability_jobs_live_space ON portability_jobs(space_id)
+  WHERE kind = 'export' AND state IN ('queued', 'running', 'completed');
+
 -- An ended export's parts are removed in committed batches, highest first, so
 -- it still holds parts exactly while its part 1 is there. This index has one
 -- entry per export holding parts (held exports are bounded per space), so the
--- step finds ended exports to remove, and submission counts them as held,
--- without reading the parts themselves or the retained job history.
+-- step finds ended exports to remove, and submission counts those of its
+-- space as held, without reading the parts themselves or the retained job
+-- history.
 CREATE INDEX IF NOT EXISTS portability_parts_held ON portability_parts(space_id, job_id)
   WHERE kind = 'export' AND part_number = 1;
 

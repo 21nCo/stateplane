@@ -256,13 +256,10 @@ async function read(db: Session, job: Row, section: Section, cursor: unknown[] |
 
 /**
  * Cancelled, failed and expired exports are never read again, and their parts go (migration 051 allows it once ended),
- * but not in the transaction that ends them: a worker removes them in committed batches (`removal`), and the export
- * counts as held until its last part is gone. An ended export still holds parts while its part 1, removed last, is
- * there (migration 052's `portability_parts_held` index).
- */
-const HOLDING = `EXISTS (SELECT 1 FROM portability_parts p WHERE p.space_id=j.space_id AND p.job_id=j.job_id AND p.part_number=1)`;
-
-/**
+ * but not in the transaction that ends them: a worker removes them in committed batches, and the export counts as held
+ * until its last part is gone. An ended export still holds parts while its part 1, removed last, is there (migration
+ * 052's `portability_parts_held` index).
+ *
  * Remove up to `removeParts` of an ended export's parts, the highest first and one per statement, so its parts left stay
  * numbered from 1 without gaps; it stops early enough that its transaction commits by `until`. The number removed.
  */
@@ -391,11 +388,14 @@ export class PostgresPortabilityExports {
         if (refused && refused !== 'NOT_FOUND' && refused !== 'SPACE_UNAVAILABLE') throw new AuthorityError('FORBIDDEN', 'Policy or placement changed');
         if (refused) throw new AuthorityError(refused);
         // Held: unfinished or completed (past its expiry too), or ended with parts a worker has yet to remove, so its
-        // parts are still stored. One never admitted holds nothing.
+        // parts are still stored. One never admitted holds nothing. Both are read through migration 052's partial
+        // indexes, live exports by space and exports holding parts, so the space's retained ended history is never read.
         const { active, held } = (await db.query(`SELECT count(*) FILTER (WHERE j.state IN ${UNFINISHED}
-            AND j.expires_at>clock_timestamp())::int AS active,count(*)::int AS held FROM portability_jobs j
-          WHERE j.space_id=$1 AND j.kind='export' AND (j.state='completed' OR (j.state IN ${UNFINISHED} AND NOT ${UNADMITTED})
-            OR (j.state IN ('cancelled','failed','expired') AND ${HOLDING}))`,
+            AND j.expires_at>clock_timestamp())::int AS active,(count(*)+(SELECT count(*) FROM portability_parts p
+              JOIN portability_jobs e ON e.space_id=p.space_id AND e.job_id=p.job_id
+            WHERE p.space_id=$1 AND p.kind='export' AND p.part_number=1 AND e.state IN ('cancelled','failed','expired')))::int AS held
+          FROM portability_jobs j WHERE j.space_id=$1 AND j.kind='export' AND j.state IN ('queued','running','completed')
+            AND (j.state='completed' OR NOT ${UNADMITTED})`,
         [spaceId])).rows[0];
         if (active >= portabilityExportBounds.activePerSpace || held >= portabilityExportBounds.heldPerSpace)
           throw new AuthorityError('BACKPRESSURE', `The space holds ${held} exports, ${active} of them unfinished; retry later`,
@@ -717,10 +717,11 @@ export class PortabilityExportWorker {
   private async run(claimed: Row, until: number, result: PortabilityStep): Promise<void> {
     try {
       while (until - RELEASE_MS - Date.now() >= MIN_PART_MS) {
-        let outcome: 'part' | 'completed' | 'failed' | 'expired' | 'lost';
+        let outcome: 'part' | 'advanced' | 'completed' | 'failed' | 'expired' | 'lost';
         try { outcome = await inTransaction(this.pool, db => this.part(db, claimed), { deadline: until - RELEASE_MS }); }
         catch (error) { if (cutShort(error)) break; throw error; }
-        if (outcome === 'part') { result.parts++; continue; }
+        if (outcome === 'part') result.parts++;
+        if (outcome === 'part' || outcome === 'advanced') continue;
         if (outcome === 'completed') result.completed++;
         if (outcome === 'failed') result.failed++;
         if (outcome === 'expired') result.expired++;
@@ -740,7 +741,7 @@ export class PortabilityExportWorker {
   }
 
   /** One part of the export under its exact lease, committed with its checkpoint; or its manifest once no row is left. */
-  private async part(db: Session, claimed: Row): Promise<'part' | 'completed' | 'failed' | 'expired' | 'lost'> {
+  private async part(db: Session, claimed: Row): Promise<'part' | 'advanced' | 'completed' | 'failed' | 'expired' | 'lost'> {
     const started = Date.now(), key = pk(claimed);
     // Until permissions are read, a policy change (a key issued or revoked, which adds or removes grants) fails the export.
     const reading = (await db.query('SELECT checkpoint FROM portability_jobs WHERE space_id=$1 AND job_id=$2', key)).rows[0];
@@ -775,7 +776,8 @@ export class PortabilityExportWorker {
     }
   }
 
-  private async advance(db: Session, job: Row, started: number): Promise<'part' | 'completed'> {
+  /** `part` once a part is written; `advanced` when the rows read only moved the checkpoint (records deleted at the watermark). */
+  private async advance(db: Session, job: Row, started: number): Promise<'part' | 'advanced' | 'completed'> {
     const key = pk(job);
     let { section, cursor, offset, runtimeMs }: Checkpoint = job.checkpoint ?? { section: 0, cursor: null, offset: 0, runtimeMs: 0 };
     const last = (await db.query(`SELECT count(*)::int AS parts,COALESCE(sum(byte_size),0)::bigint AS bytes FROM portability_parts
@@ -819,7 +821,7 @@ export class PortabilityExportWorker {
       if (done >= 0) cursor = Array.from({ length: definition.keys }, (_, i) => rows[done][`k${i + 1}`]);
       offset = end - doneEnd;
       await save();
-      return 'part';
+      return content ? 'part' : 'advanced';
     }
     // No section has rows left: the manifest, its last part, seals the export with every part's digest.
     const parts = (await db.query(`SELECT part_number,section,row_count,byte_size,content_sha256 FROM portability_parts

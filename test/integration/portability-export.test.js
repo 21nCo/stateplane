@@ -1037,14 +1037,15 @@ test('each kind ends its expired jobs in one pass per step, in its own slice and
 });
 
 /**
- * Part removal that costs `ms` a part in `spaceId` (a trigger sleeping before each part's DELETE), as a large export's
- * removal costs on a slow disk; 0 removes the cost.
+ * Removal that costs `ms` an export part or analysis page in `spaceId` (a trigger sleeping before each one's DELETE), as
+ * a large result's removal costs on a slow disk; 0 removes the cost.
  */
 async function slowRemoval(spaceId, ms) {
   await pool.query(`CREATE TABLE IF NOT EXISTS test_slow_removal (space_id text PRIMARY KEY, ms integer NOT NULL);
     CREATE OR REPLACE FUNCTION test_slow_removal() RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN PERFORM pg_sleep(r.ms / 1000.0) FROM test_slow_removal r WHERE r.space_id = OLD.space_id; RETURN OLD; END $$;
-    CREATE OR REPLACE TRIGGER test_slow_removal BEFORE DELETE ON portability_parts FOR EACH ROW EXECUTE FUNCTION test_slow_removal();`);
+    CREATE OR REPLACE TRIGGER test_slow_removal BEFORE DELETE ON portability_parts FOR EACH ROW EXECUTE FUNCTION test_slow_removal();
+    CREATE OR REPLACE TRIGGER test_slow_removal BEFORE DELETE ON analysis_result_pages FOR EACH ROW EXECUTE FUNCTION test_slow_removal();`);
   await pool.query(`INSERT INTO test_slow_removal VALUES ($1,$2) ON CONFLICT (space_id) DO UPDATE SET ms=EXCLUDED.ms`, [spaceId, ms]);
 }
 /** A space of `n` records of 700 KB, whose export holds well over one part per record (its records and revisions sections). */
@@ -1209,6 +1210,74 @@ test('cancelling an export with many parts returns at once; a worker removes the
   await slowRemoval(spaceId, 0);
   await drain();
   assert.equal((await portability.submitExport(actor, spaceId)).state, 'queued', 'removed, they no longer count');
+  await drain();
+});
+
+test('an expired analysis result whose removal needs a window of its own is removed within steps while exports keep a backlog', async () => {
+  const actor = await owner();
+  const analysed = await bulky(actor, 4);
+  const { jobId } = await services.analysis.submit(actor, analysed, 'alpha', 'export');
+  for (let i = 0; i < 40 && (await services.analysis.status(actor, analysed, 'alpha', jobId)).state !== 'completed'; i++)
+    await worker().step({ budgetMs: 5_000 });
+  const pagesOf = async () => (await pool.query('SELECT count(*)::int AS n FROM analysis_result_pages WHERE job_id=$1', [jobId])).rows[0].n;
+  const pages = await pagesOf();
+  assert.ok(pages >= 4, `${pages} pages`);
+  await bypassing(`UPDATE analysis_jobs SET created_at=created_at-interval '2 days',started_at=started_at-interval '2 days',
+    finished_at=finished_at-interval '2 days',expires_at=clock_timestamp()-interval '1 second' WHERE job_id=$1`, [jobId]);
+  // Each page takes 450 ms to remove, and an analysis job ends with its whole result removed in one transaction: about
+  // 1.8 s, longer than the expiry slice and than what a turn of exports leaves, yet within a 5 s step.
+  await slowRemoval(analysed, 450);
+  // A live export of about 30 parts, each taking 700 ms to write: a backlog through every step here.
+  const live = (await portability.submitExport(actor, await bulky(actor, 20))).jobId;
+  const jobs = slow();
+  let steps = 0, idle = 0;
+  while ((await services.analysis.status(actor, analysed, 'alpha', jobId)).state !== 'expired' || await pagesOf() > 0) {
+    assert.ok(++steps <= 4, 'the expired analysis result was removed within 4 steps');
+    // Ticks come a minute apart, so the next finds the live export's lease lapsed.
+    await pool.query(`UPDATE portability_jobs SET leased_until=clock_timestamp() WHERE job_id=$1 AND state='running'
+      AND leased_until>clock_timestamp()`, [live]);
+    const running = (await pool.query('SELECT state FROM portability_jobs WHERE job_id=$1', [live])).rows[0].state === 'running';
+    const step = await jobs.step({ budgetMs: 5_000 });
+    assert.ok(running, 'the live export is still running');
+    idle = step.exports.parts + step.exports.completed > 0 ? 0 : idle + 1;
+    assert.ok(idle < 2, `the live export wrote nothing for ${idle} steps`);
+  }
+  await slowRemoval(analysed, 0);
+  await drain();
+});
+
+test('submission counts held exports without reading the space\'s ended history, and a step counts only parts it writes', async () => {
+  const actor = await owner();
+  const spaceId = await space(actor);
+  // A record created and then deleted before the boundary: the records section reads it and writes no line.
+  const created = (await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: 'x' } })).ref.id;
+  await mutate(actor, spaceId, 'alpha', { operation: 'delete', id: created, expectedRevision: 1 });
+  const first = (await portability.submitExport(actor, spaceId)).jobId;
+  const exporter = new PortabilityExportWorker(newPool(1));
+  let parts = 0, step;
+  while ((step = await exporter.step(Date.now() + 10_000)).claimed) parts += step.parts;
+  const { status } = await result(actor, spaceId, first);
+  assert.equal(parts, status.manifest.partCount - 1, 'every data part counted once, a read that wrote nothing not at all');
+  // 20,000 ended exports retained in the space, as its history keeps them until erasure.
+  await bypassing(`INSERT INTO portability_jobs(space_id,job_id,kind,principal_id,credential_id,policy_version,placement_generation,
+      format_version,watermark,state,created_at,expires_at,finished_at)
+    SELECT space_id,'exp_'||gen_random_uuid(),kind,principal_id,credential_id,policy_version,placement_generation,format_version,
+      watermark,'expired',created_at-interval '2 days',created_at-interval '1 day',created_at-interval '1 day'
+    FROM portability_jobs, generate_series(1,20000) WHERE job_id=$1`, [first]);
+  const held = await pool.connect();
+  try {
+    await held.query('BEGIN');
+    await held.query('SET LOCAL enable_seqscan = off');
+    // The held count's plan reads the space's live exports and exports holding parts, never its ended rows.
+    const plan = JSON.stringify((await held.query(`EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM portability_jobs j
+      WHERE j.space_id=$1 AND j.kind='export' AND j.state IN ('queued','running','completed')`, [spaceId])).rows[0]['QUERY PLAN']);
+    assert.match(plan, /portability_jobs_live_space/);
+    await held.query('ROLLBACK');
+  } finally { held.release(); }
+  const started = Date.now();
+  const next = await portability.submitExport(actor, spaceId);
+  assert.equal(next.state, 'queued');
+  assert.ok(Date.now() - started < 2_000, `submission took ${Date.now() - started} ms with 20,000 ended exports`);
   await drain();
 });
 
