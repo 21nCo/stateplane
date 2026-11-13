@@ -11,7 +11,7 @@ import { scalarString, utcInstant } from './schema.js';
 import { invalid, transact } from './sources.js';
 import type { Db } from './sources.js';
 import type { PostgresSpaces } from './spaces.js';
-import { PortabilityExportWorker, removal } from './portability-exports.js';
+import { PortabilityExportWorker, removeNext } from './portability-exports.js';
 import type { PortabilityStep } from './portability-exports.js';
 
 /**
@@ -760,10 +760,10 @@ export class PostgresAnalysisWorker {
 
   /**
    * End jobs past their expiry, one per transaction, with their manifest: their slots are released as they end, and
-   * none is read again. Then remove expired jobs' pages in committed batches (`removal`, migration 052's
-   * `analysis_result_pages_held` index finding them by their page 1, removed last), the job with the fewest left first
-   * and each at most once a round, so one large result never holds up the others. With `lockBound`, each transaction
-   * waits at most the probe's lock bound. True once nothing is left to end or remove.
+   * none is read again. Then remove expired jobs' pages in committed batches (`removeNext`, from migration 052's
+   * removal queue), the job with the fewest left first and each at most once a round, so one large result never holds
+   * up the others. With `lockBound`, each transaction waits at most the probe's lock bound. True once nothing is left
+   * to end or remove.
    */
   private async expire(until: number, result: AnalysisStep, lockBound = false): Promise<boolean> {
     const passed: string[] = [];
@@ -777,15 +777,7 @@ export class PostgresAnalysisWorker {
           await db.query('DELETE FROM analysis_result_manifests WHERE space_id=$1 AND collection_id=$2 AND job_id=$3', pk(due));
           return 'expired' as const;
         }
-        const next = (await db.query(`SELECT j.space_id,j.collection_id,j.job_id FROM analysis_result_pages p
-            JOIN analysis_jobs j ON j.space_id=p.space_id AND j.collection_id=p.collection_id AND j.job_id=p.job_id
-          WHERE p.page_number=1 AND j.state IN ('cancelled','failed','expired') AND NOT j.job_id=ANY($1::text[])
-          ORDER BY (SELECT max(q.page_number) FROM analysis_result_pages q WHERE q.space_id=j.space_id
-            AND q.collection_id=j.collection_id AND q.job_id=j.job_id),j.job_id LIMIT 1 FOR UPDATE OF j SKIP LOCKED`, [passed])).rows[0];
-        if (!next) return null;
-        passed.push(next.job_id);
-        return removal(db, pk(next), until, `DELETE FROM analysis_result_pages WHERE space_id=$1 AND collection_id=$2 AND job_id=$3
-          AND page_number=(SELECT max(page_number) FROM analysis_result_pages WHERE space_id=$1 AND collection_id=$2 AND job_id=$3)`);
+        return removeNext(db, 'analysis', until, passed);
       }, { deadline: until });
       if (done === 'expired') result.expired++;
       // Each expired job holding pages has had its batch this round: another round, or nothing is left.

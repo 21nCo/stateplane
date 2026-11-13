@@ -257,24 +257,41 @@ async function read(db: Session, job: Row, section: Section, cursor: unknown[] |
 /**
  * Cancelled, failed and expired exports are never read again, and their parts go (migration 051 allows it once ended),
  * but not in the transaction that ends them: a worker removes them in committed batches, and the export counts as held
- * until its last part is gone. An ended export still holds parts while its part 1, removed last, is there (migration
- * 052's `portability_parts_held` index).
+ * until its last part is gone. Expired analysis results go the same way. Migration 052 queues each ended job still
+ * holding rows, in the transaction that ends it, with its rows left as its order; the last batch takes it off the queue.
  *
- * `removal` removes up to `removeParts` rows of an ended job's result (an export's parts, an analysis job's pages), the
- * highest numbered first, one per `remove` statement (which deletes the highest), so the rows left stay numbered from 1
- * without gaps; it stops early enough that its transaction commits by `until`. The number removed.
+ * `removeNext` takes the queued job of `kind` with the fewest rows left, not in `passed` (each gets one batch a round,
+ * so one large result never holds up the others) and whose row and queue entry no other transaction holds locked, and
+ * removes up to `removeParts` of its rows, the highest numbered first, one per statement, so the rows left stay
+ * numbered from 1 without gaps; it stops early enough that its transaction commits by `until`. It reads the queue
+ * alone to choose, never the retained results or job history. The number removed, or null when no job is queued.
  */
-export async function removal(db: Session, key: unknown[], until: number,
-  remove = `DELETE FROM portability_parts WHERE space_id=$1 AND job_id=$2 AND part_number=(SELECT max(part_number)
-    FROM portability_parts WHERE space_id=$1 AND job_id=$2)`): Promise<number> {
+const removals = {
+  exports: { queue: 'portability_removals', jobs: 'portability_jobs', rows: 'portability_parts', number: 'part_number',
+    key: ['space_id', 'job_id'] },
+  analysis: { queue: 'analysis_removals', jobs: 'analysis_jobs', rows: 'analysis_result_pages', number: 'page_number',
+    key: ['space_id', 'collection_id', 'job_id'] } };
+export async function removeNext(db: Session, kind: keyof typeof removals, until: number, passed: string[]): Promise<number | null> {
+  const { queue, jobs, rows, number, key } = removals[kind];
+  const next = (await db.query(`SELECT ${key.map(c => `r.${c}`).join(',')} FROM ${queue} r
+      JOIN ${jobs} j ON ${key.map(c => `j.${c}=r.${c}`).join(' AND ')}
+    WHERE NOT r.job_id=ANY($1::text[]) ORDER BY r.rows_left,r.job_id LIMIT 1 FOR UPDATE OF r,j SKIP LOCKED`, [passed])).rows[0];
+  if (!next) return null;
+  passed.push(next.job_id);
+  const values = key.map(c => next[c]), match = key.map((c, i) => `${c}=$${i + 1}`).join(' AND ');
   let removed = 0, slowest = 0;
   while (removed < portabilityExportBounds.removeParts && (removed === 0 || Date.now() + 2 * slowest < until)) {
     const started = Date.now();
-    const gone = (await db.query(remove, key)).rowCount;
+    const gone = (await db.query(`DELETE FROM ${rows} WHERE ${match} AND ${number}=(SELECT max(${number}) FROM ${rows}
+      WHERE ${match})`, values)).rowCount;
     if (!gone) break;
     removed++;
     slowest = Math.max(slowest, Date.now() - started);
   }
+  // What is left orders the job in its queue; with nothing left (or a stale entry, its rows already gone) it leaves it.
+  const left = (await db.query(`SELECT max(${number}) AS n FROM ${rows} WHERE ${match}`, values)).rows[0].n;
+  if (left === null) await db.query(`DELETE FROM ${queue} WHERE ${match}`, values);
+  else await db.query(`UPDATE ${queue} SET rows_left=$${values.length + 1} WHERE ${match}`, [...values, left]);
   return removed;
 }
 
@@ -325,12 +342,15 @@ async function spaceCheck(db: Session, spaceId: string, expect: { principal: str
 }
 
 /**
- * Why an admission cut short was refused: FORBIDDEN only once the access it relied on has expired; otherwise its
- * admission time or its statement bound ran out with the space held locked meanwhile, retryable BACKPRESSURE.
+ * Why an admission cut short was refused: FORBIDDEN when the access it relied on ended it (`accessEnded`) or has
+ * expired since; otherwise its admission time or its statement bound ran out with the space held locked meanwhile,
+ * retryable BACKPRESSURE.
  */
-function admissionRefusal(deadline: Deadline): AuthorityError {
-  try { released({ value: null, deadline }); }
-  catch (expired) { return expired as AuthorityError; }
+function admissionRefusal(deadline: Deadline, accessEnded: boolean): AuthorityError {
+  try {
+    if (accessEnded) throw new AuthorityError('FORBIDDEN', 'Access expired before the request committed');
+    released({ value: null, deadline });
+  } catch (expired) { return expired as AuthorityError; }
   return new AuthorityError('BACKPRESSURE', 'The space stayed busy and the export was not admitted in time; submit again',
     undefined, true);
 }
@@ -389,13 +409,12 @@ export class PostgresPortabilityExports {
           policy: scope.policyVersion }, 'FOR NO KEY UPDATE');
         if (refused && refused !== 'NOT_FOUND' && refused !== 'SPACE_UNAVAILABLE') throw new AuthorityError('FORBIDDEN', 'Policy or placement changed');
         if (refused) throw new AuthorityError(refused);
-        // Held: unfinished or completed (past its expiry too), or ended with parts a worker has yet to remove, so its
-        // parts are still stored. One never admitted holds nothing. Both are read through migration 052's partial
-        // indexes, live exports by space and exports holding parts, so the space's retained ended history is never read.
+        // Held: unfinished or completed (past its expiry too), or ended with parts a worker has yet to remove (queued for
+        // removal), so its parts are still stored. One never admitted holds nothing. Both are read by space through
+        // migration 052's live-export index and removal queue, so the space's retained ended history is never read.
         const { active, held } = (await db.query(`SELECT count(*) FILTER (WHERE j.state IN ${UNFINISHED}
-            AND j.expires_at>clock_timestamp())::int AS active,(count(*)+(SELECT count(*) FROM portability_parts p
-              JOIN portability_jobs e ON e.space_id=p.space_id AND e.job_id=p.job_id
-            WHERE p.space_id=$1 AND p.kind='export' AND p.part_number=1 AND e.state IN ('cancelled','failed','expired')))::int AS held
+            AND j.expires_at>clock_timestamp())::int AS active,
+            (count(*)+(SELECT count(*) FROM portability_removals r WHERE r.space_id=$1))::int AS held
           FROM portability_jobs j WHERE j.space_id=$1 AND j.kind='export' AND j.state IN ('queued','running','completed')
             AND (j.state='completed' OR NOT ${UNADMITTED})`,
         [spaceId])).rows[0];
@@ -441,20 +460,26 @@ export class PostgresPortabilityExports {
       // The admission commits while that access is still unexpired, or not at all. It share-locks the space first, so a
       // submission counting the space's held exports waits for it, and the admission time is read under that lock.
       const lease = randomUUID();
+      // Both bounds as epoch instants, taken together once: the access's (its monotonic deadline converted now, or its
+      // wall-clock end) and the admission time's. Which one ends a cut admission is decided by comparing these, never
+      // by reading another clock after the timer fired, which can run behind it.
+      const accessUntil = Math.min(Date.now() + deadline.monotonic - performance.now(), deadline.wallUntil);
+      const admitUntil = Date.now() + portabilityExportBounds.admissionMs;
       let admission: { rowCount: number | null };
       try {
         admission = await inTransaction(pool, async db => {
           await db.query('SELECT 1 FROM spaces WHERE space_id=$1 FOR SHARE', [spaceId]);
           return db.query(`UPDATE portability_jobs j SET state='running',lease_id=$3,leased_until=clock_timestamp()
             WHERE j.space_id=$1 AND j.job_id=$2 AND NOT ${UNADMITTED} AND j.state='queued'`, [spaceId, submitted.jobId, lease]);
-        }, { deadline: Math.min(Date.now() + deadline.monotonic - performance.now(),
-          deadline.wallUntil, Date.now() + portabilityExportBounds.admissionMs) });
+        }, { deadline: Math.min(accessUntil, admitUntil) });
       } catch (error) {
         // Sent but unacknowledged, the admission may have committed: the caller reads or cancels the export it names.
         if (error instanceof CommitOutcomeUnknownError) throw Object.assign(error, { jobId: submitted.jobId });
         // Cut short by its deadline or its statement bound (a space held locked meanwhile), it rolled back before COMMIT.
+        // The deadline is the access's when that comes first; the statement bound is the access's once it has passed.
         const timedOut = cutShort(error) || (error as { code?: unknown } | null)?.code === '57014';
-        throw await this.refusal(pool, spaceId, submitted.jobId, timedOut ? admissionRefusal(deadline) : error);
+        const accessEnded = (cutShort(error) && accessUntil <= admitUntil) || Date.now() >= accessUntil;
+        throw await this.refusal(pool, spaceId, submitted.jobId, timedOut ? admissionRefusal(deadline, accessEnded) : error);
       }
       if (!admission.rowCount)
         throw await this.refusal(pool, spaceId, submitted.jobId,
@@ -643,9 +668,9 @@ export class PortabilityExportWorker {
    * (`cancelled`), one per transaction, changing their state only, so ending
    * one never waits on its parts. A submission admitting its export holds it
    * locked, so is never cancelled under it. Then remove ended exports' parts in
-   * committed batches (`removal`), the export with the fewest parts left first
-   * and each at most once a round, so a large one never holds up the others
-   * and each still gets a batch whenever the time holds more than one; each
+   * committed batches (`removeNext`, from the removal queue), the export with
+   * the fewest parts left first and each at most once a round, so a large one
+   * never holds up the others and each still gets a batch whenever the time holds more than one; each
    * transaction ends one export or removes one batch. With `lockBound`, each
    * waits at most the probe's lock bound. True once nothing is left to end or
    * remove.
@@ -662,14 +687,7 @@ export class PortabilityExportWorker {
             [...pk(due), due.expired ? 'expired' : 'cancelled']);
           return due.expired ? 'expired' as const : 'unadmitted' as const;
         }
-        const next = (await db.query(`SELECT j.space_id,j.job_id FROM portability_parts p
-            JOIN portability_jobs j ON j.space_id=p.space_id AND j.job_id=p.job_id
-          WHERE p.kind='export' AND p.part_number=1 AND j.state IN ('cancelled','failed','expired') AND NOT j.job_id=ANY($1::text[])
-          ORDER BY (SELECT max(q.part_number) FROM portability_parts q WHERE q.space_id=j.space_id AND q.job_id=j.job_id),
-            j.finished_at,j.job_id LIMIT 1 FOR UPDATE OF j SKIP LOCKED`, [passed])).rows[0];
-        if (!next) return null;
-        passed.push(next.job_id);
-        return removal(db, pk(next), until);
+        return removeNext(db, 'exports', until, passed);
       }, { deadline: until });
       if (typeof done === 'string') result[done]++;
       else if (done !== null) result.removed += done;

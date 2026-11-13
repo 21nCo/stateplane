@@ -12,6 +12,9 @@ const MIGRATION_048_STATEMENT_MS = 15_000;
 // Initial protective bound: an undrained 049 backfills at most 50,000 feed rows, its whole step measured at 0.68 to
 // 0.92 s locally (docs/analysis-jobs.md#migration-049). A drained upgrade, which nothing waits behind, is not bounded.
 const MIGRATION_049_STATEMENT_MS = 15_000;
+// Initial protective bound, not measured: 052 holds the export and analysis job tables against writers while it
+// builds two partial indexes over portability_jobs, which no writer filled before it (docs/portability-export.md#migration-052).
+const MIGRATION_052_STATEMENT_MS = 15_000;
 let transactionOpen = false;
 let advisoryLockHeld = false;
 try {
@@ -227,6 +230,7 @@ try {
     let statementBound = null;
     if (name === '048_projection_rebuilds.sql') statementBound = MIGRATION_048_STATEMENT_MS;
     else if (name === '049_analysis_jobs.sql' && process.env.STATEPLANE_POPULATED_INDEX_UPGRADE !== 'drained') statementBound = MIGRATION_049_STATEMENT_MS;
+    else if (name === '052_portability_live_exports.sql') statementBound = MIGRATION_052_STATEMENT_MS;
     const boundedRun = statementBound !== null;
     const priorStatementTimeout = boundedRun ? (await client.query('SHOW statement_timeout')).rows[0].statement_timeout : null; // NOSONAR -- migrations run in order within the current transaction
     if (boundedRun) await client.query(`SET LOCAL statement_timeout = '${statementBound}ms'`); // NOSONAR -- set before this step's DDL, never concurrently
@@ -269,9 +273,11 @@ try {
       // 051 alters the space directory and references spaces and credentials, and replaces the purge routine.
       if (name === '051_portability_erasure_ledger.sql' && (error?.code === '55P03' || error?.code === '40P01'))
         throw new Error('Portability and erasure ledger upgrade waits for space directory, space and credential writers and space purges; retry when long transactions finish', { cause:error });
-      // 052 builds an index on portability_jobs, which export submissions, workers and space purges write.
-      if (name === '052_portability_live_exports.sql' && error?.code === '55P03')
-        throw new Error('Live export index upgrade waits for export writers and space purges; retry when long transactions finish', { cause:error });
+      // 052 locks portability_jobs, then analysis_jobs, as space purges do, which export and analysis submissions,
+      // cancellations and workers write; a writer holding them the other way round can still make PostgreSQL abort it.
+      if (name === '052_portability_live_exports.sql' && ['55P03', '40P01', '57014'].includes(error?.code))
+        throw new Error(`Live export upgrade waits for export and analysis job writers and space purges${/statement timeout/.test(error.message ?? '')
+          ? ` and ran past its ${MIGRATION_052_STATEMENT_MS / 1000} s statement bound` : ''}; it was rolled back, so retry when long transactions finish`, { cause:error });
       // 57014 is also an explicit or infrastructure cancellation; only PostgreSQL's statement timeout message names the bound.
       if (name === '048_projection_rebuilds.sql' && error?.code === '57014')
         throw new Error(/statement timeout/.test(error.message ?? '')

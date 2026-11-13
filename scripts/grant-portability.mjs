@@ -5,7 +5,8 @@ import { connectionOptions } from './db-connection.mjs';
 // connection. The role is supplied by the protected deployment inventory.
 // Space deletion proves erasure by reading every portability table. Export
 // and import workers (STA-70 and STA-71) admit and advance jobs, write parts,
-// remove the parts of cancelled, failed or expired exports, and write and
+// remove the parts of cancelled, failed or expired exports (and expired
+// analysis results) through their removal queues, and write and
 // complete principal mappings. No grant allows deleting a job or a mapping,
 // or TRUNCATE: removal stays with the scoped purge routine.
 const url=process.env.STATEPLANE_CELL_ADMIN_URL;
@@ -17,8 +18,11 @@ const grants=[
   ['portability_jobs','SELECT, INSERT, UPDATE'],
   ['portability_parts','SELECT, INSERT, DELETE'],
   ['portability_principal_map','SELECT, INSERT, UPDATE'],
-  // The shared snapshot step records whose turn is next (migration 052).
-  ['snapshot_step_turn','SELECT, UPDATE']
+  // The shared snapshot step records whose turn is next, and clears ended jobs' results through their removal queues,
+  // which a trigger fills (migration 052).
+  ['snapshot_step_turn','SELECT, UPDATE'],
+  ['portability_removals','SELECT, UPDATE, DELETE'],
+  ['analysis_removals','SELECT, UPDATE, DELETE']
 ];
 const client=new pg.Client(connectionOptions(url));
 await client.connect();

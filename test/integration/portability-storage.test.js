@@ -180,22 +180,35 @@ test('migration 051 applies on the current schema, waiting boundedly for directo
       { space_id: 'sp_deleted', archived: null, tombstoned: at, erased: null },
       { space_id: 'sp_deleting', archived: null, tombstoned: null, erased: null },
       { space_id: 'sp_suspended', archived: null, tombstoned: null, erased: null }]);
-    // 052 alone, with an export writer holding portability_jobs: its index build waits at most the bound, then rolls back.
+    // 052 alone, with an export writer holding portability_jobs or an analysis writer holding analysis_jobs (taken
+    // after portability_jobs, as a purge does): it waits at most the lock bound, then rolls back with a retry message.
     await upgraded.query(`DROP INDEX portability_jobs_live`);
+    await upgraded.query(`DROP TABLE portability_removals, analysis_removals`);
     await upgraded.query(`DELETE FROM stateplane_migrations WHERE name='052_portability_live_exports.sql'`);
+    for (const table of ['portability_jobs', 'analysis_jobs']) {
+      await holder.query('BEGIN');
+      await holder.query(`LOCK TABLE ${table} IN ROW EXCLUSIVE MODE`);
+      const started = Date.now();
+      const blockedIndex = migrate(db.upgrade);
+      const waited = Date.now() - started;
+      await holder.query('ROLLBACK');
+      assert.equal(blockedIndex.status, 1);
+      assert.match(blockedIndex.stderr, /Live export upgrade waits for export and analysis job writers and space purges; it was rolled back, so retry/);
+      assert.ok(waited < 15_000, `052 gave up after ${waited} ms`);
+      assert.deepEqual((await upgraded.query(`SELECT to_regclass('public.portability_jobs_live') AS live,
+        to_regclass('public.analysis_removals') AS removals,
+        (SELECT count(*)::int FROM stateplane_migrations WHERE name='052_portability_live_exports.sql') AS recorded`)).rows[0],
+      { live: null, removals: null, recorded: 0 }, table);
+    }
+    // An analysis page or export part writer in flight never waits for 052, which builds nothing over their tables.
     await holder.query('BEGIN');
-    await holder.query('LOCK TABLE portability_jobs IN ROW EXCLUSIVE MODE');
-    const started = Date.now();
-    const blockedIndex = migrate(db.upgrade);
-    const waited = Date.now() - started;
+    await holder.query('LOCK TABLE analysis_result_pages, portability_parts IN ROW EXCLUSIVE MODE');
+    const alongside = Date.now();
+    const appliedAlongside = migrate(db.upgrade);
+    const tookMs = Date.now() - alongside;
     await holder.query('ROLLBACK');
-    assert.equal(blockedIndex.status, 1);
-    assert.match(blockedIndex.stderr, /Live export index upgrade waits for export writers and space purges/);
-    assert.ok(waited < 15_000, `052 gave up after ${waited} ms`);
-    assert.deepEqual((await upgraded.query(`SELECT to_regclass('public.portability_jobs_live') AS live,
-      (SELECT count(*)::int FROM stateplane_migrations WHERE name='052_portability_live_exports.sql') AS recorded`)).rows[0],
-    { live: null, recorded: 0 });
-    assert.equal(migrate(db.upgrade).stdout, 'Applied 052_portability_live_exports.sql\n');
+    assert.equal(appliedAlongside.stdout, 'Applied 052_portability_live_exports.sql\n', appliedAlongside.stderr);
+    assert.ok(tookMs < 4_000, `052 took ${tookMs} ms beside page and part writers`);
     assert.equal(migrate(db.upgrade).stdout, '', 'a second run applies nothing');
 
     const fromEmpty = migrate(db.fresh);
@@ -749,13 +762,13 @@ test('the portability and control grants give operational roles only what their 
       STATEPLANE_CONTROL_URL: urlFor(db.main), STATEPLANE_CONTROL_ROLE: role };
     execFileSync(process.execPath, ['scripts/grant-portability.mjs'], { cwd: root, stdio: 'pipe', env });
     execFileSync(process.execPath, ['scripts/grant-control-journal.mjs'], { cwd: root, stdio: 'pipe', env });
-    const tables = [...portabilityTables, 'erasure_ledger', 'snapshot_step_turn'];
+    const tables = [...portabilityTables, 'erasure_ledger', 'snapshot_step_turn', 'portability_removals', 'analysis_removals'];
     const privileges = Object.fromEntries((await pool.query(`SELECT t, has_table_privilege($1,t,'SELECT') AS r,
         has_table_privilege($1,t,'INSERT') AS i, has_table_privilege($1,t,'UPDATE') AS u, has_table_privilege($1,t,'DELETE') AS d,
         has_table_privilege($1,t,'TRUNCATE') AS x FROM unnest($2::text[]) t`, [role, tables])).rows
       .map(({ t, ...row }) => [t, Object.entries(row).filter(([, granted]) => granted).map(([privilege]) => privilege).join('')]));
     assert.deepEqual(privileges, { portability_jobs: 'riu', portability_parts: 'rid', portability_principal_map: 'riu', erasure_ledger: 'ri',
-      snapshot_step_turn: 'ru' });
+      snapshot_step_turn: 'ru', portability_removals: 'rud', analysis_removals: 'rud' });
     const missing = spawnSync(process.execPath, ['scripts/grant-portability.mjs'], { cwd: root, encoding: 'utf8',
       env: { ...env, STATEPLANE_CELL_ROLE: `${role}_absent` } });
     assert.equal(missing.status, 1);

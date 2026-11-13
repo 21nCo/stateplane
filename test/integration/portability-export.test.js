@@ -632,6 +632,28 @@ test('an export becomes claimable only once its submission\'s authorization is r
   assert.deepEqual(classifyError(unanswered, false), { code: 'PROVIDER_UNAVAILABLE', retryable: true });
   const refusedCheck = (await jobs())[6];
   assert.deepEqual([refusedCheck.state, refusedCheck.parts], ['cancelled', 0]);
+  // An admission whose connection arrives after the access, as above, with the monotonic clock read 100 ms ahead just when the admission sets its deadline (the clocks drift
+  // apart, so its timer fires before either clock reads the access as expired): the access's bound ended the
+  // admission, so it is FORBIDDEN, never retryable BACKPRESSURE, whatever a clock reads after the timer fired.
+  const realNow = performance.now.bind(performance);
+  let ahead = 0, skewedConnects = 0;
+  const skewed = { connect: async () => {
+    const n = ++skewedConnects;
+    if (n === 3) { ahead = 0; await new Promise(resolve => setTimeout(resolve, 1_000)); }
+    const client = await pool.connect();
+    if (n !== 2) return client;
+    const query = client.query.bind(client), release = client.release.bind(client);
+    client.query = async (sql, ...rest) => { const done = await query(sql, ...rest); if (sql === 'COMMIT') ahead = 100; return done; };
+    client.release = (...args) => { client.query = query; client.release = release; return release(...args); };
+    return client;
+  } };
+  performance.now = () => realNow() + ahead;
+  try {
+    await rejects(new PostgresPortabilityExports(brief, new Map([['cell-a', { pool: skewed }]])).submit(actor, spaceId), 'FORBIDDEN');
+  } finally { performance.now = realNow; }
+  assert.ok(skewedConnects >= 3, 'the admission was attempted');
+  const skewedJob = (await jobs())[7];
+  assert.deepEqual([skewedJob.state, skewedJob.parts], ['cancelled', 0]);
 });
 
 test('an admission kept waiting on its locked space is retryable BACKPRESSURE, and one whose access lapses meanwhile FORBIDDEN', async () => {
@@ -699,8 +721,9 @@ test('a space holds at most 4 exports at once, completed ones until they expire,
     assert.deepEqual([ended.state, ended.failureCode, await partsOf(jobId)],
       expected === 'completed' ? ['completed', null, parts.length + 1] : ['failed', 'BUDGET_EXCEEDED', 0], `a budget of ${budget} bytes`);
     if (expected === 'completed') {
-      await bypassing(`UPDATE portability_jobs SET state='expired',finished_at=clock_timestamp() WHERE job_id=$1`, [jobId]);
-      // Ended, it is held until a step removes its parts.
+      // Ended (past its expiry, its owner's cancellation ends it expired), it is held until a step removes its parts.
+      await pastExpiry([jobId]);
+      assert.equal((await portability.cancelExport(actor, spaceId, jobId)).state, 'expired');
       await rejects(portability.submitExport(actor, spaceId), 'BACKPRESSURE', 'an ended export holds its parts until they are removed');
       assert.equal((await sweep()).removed, parts.length + 1);
     }
@@ -1355,4 +1378,108 @@ test('an export due alone takes the whole step budget, and an invalid origin con
     && /Invalid origin connection limit/.test(error.message));
   const { status, parts, manifestText } = await result(actor, spaceId, jobId);
   assert.equal((await verifyExportManifest(manifestText, status.manifest.sha256, parts.map(part => part.content))).ok, true);
+});
+
+test('cleanup chooses its next ended job from the removal queue alone: retained results never slow it, and steps clear ended jobs while both kinds run', async () => {
+  const actor = await owner();
+  // A completed analysis result and a completed export, each copied into the retained history a busy cell keeps until
+  // they expire: 100,000 completed results holding their page 1 and 20,000 completed exports holding their part 1.
+  const history = await space(actor);
+  await mutate(actor, history, 'alpha', { operation: 'create', data: { label: 'x' } });
+  const kept = await services.analysis.submit(actor, history, 'alpha', 'export');
+  const keptExport = (await portability.submitExport(actor, history)).jobId;
+  await drain();
+  for (let i = 0; i < 20 && (await services.analysis.status(actor, history, 'alpha', kept.jobId)).state !== 'completed'; i++)
+    await worker().step({ budgetMs: 5_000 });
+  await bypassing(`INSERT INTO analysis_jobs SELECT (jsonb_populate_record(j,jsonb_build_object('job_id','anj_'||gen_random_uuid()))).*
+    FROM analysis_jobs j, generate_series(1,100000) WHERE j.job_id=$1`, [kept.jobId]);
+  await bypassing(`INSERT INTO analysis_result_pages(space_id,collection_id,job_id,credential_id,spec_digest,schema_version,watermark,
+      page_number,row_offset,row_count,byte_offset,content,content_sha256)
+    SELECT p.space_id,p.collection_id,j.job_id,p.credential_id,p.spec_digest,p.schema_version,p.watermark,1,0,p.row_count,0,
+      p.content,p.content_sha256 FROM analysis_result_pages p JOIN analysis_jobs j ON j.space_id=p.space_id
+      AND j.collection_id=p.collection_id AND j.job_id<>p.job_id WHERE p.job_id=$1 AND p.page_number=1`, [kept.jobId]);
+  await bypassing(`INSERT INTO portability_jobs SELECT (jsonb_populate_record(j,jsonb_build_object('job_id','exp_'||gen_random_uuid()))).*
+    FROM portability_jobs j, generate_series(1,20000) WHERE j.job_id=$1`, [keptExport]);
+  await bypassing(`INSERT INTO portability_parts(space_id,job_id,kind,part_number,section,row_count,byte_size,content_sha256,content)
+    SELECT p.space_id,j.job_id,p.kind,1,p.section,p.row_count,p.byte_size,p.content_sha256,p.content FROM portability_parts p
+      JOIN portability_jobs j ON j.space_id=p.space_id AND j.job_id<>p.job_id WHERE p.job_id=$1 AND p.part_number=1`, [keptExport]);
+  // Three jobs that end holding rows: an expired analysis result and two exports, one expired and one cancelled.
+  const ending = await space(actor);
+  for (let i = 0; i < 3; i++) await mutate(actor, ending, 'alpha', { operation: 'create', data: { label: `r${i}` } });
+  const result = await services.analysis.submit(actor, ending, 'alpha', 'export');
+  const expiring = (await portability.submitExport(actor, ending)).jobId;
+  await drain();
+  for (let i = 0; i < 20 && (await services.analysis.status(actor, ending, 'alpha', result.jobId)).state !== 'completed'; i++)
+    await worker().step({ budgetMs: 5_000 });
+  // The cancelled one, cancelled after a step wrote some of its parts.
+  const partial = await bulky(actor, 2);
+  const cancelled = (await portability.submitExport(actor, partial)).jobId;
+  await slow().step({ budgetMs: 2_000 });
+  assert.ok(await partsOf(cancelled) > 0);
+  await pastExpiry([expiring]);
+  await bypassing(`UPDATE analysis_jobs SET created_at=created_at-interval '2 days',started_at=started_at-interval '2 days',
+    finished_at=finished_at-interval '2 days',expires_at=clock_timestamp()-interval '1 second' WHERE job_id=$1`, [result.jobId]);
+  assert.equal((await portability.cancelExport(actor, partial, cancelled)).state, 'cancelled');
+  // Both kinds keep live work: an analysis job and an export, each page or part taking 700 ms to write.
+  const busy = await bulky(actor, 6);
+  const backlog = await services.analysis.submit(actor, busy, 'alpha', 'export');
+  const live = (await portability.submitExport(actor, busy)).jobId;
+  // The steps run on a pool that records each cleanup selection (the statement choosing the next job to clear).
+  const selections = [];
+  const own = newPool(1);
+  own.on('connect', client => {
+    const query = client.query.bind(client);
+    client.query = (sql, values, ...rest) => {
+      const text = typeof sql === 'string' ? sql : sql.text;
+      if (/^\s*INSERT INTO (portability_parts|analysis_result_pages|analysis_result_manifests)/.test(text)) spin(700);
+      if (/FOR UPDATE OF/.test(text)) selections.push([text, values]);
+      return query(sql, values, ...rest);
+    };
+  });
+  const jobs = new PostgresAnalysisWorker(own, { originConnectionLimit: 5 });
+  const holding = async () => (await pool.query(`SELECT ((SELECT count(*) FROM analysis_result_pages WHERE job_id=$1)
+    +(SELECT count(*) FROM portability_parts WHERE job_id=ANY($2)))::int AS n`, [result.jobId, [expiring, cancelled]])).rows[0].n;
+  // Each selection reads the queue and the chosen job's row alone: a handful of buffers, never the retained results.
+  const explain = async () => {
+    assert.ok(selections.length > 0);
+    const explained = await pool.connect();
+    try {
+      for (const [text, values] of selections.splice(0)) {
+        await explained.query('BEGIN');
+        const [{ Plan: plan }] = (await explained.query(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${text}`, values)).rows[0]['QUERY PLAN'];
+        await explained.query('ROLLBACK');
+        const read = plan['Shared Hit Blocks'] + plan['Shared Read Blocks'];
+        assert.ok(read < 100, `${read} buffers for ${text}`);
+        assert.doesNotMatch(JSON.stringify(plan), /analysis_result_pages|portability_parts/);
+      }
+    } finally { explained.release(); }
+  };
+  // Every row of theirs takes 250 ms to remove, so their removal spans steps.
+  await slowRemoval(ending, 250);
+  await slowRemoval(partial, 250);
+  const total = await holding();
+  let steps = 0, ran = { analysis: 0, exports: 0 };
+  for (let budgetMs = 2_000; steps < 4 || await holding() > 0; budgetMs = 7_000 - budgetMs) {
+    assert.ok(steps < total, `the ended jobs' ${total} rows were removed within ${total} steps`);
+    const before = await holding();
+    await pool.query(`UPDATE portability_jobs SET leased_until=clock_timestamp() WHERE job_id=$1 AND state='running'
+      AND leased_until>clock_timestamp()`, [live]);
+    const step = await jobs.step({ budgetMs });
+    steps++;
+    ran = { analysis: ran.analysis + step.claimed, exports: ran.exports + step.exports.claimed };
+    // Every step commits removal while anything is left, whatever history the cell retains.
+    if (before > 0) assert.ok(await holding() < before, `step ${steps} at ${budgetMs} ms removed nothing (${before} rows left)`);
+    if (steps === 1) assert.ok(await holding() > 0, 'the removal spans steps');
+    // Neither kind waits more than two steps for a turn.
+    if (steps % 2 === 0) assert.ok(ran.analysis >= steps / 2 && ran.exports >= steps / 2, JSON.stringify(ran));
+    // While ended jobs are still queued, and once none is.
+    await explain();
+  }
+  await slowRemoval(ending, 0);
+  await slowRemoval(partial, 0);
+  assert.equal((await pool.query(`SELECT (SELECT count(*) FROM portability_removals)+(SELECT count(*) FROM analysis_removals)
+    AS n`)).rows[0].n, '0', 'and have left the removal queues');
+  for (let i = 0; i < 40 && (await services.analysis.status(actor, busy, 'alpha', backlog.jobId)).state !== 'completed'; i++)
+    await worker().step({ budgetMs: 5_000 });
+  await drain();
 });
