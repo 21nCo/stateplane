@@ -22,6 +22,14 @@ CREATE INDEX IF NOT EXISTS portability_jobs_live_space ON portability_jobs(space
 CREATE INDEX IF NOT EXISTS portability_parts_held ON portability_parts(space_id, job_id)
   WHERE kind = 'export' AND part_number = 1;
 
+-- The same step ends an expired analysis job by its state (and manifest)
+-- alone and removes its pages in committed batches, highest first, so a job
+-- still holds pages exactly while its page 1 is there: one entry per analysis
+-- job holding pages (bounded per space by its active jobs and their 24 h
+-- lifetime). The build reads the page table's rows, not their TOASTed content.
+CREATE INDEX IF NOT EXISTS analysis_result_pages_held ON analysis_result_pages(space_id, collection_id, job_id)
+  WHERE page_number = 1;
+
 -- The same step's turn order (docs/portability-export.md#worker): when a step
 -- has room for one turn only, the kind this row names goes first and the step
 -- names the other, so analysis jobs and exports alternate across steps,

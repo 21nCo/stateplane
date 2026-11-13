@@ -260,15 +260,17 @@ async function read(db: Session, job: Row, section: Section, cursor: unknown[] |
  * until its last part is gone. An ended export still holds parts while its part 1, removed last, is there (migration
  * 052's `portability_parts_held` index).
  *
- * Remove up to `removeParts` of an ended export's parts, the highest first and one per statement, so its parts left stay
- * numbered from 1 without gaps; it stops early enough that its transaction commits by `until`. The number removed.
+ * `removal` removes up to `removeParts` rows of an ended job's result (an export's parts, an analysis job's pages), the
+ * highest numbered first, one per `remove` statement (which deletes the highest), so the rows left stay numbered from 1
+ * without gaps; it stops early enough that its transaction commits by `until`. The number removed.
  */
-async function removal(db: Session, key: unknown[], until: number): Promise<number> {
+export async function removal(db: Session, key: unknown[], until: number,
+  remove = `DELETE FROM portability_parts WHERE space_id=$1 AND job_id=$2 AND part_number=(SELECT max(part_number)
+    FROM portability_parts WHERE space_id=$1 AND job_id=$2)`): Promise<number> {
   let removed = 0, slowest = 0;
   while (removed < portabilityExportBounds.removeParts && (removed === 0 || Date.now() + 2 * slowest < until)) {
     const started = Date.now();
-    const gone = (await db.query(`DELETE FROM portability_parts WHERE space_id=$1 AND job_id=$2 AND part_number=(SELECT
-      max(part_number) FROM portability_parts WHERE space_id=$1 AND job_id=$2)`, key)).rowCount;
+    const gone = (await db.query(remove, key)).rowCount;
     if (!gone) break;
     removed++;
     slowest = Math.max(slowest, Date.now() - started);

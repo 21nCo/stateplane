@@ -1213,37 +1213,61 @@ test('cancelling an export with many parts returns at once; a worker removes the
   await drain();
 });
 
-test('an expired analysis result whose removal needs a window of its own is removed within steps while exports keep a backlog', async () => {
+test('an expired analysis result goes in committed batches while both kinds keep a backlog, never holding up the expired jobs behind it', async () => {
   const actor = await owner();
-  const analysed = await bulky(actor, 4);
-  const { jobId } = await services.analysis.submit(actor, analysed, 'alpha', 'export');
-  for (let i = 0; i < 40 && (await services.analysis.status(actor, analysed, 'alpha', jobId)).state !== 'completed'; i++)
-    await worker().step({ budgetMs: 5_000 });
-  const pagesOf = async () => (await pool.query('SELECT count(*)::int AS n FROM analysis_result_pages WHERE job_id=$1', [jobId])).rows[0].n;
-  const pages = await pagesOf();
-  assert.ok(pages >= 4, `${pages} pages`);
-  await bypassing(`UPDATE analysis_jobs SET created_at=created_at-interval '2 days',started_at=started_at-interval '2 days',
-    finished_at=finished_at-interval '2 days',expires_at=clock_timestamp()-interval '1 second' WHERE job_id=$1`, [jobId]);
-  // Each page takes 450 ms to remove, and an analysis job ends with its whole result removed in one transaction: about
-  // 1.8 s, longer than the expiry slice and than what a turn of exports leaves, yet within a 5 s step.
-  await slowRemoval(analysed, 450);
-  // A live export of about 30 parts, each taking 700 ms to write: a backlog through every step here.
-  const live = (await portability.submitExport(actor, await bulky(actor, 20))).jobId;
-  const jobs = slow();
-  let steps = 0, idle = 0;
-  while ((await services.analysis.status(actor, analysed, 'alpha', jobId)).state !== 'expired' || await pagesOf() > 0) {
-    assert.ok(++steps <= 4, 'the expired analysis result was removed within 4 steps');
-    // Ticks come a minute apart, so the next finds the live export's lease lapsed.
-    await pool.query(`UPDATE portability_jobs SET leased_until=clock_timestamp() WHERE job_id=$1 AND state='running'
-      AND leased_until>clock_timestamp()`, [live]);
-    const running = (await pool.query('SELECT state FROM portability_jobs WHERE job_id=$1', [live])).rows[0].state === 'running';
-    const step = await jobs.step({ budgetMs: 5_000 });
-    assert.ok(running, 'the live export is still running');
-    idle = step.exports.parts + step.exports.completed > 0 ? 0 : idle + 1;
-    assert.ok(idle < 2, `the live export wrote nothing for ${idle} steps`);
+  /** A completed analysis job of `n` records of 700 KB. */
+  const completedAnalysis = async n => {
+    const analysed = await bulky(actor, n);
+    const { jobId } = await services.analysis.submit(actor, analysed, 'alpha', 'export');
+    for (let i = 0; i < 40 && (await services.analysis.status(actor, analysed, 'alpha', jobId)).state !== 'completed'; i++)
+      await worker().step({ budgetMs: 5_000 });
+    return { analysed, jobId };
+  };
+  const pagesOf = async jobId => {
+    const row = (await pool.query(`SELECT count(*)::int AS n,COALESCE(max(page_number),0)::int AS top FROM analysis_result_pages
+      WHERE job_id=$1`, [jobId])).rows[0];
+    assert.equal(row.top, row.n, 'the pages left are numbered from 1 without gaps');
+    return row.n;
+  };
+  for (const budgetMs of [5_000, 2_000]) {
+    // The oldest expired result: 6 pages, each taking 9 % of the budget to remove, so its removal outlasts the expiry
+    // slice and what the turns leave. Behind it, a small expired result in another space.
+    const large = await completedAnalysis(6);
+    const small = await completedAnalysis(1);
+    // The large one expired first, so it is ended first.
+    await bypassing(`UPDATE analysis_jobs SET created_at=created_at-interval '2 days',started_at=started_at-interval '2 days',
+      finished_at=finished_at-interval '2 days',expires_at=clock_timestamp()-CASE WHEN job_id=$1 THEN interval '2 seconds'
+      ELSE interval '1 second' END WHERE job_id IN ($1,$2)`, [large.jobId, small.jobId]);
+    const total = await pagesOf(large.jobId);
+    assert.ok(total >= 6, `${total} pages`);
+    await slowRemoval(large.analysed, Math.round(budgetMs * 0.09));
+    // Both kinds keep a backlog: an analysis job and an export, each page or part taking 700 ms to write.
+    const busy = await bulky(actor, 20);
+    const backlog = await services.analysis.submit(actor, busy, 'alpha', 'export');
+    const live = (await portability.submitExport(actor, busy)).jobId;
+    const jobs = slow();
+    let steps = 0, previous = total;
+    while (await pagesOf(large.jobId) > 0) {
+      assert.ok(++steps <= total, `the large expired result was removed within ${total} steps at ${budgetMs} ms`);
+      // Ticks come a minute apart, so the next finds every lease lapsed.
+      await pool.query(`UPDATE portability_jobs SET leased_until=clock_timestamp() WHERE job_id=$1 AND state='running'
+        AND leased_until>clock_timestamp()`, [live]);
+      await jobs.step({ budgetMs });
+      const now = await pagesOf(large.jobId);
+      assert.ok(now <= previous, `pages left only fall: ${previous} then ${now}`);
+      previous = now;
+      assert.equal((await services.analysis.status(actor, large.analysed, 'alpha', large.jobId)).state, 'expired');
+      // The small result behind it ends with its pages removed at the first step.
+      if (steps === 1)
+        assert.deepEqual([(await services.analysis.status(actor, small.analysed, 'alpha', small.jobId)).state, await pagesOf(small.jobId)],
+          ['expired', 0]);
+    }
+    assert.notEqual((await services.analysis.status(actor, busy, 'alpha', backlog.jobId)).state, 'completed', 'the analysis backlog lasted');
+    await slowRemoval(large.analysed, 0);
+    await drain();
+    for (let i = 0; i < 40 && (await services.analysis.status(actor, busy, 'alpha', backlog.jobId)).state !== 'completed'; i++)
+      await worker().step({ budgetMs: 5_000 });
   }
-  await slowRemoval(analysed, 0);
-  await drain();
 });
 
 test('submission counts held exports without reading the space\'s ended history, and a step counts only parts it writes', async () => {
