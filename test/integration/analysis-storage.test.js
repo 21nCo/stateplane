@@ -1086,6 +1086,15 @@ test('a nonowner cell role runs jobs and proves erasure only with the analysis g
       await update(live, `state='failed',failure_code='WORKER_LOST'`, [], db);
       assert.equal((await db.query('DELETE FROM analysis_result_pages WHERE job_id=$1', [live.job_id])).rowCount, 1);
       assert.equal((await pool.query('SELECT count(*)::int AS n FROM analysis_result_pages WHERE job_id=$1', [job.job_id])).rows[0].n, 1);
+      // Migration 052's queue trigger runs with owner rights: this role, which cannot insert into the queue, ends a job
+      // holding pages and it is queued at that commit with its highest page as rows left.
+      const ended = await admit(spaceId, watermark, { principal_id: actor.userPrincipalId }, db);
+      await run(ended, db);
+      await page(ended, 1, 'abc', 0, 1, 0, { db });
+      await page(ended, 2, 'def', 1, 1, 3, { db });
+      await update(ended, `state='failed',failure_code='WORKER_LOST'`, [], db);
+      assert.deepEqual((await pool.query('SELECT rows_left FROM analysis_removals WHERE job_id=$1', [ended.job_id])).rows,
+        [{ rows_left: 2 }]);
       const holder = await admit(spaceId, watermark, { principal_id: actor.userPrincipalId }, db);
       await db.query(`INSERT INTO analysis_cell_slots(cell_id,slot,holder_space_id,holder_collection_id,holder_job_id,held_until)
         VALUES('cell-a',3,$1,'alpha',$2,clock_timestamp()+interval '1 minute') ON CONFLICT (cell_id,slot) DO UPDATE

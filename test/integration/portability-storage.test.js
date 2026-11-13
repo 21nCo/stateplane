@@ -214,6 +214,13 @@ test('migration 051 applies on the current schema, waiting boundedly for directo
     const fromEmpty = migrate(db.fresh);
     assert.equal(fromEmpty.status, 0, fromEmpty.stderr);
     assert.match(fromEmpty.stdout, /Applied 051_portability_erasure_ledger\.sql\nApplied 052_portability_live_exports\.sql\n$/);
+    // 052's turn record: one row naming analysis first, kept once by a reapplied 052, and never a second.
+    for (const client of [upgraded, fresh]) {
+      assert.deepEqual((await client.query('SELECT singleton,exports_next FROM snapshot_step_turn')).rows,
+        [{ singleton: true, exports_next: false }]);
+      await assert.rejects(client.query('INSERT INTO snapshot_step_turn DEFAULT VALUES'), refused('23505'));
+      await assert.rejects(client.query('INSERT INTO snapshot_step_turn(singleton) VALUES(false)'), check('snapshot_step_turn_singleton_check'));
+    }
     const schema = async client => ({
       constraints: (await client.query(`SELECT conrelid::regclass::text AS relation,conname,pg_get_constraintdef(oid) AS definition
         FROM pg_constraint WHERE connamespace='public'::regnamespace ORDER BY relation,conname`)).rows,
@@ -814,6 +821,23 @@ test('the portability and control grants give operational roles only what their 
       .map(({ t, ...row }) => [t, Object.entries(row).filter(([, granted]) => granted).map(([privilege]) => privilege).join('')]));
     assert.deepEqual(privileges, { portability_jobs: 'riu', portability_parts: 'rid', portability_principal_map: 'riu', erasure_ledger: 'ri',
       snapshot_step_turn: 'ru', portability_removals: 'rud' });
+    // Migration 052's queue trigger runs with owner rights: this role, which cannot insert into the queue, ends an export
+    // holding parts and it is queued at that commit with its highest part as rows left.
+    const { spaceId, positions } = await space();
+    const ended = await run(await admit(spaceId, 'export', { watermark: positions[0] }));
+    for (const number of [1, 2]) await part(ended, number);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`SET LOCAL ROLE ${role}`);
+      await update(ended, `state='failed',failure_code='WORKER_LOST'`, [], client);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally { client.release(); }
+    assert.deepEqual((await pool.query('SELECT rows_left FROM portability_removals WHERE job_id=$1', [ended.job_id])).rows,
+      [{ rows_left: 2 }]);
     const missing = spawnSync(process.execPath, ['scripts/grant-portability.mjs'], { cwd: root, encoding: 'utf8',
       env: { ...env, STATEPLANE_CELL_ROLE: `${role}_absent` } });
     assert.equal(missing.status, 1);
