@@ -584,6 +584,10 @@ const PROBE_LOCK_MS = 100;
 const PROBE_MS = 250;
 /** Time a step keeps, past its preparation, for the first turn to begin its page or part. */
 const PREPARE_SLACK_MS = 100;
+/** The least time a turn needs: one page or part (each needs 1 s), its lease release, and the slack to begin it. */
+const TURN_MS = MIN_PAGE_MS + RELEASE_MS + PREPARE_SLACK_MS;
+/** The cell jobs Worker's tick, which creates its worker afresh each time (deployment/workers/jobs.ts). */
+const TICK_MS = 60_000;
 export async function probing<T extends Session>(db: T): Promise<T> {
   await db.query(`SET LOCAL lock_timeout = '${PROBE_LOCK_MS}ms'`);
   return db;
@@ -608,22 +612,27 @@ export const lockedOut = (error: unknown) => (error as { code?: unknown } | null
  * The same step writes owner space exports (`PortabilityExportWorker`,
  * docs/portability-export.md#worker). Every step first ends expired jobs of
  * each kind, each in a slice of its own (a tenth of the budget), whichever
- * kind claims first, then probes each kind, bounded alone, for the wait of
- * the job its claim would take next (an expired one's from its expiry; one
- * whose space is locked is not due). All of that ends early enough to leave
- * one page or part with its lease release; a kind left unprobed, cut short or
- * failed is due with its wait unknown, after the other. A kind due alone
- * takes the whole budget. With both due, the kind waiting longer goes first:
- * at a budget of 5 s or more it stops at its share of the time preparation
- * left (analysis three fifths, exports two fifths, never less than one page
- * or part) and gets back what the other leaves unused; below that it takes
- * the whole budget and the other what is left.
- * Every turn moves its job's wait to now, so the other kind goes first next,
- * and neither starves at any budget. A failure of either kind, a failed probe
- * included, never stops the other: the step throws it once both have run.
+ * kind claims first; no turn ends them again. It then probes each kind,
+ * bounded alone, for the wait of the job its claim would take next (one whose
+ * row, space or collection is locked is not due). All of that ends early
+ * enough to leave one turn; a kind whose probe is locked out or fails is not
+ * due, and one left unprobed or cut short is due with its wait unknown. A
+ * kind due alone takes the whole budget. Two due kinds share a step that has
+ * room for a turn of each: the one waiting longer first, stopping at its
+ * share (analysis three fifths, exports two fifths) yet leaving the other its
+ * turn, and getting back what the other leaves unused. With room for one turn
+ * only they alternate step by step, whatever their waits, so each gets a turn
+ * within two steps. A failure of either kind, a failed probe included, never
+ * stops the other: the step throws it once both have run.
  */
 export class PostgresAnalysisWorker {
   readonly #exports: PortabilityExportWorker;
+  /**
+   * The kind that goes first when two due kinds cannot share a step (0 analysis, 1 exports): the parity of the minute
+   * the worker was created in, so the jobs Worker's tick, creating one each minute, alternates them across ticks, and
+   * flipped by each such step, so a worker stepping again alternates them too.
+   */
+  #alternate = Math.floor(Date.now() / TICK_MS) % 2;
   constructor(private readonly pool: PoolLike, private readonly options: AnalysisWorkerOptions) {
     this.#exports = new PortabilityExportWorker(pool);
   }
@@ -646,36 +655,45 @@ export class PostgresAnalysisWorker {
     // An invalid origin connection limit fails analysis at every step, whatever is due, and never stops exports.
     await settle('analysis', async () => this.#slots);
     // Each kind's expiry in a slice of its own, then its due probe, bounded alone, all ending by `readyBy`, which leaves the
-    // first turn one page or part and its lease release. A kind whose expiry ran out its slice (its table locked, or much
-    // to end), or left unprobed, or whose probe is cut short or fails (reported), is due with its wait unknown: it goes second.
-    const readyBy = end - MIN_PAGE_MS - RELEASE_MS - PREPARE_SLACK_MS;
+    // first turn one page or part and its lease release. A kind whose probe is locked out or fails (reported) is not due
+    // this step; one whose expiry ran out its slice (its table locked, or much to end), or left unprobed, or whose probe is
+    // cut short, is due with its wait unknown.
+    const readyBy = end - TURN_MS;
     const ready = async (kind: 'analysis' | 'exports', expire: (until: number) => Promise<void>,
       waiting: (until: number) => Promise<number | null>) => {
       const until = Math.min(readyBy, Date.now() + Math.floor(budgetMs / 10));
       await settle(kind, () => expire(until));
       if (Date.now() >= until) return Infinity;
       return waiting(Math.min(readyBy, Date.now() + PROBE_MS)).catch((error: unknown) => {
-        if (!ended(error) && !lockedOut(error) && !failures.has(kind)) failures.set(kind, error);
-        return Infinity;
+        if (ended(error)) return Infinity;
+        if (!lockedOut(error) && !failures.has(kind)) failures.set(kind, error);
+        return null;
       });
     };
-    const due = [
-      { kind: 'analysis' as const, share: 3, since: await ready('analysis', until => this.expire(until, result), until => this.waiting(until)) },
-      { kind: 'exports' as const, share: 2, since: await ready('exports', until => this.#exports.expire(until, result.exports),
-        until => this.#exports.waiting(until)) }]
-      .filter(({ since }) => since !== null).sort((a, b) => a.since! - b.since! || a.share - b.share);
-    // Only two kinds both due share the budget; a lone kind takes all of it, and the second all the first leaves.
-    const shared = due.length === 2 && Math.floor(budgetMs * 2 / 5) >= MIN_STEP_MS;
-    const turn = (kind: 'analysis' | 'exports', until: number) =>
-      settle(kind, () => kind === 'analysis' ? this.analyse(until, budgetMs, result) : this.#exports.step(until, result.exports));
-    for (const [index, { kind, share }] of due.entries()) {
-      // The first of two shares what preparation left, keeping room for one page or part whatever preparation cost.
-      const left = end - Date.now();
-      await turn(kind, shared && index === 0
-        ? Math.min(end, Date.now() + Math.max(MIN_PAGE_MS + RELEASE_MS + PREPARE_SLACK_MS, Math.floor(left * share / 5))) : end);
+    const kinds = [
+      { kind: 'analysis' as const, share: 3, expire: (until: number) => this.expire(until, result), waiting: (until: number) => this.waiting(until) },
+      { kind: 'exports' as const, share: 2, expire: (until: number) => this.#exports.expire(until, result.exports),
+        waiting: (until: number) => this.#exports.waiting(until) }];
+    // The kind whose turn it is goes first, in preparation too, so neither's preparation always takes the other's slack.
+    if (this.#alternate) kinds.reverse();
+    const due: { kind: 'analysis' | 'exports'; share: number; since: number }[] = [];
+    for (const { kind, share, expire, waiting } of kinds) {
+      const since = await ready(kind, expire, waiting);
+      if (since !== null) due.push({ kind, share, since });
     }
+    // Two kinds due share the step when it has room for a turn of each: the one waiting longer first, stopping at its share
+    // and never later than leaves the other its turn. Otherwise they alternate, step by step, whatever their waits.
+    const left = end - Date.now(), shared = due.length === 2 && left >= 2 * TURN_MS;
+    if (shared) due.sort((a, b) => a.since - b.since || a.share - b.share);
+    else if (due.length === 2) this.#alternate ^= 1;
+    const turn = (kind: 'analysis' | 'exports', until: number) =>
+      settle(kind, () => kind === 'analysis' ? this.analyse(until, result) : this.#exports.turn(until, result.exports));
+    const [first, second] = due;
+    if (first) await turn(first.kind, shared
+      ? Math.min(end - TURN_MS, Date.now() + Math.max(TURN_MS, Math.floor(left * first.share / 5))) : end);
+    if (second) await turn(second.kind, end);
     // What the second kind left unused (nothing it could run, or a failure) goes back to the first.
-    if (shared && end - RELEASE_MS - Date.now() >= MIN_PAGE_MS) await turn(due[0].kind, end);
+    if (shared && end - RELEASE_MS - Date.now() >= MIN_PAGE_MS) await turn(first.kind, end);
     if (failures.size > 1) throw new AggregateError([...failures.values()], 'The analysis and export steps failed');
     if (failures.size) throw [...failures.values()][0];
     return result;
@@ -683,27 +701,24 @@ export class PostgresAnalysisWorker {
 
   /**
    * When the analysis job the step would claim next began waiting (epoch ms): the first in the claim's own order whose
-   * space and collection no other transaction holds locked, a queued one since its submission and a lapsed one since
-   * its lease ended; or an expired one since its expiry, if earlier. Null when none is due.
+   * row, space and collection no other transaction holds locked, a queued one since its submission and a lapsed one
+   * since its lease ended. Null when none is due.
    */
   private async waiting(until: number): Promise<number | null> {
-    const since = (await inTransaction(this.pool, async db => (await probing(db)).query(`SELECT (extract(epoch FROM least(
+    const since = (await inTransaction(this.pool, async db => (await probing(db)).query(`SELECT (extract(epoch FROM
         (SELECT x.waited FROM (SELECT CASE WHEN j.state='queued' THEN j.created_at ELSE j.leased_until END AS waited
           FROM analysis_jobs j JOIN spaces s ON s.space_id=j.space_id
             JOIN collections c ON c.space_id=j.space_id AND c.collection_id=j.collection_id
           WHERE (j.state='queued' OR (j.state='running' AND j.leased_until<=clock_timestamp())) AND j.expires_at>clock_timestamp()
-          ORDER BY j.leased_until NULLS FIRST,j.created_at,j.job_id LIMIT 1 FOR SHARE OF s,c SKIP LOCKED) x),
-        (SELECT min(expires_at) FROM analysis_jobs WHERE state IN ${ACTIVE} AND expires_at<=clock_timestamp())))*1000)::float8 AS since`),
+          ORDER BY j.leased_until NULLS FIRST,j.created_at,j.job_id LIMIT 1 FOR SHARE OF j,s,c SKIP LOCKED) x))*1000)::float8 AS since`),
     { deadline: until })).rows[0].since;
     return since === null ? null : Number(since);
   }
 
-  /** Expire, then claim and run analysis jobs until `until`. */
-  private async analyse(until: number, budgetMs: number, result: AnalysisStep): Promise<void> {
+  /** Claim and run analysis jobs until `until` (the step ended expired ones in its own slice). */
+  private async analyse(until: number, result: AnalysisStep): Promise<void> {
     // An invalid origin connection limit fails the analysis half here, and the step reports it once exports have run.
     analyticalSlots(this.options.originConnectionLimit);
-    try { await this.expire(Math.min(until, Date.now() + Math.floor(budgetMs / 4)), result); }
-    catch (error) { if (!cutShort(error)) throw error; }
     const passed: { s: string; c: string; j: string }[] = [];
     while (until - RELEASE_MS - Date.now() >= MIN_PAGE_MS) {
       let job: Row | null | 'busy' | 'failed';
@@ -738,13 +753,14 @@ export class PostgresAnalysisWorker {
    * when the job was taken meanwhile, `failed` when its binding failed it.
    */
   private async claim(until: number, passed: { s: string; c: string; j: string }[]): Promise<Row | null | 'busy' | 'failed'> {
-    // Passing over a job whose space or collection another transaction holds locked, as the probe does.
-    const next = (await inTransaction(this.pool, db => db.query(`SELECT j.space_id,j.collection_id,j.job_id FROM analysis_jobs j
-        JOIN spaces s ON s.space_id=j.space_id JOIN collections c ON c.space_id=j.space_id AND c.collection_id=j.collection_id
+    // Passing over a job whose row, space or collection another transaction holds locked, as the probe does; a table
+    // held locked past the probe's lock bound leaves nothing to claim this step.
+    const next = (await inTransaction(this.pool, async db => (await probing(db)).query(`SELECT j.space_id,j.collection_id,j.job_id
+      FROM analysis_jobs j JOIN spaces s ON s.space_id=j.space_id JOIN collections c ON c.space_id=j.space_id AND c.collection_id=j.collection_id
       WHERE (j.state='queued' OR (j.state='running' AND j.leased_until<=clock_timestamp())) AND j.expires_at>clock_timestamp()
         AND NOT $1::jsonb @> jsonb_build_array(jsonb_build_object('s',j.space_id,'c',j.collection_id,'j',j.job_id))
-      ORDER BY j.leased_until NULLS FIRST,j.created_at,j.job_id LIMIT 1 FOR SHARE OF s,c SKIP LOCKED`, [JSON.stringify(passed)]),
-    { deadline: until })).rows[0];
+      ORDER BY j.leased_until NULLS FIRST,j.created_at,j.job_id LIMIT 1 FOR SHARE OF j,s,c SKIP LOCKED`, [JSON.stringify(passed)]),
+    { deadline: until }).catch((error: unknown) => { if (lockedOut(error)) return { rows: [] }; throw error; })).rows[0];
     if (!next) return null;
     passed.push({ s: next.space_id, c: next.collection_id, j: next.job_id });
     for (let attempt = 0; attempt < 2; attempt++) {

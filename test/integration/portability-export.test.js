@@ -603,6 +603,29 @@ test('an export becomes claimable only once its submission\'s authorization is r
   assert.equal((await portability.cancelExport(actor, spaceId, lost.jobId)).state, 'cancelled');
   await drain();
   assert.deepEqual((await jobs()).map(job => [job.state, job.parts]), Array.from({ length: 4 }, () => ['cancelled', 0]));
+
+  // The admission's COMMIT is acknowledged, but the process stalls past the 300 ms access before it can read that: the
+  // export, which no worker has claimed, is withdrawn and the call refused, never released after its access expired.
+  await rejects(new PostgresPortabilityExports(brief, new Map([['cell-a', { pool: committing(3, () => spin(500)) }]]))
+    .submit(actor, spaceId), 'FORBIDDEN');
+  const withdrawn = (await jobs())[4];
+  assert.deepEqual([withdrawn.state, withdrawn.parts], ['cancelled', 0]);
+  // Stalled likewise while a worker claims it: it may run, so the outcome is unknown and the error names it.
+  const claimedMeanwhile = committing(3, async () => { await worker().step({ budgetMs: 2_000 }); spin(300); });
+  let unconfirmed;
+  await assert.rejects(new PostgresPortabilityExports(brief, new Map([['cell-a', { pool: claimedMeanwhile }]])).submit(actor, spaceId),
+    error => { unconfirmed = error; return typeof error.jobId === 'string'; });
+  assert.deepEqual(classifyError(unconfirmed, false), { code: 'COMMIT_OUTCOME_UNKNOWN', retryable: false });
+  assert.equal(unconfirmed.jobId, (await jobs())[5].job_id);
+  assert.ok(['running', 'completed'].includes((await jobs())[5].state), 'the claimed export runs');
+  // The final check changes nothing: its COMMIT unacknowledged is a check that never answered, a definite retryable
+  // refusal, and the export is cancelled unrun.
+  let unanswered;
+  await assert.rejects(new PostgresPortabilityExports(spaces, new Map([['cell-a', { pool: committing(2, () => {
+    throw new Error('the connection dropped after the check'); }) }]])).submit(actor, spaceId), error => { unanswered = error; return true; });
+  assert.deepEqual(classifyError(unanswered, false), { code: 'PROVIDER_UNAVAILABLE', retryable: true });
+  const refusedCheck = (await jobs())[6];
+  assert.deepEqual([refusedCheck.state, refusedCheck.parts], ['cancelled', 0]);
 });
 
 test('a space holds at most 4 exports at once, completed ones until they expire, and the byte budget holds the manifest', async () => {
@@ -632,6 +655,45 @@ test('a space holds at most 4 exports at once, completed ones until they expire,
       expected === 'completed' ? ['completed', null, parts.length + 1] : ['failed', 'BUDGET_EXCEEDED', 0], `a budget of ${budget} bytes`);
     if (expected === 'completed') await bypassing(`UPDATE portability_jobs SET state='expired',finished_at=clock_timestamp() WHERE job_id=$1`, [jobId]);
   }
+});
+
+test('an admission crossing its admission time is counted by a concurrent submission, so a space never holds a fifth export', async () => {
+  const actor = await owner();
+  const spaceId = await space(actor);
+  await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: 'x' } });
+  for (let i = 0; i < portabilityExportBounds.heldPerSpace - 1; i++) { await portability.submitExport(actor, spaceId); await drain(); }
+  // The fourth submission's admission passes its admission-time check 300 ms before that time ends and commits 1 s later;
+  // 500 ms in, another submission counts the space's held exports.
+  let concurrent;
+  const crossing = { connect: async () => {
+    const client = await pool.connect(), query = client.query.bind(client), release = client.release.bind(client);
+    let admitting = false;
+    client.query = async (sql, ...rest) => {
+      if (/^UPDATE portability_jobs j SET state='running'/.test(sql)) {
+        admitting = true;
+        await bypassing(`UPDATE portability_jobs SET created_at=clock_timestamp()-$2*interval '1 millisecond' WHERE job_id=$1`,
+          [rest[0][1], portabilityExportBounds.admissionMs - 300]);
+      }
+      if (sql === 'COMMIT' && admitting) {
+        // The other submission counts once the admission time has ended, before the admission commits.
+        await new Promise(resolve => setTimeout(resolve, 500));
+        concurrent = portability.submitExport(actor, spaceId).then(() => 'admitted', error => error);
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      return query(sql, ...rest);
+    };
+    client.release = (...args) => { client.query = query; client.release = release; return release(...args); };
+    return client;
+  } };
+  const fourth = await new PostgresPortabilityExports(spaces, new Map([['cell-a', { pool: crossing }]])).submit(actor, spaceId);
+  const outcome = await concurrent;
+  assert.equal(outcome.code, 'BACKPRESSURE', String(outcome?.message ?? outcome));
+  assert.match(outcome.message, /holds 4 exports/);
+  const held = (await pool.query(`SELECT count(*)::int AS n FROM portability_jobs WHERE space_id=$1 AND state IN ('queued','running','completed')`,
+    [spaceId])).rows[0].n;
+  assert.equal(held, portabilityExportBounds.heldPerSpace);
+  await drain();
+  assert.equal((await portability.exportStatus(actor, spaceId, fourth.jobId)).state, 'completed');
 });
 
 test('submission waits for writes to the space in flight, so each lands wholly on one side of the boundary', async () => {
@@ -673,8 +735,8 @@ test('exports and analysis jobs share the jobs Worker step: neither starves at t
     const step = await jobs.step({ budgetMs: 2_000 });
     turns.push([step.pages + step.completed > 0 ? 'analysis' : '', step.exports.parts + step.exports.completed > 0 ? 'export' : ''].join(''));
   }
-  // The analysis job was submitted first, so it waited longer and goes first; each turn then moves its kind's wait to now.
-  assert.deepEqual(turns, ['analysis', 'export', 'analysis', 'export']);
+  // One step cannot hold a turn of each, so they alternate step by step, whichever goes first.
+  assert.deepEqual(turns, turns[0] === 'analysis' ? ['analysis', 'export', 'analysis', 'export'] : ['export', 'analysis', 'export', 'analysis']);
   const analysisState = async () => (await services.analysis.status(actor, spaceId, 'alpha', analysisJob.jobId)).state;
   assert.equal(await analysisState(), 'running', 'the analysis job has work left');
 
@@ -695,7 +757,7 @@ test('exports and analysis jobs share the jobs Worker step: neither starves at t
   assert.equal((await verifyExportManifest(manifestText, status.manifest.sha256, parts.map(part => part.content))).ok, true);
 });
 
-test('each kind goes first by the job its claim takes next; a locked job, a busy export or a failing expiry never holds the other back', async t => {
+test('a probe follows its claim, passing over locked jobs; a locked job, a busy export or a failing expiry never holds the other back', async t => {
   const actor = await owner();
   const [spaceId, other, locked] = [await space(actor), await space(actor), await space(actor)];
   for (let i = 0; i < 4; i++) for (const [id, fill] of [[spaceId, 'x'], [other, 'y']])
@@ -710,17 +772,44 @@ test('each kind goes first by the job its claim takes next; a locked job, a busy
   t.after(async () => { await purge.query('ROLLBACK').catch(() => {}); purge.release(); });
   const jobs = slow();
   const turn = step => [step.pages + step.completed > 0 ? 'analysis' : '', step.exports.parts + step.exports.completed > 0 ? 'export' : ''].join('');
-  // An analysis job whose lease ended long ago, an export admitted after it, and a fresh analysis job queued before each
-  // step. The claim takes the fresh job first, so analysis waits from its submission, after the export: the export runs.
+  const epoch = async (sql, params) => Number((await pool.query(`SELECT (extract(epoch FROM (${sql}))*1000)::float8 AS t`, params)).rows[0].t);
+  const exporter = new PortabilityExportWorker(newPool(1));
+  // An analysis job whose lease ended long ago, then a fresh one queued: the probe reports the fresh one, which the
+  // claim takes first (queued before lapsed), not the one waiting longest.
   const lapsed = await services.analysis.submit(actor, other, 'alpha', 'export');
   assert.equal(turn(await jobs.step({ budgetMs: 2_000 })), 'analysis');
+  const fresh = await services.analysis.submit(actor, other, 'alpha', 'export');
+  const freshSince = await epoch('SELECT created_at FROM analysis_jobs WHERE job_id=$1', [fresh.jobId]);
+  assert.equal(await jobs.waiting(Date.now() + 1_000), freshSince);
+  // A job row another transaction holds locked is passed over by the probe, as by the claim: the next one reports instead,
+  // and with none left the kind is not due. The same for an export.
   const { jobId } = await portability.submitExport(actor, spaceId);
+  const rowHolder = await pool.connect();
+  try {
+    await rowHolder.query('BEGIN');
+    await rowHolder.query('SELECT 1 FROM analysis_jobs WHERE job_id=$1 FOR UPDATE', [fresh.jobId]);
+    await rowHolder.query('SELECT 1 FROM portability_jobs WHERE job_id=$1 FOR UPDATE', [jobId]);
+    assert.equal(await jobs.waiting(Date.now() + 1_000), await epoch('SELECT leased_until FROM analysis_jobs WHERE job_id=$1', [lapsed.jobId]));
+    assert.equal(await exporter.waiting(Date.now() + 1_000), null, 'a locked export is not due');
+    await rowHolder.query('SELECT 1 FROM analysis_jobs WHERE job_id=$1 FOR UPDATE', [lapsed.jobId]);
+    assert.equal(await jobs.waiting(Date.now() + 1_000), null, 'no unlocked analysis job is due');
+    await rowHolder.query('ROLLBACK');
+    assert.equal(await exporter.waiting(Date.now() + 1_000), await epoch('SELECT leased_until FROM portability_jobs WHERE job_id=$1', [jobId]));
+    // An expired job, here held locked so the step's expiry slice passes over it, is no claimable work: the probe never
+    // reports its expiry.
+    await bypassing(`UPDATE analysis_jobs SET created_at=created_at-interval '2 days',expires_at=clock_timestamp()-interval '1 hour'
+      WHERE job_id=$1`, [fresh.jobId]);
+    await rowHolder.query('BEGIN');
+    await rowHolder.query('SELECT 1 FROM analysis_jobs WHERE job_id=$1 FOR UPDATE', [fresh.jobId]);
+    assert.equal(await jobs.waiting(Date.now() + 1_000), await epoch('SELECT leased_until FROM analysis_jobs WHERE job_id=$1', [lapsed.jobId]));
+  } finally { await rowHolder.query('ROLLBACK').catch(() => {}); rowHolder.release(); }
+  // With both kinds due and room for one turn only, the steps alternate.
   const turns = [];
   for (let i = 0; i < 2; i++) {
     await services.analysis.submit(actor, other, 'alpha', 'export');
     turns.push(turn(await jobs.step({ budgetMs: 2_000 })));
   }
-  assert.deepEqual(turns, ['export', 'analysis']);
+  assert.deepEqual([...turns].sort(), ['analysis', 'export']);
   // The export's space is locked now: the export is not due, and analysis takes the step at once.
   const holder = await pool.connect();
   try {
@@ -795,18 +884,25 @@ test('a slow due probe of either kind is cut at its bound, and the other kind st
   };
   const freshAnalysis = () => services.analysis.submit(actor, spaceId, 'alpha', 'export');
   const freshExport = () => portability.submitExport(actor, spaceId);
-  // Each probe in turn waits 1.5 s; then the export's expiry nearly fills its slice and its probe is slow, while the
-  // analysis probe takes 60 ms: the preparation still leaves analysis its page. Each case starts with work of both kinds.
-  for (const [delays, others] of [[[[exportProbe, 1_500]], 'analysis'], [[[analysisProbe, 1_500]], 'exports'],
-    [[[analysisProbe, 60], [exportExpiry, 190], [exportProbe, 1_500]], 'analysis']]) {
+  // A probe cut short leaves its kind's wait unknown, which never puts it last for good. Every page and part write takes
+  // 700 ms, so neither kind's work ends in a step: each probe in turn waits 1.5 s at every step; both wait past their
+  // bound; the export's expiry nearly fills its slice and its probe is slow while the analysis probe takes 60 ms. At the
+  // 2 s minimum, each kind still writes within two steps of the same worker, each step within its budget.
+  const writes = [/^INSERT INTO (portability_parts|analysis_result_pages|analysis_result_manifests)/, 'spin'];
+  for (const delays of [[[exportProbe, 1_500]], [[analysisProbe, 1_500]], [[exportProbe, 300], [analysisProbe, 300]],
+    [[analysisProbe, 60], [exportExpiry, 190], [exportProbe, 1_500]]]) {
     await finish();
     await freshAnalysis();
     await freshExport();
-    const started = Date.now();
-    const step = await delaying(delays).step({ budgetMs: 2_000 });
-    assert.ok(Date.now() - started < 2_500, `the step took ${Date.now() - started} ms`);
-    const advanced = others === 'analysis' ? step.pages + step.completed : step.exports.parts + step.exports.completed;
-    assert.ok(advanced > 0, `${others} advanced while the other was slow: ${JSON.stringify(step)}`);
+    const jobs = delaying([...delays, writes]), advanced = { analysis: 0, exports: 0 };
+    for (let i = 0; i < 2; i++) {
+      const started = Date.now();
+      const step = await jobs.step({ budgetMs: 2_000 });
+      assert.ok(Date.now() - started < 2_500, `the step took ${Date.now() - started} ms`);
+      advanced.analysis += step.pages + step.completed;
+      advanced.exports += step.exports.parts + step.exports.completed;
+    }
+    assert.ok(advanced.analysis > 0 && advanced.exports > 0, `both kinds wrote within two steps: ${JSON.stringify(advanced)}`);
   }
   // A probe that fails (not cut short, not locked out) is reported, and the other kind, given fresh work, still runs in
   // that step.
@@ -829,6 +925,33 @@ test('a slow due probe of either kind is cut at its bound, and the other kind st
   await drain();
   assert.equal((await portability.exportStatus(actor, spaceId, older.jobId)).state, 'completed');
   await finish();
+});
+
+test('each kind ends its expired jobs once per step, in its own slice, and no turn ends them again', async () => {
+  const actor = await owner();
+  const spaceId = await space(actor);
+  for (let i = 0; i < 4; i++)
+    await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: `big ${i}`, body: `${'x'.repeat(700_000)}${i}` } });
+  const analysisJob = await services.analysis.submit(actor, spaceId, 'alpha', 'export');
+  await portability.submitExport(actor, spaceId);
+  const passes = { analysis: 0, exports: 0 };
+  const jobs = worker(sql => {
+    if (/ORDER BY expires_at LIMIT 1 FOR UPDATE SKIP LOCKED/.test(sql)) passes.analysis++;
+    if (/ORDER BY least\(j\.expires_at,j\.created_at\) LIMIT 1 FOR UPDATE SKIP LOCKED/.test(sql)) passes.exports++;
+    if (/^\s*INSERT INTO (portability_parts|analysis_result_pages|analysis_result_manifests)/.test(sql)) spin(700);
+  });
+  // With nothing expired, one expiry pass of each kind is one statement: a 5 s step shares itself between both kinds
+  // (and gives unused time back), a 2 s step runs one of them, and neither repeats a pass.
+  for (const budgetMs of [5_000, 2_000, 2_000]) {
+    passes.analysis = passes.exports = 0;
+    const step = await jobs.step({ budgetMs });
+    assert.deepEqual(passes, { analysis: 1, exports: 1 }, `one expiry pass of each kind in a ${budgetMs} ms step`);
+    assert.ok(step.pages + step.completed + step.exports.parts + step.exports.completed > 0, JSON.stringify(step));
+  }
+  await drain();
+  for (let i = 0; i < 20 && (await services.analysis.status(actor, spaceId, 'alpha', analysisJob.jobId)).state !== 'completed'; i++)
+    await worker().step({ budgetMs: 5_000 });
+  assert.equal((await services.analysis.status(actor, spaceId, 'alpha', analysisJob.jobId)).state, 'completed');
 });
 
 test('a probe stalled on a table lock leaves the other kind its window', async () => {

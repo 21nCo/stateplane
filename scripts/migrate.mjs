@@ -216,7 +216,7 @@ try {
       name === '042_claim_revision_recorder.sql' || name === '043_claim_commit_authority.sql' ||
       name === '044_links_deletion_retention.sql' || name === '045_retrieval_projections.sql' ||
       name === '046_retrieval_dispatch_checkpoint.sql' || name === '048_projection_rebuilds.sql' || name === '049_analysis_jobs.sql' ||
-      name === '051_portability_erasure_ledger.sql';
+      name === '051_portability_erasure_ledger.sql' || name === '052_portability_live_exports.sql';
     const priorLockTimeout = boundedDdl ? (await client.query('SHOW lock_timeout')).rows[0].lock_timeout : null; // NOSONAR -- migrations run in order within the current transaction
     if (boundedDdl) await client.query("SET LOCAL lock_timeout = '5s'"); // NOSONAR -- set before this step's DDL, never concurrently
     // 048 holds projection_generations exclusively from its first statement to its commit, and every retrieval write
@@ -269,6 +269,9 @@ try {
       // 051 alters the space directory and references spaces and credentials, and replaces the purge routine.
       if (name === '051_portability_erasure_ledger.sql' && (error?.code === '55P03' || error?.code === '40P01'))
         throw new Error('Portability and erasure ledger upgrade waits for space directory, space and credential writers and space purges; retry when long transactions finish', { cause:error });
+      // 052 builds an index on portability_jobs, which export submissions, workers and space purges write.
+      if (name === '052_portability_live_exports.sql' && error?.code === '55P03')
+        throw new Error('Live export index upgrade waits for export writers and space purges; retry when long transactions finish', { cause:error });
       // 57014 is also an explicit or infrastructure cancellation; only PostgreSQL's statement timeout message names the bound.
       if (name === '048_projection_rebuilds.sql' && error?.code === '57014')
         throw new Error(/statement timeout/.test(error.message ?? '')

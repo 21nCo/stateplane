@@ -180,6 +180,22 @@ test('migration 051 applies on the current schema, waiting boundedly for directo
       { space_id: 'sp_deleted', archived: null, tombstoned: at, erased: null },
       { space_id: 'sp_deleting', archived: null, tombstoned: null, erased: null },
       { space_id: 'sp_suspended', archived: null, tombstoned: null, erased: null }]);
+    // 052 alone, with an export writer holding portability_jobs: its index build waits at most the bound, then rolls back.
+    await upgraded.query(`DROP INDEX portability_jobs_live`);
+    await upgraded.query(`DELETE FROM stateplane_migrations WHERE name='052_portability_live_exports.sql'`);
+    await holder.query('BEGIN');
+    await holder.query('LOCK TABLE portability_jobs IN ROW EXCLUSIVE MODE');
+    const started = Date.now();
+    const blockedIndex = migrate(db.upgrade);
+    const waited = Date.now() - started;
+    await holder.query('ROLLBACK');
+    assert.equal(blockedIndex.status, 1);
+    assert.match(blockedIndex.stderr, /Live export index upgrade waits for export writers and space purges/);
+    assert.ok(waited < 15_000, `052 gave up after ${waited} ms`);
+    assert.deepEqual((await upgraded.query(`SELECT to_regclass('public.portability_jobs_live') AS live,
+      (SELECT count(*)::int FROM stateplane_migrations WHERE name='052_portability_live_exports.sql') AS recorded`)).rows[0],
+    { live: null, recorded: 0 });
+    assert.equal(migrate(db.upgrade).stdout, 'Applied 052_portability_live_exports.sql\n');
     assert.equal(migrate(db.upgrade).stdout, '', 'a second run applies nothing');
 
     const fromEmpty = migrate(db.fresh);
