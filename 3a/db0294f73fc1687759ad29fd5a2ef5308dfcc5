@@ -1,0 +1,39 @@
+contracts/portability-manifest.schema.json
+  s_73bc28ab8d36f7::t_f6ed78511ba816 72
+docs/analysis-jobs.md
+  s_73bc28ab8d36f7::t_dac0ee7b1af93f 116
+docs/owned-spaces.md
+  s_73bc28ab8d36f7::t_bfe7acc8bec4cd 37
+docs/portability-export.md
+  s_73bc28ab8d36f7::t_5182bea0ce1fc3 51,102
+docs/regional-topology.md
+  s_73bc28ab8d36f7::t_e3da6089a43511 5
+migrations/052_portability_live_exports.sql
+  s_73bc28ab8d36f7::t_47f8ccf599e9a1 1-14,32-44,102-105
+scripts/grant-analysis.mjs
+  s_73bc28ab8d36f7::t_f1ae8a8c6ce656 6-12
+scripts/grant-portability.mjs
+  s_73bc28ab8d36f7::t_b9afdf575f355f 6-12,23-24
+scripts/migrate.mjs
+  s_73bc28ab8d36f7::t_8634c203885618 276-277
+test/integration/portability-storage.test.js
+  s_73bc28ab8d36f7::t_aabc071700f0d4 217
+test/portability-manifest-schema.test.js
+  s_73bc28ab8d36f7::t_f49709f0c14423 31-36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3adb0294f73fc1687759ad29fd5a2ef5308dfcc5",
+  "prompts": {},
+  "sessions": {
+    "s_73bc28ab8d36f7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_73bc28ab8d36f7",
+        "model": "unknown"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
