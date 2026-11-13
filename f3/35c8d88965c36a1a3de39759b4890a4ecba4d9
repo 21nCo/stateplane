@@ -1,0 +1,51 @@
+README.md
+  s_d741f4a9e13520::t_8355dba9242a6a 43
+contracts/portability-manifest.schema.json
+  s_d741f4a9e13520::t_da5aec66832b03 1-207
+docs/analysis-jobs.md
+  s_d741f4a9e13520::t_f88a6ff6dd7fe6 118,156-158,163-164,174
+docs/owned-spaces.md
+  s_d741f4a9e13520::t_67f0458eac3d51 37
+docs/portability-export.md
+  s_d741f4a9e13520::t_6ee405c4cf9608 1-128
+docs/portability-storage.md
+  s_d741f4a9e13520::t_2a6aadd2eb5105 3,46,73
+docs/postgres-authority.md
+  s_d741f4a9e13520::t_c79d213ffd423b 23
+docs/regional-topology.md
+  s_d741f4a9e13520::t_90ba01393cf204 5
+migrations/052_portability_live_exports.sql
+  s_d741f4a9e13520::t_bf5aff121a8a9b 1-104
+package.json
+  s_d741f4a9e13520::t_e99a4da254f3e6 75
+pnpm-lock.yaml
+  s_d741f4a9e13520::t_2c5e543d3deda8 80-82,1039
+scripts/grant-analysis.mjs
+  s_d741f4a9e13520::t_fef80acd02f8c5 4,8-9,23-24
+scripts/grant-portability.mjs
+  s_d741f4a9e13520::t_af8a8c4b79e299 4,8-9,20-24
+scripts/migrate.mjs
+  s_d741f4a9e13520::t_6b1f0c052e8476 15-17,222,233,276-280
+test/integration/analysis-storage.test.js
+  s_d741f4a9e13520::t_751a0b0c7137e0 1005,1022-1025
+test/integration/portability-storage.test.js
+  s_d741f4a9e13520::t_ea21aa5ef74326 172,183-211,216,765,770-771
+test/integration/retrieval-worker.test.js
+  s_d741f4a9e13520::t_7a07a7b472745d 1602,1604,1676,1713,1772
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f335c8d88965c36a1a3de39759b4890a4ecba4d9",
+  "prompts": {},
+  "sessions": {
+    "s_d741f4a9e13520": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_d741f4a9e13520",
+        "model": "unknown"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
