@@ -146,21 +146,29 @@ function malformed(value: unknown): string | null {
  * Schema can state (a provenance span starts at or before its end).
  */
 function unlisted(manifest: ExportManifest, parts: readonly string[]): string | null {
-  const provenance: string[] = [];
+  // Provenance rows are read part by part, keeping only the line a part leaves unfinished, never the whole section.
+  let unfinished = '';
   for (const [i, listed] of manifest.parts.entries()) {
     const content = parts[i];
     if ((content.match(/\n/g)?.length ?? 0) !== listed.rows) return `part ${listed.number} does not hold ${listed.rows} rows`;
     if (manifest.parts[i + 1]?.section !== listed.section && !content.endsWith('\n'))
       return `section ${listed.section} ends with an unfinished line`;
-    if (listed.section === 'provenance') provenance.push(content);
-  }
-  for (const line of provenance.join('').split('\n').slice(0, -1)) {
-    let source: { startOffset?: unknown; endOffset?: unknown } | undefined;
-    try { source = (JSON.parse(line) as { source?: typeof source }).source; } catch { return 'a provenance row is not JSON'; }
-    if (typeof source?.startOffset === 'number' && typeof source.endOffset === 'number' && source.startOffset > source.endOffset)
-      return 'a provenance span starts after its end';
+    if (listed.section !== 'provenance') continue;
+    const lines = (unfinished + content).split('\n');
+    unfinished = lines.pop()!;
+    for (const line of lines) {
+      const reason = reversed(line);
+      if (reason) return reason;
+    }
   }
   return null;
+}
+/** Why a provenance row breaks the rule no schema states, or null: a span starts at or before its end. */
+function reversed(line: string): string | null {
+  let source: { startOffset?: unknown; endOffset?: unknown } | undefined;
+  try { source = (JSON.parse(line) as { source?: typeof source }).source; } catch { return 'a provenance row is not JSON'; }
+  return typeof source?.startOffset === 'number' && typeof source.endOffset === 'number' && source.startOffset > source.endOffset
+    ? 'a provenance span starts after its end' : null;
 }
 
 /**

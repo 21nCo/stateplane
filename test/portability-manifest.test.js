@@ -166,4 +166,8 @@ test('with its data parts, every part holds the rows the manifest lists, ends it
   const provenance = ajv.getSchema(`${schema.$id}#/$defs/provenance`);
   assert.ok(provenance(JSON.parse(cite(5, 2))), 'the schema states no span order');
   assert.equal((await check([cite(5, 2)], [1], 'provenance')).ok, false, 'a span that starts after its end');
+  // Read part by part: a reversed span split across two parts is found, a forward one so split verifies.
+  const split = (line, at) => [line.slice(0, at), line.slice(at)];
+  assert.equal((await check(split(cite(2, 5), 40), [0, 1], 'provenance')).ok, true);
+  assert.equal((await check(split(cite(5, 2), 40), [0, 1], 'provenance')).ok, false, 'a reversed span split across parts');
 });
