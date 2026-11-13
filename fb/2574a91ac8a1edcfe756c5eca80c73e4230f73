@@ -1,0 +1,41 @@
+docs/portability-export.md
+  s_e94e77a77dbf94::t_5e3ca539698326 61,67,74,98,115-116
+migrations/052_portability_live_exports.sql
+  s_e94e77a77dbf94::t_9f1a9a497a2345 15-22,34-37,86-89,91-93
+packages/postgres/src/analysis-jobs.ts
+  s_e94e77a77dbf94::t_63f1b89280ed7c 773-774,776
+packages/postgres/src/portability-exports.ts
+  s_e94e77a77dbf94::t_d99f30010ca082 79-88,284,291-294,302-305,490-491,493-495,697
+scripts/migrate.mjs
+  s_e94e77a77dbf94::t_4966335d716d07 16
+docs/analysis-jobs.md
+  s_e94e77a77dbf94::t_d128a265f08746 118
+docs/portability-storage.md
+  s_e94e77a77dbf94::t_308276662d88cf 73
+scripts/grant-analysis.mjs
+  s_e94e77a77dbf94::t_ec1306566c6ee1 4,8-9,23-24
+scripts/grant-portability.mjs
+  s_e94e77a77dbf94::t_d5bc4b61478c0d 8-9,21,24
+test/integration/analysis-storage.test.js
+  s_e94e77a77dbf94::t_4c5950d91dfe2a 1005,1022-1025
+test/integration/portability-export.test.js
+  s_e94e77a77dbf94::t_3238aa509972f1 693-713,966,978-979,981,1038,1107-1109,1453,1461,1508-1512,1515-1567
+test/integration/portability-storage.test.js
+  s_e94e77a77dbf94::t_93bed12fcbedaa 765,771
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fb2574a91ac8a1edcfe756c5eca80c73e4230f73",
+  "prompts": {},
+  "sessions": {
+    "s_e94e77a77dbf94": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0518c6eb-e6c5-4492-b286-601e433913f5",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
