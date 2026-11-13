@@ -601,9 +601,9 @@ export class PortabilityExportWorker {
    * End exports past their expiry (`expired`) and those never admitted
    * (`cancelled`), one per transaction, removing their parts. A submission
    * admitting its export holds it locked, so is never cancelled under it.
-   * With `lockBound`, each waits at most the probe's lock bound.
+   * With `lockBound`, each waits at most the probe's lock bound. True once none is left.
    */
-  async expire(until: number, result: PortabilityStep, lockBound = false): Promise<void> {
+  async expire(until: number, result: PortabilityStep, lockBound = false): Promise<boolean> {
     while (Date.now() < until) {
       const ended = await inTransaction(this.pool, async db => {
         if (lockBound) await probing(db);
@@ -615,9 +615,10 @@ export class PortabilityExportWorker {
         await discard(db, pk(due));
         return due.expired ? 'expired' : 'unadmitted';
       }, { deadline: until });
-      if (!ended) return;
+      if (!ended) return true;
       result[ended]++;
     }
+    return false;
   }
 
   /**

@@ -614,8 +614,8 @@ export const lockedOut = (error: unknown) => (error as { code?: unknown } | null
  * The same step writes owner space exports (`PortabilityExportWorker`,
  * docs/portability-export.md#worker). Every step first ends expired jobs of
  * each kind, each in a slice of its own (a tenth of the budget), whichever
- * kind claims first (a pass its slice did not finish continues in its kind's
- * turn; a finished one is not repeated). It then probes each kind,
+ * kind claims first (a pass its slice did not finish gets what its kind's
+ * turn leaves after its claims; a finished one is not repeated). It then probes each kind,
  * bounded alone, for the wait of the job its claim would take next (one whose
  * row, space or collection is locked is not due). All of that ends early
  * enough to leave one turn; a kind whose probe is locked out or fails is not
@@ -660,14 +660,15 @@ export class PostgresAnalysisWorker {
     // Each kind's expiry in a slice of its own, then its due probe, bounded alone, all ending by `readyBy`, which leaves the
     // first turn one page or part and its lease release. A kind whose probe is locked out or fails (reported) is not due
     // this step; one whose expiry ran out its slice (its table locked, or much to end), or left unprobed, or whose probe is
-    // cut short, is due with its wait unknown. An expiry pass its slice did not finish continues in its kind's turn.
+    // cut short, is due with its wait unknown. An expiry pass its slice did not finish gets what its kind's turn leaves.
     const readyBy = end - TURN_MS - TAKE_MS;
     const unfinished = new Set<'analysis' | 'exports'>();
-    const ready = async (kind: 'analysis' | 'exports', expire: (until: number) => Promise<void>,
+    const finishing = (pass: Promise<boolean>) => pass.catch((error: unknown) => { if (ended(error)) return false; throw error; });
+    const ready = async (kind: 'analysis' | 'exports', expire: (until: number) => Promise<boolean>,
       waiting: (until: number) => Promise<number | null>) => {
       const until = Math.min(readyBy, Date.now() + Math.floor(budgetMs / 10));
-      await settle(kind, () => expire(until));
-      if (Date.now() >= until) { unfinished.add(kind); return Infinity; }
+      await settle(kind, async () => { if (!await finishing(expire(until))) unfinished.add(kind); });
+      if (unfinished.has(kind)) return Infinity;
       return waiting(Math.min(readyBy, Date.now() + PROBE_MS)).catch((error: unknown) => {
         if (ended(error)) return Infinity;
         if (!lockedOut(error) && !failures.has(kind)) failures.set(kind, error);
@@ -697,13 +698,13 @@ export class PostgresAnalysisWorker {
       this.#alternate = exportsFirst ? 0 : 1;
     }
     const turn = (kind: 'analysis' | 'exports', until: number) => settle(kind, async () => {
+      await (kind === 'analysis' ? this.analyse(until, result) : this.#exports.turn(until, result.exports));
+      // What the claims leave goes to an expiry pass the slice did not finish, so a removal that does not fit never takes
+      // the kind's live work; it waits at most the lock bound, so a locked table ends it.
       const own = kinds.find(entry => entry.kind === kind)!;
-      // Its unfinished expiry pass first, waiting at most the lock bound, so a locked table leaves the turn to the claims.
-      if (unfinished.has(kind)) {
-        await own.expire(until, true).catch((error: unknown) => { if (!lockedOut(error)) throw error; });
+      if (unfinished.has(kind) && Date.now() < until
+        && await finishing(own.expire(until, true)).catch((error: unknown) => { if (lockedOut(error)) return false; throw error; }))
         unfinished.delete(kind);
-      }
-      return kind === 'analysis' ? this.analyse(until, result) : this.#exports.turn(until, result.exports);
     });
     const [first, second] = due;
     if (first) await turn(first.kind, shared
@@ -758,9 +759,9 @@ export class PostgresAnalysisWorker {
 
   /**
    * End jobs past their expiry, one per transaction, removing their results; their slots are released as they end.
-   * With `lockBound`, each waits at most the probe's lock bound.
+   * With `lockBound`, each waits at most the probe's lock bound. True once none is left.
    */
-  private async expire(until: number, result: AnalysisStep, lockBound = false): Promise<void> {
+  private async expire(until: number, result: AnalysisStep, lockBound = false): Promise<boolean> {
     while (Date.now() < until) {
       const ended = await inTransaction(this.pool, async db => {
         if (lockBound) await probing(db);
@@ -771,9 +772,10 @@ export class PostgresAnalysisWorker {
         await discard(db, pk(due));
         return true;
       }, { deadline: until });
-      if (!ended) return;
+      if (!ended) return true;
       result.expired++;
     }
+    return false;
   }
 
   /**

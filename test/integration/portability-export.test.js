@@ -928,7 +928,7 @@ test('a slow due probe of either kind is cut at its bound, and the other kind st
   await finish();
 });
 
-test('each kind ends its expired jobs once per step, in its own slice, and no turn ends them again', async () => {
+test('each kind ends its expired jobs in one pass per step, in its own slice and then with what its claims leave', async () => {
   const actor = await owner();
   const spaceId = await space(actor);
   for (let i = 0; i < 4; i++)
@@ -969,6 +969,35 @@ test('each kind ends its expired jobs once per step, in its own slice, and no tu
     assert.deepEqual(await Promise.all(ended.map(async jobId => [(await portability.exportStatus(actor, expiring, jobId)).state, await partsOf(jobId)])),
       [['expired', 0], ['expired', 0]], `both expired exports ended at a ${budgetMs} ms budget`);
   }
+  // A removal that outlasts every turn gets only what the claims leave, so it never takes the kind's live work: another
+  // space's admitted export writes parts within two steps at 2 s and at 5 s, while the expired export keeps its parts.
+  const stuckSpace = await space(actor), liveSpace = await space(actor);
+  await mutate(actor, stuckSpace, 'alpha', { operation: 'create', data: { label: 'x' } });
+  const stuck = (await portability.submitExport(actor, stuckSpace)).jobId;
+  await drain();
+  await bypassing(`UPDATE portability_jobs SET created_at=created_at-interval '25 hours',expires_at=expires_at-interval '24 hours',
+    started_at=started_at-interval '25 hours',finished_at=finished_at-interval '25 hours' WHERE job_id=$1`, [stuck]);
+  for (let i = 0; i < 4; i++)
+    await mutate(actor, liveSpace, 'alpha', { operation: 'create', data: { label: `big ${i}`, body: `${'x'.repeat(700_000)}${i}` } });
+  const { jobId: live } = await portability.submitExport(actor, liveSpace);
+  const own = newPool(1);
+  own.on('connect', client => {
+    const query = client.query.bind(client);
+    client.query = async (sql, ...rest) => {
+      if (typeof sql === 'string' && /^\s*DELETE FROM portability_parts/.test(sql)) await new Promise(resolve => setTimeout(resolve, 10_000));
+      if (typeof sql === 'string' && /^\s*INSERT INTO portability_parts/.test(sql)) spin(700);
+      return query(sql, ...rest);
+    };
+  });
+  const blocked = new PostgresAnalysisWorker(own, { originConnectionLimit: 5 });
+  for (const budgetMs of [2_000, 5_000]) {
+    const before = await partsOf(live);
+    for (let i = 0; i < 2 && await partsOf(live) === before; i++) await blocked.step({ budgetMs });
+    assert.ok(await partsOf(live) > before, `the live export wrote parts at ${budgetMs} ms while another's removal is stuck`);
+  }
+  assert.ok(await partsOf(stuck) > 0, 'the expired export whose removal never fits keeps its parts');
+  await drain();
+  assert.deepEqual([await partsOf(stuck), (await portability.exportStatus(actor, liveSpace, live)).state], [0, 'completed']);
 });
 
 test('a probe stalled on a table lock leaves the other kind its window', async () => {
