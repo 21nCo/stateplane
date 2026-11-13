@@ -6,7 +6,10 @@
 -- writer runs before STA-77, so the table is empty or small when this
 -- builds. This file locks the job tables first, in a space purge's order
 -- (portability jobs, then analysis jobs), and the strongest lock it needs, so
--- it never upgrades a lock and cannot deadlock with a purge. It takes them one
+-- it never upgrades a lock and cannot deadlock with a purge (its triggers do
+-- not exist yet when the migrator applies it, once, so DROP TRIGGER IF EXISTS
+-- takes nothing beyond SHARE ROW EXCLUSIVE; only a manual re-run with the
+-- triggers present would take ACCESS EXCLUSIVE). It takes them one
 -- at a time, so it may wait for analysis_jobs while holding portability_jobs
 -- (delaying portability writers up to the lock bound), and a writer locking
 -- them the other way round can deadlock with it; the lock bound, statement

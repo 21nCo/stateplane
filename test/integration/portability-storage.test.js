@@ -210,6 +210,27 @@ test('migration 051 applies on the current schema, waiting boundedly for directo
     assert.equal(appliedAlongside.stdout, 'Applied 052_portability_live_exports.sql\n', appliedAlongside.stderr);
     assert.ok(tookMs < 4_000, `052 took ${tookMs} ms beside page and part writers`);
     assert.equal(migrate(db.upgrade).stdout, '', 'a second run applies nothing');
+    // 052's first application, its triggers absent, beside a purge holding job rows FOR UPDATE (ROW SHARE): its
+    // DROP TRIGGER IF EXISTS takes nothing stronger than SHARE ROW EXCLUSIVE, so it applies without waiting, and the
+    // purge's DELETE then proceeds with no deadlock. A lock as strong as ACCESS EXCLUSIVE would wait out the bound.
+    await upgraded.query(`DROP INDEX portability_jobs_live`);
+    await upgraded.query(`DROP TRIGGER portability_jobs_removal ON portability_jobs; DROP TRIGGER analysis_jobs_removal ON analysis_jobs`);
+    await upgraded.query(`DROP TABLE portability_removals, analysis_removals`);
+    await upgraded.query(`DELETE FROM stateplane_migrations WHERE name='052_portability_live_exports.sql'`);
+    const purged = await admit('sp_active', 'export', {}, upgraded);
+    await holder.query('BEGIN');
+    await holder.query(`SELECT set_config('stateplane.erasing_space','sp_active',true)`);
+    assert.equal((await holder.query(`SELECT job_id FROM portability_jobs WHERE space_id='sp_active' FOR UPDATE`)).rowCount, 1);
+    await holder.query(`SELECT job_id FROM analysis_jobs WHERE space_id='sp_active' FOR UPDATE`);
+    const besidePurge = Date.now();
+    const appliedBesidePurge = migrate(db.upgrade);
+    const purgeWaitMs = Date.now() - besidePurge;
+    assert.equal(appliedBesidePurge.stdout, 'Applied 052_portability_live_exports.sql\n', appliedBesidePurge.stderr);
+    assert.ok(purgeWaitMs < 4_000, `052 took ${purgeWaitMs} ms beside a purge's row locks`);
+    assert.equal((await holder.query(`DELETE FROM portability_jobs WHERE space_id='sp_active' AND job_id=$1`, [purged.job_id])).rowCount, 1);
+    await holder.query(`DELETE FROM analysis_jobs WHERE space_id='sp_active'`);
+    await holder.query('COMMIT');
+    assert.equal((await upgraded.query(`SELECT count(*)::int AS n FROM pg_trigger WHERE tgname IN ('portability_jobs_removal','analysis_jobs_removal')`)).rows[0].n, 2);
 
     const fromEmpty = migrate(db.fresh);
     assert.equal(fromEmpty.status, 0, fromEmpty.stderr);

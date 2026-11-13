@@ -36,6 +36,17 @@ test('the manifest schema accepts a well-formed version 1 manifest', () => {
   }
 });
 
+test('the pattern checks date fields by range only; ajv-formats refuses a day its month lacks', () => {
+  for (const [snapshotAt, accepted] of [['2026-02-31T01:02:03Z', false], ['2025-02-29T01:02:03Z', false],
+    ['2024-02-29T01:02:03Z', true]]) {
+    const value = manifest();
+    value.boundary.snapshotAt = snapshotAt;
+    assert.equal(valid(value), accepted, snapshotAt);
+    // Without a date-time format assertion the pattern alone accepts all three.
+    assert.ok(new RegExp(schema.$defs.rfc3339.pattern).test(snapshotAt), snapshotAt);
+  }
+});
+
 test('the manifest schema refuses a malformed manifest', () => {
   const cases = {
     'missing jobId': m => { delete m.jobId; },
