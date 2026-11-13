@@ -3,11 +3,13 @@ import { connectionOptions } from './db-connection.mjs';
 
 // Run after migration 052 or restore through a protected cell administration
 // connection. The role is supplied by the protected deployment inventory.
-// Space deletion proves erasure by reading every analysis table. Analysis
-// workers (STA-58 and later) admit and advance jobs, write result pages and
-// manifests, remove the results of cancelled, failed or expired jobs (an
-// expired one's through its removal queue, migration 052), and add,
-// take and release concurrency slots. No grant allows deleting a job or a
+// Space deletion proves erasure by reading the analysis job, page, manifest
+// and slot tables; a removal queue row (migration 052) goes with its job.
+// Analysis workers (STA-58 and later) admit and advance jobs, write result
+// pages and manifests, remove the results of cancelled, failed or expired jobs
+// in the transaction that ends them, and add, take and release concurrency
+// slots. The queue grant is for the export step arriving with STA-77, which
+// will clear expired results through the queue. No grant allows deleting a job or a
 // slot, or TRUNCATE: removal stays with the scoped purge routine, and ending a
 // job releases its slots through an owner-rights trigger.
 const url=process.env.STATEPLANE_CELL_ADMIN_URL;

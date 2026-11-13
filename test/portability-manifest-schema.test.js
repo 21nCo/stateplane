@@ -28,6 +28,12 @@ function manifest() {
 
 test('the manifest schema accepts a well-formed version 1 manifest', () => {
   assert.ok(valid(manifest()), JSON.stringify(valid.errors));
+  // snapshotAt accepts what its description states: T or t, Z or z, or a +HH:MM or -HH:MM offset.
+  for (const snapshotAt of ['2026-11-13t01:02:03.123456z', '2026-11-13T01:02:03-05:00', '2026-11-13T01:02:03+05:30']) {
+    const value = manifest();
+    value.boundary.snapshotAt = snapshotAt;
+    assert.ok(valid(value), `${snapshotAt}: ${JSON.stringify(valid.errors)}`);
+  }
 });
 
 test('the manifest schema refuses a malformed manifest', () => {

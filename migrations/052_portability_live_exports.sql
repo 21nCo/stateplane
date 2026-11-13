@@ -1,13 +1,16 @@
--- STA-70: the jobs Worker's export step reads only live export jobs (queued,
+-- STA-70: the jobs Worker's export step (with STA-77) reads only live export jobs (queued,
 -- running, or completed and not yet expired) in its due probe, claim and
 -- expiry pass, while ended jobs stay until their space is erased (migration
 -- 051). Live exports are bounded per space (docs/portability-export.md#budgets),
 -- so this partial index keeps those reads off the retained history. No export
--- writer runs before this slice, so the table is empty or small when this
+-- writer runs before STA-77, so the table is empty or small when this
 -- builds. This file locks the job tables first, in a space purge's order
 -- (portability jobs, then analysis jobs), and the strongest lock it needs, so
--- it never waits for one while holding the other; the migrator bounds that
--- wait and every statement (docs/portability-export.md#migration-052).
+-- it never upgrades a lock and cannot deadlock with a purge. It takes them one
+-- at a time, so it may wait for analysis_jobs while holding portability_jobs
+-- (delaying portability writers up to the lock bound), and a writer locking
+-- them the other way round can deadlock with it; the lock bound, statement
+-- bound or deadlock rolls the step back (docs/portability-export.md#migration-052).
 LOCK TABLE portability_jobs, analysis_jobs IN SHARE ROW EXCLUSIVE MODE;
 CREATE INDEX IF NOT EXISTS portability_jobs_live ON portability_jobs(leased_until)
   WHERE kind = 'export' AND state IN ('queued', 'running', 'completed');
@@ -25,6 +28,7 @@ CREATE INDEX IF NOT EXISTS portability_jobs_queued ON portability_jobs(created_a
 CREATE INDEX IF NOT EXISTS portability_jobs_live_space ON portability_jobs(space_id)
   WHERE kind = 'export' AND state IN ('queued', 'running', 'completed');
 
+-- The batch removal, the step and submission's count below arrive with STA-77.
 -- An ended job's result (an export's parts, an analysis job's pages) is
 -- removed in committed batches, highest first, after the transaction that
 -- ends the job. A job still holding rows waits for that in a removal queue,
@@ -34,7 +38,7 @@ CREATE INDEX IF NOT EXISTS portability_jobs_live_space ON portability_jobs(space
 -- space's exports there as held. A trigger queues the job at the commit of
 -- the transaction that ends it, whichever path ends it, if it still holds
 -- rows then (an analysis job's cancellation or failure removes its pages in
--- that transaction, so it is never queued); the last batch removes it
+-- that transaction, so it is never queued, as its expiry does before STA-77); the last batch removes it
 -- from the queue, and a space purge removes it with its job. No ended job
 -- holds rows before this slice (they went with the transaction that ended
 -- them), so nothing is backfilled.
@@ -93,7 +97,7 @@ CREATE CONSTRAINT TRIGGER analysis_jobs_removal AFTER UPDATE OF state ON analysi
   FOR EACH ROW WHEN (NEW.state IN ('cancelled', 'failed', 'expired') AND OLD.state NOT IN ('cancelled', 'failed', 'expired'))
   EXECUTE FUNCTION stateplane_queue_removal();
 
--- The same step's turn order (docs/portability-export.md#worker): when a step
+-- The same step's turn order (with STA-77, docs/portability-export.md#worker): when a step
 -- has room for one turn only, the kind this row names goes first and the step
 -- names the other, so analysis jobs and exports alternate across steps,
 -- whichever worker (a new one each tick) runs them.

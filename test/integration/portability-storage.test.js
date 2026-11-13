@@ -214,7 +214,7 @@ test('migration 051 applies on the current schema, waiting boundedly for directo
     const fromEmpty = migrate(db.fresh);
     assert.equal(fromEmpty.status, 0, fromEmpty.stderr);
     assert.match(fromEmpty.stdout, /Applied 051_portability_erasure_ledger\.sql\nApplied 052_portability_live_exports\.sql\n$/);
-    // 052's turn record: one row naming analysis first, kept once by a reapplied 052, and never a second.
+    // 052's turn record: one row naming analysis first, and never a second.
     for (const client of [upgraded, fresh]) {
       assert.deepEqual((await client.query('SELECT singleton,exports_next FROM snapshot_step_turn')).rows,
         [{ singleton: true, exports_next: false }]);
