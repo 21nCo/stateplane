@@ -1002,7 +1002,7 @@ test('a nonowner cell role runs jobs and proves erasure only with the analysis g
     // A pre-049 cell role: every other table and the purge routine, nothing on the analysis tables, and the hardened
     // runbook's revocation of PUBLIC routine execution.
     await pool.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${role}`);
-    await pool.query(`REVOKE ALL ON ${analysis.join(',')} FROM ${role}`);
+    await pool.query(`REVOKE ALL ON ${analysis.join(',')},analysis_removals FROM ${role}`);
     await pool.query(`GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO ${role}`);
     await pool.query('REVOKE EXECUTE ON ALL ROUTINES IN SCHEMA public FROM PUBLIC');
     await pool.query(`GRANT EXECUTE ON FUNCTION stateplane_purge_space(text) TO ${role}`);
@@ -1019,6 +1019,10 @@ test('a nonowner cell role runs jobs and proves erasure only with the analysis g
       .map(({ t, ...row }) => [t, Object.entries(row).filter(([, granted]) => granted).map(([privilege]) => privilege).join('')]));
     assert.deepEqual(privileges, { analysis_jobs: 'riu', analysis_result_pages: 'rid', analysis_result_manifests: 'rid',
       analysis_space_slots: 'riu', analysis_cell_slots: 'riu' });
+    // The expired-result removal queue (migration 052) is the analysis grant's too, so analysis cleanup needs no other.
+    assert.deepEqual((await pool.query(`SELECT has_table_privilege($1,'analysis_removals','SELECT') AS r,
+      has_table_privilege($1,'analysis_removals','UPDATE') AS u,has_table_privilege($1,'analysis_removals','DELETE') AS d,
+      has_table_privilege($1,'analysis_removals','INSERT') AS i`, [role])).rows[0], { r: true, u: true, d: true, i: false });
     // The role admits, runs and completes a job, takes and releases slots, and cannot delete a job; the checked digests need
     // no routine grant.
     await asRole(async db => {
