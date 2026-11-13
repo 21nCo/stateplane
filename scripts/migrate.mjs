@@ -275,9 +275,13 @@ try {
         throw new Error('Portability and erasure ledger upgrade waits for space directory, space and credential writers and space purges; retry when long transactions finish', { cause:error });
       // 052 locks portability_jobs, then analysis_jobs, as space purges do, which analysis (and, with STA-77, export)
       // submissions, cancellations and workers write; a writer holding them the other way round can deadlock with it.
-      if (name === '052_portability_live_exports.sql' && ['55P03', '40P01', '57014'].includes(error?.code))
-        throw new Error(`Live export upgrade waits for export and analysis job writers and space purges${/statement timeout/.test(error.message ?? '')
-          ? ` and ran past its ${MIGRATION_052_STATEMENT_MS / 1000} s statement bound` : ''}; it was rolled back, so retry when long transactions finish`, { cause:error });
+      if (name === '052_portability_live_exports.sql' && (error?.code === '55P03' || error?.code === '40P01'))
+        throw new Error('Live export upgrade waits for export and analysis job writers and space purges; it was rolled back, so retry when long transactions finish', { cause:error });
+      // As for 048 below: only PostgreSQL's statement timeout message names the bound; any other 57014 is a cancellation.
+      if (name === '052_portability_live_exports.sql' && error?.code === '57014')
+        throw new Error(/statement timeout/.test(error.message ?? '')
+          ? `Live export upgrade ran past its ${MIGRATION_052_STATEMENT_MS / 1000} s statement bound and was rolled back; retry`
+          : 'Live export upgrade was cancelled and rolled back; retry', { cause:error });
       // 57014 is also an explicit or infrastructure cancellation; only PostgreSQL's statement timeout message names the bound.
       if (name === '048_projection_rebuilds.sql' && error?.code === '57014')
         throw new Error(/statement timeout/.test(error.message ?? '')

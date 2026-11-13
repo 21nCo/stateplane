@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { memoryAdapter } from '@superfunctions/db/testing';
@@ -200,6 +200,31 @@ test('migration 051 applies on the current schema, waiting boundedly for directo
         (SELECT count(*)::int FROM stateplane_migrations WHERE name='052_portability_live_exports.sql') AS recorded`)).rows[0],
       { live: null, removals: null, recorded: 0 }, table);
     }
+    // 052 cancelled from outside while it waits (an operator's pg_cancel_backend) is reported as a cancellation, not
+    // as a writer wait or its statement bound, and rolls back whole.
+    await holder.query('BEGIN');
+    await holder.query('LOCK TABLE portability_jobs IN ROW EXCLUSIVE MODE');
+    const cancelling = new Promise(resolve => {
+      const child = spawn(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: urlFor(db.upgrade) } });
+      let stderr = '';
+      child.stderr.on('data', chunk => { stderr += chunk; });
+      child.on('close', status => resolve({ status, stderr }));
+    });
+    const waiting = `SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '-- STA-70: the jobs Worker''s export step%'`;
+    for (let attempt = 0; (await upgraded.query(waiting)).rowCount === 0; attempt += 1) {
+      assert.ok(attempt < 400, '052 never waited for portability_jobs');
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal((await upgraded.query(`SELECT pg_cancel_backend(pid) AS cancelled FROM (${waiting}) w`)).rows[0].cancelled, true);
+    const cancelled = await cancelling;
+    await holder.query('ROLLBACK');
+    assert.equal(cancelled.status, 1);
+    assert.match(cancelled.stderr, /^Live export upgrade was cancelled and rolled back; retry/);
+    assert.doesNotMatch(cancelled.stderr.split('\n')[0], /writers|purges|statement bound/);
+    assert.deepEqual((await upgraded.query(`SELECT to_regclass('public.portability_jobs_live') AS live,
+      to_regclass('public.analysis_removals') AS removals,
+      (SELECT count(*)::int FROM stateplane_migrations WHERE name='052_portability_live_exports.sql') AS recorded`)).rows[0],
+    { live: null, removals: null, recorded: 0 });
     // An analysis page or export part writer in flight never waits for 052, which builds nothing over their tables.
     await holder.query('BEGIN');
     await holder.query('LOCK TABLE analysis_result_pages, portability_parts IN ROW EXCLUSIVE MODE');
