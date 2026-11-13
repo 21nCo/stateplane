@@ -761,8 +761,6 @@ test('a slow due probe of either kind is cut at its bound, and the other kind st
   const spaceId = await space(actor);
   for (let i = 0; i < 4; i++)
     await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: `big ${i}`, body: `${'x'.repeat(700_000)}${i}` } });
-  const analysisJob = await services.analysis.submit(actor, spaceId, 'alpha', 'export');
-  const { jobId } = await portability.submitExport(actor, spaceId);
   /** A jobs Worker whose statements matching each pattern wait its milliseconds first, holding no lock, or fail. */
   const delaying = delays => {
     const own = newPool(1);
@@ -771,7 +769,8 @@ test('a slow due probe of either kind is cut at its bound, and the other kind st
       client.query = async (sql, ...rest) => {
         for (const [pattern, ms] of delays) if (typeof sql === 'string' && pattern.test(sql.trim())) {
           if (ms === 'fail') throw Object.assign(new Error('the probe failed'), { code: 'XX000' });
-          await new Promise(resolve => setTimeout(resolve, ms));
+          if (ms === 'spin') spin(700);
+          else await new Promise(resolve => setTimeout(resolve, ms));
         }
         return query(sql, ...rest);
       };
@@ -783,10 +782,26 @@ test('a slow due probe of either kind is cut at its bound, and the other kind st
   const exportExpiry = /ORDER BY least\(j\.expires_at,j\.created_at\) LIMIT 1 FOR UPDATE SKIP LOCKED/;
   const progress = async () => (await pool.query(`SELECT (SELECT count(*) FROM analysis_result_pages WHERE space_id=$1)
     +(SELECT count(*) FROM portability_parts WHERE space_id=$1) AS n`, [spaceId])).rows[0].n;
+  // Run every job here to its end, none lost or failed; completed exports then end as their expiry would, so the space
+  // keeps taking exports.
+  const finish = async () => {
+    await drain();
+    for (let i = 0; i < 40 && (await pool.query(`SELECT 1 FROM analysis_jobs WHERE space_id=$1 AND state IN ('queued','running')`,
+      [spaceId])).rowCount; i++) await worker().step({ budgetMs: 5_000 });
+    const unfinished = await pool.query(`SELECT job_id,state FROM analysis_jobs WHERE space_id=$1 AND state<>'completed'
+      UNION ALL SELECT job_id,state FROM portability_jobs WHERE space_id=$1 AND state NOT IN ('completed','expired')`, [spaceId]);
+    assert.deepEqual(unfinished.rows, [], 'every job of both kinds completes in later steps');
+    await bypassing(`UPDATE portability_jobs SET state='expired' WHERE space_id=$1 AND state='completed'`, [spaceId]);
+  };
+  const freshAnalysis = () => services.analysis.submit(actor, spaceId, 'alpha', 'export');
+  const freshExport = () => portability.submitExport(actor, spaceId);
   // Each probe in turn waits 1.5 s; then the export's expiry nearly fills its slice and its probe is slow, while the
-  // analysis probe takes 60 ms: the preparation still leaves analysis its page.
+  // analysis probe takes 60 ms: the preparation still leaves analysis its page. Each case starts with work of both kinds.
   for (const [delays, others] of [[[[exportProbe, 1_500]], 'analysis'], [[[analysisProbe, 1_500]], 'exports'],
     [[[analysisProbe, 60], [exportExpiry, 190], [exportProbe, 1_500]], 'analysis']]) {
+    await finish();
+    await freshAnalysis();
+    await freshExport();
     const started = Date.now();
     const step = await delaying(delays).step({ budgetMs: 2_000 });
     assert.ok(Date.now() - started < 2_500, `the step took ${Date.now() - started} ms`);
@@ -795,20 +810,25 @@ test('a slow due probe of either kind is cut at its bound, and the other kind st
   }
   // A probe that fails (not cut short, not locked out) is reported, and the other kind, given fresh work, still runs in
   // that step.
-  await drain();
-  for (const [probe, fresh] of [[exportProbe, () => services.analysis.submit(actor, spaceId, 'alpha', 'export')],
-    [analysisProbe, () => portability.submitExport(actor, spaceId)]]) {
+  for (const [probe, fresh] of [[exportProbe, freshAnalysis], [analysisProbe, freshExport]]) {
+    await finish();
     await fresh();
     const before = await progress();
     await assert.rejects(delaying([[probe, 'fail']]).step({ budgetMs: 2_000 }), /the probe failed/);
     assert.ok(await progress() > before, 'the other kind advanced in the step that reported the failure');
   }
-  // Neither kind is lost: both finish in later steps.
+  // At the 5 s budget, preparation that succeeds within its bounds yet takes over 500 ms (each expiry pass 80 ms, each
+  // probe 180 ms) still leaves the export, which waited longer, room for a part in its share ahead of backlogged analysis.
+  await finish();
+  const older = await freshExport();
+  await freshAnalysis();
+  const prepared = delaying([[exportExpiry, 80], [/ORDER BY expires_at LIMIT 1 FOR UPDATE SKIP LOCKED/, 80], [exportProbe, 180],
+    [analysisProbe, 180], [/^INSERT INTO (portability_parts|analysis_result_pages|analysis_result_manifests)/, 'spin']]);
+  const shared = await prepared.step({ budgetMs: 5_000 });
+  assert.ok(shared.exports.parts > 0 && shared.pages > 0, `both kinds wrote in a 5 s step after slow preparation: ${JSON.stringify(shared)}`);
   await drain();
-  for (let i = 0; i < 20 && (await services.analysis.status(actor, spaceId, 'alpha', analysisJob.jobId)).state !== 'completed'; i++)
-    await worker().step({ budgetMs: 5_000 });
-  assert.equal((await services.analysis.status(actor, spaceId, 'alpha', analysisJob.jobId)).state, 'completed');
-  assert.equal((await portability.exportStatus(actor, spaceId, jobId)).state, 'completed');
+  assert.equal((await portability.exportStatus(actor, spaceId, older.jobId)).state, 'completed');
+  await finish();
 });
 
 test('a probe stalled on a table lock leaves the other kind its window', async () => {

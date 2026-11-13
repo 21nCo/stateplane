@@ -614,9 +614,10 @@ export const lockedOut = (error: unknown) => (error as { code?: unknown } | null
  * one page or part with its lease release; a kind left unprobed, cut short or
  * failed is due with its wait unknown, after the other. A kind due alone
  * takes the whole budget. With both due, the kind waiting longer goes first:
- * at a budget of 5 s or more it stops at its share (analysis three fifths,
- * exports two fifths, each at least 2 s) and gets back what the other leaves
- * unused; below that it takes the whole budget and the other what is left.
+ * at a budget of 5 s or more it stops at its share of the time preparation
+ * left (analysis three fifths, exports two fifths, never less than one page
+ * or part) and gets back what the other leaves unused; below that it takes
+ * the whole budget and the other what is left.
  * Every turn moves its job's wait to now, so the other kind goes first next,
  * and neither starves at any budget. A failure of either kind, a failed probe
  * included, never stops the other: the step throws it once both have run.
@@ -667,7 +668,12 @@ export class PostgresAnalysisWorker {
     const shared = due.length === 2 && Math.floor(budgetMs * 2 / 5) >= MIN_STEP_MS;
     const turn = (kind: 'analysis' | 'exports', until: number) =>
       settle(kind, () => kind === 'analysis' ? this.analyse(until, budgetMs, result) : this.#exports.step(until, result.exports));
-    for (const [index, { kind, share }] of due.entries()) await turn(kind, shared && index === 0 ? end - Math.floor(budgetMs * (5 - share) / 5) : end);
+    for (const [index, { kind, share }] of due.entries()) {
+      // The first of two shares what preparation left, keeping room for one page or part whatever preparation cost.
+      const left = end - Date.now();
+      await turn(kind, shared && index === 0
+        ? Math.min(end, Date.now() + Math.max(MIN_PAGE_MS + RELEASE_MS + PREPARE_SLACK_MS, Math.floor(left * share / 5))) : end);
+    }
     // What the second kind left unused (nothing it could run, or a failure) goes back to the first.
     if (shared && end - RELEASE_MS - Date.now() >= MIN_PAGE_MS) await turn(due[0].kind, end);
     if (failures.size > 1) throw new AggregateError([...failures.values()], 'The analysis and export steps failed');
