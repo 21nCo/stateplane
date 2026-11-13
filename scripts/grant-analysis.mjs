@@ -8,10 +8,11 @@ import { connectionOptions } from './db-connection.mjs';
 // Analysis workers (STA-58 and later) admit and advance jobs, write result
 // pages and manifests, remove the results of cancelled, failed or expired jobs
 // in the transaction that ends them, and add, take and release concurrency
-// slots. The queue grant is for the export step arriving with STA-77, which
-// will clear expired results through the queue. No grant allows deleting a job or a
-// slot, or TRUNCATE: removal stays with the scoped purge routine, and ending a
-// job releases its slots through an owner-rights trigger.
+// slots. The queue grant is for the shared jobs Worker snapshot step's analysis
+// expiry pass, arriving with STA-77, which will clear expired results through
+// the queue. No grant allows deleting a job or a slot, or TRUNCATE: removal
+// stays with the scoped purge routine, and ending a job releases its slots
+// through an owner-rights trigger.
 const url=process.env.STATEPLANE_CELL_ADMIN_URL;
 const role=process.env.STATEPLANE_CELL_ROLE;
 if (!url || !role || !/^(?!pg_)[a-z][a-z0-9_]{0,62}$/.test(role))
