@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://stateplane.dev/contracts/portability-manifest/1.schema.json",
   "title": "Stateplane space export, format version 1",
-  "description": "The manifest of a space export (its last part) and, under $defs, one NDJSON line of each section. Every object is closed: a field not listed here is not part of format version 1, so secret credential material, session tokens and storage object keys cannot appear in a valid export. docs/portability-export.md states the format's rules.",
+  "description": "The manifest of a space export (its last part) and, under $defs, one NDJSON line of each section. The format's own objects (the manifest and each section line's envelope) are closed (additionalProperties false): a member not listed here is not part of format version 1. The canonical JSON members ($defs/json: records and revisions data, schema definitions, extraction sourceOffsets) and the free-text members hold user content as stored, which this schema does not inspect. Credential secrets, session tokens and storage object keys stay out because the exporter never reads them, not because of this schema. docs/portability-export.md states the format's rules.",
   "type": "object",
   "additionalProperties": false,
   "required": ["format", "formatVersion", "jobId", "space", "boundary", "sections", "parts", "excluded"],

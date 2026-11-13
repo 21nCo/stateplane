@@ -51,3 +51,13 @@ test('the manifest schema refuses a malformed manifest', () => {
     assert.equal(valid(value), false, name);
   }
 });
+
+test('a section line envelope is closed while its canonical JSON data is not inspected', () => {
+  const record = ajv.getSchema(`${schema.$id}#/$defs/records`);
+  const line = () => ({ collectionId: 'col_1', id: 'rec_1', keyMode: 'generated', key: 'rec_1', revision: 1,
+    schemaVersion: 1, data: { sessionToken: 'user content as stored' } });
+  assert.ok(record(line()), JSON.stringify(record.errors));
+  const extra = line();
+  extra.sessionToken = 'x';
+  assert.equal(record(extra), false);
+});
