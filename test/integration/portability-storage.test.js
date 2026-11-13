@@ -169,7 +169,7 @@ test('migration 051 applies on the current schema, waiting boundedly for directo
 
     const applied = migrate(db.upgrade);
     assert.equal(applied.status, 0, applied.stderr);
-    assert.equal(applied.stdout, 'Applied 051_portability_erasure_ledger.sql\n');
+    assert.equal(applied.stdout, 'Applied 051_portability_erasure_ledger.sql\nApplied 052_portability_live_exports.sql\n');
     // Archived and deleted spaces take their last publication time; the others have no stamp.
     const stamps = (await upgraded.query(`SELECT space_id,(archived_at AT TIME ZONE 'UTC')::text AS archived,
       (tombstoned_at AT TIME ZONE 'UTC')::text AS tombstoned,hard_erased_at AS erased FROM space_directory ORDER BY space_id`)).rows;
@@ -184,7 +184,7 @@ test('migration 051 applies on the current schema, waiting boundedly for directo
 
     const fromEmpty = migrate(db.fresh);
     assert.equal(fromEmpty.status, 0, fromEmpty.stderr);
-    assert.match(fromEmpty.stdout, /Applied 051_portability_erasure_ledger\.sql\n$/);
+    assert.match(fromEmpty.stdout, /Applied 051_portability_erasure_ledger\.sql\nApplied 052_portability_live_exports\.sql\n$/);
     const schema = async client => ({
       constraints: (await client.query(`SELECT conrelid::regclass::text AS relation,conname,pg_get_constraintdef(oid) AS definition
         FROM pg_constraint WHERE connamespace='public'::regnamespace ORDER BY relation,conname`)).rows,

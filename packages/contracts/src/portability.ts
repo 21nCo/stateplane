@@ -24,7 +24,7 @@ export const acceleratorSections = Object.freeze(['embeddings'] as const);
 export interface ExportManifestPart { number: number; section: string; rows: number; bytes: number; sha256: string }
 export interface ExportManifest {
   format: typeof portabilityFormat;
-  formatVersion: number;
+  formatVersion: typeof portabilityFormatVersion;
   jobId: string;
   space: { spaceId: string; ownerPrincipalId: string; policyVersion: number; placementGeneration: number };
   /**
@@ -48,23 +48,20 @@ const JOB_ID = /^exp_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 const SECTION_NAME = /^[a-z][a-z0-9_]{0,62}$/;
 // RFC 3339 date-time, as the schema's `format: date-time` and its pattern name it: a calendar date, `T`, a time of day and
 // a `Z` or `+HH:MM` offset (no space separator, no `+HHMM` or `+HH` offset).
-const INSTANT = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|([+-])(\d{2}):(\d{2}))$/i;
+const INSTANT = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/i;
 const DAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 /**
- * RFC 3339 section 5.7: the day exists in its month and year, the hour, minute and offset are in range, and a second
- * of 60 is only a leap second, 23:59:60 UTC.
+ * RFC 3339 section 5.7 without leap seconds: the day exists in its month and year, and the hour, minute, second and
+ * offset are in range. Format version 1 never carries a second of 60: its instants are database clock readings, and
+ * the database's clock has no leap second, so a manifest with one was not written by an exporter.
  */
 function isInstant(value: unknown): boolean {
   const match = typeof value === 'string' ? INSTANT.exec(value) : null;
   if (!match) return false;
-  const [year, month, day, hour, minute, second, , offsetHour, offsetMinute] = match.slice(1).map(part => Number(part ?? 0));
+  const [year, month, day, hour, minute, second, offsetHour, offsetMinute] = match.slice(1).map(part => Number(part ?? 0));
   const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
   if (month < 1 || month > 12 || day < 1 || day > (month === 2 && leap ? 29 : DAYS[month - 1])) return false;
-  if (offsetHour > 23 || offsetMinute > 59 || hour > 23 || minute > 59) return false;
-  if (second <= 59) return true;
-  const sign = match[7] === '-' ? -1 : 1, utcMinute = minute - offsetMinute * sign;
-  const utcHour = hour - offsetHour * sign - (utcMinute < 0 ? 1 : 0);
-  return second === 60 && (utcHour === 23 || utcHour === -1) && (utcMinute === 59 || utcMinute === -1);
+  return hour <= 23 && minute <= 59 && second <= 59 && offsetHour <= 23 && offsetMinute <= 59;
 }
 /** The manifest schema's limits: 11 evidence sections and at most 1 accelerator; 4,095 data parts of 1 to 1 MiB. */
 const MAX_DATA_PARTS = 4_095;
@@ -77,7 +74,7 @@ const isId = (value: unknown): value is string => typeof value === 'string' && v
 const closed = (value: unknown, names: readonly string[]): value is Record<string, unknown> => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const members = Object.keys(value);
-  return members.length === names.length && names.every(name => Object.prototype.hasOwnProperty.call(value, name));
+  return members.length === names.length && names.every(name => Object.hasOwn(value, name));
 };
 
 /** The lowercase hex SHA-256 of `content`'s UTF-8 bytes. */
@@ -143,11 +140,36 @@ function malformed(value: unknown): string | null {
 }
 
 /**
+ * The reason the data parts do not hold the rows `manifest` lists, or null:
+ * each part's lines ending in it are its `rows`, each section's last part
+ * ends its last line, and every row satisfies the rule of its section no JSON
+ * Schema can state (a provenance span starts at or before its end).
+ */
+function unlisted(manifest: ExportManifest, parts: readonly string[]): string | null {
+  const provenance: string[] = [];
+  for (const [i, listed] of manifest.parts.entries()) {
+    const content = parts[i];
+    if ((content.match(/\n/g)?.length ?? 0) !== listed.rows) return `part ${listed.number} does not hold ${listed.rows} rows`;
+    if (manifest.parts[i + 1]?.section !== listed.section && !content.endsWith('\n'))
+      return `section ${listed.section} ends with an unfinished line`;
+    if (listed.section === 'provenance') provenance.push(content);
+  }
+  for (const line of provenance.join('').split('\n').slice(0, -1)) {
+    let source: { startOffset?: unknown; endOffset?: unknown } | undefined;
+    try { source = (JSON.parse(line) as { source?: typeof source }).source; } catch { return 'a provenance row is not JSON'; }
+    if (typeof source?.startOffset === 'number' && typeof source.endOffset === 'number' && source.startOffset > source.endOffset)
+      return 'a provenance span starts after its end';
+  }
+  return null;
+}
+
+/**
  * Verify an export manifest against its SHA-256 digest (the job states it;
  * the manifest is the export's last part) and, when given, every data part
- * (`parts[i]` the content of part i + 1) against the size and digest the
- * manifest lists. Any changed byte of the manifest, or of a part it lists,
+ * (`parts[i]` the content of part i + 1) against the size, digest and rows
+ * the manifest lists. Any changed byte of the manifest, or of a part it lists,
  * fails verification; a manifest with no digest to check is never trusted.
+ * Without the parts, only the manifest itself is verified.
  */
 export async function verifyExportManifest(manifestText: string, expectedSha256: string,
   parts?: readonly string[]): Promise<ManifestVerification> {
@@ -166,6 +188,8 @@ export async function verifyExportManifest(manifestText: string, expectedSha256:
       if (typeof content !== 'string' || encoder.encode(content).byteLength !== listed.bytes || await sha256Hex(content) !== listed.sha256)
         return { ok: false, reason: `part ${listed.number} does not match the manifest` };
     }
+    const rows = unlisted(sealed, parts);
+    if (rows) return { ok: false, reason: rows };
   }
   return { ok: true, manifest: sealed };
 }

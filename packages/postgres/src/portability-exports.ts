@@ -3,7 +3,7 @@ import { exportSections, portabilityFormat, portabilityFormatVersion } from '@st
 import type { ExportManifest, VerifiedCredential } from '@stateplane/contracts';
 import { AuthorityError } from './index.js';
 import type { AuthorityScope } from './index.js';
-import { finalCheck, probing, publish, released } from './analysis-jobs.js';
+import { finalCheck, lockedOut, probing, publish, released } from './analysis-jobs.js';
 import type { Deadline } from './analysis-jobs.js';
 import { DeadlineExceededError, inTransaction } from './faults.js';
 import type { PoolLike, Session } from './faults.js';
@@ -16,15 +16,16 @@ import type { PostgresSpaces } from './spaces.js';
  * per export, 1 GiB of parts, 4,096 parts (the manifest included, so its part
  * list stays far inside one 1 MiB part), 3,600,000 ms of step time and a 24 h
  * lifetime, completed result included; at most 2 unfinished exports per
- * space; parts of at most 1 MiB (migration 051's bound) read 1,000 rows at a
- * time; a 30 s lease extended by every part; pending record events published
- * at submission in rounds of 5,000, at most 20; 30 s for a submission's
- * final credential check to admit its queued export, after which a worker
- * cancels it unrun.
+ * space, and at most 4 held (unfinished, or completed and unexpired), so a
+ * space holds at most 4 GiB of export parts; parts of at most 1 MiB
+ * (migration 051's bound) read 1,000 rows at a time; a 30 s lease extended by
+ * every part; pending record events published at submission in rounds of
+ * 5,000, at most 20; 30 s for a submission to admit its queued export once
+ * its final credential check is released, after which a worker cancels it unrun.
  */
 export const portabilityExportBounds = Object.freeze({ budgetBytes: 1_073_741_824, maxParts: 4_096, budgetRuntimeMs: 3_600_000,
-  lifetimeMs: 86_400_000, activePerSpace: 2, partBytes: 1_048_576, readRows: 1_000, leaseMs: 30_000, publishBatch: 5_000,
-  publishRounds: 20, admissionMs: 30_000 });
+  lifetimeMs: 86_400_000, activePerSpace: 2, heldPerSpace: 4, partBytes: 1_048_576, readRows: 1_000, leaseMs: 30_000,
+  publishBatch: 5_000, publishRounds: 20, admissionMs: 30_000 });
 
 export type PortabilityJobState = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'expired';
 /** The state a space export is read at: records as of the watermark, everything else as of the snapshot instant. */
@@ -61,8 +62,9 @@ type Row = Record<string, any>;
 const JOB_ID = /^exp_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const UNFINISHED = `('queued','running')`;
 /**
- * Admission. Submission inserts an export `queued` and, once its final
- * credential check passes, admits it in the same transaction as that check:
+ * Admission. Submission inserts an export `queued`, makes its final credential
+ * check in a transaction of its own and, only once that check's COMMIT is
+ * acknowledged with the access it relied on unexpired, admits it in a third:
  * `running` with no attempt yet and a lease that has already ended, so it is
  * due at once. Workers claim only admitted exports; a queued export is never
  * run. One still queued once `admissionMs` has passed was never admitted (its
@@ -240,7 +242,7 @@ async function read(db: Session, job: Row, section: Section, cursor: unknown[] |
   });
   const limit = `$${params.push(portabilityExportBounds.readRows)}`, budget = `$${params.push(bytes)}`;
   return (await db.query(`SELECT * FROM (SELECT x.*,sum(COALESCE(x.size,0)) OVER (ORDER BY ${keys}) AS running
-      FROM (${sql.replace(/\$2(?!\d)/g, '$2::timestamptz')} LIMIT ${limit}) x) y
+      FROM (${sql.replace(/\$2(?!\d)/g, () => '$2::timestamptz')} LIMIT ${limit}) x) y
     WHERE y.running-COALESCE(y.size,0)<${budget} AND $2::timestamptz IS NOT NULL AND $3::bigint IS NOT NULL
     ORDER BY ${keys}`, params)).rows;
 }
@@ -331,8 +333,10 @@ export class PostgresPortabilityExports {
   /**
    * Export the space as of a boundary pinned now. Writes to the space wait
    * while the boundary is pinned (a busy space is retryable BACKPRESSURE); a
-   * space with 2 unfinished exports, or more unpublished record events than
-   * 20 rounds publish, is refused with retryable BACKPRESSURE.
+   * space with 2 unfinished or 4 held exports, or more unpublished record
+   * events than 20 rounds publish, is refused with retryable BACKPRESSURE. A
+   * submission whose admission was not acknowledged once its authorization was
+   * released throws `ExportAdmissionUnconfirmed` (`RECEIPT_PENDING`), whose `jobId` names the export.
    */
   async submit(actor: VerifiedCredential, spaceId: string): Promise<PortabilityExportStatus> {
     const admitted = await this.owner(actor, spaceId);
@@ -345,10 +349,13 @@ export class PostgresPortabilityExports {
           policy: scope.policyVersion }, 'FOR NO KEY UPDATE');
         if (refused && refused !== 'NOT_FOUND' && refused !== 'SPACE_UNAVAILABLE') throw new AuthorityError('FORBIDDEN', 'Policy or placement changed');
         if (refused) throw new AuthorityError(refused);
-        const active = (await db.query(`SELECT count(*)::int AS n FROM portability_jobs j WHERE j.space_id=$1 AND j.kind='export'
-          AND j.state IN ${UNFINISHED} AND j.expires_at>clock_timestamp() AND NOT ${UNADMITTED}`, [spaceId])).rows[0].n;
-        if (active >= portabilityExportBounds.activePerSpace)
-          throw new AuthorityError('BACKPRESSURE', `The space has ${active} unfinished exports; retry later`, undefined, true);
+        // Held: unfinished, or completed and unexpired, so its parts are still stored. One never admitted holds nothing.
+        const { active, held } = (await db.query(`SELECT count(*) FILTER (WHERE j.state IN ${UNFINISHED})::int AS active,
+            count(*)::int AS held FROM portability_jobs j WHERE j.space_id=$1 AND j.kind='export' AND j.expires_at>clock_timestamp()
+            AND (j.state='completed' OR (j.state IN ${UNFINISHED} AND NOT ${UNADMITTED}))`, [spaceId])).rows[0];
+        if (active >= portabilityExportBounds.activePerSpace || held >= portabilityExportBounds.heldPerSpace)
+          throw new AuthorityError('BACKPRESSURE', `The space holds ${active} unfinished and ${held - active} completed exports; retry later`,
+            undefined, true);
         const collections = (await db.query('SELECT collection_id FROM collections WHERE space_id=$1 ORDER BY collection_id',
           [spaceId])).rows.map(row => row.collection_id as string);
         let left = portabilityExportBounds.publishBatch;
@@ -371,35 +378,38 @@ export class PostgresPortabilityExports {
       });
       if (!submitted) continue;
       // The final credential check runs after the hold is released, so writers never wait on the provider. The export
-      // is admitted in the check's own transaction (locked meanwhile, so no worker cancels it), so a refused or
-      // interrupted check leaves it queued, which no worker runs; a refused owner's export is cancelled here at once.
+      // stays queued, which no worker runs, until the check's COMMIT is acknowledged with its access unexpired; a
+      // refused or lapsed check cancels it here, before it could ever run.
+      try { released(await transact(pool, async db => ({ value: null, deadline: await this.recheck(db, actor, admitted) }))); }
+      catch (error) { throw await this.refusal(pool, spaceId, submitted.jobId, error); }
+      let admission: { rowCount: number | null };
       try {
-        return released(await transact(pool, async db => {
-          const admission = await db.query(`UPDATE portability_jobs j SET state='running',lease_id=$3,leased_until=clock_timestamp()
-            WHERE j.space_id=$1 AND j.job_id=$2 AND NOT ${UNADMITTED} AND j.state='queued' RETURNING j.job_id`,
-          [spaceId, submitted.jobId, randomUUID()]);
-          if (!admission.rowCount) throw new AuthorityError('BACKPRESSURE', 'The export was not admitted in time; submit again', undefined, true);
-          return { value: submitted, deadline: await this.recheck(db, actor, admitted) };
-        }));
+        admission = await transact(pool, db => db.query(`UPDATE portability_jobs j SET state='running',lease_id=$3,
+            leased_until=clock_timestamp() WHERE j.space_id=$1 AND j.job_id=$2 AND NOT ${UNADMITTED} AND j.state='queued'`,
+        [spaceId, submitted.jobId, randomUUID()]));
       } catch (error) {
-        try {
-          await transact(pool, async db => {
-            const cancelled = await db.query(`UPDATE portability_jobs SET state='cancelled' WHERE space_id=$1 AND job_id=$2
-              AND state IN ${UNFINISHED} RETURNING job_id`, [spaceId, submitted.jobId]);
-            // Only the export cancelled here has parts to remove. One already ended had them removed as it ended, and
-            // one already completed (its admission committed, but the call failed after, and a worker finished it
-            // meanwhile) keeps its result: owner-only, readable only through reads that authorize again, until it expires.
-            if (cancelled.rowCount) await discard(db, [spaceId, submitted.jobId]);
-          });
-        } catch (cleanup) {
-          // An export whose check never committed is still queued: never run, and cancelled once its admission time passes.
-          throw new AggregateError([error, cleanup], 'The export was refused and could not be cancelled at once', { cause: cleanup });
-        }
-        throw error;
+        // Authorized and released, but whether the admission committed is unknown: it runs or is cancelled unrun.
+        throw unconfirmed(submitted.jobId, error);
       }
+      if (!admission.rowCount)
+        throw await this.refusal(pool, spaceId, submitted.jobId,
+          new AuthorityError('BACKPRESSURE', 'The export was not admitted in time; submit again', undefined, true));
+      return submitted;
     }
     throw new AuthorityError('BACKPRESSURE', 'The space has more unpublished events than one submission publishes; retry',
       undefined, true);
+  }
+
+  /** Cancel a refused submission's export, still queued, so never run and without parts: returns the error to throw. */
+  private async refusal(pool: PoolLike, spaceId: string, jobId: string, error: unknown): Promise<unknown> {
+    try {
+      await transact(pool, db => db.query(`UPDATE portability_jobs SET state='cancelled' WHERE space_id=$1 AND job_id=$2
+        AND state='queued'`, [spaceId, jobId]));
+      return error;
+    } catch (cleanup) {
+      // Still queued: never run, and cancelled by a worker once its admission time passes.
+      return new AggregateError([error, cleanup], 'The export was refused and could not be cancelled at once', { cause: cleanup });
+    }
   }
 
   /** The export's state, progress and boundary, and its manifest digest once complete. */
@@ -468,6 +478,15 @@ export class PostgresPortabilityExports {
   }
 }
 
+/**
+ * A submission authorized and released whose admission was sent but not
+ * acknowledged: the export either runs or, never admitted, is cancelled unrun
+ * once its admission time passes. Read or cancel it by `jobId`.
+ */
+export interface ExportAdmissionUnconfirmed extends AuthorityError { code: 'RECEIPT_PENDING'; jobId: string }
+const unconfirmed = (jobId: string, cause: unknown) => Object.assign(new AuthorityError('RECEIPT_PENDING',
+  `Export ${jobId} was authorized, but its admission was not acknowledged; read its status`), { jobId, cause }) as ExportAdmissionUnconfirmed;
+
 // ---- The jobs Worker's export step ----
 
 /** An export failure the step records: the job ends failed with `code`. */
@@ -500,7 +519,8 @@ interface Checkpoint { section: number; cursor: unknown[] | null; offset: number
  * seals the export.
  */
 export class PortabilityExportWorker {
-  constructor(private readonly pool: PoolLike) {}
+  /** `budgetBytes`, each export's byte budget, its manifest included (a smaller one only to exercise that bound). */
+  constructor(private readonly pool: PoolLike, private readonly budgetBytes: number = portabilityExportBounds.budgetBytes) {}
 
   /**
    * When the longest-waiting due export began waiting (epoch ms: an admitted
@@ -519,8 +539,8 @@ export class PortabilityExportWorker {
     return since === null ? null : Number(since);
   }
 
-  async step(until: number): Promise<PortabilityStep> {
-    const result: PortabilityStep = { expired: 0, claimed: 0, parts: 0, completed: 0, failed: 0, unadmitted: 0 };
+  async step(until: number, result: PortabilityStep = { expired: 0, claimed: 0, parts: 0, completed: 0, failed: 0, unadmitted: 0 }):
+    Promise<PortabilityStep> {
     try { await this.expire(until, result); } catch (error) { if (!cutShort(error)) throw error; }
     const passed: string[] = [];
     while (until - RELEASE_MS - Date.now() >= MIN_PART_MS) {
@@ -540,7 +560,7 @@ export class PortabilityExportWorker {
    * (`cancelled`), one per transaction, removing their parts. A submission
    * admitting its export holds it locked, so is never cancelled under it.
    */
-  private async expire(until: number, result: PortabilityStep): Promise<void> {
+  async expire(until: number, result: PortabilityStep): Promise<void> {
     while (Date.now() < until) {
       const ended = await inTransaction(this.pool, async db => {
         const due = (await db.query(`SELECT j.space_id,j.job_id,j.expires_at<=clock_timestamp() AS expired FROM portability_jobs j
@@ -557,7 +577,11 @@ export class PortabilityExportWorker {
     }
   }
 
-  /** Claim the next due export not passed over in this step: null when none, `busy` when taken meanwhile, `failed` when its binding failed it. */
+  /**
+   * Claim the next due export not passed over in this step: null when none, `busy` when taken meanwhile or its space
+   * stays locked past the probe's lock bound (its wait then restarts now, so it does not keep first place at the next
+   * step), `failed` when its binding failed it.
+   */
   private async claim(until: number, passed: string[]): Promise<Row | null | 'busy' | 'failed'> {
     // Only admitted exports: running (from admission or a lost lease) with their lease ended. A queued one is never run.
     const next = (await inTransaction(this.pool, db => db.query(`SELECT space_id,job_id FROM portability_jobs
@@ -566,6 +590,7 @@ export class PortabilityExportWorker {
     if (!next) return null;
     passed.push(next.job_id);
     return inTransaction(this.pool, async db => {
+      await probing(db);
       const job = (await db.query('SELECT * FROM portability_jobs WHERE space_id=$1 AND job_id=$2', pk(next))).rows[0];
       if (!job) return 'busy' as const;
       const failure = await spaceCheck(db, job.space_id, { principal: job.principal_id, placement: Number(job.placement_generation) });
@@ -577,11 +602,16 @@ export class PortabilityExportWorker {
       if (failure) { await this.fail(db, locked, failure); return 'failed' as const; }
       return (await db.query(`UPDATE portability_jobs SET state='running',lease_id=$3,leased_until=$4,attempts=attempts+1
         WHERE space_id=$1 AND job_id=$2 RETURNING *`, [...pk(locked), randomUUID(), locked.until])).rows[0];
-    }, { deadline: until }).catch((error: unknown) => {
+    }, { deadline: until }).catch(async (error: unknown) => {
       // A space changing meanwhile refuses the claim: retry later.
       const code = (error as { code?: unknown }).code;
-      if (code === '55P03' || code === '23514' || code === '40001') return 'busy' as const;
-      throw error;
+      if (code !== '55P03' && code !== '23514' && code !== '40001') throw error;
+      if (lockedOut(error)) await inTransaction(this.pool, async db => (await probing(db)).query(`UPDATE portability_jobs
+        SET leased_until=clock_timestamp() WHERE space_id=$1 AND job_id=$2 AND state='running' AND leased_until<=clock_timestamp()
+          AND expires_at>clock_timestamp()`, pk(next)), { deadline: until }).catch((moved: unknown) => {
+        if (!lockedOut(moved) && !cutShort(moved)) throw moved;
+      });
+      return 'busy' as const;
     });
   }
 
@@ -685,7 +715,7 @@ export class PortabilityExportWorker {
       if (content) {
         if (last.parts + 1 >= portabilityExportBounds.maxParts)
           throw new ExportFailure('RESULT_TOO_LARGE', `More than ${portabilityExportBounds.maxParts - 1} parts`);
-        if (Number(last.bytes) + Buffer.byteLength(content) > portabilityExportBounds.budgetBytes)
+        if (Number(last.bytes) + Buffer.byteLength(content) > this.budgetBytes)
           throw new ExportFailure('BUDGET_EXCEEDED', 'The export exceeds its byte budget');
         await write(exportSections[section], completed, content);
       }
@@ -698,7 +728,8 @@ export class PortabilityExportWorker {
     const parts = (await db.query(`SELECT part_number,section,row_count,byte_size,content_sha256 FROM portability_parts
       WHERE space_id=$1 AND job_id=$2 ORDER BY part_number`, key)).rows;
     const space = (await db.query('SELECT owner_principal_id FROM spaces WHERE space_id=$1', [job.space_id])).rows[0];
-    const manifest: ExportManifest = { format: portabilityFormat, formatVersion: Number(job.format_version), jobId: job.job_id,
+    const manifest: ExportManifest = { format: portabilityFormat,
+      formatVersion: Number(job.format_version) as typeof portabilityFormatVersion, jobId: job.job_id,
       space: { spaceId: job.space_id, ownerPrincipalId: space.owner_principal_id, policyVersion: Number(job.policy_version),
         placementGeneration: Number(job.placement_generation) },
       boundary: { watermark: Number(job.watermark), snapshotAt: job.snapshot_at, records: 'as-of-watermark', evidence: 'as-of-snapshot' },
@@ -709,6 +740,9 @@ export class PortabilityExportWorker {
       parts: parts.map(p => ({ number: p.part_number, section: p.section, rows: p.row_count, bytes: p.byte_size, sha256: p.content_sha256 })),
       excluded: EXCLUDED };
     const text = JSON.stringify(manifest);
+    // The byte budget holds the manifest too: an export whose manifest would pass it fails rather than seal over it.
+    if (Number(last.bytes) + Buffer.byteLength(text) > this.budgetBytes)
+      throw new ExportFailure('BUDGET_EXCEEDED', 'The export and its manifest exceed its byte budget');
     await write('manifest', 1, text);
     await save();
     await db.query(`UPDATE portability_jobs SET state='completed',manifest_sha256=$3,part_count=$4 WHERE space_id=$1 AND job_id=$2`,

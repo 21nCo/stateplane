@@ -11,8 +11,8 @@ import { memoryAdapter } from '@superfunctions/db/testing';
 import { createAuthFn, createUser, issueSession } from '@authfn/core';
 import { AuthFnAgentKeys, AuthFnIdentityVerifier } from '../../packages/auth/dist/index.js';
 import { exportSections, verifyExportManifest } from '../../packages/contracts/dist/index.js';
-import { AuthorityError, PostgresAnalysisWorker, PostgresClaims, PostgresLinks, PostgresPortabilityExports, PostgresSources,
-  PostgresSpaces, portabilityExportBounds, postgresServices } from '../../packages/postgres/dist/index.js';
+import { AuthorityError, PortabilityExportWorker, PostgresAnalysisWorker, PostgresClaims, PostgresLinks, PostgresPortabilityExports,
+  PostgresSources, PostgresSpaces, portabilityExportBounds, postgresServices } from '../../packages/postgres/dist/index.js';
 import { R2BlobStore } from '../../packages/storage/dist/index.js';
 
 // STA-70: owner exports of a whole space in the open versioned format. Every
@@ -37,28 +37,23 @@ const newPool = (max = 1) => { const created = new pg.Pool({ connectionString: u
 test.after(async () => { await Promise.all([pool, ...extraPools].map(item => item.end())); await admin(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`); });
 
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+/** An R2 binding in memory, objects by key with the SHA-256 their writer stated: what sources read and write. */
 class MemoryR2 {
   objects = new Map();
-  async put(key, body, options = {}) {
-    const chunks = [];
-    const reader = body.getReader();
-    for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(Buffer.from(value)); }
-    const bytes = Buffer.concat(chunks);
-    if (options.sha256 !== undefined && options.sha256 !== sha(bytes)) throw new Error('put: checksum mismatch');
-    this.objects.set(key, { bytes, sha256: options.sha256 });
-    return this.meta(key);
+  async put(key, body, { sha256 } = {}) {
+    const bytes = Buffer.from(await new Response(body).arrayBuffer());
+    if (sha256 !== undefined && sha256 !== sha(bytes)) throw new Error('put: checksum mismatch');
+    this.objects.set(key, { bytes, sha256 });
+    return this.head(key);
   }
-  meta(key) {
-    const object = this.objects.get(key);
-    return object ? { size: object.bytes.length, checksums: object.sha256 ? { sha256: new Uint8Array(Buffer.from(object.sha256, 'hex')).buffer } : {} } : null;
+  async head(key) {
+    const { bytes, sha256 } = this.objects.get(key) ?? {};
+    if (!bytes) return null;
+    return { size: bytes.length, checksums: sha256 ? { sha256: new Uint8Array(Buffer.from(sha256, 'hex')).buffer } : {} };
   }
-  async head(key) { return this.meta(key); }
-  async get(key) { const meta = this.meta(key); return meta && { ...meta, body: new Blob([this.objects.get(key).bytes]).stream() }; }
+  async get(key) { const head = await this.head(key); return head && { ...head, body: new Blob([this.objects.get(key).bytes]).stream() }; }
   async delete(key) { this.objects.delete(key); }
-  async list({ startAfter = '', limit = 1000 } = {}) {
-    const after = [...this.objects.keys()].sort().filter(key => key > startAfter);
-    return { objects: after.slice(0, limit).map(key => ({ key })), truncated: after.length > limit };
-  }
+  async list() { return { objects: [...this.objects.keys()].sort().map(key => ({ key })), truncated: false }; }
 }
 
 const config = { database: memoryAdapter(), namespace: `portability-export-${randomUUID()}`, plugins: [] };
@@ -94,6 +89,30 @@ function worker(fault = () => {}) {
     client.query = (sql, ...rest) => { fault(typeof sql === 'string' ? sql : sql.text); return query(sql, ...rest); };
   });
   return new PostgresAnalysisWorker(own, { originConnectionLimit: 5 });
+}
+/** Page and part writes that take 700 ms each: at the 2 s minimum budget one turn writes one, and no other kind fits. */
+const spin = ms => { const until = Date.now() + ms; while (Date.now() < until); };
+const slow = () => worker(sql => { if (/^\s*INSERT INTO (portability_parts|analysis_result_pages|analysis_result_manifests)/.test(sql)) spin(700); });
+const partsOf = async jobId => (await pool.query('SELECT count(*)::int AS n FROM portability_parts WHERE job_id=$1', [jobId])).rows[0].n;
+/** Run `sql` with triggers off, as only a test moves the stamps migrations 049 and 051 keep. */
+async function bypassing(sql, params) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query("SET LOCAL session_replication_role = 'replica'");
+    await client.query(sql, params);
+    await client.query('COMMIT');
+  } finally { client.release(); }
+}
+/** A cell pool whose `n`-th COMMIT reaches the database and then runs `after`, which may throw in place of its acknowledgement. */
+function committing(n, after) {
+  let commits = 0;
+  return { connect: async () => {
+    const client = await pool.connect(), query = client.query.bind(client), release = client.release.bind(client);
+    client.query = async (sql, ...rest) => { const done = await query(sql, ...rest); if (sql === 'COMMIT' && ++commits === n) await after(); return done; };
+    client.release = (...args) => { client.query = query; client.release = release; return release(...args); };
+    return client;
+  } };
 }
 /** Run steps until no export is left to claim, as successive ticks would. */
 async function drain(jobs = worker()) {
@@ -431,7 +450,6 @@ test('only the owner exports, every read authorizes again, and cancellation and 
   let partWrites = 0;
   await assert.rejects(worker(sql => { if (/^\s*INSERT INTO portability_parts/.test(sql) && ++partWrites === 2) throw new Error('cut'); })
     .step({ budgetMs: 10_000 }), /cut/);
-  const partsOf = async jobId => (await pool.query('SELECT count(*)::int AS n FROM portability_parts WHERE job_id=$1', [jobId])).rows[0].n;
   assert.deepEqual([(await portability.exportStatus(actor, spaceId, running.jobId)).state, await partsOf(running.jobId)], ['running', 1]);
   assert.equal((await portability.cancelExport(actor, spaceId, running.jobId)).state, 'cancelled');
   await pool.query(`UPDATE portability_jobs SET leased_until=clock_timestamp() WHERE job_id=$1 AND state='running'`, [running.jobId]);
@@ -477,7 +495,6 @@ test('an export is never run unless its submission\'s final check admits it: a r
   await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: 'x' } });
   const jobOf = async () => (await pool.query(`SELECT job_id,state FROM portability_jobs WHERE space_id=$1 ORDER BY created_at DESC
     LIMIT 1`, [spaceId])).rows[0];
-  const partsOf = async jobId => (await pool.query('SELECT count(*)::int AS n FROM portability_parts WHERE job_id=$1', [jobId])).rows[0].n;
 
   // The provider's final check pauses, then refuses the owner. A worker step meanwhile finds nothing to run.
   let reach, release;
@@ -517,14 +534,8 @@ test('an export is never run unless its submission\'s final check admits it: a r
   assert.equal((await portability.exportStatus(actor, spaceId, orphan.job_id)).state, 'queued');
   // Once its admission time has passed (backdated here; migration 051 keeps created_at, so its trigger is bypassed),
   // a worker cancels it unrun, and it no longer holds one of the space's two export slots.
-  const backdate = await pool.connect();
-  try {
-    await backdate.query('BEGIN');
-    await backdate.query("SET LOCAL session_replication_role = 'replica'");
-    await backdate.query(`UPDATE portability_jobs SET created_at=created_at-$2::int*interval '1 millisecond' WHERE job_id=$1`,
-      [orphan.job_id, portabilityExportBounds.admissionMs + 1_000]);
-    await backdate.query('COMMIT');
-  } finally { backdate.release(); }
+  await bypassing(`UPDATE portability_jobs SET created_at=created_at-$2::int*interval '1 millisecond' WHERE job_id=$1`,
+    [orphan.job_id, portabilityExportBounds.admissionMs + 1_000]);
   const swept = await worker().step({ budgetMs: 2_000 });
   assert.deepEqual([swept.exports.unadmitted, swept.exports.claimed], [1, 0]);
   assert.deepEqual([(await jobOf()).state, await partsOf(orphan.job_id)], ['cancelled', 0]);
@@ -536,33 +547,68 @@ test('an export is never run unless its submission\'s final check admits it: a r
   assert.equal((await portability.exportStatus(actor, spaceId, admitted.jobId)).state, 'completed');
 });
 
-test('a submission whose admission committed but whose call then failed leaves an export a worker completed meanwhile as it is', async () => {
+test('an export becomes claimable only once its submission\'s authorization is released, and a lost admission names it', async () => {
   const actor = await owner();
   const spaceId = await space(actor);
   await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: 'x' } });
-  // The admission's COMMIT (the submission's second) reaches the database, a worker completes the export, and only then
-  // is the acknowledgement lost.
-  let commits = 0;
-  const lossy = { connect: async () => {
-    const client = await pool.connect(), query = client.query.bind(client);
-    client.query = async (sql, ...rest) => {
-      const done = await query(sql, ...rest);
-      if (sql === 'COMMIT' && ++commits === 2) { await drain(); throw new Error('the connection dropped after COMMIT'); }
-      return done;
-    };
-    const release = client.release.bind(client);
-    client.release = (...args) => { client.query = query; client.release = release; return release(...args); };
-    return client;
-  } };
-  // The call fails with its own error alone: the compensation finds the export completed and leaves it and its parts.
-  await assert.rejects(new PostgresPortabilityExports(spaces, new Map([['cell-a', { pool: lossy }]])).submit(actor, spaceId),
-    error => !(error instanceof AggregateError) && /the connection dropped after COMMIT/.test(`${error.message} ${error.cause?.message}`));
-  const [job] = (await pool.query(`SELECT job_id,state,part_count,(SELECT count(*)::int FROM portability_parts p
-    WHERE p.job_id=j.job_id) AS parts FROM portability_jobs j WHERE space_id=$1`, [spaceId])).rows;
-  assert.deepEqual([job.state, job.parts], ['completed', job.part_count]);
-  // It stays the owner's, read only through reads that authorize again, until it expires.
-  const { status, parts, manifestText } = await result(actor, spaceId, job.job_id);
-  assert.equal((await verifyExportManifest(manifestText, status.manifest.sha256, parts.map(part => part.content))).ok, true);
+  const jobs = async () => (await pool.query(`SELECT job_id,state,(SELECT count(*)::int FROM portability_parts p WHERE p.job_id=j.job_id)
+    AS parts FROM portability_jobs j WHERE space_id=$1 ORDER BY created_at`, [spaceId])).rows;
+  // The provider confirms the owner for 300 ms. The check's COMMIT (the submission's second) is acknowledged only after
+  // that has passed, so the call is refused; worker steps meanwhile find nothing they may run.
+  const brief = { scope: (...args) => spaces.scope(...args), assertCurrentUntil: async () => Date.now() + 300 };
+  let meanwhile;
+  const late = committing(2, async () => {
+    meanwhile = [await worker().step({ budgetMs: 2_000 }), await worker().step({ budgetMs: 2_000 })];
+    await new Promise(resolve => setTimeout(resolve, 300));
+  });
+  await rejects(new PostgresPortabilityExports(brief, new Map([['cell-a', { pool: late }]])).submit(actor, spaceId), 'FORBIDDEN');
+  assert.deepEqual(meanwhile.map(step => step.exports.claimed + step.exports.parts), [0, 0], 'no worker runs an unreleased export');
+  const [refused] = await jobs();
+  assert.deepEqual([refused.state, refused.parts], ['cancelled', 0]);
+  await drain();
+  assert.deepEqual((await jobs()).map(job => job.state), ['cancelled'], 'nothing completes for a refused submission');
+
+  // Released, then the admission's COMMIT (the third) reaches the database and its acknowledgement is lost: the error
+  // names the export, which the owner reads and cancels by that ID.
+  const lossy = committing(3, () => { throw new Error('the connection dropped after COMMIT'); });
+  let lost;
+  await assert.rejects(new PostgresPortabilityExports(spaces, new Map([['cell-a', { pool: lossy }]])).submit(actor, spaceId), error => {
+    lost = error;
+    return error.code === 'RECEIPT_PENDING' && /the connection dropped/.test(`${error.cause.message} ${error.cause.cause?.message}`);
+  });
+  assert.equal(lost.jobId, (await jobs())[1].job_id);
+  assert.equal((await portability.exportStatus(actor, spaceId, lost.jobId)).state, 'queued', 'admitted, not yet claimed');
+  assert.equal((await portability.cancelExport(actor, spaceId, lost.jobId)).state, 'cancelled');
+  await drain();
+  assert.deepEqual((await jobs()).map(job => [job.state, job.parts]), [['cancelled', 0], ['cancelled', 0]]);
+});
+
+test('a space holds at most 4 exports at once, completed ones until they expire, and the byte budget holds the manifest', async () => {
+  const actor = await owner();
+  const spaceId = await space(actor);
+  await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: 'x' } });
+  const held = [];
+  for (let i = 0; i < portabilityExportBounds.heldPerSpace; i++) { held.push((await portability.submitExport(actor, spaceId)).jobId); await drain(); }
+  await rejects(portability.submitExport(actor, spaceId), 'BACKPRESSURE', 'a fifth export while four completed ones are held');
+  // Once one expires and a step ends it (its parts removed), the space takes another.
+  await bypassing(`UPDATE portability_jobs SET created_at=created_at-interval '25 hours',expires_at=expires_at-interval '24 hours',
+    started_at=started_at-interval '25 hours',finished_at=finished_at-interval '25 hours' WHERE job_id=$1`, [held[0]]);
+  assert.equal((await worker().step({ budgetMs: 2_000 })).exports.expired, 1);
+  assert.equal(await partsOf(held[0]), 0);
+  const { status, parts, manifestText } = await result(actor, spaceId, held[1]);
+  const bytes = parts.reduce((n, part) => n + part.byteSize, 0) + Buffer.byteLength(manifestText);
+  // The same space exported again writes the same bytes. A budget of exactly them seals; one byte less fails the
+  // export at its manifest, its data parts all written and then removed.
+  assert.equal(status.manifest.partCount, parts.length + 1);
+  for (const [budget, expected] of [[bytes, 'completed'], [bytes - 1, 'failed']]) {
+    const { jobId } = await portability.submitExport(actor, spaceId);
+    const exporter = new PortabilityExportWorker(newPool(1), budget);
+    while ((await exporter.step(Date.now() + 10_000)).claimed);
+    const ended = await portability.exportStatus(actor, spaceId, jobId);
+    assert.deepEqual([ended.state, ended.failureCode, await partsOf(jobId)],
+      expected === 'completed' ? ['completed', null, parts.length + 1] : ['failed', 'BUDGET_EXCEEDED', 0], `a budget of ${budget} bytes`);
+    if (expected === 'completed') await bypassing(`UPDATE portability_jobs SET state='expired',finished_at=clock_timestamp() WHERE job_id=$1`, [jobId]);
+  }
 });
 
 test('submission waits for writes to the space in flight, so each lands wholly on one side of the boundary', async () => {
@@ -586,7 +632,7 @@ test('submission waits for writes to the space in flight, so each lands wholly o
     const { lines } = await result(actor, spaceId, jobId);
     // Stamped before the snapshot instant and committed before it was taken: inside the boundary.
     assert.deepEqual(lines.schemas.map(({ collectionId, version }) => [collectionId, version]), [['alpha', 1], ['beta', 1], ['beta', 2]]);
-  } finally { writer.release(); }
+  } finally { await writer.query('ROLLBACK').catch(() => {}); writer.release(); }
 });
 
 test('exports and analysis jobs share the jobs Worker step: neither starves at the minimum budget, and an export failure never stops analysis', async () => {
@@ -599,11 +645,9 @@ test('exports and analysis jobs share the jobs Worker step: neither starves at t
   const exportJob = await portability.submitExport(actor, spaceId);
   // Every page and part write takes 700 ms, so at the 2 s minimum budget one turn writes one of them and leaves no room
   // for the other kind: the step must choose, and the choice must alternate.
-  const spin = ms => { const until = Date.now() + ms; while (Date.now() < until); };
-  const slow = worker(sql => { if (/^\s*INSERT INTO (portability_parts|analysis_result_pages|analysis_result_manifests)/.test(sql)) spin(700); });
-  const turns = [];
+  const turns = [], jobs = slow();
   for (let i = 0; i < 4; i++) {
-    const step = await slow.step({ budgetMs: 2_000 });
+    const step = await jobs.step({ budgetMs: 2_000 });
     turns.push([step.pages + step.completed > 0 ? 'analysis' : '', step.exports.parts + step.exports.completed > 0 ? 'export' : ''].join(''));
   }
   // The analysis job was submitted first, so it waited longer and goes first; each turn then moves its kind's wait to now.
@@ -626,6 +670,91 @@ test('exports and analysis jobs share the jobs Worker step: neither starves at t
   await drain();
   const { status, parts, manifestText } = await result(actor, spaceId, exportJob.jobId);
   assert.equal((await verifyExportManifest(manifestText, status.manifest.sha256, parts.map(part => part.content))).ok, true);
+});
+
+test('each kind goes first by the job its claim takes next; a busy export or a failing expiry never holds analysis back', async () => {
+  const actor = await owner();
+  const [spaceId, other] = [await space(actor), await space(actor)];
+  for (let i = 0; i < 4; i++) for (const [id, fill] of [[spaceId, 'x'], [other, 'y']])
+    await mutate(actor, id, 'alpha', { operation: 'create', data: { label: `big ${i}`, body: `${fill.repeat(700_000)}${i}` } });
+  const jobs = slow();
+  const turn = step => [step.pages + step.completed > 0 ? 'analysis' : '', step.exports.parts + step.exports.completed > 0 ? 'export' : ''].join('');
+  // An analysis job whose lease ended long ago, an export admitted after it, and a fresh analysis job queued before each
+  // step. The claim takes the fresh job first, so analysis waits from its submission, after the export: the export runs.
+  const lapsed = await services.analysis.submit(actor, other, 'alpha', 'export');
+  assert.equal(turn(await jobs.step({ budgetMs: 2_000 })), 'analysis');
+  const { jobId } = await portability.submitExport(actor, spaceId);
+  const turns = [];
+  for (let i = 0; i < 2; i++) {
+    await services.analysis.submit(actor, other, 'alpha', 'export');
+    turns.push(turn(await jobs.step({ budgetMs: 2_000 })));
+  }
+  assert.deepEqual(turns, ['export', 'analysis']);
+  // The export's space is locked past the claim's lock bound: its claim is busy at once, analysis takes the step, and the
+  // busy export waits from then, so analysis goes first again at the next step.
+  const holder = await pool.connect();
+  try {
+    await holder.query('BEGIN');
+    await holder.query('SELECT 1 FROM spaces WHERE space_id=$1 FOR UPDATE', [spaceId]);
+    assert.equal(turn(await jobs.step({ budgetMs: 2_000 })), 'analysis', 'analysis runs while the export is busy');
+    await holder.query('COMMIT');
+  } finally { await holder.query('ROLLBACK').catch(() => {}); holder.release(); }
+  assert.equal(turn(await jobs.step({ budgetMs: 2_000 })), 'analysis', 'the busy export does not go first next');
+
+  // Both an analysis job holding pages and slots and the export have expired, and removing the export's parts fails:
+  // the analysis job still ends in that step (pages and slots released), another analysis job advances, and the
+  // failure is reported.
+  await bypassing(`UPDATE analysis_jobs SET created_at=created_at-interval '2 days',expires_at=clock_timestamp()-interval '1 second',
+    leased_until=clock_timestamp()-interval '2 seconds' WHERE job_id=$1`, [lapsed.jobId]);
+  await bypassing(`UPDATE portability_jobs SET created_at=created_at-interval '2 days',expires_at=clock_timestamp()-interval '1 second',
+    leased_until=clock_timestamp()-interval '2 seconds' WHERE job_id=$1`, [jobId]);
+  const pages = async () => (await pool.query(`SELECT count(*) FILTER (WHERE job_id=$2)::int AS lapsed,count(*)::int AS all
+    FROM analysis_result_pages WHERE space_id=$1`, [other, lapsed.jobId])).rows[0];
+  const before = await pages();
+  assert.ok(before.lapsed > 0);
+  await assert.rejects(worker(sql => {
+    if (/^\s*DELETE FROM portability_parts/.test(sql)) throw new Error('removing the parts failed');
+    if (/^\s*INSERT INTO analysis_result_pages/.test(sql)) spin(700);
+  }).step({ budgetMs: 2_000 }), /removing the parts failed/);
+  const after = await pages();
+  assert.equal((await services.analysis.status(actor, other, 'alpha', lapsed.jobId)).state, 'expired');
+  assert.equal(after.lapsed, 0);
+  assert.ok(after.all - after.lapsed > before.all - before.lapsed, 'another analysis job wrote a page in the same step');
+  assert.equal((await pool.query(`SELECT (SELECT count(*) FROM analysis_space_slots WHERE holder_job_id=$1)
+    +(SELECT count(*) FROM analysis_cell_slots WHERE holder_job_id=$1) AS n`, [lapsed.jobId])).rows[0].n, '0');
+  await drain();
+  assert.deepEqual([(await portability.exportStatus(actor, spaceId, jobId)).state, await partsOf(jobId)], ['expired', 0]);
+});
+
+test('a slow due probe of either kind is cut at its bound, and the other kind still runs in that step', async () => {
+  const actor = await owner();
+  const spaceId = await space(actor);
+  for (let i = 0; i < 4; i++)
+    await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: `big ${i}`, body: `${'x'.repeat(700_000)}${i}` } });
+  const analysisJob = await services.analysis.submit(actor, spaceId, 'alpha', 'export');
+  const { jobId } = await portability.submitExport(actor, spaceId);
+  // Each probe in turn waits 1.5 s before it reaches the database, holding no lock.
+  for (const [probe, others] of [[/^SELECT \(extract\(epoch FROM min\(CASE/, 'analysis'], [/^SELECT \(extract\(epoch FROM least\(/, 'exports']]) {
+    const own = newPool(1);
+    own.on('connect', client => {
+      const query = client.query.bind(client);
+      client.query = async (sql, ...rest) => {
+        if (typeof sql === 'string' && probe.test(sql.trim())) await new Promise(resolve => setTimeout(resolve, 1_500));
+        return query(sql, ...rest);
+      };
+    });
+    const started = Date.now();
+    const step = await new PostgresAnalysisWorker(own, { originConnectionLimit: 5 }).step({ budgetMs: 2_000 });
+    assert.ok(Date.now() - started < 2_500, `the step took ${Date.now() - started} ms`);
+    const advanced = others === 'analysis' ? step.pages + step.completed : step.exports.parts + step.exports.completed;
+    assert.ok(advanced > 0, `${others} advanced while the other probe was slow: ${JSON.stringify(step)}`);
+  }
+  // Neither kind is lost: both finish in later steps.
+  await drain();
+  for (let i = 0; i < 20 && (await services.analysis.status(actor, spaceId, 'alpha', analysisJob.jobId)).state !== 'completed'; i++)
+    await worker().step({ budgetMs: 5_000 });
+  assert.equal((await services.analysis.status(actor, spaceId, 'alpha', analysisJob.jobId)).state, 'completed');
+  assert.equal((await portability.exportStatus(actor, spaceId, jobId)).state, 'completed');
 });
 
 test('a probe stalled on a table lock leaves the other kind its window', async () => {
@@ -666,7 +795,6 @@ test('an export due alone takes the whole step budget, and an invalid origin con
   const { jobId } = await portability.submitExport(actor, spaceId);
   // Every part write takes 700 ms. Capped at exports' 2 s share, a step would write one; with no analysis job due, the
   // export takes all 5 s.
-  const spin = ms => { const until = Date.now() + ms; while (Date.now() < until); };
   const step = await worker(sql => { if (/^\s*INSERT INTO portability_parts/.test(sql)) spin(700); }).step({ budgetMs: 5_000 });
   assert.ok(step.exports.parts >= 3, `a lone export wrote ${step.exports.parts} parts in a 5 s step`);
   await pool.query(`UPDATE portability_jobs SET leased_until=clock_timestamp() WHERE job_id=$1 AND state='running'`, [jobId]);

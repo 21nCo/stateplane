@@ -28,15 +28,22 @@
       }
     },
     "sections": {
-      "description": "Every evidence section, in this order, each with its total rows and bytes; an accelerator section (embeddings) is optional and never the only copy of anything.",
+      "description": "Every evidence section, once each and in this order, each with its total rows and bytes; then, optionally, the accelerator section embeddings, never the only copy of anything.",
       "type": "array", "minItems": 11, "maxItems": 12,
-      "items": {
-        "type": "object", "additionalProperties": false, "required": ["name", "rows", "bytes", "accelerator"],
-        "properties": {
-          "name": { "enum": ["permissions", "schemas", "retrieval", "sources", "extractions", "claims", "provenance", "links", "events", "records", "revisions", "embeddings"] },
-          "rows": { "$ref": "#/$defs/count" }, "bytes": { "$ref": "#/$defs/count" }, "accelerator": { "type": "boolean" }
-        }
-      }
+      "prefixItems": [
+        { "$ref": "#/$defs/evidenceSection", "properties": { "name": { "const": "permissions" } } },
+        { "$ref": "#/$defs/evidenceSection", "properties": { "name": { "const": "schemas" } } },
+        { "$ref": "#/$defs/evidenceSection", "properties": { "name": { "const": "retrieval" } } },
+        { "$ref": "#/$defs/evidenceSection", "properties": { "name": { "const": "sources" } } },
+        { "$ref": "#/$defs/evidenceSection", "properties": { "name": { "const": "extractions" } } },
+        { "$ref": "#/$defs/evidenceSection", "properties": { "name": { "const": "claims" } } },
+        { "$ref": "#/$defs/evidenceSection", "properties": { "name": { "const": "provenance" } } },
+        { "$ref": "#/$defs/evidenceSection", "properties": { "name": { "const": "links" } } },
+        { "$ref": "#/$defs/evidenceSection", "properties": { "name": { "const": "events" } } },
+        { "$ref": "#/$defs/evidenceSection", "properties": { "name": { "const": "records" } } },
+        { "$ref": "#/$defs/evidenceSection", "properties": { "name": { "const": "revisions" } } }
+      ],
+      "items": { "$ref": "#/$defs/section", "properties": { "name": { "const": "embeddings" }, "accelerator": { "const": true } } }
     },
     "parts": {
       "description": "Every data part, numbered from 1 without gaps, each one section's NDJSON from where that section's previous part stopped (a line may continue into the next part). rows counts the lines that end in the part. The manifest itself is the part after the last listed.",
@@ -45,7 +52,7 @@
         "type": "object", "additionalProperties": false, "required": ["number", "section", "rows", "bytes", "sha256"],
         "properties": {
           "number": { "$ref": "#/$defs/positive" },
-          "section": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" },
+          "section": { "enum": ["permissions", "schemas", "retrieval", "sources", "extractions", "claims", "provenance", "links", "events", "records", "revisions", "embeddings"] },
           "rows": { "$ref": "#/$defs/count" },
           "bytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
           "sha256": { "$ref": "#/$defs/sha256" }
@@ -56,10 +63,14 @@
   },
   "$defs": {
     "id": { "type": "string", "minLength": 1 },
+    "section": { "type": "object", "additionalProperties": false, "required": ["name", "rows", "bytes", "accelerator"],
+      "properties": { "name": { "type": "string" }, "rows": { "$ref": "#/$defs/count" }, "bytes": { "$ref": "#/$defs/count" },
+        "accelerator": { "type": "boolean" } } },
+    "evidenceSection": { "$ref": "#/$defs/section", "properties": { "accelerator": { "const": false } } },
     "count": { "type": "integer", "minimum": 0 },
     "positive": { "type": "integer", "minimum": 1 },
-    "rfc3339": { "description": "An RFC 3339 date-time: a calendar date, T, a time of day (hour 00 to 23, minute 00 to 59, a second of 60 only as a leap second) and Z or a +HH:MM offset.", "type": "string", "format": "date-time",
-      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])[Tt]([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\\.[0-9]+)?([Zz]|[+-]([01][0-9]|2[0-3]):[0-5][0-9])$" },
+    "rfc3339": { "description": "An RFC 3339 date-time without a leap second: a calendar date, T, a time of day (hour 00 to 23, minute and second 00 to 59) and Z or a +HH:MM offset. Format version 1 never carries a second of 60: its instants are database clock readings, which have none.", "type": "string", "format": "date-time",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])[Tt]([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]+)?([Zz]|[+-]([01][0-9]|2[0-3]):[0-5][0-9])$" },
     "instant": { "description": "A stored instant exactly as the database holds it: UTC, to the microsecond.", "$ref": "#/$defs/rfc3339",
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{6}Z$" },
     "optionalInstant": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/instant" }] },
@@ -131,7 +142,7 @@
         "committedAt": { "$ref": "#/$defs/instant" } }
     },
     "provenance": {
-      "description": "One evidence a claim revision cites: a whole source (extractionVersion, startOffset and endOffset null), a whole extraction version (offsets null), or a span of one (startOffset at most endOffset), exactly as stored.",
+      "description": "One evidence a claim revision cites: a whole source (extractionVersion, startOffset and endOffset null), a whole extraction version (offsets null), or a span of one, exactly as stored. A span's startOffset is at most its endOffset: a rule no JSON Schema states, which verifyExportManifest checks when given the data parts.",
       "type": "object", "additionalProperties": false, "required": ["collectionId", "claimId", "revision", "ordinal", "source"],
       "properties": { "collectionId": { "$ref": "#/$defs/id" }, "claimId": { "$ref": "#/$defs/id" }, "revision": { "$ref": "#/$defs/positive" },
         "ordinal": { "$ref": "#/$defs/count" },
@@ -162,7 +173,9 @@
       "properties": { "eventId": { "$ref": "#/$defs/id" }, "collectionId": { "$ref": "#/$defs/id" }, "kind": { "enum": ["source", "claim", "link"] },
         "entityId": { "$ref": "#/$defs/id" }, "revision": { "$ref": "#/$defs/positive" }, "operation": { "enum": ["create", "delete", "detach"] },
         "credentialId": { "type": ["string", "null"] }, "committedAt": { "$ref": "#/$defs/instant" } },
-      "anyOf": [{ "properties": { "kind": { "const": "link" } } }, { "properties": { "operation": { "const": "delete" } } }]
+      "anyOf": [{ "properties": { "kind": { "const": "link" } } }, { "properties": { "operation": { "const": "delete" } } }],
+      "if": { "properties": { "operation": { "const": "detach" } } }, "then": { "properties": { "credentialId": { "type": "null" } } },
+      "else": { "properties": { "credentialId": { "type": "string" } } }
     },
     "records": {
       "description": "One record live at the watermark, at its revision there, with its key: its normalized external key, or its own ID when generated.",
