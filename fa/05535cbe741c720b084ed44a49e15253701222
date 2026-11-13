@@ -1,0 +1,29 @@
+docs/analysis-jobs.md
+  s_5abfb1e95385eb::t_3620ab7b1e4919 118
+docs/owned-spaces.md
+  s_5abfb1e95385eb::t_5099ced888481c 37
+docs/portability-storage.md
+  s_5abfb1e95385eb::t_0ae1fa02fdb8cc 85
+docs/postgres-authority.md
+  s_5abfb1e95385eb::t_1f3870b4491e36 23
+docs/regional-topology.md
+  s_5abfb1e95385eb::t_615c2c86a263e5 5
+scripts/grant-analysis.mjs
+  s_5abfb1e95385eb::t_e6c76d7fbad7c3 11-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fa05535cbe741c720b084ed44a49e15253701222",
+  "prompts": {},
+  "sessions": {
+    "s_5abfb1e95385eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_5abfb1e95385eb",
+        "model": "unknown"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
