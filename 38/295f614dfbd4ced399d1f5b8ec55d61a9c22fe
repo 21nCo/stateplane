@@ -1,0 +1,37 @@
+docs/analysis-jobs.md
+  s_dcbe1f8efdf778::t_237208085649d4 161
+docs/portability-export.md
+  s_dcbe1f8efdf778::t_ae53f1269ea038 67,74,96-99,111,115-116
+docs/portability-storage.md
+  s_dcbe1f8efdf778::t_50b8c55b068f8f 73
+migrations/052_portability_live_exports.sql
+  s_dcbe1f8efdf778::t_6b1e3df82c289a 7-11,20-48,50-81
+packages/postgres/src/analysis-jobs.ts
+  s_dcbe1f8efdf778::t_86bc603af7a624 14,763-766,780
+packages/postgres/src/portability-exports.ts
+  s_dcbe1f8efdf778::t_f1aa6e8ff73cf8 260-261,263-267,269-281,285-286,291-294,345-347,349-353,412-414,416-417,463-467,474,479,481-482,671-673,690
+scripts/grant-portability.mjs
+  s_dcbe1f8efdf778::t_ee5e6bec0c9c9c 8-9,21-25
+scripts/migrate.mjs
+  s_dcbe1f8efdf778::t_e20ec1bd7ce200 15-17,233,276-280
+test/integration/portability-export.test.js
+  s_dcbe1f8efdf778::t_74697ee3fa48d0 635-656,724-726,1382-1485
+test/integration/portability-storage.test.js
+  s_dcbe1f8efdf778::t_fc0a22cef5ef83 183-184,186,188-203,205-208,210-211,765,771
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "38295f614dfbd4ced399d1f5b8ec55d61a9c22fe",
+  "prompts": {},
+  "sessions": {
+    "s_dcbe1f8efdf778": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_dcbe1f8efdf778",
+        "model": "unknown"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
