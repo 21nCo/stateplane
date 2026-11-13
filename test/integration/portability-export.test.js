@@ -729,10 +729,11 @@ test('exports and analysis jobs share the jobs Worker step: neither starves at t
   const analysisJob = await services.analysis.submit(actor, spaceId, 'alpha', 'export');
   const exportJob = await portability.submitExport(actor, spaceId);
   // Every page and part write takes 700 ms, so at the 2 s minimum budget one turn writes one of them and leaves no room
-  // for the other kind: the step must choose, and the choice must alternate.
-  const turns = [], jobs = slow();
+  // for the other kind: the step must choose, and the choice must alternate, here with a new worker at every step (as
+  // the jobs Worker creates one each tick, mostly within one minute, so of the same minute parity).
+  const turns = [];
   for (let i = 0; i < 4; i++) {
-    const step = await jobs.step({ budgetMs: 2_000 });
+    const step = await slow().step({ budgetMs: 2_000 });
     turns.push([step.pages + step.completed > 0 ? 'analysis' : '', step.exports.parts + step.exports.completed > 0 ? 'export' : ''].join(''));
   }
   // One step cannot hold a turn of each, so they alternate step by step, whichever goes first.
@@ -952,6 +953,22 @@ test('each kind ends its expired jobs once per step, in its own slice, and no tu
   for (let i = 0; i < 20 && (await services.analysis.status(actor, spaceId, 'alpha', analysisJob.jobId)).state !== 'completed'; i++)
     await worker().step({ budgetMs: 5_000 });
   assert.equal((await services.analysis.status(actor, spaceId, 'alpha', analysisJob.jobId)).state, 'completed');
+
+  // An expiry pass its slice cannot finish (each export's part removal takes longer than a tenth of the budget) continues
+  // in its kind's turn: two expired exports end within two steps, their parts removed, and the space takes exports again.
+  for (const budgetMs of [2_000, 5_000]) {
+    const expiring = await space(actor);
+    await mutate(actor, expiring, 'alpha', { operation: 'create', data: { label: 'x' } });
+    const ended = [];
+    for (let i = 0; i < 2; i++) { ended.push((await portability.submitExport(actor, expiring)).jobId); await drain(); }
+    await bypassing(`UPDATE portability_jobs SET created_at=created_at-interval '25 hours',expires_at=expires_at-interval '24 hours',
+      started_at=started_at-interval '25 hours',finished_at=finished_at-interval '25 hours' WHERE job_id=ANY($1)`, [ended]);
+    const removing = worker(sql => { if (/^\s*DELETE FROM portability_parts/.test(sql)) spin(budgetMs / 10 + 100); });
+    for (let i = 0; i < 2 && (await pool.query(`SELECT 1 FROM portability_jobs WHERE job_id=ANY($1) AND state<>'expired'`, [ended])).rowCount; i++)
+      await removing.step({ budgetMs });
+    assert.deepEqual(await Promise.all(ended.map(async jobId => [(await portability.exportStatus(actor, expiring, jobId)).state, await partsOf(jobId)])),
+      [['expired', 0], ['expired', 0]], `both expired exports ended at a ${budgetMs} ms budget`);
+  }
 });
 
 test('a probe stalled on a table lock leaves the other kind its window', async () => {

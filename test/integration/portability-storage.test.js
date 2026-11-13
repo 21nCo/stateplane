@@ -749,12 +749,13 @@ test('the portability and control grants give operational roles only what their 
       STATEPLANE_CONTROL_URL: urlFor(db.main), STATEPLANE_CONTROL_ROLE: role };
     execFileSync(process.execPath, ['scripts/grant-portability.mjs'], { cwd: root, stdio: 'pipe', env });
     execFileSync(process.execPath, ['scripts/grant-control-journal.mjs'], { cwd: root, stdio: 'pipe', env });
-    const tables = [...portabilityTables, 'erasure_ledger'];
+    const tables = [...portabilityTables, 'erasure_ledger', 'snapshot_step_turn'];
     const privileges = Object.fromEntries((await pool.query(`SELECT t, has_table_privilege($1,t,'SELECT') AS r,
         has_table_privilege($1,t,'INSERT') AS i, has_table_privilege($1,t,'UPDATE') AS u, has_table_privilege($1,t,'DELETE') AS d,
         has_table_privilege($1,t,'TRUNCATE') AS x FROM unnest($2::text[]) t`, [role, tables])).rows
       .map(({ t, ...row }) => [t, Object.entries(row).filter(([, granted]) => granted).map(([privilege]) => privilege).join('')]));
-    assert.deepEqual(privileges, { portability_jobs: 'riu', portability_parts: 'rid', portability_principal_map: 'riu', erasure_ledger: 'ri' });
+    assert.deepEqual(privileges, { portability_jobs: 'riu', portability_parts: 'rid', portability_principal_map: 'riu', erasure_ledger: 'ri',
+      snapshot_step_turn: 'ru' });
     const missing = spawnSync(process.execPath, ['scripts/grant-portability.mjs'], { cwd: root, encoding: 'utf8',
       env: { ...env, STATEPLANE_CELL_ROLE: `${role}_absent` } });
     assert.equal(missing.status, 1);

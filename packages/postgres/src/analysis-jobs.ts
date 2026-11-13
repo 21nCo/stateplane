@@ -588,6 +588,8 @@ const PREPARE_SLACK_MS = 100;
 const TURN_MS = MIN_PAGE_MS + RELEASE_MS + PREPARE_SLACK_MS;
 /** The cell jobs Worker's tick, which creates its worker afresh each time (deployment/workers/jobs.ts). */
 const TICK_MS = 60_000;
+/** The bound on reading and passing on the cell's turn record, kept back from preparation. */
+const TAKE_MS = 100;
 export async function probing<T extends Session>(db: T): Promise<T> {
   await db.query(`SET LOCAL lock_timeout = '${PROBE_LOCK_MS}ms'`);
   return db;
@@ -612,7 +614,8 @@ export const lockedOut = (error: unknown) => (error as { code?: unknown } | null
  * The same step writes owner space exports (`PortabilityExportWorker`,
  * docs/portability-export.md#worker). Every step first ends expired jobs of
  * each kind, each in a slice of its own (a tenth of the budget), whichever
- * kind claims first; no turn ends them again. It then probes each kind,
+ * kind claims first (a pass its slice did not finish continues in its kind's
+ * turn; a finished one is not repeated). It then probes each kind,
  * bounded alone, for the wait of the job its claim would take next (one whose
  * row, space or collection is locked is not due). All of that ends early
  * enough to leave one turn; a kind whose probe is locked out or fails is not
@@ -621,16 +624,16 @@ export const lockedOut = (error: unknown) => (error as { code?: unknown } | null
  * room for a turn of each: the one waiting longer first, stopping at its
  * share (analysis three fifths, exports two fifths) yet leaving the other its
  * turn, and getting back what the other leaves unused. With room for one turn
- * only they alternate step by step, whatever their waits, so each gets a turn
- * within two steps. A failure of either kind, a failed probe included, never
+ * only they alternate step by step, whatever their waits, by the cell's turn
+ * record (migration 052), so each gets a turn within two steps. A failure of either kind, a failed probe included, never
  * stops the other: the step throws it once both have run.
  */
 export class PostgresAnalysisWorker {
   readonly #exports: PortabilityExportWorker;
   /**
-   * The kind that goes first when two due kinds cannot share a step (0 analysis, 1 exports): the parity of the minute
-   * the worker was created in, so the jobs Worker's tick, creating one each minute, alternates them across ticks, and
-   * flipped by each such step, so a worker stepping again alternates them too.
+   * The kind that goes first in preparation (0 analysis, 1 exports), and, when two due kinds cannot share a step and the
+   * cell's turn record cannot be read, in the turns too: from the parity of the minute the worker was created in, then
+   * the kind the last such step put second.
    */
   #alternate = Math.floor(Date.now() / TICK_MS) % 2;
   constructor(private readonly pool: PoolLike, private readonly options: AnalysisWorkerOptions) {
@@ -657,13 +660,14 @@ export class PostgresAnalysisWorker {
     // Each kind's expiry in a slice of its own, then its due probe, bounded alone, all ending by `readyBy`, which leaves the
     // first turn one page or part and its lease release. A kind whose probe is locked out or fails (reported) is not due
     // this step; one whose expiry ran out its slice (its table locked, or much to end), or left unprobed, or whose probe is
-    // cut short, is due with its wait unknown.
-    const readyBy = end - TURN_MS;
+    // cut short, is due with its wait unknown. An expiry pass its slice did not finish continues in its kind's turn.
+    const readyBy = end - TURN_MS - TAKE_MS;
+    const unfinished = new Set<'analysis' | 'exports'>();
     const ready = async (kind: 'analysis' | 'exports', expire: (until: number) => Promise<void>,
       waiting: (until: number) => Promise<number | null>) => {
       const until = Math.min(readyBy, Date.now() + Math.floor(budgetMs / 10));
       await settle(kind, () => expire(until));
-      if (Date.now() >= until) return Infinity;
+      if (Date.now() >= until) { unfinished.add(kind); return Infinity; }
       return waiting(Math.min(readyBy, Date.now() + PROBE_MS)).catch((error: unknown) => {
         if (ended(error)) return Infinity;
         if (!lockedOut(error) && !failures.has(kind)) failures.set(kind, error);
@@ -671,8 +675,9 @@ export class PostgresAnalysisWorker {
       });
     };
     const kinds = [
-      { kind: 'analysis' as const, share: 3, expire: (until: number) => this.expire(until, result), waiting: (until: number) => this.waiting(until) },
-      { kind: 'exports' as const, share: 2, expire: (until: number) => this.#exports.expire(until, result.exports),
+      { kind: 'analysis' as const, share: 3, expire: (until: number, lockBound = false) => this.expire(until, result, lockBound),
+        waiting: (until: number) => this.waiting(until) },
+      { kind: 'exports' as const, share: 2, expire: (until: number, lockBound = false) => this.#exports.expire(until, result.exports, lockBound),
         waiting: (until: number) => this.#exports.waiting(until) }];
     // The kind whose turn it is goes first, in preparation too, so neither's preparation always takes the other's slack.
     if (this.#alternate) kinds.reverse();
@@ -682,12 +687,24 @@ export class PostgresAnalysisWorker {
       if (since !== null) due.push({ kind, share, since });
     }
     // Two kinds due share the step when it has room for a turn of each: the one waiting longer first, stopping at its share
-    // and never later than leaves the other its turn. Otherwise they alternate, step by step, whatever their waits.
+    // and never later than leaves the other its turn. Otherwise they alternate, step by step, whatever their waits: the
+    // kind the cell's turn record names goes first and the record names the other (this worker's own turn if unreadable).
     const left = end - Date.now(), shared = due.length === 2 && left >= 2 * TURN_MS;
     if (shared) due.sort((a, b) => a.since - b.since || a.share - b.share);
-    else if (due.length === 2) this.#alternate ^= 1;
-    const turn = (kind: 'analysis' | 'exports', until: number) =>
-      settle(kind, () => kind === 'analysis' ? this.analyse(until, result) : this.#exports.turn(until, result.exports));
+    else if (due.length === 2) {
+      const exportsFirst = await this.#taking(Math.min(end - TURN_MS, Date.now() + TAKE_MS)).catch(() => this.#alternate === 1);
+      if ((due[0].kind === 'exports') !== exportsFirst) due.reverse();
+      this.#alternate = exportsFirst ? 0 : 1;
+    }
+    const turn = (kind: 'analysis' | 'exports', until: number) => settle(kind, async () => {
+      const own = kinds.find(entry => entry.kind === kind)!;
+      // Its unfinished expiry pass first, waiting at most the lock bound, so a locked table leaves the turn to the claims.
+      if (unfinished.has(kind)) {
+        await own.expire(until, true).catch((error: unknown) => { if (!lockedOut(error)) throw error; });
+        unfinished.delete(kind);
+      }
+      return kind === 'analysis' ? this.analyse(until, result) : this.#exports.turn(until, result.exports);
+    });
     const [first, second] = due;
     if (first) await turn(first.kind, shared
       ? Math.min(end - TURN_MS, Date.now() + Math.max(TURN_MS, Math.floor(left * first.share / 5))) : end);
@@ -697,6 +714,14 @@ export class PostgresAnalysisWorker {
     if (failures.size > 1) throw new AggregateError([...failures.values()], 'The analysis and export steps failed');
     if (failures.size) throw [...failures.values()][0];
     return result;
+  }
+
+  /** Whether exports go first at this step, as the cell's turn record says, which then names the other kind. */
+  async #taking(until: number): Promise<boolean> {
+    const row = (await inTransaction(this.pool, async db => (await probing(db)).query(`UPDATE snapshot_step_turn
+      SET exports_next=NOT exports_next RETURNING NOT exports_next AS exports_first`), { deadline: until })).rows[0];
+    if (!row) throw new Error('The snapshot step turn record is missing');
+    return row.exports_first === true;
   }
 
   /**
@@ -731,10 +756,14 @@ export class PostgresAnalysisWorker {
     }
   }
 
-  /** End jobs past their expiry, one per transaction, removing their results; their slots are released as they end. */
-  private async expire(until: number, result: AnalysisStep): Promise<void> {
+  /**
+   * End jobs past their expiry, one per transaction, removing their results; their slots are released as they end.
+   * With `lockBound`, each waits at most the probe's lock bound.
+   */
+  private async expire(until: number, result: AnalysisStep, lockBound = false): Promise<void> {
     while (Date.now() < until) {
       const ended = await inTransaction(this.pool, async db => {
+        if (lockBound) await probing(db);
         const due = (await db.query(`SELECT space_id,collection_id,job_id FROM analysis_jobs
           WHERE state IN ${ACTIVE} AND expires_at<=clock_timestamp() ORDER BY expires_at LIMIT 1 FOR UPDATE SKIP LOCKED`)).rows[0];
         if (!due) return false;

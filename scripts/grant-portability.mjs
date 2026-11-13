@@ -1,7 +1,7 @@
 import pg from 'pg';
 import { connectionOptions } from './db-connection.mjs';
 
-// Run after migration 051 or restore through a protected cell administration
+// Run after migration 052 or restore through a protected cell administration
 // connection. The role is supplied by the protected deployment inventory.
 // Space deletion proves erasure by reading every portability table. Export
 // and import workers (STA-70 and STA-71) admit and advance jobs, write parts,
@@ -16,7 +16,9 @@ if (!url || !role || !/^(?!pg_)[a-z][a-z0-9_]{0,62}$/.test(role))
 const grants=[
   ['portability_jobs','SELECT, INSERT, UPDATE'],
   ['portability_parts','SELECT, INSERT, DELETE'],
-  ['portability_principal_map','SELECT, INSERT, UPDATE']
+  ['portability_principal_map','SELECT, INSERT, UPDATE'],
+  // The shared snapshot step records whose turn is next (migration 052).
+  ['snapshot_step_turn','SELECT, UPDATE']
 ];
 const client=new pg.Client(connectionOptions(url));
 await client.connect();

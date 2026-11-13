@@ -7,3 +7,13 @@
 -- builds.
 CREATE INDEX IF NOT EXISTS portability_jobs_live ON portability_jobs(leased_until)
   WHERE kind = 'export' AND state IN ('queued', 'running', 'completed');
+
+-- The same step's turn order (docs/portability-export.md#worker): when a step
+-- has room for one turn only, the kind this row names goes first and the step
+-- names the other, so analysis jobs and exports alternate across steps,
+-- whichever worker (a new one each tick) runs them.
+CREATE TABLE IF NOT EXISTS snapshot_step_turn (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  exports_next boolean NOT NULL DEFAULT false
+);
+INSERT INTO snapshot_step_turn DEFAULT VALUES ON CONFLICT DO NOTHING;
