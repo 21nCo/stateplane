@@ -1,0 +1,23 @@
+docs/owned-spaces.md
+  s_eafaac4551d97b::t_363c7c64cda2ba 37
+docs/postgres-authority.md
+  s_eafaac4551d97b::t_f24e16524496f0 23
+docs/regional-topology.md
+  s_eafaac4551d97b::t_0598b4cfc3b0e5 5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "254fa69a3825053ede1c3a56919709b997062192",
+  "prompts": {},
+  "sessions": {
+    "s_eafaac4551d97b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_eafaac4551d97b",
+        "model": "unknown"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
