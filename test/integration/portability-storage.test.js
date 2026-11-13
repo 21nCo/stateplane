@@ -542,6 +542,51 @@ test('parts are written in order by their running job under its lease, are check
   await assert.rejects(pool.query('DELETE FROM portability_parts WHERE job_id=$1', [imported.job_id]), check('portability_parts_kept'));
 });
 
+// Migration 052's removal queue: an export that ends cancelled, failed or expired holding parts is queued at the
+// commit that ends it, with its highest part number as rows left; an export ending without parts and an import never
+// are; a space purge takes the queue with its jobs.
+test('an export ended holding parts is queued for removal at commit; one without parts and an import never are', async () => {
+  const { spaceId, positions } = await space();
+  const queued = async job => (await pool.query('SELECT rows_left FROM portability_removals WHERE space_id=$1 AND job_id=$2',
+    [job.space_id, job.job_id])).rows.map(row => row.rows_left);
+  // An export of `parts` parts; one to expire is admitted to expire 1 s on, leased until then (a lease never outlasts its
+  // job) and waited past its expiry once written.
+  const written = async (ending, parts) => {
+    const expiring = ending === `state='expired'`;
+    const admitted = await admit(spaceId, 'export', { watermark: positions[0],
+      ...(expiring ? { expires_at: new Date(Date.now() + 1_000) } : {}) });
+    const job = expiring ? await update(admitted, `state='running',lease_id='lease',leased_until=expires_at,attempts=attempts+1`)
+      : await run(admitted);
+    for (let number = 1; number <= parts; number += 1) await part(job, number);
+    if (expiring) await sleep(1_100);
+    return job;
+  };
+  for (const ending of [`state='cancelled'`, `state='failed',failure_code='WORKER_LOST'`, `state='expired'`]) {
+    const job = await written(ending, 3);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await update(job, ending, [], client);
+      assert.deepEqual(await queued(job), [], `${ending}: queued only at commit`);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally { client.release(); }
+    assert.deepEqual(await queued(job), [3], ending);
+    const empty = await written(ending, 0);
+    await update(empty, ending);
+    assert.deepEqual(await queued(empty), [], `${ending} without parts`);
+  }
+  const imported = await run(await admit(spaceId, 'import'));
+  await part(imported, 1);
+  await update(imported, `state='failed',failure_code='CONFLICT'`);
+  assert.deepEqual(await queued(imported), []);
+  await pool.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1`, [spaceId]);
+  await pool.query('SELECT stateplane_purge_space($1)', [spaceId]);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM portability_removals WHERE space_id=$1', [spaceId])).rows[0].n, 0);
+});
+
 /** Wait until the session behind `client` waits for a lock. */
 async function waiting(client) {
   const pid = client.processID;

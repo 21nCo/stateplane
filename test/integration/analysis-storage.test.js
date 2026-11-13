@@ -951,6 +951,44 @@ test('space erasure removes every job, page, manifest and space slot of that spa
     'cell slots are cell capacity, not space data');
 });
 
+// Migration 052's removal queue: an ending that leaves pages queues the job at the commit that ends it, with its
+// highest page as rows left; an ending that removes its pages in the same transaction, as every ending does until
+// STA-77, queues nothing; a space purge takes the queue with its jobs.
+test('an analysis job ended with pages left is queued for removal at commit, one ended with its pages removed never is', async () => {
+  const { spaceId, watermark } = await space();
+  const queued = async job => (await pool.query(`SELECT rows_left FROM analysis_removals WHERE space_id=$1 AND collection_id=$2
+    AND job_id=$3`, key(job))).rows.map(row => row.rows_left);
+  // A running job with two pages, brought to the state its ending leaves from: cancelling for a cancellation, and past
+  // its expiry (admitted to expire 1 s on and leased until then) for an expiry.
+  const paged = async ending => {
+    const expiring = ending === `state='expired'`;
+    const job = await admit(spaceId, watermark, expiring ? { expires_in: '1 second' } : {});
+    await (expiring ? update(job, `state='running',lease_id='lease-1',leased_until=expires_at,attempts=attempts+1`) : run(job));
+    await page(job, 1, '{"rec_1":1}\n', 0, 1, 0);
+    await page(job, 2, '{"rec_2":2}\n', 1, 1, 12);
+    if (ending === `state='cancelled'`) await update(job, `state='cancelling'`);
+    if (expiring) await new Promise(resolve => setTimeout(resolve, 1_100));
+    return job;
+  };
+  for (const ending of [`state='cancelled'`, `state='failed',failure_code='UNPROCESSABLE'`, `state='expired'`]) {
+    const discarded = await paged(ending);
+    await inTransaction(async db => {
+      await update(discarded, ending, [], db);
+      await db.query(`DELETE FROM analysis_result_pages WHERE ${jobWhere}`, key(discarded));
+    });
+    assert.deepEqual(await queued(discarded), [], ending);
+    const left = await paged(ending);
+    await inTransaction(async db => {
+      await update(left, ending, [], db);
+      assert.deepEqual(await queued(left), [], `${ending}: queued only at commit`);
+    });
+    assert.deepEqual(await queued(left), [2], ending);
+  }
+  await pool.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1`, [spaceId]);
+  await pool.query('SELECT stateplane_purge_space($1)', [spaceId]);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM analysis_removals WHERE space_id=$1', [spaceId])).rows[0].n, 0);
+});
+
 test('a space slot is added only while its space is live, so none outlives a purge, whichever starts first', async () => {
   const [purged, raced] = [await space(), await space()];
   const addSlot = (spaceId, db = pool) => db.query('INSERT INTO analysis_space_slots(space_id,slot) VALUES($1,1)', [spaceId]);
