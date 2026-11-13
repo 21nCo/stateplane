@@ -1,0 +1,19 @@
+cubic.yaml
+  s_d4986a6f16d675::t_6d8d91b856d6ac 3-4,16-18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1883dc227184a20bcd46de89117c19cabb106769",
+  "prompts": {},
+  "sessions": {
+    "s_d4986a6f16d675": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4ae9acab-aca5-495d-891f-542066b6ebfa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
