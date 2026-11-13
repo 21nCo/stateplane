@@ -1,0 +1,43 @@
+docs/portability-export.md
+  s_c9462cfce9510f::t_cc1a66c23d681e 3,5,104-106,127
+test/integration/analysis-storage.test.js
+  s_19abec75182420::t_1b882be2791f52 953-990
+test/integration/portability-storage.test.js
+  s_19abec75182420::t_f6a09ad8034b49 545-589
+docs/analysis-jobs.md
+  s_19abec75182420::t_e8f0b715e11cfe 118,158,163,174
+docs/owned-spaces.md
+  s_19abec75182420::t_fbeab0980752d5 37
+docs/postgres-authority.md
+  s_19abec75182420::t_daf3f639e1db6b 23
+docs/regional-topology.md
+  s_19abec75182420::t_4ffc97b75f3b16 5
+test/integration/analysis-jobs.test.js
+  s_19abec75182420::t_25883e48904012 576-578
+test/portability-manifest-schema.test.js
+  s_19abec75182420::t_34989d93f06495 1-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9e9a41d530c8b7216c1cb490abc75e4261c3acd8",
+  "prompts": {},
+  "sessions": {
+    "s_19abec75182420": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d61a7abd-8c27-4e7c-ba23-13d43e2da322",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    },
+    "s_c9462cfce9510f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f9695f49-9cf7-4aa1-a6c9-a722a2973609",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
