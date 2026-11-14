@@ -220,4 +220,7 @@ test('a provenance row continued across thousands of parts verifies in linear ti
   const long = await check(chunks(row(2, 5, 1_048_578), 3));
   assert.equal(long.ok, false);
   assert.match(long.reason, /provenance row is longer than 1048576 characters/);
+  // Refused while still unfinished: two parts carry more than the limit before the third would end the row.
+  const carried = await check(chunks(row(2, 5, 2_200_000), 3));
+  assert.deepEqual(carried, { ok: false, reason: 'a provenance row is longer than 1048576 characters' });
 });

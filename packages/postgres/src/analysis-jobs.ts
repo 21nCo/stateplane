@@ -87,8 +87,12 @@ const pk = (job: Row): string[] => [job.space_id, job.collection_id, job.job_id]
 const cutShort = (error: unknown) => error instanceof DeadlineExceededError;
 /** A transaction whose deadline ended it, at its COMMIT too (that transaction is retried or resumed), has only run out of time. */
 export const ended = (error: unknown) => cutShort(error) || (error instanceof CommitOutcomeUnknownError && cutShort(error.cause));
-/** A lease's length, slot holds included: at most `leaseMs`, and ending with the turn (`turnEnd`), so it lapses then even if never given back. */
-const leaseFor = (turnEnd: number) => Math.max(1, Math.min(analysisJobBounds.leaseMs, turnEnd - Date.now()));
+/**
+ * The turn's end on the database clock, which every lease and slot hold of the turn ends by, so they lapse then even if
+ * never given back: `read`, a clock reading the database returned, plus the time the turn had left when it arrived.
+ * Never later than the turn's end, however long a statement took to reach the database or waited there.
+ */
+export const turnBound = (read: Date, turnEnd: number) => new Date(read.getTime() + turnEnd - Date.now());
 
 
 const STATUS = `SELECT j.*,CASE WHEN j.state IN ${ACTIVE} AND j.expires_at<=clock_timestamp() THEN 'expired' ELSE j.state END AS effective,
@@ -820,19 +824,21 @@ export class PostgresAnalysisWorker {
         // Space and collection first, as the purge and every reader lock them; then the job; then its slots. A lock held
         // past the probe's bound leaves the job busy, so the claim never waits out the step.
         await probing(db);
-        const job = (await db.query('SELECT * FROM analysis_jobs WHERE space_id=$1 AND collection_id=$2 AND job_id=$3', pk(next))).rows[0];
+        const job = (await db.query(`SELECT *,clock_timestamp() AS read_at FROM analysis_jobs WHERE space_id=$1 AND collection_id=$2
+          AND job_id=$3`, pk(next))).rows[0];
         if (!job) return 'busy' as const;
+        const bound = turnBound(job.read_at, turnEnd);
         const failure = await binding(db, job);
-        const locked = (await db.query(`SELECT *,least(clock_timestamp()+$4::int*interval '1 millisecond',expires_at) AS until
+        const locked = (await db.query(`SELECT *,least(clock_timestamp()+$4::int*interval '1 millisecond',$5::timestamptz,expires_at) AS until
           FROM analysis_jobs WHERE space_id=$1 AND collection_id=$2 AND job_id=$3
             AND (state='queued' OR (state='running' AND leased_until<=clock_timestamp())) AND expires_at>clock_timestamp()
-          FOR UPDATE SKIP LOCKED`, [...pk(next), leaseFor(turnEnd)])).rows[0];
+          FOR UPDATE SKIP LOCKED`, [...pk(next), analysisJobBounds.leaseMs, bound])).rows[0];
         if (!locked) return 'busy' as const;
         if (failure) { await this.fail(db, locked, failure); return 'failed' as const; }
         const cell = (await db.query('SELECT cell_id FROM spaces WHERE space_id=$1', [locked.space_id])).rows[0].cell_id;
         await this.take(db, locked, cell);
-        return (await db.query(`UPDATE analysis_jobs SET state='running',lease_id=$4,leased_until=$5,attempts=attempts+1
-          WHERE space_id=$1 AND collection_id=$2 AND job_id=$3 RETURNING *`, [...pk(locked), lease, locked.until])).rows[0];
+        return Object.assign((await db.query(`UPDATE analysis_jobs SET state='running',lease_id=$4,leased_until=$5,attempts=attempts+1
+          WHERE space_id=$1 AND collection_id=$2 AND job_id=$3 RETURNING *`, [...pk(locked), lease, locked.until])).rows[0], { turn_end: bound });
       }, { deadline: until }).catch((error: unknown) => {
         if (error instanceof SlotOutcome) return error.outcome;
         // Taking a slot that another transaction holds meanwhile, or in a space changing meanwhile, is refused: retry later.
@@ -884,11 +890,12 @@ export class PostgresAnalysisWorker {
 
   /** Run the claimed job page by page until it ends, its lease is lost or the budget ends; then give the lease back. */
   private async run(claimed: Row, until: number, result: AnalysisStep): Promise<void> {
-    let thrown = false;
+    // Whether writing failed the step: a deadline that ended it did not.
+    let failed = false;
     try {
       while (until - RELEASE_MS - Date.now() >= MIN_PAGE_MS) {
         let outcome: 'page' | 'completed' | 'failed' | 'expired' | 'lost';
-        try { outcome = await inTransaction(this.pool, db => this.page(db, claimed, until), { deadline: until - RELEASE_MS }); }
+        try { outcome = await inTransaction(this.pool, db => this.page(db, claimed), { deadline: until - RELEASE_MS }); }
         catch (error) { if (cutShort(error)) break; throw error; }
         if (outcome === 'page') { result.pages++; continue; }
         if (outcome === 'completed') result.completed++;
@@ -896,9 +903,9 @@ export class PostgresAnalysisWorker {
         if (outcome === 'expired') result.expired++;
         return;
       }
-    } catch (error) { thrown = true; throw error; } finally {
+    } catch (error) { failed = !ended(error); throw error; } finally {
       // Its lease and slot holds end now, so the job is due again and its slots free; unsent, they still end with the turn
-      // (`leaseFor`). A give-back the deadline cut short is counted; any other failure is the step's, unless the pages already failed it.
+      // (`turnBound`). A give-back the deadline cut short is counted; any other failure is the step's, unless the pages already failed it.
       await inTransaction(this.pool, async db => {
         const held = (await db.query(`UPDATE analysis_jobs SET leased_until=clock_timestamp() WHERE space_id=$1 AND collection_id=$2
           AND job_id=$3 AND state='running' AND lease_id=$4 AND leased_until>clock_timestamp() RETURNING job_id`,
@@ -909,8 +916,8 @@ export class PostgresAnalysisWorker {
         await db.query(`UPDATE analysis_space_slots SET held_until=clock_timestamp() WHERE space_id=$1 AND holder_collection_id=$2
           AND holder_job_id=$3`, pk(claimed));
       }, { deadline: until }).catch((error: unknown) => {
-        result.unreleased++;
-        if (!thrown && !ended(error)) throw error;
+        if (ended(error)) result.unreleased++;
+        else if (!failed) throw error;
       });
     }
   }
@@ -922,13 +929,14 @@ export class PostgresAnalysisWorker {
   }
 
   /** One page of the job under its exact lease, committed with its checkpoint; or its manifest once no record is left. */
-  private async page(db: Session, claimed: Row, turnEnd: number): Promise<'page' | 'completed' | 'failed' | 'expired' | 'lost'> {
+  private async page(db: Session, claimed: Row): Promise<'page' | 'completed' | 'failed' | 'expired' | 'lost'> {
     const started = Date.now();
     const key = pk(claimed);
     const failure = await binding(db, claimed);
-    const job = (await db.query(`SELECT *,least(clock_timestamp()+$5::int*interval '1 millisecond',expires_at) AS until
+    const job = (await db.query(`SELECT *,least(clock_timestamp()+$5::int*interval '1 millisecond',$6::timestamptz,expires_at) AS until
       FROM analysis_jobs WHERE space_id=$1 AND collection_id=$2 AND job_id=$3 AND state='running' AND lease_id=$4
-        AND leased_until>clock_timestamp() AND expires_at>clock_timestamp() FOR UPDATE`, [...key, claimed.lease_id, leaseFor(turnEnd)])).rows[0];
+        AND leased_until>clock_timestamp() AND expires_at>clock_timestamp() FOR UPDATE`, [...key, claimed.lease_id, analysisJobBounds.leaseMs,
+      claimed.turn_end])).rows[0];
     if (!job) return 'lost';
     if (failure) { await this.fail(db, job, failure); return 'failed'; }
     // One slot is one backend: no parallel workers outside the analytical budget.

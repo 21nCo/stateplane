@@ -1566,13 +1566,14 @@ test('a removal batch budgets its whole transaction: with every statement slow, 
   { exports: 0, analysis: 0 });
 });
 
-/** A jobs Worker whose statements matching `stalls` wait `ms` before they are sent: a latent or stalled session. */
-function stalling(stalls, ms) {
+/** A jobs Worker each of whose statements waits the milliseconds `stalls` gives it before it is sent: a latent or stalled session. */
+function stalling(stalls) {
   const own = newPool(1);
   own.on('connect', client => {
     const query = client.query.bind(client);
     client.query = async (sql, ...rest) => {
-      if (stalls(typeof sql === 'string' ? sql : sql.text)) await new Promise(resolve => setTimeout(resolve, ms));
+      const ms = stalls(typeof sql === 'string' ? sql : sql.text);
+      if (ms) await new Promise(resolve => setTimeout(resolve, ms));
       return query(sql, ...rest);
     };
   });
@@ -1587,19 +1588,24 @@ async function settleAll() {
   throw new Error('jobs did not finish');
 }
 
-test('a lease and its slot holds end with their turn: a write and its give-back cut at the deadline leave the job due at once', async () => {
+test('a lease and its slot holds end with their turn: late lease statements, and a write and give-back cut at the deadline, leave the job due at once', async () => {
   const actor = await owner();
   const spaceId = await space(actor);
   await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: 'one' } });
-  // The first write and every give-back stall past the step, as a session lost at the deadline or a new one too slow
-  // to fit the release reserve: the write is cut at the deadline less the reserve, and its give-back at the deadline.
+  // Every statement that sets a lease (the claim and each renewal) arrives a second late, and the first write and every
+  // give-back stall past the step, as a session lost at the deadline or a new one too slow to fit the release reserve:
+  // the write is cut at the deadline less the reserve, and its give-back at the deadline.
   let writes = 0;
-  const cut = () => stalling(sql => (/^\s*INSERT INTO (portability_parts|analysis_result_pages|analysis_result_manifests)/.test(sql)
-    && ++writes === 1) || /SET leased_until=clock_timestamp\(\)/.test(sql), 6_000);
+  const cut = () => stalling(sql => {
+    if (/least\(clock_timestamp\(\)/.test(sql)) return 1_000;
+    const stalled = (/^\s*INSERT INTO (portability_parts|analysis_result_pages|analysis_result_manifests)/.test(sql) && ++writes === 1)
+      || /SET leased_until=clock_timestamp\(\)/.test(sql);
+    return stalled ? 8_000 : 0;
+  });
   const held = async (table, jobId) => (await pool.query(`SELECT state,leased_until>clock_timestamp()+interval '100 milliseconds' AS leased
     FROM ${table} WHERE job_id=$1`, [jobId])).rows[0];
   const analysed = await services.analysis.submit(actor, spaceId, 'alpha', 'export');
-  const analysis = await cut().step({ budgetMs: 4_000 });
+  const analysis = await cut().step({ budgetMs: 6_000 });
   assert.deepEqual([analysis.claimed, analysis.pages, analysis.unreleased], [1, 0, 1], 'the page and the give-back were cut');
   assert.deepEqual(await held('analysis_jobs', analysed.jobId), { state: 'running', leased: false }, 'the lease ended with the turn');
   assert.equal((await pool.query(`SELECT (SELECT count(*) FROM analysis_cell_slots WHERE holder_job_id=$1
@@ -1609,7 +1615,7 @@ test('a lease and its slot holds end with their turn: a write and its give-back 
 
   writes = 0;
   const exported = await portability.submitExport(actor, spaceId);
-  const exportStep = (await cut().step({ budgetMs: 4_000 })).exports;
+  const exportStep = (await cut().step({ budgetMs: 6_000 })).exports;
   assert.deepEqual([exportStep.claimed, exportStep.parts, exportStep.unreleased], [1, 0, 1], 'the part and the give-back were cut');
   assert.deepEqual(await held('portability_jobs', exported.jobId), { state: 'running', leased: false }, 'the lease ended with the turn');
   assert.equal((await worker().step({ budgetMs: 4_000 })).exports.claimed, 1, 'the next step claims the export at once');
@@ -1624,12 +1630,13 @@ test('a lease and its slot holds end with their turn: a write and its give-back 
 });
 
 test('the cell\'s turn record falls back to the worker\'s own turn when locked out, and reports any other failure once both kinds ran', async () => {
+  await settleAll();
   const actor = await owner();
   const spaceId = await space(actor);
   await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: 'one' } });
-  const written = async () => Number((await pool.query(`SELECT (SELECT count(*) FROM portability_parts p JOIN portability_jobs j
-      ON j.space_id=p.space_id AND j.job_id=p.job_id WHERE j.space_id=$1)+(SELECT count(*) FROM analysis_result_pages WHERE space_id=$1) AS n`,
-  [spaceId])).rows[0].n);
+  // Claims of either kind so far: a claim counts an attempt, and attempts never go down.
+  const written = async () => Number((await pool.query(`SELECT (SELECT COALESCE(sum(attempts),0) FROM portability_jobs)
+    +(SELECT COALESCE(sum(attempts),0) FROM analysis_jobs) AS n`)).rows[0].n);
   // At the 2 s minimum budget with 700 ms writes, two due kinds cannot share the step, so it reads the turn record.
   const turning = fault => worker(sql => {
     if (/^\s*INSERT INTO (portability_parts|analysis_result_pages|analysis_result_manifests)/.test(sql)) spin(700);
@@ -1661,6 +1668,7 @@ test('the cell\'s turn record falls back to the worker\'s own turn when locked o
 });
 
 test('an export\'s status names no section until a worker checkpoints one, and an integer the format cannot carry fails it', async () => {
+  await settleAll();
   const actor = await owner();
   const spaceId = await space(actor);
   await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: 'one' } });

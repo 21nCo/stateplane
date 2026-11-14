@@ -3,7 +3,7 @@ import { exportSections, portabilityFormat, portabilityFormatVersion } from '@st
 import type { ExportManifest, VerifiedCredential } from '@stateplane/contracts';
 import { AuthorityError, CommitOutcomeUnknownError } from './index.js';
 import type { AuthorityScope } from './index.js';
-import { ended, finalCheck, lockedOut, probing, publish, released } from './analysis-jobs.js';
+import { ended, finalCheck, lockedOut, probing, publish, released, turnBound } from './analysis-jobs.js';
 import type { Deadline } from './analysis-jobs.js';
 import { DeadlineExceededError, inTransaction } from './faults.js';
 import type { PoolLike, Session } from './faults.js';
@@ -112,8 +112,6 @@ function exact(value: unknown): number {
   if (!Number.isSafeInteger(number)) throw new RangeError(`An integer the export format cannot carry exactly: ${String(value)}`);
   return number;
 }
-/** A lease's length: at most `leaseMs`, and ending with the turn (`turnEnd`), so it lapses then even if never given back. */
-const leaseFor = (turnEnd: number) => Math.max(1, Math.min(portabilityExportBounds.leaseMs, turnEnd - Date.now()));
 /** What no export carries, whatever the space holds: the manifest states it. */
 const EXCLUDED = ['credential-secrets', 'session-tokens', 'storage-object-keys', 'original-bytes', 'derived-projections'];
 
@@ -737,17 +735,19 @@ export class PortabilityExportWorker {
     passed.push(next.job_id);
     return inTransaction(this.pool, async db => {
       await probing(db);
-      const job = (await db.query('SELECT * FROM portability_jobs WHERE space_id=$1 AND job_id=$2', pk(next))).rows[0];
+      const job = (await db.query('SELECT *,clock_timestamp() AS read_at FROM portability_jobs WHERE space_id=$1 AND job_id=$2',
+        pk(next))).rows[0];
       if (!job) return 'busy' as const;
+      const bound = turnBound(job.read_at, turnEnd);
       const failure = await spaceCheck(db, job.space_id, { principal: job.principal_id, placement: Number(job.placement_generation) });
-      const locked = (await db.query(`SELECT *,least(clock_timestamp()+$3::int*interval '1 millisecond',expires_at) AS until
+      const locked = (await db.query(`SELECT *,least(clock_timestamp()+$3::int*interval '1 millisecond',$4::timestamptz,expires_at) AS until
         FROM portability_jobs WHERE space_id=$1 AND job_id=$2
           AND state='running' AND leased_until<=clock_timestamp() AND expires_at>clock_timestamp()
-        FOR UPDATE SKIP LOCKED`, [...pk(next), leaseFor(turnEnd)])).rows[0];
+        FOR UPDATE SKIP LOCKED`, [...pk(next), portabilityExportBounds.leaseMs, bound])).rows[0];
       if (!locked) return 'busy' as const;
       if (failure) { await this.fail(db, locked, failure); return 'failed' as const; }
-      return (await db.query(`UPDATE portability_jobs SET state='running',lease_id=$3,leased_until=$4,attempts=attempts+1
-        WHERE space_id=$1 AND job_id=$2 RETURNING *`, [...pk(locked), randomUUID(), locked.until])).rows[0];
+      return Object.assign((await db.query(`UPDATE portability_jobs SET state='running',lease_id=$3,leased_until=$4,attempts=attempts+1
+        WHERE space_id=$1 AND job_id=$2 RETURNING *`, [...pk(locked), randomUUID(), locked.until])).rows[0], { turn_end: bound });
     }, { deadline: until }).catch((error: unknown) => {
       // A space changing meanwhile refuses the claim: retry later.
       const code = (error as { code?: unknown }).code;
@@ -758,11 +758,12 @@ export class PortabilityExportWorker {
 
   /** Write the claimed export's parts until it ends, its lease is lost or the budget ends; then give the lease back. */
   private async run(claimed: Row, until: number, result: PortabilityStep): Promise<void> {
-    let thrown = false;
+    // Whether writing failed the step: a deadline that ended it did not.
+    let failed = false;
     try {
       while (until - RELEASE_MS - Date.now() >= MIN_PART_MS) {
         let outcome: 'part' | 'advanced' | 'completed' | 'failed' | 'expired' | 'lost';
-        try { outcome = await inTransaction(this.pool, db => this.part(db, claimed, until), { deadline: until - RELEASE_MS }); }
+        try { outcome = await inTransaction(this.pool, db => this.part(db, claimed), { deadline: until - RELEASE_MS }); }
         catch (error) { if (cutShort(error)) break; throw error; }
         if (outcome === 'part') result.parts++;
         if (outcome === 'part' || outcome === 'advanced') continue;
@@ -771,14 +772,14 @@ export class PortabilityExportWorker {
         if (outcome === 'expired') result.expired++;
         return;
       }
-    } catch (error) { thrown = true; throw error; } finally {
-      // Its lease ends now, so the export is due again at once; unsent, it still ends with the turn (`leaseFor`). A
+    } catch (error) { failed = !ended(error); throw error; } finally {
+      // Its lease ends now, so the export is due again at once; unsent, it still ends with the turn (`turnBound`). A
       // give-back the deadline cut short is counted; any other failure is the step's, unless writing parts already failed it.
       await inTransaction(this.pool, db => db.query(`UPDATE portability_jobs SET leased_until=clock_timestamp()
         WHERE space_id=$1 AND job_id=$2 AND state='running' AND lease_id=$3 AND leased_until>clock_timestamp()`,
       [...pk(claimed), claimed.lease_id]), { deadline: until }).catch((error: unknown) => {
-        result.unreleased++;
-        if (!thrown && !ended(error)) throw error;
+        if (ended(error)) result.unreleased++;
+        else if (!failed) throw error;
       });
     }
   }
@@ -789,17 +790,17 @@ export class PortabilityExportWorker {
   }
 
   /** One part of the export under its exact lease, committed with its checkpoint; or its manifest once no row is left. */
-  private async part(db: Session, claimed: Row, turnEnd: number): Promise<'part' | 'advanced' | 'completed' | 'failed' | 'expired' | 'lost'> {
+  private async part(db: Session, claimed: Row): Promise<'part' | 'advanced' | 'completed' | 'failed' | 'expired' | 'lost'> {
     const started = Date.now(), key = pk(claimed);
     // Until permissions are read, a policy change (a key issued or revoked, which adds or removes grants) fails the export.
     const reading = (await db.query('SELECT checkpoint FROM portability_jobs WHERE space_id=$1 AND job_id=$2', key)).rows[0];
     const permissions = ((reading?.checkpoint as Checkpoint | null)?.section ?? 0) <= exportSections.indexOf('permissions');
     const failure = await spaceCheck(db, claimed.space_id, { principal: claimed.principal_id,
       placement: Number(claimed.placement_generation), policy: permissions ? Number(claimed.policy_version) : undefined });
-    const job = (await db.query(`SELECT j.*,j.created_at::text AS snapshot,${SNAPSHOT_AT},least(clock_timestamp()+$4::int*interval '1 millisecond',expires_at) AS until
+    const job = (await db.query(`SELECT j.*,j.created_at::text AS snapshot,${SNAPSHOT_AT},least(clock_timestamp()+$4::int*interval '1 millisecond',$5::timestamptz,expires_at) AS until
       FROM portability_jobs j WHERE space_id=$1 AND job_id=$2 AND state='running' AND lease_id=$3
         AND leased_until>clock_timestamp() AND expires_at>clock_timestamp() FOR UPDATE`,
-    [...key, claimed.lease_id, leaseFor(turnEnd)])).rows[0];
+    [...key, claimed.lease_id, portabilityExportBounds.leaseMs, claimed.turn_end])).rows[0];
     if (!job) return 'lost';
     if (failure) { await this.fail(db, job, failure); return 'failed'; }
     await db.query('SET LOCAL max_parallel_workers_per_gather = 0');
