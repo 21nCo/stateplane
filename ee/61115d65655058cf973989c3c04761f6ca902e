@@ -1,0 +1,32 @@
+packages/application/src/services.ts
+  h_bdc5b81c173ee9 109-118
+packages/contracts/src/index.ts
+  h_bdc5b81c173ee9 56
+packages/contracts/src/portability.ts
+  h_bdc5b81c173ee9 1-203
+packages/postgres/src/analysis-jobs.ts
+  h_bdc5b81c173ee9 3,14-15,69-71,136,151,179,196,576-598,613-631,634-642,645-647,650-748,761-769,771-774,776-782,784-786,788,797-804,810-812
+packages/postgres/src/index.ts
+  h_bdc5b81c173ee9 2195-2197
+packages/postgres/src/portability-exports.ts
+  h_bdc5b81c173ee9 1-884
+packages/postgres/src/services.ts
+  h_bdc5b81c173ee9 10,193,315-320
+test/integration/portability-export.test.js
+  h_bdc5b81c173ee9 1-1567
+test/integration/portability-storage.test.js
+  h_bdc5b81c173ee9 5
+test/portability-manifest.test.js
+  h_bdc5b81c173ee9 1-173
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ee61115d65655058cf973989c3c04761f6ca902e",
+  "prompts": {},
+  "humans": {
+    "h_bdc5b81c173ee9": {
+      "author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
