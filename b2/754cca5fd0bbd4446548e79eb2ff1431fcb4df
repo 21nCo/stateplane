@@ -1,0 +1,30 @@
+packages/postgres/src/analysis-jobs.ts
+  s_2fa574f6f4b199::t_1167a8515c997e 90-95,827-828,830,832,835,840-841,893-894,898,906,908,919-920,932,936,938-939
+packages/postgres/src/portability-exports.ts
+  s_2fa574f6f4b199::t_8045f810b46799 6,738-739,741,743,746,749-750,761-762,766,775-776,781-782,793,800,803
+test/integration/portability-export.test.js
+  s_2fa574f6f4b199::t_4a403b3f53cdd0 1569-1570,1575-1576,1591,1595-1597,1599-1604,1608,1618,1633,1637-1639,1671
+test/portability-manifest.test.js
+  s_2fa574f6f4b199::t_7ae4710b461395 223-225
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b2754cca5fd0bbd4446548e79eb2ff1431fcb4df",
+  "prompts": {},
+  "humans": {
+    "h_bdc5b81c173ee9": {
+      "author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_2fa574f6f4b199": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_2fa574f6f4b199",
+        "model": "unknown"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
