@@ -1,0 +1,32 @@
+packages/contracts/src/portability.ts
+  s_78961878458875::t_56c31563bb10c7 69-73,75-78,158-160,167-172,207
+packages/postgres/src/analysis-jobs.ts
+  s_78961878458875::t_99b7a3863f4928 22,70-71,88-91,657-661,704-709,762,806,829,887,891,899-901,911-914,925,931
+packages/postgres/src/portability-exports.ts
+  s_78961878458875::t_a555d058a3b18a 6,22,60-61,109-116,253,334,643,669,680,728,746,761,765,774-776,779-782,792,802,880-882
+test/integration/portability-export.test.js
+  s_78961878458875::t_b908417512d0cc 1568-1687
+test/portability-manifest.test.js
+  s_78961878458875::t_ce5f01618ba222 174-223
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e091044ebc8c85ae735d2891faf6ae3a7df1d246",
+  "prompts": {},
+  "humans": {
+    "h_bdc5b81c173ee9": {
+      "author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_78961878458875": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_78961878458875",
+        "model": "unknown"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
