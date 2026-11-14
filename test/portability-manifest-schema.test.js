@@ -97,6 +97,8 @@ const lines = {
     position: 1, operation: 'create', schemaVersion: 1, credentialId: 'cred_1', committedAt: t, data: {} }),
   events: () => ({ eventId: 'eev_1', collectionId: 'col_1', kind: 'link', entityId: 'lnk_1', revision: 1,
     operation: 'create', credentialId: 'cred_1', committedAt: t }),
+  embeddings: () => ({ collectionId: 'col_1', refKind: 'record', refId: 'rec_1', revision: 1, chunkIndex: 0,
+    contentSha256: sha, embedder: 'e', embeddingModel: 'm', modelVersion: '1', dimensions: 2, embedding: [0, 1] }),
   permissions: () => ({ credentialId: 'cred_1', principalId: 'usr_1', createdAt: t, expiresAt: t, activatedAt: null,
     confirmedAt: null, revokedAt: null, grants: [{ collectionId: 'col_1', capabilities: ['records:read'], expiresAt: null }] })
 };
@@ -154,6 +156,7 @@ test('section lines the authority refuses are refused', () => {
     'an empty event credential': ['events', l => { l.credentialId = ''; }],
     'a record field that is not a JSON Pointer': ['retrieval', l => { l.recordFields = ['title']; }],
     'a repeated record field': ['retrieval', l => { l.recordFields = ['/a', '/a']; }],
+    'thirty-three record fields': ['retrieval', l => { l.recordFields = Array.from({ length: 33 }, (_, i) => `/f${i}`); }],
     'an uppercase region': ['retrieval', l => { l.processingRegions = ['EU']; }],
     'a repeated region': ['retrieval', l => { l.processingRegions = ['eu', 'eu']; }],
     'seventeen regions': ['retrieval', l => { l.processingRegions = Array.from({ length: 17 }, (_, i) => `r${i}`); }],
@@ -171,6 +174,7 @@ test('section lines the authority refuses are refused', () => {
     'a stored original without a digest': ['sources', l => { l.original.sha256 = null; }],
     'a stored original without a size': ['sources', l => { l.original.byteSize = null; }],
     'a stored original without a type': ['sources', l => { l.original.mimeType = null; }],
+    'a malformed original type': ['sources', l => { l.original.mimeType = 'Text/Plain'; }],
     // Each reference-only case keeps the locator, so only the rule it names refuses it.
     'a reference-only original with a digest': ['sources', l => {
       l.locator = 'https://example.com/a'; Object.assign(l.original, { referenceOnly: true, byteSize: null });
@@ -190,6 +194,7 @@ test('section lines the authority refuses are refused', () => {
     'an unknown deletion policy': ['links', l => { l.deletionPolicy = 'cascade'; }],
     'an unknown endpoint kind': ['links', l => { l.to.kind = 'space'; }],
     'a null link credential': ['links', l => { l.credentialId = null; }],
+    'an unknown embedding ref kind': ['embeddings', l => { l.refKind = 'link'; }],
     'an unknown capability': ['permissions', l => { l.grants[0].capabilities = ['records:admin']; }]
   };
   for (const [name, [kind, change]] of Object.entries(refused)) {
