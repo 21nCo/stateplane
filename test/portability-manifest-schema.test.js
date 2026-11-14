@@ -159,8 +159,10 @@ test('section lines the authority refuses are refused', () => {
     'seventeen regions': ['retrieval', l => { l.processingRegions = Array.from({ length: 17 }, (_, i) => `r${i}`); }],
     'an unknown review status': ['claims', l => { l.reviewStatus = 'maybe'; }],
     'a null review status': ['claims', l => { l.reviewStatus = null; }],
-    'an accepted claim without a reviewer': ['claims', l => { l.reviewStatus = 'accepted'; }],
-    'an unreviewed claim with a reviewer': ['claims', l => { l.reviewedBy = 'usr_1'; l.reviewedAt = t; }],
+    'an accepted claim without a reviewer': ['claims', l => { l.reviewStatus = 'accepted'; l.reviewedAt = t; }],
+    'an accepted claim without a review time': ['claims', l => { l.reviewStatus = 'accepted'; l.reviewedBy = 'usr_1'; }],
+    'an unreviewed claim with a reviewer': ['claims', l => { l.reviewedBy = 'usr_1'; }],
+    'an unreviewed claim with a review time': ['claims', l => { l.reviewedAt = t; }],
     'an unknown record operation': ['revisions', l => { l.operation = 'upsert'; }],
     'a null revision credential': ['revisions', l => { l.credentialId = null; }],
     'a null source principal': ['sources', l => { l.principalId = null; }],
@@ -169,7 +171,13 @@ test('section lines the authority refuses are refused', () => {
     'a stored original without a digest': ['sources', l => { l.original.sha256 = null; }],
     'a stored original without a size': ['sources', l => { l.original.byteSize = null; }],
     'a stored original without a type': ['sources', l => { l.original.mimeType = null; }],
-    'a reference-only original with a digest': ['sources', l => { l.original.referenceOnly = true; }],
+    // Each reference-only case keeps the locator, so only the rule it names refuses it.
+    'a reference-only original with a digest': ['sources', l => {
+      l.locator = 'https://example.com/a'; Object.assign(l.original, { referenceOnly: true, byteSize: null });
+    }],
+    'a reference-only original with a size': ['sources', l => {
+      l.locator = 'https://example.com/a'; Object.assign(l.original, { referenceOnly: true, sha256: null });
+    }],
     'a reference-only original without a locator': ['sources', l => {
       l.original = { referenceOnly: true, sha256: null, byteSize: null, mimeType: null, capturedAt: t, observedAt: t };
     }],

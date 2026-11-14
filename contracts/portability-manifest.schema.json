@@ -212,7 +212,7 @@
       "description": "Optional accelerator: one stored embedding with the model it came from and the digest of the chunk it embeds. Never the only copy of any evidence; an importer may use it only where the chunk it rebuilds from authority has the same digest, and may ignore it. Format version 1 exporters may omit it.",
       "type": "object", "additionalProperties": false,
       "required": ["collectionId", "refKind", "refId", "revision", "chunkIndex", "contentSha256", "embedder", "embeddingModel", "modelVersion", "dimensions", "embedding"],
-      "properties": { "collectionId": { "$ref": "#/$defs/id" }, "refKind": { "type": "string" }, "refId": { "$ref": "#/$defs/id" },
+      "properties": { "collectionId": { "$ref": "#/$defs/id" }, "refKind": { "enum": ["record", "source", "claim"] }, "refId": { "$ref": "#/$defs/id" },
         "revision": { "$ref": "#/$defs/positive" }, "chunkIndex": { "$ref": "#/$defs/count" }, "contentSha256": { "$ref": "#/$defs/sha256" },
         "embedder": { "type": "string" }, "embeddingModel": { "type": "string" }, "modelVersion": { "type": "string" },
         "dimensions": { "$ref": "#/$defs/positive" }, "embedding": { "type": "array", "items": { "type": "number" } } }
