@@ -106,4 +106,14 @@ export interface StateplaneServices {
     /** One page of a complete result, reauthorized at every fetch. */
     page(actor: VerifiedCredential, spaceId: string, collectionId: string, jobId: string, page: number): Promise<unknown>;
   };
+  /** Owner-only whole-space exports in the open versioned format (docs/portability-export.md). */
+  portability: {
+    /** Export the space as of a boundary pinned now: records as of a feed watermark, evidence as of the same instant. */
+    submitExport(actor: VerifiedCredential, spaceId: string): Promise<unknown>;
+    /** An export's state, progress and boundary, with its manifest digest and part count once complete. */
+    exportStatus(actor: VerifiedCredential, spaceId: string, jobId: string): Promise<unknown>;
+    cancelExport(actor: VerifiedCredential, spaceId: string, jobId: string): Promise<unknown>;
+    /** One part of a complete export (the last is its manifest), reauthorized at every fetch. */
+    exportPart(actor: VerifiedCredential, spaceId: string, jobId: string, part: number): Promise<unknown>;
+  };
 }

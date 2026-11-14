@@ -53,3 +53,4 @@ export function isSafeHttpRead(method:string,route:readonly string[]):boolean {
     (route[5]==='query' || route[5]==='count');
 }
 export * from './analysis.js';
+export * from './portability.js';
