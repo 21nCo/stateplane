@@ -61,6 +61,8 @@
     },
     "excluded": { "type": "array", "items": { "type": "string" } }
   },
+  "if": { "properties": { "sections": { "maxItems": 11 } } },
+  "then": { "properties": { "parts": { "items": { "properties": { "section": { "not": { "const": "embeddings" } } } } } } },
   "$defs": {
     "id": { "type": "string", "minLength": 1 },
     "section": { "type": "object", "additionalProperties": false, "required": ["name", "rows", "bytes", "accelerator"],
@@ -88,11 +90,12 @@
       "type": "object", "additionalProperties": false,
       "required": ["collectionId", "version", "previousVersion", "recordFields", "sourceContent", "claimStatements", "lexical", "vector", "textSearchConfig", "processingRegions", "credentialId", "createdAt"],
       "properties": { "collectionId": { "$ref": "#/$defs/id" }, "version": { "$ref": "#/$defs/positive" },
-        "previousVersion": { "type": ["integer", "null"] }, "recordFields": { "type": "array", "items": { "type": "string" } },
+        "previousVersion": { "type": ["integer", "null"], "minimum": 1 }, "recordFields": { "type": "array", "items": { "type": "string" } },
         "sourceContent": { "type": "boolean" }, "claimStatements": { "type": "boolean" }, "lexical": { "type": "boolean" },
-        "vector": { "type": "boolean" }, "textSearchConfig": { "type": ["string", "null"] },
-        "processingRegions": { "type": ["array", "null"], "items": { "type": "string" } }, "credentialId": { "type": ["string", "null"] },
-        "createdAt": { "$ref": "#/$defs/instant" } }
+        "vector": { "type": "boolean" }, "textSearchConfig": { "type": "string", "pattern": "^[a-z_]{1,63}$" },
+        "processingRegions": { "type": "array", "items": { "type": "string" } }, "credentialId": { "$ref": "#/$defs/id" },
+        "createdAt": { "$ref": "#/$defs/instant" } },
+      "if": { "properties": { "vector": { "const": true } } }, "then": { "properties": { "processingRegions": { "minItems": 1 } } }
     },
     "permissions": {
       "description": "One agent credential's identity, times and collection grants. Never a secret, its hash or a token: an importer reissues credentials.",
@@ -103,29 +106,32 @@
         "activatedAt": { "$ref": "#/$defs/optionalInstant" }, "confirmedAt": { "$ref": "#/$defs/optionalInstant" },
         "revokedAt": { "$ref": "#/$defs/optionalInstant" },
         "grants": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["collectionId", "capabilities", "expiresAt"],
-          "properties": { "collectionId": { "$ref": "#/$defs/id" }, "capabilities": { "type": "array", "items": { "type": "string" } },
+          "properties": { "collectionId": { "$ref": "#/$defs/id" }, "capabilities": { "type": "array", "items": { "enum": ["schema:write", "records:read", "records:write", "sources:read", "sources:write", "claims:read", "claims:write", "claims:review", "events:read", "export:read", "space:admin"] } },
             "expiresAt": { "$ref": "#/$defs/optionalInstant" } } } } }
     },
     "sources": {
       "description": "One live source with its original's digest, size and type. Original bytes travel apart from the export and are checked against sha256; the storage key is never exported.",
       "type": "object", "additionalProperties": false,
       "required": ["collectionId", "sourceId", "kind", "locator", "principalId", "credentialId", "createdAt", "original"],
-      "properties": { "collectionId": { "$ref": "#/$defs/id" }, "sourceId": { "$ref": "#/$defs/id" }, "kind": { "type": ["string", "null"] },
-        "locator": { "type": ["string", "null"] }, "principalId": { "type": ["string", "null"] }, "credentialId": { "type": ["string", "null"] },
+      "properties": { "collectionId": { "$ref": "#/$defs/id" }, "sourceId": { "$ref": "#/$defs/id" }, "kind": { "const": "source" },
+        "locator": { "type": ["string", "null"] }, "principalId": { "$ref": "#/$defs/id" }, "credentialId": { "$ref": "#/$defs/id" },
         "createdAt": { "$ref": "#/$defs/instant" },
         "original": { "type": "object", "additionalProperties": false,
           "required": ["referenceOnly", "sha256", "byteSize", "mimeType", "capturedAt", "observedAt"],
           "properties": { "referenceOnly": { "type": "boolean" }, "sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
-            "byteSize": { "type": ["integer", "null"], "minimum": 0 }, "mimeType": { "type": ["string", "null"] },
-            "capturedAt": { "$ref": "#/$defs/optionalInstant" }, "observedAt": { "$ref": "#/$defs/optionalInstant" } } } }
+            "byteSize": { "type": ["integer", "null"], "minimum": 0 },
+            "mimeType": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$" },
+            "capturedAt": { "$ref": "#/$defs/instant" }, "observedAt": { "$ref": "#/$defs/instant" } },
+          "if": { "properties": { "referenceOnly": { "const": true } } }, "then": { "properties": { "sha256": { "type": "null" }, "byteSize": { "type": "null" } } },
+          "else": { "properties": { "sha256": { "type": "string" }, "byteSize": { "type": "integer" }, "mimeType": { "type": "string" } } } } }
     },
     "extractions": {
       "description": "One extraction version of a live source.",
       "type": "object", "additionalProperties": false,
       "required": ["collectionId", "sourceId", "version", "previousVersion", "sourceSha256", "parser", "parserVersion", "credentialId", "createdAt", "content", "sourceOffsets"],
       "properties": { "collectionId": { "$ref": "#/$defs/id" }, "sourceId": { "$ref": "#/$defs/id" }, "version": { "$ref": "#/$defs/positive" },
-        "previousVersion": { "type": ["integer", "null"] }, "sourceSha256": { "type": ["string", "null"] }, "parser": { "type": ["string", "null"] },
-        "parserVersion": { "type": ["string", "null"] }, "credentialId": { "type": ["string", "null"] }, "createdAt": { "$ref": "#/$defs/instant" },
+        "previousVersion": { "type": ["integer", "null"], "minimum": 1 }, "sourceSha256": { "$ref": "#/$defs/sha256" }, "parser": { "type": "string", "minLength": 1 },
+        "parserVersion": { "type": "string", "minLength": 1 }, "credentialId": { "$ref": "#/$defs/id" }, "createdAt": { "$ref": "#/$defs/instant" },
         "content": { "type": "string" }, "sourceOffsets": { "$ref": "#/$defs/json" } }
     },
     "claims": {
@@ -133,13 +139,16 @@
       "type": "object", "additionalProperties": false,
       "required": ["collectionId", "claimId", "revision", "kind", "principalId", "createdAt", "previousRevision", "statement", "attributedTo", "credentialId", "recordedBy", "observedAt", "validFrom", "validUntil", "reviewStatus", "reviewedBy", "reviewedAt", "committedAt"],
       "properties": { "collectionId": { "$ref": "#/$defs/id" }, "claimId": { "$ref": "#/$defs/id" }, "revision": { "$ref": "#/$defs/positive" },
-        "kind": { "type": ["string", "null"] }, "principalId": { "type": ["string", "null"] }, "createdAt": { "$ref": "#/$defs/instant" },
-        "previousRevision": { "type": ["integer", "null"] }, "statement": { "type": ["string", "null"] }, "attributedTo": { "type": ["string", "null"] },
-        "credentialId": { "type": ["string", "null"] }, "recordedBy": { "type": ["string", "null"] },
+        "kind": { "const": "claim" }, "principalId": { "$ref": "#/$defs/id" }, "createdAt": { "$ref": "#/$defs/instant" },
+        "previousRevision": { "type": ["integer", "null"], "minimum": 1 }, "statement": { "type": "string", "minLength": 1 }, "attributedTo": { "type": "string", "minLength": 1 },
+        "credentialId": { "$ref": "#/$defs/id" }, "recordedBy": { "type": ["string", "null"] },
         "observedAt": { "$ref": "#/$defs/optionalInstant" }, "validFrom": { "$ref": "#/$defs/optionalInstant" },
-        "validUntil": { "$ref": "#/$defs/optionalInstant" }, "reviewStatus": { "type": ["string", "null"] },
-        "reviewedBy": { "type": ["string", "null"] }, "reviewedAt": { "$ref": "#/$defs/optionalInstant" },
-        "committedAt": { "$ref": "#/$defs/instant" } }
+        "validUntil": { "$ref": "#/$defs/optionalInstant" }, "reviewStatus": { "enum": ["unreviewed", "accepted", "rejected"] },
+        "reviewedBy": { "type": ["string", "null"], "minLength": 1 }, "reviewedAt": { "$ref": "#/$defs/optionalInstant" },
+        "committedAt": { "$ref": "#/$defs/instant" } },
+      "if": { "properties": { "reviewStatus": { "const": "unreviewed" } } },
+      "then": { "properties": { "reviewedBy": { "type": "null" }, "reviewedAt": { "type": "null" } } },
+      "else": { "properties": { "reviewedBy": { "type": "string" }, "reviewedAt": { "type": "string" } } }
     },
     "provenance": {
       "description": "One evidence a claim revision cites: a whole source (extractionVersion, startOffset and endOffset null), a whole extraction version (offsets null), or a span of one, exactly as stored. A span's startOffset is at most its endOffset: a rule no JSON Schema states, which verifyExportManifest checks when given the data parts.",
@@ -160,12 +169,12 @@
       "type": "object", "additionalProperties": false,
       "required": ["collectionId", "linkId", "revision", "linkType", "deletionPolicy", "from", "to", "credentialId", "createdAt"],
       "properties": { "collectionId": { "$ref": "#/$defs/id" }, "linkId": { "$ref": "#/$defs/id" }, "revision": { "$ref": "#/$defs/positive" },
-        "linkType": { "type": "string" }, "deletionPolicy": { "type": "string" },
+        "linkType": { "type": "string", "minLength": 1 }, "deletionPolicy": { "enum": ["restrict", "detach"] },
         "from": { "$ref": "#/$defs/endpoint" }, "to": { "$ref": "#/$defs/endpoint" },
-        "credentialId": { "type": ["string", "null"] }, "createdAt": { "$ref": "#/$defs/instant" } }
+        "credentialId": { "$ref": "#/$defs/id" }, "createdAt": { "$ref": "#/$defs/instant" } }
     },
     "endpoint": { "type": "object", "additionalProperties": false, "required": ["kind", "collectionId", "id"],
-      "properties": { "kind": { "type": "string" }, "collectionId": { "$ref": "#/$defs/id" }, "id": { "$ref": "#/$defs/id" } } },
+      "properties": { "kind": { "enum": ["record", "source", "claim"] }, "collectionId": { "$ref": "#/$defs/id" }, "id": { "$ref": "#/$defs/id" } } },
     "events": {
       "description": "One evidence lifecycle event committed at or before the snapshot: a source's or claim's deletion, or a link's creation, deletion or detachment (detachment has no credential). A deleted source or claim appears only here.",
       "type": "object", "additionalProperties": false,
@@ -190,8 +199,8 @@
       "required": ["collectionId", "id", "keyMode", "key", "revision", "eventId", "position", "operation", "schemaVersion", "credentialId", "committedAt", "data"],
       "properties": { "collectionId": { "$ref": "#/$defs/id" }, "id": { "$ref": "#/$defs/id" },
         "keyMode": { "$ref": "#/$defs/keyMode" }, "key": { "$ref": "#/$defs/id" }, "revision": { "$ref": "#/$defs/positive" },
-        "eventId": { "$ref": "#/$defs/id" }, "position": { "$ref": "#/$defs/positive" }, "operation": { "type": "string" },
-        "schemaVersion": { "$ref": "#/$defs/positive" }, "credentialId": { "type": ["string", "null"] },
+        "eventId": { "$ref": "#/$defs/id" }, "position": { "$ref": "#/$defs/positive" }, "operation": { "enum": ["create", "replace", "patch", "delete"] },
+        "schemaVersion": { "$ref": "#/$defs/positive" }, "credentialId": { "type": "string" },
         "committedAt": { "$ref": "#/$defs/instant" }, "data": { "$ref": "#/$defs/json" } }
     },
     "embeddings": {
