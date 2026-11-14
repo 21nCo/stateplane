@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { memoryAdapter } from '@superfunctions/db/testing';
@@ -169,7 +169,7 @@ test('migration 051 applies on the current schema, waiting boundedly for directo
 
     const applied = migrate(db.upgrade);
     assert.equal(applied.status, 0, applied.stderr);
-    assert.equal(applied.stdout, 'Applied 051_portability_erasure_ledger.sql\n');
+    assert.equal(applied.stdout, 'Applied 051_portability_erasure_ledger.sql\nApplied 052_portability_live_exports.sql\n');
     // Archived and deleted spaces take their last publication time; the others have no stamp.
     const stamps = (await upgraded.query(`SELECT space_id,(archived_at AT TIME ZONE 'UTC')::text AS archived,
       (tombstoned_at AT TIME ZONE 'UTC')::text AS tombstoned,hard_erased_at AS erased FROM space_directory ORDER BY space_id`)).rows;
@@ -180,11 +180,93 @@ test('migration 051 applies on the current schema, waiting boundedly for directo
       { space_id: 'sp_deleted', archived: null, tombstoned: at, erased: null },
       { space_id: 'sp_deleting', archived: null, tombstoned: null, erased: null },
       { space_id: 'sp_suspended', archived: null, tombstoned: null, erased: null }]);
+    // 052 alone, with an export writer holding portability_jobs or an analysis writer holding analysis_jobs (taken
+    // after portability_jobs, as a purge does): it waits at most the lock bound, then rolls back with a retry message.
+    await upgraded.query(`DROP INDEX portability_jobs_live`);
+    await upgraded.query(`DROP TABLE portability_removals, analysis_removals`);
+    await upgraded.query(`DELETE FROM stateplane_migrations WHERE name='052_portability_live_exports.sql'`);
+    for (const table of ['portability_jobs', 'analysis_jobs']) {
+      await holder.query('BEGIN');
+      await holder.query(`LOCK TABLE ${table} IN ROW EXCLUSIVE MODE`);
+      const started = Date.now();
+      const blockedIndex = migrate(db.upgrade);
+      const waited = Date.now() - started;
+      await holder.query('ROLLBACK');
+      assert.equal(blockedIndex.status, 1);
+      assert.match(blockedIndex.stderr, /Live export upgrade waits for export and analysis job writers and space purges; it was rolled back, so retry/);
+      assert.ok(waited < 15_000, `052 gave up after ${waited} ms`);
+      assert.deepEqual((await upgraded.query(`SELECT to_regclass('public.portability_jobs_live') AS live,
+        to_regclass('public.analysis_removals') AS removals,
+        (SELECT count(*)::int FROM stateplane_migrations WHERE name='052_portability_live_exports.sql') AS recorded`)).rows[0],
+      { live: null, removals: null, recorded: 0 }, table);
+    }
+    // 052 cancelled from outside while it waits (an operator's pg_cancel_backend) is reported as a cancellation, not
+    // as a writer wait or its statement bound, and rolls back whole.
+    await holder.query('BEGIN');
+    await holder.query('LOCK TABLE portability_jobs IN ROW EXCLUSIVE MODE');
+    const cancelling = new Promise(resolve => {
+      const child = spawn(process.execPath, ['scripts/migrate.mjs'], { cwd: root, env: { ...process.env, DATABASE_URL: urlFor(db.upgrade) } });
+      let stderr = '';
+      child.stderr.on('data', chunk => { stderr += chunk; });
+      child.on('close', status => resolve({ status, stderr }));
+    });
+    const waiting = `SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '-- STA-70: the jobs Worker''s export step%'`;
+    for (let attempt = 0; (await upgraded.query(waiting)).rowCount === 0; attempt += 1) {
+      assert.ok(attempt < 400, '052 never waited for portability_jobs');
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal((await upgraded.query(`SELECT pg_cancel_backend(pid) AS cancelled FROM (${waiting}) w`)).rows[0].cancelled, true);
+    const cancelled = await cancelling;
+    await holder.query('ROLLBACK');
+    assert.equal(cancelled.status, 1);
+    assert.match(cancelled.stderr, /^Live export upgrade was cancelled and rolled back; retry/);
+    assert.doesNotMatch(cancelled.stderr.split('\n')[0], /writers|purges|statement bound/);
+    assert.deepEqual((await upgraded.query(`SELECT to_regclass('public.portability_jobs_live') AS live,
+      to_regclass('public.analysis_removals') AS removals,
+      (SELECT count(*)::int FROM stateplane_migrations WHERE name='052_portability_live_exports.sql') AS recorded`)).rows[0],
+    { live: null, removals: null, recorded: 0 });
+    // An analysis page or export part writer in flight never waits for 052, which builds nothing over their tables.
+    await holder.query('BEGIN');
+    await holder.query('LOCK TABLE analysis_result_pages, portability_parts IN ROW EXCLUSIVE MODE');
+    const alongside = Date.now();
+    const appliedAlongside = migrate(db.upgrade);
+    const tookMs = Date.now() - alongside;
+    await holder.query('ROLLBACK');
+    assert.equal(appliedAlongside.stdout, 'Applied 052_portability_live_exports.sql\n', appliedAlongside.stderr);
+    assert.ok(tookMs < 4_000, `052 took ${tookMs} ms beside page and part writers`);
     assert.equal(migrate(db.upgrade).stdout, '', 'a second run applies nothing');
+    // 052's first application, its triggers absent, beside a purge holding job rows FOR UPDATE (ROW SHARE): its
+    // DROP TRIGGER IF EXISTS takes nothing stronger than SHARE ROW EXCLUSIVE, so it applies without waiting, and the
+    // purge's DELETE then proceeds with no deadlock. A lock as strong as ACCESS EXCLUSIVE would wait out the bound.
+    await upgraded.query(`DROP INDEX portability_jobs_live`);
+    await upgraded.query(`DROP TRIGGER portability_jobs_removal ON portability_jobs; DROP TRIGGER analysis_jobs_removal ON analysis_jobs`);
+    await upgraded.query(`DROP TABLE portability_removals, analysis_removals`);
+    await upgraded.query(`DELETE FROM stateplane_migrations WHERE name='052_portability_live_exports.sql'`);
+    const purged = await admit('sp_active', 'export', {}, upgraded);
+    await holder.query('BEGIN');
+    await holder.query(`SELECT set_config('stateplane.erasing_space','sp_active',true)`);
+    assert.equal((await holder.query(`SELECT job_id FROM portability_jobs WHERE space_id='sp_active' FOR UPDATE`)).rowCount, 1);
+    await holder.query(`SELECT job_id FROM analysis_jobs WHERE space_id='sp_active' FOR UPDATE`);
+    const besidePurge = Date.now();
+    const appliedBesidePurge = migrate(db.upgrade);
+    const purgeWaitMs = Date.now() - besidePurge;
+    assert.equal(appliedBesidePurge.stdout, 'Applied 052_portability_live_exports.sql\n', appliedBesidePurge.stderr);
+    assert.ok(purgeWaitMs < 4_000, `052 took ${purgeWaitMs} ms beside a purge's row locks`);
+    assert.equal((await holder.query(`DELETE FROM portability_jobs WHERE space_id='sp_active' AND job_id=$1`, [purged.job_id])).rowCount, 1);
+    await holder.query(`DELETE FROM analysis_jobs WHERE space_id='sp_active'`);
+    await holder.query('COMMIT');
+    assert.equal((await upgraded.query(`SELECT count(*)::int AS n FROM pg_trigger WHERE tgname IN ('portability_jobs_removal','analysis_jobs_removal')`)).rows[0].n, 2);
 
     const fromEmpty = migrate(db.fresh);
     assert.equal(fromEmpty.status, 0, fromEmpty.stderr);
-    assert.match(fromEmpty.stdout, /Applied 051_portability_erasure_ledger\.sql\n$/);
+    assert.match(fromEmpty.stdout, /Applied 051_portability_erasure_ledger\.sql\nApplied 052_portability_live_exports\.sql\n$/);
+    // 052's turn record: one row naming analysis first, and never a second.
+    for (const client of [upgraded, fresh]) {
+      assert.deepEqual((await client.query('SELECT singleton,exports_next FROM snapshot_step_turn')).rows,
+        [{ singleton: true, exports_next: false }]);
+      await assert.rejects(client.query('INSERT INTO snapshot_step_turn DEFAULT VALUES'), refused('23505'));
+      await assert.rejects(client.query('INSERT INTO snapshot_step_turn(singleton) VALUES(false)'), check('snapshot_step_turn_singleton_check'));
+    }
     const schema = async client => ({
       constraints: (await client.query(`SELECT conrelid::regclass::text AS relation,conname,pg_get_constraintdef(oid) AS definition
         FROM pg_constraint WHERE connamespace='public'::regnamespace ORDER BY relation,conname`)).rows,
@@ -513,6 +595,51 @@ test('parts are written in order by their running job under its lease, are check
   await assert.rejects(pool.query('DELETE FROM portability_parts WHERE job_id=$1', [imported.job_id]), check('portability_parts_kept'));
 });
 
+// Migration 052's removal queue: an export that ends cancelled, failed or expired holding parts is queued at the
+// commit that ends it, with its highest part number as rows left; an export ending without parts and an import never
+// are; a space purge takes the queue with its jobs.
+test('an export ended holding parts is queued for removal at commit; one without parts and an import never are', async () => {
+  const { spaceId, positions } = await space();
+  const queued = async job => (await pool.query('SELECT rows_left FROM portability_removals WHERE space_id=$1 AND job_id=$2',
+    [job.space_id, job.job_id])).rows.map(row => row.rows_left);
+  // An export of `parts` parts; one to expire is admitted to expire 1 s on, leased until then (a lease never outlasts its
+  // job) and waited past its expiry once written.
+  const written = async (ending, parts) => {
+    const expiring = ending === `state='expired'`;
+    const admitted = await admit(spaceId, 'export', { watermark: positions[0],
+      ...(expiring ? { expires_at: new Date(Date.now() + 1_000) } : {}) });
+    const job = expiring ? await update(admitted, `state='running',lease_id='lease',leased_until=expires_at,attempts=attempts+1`)
+      : await run(admitted);
+    for (let number = 1; number <= parts; number += 1) await part(job, number);
+    if (expiring) await sleep(1_100);
+    return job;
+  };
+  for (const ending of [`state='cancelled'`, `state='failed',failure_code='WORKER_LOST'`, `state='expired'`]) {
+    const job = await written(ending, 3);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await update(job, ending, [], client);
+      assert.deepEqual(await queued(job), [], `${ending}: queued only at commit`);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally { client.release(); }
+    assert.deepEqual(await queued(job), [3], ending);
+    const empty = await written(ending, 0);
+    await update(empty, ending);
+    assert.deepEqual(await queued(empty), [], `${ending} without parts`);
+  }
+  const imported = await run(await admit(spaceId, 'import'));
+  await part(imported, 1);
+  await update(imported, `state='failed',failure_code='CONFLICT'`);
+  assert.deepEqual(await queued(imported), []);
+  await pool.query(`UPDATE spaces SET lifecycle='deleting' WHERE space_id=$1`, [spaceId]);
+  await pool.query('SELECT stateplane_purge_space($1)', [spaceId]);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM portability_removals WHERE space_id=$1', [spaceId])).rows[0].n, 0);
+});
+
 /** Wait until the session behind `client` waits for a lock. */
 async function waiting(client) {
   const pid = client.processID;
@@ -733,12 +860,30 @@ test('the portability and control grants give operational roles only what their 
       STATEPLANE_CONTROL_URL: urlFor(db.main), STATEPLANE_CONTROL_ROLE: role };
     execFileSync(process.execPath, ['scripts/grant-portability.mjs'], { cwd: root, stdio: 'pipe', env });
     execFileSync(process.execPath, ['scripts/grant-control-journal.mjs'], { cwd: root, stdio: 'pipe', env });
-    const tables = [...portabilityTables, 'erasure_ledger'];
+    const tables = [...portabilityTables, 'erasure_ledger', 'snapshot_step_turn', 'portability_removals'];
     const privileges = Object.fromEntries((await pool.query(`SELECT t, has_table_privilege($1,t,'SELECT') AS r,
         has_table_privilege($1,t,'INSERT') AS i, has_table_privilege($1,t,'UPDATE') AS u, has_table_privilege($1,t,'DELETE') AS d,
         has_table_privilege($1,t,'TRUNCATE') AS x FROM unnest($2::text[]) t`, [role, tables])).rows
       .map(({ t, ...row }) => [t, Object.entries(row).filter(([, granted]) => granted).map(([privilege]) => privilege).join('')]));
-    assert.deepEqual(privileges, { portability_jobs: 'riu', portability_parts: 'rid', portability_principal_map: 'riu', erasure_ledger: 'ri' });
+    assert.deepEqual(privileges, { portability_jobs: 'riu', portability_parts: 'rid', portability_principal_map: 'riu', erasure_ledger: 'ri',
+      snapshot_step_turn: 'ru', portability_removals: 'rud' });
+    // Migration 052's queue trigger runs with owner rights: this role, which cannot insert into the queue, ends an export
+    // holding parts and it is queued at that commit with its highest part as rows left.
+    const { spaceId, positions } = await space();
+    const ended = await run(await admit(spaceId, 'export', { watermark: positions[0] }));
+    for (const number of [1, 2]) await part(ended, number);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`SET LOCAL ROLE ${role}`);
+      await update(ended, `state='failed',failure_code='WORKER_LOST'`, [], client);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally { client.release(); }
+    assert.deepEqual((await pool.query('SELECT rows_left FROM portability_removals WHERE job_id=$1', [ended.job_id])).rows,
+      [{ rows_left: 2 }]);
     const missing = spawnSync(process.execPath, ['scripts/grant-portability.mjs'], { cwd: root, encoding: 'utf8',
       env: { ...env, STATEPLANE_CELL_ROLE: `${role}_absent` } });
     assert.equal(missing.status, 1);

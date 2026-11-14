@@ -1,12 +1,15 @@
 import pg from 'pg';
 import { connectionOptions } from './db-connection.mjs';
 
-// Run after migration 051 or restore through a protected cell administration
+// Run after migration 052 or restore through a protected cell administration
 // connection. The role is supplied by the protected deployment inventory.
-// Space deletion proves erasure by reading every portability table. Export
-// and import workers (STA-70 and STA-71) admit and advance jobs, write parts,
-// remove the parts of cancelled, failed or expired exports, and write and
-// complete principal mappings. No grant allows deleting a job or a mapping,
+// Space deletion proves erasure by reading the portability job, part and
+// principal map tables; a removal queue row (migration 052) goes with its
+// export, and the turn record is cell-wide, not space data. No export or
+// import worker runs at this head: export workers (with STA-77) and import
+// workers (STA-71) will admit and advance jobs, write parts, remove the parts
+// of cancelled, failed or expired exports through their removal queue, and
+// write and complete principal mappings. No grant allows deleting a job or a mapping,
 // or TRUNCATE: removal stays with the scoped purge routine.
 const url=process.env.STATEPLANE_CELL_ADMIN_URL;
 const role=process.env.STATEPLANE_CELL_ROLE;
@@ -16,7 +19,11 @@ if (!url || !role || !/^(?!pg_)[a-z][a-z0-9_]{0,62}$/.test(role))
 const grants=[
   ['portability_jobs','SELECT, INSERT, UPDATE'],
   ['portability_parts','SELECT, INSERT, DELETE'],
-  ['portability_principal_map','SELECT, INSERT, UPDATE']
+  ['portability_principal_map','SELECT, INSERT, UPDATE'],
+  // For the shared snapshot step arriving with STA-77, which will record whose turn is next and clear ended exports'
+  // parts through their removal queue, which a trigger fills (migration 052).
+  ['snapshot_step_turn','SELECT, UPDATE'],
+  ['portability_removals','SELECT, UPDATE, DELETE']
 ];
 const client=new pg.Client(connectionOptions(url));
 await client.connect();

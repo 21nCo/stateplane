@@ -1,14 +1,19 @@
 import pg from 'pg';
 import { connectionOptions } from './db-connection.mjs';
 
-// Run after migration 049 or restore through a protected cell administration
+// Run after migration 052 or restore through a protected cell administration
 // connection. The role is supplied by the protected deployment inventory.
-// Space deletion proves erasure by reading every analysis table. Analysis
-// workers (STA-58 and later) admit and advance jobs, write result pages and
-// manifests, remove the results of cancelled, failed or expired jobs, and add,
-// take and release concurrency slots. No grant allows deleting a job or a
-// slot, or TRUNCATE: removal stays with the scoped purge routine, and ending a
-// job releases its slots through an owner-rights trigger.
+// Space deletion proves erasure by reading the analysis job, page, manifest
+// and slot tables; a removal queue row (migration 052) goes with its job.
+// Analysis workers (STA-58 and later) admit and advance jobs, write result
+// pages and manifests, remove the results of cancelled, failed or expired jobs
+// in the transaction that ends them, and add, take and release concurrency
+// slots. The queue grant (the removal queue of ended, that is cancelled, failed
+// or expired, jobs that still hold result pages; empty at this head) is for the
+// shared jobs Worker snapshot step's analysis expiry pass, arriving with
+// STA-77, which will clear those results through the queue. No grant allows deleting a job or a slot, or TRUNCATE: removal
+// stays with the scoped purge routine, and ending a job releases its slots
+// through an owner-rights trigger.
 const url=process.env.STATEPLANE_CELL_ADMIN_URL;
 const role=process.env.STATEPLANE_CELL_ROLE;
 if (!url || !role || !/^(?!pg_)[a-z][a-z0-9_]{0,62}$/.test(role))
@@ -19,7 +24,8 @@ const grants=[
   ['analysis_result_pages','SELECT, INSERT, DELETE'],
   ['analysis_result_manifests','SELECT, INSERT, DELETE'],
   ['analysis_space_slots','SELECT, INSERT, UPDATE'],
-  ['analysis_cell_slots','SELECT, INSERT, UPDATE']
+  ['analysis_cell_slots','SELECT, INSERT, UPDATE'],
+  ['analysis_removals','SELECT, UPDATE, DELETE']
 ];
 const client=new pg.Client(connectionOptions(url));
 await client.connect();

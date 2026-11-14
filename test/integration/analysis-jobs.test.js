@@ -573,6 +573,9 @@ test('cancellation and expiry end a job, release its cell and space slots and re
   await rejects(services.analysis.page(f.owner, f.spaceId, 'items', completing, 1), 'CONFLICT');
   assert.equal((await worker().step({ budgetMs: 2_000 })).expired, 1);
   assert.equal(Number((await pool.query('SELECT count(*) FROM analysis_result_pages WHERE job_id=$1', [completing])).rows[0].count), 0);
+  // Each of these endings removed its pages in the transaction that ended it, so migration 052's removal queue holds none.
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM analysis_removals WHERE job_id = ANY($1)',
+    [[job.jobId, short, completing]])).rows[0].n, 0);
 });
 
 test('every read reauthorizes: a revoked key or grant cannot read a materialized result, and only the submitting key reads its job', async () => {
