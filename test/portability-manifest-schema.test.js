@@ -63,7 +63,7 @@ test('the manifest schema refuses a malformed manifest', () => {
   }
 });
 
-test('a section line envelope is closed while its canonical JSON data is not inspected', () => {
+test('a section line envelope is closed while its canonical JSON data\'s content is not inspected', () => {
   const record = ajv.getSchema(`${schema.$id}#/$defs/records`);
   const line = () => ({ collectionId: 'col_1', id: 'rec_1', keyMode: 'generated', key: 'rec_1', revision: 1,
     schemaVersion: 1, data: { sessionToken: 'user content as stored' } });
@@ -74,10 +74,18 @@ test('a section line envelope is closed while its canonical JSON data is not ins
 });
 
 // Section lines follow their authority columns (migrations 002, 011, 040, 042, 044 and 045) wherever JSON Schema can
-// state the rule: null only where the column is, digests as digests, CHECK lists as enums, predecessors null exactly
-// at version 1, and the row rules of originals, reviews and vector retrieval.
+// state the rule: null only where the column is, digests as digests, CHECK lists and patterns as enums and patterns,
+// byte limits as character limits, predecessors null exactly at version 1, canonical JSON as objects (a deletion's
+// data is the {} the record_events writer stores), and the row rules of originals, reviews and vector retrieval.
 const t = '2026-11-13T01:02:03.123456Z';
+const uuid = '00000000-0000-4000-8000-000000000000';
+const long = n => 'a'.repeat(n);
 const lines = {
+  schemas: () => ({ collectionId: 'col_1', version: 1, acceptedAt: t, definition: { fields: {} } }),
+  records: () => ({ collectionId: 'col_1', id: 'rec_1', keyMode: 'generated', key: 'rec_1', revision: 1, schemaVersion: 1,
+    data: {} }),
+  provenance: () => ({ collectionId: 'col_1', claimId: 'clm_1', revision: 1, ordinal: 0,
+    source: { collectionId: 'col_1', sourceId: 'src_1', extractionVersion: 1, startOffset: 0, endOffset: 1 } }),
   retrieval: () => ({ collectionId: 'col_1', version: 1, previousVersion: null, recordFields: [], sourceContent: false,
     claimStatements: false, lexical: true, vector: false, textSearchConfig: 'simple', processingRegions: [],
     credentialId: 'cred_1', createdAt: t }),
@@ -95,7 +103,7 @@ const lines = {
     credentialId: 'cred_1', createdAt: t }),
   revisions: () => ({ collectionId: 'col_1', id: 'rec_1', keyMode: 'generated', key: 'rec_1', revision: 1, eventId: 'evt_1',
     position: 1, operation: 'create', schemaVersion: 1, credentialId: 'cred_1', committedAt: t, data: {} }),
-  events: () => ({ eventId: 'eev_1', collectionId: 'col_1', kind: 'link', entityId: 'lnk_1', revision: 1,
+  events: () => ({ eventId: `eev_${uuid}`, collectionId: 'col_1', kind: 'link', entityId: 'lnk_1', revision: 1,
     operation: 'create', credentialId: 'cred_1', committedAt: t }),
   embeddings: () => ({ collectionId: 'col_1', refKind: 'record', refId: 'rec_1', revision: 1, chunkIndex: 0,
     contentSha256: sha, embedder: 'e', embeddingModel: 'm', modelVersion: '1', dimensions: 2, embedding: [0, 1] }),
@@ -119,7 +127,18 @@ test('section lines the authority stores are accepted', () => {
     'a pre-042 revision without a recorder': [['claims', l => { l.recordedBy = null; }]],
     'vector retrieval with a region': [['retrieval', l => { l.vector = true; l.processingRegions = ['eu-west-1']; }]],
     'record fields as JSON Pointers': [['retrieval', l => { l.recordFields = ['/title', '/a~1b/0']; }]],
-    'a deletion revision': [['revisions', l => { l.operation = 'delete'; l.data = null; }]]
+    'a deletion revision with the {} it stores': [['revisions', l => { l.operation = 'delete'; l.data = {}; }]],
+    'a patch revision with its data': [['revisions', l => { l.operation = 'patch'; l.data = { a: 1 }; }]],
+    'an authority-shaped embedding': [['embeddings', l => {
+      Object.assign(l, { embedder: 'openai.text-3_x', embeddingModel: 'text-embedding-3-small', dimensions: 3, embedding: [0.1, -2, 3e-3] });
+    }]],
+    'text and numbers at their limits': [['sources', l => { l.locator = long(4096); }],
+      ['extractions', l => { l.parser = long(256); l.parserVersion = long(256); }],
+      ['claims', l => { l.attributedTo = long(1024); }], ['links', l => { l.linkType = long(256); }],
+      ['retrieval', l => { l.recordFields = [`/${long(255)}`]; }], ['provenance', l => { l.ordinal = 2147483647; }],
+      ['embeddings', l => {
+        Object.assign(l, { embedder: `a${long(63)}`, embeddingModel: long(256), modelVersion: long(256), chunkIndex: 2147483647 });
+      }]]
   };
   for (const [name, changes] of Object.entries(accepted)) {
     for (const [kind, change] of changes) {
@@ -195,7 +214,36 @@ test('section lines the authority refuses are refused', () => {
     'an unknown endpoint kind': ['links', l => { l.to.kind = 'space'; }],
     'a null link credential': ['links', l => { l.credentialId = null; }],
     'an unknown embedding ref kind': ['embeddings', l => { l.refKind = 'link'; }],
-    'an unknown capability': ['permissions', l => { l.grants[0].capabilities = ['records:admin']; }]
+    'an unknown capability': ['permissions', l => { l.grants[0].capabilities = ['records:admin']; }],
+    'a definition that is not an object': ['schemas', l => { l.definition = []; }],
+    'record data that is not an object': ['records', l => { l.data = 'x'; }],
+    'null record data': ['records', l => { l.data = null; }],
+    'revision data that is not an object': ['revisions', l => { l.data = [1]; }],
+    'null revision data': ['revisions', l => { l.data = null; }],
+    'a deletion carrying data': ['revisions', l => { l.operation = 'delete'; l.data = { a: 1 }; }],
+    'a deletion with null data': ['revisions', l => { l.operation = 'delete'; l.data = null; }],
+    'source offsets that are not an array': ['extractions', l => { l.sourceOffsets = {}; }],
+    'an event ID that is not eev_ and a UUID': ['events', l => { l.eventId = 'eev_1'; }],
+    'an uppercase event ID': ['events', l => { l.eventId = `eev_${uuid.replace('0000-4000', 'AAAA-4000')}`; }],
+    'a locator over 4096 bytes': ['sources', l => { l.locator = long(4097); }],
+    'a parser over 256 bytes': ['extractions', l => { l.parser = long(257); }],
+    'a parser version over 256 bytes': ['extractions', l => { l.parserVersion = long(257); }],
+    'extraction content over 1 MiB': ['extractions', l => { l.content = long(1048577); }],
+    'a statement over 1 MiB': ['claims', l => { l.statement = long(1048577); }],
+    'an attribution over 1024 bytes': ['claims', l => { l.attributedTo = long(1025); }],
+    'a link type over 256 bytes': ['links', l => { l.linkType = long(257); }],
+    'a record field over 256 bytes': ['retrieval', l => { l.recordFields = [`/${long(256)}`]; }],
+    'an ordinal past 32 bits': ['provenance', l => { l.ordinal = 2147483648; }],
+    'a chunk index past 32 bits': ['embeddings', l => { l.chunkIndex = 2147483648; }],
+    'an uppercase embedder': ['embeddings', l => { l.embedder = 'E'; }],
+    'an embedder over 64 characters': ['embeddings', l => { l.embedder = `a${long(64)}`; }],
+    'an empty embedding model': ['embeddings', l => { l.embeddingModel = ''; }],
+    'an embedding model over 256 bytes': ['embeddings', l => { l.embeddingModel = long(257); }],
+    'an empty model version': ['embeddings', l => { l.modelVersion = ''; }],
+    'a model version over 256 bytes': ['embeddings', l => { l.modelVersion = long(257); }],
+    'more than 16000 dimensions': ['embeddings', l => { l.dimensions = 16001; }],
+    'an empty embedding': ['embeddings', l => { l.embedding = []; }],
+    'an embedding over 16000 values': ['embeddings', l => { l.embedding = new Array(16001).fill(0); }]
   };
   for (const [name, [kind, change]] of Object.entries(refused)) {
     const line = lines[kind]();
