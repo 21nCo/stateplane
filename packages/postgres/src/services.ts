@@ -7,6 +7,7 @@ import { AuthorityError, AuthorityTransaction, PostgresAuthority } from './index
 import { PostgresAggregations } from './aggregations.js';
 import type { AggregationCell } from './aggregations.js';
 import { PostgresAnalysisJobs } from './analysis-jobs.js';
+import { PostgresPortabilityExports } from './portability-exports.js';
 import { PostgresContextBundles } from './bundles.js';
 import { generationViews } from './generations.js';
 import { PostgresRetrievalWorker } from './retrieval.js';
@@ -189,6 +190,7 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
   const aggregations=new PostgresAggregations(spaces,analytical);
   // Jobs admit, authorize and recheck every call themselves on the interactive pool; the jobs Worker computes them.
   const jobs=new PostgresAnalysisJobs(spaces,new Map([...cells].map(([id,cell])=>[id,{pool:cell.pool}])));
+  const exports=new PostgresPortabilityExports(spaces,new Map([...cells].map(([id,cell])=>[id,{pool:cell.pool}])));
   return {
     spaces: {
       list:(actor,cursor)=>spaces.listPage(actor,cursor), create:(actor,cellId,spaceId)=>spaces.create(actor,cellId,spaceId),
@@ -310,6 +312,12 @@ export function postgresServices(spaces: PostgresSpaces, cells: ReadonlyMap<stri
       status:(actor,spaceId,collectionId,jobId)=>jobs.status(actor,spaceId,collectionId,jobId),
       cancel:(actor,spaceId,collectionId,jobId)=>jobs.cancel(actor,spaceId,collectionId,jobId),
       page:(actor,spaceId,collectionId,jobId,page)=>jobs.page(actor,spaceId,collectionId,jobId,page)
+    },
+    portability: {
+      submitExport:(actor,spaceId)=>exports.submit(actor,spaceId),
+      exportStatus:(actor,spaceId,jobId)=>exports.status(actor,spaceId,jobId),
+      cancelExport:(actor,spaceId,jobId)=>exports.cancel(actor,spaceId,jobId),
+      exportPart:(actor,spaceId,jobId,part)=>exports.part(actor,spaceId,jobId,part)
     }
   };
 }

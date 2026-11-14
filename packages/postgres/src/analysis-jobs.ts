@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Capability, VerifiedCredential } from '@stateplane/contracts';
-import { AuthorityError, AuthorityTransaction, predicateFilter } from './index.js';
+import { AuthorityError, AuthorityTransaction, CommitOutcomeUnknownError, predicateFilter } from './index.js';
 import type { AuthorityScope } from './index.js';
 import { admit, aggregationBounds, analyticalSlots, declarations, describe, formatGroups, jsonBytes, parse, recheckWithin,
   statement, zones } from './aggregations.js';
@@ -11,13 +11,15 @@ import { scalarString, utcInstant } from './schema.js';
 import { invalid, transact } from './sources.js';
 import type { Db } from './sources.js';
 import type { PostgresSpaces } from './spaces.js';
+import { PortabilityExportWorker, removeNext } from './portability-exports.js';
+import type { PortabilityStep } from './portability-exports.js';
 
 /**
  * Protective bounds, with their evidence (or that a bound is structural and
  * not measured) in docs/analysis-measurements.md#limits (STA-60): per job, 10,000,000 records
  * scanned, 64 MiB of result pages, 600,000 ms of step time and a 24 h
  * lifetime; at most 8 unfinished jobs per space; pages of at most 1,000
- * records and 1 MiB (the page bound of migration 049); a 30 s lease,
+ * records and 1 MiB (the page bound of migration 049); a lease of at most 30 s, never past the turn,
  * extended by every page; event publication before pinning in rounds of
  * 5,000 events, at most 20 rounds per submission.
  */
@@ -64,7 +66,11 @@ export interface AnalysisPage {
   page: { number: number; rowOffset: number; rowCount: number; byteOffset: number; byteSize: number; sha256: string; content: string };
   complete: true;
 }
-export interface AnalysisStep { expired: number; claimed: number; pages: number; completed: number; failed: number }
+export interface AnalysisStep { expired: number; claimed: number; pages: number; completed: number; failed: number;
+  /** Leases whose give-back the deadline cut short: each, with its slot holds, still ends with its turn. */
+  unreleased: number;
+  /** Owner space exports the same step advanced (docs/portability-export.md#worker). */
+  exports: PortabilityStep }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- driver rows, read by column name
 type Row = Record<string, any>;
@@ -79,6 +85,14 @@ const iso = (value: Date | null) => value === null ? null : new Date(value).toIS
 const sha256 = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
 const pk = (job: Row): string[] => [job.space_id, job.collection_id, job.job_id];
 const cutShort = (error: unknown) => error instanceof DeadlineExceededError;
+/** A transaction whose deadline ended it, at its COMMIT too (that transaction is retried or resumed), has only run out of time. */
+export const ended = (error: unknown) => cutShort(error) || (error instanceof CommitOutcomeUnknownError && cutShort(error.cause));
+/**
+ * The turn's end on the database clock, which every lease and slot hold of the turn ends by, so they lapse then even if
+ * never given back: `read`, a clock reading the database returned, plus the time the turn had left when it arrived.
+ * Never later than the turn's end, however long a statement took to reach the database or waited there.
+ */
+export const turnBound = (read: Date, turnEnd: number) => new Date(read.getTime() + turnEnd - Date.now());
 
 
 const STATUS = `SELECT j.*,CASE WHEN j.state IN ${ACTIVE} AND j.expires_at<=clock_timestamp() THEN 'expired' ELSE j.state END AS effective,
@@ -129,7 +143,7 @@ function view(row: Row): AnalysisJobStatus {
  * its read, and `wallUntil`, the provider credential's own absolute expiry
  * (Infinity when none), so a wall-clock step past it is caught too.
  */
-interface Deadline { monotonic: number; wallUntil: number }
+export interface Deadline { monotonic: number; wallUntil: number }
 const lapsed = (deadline: Deadline) => performance.now() >= deadline.monotonic || Date.now() >= deadline.wallUntil;
 /** The final credential check's bound, STA-58's: its provider call and statement together. */
 const RECHECK_MS = aggregationBounds.statementMs;
@@ -144,7 +158,7 @@ const RECHECK_MS = aggregationBounds.statementMs;
  * statement. Returns the `Deadline` the caller requires unexpired once COMMIT
  * is acknowledged: locks fence revocation, not time.
  */
-async function finalCheck(spaces: PostgresSpaces, db: Db, actor: VerifiedCredential, ownerPrincipalId: string,
+export async function finalCheck(spaces: PostgresSpaces, db: Db, actor: VerifiedCredential, ownerPrincipalId: string,
   scope: Readonly<AuthorityScope>, capability: Capability): Promise<Deadline> {
   await db.query(`SET LOCAL statement_timeout = '${RECHECK_MS}ms'`);
   let deadline: Deadline = { monotonic: -Infinity, wallUntil: -Infinity };
@@ -172,7 +186,7 @@ async function finalCheck(spaces: PostgresSpaces, db: Db, actor: VerifiedCredent
   return deadline;
 }
 /** A reply is released only while the access its final check relied on is unexpired, once COMMIT was acknowledged. */
-function released<T>({ value, deadline }: { value: T; deadline: Deadline }): T {
+export function released<T>({ value, deadline }: { value: T; deadline: Deadline }): T {
   if (lapsed(deadline)) throw new AuthorityError('FORBIDDEN', 'Access expired before the request committed');
   return value;
 }
@@ -189,7 +203,7 @@ async function discard(db: Session, key: unknown[]): Promise<void> {
  * turns. One statement sees every pending event committed before it, so a
  * writer's events are published together or after the boundary pinned next.
  */
-async function publish(db: Session, scope: Readonly<AuthorityScope>, limit: number): Promise<number> {
+export async function publish(db: Session, scope: Readonly<Pick<AuthorityScope, 'spaceId' | 'collectionId'>>, limit: number): Promise<number> {
   await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 1))', [JSON.stringify([scope.spaceId, scope.collectionId])]);
   const published = await db.query(`WITH next AS (
       SELECT event_id,space_id,collection_id FROM record_event_pending WHERE space_id=$1 AND collection_id=$2
@@ -570,6 +584,29 @@ export interface AnalysisWorkerOptions {
 }
 
 /**
+ * How long a step's probe or claim waits for one lock (on its job table, from DDL, `VACUUM FULL` or `LOCK TABLE`, or on
+ * a space row a claim's own probe found free): past that the probe is cut short and the claim finds its job busy, so a
+ * stalled lock never takes the other kind's window. A job whose space (or collection) another transaction holds locked
+ * is not due at all: probes and claims pass it over (`SKIP LOCKED`), so it never keeps first place.
+ */
+const PROBE_LOCK_MS = 100;
+/** A due probe's whole bound, connection checkout, lock waits and execution together: an eighth of the smallest budget. */
+const PROBE_MS = 250;
+/** Time a step keeps, past its preparation, for the first turn to begin its page or part. */
+const PREPARE_SLACK_MS = 100;
+/** The least time a turn needs: one page or part (each needs 1 s), its lease release, and the slack to begin it. */
+const TURN_MS = MIN_PAGE_MS + RELEASE_MS + PREPARE_SLACK_MS;
+/** The cell jobs Worker's tick, which creates its worker afresh each time (deployment/workers/jobs.ts). */
+const TICK_MS = 60_000;
+/** The bound on reading and passing on the cell's turn record, kept back from preparation. */
+const TAKE_MS = 100;
+export async function probing<T extends Session>(db: T): Promise<T> {
+  await db.query(`SET LOCAL lock_timeout = '${PROBE_LOCK_MS}ms'`);
+  return db;
+}
+export const lockedOut = (error: unknown) => (error as { code?: unknown } | null)?.code === '55P03';
+
+/**
  * The jobs Worker's analysis step (docs/analysis-jobs.md#worker). Each step
  * expires jobs past their expiry, then claims due jobs one at a time (queued,
  * or running with a lapsed lease; least recently run first), each with one
@@ -583,45 +620,186 @@ export interface AnalysisWorkerOptions {
  * no record is left, the manifest seals the result and the job completes. A
  * step gives its lease and slot holds back when it stops, so the next step
  * (or an interactive aggregation) can take them at once.
+ *
+ * The same step writes owner space exports (`PortabilityExportWorker`,
+ * docs/portability-export.md#worker). Every step first ends expired jobs of
+ * each kind, each in a slice of its own (a tenth of the budget, within the
+ * preparation time), whichever kind claims first, and a finished pass is not
+ * repeated. A job of either kind ends by its state alone and its result goes
+ * in committed batches, so every slice makes progress, and a pass its slice
+ * did not finish continues only in what both turns leave. It then probes each kind,
+ * bounded alone, for the wait of the job its claim would take next (one whose
+ * row, space or collection is locked is not due). All of that ends early
+ * enough to leave one turn; a kind whose probe is locked out or fails is not
+ * due, and one left unprobed or cut short is due with its wait unknown. A
+ * kind due alone takes the whole budget. Two due kinds share a step that has
+ * room for a turn of each: the one waiting longer first, stopping at its
+ * share (analysis three fifths, exports two fifths) yet leaving the other its
+ * turn, and getting back what the other leaves unused. With room for one turn
+ * only they alternate step by step, whatever their waits, by the cell's turn
+ * record (migration 052), so each gets a turn within two steps. A failure of either kind, a failed probe included, never
+ * stops the other: the step throws it once both have run.
  */
 export class PostgresAnalysisWorker {
-  readonly #slots: { cell: number; space: number };
-  constructor(private readonly pool: PoolLike, options: AnalysisWorkerOptions) {
-    this.#slots = analyticalSlots(options.originConnectionLimit);
+  readonly #exports: PortabilityExportWorker;
+  /**
+   * The kind that goes first in preparation (0 analysis, 1 exports), and, when two due kinds cannot share a step and the
+   * cell's turn record cannot be read, in the turns too: from the parity of the minute the worker was created in, then
+   * the kind the last such step put second.
+   */
+  #alternate = Math.floor(Date.now() / TICK_MS) % 2;
+  constructor(private readonly pool: PoolLike, private readonly options: AnalysisWorkerOptions) {
+    this.#exports = new PortabilityExportWorker(pool);
   }
+
+  /** The cell's analytical slots, derived when analysis runs: an invalid origin limit fails analysis only, never exports. */
+  get #slots(): { cell: number; space: number } { return analyticalSlots(this.options.originConnectionLimit); }
 
   async step(settings: { budgetMs?: number } = {}): Promise<AnalysisStep> {
     const budgetMs = bounded(settings.budgetMs ?? 5_000, MIN_STEP_MS, 60_000);
-    const until = Date.now() + budgetMs;
-    const result: AnalysisStep = { expired: 0, claimed: 0, pages: 0, completed: 0, failed: 0 };
-    try { await this.expire(Date.now() + Math.floor(budgetMs / 4), result); } catch (error) { if (!cutShort(error)) throw error; }
+    const end = Date.now() + budgetMs;
+    const result: AnalysisStep = { expired: 0, claimed: 0, pages: 0, completed: 0, failed: 0, unreleased: 0,
+      exports: { expired: 0, claimed: 0, parts: 0, completed: 0, failed: 0, unadmitted: 0, removed: 0, unreleased: 0 } };
+    // The first failure of each kind and of the turn record, thrown once both kinds have run. A slice or turn whose
+    // deadline ends it (`ended`) has only run out of time.
+    const failures = new Map<'analysis' | 'exports' | 'turn', unknown>();
+    const settle = async (kind: 'analysis' | 'exports', run: () => Promise<unknown>) => {
+      try { await run(); } catch (error) { if (!ended(error) && !failures.has(kind)) failures.set(kind, error); }
+    };
+    // An invalid origin connection limit fails analysis at every step, whatever is due, and never stops exports.
+    await settle('analysis', async () => this.#slots);
+    // Preparation ends by `readyBy`, which leaves the first turn one page or part and its lease release. First each kind's
+    // expiry, every step, in a slice of its own: a tenth of the budget, and at most two fifths of the preparation time
+    // left for the first kind and two thirds of what is then left for the second, so both slices fit at the 2 s minimum
+    // (120 ms each there when both are used up) and the probes keep the rest. An export's parts go in committed batches, so every
+    // slice makes progress however large the export. Then each kind's due probe, bounded alone: a kind whose probe is
+    // locked out or fails (reported) is not due this step, and one left unprobed or whose probe is cut short is due
+    // with its wait unknown. A job of either kind ends by its state alone and its result goes in committed batches, so
+    // cleanup never makes a kind due: an expiry pass its slice did not finish continues only in what both turns leave.
+    const readyBy = end - TURN_MS - TAKE_MS;
+    const unfinished = new Set<'analysis' | 'exports'>();
+    const finishing = (pass: Promise<boolean>) => pass.catch((error: unknown) => { if (ended(error)) return false; throw error; });
+    const kinds = [
+      { kind: 'analysis' as const, share: 3, expire: (until: number, lockBound = false) => this.expire(until, result, lockBound),
+        waiting: (until: number) => this.waiting(until) },
+      { kind: 'exports' as const, share: 2, expire: (until: number, lockBound = false) => this.#exports.expire(until, result.exports, lockBound),
+        waiting: (until: number) => this.#exports.waiting(until) }];
+    // The kind whose turn it is goes first, in preparation too, so neither's preparation always takes the other's slack.
+    if (this.#alternate) kinds.reverse();
+    for (const [i, { kind, expire }] of kinds.entries()) {
+      const slice = Math.min(Math.floor(budgetMs / 10), Math.floor((readyBy - Date.now()) * (i === 0 ? 2 / 5 : 2 / 3)));
+      await settle(kind, async () => { if (!await finishing(expire(Date.now() + Math.max(0, slice)))) unfinished.add(kind); });
+    }
+    const due: { kind: 'analysis' | 'exports'; share: number; since: number }[] = [];
+    for (const { kind, share, waiting } of kinds) {
+      const since = await waiting(Math.min(readyBy, Date.now() + PROBE_MS)).catch((error: unknown) => {
+        if (ended(error)) return Infinity;
+        if (!lockedOut(error) && !failures.has(kind)) failures.set(kind, error);
+        return null;
+      });
+      if (since !== null) due.push({ kind, share, since });
+    }
+    // Two kinds due share the step when it has room for a turn of each: the one waiting longer first, stopping at its share
+    // and never later than leaves the other its turn. Otherwise they alternate, step by step, whatever their waits: the
+    // kind the cell's turn record names goes first and the record names the other (this worker's own turn if unreadable).
+    const left = end - Date.now(), shared = due.length === 2 && left >= 2 * TURN_MS;
+    if (shared) due.sort((a, b) => a.since - b.since || a.share - b.share);
+    else if (due.length === 2) {
+      // A turn record cut short or locked out falls back to this worker's own turn; any other failure (a missing record, a
+      // refused or failed statement) does too, and is reported once both kinds have run.
+      const exportsFirst = await this.#taking(Math.min(end - TURN_MS, Date.now() + TAKE_MS)).catch((error: unknown) => {
+        if (!ended(error) && !lockedOut(error) && !failures.has('turn')) failures.set('turn', error);
+        return this.#alternate === 1;
+      });
+      if ((due[0].kind === 'exports') !== exportsFirst) due.reverse();
+      this.#alternate = exportsFirst ? 0 : 1;
+    }
+    const turn = (kind: 'analysis' | 'exports', until: number) => settle(kind, () =>
+      kind === 'analysis' ? this.analyse(until, result) : this.#exports.turn(until, result.exports));
+    const [first, second] = due;
+    if (first) await turn(first.kind, shared
+      ? Math.min(end - TURN_MS, Date.now() + Math.max(TURN_MS, Math.floor(left * first.share / 5))) : end);
+    if (second) await turn(second.kind, end);
+    // What the second kind left unused (nothing it could run, or a failure) goes back to the first.
+    if (shared && end - RELEASE_MS - Date.now() >= MIN_PAGE_MS) await turn(first.kind, end);
+    // Only now, in what both turns left, do the expiry passes their slices did not finish continue, in the step's order;
+    // each transaction waits at most the lock bound, so a locked table ends the pass.
+    for (const { kind, expire } of kinds)
+      if (unfinished.has(kind) && Date.now() < end)
+        await settle(kind, () => finishing(expire(end, true)).catch((error: unknown) => { if (lockedOut(error)) return false; throw error; }));
+    if (failures.size > 1) throw new AggregateError([...failures.values()], 'The analysis and export steps failed');
+    if (failures.size) throw [...failures.values()][0];
+    return result;
+  }
+
+  /** Whether exports go first at this step, as the cell's turn record says, which then names the other kind. */
+  async #taking(until: number): Promise<boolean> {
+    const row = (await inTransaction(this.pool, async db => (await probing(db)).query(`UPDATE snapshot_step_turn
+      SET exports_next=NOT exports_next RETURNING NOT exports_next AS exports_first`), { deadline: until })).rows[0];
+    if (!row) throw new Error('The snapshot step turn record is missing');
+    return row.exports_first === true;
+  }
+
+  /**
+   * When the analysis job the step would claim next began waiting (epoch ms): the first in the claim's own order whose
+   * row, space and collection no other transaction holds locked, a queued one since its submission and a lapsed one
+   * since its lease ended. Null when none is due.
+   */
+  private async waiting(until: number): Promise<number | null> {
+    const since = (await inTransaction(this.pool, async db => (await probing(db)).query(`SELECT (extract(epoch FROM
+        (SELECT x.waited FROM (SELECT CASE WHEN j.state='queued' THEN j.created_at ELSE j.leased_until END AS waited
+          FROM analysis_jobs j JOIN spaces s ON s.space_id=j.space_id
+            JOIN collections c ON c.space_id=j.space_id AND c.collection_id=j.collection_id
+          WHERE (j.state='queued' OR (j.state='running' AND j.leased_until<=clock_timestamp())) AND j.expires_at>clock_timestamp()
+          ORDER BY j.leased_until NULLS FIRST,j.created_at,j.job_id LIMIT 1 FOR SHARE OF j,s,c SKIP LOCKED) x))*1000)::float8 AS since`),
+    { deadline: until })).rows[0].since;
+    return since === null ? null : Number(since);
+  }
+
+  /** Claim and run analysis jobs until `until` (the step ended expired ones in its own slice). */
+  private async analyse(until: number, result: AnalysisStep): Promise<void> {
+    // An invalid origin connection limit fails the analysis half here, and the step reports it once exports have run.
+    analyticalSlots(this.options.originConnectionLimit);
     const passed: { s: string; c: string; j: string }[] = [];
     while (until - RELEASE_MS - Date.now() >= MIN_PAGE_MS) {
       let job: Row | null | 'busy' | 'failed';
-      try { job = await this.claim(until - RELEASE_MS, passed); } catch (error) { if (cutShort(error)) break; throw error; }
+      try { job = await this.claim(until - RELEASE_MS, passed, until); } catch (error) { if (cutShort(error)) break; throw error; }
       if (job === null) break;
       if (job === 'failed') result.failed++;
       if (job === 'busy' || job === 'failed') continue;
       result.claimed++;
       await this.run(job, until, result);
     }
-    return result;
   }
 
-  /** End jobs past their expiry, one per transaction, removing their results; their slots are released as they end. */
-  private async expire(until: number, result: AnalysisStep): Promise<void> {
+  /**
+   * End jobs past their expiry, one per transaction, with their manifest: their slots are released as they end, and
+   * none is read again. Then remove expired jobs' pages in committed batches (`removeNext`, from migration 052's
+   * removal queue), the job with the fewest left first and each at most once a round, so one large result never holds
+   * up the others. With `lockBound`, each transaction waits at most the probe's lock bound. True once nothing is left
+   * to end or remove.
+   */
+  private async expire(until: number, result: AnalysisStep, lockBound = false): Promise<boolean> {
+    const passed: string[] = [];
     while (Date.now() < until) {
-      const ended = await inTransaction(this.pool, async db => {
+      const done = await inTransaction(this.pool, async db => {
+        if (lockBound) await probing(db);
+        // By `now()`, the transaction's start, so the bound is a range of `analysis_jobs_expiry`, never a scan of every
+        // completed result the cell retains.
         const due = (await db.query(`SELECT space_id,collection_id,job_id FROM analysis_jobs
-          WHERE state IN ${ACTIVE} AND expires_at<=clock_timestamp() ORDER BY expires_at LIMIT 1 FOR UPDATE SKIP LOCKED`)).rows[0];
-        if (!due) return false;
-        await db.query(`UPDATE analysis_jobs SET state='expired' WHERE space_id=$1 AND collection_id=$2 AND job_id=$3`, pk(due));
-        await discard(db, pk(due));
-        return true;
+          WHERE state IN ${ACTIVE} AND expires_at<=now() ORDER BY expires_at LIMIT 1 FOR UPDATE SKIP LOCKED`)).rows[0];
+        if (due) {
+          await db.query(`UPDATE analysis_jobs SET state='expired' WHERE space_id=$1 AND collection_id=$2 AND job_id=$3`, pk(due));
+          await db.query('DELETE FROM analysis_result_manifests WHERE space_id=$1 AND collection_id=$2 AND job_id=$3', pk(due));
+          return 'expired' as const;
+        }
+        return removeNext(db, 'analysis', until, passed);
       }, { deadline: until });
-      if (!ended) return;
-      result.expired++;
+      if (done === 'expired') result.expired++;
+      // Each expired job holding pages has had its batch this round: another round, or nothing is left.
+      else if (done === null) { if (!passed.length) return true; passed.length = 0; }
     }
+    return false;
   }
 
   /**
@@ -629,30 +807,38 @@ export class PostgresAnalysisWorker {
    * cell and of its space: null when none is due or no slot is free, `busy`
    * when the job was taken meanwhile, `failed` when its binding failed it.
    */
-  private async claim(until: number, passed: { s: string; c: string; j: string }[]): Promise<Row | null | 'busy' | 'failed'> {
-    const next = (await inTransaction(this.pool, db => db.query(`SELECT space_id,collection_id,job_id FROM analysis_jobs
-      WHERE (state='queued' OR (state='running' AND leased_until<=clock_timestamp())) AND expires_at>clock_timestamp()
-        AND NOT $1::jsonb @> jsonb_build_array(jsonb_build_object('s',space_id,'c',collection_id,'j',job_id))
-      ORDER BY leased_until NULLS FIRST,created_at,job_id LIMIT 1`, [JSON.stringify(passed)]), { deadline: until })).rows[0];
+  private async claim(until: number, passed: { s: string; c: string; j: string }[], turnEnd: number): Promise<Row | null | 'busy' | 'failed'> {
+    // Passing over a job whose row, space or collection another transaction holds locked, as the probe does; a table
+    // held locked past the probe's lock bound leaves nothing to claim this step.
+    const next = (await inTransaction(this.pool, async db => (await probing(db)).query(`SELECT j.space_id,j.collection_id,j.job_id
+      FROM analysis_jobs j JOIN spaces s ON s.space_id=j.space_id JOIN collections c ON c.space_id=j.space_id AND c.collection_id=j.collection_id
+      WHERE (j.state='queued' OR (j.state='running' AND j.leased_until<=clock_timestamp())) AND j.expires_at>clock_timestamp()
+        AND NOT $1::jsonb @> jsonb_build_array(jsonb_build_object('s',j.space_id,'c',j.collection_id,'j',j.job_id))
+      ORDER BY j.leased_until NULLS FIRST,j.created_at,j.job_id LIMIT 1 FOR SHARE OF j,s,c SKIP LOCKED`, [JSON.stringify(passed)]),
+    { deadline: until }).catch((error: unknown) => { if (lockedOut(error)) return { rows: [] }; throw error; })).rows[0];
     if (!next) return null;
     passed.push({ s: next.space_id, c: next.collection_id, j: next.job_id });
     for (let attempt = 0; attempt < 2; attempt++) {
       const lease = randomUUID();
       const claimed = await inTransaction(this.pool, async db => {
-        // Space and collection first, as the purge and every reader lock them; then the job; then its slots.
-        const job = (await db.query('SELECT * FROM analysis_jobs WHERE space_id=$1 AND collection_id=$2 AND job_id=$3', pk(next))).rows[0];
+        // Space and collection first, as the purge and every reader lock them; then the job; then its slots. A lock held
+        // past the probe's bound leaves the job busy, so the claim never waits out the step.
+        await probing(db);
+        const job = (await db.query(`SELECT *,clock_timestamp() AS read_at FROM analysis_jobs WHERE space_id=$1 AND collection_id=$2
+          AND job_id=$3`, pk(next))).rows[0];
         if (!job) return 'busy' as const;
+        const bound = turnBound(job.read_at, turnEnd);
         const failure = await binding(db, job);
-        const locked = (await db.query(`SELECT *,least(clock_timestamp()+$4::int*interval '1 millisecond',expires_at) AS until
+        const locked = (await db.query(`SELECT *,least(clock_timestamp()+$4::int*interval '1 millisecond',$5::timestamptz,expires_at) AS until
           FROM analysis_jobs WHERE space_id=$1 AND collection_id=$2 AND job_id=$3
             AND (state='queued' OR (state='running' AND leased_until<=clock_timestamp())) AND expires_at>clock_timestamp()
-          FOR UPDATE SKIP LOCKED`, [...pk(next), analysisJobBounds.leaseMs])).rows[0];
+          FOR UPDATE SKIP LOCKED`, [...pk(next), analysisJobBounds.leaseMs, bound])).rows[0];
         if (!locked) return 'busy' as const;
         if (failure) { await this.fail(db, locked, failure); return 'failed' as const; }
         const cell = (await db.query('SELECT cell_id FROM spaces WHERE space_id=$1', [locked.space_id])).rows[0].cell_id;
         await this.take(db, locked, cell);
-        return (await db.query(`UPDATE analysis_jobs SET state='running',lease_id=$4,leased_until=$5,attempts=attempts+1
-          WHERE space_id=$1 AND collection_id=$2 AND job_id=$3 RETURNING *`, [...pk(locked), lease, locked.until])).rows[0];
+        return Object.assign((await db.query(`UPDATE analysis_jobs SET state='running',lease_id=$4,leased_until=$5,attempts=attempts+1
+          WHERE space_id=$1 AND collection_id=$2 AND job_id=$3 RETURNING *`, [...pk(locked), lease, locked.until])).rows[0], { turn_end: bound });
       }, { deadline: until }).catch((error: unknown) => {
         if (error instanceof SlotOutcome) return error.outcome;
         // Taking a slot that another transaction holds meanwhile, or in a space changing meanwhile, is refused: retry later.
@@ -704,6 +890,8 @@ export class PostgresAnalysisWorker {
 
   /** Run the claimed job page by page until it ends, its lease is lost or the budget ends; then give the lease back. */
   private async run(claimed: Row, until: number, result: AnalysisStep): Promise<void> {
+    // Whether writing failed the step: a deadline that ended it did not.
+    let failed = false;
     try {
       while (until - RELEASE_MS - Date.now() >= MIN_PAGE_MS) {
         let outcome: 'page' | 'completed' | 'failed' | 'expired' | 'lost';
@@ -715,8 +903,9 @@ export class PostgresAnalysisWorker {
         if (outcome === 'expired') result.expired++;
         return;
       }
-    } finally {
-      // Its lease and slot holds end now, so the job is due again and its slots free. A failure here only leaves them to lapse.
+    } catch (error) { failed = !ended(error); throw error; } finally {
+      // Its lease and slot holds end now, so the job is due again and its slots free; unsent, they still end with the turn
+      // (`turnBound`). A give-back the deadline cut short is counted; any other failure is the step's, unless the pages already failed it.
       await inTransaction(this.pool, async db => {
         const held = (await db.query(`UPDATE analysis_jobs SET leased_until=clock_timestamp() WHERE space_id=$1 AND collection_id=$2
           AND job_id=$3 AND state='running' AND lease_id=$4 AND leased_until>clock_timestamp() RETURNING job_id`,
@@ -726,7 +915,10 @@ export class PostgresAnalysisWorker {
           AND holder_job_id=$3`, pk(claimed));
         await db.query(`UPDATE analysis_space_slots SET held_until=clock_timestamp() WHERE space_id=$1 AND holder_collection_id=$2
           AND holder_job_id=$3`, pk(claimed));
-      }, { deadline: until }).catch(() => {});
+      }, { deadline: until }).catch((error: unknown) => {
+        if (ended(error)) result.unreleased++;
+        else if (!failed) throw error;
+      });
     }
   }
 
@@ -741,9 +933,10 @@ export class PostgresAnalysisWorker {
     const started = Date.now();
     const key = pk(claimed);
     const failure = await binding(db, claimed);
-    const job = (await db.query(`SELECT *,least(clock_timestamp()+$5::int*interval '1 millisecond',expires_at) AS until
+    const job = (await db.query(`SELECT *,least(clock_timestamp()+$5::int*interval '1 millisecond',$6::timestamptz,expires_at) AS until
       FROM analysis_jobs WHERE space_id=$1 AND collection_id=$2 AND job_id=$3 AND state='running' AND lease_id=$4
-        AND leased_until>clock_timestamp() AND expires_at>clock_timestamp() FOR UPDATE`, [...key, claimed.lease_id, analysisJobBounds.leaseMs])).rows[0];
+        AND leased_until>clock_timestamp() AND expires_at>clock_timestamp() FOR UPDATE`, [...key, claimed.lease_id, analysisJobBounds.leaseMs,
+      claimed.turn_end])).rows[0];
     if (!job) return 'lost';
     if (failure) { await this.fail(db, job, failure); return 'failed'; }
     // One slot is one backend: no parallel workers outside the analytical budget.

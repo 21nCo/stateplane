@@ -952,8 +952,8 @@ test('space erasure removes every job, page, manifest and space slot of that spa
 });
 
 // Migration 052's removal queue: an ending that leaves pages queues the job at the commit that ends it, with its
-// highest page as rows left; an ending that removes its pages in the same transaction, as every ending does until
-// STA-77, queues nothing; a space purge takes the queue with its jobs.
+// highest page as rows left (as the jobs Worker's expiry does); an ending that removes its pages in the same
+// transaction (as a cancellation or failure does) queues nothing; a space purge takes the queue with its jobs.
 test('an analysis job ended with pages left is queued for removal at commit, one ended with its pages removed never is', async () => {
   const { spaceId, watermark } = await space();
   const queued = async job => (await pool.query(`SELECT rows_left FROM analysis_removals WHERE space_id=$1 AND collection_id=$2
