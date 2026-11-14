@@ -1,0 +1,42 @@
+packages/postgres/src/services.ts
+  h_bdc5b81c173ee9 10,193,315-320
+packages/postgres/src/index.ts
+  h_bdc5b81c173ee9 2195-2197
+packages/postgres/src/analysis-jobs.ts
+  h_bdc5b81c173ee9 3,14-15,69-71,136,151,179,196,576-598,613-631,634-642,645-647,650-748,761-769,771-774,776-782,784-786,788,797-804,810-812
+packages/application/src/services.ts
+  h_bdc5b81c173ee9 109-118
+packages/contracts/src/portability.ts
+  h_bdc5b81c173ee9 1-203
+test/portability-manifest.test.js
+  h_bdc5b81c173ee9 1-173
+packages/contracts/src/index.ts
+  h_bdc5b81c173ee9 56
+test/integration/portability-export.test.js
+  h_bdc5b81c173ee9 1-1567
+packages/postgres/src/portability-exports.ts
+  h_bdc5b81c173ee9 1-884
+test/integration/analysis-storage.test.js
+  s_bcc697c7cc6458::t_ff5d464848d960 955-956
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a4df0c86785fb530055df47890aebb4c36d81f9e",
+  "prompts": {},
+  "humans": {
+    "h_bdc5b81c173ee9": {
+      "author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_bcc697c7cc6458": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "62579a62-e3b9-46dc-86f5-b11888ecbf3c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
