@@ -1,0 +1,26 @@
+packages/postgres/src/portability-exports.ts
+  s_f198c9d5dc8814::t_7b27c21d5308f0 109,136,159,165,178,185-186,197-198,209,219,226,240,250,252
+test/integration/portability-export.test.js
+  s_f198c9d5dc8814::t_b3b5dd962c5fd6 1695-1701
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3b63a605e8d164203b67ca823a8b27f1115fd443",
+  "prompts": {},
+  "humans": {
+    "h_bdc5b81c173ee9": {
+      "author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_f198c9d5dc8814": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "98cb9fee-70a1-450b-ab36-03f27d9eba3c",
+        "model": "unknown"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
