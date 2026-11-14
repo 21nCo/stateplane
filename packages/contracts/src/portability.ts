@@ -66,7 +66,16 @@ function isInstant(value: unknown): boolean {
 /** The manifest schema's limits: 11 evidence sections and at most 1 accelerator; 4,095 data parts of 1 to 1 MiB. */
 const MAX_DATA_PARTS = 4_095;
 const MAX_PART_BYTES = 1_048_576;
+/**
+ * The longest provenance row verified, in UTF-16 code units: a part's limit. An exporter's rows are a few hundred bytes
+ * (identifiers, a revision, an ordinal and offsets); a longer one is refused rather than accumulated across parts.
+ */
+const MAX_PROVENANCE_ROW = MAX_PART_BYTES;
 const encoder = new TextEncoder();
+/**
+ * Every integer of the format is a JSON number an importer must read exactly, so at most 2^53 - 1: a larger one parses
+ * rounded, and an exporter refuses to write one rather than round it.
+ */
 const isCount = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
 const isPositive = (value: unknown): value is number => isCount(value) && value >= 1;
 const isId = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
@@ -146,16 +155,21 @@ function malformed(value: unknown): string | null {
  * Schema can state (a provenance span starts at or before its end).
  */
 function unlisted(manifest: ExportManifest, parts: readonly string[]): string | null {
-  // Provenance rows are read part by part, keeping only the line a part leaves unfinished, never the whole section.
-  let unfinished = '';
+  // Provenance rows are read part by part, keeping only the pieces of the line parts leave unfinished, joined once when
+  // a part ends it, never the whole section, and each row at most `MAX_PROVENANCE_ROW` long.
+  let unfinished: string[] = [], carried = 0;
   for (const [i, listed] of manifest.parts.entries()) {
     const content = parts[i];
     if ((content.match(/\n/g)?.length ?? 0) !== listed.rows) return `part ${listed.number} does not hold ${listed.rows} rows`;
     if (manifest.parts[i + 1]?.section !== listed.section && !content.endsWith('\n'))
       return `section ${listed.section} ends with an unfinished line`;
     if (listed.section !== 'provenance') continue;
-    const lines = (unfinished + content).split('\n');
-    unfinished = lines.pop()!;
+    const lines = content.split('\n');
+    const rest = lines.pop()!;
+    if (lines.length) { lines[0] = unfinished.join('') + lines[0]; unfinished = []; carried = 0; }
+    if (rest) { unfinished.push(rest); carried += rest.length; }
+    if (carried > MAX_PROVENANCE_ROW || lines.some(line => line.length > MAX_PROVENANCE_ROW))
+      return `a provenance row is longer than ${MAX_PROVENANCE_ROW} characters`;
     for (const line of lines) {
       const reason = reversed(line);
       if (reason) return reason;
@@ -190,6 +204,7 @@ export async function verifyExportManifest(manifestText: string, expectedSha256:
   if (reason) return { ok: false, reason };
   const sealed = manifest as ExportManifest;
   if (parts !== undefined) {
+    if (!Array.isArray(parts)) return { ok: false, reason: 'parts must be an array of the data parts\' contents' };
     if (parts.length !== sealed.parts.length) return { ok: false, reason: `the manifest lists ${sealed.parts.length} parts, ${parts.length} given` };
     for (const [i, listed] of sealed.parts.entries()) {
       const content = parts[i];

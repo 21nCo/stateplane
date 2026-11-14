@@ -3,7 +3,7 @@ import { exportSections, portabilityFormat, portabilityFormatVersion } from '@st
 import type { ExportManifest, VerifiedCredential } from '@stateplane/contracts';
 import { AuthorityError, CommitOutcomeUnknownError } from './index.js';
 import type { AuthorityScope } from './index.js';
-import { finalCheck, lockedOut, probing, publish, released } from './analysis-jobs.js';
+import { ended, finalCheck, lockedOut, probing, publish, released } from './analysis-jobs.js';
 import type { Deadline } from './analysis-jobs.js';
 import { DeadlineExceededError, inTransaction } from './faults.js';
 import type { PoolLike, Session } from './faults.js';
@@ -19,7 +19,7 @@ import type { PostgresSpaces } from './spaces.js';
  * space, and at most 4 held (unfinished, or completed, or ended with parts
  * not yet removed), so a space holds at most 4 GiB of export parts; parts of at most 1 MiB
  * (migration 051's bound) read 1,000 rows at a time, and removed at most 16 per
- * transaction (measured, docs/portability-export.md#worker); a 30 s lease extended by
+ * transaction (measured, docs/portability-export.md#worker); a lease of at most 30 s, never past the turn, extended by
  * every part; pending record events published at submission in rounds of
  * 5,000, at most 20; 30 s for a submission to admit its queued export once
  * its final credential check is released, after which a worker cancels it unrun.
@@ -57,6 +57,8 @@ export interface PortabilityStep {
   unadmitted: number;
   /** Parts removed from ended exports. */
   removed: number;
+  /** Leases whose give-back the deadline cut short: each still ends with its turn. */
+  unreleased: number;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- driver rows, read by column name
@@ -104,6 +106,14 @@ function instant(value: unknown): string | null {
 }
 const sha256 = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
 const cutShort = (error: unknown) => error instanceof DeadlineExceededError;
+/** A database integer as the JSON number the format carries, refused past 2^53 - 1 (verifyExportManifest's bound), where it would round. */
+function exact(value: unknown): number {
+  const number = Number(value);
+  if (!Number.isSafeInteger(number)) throw new RangeError(`An integer the export format cannot carry exactly: ${String(value)}`);
+  return number;
+}
+/** A lease's length: at most `leaseMs`, and ending with the turn (`turnEnd`), so it lapses then even if never given back. */
+const leaseFor = (turnEnd: number) => Math.max(1, Math.min(portabilityExportBounds.leaseMs, turnEnd - Date.now()));
 /** What no export carries, whatever the space holds: the manifest states it. */
 const EXCLUDED = ['credential-secrets', 'session-tokens', 'storage-object-keys', 'original-bytes', 'derived-projections'];
 
@@ -240,7 +250,7 @@ const SECTIONS: Record<typeof exportSections[number], Section> = {
     WHERE e.space_id=$1 AND f.position<=$3 AND AFTER(e.collection_id,e.record_id,e.revision)
     ORDER BY e.collection_id,e.record_id,e.revision`,
   line: r => withRaw({ collectionId: r.k1, id: r.k2, keyMode: r.key_mode, key: r.normalized_key, revision: Number(r.k3),
-    eventId: r.event_id, position: Number(r.position),
+    eventId: r.event_id, position: exact(r.position),
     operation: r.operation, schemaVersion: Number(r.schema_version), credentialId: r.credential_id, committedAt: instant(r.committed_at) },
   'data', r.canonical_data) }
 };
@@ -321,7 +331,7 @@ function view(row: Row): PortabilityExportStatus {
     boundary: { spaceId: row.space_id, watermark: Number(row.watermark), snapshotAt: row.snapshot_at, records: 'as-of-watermark',
       evidence: 'as-of-snapshot', policyVersion: Number(row.policy_version), placementGeneration: Number(row.placement_generation),
       formatVersion: Number(row.format_version) },
-    progress: { section: row.state === 'completed' ? null : exportSections[checkpoint.section ?? 0] ?? null,
+    progress: { section: row.state === 'completed' || row.checkpoint === null ? null : exportSections[checkpoint.section] ?? null,
       partsWritten: Number(row.parts_written ?? 0), attempts: Number(row.attempts), runtimeMs: Number(checkpoint.runtimeMs ?? 0) },
     budgets: { bytes: portabilityExportBounds.budgetBytes, parts: portabilityExportBounds.maxParts,
       runtimeMs: portabilityExportBounds.budgetRuntimeMs },
@@ -630,7 +640,7 @@ interface Checkpoint { section: number; cursor: unknown[] | null; offset: number
  * run by `PostgresAnalysisWorker.step` on the jobs Worker's one connection:
  * it ends exports past their expiry, then claims due exports one at a time
  * (queued, or running with a lapsed lease; least recently run first) and
- * writes their parts under a 30 s lease, one part per transaction, as STA-59
+ * writes their parts under a lease of at most 30 s that ends with the turn, one part per transaction, as STA-59
  * writes pages: the space share-locked and its binding checked, the job
  * locked at its exact lease, the next rows of the current section read after
  * the checkpoint, and the part committed with the checkpoint. An interruption
@@ -656,7 +666,7 @@ export class PortabilityExportWorker {
 
   /** End expired and never admitted exports, then write parts until `until`. */
   async step(until: number, result: PortabilityStep = { expired: 0, claimed: 0, parts: 0, completed: 0, failed: 0, unadmitted: 0,
-    removed: 0 }):
+    removed: 0, unreleased: 0 }):
     Promise<PortabilityStep> {
     try { await this.expire(until, result); } catch (error) { if (!cutShort(error)) throw error; }
     return this.turn(until, result);
@@ -667,7 +677,7 @@ export class PortabilityExportWorker {
     const passed: string[] = [];
     while (until - RELEASE_MS - Date.now() >= MIN_PART_MS) {
       let job: Row | null | 'busy' | 'failed';
-      try { job = await this.claim(until - RELEASE_MS, passed); } catch (error) { if (cutShort(error)) break; throw error; }
+      try { job = await this.claim(until - RELEASE_MS, passed, until); } catch (error) { if (cutShort(error)) break; throw error; }
       if (job === null) break;
       if (job === 'failed') result.failed++;
       if (job === 'busy' || job === 'failed') continue;
@@ -715,7 +725,7 @@ export class PortabilityExportWorker {
    * Claim the next due export not passed over in this step and whose space no other transaction holds locked: null
    * when none, `busy` when taken or locked meanwhile, `failed` when its binding failed it.
    */
-  private async claim(until: number, passed: string[]): Promise<Row | null | 'busy' | 'failed'> {
+  private async claim(until: number, passed: string[], turnEnd: number): Promise<Row | null | 'busy' | 'failed'> {
     // Only admitted exports: running (from admission or a lost lease) with their lease ended. A queued one is never run.
     // As the probe does, it passes over one whose row or space is locked; a table held locked past the lock bound leaves none.
     const next = (await inTransaction(this.pool, async db => (await probing(db)).query(`SELECT j.space_id,j.job_id
@@ -733,7 +743,7 @@ export class PortabilityExportWorker {
       const locked = (await db.query(`SELECT *,least(clock_timestamp()+$3::int*interval '1 millisecond',expires_at) AS until
         FROM portability_jobs WHERE space_id=$1 AND job_id=$2
           AND state='running' AND leased_until<=clock_timestamp() AND expires_at>clock_timestamp()
-        FOR UPDATE SKIP LOCKED`, [...pk(next), portabilityExportBounds.leaseMs])).rows[0];
+        FOR UPDATE SKIP LOCKED`, [...pk(next), leaseFor(turnEnd)])).rows[0];
       if (!locked) return 'busy' as const;
       if (failure) { await this.fail(db, locked, failure); return 'failed' as const; }
       return (await db.query(`UPDATE portability_jobs SET state='running',lease_id=$3,leased_until=$4,attempts=attempts+1
@@ -748,10 +758,11 @@ export class PortabilityExportWorker {
 
   /** Write the claimed export's parts until it ends, its lease is lost or the budget ends; then give the lease back. */
   private async run(claimed: Row, until: number, result: PortabilityStep): Promise<void> {
+    let thrown = false;
     try {
       while (until - RELEASE_MS - Date.now() >= MIN_PART_MS) {
         let outcome: 'part' | 'advanced' | 'completed' | 'failed' | 'expired' | 'lost';
-        try { outcome = await inTransaction(this.pool, db => this.part(db, claimed), { deadline: until - RELEASE_MS }); }
+        try { outcome = await inTransaction(this.pool, db => this.part(db, claimed, until), { deadline: until - RELEASE_MS }); }
         catch (error) { if (cutShort(error)) break; throw error; }
         if (outcome === 'part') result.parts++;
         if (outcome === 'part' || outcome === 'advanced') continue;
@@ -760,11 +771,15 @@ export class PortabilityExportWorker {
         if (outcome === 'expired') result.expired++;
         return;
       }
-    } finally {
-      // Its lease ends now, so the export is due again at once. A failure here only leaves the lease to lapse.
+    } catch (error) { thrown = true; throw error; } finally {
+      // Its lease ends now, so the export is due again at once; unsent, it still ends with the turn (`leaseFor`). A
+      // give-back the deadline cut short is counted; any other failure is the step's, unless writing parts already failed it.
       await inTransaction(this.pool, db => db.query(`UPDATE portability_jobs SET leased_until=clock_timestamp()
         WHERE space_id=$1 AND job_id=$2 AND state='running' AND lease_id=$3 AND leased_until>clock_timestamp()`,
-      [...pk(claimed), claimed.lease_id]), { deadline: until }).catch(() => {});
+      [...pk(claimed), claimed.lease_id]), { deadline: until }).catch((error: unknown) => {
+        result.unreleased++;
+        if (!thrown && !ended(error)) throw error;
+      });
     }
   }
 
@@ -774,7 +789,7 @@ export class PortabilityExportWorker {
   }
 
   /** One part of the export under its exact lease, committed with its checkpoint; or its manifest once no row is left. */
-  private async part(db: Session, claimed: Row): Promise<'part' | 'advanced' | 'completed' | 'failed' | 'expired' | 'lost'> {
+  private async part(db: Session, claimed: Row, turnEnd: number): Promise<'part' | 'advanced' | 'completed' | 'failed' | 'expired' | 'lost'> {
     const started = Date.now(), key = pk(claimed);
     // Until permissions are read, a policy change (a key issued or revoked, which adds or removes grants) fails the export.
     const reading = (await db.query('SELECT checkpoint FROM portability_jobs WHERE space_id=$1 AND job_id=$2', key)).rows[0];
@@ -784,7 +799,7 @@ export class PortabilityExportWorker {
     const job = (await db.query(`SELECT j.*,j.created_at::text AS snapshot,${SNAPSHOT_AT},least(clock_timestamp()+$4::int*interval '1 millisecond',expires_at) AS until
       FROM portability_jobs j WHERE space_id=$1 AND job_id=$2 AND state='running' AND lease_id=$3
         AND leased_until>clock_timestamp() AND expires_at>clock_timestamp() FOR UPDATE`,
-    [...key, claimed.lease_id, portabilityExportBounds.leaseMs])).rows[0];
+    [...key, claimed.lease_id, leaseFor(turnEnd)])).rows[0];
     if (!job) return 'lost';
     if (failure) { await this.fail(db, job, failure); return 'failed'; }
     await db.query('SET LOCAL max_parallel_workers_per_gather = 0');
@@ -862,9 +877,9 @@ export class PortabilityExportWorker {
     const space = (await db.query('SELECT owner_principal_id FROM spaces WHERE space_id=$1', [job.space_id])).rows[0];
     const manifest: ExportManifest = { format: portabilityFormat,
       formatVersion: Number(job.format_version) as typeof portabilityFormatVersion, jobId: job.job_id,
-      space: { spaceId: job.space_id, ownerPrincipalId: space.owner_principal_id, policyVersion: Number(job.policy_version),
-        placementGeneration: Number(job.placement_generation) },
-      boundary: { watermark: Number(job.watermark), snapshotAt: job.snapshot_at, records: 'as-of-watermark', evidence: 'as-of-snapshot' },
+      space: { spaceId: job.space_id, ownerPrincipalId: space.owner_principal_id, policyVersion: exact(job.policy_version),
+        placementGeneration: exact(job.placement_generation) },
+      boundary: { watermark: exact(job.watermark), snapshotAt: job.snapshot_at, records: 'as-of-watermark', evidence: 'as-of-snapshot' },
       sections: exportSections.map(name => {
         const own = parts.filter(p => p.section === name);
         return { name, rows: own.reduce((n, p) => n + p.row_count, 0), bytes: own.reduce((n, p) => n + p.byte_size, 0), accelerator: false };

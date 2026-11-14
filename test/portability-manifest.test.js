@@ -171,3 +171,53 @@ test('with its data parts, every part holds the rows the manifest lists, ends it
   assert.equal((await check(split(cite(2, 5), 40), [0, 1], 'provenance')).ok, true);
   assert.equal((await check(split(cite(5, 2), 40), [0, 1], 'provenance')).ok, false, 'a reversed span split across parts');
 });
+
+test('parts must be an array: null, a string or an array-like object is refused, never thrown on or trusted', async () => {
+  const [text, digest] = sealed(manifest());
+  for (const parts of [null, content, { length: 1, 0: content }, 42])
+    assert.equal((await verifyExportManifest(text, digest, parts)).ok, false, `parts ${JSON.stringify(parts)} verified`);
+  assert.equal((await verifyExportManifest(text, digest, [content])).ok, true);
+});
+
+test('integers verify up to 2^53 - 1, where a JSON number is still exact; a larger one is refused rather than rounded', async () => {
+  const at = watermark => sealed(edit(m => { m.boundary.watermark = watermark; }));
+  assert.equal((await verifyExportManifest(...at(Number.MAX_SAFE_INTEGER))).ok, true);
+  // JSON.stringify writes 2^53 exactly; parsed back it is no longer a safe integer.
+  assert.equal((await verifyExportManifest(...at(2 ** 53))).ok, false);
+  const [text] = at(0);
+  const big = text.replace('"watermark":0', '"watermark":9007199254740993');
+  assert.equal((await verifyExportManifest(big, sha(big))).ok, false, 'a watermark that parses rounded');
+});
+
+test('a provenance row continued across thousands of parts verifies in linear time, and an over-long row is refused', async () => {
+  /** Provenance `contents`, each part listing the rows it ends, re-sealed and verified with those parts. */
+  const check = async contents => {
+    const value = manifest();
+    value.parts = contents.map((part, i) => ({ number: i + 1, section: 'provenance', rows: (part.match(/\n/g) ?? []).length,
+      bytes: Buffer.byteLength(part), sha256: sha(part) }));
+    for (const entry of value.sections) {
+      const own = value.parts.filter(part => part.section === entry.name);
+      Object.assign(entry, { rows: own.reduce((n, part) => n + part.rows, 0), bytes: own.reduce((n, part) => n + part.bytes, 0) });
+    }
+    const [text, digest] = sealed(value);
+    return verifyExportManifest(text, digest, contents);
+  };
+  const row = (start, end, length) => {
+    const base = { collectionId: 'alpha', claimId: '', revision: 1, ordinal: 0,
+      source: { collectionId: 'alpha', sourceId: 's', extractionVersion: 1, startOffset: start, endOffset: end } };
+    base.claimId = 'c'.repeat(length - JSON.stringify(base).length - 1);
+    return `${JSON.stringify(base)}\n`;
+  };
+  const chunks = (line, count) => Array.from({ length: count }, (_, i) =>
+    line.slice(Math.floor(i * line.length / count), Math.floor((i + 1) * line.length / count)));
+  // One row of a million characters in 4,000 parts: carried once, never copied again for every part.
+  const started = performance.now();
+  assert.equal((await check(chunks(row(2, 5, 1_000_000), 4_000))).ok, true);
+  assert.ok(performance.now() - started < 10_000, `took ${Math.round(performance.now() - started)} ms`);
+  const reversed = await check(chunks(row(5, 2, 1_000_000), 4_000));
+  assert.deepEqual(reversed, { ok: false, reason: 'a provenance span starts after its end' });
+  // A row longer than a part's limit is refused, whether it ends or is still unfinished when the limit passes.
+  const long = await check(chunks(row(2, 5, 1_048_578), 3));
+  assert.equal(long.ok, false);
+  assert.match(long.reason, /provenance row is longer than 1048576 characters/);
+});

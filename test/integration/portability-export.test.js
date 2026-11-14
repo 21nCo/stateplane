@@ -1565,3 +1565,123 @@ test('a removal batch budgets its whole transaction: with every statement slow, 
     (SELECT count(*) FROM analysis_removals WHERE job_id=$2)::int AS analysis`, [exported, analysed.jobId])).rows[0],
   { exports: 0, analysis: 0 });
 });
+
+/** A jobs Worker whose statements matching `stalls` wait `ms` before they are sent: a latent or stalled session. */
+function stalling(stalls, ms) {
+  const own = newPool(1);
+  own.on('connect', client => {
+    const query = client.query.bind(client);
+    client.query = async (sql, ...rest) => {
+      if (stalls(typeof sql === 'string' ? sql : sql.text)) await new Promise(resolve => setTimeout(resolve, ms));
+      return query(sql, ...rest);
+    };
+  });
+  return new PostgresAnalysisWorker(own, { originConnectionLimit: 5 });
+}
+/** Every job of both kinds run to its end, as successive ticks would. */
+async function settleAll() {
+  for (let i = 0; i < 200; i++) {
+    const step = await worker().step({ budgetMs: 10_000 });
+    if (!step.claimed && !step.exports.claimed) return;
+  }
+  throw new Error('jobs did not finish');
+}
+
+test('a lease and its slot holds end with their turn: a write and its give-back cut at the deadline leave the job due at once', async () => {
+  const actor = await owner();
+  const spaceId = await space(actor);
+  await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: 'one' } });
+  // The first write and every give-back stall past the step, as a session lost at the deadline or a new one too slow
+  // to fit the release reserve: the write is cut at the deadline less the reserve, and its give-back at the deadline.
+  let writes = 0;
+  const cut = () => stalling(sql => (/^\s*INSERT INTO (portability_parts|analysis_result_pages|analysis_result_manifests)/.test(sql)
+    && ++writes === 1) || /SET leased_until=clock_timestamp\(\)/.test(sql), 6_000);
+  const held = async (table, jobId) => (await pool.query(`SELECT state,leased_until>clock_timestamp()+interval '100 milliseconds' AS leased
+    FROM ${table} WHERE job_id=$1`, [jobId])).rows[0];
+  const analysed = await services.analysis.submit(actor, spaceId, 'alpha', 'export');
+  const analysis = await cut().step({ budgetMs: 4_000 });
+  assert.deepEqual([analysis.claimed, analysis.pages, analysis.unreleased], [1, 0, 1], 'the page and the give-back were cut');
+  assert.deepEqual(await held('analysis_jobs', analysed.jobId), { state: 'running', leased: false }, 'the lease ended with the turn');
+  assert.equal((await pool.query(`SELECT (SELECT count(*) FROM analysis_cell_slots WHERE holder_job_id=$1
+      AND held_until>clock_timestamp()+interval '100 milliseconds')+(SELECT count(*) FROM analysis_space_slots WHERE holder_job_id=$1
+      AND held_until>clock_timestamp()+interval '100 milliseconds') AS n`, [analysed.jobId])).rows[0].n, '0', 'no slot is held');
+  assert.equal((await worker().step({ budgetMs: 4_000 })).claimed, 1, 'the next step claims the job at once');
+
+  writes = 0;
+  const exported = await portability.submitExport(actor, spaceId);
+  const exportStep = (await cut().step({ budgetMs: 4_000 })).exports;
+  assert.deepEqual([exportStep.claimed, exportStep.parts, exportStep.unreleased], [1, 0, 1], 'the part and the give-back were cut');
+  assert.deepEqual(await held('portability_jobs', exported.jobId), { state: 'running', leased: false }, 'the lease ended with the turn');
+  assert.equal((await worker().step({ budgetMs: 4_000 })).exports.claimed, 1, 'the next step claims the export at once');
+
+  // A give-back that fails for any other reason is the step's failure, never swallowed.
+  const refused = await portability.submitExport(actor, spaceId);
+  await assert.rejects(worker(sql => {
+    if (/SET leased_until=clock_timestamp\(\)/.test(sql)) throw Object.assign(new Error('give-back refused'), { code: '42501' });
+  }).step({ budgetMs: 10_000 }), /give-back refused/);
+  await pool.query(`UPDATE portability_jobs SET leased_until=clock_timestamp() WHERE job_id=$1 AND state='running'`, [refused.jobId]);
+  await settleAll();
+});
+
+test('the cell\'s turn record falls back to the worker\'s own turn when locked out, and reports any other failure once both kinds ran', async () => {
+  const actor = await owner();
+  const spaceId = await space(actor);
+  await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: 'one' } });
+  const written = async () => Number((await pool.query(`SELECT (SELECT count(*) FROM portability_parts p JOIN portability_jobs j
+      ON j.space_id=p.space_id AND j.job_id=p.job_id WHERE j.space_id=$1)+(SELECT count(*) FROM analysis_result_pages WHERE space_id=$1) AS n`,
+  [spaceId])).rows[0].n);
+  // At the 2 s minimum budget with 700 ms writes, two due kinds cannot share the step, so it reads the turn record.
+  const turning = fault => worker(sql => {
+    if (/^\s*INSERT INTO (portability_parts|analysis_result_pages|analysis_result_manifests)/.test(sql)) spin(700);
+    if (/UPDATE snapshot_step_turn/.test(sql)) fault();
+  });
+  const due = async () => {
+    await services.analysis.submit(actor, spaceId, 'alpha', 'export');
+    await portability.submitExport(actor, spaceId);
+  };
+  await due();
+  let before = await written();
+  await turning(() => { throw Object.assign(new Error('lock timeout'), { code: '55P03' }); }).step({ budgetMs: 2_000 });
+  assert.ok(await written() > before, 'a locked-out turn record falls back to the worker\'s turn');
+  await settleAll();
+  await due();
+  before = await written();
+  await assert.rejects(turning(() => { throw Object.assign(new Error('permission denied for table snapshot_step_turn'), { code: '42501' }); })
+    .step({ budgetMs: 2_000 }), /permission denied for table snapshot_step_turn/);
+  assert.ok(await written() > before, 'a kind still ran before the failure was reported');
+  await settleAll();
+  await due();
+  before = await written();
+  await pool.query('DELETE FROM snapshot_step_turn');
+  try {
+    await assert.rejects(turning(() => {}).step({ budgetMs: 2_000 }), /turn record is missing/);
+  } finally { await pool.query('INSERT INTO snapshot_step_turn DEFAULT VALUES ON CONFLICT DO NOTHING'); }
+  assert.ok(await written() > before, 'a kind still ran without the turn record');
+  await settleAll();
+});
+
+test('an export\'s status names no section until a worker checkpoints one, and an integer the format cannot carry fails it', async () => {
+  const actor = await owner();
+  const spaceId = await space(actor);
+  await mutate(actor, spaceId, 'alpha', { operation: 'create', data: { label: 'one' } });
+  const { jobId } = await portability.submitExport(actor, spaceId);
+  const progress = async () => (await portability.exportStatus(actor, spaceId, jobId)).progress;
+  assert.equal((await portability.exportStatus(actor, spaceId, jobId)).state, 'queued');
+  assert.deepEqual(await progress(), { section: null, partsWritten: 0, attempts: 0, runtimeMs: 0 }, 'unclaimed, no section is read');
+  // One part committed with its checkpoint, then the step is cut at the next.
+  let writes = 0;
+  await assert.rejects(worker(sql => { if (/^\s*INSERT INTO portability_parts/.test(sql) && ++writes === 2) throw new Error('cut'); })
+    .step({ budgetMs: 10_000 }), /cut/);
+  const checkpointed = await progress();
+  assert.ok(exportSections.includes(checkpointed.section) && checkpointed.partsWritten === 1, JSON.stringify(checkpointed));
+  await pool.query(`UPDATE portability_jobs SET leased_until=clock_timestamp() WHERE job_id=$1 AND state='running'`, [jobId]);
+  await drain();
+  assert.equal((await progress()).section, null, 'completed');
+
+  // A watermark past 2^53 - 1 would round as a JSON number: the export fails rather than seal a manifest that misstates it.
+  const unsafe = await portability.submitExport(actor, spaceId);
+  await bypassing('UPDATE portability_jobs SET watermark=9007199254740993 WHERE job_id=$1', [unsafe.jobId]);
+  await drain();
+  const failed = await portability.exportStatus(actor, spaceId, unsafe.jobId);
+  assert.deepEqual([failed.state, failed.failureCode], ['failed', 'UNPROCESSABLE']);
+});
