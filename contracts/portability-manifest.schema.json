@@ -127,7 +127,8 @@
             "mimeType": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$" },
             "capturedAt": { "$ref": "#/$defs/instant" }, "observedAt": { "$ref": "#/$defs/instant" } },
           "if": { "properties": { "referenceOnly": { "const": true } } }, "then": { "properties": { "sha256": { "type": "null" }, "byteSize": { "type": "null" } } },
-          "else": { "properties": { "sha256": { "type": "string" }, "byteSize": { "type": "integer" }, "mimeType": { "type": "string" } } } } }
+          "else": { "properties": { "sha256": { "type": "string" }, "byteSize": { "type": "integer" }, "mimeType": { "type": "string" } } } } },
+      "if": { "properties": { "original": { "properties": { "referenceOnly": { "const": true } } } } }, "then": { "properties": { "locator": { "type": "string" } } }
     },
     "extractions": {
       "description": "One extraction version of a live source.",

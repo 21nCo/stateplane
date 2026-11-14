@@ -73,9 +73,9 @@ test('a section line envelope is closed while its canonical JSON data is not ins
   assert.equal(record(extra), false);
 });
 
-// Each section line admits only what its authority columns can hold (migrations 002, 040, 042, 045): null only
-// where the column is, digests as digests, CHECK lists as enums, predecessors null or at least 1, and the row rules
-// of originals, reviews and vector retrieval.
+// Section lines follow their authority columns (migrations 002, 011, 040, 042, 044 and 045) wherever JSON Schema can
+// state the rule: null only where the column is, digests as digests, CHECK lists as enums, predecessors null exactly
+// at version 1, and the row rules of originals, reviews and vector retrieval.
 const t = '2026-11-13T01:02:03.123456Z';
 const lines = {
   retrieval: () => ({ collectionId: 'col_1', version: 1, previousVersion: null, recordFields: [], sourceContent: false,
@@ -170,6 +170,9 @@ test('section lines the authority refuses are refused', () => {
     'a stored original without a size': ['sources', l => { l.original.byteSize = null; }],
     'a stored original without a type': ['sources', l => { l.original.mimeType = null; }],
     'a reference-only original with a digest': ['sources', l => { l.original.referenceOnly = true; }],
+    'a reference-only original without a locator': ['sources', l => {
+      l.original = { referenceOnly: true, sha256: null, byteSize: null, mimeType: null, capturedAt: t, observedAt: t };
+    }],
     'an original without a capture time': ['sources', l => { l.original.capturedAt = null; }],
     'an original without an observation time': ['sources', l => { l.original.observedAt = null; }],
     'a null retrieval credential': ['retrieval', l => { l.credentialId = null; }],
