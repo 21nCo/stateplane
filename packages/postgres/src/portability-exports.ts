@@ -106,7 +106,7 @@ function instant(value: unknown): string | null {
 }
 const sha256 = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
 const cutShort = (error: unknown) => error instanceof DeadlineExceededError;
-/** A database integer as the JSON number the format carries, refused past 2^53 - 1 (verifyExportManifest's bound), where it would round. */
+/** A database integer as the JSON number the format carries: every integer an export writes, refused past 2^53 - 1, where it would round. */
 function exact(value: unknown): number {
   const number = Number(value);
   if (!Number.isSafeInteger(number)) throw new RangeError(`An integer the export format cannot carry exactly: ${String(value)}`);
@@ -133,7 +133,7 @@ const notDeleted = (kind: string, collection: string, id: string) => `NOT EXISTS
 const withRaw = (fields: object, name: string, raw: string | null) =>
   `${JSON.stringify(fields).slice(0, -1)},${JSON.stringify(name)}:${raw ?? 'null'}}`;
 const at = (value: unknown, snapshot = true) => snapshot ? instant(value) : null;
-const integer = (value: unknown) => value === null || value === undefined ? null : Number(value);
+const integer = (value: unknown) => value === null || value === undefined ? null : exact(value);
 
 const SECTIONS: Record<typeof exportSections[number], Section> = {
   // Identifiers, times and grants only: no credential row holds secret material, and none is read. Grants have no
@@ -156,13 +156,13 @@ const SECTIONS: Record<typeof exportSections[number], Section> = {
       octet_length(v.canonical_definition) AS size
     FROM collection_versions v WHERE v.space_id=$1 AND v.accepted_at<=$2 AND AFTER(v.collection_id,v.version)
     ORDER BY v.collection_id,v.version`,
-  line: r => withRaw({ collectionId: r.k1, version: Number(r.k2), acceptedAt: instant(r.accepted_at) }, 'definition', r.canonical_definition) },
+  line: r => withRaw({ collectionId: r.k1, version: exact(r.k2), acceptedAt: instant(r.accepted_at) }, 'definition', r.canonical_definition) },
   retrieval: { keys: 2, sql: `SELECT p.collection_id AS k1,p.version AS k2,p.previous_version,p.record_fields,p.source_content,
       p.claim_statements,p.lexical,p.vector,p.text_search_config,p.processing_regions,p.credential_id,
       ${utc('p.created_at')} AS created_at,256 AS size
     FROM retrieval_policies p WHERE p.space_id=$1 AND p.created_at<=$2 AND AFTER(p.collection_id,p.version)
     ORDER BY p.collection_id,p.version`,
-  line: r => JSON.stringify({ collectionId: r.k1, version: Number(r.k2), previousVersion: r.previous_version === null ? null : Number(r.previous_version),
+  line: r => JSON.stringify({ collectionId: r.k1, version: exact(r.k2), previousVersion: r.previous_version === null ? null : exact(r.previous_version),
     recordFields: r.record_fields, sourceContent: r.source_content, claimStatements: r.claim_statements, lexical: r.lexical,
     vector: r.vector, textSearchConfig: r.text_search_config, processingRegions: r.processing_regions, credentialId: r.credential_id,
     createdAt: instant(r.created_at) }) },
@@ -175,15 +175,15 @@ const SECTIONS: Record<typeof exportSections[number], Section> = {
       AND AFTER(s.collection_id,s.source_id) ORDER BY s.collection_id,s.source_id`,
   line: r => JSON.stringify({ collectionId: r.k1, sourceId: r.k2, kind: r.kind, locator: r.locator, principalId: r.principal_id,
     credentialId: r.credential_id, createdAt: instant(r.created_at), original: { referenceOnly: r.reference_only ?? true,
-      sha256: r.sha256 ?? null, byteSize: r.byte_size === null || r.byte_size === undefined ? null : Number(r.byte_size),
+      sha256: r.sha256 ?? null, byteSize: r.byte_size === null || r.byte_size === undefined ? null : exact(r.byte_size),
       mimeType: r.mime_type ?? null, capturedAt: instant(r.captured_at), observedAt: instant(r.observed_at) } }) },
   extractions: { keys: 3, sql: `SELECT x.collection_id AS k1,x.source_id AS k2,x.version AS k3,x.previous_version,x.source_sha256,
       x.parser,x.parser_version,x.content,x.source_offsets::text AS source_offsets,x.credential_id,${utc('x.created_at')} AS created_at,
       octet_length(x.content)+octet_length(x.source_offsets::text) AS size
     FROM extraction_versions x WHERE x.space_id=$1 AND x.created_at<=$2 AND ${notDeleted('source', 'x.collection_id', 'x.source_id')}
       AND AFTER(x.collection_id,x.source_id,x.version) ORDER BY x.collection_id,x.source_id,x.version`,
-  line: r => withRaw({ collectionId: r.k1, sourceId: r.k2, version: Number(r.k3),
-    previousVersion: r.previous_version === null ? null : Number(r.previous_version), sourceSha256: r.source_sha256, parser: r.parser,
+  line: r => withRaw({ collectionId: r.k1, sourceId: r.k2, version: exact(r.k3),
+    previousVersion: r.previous_version === null ? null : exact(r.previous_version), sourceSha256: r.source_sha256, parser: r.parser,
     parserVersion: r.parser_version, credentialId: r.credential_id, createdAt: instant(r.created_at), content: r.content },
   'sourceOffsets', r.source_offsets) },
   claims: { keys: 3, sql: `SELECT r.collection_id AS k1,r.claim_id AS k2,r.revision AS k3,c.kind,c.principal_id,
@@ -194,8 +194,8 @@ const SECTIONS: Record<typeof exportSections[number], Section> = {
     FROM claim_revisions r JOIN claims c ON c.space_id=r.space_id AND c.collection_id=r.collection_id AND c.claim_id=r.claim_id
     WHERE r.space_id=$1 AND r.committed_at<=$2 AND ${notDeleted('claim', 'r.collection_id', 'r.claim_id')}
       AND AFTER(r.collection_id,r.claim_id,r.revision) ORDER BY r.collection_id,r.claim_id,r.revision`,
-  line: r => JSON.stringify({ collectionId: r.k1, claimId: r.k2, revision: Number(r.k3), kind: r.kind, principalId: r.principal_id,
-    createdAt: instant(r.created_at), previousRevision: r.previous_revision === null ? null : Number(r.previous_revision),
+  line: r => JSON.stringify({ collectionId: r.k1, claimId: r.k2, revision: exact(r.k3), kind: r.kind, principalId: r.principal_id,
+    createdAt: instant(r.created_at), previousRevision: r.previous_revision === null ? null : exact(r.previous_revision),
     statement: r.statement, attributedTo: r.attributed_to, credentialId: r.credential_id, recordedBy: r.recorded_by,
     observedAt: instant(r.observed_at), validFrom: instant(r.valid_from), validUntil: instant(r.valid_until),
     reviewStatus: r.review_status, reviewedBy: r.reviewed_by, reviewedAt: instant(r.reviewed_at),
@@ -206,7 +206,7 @@ const SECTIONS: Record<typeof exportSections[number], Section> = {
       AND r.claim_id=e.claim_id AND r.revision=e.revision
     WHERE e.space_id=$1 AND r.committed_at<=$2 AND ${notDeleted('claim', 'e.collection_id', 'e.claim_id')}
       AND AFTER(e.collection_id,e.claim_id,e.revision,e.ordinal) ORDER BY e.collection_id,e.claim_id,e.revision,e.ordinal`,
-  line: r => JSON.stringify({ collectionId: r.k1, claimId: r.k2, revision: Number(r.k3), ordinal: r.k4,
+  line: r => JSON.stringify({ collectionId: r.k1, claimId: r.k2, revision: exact(r.k3), ordinal: r.k4,
     // A whole-source citation has no extraction version and no offsets, a whole-extraction one no offsets: null as stored.
     source: { collectionId: r.source_collection_id, sourceId: r.source_id, extractionVersion: integer(r.extraction_version),
       startOffset: integer(r.start_offset), endOffset: integer(r.end_offset) } }) },
@@ -216,14 +216,14 @@ const SECTIONS: Record<typeof exportSections[number], Section> = {
       l.revision-CASE WHEN l.tombstone THEN 1 ELSE 0 END AS revision,128 AS size
     FROM links l WHERE l.space_id=$1 AND l.created_at<=$2 AND (NOT l.tombstone OR l.tombstoned_at>$2)
       AND AFTER(l.collection_id,l.link_id) ORDER BY l.collection_id,l.link_id`,
-  line: r => JSON.stringify({ collectionId: r.k1, linkId: r.k2, revision: Number(r.revision), linkType: r.link_type,
+  line: r => JSON.stringify({ collectionId: r.k1, linkId: r.k2, revision: exact(r.revision), linkType: r.link_type,
     deletionPolicy: r.deletion_policy, from: { kind: r.from_kind, collectionId: r.from_collection_id, id: r.from_id },
     to: { kind: r.to_kind, collectionId: r.to_collection_id, id: r.to_id }, credentialId: r.credential_id, createdAt: instant(r.created_at) }) },
   events: { keys: 4, sql: `SELECT v.collection_id AS k1,v.kind AS k2,v.entity_id AS k3,v.revision AS k4,v.event_id,v.operation,
       v.credential_id,${utc('v.committed_at')} AS committed_at,128 AS size
     FROM evidence_events v WHERE v.space_id=$1 AND v.committed_at<=$2 AND AFTER(v.collection_id,v.kind,v.entity_id,v.revision)
     ORDER BY v.collection_id,v.kind,v.entity_id,v.revision`,
-  line: r => JSON.stringify({ eventId: r.event_id, collectionId: r.k1, kind: r.k2, entityId: r.k3, revision: Number(r.k4),
+  line: r => JSON.stringify({ eventId: r.event_id, collectionId: r.k1, kind: r.k2, entityId: r.k3, revision: exact(r.k4),
     operation: r.operation, credentialId: r.credential_id, committedAt: instant(r.committed_at) }) },
   // Each record at its highest revision published at or below the watermark (migration 049's as-of index, as STA-59
   // reads it); a record deleted there is passed with no line, one first written later is no candidate.
@@ -237,7 +237,7 @@ const SECTIONS: Record<typeof exportSections[number], Section> = {
       AND e.revision=a.revision
     WHERE r.space_id=$1 AND AFTER(r.collection_id,r.record_id) ORDER BY r.collection_id,r.record_id`,
   line: r => r.operation === 'delete' ? '' : withRaw({ collectionId: r.k1, id: r.k2, keyMode: r.key_mode, key: r.normalized_key,
-    revision: Number(r.revision), schemaVersion: Number(r.schema_version) }, 'data', r.canonical_data) },
+    revision: exact(r.revision), schemaVersion: exact(r.schema_version) }, 'data', r.canonical_data) },
   // Every record event published at or below the watermark, deletions included, with its feed position and the
   // record's key, so a record deleted by then (and so absent from records) keeps its external key.
   revisions: { keys: 3, sql: `SELECT e.collection_id AS k1,e.record_id AS k2,e.revision AS k3,e.event_id,e.operation,e.schema_version,
@@ -247,9 +247,9 @@ const SECTIONS: Record<typeof exportSections[number], Section> = {
       JOIN records r ON r.space_id=e.space_id AND r.collection_id=e.collection_id AND r.record_id=e.record_id
     WHERE e.space_id=$1 AND f.position<=$3 AND AFTER(e.collection_id,e.record_id,e.revision)
     ORDER BY e.collection_id,e.record_id,e.revision`,
-  line: r => withRaw({ collectionId: r.k1, id: r.k2, keyMode: r.key_mode, key: r.normalized_key, revision: Number(r.k3),
+  line: r => withRaw({ collectionId: r.k1, id: r.k2, keyMode: r.key_mode, key: r.normalized_key, revision: exact(r.k3),
     eventId: r.event_id, position: exact(r.position),
-    operation: r.operation, schemaVersion: Number(r.schema_version), credentialId: r.credential_id, committedAt: instant(r.committed_at) },
+    operation: r.operation, schemaVersion: exact(r.schema_version), credentialId: r.credential_id, committedAt: instant(r.committed_at) },
   'data', r.canonical_data) }
 };
 

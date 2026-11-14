@@ -1692,4 +1692,11 @@ test('an export\'s status names no section until a worker checkpoints one, and a
   await drain();
   const failed = await portability.exportStatus(actor, spaceId, unsafe.jobId);
   assert.deepEqual([failed.state, failed.failureCode], ['failed', 'UNPROCESSABLE']);
+  // So does any integer a row carries: here a source's original byte size.
+  await sources.ingestText(actor, spaceId, 'alpha', { idempotencyKey: `unsafe-${randomUUID()}`, text: 'Sized.' });
+  await bypassing('UPDATE original_objects SET byte_size=9007199254740993 WHERE space_id=$1', [spaceId]);
+  const sized = await portability.submitExport(actor, spaceId);
+  await drain();
+  const rowFailed = await portability.exportStatus(actor, spaceId, sized.jobId);
+  assert.deepEqual([rowFailed.state, rowFailed.failureCode], ['failed', 'UNPROCESSABLE']);
 });
