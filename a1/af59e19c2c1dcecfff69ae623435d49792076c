@@ -1,0 +1,23 @@
+contracts/portability-manifest.schema.json
+  s_77ba148794ff7a::t_cf04f2e7657d2f 130-131
+docs/portability-export.md
+  s_77ba148794ff7a::t_3a3fe22a90bd10 49,106
+test/portability-manifest-schema.test.js
+  s_77ba148794ff7a::t_87e40450c3f08d 76-78,173-175
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a1af59e19c2c1dcecfff69ae623435d49792076c",
+  "prompts": {},
+  "sessions": {
+    "s_77ba148794ff7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "40998f85-15ac-463f-b0fa-7451ec5cf587",
+        "model": "unknown"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
