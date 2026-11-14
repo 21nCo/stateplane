@@ -95,6 +95,8 @@ const lines = {
     credentialId: 'cred_1', createdAt: t }),
   revisions: () => ({ collectionId: 'col_1', id: 'rec_1', keyMode: 'generated', key: 'rec_1', revision: 1, eventId: 'evt_1',
     position: 1, operation: 'create', schemaVersion: 1, credentialId: 'cred_1', committedAt: t, data: {} }),
+  events: () => ({ eventId: 'eev_1', collectionId: 'col_1', kind: 'link', entityId: 'lnk_1', revision: 1,
+    operation: 'create', credentialId: 'cred_1', committedAt: t }),
   permissions: () => ({ credentialId: 'cred_1', principalId: 'usr_1', createdAt: t, expiresAt: t, activatedAt: null,
     confirmedAt: null, revokedAt: null, grants: [{ collectionId: 'col_1', capabilities: ['records:read'], expiresAt: null }] })
 };
@@ -104,7 +106,7 @@ test('section lines the authority stores are accepted', () => {
   const accepted = {
     'version 1 with null predecessors': [['retrieval', () => {}], ['extractions', () => {}], ['claims', () => {}]],
     'a later version naming its predecessor': [['retrieval', l => { l.version = 2; l.previousVersion = 1; }],
-      ['claims', l => { l.revision = 2; l.previousRevision = 1; }]],
+      ['extractions', l => { l.version = 2; l.previousVersion = 1; }], ['claims', l => { l.revision = 2; l.previousRevision = 1; }]],
     'a reference-only original': [['sources', l => {
       l.locator = 'https://example.com/a';
       l.original = { referenceOnly: true, sha256: null, byteSize: null, mimeType: null, capturedAt: t, observedAt: t };
@@ -113,7 +115,8 @@ test('section lines the authority stores are accepted', () => {
       Object.assign(l, { reviewStatus: 'accepted', reviewedBy: 'usr_1', reviewedAt: t });
     }]],
     'a pre-042 revision without a recorder': [['claims', l => { l.recordedBy = null; }]],
-    'vector retrieval with a region': [['retrieval', l => { l.vector = true; l.processingRegions = ['eu']; }]],
+    'vector retrieval with a region': [['retrieval', l => { l.vector = true; l.processingRegions = ['eu-west-1']; }]],
+    'record fields as JSON Pointers': [['retrieval', l => { l.recordFields = ['/title', '/a~1b/0']; }]],
     'a deletion revision': [['revisions', l => { l.operation = 'delete'; l.data = null; }]]
   };
   for (const [name, changes] of Object.entries(accepted)) {
@@ -127,9 +130,15 @@ test('section lines the authority stores are accepted', () => {
 
 test('section lines the authority refuses are refused', () => {
   const refused = {
-    'a predecessor of 0': ['extractions', l => { l.previousVersion = 0; }],
-    'a negative predecessor': ['retrieval', l => { l.previousVersion = -1; }],
-    'a claim predecessor of 0': ['claims', l => { l.previousRevision = 0; }],
+    'a predecessor of 0': ['extractions', l => { l.version = 2; l.previousVersion = 0; }],
+    'a negative predecessor': ['retrieval', l => { l.version = 2; l.previousVersion = -1; }],
+    'a predecessor at version 1': ['retrieval', l => { l.previousVersion = 1; }],
+    'no predecessor after version 1': ['retrieval', l => { l.version = 2; }],
+    'an extraction predecessor at version 1': ['extractions', l => { l.previousVersion = 1; }],
+    'no extraction predecessor after version 1': ['extractions', l => { l.version = 3; }],
+    'a claim predecessor at revision 1': ['claims', l => { l.previousRevision = 1; }],
+    'no claim predecessor after revision 1': ['claims', l => { l.revision = 2; }],
+    'a claim predecessor of 0': ['claims', l => { l.revision = 2; l.previousRevision = 0; }],
     'a null extraction digest': ['extractions', l => { l.sourceSha256 = null; }],
     'a malformed extraction digest': ['extractions', l => { l.sourceSha256 = 'A'.repeat(64); }],
     'a null parser': ['extractions', l => { l.parser = null; }],
@@ -140,6 +149,14 @@ test('section lines the authority refuses are refused', () => {
     'a null statement': ['claims', l => { l.statement = null; }],
     'a null attribution': ['claims', l => { l.attributedTo = null; }],
     'a null claim credential': ['claims', l => { l.credentialId = null; }],
+    'an empty recorder': ['claims', l => { l.recordedBy = ''; }],
+    'an empty locator': ['sources', l => { l.locator = ''; }],
+    'an empty event credential': ['events', l => { l.credentialId = ''; }],
+    'a record field that is not a JSON Pointer': ['retrieval', l => { l.recordFields = ['title']; }],
+    'a repeated record field': ['retrieval', l => { l.recordFields = ['/a', '/a']; }],
+    'an uppercase region': ['retrieval', l => { l.processingRegions = ['EU']; }],
+    'a repeated region': ['retrieval', l => { l.processingRegions = ['eu', 'eu']; }],
+    'seventeen regions': ['retrieval', l => { l.processingRegions = Array.from({ length: 17 }, (_, i) => `r${i}`); }],
     'an unknown review status': ['claims', l => { l.reviewStatus = 'maybe'; }],
     'a null review status': ['claims', l => { l.reviewStatus = null; }],
     'an accepted claim without a reviewer': ['claims', l => { l.reviewStatus = 'accepted'; }],
